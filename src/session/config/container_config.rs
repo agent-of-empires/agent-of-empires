@@ -11,7 +11,8 @@ use anyhow::{Context, Result};
 
 use crate::containers::{ContainerConfig, EnvEntry, NamedVolumeMount, RunPolicy, VolumeMount};
 use crate::git::GitWorktree;
-use crate::session::config::VolumeIgnoresStrategy;
+use crate::session::config::{SharedCredentialMode, VolumeIgnoresStrategy};
+use crate::session::sandbox_login::{claude, now_ms, AgentLogin, CredentialState, LaunchAuth};
 
 use crate::hooks::SymlinkPolicy;
 use crate::session::environment::collect_environment;
@@ -22,6 +23,8 @@ use seed::{sync_agent_config, NativeStateBoundary};
 /// Subdirectory name inside each agent's config dir for sandbox config.
 const SANDBOX_SUBDIR: &str = "sandbox";
 const SANDBOX_PRIVATE_SUBDIR: &str = "sandbox-v2";
+/// The home directory every sandbox runs under.
+pub(crate) const CONTAINER_HOME: &str = "/root";
 pub(crate) const CURRENT_SANDBOX_STORE_GENERATION: u8 = 2;
 
 /// Content seeded into the Claude sandbox `.sandbox-gitconfig`. Scoped to github.com;
@@ -50,6 +53,8 @@ struct AgentConfigMount {
     preserve_files: &'static [&'static str],
     /// Shared rotating credentials retain their existing separately locked flow.
     shared_credential_files: &'static [&'static str],
+    /// The agent's sandbox login, when it has one.
+    login: Option<&'static AgentLogin>,
     /// Portable encrypted credentials are published as complete seed-once pairs.
     credential_pairs: &'static [(&'static str, &'static str)],
     /// Seed-once consistent snapshots, not raw database/sidecar copies.
@@ -72,11 +77,12 @@ const AGENT_CONFIG_MOUNTS: &[AgentConfigMount] = &[
         // Onboarding is home-level. IS_SANDBOX makes Claude use the separately
         // mounted gitconfig; its helper forwards GH_TOKEN only for github.com get.
         home_seed_files: &[
-            (".claude.json", r#"{"hasCompletedOnboarding":true}"#),
+            (".claude.json", claude::ONBOARDING_SEED),
             (".sandbox-gitconfig", SANDBOX_GITCONFIG_SEED),
         ],
         preserve_files: &["settings.json"],
         shared_credential_files: &[".credentials.json"],
+        login: Some(&claude::LOGIN),
         credential_pairs: &[],
         sqlite_seed_files: &[],
         native_state_paths: &[
@@ -103,6 +109,7 @@ const AGENT_CONFIG_MOUNTS: &[AgentConfigMount] = &[
         home_seed_files: &[],
         preserve_files: &[],
         shared_credential_files: &[],
+        login: None,
         credential_pairs: &[],
         sqlite_seed_files: &[],
         native_state_paths: &["opencode.db*", "storage", "log", "snapshot"],
@@ -118,6 +125,7 @@ const AGENT_CONFIG_MOUNTS: &[AgentConfigMount] = &[
         home_seed_files: &[],
         preserve_files: &[],
         shared_credential_files: &[],
+        login: None,
         credential_pairs: &[],
         sqlite_seed_files: &[],
         native_state_paths: &[],
@@ -133,6 +141,7 @@ const AGENT_CONFIG_MOUNTS: &[AgentConfigMount] = &[
         home_seed_files: &[],
         preserve_files: &[],
         shared_credential_files: &[],
+        login: None,
         credential_pairs: &[],
         sqlite_seed_files: &[],
         native_state_paths: &[
@@ -166,6 +175,7 @@ const AGENT_CONFIG_MOUNTS: &[AgentConfigMount] = &[
         home_seed_files: &[],
         preserve_files: &[],
         shared_credential_files: &[],
+        login: None,
         credential_pairs: &[],
         sqlite_seed_files: &[],
         native_state_paths: &["tmp", "history", "sessions", "cache"],
@@ -181,6 +191,7 @@ const AGENT_CONFIG_MOUNTS: &[AgentConfigMount] = &[
         home_seed_files: &[],
         preserve_files: &[],
         shared_credential_files: &[],
+        login: None,
         credential_pairs: &[],
         sqlite_seed_files: &[],
         native_state_paths: &["logs", "sessions", "history"],
@@ -202,6 +213,7 @@ const AGENT_CONFIG_MOUNTS: &[AgentConfigMount] = &[
         home_seed_files: &[],
         preserve_files: &[],
         shared_credential_files: &[],
+        login: None,
         credential_pairs: &[],
         sqlite_seed_files: &[],
         native_state_paths: &["chats", "projects", "agent-transcripts", "store.db*"],
@@ -223,6 +235,7 @@ const AGENT_CONFIG_MOUNTS: &[AgentConfigMount] = &[
         home_seed_files: &[],
         preserve_files: &[],
         shared_credential_files: &[],
+        login: None,
         credential_pairs: &[],
         sqlite_seed_files: &[],
         native_state_paths: &["session-state", "sessions", "history.jsonl", "logs"],
@@ -257,6 +270,7 @@ const AGENT_CONFIG_MOUNTS: &[AgentConfigMount] = &[
         home_seed_files: &[],
         preserve_files: &[],
         shared_credential_files: &[],
+        login: None,
         credential_pairs: &[],
         sqlite_seed_files: &[],
         native_state_paths: &["agent/sessions", "agent/pi-debug.log", "agent/tmp"],
@@ -325,6 +339,7 @@ const AGENT_CONFIG_MOUNTS: &[AgentConfigMount] = &[
         home_seed_files: &[],
         preserve_files: &[],
         shared_credential_files: &[],
+        login: None,
         credential_pairs: &[],
         sqlite_seed_files: &["agent/agent.db"],
         native_state_paths: &[
@@ -355,6 +370,7 @@ const AGENT_CONFIG_MOUNTS: &[AgentConfigMount] = &[
         home_seed_files: &[],
         preserve_files: &["shell-hooks-allowlist.json"],
         shared_credential_files: &[],
+        login: None,
         credential_pairs: &[],
         sqlite_seed_files: &[],
         // Hermes native state is declared by its own rule catalogue
@@ -379,6 +395,7 @@ const AGENT_CONFIG_MOUNTS: &[AgentConfigMount] = &[
         home_seed_files: &[],
         preserve_files: &[],
         shared_credential_files: &[],
+        login: None,
         credential_pairs: &[
             ("auth.v2.file", "auth.v2.key"),
             ("mcp-oauth.v2.file", "mcp-oauth.v2.key"),
@@ -397,6 +414,7 @@ const AGENT_CONFIG_MOUNTS: &[AgentConfigMount] = &[
         home_seed_files: &[],
         preserve_files: &[],
         shared_credential_files: &[],
+        login: None,
         credential_pairs: &[],
         sqlite_seed_files: &[],
         native_state_paths: &["sessions", "logs", "cache"],
@@ -418,6 +436,7 @@ const AGENT_CONFIG_MOUNTS: &[AgentConfigMount] = &[
         home_seed_files: &[],
         preserve_files: &[],
         shared_credential_files: &[],
+        login: None,
         credential_pairs: &[],
         sqlite_seed_files: &[],
         native_state_paths: &["sessions", "tmp", "cache", "history"],
@@ -441,6 +460,7 @@ const AGENT_CONFIG_MOUNTS: &[AgentConfigMount] = &[
         home_seed_files: &[],
         preserve_files: &["antigravity-oauth-token"],
         shared_credential_files: &[],
+        login: None,
         credential_pairs: &[],
         sqlite_seed_files: &[],
         native_state_paths: &[
@@ -467,6 +487,7 @@ const AGENT_CONFIG_MOUNTS: &[AgentConfigMount] = &[
         home_seed_files: &[],
         preserve_files: &[],
         shared_credential_files: &[],
+        login: None,
         credential_pairs: &[],
         sqlite_seed_files: &[],
         native_state_paths: &["sessions", "session_index.jsonl", "logs", "cache", "agents"],
@@ -482,6 +503,7 @@ const AGENT_CONFIG_MOUNTS: &[AgentConfigMount] = &[
         home_seed_files: &[],
         preserve_files: &[],
         shared_credential_files: &[],
+        login: None,
         credential_pairs: &[],
         sqlite_seed_files: &[],
         native_state_paths: &["sessions", "kernel-venv"],
@@ -489,8 +511,6 @@ const AGENT_CONFIG_MOUNTS: &[AgentConfigMount] = &[
 ];
 
 fn rewrite_claude_plugin_paths(sandbox_dir: &Path, host_home: &Path) -> Result<()> {
-    const CONTAINER_HOME: &str = "/root";
-
     let plugins_dir = sandbox_dir.join("plugins");
     if !plugins_dir.exists() {
         return Ok(());
@@ -572,50 +592,17 @@ fn rewrite_plugin_value_paths(
     }
 }
 
-/// The furthest `expiresAt` a real token carries. The shared file is writable
-/// from inside every sandbox, so a planted timestamp beyond this would
-/// otherwise outrank every later login for good.
-const CREDENTIAL_EXPIRY_HORIZON: std::time::Duration =
-    std::time::Duration::from_secs(400 * 24 * 60 * 60);
-
-/// The `expiresAt` of a credential a container could use, or `None` when the
-/// content is not one.
-///
-/// A blanked token block is not one. Claude Code empties `accessToken` and
-/// `refreshToken` in place when its credential fails to authenticate and
-/// keeps the rest of the block, so what it leaves still parses and can still
-/// carry an expiry (#3860). Read as a credential, that shell mounts dead into
-/// every later container and blocks the seed that would repair it.
-fn plausible_credential_expires_at(content: &str, now_ms: u64) -> Option<u64> {
-    let value: serde_json::Value = serde_json::from_str(content).ok()?;
-    let oauth = value.get("claudeAiOauth")?;
-    let filled = |field| {
-        oauth
-            .get(field)
-            .and_then(serde_json::Value::as_str)
-            .is_some_and(|token| !token.trim().is_empty())
-    };
-    if !filled("accessToken") && !filled("refreshToken") {
-        return None;
-    }
-    oauth.get("expiresAt")?.as_u64().filter(|expires_at| {
-        *expires_at <= now_ms.saturating_add(CREDENTIAL_EXPIRY_HORIZON.as_millis() as u64)
-    })
-}
-
-fn now_ms() -> u64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map_or(0, |elapsed| elapsed.as_millis() as u64)
-}
-
 /// Decide whether an incoming credential should overwrite the existing one,
 /// based on `expiresAt` timestamps. Returns `true` if the incoming credential
 /// should be written.
-fn should_overwrite_credential(existing_content: &str, incoming_content: &str) -> bool {
+fn should_overwrite_credential(
+    login: &AgentLogin,
+    existing_content: &str,
+    incoming_content: &str,
+) -> bool {
     let now = now_ms();
-    let existing_exp = plausible_credential_expires_at(existing_content, now);
-    let incoming_exp = plausible_credential_expires_at(incoming_content, now);
+    let existing_exp = (login.credential_expires_at)(existing_content, now);
+    let incoming_exp = (login.credential_expires_at)(incoming_content, now);
 
     match (existing_exp, incoming_exp) {
         (Some(existing), Some(incoming)) => incoming > existing,
@@ -725,7 +712,8 @@ fn read_credential_candidate(dir: &Path, name: &str, follow: SymlinkPolicy) -> O
 /// Which candidates a fold may put over a credential the shared file holds.
 /// The host file and the Keychain only ever seed a file holding none: a token
 /// copied from the host is the host's own refresh token, and the first side
-/// to refresh would log the other out.
+/// to refresh would log the other out. A caller that prepares a store applies
+/// [`CredentialFold::under`] with the configured `sandbox.shared_credential`.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub(crate) enum CredentialFold {
     /// A come-up, create or start: a fresher copy left in the store by an
@@ -734,11 +722,20 @@ pub(crate) enum CredentialFold {
     Freshest,
     /// Off a come-up: nothing replaces what the file holds.
     SeedOnly,
+    /// `sandbox.shared_credential = "separate_login"`: only a login made in
+    /// the sandboxes fills the file. No candidate is read, and an absent file is
+    /// created empty.
+    SeparateLogin,
 }
 
-/// Whether `content` carries a credential a container could use.
-fn holds_credential(content: &str) -> bool {
-    plausible_credential_expires_at(content, now_ms()).is_some()
+impl CredentialFold {
+    /// The fold `mode` leaves. An agent without a shared credential file is unaffected.
+    pub(crate) fn under(self, mode: SharedCredentialMode) -> Self {
+        match mode {
+            SharedCredentialMode::HostSeed => self,
+            SharedCredentialMode::SeparateLogin => Self::SeparateLogin,
+        }
+    }
 }
 
 /// Fold the freshest credential into the file every store of this agent
@@ -752,10 +749,10 @@ fn holds_credential(content: &str) -> bool {
 /// login before the file was shared), the host file and the macOS Keychain,
 /// the freshest by `expiresAt` winning among those `fold` admits; see
 /// [`CredentialFold`]. Only the winner's
-/// `claudeAiOauth` replaces the file's, so what the agent keeps beside it
+/// credential replaces the file's, so what the agent keeps beside it
 /// survives. The file is written in place: a rename would leave every running
 /// container's bind mount on the old inode. An absent file is created
-/// empty-but-valid so the mount has a source; the agent's own login fills it.
+/// empty-but-valid so the mount has a source; the agent's login fills it.
 fn sync_shared_credential(
     mount: &AgentConfigMount,
     host_dir: &Path,
@@ -763,6 +760,9 @@ fn sync_shared_credential(
     name: &str,
     fold: CredentialFold,
 ) -> Result<Option<PathBuf>> {
+    let Some(login) = mount.login else {
+        return Ok(None);
+    };
     let Some(shared) = shared_credential_path(sandbox_dir, name) else {
         return Ok(None);
     };
@@ -770,9 +770,57 @@ fn sync_shared_credential(
         return Ok(None);
     };
     std::fs::create_dir_all(root)?;
+    let candidates = credential_candidates(
+        mount,
+        host_dir,
+        sandbox_dir,
+        name,
+        fold,
+        read_keychain_credential,
+    );
 
-    // Each candidate with whether it is a sandbox chain of its own.
+    // The candidates are gathered outside the lock (the Keychain read is a
+    // subprocess); the file is read again under it, right before the write,
+    // so another come-up or a container's own refresh in between is seen.
+    crate::hooks::with_config_lock_policy(&shared, "lock", SymlinkPolicy::Never, || {
+        let existing = read_credential_file(root, name, SymlinkPolicy::Never)?;
+        let existing_usable = login.usable(existing.as_deref());
+        let mut winner: Option<&str> = None;
+        for (candidate, sandbox_chain) in &candidates {
+            if existing_usable && !(*sandbox_chain && fold == CredentialFold::Freshest) {
+                continue;
+            }
+            let current = winner.or(existing.as_deref());
+            if current.is_none_or(|current| should_overwrite_credential(login, current, candidate))
+            {
+                winner = Some(candidate);
+            }
+        }
+        match (existing.as_deref(), winner) {
+            (None, None) => write_credential_in_place(&shared, "{}"),
+            (_, None) => Ok(()),
+            (existing, Some(winner)) => {
+                write_credential_in_place(&shared, &(login.merge_credential)(existing, winner))
+            }
+        }
+    })?;
+    Ok(Some(shared))
+}
+
+/// Each candidate `fold` lets [`sync_shared_credential`] read, with whether it
+/// is a sandbox chain of its own.
+fn credential_candidates(
+    mount: &AgentConfigMount,
+    host_dir: &Path,
+    sandbox_dir: &Path,
+    name: &str,
+    fold: CredentialFold,
+    read_keychain: impl FnOnce(&str) -> Result<Option<String>>,
+) -> Vec<(String, bool)> {
     let mut candidates = Vec::new();
+    if fold == CredentialFold::SeparateLogin {
+        return candidates;
+    }
     candidates.extend(
         read_credential_candidate(sandbox_dir, name, SymlinkPolicy::Never).map(|c| (c, true)),
     );
@@ -783,54 +831,13 @@ fn sync_shared_credential(
         .keychain_credential
         .filter(|(_, filename)| *filename == name)
     {
-        match read_keychain_credential(service) {
+        match read_keychain(service) {
             Ok(content) => candidates.extend(content.map(|c| (c, false))),
             Err(e) => tracing::warn!(target: "session.profile",
                 "Failed to read keychain credential for {}: {}", mount.host_rel, e),
         }
     }
-
-    // The candidates are gathered outside the lock (the Keychain read is a
-    // subprocess); the file is read again under it, right before the write,
-    // so another come-up or a container's own refresh in between is seen.
-    crate::hooks::with_config_lock_policy(&shared, "lock", SymlinkPolicy::Never, || {
-        let existing = read_credential_file(root, name, SymlinkPolicy::Never)?;
-        let existing_usable = existing.as_deref().is_some_and(holds_credential);
-        let mut winner: Option<&str> = None;
-        for (candidate, sandbox_chain) in &candidates {
-            if existing_usable && !(*sandbox_chain && fold == CredentialFold::Freshest) {
-                continue;
-            }
-            let current = winner.or(existing.as_deref());
-            if current.is_none_or(|current| should_overwrite_credential(current, candidate)) {
-                winner = Some(candidate);
-            }
-        }
-        match (existing.as_deref(), winner) {
-            (None, None) => write_credential_in_place(&shared, "{}"),
-            (_, None) => Ok(()),
-            (existing, Some(winner)) => {
-                write_credential_in_place(&shared, &merge_credential(existing, winner))
-            }
-        }
-    })?;
-    Ok(Some(shared))
-}
-
-/// `winner` with everything `existing` held beside `claudeAiOauth` kept, so a
-/// host copy that wins on expiry does not drop what the agent stored in the
-/// file inside a container. Anything that is not two JSON objects is replaced
-/// whole.
-fn merge_credential(existing: Option<&str>, winner: &str) -> String {
-    let parsed = |content: &str| {
-        serde_json::from_str::<serde_json::Map<String, serde_json::Value>>(content).ok()
-    };
-    let merged = existing.and_then(parsed).and_then(|mut merged| {
-        let oauth = parsed(winner)?.remove("claudeAiOauth")?;
-        merged.insert("claudeAiOauth".to_string(), oauth);
-        serde_json::to_string(&merged).ok()
-    });
-    merged.unwrap_or_else(|| winner.to_string())
+    candidates
 }
 
 /// Place the mountpoint each store needs for the shared credential file
@@ -868,7 +875,7 @@ pub(crate) fn place_shadowed_credential_mountpoints(config: &ContainerConfig) {
         };
         // Only a store beside the shared file holds a shadowed copy. A user
         // extra_volumes entry at the config path replaces the store mount, and
-        // the credential under it is the user's own login.
+        // the credential under it is the user's login.
         if Path::new(&store.host_path).parent() != Path::new(&shared.host_path).parent() {
             continue;
         }
@@ -891,12 +898,23 @@ pub(crate) fn place_shadowed_credential_mountpoints(config: &ContainerConfig) {
 /// the only chain there is, and a plain file already serves as the
 /// mountpoint. Either side that cannot be read keeps the copy.
 fn shadowed_copy_is_folded(shared_root: &Path, store: &Path, name: &str) -> bool {
+    let Some(login) = login_for_credential_file(name) else {
+        return false;
+    };
     let shared = read_credential_file(shared_root, name, SymlinkPolicy::Never);
     let copy = read_credential_file(store, name, SymlinkPolicy::Never);
     match (shared, copy) {
-        (Ok(Some(shared)), Ok(Some(copy))) => !should_overwrite_credential(&shared, &copy),
+        (Ok(Some(shared)), Ok(Some(copy))) => !should_overwrite_credential(login, &shared, &copy),
         _ => false,
     }
+}
+
+/// The login of the agent whose shared credential file is called `name`.
+fn login_for_credential_file(name: &str) -> Option<&'static AgentLogin> {
+    AGENT_CONFIG_MOUNTS
+        .iter()
+        .find(|mount| mount.shared_credential_files.contains(&name))
+        .and_then(|mount| mount.login)
 }
 
 /// A plain file at `path` for the runtime to mount over, emptied when
@@ -1923,6 +1941,230 @@ impl<'a> RefreshContext<'a> for (bool, &'a Path) {
     }
 }
 
+/// Where the sandbox login of one agent lands, resolved for a tool and the command it launches.
+#[derive(Debug)]
+pub(crate) struct LoginTarget {
+    pub login: &'static AgentLogin,
+    /// The shared credential file every sandbox of the agent mounts.
+    pub credential: PathBuf,
+    /// Where a sandbox, and the login helper, sees it.
+    pub credential_in_container: String,
+}
+
+/// The sandbox login of the agent `tool` resolves to under `profile` for `command`, or
+/// `None` when that agent declares none. The identity is resolved from the profile's
+/// settings alone, as the container mount resolves the agent it mounts
+/// ([`build_container_config`]): a target the mount would not honour must not be gated on.
+pub(crate) fn login_target_for(
+    profile: &str,
+    tool: &str,
+    command: Option<&str>,
+) -> Option<LoginTarget> {
+    login_target_in(AGENT_CONFIG_MOUNTS, profile, tool, command)
+}
+
+fn login_target_in(
+    mounts: &[AgentConfigMount],
+    profile: &str,
+    tool: &str,
+    command: Option<&str>,
+) -> Option<LoginTarget> {
+    let home = dirs::home_dir()?;
+    let config = super::profile_config::resolve_config_or_warn(profile);
+    let agent = resolve_active_agent(tool, command, &config.session)?;
+    let mount = mounts
+        .iter()
+        .find(|m| m.tool_name == agent.name && m.login.is_some())?;
+    let name = mount.shared_credential_files.first()?;
+    let declared = config.session.agent_config_dir_for(tool, &home);
+    let root = sandbox_store_roots(agent.name, &home, declared.as_deref())
+        .into_iter()
+        .next()?;
+    Some(LoginTarget {
+        login: mount.login?,
+        credential: root.join(name),
+        credential_in_container: format!(
+            "{}/{name}",
+            agent_config_container_path(mount, CONTAINER_HOME, &[])
+        ),
+    })
+}
+
+/// The login target a session of `tool` under `profile` is gated on, for a surface with no
+/// session to ask (login, status, cleanup). It resolves as the gate does, through
+/// [`login_target_with_command`], so the two cannot drift.
+pub(crate) fn login_target(profile: &str, tool: &str) -> Option<LoginTarget> {
+    login_target_with_command(profile, tool, None)
+}
+
+/// The login target of a launch of `tool` under `profile`. `command` is the session's own
+/// command for the tool, a per-session override; `None` or empty leaves the launch command
+/// to [`effective_launch_command`]. The gate and every login surface resolve through this
+/// one function.
+pub(crate) fn login_target_with_command(
+    profile: &str,
+    tool: &str,
+    command: Option<&str>,
+) -> Option<LoginTarget> {
+    let command = effective_launch_command(profile, tool, command.unwrap_or(""));
+    login_target_for(
+        profile,
+        tool,
+        Some(command.as_str()).filter(|c| !c.is_empty()),
+    )
+}
+
+/// The command a launch of `tool` runs: the session's own command when it has one, else
+/// the one the profile's settings give the tool.
+pub(crate) fn effective_launch_command(profile: &str, tool: &str, session_command: &str) -> String {
+    if !session_command.is_empty() {
+        return session_command.to_string();
+    }
+    super::profile_config::resolve_config_or_warn(profile)
+        .session
+        .launch_command_for(tool)
+}
+
+/// The tool a login without `--tool` is for: the profile's default tool when it has a sandbox
+/// login, else the only agent that declares one. `None` when neither picks one.
+pub(crate) fn default_login_tool(profile: &str) -> Option<String> {
+    let config = super::profile_config::resolve_config_or_warn(profile);
+    if let Some(tool) = config.session.default_tool.as_deref() {
+        if login_target(profile, tool).is_some() {
+            return Some(tool.to_string());
+        }
+    }
+    let mut capable = login_capable_agents();
+    let only = capable.next()?;
+    capable.next().is_none().then(|| only.to_string())
+}
+
+/// The agents that declare a sandbox login, once each.
+pub(crate) fn login_capable_agents() -> impl Iterator<Item = &'static str> {
+    let mut seen = Vec::new();
+    AGENT_CONFIG_MOUNTS
+        .iter()
+        .filter(|mount| mount.login.is_some())
+        .map(|mount| mount.tool_name)
+        .filter(move |name| {
+            let new = !seen.contains(name);
+            seen.push(name);
+            new
+        })
+}
+
+/// The file's content read under its config lock; `None` when absent or empty.
+/// A missing file is not locked: taking the lock would create its root and lock file.
+pub(crate) fn read_shared_credential(path: &Path) -> Result<Option<String>> {
+    let (Some(root), Some(name)) = (path.parent(), path.file_name().and_then(|n| n.to_str()))
+    else {
+        return Ok(None);
+    };
+    if std::fs::symlink_metadata(path).is_err_and(|e| e.kind() == std::io::ErrorKind::NotFound) {
+        return Ok(None);
+    }
+    crate::hooks::with_config_lock_policy(path, "lock", SymlinkPolicy::Never, || {
+        read_credential_file(root, name, SymlinkPolicy::Never)
+    })
+}
+
+/// Creates the file as `{}` under its config lock when it holds nothing, the
+/// placeholder a come-up writes, so a bind mount of it has an inode to keep.
+pub(crate) fn ensure_shared_credential_file(path: &Path) -> Result<()> {
+    let (Some(root), Some(name)) = (path.parent(), path.file_name().and_then(|n| n.to_str()))
+    else {
+        anyhow::bail!("{} is not a credential file path", path.display());
+    };
+    crate::hooks::with_config_lock_policy(path, "lock", SymlinkPolicy::Never, || {
+        match read_credential_file(root, name, SymlinkPolicy::Never)? {
+            Some(_) => Ok(()),
+            None => write_credential_in_place(path, "{}"),
+        }
+    })
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum LoginGate {
+    Proceed,
+    /// The launch waits for a login the helper can perform.
+    LoginRequired,
+    /// The launch needs a login the active runtime cannot perform: refused, never held.
+    Unsupported,
+}
+
+/// Whether a sandbox launch of `login`'s agent may bring it up, needs a login first, or
+/// needs one that `runtime` cannot give. The agent's integration decides whether this
+/// launch uses the shared credential at all, and only then is the credential read.
+pub(crate) fn login_gate(
+    mode: SharedCredentialMode,
+    runtime: crate::containers::RuntimeKind,
+    login: &AgentLogin,
+    auth: &LaunchAuth,
+    read_shared: impl FnOnce() -> Option<String>,
+) -> LoginGate {
+    if mode != SharedCredentialMode::SeparateLogin || !(login.needs_credential)(auth) {
+        return LoginGate::Proceed;
+    }
+    if login.usable(read_shared().as_deref()) {
+        LoginGate::Proceed
+    } else if crate::session::sandbox_login::helper::supports_runtime(runtime) {
+        LoginGate::LoginRequired
+    } else {
+        LoginGate::Unsupported
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[serde(tag = "state", rename_all = "snake_case")]
+pub(crate) enum SandboxLoginStatus {
+    NotApplicable,
+    /// `separate_login` on a runtime that cannot run the login helper.
+    Unsupported,
+    Needed,
+    Ok {
+        refresh_expires_at: Option<u64>,
+    },
+}
+
+/// Whether the separate sandbox login is needed for the sandboxes of `tool` under
+/// `profile`: the file a session of that tool is gated on ([`login_target_with_command`]).
+/// `command` is the one a session's launch runs for `tool` when it overrides the profile's;
+/// `None` is the profile's.
+pub(crate) fn sandbox_login_status(
+    profile: &str,
+    tool: &str,
+    command: Option<&str>,
+) -> SandboxLoginStatus {
+    let mode = super::profile_config::resolve_config_or_warn(profile)
+        .sandbox
+        .shared_credential;
+    if mode != SharedCredentialMode::SeparateLogin {
+        return SandboxLoginStatus::NotApplicable;
+    }
+    let Some(target) = login_target_with_command(profile, tool, command) else {
+        return SandboxLoginStatus::NotApplicable;
+    };
+    // The credential is read first: a usable login needs no helper, so the runtime only
+    // matters when a login is actually needed, as in [`login_gate`].
+    let content = read_shared_credential(&target.credential).unwrap_or_else(|e| {
+        tracing::warn!(target: "session.profile", "Failed to read the shared credential of {tool}: {e:#}");
+        None
+    });
+    match target.login.state(content.as_deref()) {
+        CredentialState::Usable { refresh_expires_at } => {
+            SandboxLoginStatus::Ok { refresh_expires_at }
+        }
+        CredentialState::Unusable
+            if !crate::session::sandbox_login::helper::supports_runtime(
+                crate::containers::get_container_runtime().kind,
+            ) =>
+        {
+            SandboxLoginStatus::Unsupported
+        }
+        CredentialState::Unusable => SandboxLoginStatus::Needed,
+    }
+}
+
 /// Re-sync the current instance's physically isolated agent config.
 pub(crate) fn refresh_agent_configs_for_instance<'a>(
     profile_config: &super::Config,
@@ -1941,6 +2183,7 @@ pub(crate) fn refresh_agent_configs_for_instance<'a>(
         return;
     };
     let declared = profile_config.session.agent_config_dir_for(tool, &home);
+    let fold = fold.under(profile_config.sandbox.shared_credential);
     for mount in AGENT_CONFIG_MOUNTS
         .iter()
         .filter(|mount| mount.tool_name == agent.name)
@@ -2581,8 +2824,6 @@ pub(crate) fn build_container_config(
 
     let sandbox_config = launch_config.sandbox();
 
-    const CONTAINER_HOME: &str = "/root";
-
     let mut environment = collect_environment(sandbox_config, sandbox_info);
     // Pin the home used to place agent hooks. Container images may declare a
     // different ENV HOME, so absence is not proof that `/root` is effective.
@@ -2705,6 +2946,10 @@ pub(crate) fn build_container_config(
         profile_config,
         Path::new(&workspace_path),
     )?;
+    // Global-only and read without the repo merge.
+    let credential_fold = agent_selection
+        .credential_fold
+        .under(profile_config.sandbox.shared_credential);
     for mount in AGENT_CONFIG_MOUNTS
         .iter()
         .filter(|m| m.tool_name == config_tool)
@@ -2717,7 +2962,7 @@ pub(crate) fn build_container_config(
                 directory.clone(),
                 directory.join(SANDBOX_PRIVATE_SUBDIR).join(instance_id),
                 &home,
-                agent_selection.credential_fold,
+                credential_fold,
                 auto_propagate,
                 profile_session_config,
                 Path::new(&workspace_path),
@@ -2726,7 +2971,7 @@ pub(crate) fn build_container_config(
                 mount,
                 &home,
                 Some(instance_id),
-                agent_selection.credential_fold,
+                credential_fold,
                 auto_propagate,
                 profile_session_config,
                 Path::new(&workspace_path),
@@ -3184,6 +3429,7 @@ fn common_ancestor(a: &Path, b: &Path) -> PathBuf {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::containers::RuntimeKind;
     use crate::hooks::test_support::BaseGuard;
     use std::fs;
     use tempfile::TempDir;
@@ -4558,62 +4804,18 @@ mod tests {
     /// Fields in the order `serde_json` writes them back, so a fold that
     /// re-serializes a credential produces this string again.
     fn credential(expires_at: u64) -> String {
-        format!(
-            r#"{{"claudeAiOauth":{{"accessToken":"access-{expires_at}","expiresAt":{expires_at},"refreshToken":"refresh-{expires_at}"}}}}"#
-        )
+        crate::session::sandbox_login::claude::fixtures::credential(expires_at)
     }
 
     /// What Claude Code leaves behind when its credential fails to
     /// authenticate: both tokens emptied in place, the rest of the block kept.
     fn blanked_credential(expires_at: u64) -> String {
-        format!(
-            r#"{{"claudeAiOauth":{{"accessToken":"","expiresAt":{expires_at},"refreshToken":"","scopes":["user:inference"],"subscriptionType":"max"}}}}"#
-        )
-    }
-
-    #[test]
-    fn only_a_usable_credential_carries_an_expiry() {
-        let now = now_ms();
-        let horizon = CREDENTIAL_EXPIRY_HORIZON.as_millis() as u64;
-        let cases = [
-            (credential(1700000000), Some(1700000000)),
-            // Emptied tokens are not a credential, whatever expiry is left
-            // beside them (#3860).
-            (blanked_credential(1700000000), None),
-            (blanked_credential(0), None),
-            // Either token alone keeps a container going: an access token
-            // until it expires, a refresh token to get another.
-            (
-                r#"{"claudeAiOauth":{"accessToken":"a","expiresAt":10}}"#.into(),
-                Some(10),
-            ),
-            (
-                r#"{"claudeAiOauth":{"refreshToken":"r","expiresAt":10}}"#.into(),
-                Some(10),
-            ),
-            (r#"{"other":"data"}"#.into(), None),
-            (r#"{"claudeAiOauth":{"accessToken":"a"}}"#.into(), None),
-            (
-                r#"{"claudeAiOauth":{"accessToken":"a","expiresAt":"10"}}"#.into(),
-                None,
-            ),
-            ("not json at all".into(), None),
-            (String::new(), None),
-            // Planted from inside a sandbox to outrank every later login.
-            (credential(now + horizon + 1), None),
-        ];
-        for (content, expires_at) in cases {
-            assert_eq!(
-                plausible_credential_expires_at(&content, now),
-                expires_at,
-                "{content}"
-            );
-        }
+        crate::session::sandbox_login::claude::fixtures::blanked_credential(expires_at)
     }
 
     #[test]
     fn the_freshest_credential_wins_an_overwrite() {
-        let far = credential(now_ms() + 2 * CREDENTIAL_EXPIRY_HORIZON.as_millis() as u64);
+        let far = credential(now_ms() + 2 * claude::CREDENTIAL_EXPIRY_HORIZON.as_millis() as u64);
         let cases = [
             (credential(2000), credential(1000), false),
             (credential(1000), credential(2000), true),
@@ -4631,7 +4833,7 @@ mod tests {
         ];
         for (existing, incoming, overwrite) in cases {
             assert_eq!(
-                should_overwrite_credential(&existing, &incoming),
+                should_overwrite_credential(&claude::LOGIN, &existing, &incoming),
                 overwrite,
                 "{existing} -> {incoming}"
             );
@@ -4678,19 +4880,6 @@ mod tests {
         fs::create_dir(&shared).unwrap();
         prepare();
         assert!(shared.is_dir());
-    }
-
-    #[test]
-    fn merge_keeps_what_the_file_held_beside_the_oauth_token() {
-        let existing = r#"{"claudeAiOauth":{"expiresAt":1},"designOauth":{"k":"v"}}"#;
-        let winner = r#"{"claudeAiOauth":{"expiresAt":2}}"#;
-        let merged: serde_json::Value =
-            serde_json::from_str(&merge_credential(Some(existing), winner)).unwrap();
-        assert_eq!(merged["claudeAiOauth"]["expiresAt"], 2);
-        assert_eq!(merged["designOauth"]["k"], "v");
-        assert_eq!(merge_credential(Some("{}"), winner), winner);
-        assert_eq!(merge_credential(Some("not json"), winner), winner);
-        assert_eq!(merge_credential(None, winner), winner);
     }
 
     /// The Claude mount without its Keychain source, so a developer's own
@@ -4879,7 +5068,7 @@ mod tests {
             fs::write(&shared, blanked_credential(900)).unwrap();
             prepare(fold);
             let seeded = fs::read_to_string(&shared).unwrap();
-            assert!(holds_credential(&seeded), "{fold:?}");
+            assert!(claude::LOGIN.usable(Some(&seeded)), "{fold:?}");
             assert_eq!(seeded, credential(100), "{fold:?}");
         }
 
@@ -4894,6 +5083,221 @@ mod tests {
         fs::write(store.join(".credentials.json"), blanked_credential(900)).unwrap();
         prepare(CredentialFold::Freshest);
         assert_eq!(fs::read_to_string(&shared).unwrap(), credential(100));
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn separate_login_never_folds_a_candidate_into_the_shared_file() {
+        let (_hook_guard, _, _application) = BaseGuard::ready();
+        let home = TempDir::new().unwrap();
+        let host = home.path().join(".claude");
+        let mount = claude_mount_without_keychain();
+        let root = host.join(SANDBOX_PRIVATE_SUBDIR);
+        let store = root.join("aaaaaaaaaaaaaaaa");
+        let shared = root.join(".credentials.json");
+        let private = store.join(".credentials.json");
+        fs::create_dir_all(&store).unwrap();
+        let held = crate::session::sandbox_login::claude::fixtures::beside_other_data();
+        // (case, shared file before, expected after)
+        let cases = [
+            ("never seeds from the host", None, "{}".to_string()),
+            (
+                "leaves a blanked file blank",
+                Some(blanked_credential(900)),
+                blanked_credential(900),
+            ),
+            (
+                "leaves an existing credential untouched",
+                Some(held.clone()),
+                held,
+            ),
+        ];
+        for (case, before, expected) in cases {
+            for fold in [CredentialFold::Freshest, CredentialFold::SeedOnly] {
+                fs::write(host.join(".credentials.json"), credential(5000)).unwrap();
+                fs::write(&private, credential(4000)).unwrap();
+                match &before {
+                    Some(content) => fs::write(&shared, content).unwrap(),
+                    None => {
+                        let _ = fs::remove_file(&shared);
+                    }
+                }
+                prepare_owned_fixture_from(
+                    &mount,
+                    host.clone(),
+                    store.clone(),
+                    home.path(),
+                    fold.under(SharedCredentialMode::SeparateLogin),
+                    &crate::session::config::SessionConfig::default(),
+                    home.path(),
+                )
+                .unwrap();
+                assert_eq!(
+                    fs::read_to_string(&shared).unwrap(),
+                    expected,
+                    "{case} ({fold:?})"
+                );
+            }
+        }
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn host_seed_is_the_default_and_still_seeds_from_the_host() {
+        let (_hook_guard, _, _application) = BaseGuard::ready();
+        let default_mode = crate::session::config::SandboxConfig::default().shared_credential;
+        assert_eq!(default_mode, SharedCredentialMode::HostSeed);
+        let home = TempDir::new().unwrap();
+        let host = home.path().join(".claude");
+        let mount = claude_mount_without_keychain();
+        let root = host.join(SANDBOX_PRIVATE_SUBDIR);
+        let store = root.join("aaaaaaaaaaaaaaaa");
+        let shared = root.join(".credentials.json");
+        fs::create_dir_all(&store).unwrap();
+        fs::write(host.join(".credentials.json"), credential(100)).unwrap();
+        for fold in [CredentialFold::Freshest, CredentialFold::SeedOnly] {
+            assert_eq!(fold.under(default_mode), fold);
+            fs::write(&shared, blanked_credential(900)).unwrap();
+            prepare_owned_fixture_from(
+                &mount,
+                host.clone(),
+                store.clone(),
+                home.path(),
+                fold.under(default_mode),
+                &crate::session::config::SessionConfig::default(),
+                home.path(),
+            )
+            .unwrap();
+            assert_eq!(
+                fs::read_to_string(&shared).unwrap(),
+                credential(100),
+                "{fold:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn separate_login_never_reads_the_keychain_or_a_candidate_file() {
+        let home = TempDir::new().unwrap();
+        let host = home.path().join(".claude");
+        let store = host.join(SANDBOX_PRIVATE_SUBDIR).join("aaaaaaaaaaaaaaaa");
+        fs::create_dir_all(&store).unwrap();
+        fs::write(host.join(".credentials.json"), credential(5000)).unwrap();
+        fs::write(store.join(".credentials.json"), credential(4000)).unwrap();
+        let mount = AGENT_CONFIG_MOUNTS
+            .iter()
+            .find(|mount| mount.tool_name == "claude")
+            .unwrap();
+        assert!(mount.keychain_credential.is_some());
+        // (fold, Keychain read expected, candidates expected)
+        for (fold, keychain_read, candidates) in [
+            (
+                CredentialFold::Freshest.under(SharedCredentialMode::SeparateLogin),
+                false,
+                0,
+            ),
+            (
+                CredentialFold::SeedOnly.under(SharedCredentialMode::SeparateLogin),
+                false,
+                0,
+            ),
+            (CredentialFold::Freshest, true, 3),
+            (CredentialFold::SeedOnly, true, 3),
+        ] {
+            let read = std::cell::Cell::new(false);
+            let gathered =
+                credential_candidates(mount, &host, &store, ".credentials.json", fold, |_| {
+                    read.set(true);
+                    Ok(Some(credential(3000)))
+                });
+            assert_eq!(read.get(), keychain_read, "{fold:?}");
+            assert_eq!(gathered.len(), candidates, "{fold:?}");
+        }
+    }
+
+    /// Both production paths, a come-up and the status poll, take the global
+    /// mode; neither a profile nor a repo config can switch it back.
+    #[test]
+    #[serial_test::serial]
+    fn separate_login_reaches_the_come_up_and_the_poll() {
+        let (_hg, _, _tmp_base) = BaseGuard::ready();
+        let temp_home = TempDir::new().unwrap();
+        let _home_guard = crate::session::test_support::isolate_home(temp_home.path());
+        let host = temp_home.path().join(".claude");
+        fs::create_dir_all(&host).unwrap();
+        fs::write(host.join(".credentials.json"), credential(now_ms() + 1000)).unwrap();
+        crate::session::config::update_config(|config| {
+            config.sandbox.shared_credential = SharedCredentialMode::SeparateLogin;
+        })
+        .unwrap();
+        let profile = crate::session::config::effective_profile("");
+        crate::session::config::profile_config::save_profile_config(
+            &profile,
+            &serde_json::from_value(
+                serde_json::json!({"sandbox": {"shared_credential": "host_seed"}}),
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        let project_dir = TempDir::new().unwrap();
+        let repo_config = project_dir.path().join(".agent-of-empires");
+        fs::create_dir_all(&repo_config).unwrap();
+        fs::write(
+            repo_config.join("config.toml"),
+            "[sandbox]\nshared_credential = \"host_seed\"\n",
+        )
+        .unwrap();
+        git2::Repository::init(project_dir.path()).unwrap();
+        let sandbox_info = crate::session::instance::SandboxInfo {
+            provider: None,
+            enabled: true,
+            container_id: None,
+            image: "test:latest".to_string(),
+            container_name: "test-container".to_string(),
+            extra_env: None,
+            custom_instruction: None,
+            before_start_env: Vec::new(),
+            before_start_hook_env: Vec::new(),
+            container_workdir: None,
+        };
+        let instance_id = "separate-login-a";
+        let store = host.join(SANDBOX_PRIVATE_SUBDIR).join(instance_id);
+        fs::create_dir_all(&store).unwrap();
+        certify_fixture_content(&store, ".claude").unwrap();
+        let shared = host.join(SANDBOX_PRIVATE_SUBDIR).join(".credentials.json");
+        let come_up = || {
+            build_container_config(
+                project_dir.path().to_str().unwrap(),
+                &sandbox_info,
+                ContainerAgentSelection::new("claude", None),
+                SandboxYolo::default(),
+                instance_id,
+                None,
+                "",
+            )
+            .unwrap();
+        };
+        let poll = || {
+            refresh_agent_configs_for_instance(
+                &crate::session::config::profile_config::resolve_config_or_warn(&profile),
+                instance_id,
+                "claude",
+                None,
+                CredentialFold::SeedOnly,
+                project_dir.path(),
+            );
+        };
+
+        come_up();
+        assert_eq!(fs::read_to_string(&shared).unwrap(), "{}");
+        fs::write(&shared, blanked_credential(900)).unwrap();
+        poll();
+        come_up();
+        assert_eq!(
+            fs::read_to_string(&shared).unwrap(),
+            blanked_credential(900)
+        );
+        crate::hooks::cleanup_hook_status_dir(instance_id);
     }
 
     #[test]
@@ -4966,6 +5370,336 @@ mod tests {
     }
 
     #[test]
+    fn sandbox_login_status_gate_decision_table() {
+        let usable = credential(now_ms() + 3_600_000);
+        let refresh_only = crate::session::sandbox_login::claude::fixtures::refresh_only(
+            now_ms().saturating_sub(1000),
+        );
+        let blanked = blanked_credential(900);
+        // (mode, launch uses the shared OAuth login, shared file, expected)
+        let cases: [(SharedCredentialMode, bool, Option<&str>, LoginGate); 8] = [
+            (
+                SharedCredentialMode::HostSeed,
+                true,
+                None,
+                LoginGate::Proceed,
+            ),
+            (
+                SharedCredentialMode::HostSeed,
+                true,
+                Some("{}"),
+                LoginGate::Proceed,
+            ),
+            (
+                SharedCredentialMode::SeparateLogin,
+                false,
+                None,
+                LoginGate::Proceed,
+            ),
+            (
+                SharedCredentialMode::SeparateLogin,
+                true,
+                None,
+                LoginGate::LoginRequired,
+            ),
+            (
+                SharedCredentialMode::SeparateLogin,
+                true,
+                Some("{}"),
+                LoginGate::LoginRequired,
+            ),
+            (
+                SharedCredentialMode::SeparateLogin,
+                true,
+                Some(&blanked),
+                LoginGate::LoginRequired,
+            ),
+            (
+                SharedCredentialMode::SeparateLogin,
+                true,
+                Some(&usable),
+                LoginGate::Proceed,
+            ),
+            (
+                SharedCredentialMode::SeparateLogin,
+                true,
+                Some(&refresh_only),
+                LoginGate::Proceed,
+            ),
+        ];
+        for (mode, oauth, shared, expected) in cases {
+            let auth = if oauth {
+                LaunchAuth::default()
+            } else {
+                LaunchAuth::from_env(&[EnvEntry::Literal {
+                    key: "CLAUDE_CODE_USE_BEDROCK".to_string(),
+                    value: "1".to_string(),
+                }])
+            };
+            assert_eq!(
+                login_gate(mode, RuntimeKind::Docker, &claude::LOGIN, &auth, || shared
+                    .map(str::to_string)),
+                expected,
+                "{mode:?} {oauth} {shared:?}"
+            );
+        }
+    }
+
+    /// A second integration, with another credential file, format, command and auth route,
+    /// runs through target resolution, the gate and the seeding fold without any Claude code.
+    #[test]
+    #[serial_test::serial]
+    fn a_second_login_integration_runs_through_the_generic_machinery() {
+        use crate::session::sandbox_login::fake;
+        let (_hg, _, _base) = BaseGuard::ready();
+        let home = TempDir::new().unwrap();
+        let _home_guard = crate::session::test_support::isolate_home(home.path());
+        let profile = crate::session::config::effective_profile("");
+        let mount = AgentConfigMount {
+            shared_credential_files: &[fake::CREDENTIAL_FILE],
+            login: Some(&fake::LOGIN),
+            keychain_credential: None,
+            ..*AGENT_CONFIG_MOUNTS
+                .iter()
+                .find(|mount| mount.tool_name == "codex")
+                .unwrap()
+        };
+        let mounts = [mount];
+
+        let target = login_target_in(&mounts, &profile, "codex", None).unwrap();
+        assert_eq!(
+            target.credential,
+            home.path()
+                .join(".codex/sandbox-v2")
+                .join(fake::CREDENTIAL_FILE)
+        );
+        assert_eq!(target.credential_in_container, "/root/.codex/auth.token");
+        assert!(login_target_in(&mounts, &profile, "claude", None).is_none());
+        assert!(login_target_in(&[], &profile, "codex", None).is_none());
+
+        let keyed = LaunchAuth::from_env(&[EnvEntry::Literal {
+            key: "FAKE_AGENT_API_KEY".to_string(),
+            value: "k".to_string(),
+        }]);
+        let plain = LaunchAuth::default();
+        let separate = SharedCredentialMode::SeparateLogin;
+        let gate = |mode, auth: &LaunchAuth, file: Option<&str>| {
+            login_gate(mode, RuntimeKind::Docker, &fake::LOGIN, auth, || {
+                file.map(str::to_string)
+            })
+        };
+        assert_eq!(gate(separate, &plain, None), LoginGate::LoginRequired);
+        assert_eq!(gate(separate, &plain, Some("{}")), LoginGate::LoginRequired);
+        assert_eq!(gate(separate, &plain, Some("TOKEN:5")), LoginGate::Proceed);
+        assert_eq!(gate(separate, &keyed, Some("{}")), LoginGate::Proceed);
+        assert_eq!(
+            gate(SharedCredentialMode::HostSeed, &plain, None),
+            LoginGate::Proceed
+        );
+        // A runtime that cannot run the helper refuses what would have waited for the login
+        // and leaves every other launch alone, whichever agent declares the login.
+        let on = |kind, mode, auth: &LaunchAuth, file: Option<&str>| {
+            login_gate(mode, kind, &fake::LOGIN, auth, || file.map(str::to_string))
+        };
+        let apple = RuntimeKind::AppleContainer;
+        assert_eq!(on(apple, separate, &plain, None), LoginGate::Unsupported);
+        assert_eq!(
+            on(apple, separate, &plain, Some("{}")),
+            LoginGate::Unsupported
+        );
+        assert_eq!(
+            on(apple, separate, &plain, Some("TOKEN:5")),
+            LoginGate::Proceed
+        );
+        assert_eq!(on(apple, separate, &keyed, None), LoginGate::Proceed);
+        assert_eq!(
+            on(apple, SharedCredentialMode::HostSeed, &plain, None),
+            LoginGate::Proceed
+        );
+        for kind in [RuntimeKind::Docker, RuntimeKind::Podman] {
+            assert_eq!(on(kind, separate, &plain, None), LoginGate::LoginRequired);
+        }
+        assert_eq!(
+            fake::LOGIN.state(Some("TOKEN:5")),
+            CredentialState::Usable {
+                refresh_expires_at: Some(5)
+            }
+        );
+
+        // Seeding folds by the integration's own expiry reading.
+        let host = home.path().join(".codex");
+        let root = host.join(SANDBOX_PRIVATE_SUBDIR);
+        let store = root.join("aaaaaaaaaaaaaaaa");
+        let shared = root.join(fake::CREDENTIAL_FILE);
+        fs::create_dir_all(&store).unwrap();
+        fs::write(host.join(fake::CREDENTIAL_FILE), "TOKEN:100").unwrap();
+        for (fold, before, expected) in [
+            (CredentialFold::Freshest, "{}", "TOKEN:100"),
+            (CredentialFold::Freshest, "TOKEN:900", "TOKEN:900"),
+            (CredentialFold::SeparateLogin, "{}", "{}"),
+        ] {
+            fs::write(&shared, before).unwrap();
+            prepare_owned_fixture_from(
+                &mounts[0],
+                host.clone(),
+                store.clone(),
+                home.path(),
+                fold,
+                &crate::session::config::SessionConfig::default(),
+                home.path(),
+            )
+            .unwrap();
+            assert_eq!(
+                fs::read_to_string(&shared).unwrap(),
+                expected,
+                "{fold:?} {before}"
+            );
+        }
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn sandbox_login_status_follows_mode_file_and_declared_dir() {
+        let (_hg, _, _base) = BaseGuard::ready();
+        let home = TempDir::new().unwrap();
+        let _home_guard = crate::session::test_support::isolate_home(home.path());
+        let profile = crate::session::config::effective_profile("");
+        let shared = home
+            .path()
+            .join(".claude")
+            .join(SANDBOX_PRIVATE_SUBDIR)
+            .join(".credentials.json");
+        assert_eq!(
+            login_target_for(&profile, "claude", None).map(|t| t.credential),
+            Some(shared.clone())
+        );
+        assert_eq!(
+            login_target_for(&profile, "codex", None).map(|t| t.credential),
+            None
+        );
+        assert_eq!(
+            sandbox_login_status(&profile, "claude", None),
+            SandboxLoginStatus::NotApplicable
+        );
+        assert_eq!(
+            serde_json::to_value(sandbox_login_status(&profile, "claude", None)).unwrap(),
+            serde_json::json!({"state":"not_applicable"})
+        );
+
+        crate::session::config::update_config(|c| {
+            c.sandbox.shared_credential = SharedCredentialMode::SeparateLogin;
+        })
+        .unwrap();
+        assert_eq!(
+            sandbox_login_status(&profile, "claude", None),
+            SandboxLoginStatus::Needed
+        );
+        assert!(
+            !shared.parent().unwrap().exists(),
+            "a status read creates nothing"
+        );
+        assert_eq!(
+            serde_json::to_value(sandbox_login_status(&profile, "claude", None)).unwrap(),
+            serde_json::json!({"state":"needed"})
+        );
+        // The root also holds the per-instance stores, so it often exists first.
+        fs::create_dir_all(shared.parent().unwrap()).unwrap();
+        assert_eq!(
+            sandbox_login_status(&profile, "claude", None),
+            SandboxLoginStatus::Needed
+        );
+        assert!(
+            !shared.with_file_name(".credentials.lock").exists(),
+            "a status read creates no lock file"
+        );
+        fs::write(&shared, credential(now_ms() + 3_600_000)).unwrap();
+        assert_eq!(
+            sandbox_login_status(&profile, "claude", None),
+            SandboxLoginStatus::Ok {
+                refresh_expires_at: None
+            }
+        );
+        let with_refresh_expiry =
+            crate::session::sandbox_login::claude::fixtures::with_refresh_expiry(
+                now_ms() + 3_600_000,
+                1_790_000_000_000,
+            );
+        fs::write(&shared, with_refresh_expiry).unwrap();
+        assert_eq!(
+            sandbox_login_status(&profile, "claude", None),
+            SandboxLoginStatus::Ok {
+                refresh_expires_at: Some(1_790_000_000_000)
+            }
+        );
+        assert_eq!(
+            serde_json::to_value(sandbox_login_status(&profile, "claude", None)).unwrap(),
+            serde_json::json!({"state":"ok","refresh_expires_at":1790000000000u64})
+        );
+        fs::write(&shared, blanked_credential(900)).unwrap();
+        assert_eq!(
+            sandbox_login_status(&profile, "claude", None),
+            SandboxLoginStatus::Needed
+        );
+        assert_eq!(
+            read_shared_credential(&shared).unwrap().as_deref(),
+            Some(blanked_credential(900).as_str())
+        );
+
+        crate::session::config::update_config(|c| {
+            c.session
+                .agent_config_dir
+                .insert("claude".to_string(), "~/.claude-personal".to_string());
+        })
+        .unwrap();
+        let declared = home
+            .path()
+            .join(".claude-personal")
+            .join(SANDBOX_PRIVATE_SUBDIR)
+            .join(".credentials.json");
+        assert_eq!(
+            login_target_for(&profile, "claude", None).map(|t| t.credential),
+            Some(declared.clone())
+        );
+        assert_eq!(
+            sandbox_login_status(&profile, "claude", None),
+            SandboxLoginStatus::Needed
+        );
+        fs::create_dir_all(declared.parent().unwrap()).unwrap();
+        fs::write(&declared, credential(now_ms() + 3_600_000)).unwrap();
+        assert_eq!(
+            sandbox_login_status(&profile, "claude", None),
+            SandboxLoginStatus::Ok {
+                refresh_expires_at: None
+            }
+        );
+
+        // Apple Container cannot run the helper, which only matters when a login is
+        // needed: a usable credential is still ok there, as the launch gate admits it, and
+        // an unusable one is unsupported for a tool that declares a login; an unknown tool
+        // stays what it was.
+        crate::session::config::update_config(|c| {
+            c.sandbox.container_runtime =
+                crate::session::config::ContainerRuntimeName::AppleContainer;
+        })
+        .unwrap();
+        assert_eq!(
+            sandbox_login_status(&profile, "claude", None),
+            SandboxLoginStatus::Ok {
+                refresh_expires_at: None
+            }
+        );
+        fs::write(&declared, blanked_credential(900)).unwrap();
+        assert_eq!(
+            sandbox_login_status(&profile, "claude", None),
+            SandboxLoginStatus::Unsupported
+        );
+        assert_eq!(
+            sandbox_login_status(&profile, "codex", None),
+            SandboxLoginStatus::NotApplicable
+        );
+    }
+
+    #[test]
     fn shadowed_credential_copy_is_emptied_only_in_a_store() {
         let home = TempDir::new().unwrap();
         let host = home.path().join(".claude");
@@ -4991,7 +5725,7 @@ mod tests {
             ..Default::default()
         };
         // A user extra_volumes entry at the config path replaces the store
-        // mount; its host copy is the user's own login, not a shadowed one.
+        // mount; its host copy is the user's login, not a shadowed one.
         for (dir, emptied) in [(&store, true), (&host, false)] {
             let copy = dir.join(".credentials.json");
             fs::write(&copy, credential(1)).unwrap();

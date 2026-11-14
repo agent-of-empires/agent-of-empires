@@ -1,7 +1,7 @@
 //! Sandbox container lifecycle for structured view sessions.
 
 use crate::server::session_store::NativeSessionStore;
-use crate::session::{Instance, SessionStore};
+use crate::session::{BeforeStartHook, Instance, Releasing, SessionStore};
 use anyhow::{Context, Result};
 use std::sync::Arc;
 
@@ -10,6 +10,9 @@ pub(crate) struct LaunchExclusion {
     namespace: Option<tokio::sync::OwnedRwLockReadGuard<()>>,
     instance: Option<tokio::sync::OwnedMutexGuard<()>>,
     submission: Option<tokio::sync::OwnedMutexGuard<()>>,
+    /// Set while the guards are given up for a hook run: whether the launch held the
+    /// submission guard, which [`Self::reacquire`] takes back.
+    released: Option<bool>,
 }
 
 impl LaunchExclusion {
@@ -36,49 +39,139 @@ impl LaunchExclusion {
             namespace: Some(namespace),
             instance: Some(instance),
             submission,
+            released: None,
         })
     }
 
-    fn release_for_hook(&mut self) -> bool {
+    /// Gives the guards up for a hook run, which holds the session's resolution slot. It
+    /// never waits for them while it holds the slot: they are taken back by
+    /// [`Self::reacquire`] once the slot is free, so every caller takes the guards first and
+    /// the slot second.
+    fn release_for_hook(&mut self) {
         let submission = self.submission.is_some();
+        self.released.get_or_insert(submission);
         self.instance.take();
         self.submission.take();
         self.namespace.take();
-        submission
+    }
+
+    /// Takes back what [`Self::release_for_hook`] gave up, then re-validates the launch: the
+    /// session may have been deleted, trashed or restarted while the guards were out. Does
+    /// nothing when the guards were not released.
+    fn reacquire(&mut self, instance: &Instance, store: &NativeSessionStore) -> Result<()> {
+        let Some(submission) = self.released else {
+            return Ok(());
+        };
+        *self = tokio::runtime::Handle::current().block_on(Self::acquire(
+            self.state.clone(),
+            &instance.id,
+            submission,
+        ))?;
+        validate_launch(store, instance)
     }
 
     pub(crate) fn take_submission(&mut self) -> Option<tokio::sync::OwnedMutexGuard<()>> {
         self.submission.take()
     }
 
-    fn mint_before_start(
-        &mut self,
-        instance: &mut Instance,
-        config: &crate::session::LaunchConfig,
-        store: &NativeSessionStore,
-    ) -> Result<()> {
-        let submission = self.release_for_hook();
-        let result = instance.mint_before_start_env(config);
-        *self = tokio::runtime::Handle::current().block_on(Self::acquire(
-            self.state.clone(),
-            &instance.id,
-            submission,
-        ))?;
-        validate_launch(store, instance)?;
-        result
+    /// The before-start hook of a launch under this exclusion: it mints with the guards
+    /// released and takes them back after the session's slot is released.
+    fn before_start_hook<'a>(
+        &'a mut self,
+        store: &'a NativeSessionStore,
+    ) -> impl BeforeStartHook + 'a {
+        Releasing::new(
+            self,
+            |exclusion: &mut &mut Self,
+             instance: &mut Instance,
+             config: &crate::session::LaunchConfig| {
+                exclusion.release_for_hook();
+                instance.mint_before_start_env(config)
+            },
+            move |exclusion: &mut &mut Self, instance: &mut Instance| {
+                exclusion.reacquire(instance, store)
+            },
+        )
     }
+}
+
+/// The sandbox login admission of a launch, without bringing anything up: a refusal leaves
+/// the session's worker and container as they are. It resolves a `before_start` hook the
+/// cheap decision cannot see, once per session, so the launch that follows finds the
+/// resolution. The hook runs with the launch locks released, as the come-up's does.
+pub(crate) async fn admit_sandbox_launch(
+    store: Arc<NativeSessionStore>,
+    mut instance: Instance,
+    mut exclusion: LaunchExclusion,
+    launch_agent: Option<String>,
+    request_env: Vec<(String, String)>,
+) -> Result<LaunchExclusion> {
+    tokio::task::spawn_blocking(move || {
+        admit_sandbox_launch_blocking(
+            &store,
+            &mut instance,
+            &mut exclusion,
+            launch_agent.as_deref(),
+            &request_env,
+        )?;
+        Ok(exclusion)
+    })
+    .await
+    .context("sandbox login admission task failed to join")?
+}
+
+fn admit_sandbox_launch_blocking(
+    store: &Arc<NativeSessionStore>,
+    instance: &mut Instance,
+    exclusion: &mut LaunchExclusion,
+    launch_agent: Option<&str>,
+    request_env: &[(String, String)],
+) -> Result<()> {
+    validate_launch(&**store, instance)?;
+    if instance.is_sandboxed() {
+        instance.ensure_sandbox_launchable_for(
+            &**store,
+            launch_agent,
+            request_env,
+            &mut exclusion.before_start_hook(store),
+        )?;
+    }
+    Ok(())
 }
 
 pub(crate) async fn ensure_container_for_session(
     store: Arc<NativeSessionStore>,
+    instance: Instance,
+    exclusion: LaunchExclusion,
+) -> Result<(Option<crate::session::SandboxInfo>, LaunchExclusion)> {
+    ensure_container_for_session_with_request_env(store, instance, exclusion, None, Vec::new())
+        .await
+}
+
+/// [`ensure_container_for_session`] for a launch that carries a request's `provider_env` and
+/// the agent the request selected. The sandbox login admission counts a credential the
+/// request supplies for this launch, as the launch forwards it, and reads the allowlist of
+/// `launch_agent`'s adapter, the one the launch forwards host variables by (`None` is the
+/// stored agent). Both live in memory for the check only: they are neither stored nor
+/// logged, and a later launch without the request is admitted on what is stored.
+pub(crate) async fn ensure_container_for_session_with_request_env(
+    store: Arc<NativeSessionStore>,
     mut instance: Instance,
     mut exclusion: LaunchExclusion,
+    launch_agent: Option<String>,
+    request_env: Vec<(String, String)>,
 ) -> Result<(Option<crate::session::SandboxInfo>, LaunchExclusion)> {
     tokio::task::spawn_blocking(move || {
         validate_launch(&*store, &instance)?;
         if !instance.is_sandboxed() {
             return Ok((None, exclusion));
         }
+        instance.ensure_sandbox_launchable_for(
+            &*store,
+            launch_agent.as_deref(),
+            &request_env,
+            &mut exclusion.before_start_hook(&store),
+        )?;
         reconcile_provider_container_with(&mut instance, &*store, |id| {
             crate::containers::DockerContainer::from_session_id(id).discard()
         })?;
@@ -87,7 +180,7 @@ pub(crate) async fn ensure_container_for_session(
                 &*store,
                 &tokio_util::sync::CancellationToken::new(),
                 None,
-                |instance, config| exclusion.mint_before_start(instance, config, &store),
+                exclusion.before_start_hook(&store),
             )
             .context("ensuring sandbox container")?;
         publish_built_sandbox(&store, &instance, &container, created)?;
@@ -165,6 +258,32 @@ fn record_built_sandbox(store: &NativeSessionStore, instance: &Instance) -> Resu
     store
         .adopt_runtime_fields(instance)
         .context(crate::session::SessionCommitApplied)
+}
+
+/// The environment the sandboxed launch of `agent` runs with, as far as its authentication
+/// goes: `sandbox_env`, then the request's `provider_env`, then the adapter's allowlisted
+/// host variables, exactly as the launch claims them. The adapter spec is resolved as the
+/// supervisor resolves it: the registry entry, else a custom `agent_acp_cmd` (no allowlist),
+/// else the `agent_detect_as` base.
+pub(crate) fn effective_launch_env(
+    agent: &str,
+    session: &crate::session::config::SessionConfig,
+    sandbox_env: &[crate::containers::EnvEntry],
+    request_env: &[(String, String)],
+) -> Vec<crate::containers::EnvEntry> {
+    let registry = crate::acp::AgentRegistry::with_defaults();
+    let spec = registry.get(agent).or_else(|| {
+        if session.agent_acp_cmd.contains_key(agent) {
+            return None;
+        }
+        let base = crate::acp::inherited_acp_base(agent, &session.agent_detect_as)?;
+        registry.get(&base)
+    });
+    crate::acp::acp_client::effective_launch_env(
+        sandbox_env,
+        request_env,
+        spec.and_then(|s| s.env_allowlist.as_deref()),
+    )
 }
 
 /// Discard first, persist the new mount stamp second, then build. A failed
@@ -777,5 +896,151 @@ esac
             .unwrap();
             drop(state);
         }
+    }
+
+    /// Two overlapping admissions of one session, through the real launch guards (profile
+    /// namespace, prompt submission, instance lock). The first runs a healthy hook with its
+    /// guards released; the second takes them and waits for the first's resolution. When
+    /// the hook finishes, the first must get its guards back without waiting on the second,
+    /// which is waiting on the first's slot: both are admitted, on one hook run, with no
+    /// wait for the slot to time out. Synchronized by two FIFOs (the hook is up, the hook
+    /// may finish) and the slot's waiter count, never by sleeping. The test holds both
+    /// FIFOs open read-write and nonblocking, so no thread can block on a missing peer
+    /// and every wait is bounded by a deadline.
+    #[cfg(unix)]
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn overlapping_admissions_run_one_hook_without_a_lock_order_cycle() {
+        let app_dir = crate::session::test_support::isolate_app_dir();
+        let (_runtime, _calls) =
+            crate::session::test_support::failing_container_runtime(app_dir.path());
+        let _env = crate::session::test_support::EnvGuard::unset(&[
+            "ANTHROPIC_API_KEY",
+            "ANTHROPIC_AUTH_TOKEN",
+            "CLAUDE_CODE_OAUTH_TOKEN",
+            "CLAUDE_CODE_USE_BEDROCK",
+            "CLAUDE_CODE_USE_VERTEX",
+        ])
+        .and_set("SHELL", "/bin/sh");
+        crate::session::config::update_config(|c| {
+            c.sandbox.shared_credential =
+                crate::session::config::SharedCredentialMode::SeparateLogin;
+        })
+        .unwrap();
+        let root = app_dir.path().join(".claude").join("sandbox-v2");
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(root.join(".credentials.json"), "{}").unwrap();
+        let project = app_dir.path().join("project");
+        std::fs::create_dir_all(&project).unwrap();
+        let (counter, up, go) = (
+            app_dir.path().join("hook-runs"),
+            app_dir.path().join("hook-up"),
+            app_dir.path().join("hook-go"),
+        );
+        for fifo in [&up, &go] {
+            assert!(std::process::Command::new("mkfifo")
+                .arg(fifo)
+                .status()
+                .unwrap()
+                .success());
+        }
+        // Read-write keeps each FIFO open without a peer: the hook's open never blocks and
+        // written bytes persist until read.
+        let open_fifo = |path: &std::path::Path| {
+            use std::os::unix::fs::OpenOptionsExt as _;
+            std::fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .custom_flags(libc::O_NONBLOCK)
+                .open(path)
+                .unwrap()
+        };
+        let (mut up_fifo, mut go_fifo) = (open_fifo(&up), open_fifo(&go));
+        let quoted = |path: &std::path::Path| {
+            crate::session::environment::shell_escape(&path.to_string_lossy())
+        };
+        let hook = format!(
+            "echo run >> {}; echo up > {}; read go < {}; echo ANTHROPIC_API_KEY=sk-hook",
+            quoted(&counter),
+            quoted(&up),
+            quoted(&go),
+        );
+        crate::session::config::update_config(|c| c.host_hooks.before_start = vec![hook]).unwrap();
+        let mut instance = sandboxed(None);
+        instance.project_path = project.to_string_lossy().into_owned();
+        instance.tool = "claude".into();
+        instance.agent_name = Some("claude".into());
+        instance.agent_provider = None;
+        let id = instance.id.clone();
+        let (state, store) = native(&instance).await;
+
+        // A bound for a failing run: a wait for the slot gives up after the hook deadline
+        // plus a margin, which would otherwise be the production two minutes.
+        let admit = |exclusion: LaunchExclusion| {
+            let (store, mut instance) = (store.clone(), instance.clone());
+            tokio::task::spawn_blocking(move || {
+                let _deadline =
+                    crate::session::HookTimeoutScope::new(std::time::Duration::from_secs(10));
+                let mut exclusion = exclusion;
+                admit_sandbox_launch_blocking(&store, &mut instance, &mut exclusion, None, &[])
+                    .map(|()| exclusion)
+            })
+        };
+
+        let first = LaunchExclusion::acquire(state.clone(), &id, true)
+            .await
+            .unwrap();
+        let first = admit(first);
+        // The hook is running: the first admission released its guards for it.
+        let up_deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+        let mut signal = [0u8; 8];
+        loop {
+            match std::io::Read::read(&mut up_fifo, &mut signal) {
+                Ok(n) if n > 0 => break,
+                Ok(_) => {}
+                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {}
+                Err(e) => panic!("reading the hook signal: {e}"),
+            }
+            if first.is_finished() {
+                panic!(
+                    "the first admission ended before the hook signalled: {:?}",
+                    first.await.unwrap().map(|_| ())
+                );
+            }
+            assert!(
+                std::time::Instant::now() < up_deadline,
+                "the first admission never ran the hook"
+            );
+            tokio::task::yield_now().await;
+        }
+        let second = LaunchExclusion::acquire(state.clone(), &id, true)
+            .await
+            .unwrap();
+        let second = admit(second);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while crate::session::before_start_slot_waiters(&id) == 0 {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the second admission never waited for the slot"
+            );
+            tokio::task::yield_now().await;
+        }
+        std::io::Write::write_all(&mut go_fifo, b"go\n").unwrap();
+
+        // The second finishes on the first's resolution; its guards go back before the
+        // first (which may be queued for them) is awaited.
+        let second = second.await.unwrap();
+        let second_ok = second.is_ok();
+        let second_error = second.as_ref().err().map(|e| format!("{e:#}"));
+        drop(second);
+        let first = first.await.unwrap();
+        assert!(first.is_ok(), "first admission: {:?}", first.err());
+        assert!(second_ok, "second admission: {second_error:?}");
+        drop(first);
+        assert_eq!(
+            std::fs::read_to_string(&counter).unwrap().lines().count(),
+            1,
+            "one hook run between the two admissions"
+        );
     }
 }
