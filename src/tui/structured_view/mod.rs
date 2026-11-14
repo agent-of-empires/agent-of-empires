@@ -2245,6 +2245,7 @@ mod tests {
             if osc_busy {
                 let (entered, observed) = std::sync::mpsc::sync_channel(1);
                 let (finish, finished) = std::sync::mpsc::sync_channel(1);
+                let output = output.clone();
                 writer = Some(std::thread::spawn(move || {
                     output.osc52(
                         Duration::from_secs(5),
@@ -2275,6 +2276,7 @@ mod tests {
             );
             tokio::pin!(waiting);
             assert!(futures_util::poll!(&mut waiting).is_pending());
+            let initial_output = output.diagnostic_snapshot();
             if let Some(release) = release {
                 release.send(()).unwrap();
                 writer.take().unwrap().join().unwrap().unwrap();
@@ -2296,10 +2298,12 @@ mod tests {
                     }
                 }
             }).await.unwrap_or_else(|error| {
+                let question_mark_prefix = emitted.iter().take_while(|&&byte| byte == b'?').count();
                 panic!(
-                    "error frame incomplete: {error}; osc_busy={osc_busy}, emitted={}, needs_redraw={}",
+                    "error frame incomplete: {error}; osc_busy={osc_busy}, emitted={}, needs_redraw={}; question_mark_prefix={question_mark_prefix} (prefix only, not total filler); emitted_bytes={emitted:?}; initial_output={initial_output}; final_output_after_deadline={}",
                     emitted.len(),
-                    crate::tui::terminal_output::needs_redraw()
+                    crate::tui::terminal_output::needs_redraw(),
+                    output.diagnostic_snapshot()
                 )
             });
             send.send(Ok(CrosstermEvent::Key(KeyEvent::from(KeyCode::Char('x')))))

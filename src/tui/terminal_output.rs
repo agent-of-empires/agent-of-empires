@@ -778,6 +778,32 @@ pub(crate) fn install_test_output(file: File) -> (TestOutputGuard, TestOutput) {
 
 #[cfg(test)]
 impl TestOutput {
+    pub(crate) fn diagnostic_snapshot(&self) -> String {
+        let state = match self.0.try_lock() {
+            Ok(state) => state,
+            Err(TryLockError::WouldBlock) => return "output_lock=would_block".to_owned(),
+            Err(TryLockError::Poisoned(error)) => {
+                return format!("output_lock=poisoned: {error}");
+            }
+        };
+        format!(
+            "pending(id,offset,len,bytes)={:?}; completed={:?}; next_frame={}; suspended={}; recovery(offset,len,bytes)={:?}; control(offset,len,bytes)={:?}; needs_redraw={}",
+            state.pending.as_ref().map(|frame| {
+                (frame.id, frame.offset, frame.bytes.len(), frame.bytes.as_slice())
+            }),
+            state.completed,
+            state.next_frame,
+            state.suspended,
+            state.recovery.as_ref().map(|(bytes, offset)| {
+                (*offset, bytes.len(), bytes.as_slice())
+            }),
+            state.control.as_ref().map(|control| {
+                (control.offset, control.bytes.len(), control.bytes.as_slice())
+            }),
+            REDRAW.load(Ordering::Acquire),
+        )
+    }
+
     pub(crate) fn osc52(
         &self,
         timeout: Duration,
