@@ -576,32 +576,24 @@ pub(crate) fn owned_status(
         return None;
     }
     let registry = super::registry();
-    let configured = registry.active().any(|plugin| {
-        plugin
-            .manifest
-            .capabilities
-            .iter()
-            .any(|c| c.as_str() == "session.integration")
-            && plugin
-                .manifest
-                .agent_integrations
-                .iter()
-                .any(|entry| entry.tool == instance.tool)
-    });
-    if !configured {
-        return None;
-    }
+    let alias = crate::tmux::status_rules::detection_tool(
+        &instance.source_profile,
+        &instance.tool,
+        &instance.detect_as,
+    );
+    let (tool, plugin) = match provider(&registry, &instance.tool) {
+        Ok(None) => (alias.as_ref(), provider(&registry, &alias)),
+        result => (instance.tool.as_str(), result),
+    };
+    let plugin = match plugin {
+        Ok(Some(plugin)) => Some(plugin),
+        Ok(None) => return None,
+        Err(_) => None,
+    };
     let report = if pane_dead {
         None
     } else {
-        provider(&registry, &instance.tool)
-            .ok()
-            .flatten()
-            .and_then(|plugin| {
-                read_report(&instance.id, &instance.tool, plugin)
-                    .ok()
-                    .flatten()
-            })
+        plugin.and_then(|plugin| read_report(&instance.id, tool, plugin).ok().flatten())
     };
     session_status_override(true, pane_dead, report.as_ref().map(|report| report.status))
         .map(|status| (status, report.is_some()))
@@ -1589,6 +1581,75 @@ sandbox = "unsupported"
         assert_eq!(
             (omp.detect_status)("plain command output"),
             crate::session::Status::Idle
+        );
+    }
+
+    #[test]
+    #[serial_test::serial(hook_base)]
+    fn status_prefers_own_provider_then_detection_alias() {
+        let (_base, _, _tmp) = crate::hooks::test_support::BaseGuard::ready();
+        let temp = tempfile::tempdir().unwrap();
+        let _reload = super::super::ReloadRegistryOnDrop;
+        let _env = crate::session::test_support::EnvGuard::set(&[
+            ("HOME", temp.path()),
+            ("XDG_CONFIG_HOME", temp.path()),
+            ("USERPROFILE", temp.path()),
+        ]);
+        let _featured = crate::session::test_support::EnvGuard::unset(&["AOE_FEATURED_INDEX_PATH"]);
+        let _rules = crate::tmux::status_rules::ProfileRegistryGuard::take("alias-ownership");
+        let mut config = crate::session::Config::default();
+        config
+            .session
+            .agent_detect_as
+            .insert("own-agent".into(), "alias-agent".into());
+        crate::tmux::status_rules::install_from_config("alias-ownership", &config);
+        install_test_integration("acme.alias", "alias-agent");
+        super::super::reload_registry();
+
+        let mut instance = Instance::new("alias-report", "/tmp");
+        instance.tool = "own-agent".into();
+        instance.source_profile = "alias-ownership".into();
+        instance.status = crate::session::Status::Running;
+        assert_eq!(
+            owned_status(&instance, false),
+            Some((crate::session::Status::Unknown, false))
+        );
+        let dir = dir_guard::open_instance_dir(&instance.id).unwrap();
+        let mut report = snapshot();
+        report.instance_id = instance.id.clone();
+        dir_guard::write_atomic(
+            dir.as_fd(),
+            "integration-acme.alias.json",
+            &serde_json::to_vec(&report).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            owned_status(&instance, false),
+            Some((crate::session::Status::Waiting, true))
+        );
+
+        install_test_integration("acme.own", "own-agent");
+        super::super::reload_registry();
+        assert_eq!(
+            owned_status(&instance, false),
+            Some((crate::session::Status::Unknown, false))
+        );
+        report.status = AgentIntegrationStatus::Running;
+        dir_guard::write_atomic(
+            dir.as_fd(),
+            "integration-acme.own.json",
+            &serde_json::to_vec(&report).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            owned_status(&instance, false),
+            Some((crate::session::Status::Running, true))
+        );
+        install_test_integration("acme.duplicate", "own-agent");
+        super::super::reload_registry();
+        assert_eq!(
+            owned_status(&instance, false),
+            Some((crate::session::Status::Unknown, false))
         );
     }
 
