@@ -2227,10 +2227,10 @@ mod tests {
     async fn stalled_error_screen_completes_without_a_dismiss_key() {
         use crate::tui::terminal_output::{
             install_test_output,
-            tests::{block_terminal, drain_terminal, private_terminal, resume_terminal},
+            tests::{block_terminal, private_terminal, resume_terminal, TerminalDrainer},
         };
         for osc_busy in [false, true] {
-            let (mut master, slave) = private_terminal();
+            let (master, slave) = private_terminal();
             let mut control = slave.try_clone().unwrap();
             let (_guard, output) = install_test_output(slave);
             let mut terminal = Terminal::with_options(
@@ -2277,43 +2277,56 @@ mod tests {
             tokio::pin!(waiting);
             let observation_started = std::time::Instant::now();
             assert!(futures_util::poll!(&mut waiting).is_pending());
-            let (initial_poll_elapsed, initial_output) =
-                (observation_started.elapsed(), output.diagnostic_snapshot());
+            let initial_poll_elapsed = observation_started.elapsed();
+            if !osc_busy {
+                assert!(
+                    output.pending_frame_contains(b"ERROR-COMPLETE").unwrap(),
+                    "error frame must retain an unwritten suffix before resume: {}",
+                    output.diagnostic_snapshot()
+                );
+            }
+            let drainer = TerminalDrainer::start(&master, Vec::new());
             if let Some(release) = release {
                 release.send(()).unwrap();
                 writer.take().unwrap().join().unwrap().unwrap();
             } else {
                 resume_terminal(&control);
             }
-            let mut emitted = Vec::new();
-            let mut last_pre_deadline_drain_elapsed = None;
+            let completion_started = std::time::Instant::now();
+            let completion_deadline = completion_started + Duration::from_secs(5);
+            let mut last_gate = None;
             let mut poll = tokio::time::interval(Duration::from_millis(10));
-            let observation = tokio::time::timeout(Duration::from_secs(5), async {
-                loop {
-                    poll.reset();
-                    tokio::select! {
-                        result = &mut waiting => panic!("dismissed without input: {result:?}"),
-                        _ = poll.tick() => {
-                            drain_terminal(&mut master, &mut emitted);
-                            last_pre_deadline_drain_elapsed = Some(observation_started.elapsed());
-                            if emitted.windows(b"ERROR-COMPLETE".len()).any(|bytes| bytes == b"ERROR-COMPLETE")
-                                && !crate::tui::terminal_output::needs_redraw() { break; }
+            let observation = tokio::time::timeout_at(
+                tokio::time::Instant::from_std(completion_deadline),
+                async {
+                    loop {
+                        poll.reset();
+                        tokio::select! {
+                            result = &mut waiting => panic!("dismissed without input: {result:?}"),
+                            _ = poll.tick() => {
+                                let marker = drainer.contains_bytes(b"ERROR-COMPLETE");
+                                let redraw = crate::tui::terminal_output::needs_redraw();
+                                let observed_at = std::time::Instant::now();
+                                last_gate = Some((observed_at.duration_since(completion_started), marker, redraw));
+                                if observed_at >= completion_deadline { break false; }
+                                if marker && !redraw { break true; }
+                            }
                         }
                     }
-                }
-            }).await;
-            observation.unwrap_or_else(|error| {
-                let question_mark_prefix = emitted.iter().take_while(|&&byte| byte == b'?').count();
-                let mut post_deadline_diagnostic_bytes = Vec::new();
-                drain_terminal(&mut master, &mut post_deadline_diagnostic_bytes);
-                let post_deadline_drain_elapsed = observation_started.elapsed();
+                },
+            ).await;
+            if !matches!(&observation, Ok(true)) {
+                let owner = output.diagnostic_snapshot();
+                let diagnostic_only_bytes_after_stop = drainer.finish();
+                let question_mark_prefix = diagnostic_only_bytes_after_stop
+                    .iter()
+                    .take_while(|&&byte| byte == b'?')
+                    .count();
                 panic!(
-                    "error frame incomplete: {error}; osc_busy={osc_busy}, emitted={}, needs_redraw={}; question_mark_prefix={question_mark_prefix} (prefix only, not total filler); initial_poll_elapsed={initial_poll_elapsed:?}; last_pre_deadline_drain_elapsed={last_pre_deadline_drain_elapsed:?}; post_deadline_drain_elapsed={post_deadline_drain_elapsed:?}; pre_deadline_emitted_bytes={emitted:?}; POST_DEADLINE_diagnostic_bytes={post_deadline_diagnostic_bytes:?}; initial_output={initial_output}; final_output_after_post_deadline_drain={}",
-                    emitted.len(),
-                    crate::tui::terminal_output::needs_redraw(),
-                    output.diagnostic_snapshot()
-                )
-            });
+                    "error frame incomplete or late: observation={observation:?}; osc_busy={osc_busy}, needs_redraw={}; initial_poll_elapsed={initial_poll_elapsed:?}; last_gate(elapsed,marker,redraw)={last_gate:?}; question_mark_prefix={question_mark_prefix} (prefix only, not total filler); owner_at_failure={owner}; bytes_collected_after_stop_DIAGNOSTIC_ONLY={diagnostic_only_bytes_after_stop:?}",
+                    crate::tui::terminal_output::needs_redraw()
+                );
+            }
             send.send(Ok(CrosstermEvent::Key(KeyEvent::from(KeyCode::Char('x')))))
                 .await
                 .unwrap();
@@ -2321,6 +2334,7 @@ mod tests {
                 .await
                 .unwrap()
                 .unwrap();
+            let _diagnostic_only_bytes_after_dismissal = drainer.finish();
         }
     }
     use crate::acp::state::{ConfigOptionCategory, ConfigOptionChoice, ConfigOptionDescriptor};

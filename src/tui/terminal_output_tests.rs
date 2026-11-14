@@ -217,6 +217,16 @@ impl TerminalDrainer {
         }
     }
 
+    pub(crate) fn contains_bytes(&self, marker: &[u8]) -> bool {
+        marker.is_empty()
+            || self
+                .bytes
+                .lock()
+                .unwrap()
+                .windows(marker.len())
+                .any(|bytes| bytes == marker)
+    }
+
     pub(crate) fn finish(mut self) -> Vec<u8> {
         self.stop();
         std::mem::take(&mut *self.bytes.lock().unwrap())
