@@ -2245,6 +2245,7 @@ mod tests {
             if osc_busy {
                 let (entered, observed) = std::sync::mpsc::sync_channel(1);
                 let (finish, finished) = std::sync::mpsc::sync_channel(1);
+                let output = output.clone();
                 writer = Some(std::thread::spawn(move || {
                     output.osc52(
                         Duration::from_secs(5),
@@ -2274,7 +2275,10 @@ mod tests {
                 &mut events,
             );
             tokio::pin!(waiting);
+            let observation_started = std::time::Instant::now();
             assert!(futures_util::poll!(&mut waiting).is_pending());
+            let (initial_poll_elapsed, initial_output) =
+                (observation_started.elapsed(), output.diagnostic_snapshot());
             if let Some(release) = release {
                 release.send(()).unwrap();
                 writer.take().unwrap().join().unwrap().unwrap();
@@ -2282,24 +2286,32 @@ mod tests {
                 resume_terminal(&control);
             }
             let mut emitted = Vec::new();
+            let mut last_pre_deadline_drain_elapsed = None;
             let mut poll = tokio::time::interval(Duration::from_millis(10));
-            tokio::time::timeout(Duration::from_secs(5), async {
+            let observation = tokio::time::timeout(Duration::from_secs(5), async {
                 loop {
                     poll.reset();
                     tokio::select! {
                         result = &mut waiting => panic!("dismissed without input: {result:?}"),
                         _ = poll.tick() => {
                             drain_terminal(&mut master, &mut emitted);
+                            last_pre_deadline_drain_elapsed = Some(observation_started.elapsed());
                             if emitted.windows(b"ERROR-COMPLETE".len()).any(|bytes| bytes == b"ERROR-COMPLETE")
                                 && !crate::tui::terminal_output::needs_redraw() { break; }
                         }
                     }
                 }
-            }).await.unwrap_or_else(|error| {
+            }).await;
+            observation.unwrap_or_else(|error| {
+                let question_mark_prefix = emitted.iter().take_while(|&&byte| byte == b'?').count();
+                let mut post_deadline_diagnostic_bytes = Vec::new();
+                drain_terminal(&mut master, &mut post_deadline_diagnostic_bytes);
+                let post_deadline_drain_elapsed = observation_started.elapsed();
                 panic!(
-                    "error frame incomplete: {error}; osc_busy={osc_busy}, emitted={}, needs_redraw={}",
+                    "error frame incomplete: {error}; osc_busy={osc_busy}, emitted={}, needs_redraw={}; question_mark_prefix={question_mark_prefix} (prefix only, not total filler); initial_poll_elapsed={initial_poll_elapsed:?}; last_pre_deadline_drain_elapsed={last_pre_deadline_drain_elapsed:?}; post_deadline_drain_elapsed={post_deadline_drain_elapsed:?}; pre_deadline_emitted_bytes={emitted:?}; POST_DEADLINE_diagnostic_bytes={post_deadline_diagnostic_bytes:?}; initial_output={initial_output}; final_output_after_post_deadline_drain={}",
                     emitted.len(),
-                    crate::tui::terminal_output::needs_redraw()
+                    crate::tui::terminal_output::needs_redraw(),
+                    output.diagnostic_snapshot()
                 )
             });
             send.send(Ok(CrosstermEvent::Key(KeyEvent::from(KeyCode::Char('x')))))

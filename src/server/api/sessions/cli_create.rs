@@ -240,11 +240,25 @@ fn resolve_host_creation(
             names.join(", ")
         )
     };
+    let plugin_registry = crate::plugin::registry();
+    let plugin_tool = |command: &str| {
+        crate::plugin::agent_integration::resolve_declared_tool(
+            &plugin_registry,
+            command,
+            config
+                .session
+                .custom_agents
+                .iter()
+                .filter(|(_, command)| !command.trim().is_empty())
+                .map(|(name, _)| name.as_str()),
+        )
+    };
     let explicit_tool = !body.tool.trim().is_empty() || options.command.is_some();
     if let Some(command) = options.command.as_deref() {
         body.tool = crate::agents::resolve_tool_name(command)
-            .with_context(|| unknown_tool(&format!("Unknown tool in command: {command}")))?
-            .to_owned();
+            .map(str::to_owned)
+            .or_else(|| plugin_tool(command))
+            .with_context(|| unknown_tool(&format!("Unknown tool in command: {command}")))?;
         if command.trim().contains(' ')
             && body.command_override.is_empty()
             && config.session.resolve_tool_command(&body.tool).is_empty()
@@ -277,22 +291,12 @@ fn resolve_host_creation(
             body.tool = name.to_owned();
         } else if let Some(tool) = crate::agents::resolve_tool_name(name) {
             body.tool = tool.to_owned();
-        } else if crate::plugin::agent_integration::agent_command(
-            name,
-            config
-                .session
-                .custom_agents
-                .iter()
-                .filter(|(_, command)| !command.trim().is_empty())
-                .map(|(name, _)| name.as_str()),
-        )
-        .is_some()
-        {
+        } else if let Some(tool) = plugin_tool(name) {
             anyhow::ensure!(
                 body.command_override.is_empty(),
-                "--cmd-override cannot be used with configured custom agent --tool selections"
+                "--cmd-override cannot be used with configured plugin agent --tool selections"
             );
-            body.tool = name.to_owned();
+            body.tool = tool;
         } else {
             anyhow::ensure!(
                 !config.session.custom_agents.contains_key(name),
@@ -314,7 +318,9 @@ fn resolve_host_creation(
                     {
                         Some(name.to_owned())
                     } else {
-                        crate::agents::resolve_tool_name(name).map(str::to_owned)
+                        crate::agents::resolve_tool_name(name)
+                            .map(str::to_owned)
+                            .or_else(|| plugin_tool(name))
                     }
                 })
             })
@@ -329,9 +335,9 @@ fn resolve_host_creation(
     if explicit_tool {
         let configured = config.session.resolve_tool_command(&body.tool);
         if options.command.is_some() && !configured.is_empty() {
-            let binary = shell_words::split(&configured)?
-                .into_iter()
-                .next()
+            let binary = aoe_plugin_api::agent_integration::launch_prefix(&configured)
+                .and_then(|(prefix, _)| prefix.last().map(|word| (*word).to_owned()))
+                .or_else(|| shell_words::split(&configured).ok()?.into_iter().next())
                 .context("Configured agent command is empty")?;
             anyhow::ensure!(
                 crate::tmux::is_binary_on_path(&binary),

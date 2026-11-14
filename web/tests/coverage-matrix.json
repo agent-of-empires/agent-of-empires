@@ -3,6 +3,32 @@
   "description": "Surface/flow coverage matrix for the agent-of-empires web dashboard. Every component file under web/src/components/** must appear in at least one entry's `components` list (covered, deferred, or out-of-scope), or in coverage-matrix.exempt.json. CI validates this on every PR via tests/validate-coverage-matrix.mjs.",
   "surfaces": [
     {
+      "id": "settings.plugin-agent-consent",
+      "kind": "vitest",
+      "risk": "high",
+      "specs": [
+        "src/components/settings/__tests__/PluginConsentModals.test.tsx",
+        "src/components/settings/__tests__/agentIntegrationDetails.test.ts"
+      ],
+      "components": [
+        "web/src/components/settings/PluginInstallConsentModal.tsx",
+        "web/src/components/settings/PluginUpdateConsentModal.tsx",
+        "web/src/components/settings/agentIntegrationDetails.ts"
+      ],
+      "notes": "Install and update consent expose agent launch, detection and reply declarations as text with control and format characters made visible."
+    },
+    {
+      "id": "settings.plugin-agent-consent-browser",
+      "kind": "mocked-playwright",
+      "risk": "high",
+      "specs": ["tests/plugin-agent-consent.spec.ts"],
+      "components": [
+        "web/src/components/settings/PluginInstallConsentModal.tsx",
+        "web/src/components/settings/PluginUpdateConsentModal.tsx"
+      ],
+      "notes": "Marketplace install and installed-plugin update previews display agent declarations and escape hostile text before approval."
+    },
+    {
       "id": "trash.unfinished-recovery",
       "kind": "live-playwright",
       "risk": "high",
