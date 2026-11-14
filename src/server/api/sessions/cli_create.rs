@@ -240,18 +240,36 @@ fn resolve_host_creation(
             names.join(", ")
         )
     };
+    let configured_custom_agents: Vec<&str> = config
+        .session
+        .custom_agents
+        .iter()
+        .filter(|(_, command)| !command.trim().is_empty())
+        .map(|(name, _)| name.as_str())
+        .collect();
     let plugin_registry = crate::plugin::registry();
     let plugin_tool = |command: &str| {
         crate::plugin::agent_integration::resolve_declared_tool(
             &plugin_registry,
             command,
-            config
-                .session
-                .custom_agents
-                .iter()
-                .filter(|(_, command)| !command.trim().is_empty())
-                .map(|(name, _)| name.as_str()),
+            configured_custom_agents.iter().copied(),
         )
+    };
+    let plugin_owned = |name: &str| {
+        if config
+            .session
+            .agent_command_override
+            .get(name)
+            .is_some_and(|command| !command.trim().is_empty())
+        {
+            return false;
+        }
+        crate::plugin::agent_integration::declared_agent(
+            plugin_registry.clone(),
+            name,
+            configured_custom_agents.iter().copied(),
+        )
+        .is_some()
     };
     let explicit_tool = !body.tool.trim().is_empty() || options.command.is_some();
     if let Some(command) = options.command.as_deref() {
@@ -292,10 +310,6 @@ fn resolve_host_creation(
         } else if let Some(tool) = crate::agents::resolve_tool_name(name) {
             body.tool = tool.to_owned();
         } else if let Some(tool) = plugin_tool(name) {
-            anyhow::ensure!(
-                body.command_override.is_empty(),
-                "--cmd-override cannot be used with configured plugin agent --tool selections"
-            );
             body.tool = tool;
         } else {
             anyhow::ensure!(
@@ -331,6 +345,11 @@ fn resolve_host_creation(
                 body.tool = name.to_owned();
             }
         }
+    }
+    // Every selection path lands here with its canonical tool, so this one check
+    // rejects the override for explicit and implicit plugin selections alike.
+    if !body.command_override.is_empty() && plugin_owned(&body.tool) {
+        anyhow::bail!("--cmd-override cannot be used with a plugin-provided agent");
     }
     if explicit_tool {
         let configured = config.session.resolve_tool_command(&body.tool);
@@ -454,6 +473,85 @@ fn resolve_host_creation(
     }
     body.cli = Some(options);
     Ok((body, warnings))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    #[serial_test::serial]
+    fn configured_agent_command_allows_cli_override() {
+        let home = tempfile::tempdir().unwrap();
+        let _reload = crate::plugin::ReloadRegistryOnDrop;
+        let _env = crate::session::test_support::EnvGuard::set(&[
+            ("HOME", home.path()),
+            ("XDG_CONFIG_HOME", home.path()),
+            ("USERPROFILE", home.path()),
+        ]);
+        let _featured = crate::session::test_support::EnvGuard::unset(&["AOE_FEATURED_INDEX_PATH"]);
+        let manifest = r#"id = "acme.cli-override"
+name = "CLI override"
+version = "1.0.0"
+api_version = 19
+capabilities = ["session.integration"]
+[[agent_integrations]]
+tool = "plugin-helper"
+command = "true"
+provider_versions = ["^18"]
+"#;
+        let dir = crate::plugin::plugins_dir()
+            .unwrap()
+            .join("acme.cli-override");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("aoe-plugin.toml"), manifest).unwrap();
+        crate::session::update_config(|config| {
+            config.plugins.insert(
+                "acme.cli-override".into(),
+                crate::session::PluginConfig {
+                    grant: Some(crate::session::CapabilityGrant {
+                        manifest_hash: aoe_plugin_api::PluginManifest::hash_bytes(
+                            manifest.as_bytes(),
+                        ),
+                        capabilities: vec!["session.integration".into()],
+                        granted_at: chrono::Utc::now(),
+                    }),
+                    ..Default::default()
+                },
+            );
+            config.session.default_tool = Some("plugin-helper".into());
+        })
+        .unwrap();
+        crate::plugin::reload_registry();
+
+        for configured in ["", "   ", "true"] {
+            crate::session::update_config(|config| {
+                config
+                    .session
+                    .agent_command_override
+                    .insert("plugin-helper".into(), configured.into());
+            })
+            .unwrap();
+            for tool in ["plugin-helper", ""] {
+                let body: CreateSessionBody = serde_json::from_value(serde_json::json!({
+                    "path": home.path(), "tool": tool, "command_override": "false"
+                }))
+                .unwrap();
+                let result = resolve_host_creation(body, Default::default(), None, "default");
+                if configured.trim().is_empty() {
+                    assert!(result
+                        .err()
+                        .expect("plugin-owned override must be rejected")
+                        .to_string()
+                        .contains("--cmd-override cannot be used"));
+                } else {
+                    let (body, _) = result.unwrap();
+                    assert_eq!(body.tool, "plugin-helper");
+                    assert_eq!(body.command_override, "false");
+                }
+            }
+        }
+    }
 }
 
 /// An explicit flag wins over the setting. The setting only applies to a
