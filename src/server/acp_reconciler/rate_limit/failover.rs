@@ -524,11 +524,14 @@ pub(super) async fn maybe_fail_over(
     let state = Arc::clone(state);
     let id = row.id.clone();
     let from = row.tool.clone();
+    let generation = row.lifecycle_generation;
     tokio::spawn(async move {
         let _permit = permit;
         let _claim = claim;
-        match crate::server::api::sessions::failover_account_swap(&state, &id, &target, head_seq)
-            .await
+        match crate::server::api::sessions::failover_account_swap(
+            &state, &id, &target, head_seq, generation,
+        )
+        .await
         {
             Ok(()) => {
                 lock(&RETRIES).succeeded(&id);
