@@ -2844,7 +2844,6 @@ pub(super) mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     #[serial_test::serial]
     async fn deferred_installation_reuses_the_exact_running_original_after_its_deadline() {
-        use axum::response::IntoResponse;
         for mode in ["resume", "stop", "replacement"] {
             super::super::test_support::managed::with_managed(|scope| Box::pin(async move {
                 let directory = scope.tempdir();
@@ -2894,11 +2893,7 @@ pub(super) mod tests {
                 let record = worker_registry::load_strict(&id).unwrap().unwrap();
                 assert!(owner.owns_record(&record));
                 if mode != "resume" {
-                    let stopped = crate::server::api::sessions::stop_session(
-                        axum::extract::State(scope.state.clone()),
-                        axum::extract::Path(id.clone()),
-                    ).await.into_response();
-                    assert_eq!(stopped.status(), axum::http::StatusCode::OK);
+                    scope.stop_observed_original(&lease).await;
                     assert!(!supervisor.resume_deferred(&id).await.unwrap());
                     assert!(supervisor.running_lease(&id).is_none());
                     assert!(!supervisor.process_control.is_alive(owner));
@@ -2932,11 +2927,13 @@ pub(super) mod tests {
                         assert_eq!(std::fs::read(worker_registry::record_path(&id).unwrap()).unwrap(), bytes);
                         assert_eq!(replacement_peer.requests().iter().filter(|method| method.as_str() == "session/load").count(), 1);
                     }
+                    eprintln!("deferred installation {mode} assertions completed before cleanup: {id}");
                     return;
                 }
                 let resumed = tokio::time::timeout(Duration::from_secs(10), supervisor.resume_deferred(&id))
                     .await.expect("bounded retry of retained installation");
                 assert!(matches!(resumed, Ok(true)), "the exact Running original must resume, not retire: {resumed:?}");
+                let managed = scope.observe_external_resume(id.clone(), frames.resubscribe()).await;
                 supervisor.test_assert_installed_client(&id, &original).await;
                 tokio::time::timeout(Duration::from_secs(10), supervisor.wait_until_ready(&id)).await.unwrap().unwrap();
                 assert_eq!(supervisor.running_lease(&id), Some(lease.clone()));
@@ -2957,10 +2954,8 @@ pub(super) mod tests {
                 assert_eq!(peer.requests().iter().filter(|method| method.as_str() == "session/new").count(), 1);
                 assert_eq!(peer.requests().iter().filter(|method| method.as_str() == "initialize").count(), 1);
                 assert!(!lease.retirement().has_deferred());
-                let stopped = crate::server::api::sessions::stop_session(
-                    axum::extract::State(scope.state.clone()), axum::extract::Path(id.clone()),
-                ).await.into_response();
-                assert_eq!(stopped.status(), axum::http::StatusCode::OK);
+                managed.stop_session().await;
+                eprintln!("deferred installation {mode} assertions completed before cleanup: {id}");
             })).await;
         }
     }

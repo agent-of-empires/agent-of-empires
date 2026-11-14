@@ -233,20 +233,7 @@ impl ManagedClient {
     }
 
     pub(crate) async fn stop_session(&self) {
-        let stopped = crate::server::api::sessions::stop_session(
-            State(self.state.clone()),
-            axum::extract::Path(self.id.clone()),
-        )
-        .await
-        .into_response();
-        assert_eq!(
-            stopped.status(),
-            axum::http::StatusCode::OK,
-            "real Stop must settle the original projection before retained Load/Fork"
-        );
-        self.retirement
-            .completed
-            .store(true, std::sync::atomic::Ordering::Release);
+        self.retirement.stop_session().await;
     }
 
     /// Release the stopped case's real SID ownership before reusing it.
@@ -541,6 +528,22 @@ impl ManagedRetirement {
         .await??;
         let _ = self.prepared.set(prepared.clone());
         Ok(Some(prepared))
+    }
+
+    async fn stop_session(&self) {
+        let id = self.target.lease.as_ref().expect("captured original lease").session_id();
+        let stopped = crate::server::api::sessions::stop_session(
+            State(self.state.clone()),
+            axum::extract::Path(id.to_owned()),
+        )
+        .await
+        .into_response();
+        assert_eq!(
+            stopped.status(),
+            axum::http::StatusCode::OK,
+            "real Stop must settle the original projection before retained Load/Fork"
+        );
+        self.completed.store(true, std::sync::atomic::Ordering::Release);
     }
 
     async fn retire(&self) -> anyhow::Result<()> {
@@ -2390,6 +2393,25 @@ socket.on('error', error => { console.error(error); process.exit(1); });
         events: broadcast::Receiver<AcpBroadcastFrame>,
     ) -> ManagedClient {
         self.installed(id, events).await
+    }
+
+    pub(crate) async fn stop_observed_original(&mut self, lease: &Lease) {
+        assert!(self.leases.lock().unwrap().contains(lease), "the original must belong to this actual launcher");
+        assert_eq!(
+            self.state.acp_supervisor.lifecycle.lock().unwrap_or_else(|error| error.into_inner())
+                .current_lease(lease.session_id()).as_ref(),
+            Some(lease),
+            "capture the exact current original before public Stop"
+        );
+        let retirement = self.retirements.iter().find(|retirement| {
+            retirement.target.lease.as_ref() == Some(lease)
+                && Arc::ptr_eq(&retirement.state, &self.state)
+        }).cloned().unwrap_or_else(|| {
+            let retirement = Arc::new(ManagedRetirement::capture(self.state.clone(), lease.clone()));
+            self.retirements.push(retirement.clone());
+            retirement
+        });
+        retirement.stop_session().await;
     }
 
     pub(crate) async fn reconcile_after<F: Future<Output = ()>>(
