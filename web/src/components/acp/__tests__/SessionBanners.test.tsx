@@ -948,3 +948,86 @@ describe("accepted integration-loss snapshot diagnostics", () => {
     expect(nativeInputAvailable(cleared)).toBe(false);
   });
 });
+
+describe("host-only Stop while the same Native constructor is pending", () => {
+  const connection = {
+    status: "open" as const,
+    hasEverOpened: true,
+    reconnecting: false,
+    retryCount: 0,
+    maxRetries: 5,
+  };
+  const intent = "5fdcc941-9be3-4f26-ab31-21b612084392";
+  const revision = Array.from({ length: 32 }, (_, i) => i) as EstablishmentRevision;
+  const props = {
+    sessionId: "pending-host-worker",
+    acpWorkerState: "running" as const,
+    canRestart: true,
+    trashedAt: null,
+    archivedAt: null,
+    snoozedUntil: null,
+    dismissError: vi.fn(),
+  };
+
+  it.each(["before", "after"] as const)(
+    "does not report physical retirement when the host stop arrives %s its live snapshot",
+    (order) => {
+      const initial = currentControlSnapshot(emptyAcpState(), { ready: false, wakeEligible: true }, 2);
+      initial.state.host_prompt_intent = intent;
+      initial.state.establishment_revision = revision;
+      let state = reducer(emptyAcpState(), initial);
+      const stopped = {
+        kind: "frame" as const,
+        frame: {
+          session_id: props.sessionId,
+          seq: 3,
+          scope: "history_only",
+          event: { Stopped: { reason: "user_stopped" } },
+        },
+      };
+      const settled = currentControlSnapshot(state, { ready: false, wakeEligible: true }, 3);
+      settled.state.host_prompt_intent = null;
+      settled.unchanged.push("establishment_revision");
+      delete settled.state.establishment_revision;
+      if (order === "before") {
+        state = reducer(state, stopped);
+        expect(state.hostPromptIntent).toBe(intent);
+        expect(state.establishmentRevision).toEqual(revision);
+        state = reducer(state, settled);
+      } else {
+        state = reducer(state, settled);
+        state = reducer(state, stopped);
+      }
+      expect(state.hostPromptIntent).toBeNull();
+      expect(state.establishmentRevision).toEqual(revision);
+      expect(nativeInputAvailable(state)).toBe(false);
+      expect(state.turnActive).toBe(false);
+      render(<SessionBanners {...props} state={state}
+        startingAgent={isNewSessionStarting(state, connection, "running", false) ? "Claude Code" : null} />);
+      expect(screen.getByTestId("startup-wait-line")).toBeTruthy();
+      expect(screen.queryByText("Structured view worker stopped")).toBeNull();
+    },
+  );
+
+  it("retains the real worker-stop explanation when the live constructor is gone", () => {
+    const initial = currentControlSnapshot(emptyAcpState(), { ready: false, wakeEligible: true }, 2);
+    initial.state.host_prompt_intent = intent;
+    initial.state.establishment_revision = revision;
+    let state = reducer(emptyAcpState(), initial);
+    state = reducer(state, {
+      kind: "frame",
+      frame: { session_id: props.sessionId, seq: 3, event: { Stopped: { reason: "user_stopped" } } },
+    });
+    const retired = currentControlSnapshot(state, { ready: false, wakeEligible: false }, 3);
+    retired.state.host_prompt_intent = null;
+    retired.state.establishment_revision = null;
+    state = reducer(state, retired);
+    render(<SessionBanners {...props} state={state} acpWorkerState="absent"
+      startingAgent={isNewSessionStarting(state, connection, "absent", false) ? "Claude Code" : null} />);
+    expect(nativeInputAvailable(state)).toBe(false);
+    expect(state.hostPromptIntent).toBeNull();
+    expect(state.establishmentRevision).toBeNull();
+    expect(screen.queryByTestId("startup-wait-line")).toBeNull();
+    expect(screen.getByText("Structured view worker stopped")).toBeTruthy();
+  });
+});

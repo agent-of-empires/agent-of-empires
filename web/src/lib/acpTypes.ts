@@ -1336,9 +1336,10 @@ export function applyEvent(state: AcpState, frame: AcpFrame): AcpState {
   // Raw callback resolutions settle only their unique matching nonce; unlike a
   // historical turn reset, that acknowledgement may clear its transient error.
   if (!acknowledgesOwnPrompt && !callbackResolution) next.interactionError = state.interactionError;
-  // Positive current readiness heals old worker/compatibility chrome. Qualified
-  // loss likewise cannot be rewritten as process death by a prior owner's stop.
-  if (nativeInputAvailable(state) || state.connectionUnavailable) {
+  // Live input or a fenced pending constructor heals old lifecycle chrome only.
+  // Neither the comparison revision nor governed wake is Native input authority.
+  if (nativeInputAvailable(state) || state.connectionUnavailable ||
+    (state.promptWakeEligible && state.establishmentRevision !== null)) {
     next.workerStopped = state.workerStopped;
     next.workerRestarting = state.workerRestarting;
     next.workerIdleStopped = state.workerIdleStopped;
@@ -1488,8 +1489,8 @@ function applyRawEvent(state: AcpState, frame: AcpFrame, rawTurnActive: boolean,
     return next;
   }
   if ("Stopped" in event) {
-    next.hostPromptIntent = null;
-    next.establishmentRevision = null;
+    // A raw stop has no host-intent identity and may belong to prior history.
+    // Only a canonical snapshot or management boundary revokes live comparison data.
     // Whether this `Stopped` ends the turn is the daemon's call (see closeTurn); the escalation deadline is ours.
     next.cancelEscalatesAt = null;
     closeTurn(next);
@@ -1954,6 +1955,10 @@ export function applyReducedState(
   ) {
     next.integrationLost = reduced.integration_lost;
     next.integrationLostSnapshotSeq = snapshotSeq;
+  }
+  if (authoritative && next.promptWakeEligible && next.establishmentRevision !== null) {
+    // The same fenced observation still has a pending actor, not a retired worker.
+    next.workerStopped = false;
   }
   if (connectionReady) {
     next.sessionAssigned = true;
