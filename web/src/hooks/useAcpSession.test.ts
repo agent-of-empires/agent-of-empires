@@ -4,7 +4,7 @@ import { act, renderHook, waitFor } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import { emptyAcpState } from "../lib/acpTypes";
-import { STATE_TTL_MS, STORAGE_KEY_PREFIX } from "../lib/acpStateStorage";
+import { STATE_TTL_MS, STORAGE_KEY_PREFIX, getLiveQueueCount } from "../lib/acpStateStorage";
 import { reportAcpInteraction, type ServerQueuedPrompt } from "../lib/api";
 import { ACP_DIAL_TIMEOUT_MS, ACP_MAX_RETRIES, ACP_WS_STALE_MS, acpRetryDelayMs } from "./acpSession/useAcpConnection";
 import {
@@ -731,6 +731,8 @@ describe("server queue", () => {
   let serverQueue: Map<string, ServerQueuedPrompt>;
   let serverBusy: boolean;
   let workerDown: boolean;
+  // Set to hold the queue list's response until it resolves.
+  let queueListHeld: Promise<void> | null;
   const row = (id: string, text: string, extra: Partial<ServerQueuedPrompt> = {}): ServerQueuedPrompt => ({
     id,
     seq: serverQueue.size,
@@ -743,11 +745,15 @@ describe("server queue", () => {
     serverQueue = new Map();
     serverBusy = false;
     workerDown = false;
+    queueListHeld = null;
     vi.mocked(reportAcpInteraction).mockClear();
     calls = installAcpFakes(({ url, method, body }) => {
       if (url.includes("/queue")) {
         const item = url.match(/\/queue\/([^/?]+)/)?.[1];
-        if (method === "GET") return json([...serverQueue.values()].sort((a, b) => a.seq - b.seq));
+        if (method === "GET") {
+          const list = () => json([...serverQueue.values()].sort((a, b) => a.seq - b.seq));
+          return queueListHeld ? queueListHeld.then(list) : list();
+        }
         if (method === "POST") {
           const parsed = JSON.parse(body!) as { id: string; text: string };
           serverQueue.set(parsed.id, row(parsed.id, parsed.text));
@@ -785,6 +791,50 @@ describe("server queue", () => {
     await flushAsync();
     return hook;
   }
+
+  it("lends the sidebar its queue count only from the queue list after an open until the close", async () => {
+    const id = "sess-live-count";
+    const persisted = ["p1", "p2", "p3"].map((pid) => ({ id: pid, text: pid, queuedAt: "2026-01-01T00:00:00.000Z" }));
+    localStorage.setItem(
+      `${STORAGE_KEY_PREFIX}${id}`,
+      JSON.stringify({ savedAt: Date.now(), state: { ...emptyAcpState(), queuedPrompts: persisted } }),
+    );
+    serverQueue.set("q1", row("q1", "held"));
+    const hook = render(id);
+    await flushAsync();
+    // The persisted copy is on screen but isn't the Daemon's queue.
+    expect(hook.result.current.state.queuedPrompts).toHaveLength(3);
+    expect(getLiveQueueCount(id)).toBeUndefined();
+
+    const list = Promise.withResolvers<void>();
+    queueListHeld = list.promise;
+    lastSocket().open();
+    await flushAsync();
+    // Open, but the Daemon's list hasn't arrived: the persisted copy still isn't lent.
+    expect(getLiveQueueCount(id)).toBeUndefined();
+    queueListHeld = null;
+    list.resolve();
+    await flushAsync();
+    expect(getLiveQueueCount(id)).toBe(1);
+
+    // A row queued here counts before any session list could report it.
+    serverBusy = true;
+    lastSocket().message({ session_id: id, seq: 1, event: { UserPromptSent: { text: "kick" } } });
+    await flushAsync();
+    act(() => void hook.result.current.sendPrompt("follow-up"));
+    await flushAsync();
+    expect(getLiveQueueCount(id)).toBe(2);
+
+    lastSocket().drop();
+    await flushAsync();
+    expect(getLiveQueueCount(id)).toBeUndefined();
+
+    lastSocket().open();
+    await flushAsync();
+    expect(getLiveQueueCount(id)).toBe(2);
+    hook.unmount();
+    expect(getLiveQueueCount(id)).toBeUndefined();
+  });
 
   it("shows the row the daemon reports when it parks a busy-turn prompt", async () => {
     const { result } = await openBusy("sess-busy");

@@ -24,6 +24,7 @@ import {
 import { classifyResolveResponse, reducer, type Action } from "./acpSession/reducer";
 import { ACP_MAX_RETRIES, useAcpConnection } from "./acpSession/useAcpConnection";
 import { cacheGet, cacheSet, sweepExpiredStorage } from "./acpSession/stateCache";
+import { setLiveQueueCount } from "../lib/acpStateStorage";
 import { useLatestRef } from "./useLatestRef";
 
 export { reducer, transcriptDeltaAction, type Action } from "./acpSession/reducer";
@@ -311,6 +312,20 @@ export function useAcpSession(
   // list per session re-sends rows the server never confirmed; a confirmed row missing from the
   // server was drained and must not be re-created.
   const queueMigratedRef = useRef<Set<string>>(new Set());
+  // The sidebar badge takes this browser's count only between the first queue list after an open and the close.
+  const queueListedRef = useRef(false);
+  useEffect(() => {
+    if (!sessionId || status !== "open") return;
+    return () => {
+      queueListedRef.current = false;
+      setLiveQueueCount(sessionId, null);
+    };
+  }, [sessionId, status]);
+  useEffect(() => {
+    // eslint-disable-next-line react-you-might-not-need-an-effect/no-event-handler -- syncs reducer state to the sidebar's store
+    if (!sessionId || status !== "open" || !queueListedRef.current) return;
+    setLiveQueueCount(sessionId, state.queuedPrompts.length);
+  }, [sessionId, status, state.queuedPrompts]);
   useEffect(() => {
     if (!sessionId || status !== "open") return;
     let cancelled = false;
@@ -328,7 +343,9 @@ export function useAcpSession(
         }
       }
       const rows = await listServerQueue(sessionId);
-      if (!cancelled) dispatch({ kind: "hydrate_server_queue", rows });
+      if (cancelled) return;
+      queueListedRef.current = true;
+      dispatch({ kind: "hydrate_server_queue", rows });
     })();
     return () => {
       cancelled = true;

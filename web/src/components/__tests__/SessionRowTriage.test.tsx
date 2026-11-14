@@ -84,6 +84,27 @@ describe("SessionRow chips", () => {
 });
 
 describe("SessionRow row tags", () => {
+  it("titles the queued chip with what the queue waits on, when every session with messages agrees", () => {
+    const chip = () => screen.queryByLabelText(/queued/);
+    renderRow(ws({ view: "structured", queued_count: 1, queue_reason: "compacting" }));
+    expect(chip()?.getAttribute("aria-label")).toBe("1 queued · sends after compacting");
+    expect(chip()?.getAttribute("title")).toBe("1 queued message · sends after compacting");
+    cleanup();
+    renderRow(ws({ view: "structured", queued_count: 2 }));
+    expect(chip()?.getAttribute("title")).toBe("2 queued messages");
+    cleanup();
+    const mixed = [
+      makeSession({ id: "a", view: "structured", queued_count: 1, queue_reason: "compacting" }),
+      makeSession({ id: "b", view: "structured", queued_count: 1, queue_reason: "cancelling" }),
+    ];
+    renderRow(makeWorkspace("w", mixed));
+    expect(chip()?.getAttribute("title")).toBe("2 queued messages");
+    cleanup();
+    // A reason with nothing queued shows no chip.
+    renderRow(ws({ view: "structured", queue_reason: "compacting" }));
+    expect(chip()).toBeNull();
+  });
+
   it("renders a compact branch tag instead of the branch subtitle, and nothing for none", () => {
     const branched = makeWorkspace("w", [makeSession({ branch: "feature/web-row-tag" })], {
       branch: "feature/web-row-tag",
