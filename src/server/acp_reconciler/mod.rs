@@ -509,7 +509,10 @@ async fn drain_queued_prompts(state: &Arc<AppState>) {
             .iter()
             .filter(|i| {
                 !i.queued_prompts.is_empty()
-                    && i.status == crate::session::Status::Idle
+                    && matches!(
+                        i.status,
+                        crate::session::Status::Idle | crate::session::Status::Running
+                    )
                     && is_untriaged_structured(i)
             })
             .map(|i| (i.id.clone(), i.is_idle_dormant()))
@@ -517,6 +520,9 @@ async fn drain_queued_prompts(state: &Arc<AppState>) {
     };
     for (id, dormant) in candidates {
         let service = Arc::clone(&state.session_service);
+        if !service.fold_control_state(&id).await.accepts_queue_drain() {
+            continue;
+        }
         if state.acp_supervisor.is_running(&id).await {
             crate::task_util::spawn_supervised(
                 "acp.queue_drain",
@@ -974,6 +980,182 @@ mod tests {
             attempts + 1,
             "the kept request respawns the session once the teardown ends"
         );
+    }
+
+    #[tokio::test]
+    async fn queue_drain_preserves_a_deliberately_stopped_dormant_session() {
+        use crate::session::{Instance, Status, View};
+
+        let _app_dir = crate::session::test_support::isolate_app_dir();
+        let id = "stopped-with-queue";
+        let mut inst = Instance::new(id, "/tmp/aoe-stopped-with-queue");
+        inst.id = id.into();
+        inst.view = View::Structured;
+        inst.status = Status::Stopped;
+        inst.mark_idle_dormant();
+        inst.queued_prompts.push(test_fixtures::queued_prompt());
+        let state = crate::server::test_support::build_test_app_state(vec![inst]);
+        let mut tick = test_fixtures::Tick::default();
+        for _ in 0..3 {
+            tick.run(&state).await;
+        }
+        let instances = state.instances.read().await;
+        assert!(
+            instances[0].is_idle_dormant(),
+            "a deliberate stop must stay dormant"
+        );
+        assert!(
+            !tick.attempted.contains(id),
+            "queue drain must not attempt a stopped session"
+        );
+        assert_eq!(instances[0].queued_prompts.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn queue_drain_ignores_background_work_but_preserves_foreground_barriers() {
+        use crate::acp::state::test_support::{chunk, prompt, stopped};
+        use crate::acp::state::Event;
+        use crate::acp::supervisor::{BroadcastSink, ChannelSink};
+        use crate::session::{Instance, Status, View};
+
+        let _app_dir = crate::session::test_support::isolate_app_dir();
+        let task = Event::BackgroundTaskStarted {
+            task_id: "task".into(),
+            tool_call_id: None,
+            description: "build".into(),
+            workflow: None,
+            started_at: None,
+        };
+        let agent = Event::BackgroundAgentLaunched {
+            agent_id: "agent".into(),
+            tool_call_id: "tool".into(),
+            description: "research".into(),
+            prompt: "research".into(),
+            model: "model".into(),
+            output_file: String::new(),
+            started_at: chrono::Utc::now(),
+            workflow: None,
+        };
+        for (name, events, text, drains) in [
+            (
+                "task",
+                vec![prompt("go"), task.clone(), stopped("end_turn")],
+                "follow up",
+                true,
+            ),
+            (
+                "agent",
+                vec![prompt("go"), agent, stopped("end_turn")],
+                "follow up",
+                true,
+            ),
+            ("main", vec![prompt("go"), task.clone()], "follow up", false),
+            (
+                "notification",
+                vec![task.clone(), chunk("result")],
+                "follow up",
+                false,
+            ),
+            (
+                "cancel",
+                vec![
+                    task.clone(),
+                    Event::CancelRequested {
+                        escalates_at: chrono::Utc::now(),
+                    },
+                ],
+                "follow up",
+                false,
+            ),
+            (
+                "compact",
+                vec![task.clone(), Event::ConversationCompactionStarted],
+                "follow up",
+                false,
+            ),
+            ("clear", vec![task.clone()], "/clear", false),
+        ] {
+            let mut inst = Instance::new(name, "/tmp/aoe-queue-background");
+            inst.id = name.into();
+            inst.view = View::Structured;
+            inst.agent_name = Some("claude".into());
+            // The display stays busy even after the foreground turn ends.
+            inst.status = Status::Running;
+            let state = crate::server::test_support::build_test_app_state(vec![inst]);
+            let commands = state
+                .acp_supervisor
+                .test_insert_worker_cmd_recording(name)
+                .await;
+            let sink = ChannelSink::new(
+                state.acp_events_tx.clone(),
+                Arc::clone(&state.acp_event_store),
+                Arc::clone(&state.acp_control_cache),
+            );
+            for (seq, event) in events.iter().enumerate() {
+                assert!(sink.publish_persisted(name, seq as u64 + 1, event));
+            }
+            state
+                .session_service
+                .enqueue_prompt(name, "q".into(), text.into(), Vec::new(), None, None)
+                .await
+                .unwrap();
+            if drains {
+                drain_queued_prompts(&state).await;
+                tokio::time::timeout(Duration::from_secs(5), async {
+                    while !state
+                        .session_service
+                        .queued_prompts_snapshot(name)
+                        .await
+                        .is_empty()
+                    {
+                        tokio::task::yield_now().await;
+                    }
+                })
+                .await
+                .expect("reconciler must deliver while background work runs");
+            } else {
+                // Await the delivery path itself before asserting non-delivery.
+                state.session_service.drain_queued_prompts_once(name).await;
+                assert_eq!(
+                    state
+                        .session_service
+                        .queued_prompts_snapshot(name)
+                        .await
+                        .len(),
+                    1,
+                    "{name}"
+                );
+            }
+            state.acp_supervisor.test_flush_worker_commands(name).await;
+            assert_eq!(
+                commands
+                    .lock()
+                    .unwrap()
+                    .iter()
+                    .filter(|cmd| **cmd == "prompt")
+                    .count(),
+                usize::from(drains),
+                "{name}"
+            );
+            if name == "clear" {
+                assert!(sink.publish_persisted(
+                    name,
+                    2,
+                    &Event::BackgroundTaskFinished {
+                        task_id: "task".into(),
+                        ended_at: None
+                    }
+                ));
+                state.session_service.drain_queued_prompts_once(name).await;
+                assert!(state
+                    .session_service
+                    .queued_prompts_snapshot(name)
+                    .await
+                    .is_empty());
+                state.acp_supervisor.test_flush_worker_commands(name).await;
+                assert!(commands.lock().unwrap().contains(&"reset_session"));
+            }
+        }
     }
 
     /// Wake-on-drain: a dormant session with a queue must be woken, or its
