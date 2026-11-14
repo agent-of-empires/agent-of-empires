@@ -342,7 +342,7 @@ pub(super) fn context_resume_with<'a>(
         };
     }
 
-    match inst.terminal_context_resume_cached_with(profile_config()) {
+    match inst.terminal_context_resume_cached_with(profile_config) {
         TerminalContextResume::Available => ContextResumeAvailability::Available,
         TerminalContextResume::RuntimeCheckRequired => ContextResumeAvailability::Indeterminate {
             reason: ContextResumeIndeterminateReason::RuntimeCheckRequired,

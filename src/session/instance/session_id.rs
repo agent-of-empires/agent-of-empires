@@ -610,12 +610,16 @@ impl Instance {
     /// refuses, so the availability the API and TUI render cannot drift from
     /// the launch line.
     fn terminal_resume_static_unavailable(&self) -> Option<ResumeStaticUnavailable> {
-        self.terminal_resume_static_unavailable_with(&resume_profile_config(&self.source_profile))
+        let mut resolved = None;
+        self.terminal_resume_static_unavailable_with(|| {
+            resolved.insert(resume_profile_config(&self.source_profile))
+        })
     }
 
-    fn terminal_resume_static_unavailable_with(
+    /// `profile_config` runs only past the declared-agent check, which needs no config.
+    fn terminal_resume_static_unavailable_with<'a>(
         &self,
-        resolved: &ResumeProfileConfig,
+        profile_config: impl FnOnce() -> &'a ResumeProfileConfig,
     ) -> Option<ResumeStaticUnavailable> {
         if let Some(declared) = self.declared_agent() {
             return declared
@@ -632,6 +636,7 @@ impl Instance {
                 })
                 .unwrap_or(Some(ResumeStaticUnavailable::Agent));
         }
+        let resolved = profile_config();
         let config = &resolved.config.session;
         let native = resolved
             .resolved
@@ -667,28 +672,31 @@ impl Instance {
     }
 
     pub(crate) fn terminal_context_resume_cached(&self) -> TerminalContextResume {
-        self.terminal_context_resume_cached_with(&resume_profile_config(&self.source_profile))
+        let mut resolved = None;
+        self.terminal_context_resume_cached_with(|| {
+            resolved.insert(resume_profile_config(&self.source_profile))
+        })
     }
 
     /// [`Self::terminal_context_resume_cached`] with the profile config resolved
     /// by the caller, so a projection resolves once per profile.
-    pub(crate) fn terminal_context_resume_cached_with(
+    pub(crate) fn terminal_context_resume_cached_with<'a>(
         &self,
-        resolved: &ResumeProfileConfig,
+        profile_config: impl FnOnce() -> &'a ResumeProfileConfig,
     ) -> TerminalContextResume {
-        self.terminal_context_resume_with_runtime_source(resolved, || {
+        self.terminal_context_resume_with_runtime_source(profile_config, || {
             self.tmux_session()
                 .map(|session| crate::tmux::cached_session_existence(session.name()))
                 .unwrap_or(crate::tmux::SessionExistence::Unknown)
         })
     }
 
-    fn terminal_context_resume_with_runtime_source(
+    fn terminal_context_resume_with_runtime_source<'a>(
         &self,
-        resolved: &ResumeProfileConfig,
+        profile_config: impl FnOnce() -> &'a ResumeProfileConfig,
         runtime_source: impl FnOnce() -> crate::tmux::SessionExistence,
     ) -> TerminalContextResume {
-        if let Some(unavailable) = self.terminal_resume_static_unavailable_with(resolved) {
+        if let Some(unavailable) = self.terminal_resume_static_unavailable_with(profile_config) {
             return match unavailable {
                 ResumeStaticUnavailable::Agent => TerminalContextResume::AgentUnsupported,
                 ResumeStaticUnavailable::Sandbox => TerminalContextResume::SandboxUnsupported,
@@ -2360,23 +2368,24 @@ work-opencode = "opencode"
     fn terminal_context_resume_matches_emission_constraints() {
         let sid = "44444444-4444-4444-8444-444444444444".to_string();
         let mut inst = tool_instance("claude", "/tmp/context");
+        let config = resume_profile_config(&inst.source_profile);
         assert_eq!(
             inst.terminal_context_resume_with_runtime_source(
-                &resume_profile_config(&inst.source_profile),
+                || &config,
                 || { crate::tmux::SessionExistence::Absent }
             ),
             TerminalContextResume::NoTarget
         );
         assert_eq!(
             inst.terminal_context_resume_with_runtime_source(
-                &resume_profile_config(&inst.source_profile),
+                || &config,
                 || { crate::tmux::SessionExistence::Present }
             ),
             TerminalContextResume::RuntimeCheckRequired
         );
         assert_eq!(
             inst.terminal_context_resume_with_runtime_source(
-                &resume_profile_config(&inst.source_profile),
+                || &config,
                 || { crate::tmux::SessionExistence::Unknown }
             ),
             TerminalContextResume::RuntimeCheckRequired
