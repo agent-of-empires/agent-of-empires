@@ -110,10 +110,13 @@ fn shell_consumed_by(command: &str) -> Option<&'static str> {
                     quote = Quote::Double;
                     at_word_start = false;
                 }
-                '\\' => {
-                    at_word_start = false;
-                    let _ = chars.next();
-                }
+                // A backslash-newline is removed before tokenization, so it
+                // neither starts nor ends a word: `helper \<LF># x` is still a
+                // comment, while `\#` is a literal `#` inside a word.
+                '\\' => match chars.next() {
+                    Some('\n') => {}
+                    _ => at_word_start = false,
+                },
                 '|' => return Some("a pipe (`|`)"),
                 '&' => return Some("a chained command (`&`)"),
                 ';' => return Some("a second command (`;`)"),
@@ -2085,7 +2088,7 @@ sandbox = "unsupported"
 
         // The session's extra args are appended before the instruction, so a
         // construct they introduce must not receive it either.
-        for extra in ["| tee log", "# trailing"] {
+        for extra in ["| tee log", "# trailing", "\\\n# trailing"] {
             let mut inst = declared("zzgamma", "prime-agent");
             inst.extra_args = extra.into();
             let config = inst.build_container_config_for_test().unwrap();
@@ -2101,6 +2104,20 @@ sandbox = "unsupported"
                 "{extra}: {error}"
             );
         }
+
+        // A continuation that joins words without introducing a construct keeps
+        // the instruction as argv.
+        let mut continued = declared("zzgamma", "prime-agent");
+        continued.extra_args = "--fast \\\n--verbose".into();
+        let config = continued.build_container_config_for_test().unwrap();
+        let _transport = install_container_transport(temp.path(), "zzgamma", &config.volumes);
+        let prepared = continued
+            .prepare_launch_command(continued.conversation_state())
+            .expect("a continued invocation must launch");
+        assert!(
+            prepared.command.unwrap().contains("--prompt="),
+            "a continued command must receive the instruction"
+        );
 
         // YOLO off and a bare command: the instruction is appended as argv. The
         // transport is fixtures so the launch does not depend on a host runtime.
@@ -2223,7 +2240,7 @@ sandbox = "unsupported"
 
         // The session's extra args are appended before the flag, so a construct
         // they introduce is the shell's problem too.
-        for extra in ["| tee log", "# trailing"] {
+        for extra in ["| tee log", "# trailing", "\\\n# trailing"] {
             let (mut inst, _) = declared("zzepsilon");
             inst.yolo_mode = true;
             inst.extra_args = extra.into();
@@ -2241,6 +2258,19 @@ sandbox = "unsupported"
                 "{extra}: {error}"
             );
         }
+
+        // A continuation that joins words without introducing a construct keeps
+        // the flag as argv.
+        let (mut continued, _) = declared("zzepsilon");
+        continued.yolo_mode = true;
+        continued.extra_args = "--fast \\\n--verbose".into();
+        let prepared = continued
+            .prepare_launch_command(continued.conversation_state())
+            .expect("a continued invocation must launch");
+        assert!(
+            prepared.command.unwrap().contains("--yolo"),
+            "a continued command must receive the mode flag"
+        );
 
         let (mut direct, _) = declared("zzepsilon");
         direct.yolo_mode = true;
