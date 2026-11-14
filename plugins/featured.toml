@@ -55,3 +55,11 @@ versions = {"1.0.0" = "sha256:1c4ed57deca62072ff0ebd061e4c849028f3a2ed25b35c25a4
 [plugins."agent-of-empires.linear"]
 source = "gh:agent-of-empires/plugin-linear"
 versions = {"0.1.0" = "sha256:d83d52337a66bded91103cb88778cbbbee0f639e68b15d68d7981cd54c51a49f"}
+
+# Released and pinned at `v0.1.0`, so an install with no `@ref` resolves that
+# tag instead of a moving default branch.
+#
+# plugin-freebuf v0.1.0 @ 5ee12932cd96a32cd4d0dea91b8527adaf6c5dfa
+[plugins."agent-of-empires.aoe-freebuf"]
+source = "gh:agent-of-empires/plugin-freebuf"
+versions = {"0.1.0" = "sha256:9cb9f8a5d979b03b54de8c680aafffe70e5f9ccda7ae0d20d57fb36b8ca1511b"}
