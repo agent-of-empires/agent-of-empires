@@ -7,7 +7,8 @@
 
 import * as acp from "@agentclientprotocol/sdk";
 import net from "node:net";
-import { appendFile, access, writeFile } from "node:fs/promises";
+import { appendFileSync } from "node:fs";
+import { access, writeFile } from "node:fs/promises";
 import { Duplex, Readable, Writable } from "node:stream";
 
 // One shim process serves one ACP connection, so module state is per connection.
@@ -35,9 +36,10 @@ async function waitForFile(path) {
   }
 }
 
-async function record(envVar, line) {
+// Sync, so concurrent requests record in arrival order.
+function record(envVar, line) {
   const file = process.env[envVar];
-  if (file) await appendFile(file, line);
+  if (file) appendFileSync(file, line);
 }
 
 // SHIM_ENV_RECORD_FILE: the Claude routing variables as the adapter process
