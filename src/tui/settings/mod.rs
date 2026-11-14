@@ -1483,12 +1483,20 @@ mod dirty_tracking_tests {
                     .unwrap();
                 view.focus = SettingsFocus::Fields;
                 view.plugins_fields_focus = true;
-                view.rebuild_fields();
                 let identity = match editor {
                     "text" => "plugin:acme.editor.text",
                     "list" => "plugin:acme.editor.items",
                     _ => "worktree.path_template",
                 };
+                if editor != "unrelated" {
+                    // The field list shows only the plugin under the manager's
+                    // cursor, and registry row order is not ours to assume: the
+                    // `aoe.web` builtin is compiled in only under `web`, and
+                    // there it holds row 0. Select the fixture's row the way a
+                    // settings search jump does.
+                    assert!(view.plugin_manager.select_plugin_owning_ident(identity));
+                }
+                view.rebuild_fields();
                 // Preserve an editor across a change in field order, not just a reload.
                 if mutation == "unchanged" || editor == "unrelated" {
                     view.fields.rotate_left(1);
