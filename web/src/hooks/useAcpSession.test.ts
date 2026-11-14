@@ -1137,9 +1137,12 @@ describe("current native admission", () => {
       } else {
         await act(() => hook.result.current.escalation.onCancel());
       }
-      expect(posts("/acp/cancel")).toEqual([{
-        method: "POST", url: `/api/sessions/${id}/acp/cancel`, body: { host_prompt_intent: intent },
-      }]);
+      const cancels = posts("/acp/cancel");
+      expect(cancels).toHaveLength(1);
+      expect(cancels[0]).toMatchObject({
+        method: "POST", url: `/api/sessions/${id}/acp/cancel`,
+      });
+      expect(JSON.parse(cancels[0]!.body as string)).toEqual({ host_prompt_intent: intent });
       await act(async () => {
         await hook.result.current.acp.cancelSubagent("child");
         await hook.result.current.acp.setConfigOption("model", "not-authorized");

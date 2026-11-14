@@ -1055,10 +1055,17 @@ mod tests {
                 "mounts":[{"host_path":"SENSITIVE_REVISION_MOUNT","container_path":"/project","read_only":false}],
                 "shadow_mounts":["SENSITIVE_REVISION_SHADOW"]}
         })).unwrap());
-        row.agent_session_binding = Some(serde_json::from_value(serde_json::json!({
-            "session_id":row.agent_session_id,
-            "execution":binding,"provenance":"observed","transcript_path":"SENSITIVE_REVISION_TRANSCRIPT"
-        })).unwrap());
+        let session_id = match &row.resume_intent {
+            crate::session::ResumeIntent::Use(session_id) => session_id.clone(),
+            _ => panic!("the comparison fixture selects an existing retained session"),
+        };
+        row.agent_session_id = Some(session_id.clone());
+        row.agent_session_binding = Some(crate::session::ConversationBinding {
+            session_id,
+            execution: Some(row.active_execution.as_ref().unwrap().binding.clone()),
+            provenance: crate::session::ConversationProvenance::Observed,
+            transcript_path: Some("SENSITIVE_REVISION_TRANSCRIPT".into()),
+        });
         row.resume_binding = row.agent_session_binding.clone();
         row
     }

@@ -422,7 +422,7 @@ mod tests {
                     matches!(outcome, Err(AttachError::Rejected(_))),
                     "{outcome:?}"
                 );
-                managed.client.shutdown().await;
+                managed.client.shutdown().await.unwrap();
             })
         }).await;
     }
