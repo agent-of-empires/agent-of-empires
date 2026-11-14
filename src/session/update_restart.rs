@@ -137,11 +137,13 @@ pub fn binary_updated(inst: &Instance) -> bool {
             .and_then(|(path, started_at)| {
                 let observed =
                     cached_observation(path.display().to_string(), || Some(path.clone()))?;
-                Some(executable_updated(
-                    &observed,
-                    inst.launch_resolved_executable.as_deref(),
-                    started_at,
-                ))
+                let launched = inst.launch_resolved_executable.as_deref();
+                // A cached view may predate the launch; confirm a flag against the live path.
+                Some(
+                    executable_updated(&observed, launched, started_at)
+                        && observe(path)
+                            .is_some_and(|live| executable_updated(&live, launched, started_at)),
+                )
             })
     };
     stale.unwrap_or(false)
@@ -280,6 +282,40 @@ mod tests {
         // A dangling link is not an update.
         std::fs::remove_file(&v2).unwrap();
         assert!(observe(&link).is_none());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_restart_right_after_a_link_switch_is_not_flagged_by_a_cached_view() {
+        use std::os::unix::fs::symlink;
+        let dir = tempfile::tempdir().unwrap();
+        let (v1, v2, link) = (
+            dir.path().join("v1"),
+            dir.path().join("v2"),
+            dir.path().join("agent"),
+        );
+        for version in [&v1, &v2] {
+            std::fs::write(version, "#!/bin/sh\n").unwrap();
+            std::fs::File::options()
+                .write(true)
+                .open(version)
+                .unwrap()
+                .set_modified(UNIX_EPOCH + Duration::from_secs(500))
+                .unwrap();
+        }
+        symlink(&v1, &link).unwrap();
+        let mut inst = Instance::new("t", "/tmp");
+        inst.status = Status::Idle;
+        inst.started_at = DateTime::from_timestamp(1_000, 0);
+        inst.launch_executable = Some(link.clone());
+        inst.launch_resolved_executable = std::fs::canonicalize(&link).ok();
+        assert!(!binary_updated(&inst));
+
+        // The link moves to v2 and the session restarts on it inside the cache TTL.
+        std::fs::remove_file(&link).unwrap();
+        symlink(&v2, &link).unwrap();
+        inst.launch_resolved_executable = std::fs::canonicalize(&link).ok();
+        assert!(!binary_updated(&inst));
     }
 
     #[cfg(unix)]
