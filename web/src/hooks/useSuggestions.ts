@@ -34,13 +34,14 @@ const PENDING_NOTICE = "A session is still being created. Wait for it to finish.
 
 export const suggestionKey = (item: SuggestionItem) => `${item.provider_id}:${item.id}`;
 
+// Module-level so a direct start in flight is seen by every hook instance, not only this view.
+let directStartInFlight = false;
+
 /**
  * Snapshot plus the mutations both suggestion views share. Every mutation reloads the snapshot.
  * With "Start without review" on and a resolved, templated draft, `start` creates the session and
  * calls `onStarted`; anything unresolved or needing hook trust opens the wizard through `onPrepare`.
  */
-let directStartInFlight = false;
-
 export function useSuggestions(
   onPrepare: (prefill: WizardPrefill) => void,
   onStarted?: (session: SessionResponse) => void,
