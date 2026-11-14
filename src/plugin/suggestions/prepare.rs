@@ -127,9 +127,20 @@ pub(crate) fn load_mappings(conn: &Connection, profile: &str) -> anyhow::Result<
         .collect::<Result<_, _>>()?;
     Ok(rows
         .into_iter()
-        .filter_map(|(provider_id, key, paths)| {
-            Some(((provider_id, key), serde_json::from_str(&paths).ok()?))
-        })
+        .filter_map(
+            |(provider_id, key, paths)| match serde_json::from_str(&paths) {
+                Ok(projects) => Some(((provider_id, key), projects)),
+                Err(e) => {
+                    tracing::warn!(
+                        target: "plugin.suggestions",
+                        provider = %provider_id,
+                        mapping_key = %key,
+                        "ignoring undecodable stored mapping: {e}"
+                    );
+                    None
+                }
+            },
+        )
         .collect())
 }
 
@@ -480,5 +491,22 @@ mod tests {
         assert!(resolved(2).is_null(), "an ambiguous hint is never guessed");
         assert!(resolved(3).is_null());
         assert!(resolved(4).is_null(), "a mapping belongs to its provider");
+    }
+
+    #[test]
+    fn an_undecodable_stored_mapping_is_skipped() {
+        let conn = Connection::open_in_memory().unwrap();
+        crate::plugin::suggestions::init(&conn).unwrap();
+        for (key, json) in [("good", r#"["/a"]"#), ("bad", "not json")] {
+            conn.execute(
+                "INSERT INTO suggestion_mappings (profile, provider_id, mapping_key, projects_json)
+                 VALUES ('p', 'x', ?1, ?2)",
+                [key, json],
+            )
+            .unwrap();
+        }
+        let mappings = load_mappings(&conn, "p").unwrap();
+        assert_eq!(mappings.len(), 1);
+        assert_eq!(mappings[&("x".into(), "good".into())], ["/a"]);
     }
 }
