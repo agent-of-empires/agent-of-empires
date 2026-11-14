@@ -114,6 +114,12 @@ conditional consumer contract, not the original macOS event order. The blocking
 stale cases verify completed private-alias consumption, not end-to-end App handoff.
 Root terminal checks and native kqueue coverage are still required.
 
+Coverage is 16 real PTY controls plus two real Unix stream socketpair full-buffer
+controls on both Linux and macOS. The latter retain the complete 1025-byte prequeue,
+one actual 1024-byte read, and original one-byte tail. Their writer stays open
+through the final zero-time poll. These two cases do **not** prove a 1024-byte
+terminal read on Darwin; the other 16 cases retain their real terminal-mode checks.
+
 Release archives carry `LICENSE`, `THIRD_PARTY_NOTICES.md`, and all of `licenses/`.
 Both Nix packages include the fork's notice and install complete notices under
 `$out/share/licenses/aoe`. Crane dependency builds restore real vendor sources and
