@@ -15,6 +15,8 @@ Both surfaces consume the same `aoe serve` daemon over the same HTTP and WebSock
 - The local TUI and local `aoe acp` commands use the same-host daemon's owner-verified Unix socket, not TCP loopback. Kernel peer identity authorizes them without a bearer token or passphrase exchange, including with `--behind-proxy`. TCP loopback grants no local-owner exemption; see [dashboard authentication](../guides/web-dashboard.md#authentication). For explicitly configured TCP or remote endpoints, see [Cross-machine attach](../structured-view.md#cross-machine-attach).
 - Same-UID processes are trusted. Namespace, tmux, and protocol checks reject accidental mismatches, not a malicious process running as that user; see the [native transport trust model](../api.md#authentication).
 
+![A narrow TUI session list with the structured badge on, truncating a long title, and off, showing it in full](../assets/structured-view/structured-badge.png)
+
 ### TUI keybinds
 
 The view opens with the composer ready. The transcript stays scrollable from the composer, a pending authorization opens a focused approval shelf above it, and the status line keeps the worker state and primary controls visible. The active session's agent, directory, and permission mode sit in a compact card in the upper left; user turns use a `›` gutter and agent replies a `•` gutter, so only modal decisions get a full-width border.
