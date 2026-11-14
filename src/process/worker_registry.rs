@@ -585,14 +585,18 @@ pub fn update_stored_acp_session_id(session_id: &str, owner_pid: u32, acp_id: &s
     Ok(())
 }
 
-/// A live registry owner has the recorded birth and its expected socket.
+/// A live registry owner has the recorded birth, is still executing (not a zombie) and has
+/// its expected socket.
 pub fn is_record_live(rec: &WorkerRecord) -> bool {
     let same_birth = rec.runner_identity.as_ref().is_none_or(|expected| {
         crate::process::process_birth_identity(rec.pid)
             .map(|actual| actual.as_ref() == Some(expected))
             .unwrap_or(false)
     });
-    same_birth && is_pid_alive(rec.pid) && socket_exists(&expected_socket(rec))
+    // An unreadable state stays live: "not live" lets teardown and purge proceed.
+    let executing =
+        crate::process::process_executing(rec.pid).unwrap_or_else(|_| is_pid_alive(rec.pid));
+    same_birth && executing && socket_exists(&expected_socket(rec))
 }
 
 fn expected_socket(rec: &WorkerRecord) -> std::path::PathBuf {
@@ -1130,6 +1134,100 @@ mod tests {
             assert!(!crate::process::runner_group_executing(pid).unwrap());
             assert!(is_pid_alive(pid));
         }
+    }
+
+    /// A zombie runner's own group can outlive it, so the record reads dead while the guard,
+    /// which settles the group, still sees it executing.
+    #[test]
+    #[serial]
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    fn a_zombie_runner_is_not_live_while_its_group_still_executes() {
+        use std::io::BufRead as _;
+        use std::os::unix::process::CommandExt as _;
+        use std::time::{Duration, Instant};
+        struct Group(Option<std::process::Child>);
+        impl Drop for Group {
+            fn drop(&mut self) {
+                if let Some(mut leader) = self.0.take() {
+                    crate::process::worker::kill_process_group(leader.id());
+                    let _ = leader.wait();
+                }
+            }
+        }
+        // The guard can attest a zombie leader's group only on Linux.
+        let members: &[bool] = if cfg!(target_os = "linux") {
+            &[false, true]
+        } else {
+            &[false]
+        };
+        with_temp_home(|| {
+            for &member in members {
+                let script = if member {
+                    "sleep 600 & printf 'ready\n'; read -r ignored"
+                } else {
+                    "printf 'ready\n'; read -r ignored"
+                };
+                let mut group = Group(Some(
+                    std::process::Command::new("bash")
+                        .args(["-c", script])
+                        .process_group(0)
+                        .stdin(std::process::Stdio::piped())
+                        .stdout(std::process::Stdio::piped())
+                        .spawn()
+                        .unwrap(),
+                ));
+                let leader = group.0.as_mut().unwrap();
+                let pid = leader.id();
+                let mut line = String::new();
+                std::io::BufReader::new(leader.stdout.take().unwrap())
+                    .read_line(&mut line)
+                    .unwrap();
+                assert_eq!(line, "ready\n");
+                let record = new_record(
+                    "zombie-runner",
+                    pid,
+                    socket_path_for("zombie-runner").unwrap(),
+                );
+                touch_live_socket(&record.socket_path);
+                assert!(
+                    is_record_live(&record),
+                    "member {member}: a running runner is live"
+                );
+
+                drop(leader.stdin.take());
+                let deadline = Instant::now() + Duration::from_secs(5);
+                while crate::process::process_executing(pid).unwrap() {
+                    assert!(
+                        Instant::now() < deadline,
+                        "member {member}: leader did not exit"
+                    );
+                    std::thread::sleep(Duration::from_millis(25));
+                }
+                assert!(is_pid_alive(pid), "member {member}: the leader is unreaped");
+                assert!(
+                    !is_record_live(&record),
+                    "member {member}: a zombie runner is not live"
+                );
+                if member {
+                    let fingerprint = record
+                        .runner_identity
+                        .as_ref()
+                        .map(|birth| birth.fingerprint());
+                    let guard =
+                        crate::process::RunnerProcessGuard::capture(pid, fingerprint).unwrap();
+                    assert!(
+                        guard.executing().unwrap(),
+                        "its live child keeps the group executing"
+                    );
+                }
+
+                drop(group);
+                assert!(
+                    !crate::process::process_executing(pid).unwrap(),
+                    "member {member}: reaped"
+                );
+            }
+        });
     }
 
     struct KillOnDrop(std::process::Child);

@@ -9,6 +9,8 @@ export type ActivityNode =
   /** Hidden calls, never including an error. `run` is one kind, `span` a mixed middle. */
   | { type: "fold"; shape: "run" | "span"; tools: ActivityTool[] };
 
+/** Up to this many calls show as rows, with nothing folded. */
+export const SHORT_ACTIVITY = 8;
 /** More raw calls than this show only a head and a tail, folding the middle. */
 export const LONG_ACTIVITY = 20;
 export const HEAD_ROWS = 3;
@@ -41,16 +43,19 @@ function foldSegments(tools: ActivityTool[], shape: "run" | "span", min: number)
   return out;
 }
 
+const rows = (tools: ActivityTool[]) => tools.map((tool): ActivityNode => ({ type: "row", tool }));
+
+/** A fold that would be the only node hides nothing worth a click, so the calls show as rows. */
 export function foldActivity(tools: ActivityTool[]): ActivityNode[] {
-  if (tools.length <= LONG_ACTIVITY) return foldSegments(tools, "run", MIN_RUN);
+  if (tools.length <= SHORT_ACTIVITY) return rows(tools);
+  if (tools.length <= LONG_ACTIVITY) {
+    const nodes = foldSegments(tools, "run", MIN_RUN);
+    return nodes.length === 1 ? rows(tools) : nodes;
+  }
   const head = tools.slice(0, HEAD_ROWS);
   const tail = tools.slice(-TAIL_ROWS);
   const middle = tools.slice(HEAD_ROWS, tools.length - TAIL_ROWS);
-  return [
-    ...head.map((tool): ActivityNode => ({ type: "row", tool })),
-    ...foldSegments(middle, "span", 2),
-    ...tail.map((tool): ActivityNode => ({ type: "row", tool })),
-  ];
+  return [...rows(head), ...foldSegments(middle, "span", 2), ...rows(tail)];
 }
 
 const KIND_LABELS: Record<string, [string, string]> = {
@@ -62,6 +67,7 @@ const KIND_LABELS: Record<string, [string, string]> = {
   fetch: ["fetch", "fetches"],
   think: ["think", "thinks"],
   agent: ["agent", "agents"],
+  mcp: ["MCP call", "MCP calls"],
   other: ["call", "calls"],
 };
 
@@ -84,10 +90,6 @@ export function foldLabel(node: Extract<ActivityNode, { type: "fold" }>): string
 
 /** While following a running agent: only the newest rows, the rest one fold. */
 export function followTail(tools: ActivityTool[], keep = 8): ActivityNode[] {
-  if (tools.length <= keep) return tools.map((tool): ActivityNode => ({ type: "row", tool }));
-  const older = tools.slice(0, tools.length - keep);
-  return [
-    ...foldSegments(older, "span", 2),
-    ...tools.slice(-keep).map((tool): ActivityNode => ({ type: "row", tool })),
-  ];
+  if (tools.length <= keep) return rows(tools);
+  return [...foldSegments(tools.slice(0, tools.length - keep), "span", 2), ...rows(tools.slice(-keep))];
 }

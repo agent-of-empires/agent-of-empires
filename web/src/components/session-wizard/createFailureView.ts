@@ -5,7 +5,8 @@ export type FailureAction =
   | "launch_without_sandbox"
   | "change_image"
   | "choose_project"
-  | "try_again";
+  | "try_again"
+  | "create_without_setup";
 
 export const FAILURE_ACTION_LABEL: Record<FailureAction, string> = {
   retry_runtime: "Retry",
@@ -13,6 +14,7 @@ export const FAILURE_ACTION_LABEL: Record<FailureAction, string> = {
   change_image: "Change image",
   choose_project: "Choose Project",
   try_again: "Try again",
+  create_without_setup: "Create without setup",
 };
 
 export interface FailureView {
@@ -60,7 +62,11 @@ export function failureFields(failure: CreateFailure): readonly ("path" | "sandb
  *  Container runtime still down. */
 export function failureView(
   failure: CreateFailure,
-  { sandboxEnabled, runtimeDown }: { sandboxEnabled: boolean; runtimeDown: boolean },
+  {
+    sandboxEnabled,
+    runtimeDown,
+    canSkipSetup = true,
+  }: { sandboxEnabled: boolean; runtimeDown: boolean; canSkipSetup?: boolean },
 ): FailureView {
   const base = {
     step: failure.stage ? STEP[failure.stage] : null,
@@ -94,7 +100,8 @@ export function failureView(
         ...base,
         title: "An on_create hook failed",
         primary: "try_again",
-        secondary: null,
+        // CityHall servers refuse to skip setup.
+        secondary: canSkipSetup ? "create_without_setup" : null,
         row: null,
         cue: null,
         showOutput: true,

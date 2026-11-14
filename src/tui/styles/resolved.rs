@@ -262,15 +262,15 @@ fn web_projection(theme: &Theme, appearance: ThemeAppearance) -> CssVarProjectio
         deeper,
         composite(theme.error, bg, 0.1),
     ];
-    let hint = hex(lift_until(
+    let lifted_hint = hex(lift_until(
         theme.hint,
         bg,
         &text_surfaces,
         TEXT_CONTRAST_RATIO,
     ));
     css.insert("--color-text-primary".into(), hex(theme.text));
-    css.insert("--color-text-secondary".into(), hint.clone());
-    css.insert("--color-text-muted".into(), hint);
+    css.insert("--color-text-secondary".into(), lifted_hint.clone());
+    css.insert("--color-text-muted".into(), lifted_hint);
     css.insert("--color-text-dim".into(), hex(theme.dimmed));
     // Dimmed lifted for small text that cannot use the raw slot.
     css.insert(
@@ -463,13 +463,26 @@ fn active_frame(accent: Color, bg: Color, fill: Color) -> Color {
 }
 
 /// `color` mixed toward `bg`'s readable pole in 10% steps until it clears
-/// `floor` against every surface.
+/// `floor` against every surface. When no step does (surfaces on both sides of
+/// mid-grey), it returns the step whose worst surface reads best.
 fn lift_until(color: Color, bg: Color, surfaces: &[Color], floor: f32) -> Color {
     let pole = readable_on(bg);
-    (0..=10)
-        .map(|step| mix(color, pole, step as f32 / 10.0))
-        .find(|c| surfaces.iter().all(|s| contrast_ratio(*c, *s) >= floor))
-        .unwrap_or(pole)
+    let worst = |c: Color| {
+        surfaces
+            .iter()
+            .map(|s| contrast_ratio(c, *s))
+            .fold(f32::INFINITY, f32::min)
+    };
+    let steps: [Color; 11] = std::array::from_fn(|step| mix(color, pole, step as f32 / 10.0));
+    steps
+        .into_iter()
+        .find(|c| worst(*c) >= floor)
+        .unwrap_or_else(|| {
+            steps
+                .into_iter()
+                .max_by(|a, b| worst(*a).total_cmp(&worst(*b)))
+                .expect("eleven steps")
+        })
 }
 
 /// `fg` at `alpha` over an opaque `bg`, matching how the browser composites
@@ -596,6 +609,29 @@ mod tests {
             luminance_of_hex(deeper_dark) <= luminance_of_hex(bg_dark),
             "dark theme: surface-950 ({deeper_dark}) should be <= surface-900 ({bg_dark})"
         );
+    }
+
+    #[test]
+    fn a_lift_that_cannot_clear_every_surface_keeps_the_best_worst_case() {
+        // A mid-grey background puts surface-950 on the far side from the pole.
+        let bg = Color::Rgb(128, 128, 128);
+        let surfaces = [bg, mix(bg, BLACK, 0.45)];
+        let worst = |c: Color| {
+            surfaces
+                .iter()
+                .map(|s| contrast_ratio(c, *s))
+                .fold(f32::INFINITY, f32::min)
+        };
+        let lifted = lift_until(WHITE, bg, &surfaces, TEXT_CONTRAST_RATIO);
+        assert!(
+            worst(WHITE) < TEXT_CONTRAST_RATIO,
+            "raw white must miss the floor for the fallback to run"
+        );
+        assert!(
+            worst(BLACK) < worst(WHITE),
+            "the pole must read worse than raw white on the worst surface"
+        );
+        assert_eq!(lifted, WHITE, "raw white reads best on the worst surface");
     }
 
     #[test]

@@ -338,6 +338,7 @@ mod tests {
             m.apply_event(i as u64 + 1, &e);
         }
         m
+
     }
 
     fn kinds(m: &TranscriptModel) -> Vec<TranscriptRowKind> {
@@ -370,9 +371,7 @@ mod tests {
         // (event, row id, kind, text)
         let cases = [
             (
-                Event::AgentStartupError {
-                    message: "node missing".into(),
-                },
+                Event::startup_error("node missing"),
                 "notice-1",
                 TranscriptRowKind::Notice,
                 "agent startup failed: node missing".to_string(),
@@ -1316,9 +1315,7 @@ mod tests {
     fn orphan_output_clears_at_observed_turn_endings_without_stopped_rows() {
         for closer in [
             stopped("cancelled"),
-            Event::AgentStartupError {
-                message: "boom".into(),
-            },
+            Event::startup_error("boom"),
             Event::IncompatibleAgent {
                 detail: crate::acp::state::StartupErrorDetail::UnsupportedProtocolVersion {
                     expected: "1".into(),
@@ -1355,9 +1352,7 @@ mod tests {
     fn orphan_output_clears_at_live_turn_endings_without_stopped_rows() {
         for closer in [
             stopped("cancelled"),
-            Event::AgentStartupError {
-                message: "boom".into(),
-            },
+            Event::startup_error("boom"),
             Event::IncompatibleAgent {
                 detail: crate::acp::state::StartupErrorDetail::UnsupportedProtocolVersion {
                     expected: "1".into(),
@@ -1557,9 +1552,7 @@ mod tests {
 
         let closers = [
             stopped("cancelled"),
-            Event::AgentStartupError {
-                message: "boom".into(),
-            },
+            Event::startup_error("boom"),
             Event::IncompatibleAgent {
                 detail: crate::acp::state::StartupErrorDetail::UnsupportedProtocolVersion {
                     expected: "1".into(),

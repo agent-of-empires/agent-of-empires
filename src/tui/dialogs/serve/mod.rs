@@ -15,16 +15,21 @@ use ratatui::prelude::*;
 
 use crate::acp::client::autostart::{initial_log_tail, LogContext};
 use crate::cli::serve::{ServeLaunch, ServeUrl, TuiControlLease, TuiControlTarget};
+use crate::server::tunnel::FunnelReach;
 use crate::tui::components::hover::HoverState;
 use crate::tui::dialogs::{contains, hit, target_rects};
 use crate::tui::styles::Theme;
 use daemon::*;
 pub(crate) use jobs::ServeJobs;
 use jobs::{Submitter, Ticket};
-use work::{run_job, Job, JobResult};
+use work::{run_job, Job, JobResult, StartingObservation};
 
 const FLASH_TTL: Duration = Duration::from_millis(1500);
 const CONFIRM_TTL: Duration = Duration::from_secs(3);
+/// How often the open provider screen re-checks its providers in the background.
+const PROVIDER_REFRESH: Duration = Duration::from_secs(5);
+/// How often an open Active view re-reads the daemon's URLs and Funnel state.
+const ACCESS_REFRESH: Duration = Duration::from_secs(5);
 
 pub enum ServeAction {
     Stop(ServeStopRequest),
@@ -380,6 +385,8 @@ enum ServeViewState {
         url_index: usize,
         /// Known only when this TUI started the daemon or the server wrote it to disk.
         passphrase: Option<String>,
+        /// Tailscale only: anything but `Ours` means the Funnel URL is withdrawn.
+        funnel: FunnelReach,
         opened_at: Instant,
         log_offset: u64,
     },
@@ -460,12 +467,14 @@ impl ServeViewState {
         }
     }
 
-    /// Active once the daemon has published its URLs, Starting until then.
+    /// Active once the daemon has published its URLs, Starting until then. The Funnel
+    /// state goes through `shown_reach`, as every later re-read does.
     fn running(
         mode: ServeMode,
         transport: Option<TunnelTransport>,
         passphrase: Option<String>,
         urls: Vec<ServeUrl>,
+        funnel: FunnelReach,
         log_offset: u64,
     ) -> Self {
         if urls.is_empty() {
@@ -480,6 +489,7 @@ impl ServeViewState {
         ServeViewState::Active {
             mode,
             transport,
+            funnel: shown_reach(mode, &urls, funnel),
             urls,
             url_index: 0,
             passphrase,
@@ -540,6 +550,9 @@ struct RestartEffect {
     passphrase: bool,
     /// The token is near expiry, so a standing help screen cannot say the link stays.
     may_change: bool,
+    /// The Funnel URL is withdrawn and the restart takes the Funnel path, which gets the same
+    /// link back only if no other server holds it.
+    retakes_funnel: bool,
 }
 
 /// What the next start will do, read when R, G or help states it: the restarted daemon reads
@@ -601,13 +614,19 @@ impl RestartEffect {
     /// quick tunnel. A Local daemon republishes this machine's addresses on
     /// the reused or a random port, with a new token once the old one has aged out. Behind the
     /// passphrase wall, sign-ins then survive only if the running daemon wrote them to disk and
-    /// the next start reads them back.
+    /// the next start reads them back. A withdrawn Funnel URL is the one a Funnel restart takes
+    /// back, so it counts as kept.
     fn of(
         mode: ServeMode,
         urls: &[ServeUrl],
+        funnel: FunnelReach,
         probe: &RestartProbe,
         running_persists: Option<bool>,
     ) -> Self {
+        let retakes_funnel = mode == ServeMode::Tunnel
+            && funnel != FunnelReach::Ours
+            && probe.on_funnel
+            && probe.named_host.is_none();
         let (link, passphrase) = match mode {
             ServeMode::Local => {
                 let hosts_stay = urls.iter().all(|u| {
@@ -633,7 +652,10 @@ impl RestartEffect {
                     Some(named) => urls
                         .iter()
                         .any(|u| link_host(&u.url).is_some_and(|host| host == named)),
-                    None => probe.on_funnel && urls.iter().any(|u| is_funnel_link(&u.url)),
+                    None => {
+                        retakes_funnel
+                            || probe.on_funnel && urls.iter().any(|u| is_funnel_link(&u.url))
+                    }
                 };
                 (
                     if stays {
@@ -661,6 +683,7 @@ impl RestartEffect {
             logins,
             passphrase,
             may_change: mode == ServeMode::Local && probe.local_token == TokenWindow::Boundary,
+            retakes_funnel,
         }
     }
 }
@@ -724,6 +747,22 @@ fn link_port(url: &str) -> Option<u16> {
     link_authority(url)?.rsplit_once(':')?.1.parse().ok()
 }
 
+/// The Funnel state the view shows. Only a Tunnel has one. `serve.funnel` and `serve.url` are
+/// two writes, so a read between them can pair "ours" with the loopback-only URL; that is Unknown.
+fn shown_reach(mode: ServeMode, urls: &[ServeUrl], read: FunnelReach) -> FunnelReach {
+    if mode != ServeMode::Tunnel {
+        return FunnelReach::Ours;
+    }
+    let loopback_only = urls
+        .iter()
+        .all(|url| link_host(&url.url).is_some_and(is_loopback_host));
+    if read == FunnelReach::Ours && loopback_only {
+        FunnelReach::Unknown
+    } else {
+        read
+    }
+}
+
 /// Funnel serves the machine's stable `https://<host>.<tailnet>.ts.net` origin.
 fn is_funnel_link(url: &str) -> bool {
     link_host(url).is_some_and(|host| host.ends_with(".ts.net"))
@@ -759,8 +798,9 @@ enum PendingJob {
     Providers {
         selected: Option<TunnelTransport>,
         failed: Option<TunnelTransport>,
-        refreshed: bool,
     },
+    /// The provider screen's background re-check; any key drops it.
+    ProvidersRefresh,
     Retry {
         failed: Option<TunnelTransport>,
         target: TuiControlTarget,
@@ -774,6 +814,7 @@ enum PendingJob {
     LaunchOutcome,
     Starting,
     Active,
+    Access,
     Copy,
 }
 
@@ -817,11 +858,15 @@ pub struct ServeView {
     stop_requested: bool,
     submitter: Submitter,
     pending: Option<PendingWork>,
+    /// When the provider screen last received provider statuses.
+    providers_checked_at: Option<Instant>,
     last_attempt: u64,
     target: Option<crate::cli::serve::TuiControlTarget>,
     control_error: Option<String>,
     local_primary: String,
     elapsed_second: Option<u64>,
+    /// When Active last re-read the daemon's URLs and Funnel state.
+    access_checked_at: Option<Instant>,
 }
 
 impl ServeView {
@@ -907,11 +952,13 @@ impl ServeView {
             copied: None,
             running_persists: None,
             restart_probe: RestartProbe::default(),
+            access_checked_at: None,
             pending_launch: None,
             launch_in_flight: false,
             stop_requested: false,
             submitter,
             pending: None,
+            providers_checked_at: None,
             last_attempt: 0,
             target: None,
             control_error: None,
@@ -1066,28 +1113,11 @@ impl ServeView {
             return false;
         };
         match &pending.kind {
-            PendingJob::Providers {
-                selected, failed, ..
-            } => {
-                let (selected, failed) = (*selected, *failed);
-                match code {
-                    KeyCode::Char('r' | 'R') => self.request(
-                        Job::Providers,
-                        PendingJob::Providers {
-                            selected,
-                            failed,
-                            refreshed: true,
-                        },
-                    ),
-                    KeyCode::Char('L') => self.request_picker(Some(ServeMode::Local)),
-                    _ => {}
-                }
-                true
-            }
+            PendingJob::Providers { .. } => true,
             PendingJob::Picker { .. } => {
                 let selected = match code {
-                    KeyCode::Char('L') | KeyCode::Left => Some(ServeMode::Local),
-                    KeyCode::Char('t' | 'T') | KeyCode::Right => Some(ServeMode::Tunnel),
+                    KeyCode::Left | KeyCode::Char('h') => Some(ServeMode::Local),
+                    KeyCode::Right | KeyCode::Char('l') => Some(ServeMode::Tunnel),
                     _ => return true,
                 };
                 self.request_picker(selected);
@@ -1117,11 +1147,23 @@ impl ServeView {
             | PendingJob::Reset
             | PendingJob::LaunchContext(_)
             | PendingJob::LaunchOutcome => true,
+            // A key restarts the interval, so typing never runs back-to-back checks.
+            PendingJob::ProvidersRefresh => {
+                self.pending = None;
+                self.providers_checked_at = Some(Instant::now());
+                false
+            }
             PendingJob::Passphrase
             | PendingJob::Starting
             | PendingJob::Active
             | PendingJob::Copy => {
                 self.pending = None;
+                false
+            }
+            // A key restarts the interval, so typing never runs back-to-back reads.
+            PendingJob::Access => {
+                self.pending = None;
+                self.access_checked_at = Some(Instant::now());
                 false
             }
         }
@@ -1149,15 +1191,6 @@ impl ServeView {
                     ServeMode::Tunnel if *local_available => ServeMode::Local,
                     other => other,
                 }
-            }
-            KeyCode::Char('t' | 'T') => {
-                *selected = ServeMode::Tunnel;
-                return self.commit_mode();
-            }
-            // Lowercase `l` moves right, so capital `L` is the Local shortcut.
-            KeyCode::Char('L') => {
-                *selected = ServeMode::Local;
-                return self.commit_mode();
             }
             KeyCode::Enter => return self.commit_mode(),
             KeyCode::Esc | KeyCode::Char('q') => return ServeAction::Close,
@@ -1187,7 +1220,6 @@ impl ServeView {
                     PendingJob::Providers {
                         selected: None,
                         failed: None,
-                        refreshed: false,
                     },
                 );
                 return ServeAction::Continue;
@@ -1227,17 +1259,6 @@ impl ServeView {
                 return self.commit_transport();
             }
             KeyCode::Enter => return self.commit_transport(),
-            KeyCode::Char('r' | 'R') => {
-                let selected = *selected;
-                self.request(
-                    Job::Providers,
-                    PendingJob::Providers {
-                        selected: Some(selected),
-                        failed: None,
-                        refreshed: true,
-                    },
-                );
-            }
             KeyCode::Esc | KeyCode::Char('q') => return ServeAction::Close,
             _ => {}
         }
@@ -1265,14 +1286,14 @@ impl ServeView {
                 "Tailscale Funnel isn't enabled for this node; pick Cloudflare or update your ACL."
             }
             (TunnelTransport::Tailscale, TransportStatus::TimedOut, TransportStatus::Ready) => {
-                "Tailscale didn't answer in time; press R to retry or pick Cloudflare."
+                "Tailscale didn't answer in time; checking again, or pick Cloudflare."
             }
             (TunnelTransport::Tailscale, TransportStatus::TimedOut, _) => {
-                "Tailscale didn't answer in time; press R to retry."
+                "Tailscale didn't answer in time; checking again."
             }
             (TunnelTransport::Tailscale, ..) => "Tailscale isn't installed; pick Cloudflare.",
             (TunnelTransport::Cloudflare, TransportStatus::TimedOut, _) => {
-                "cloudflared isn't installed; press R to retry Tailscale."
+                "cloudflared isn't installed, and Tailscale didn't answer in time; checking again."
             }
             (TunnelTransport::Cloudflare, ..) => "cloudflared isn't installed; pick Tailscale.",
         };
@@ -1514,12 +1535,13 @@ impl ServeView {
             mode,
             transport,
             urls,
+            funnel,
             ..
         } = &self.state
         else {
             return;
         };
-        let (mode, transport) = (*mode, *transport);
+        let (mode, transport, funnel) = (*mode, *transport, *funnel);
         let RestartIntent::Confirm(action) = intent else {
             self.restart_probe = fresh;
             self.show_help = true;
@@ -1527,8 +1549,14 @@ impl ServeView {
         };
         let repeated = confirmed == Some(action);
         let unchanged = action == PendingConfirm::NewPassphrase
-            || RestartEffect::of(mode, urls, &fresh, self.running_persists)
-                == RestartEffect::of(mode, urls, &self.restart_probe, self.running_persists);
+            || RestartEffect::of(mode, urls, funnel, &fresh, self.running_persists)
+                == RestartEffect::of(
+                    mode,
+                    urls,
+                    funnel,
+                    &self.restart_probe,
+                    self.running_persists,
+                );
         if repeated && unchanged {
             let Some(target) = self.target.clone() else {
                 self.fail_work(
@@ -1604,6 +1632,13 @@ impl ServeView {
         }
         if self.pending.is_none() && !self.launch_in_flight && !self.stop_requested {
             match self.state {
+                ServeViewState::Confirm { .. }
+                    if self
+                        .providers_checked_at
+                        .is_none_or(|at| at.elapsed() >= PROVIDER_REFRESH) =>
+                {
+                    self.request(Job::Providers, PendingJob::ProvidersRefresh);
+                }
                 ServeViewState::Starting {
                     mode, transport, ..
                 } => {
@@ -1622,14 +1657,24 @@ impl ServeView {
                 ServeViewState::Active {
                     mode,
                     ref passphrase,
+                    opened_at,
                     ..
                 } => {
-                    let target = if mode == ServeMode::Tunnel && passphrase.is_none() {
-                        self.target.clone()
-                    } else {
-                        None
-                    };
-                    self.request(Job::ObserveActive(target), PendingJob::Active)
+                    let access_due = self
+                        .access_checked_at
+                        .map_or(opened_at, |checked| checked.max(opened_at))
+                        .elapsed()
+                        >= ACCESS_REFRESH;
+                    match self.target.clone() {
+                        Some(target) if access_due => {
+                            self.request(Job::RefreshAccess(target), PendingJob::Access)
+                        }
+                        target => {
+                            let target = target
+                                .filter(|_| mode == ServeMode::Tunnel && passphrase.is_none());
+                            self.request(Job::ObserveActive(target), PendingJob::Active)
+                        }
+                    }
                 }
                 _ => {}
             }
@@ -1658,6 +1703,11 @@ impl ServeView {
         transport: Option<TunnelTransport>,
         message: String,
     ) {
+        // A background re-check that fails leaves the screen as it is and tries again later.
+        if matches!(kind, PendingJob::ProvidersRefresh) {
+            self.providers_checked_at = Some(Instant::now());
+            return;
+        }
         if let PendingJob::Retry { target, .. } = kind {
             self.target = Some(target);
             self.fail_work(mode, transport, message);
@@ -1686,6 +1736,35 @@ impl ServeView {
             mode,
             transport,
         };
+    }
+
+    /// Applies a re-read of the running daemon's URLs and Funnel state. The selected URL stays
+    /// selected by its label when the list changes, as a rotated token changes every URL.
+    fn apply_access(&mut self, observation: StartingObservation) -> bool {
+        let ServeViewState::Active {
+            mode,
+            urls,
+            url_index,
+            funnel,
+            ..
+        } = &mut self.state
+        else {
+            return false;
+        };
+        if !observation.running || observation.urls.is_empty() {
+            return false;
+        }
+        let next = shown_reach(*mode, &observation.urls, observation.funnel);
+        let mut changed = std::mem::replace(funnel, next) != next;
+        if observation.urls != *urls {
+            let label = urls.get(*url_index).map(|url| url.label.clone());
+            *url_index = label
+                .and_then(|label| observation.urls.iter().position(|url| url.label == label))
+                .unwrap_or(0);
+            *urls = observation.urls;
+            changed = true;
+        }
+        changed
     }
 
     fn apply_result(&mut self, pending: PendingWork, result: JobResult) -> bool {
@@ -1739,26 +1818,34 @@ impl ServeView {
                 self.pending_passphrase = passphrase
             }
             (
-                PendingJob::Providers {
-                    selected,
-                    failed,
-                    refreshed,
-                },
+                PendingJob::Providers { selected, failed },
                 JobResult::Providers(tailscale, cloudflare),
             ) => {
                 self.state = ServeViewState::provider_retry(failed, tailscale, cloudflare);
+                self.providers_checked_at = Some(Instant::now());
+                if let (
+                    ServeViewState::Confirm {
+                        selected: current, ..
+                    },
+                    Some(selected),
+                ) = (&mut self.state, selected)
+                {
+                    *current = selected;
+                }
+            }
+            (
+                PendingJob::ProvidersRefresh,
+                JobResult::Providers(fresh_tailscale, fresh_cloudflare),
+            ) => {
                 if let ServeViewState::Confirm {
-                    selected: current,
-                    flash,
+                    tailscale,
+                    cloudflare,
                     ..
                 } = &mut self.state
                 {
-                    if let Some(selected) = selected {
-                        *current = selected;
-                    }
-                    if refreshed {
-                        *flash = Some(("Refreshed.".to_owned(), Instant::now()));
-                    }
+                    *tailscale = fresh_tailscale;
+                    *cloudflare = fresh_cloudflare;
+                    self.providers_checked_at = Some(Instant::now());
                 }
             }
             (
@@ -1771,6 +1858,7 @@ impl ServeView {
             ) => {
                 self.target = Some(target);
                 self.state = ServeViewState::provider_retry(failed, tailscale, cloudflare);
+                self.providers_checked_at = Some(Instant::now());
             }
             (PendingJob::Reset, JobResult::Reset(result)) => {
                 let message = match result {
@@ -1839,12 +1927,14 @@ impl ServeView {
                             .then_some(observation.passphrase)
                             .flatten()
                     });
+                    let funnel = shown_reach(*mode, &observation.urls, observation.funnel);
                     self.state = ServeViewState::Active {
                         mode: *mode,
                         transport: *transport,
                         urls: observation.urls,
                         url_index: 0,
                         passphrase,
+                        funnel,
                         opened_at: Instant::now(),
                         log_offset: observation.log_offset,
                     };
@@ -1892,6 +1982,10 @@ impl ServeView {
                     return grew || recovered;
                 }
                 return false;
+            }
+            (PendingJob::Access, JobResult::Access(observation)) => {
+                self.access_checked_at = Some(Instant::now());
+                return observation.is_some_and(|observation| self.apply_access(observation));
             }
             (PendingJob::Copy, JobResult::CopyFeedback(message)) => {
                 self.copied = Some((message, Instant::now()))

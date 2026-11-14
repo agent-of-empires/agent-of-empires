@@ -1397,6 +1397,10 @@ impl HomeView {
             }
         }
         render_dialogs!(connections_view);
+        // Under the info dialog: a refused resubmit reopens it beneath the refusal.
+        if let Some((dialog, _)) = &mut self.create_hook_failed {
+            dialog.render(frame, area, theme);
+        }
         if self.snooze_duration_dialog.is_none() {
             render_dialogs!(info_dialog);
         }
@@ -1888,6 +1892,7 @@ impl HomeView {
             || self.rename_dialog.is_some()
             || self.worktree_name_dialog.is_some()
             || self.repo_trust_dialog.is_some()
+            || self.create_hook_failed.is_some()
             || self.hooks_install_dialog.is_some()
             || self.volume_ignores_glob_dialog.is_some()
             || self.intro_dialog.is_some()
@@ -2188,15 +2193,14 @@ impl HomeView {
                 )
             });
 
+        let show_structured = inst.is_structured() && self.show_structured_badge;
         let badge_text: Option<&'static str> =
-            if inst.is_structured() && self.view_mode != ViewMode::Terminal {
-                Some(" [structured]")
-            } else if self.view_mode == ViewMode::Terminal && inst.is_sandboxed() {
+            if self.view_mode == ViewMode::Terminal && inst.is_sandboxed() {
                 Some(match self.get_terminal_mode(id) {
                     TerminalMode::Container => " [container]",
                     TerminalMode::Host => " [host]",
                 })
-            } else if inst.is_structured() {
+            } else if show_structured {
                 Some(" [structured]")
             } else {
                 None
@@ -2209,9 +2213,12 @@ impl HomeView {
         let update_badge = (!inst.is_structured()
             && crate::session::update_restart::binary_updated(inst))
         .then_some(" [update]");
+        // Its on_create hooks were skipped at creation, so their setup never ran.
+        let setup_badge = inst.created_without_setup.then_some(" [no setup]");
         let badge_width = badge_text.map_or(0, |s| s.len())
             + terminal_badge.as_ref().map_or(0, |s| s.len())
-            + update_badge.map_or(0, |s| s.len());
+            + update_badge.map_or(0, |s| s.len())
+            + setup_badge.map_or(0, |s| s.len());
         let age = if self.show_activity_age {
             row_age(inst, in_attention)
         } else {
@@ -2282,6 +2289,17 @@ impl HomeView {
         }
         if let Some(badge) = update_badge {
             let badge_style = Style::default().fg(theme.waiting);
+            line_spans.push(Span::styled(
+                badge,
+                if is_selected {
+                    selected_row_style(badge_style, theme)
+                } else {
+                    badge_style
+                },
+            ));
+        }
+        if let Some(badge) = setup_badge {
+            let badge_style = Style::default().fg(theme.dimmed);
             line_spans.push(Span::styled(
                 badge,
                 if is_selected {
@@ -2664,7 +2682,10 @@ impl HomeView {
     pub(super) fn preview_vt_enabled(&self, target: Option<&str>) -> bool {
         self.vt_live_enabled
             && !matches!(self.view_mode, ViewMode::Terminal)
-            && (self.vt_yield.is_none() || self.vt_yield.as_deref() != target)
+            && self
+                .live_takeover
+                .as_ref()
+                .is_none_or(|taken| Some(taken.tmux_name.as_str()) != target)
     }
 
     /// Point the capture worker at `desired` (the displayed pane's tmux session) and
@@ -4282,6 +4303,8 @@ impl HomeView {
     }
 
     fn render_status_bar(&mut self, frame: &mut Frame, area: Rect, theme: &Theme) {
+        // The bar is on screen from here, so a queued flash can start counting.
+        self.arm_status_flash();
         // Action feedback takes precedence over a hovered link target.
         let hovered = (!self.live_send_pending_leader)
             .then(|| self.hovered_link())
@@ -4560,12 +4583,40 @@ impl HomeView {
                 }
                 None => (None, None),
             };
+            // After another window took live control: its status, then the key that takes
+            // control back. Only live entry claims the size lock; a full-screen attach doesn't.
+            let takeover = self
+                .live_takeover
+                .as_ref()
+                .filter(|taken| self.selected_session.as_deref() == Some(taken.session_id.as_str()))
+                .map(|taken| taken.taker);
+            let live_key = takeover.and_then(|taker| {
+                groups.push((
+                    0,
+                    None,
+                    vec![Span::styled(
+                        taker.label(),
+                        Style::default().fg(theme.text).bold(),
+                    )],
+                ));
+                // No key hint where neither key enters live mode; the row's hints stay.
+                let (click, key) = match self.live_key(self.selected_session.as_deref()?)? {
+                    live_send::LiveKey::Tab => (ktab, "Tab"),
+                    live_send::LiveKey::Enter => (kenter, "↵"),
+                };
+                groups.push((0, click, mk(key, "take control")));
+                Some(click)
+            });
             if let Some(enter_action_text) = enter_action_text {
                 // U+21B5 keeps Enter to one display cell without shortening its action label.
-                groups.push((0, kenter, mk("↵", enter_action_text)));
+                if live_key != Some(kenter) {
+                    groups.push((0, kenter, mk("↵", enter_action_text)));
+                }
             }
             if let Some(tab_action_text) = tab_action_text {
-                groups.push((2, ktab, mk("⇥ ", tab_action_text)));
+                if live_key != Some(ktab) {
+                    groups.push((2, ktab, mk("⇥ ", tab_action_text)));
+                }
             }
 
             let (click, key) = bound(ActionId::ToggleView);

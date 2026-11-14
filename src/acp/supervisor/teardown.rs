@@ -207,6 +207,11 @@ fn finish_stop_completion<S: BroadcastSink>(sink: &S, seqs: &super::SeqMap, leas
                 return false;
             }
         }
+        for event in super::publish::cancelled_open_subagents(sink, id) {
+            if !super::publish_next_persisted(sink, seqs, id, &event).1 {
+                return false;
+            }
+        }
         for agent_id in sink.unresolved_background_agent_ids(id) {
             let event = Event::BackgroundAgentCompleted {
                 agent_id,
@@ -364,6 +369,18 @@ impl<S: BroadcastSink> Supervisor<S> {
                     task_id,
                     ended_at: Some(chrono::Utc::now()),
                 },
+            )
+            .1
+            {
+                return Err(SupervisorError::TeardownPending(session_id.to_owned()));
+            }
+        }
+        for event in super::publish::cancelled_open_subagents(self.sink.as_ref(), session_id) {
+            if !super::publish_next_persisted(
+                self.sink.as_ref(),
+                &self.next_seqs,
+                session_id,
+                &event,
             )
             .1
             {
@@ -2382,6 +2399,28 @@ mod tests {
                 },
             )
             .unwrap();
+        store
+            .record(
+                session,
+                3,
+                &Event::SubagentUpdated {
+                    subagent: crate::acp::state::SubagentRecord {
+                        session_id: "child".into(),
+                        parent_session_id: "root".into(),
+                        parent_tool_call_id: Some("tc-1".into()),
+                        title: None,
+                        description: None,
+                        state: crate::acp::state::SubagentState::RequiresAction,
+                        stop_reason: None,
+                        error: None,
+                        cancel_capable: true,
+                        model: None,
+                        background: true,
+                    },
+                    at: chrono::Utc::now(),
+                },
+            )
+            .unwrap();
         let dead_pid = {
             let mut child = std::process::Command::new("/bin/sh")
                 .args(["-c", "exit 0"])
@@ -2399,6 +2438,20 @@ mod tests {
 
         assert!(store.unresolved_background_task_ids(session).is_empty());
         assert!(store.unresolved_background_agent_ids(session).is_empty());
+        assert!(store.open_subagents(session).is_empty());
+        let mut state = crate::acp::state::AcpState::new(
+            AcpSessionId(session.into()),
+            crate::acp::state::AgentName("claude".into()),
+            None,
+        );
+        for (seq, event) in store.replay_from(session, 0) {
+            state.apply_event(seq, event).unwrap();
+        }
+        assert_eq!(
+            state.background_agents[0].status,
+            BackgroundAgentStatus::Detached,
+            "the child's cancel must not overwrite its agent's detach"
+        );
     }
 
     #[tokio::test]

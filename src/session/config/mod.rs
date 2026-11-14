@@ -1062,6 +1062,22 @@ pub struct AppStateConfig {
     #[serde(default)]
     pub used_system_health: bool,
 
+    /// Web setup wizard steps the user chose to skip. See `GET /api/setup`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub setup_skipped_steps: Vec<String>,
+    /// Optional web setup steps whose defaults the user kept.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub setup_confirmed_steps: Vec<String>,
+    /// The user finished the web setup wizard.
+    #[serde(default)]
+    pub setup_finished: bool,
+    /// The user left the wizard for the dashboard, so `/` stops redirecting.
+    #[serde(default)]
+    pub setup_deferred: bool,
+    /// The user closed the dashboard's "Finish setting up" banner.
+    #[serde(default)]
+    pub setup_banner_dismissed: bool,
+
     /// Server-side mirror of the web dashboard's syncable UI state, keyed by
     /// the frontend's localStorage key (the value is the opaque string the
     /// browser stored). Single-tenant: there is one user, so these prefs
@@ -1717,6 +1733,18 @@ pub struct SessionConfig {
     )]
     pub show_activity_age: bool,
 
+    /// Show the `[structured]` badge on Structured view rows in the TUI
+    /// session list. Hiding it returns that width to the title and plugin row
+    /// badges; the row still opens the Structured view.
+    #[serde(default = "default_true")]
+    #[setting(
+        label = "Show Structured view badge",
+        widget = "toggle",
+        tui_only,
+        summary = "The [structured] marker on Structured view rows in the session list."
+    )]
+    pub show_structured_badge: bool,
+
     /// Comma-separated chord specs that exit live-send mode. Tmux-style: C-q,
     /// M-x, F12. The first chord in the list that matches an event ends live
     /// mode. Default `C-q` works in every terminal we ship to; add entries for
@@ -2267,6 +2295,7 @@ impl Default for SessionConfig {
             startup_recovery_wake: false,
             row_tag: RowTagMode::default(),
             show_activity_age: true,
+            show_structured_badge: true,
             live_send_exit_chord: default_live_send_exit_chord(),
             live_send_leader: default_live_send_leader(),
             default_attach_mode: AttachMode::default(),

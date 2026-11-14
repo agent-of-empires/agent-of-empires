@@ -221,7 +221,7 @@ export const SessionRow = memo(function SessionRow(props: SessionRowProps) {
           </Tooltip>
           <div className="min-w-0 flex-1">
             <span
-              className={`flex items-center gap-1.5 text-[13px] md:text-[14px] ${labelTone} ${model.effectivePinned ? "font-semibold" : ""} ${model.effectiveArchived || model.effectiveSnoozed ? "italic opacity-70" : ""}`}
+              className={`flex items-center gap-1.5 text-[13px] md:text-[14px] ${labelTone} ${model.effectivePinned ? "font-semibold" : ""} ${model.effectiveArchived || model.effectiveSnoozed ? "italic" : ""}`}
             >
               {sessionColorsEnabled && model.sessionColorDot && (
                 <span

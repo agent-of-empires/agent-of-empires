@@ -387,7 +387,13 @@ mod forced_batch_tests {
         fs::{self, File, OpenOptions},
         io::{Read, Write},
         mem::MaybeUninit,
-        os::unix::io::{AsRawFd, FromRawFd},
+        os::{
+            fd::OwnedFd,
+            unix::{
+                io::{AsRawFd, FromRawFd},
+                net::UnixStream,
+            },
+        },
         process::{Child, Command, Stdio},
         thread,
         time::Instant,
@@ -395,13 +401,13 @@ mod forced_batch_tests {
 
     const POLL_TIMEOUT: Duration = Duration::from_millis(250);
 
-    struct PrivatePty {
-        master: File,
+    struct PrivateInput {
+        writer: File,
         alias: File,
         source: UnixInternalEventSource,
     }
 
-    impl PrivatePty {
+    impl PrivateInput {
         fn new() -> Self {
             Self::with_mode(false, false)
         }
@@ -420,7 +426,7 @@ mod forced_batch_tests {
             };
             assert_eq!(opened, 0, "openpty: {}", io::Error::last_os_error());
             // Own both descriptors immediately; neither replaces stdin nor becomes a ctty.
-            let master = unsafe { File::from_raw_fd(master_fd) };
+            let writer = unsafe { File::from_raw_fd(master_fd) };
             let slave = unsafe { File::from_raw_fd(slave_fd) };
             let mut settings = MaybeUninit::<probe_libc::termios>::uninit();
             assert_eq!(
@@ -481,7 +487,7 @@ mod forced_batch_tests {
             let alias = slave.try_clone().expect("private legitimate-consumer alias");
             let source = UnixInternalEventSource::from_file_descriptor(FileDesc::Owned(slave.into()))
                 .expect("register actual private PTY with actual Mio Poll");
-            let fixture = Self { master, alias, source };
+            let fixture = Self { writer, alias, source };
             let actual_flags = unsafe {
                 probe_libc::fcntl(fixture.source.tty_fd.raw_fd(), probe_libc::F_GETFL)
             };
@@ -499,13 +505,37 @@ mod forced_batch_tests {
             assert_eq!(actual.c_cc[probe_libc::VMIN], 1);
             assert_eq!(actual.c_cc[probe_libc::VTIME], 0);
             eprintln!(
-                "ACTUAL PRIVATE MODE: blocking={blocking}, flags={actual_flags}, VMIN={}, VTIME={}",
+                "ACTUAL PRIVATE PTY MODE: blocking={blocking}, flags={actual_flags}, VMIN={}, VTIME={}",
                 actual.c_cc[probe_libc::VMIN], actual.c_cc[probe_libc::VTIME]
             );
             if controlling {
                 assert_eq!(crate::terminal::size().expect("private controlling geometry"), (91, 37));
             }
             fixture
+        }
+
+        fn with_socketpair() -> Self {
+            let (writer, receiver) = UnixStream::pair().expect("real private stream socketpair");
+            writer.set_nonblocking(false).expect("blocking socket writer");
+            receiver.set_nonblocking(false).expect("blocking socket receiver");
+            let flags = unsafe { probe_libc::fcntl(receiver.as_raw_fd(), probe_libc::F_GETFL) };
+            assert!(flags >= 0, "socket receiver F_GETFL: {}", io::Error::last_os_error());
+            assert_eq!(flags & probe_libc::O_NONBLOCK, 0);
+            let alias = receiver.try_clone().expect("duplicate actual receiving socket");
+            let writer = File::from(OwnedFd::from(writer));
+            let alias = File::from(OwnedFd::from(alias));
+            let source = UnixInternalEventSource::from_file_descriptor(FileDesc::Owned(receiver.into()))
+                .expect("register actual socket input with actual Mio Poll");
+            let actual_flags = unsafe {
+                probe_libc::fcntl(source.tty_fd.raw_fd(), probe_libc::F_GETFL)
+            };
+            assert!(actual_flags >= 0, "registered socket F_GETFL: {}", io::Error::last_os_error());
+            assert_eq!(actual_flags & probe_libc::O_NONBLOCK, 0);
+            let alias_flags = unsafe { probe_libc::fcntl(alias.as_raw_fd(), probe_libc::F_GETFL) };
+            assert!(alias_flags >= 0);
+            assert_eq!(alias_flags & probe_libc::O_NONBLOCK, 0);
+            eprintln!("ACTUAL PRIVATE SOCKETPAIR MODE: blocking=true, flags={actual_flags}");
+            Self { writer, alias, source }
         }
 
         fn pending(&self) -> usize {
@@ -530,7 +560,7 @@ mod forced_batch_tests {
         }
 
         fn prequeue_and_wake(&mut self, bytes: &[u8], order: ForcedOrder, signal: bool) {
-            let written = self.master.write(bytes).expect("one actual input write");
+            let written = self.writer.write(bytes).expect("one actual input write");
             assert_eq!(
                 written, bytes.len(),
                 "PRECONDITION FAILURE: fixed input must be queued by one complete write"
@@ -553,7 +583,7 @@ mod forced_batch_tests {
                 }
                 assert!(
                     Instant::now() < deadline,
-                    "PRECONDITION FAILURE: sole real byte never became readable"
+                    "PRECONDITION FAILURE: {expected} prequeued input bytes never became readable"
                 );
                 thread::sleep(Duration::from_millis(1));
             }
@@ -615,7 +645,7 @@ mod forced_batch_tests {
 
     #[test]
     fn forced_batch_wake_before_tty_retains_prequeued_key() {
-        let mut pty = PrivatePty::new();
+        let mut pty = PrivateInput::new();
         pty.prequeue_key_and_wake(ForcedOrder::WakeFirst);
         let start = Instant::now();
         let first = pty.source.try_read(Some(POLL_TIMEOUT));
@@ -640,7 +670,7 @@ mod forced_batch_tests {
 
     #[test]
     fn forced_batch_tty_before_wake_delivers_key() {
-        let mut pty = PrivatePty::new();
+        let mut pty = PrivateInput::new();
         pty.prequeue_key_and_wake(ForcedOrder::TtyFirst);
         let start = Instant::now();
         let first = pty.source.try_read(Some(POLL_TIMEOUT));
@@ -661,7 +691,7 @@ mod forced_batch_tests {
 
     #[test]
     fn forced_batch_wake_only_preserves_cancellation() {
-        let mut pty = PrivatePty::new();
+        let mut pty = PrivateInput::new();
         assert_eq!(pty.pending(), 0);
         pty.source.waker().wake().expect("actual wake without input");
         let start = Instant::now();
@@ -748,7 +778,7 @@ mod forced_batch_tests {
     }
 
     fn run_live_stale(stale: bool, timeout: Duration) {
-        let mut pty = PrivatePty::with_mode(true, false);
+        let mut pty = PrivateInput::with_mode(true, false);
         pty.prequeue_key_and_wake(ForcedOrder::WakeFirst);
         assert_interrupted(&pty.call("blocking wake-first", POLL_TIMEOUT));
         assert_eq!(pty.source.probe.read_attempts, 0);
@@ -769,7 +799,7 @@ mod forced_batch_tests {
             assert_eq!(pty.source.probe.read_attempts, 0, "not just zero completed reads");
             assert_eq!(pty.pending(), 0);
             eprintln!("NEGATIVE STALE PHASE PASSED; only now queue separate liveness y");
-            pty.master.write_all(b"y").expect("post-negative new input");
+            pty.writer.write_all(b"y").expect("post-negative new input");
             pty.wait_pending(1);
             let next = pty.call("separate future liveness, no wake", POLL_TIMEOUT);
             assert_char(&next, 'y');
@@ -783,7 +813,7 @@ mod forced_batch_tests {
     }
 
     fn run_two_keys() {
-        let mut pty = PrivatePty::with_mode(true, false);
+        let mut pty = PrivateInput::with_mode(true, false);
         pty.prequeue_and_wake(b"xy", ForcedOrder::TtyFirst, false);
         assert_char(&pty.call("two-key first actual read", POLL_TIMEOUT), 'x');
         assert_eq!(pty.source.probe.reads, vec![Ok(2)], "PRECONDITION FAILURE: require read2");
@@ -802,48 +832,48 @@ mod forced_batch_tests {
     }
 
     fn run_full_buffer(consumed: bool) {
-        let mut pty = PrivatePty::with_mode(true, false);
+        let mut fixture = PrivateInput::with_socketpair();
         let mut input = vec![b'x'; TTY_BUFFER_SIZE];
         input.push(b'y');
-        pty.prequeue_and_wake(&input, ForcedOrder::TtyFirst, false);
-        assert_char(&pty.call("1025 queued, first actual buffer", POLL_TIMEOUT), 'x');
+        fixture.prequeue_and_wake(&input, ForcedOrder::TtyFirst, false);
+        assert_char(&fixture.call("1025 queued socket bytes, first actual buffer", POLL_TIMEOUT), 'x');
         assert_eq!(
-            pty.source.probe.reads, vec![Ok(TTY_BUFFER_SIZE)],
+            fixture.source.probe.reads, vec![Ok(TTY_BUFFER_SIZE)],
             "PRECONDITION FAILURE: require actual full1024 read"
         );
-        assert_eq!(pty.pending(), 1);
-        assert!(pty.source.tty_refresh_pending);
-        assert_interrupted(&pty.call("saved WAKE before1023 parser events", POLL_TIMEOUT));
+        assert_eq!(fixture.pending(), 1);
+        assert!(fixture.source.tty_refresh_pending);
+        assert_interrupted(&fixture.call("saved WAKE before1023 parser events", POLL_TIMEOUT));
         if consumed {
-            pty.consume_exact(b"y");
+            fixture.consume_exact(b"y");
         }
         for _ in 0..TTY_BUFFER_SIZE - 1 {
-            assert_char(&pty.source.try_read(Some(POLL_TIMEOUT)), 'x');
-            assert_eq!(pty.source.probe.read_attempts, 1);
-            assert_eq!(pty.source.probe.refresh_attempts, 0);
-            assert!(pty.source.tty_refresh_pending);
+            assert_char(&fixture.source.try_read(Some(POLL_TIMEOUT)), 'x');
+            assert_eq!(fixture.source.probe.read_attempts, 1);
+            assert_eq!(fixture.source.probe.refresh_attempts, 0);
+            assert!(fixture.source.tty_refresh_pending);
         }
         // Exactly1024 total x events, no write or wake after original fixed input.
-        let next = pty.call("visited undrained TTY after parser exhaustion", POLL_TIMEOUT);
+        let next = fixture.call("visited undrained socket input after parser exhaustion", POLL_TIMEOUT);
         if consumed {
             assert_eq!(next.unwrap(), None);
-            assert_eq!(pty.source.probe.read_attempts, 1, "no replay of visited stale TTY");
-            assert_eq!(pty.source.probe.reads, vec![Ok(TTY_BUFFER_SIZE)]);
+            assert_eq!(fixture.source.probe.read_attempts, 1, "no replay of visited stale input");
+            assert_eq!(fixture.source.probe.reads, vec![Ok(TTY_BUFFER_SIZE)]);
         } else {
             assert_char(&next, 'y');
-            assert_eq!(pty.source.probe.reads, vec![Ok(TTY_BUFFER_SIZE), Ok(1)]);
-            assert_eq!(pty.source.probe.read_attempts, 2);
+            assert_eq!(fixture.source.probe.reads, vec![Ok(TTY_BUFFER_SIZE), Ok(1)]);
+            assert_eq!(fixture.source.probe.read_attempts, 2);
         }
-        assert_eq!(pty.source.probe.refresh_results, vec![Ok(())]);
-        let attempts = pty.source.probe.read_attempts;
-        assert_eq!(pty.call("final zero-time no duplicates", Duration::ZERO).unwrap(), None);
-        assert_eq!(pty.source.probe.read_attempts, attempts);
-        assert_eq!(pty.source.probe.poll_timeouts.last(), Some(&Some(Duration::ZERO)));
-        assert_eq!(pty.pending(), 0);
+        assert_eq!(fixture.source.probe.refresh_results, vec![Ok(())]);
+        let attempts = fixture.source.probe.read_attempts;
+        assert_eq!(fixture.call("final zero-time no duplicates", Duration::ZERO).unwrap(), None);
+        assert_eq!(fixture.source.probe.read_attempts, attempts);
+        assert_eq!(fixture.source.probe.poll_timeouts.last(), Some(&Some(Duration::ZERO)));
+        assert_eq!(fixture.pending(), 0);
     }
 
     fn run_signal(order: ForcedOrder, size_error: bool, consumed: bool) {
-        let mut pty = PrivatePty::with_mode(true, true);
+        let mut pty = PrivateInput::with_mode(true, true);
         if size_error {
             pty.source.probe.size_error_once = Some(io::ErrorKind::PermissionDenied);
         }
@@ -891,7 +921,7 @@ mod forced_batch_tests {
     }
 
     fn run_refresh_error() {
-        let mut pty = PrivatePty::with_mode(true, false);
+        let mut pty = PrivateInput::with_mode(true, false);
         pty.prequeue_key_and_wake(ForcedOrder::WakeFirst);
         assert_interrupted(&pty.call("before registration fault", POLL_TIMEOUT));
         pty.source.probe.refresh_error_once = Some(io::ErrorKind::PermissionDenied);
@@ -912,7 +942,7 @@ mod forced_batch_tests {
     }
 
     fn run_poll_error() {
-        let mut pty = PrivatePty::with_mode(true, false);
+        let mut pty = PrivateInput::with_mode(true, false);
         pty.prequeue_key_and_wake(ForcedOrder::WakeFirst);
         assert_interrupted(&pty.call("before Poll fault", POLL_TIMEOUT));
         pty.source.probe.poll_error_once = Some(io::ErrorKind::Other);
@@ -926,7 +956,7 @@ mod forced_batch_tests {
         assert_char(&pty.call("real Poll after failure; no replayed WAKE", POLL_TIMEOUT), 'x');
         assert_eq!(pty.source.probe.read_attempts, 1);
 
-        let mut empty = PrivatePty::with_mode(true, false);
+        let mut empty = PrivateInput::with_mode(true, false);
         empty.source.probe.poll_error_once = Some(io::ErrorKind::Interrupted);
         assert_eq!(empty.call("interrupted Poll retries same budget", POLL_TIMEOUT).unwrap(), None);
         assert_eq!(empty.source.probe.poll_attempts, 2);

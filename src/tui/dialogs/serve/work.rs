@@ -34,6 +34,8 @@ pub(super) enum Job {
     },
     ObserveStarting(TuiControlTarget),
     ObserveActive(Option<TuiControlTarget>),
+    /// Re-reads the running daemon's URLs and Funnel state.
+    RefreshAccess(TuiControlTarget),
     Copy(&'static str, String),
 }
 
@@ -48,6 +50,7 @@ pub(super) struct StartingObservation {
     pub(super) running: bool,
     pub(super) target: TuiControlTarget,
     pub(super) urls: Vec<crate::cli::serve::ServeUrl>,
+    pub(super) funnel: crate::server::tunnel::FunnelReach,
     pub(super) passphrase: Option<String>,
     pub(super) log_offset: u64,
     pub(super) tail: crate::acp::client::autostart::LogContext,
@@ -76,6 +79,8 @@ pub(super) enum JobResult {
         log_offset: u64,
         passphrase: Option<String>,
     },
+    /// None when the observed daemon could not be read.
+    Access(Option<StartingObservation>),
     CopyFeedback(String),
     Failed(String),
 }
@@ -111,6 +116,7 @@ fn dashboard(
             None,
             observation.passphrase,
             observation.urls,
+            observation.funnel,
             observation.log_offset,
         )
     } else {
@@ -150,10 +156,13 @@ fn observe(
     read_passphrase: bool,
     cancel: &CancellationToken,
 ) -> anyhow::Result<StartingObservation> {
-    let mut urls = if lease.has_dashboard() {
-        crate::cli::serve::read_serve_urls()
+    let (mut urls, funnel) = if lease.has_dashboard() {
+        (
+            crate::cli::serve::read_serve_urls(),
+            crate::cli::serve::read_serve_funnel(),
+        )
     } else {
-        Vec::new()
+        (Vec::new(), crate::server::tunnel::FunnelReach::Ours)
     };
     let log_offset = log_file_size();
     let passphrase = observe_passphrase(&mut lease, read_passphrase && !urls.is_empty(), cancel)?;
@@ -165,6 +174,7 @@ fn observe(
     Ok(StartingObservation {
         running,
         urls,
+        funnel,
         passphrase,
         log_offset,
         tail,
@@ -281,6 +291,7 @@ pub(super) fn run_job(job: Job, control: &Control, runtime: &tokio::runtime::Run
                     transport,
                     passphrase.or(observation.passphrase),
                     observation.urls,
+                    observation.funnel,
                     log_offset,
                 );
                 Ok(JobResult::Snapshot(Snapshot {
@@ -312,6 +323,14 @@ pub(super) fn run_job(job: Job, control: &Control, runtime: &tokio::runtime::Run
                 passphrase,
             }
         }
+        Job::RefreshAccess(target) => JobResult::Access(
+            runtime
+                .block_on(async {
+                    let lease = TuiObservationLease::prepare(Some(target), cancel).await?;
+                    observe(lease, false, cancel)
+                })
+                .ok(),
+        ),
         Job::Copy(label, value) => {
             use std::io::{self, Write};
 

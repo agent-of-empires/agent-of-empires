@@ -2,14 +2,13 @@
 // Cards that fold several tool calls: action runs and sub-agent tasks.
 
 import { useMemo, useState } from "react";
-import { Layers, Square } from "lucide-react";
+import { Layers } from "lucide-react";
 
 import type { ToolCall } from "../../lib/acpTypes";
 import {
   isActiveAgent,
   isStoppable,
   useBackgroundAgentFor,
-  useCancelSubagent,
   useOpenBackgroundAgentsPane,
   useSubagentFor,
 } from "./backgroundAgentsContext";
@@ -18,7 +17,7 @@ import { useToolDisplayMode } from "./ToolDisplayMode";
 import { useToolExpansionStore } from "./ToolExpansion";
 import { ToolCard } from "./ToolCards";
 import { ToolOutputMedia } from "./ToolOutputMedia";
-import { fromBackground, fromInline, taskPrompt } from "./subagents/model";
+import { fromBackground, fromInline } from "./subagents/model";
 import { SubagentDetail } from "./subagents/SubagentDetail";
 
 export { extractTaskResult } from "./subagents/model";
@@ -100,67 +99,31 @@ export function ToolGroupCard({ items }: { items: (ToolCardProps & { kind: strin
   );
 }
 
-/** Stops one child. The header is a button, so a nested one would be invalid markup. */
-function StopSubagentButton({ sessionId }: { sessionId: string }) {
-  const cancel = useCancelSubagent();
-  if (!cancel) return null;
-  return (
-    <span
-      role="button"
-      tabIndex={0}
-      title="Stop this sub-agent"
-      aria-label="Stop sub-agent"
-      onClick={(e) => {
-        e.stopPropagation();
-        void cancel(sessionId);
-      }}
-      onKeyDown={(e) => {
-        if (e.key !== "Enter" && e.key !== " ") return;
-        e.preventDefault();
-        e.stopPropagation();
-        void cancel(sessionId);
-      }}
-      className="inline-flex items-center text-text-dim hover:text-rose-300"
-    >
-      <Square className="h-3 w-3 fill-current" strokeWidth={0} />
-    </span>
-  );
-}
-
 /** Async sub-agent launch, linked to its live Background agents record by
  *  tool-call id. Running until the first tailer event arrives. */
 export function AsyncSubagentCard({ tool }: { tool: ToolCall }) {
   const agent = useBackgroundAgentFor(tool.id);
   const roster = useSubagentFor(tool.id);
   const openPane = useOpenBackgroundAgentsPane();
-  const stoppable = !!agent && isActiveAgent(agent) && isStoppable(roster);
+  const stoppable = (!agent || isActiveAgent(agent)) && isStoppable(roster);
   const record = useMemo(
-    () =>
-      agent
-        ? fromBackground(agent)
-        : {
-            ...fromInline(tool, undefined, []),
-            background: true,
-            prompt: tool.prompt ?? taskPrompt(tool.args_preview),
-          },
-    [agent, tool],
+    () => (agent ? fromBackground(agent) : { ...fromInline(tool, undefined, [], roster), background: true }),
+    [agent, tool, roster],
   );
   return (
     <SubagentDetail
       record={record}
+      stopChildId={stoppable ? roster.session_id : undefined}
       actions={
-        <>
-          {openPane && (
-            <button
-              type="button"
-              onClick={() => openPane(agent?.agentId)}
-              className="text-[11px] text-text-dim hover:text-text-secondary"
-            >
-              Open in side pane
-            </button>
-          )}
-          {stoppable && <StopSubagentButton sessionId={roster.session_id} />}
-        </>
+        openPane && (
+          <button
+            type="button"
+            onClick={() => openPane(agent?.agentId ?? roster?.session_id)}
+            className="text-[11px] text-text-dim hover:text-text-secondary"
+          >
+            Open in side pane
+          </button>
+        )
       }
     />
   );
@@ -173,10 +136,7 @@ export function SubagentCard({ tool, result, children }: ToolCardProps & { child
   const record = useMemo(() => fromInline(tool, result, children, roster), [tool, result, children, roster]);
   return (
     <>
-      <SubagentDetail
-        record={record}
-        actions={isStoppable(roster) && <StopSubagentButton sessionId={roster.session_id} />}
-      />
+      <SubagentDetail record={record} stopChildId={isStoppable(roster) ? roster.session_id : undefined} />
       {result?.output?.length ? <ToolOutputMedia blocks={result.output} /> : null}
     </>
   );

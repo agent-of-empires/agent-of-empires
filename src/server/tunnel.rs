@@ -24,7 +24,38 @@ struct FunnelRoute {
     program: std::ffi::OsString,
     /// The advertised `<machine>.<tailnet>.ts.net`, whose :443 vhost the watcher reads.
     host: String,
-    reach: tokio::sync::watch::Sender<bool>,
+    reach: tokio::sync::watch::Sender<FunnelReach>,
+}
+
+/// Whether the Funnel's `/` on :443 still routes to this daemon, as the watcher last read it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FunnelReach {
+    Ours,
+    /// `/` routes to another server.
+    Lost,
+    /// `tailscale funnel status` was unreadable 3 times in a row.
+    Unknown,
+}
+
+impl FunnelReach {
+    /// The `serve.funnel` contents, or None when the file is absent (the Funnel is ours).
+    pub fn marker(self) -> Option<&'static str> {
+        match self {
+            Self::Ours => None,
+            Self::Lost => Some("lost\n"),
+            Self::Unknown => Some("unknown\n"),
+        }
+    }
+
+    /// Reads `serve.funnel`. Only an absent file means ours; one caught mid-write (empty) or
+    /// holding anything else is Unknown.
+    pub fn from_marker(contents: Option<&str>) -> Self {
+        match contents.map(str::trim) {
+            None => Self::Ours,
+            Some("lost") => Self::Lost,
+            Some(_) => Self::Unknown,
+        }
+    }
 }
 
 #[derive(Clone)]
@@ -59,8 +90,8 @@ impl TunnelHandle {
         self.kind.mode_label()
     }
 
-    /// Tailscale only: true while `/` on :443 routes to this daemon, so its URL may be advertised.
-    pub fn funnel_reach(&self) -> Option<tokio::sync::watch::Receiver<bool>> {
+    /// Tailscale only: whether `/` on :443 routes to this daemon, so its URL may be advertised.
+    pub fn funnel_reach(&self) -> Option<tokio::sync::watch::Receiver<FunnelReach>> {
         self.funnel.as_ref().map(|route| route.reach.subscribe())
     }
 
@@ -389,7 +420,7 @@ impl TunnelHandle {
             funnel: Some(FunnelRoute {
                 program: program.to_owned(),
                 host,
-                reach: tokio::sync::watch::Sender::new(true),
+                reach: tokio::sync::watch::Sender::new(FunnelReach::Ours),
             }),
         })
     }
@@ -1083,27 +1114,48 @@ fn root_is_ours(status: Option<&std::process::Output>, host: &str, port: u16) ->
     let parsed = status
         .filter(|out| out.status.success())
         .and_then(|out| serde_json::from_slice::<serde_json::Value>(&out.stdout).ok())?;
-    let ours = format!("127.0.0.1:{port}");
     let proxy = parsed
         .get("Web")
         .and_then(|web| web.get(format!("{host}:443")))
         .and_then(|cfg| cfg.get("Handlers")?.get("/")?.get("Proxy")?.as_str());
-    Some(proxy.is_some_and(|proxy| {
-        let authority = proxy.split_once("://").map_or(proxy, |(_, rest)| rest);
-        authority.split(['/', '?', '#']).next() == Some(ours.as_str())
-    }))
+    Some(proxy.is_some_and(|proxy| routes_here(proxy, port)))
+}
+
+/// Whether a Funnel proxy target is the route this daemon writes, `127.0.0.1:<port>`.
+fn routes_here(proxy: &str, port: u16) -> bool {
+    let authority = proxy.split_once("://").map_or(proxy, |(_, rest)| rest);
+    authority.split(['/', '?', '#']).next() == Some(format!("127.0.0.1:{port}").as_str())
+}
+
+/// Consecutive unreadable `tailscale funnel status` reads after which the Funnel URL is withdrawn.
+const FUNNEL_UNREADABLE_LIMIT: u32 = 3;
+
+/// The watcher's answer after one read of whether `/` is ours (None: unreadable), or None to keep
+/// the last one. `unreadable` counts the consecutive unreadable reads.
+fn next_reach(unreadable: &mut u32, ours: Option<bool>) -> Option<FunnelReach> {
+    let Some(ours) = ours else {
+        *unreadable += 1;
+        return (*unreadable >= FUNNEL_UNREADABLE_LIMIT).then_some(FunnelReach::Unknown);
+    };
+    *unreadable = 0;
+    Some(if ours {
+        FunnelReach::Ours
+    } else {
+        FunnelReach::Lost
+    })
 }
 
 /// Re-reads the Funnel until cancelled and publishes whether `/` on :443 is still this daemon's.
-/// An unreadable status keeps the last answer, so a slow `tailscale` doesn't flap it.
+/// An unreadable status keeps the last answer until [`FUNNEL_UNREADABLE_LIMIT`] in a row.
 async fn watch_funnel(
     program: std::ffi::OsString,
     host: String,
     port: u16,
     every: std::time::Duration,
-    reach: tokio::sync::watch::Sender<bool>,
+    reach: tokio::sync::watch::Sender<FunnelReach>,
     cancel: CancellationToken,
 ) {
+    let mut unreadable = 0;
     loop {
         tokio::select! {
             _ = tokio::time::sleep(every) => {}
@@ -1118,14 +1170,21 @@ async fn watch_funnel(
             .await
             .ok()
             .and_then(Result::ok);
-        let Some(ours) = root_is_ours(status.as_ref(), &host, port) else {
+        let Some(next) = next_reach(&mut unreadable, root_is_ours(status.as_ref(), &host, port))
+        else {
             continue;
         };
-        if reach.send_if_modified(|advertised| std::mem::replace(advertised, ours) != ours) {
-            if ours {
-                info!(target: "serve.tunnel", "Tailscale Funnel on port 443 routes to this daemon again; advertising its URL");
-            } else {
-                warn!(target: "serve.tunnel", "Tailscale Funnel on port 443 no longer routes to this daemon, so its URL is no longer advertised");
+        if reach.send_if_modified(|advertised| std::mem::replace(advertised, next) != next) {
+            match next {
+                FunnelReach::Ours => {
+                    info!(target: "serve.tunnel", "Tailscale Funnel on port 443 routes to this daemon again; advertising its URL")
+                }
+                FunnelReach::Lost => {
+                    warn!(target: "serve.tunnel", "Tailscale Funnel on port 443 no longer routes to this daemon, so its URL is no longer advertised")
+                }
+                FunnelReach::Unknown => {
+                    warn!(target: "serve.tunnel", "Tailscale hasn't answered `tailscale funnel status` {FUNNEL_UNREADABLE_LIMIT} times in a row, so the Funnel URL is no longer advertised until it does")
+                }
             }
         }
     }
@@ -1159,10 +1218,9 @@ fn funnel_preflight(
         for (path, handler) in handlers.iter() {
             if let Some(proxy) = handler.get("Proxy").and_then(|v| v.as_str()) {
                 // `--bg` replaces only `/`. A loopback `/` is replaced when it's this daemon's
-                // port or nothing serves it; a live one may be another user's daemon.
+                // route or nothing serves it; a live one may be another user's daemon.
                 if proxy_is_loopback(proxy) {
-                    let ours = loopback_addr(proxy).is_some_and(|(_, port)| port == local_port);
-                    if path == "/" && !ours && is_live(proxy) {
+                    if path == "/" && !routes_here(proxy, local_port) && is_live(proxy) {
                         return live_funnel_backend(proxy);
                     }
                     debug!(
@@ -1681,10 +1739,14 @@ mod tests {
             (root("http://127.0.0.1:9999"), true),
             (root("http://localhost:9999/"), true),
             (root("http://[::1]:9999"), true),
-            // This daemon's own port is live, and is its to replace.
+            // This daemon's own route is live, and is its to replace.
             (root("http://127.0.0.1:8081"), false),
+            // Its port on another loopback host isn't a route aoe writes.
+            (root("http://[::1]:8081"), true),
+            (root("http://localhost:8081"), true),
             // Nothing serves it: a dead earlier run.
             (root("http://127.0.0.1:7777"), false),
+            (root("http://[::1]:7777"), false),
             // `--bg` leaves other paths alone, live or not.
             (
                 doc(
@@ -1812,9 +1874,38 @@ mod tests {
         fake
     }
 
+    #[test]
+    fn the_watcher_withdraws_only_after_consecutive_unreadable_reads() {
+        use FunnelReach::*;
+        // (read: whether `/` is ours, None when unreadable; the answer published, None keeps it)
+        let reads = [
+            (None, None),
+            (None, None),
+            (None, Some(Unknown)),
+            (None, Some(Unknown)),
+            (Some(true), Some(Ours)),
+            // A readable answer resets the count.
+            (None, None),
+            (None, None),
+            (Some(false), Some(Lost)),
+            (None, None),
+            (None, None),
+            (None, Some(Unknown)),
+        ];
+        let mut unreadable = 0;
+        for (i, (read, want)) in reads.into_iter().enumerate() {
+            assert_eq!(
+                next_reach(&mut unreadable, read),
+                want,
+                "read {i}: {read:?}"
+            );
+        }
+    }
+
     #[cfg(unix)]
     #[tokio::test]
-    async fn the_watcher_follows_who_root_routes_to_and_keeps_its_answer_when_unreadable() {
+    async fn the_watcher_follows_who_root_routes_to_and_withdraws_after_repeated_unreadable_reads()
+    {
         const DEADLINE: std::time::Duration = std::time::Duration::from_secs(10);
         let dir = tempfile::tempdir().unwrap();
         let fake = status_only_tailscale(dir.path());
@@ -1830,7 +1921,7 @@ mod tests {
                 .unwrap_or(0)
         };
         set_state("not json");
-        let (tx, mut rx) = tokio::sync::watch::channel(true);
+        let (tx, mut rx) = tokio::sync::watch::channel(FunnelReach::Ours);
         let cancel = CancellationToken::new();
         let watcher = tokio::spawn(watch_funnel(
             fake.into_os_string(),
@@ -1841,23 +1932,27 @@ mod tests {
             cancel.clone(),
         ));
 
-        // Unreadable: two reads later the URL is still advertised.
-        tokio::time::timeout(DEADLINE, async {
-            while calls() < 2 {
-                tokio::time::sleep(std::time::Duration::from_millis(5)).await;
-            }
-        })
+        tokio::time::timeout(
+            DEADLINE,
+            rx.wait_for(|reach| *reach == FunnelReach::Unknown),
+        )
         .await
-        .expect("the watcher reads the status");
-        assert!(*rx.borrow_and_update());
+        .expect("repeated unreadable reads withdraw the URL")
+        .unwrap();
+        assert!(calls() >= FUNNEL_UNREADABLE_LIMIT as usize);
+        set_state(&route(8081));
+        tokio::time::timeout(DEADLINE, rx.wait_for(|reach| *reach == FunnelReach::Ours))
+            .await
+            .expect("a readable route of ours advertises it again")
+            .unwrap();
 
         set_state(&route(8080));
-        tokio::time::timeout(DEADLINE, rx.wait_for(|advertised| !advertised))
+        tokio::time::timeout(DEADLINE, rx.wait_for(|reach| *reach == FunnelReach::Lost))
             .await
             .expect("a takeover is noticed")
             .unwrap();
         set_state(&route(8081));
-        tokio::time::timeout(DEADLINE, rx.wait_for(|advertised| *advertised))
+        tokio::time::timeout(DEADLINE, rx.wait_for(|reach| *reach == FunnelReach::Ours))
             .await
             .expect("a returned route is advertised again")
             .unwrap();
@@ -2542,6 +2637,19 @@ esac
                 want,
                 "{line}"
             );
+        }
+    }
+
+    #[test]
+    fn only_a_missing_funnel_marker_means_ours() {
+        for (contents, want) in [
+            (None, FunnelReach::Ours),
+            (Some("lost\n"), FunnelReach::Lost),
+            (Some("unknown\n"), FunnelReach::Unknown),
+            (Some(""), FunnelReach::Unknown),
+            (Some("garbage"), FunnelReach::Unknown),
+        ] {
+            assert_eq!(FunnelReach::from_marker(contents), want, "{contents:?}");
         }
     }
 

@@ -6,6 +6,7 @@ import {
   Globe,
   HelpCircle,
   Pencil,
+  Plug,
   Search,
   Sparkles,
   Terminal,
@@ -35,6 +36,7 @@ const KIND_ICONS: Record<string, LucideIcon> = {
   search: Search,
   fetch: Globe,
   agent: Sparkles,
+  mcp: Plug,
 };
 
 const GLYPHS: Record<ToolStatus, { char: string; cls: string; word: string }> = {
@@ -64,14 +66,16 @@ function Row({ tool }: { tool: ActivityTool }) {
         aria-expanded={open}
         onClick={() => setToggled(!open)}
         title={tool.target ? `${tool.name} ${tool.target}` : tool.name}
-        className="flex h-7 w-full items-center gap-2 px-2 text-left text-xs hover:bg-surface-800"
+        className="flex h-7 w-full min-w-0 items-center gap-2 px-2 text-left text-xs hover:bg-surface-800"
       >
         <span aria-label={glyph.word} role="img" className={`w-3 shrink-0 text-center ${glyph.cls}`}>
           {glyph.char}
         </span>
         <Icon className="h-3.5 w-3.5 shrink-0 text-text-dim" />
-        <span className="shrink-0 font-mono text-text-secondary">{tool.name}</span>
-        <span className="min-w-0 flex-1 truncate font-mono text-text-dim">{tool.target}</span>
+        <span className={`min-w-0 truncate font-mono text-text-secondary ${tool.target ? "max-w-[50%]" : "flex-1"}`}>
+          {tool.name}
+        </span>
+        {tool.target && <span className="min-w-0 flex-1 truncate font-mono text-text-dim">{tool.target}</span>}
         {time && <span className="shrink-0 tabular-nums text-[11px] text-text-dim">{time}</span>}
       </button>
       {open && (
@@ -140,6 +144,8 @@ export function ActivityFilters({
   onChange: (f: ActivityFilter) => void;
 }) {
   const kinds = useMemo(() => [...new Set(tools.map((t) => t.kind))], [tools]);
+  // "Other" names no kind, so it gets no chip of its own.
+  const named = kinds.filter((k) => k !== "other");
   const errors = tools.filter((t) => t.status === "err").length;
   const active = (f: ActivityFilter) =>
     f === filter || (typeof f === "object" && typeof filter === "object" && f.kind === filter.kind);
@@ -158,7 +164,7 @@ export function ActivityFilters({
     <div className="flex flex-wrap items-center gap-0.5" role="group" aria-label="Filter activity">
       {chip("All", "all")}
       {errors > 0 && chip(`Errors ${errors}`, "errors")}
-      {kinds.length > 1 && kinds.map((k) => chip(kindLabel(k, 2), { kind: k }))}
+      {kinds.length > 1 && named.map((k) => chip(kindLabel(k, 2), { kind: k }))}
     </div>
   );
 }

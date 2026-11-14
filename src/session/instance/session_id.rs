@@ -621,15 +621,29 @@ impl Instance {
     /// refuses, so the availability the API and TUI render cannot drift from
     /// the launch line.
     fn terminal_resume_static_unavailable(&self) -> Option<ResumeStaticUnavailable> {
-        let Some(agent) = self
-            .default_selector_agent()
+        // One resolve serves every check; a projection runs this per session.
+        let profile = self.effective_profile();
+        let resolved = crate::session::config::profile_config::resolve_config(&profile);
+        let fallback;
+        let config = match &resolved {
+            Ok(config) => &config.session,
+            Err(_) => {
+                fallback = crate::session::config::profile_config::resolve_config_or_warn(&profile);
+                &fallback.session
+            }
+        };
+        let native = resolved.as_ref().ok().and_then(|resolved| {
+            Self::execution_agent_for(&self.tool, self.get_tool_command(), &resolved.session).ok()
+        });
+        let Some(agent) = native
+            .or_else(|| self.legacy_default_selector_agent_in(config))
             .filter(|agent| agent.session_support.is_some())
         else {
             return Some(ResumeStaticUnavailable::Agent);
         };
-        if !self.launch_can_carry_resume_selector(agent)
+        if !self.launch_carries_selector(native, agent)
             && !self.can_attempt_default_resume(agent)
-            && self.legacy_default_selector_agent().is_none()
+            && self.legacy_default_selector_agent_in(config).is_none()
         {
             return Some(ResumeStaticUnavailable::Command);
         }
@@ -1273,6 +1287,37 @@ mod tests {
                 &mut fresh.conversation_state()
             )
             .unwrap());
+    }
+
+    #[test]
+    #[serial]
+    fn resume_availability_resolves_config_once_per_session() {
+        const PROFILE: &str = "resume-resolve-once";
+        let root = tempdir().unwrap();
+        let _app = crate::session::test_support::isolate_app_dir_at(&root.path().join("app"));
+        let profile_path =
+            crate::session::config::profile_config::get_profile_config_path(PROFILE).unwrap();
+        std::fs::create_dir_all(profile_path.parent().unwrap()).unwrap();
+        std::fs::write(
+            profile_path,
+            "[session.agent_detect_as]\nwork-claude = \"claude\"\n",
+        )
+        .unwrap();
+        let _registry = crate::tmux::status_rules::ProfileRegistryGuard::take(PROFILE);
+        // Direct launch, bare wrapper, and a tool with no session support.
+        for (tool, command) in [
+            ("claude", "claude"),
+            ("work-claude", "work-claude"),
+            ("shell", ""),
+        ] {
+            let mut inst = tool_instance(tool, root.path().to_str().unwrap());
+            inst.source_profile = PROFILE.into();
+            inst.command = command.into();
+            crate::session::config::profile_config::RESOLVES.with(|n| n.set(0));
+            inst.terminal_context_resume_cached();
+            let resolves = crate::session::config::profile_config::RESOLVES.with(|n| n.get());
+            assert_eq!(resolves, 1, "{tool} resolved config {resolves} times");
+        }
     }
 
     #[test]

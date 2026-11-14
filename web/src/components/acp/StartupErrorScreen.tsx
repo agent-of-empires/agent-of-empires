@@ -1,16 +1,20 @@
 import { useEffect, useId, useState } from "react";
+import { createPortal } from "react-dom";
 
 import type { IncompatibleAgentDetail } from "../../lib/acpTypes";
 import { fetchAgentInstallInfo, type AgentInstallInfo } from "../../lib/api";
 import { useRespawnSession } from "../../hooks/useRespawnSession";
 import { splitInstallHint, useAdapterInstall } from "./adapterRecovery";
 import { CommandBlock, RecoveryActionRow, type RecoveryAction } from "./RecoveryActionRow";
+import { RecreateContainerDialog } from "../sidebar/RecreateContainerDialog";
 
 interface Props {
   detail: IncompatibleAgentDetail;
   sessionId: string;
   /** Used until install-info answers. */
   isSandboxed?: boolean;
+  /** The Session's title when the dashboard may recreate its container; omitted otherwise. */
+  recreateContainerTitle?: string;
 }
 
 const SETTING_PATH = 'TUI › Settings › Global › Acp › Advanced › "Let the Web dashboard install Agents"';
@@ -51,12 +55,13 @@ function useInstallInfo(sessionId: string, detail: IncompatibleAgentDetail): Age
 
 /** Replaces the chat when the adapter compatibility check refuses the Session:
  *  the steps that fix it from here, or the command to run by hand. */
-export function StartupErrorScreen({ detail, sessionId, isSandboxed = false }: Props) {
+export function StartupErrorScreen({ detail, sessionId, isSandboxed = false, recreateContainerTitle }: Props) {
   const info = useInstallInfo(sessionId, detail);
   const sandboxed = info?.sandboxed ?? isSandboxed;
   const name = info?.display_name ?? null;
   const stepOneId = useId();
   const [detailsOpen, setDetailsOpen] = useState(false);
+  const [recreating, setRecreating] = useState(false);
 
   const { state: respawnState, error: respawnError, respawn } = useRespawnSession(sessionId);
   // A version failure that arrives after a successful install is a new detail.
@@ -124,7 +129,15 @@ export function StartupErrorScreen({ detail, sessionId, isSandboxed = false }: P
         Run <Code>aoe acp doctor --fix</Code>.
       </>
     );
-  const secondary = containerDown ? [] : webInstall ? [checkAgain] : [];
+  const recreate: RecoveryAction = {
+    label: "Recreate container",
+    onClick: () => setRecreating(true),
+    testId: "startup-error-recreate-container",
+    disabled: busy,
+  };
+  // Waits for install-info, which also names the read-only and CityHall dashboards the server would refuse.
+  const canRecreate = info?.sandboxed === true && !observer && recreateContainerTitle !== undefined;
+  const secondary = [...(webInstall && !containerDown ? [checkAgain] : []), ...(canRecreate ? [recreate] : [])];
 
   return (
     <div
@@ -262,6 +275,8 @@ export function StartupErrorScreen({ detail, sessionId, isSandboxed = false }: P
                   Refreshing the Sandbox image fixes new Sessions only: this Session's container keeps the image it
                   started with. When a newer image is published and update checks are on, the dashboard's "Sandbox image
                   update available" banner offers Update now to pull it, or shows the command to run.
+                  {canRecreate &&
+                    " Recreate container restarts this Session on the current image; files outside the Working directory and mounted folders are lost."}
                 </p>
               )}
               <p>
@@ -273,6 +288,16 @@ export function StartupErrorScreen({ detail, sessionId, isSandboxed = false }: P
           )}
         </div>
       </div>
+      {recreating &&
+        recreateContainerTitle !== undefined &&
+        createPortal(
+          <RecreateContainerDialog
+            sessionId={sessionId}
+            sessionTitle={recreateContainerTitle}
+            onClose={() => setRecreating(false)}
+          />,
+          document.body,
+        )}
     </div>
   );
 }

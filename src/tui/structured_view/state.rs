@@ -722,8 +722,10 @@ mod tests {
                 description: None,
                 state: crate::acp::state::SubagentState::Running,
                 stop_reason: None,
+                error: None,
                 cancel_capable: true,
                 model: None,
+                background: false,
             });
         state.reconcile_interaction_authority();
         assert!(!state.interaction_presented());

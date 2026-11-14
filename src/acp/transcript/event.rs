@@ -286,7 +286,7 @@ pub(crate) fn memory(event: &Event) -> View<'_, Memory> {
             answers,
         },
         Event::Stopped { .. } => View::Stopped,
-        Event::AgentStartupError { message } => View::AgentStartupError { message },
+        Event::AgentStartupError { message, .. } => View::AgentStartupError { message },
         Event::IncompatibleAgent { .. } => View::IncompatibleAgent,
         Event::AgentSwitched { from, to, reason } => View::AgentSwitched { from, to, reason },
         Event::SessionCleared => View::SessionCleared,

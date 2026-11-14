@@ -31,8 +31,8 @@ export function useRespawnSession(
   }: {
     /** Restart instead: stop the Worker or its start in progress, then start a replacement. */
     restart?: boolean;
-    /** Called with the failure's HTTP status, or null when the request never got one. */
-    onFailed?: (status: number | null, error: string) => void;
+    /** Called with the failure's HTTP status, or null when the request never got one, and its full detail. */
+    onFailed?: (status: number | null, error: string, detail: string) => void;
   } = {},
 ) {
   const [snapshot, setSnapshot] = useState<RespawnSnapshot>({
@@ -79,12 +79,12 @@ export function useRespawnSession(
       }
       const error = `Server returned ${res.status}. ${body.slice(0, 200)}`.trim();
       settle("failed", error, body);
-      onFailed?.(res.status, error);
+      onFailed?.(res.status, error, body || error);
       return false;
     } catch (e) {
       const error = e instanceof Error ? e.message : String(e);
       settle("failed", error);
-      onFailed?.(null, error);
+      onFailed?.(null, error, error);
       return false;
     }
   };

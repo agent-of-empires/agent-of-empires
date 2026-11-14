@@ -163,9 +163,7 @@ fn cursor_boundaries_preserve_latest_output_order_reuse_and_question_suppression
 fn turn_endings_keep_orphans_separate_and_sweep_open_prefix_tools() {
     let closers = [
         stopped("cancelled"),
-        Event::AgentStartupError {
-            message: "boom".into(),
-        },
+        Event::startup_error("boom"),
         Event::IncompatibleAgent {
             detail: crate::acp::state::StartupErrorDetail::UnsupportedProtocolVersion {
                 expected: "1".into(),
