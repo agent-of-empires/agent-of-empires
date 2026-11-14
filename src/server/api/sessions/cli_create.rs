@@ -284,7 +284,7 @@ fn resolve_host_creation(
                 .filter(|name| !name.trim().is_empty())
             {
                 anyhow::ensure!(
-                    crate::agents::get_agent(detect_as).is_some(),
+                    crate::agents::native_definition(detect_as).is_some(),
                     "Unknown agent_detect_as for custom agent '{name}'"
                 );
             }
@@ -468,6 +468,64 @@ fn wants_workspace(
     workspace_by_default: bool,
 ) -> bool {
     flag.unwrap_or(workspace_by_default && has_worktree && create_new_branch && !generated_name)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A takeover hides `omp` from listings, but a configured wrapper detected
+    /// as `omp` still names a real identity, so `--tool` must accept it.
+    #[test]
+    #[serial_test::serial]
+    fn a_takeover_keeps_a_configured_wrapper_detectable_as_omp() {
+        let home = tempfile::tempdir().unwrap();
+        let _reload = crate::plugin::ReloadRegistryOnDrop;
+        let _app = crate::session::test_support::isolate_app_dir_at(home.path());
+        crate::session::update_config(|config| {
+            config
+                .session
+                .custom_agents
+                .insert("work-omp".into(), "omp --verbose".into());
+            config
+                .session
+                .agent_detect_as
+                .insert("work-omp".into(), "omp".into());
+        })
+        .unwrap();
+        let resolve = || {
+            let body: CreateSessionBody = serde_json::from_value(serde_json::json!({
+                "path": home.path(), "scratch": true, "tool": "work-omp"
+            }))
+            .unwrap();
+            resolve_host_creation(body, Default::default(), None, "default")
+        };
+        let accepted = || {
+            resolve()
+                .expect("a wrapper detected as omp is a known agent")
+                .0
+                .tool
+        };
+
+        assert_eq!(accepted(), "work-omp");
+
+        crate::session::test_support::install_omp_takeover("omp-next");
+        assert!(crate::agents::get_agent("omp").is_none());
+        assert_eq!(accepted(), "work-omp");
+
+        crate::session::update_config(|config| {
+            config
+                .session
+                .agent_detect_as
+                .insert("work-omp".into(), "no-such-agent".into());
+        })
+        .unwrap();
+        let refused = match resolve() {
+            Ok(_) => panic!("an unknown alias stays unknown"),
+            Err(error) => format!("{error:#}"),
+        };
+        assert!(refused.contains("Unknown agent_detect_as"), "{refused}");
+    }
 }
 
 #[cfg(test)]
