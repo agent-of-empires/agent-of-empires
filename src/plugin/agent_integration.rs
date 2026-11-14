@@ -51,6 +51,23 @@ static RESERVED_WARNED: std::sync::LazyLock<
     std::sync::Mutex<std::collections::HashSet<(String, String)>>,
 > = std::sync::LazyLock::new(|| std::sync::Mutex::new(std::collections::HashSet::new()));
 
+/// Tools already reported as ambiguously claimed, so poll-time lookups warn
+/// once per process rather than on every tick.
+static AMBIGUOUS_WARNED: std::sync::LazyLock<std::sync::Mutex<std::collections::HashSet<String>>> =
+    std::sync::LazyLock::new(|| std::sync::Mutex::new(std::collections::HashSet::new()));
+
+/// An ambiguity is a configuration fault with no report to read, so a session
+/// it affects stays plugin-owned `Unknown`; say which name collided.
+fn warn_ambiguous(tool: &str, error: &anyhow::Error) {
+    let mut warned = AMBIGUOUS_WARNED
+        .lock()
+        .unwrap_or_else(|error| error.into_inner());
+    if warned.insert(tool.to_owned()) {
+        tracing::warn!(target: "plugin.agents", %tool, %error,
+            "approved integrations claim this tool ambiguously; leaving its status to pane rules");
+    }
+}
+
 fn warn_reserved(plugin: &str, tool: &str, builtin: &str) {
     let mut warned = RESERVED_WARNED
         .lock()
@@ -743,6 +760,13 @@ pub(crate) fn owned_status(
         Ok(None) => provider(&registry, &alias),
         _ => Ok(None),
     };
+    // Report each ambiguous name once, whichever branch consumes it.
+    if let Err(error) = &own_claim {
+        warn_ambiguous(&instance.tool, error);
+    }
+    if let Err(error) = &alias_claim {
+        warn_ambiguous(&alias, error);
+    }
     if matches!(&own_claim, Ok(None)) && matches!(&alias_claim, Ok(None)) {
         // No plugin claims this session under either name, so nothing can grant
         // it status: the per-tick path for an undeclared session reads no
@@ -750,12 +774,12 @@ pub(crate) fn owned_status(
         return None;
     }
     let own = custom_ownership(instance, &instance.tool);
-    // A same-name custom wrapper is a different program from the declaration,
-    // so a plugin claiming this session's own name has no report to give. An
-    // ambiguous claim is excluded too: the wrapper is readable and known, so it
-    // keeps its pane rules rather than reading as plugin-owned `Unknown`. A
-    // wrapper detected as another provider still answers through that alias.
-    if own == CustomOwnership::Custom && !matches!(&own_claim, Ok(None)) {
+    // A custom wrapper is a different program from the declaration, so a plugin
+    // claiming its own name has no report to give, and two claims on its
+    // detection alias leave nothing to read either. Both keep the wrapper's
+    // pane rules rather than reading as plugin-owned `Unknown`. A wrapper
+    // detected as another, unambiguous provider still answers through that alias.
+    if own == CustomOwnership::Custom && (!matches!(&own_claim, Ok(None)) || alias_claim.is_err()) {
         return None;
     }
     let (tool, plugin) = match own_claim {
@@ -1017,9 +1041,15 @@ pub fn respond(
         .context("provider integration is not enabled and approved")?;
     // The dialog may have opened while the plugin still owned this name. Only a
     // configuration that still leaves the name to the plugin may send keys.
+    let own = custom_ownership(instance, &instance.tool);
     ensure!(
-        custom_ownership(instance, &instance.tool) == CustomOwnership::Plugin,
-        "a custom program now runs this agent, so the provider integration does not own its replies"
+        own == CustomOwnership::Plugin,
+        "{} so the provider integration does not own its replies",
+        // An unreadable configuration may hide a custom program; say only that.
+        match own {
+            CustomOwnership::Custom => "a custom program now runs this agent",
+            _ => "the configuration is unreadable, so a custom program may now run this agent",
+        }
     );
     let current = read_report(&instance.id, &instance.tool, plugin)?
         .context("provider integration report is unavailable")?;
@@ -1805,6 +1835,10 @@ sandbox = "unsupported"
             .session
             .agent_detect_as
             .insert("own-agent".into(), "alias-agent".into());
+        config
+            .session
+            .agent_detect_as
+            .insert("unclaimed-agent".into(), "alias-agent".into());
         crate::tmux::status_rules::install_from_config("alias-ownership", &config);
         install_test_integration("acme.alias", "alias-agent");
         super::super::reload_registry();
@@ -1852,6 +1886,18 @@ sandbox = "unsupported"
         super::super::reload_registry();
         assert_eq!(
             owned_status(&instance, false),
+            Some((crate::session::Status::Unknown, false))
+        );
+
+        // Two claims on the detection alias leave a session whose own name no
+        // plugin claims owned but unreadable.
+        install_test_integration("acme.alias-two", "alias-agent");
+        super::super::reload_registry();
+        let mut wrapper = Instance::new("alias-ambiguity", "/tmp");
+        wrapper.tool = "unclaimed-agent".into();
+        wrapper.source_profile = "alias-ownership".into();
+        assert_eq!(
+            owned_status(&wrapper, false),
             Some((crate::session::Status::Unknown, false))
         );
     }
@@ -1944,6 +1990,26 @@ sandbox = "unsupported"
         );
         assert_eq!(owned_status(&instance, false), None);
         assert!(!replies_configured(&instance));
+
+        // An ambiguity on the detection alias alone leaves a readable wrapper
+        // its pane rules too, rather than reading as plugin-owned `Unknown`.
+        crate::session::update_config(|config| {
+            config
+                .session
+                .custom_agents
+                .insert("alias-shadow".into(), "/opt/custom/shadow --serve".into());
+        })
+        .unwrap();
+        let mut wrapper = Instance::new("custom-alias-ambiguous", "/tmp");
+        wrapper.tool = "alias-shadow".into();
+        wrapper.detect_as = "shadow-agent".into();
+        wrapper.source_profile = "custom-ambiguous".into();
+        wrapper.status = crate::session::Status::Running;
+        assert_eq!(
+            custom_ownership(&wrapper, "alias-shadow"),
+            CustomOwnership::Custom
+        );
+        assert_eq!(owned_status(&wrapper, false), None);
     }
 
     /// Repo config cannot select a custom command, so a malformed one must not
@@ -1955,7 +2021,6 @@ sandbox = "unsupported"
         let temp = tempfile::tempdir().unwrap();
         let _app = crate::session::test_support::isolate_app_dir_at(temp.path());
         let _featured = crate::session::test_support::EnvGuard::unset(&["AOE_FEATURED_INDEX_PATH"]);
-        crate::plugin::reload_registry();
         let project = temp.path().join("repo");
         std::fs::create_dir_all(project.join(".agent-of-empires")).unwrap();
         std::fs::write(project.join(".agent-of-empires/config.toml"), "[session\n").unwrap();
@@ -2029,6 +2094,50 @@ sandbox = "unsupported"
         assert!(
             error.to_string().contains("does not own its replies"),
             "the reply must be refused on ownership, got {error}"
+        );
+        assert!(
+            error
+                .to_string()
+                .contains("a custom program now runs this agent"),
+            "the refusal must name the custom program, got {error}"
+        );
+
+        // An unreadable configuration is not evidence of a custom program, and
+        // the refusal must say so rather than claim one runs the agent.
+        use std::os::unix::fs::PermissionsExt as _;
+        struct Restore<'a> {
+            path: &'a std::path::Path,
+            mode: u32,
+        }
+        impl Drop for Restore<'_> {
+            fn drop(&mut self) {
+                let _ =
+                    std::fs::set_permissions(self.path, std::fs::Permissions::from_mode(self.mode));
+            }
+        }
+        let config = crate::session::config::config_path().unwrap();
+        let mode = std::fs::metadata(&config).unwrap().permissions().mode();
+        std::fs::set_permissions(&config, std::fs::Permissions::from_mode(0o000)).unwrap();
+        let _restore = Restore {
+            path: &config,
+            mode,
+        };
+        if nix::unistd::geteuid().is_root() {
+            return;
+        }
+        let unreadable = respond(
+            &instance,
+            &retained,
+            AgentIntegrationResponse::Approval {
+                choice: IntegrationApprovalChoice::Allow,
+            },
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(
+            unreadable.contains("the configuration is unreadable")
+                && unreadable.contains("does not own its replies"),
+            "a config that cannot be read must not be called a custom program, got {unreadable}"
         );
     }
 
