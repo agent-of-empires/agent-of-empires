@@ -41,6 +41,19 @@ async function gateRoute(page: Page, url: string, json: unknown) {
   return { requested, release };
 }
 
+/** A built-in ACP agent the Import session tab offers. */
+const builtin = (name: string, acp_command: string) => ({
+  name,
+  kind: "builtin",
+  binary: name,
+  host_only: false,
+  installed: true,
+  install_hint: "",
+  acp_capable: true,
+  acp_installed: true,
+  acp_command,
+});
+
 /** A pick returns to the form, whose Project row names it. */
 async function expectSelected(page: Page, path: string) {
   await expect(wizard(page).getByTestId("wizard-project-row")).toContainText(path);
@@ -122,32 +135,55 @@ test.describe("project tabs", () => {
     await expect(page.getByLabel("Search projects")).toBeFocused();
   });
 
-  test("a projects retry does not take focus moved to Done", async ({ page }) => {
-    await mockBrowse(page, [{ name: "alpha" }]);
-    await startWizard(page);
-    let release!: () => void;
-    const gate = new Promise<void>((r) => (release = r));
-    let calls = 0;
-    await page.route("**/api/projects**", async (r) => {
-      if (++calls === 1) return r.fulfill({ status: 500, json: {} });
-      await gate;
-      await r.fulfill({ json: [{ name: "example", path: "/tmp/example", scope: "global" }] });
+  // Each tab's field remounts when a Retry reload finishes; `settled` waits until its focus effect has run.
+  const retryCases = [
+    {
+      tab: "Browse",
+      field: (page: Page) => page.getByPlaceholder("Type to filter..."),
+      // DirectoryBrowser requests from a microtask queued in the same effect flush as the focus guard.
+      settled: (page: Page) => page.waitForRequest("**/api/filesystem/**"),
+    },
+    {
+      tab: "Clone URL",
+      field: (page: Page) => page.locator("#clone-url"),
+      // Native autoFocus would run in the commit that mounts the field.
+      settled: (page: Page) => expect(page.locator("#clone-url")).toBeVisible(),
+    },
+    {
+      tab: "Import session",
+      field: (page: Page) => page.getByLabel("Agent to import from"),
+      // The picker lists sessions from the same effect flush as the focus guard.
+      settled: (page: Page) => page.waitForRequest("**/api/importable-sessions**"),
+    },
+  ];
+  for (const { tab, field, settled } of retryCases) {
+    test(`a projects retry on the ${tab} tab does not take focus moved to Done`, async ({ page }) => {
+      await mockBrowse(page, [{ name: "alpha" }]);
+      await page.route("**/api/importable-sessions**", (r) => r.fulfill({ json: { sessions: [], truncated: false } }));
+      await startWizard(page, { agents: [builtin("claude", "claude-agent-acp")] });
+      let release!: () => void;
+      const gate = new Promise<void>((r) => (release = r));
+      let calls = 0;
+      await page.route("**/api/projects**", async (r) => {
+        if (++calls === 1) return r.fulfill({ status: 500, json: {} });
+        await gate;
+        await r.fulfill({ json: [{ name: "example", path: "/tmp/example", scope: "global" }] });
+      });
+      await openPanel(page, "Project");
+      const w = wizard(page);
+      await w.getByRole("button", { name: tab, exact: true }).click();
+      await expect(field(page)).toBeFocused();
+      const retried = page.waitForRequest("**/api/projects**");
+      await w.getByRole("button", { name: "Retry" }).click();
+      await retried;
+      const done = w.getByRole("button", { name: "Done" });
+      await done.focus();
+      const reloaded = settled(page);
+      release();
+      await reloaded;
+      await expect(done).toBeFocused();
     });
-    await openPanel(page, "Project");
-    const w = wizard(page);
-    await w.getByRole("button", { name: "Browse", exact: true }).click();
-    await expect(page.getByPlaceholder("Type to filter...")).toBeFocused();
-    const retried = page.waitForRequest("**/api/projects**");
-    await w.getByRole("button", { name: "Retry" }).click();
-    await retried;
-    const done = w.getByRole("button", { name: "Done" });
-    await done.focus();
-    // DirectoryBrowser requests from a microtask queued in the same effect flush as the focus guard.
-    const browsed = page.waitForRequest("**/api/filesystem/**");
-    release();
-    await browsed;
-    await expect(done).toBeFocused();
-  });
+  }
 
   test("Clone tab gates the button on a non-blank URL and Advanced reveals destination + shallow", async ({ page }) => {
     await startWizard(page, { project: false });
@@ -312,18 +348,6 @@ test.describe("scratch sessions", () => {
 });
 
 test.describe("import session", () => {
-  const builtin = (name: string, acp_command: string) => ({
-    name,
-    kind: "builtin",
-    binary: name,
-    host_only: false,
-    installed: true,
-    install_hint: "",
-    acp_capable: true,
-    acp_installed: true,
-    acp_command,
-  });
-
   test("imports a pi session through the generic tab", async ({ page }) => {
     const importedProfiles: (string | null)[] = [];
     await page.route("**/api/importable-sessions**", (r) => {

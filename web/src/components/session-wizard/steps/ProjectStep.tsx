@@ -42,17 +42,19 @@ export function ProjectStep({
 
   const searchRef = useRef<HTMLInputElement>(null);
   const filterRef = useRef<HTMLInputElement>(null);
+  const cloneRef = useRef<HTMLInputElement>(null);
+  const importRef = useRef<HTMLSelectElement>(null);
   const opener = useRef(document.activeElement);
   const tabFocusRequested = useRef(false);
   // The fields mount only once projects load: focus them then, unless the user moved focus since the panel opened.
   // A tab click is explicit intent, so it focuses once regardless.
   useEffect(() => {
-    if (loading || !hasFinePointer()) return;
     const requested = tabFocusRequested.current;
     tabFocusRequested.current = false;
+    if (loading || !hasFinePointer()) return;
     const active = document.activeElement;
     if (!requested && active && active !== document.body && active !== opener.current) return;
-    (searchRef.current ?? filterRef.current)?.focus();
+    (searchRef.current ?? filterRef.current ?? cloneRef.current ?? importRef.current)?.focus();
   }, [loading, activeTab]);
 
   const normalizePath = (p: string) => p.replace(/\/+$/, "") || "/";
@@ -164,12 +166,13 @@ export function ProjectStep({
             profile={profile}
             onSelect={handleImportSelect}
             selectedSessionId={data.importAcpSessionId}
+            selectRef={importRef}
           />
         ) : (
           <p className="text-sm text-text-muted">Resolve the server profile or select a profile to import a session.</p>
         ))}
 
-      {!loading && activeTab === "clone" && <CloneRepoForm onCloned={selectPath} />}
+      {!loading && activeTab === "clone" && <CloneRepoForm onCloned={selectPath} inputRef={cloneRef} />}
 
       {!loading && activeTab === "scratch" && (
         <div className="space-y-3">
