@@ -2284,6 +2284,40 @@ Tips for getting started:
     }
 
     #[test]
+    fn approval_prompt_ignores_allow_and_approve_in_prose() {
+        let prose = "\
+The flag allows three retries, and the reviewer approved the plan.
+Writes are allowed once the lock is released.
+";
+        for agent in [
+            "antigravity",
+            "claude",
+            "codex",
+            "copilot",
+            "droid",
+            "gemini",
+            "qwen",
+        ] {
+            assert!(
+                !super::super::detect::rule_matches(agent, "approval_prompt", prose, "", None),
+                "{agent}"
+            );
+        }
+        let prompt_above_dialog =
+            format!(" > summarize the readme\n\n{GEMINI_FOLDER_TRUST_PROMPT}");
+        let d = super::super::detect::detect(
+            "gemini",
+            &prompt_above_dialog,
+            &Observation::new("", None, true),
+        )
+        .expect("gemini has a manifest");
+        assert_eq!(
+            (d.rule, d.status),
+            ("folder_trust_prompt", Some(Status::Waiting))
+        );
+    }
+
+    #[test]
     fn claude_prose_carrying_a_numbered_list_is_not_waiting() {
         let cases = [
             "\
