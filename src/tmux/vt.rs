@@ -4542,6 +4542,70 @@ mod tests {
         REGISTRY.lock().unwrap().remove(&name);
     }
 
+    /// #5694: a viewer still holding the pre-restart channel must not pin
+    /// sends to the pane that died with it.
+    #[test]
+    fn paste_after_recreate_reaches_the_new_pane_while_the_old_channel_is_held() {
+        if !crate::tmux::test_helpers::tmux_available() {
+            eprintln!("Skipping test: tmux not available");
+            return;
+        }
+        // Keeps the server up across the kill so the recreated pane gets a new id.
+        let keeper = crate::tmux::test_helpers::TmuxTestSession::new("aoe_test_vt_keeper");
+        let guard = crate::tmux::test_helpers::TmuxTestSession::new("aoe_test_vt_recreate");
+        let create = |name: &str| {
+            let mut args: Vec<String> = ["new-session", "-d", "-s", name, "cat"]
+                .iter()
+                .map(|arg| arg.to_string())
+                .collect();
+            crate::tmux::utils::append_pane_base_index_args(&mut args, name);
+            let output = crate::tmux::tmux_command()
+                .args(&args)
+                .output()
+                .expect("tmux new-session");
+            assert!(output.status.success());
+        };
+        create(keeper.name());
+        create(guard.name());
+        let old_pane = crate::tmux::test_helpers::only_pane_id(guard.name());
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (mut held, lifecycle) = dummy_channel(guard.name(), dir.path());
+        Arc::get_mut(&mut held).expect("unshared").target = old_pane.clone();
+        VtLifecycle::fail(&lifecycle);
+        REGISTRY
+            .lock()
+            .unwrap()
+            .insert(guard.name().to_string(), Arc::downgrade(&held));
+
+        let killed = crate::tmux::tmux_command()
+            .args(["kill-session", "-t", guard.name()])
+            .output()
+            .expect("tmux kill-session");
+        assert!(killed.status.success());
+        create(guard.name());
+        let new_pane = crate::tmux::test_helpers::only_pane_id(guard.name());
+        assert_ne!(old_pane, new_pane);
+
+        crate::tmux::Session::from_name(guard.name())
+            .paste_text("after-recreate")
+            .expect("paste must target the recreated pane");
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            let output = crate::tmux::tmux_command()
+                .args(["capture-pane", "-p", "-t", &new_pane])
+                .output()
+                .expect("tmux capture-pane");
+            if String::from_utf8_lossy(&output.stdout).contains("after-recreate") {
+                break;
+            }
+            assert!(Instant::now() < deadline, "paste never reached {new_pane}");
+            std::thread::sleep(Duration::from_millis(10));
+        }
+
+        REGISTRY.lock().unwrap().remove(guard.name());
+    }
+
     #[test]
     fn concurrent_acquire_for_one_session_serializes_without_deadlock() {
         // Two racing acquires for the same (nonexistent) session must both
