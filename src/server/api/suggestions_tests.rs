@@ -18,7 +18,7 @@ const MANIFEST: &str = r#"
 id = "acme.gh"
 name = "GitHub"
 version = "1.0.0"
-api_version = 22
+api_version = 23
 capabilities = ["runtime.worker"]
 
 [runtime]
