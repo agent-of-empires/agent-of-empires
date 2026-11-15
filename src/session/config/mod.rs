@@ -2843,6 +2843,12 @@ impl ServeConfig {
         }
     }
 
+    /// Like [`ServeConfig::load`], but propagates read and parse errors, for callers that act on
+    /// the result destructively. An absent config.toml still yields the defaults.
+    pub(crate) fn load_strict() -> Result<Self> {
+        Self::from_table(&Config::load_raw_table()?)
+    }
+
     fn from_table(table: &toml::Table) -> Result<Self> {
         let Some(serve) = table.get("serve") else {
             return Ok(Self::default());

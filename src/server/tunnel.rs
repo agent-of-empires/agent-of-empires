@@ -703,7 +703,7 @@ async fn tailscale_probe_with(
 /// The `tailscale funnel` arguments that turn off the Funnel on `https_port`. Without
 /// `--set-path` this removes every path on that port, so it only runs when the pre-flight found
 /// the port unused; `tailscale funnel reset` would clear every port.
-fn funnel_off_args(https_port: u16) -> [String; 3] {
+pub(crate) fn funnel_off_args(https_port: u16) -> [String; 3] {
     [
         "funnel".into(),
         format!("--https={https_port}"),
@@ -1047,7 +1047,7 @@ fn unreadable_funnel_status(https_port: u16) -> FunnelPreflight {
 }
 
 /// Clears every path on one port and leaves the others; `tailscale funnel reset` clears every port.
-fn funnel_off_command(https_port: u16) -> String {
+pub(crate) fn funnel_off_command(https_port: u16) -> String {
     format!("tailscale {}", funnel_off_args(https_port).join(" "))
 }
 
