@@ -1948,6 +1948,42 @@ sandbox = "unsupported"
         assert!(declared_agent(registry, "shadow-agent", std::iter::empty()).is_none());
     }
 
+    /// A configured custom agent names its own program, so the same name must not
+    /// resolve a declaration's launch or reply contract. The declared tool keeps it.
+    #[test]
+    #[serial_test::serial]
+    fn a_configured_custom_name_gets_no_plugin_declarations() {
+        let temp = tempfile::tempdir().unwrap();
+        let _reload = super::super::ReloadRegistryOnDrop;
+        let _env = crate::session::test_support::EnvGuard::set(&[
+            ("HOME", temp.path()),
+            ("XDG_CONFIG_HOME", temp.path()),
+            ("USERPROFILE", temp.path()),
+        ]);
+        let _featured = crate::session::test_support::EnvGuard::unset(&["AOE_FEATURED_INDEX_PATH"]);
+        install_test_integration("acme.wrapped-provider", "wrapped-tool");
+        super::super::reload_registry();
+
+        let instance = || {
+            let mut instance = Instance::new("custom-name", temp.path().to_str().unwrap());
+            instance.tool = "wrapped-tool".into();
+            instance
+        };
+
+        // The declared tool resolves the approved declaration.
+        assert!(instance().declared_agent().is_some());
+
+        // A configured custom agent of the same name does not.
+        crate::session::update_config(|config| {
+            config.session.custom_agents.insert(
+                "wrapped-tool".into(),
+                "/opt/wrappers/wrapped --serve".into(),
+            );
+        })
+        .unwrap();
+        assert!(instance().declared_agent().is_none());
+    }
+
     /// Two approved providers make the own-name claim ambiguous. A readable
     /// custom selection still owns its program, so ambiguity must not hand it to
     /// the plugins and report `Unknown` over the wrapper's pane rules.
