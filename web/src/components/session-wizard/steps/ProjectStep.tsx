@@ -39,16 +39,21 @@ export function ProjectStep({
   const { loading, error, retry, registryAvailable, saved, query, setQuery, filteredSaved, filteredRecent, hasPicks } =
     useProjectPicker(profile);
   const activeTab: Tab = manualTab ?? (!loading && !hasPicks ? "browse" : "recent");
-  const [tabClicked, setTabClicked] = useState(false);
 
   const searchRef = useRef<HTMLInputElement>(null);
   const filterRef = useRef<HTMLInputElement>(null);
-  // The fields mount only once projects load, so focus then unless the user already focused something.
+  const opener = useRef(document.activeElement);
+  const tabFocusRequested = useRef(false);
+  // The fields mount only once projects load: focus them then, unless the user moved focus since the panel opened.
+  // A tab click is explicit intent, so it focuses once regardless.
   useEffect(() => {
     if (loading || !hasFinePointer()) return;
-    if (document.activeElement && document.activeElement !== document.body) return;
+    const requested = tabFocusRequested.current;
+    tabFocusRequested.current = false;
+    const active = document.activeElement;
+    if (!requested && active && active !== document.body && active !== opener.current) return;
     (searchRef.current ?? filterRef.current)?.focus();
-  }, [loading]);
+  }, [loading, activeTab]);
 
   const normalizePath = (p: string) => p.replace(/\/+$/, "") || "/";
 
@@ -111,8 +116,9 @@ export function ProjectStep({
               key={tab.id}
               type="button"
               onClick={() => {
+                if (tab.id === activeTab) return;
                 setManualTab(tab.id);
-                setTabClicked(true);
+                tabFocusRequested.current = true;
               }}
               className={`px-3 py-2 text-sm whitespace-nowrap cursor-pointer transition-colors border-b-2 -mb-px ${
                 activeTab === tab.id
@@ -143,14 +149,11 @@ export function ProjectStep({
           isSelected={(path) => !data.scratch && data.path === path}
           onSelect={(path) => selectPath(path)}
           emptyMessage="No projects match that search. Try the Browse tab."
-          autoFocus={tabClicked && hasFinePointer()}
           inputRef={searchRef}
         />
       )}
 
-      {!loading && activeTab === "browse" && (
-        <DirectoryBrowser onSelect={selectPath} autoFocus={tabClicked && hasFinePointer()} inputRef={filterRef} />
-      )}
+      {!loading && activeTab === "browse" && <DirectoryBrowser onSelect={selectPath} inputRef={filterRef} />}
 
       {!loading &&
         activeTab === "import" &&

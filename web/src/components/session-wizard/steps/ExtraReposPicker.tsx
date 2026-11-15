@@ -117,10 +117,12 @@ export function ExtraReposPicker({
 
   const pathRef = useRef<HTMLInputElement>(null);
   const searchRef = useRef<HTMLInputElement>(null);
-  // The search box only exists once projects load, so pick the target then, unless the user already focused something.
+  const opener = useRef(document.activeElement);
+  // The search box only exists once projects load, so pick the target then, unless the user moved focus since opening.
   useEffect(() => {
     if (loading || !hasFinePointer()) return;
-    if (document.activeElement && document.activeElement !== document.body) return;
+    const active = document.activeElement;
+    if (active && active !== document.body && active !== opener.current) return;
     (searchRef.current ?? pathRef.current)?.focus();
   }, [loading]);
 

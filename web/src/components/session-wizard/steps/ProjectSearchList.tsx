@@ -23,7 +23,6 @@ interface Props {
   onSelect: (path: string) => void;
   /** Shown when a query matches nothing in either list. */
   emptyMessage?: string;
-  autoFocus?: boolean;
   inputRef?: Ref<HTMLInputElement>;
 }
 
@@ -36,7 +35,6 @@ export function ProjectSearchList({
   isSelected,
   onSelect,
   emptyMessage = "No projects match that search.",
-  autoFocus = false,
   inputRef,
 }: Props) {
   return (
@@ -44,7 +42,6 @@ export function ProjectSearchList({
       <input
         ref={inputRef}
         type="text"
-        autoFocus={autoFocus}
         value={query}
         onChange={(e) => onQueryChange(e.target.value)}
         placeholder="Search projects by name or path"
