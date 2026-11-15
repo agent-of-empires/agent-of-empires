@@ -134,6 +134,19 @@ pub struct AgentInfo {
     /// deprecated badge in the wizard picker and switch-agent modal.
     #[serde(skip_serializing_if = "crate::agents::AgentLifecycle::is_active")]
     pub lifecycle: crate::agents::AgentLifecycle,
+    /// Resolved binary on the daemon's PATH, for installed built-in agents.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub path: Option<String>,
+    /// Command that installs the ACP adapter, when it is missing and known.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub acp_install_command: Option<String>,
+}
+
+/// The install command for an ACP adapter, keyed on its binary name since the
+/// registry command may be a data-dir path (`aoe-agent`).
+fn adapter_install_command(acp_command: Option<&str>) -> Option<String> {
+    let binary = std::path::Path::new(acp_command?).file_name()?.to_str()?;
+    crate::acp::install_hints::install_hint_for(binary).map(str::to_string)
 }
 
 /// Resolve the acp launch command + args for a built-in agent from
@@ -209,6 +222,8 @@ fn build_custom_agent_infos(
                 // serialized here; they can hold hostnames or secrets.
                 acp_command: None,
                 acp_args: Vec::new(),
+                path: None,
+                acp_install_command: None,
             }
         })
         .collect();
@@ -282,6 +297,7 @@ pub async fn list_agents(
         let data_dir = crate::session::get_app_dir().ok();
         let mut agents = crate::agents::AGENTS
             .iter()
+            .chain(crate::plugin::bundled_agents::available())
             .map(|a| {
                 let (acp_command, acp_args) =
                     acp_command_fields(acp_registry.get(a.name), data_dir.as_deref());
@@ -305,6 +321,8 @@ pub async fn list_agents(
                     acp_allowed: policy.allows(a.name),
                     acp_command,
                     acp_args,
+                    path: None,
+                    acp_install_command: None,
                 }
             })
             .collect::<Vec<_>>();
@@ -318,18 +336,47 @@ pub async fn list_agents(
                 .map(|(name, _)| name.as_str()),
         );
         for integration in plugin_agents {
+            // A host-owned adapter outlives the takeover: `omp acp` is still
+            // registered even while a declaration provides the tool, so the row
+            // keeps the adapter fields the builtin row would report. Selection
+            // stays keyed on the bundled identity, not the plugin-chosen name.
+            let adapter = crate::plugin::bundled_agents::contains(integration.tool)
+                .then(|| acp_registry.get(integration.tool))
+                .flatten();
+            let (acp_command, acp_args) = acp_command_fields(adapter, data_dir.as_deref());
+            let acp_capable = adapter.is_some();
+            let launch = registry
+                .get(integration.plugin)
+                .and_then(|owner| {
+                    owner
+                        .manifest
+                        .agent_integrations
+                        .iter()
+                        .find(|entry| entry.tool == integration.tool)
+                })
+                .and_then(|entry| entry.launch.as_ref());
             agents.push(AgentInfo {
                 kind: "plugin".to_string(),
                 name: integration.tool.to_string(),
                 display_name: integration.tool.to_string(),
-                binary: integration.tool.to_string(),
-                host_only: false,
-                always_yolo: crate::acp::runs_always_yolo(
-                    integration.tool,
-                    crate::session::View::Terminal,
-                    agent_acp_cmd,
-                    agent_detect_as,
-                ),
+                binary: aoe_plugin_api::agent_integration::launch_prefix(integration.command)
+                    .and_then(|(prefix, _)| prefix.last().map(|word| (*word).to_owned()))
+                    .unwrap_or_else(|| integration.tool.to_owned()),
+                host_only: launch.is_some_and(|launch| launch.host_only),
+                // A launch declaration decides this itself, matching the new-session
+                // dialog. Only an agent without one inherits the built-in it aliases.
+                always_yolo: match launch {
+                    Some(launch) => matches!(
+                        launch.yolo.as_ref(),
+                        Some(aoe_plugin_api::agent_integration::AgentYoloDeclaration::Always)
+                    ),
+                    None => crate::acp::runs_always_yolo(
+                        integration.tool,
+                        crate::session::View::Terminal,
+                        agent_acp_cmd,
+                        agent_detect_as,
+                    ),
+                },
                 acp_always_yolo: crate::acp::runs_always_yolo(
                     integration.tool,
                     crate::session::View::Structured,
@@ -337,15 +384,22 @@ pub async fn list_agents(
                     agent_detect_as,
                 ),
                 installed: available.iter().any(|name| name == integration.tool),
-                install_hint: format!("Provided by AoE plugin {}", integration.plugin),
-                oneshot_capable: false,
-                acp_capable: false,
+                install_hint: launch
+                    .and_then(|launch| launch.install_hint.clone())
+                    .unwrap_or_else(|| format!("Provided by AoE plugin {}", integration.plugin)),
+                // The oneshot gate rejects a shell tail, so do not offer it here.
+                oneshot_capable: launch.is_some_and(|launch| launch.oneshot_flag.is_some())
+                    && aoe_plugin_api::agent_integration::direct_launch_words(integration.command)
+                        .is_some(),
+                acp_capable,
                 acp_installed: false,
                 acp_create_ready: false,
                 acp_allowed: policy.allows(integration.tool),
-                acp_command: None,
-                acp_args: Vec::new(),
+                acp_command,
+                acp_args,
                 lifecycle: crate::agents::AgentLifecycle::Active,
+                path: None,
+                acp_install_command: None,
             });
         }
         agents.extend(build_custom_agent_infos(
@@ -367,13 +421,19 @@ pub async fn list_agents(
         });
         // Without a project only the profile's hooks can run, as for scratch.
         let hooks_apply = || match project.as_deref() {
-            Some(path) => preparation_hooks_apply(&config.hooks, path, false, None),
-            None => preparation_hooks_apply(&config.hooks, std::path::Path::new(""), true, None),
+            Some(path) => preparation_hooks_apply(&config.hooks, path, false, None, false),
+            None => {
+                preparation_hooks_apply(&config.hooks, std::path::Path::new(""), true, None, false)
+            }
         };
         for agent in agents.iter_mut() {
             if agent.acp_capable {
                 agent.acp_installed =
                     adapter_installed(&agent.name, &config, &host_environment, &|| false);
+                if !agent.acp_installed {
+                    agent.acp_install_command =
+                        adapter_install_command(agent.acp_command.as_deref());
+                }
             }
             // Every row, since the repository may give a profile-terminal agent an ACP base.
             agent.acp_create_ready = adapter_installed(
@@ -382,6 +442,14 @@ pub async fn list_agents(
                 create_environment.as_deref().unwrap_or(&host_environment),
                 &hooks_apply,
             );
+        }
+        for agent in agents
+            .iter_mut()
+            .filter(|a| a.kind == "builtin" && a.installed)
+        {
+            agent.path = which::which(&agent.binary)
+                .ok()
+                .map(|p| p.display().to_string());
         }
         agents
     })
@@ -3746,6 +3814,28 @@ mod tests {
         }
     }
 
+    #[test]
+    fn adapter_install_command_resolves_by_binary_name() {
+        for (command, expected) in [
+            (
+                Some("codex-acp"),
+                Some("npm install -g @agentclientprotocol/codex-acp@latest"),
+            ),
+            (
+                Some("/data/aoe/bin/aoe-agent"),
+                Some("aoe acp doctor --fix --adapter aoe-agent"),
+            ),
+            (Some("unknown-acp"), None),
+            (None, None),
+        ] {
+            assert_eq!(
+                adapter_install_command(command).as_deref(),
+                expected,
+                "{command:?}"
+            );
+        }
+    }
+
     /// The wizard names the runtime that isn't running, so it's reported
     /// whether or not it's available.
     #[tokio::test]
@@ -3807,6 +3897,79 @@ mod tests {
             panic!("an unknown profile must not list agents");
         };
         assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    }
+
+    /// A declaration that takes over a bundled agent replaces its launch command,
+    /// not the ACP adapter the host registered for that identity, so the row
+    /// still reports `omp acp`. A plugin naming any other tool has no adapter
+    /// and must not advertise one.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn a_plugin_row_reports_only_the_adapter_the_host_registered() {
+        // Declared first so it reloads after the app directory is restored.
+        let _reload = crate::plugin::ReloadRegistryOnDrop;
+        let _home = crate::session::test_support::isolate_app_dir();
+        let manifest = r#"
+id = "acme.takeover"
+name = "Takeover"
+version = "1.0.0"
+api_version = 21
+
+[[agent_integrations]]
+tool = "omp"
+command = "omp --takeover"
+[agent_integrations.launch]
+instruction_flag = "--prompt={}"
+
+[[agent_integrations]]
+tool = "zzzeta"
+command = "zzzeta"
+"#;
+        let dir = crate::plugin::plugins_dir().unwrap().join("acme.takeover");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("aoe-plugin.toml"), manifest).unwrap();
+        crate::session::update_config(|config| {
+            config.plugins.insert(
+                "acme.takeover".into(),
+                crate::session::PluginConfig {
+                    grant: Some(crate::session::CapabilityGrant {
+                        manifest_hash: aoe_plugin_api::PluginManifest::hash_bytes(
+                            manifest.as_bytes(),
+                        ),
+                        capabilities: Vec::new(),
+                        granted_at: chrono::Utc::now(),
+                    }),
+                    ..Default::default()
+                },
+            );
+        })
+        .unwrap();
+        crate::plugin::reload_registry();
+        crate::session::create_profile("default").unwrap();
+        let state = crate::server::test_support::build_test_app_state(Vec::new());
+        crate::server::test_support::refresh_canonical_metadata_for_test(&state).await;
+        let Ok(Json(agents)) =
+            list_agents(State(state), axum::extract::Query(AgentsQuery::default())).await
+        else {
+            panic!("list_agents failed");
+        };
+
+        let takeover = agents
+            .iter()
+            .find(|agent| agent.name == "omp")
+            .expect("the declared tool is listed");
+        assert_eq!(takeover.kind, "plugin");
+        assert!(takeover.acp_capable);
+        assert_eq!(takeover.acp_command.as_deref(), Some("omp"));
+        assert_eq!(takeover.acp_args, vec!["acp".to_string()]);
+
+        let foreign = agents
+            .iter()
+            .find(|agent| agent.name == "zzzeta")
+            .expect("the plugin row is listed");
+        assert!(!foreign.acp_capable);
+        assert!(foreign.acp_command.is_none());
+        assert!(foreign.acp_args.is_empty());
     }
 
     /// Both fields follow the structured create check, so a custom agent counts when its

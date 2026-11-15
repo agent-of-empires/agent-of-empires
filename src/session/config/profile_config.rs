@@ -174,8 +174,15 @@ pub fn apply_cityhall_overrides(config: &mut Config) {
     config.worktree.enabled = true;
 }
 
+#[cfg(test)]
+thread_local! {
+    pub(crate) static RESOLVES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
 /// Load effective config for a profile (global + profile overrides merged)
 pub fn resolve_config(profile: &str) -> Result<Config> {
+    #[cfg(test)]
+    RESOLVES.with(|n| n.set(n.get() + 1));
     let global = Config::load()?;
     let profile_config = load_profile_config(profile)?;
     let mut config = merge_configs(global, &profile_config);

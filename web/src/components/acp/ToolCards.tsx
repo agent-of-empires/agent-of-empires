@@ -2,7 +2,6 @@
 
 import type { ReactNode } from "react";
 
-import { parseJsonObject, pickStr } from "../../lib/acpArgs";
 import type { ActivityRow, ToolCall } from "../../lib/acpTypes";
 import { useAgentProfile } from "../../lib/agentProfileContext";
 import type { AgentProfile, CardKind } from "../../lib/agentProfiles";
@@ -42,7 +41,7 @@ import { ToolOutputMedia } from "./ToolOutputMedia";
 interface Props {
   tool: ToolCall;
   result?: ActivityRow;
-  /** Inside a SubagentCard, whose border already shows the linkage, so skip the subagent wrap. */
+  /** Inside a SubagentCard, so never the child's own launch card. */
   nested?: boolean;
 }
 
@@ -66,13 +65,7 @@ export function ToolCard({ tool, result, nested }: Props) {
     ) : (
       card
     );
-  const wrapped =
-    !nested && pickStr(parseJsonObject(tool.args_preview), "_aoe_parent_tool_call_id") ? (
-      <SubagentChildWrap>{content}</SubagentChildWrap>
-    ) : (
-      content
-    );
-  return <ToolIdProvider id={tool.id}>{wrapped}</ToolIdProvider>;
+  return <ToolIdProvider id={tool.id}>{content}</ToolIdProvider>;
 }
 
 const KIND_CARDS: Record<string, (props: { tool: ToolCall; result?: ActivityRow }) => ReactNode> = {
@@ -125,16 +118,4 @@ function resolveEffectiveKind(tool: ToolCall, reclassifiedKind: string, profile:
     if (aliases.includes(name)) return card;
   }
   return reclassifiedKind;
-}
-
-function SubagentChildWrap({ children }: { children: ReactNode }) {
-  return (
-    <div className="border-l-2 border-accent-600/60 pl-2 ml-1">
-      <div className="mb-0.5 inline-flex items-center gap-1 text-[10px] uppercase tracking-wider text-accent-600">
-        <span>↳</span>
-        <span>subagent</span>
-      </div>
-      {children}
-    </div>
-  );
 }

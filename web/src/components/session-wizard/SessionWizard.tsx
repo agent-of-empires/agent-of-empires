@@ -54,7 +54,7 @@ import { SandboxPanel } from "./steps/SandboxPanel";
 import { ProfilePresetPicker } from "./steps/ProfilePresetPicker";
 import { GroupCombobox } from "./steps/GroupCombobox";
 import { CreateFailureBox } from "./CreateFailureBox";
-import { failureView, type FailureAction } from "./createFailureView";
+import { failureFields, failureView, type FailureAction } from "./createFailureView";
 import { CreateProgressView } from "./CreateProgressView";
 import { FieldRow, NavRow, PanelHeader, ROW_INPUT, RowGroup, SegmentedRow, SwitchRow } from "./WizardRows";
 import { LaunchFooter } from "./LaunchFooter";
@@ -62,6 +62,11 @@ import { agentsView, initialData, reducer, type WizardData } from "./wizardReduc
 import { buildCreateRequest, launchEligible } from "./createRequest";
 import { commandMapsFromSettings, EMPTY_COMMAND_MAPS, type CommandMaps } from "./commandMaps";
 import { profileDefaults, type ProfileDefaults } from "./profileDefaults";
+import { useSandboxImageRowStatus } from "./useSandboxImageRowStatus";
+import { useLatestRef } from "../../hooks/useLatestRef";
+import { PULL_GATED_HINT, PULL_LATEST_HINT, pullLatestChecked, pullLatestOffer } from "./pullLatestImage";
+import { CopyCommand } from "../SandboxImageBanner";
+import { notifySandboxImagePulled } from "../../lib/sandboxImageEvents";
 
 // Validated against ACP_CAPABLE_TOOLS on read, since another install may have written it.
 const LAST_USED_TOOL_KEY = "aoe-acp-last-tool";
@@ -100,7 +105,8 @@ function initialWizardData(prefill: WizardPrefill | undefined, nameOnly: boolean
   if (!prefill) return base;
   return {
     ...base,
-    path: prefill.scratch ? "" : prefill.path || "",
+    // A prefill without a path (group-only) keeps the remembered project; a tab-only one opens the picker.
+    path: prefill.scratch ? "" : prefill.path || (prefill.initialTab ? "" : base.path),
     tool: prefill.tool || base.tool,
     yoloMode: prefill.yoloMode ?? false,
     sandboxEnabled: prefill.sandboxEnabled ?? false,
@@ -166,6 +172,34 @@ function waitUntilVisible(): Promise<void> {
   });
 }
 
+/** Below these summary widths the lead (cue and status) leaves the image no room, so it takes its own line.
+ *  The longest lead is 159px without a cue and 260px with one, plus about 64px for the image. */
+const STACK_UNDER = {
+  status: { row: "@max-[14rem]:flex-col", lead: "@max-[14rem]:whitespace-normal", sep: "@max-[14rem]:hidden" },
+  cue: { row: "@max-[21rem]:flex-col", lead: "@max-[21rem]:whitespace-normal", sep: "@max-[21rem]:hidden" },
+};
+
+/** The failure cue and status stay whole and only the image truncates, so a narrow row still says what
+ *  went wrong and whether to update. Sized by the summary's width, not the viewport. */
+function SandboxImageSummary({ cue, status, image }: { cue: string | null; status: string | null; image: string }) {
+  const stack = cue ? STACK_UNDER.cue : STACK_UNDER.status;
+  return (
+    <span className="@container block min-w-0">
+      <span className={`flex min-w-0 ${stack.row}`}>
+        {(cue || status) && (
+          <span data-testid="sandbox-image-status" className={`shrink-0 whitespace-pre ${stack.lead}`}>
+            {cue && <span className="text-status-error">{cue}</span>}
+            {cue && status && " · "}
+            {status}
+            <span className={stack.sep}> · </span>
+          </span>
+        )}
+        <span className="min-w-0 truncate">{image || "default image"}</span>
+      </span>
+    </span>
+  );
+}
+
 /** Worktree row summary: branch name, attach mode and base. */
 function worktreeSummary(data: WizardData): string {
   const name = data.worktreeBranch.trim() || "auto";
@@ -180,6 +214,8 @@ const basename = (path: string) => path.replace(/\/+$/, "").split("/").pop() || 
 export interface WizardRestore {
   data: WizardData;
   failure: CreateFailure;
+  /** The create's last progress snapshot, for a failed hook's output tail. */
+  progress?: CreateProgress | null;
 }
 
 interface Props {
@@ -188,7 +224,7 @@ interface Props {
   /** A create the user sent to the background finished; the wizard is already closed. */
   onCreatedInBackground?: (session?: SessionResponse) => void;
   /** Reopens the wizard on a background create's failure, from its toast. */
-  onReopenFailure?: (restore: WizardRestore) => void;
+  onReopenFailure?: (restore: WizardRestore) => boolean | void;
   /** Opens on this failure and form instead of the prefill and profile defaults. */
   restore?: WizardRestore;
   prefill?: WizardPrefill;
@@ -237,9 +273,36 @@ export function SessionWizard({
   const [runtimeDown, setRuntimeDown] = useState(false);
   const [rechecking, setRechecking] = useState(false);
   const viewGroupRef = useRef<HTMLDivElement>(null);
+  const pullLatestRef = useRef<HTMLDivElement>(null);
+  // The failure box grows the footer and shrinks the form above it; keep the pull box it blames in view.
+  useEffect(() => {
+    if (state.failure && failureFields(state.failure).includes("pullLatestImage"))
+      pullLatestRef.current?.scrollIntoView({ block: "nearest" });
+  }, [state.failure]);
   const offline = useServerDown();
-  const [progress, setProgress] = useState<CreateProgress | null>(null);
-  const [progressKey, setProgressKey] = useState<string | null>(null);
+  const [progress, setProgress] = useState<CreateProgress | null>(restore?.progress ?? null);
+  // The latest snapshot, which a backgrounded create keeps polling once the wizard is gone.
+  const lastProgressRef = useRef<CreateProgress | null>(null);
+  // Polls can overlap, so a response older than the last one accepted is dropped.
+  const progressSeqRef = useRef({ sent: 0, accepted: 0 });
+  const fetchNewerProgress = async (key: string) => {
+    const seq = ++progressSeqRef.current.sent;
+    const p = await fetchCreateProgress(key);
+    if (!p || seq <= progressSeqRef.current.accepted) return null;
+    progressSeqRef.current.accepted = seq;
+    return p;
+  };
+  const backgroundPollRef = useRef<ReturnType<typeof setInterval> | null>(null);
+  const stopBackgroundPoll = () => {
+    if (backgroundPollRef.current) clearInterval(backgroundPollRef.current);
+    backgroundPollRef.current = null;
+  };
+  const [progressKey, setProgressKeyState] = useState<string | null>(null);
+  const progressKeyRef = useRef<string | null>(null);
+  const setProgressKey = (key: string | null) => {
+    progressKeyRef.current = key;
+    setProgressKeyState(key);
+  };
   const [showProgress, setShowProgress] = useState(false);
   // A create whose response never arrived; Launch and reconnects retry it under its key.
   // Seeded from a create an earlier wizard left unresolved, so Launch retries it under its key.
@@ -473,8 +536,10 @@ export function SessionWizard({
     let cancelled = false;
     const delay = setTimeout(() => !cancelled && setShowProgress(true), PROGRESS_DELAY_MS);
     const poll = setInterval(() => {
-      void fetchCreateProgress(progressKey).then((p) => {
-        if (!cancelled && p) setProgress(p);
+      void fetchNewerProgress(progressKey).then((p) => {
+        if (cancelled || !p) return;
+        lastProgressRef.current = p;
+        setProgress(p);
       });
     }, PROGRESS_POLL_MS);
     return () => {
@@ -593,6 +658,15 @@ export function SessionWizard({
   const runCreate = async (body: CreateSessionRequest, tool: string, resume?: PendingCreate, sent?: WizardData) => {
     // The last snapshot outlives the request: a failed hook's output tail comes from it.
     setProgress(null);
+    lastProgressRef.current = null;
+    try {
+      await sendCreate(body, tool, resume, sent);
+    } finally {
+      stopBackgroundPoll();
+    }
+  };
+
+  const sendCreate = async (body: CreateSessionRequest, tool: string, resume?: PendingCreate, sent?: WizardData) => {
     // A create can be sent twice: once, then again after a review that asks for no trust.
     for (let resend = 0; ; resend++) {
       setUnknownOutcome(null);
@@ -655,12 +729,13 @@ export function SessionWizard({
         safeSetItem(LAST_USED_INSTRUCTION_KEY, body.custom_instruction ?? "");
         if (body.path.startsWith("/")) safeSetItem(LAST_USED_PROJECT_KEY, body.path);
         for (const w of result.session?.warnings ?? []) toastBus.handler?.error(w);
+        if (body.pull_latest_image) notifySandboxImagePulled();
         if (background) onCreatedInBackground?.(result.session);
         else onCreated(result.session);
       } else if (background) {
         const failure = result.failure;
         if (failure && onReopenFailure && sent) {
-          const restored = { data: sent, failure };
+          const restored = { data: sent, failure, progress: lastProgressRef.current };
           const { title } = failureView(failure, { sandboxEnabled: restored.data.sandboxEnabled, runtimeDown: false });
           const reference = failure.reference ? ` Reference ${failure.reference.slice(0, 8)}… · in debug.log` : "";
           toastBus.handler?.action(`Session was not created: ${title}.${reference}`, "Reopen", () =>
@@ -693,7 +768,12 @@ export function SessionWizard({
   };
 
   // `overrides` and `runtimeUp` were dispatched in the same event, which `state` doesn't hold yet.
-  const handleSubmit = async (overrides: Partial<WizardData> = {}, runtimeUp = false) => {
+  // `skipOnCreate` stays out of the form, so a reopened or later Launch runs setup again.
+  const handleSubmit = async (
+    overrides: Partial<WizardData> = {},
+    runtimeUp = false,
+    { skipOnCreate = false }: { skipOnCreate?: boolean } = {},
+  ) => {
     dispatch({ type: "SUBMIT_START" });
     setRuntimeDown(false);
     if (unknownOutcome) {
@@ -719,6 +799,7 @@ export function SessionWizard({
           agents.find((a) => a.name === d.tool),
           d,
         ),
+        { skipOnCreate, pullLatest: pullLatestChecked(pullOfferRef.current, d.pullLatestImage) },
       ),
       idempotency_key: newIdempotencyKey(),
     };
@@ -745,6 +826,15 @@ export function SessionWizard({
     return () => {
       backgroundRef.current = true;
       unmountedRef.current = true;
+      // A create still in flight reports its failure later, so keep its output tail current.
+      const key = progressKeyRef.current;
+      if (key) {
+        backgroundPollRef.current = setInterval(() => {
+          void fetchNewerProgress(key).then((p) => {
+            if (p && backgroundPollRef.current) lastProgressRef.current = p;
+          });
+        }, PROGRESS_POLL_MS);
+      }
       if (unknownOutcomeRef.current) releasePendingCreate(unknownOutcomeRef.current.body.idempotency_key);
     };
   }, []);
@@ -833,8 +923,17 @@ export function SessionWizard({
       case "choose_project":
         setPanel("project");
         return;
+      case "launch_with_current_image":
+        handleChange("pullLatestImage", false);
+        await handleSubmit({ pullLatestImage: false });
+        return;
       case "try_again":
         await handleSubmit();
+        return;
+      case "create_without_setup":
+        // A new key: the server answers a reused key with the failed create's stored result.
+        await handleSubmit({}, false, { skipOnCreate: true });
+        return;
     }
   };
 
@@ -844,7 +943,9 @@ export function SessionWizard({
   };
 
   const d = state.data;
-  const failed = state.failure && failureView(state.failure, { sandboxEnabled: d.sandboxEnabled, runtimeDown });
+  const failed =
+    state.failure &&
+    failureView(state.failure, { sandboxEnabled: d.sandboxEnabled, runtimeDown, canSkipSetup: !nameOnly });
   // A scratch session has no project whose overrides could be unknown.
   const projectUnresolved = registryUnresolved && !d.scratch && !d.importAcpSessionId;
   // Only the Yolo row needs the agent list, and a name-only form has none.
@@ -857,7 +958,8 @@ export function SessionWizard({
   const resendBlocked = (action: FailureAction) => {
     if (action === "change_image" || action === "choose_project") return false;
     // Retry checks the runtime itself, and Launch without Sandbox doesn't need it.
-    return !canResend || (action === "try_again" && d.sandboxEnabled && !state.dockerChecked);
+    const resendsSandbox = action === "try_again" || action === "create_without_setup";
+    return !canResend || (resendsSandbox && d.sandboxEnabled && !state.dockerChecked);
   };
   const selectedAgent = agents.find((a) => a.name === d.tool);
   const acpCapable = isAcpEligible(d.tool, selectedAgent);
@@ -873,11 +975,18 @@ export function SessionWizard({
       : isHostOnly
         ? hostOnlyReason
         : null;
+  const sandboxCue = failed?.row === "sandbox" ? failed.cue : null;
   const sandboxBlocked = isHostOnly
     ? hostOnlyReason
     : !state.dockerAvailable
       ? `${state.dockerRuntimeName ?? "Container runtime"} is not running`
       : null;
+  const imageStatus = useSandboxImageRowStatus(d.sandboxImage, defaultsReady && d.sandboxEnabled && !sandboxBlocked);
+  const pullOffer = pullLatestOffer(imageStatus?.reply, {
+    sandbox: d.sandboxEnabled && !sandboxBlocked,
+    structured: structuredOn,
+  });
+  const pullOfferRef = useLatestRef(pullOffer);
   // Locked on without touching the stored value, so another agent gets it back.
   const alwaysYolo = (structuredOn ? selectedAgent?.acp_always_yolo : selectedAgent?.always_yolo) === true;
   const agentCustomized = !!(d.extraArgs || d.commandOverride || d.customInstruction);
@@ -1077,10 +1186,14 @@ export function SessionWizard({
           disabled={!!sandboxBlocked && !d.sandboxEnabled}
           highlight={failed?.row === "sandbox" ? "error" : undefined}
           summary={
-            <>
-              {failed?.row === "sandbox" && <span className="text-status-error">{failed.cue} · </span>}
-              {sandboxBlocked ?? (d.sandboxEnabled ? d.sandboxImage || "default image" : "run on the host")}
-            </>
+            sandboxBlocked == null && d.sandboxEnabled ? (
+              <SandboxImageSummary cue={sandboxCue} status={imageStatus?.label ?? null} image={d.sandboxImage} />
+            ) : (
+              <>
+                {sandboxCue && <span className="text-status-error">{sandboxCue} · </span>}
+                {sandboxBlocked ?? "run on the host"}
+              </>
+            )
           }
           onConfigure={!sandboxBlocked && d.sandboxEnabled ? openPanel("sandbox") : undefined}
         />
@@ -1093,6 +1206,33 @@ export function SessionWizard({
           />
         </FieldRow>
       </RowGroup>
+      {pullOffer && (
+        <div ref={pullLatestRef} className="mt-3 flex flex-col gap-1" data-testid="wizard-pull-latest">
+          <label className={`flex items-center gap-2 ${pullOffer.command ? "" : "cursor-pointer"}`}>
+            <input
+              type="checkbox"
+              className="accent-brand-600"
+              checked={pullLatestChecked(pullOffer, d.pullLatestImage)}
+              disabled={!!pullOffer.command}
+              onChange={(e) => handleChange("pullLatestImage", e.target.checked)}
+              aria-describedby="wizard-pull-latest-hint"
+            />
+            <span className={`text-sm ${pullOffer.command ? "text-text-dim" : "text-text-secondary"}`}>
+              Pull latest image first
+            </span>
+          </label>
+          <div id="wizard-pull-latest-hint" className="pl-6 text-xs text-text-secondary" aria-live="polite">
+            {pullOffer.command ? (
+              <>
+                <CopyCommand command={pullOffer.command} />
+                <span className="block">{PULL_GATED_HINT}</span>
+              </>
+            ) : (
+              PULL_LATEST_HINT
+            )}
+          </div>
+        </div>
+      )}
     </div>
   );
 

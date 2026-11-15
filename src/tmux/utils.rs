@@ -294,6 +294,26 @@ pub(crate) fn first_pane_id_with_deadline(
         .next()
 }
 
+/// An empty tmux server answers session-scoped commands with `no current
+/// target`; a successful `list-sessions` that omits `name` proves absence.
+fn no_current_target_proves_absent(
+    stderr: &str,
+    name: &str,
+    deadline: &crate::tmux::TmuxCommandDeadline,
+) -> bool {
+    stderr
+        .lines()
+        .any(|line| line.trim() == "no current target")
+        && deadline
+            .run(crate::tmux::tmux_query_command().args(["list-sessions", "-F", "#{session_name}"]))
+            .is_ok_and(|inventory| {
+                inventory.status.success()
+                    && std::str::from_utf8(&inventory.stdout).is_ok_and(|names| {
+                        !names.split_terminator('\n').any(|session| session == name)
+                    })
+            })
+}
+
 enum PaneListLookup {
     Panes(Vec<String>),
     Missing,
@@ -318,10 +338,12 @@ fn first_window_pane_ids_classified(
         return PaneListLookup::Unknown;
     };
     if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
         return if tmux_no_server_running(&output.stderr)
-            || String::from_utf8_lossy(&output.stderr)
+            || stderr
                 .lines()
                 .any(|line| line.trim().starts_with("can't find session:"))
+            || no_current_target_proves_absent(&stderr, session_name, deadline)
         {
             PaneListLookup::Missing
         } else {
@@ -389,6 +411,33 @@ pub(crate) fn classify_pane_probe(succeeded: bool, stdout: &str, stderr: &[u8]) 
 /// separate existence gate) use [`probe_pane`] instead.
 pub fn is_pane_dead(session_name: &str) -> bool {
     probe_pane(session_name) == PaneProbe::Dead
+}
+
+/// Whether any pane in any window of `session_name` may still run a process.
+/// An unreadable answer counts as live: only a confirmed absence frees the checkout.
+pub(crate) fn session_has_live_pane(session_name: &str) -> bool {
+    let target = format!("={session_name}:");
+    let mut cmd = crate::tmux::tmux_query_command();
+    cmd.args(["list-panes", "-s", "-t", &target, "-F", "#{pane_dead}"]);
+    let Ok(output) = crate::tmux::run_tmux_command_with_timeout(&mut cmd) else {
+        return true;
+    };
+    classify_live_panes(output.status.success(), &output.stdout, &output.stderr)
+}
+
+fn classify_live_panes(succeeded: bool, stdout: &[u8], stderr: &[u8]) -> bool {
+    if !succeeded {
+        let stderr = String::from_utf8_lossy(stderr);
+        let gone = tmux_no_server_running(stderr.as_bytes())
+            || stderr
+                .lines()
+                .any(|line| line.trim().starts_with("can't find session:"));
+        return !gone;
+    }
+    stdout.is_empty()
+        || String::from_utf8_lossy(stdout)
+            .lines()
+            .any(|l| l.trim() != "1")
 }
 
 pub(crate) fn pane_current_command(session_name: &str) -> Option<String> {
@@ -547,22 +596,11 @@ pub(crate) fn kill_session_if_present(name: &str) -> Result<()> {
                 .lines()
                 .any(|line| line.trim().starts_with("can't find session:"));
         if !absent {
-            let confirmed_missing = stderr
-                .lines()
-                .any(|line| line.trim() == "no current target")
-                && crate::tmux::run_tmux_command_with_timeout(
-                    crate::tmux::tmux_query_command().args([
-                        "list-sessions",
-                        "-F",
-                        "#{session_name}",
-                    ]),
-                )
-                .is_ok_and(|inventory| {
-                    inventory.status.success()
-                        && std::str::from_utf8(&inventory.stdout).is_ok_and(|names| {
-                            !names.split_terminator('\n').any(|session| session == name)
-                        })
-                });
+            let confirmed_missing = no_current_target_proves_absent(
+                &stderr,
+                name,
+                &crate::tmux::TmuxCommandDeadline::new(),
+            );
             if !confirmed_missing {
                 bail!("Failed to kill tmux session '{}': {}", name, stderr);
             }
@@ -1217,6 +1255,16 @@ mod tests {
                 "the private server must be live and empty"
             );
             kill_session_if_present("missing|proof").unwrap();
+            assert!(
+                matches!(
+                    first_window_pane_ids_classified(
+                        "missing|proof",
+                        &crate::tmux::TmuxCommandDeadline::new()
+                    ),
+                    PaneListLookup::Missing
+                ),
+                "an empty server must classify the pane list as Missing"
+            );
             let still_empty = inventory();
             assert!(still_empty.status.success() && still_empty.stdout.is_empty());
             assert!(
@@ -1686,5 +1734,34 @@ mod pane_probe_tests {
     fn probe_pane_rejects_an_empty_session_name() {
         assert_eq!(probe_pane(""), PaneProbe::Missing);
         assert!(!is_pane_dead(""));
+    }
+
+    #[test]
+    fn live_pane_classification_fails_safe() {
+        let cases: [(&str, bool, &[u8], &[u8], bool); 8] = [
+            ("all dead", true, b"1\n1\n", b"", false),
+            ("secondary alive", true, b"1\n0\n", b"", true),
+            ("first alive", true, b"0\n1\n", b"", true),
+            ("empty success", true, b"", b"", true),
+            ("garbage output", true, b"?\n", b"", true),
+            (
+                "session gone",
+                false,
+                b"",
+                b"can't find session: x\n",
+                false,
+            ),
+            (
+                "no server",
+                false,
+                b"",
+                b"no server running on /tmp/s\n",
+                false,
+            ),
+            ("other failure", false, b"", b"boom\n", true),
+        ];
+        for (case, ok, out, err, expected) in cases {
+            assert_eq!(classify_live_panes(ok, out, err), expected, "{case}");
+        }
     }
 }

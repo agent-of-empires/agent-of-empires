@@ -1340,9 +1340,9 @@ pub(super) fn runner_group_executing(group: u32) -> anyhow::Result<bool> {
     let mut bytes = [0u8; 1024];
     for entry in fs::read_dir("/proc")? {
         let entry = entry?;
-        if entry.file_name().to_string_lossy().parse::<u32>().is_err() {
+        let Ok(pid) = entry.file_name().to_string_lossy().parse::<u32>() else {
             continue;
-        }
+        };
         let size = match fs::File::open(entry.path().join("stat"))
             .and_then(|mut file| file.read(&mut bytes))
         {
@@ -1352,16 +1352,17 @@ pub(super) fn runner_group_executing(group: u32) -> anyhow::Result<bool> {
                 use std::os::unix::fs::MetadataExt as _;
                 let owner = entry.metadata().ok().map(|metadata| metadata.uid());
                 if foreign_process_permission_error(&error, owner, unsafe { libc::geteuid() }) {
+                    // Unreadable stat (hidepid): getpgid needs no /proc access. State is
+                    // unknown, so a member counts as executing.
+                    if u32::try_from(unsafe { libc::getpgid(pid as i32) }).ok() == Some(group) {
+                        return Ok(true);
+                    }
                     continue;
                 }
                 return Err(error).context("runner group census unavailable");
             }
         };
-        let offset = bytes[..size]
-            .windows(2)
-            .rposition(|pair| pair == b") ")
-            .context("invalid process stat")?;
-        let mut fields = std::str::from_utf8(&bytes[offset + 2..size])?.split_ascii_whitespace();
+        let mut fields = stat_fields(&bytes[..size])?;
         let state = fields.next().context("missing process state")?;
         let process_group = parse_process_group(fields.nth(1).context("missing process group")?)?;
         if process_group == Some(group) && state != "Z" {
@@ -1377,15 +1378,35 @@ pub(super) fn process_start_id(pid: u32) -> anyhow::Result<Option<String>> {
         Err(error) if process_disappeared(&error) => return Ok(None),
         Err(error) => return Err(error).context("reading process birth identity"),
     };
+    let mut fields = stat_fields(&stat)?;
+    fields.next().context("missing process state")?;
+    let start = fields.nth(18).context("missing process birth identity")?;
+    Ok(Some(format!("proc:{start}")))
+}
+
+/// False once `pid` is gone, or exited and not yet reaped (state Z or X).
+pub(super) fn process_executing(pid: u32) -> anyhow::Result<bool> {
+    let stat = match fs::read(format!("/proc/{pid}/stat")) {
+        Ok(stat) => stat,
+        Err(error) if process_disappeared(&error) => return Ok(false),
+        Err(error) => return Err(error).context("reading process state"),
+    };
+    stat_executing(&stat)
+}
+
+fn stat_executing(stat: &[u8]) -> anyhow::Result<bool> {
+    let state = stat_fields(stat)?.next().context("missing process state")?;
+    Ok(!matches!(state, "Z" | "X"))
+}
+
+/// The `/proc/<pid>/stat` fields from the state on. comm can hold spaces and `)`, so the
+/// split is at the last `") "`.
+fn stat_fields(stat: &[u8]) -> anyhow::Result<std::str::SplitAsciiWhitespace<'_>> {
     let offset = stat
         .windows(2)
         .rposition(|pair| pair == b") ")
         .context("invalid process stat")?;
-    let tail = std::str::from_utf8(&stat[offset + 2..])?;
-    let mut fields = tail.split_ascii_whitespace();
-    fields.next().context("missing process state")?;
-    let start = fields.nth(18).context("missing process birth identity")?;
-    Ok(Some(format!("proc:{start}")))
+    Ok(std::str::from_utf8(&stat[offset + 2..])?.split_ascii_whitespace())
 }
 
 pub(super) struct ProcessHandle(std::os::fd::OwnedFd);
@@ -1395,13 +1416,8 @@ pub(super) fn process_group_id(pid: u32) -> anyhow::Result<Option<u32>> {
         Err(error) if process_disappeared(&error) => return Ok(None),
         Err(error) => return Err(error.into()),
     };
-    let offset = stat
-        .windows(2)
-        .rposition(|pair| pair == b") ")
-        .context("invalid process stat")?;
-    let tail = std::str::from_utf8(&stat[offset + 2..])?;
     parse_process_group(
-        tail.split_ascii_whitespace()
+        stat_fields(&stat)?
             .nth(2)
             .context("missing process group")?,
     )
@@ -1988,6 +2004,25 @@ impl super::SleepInhibit for SystemdInhibitor {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn stat_state_reads_after_the_last_paren_and_excludes_exited() {
+        for (stat, executing) in [
+            ("7 (aoe) R 1 7 7", true),
+            ("7 (aoe) S 1 7 7", true),
+            ("7 (aoe) Z 1 7 7", false),
+            ("7 (aoe) X 1 7 7", false),
+            ("7 (a) b) Z 1 7 7", false),
+            ("7 (a) Z) S 1 7 7", true),
+        ] {
+            assert_eq!(
+                stat_executing(stat.as_bytes()).unwrap(),
+                executing,
+                "{stat}"
+            );
+        }
+        assert!(stat_executing(b"7 aoe").is_err());
+    }
 
     #[test]
     fn process_group_field_tolerates_a_process_mid_exit() {

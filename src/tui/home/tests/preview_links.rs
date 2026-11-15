@@ -171,10 +171,10 @@ fn status_flash_shows_then_expires_without_acknowledgement() {
     assert!(!env.view.expire_status_flash());
 
     // Reach the deadline without sleeping through it.
-    env.view.status_flash = Some((
-        "opened https://example.com/aoe".to_string(),
-        std::time::Instant::now(),
-    ));
+    env.view.status_flash = Some(crate::tui::home::overlays::StatusFlash {
+        text: "opened https://example.com/aoe".to_string(),
+        until: Some(std::time::Instant::now()),
+    });
     assert_eq!(env.view.status_flash_text(), None, "window has closed");
     assert!(
         env.view.expire_status_flash(),

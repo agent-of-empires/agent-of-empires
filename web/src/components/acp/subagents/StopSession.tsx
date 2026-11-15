@@ -1,22 +1,68 @@
-// ACP has no per-agent cancel, so Stop interrupts the whole session; confirm before sending it.
+// Stop for a whole session or one sub-agent, confirmed before it is sent.
 
 import { Square } from "lucide-react";
-import { useState } from "react";
+import { useState, type ReactNode } from "react";
 
 import { reportError } from "../../../lib/toastBus";
 
+/** Interrupts the main agent, which stops every sub-agent with it. */
 export function StopSession({ sessionId, running }: { sessionId: string; running: number }) {
-  // Holds the session the confirmation was opened for, so switching sessions closes it.
-  const [confirmingFor, setConfirmingFor] = useState<string | null>(null);
-  const confirming = confirmingFor === sessionId;
-  const [busy, setBusy] = useState(false);
   const stop = async () => {
-    setBusy(true);
     try {
       const res = await fetch(`/api/sessions/${encodeURIComponent(sessionId)}/acp/cancel`, { method: "POST" });
       if (!res.ok) reportError("Could not interrupt the session. Try again.");
     } catch {
       reportError("Could not interrupt the session. Try again.");
+    }
+  };
+  return (
+    <ConfirmStop
+      target={sessionId}
+      title="Interrupt the session and stop running sub-agents"
+      confirmLabel="Interrupt session"
+      onStop={stop}
+    >
+      This interrupts the main agent and all {running > 0 ? `${running} ` : ""}running sub-agent
+      {running === 1 ? "" : "s"}. Work already written to disk stays.
+    </ConfirmStop>
+  );
+}
+
+/** Stops one sub-agent and leaves the main agent running. */
+export function StopSubagent({ childId, cancel }: { childId: string; cancel: (childId: string) => Promise<void> }) {
+  return (
+    <ConfirmStop
+      target={childId}
+      title="Stop this sub-agent"
+      confirmLabel="Stop sub-agent"
+      onStop={() => cancel(childId)}
+    >
+      This stops this sub-agent only. Work already written to disk stays.
+    </ConfirmStop>
+  );
+}
+
+function ConfirmStop({
+  target,
+  title,
+  confirmLabel,
+  onStop,
+  children,
+}: {
+  target: string;
+  title: string;
+  confirmLabel: string;
+  onStop: () => Promise<void>;
+  children: ReactNode;
+}) {
+  // Holds the target the confirmation was opened for, so switching targets closes it.
+  const [confirmingFor, setConfirmingFor] = useState<string | null>(null);
+  const confirming = confirmingFor === target;
+  const [busy, setBusy] = useState(false);
+  const stop = async () => {
+    setBusy(true);
+    try {
+      await onStop();
     } finally {
       setBusy(false);
       setConfirmingFor(null);
@@ -26,8 +72,8 @@ export function StopSession({ sessionId, running }: { sessionId: string; running
     <>
       <button
         type="button"
-        title="Interrupt the session and stop running sub-agents"
-        onClick={() => setConfirmingFor(sessionId)}
+        title={title}
+        onClick={() => setConfirmingFor(target)}
         className={[
           "inline-flex items-center gap-1 rounded-md border border-surface-600 bg-surface-800 px-2 py-0.5",
           "text-[11px] text-text-secondary transition-colors",
@@ -43,10 +89,7 @@ export function StopSession({ sessionId, running }: { sessionId: string; running
           aria-label="Confirm stop"
           className="basis-full rounded-md border border-rose-700/50 bg-rose-950/20 px-3 py-2 text-xs text-text-secondary"
         >
-          <p>
-            This interrupts the main agent and all {running > 0 ? `${running} ` : ""}running sub-agent
-            {running === 1 ? "" : "s"}. Work already written to disk stays.
-          </p>
+          <p>{children}</p>
           <div className="mt-2 flex gap-2">
             <button
               type="button"
@@ -54,7 +97,7 @@ export function StopSession({ sessionId, running }: { sessionId: string; running
               onClick={() => void stop()}
               className="rounded border border-rose-700/60 px-2 py-0.5 text-rose-300 hover:bg-rose-950/40 disabled:opacity-50"
             >
-              Interrupt session
+              {confirmLabel}
             </button>
             <button
               type="button"

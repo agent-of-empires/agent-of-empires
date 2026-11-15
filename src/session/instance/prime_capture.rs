@@ -251,7 +251,7 @@ impl Instance {
     }
 
     pub(super) fn prime_agent_launch_options(&self) -> Option<PrimeAgentLaunchOptions> {
-        let parsed = parse_launch_command(self.get_tool_command())?;
+        let parsed = parse_launch_command(&self.get_tool_command())?;
         let mut words = parsed.words;
         words.extend(shell_words::split(&self.extra_args).ok()?);
         let options = parse_prime_agent_launch_options(&words)?;

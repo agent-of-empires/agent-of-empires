@@ -47,15 +47,40 @@ fn worker_pid(pid: u32) -> Option<nix::unistd::Pid> {
         .map(nix::unistd::Pid::from_raw)
 }
 
-/// A surviving group member or leader prevents exit proof; probe errors fail closed.
+/// A surviving group member or executing leader prevents exit proof; an unreaped zombie does
+/// not. Probe errors fail closed.
 #[cfg(unix)]
 pub fn is_process_group_alive(pid: u32) -> bool {
-    use nix::errno::Errno;
     use nix::sys::signal::{kill, killpg};
-    let Some(pid) = worker_pid(pid) else {
+    let Some(group) = worker_pid(pid) else {
         return true;
     };
-    !matches!(killpg(pid, None), Err(Errno::ESRCH)) || !matches!(kill(pid, None), Err(Errno::ESRCH))
+    if let Some(alive) = probe_verdict(killpg(group, None), kill(group, None)) {
+        return alive;
+    }
+    // Signal probes also succeed on zombies, so ask the process table.
+    let executing = || -> anyhow::Result<bool> {
+        Ok(crate::process::runner_group_executing(pid)? || crate::process::process_executing(pid)?)
+    };
+    executing().unwrap_or(true)
+}
+
+/// `Some` when the signal probes decide alone: gone only if both say ESRCH, alive on any
+/// other error (EPERM means a member we may not signal exists, which the census cannot
+/// vouch for). `None` when both succeed and the census must tell zombies apart.
+#[cfg(unix)]
+fn probe_verdict(group: nix::Result<()>, leader: nix::Result<()>) -> Option<bool> {
+    use nix::errno::Errno;
+    // macOS answers EPERM when signalling a zombie, and its `ps` census lists every
+    // user's processes, so there the census settles EPERM.
+    let undecided = |error: Errno| {
+        error == Errno::ESRCH || (cfg!(target_os = "macos") && error == Errno::EPERM)
+    };
+    match (group, leader) {
+        (Err(Errno::ESRCH), Err(Errno::ESRCH)) => Some(false),
+        (Err(error), _) | (_, Err(error)) if !undecided(error) => Some(true),
+        _ => None,
+    }
 }
 
 #[cfg(not(unix))]
@@ -525,6 +550,94 @@ mod tests {
                 start.elapsed() < std::time::Duration::from_secs(1),
                 "{name}"
             );
+        }
+    }
+
+    /// An unreaped zombie leader (a container's PID 1 may never reap it) is gone, but a live
+    /// member keeps its group alive.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn signal_probe_errors_other_than_esrch_mean_alive() {
+        use nix::errno::Errno::{EPERM, ESRCH};
+        let cases = [
+            (Err(ESRCH), Err(ESRCH), Some(false)),
+            (Err(EPERM), Err(ESRCH), Some(true)),
+            (Err(ESRCH), Err(EPERM), Some(true)),
+            (Ok(()), Err(EPERM), Some(true)),
+            (Err(EPERM), Ok(()), Some(true)),
+            (Ok(()), Ok(()), None),
+            (Ok(()), Err(ESRCH), None),
+            (Err(ESRCH), Ok(()), None),
+        ];
+        for (group, leader, expected) in cases {
+            assert_eq!(
+                probe_verdict(group, leader),
+                expected,
+                "{group:?} {leader:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_zombie_group_leader_is_not_alive_unless_a_member_runs() {
+        use std::io::BufRead as _;
+        use std::os::unix::process::CommandExt as _;
+        use std::time::{Duration, Instant};
+        struct Group(Option<std::process::Child>);
+        impl Drop for Group {
+            fn drop(&mut self) {
+                if let Some(mut leader) = self.0.take() {
+                    kill_process_group(leader.id());
+                    let _ = leader.wait();
+                }
+            }
+        }
+        for member in [false, true] {
+            let script = if member {
+                "sleep 600 & printf 'ready\n'; read -r ignored"
+            } else {
+                "printf 'ready\n'; read -r ignored"
+            };
+            let mut group = Group(Some(
+                std::process::Command::new("bash")
+                    .args(["-c", script])
+                    .process_group(0)
+                    .stdin(std::process::Stdio::piped())
+                    .stdout(std::process::Stdio::piped())
+                    .spawn()
+                    .unwrap(),
+            ));
+            let leader = group.0.as_mut().unwrap();
+            let pid = leader.id();
+            let mut line = String::new();
+            std::io::BufReader::new(leader.stdout.take().unwrap())
+                .read_line(&mut line)
+                .unwrap();
+            assert_eq!(line, "ready\n");
+            assert!(is_process_group_alive(pid), "member {member}: running");
+
+            drop(leader.stdin.take());
+            let deadline = Instant::now() + Duration::from_secs(5);
+            while crate::process::process_executing(pid).unwrap() {
+                assert!(
+                    Instant::now() < deadline,
+                    "member {member}: leader did not exit"
+                );
+                std::thread::sleep(Duration::from_millis(25));
+            }
+            assert!(is_pid_alive(pid), "member {member}: leader is unreaped");
+            assert_eq!(
+                is_process_group_alive(pid),
+                member,
+                "member {member}: zombie leader"
+            );
+
+            drop(group);
+            let deadline = Instant::now() + Duration::from_secs(5);
+            while is_process_group_alive(pid) {
+                assert!(Instant::now() < deadline, "member {member}: not reaped");
+                std::thread::sleep(Duration::from_millis(25));
+            }
         }
     }
 }

@@ -1,4 +1,5 @@
 import type { PluginUpdateChangelog, PluginUpdateConsent } from "../../lib/api";
+import { agentIntegrationDetails, displayAgentText } from "./agentIntegrationDetails";
 import { BuildSteps, ModalActions, ModalSection, PluginModal } from "./PluginModal";
 import { uniqueSlots } from "./uniqueSlots";
 
@@ -56,7 +57,7 @@ export function PluginUpdateConsentModal({
 
       {needsConsent && (
         <p className="mb-3 text-xs text-text-dim">
-          This update changes plugin access or launch commands. Review the changes before approving.
+          This update changes plugin access or agent declarations. Review the changes before approving.
         </p>
       )}
       {consent && consent.added_capabilities.length > 0 && (
@@ -83,11 +84,18 @@ export function PluginUpdateConsentModal({
 
       {consent && <BuildSteps steps={consent.build_steps} testId="plugin-update-build-steps" />}
       {consent && consent.agent_integrations.length > 0 && (
-        <ModalSection label="Agent launch commands" warn testId="plugin-update-agent-integrations">
+        <ModalSection label="Agent declarations" warn testId="plugin-update-agent-integrations">
           <ul className="space-y-0.5">
             {consent.agent_integrations.map((agent) => (
               <li key={agent.tool} className="font-mono text-[11px] text-text-dim">
-                {agent.tool}: {agent.command ?? "No launch command declared"}
+                <div>
+                  {displayAgentText(agent.tool)}: {displayAgentText(agent.command ?? "No launch command declared")}
+                </div>
+                {agentIntegrationDetails(agent).map((detail, index) => (
+                  <div key={index} className="pl-4">
+                    {detail}
+                  </div>
+                ))}
               </li>
             ))}
           </ul>

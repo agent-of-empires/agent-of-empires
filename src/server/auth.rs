@@ -143,6 +143,9 @@ fn is_machine_endpoint(path: &str) -> bool {
 fn is_login_session_exempt(path: &str) -> bool {
     path == "/"
         || path == "/login"
+        // Page shell only: /api/setup stays session-gated, and
+        // patch_setup checks read_only and CityHall itself.
+        || path == "/setup"
         || path.starts_with("/session/")
         || path.starts_with("/plugins/")
         || path == "/api/login"
@@ -1083,6 +1086,7 @@ mod tests {
         let exempt = [
             "/",
             "/login",
+            "/setup",
             "/session/abc",
             "/session/2626c6af68754732",
             "/plugins/github/prs",
@@ -1211,6 +1215,7 @@ mod tests {
             // Cosmetic UI state and the update banner grant no capability; the
             // handlers still enforce read_only.
             (Method::POST, "/api/app-state/web-tour-seen"),
+            (Method::PATCH, "/api/setup"),
             (Method::POST, "/api/app-state/dismiss-update"),
             (Method::PATCH, "/api/app-state/web-ui-state"),
             // Read-only GETs, even on settings and profile paths.

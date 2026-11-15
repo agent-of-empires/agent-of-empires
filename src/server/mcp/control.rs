@@ -442,8 +442,9 @@ impl McpServer {
     }
 
     /// Whether a terminal session's status rules detect a dialog or question waiting on a
-    /// person, read once, without waiting. A check that fails to run, or a pane that cannot be
-    /// captured, counts as waiting, so `send` refuses.
+    /// person, read once, without waiting. A check that fails to run counts as waiting, as does,
+    /// for an agent with a status manifest, a pane that can't be captured. `send` is explicit, so
+    /// an agent without one (`NoPromptRule`) is not refused.
     async fn terminal_pane_waiting(&self, id: &str) -> bool {
         let instance = self
             .state

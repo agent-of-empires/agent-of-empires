@@ -1,4 +1,4 @@
-import { useMemo } from "react";
+import { useMemo, type ReactNode } from "react";
 import type { SessionResponse } from "../lib/types";
 import { getStatusTextClass, isSessionActive } from "../lib/session";
 import { useIdleDecayWindowMs } from "../lib/idleDecay";
@@ -19,6 +19,8 @@ interface Props {
   canManageProjects?: boolean;
   onToggleSidebar: () => void;
   readOnly?: boolean;
+  /** Shown above the action panes, e.g. the setup checklist. */
+  banner?: ReactNode;
 }
 
 export function Dashboard({
@@ -29,6 +31,7 @@ export function Dashboard({
   onToggleSidebar,
   readOnly,
   canManageProjects = true,
+  banner,
 }: Props) {
   const idleDecayWindowMs = useIdleDecayWindowMs();
   const isWideViewport = useIsWideViewport();
@@ -196,6 +199,8 @@ export function Dashboard({
         </StrokeIcon>
         Show sessions
       </button>
+
+      {banner}
 
       {/* Action panes */}
       {readOnly ? (

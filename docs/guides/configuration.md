@@ -52,6 +52,7 @@ Updates use a locked read-modify-write operation, preserving concurrent changes.
 | `AOE_LOG_LEVEL` | File log level for AoE's own targets: `trace`, `debug`, `info`, `warn`, `error`. Dependency crates stay at `warn`. One-shot CLI commands always log to the same file at the configured level once the app directory exists; `[logging].output = "stdout"` applies to a foreground `aoe serve` only |
 | `AGENT_OF_EMPIRES_DEBUG` | Legacy alias for `AOE_LOG_LEVEL=debug` |
 | `AOE_DEFER_SANDBOX_MIGRATION` | Start without moving sandboxed sessions' agent stores; retried later or by `aoe migrate`. See [Per-session agent stores](sandbox.md#per-session-agent-stores) |
+| `AOE_SERVE_PORT` | Port for a newly started `aoe serve` daemon, below `--port` and above `[serve] port`. See [Serve](#serve) |
 
 ## Theme
 
@@ -88,6 +89,7 @@ name_agent_session = false
 auto_stop_idle_secs = 0   # 0 disables; e.g. 7200 = stop after 2h idle
 row_tag = "branch"        # none | auto | profile | sandbox | branch
 sidebar_position = "left" # left | right; TUI session list
+narrow_layout = "stacked" # stacked | one_pane | big_preview; see below
 ```
 
 After your 31st session creation, a one-time tip explains how to hide the shortcut bar.
@@ -105,7 +107,9 @@ You can browse tips from **Ctrl+K > Show tips** even with the bar hidden.
 | `session_id_poller_max_threads` | `50` | Ceiling on concurrent native-session-ID pollers per process. Overflow IDs stop refreshing until a poller is available, with a 5 s to 60 s retry backoff. `0` keeps the default. Global only; applied when the Daemon starts. |
 | `row_tag` | `"branch"` | Controls the compact metadata shown next to each TUI session title: `none` shows nothing; `auto` shows the profile code only in all-profiles view; `profile` always shows the profile code; `sandbox` shows `sb` on sandboxed sessions; `branch` shows a compact worktree or workspace branch tag. |
 | `show_activity_age` | `true` | Show the age column at the right edge of each TUI session row: time since the agent stopped on `Idle` rows, time since last access on `Unknown` rows, and remaining snooze time under the Attention sort. |
-| `sidebar_position` | `"left"` | Places the TUI session list on the left or right. Narrow terminals keep the list above the preview. Global only. |
+| `show_structured_badge` | `true` | Show the `[structured]` badge on Structured view rows in the TUI session list. Hiding it returns the width to the title and plugin row badges; the row still opens the Structured view. TUI only; the web session list never shows the badge. |
+| `sidebar_position` | `"left"` | Places the TUI session list on the left or right. Below 80 columns the layout follows `narrow_layout` instead. Global only. |
+| `narrow_layout` | `"stacked"` | How the TUI lays out the session list and preview once the terminal is too narrow for them side by side (below 80 columns). `stacked` puts the list above the preview; `one_pane` shows only one pane at a time, the list normally and the preview while it is the pane being worked in (live mode relaying keys, an interactive structured transcript, a retained trashed transcript, or System Health), then Esc or Ctrl+Q returns to the list; `big_preview` keeps the stack but squeezes the list to its minimum while the preview is that active pane, giving the preview most of the height. Global only, under Settings > Global > Session. |
 | `split_terminal_height_percent` | `50` | Paired-terminal share of split preview height. Range `1` to `99`. Global only; see [Live mode](live-mode.md). |
 | `split_terminal_min_width` | `100` | Minimum whole-window width in columns for the paired-terminal split. Range `0` to `1000`. Global only. |
 | `split_terminal_min_height` | `30` | Minimum whole-window height in rows for the paired-terminal split. Range `0` to `1000`. Global only. |
@@ -137,6 +141,8 @@ Per-agent structured view defaults live under `[acp]`, not `[session]`:
 | `acp.restrict_agents` | `false` | Restrict structured view sessions to `acp.allowed_agents`. Read from the global config only, so a profile cannot widen it; changing it from the web needs the passphrase step-up. |
 | `acp.allowed_agents` | `[]` | Registry keys allowed while the restriction is on, e.g. `["claude", "codex"]`. Each alias counts separately, and an empty list denies every agent. A worker on a now-disallowed agent is terminated at its next respawn. |
 | `acp.rate_limit_auto_resume` | `false` | Respawn a worker parked on a provider rate limit once the reported reset passes. See [Rate-limit recovery](../structured-view/troubleshooting.md#rate-limits-and-agent-hand-off). |
+| `acp.rate_limit_failover` | `false` | Continue a session parked on a rate limit on another account from `acp.rate_limit_failover_accounts` instead of waiting for the reset. Host Claude sessions only; local-only. See [Automatic account failover](../structured-view/troubleshooting.md#automatic-account-failover). You are responsible for complying with the agent provider's terms for the accounts you configure. |
+| `acp.rate_limit_failover_accounts` | `[]` | Ordered failover pool: tool names declared under `agent_config_dir` that run the same agent as the session. Others are ignored with a warning. |
 
 Agent status overrides use `[agents.<name>]`:
 
@@ -272,7 +278,8 @@ Put specific states such as `waiting` and `error` before broad `running` matches
 
 #### OMP terminal status
 
-Built-in OMP detection reads the visible pane and locates activity, pinned errors,
+When no approved, enabled OMP status integration owns the session, the bundled
+OMP detector reads the visible pane and locates activity, pinned errors,
 and blocking dialogs relative to the current composer. Question dialogs remain
 waiting when paging hides the selected option; session pickers accept bracketed
 key legends. Extension status rows, including plugin badges, do not need
@@ -319,6 +326,8 @@ opencode = "nono run --profile opencode-dev --allow-cwd -- opencode"
 ```
 
 Set the same thing in the TUI under **Agents**, using `<agent>=<cmd>`, or per session with `aoe add --cmd-override <CMD>`. Overrides are evaluated per-session first, then profile, then global (a repo config cannot set one).
+
+For a plugin-provided agent, `--cmd-override` is accepted when a nonblank `agent_command_override` is configured for that agent. Without one, the plugin owns the launch and `--cmd-override` is rejected.
 
 A configured override also applies to plain `aoe add --cmd <agent>`, and the on-PATH check validates the resolved override binary, so a session works when only the wrapper is installed. For native resume and fork behavior, including wrappers and automatic restarts, see [execution identity and wrappers](session-resume.md#execution-identity-and-wrappers).
 
@@ -536,6 +545,15 @@ update_check_mode = "notify"   # auto | notify | off
 - `off`: no check, banner, or dashboard poll. Use it on offline networks.
 
 Checks hit GitHub at most once a day; the dashboard re-polls the cached status hourly while open.
+
+## Serve
+
+```toml
+[serve]
+port = 8080               # debug builds default to 8081
+```
+
+`aoe serve` and runtime autostart take a new daemon's port from `--port`, then `AOE_SERVE_PORT`, then this key. The TUI Serve dialog keeps its own saved port unless `AOE_SERVE_PORT` is set, and does not read this key. A restart keeps the recorded port unless one is requested, so a changed value applies after a stop and start. Global only.
 
 ## Tools
 

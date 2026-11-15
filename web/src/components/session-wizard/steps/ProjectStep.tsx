@@ -49,9 +49,11 @@ export function ProjectStep({
     onPicked?.();
   };
 
-  // Import resumes through the built-in ACP adapter, so it needs both the CLI and the adapter.
+  // Import resumes through the ACP adapter the server reports for the row, so it needs the CLI,
+  // that adapter, and the policy. A plugin-provided tool qualifies only where the host still
+  // owns the adapter; a configured custom adapter never grants import.
   const importAgents = agents
-    .filter((a) => a.kind === "builtin" && a.acp_capable && a.installed && a.acp_installed && a.acp_allowed !== false)
+    .filter((a) => a.kind !== "custom" && a.acp_capable && a.installed && a.acp_installed && a.acp_allowed !== false)
     .map((a) => a.name);
 
   const tabs: { id: Tab; label: string }[] = [

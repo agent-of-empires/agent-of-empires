@@ -99,6 +99,9 @@ pub struct CreateSessionBody {
     pub extra_args: String,
     #[serde(default)]
     pub sandbox_image: Option<String>,
+    /// Force-pull the Sandbox image before the create hooks, even when it exists locally.
+    #[serde(default)]
+    pub pull_latest_image: bool,
     #[serde(default)]
     pub extra_env: Vec<String>,
     /// Host-only env for `host_hooks.before_start`; never enters the container. Sandbox only.
@@ -136,6 +139,10 @@ pub struct CreateSessionBody {
     /// Require the reviewed configuration to remain unchanged before provisioning.
     #[serde(default)]
     pub trust_review: Option<CreationTrustFingerprint>,
+    /// Skip every `on_create` hook and tag the session `created_without_setup`. The trust
+    /// decision and the other hook types still apply.
+    #[serde(default)]
+    pub skip_on_create: bool,
     /// Resume a Claude conversation through ACP; path must be its original cwd.
     #[serde(default)]
     pub import_acp_session_id: Option<String>,
@@ -546,6 +553,8 @@ pub struct TrashSessionBody {
     /// Reject a lifecycle change after the caller captured its target.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub expected_generation: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expected_profile: Option<String>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -580,9 +589,11 @@ impl Default for TrashSessionBody {
         Self {
             kill_pane: default_kill_pane(),
             expected_generation: None,
+            expected_profile: None,
         }
     }
 }
+
 #[derive(Debug, Default, Clone, Serialize, Deserialize)]
 pub struct DeleteSessionBody {
     #[serde(default)]
@@ -893,6 +904,10 @@ pub enum RestoreOutcome {
     AlreadyRestored,
 }
 
+fn is_zero(n: &usize) -> bool {
+    *n == 0
+}
+
 /// One session from the daemon. Only `id` is required when decoding.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
 pub struct SessionResponse {
@@ -979,6 +994,9 @@ pub struct SessionResponse {
     /// Whether the session uses an auto-provisioned scratch directory.
     #[serde(default)]
     pub scratch: bool,
+    /// Created with its `on_create` hooks skipped, so their setup never ran.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub created_without_setup: bool,
     /// True when the session is marked as a user favorite. Mirrors
     /// `Instance::is_favorited()`; surfaced so the web sidebar can pin
     /// favorited rows and render the `*` marker without re-implementing
@@ -1136,6 +1154,19 @@ pub struct SessionResponse {
     /// whose readers keep the value they last saw.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub rate_limit_auto_resume: Option<bool>,
+    /// The pool account a failover is about to move this parked session to, so the banner can
+    /// say it is switching rather than ask. Absent when the session will stay parked:
+    /// failover off or already tried, or no pool account has headroom. Set by the list handler.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rate_limit_failover_to: Option<String>,
+    /// Messages on the daemon's queue for this session, so a client that never opened it
+    /// can still show them.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub queued_count: usize,
+    /// What the queue is waiting on, as a prompt sent now would be told. Absent when the
+    /// queue is empty or nothing holds it. Set by the list handler.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub queue_reason: Option<crate::acp::dispatch::QueueReason>,
     /// True when this session's agent can run in structured view: a built-in
     /// with an ACP adapter, or a custom agent whose profile config
     /// declares a valid `agent_acp_cmd`. The web terminal view reads
