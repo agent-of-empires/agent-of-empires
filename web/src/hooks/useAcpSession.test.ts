@@ -1070,6 +1070,49 @@ describe("server queue", () => {
     again.unmount();
   });
 
+  it.each([
+    ["opens another Session", "switch"],
+    ["closes it", "unmount"],
+  ] as const)("confirms a prompt queued while open in its stored state when the user %s mid-POST", async (_, leave) => {
+    const a = `sess-queued-${leave}`;
+    const lists = () => calls.filter((c) => c.method === "GET" && c.url.includes("/queue") && c.url.includes(a)).length;
+    const first = renderHook(({ id }: { id: string }) => useAcpSession(id, "running"), {
+      wrapper: profileWrapper,
+      initialProps: { id: a },
+    });
+    await flushAsync();
+    lastSocket().open();
+    await flushAsync();
+    const post = Promise.withResolvers<void>();
+    const started = Promise.withResolvers<void>();
+    queuePostHeld = post.promise;
+    queuePostStarted = started.resolve;
+    workerDown = true;
+    await act(() => first.result.current.sendPrompt("later"));
+    await started.promise;
+    queuePostHeld = null;
+    queuePostStarted = null;
+    workerDown = false;
+    // The user leaves A; the Daemon then delivers the row before its response arrives.
+    if (leave === "switch") first.rerender({ id: "sess-elsewhere" });
+    else first.unmount();
+    await flushAsync();
+    serverQueue.clear();
+    post.resolve();
+    await waitFor(() => expect(cacheGet(a)?.queuedPrompts).toMatchObject([{ text: "later", pending: false }]));
+    if (leave === "switch") first.unmount();
+
+    const listed = lists();
+    const again = render(a);
+    await flushAsync();
+    lastSocket().open();
+    await waitFor(() => expect(lists()).toBeGreaterThan(listed));
+    await waitFor(() => expect(again.result.current.state.queuedPrompts).toEqual([]));
+    expect(posts("/queue")).toHaveLength(1);
+    expect(serverQueue.size).toBe(0);
+    again.unmount();
+  });
+
   it("confirms a re-sent row in the open hook under StrictMode, so a delivered one is dropped", async () => {
     const a = "sess-strict";
     const queuedAt = "2026-01-01T00:00:00.000Z";

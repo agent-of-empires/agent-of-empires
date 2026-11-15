@@ -301,14 +301,14 @@ export function useAcpSession(
       reportAcpInteraction("prompt_queued");
       void (async () => {
         const row = await enqueueServerPrompt(sessionId, { id, text, attachments });
-        dispatch(
-          row
-            ? { kind: "confirm_queued_prompt", id }
-            : {
-                kind: "error",
-                message: "Couldn't queue your message on the server; it may not send. Remove it and try again.",
-              },
-        );
+        if (row) {
+          acknowledgeQueued(sessionId, { kind: "confirm_queued_prompt", id });
+          return;
+        }
+        dispatch({
+          kind: "error",
+          message: "Couldn't queue your message on the server; it may not send. Remove it and try again.",
+        });
       })();
     },
     [sessionId],
