@@ -14,7 +14,7 @@ afterEach(() => {
   vi.unstubAllGlobals();
 });
 
-const GONE = "This Session's sandbox container was removed. Start the Session again to create a new one.";
+const GONE = "This Session's sandbox container is gone. Recreate it or start a new Session and container.";
 const frame = (seq: number, event: AcpEvent): Action => ({ kind: "frame", frame: { session_id: "s1", seq, event } });
 
 /** A started Session whose last startup error is `event`, owned as StructuredView owns it. */

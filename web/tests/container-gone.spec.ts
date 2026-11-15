@@ -7,7 +7,7 @@ import { mockAcpSession, openStructuredSession } from "./helpers/acpMock";
 import { wizard } from "./helpers/wizard";
 
 const TITLE = "story-container-gone";
-const MESSAGE = "This Session's sandbox container was removed. Start the Session again to create a new one.";
+const MESSAGE = "This Session's sandbox container is gone. Recreate it or start a new Session and container.";
 
 async function openGoneSession(page: Page, { readOnly = false, queued = false } = {}) {
   const mock = await mockAcpSession(page, {
