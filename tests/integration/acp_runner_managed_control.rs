@@ -170,7 +170,9 @@ async fn agent_request_during_session_new_does_not_deadlock_the_runner() {
                 loop {
                     match crate::process::worker_registry::load_strict(&client.id) {
                         Ok(record) => break record.expect("actual original registry record"),
-                        Err(error) if error.is::<crate::process::worker_registry::RegistryBusy>() => {
+                        Err(error)
+                            if error.is::<crate::process::worker_registry::RegistryBusy>() =>
+                        {
                             tokio::task::yield_now().await;
                         }
                         Err(error) => panic!("original registry observation failed: {error}"),

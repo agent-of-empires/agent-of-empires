@@ -1308,17 +1308,17 @@ mod shared_recovery_tests {
         output_file: &str,
     ) {
         let notification = serde_json::json!({
-                "jsonrpc":"2.0","method":"session/update","params":{
-                    "sessionId":live.sid,"update":{
-                        "sessionUpdate":"tool_call_update","toolCallId":format!("{agent_id}-tool"),
-                        "_meta":{"claudeCode":{"toolName":"Agent","toolResponse":{
-                            "agentId":agent_id,"description":"background recovery guard",
-                            "prompt":"keep working","resolvedModel":"test-model",
-                            "outputFile":output_file,"status":"async_launched"
-                        }}}
-                    }
+            "jsonrpc":"2.0","method":"session/update","params":{
+                "sessionId":live.sid,"update":{
+                    "sessionUpdate":"tool_call_update","toolCallId":format!("{agent_id}-tool"),
+                    "_meta":{"claudeCode":{"toolName":"Agent","toolResponse":{
+                        "agentId":agent_id,"description":"background recovery guard",
+                        "prompt":"keep working","resolvedModel":"test-model",
+                        "outputFile":output_file,"status":"async_launched"
+                    }}}
                 }
-            });
+            }
+        });
         tokio::time::timeout(std::time::Duration::from_secs(10), async {
             loop {
                 live.native.send(notification.clone()).await;
@@ -1361,7 +1361,8 @@ mod shared_recovery_tests {
         with_managed(|scope| {
             Box::pin(async move {
                 let mut live =
-                    managed_control_session(scope, "shared-recovery-queued-input", "claude", None).await;
+                    managed_control_session(scope, "shared-recovery-queued-input", "claude", None)
+                        .await;
                 let id = live.id().to_owned();
                 let state = live.state.clone();
                 let prompt = live.start_prompt("failed explicit input").await;
@@ -1476,8 +1477,13 @@ mod shared_recovery_tests {
     async fn qualified_background_work_refuses_concurrent_same_and_fresh() {
         with_managed(|scope| {
             Box::pin(async move {
-                let mut live =
-                    managed_control_session(scope, "shared-recovery-current-background", "codex", None).await;
+                let mut live = managed_control_session(
+                    scope,
+                    "shared-recovery-current-background",
+                    "codex",
+                    None,
+                )
+                .await;
                 let id = live.id().to_owned();
                 let state = live.state.clone();
                 let prompt = live.start_prompt("failed main turn").await;
@@ -1485,7 +1491,12 @@ mod shared_recovery_tests {
                 let output = scope.tempdir();
                 let transcript = output.path().join("current-background.jsonl");
                 std::fs::write(&transcript, "").unwrap();
-                background_agent(&mut live, "current-background", transcript.to_str().unwrap()).await;
+                background_agent(
+                    &mut live,
+                    "current-background",
+                    transcript.to_str().unwrap(),
+                )
+                .await;
                 let folded = state.session_service.fold_control_state(&id).await.unwrap();
                 assert!(!folded.turn_active && folded.has_qualified_background_work());
                 assert!(state

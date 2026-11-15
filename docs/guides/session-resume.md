@@ -241,8 +241,9 @@ Structured-view conversations remain managed by ACP. For a Claude terminal hando
 or authentication error can leave the original Native process and conversation
 usable. Historical error evidence and the current runtime observation are
 separate: an ACP channel observed ready does not prove OS-process liveness, and a
-lost channel does not prove process exit. Unknown identity grants no retry or
-Same shortcut.
+lost channel does not prove process exit. A missing or not-yet-observed pane is
+Unknown, not a confirmed runtime exit. Unknown identity grants no retry or Same
+shortcut.
 
 Inspect the shared diagnostic before acting:
 

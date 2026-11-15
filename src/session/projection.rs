@@ -254,9 +254,7 @@ pub(crate) fn terminal_recovery_observation(row: &Instance) -> RecoveryObservati
         && row.agent_pane.legacy_tool.is_none();
     let runtime = match row.agent_pane.state {
         PanePresence::Alive if owned => RuntimeEvidence::PaneAlive,
-        PanePresence::Dead => {
-            RuntimeEvidence::PaneExited { exit_code: None }
-        }
+        PanePresence::Dead => RuntimeEvidence::PaneExited { exit_code: None },
         _ => RuntimeEvidence::Unknown,
     };
     let same_qualified = row.clone().qualify_recovery_same().is_ok();
@@ -290,7 +288,10 @@ pub(crate) fn terminal_recovery_observation(row: &Instance) -> RecoveryObservati
         owned_runtime: owned,
         same_qualified,
         replacement_qualified: owned
-            || matches!(row.agent_pane.state, PanePresence::Dead | PanePresence::Absent),
+            || matches!(
+                row.agent_pane.state,
+                PanePresence::Dead | PanePresence::Absent
+            ),
         channel_unavailable: false,
     }
 }
