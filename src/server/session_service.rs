@@ -293,6 +293,9 @@ pub struct SessionService {
     /// fast path and the reconciler tick cannot queue duplicate drains.
     /// Sync mutex: critical sections are tiny and never span an `await`.
     pending_drains: std::sync::Mutex<std::collections::HashSet<String>>,
+    /// `(session, text)` of consumed initial turns whose clear never reached
+    /// disk; a reload that restores the row must not type them again.
+    unpersisted_clears: std::sync::Mutex<std::collections::HashSet<(String, String)>>,
     /// Per-session persist locks for `mutate_instance_persisted`, held across
     /// snapshot AND disk write so the two cannot be reordered. Distinct from
     /// the other two: the drains hold `prompt_locks` across `send_turn` and
@@ -505,6 +508,7 @@ impl SessionService {
             sandbox_login: Arc::default(),
             create_in_flight: std::sync::Mutex::new(HashMap::new()),
             pending_drains: std::sync::Mutex::new(std::collections::HashSet::new()),
+            unpersisted_clears: std::sync::Mutex::new(std::collections::HashSet::new()),
             persist_locks: RwLock::new(HashMap::new()),
             reload_gate: Arc::new(RwLock::new(())),
             prompt_locks: RwLock::new(HashMap::new()),
@@ -1423,7 +1427,12 @@ impl SessionService {
             })
             .and_then(|i| {
                 let turn = i.pending_initial_turn.as_ref()?;
-                turn.error.is_none().then(|| (i.clone(), turn.text.clone()))
+                let consumed = self
+                    .unpersisted_clears
+                    .lock()
+                    .expect("unpersisted_clears mutex poisoned")
+                    .contains(&(id.to_string(), turn.text.clone()));
+                (turn.error.is_none() && !consumed).then(|| (i.clone(), turn.text.clone()))
             })
     }
 
@@ -1675,28 +1684,43 @@ impl SessionService {
     /// rate-limit resume continuation, so the stale continuation must not
     /// replay after the newer message (#3028). No-op when nothing is queued.
     pub(crate) async fn clear_pending_initial_turn(self: &Arc<Self>, id: &str) {
-        let pending = self
+        let Some(text) = self
             .instances
             .read()
             .await
             .iter()
-            .any(|i| i.id == id && i.pending_initial_turn.is_some());
-        if !pending {
-            return;
-        }
-        let outcome = self
-            .mutate_instance_persisted_with(id, true, |inst| {
-                inst.pending_initial_turn = None;
-                ((), None)
+            .find(|i| i.id == id)
+            .and_then(|i| {
+                i.pending_initial_turn
+                    .as_ref()
+                    .map(|turn| turn.text.clone())
             })
-            .await;
-        if matches!(outcome, Some(((), false))) {
-            tracing::warn!(
-                target: "acp.supervisor",
-                session = %id,
-                "failed to persist pending-turn clear; the drain re-checks liveness before delivery"
-            );
+        else {
+            return;
+        };
+        for attempt in 0..CLEAR_PERSIST_ATTEMPTS {
+            if attempt > 0 {
+                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            }
+            let outcome = self
+                .mutate_instance_persisted_with(id, true, |inst| {
+                    inst.pending_initial_turn = None;
+                    ((), None)
+                })
+                .await;
+            if !matches!(outcome, Some(((), false))) {
+                return;
+            }
         }
+        tracing::warn!(
+            target: "acp.supervisor",
+            session = %id,
+            "failed to persist pending-turn clear; the turn stays suppressed until a daemon restart"
+        );
+        self.unpersisted_clears
+            .lock()
+            .expect("unpersisted_clears mutex poisoned")
+            .insert((id.to_string(), text));
     }
 
     /// Invalidate earlier disk snapshots under instances.write() or reload_gate.
@@ -2815,6 +2839,9 @@ fn same_terminal_turn(
         && current.tool == waited.tool
         && current_text == waited_text
 }
+
+/// Disk writes tried before a consumed turn is only suppressed in memory.
+const CLEAR_PERSIST_ATTEMPTS: u32 = 3;
 
 /// Releases a session's `pending_drains` claim on every exit path of
 /// [`SessionService::drain_pending_initial_turn`], including panics.
@@ -4917,6 +4944,46 @@ mod tests {
         rows.into_iter()
             .find(|i| i.id == id)
             .and_then(|i| i.pending_initial_turn)
+    }
+
+    /// A consumed turn whose clear cannot reach disk is not typed again after
+    /// a reload restores the row.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn a_consumed_turn_is_not_retyped_after_a_failed_clear_write_and_reload() {
+        use std::os::unix::fs::PermissionsExt;
+        if !crate::tmux::is_tmux_available() {
+            return;
+        }
+        let _app_dir = crate::session::test_support::isolate_app_dir();
+        let inst = terminal_turn_instance("sess-clear-fail", "term-clear-fail", "typed-once");
+        crate::server::test_support::seed_instances_on_disk_for_test(
+            &inst.source_profile,
+            vec![inst.clone()],
+        );
+        let pane = start_terminal_pane(&inst, READY_AGENT_SCRIPT, false);
+        let state = crate::server::test_support::build_test_app_state(vec![inst.clone()]);
+        let service = state.session_service.clone();
+        crate::server::test_support::refresh_canonical_metadata_for_test(&state).await;
+
+        let profile_dir = crate::session::get_profile_dir(&inst.source_profile).unwrap();
+        let writable = std::fs::metadata(&profile_dir).unwrap().permissions();
+        std::fs::set_permissions(&profile_dir, std::fs::Permissions::from_mode(0o555)).unwrap();
+        service.clear_pending_initial_turn("sess-clear-fail").await;
+        std::fs::set_permissions(&profile_dir, writable).unwrap();
+
+        assert!(pending_turn(&service, "sess-clear-fail").await.is_none());
+        assert!(disk_turn(&inst.source_profile, "sess-clear-fail").is_some());
+        // The reload restores the row with its turn from the stale disk copy.
+        service.instances.write().await[0].pending_initial_turn =
+            disk_turn(&inst.source_profile, "sess-clear-fail");
+        service
+            .drain_terminal_initial_turn_within(
+                "sess-clear-fail",
+                std::time::Duration::from_secs(3),
+            )
+            .await;
+        assert!(!pane_text(&pane).contains("typed-once"));
     }
 
     /// An agent with no ready marker cannot tell a prompt from a dialog, so
