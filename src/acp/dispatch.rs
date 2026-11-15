@@ -16,8 +16,10 @@ pub enum PromptDispatch {
     Queued { reason: QueueReason },
 }
 
-/// Why a prompt was parked.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+/// Why a prompt was parked, or why a session's server queue is still waiting.
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize, schemars::JsonSchema,
+)]
 #[serde(rename_all = "snake_case")]
 pub enum QueueReason {
     /// A running turn that cannot take this prompt: the agent is not
@@ -93,6 +95,19 @@ pub fn hold_solo_command(dispatch: PromptDispatch, solo: bool) -> PromptDispatch
     }
 }
 
+/// What a session's server queue is waiting on: the reason its first message would be
+/// parked if it were sent now, or None when nothing holds it.
+pub fn queue_hold(
+    state: &AcpState,
+    worker: WorkerLiveness,
+    first_is_solo: bool,
+) -> Option<QueueReason> {
+    match hold_solo_command(decide(state, worker), first_is_solo) {
+        PromptDispatch::Queued { reason } => Some(reason),
+        PromptDispatch::Sent | PromptDispatch::Steered => None,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -129,6 +144,92 @@ mod tests {
                 reason: QueueReason::IntegrationLost
             }
         );
+    }
+
+    /// A queue holds for every reason a prompt would park, and for nothing a prompt would
+    /// go through: a steerable turn takes it, unless its first message is a solo command.
+    #[test]
+    fn a_queue_holds_exactly_when_its_first_message_would_park() {
+        const LIVE: (bool, bool, bool) = (true, false, false);
+        let lost = || {
+            let mut s = state((false, false, false, false));
+            s.integration_lost = Some(crate::acp::state::IntegrationLostReason::HoldOverflow);
+            s
+        };
+        for (label, s, live, solo, expected) in [
+            (
+                "turn active",
+                state((true, false, false, false)),
+                LIVE,
+                false,
+                Some(QueueReason::TurnActive),
+            ),
+            (
+                "cancelling",
+                state((true, false, true, false)),
+                LIVE,
+                false,
+                Some(QueueReason::Cancelling),
+            ),
+            (
+                "compacting",
+                state((true, false, false, true)),
+                LIVE,
+                false,
+                Some(QueueReason::Compacting),
+            ),
+            (
+                "worker down",
+                state((false, false, false, false)),
+                (false, false, false),
+                false,
+                Some(QueueReason::WorkerDown),
+            ),
+            (
+                "integration lost",
+                lost(),
+                LIVE,
+                false,
+                Some(QueueReason::IntegrationLost),
+            ),
+            (
+                "steerable turn",
+                state((true, true, false, false)),
+                LIVE,
+                false,
+                None,
+            ),
+            (
+                "steerable turn, solo first",
+                state((true, true, false, false)),
+                LIVE,
+                true,
+                Some(QueueReason::TurnActive),
+            ),
+            (
+                "idle",
+                state((false, false, false, false)),
+                LIVE,
+                false,
+                None,
+            ),
+            (
+                "rate-limit park, no turn",
+                state((false, false, false, false)),
+                (false, false, true),
+                false,
+                None,
+            ),
+            (
+                "idle-dormant",
+                state((false, false, false, false)),
+                (false, true, false),
+                false,
+                None,
+            ),
+        ] {
+            assert_eq!(queue_hold(&s, worker(live), solo), expected, "{label}");
+        }
     }
 
     /// The decision table, keyed by the incident each row exists for.

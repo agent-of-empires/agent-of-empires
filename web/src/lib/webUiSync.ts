@@ -6,7 +6,6 @@ import { SETTINGS_INTRO_KEY_PREFIX } from "./settingsIntros";
 import { markWebUiStateHydrated } from "./webUiHydration";
 
 const EXACT_KEYS = new Set<string>([
-  "aoe-welcome-seen", // theme welcome modal seen (mirrors the server-side tour flag)
   "aoe.acp.toolDensity.v1", // compact/detailed tool display
   "aoe-sidebar-sort-mode",
   "aoe-sidebar-axis",

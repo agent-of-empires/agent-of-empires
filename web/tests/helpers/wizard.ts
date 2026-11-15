@@ -13,7 +13,9 @@ export async function openWizard(page: Page) {
   // login-status gate. Match the scratch-shortcut readiness guard before
   // sending a one-shot key event that would otherwise be lost during startup.
   await expect(page.getByRole("button", { name: /New session/ }).first()).toBeVisible();
-  await page.locator("body").click();
+  // Blur rather than click the body: a centre click lands on the empty dashboard's New session card,
+  // which opens the wizard early and the "n" then types into its autofocused search.
+  await page.evaluate(() => (document.activeElement as HTMLElement | null)?.blur());
   await page.keyboard.press("n");
   await expect(page.getByTestId("session-wizard")).toBeVisible();
 }

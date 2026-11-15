@@ -17,6 +17,7 @@ export function Tooltip({
   detail,
   children,
   multiline = false,
+  bubbleClassName = "",
   id,
   open: controlledOpen,
 }: {
@@ -26,6 +27,8 @@ export function Tooltip({
   children: ReactNode;
   // Single-line callers (sidebar, sort picker) keep the default `whitespace-nowrap` pill.
   multiline?: boolean;
+  /** Extra classes for the bubble. */
+  bubbleClassName?: string;
   /** The bubble's id, for a caller that describes its own focus target with it. */
   id?: string;
   /**
@@ -129,7 +132,7 @@ export function Tooltip({
             style={{ left: pos?.x ?? 0, top: pos?.y ?? 0, visibility: pos ? "visible" : "hidden" }}
             className={`pointer-events-none fixed z-50 px-2 py-1 rounded bg-surface-950 border border-surface-700 text-[11px] text-text-secondary ${
               multiline ? "max-w-xs whitespace-normal" : "whitespace-nowrap"
-            }`}
+            } ${bubbleClassName}`}
           >
             {text}
             {detail && <span className="block text-text-subtle">{detail}</span>}

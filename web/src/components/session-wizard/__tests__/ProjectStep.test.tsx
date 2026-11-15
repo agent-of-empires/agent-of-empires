@@ -310,6 +310,25 @@ describe("Import session tab", () => {
     await waitFor(() => expect(screen.queryByText("Fix the spinner bug")).toBeNull());
   });
 
+  it("imports through a plugin row only while the host owns the adapter", async () => {
+    const OMP = agent("omp", {
+      kind: "plugin",
+      acp_installed: true,
+      acp_command: "omp",
+      acp_args: ["acp"],
+    });
+    renderImport("", [OMP]);
+    await screen.findByText("Fix the spinner bug");
+    expect(agentSelect().value).toBe("omp");
+    expect(listImportableSessions).toHaveBeenLastCalledWith("omp", "default");
+    cleanup();
+
+    // A configured custom adapter is not a host-owned one, so it never imports.
+    renderImport("", [{ ...OMP, kind: "custom" }]);
+    await Promise.resolve();
+    expect(screen.queryByText("Import session")).toBeNull();
+  });
+
   it("is not offered without an installed ACP adapter", async () => {
     renderImport("", [{ ...CLAUDE, acp_installed: false }]);
     await Promise.resolve();

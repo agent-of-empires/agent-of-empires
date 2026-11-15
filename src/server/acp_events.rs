@@ -439,6 +439,18 @@ pub(super) async fn acp_event_listener(state: Arc<AppState>) {
                 &inflight,
             )
         };
+        // `try_smart_rename` refuses these too, but only after the history read.
+        let should_rename = should_rename
+            && state
+                .instances
+                .read()
+                .await
+                .iter()
+                .find(|i| i.id == frame.session_id)
+                .is_some_and(|i| {
+                    i.is_structured()
+                        && crate::session::civilizations::is_default_civ_name(&i.title)
+                });
         if should_rename {
             if let Some((first_user_prompt, agent_prose)) =
                 state.acp_event_store.first_turn_context(
@@ -1334,8 +1346,8 @@ pub(super) fn derive_acp_session_change(event: &crate::acp::Event) -> Option<Acp
 pub(crate) enum StatusPolicy {
     Authoritative,
     /// A no-op while the sidebar sits on a status only the main turn may
-    /// resolve: `Waiting`, `Stopped` or `Error`. Used only by the
-    /// `Background*` arms (#4001).
+    /// resolve: `Waiting`, `Stopped` or `Error`. Used only by background
+    /// work events (#4001).
     Background,
     /// Only takes effect from `Error` or `Stopped`: a fresh worker attached.
     Heal,
@@ -1366,7 +1378,8 @@ pub(crate) fn status_policy(event: &crate::acp::Event) -> Option<StatusPolicy> {
             ..
         }
         | Event::BackgroundAgentCompleted { .. }
-        | Event::BackgroundTaskFinished { .. } => Some(StatusPolicy::Background),
+        | Event::BackgroundTaskFinished { .. }
+        | Event::SubagentUpdated { .. } => Some(StatusPolicy::Background),
         Event::RateLimitAutoResumed { .. } => Some(StatusPolicy::Heal),
         _ => None,
     }
@@ -2402,9 +2415,9 @@ mod tests {
             .send(AcpBroadcastFrame {
                 session_id: id.clone(),
                 seq: 7,
-                event: Arc::new(crate::acp::Event::AgentStartupError {
-                    message: "event store write failed at seq 7".into(),
-                }),
+                event: Arc::new(crate::acp::Event::startup_error(
+                    "event store write failed at seq 7",
+                )),
                 worker_generation: None,
                 sidebar_status: None,
             })
@@ -2942,12 +2955,7 @@ mod tests {
                 },
                 Some(Authoritative),
             ),
-            (
-                Event::AgentStartupError {
-                    message: "boom".into(),
-                },
-                Some(Authoritative),
-            ),
+            (Event::startup_error("boom"), Some(Authoritative)),
             (
                 Event::ApprovalResolved {
                     nonce: Nonce("x".into()),
@@ -2965,6 +2973,25 @@ mod tests {
             ),
             (progress(BackgroundAgentStatus::Running), Some(Background)),
             (progress(BackgroundAgentStatus::Completed), None),
+            (
+                Event::SubagentUpdated {
+                    subagent: crate::acp::state::SubagentRecord {
+                        session_id: "child".into(),
+                        parent_session_id: "root".into(),
+                        parent_tool_call_id: None,
+                        title: None,
+                        description: None,
+                        state: crate::acp::state::SubagentState::Idle,
+                        stop_reason: Some("end_turn".into()),
+                        error: None,
+                        cancel_capable: false,
+                        model: None,
+                        background: true,
+                    },
+                    at: chrono::Utc::now(),
+                },
+                Some(Background),
+            ),
             (
                 Event::AcpSessionAssigned {
                     acp_session_id: "a".into(),

@@ -6,6 +6,7 @@ import { act, cleanup, fireEvent, render, screen } from "@testing-library/react"
 
 import type { SandboxImageStatus } from "../../lib/api";
 import { useSandboxImageBanner } from "../../hooks/useSandboxImageBanner";
+import { notifySandboxImagePulled } from "../../lib/sandboxImageEvents";
 import { SandboxImageBanner } from "../SandboxImageBanner";
 
 const fetchSandboxImageStatus = vi.fn();
@@ -481,6 +482,39 @@ describe("SandboxImageBanner", () => {
     expect(banner()).not.toBeNull();
     fetchSandboxImageStatus.mockResolvedValue({ ...status(), state: "check_failed", error: "registry timed out" });
     await pollAfter(60 * 60_000);
+    expect(banner()).toBeNull();
+  });
+
+  it("asks again as soon as a create pulled the image, not at the next hourly poll", async () => {
+    for (const refused of [false, true]) {
+      const { unmount } = await mount(status());
+      if (refused) {
+        pullSandboxImage.mockResolvedValueOnce({ ok: false, message: "Pulling is off on this server." });
+        fireEvent.click(screen.getByRole("button", { name: "Update now" }));
+        await pollAfter(0);
+        expect(banner()?.textContent).toContain("Pulling is off on this server.");
+      }
+      expect(banner(), String(refused)).not.toBeNull();
+      fetchSandboxImageStatus.mockResolvedValue(status({ state: "current" } as Partial<SandboxImageStatus>));
+      act(() => notifySandboxImagePulled());
+      await pollAfter(0);
+      expect(banner(), String(refused)).toBeNull();
+      unmount();
+    }
+  });
+
+  it("ignores a late refusal of an Update now that a create's pull superseded", async () => {
+    await mount(status());
+    let reply!: (r: { ok: boolean; message?: string }) => void;
+    pullSandboxImage.mockImplementationOnce(() => new Promise((resolve) => (reply = resolve)));
+    fireEvent.click(screen.getByRole("button", { name: "Update now" }));
+    fetchSandboxImageStatus.mockResolvedValue(status({ state: "current" } as Partial<SandboxImageStatus>));
+    act(() => notifySandboxImagePulled());
+    await pollAfter(0);
+    // Not "Downloading": the pending Update now no longer stands in for the status.
+    expect(banner()).toBeNull();
+    await act(async () => reply({ ok: false, message: "Pulling is off on this server." }));
+    await pollAfter(0);
     expect(banner()).toBeNull();
   });
 

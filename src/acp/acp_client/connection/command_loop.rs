@@ -27,6 +27,7 @@ use crate::acp::acp_client::config_options::{
     thought_level_config_id, ConfigOptionDispatchPurpose, SessionChannels,
 };
 use crate::acp::acp_client::control::DaemonControlClient;
+use crate::acp::acp_client::control::{control_outcome_reason, prompt_outcome_to_response};
 use crate::acp::acp_client::delete::handle_delete_session_cmd;
 use crate::acp::acp_client::errors::acp_internal_error;
 use crate::acp::acp_client::lifecycle::LifecycleEnvelope;
@@ -66,6 +67,8 @@ pub(super) struct Session {
 
 impl Session {
     pub(super) async fn send_cancel(&self) -> Result<(), agent_client_protocol::Error> {
+        #[cfg(test)]
+        let _gate = self.shared.cancel_send_gate.read().await;
         match self.control.as_ref() {
             Some(control) => {
                 control.cancel().await;
@@ -144,16 +147,48 @@ impl Session {
         // is serialized with every command.
         let mut idle_tick = tokio::time::interval(BETWEEN_PROMPT_IDLE_CHECK_INTERVAL);
         idle_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        let shared = self.shared.clone();
+        let mut completion = shared.adopted_completion_tx.subscribe();
         loop {
             self.acp_session_id =
                 self.shared.ingress.current().ok_or_else(|| {
                     acp_internal_error("native session is not established".into())
                 })?;
+            let cancel_deadline = *shared.cancel_deadline.lock().unwrap();
             // Fallback prompts go first so later messages cannot overtake them.
             let cmd = match self.pending_prompts.pop_front() {
                 Some(blocks) => Some(ClientCmd::Prompt(blocks)),
                 None => tokio::select! {
+                    biased;
+                    outcome = async {
+                        completion.wait_for(Option::is_some).await.expect("shared owns the completion sender").clone().unwrap()
+                    } => {
+                        let parked = self.finish_adopted_turn(outcome).await;
+                        shared.adopted_completion_tx.send_replace(None);
+                        shared.local_prompt_settled.notify_waiters();
+                        if parked {
+                            break;
+                        }
+                        continue;
+                    }
                     cmd = self.cmd_rx.recv() => cmd,
+                    _ = async {
+                        match cancel_deadline {
+                            Some(deadline) => tokio::time::sleep_until(deadline).await,
+                            None => std::future::pending().await,
+                        }
+                    } => {
+                        if shared.prompt_in_flight.swap(false, Ordering::Relaxed)
+                            && shared.terminal_claim.claim()
+                        {
+                            self.stand_down_idle_completion();
+                            *shared.cancel_deadline.lock().unwrap() = None;
+                            shared.publish_terminal("agent_unresponsive".into(), vec![]).await;
+                            break;
+                        }
+                        *shared.cancel_deadline.lock().unwrap() = None;
+                        continue;
+                    }
                     _ = idle_tick.tick() => {
                         if self.between_prompt_idle_tick().await {
                             break;
@@ -175,6 +210,15 @@ impl Session {
                     let _ = respond_to.send(self.cancel_child(session_id).await);
                 }
                 Some(ClientCmd::Cancel) => {
+                    if shared.adopted_turn_active.load(Ordering::Relaxed)
+                        && shared.prompt_in_flight.load(Ordering::Relaxed)
+                        && !shared.terminal_claim.claimed()
+                    {
+                        // Arm first: a control loss during the send keeps the deadline.
+                        self.request_cancel().await;
+                        self.send_cancel().await?;
+                        continue;
+                    }
                     info!(target: "acp.protocol", "sending session/cancel (no prompt in flight)");
                     // Not `?`: a dead connection is when the UI most needs
                     // the synthetic Stopped below.
@@ -187,9 +231,7 @@ impl Session {
                     }
                     if self.stand_down_idle_completion() {
                         self.shared
-                            .emit(Event::Stopped {
-                                reason: "cancelled".into(),
-                            })
+                            .publish_terminal("cancelled".into(), vec![])
                             .await;
                     }
                 }
@@ -245,6 +287,52 @@ impl Session {
         Ok(())
     }
 
+    /// Finish the adopted turn, returning whether it must park for a rate limit.
+    pub(super) async fn finish_adopted_turn(
+        &self,
+        outcome: crate::acp::control_protocol::PromptOutcome,
+    ) -> bool {
+        let shared = &self.shared;
+        if !shared.adopted_turn_active.swap(false, Ordering::Relaxed)
+            || !shared.prompt_in_flight.load(Ordering::Relaxed)
+        {
+            return false;
+        }
+        let completion_reason = control_outcome_reason(&outcome);
+        let result = prompt_outcome_to_response(outcome);
+        let rate_limit = self.completion_rate_limit(&result);
+        let parked = rate_limit.is_some();
+        let prompt_failed = !parked && result.is_err();
+        let claimed = if prompt_failed {
+            shared.terminal_claim.claim_failed()
+        } else {
+            shared.terminal_claim.claim()
+        };
+        if !claimed {
+            return false;
+        }
+        shared.between_prompt.deactivate();
+        *shared.cancel_deadline.lock().unwrap() = None;
+        let mut preceding = Vec::new();
+        let reason = if let Some(info) = rate_limit {
+            preceding.push(Event::RateLimit { info });
+            "rate_limited".into()
+        } else if let Err(error) = result {
+            warn!(target: "acp.protocol", error = ?error, "adopted prompt failed; preserving runner and conversation");
+            preceding.push(crate::acp::acp_client::errors::prompt_runtime_error(
+                &error,
+                crate::session::ErrorEvidenceSource::RunnerCompletion,
+            ));
+            "prompt_failed".into()
+        } else {
+            completion_reason.into()
+        };
+        shared.publish_terminal(reason, preceding).await;
+        shared.prompt_in_flight.store(false, Ordering::Release);
+        shared.reset_message_dedup();
+        parked
+    }
+
     /// Claim an idle terminal without overriding an already-completed turn.
     fn stand_down_idle_completion(&self) -> bool {
         let claimed = self.shared.terminal_claim.claim();
@@ -259,10 +347,12 @@ impl Session {
     /// then end so the drain loop drops the worker and the reaper can resume it.
     async fn between_prompt_idle_tick(&self) -> bool {
         let shared = &self.shared;
-        let Some(cost_seen) = shared
-            .between_prompt
-            .take_idle_fire(now_ms(), shared.aoe.leases.working(now_ms()))
-        else {
+        shared.expire_silent_subagents(now_ms()).await;
+        let Some(cost_seen) = shared.between_prompt.take_idle_fire(
+            now_ms(),
+            shared.aoe.leases.working(now_ms()),
+            shared.subagent_working(now_ms()),
+        ) else {
             return false;
         };
         // An adopted turn races the detached resume-idle task for its
@@ -284,11 +374,8 @@ impl Session {
                 resets_at = ?info.resets_at,
                 "agent-initiated turn ended on a rejected rate-limit window; emitting RateLimit + Stopped"
             );
-            shared.emit(Event::RateLimit { info }).await;
             shared
-                .emit(Event::Stopped {
-                    reason: "rate_limited".into(),
-                })
+                .publish_terminal("rate_limited".into(), vec![Event::RateLimit { info }])
                 .await;
             return true;
         }
@@ -299,11 +386,7 @@ impl Session {
             reason,
             "between-prompt idle watchdog: synthesizing Stopped for completed turn"
         );
-        shared
-            .emit(Event::Stopped {
-                reason: reason.into(),
-            })
-            .await;
+        shared.publish_terminal(reason.into(), vec![]).await;
         false
     }
 
@@ -613,7 +696,6 @@ impl Session {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::acp::acp_client::lifecycle::TerminalClaim;
     use crate::acp::acp_client::session_identity::{RequestPolicy, SessionIngress};
     use agent_client_protocol::{ByteStreams, Client};
     use futures_util::FutureExt as _;
@@ -666,7 +748,7 @@ mod tests {
                         "reset-fence-test".into(),
                         &crate::acp::agent_profiles::GEMINI,
                         lifecycle_tx,
-                        Arc::new(TerminalClaim::new()),
+                        Arc::new(crate::acp::acp_client::SessionState::default()),
                         Arc::new(AtomicBool::new(false)),
                         None,
                         ingress.clone(),

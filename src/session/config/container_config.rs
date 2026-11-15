@@ -2140,15 +2140,19 @@ pub(crate) fn resolve_active_agent(
     tool: &str,
     command: Option<&str>,
     session_config: &super::SessionConfig,
-) -> Option<&'static crate::agents::AgentDef> {
+) -> Option<&'static crate::agents::AgentDef<'static>> {
     resolve_executed_agent(tool, command, session_config).or_else(|| {
         // Legacy status-only provisioning never grants native conversation authority.
         if session_config.agent_execution_as.contains_key(tool) {
             return None;
         }
         match session_config.agent_detect_as.get(tool) {
-            Some(name) => crate::agents::get_agent(name),
-            None => crate::agents::get_agent(tool),
+            // A declaration takes the listing but not the detection it replaces,
+            // so this keeps mounts and stores and grants no conversation authority.
+            Some(name) => {
+                crate::agents::get_agent(name).or_else(|| crate::agents::native_definition(name))
+            }
+            None => crate::agents::native_definition(tool),
         }
     })
 }
@@ -2157,7 +2161,7 @@ fn resolve_executed_agent(
     tool: &str,
     command: Option<&str>,
     session_config: &super::SessionConfig,
-) -> Option<&'static crate::agents::AgentDef> {
+) -> Option<&'static crate::agents::AgentDef<'static>> {
     let command = command
         .or_else(|| session_config.custom_agents.get(tool).map(String::as_str))
         .or_else(|| crate::agents::get_agent(tool).map(|agent| agent.binary))
@@ -2486,7 +2490,7 @@ pub(crate) fn stranded_named_ignore_volumes(
 /// Reject managed agent paths that would bypass the sandbox's private mounts.
 fn validate_managed_container_environment(
     environment: &[EnvEntry],
-    active_agent: Option<&crate::agents::AgentDef>,
+    active_agent: Option<&crate::agents::AgentDef<'_>>,
     container_home: &str,
 ) -> Result<()> {
     let require_path = |key: &str, expected: &str| -> Result<()> {
@@ -2543,11 +2547,38 @@ pub(crate) fn build_container_config(
     let project_path = Path::new(project_path_str);
     let profile_config = &launch_config.profile;
     let profile_session_config = &profile_config.session;
-    let active_agent = resolve_active_agent(
-        agent_selection.tool,
-        agent_selection.command,
-        profile_session_config,
-    );
+    let plugin_agent = if crate::agents::get_agent(agent_selection.tool).is_none()
+        && !profile_session_config
+            .agent_command_override
+            .get(agent_selection.tool)
+            .is_some_and(|command| !command.trim().is_empty())
+    {
+        crate::plugin::agent_integration::declared_agent(
+            crate::plugin::registry(),
+            agent_selection.tool,
+            profile_session_config
+                .custom_agents
+                .iter()
+                .filter(|(_, command)| !command.trim().is_empty())
+                .map(|(name, _)| name.as_str()),
+        )
+        .filter(|agent| {
+            agent_selection
+                .command
+                .is_none_or(|command| agent.contribution().command.as_deref() == Some(command))
+        })
+    } else {
+        None
+    };
+    let active_agent = if plugin_agent.is_none() {
+        resolve_active_agent(
+            agent_selection.tool,
+            agent_selection.command,
+            profile_session_config,
+        )
+    } else {
+        None
+    };
     let config_tool = active_agent.map_or(agent_selection.tool, |agent| agent.name);
 
     // A workspace mounts its own dir plus every main repo, a bare-repo worktree
@@ -2593,6 +2624,13 @@ pub(crate) fn build_container_config(
         });
     }
     validate_managed_container_environment(&environment, active_agent, CONTAINER_HOME)?;
+    if let Some(agent) = &plugin_agent {
+        agent
+            .with_definition(|agent| {
+                validate_managed_container_environment(&environment, Some(agent), CONTAINER_HOME)
+            })
+            .transpose()?;
+    }
     if !environment.iter().any(|entry| entry.key() == "CODEX_HOME") {
         if let Some(codex_home) = managed_codex_home_from_config(
             agent_selection.tool,
@@ -2981,6 +3019,24 @@ pub(crate) fn build_container_config(
                 });
             }
         }
+    }
+    if let Some(agent) = &plugin_agent {
+        agent.with_definition(|agent| {
+            for &(key, value) in agent.container_env {
+                environment.push(EnvEntry::Literal {
+                    key: key.to_owned(),
+                    value: value.to_owned(),
+                });
+            }
+            if yolo.enabled {
+                if let Some(crate::agents::YoloMode::EnvVar(key, value)) = agent.yolo.as_ref() {
+                    environment.push(EnvEntry::Literal {
+                        key: (*key).to_owned(),
+                        value: (*value).to_owned(),
+                    });
+                }
+            }
+        });
     }
 
     // The agent registry distinguishes approval gates from startup-only trust prompts.
@@ -6428,7 +6484,7 @@ codex-work = "{}"
         let project_dir = TempDir::new().unwrap();
         git2::Repository::init(project_dir.path()).unwrap();
 
-        let sidecar_agents: Vec<&crate::agents::AgentDef> = crate::agents::AGENTS
+        let sidecar_agents: Vec<&crate::agents::AgentDef<'_>> = crate::agents::AGENTS
             .iter()
             .filter(|a| a.sidecar_hooks.is_some() && !a.host_only)
             .collect();
@@ -6718,6 +6774,134 @@ codex-work = "{}"
             msg.contains("AOE_INSTANCE_ID"),
             "error must surface validator failure, got: {msg}"
         );
+    }
+
+    /// A wrapper that only detects as an agent keeps that agent's sandbox roots
+    /// whether or not a declaration takes its listing, and never gains resume
+    /// authority from the detection.
+    #[test]
+    #[serial_test::serial]
+    fn a_detected_wrapper_keeps_its_roots_through_a_takeover_and_a_revocation() {
+        let temporary = TempDir::new().unwrap();
+        let _reload = crate::plugin::ReloadRegistryOnDrop;
+        let _app = crate::session::test_support::isolate_app_dir_at(temporary.path());
+        let home = TempDir::new().unwrap();
+        let mut session = super::super::SessionConfig::default();
+        session
+            .agent_detect_as
+            .insert("wrapped-omp".into(), "omp".into());
+        let roots = || {
+            sandbox_content_roots(
+                "wrapped-omp",
+                None,
+                &session,
+                home.path(),
+                "1111111111111111",
+            )
+            .unwrap()
+        };
+
+        let detected = roots();
+        assert!(!detected.is_empty(), "the detection must name roots");
+        assert!(detected.iter().all(|root| root.host.ends_with(".omp")));
+
+        crate::session::test_support::install_omp_takeover("omp-next");
+        assert!(crate::agents::get_agent("omp").is_none());
+        assert_eq!(
+            roots(),
+            detected,
+            "a takeover must not empty a detected wrapper's roots"
+        );
+
+        let plugin = crate::plugin::plugins_dir()
+            .unwrap()
+            .join("acme.omp-cutover");
+        fs::remove_dir_all(&plugin).unwrap();
+        crate::session::update_config(|config| {
+            config.plugins.remove("acme.omp-cutover");
+        })
+        .unwrap();
+        crate::plugin::reload_registry();
+        assert_eq!(crate::agents::get_agent("omp").map(|a| a.name), Some("omp"));
+        assert_eq!(roots(), detected, "a revocation must keep the same roots");
+
+        let refused = match crate::session::Instance::execution_agent_for(
+            "wrapped-omp",
+            "wrapped-omp",
+            &session,
+        ) {
+            Ok(agent) => panic!("detection must not grant resume authority: {}", agent.name),
+            Err(error) => format!("{error:#}"),
+        };
+        assert!(
+            refused.contains("agent_detect_as is only status detection"),
+            "{refused}"
+        );
+    }
+
+    /// A stored command keeps the execution and store owner its tool's own
+    /// identity names, so a takeover of that tool cannot reattribute it to a
+    /// command that does not select the declaration.
+    #[test]
+    #[serial_test::serial]
+    fn a_takeover_cannot_reattribute_a_stored_command() {
+        let temporary = TempDir::new().unwrap();
+        let _reload = crate::plugin::ReloadRegistryOnDrop;
+        let _app = crate::session::test_support::isolate_app_dir_at(temporary.path());
+        let home = TempDir::new().unwrap();
+        let session = super::super::SessionConfig::default();
+        let roots = || {
+            sandbox_content_roots(
+                "omp",
+                Some("codex"),
+                &session,
+                home.path(),
+                "1111111111111111",
+            )
+            .unwrap()
+        };
+        let refused =
+            || match crate::session::Instance::execution_agent_for("omp", "codex", &session) {
+                Ok(agent) => panic!("a foreign command must not run as {}", agent.name),
+                Err(error) => format!("{error:#}"),
+            };
+        let stored = || {
+            crate::session::Instance::execution_agent_for("omp", "omp", &session)
+                .expect("a stored fallback command keeps its native identity")
+                .name
+        };
+
+        let before = roots();
+        assert!(refused().contains("contradicts the selected native execution identity"));
+        assert_eq!(stored(), "omp");
+        assert!(before.iter().all(|root| root.host.ends_with(".omp")));
+
+        // The takeover hides the fallback from listings without changing what
+        // either stored command means.
+        crate::session::test_support::install_omp_takeover("omp-next");
+        assert!(crate::agents::get_agent("omp").is_none());
+        assert!(refused().contains("contradicts the selected native execution identity"));
+        assert_eq!(stored(), "omp");
+        assert_eq!(roots(), before, "a takeover must not move the store owner");
+        assert_eq!(
+            crate::session::Instance::execution_agent_for("omp", "omp-next", &session)
+                .expect("the declaration's own command runs the tool's identity")
+                .name,
+            "omp"
+        );
+
+        let plugin = crate::plugin::plugins_dir()
+            .unwrap()
+            .join("acme.omp-cutover");
+        fs::remove_dir_all(&plugin).unwrap();
+        crate::session::update_config(|config| {
+            config.plugins.remove("acme.omp-cutover");
+        })
+        .unwrap();
+        crate::plugin::reload_registry();
+        assert!(refused().contains("contradicts the selected native execution identity"));
+        assert_eq!(stored(), "omp");
+        assert_eq!(roots(), before, "a revocation must keep the store owner");
     }
 
     /// The profile decides codex sandbox status hooks: disabling them drops the status writers,

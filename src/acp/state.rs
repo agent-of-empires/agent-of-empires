@@ -324,6 +324,24 @@ pub struct ConfigOptionSwitchFailure {
     pub reason: String,
 }
 
+/// A startup failure aoe has diagnosed; clients branch on it instead of the message.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum StartupCause {
+    /// The sandboxed Session's container no longer exists, so a respawn can't reach it.
+    ContainerMissing,
+}
+
+impl Event {
+    /// An [`Event::AgentStartupError`] with no diagnosed cause.
+    pub fn startup_error(message: impl Into<String>) -> Self {
+        Self::AgentStartupError {
+            message: message.into(),
+            cause: None,
+        }
+    }
+}
+
 /// Why aoe refused a session whose adapter failed the compatibility check
 /// after `initialize`. `auto_install` means "Update & restart" can fix it.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -392,6 +410,8 @@ pub enum BackgroundAgentStatus {
     /// The agent cannot say what the subagent is doing (RFD `unknown`).
     Unknown,
     Completed,
+    /// Cancelled before it finished.
+    Stopped,
     /// The parent session ended before the agent finished.
     Detached,
     /// The transcript could not be read or parsed.
@@ -400,7 +420,10 @@ pub enum BackgroundAgentStatus {
 
 impl BackgroundAgentStatus {
     fn is_terminal(self) -> bool {
-        matches!(self, Self::Completed | Self::Detached | Self::Error)
+        matches!(
+            self,
+            Self::Completed | Self::Stopped | Self::Detached | Self::Error
+        )
     }
 }
 
@@ -488,6 +511,13 @@ pub enum SubagentState {
     Unknown,
 }
 
+impl SubagentState {
+    /// Still working: it holds its parent busy until it idles.
+    pub fn is_active(self) -> bool {
+        matches!(self, Self::Running | Self::RequiresAction)
+    }
+}
+
 /// One subagent session announced by its parent. The event carries the whole
 /// merged snapshot, so replay is last-write-wins.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -507,12 +537,18 @@ pub struct SubagentRecord {
     /// Open string: the RFD reserves values for future stop reasons.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub stop_reason: Option<String>,
+    /// The error message an `error` stop carried.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
     /// Whether `session/cancel` may target this child.
     #[serde(default)]
     pub cancel_capable: bool,
     /// Read-only: the child's own model selector, never set by aoe.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub model: Option<String>,
+    /// Launched in the background: its card stays open until it goes idle.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub background: bool,
 }
 
 /// One tool call a background sub-agent made, parsed from its transcript.
@@ -928,6 +964,9 @@ pub enum Event {
     /// The agent failed to spawn or never completed `initialize`.
     AgentStartupError {
         message: String,
+        /// Set when aoe knows why, so clients never match `message` text.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        cause: Option<StartupCause>,
     },
     /// `initialize` completed but the adapter failed the compatibility policy.
     IncompatibleAgent {
@@ -1046,14 +1085,15 @@ impl AcpState {
         }
     }
 
-    /// Whether any background sub-agent or task is still in flight. Agents
-    /// are keyed on `ended_at`, not `status`: a terminal
+    /// Whether any background sub-agent, subagent session or task is still in
+    /// flight. Agents are keyed on `ended_at`, not `status`: a terminal
     /// `BackgroundAgentCompleted` can carry `status: Stalled` (the tailer's
     /// abort timeout gives up without a clean `end_turn`), and that record is
     /// done like any other (#4001).
     pub fn has_active_background_agent(&self) -> bool {
         !self.background_tasks.is_empty()
             || self.background_agents.iter().any(|a| a.ended_at.is_none())
+            || self.subagents.iter().any(|s| s.state.is_active())
     }
 
     /// Task ids can be reused, so only the run still open on `task_id` closes.
@@ -1068,16 +1108,34 @@ impl AcpState {
         }
     }
 
+    /// Queue delivery ignores background work, but never overlaps a foreground turn.
+    pub fn accepts_queue_drain(&self) -> bool {
+        !self.turn_active
+            && matches!(
+                self.sidebar_phase,
+                SidebarPhase::Idle | SidebarPhase::PromptFailed
+            )
+            && !self.cancelling
+            && !self.has_pending_request()
+            && !self.compacting
+    }
+
     /// The sidebar status this state implies. A live background agent keeps
     /// the row `Running` between main turns.
     pub fn sidebar_status(&self) -> Status {
         match self.sidebar_phase {
             SidebarPhase::Error | SidebarPhase::PromptFailed => Status::Error,
             SidebarPhase::Waiting => Status::Waiting,
+            // Subagent and late parent events re-arm `Active` while a question is open.
+            SidebarPhase::Active if self.has_pending_request() => Status::Waiting,
             SidebarPhase::Active => Status::Running,
             SidebarPhase::Idle if self.has_active_background_agent() => Status::Running,
             SidebarPhase::Idle => Status::Idle,
         }
+    }
+
+    fn has_pending_request(&self) -> bool {
+        !self.pending_approvals.is_empty() || !self.pending_elicitations.is_empty()
     }
 
     pub fn apply_event(&mut self, seq: u64, event: Event) -> Result<u64, StateError> {
@@ -1614,10 +1672,11 @@ impl BackgroundAgentRecord {
             SubagentState::Running => (BackgroundAgentStatus::Running, false),
             SubagentState::RequiresAction => (BackgroundAgentStatus::RequiresAction, false),
             SubagentState::Unknown => (BackgroundAgentStatus::Unknown, false),
-            SubagentState::Idle if child.stop_reason.as_deref() == Some("error") => {
-                (BackgroundAgentStatus::Error, true)
-            }
-            SubagentState::Idle => (BackgroundAgentStatus::Completed, true),
+            SubagentState::Idle => match child.stop_reason.as_deref() {
+                Some("error") => (BackgroundAgentStatus::Error, true),
+                Some("cancelled") => (BackgroundAgentStatus::Stopped, true),
+                _ => (BackgroundAgentStatus::Completed, true),
+            },
         };
         self.status = status;
         self.ended_at = ended.then(|| self.ended_at.unwrap_or(at));
@@ -1849,9 +1908,7 @@ mod tests {
             warning: None,
             ended_at: Utc::now(),
         };
-        let startup_error = || Event::AgentStartupError {
-            message: "boom".into(),
-        };
+        let startup_error = || Event::startup_error("boom");
         let assigned = || Event::AcpSessionAssigned {
             acp_session_id: "a-1".into(),
         };
@@ -1904,6 +1961,44 @@ mod tests {
                     prompt("go"),
                     Event::ElicitationRequested {
                         elicitation: elicitation.clone(),
+                    },
+                ],
+                Status::Waiting,
+            ),
+            (
+                "question open while a subagent runs tools",
+                vec![
+                    prompt("go"),
+                    Event::ElicitationRequested {
+                        elicitation: elicitation.clone(),
+                    },
+                    Event::ToolCallStarted {
+                        tool_call: ToolCall {
+                            parent_tool_call_id: Some("task-1".into()),
+                            ..tool()
+                        },
+                    },
+                    chunk("x"),
+                ],
+                Status::Waiting,
+            ),
+            (
+                "one of two questions answered",
+                vec![
+                    prompt("go"),
+                    Event::ElicitationRequested {
+                        elicitation: elicitation.clone(),
+                    },
+                    Event::ElicitationRequested {
+                        elicitation: Elicitation {
+                            nonce: Nonce("e-2".into()),
+                            ..elicitation.clone()
+                        },
+                    },
+                    Event::ElicitationResolved {
+                        nonce: Nonce("e-1".into()),
+                        outcome: ElicitationOutcome::Cancelled,
+                        answers: Vec::new(),
                     },
                 ],
                 Status::Waiting,
@@ -2225,6 +2320,31 @@ mod tests {
             }
         ));
 
+        let legacy: Event =
+            serde_json::from_value(serde_json::json!({ "AgentStartupError": { "message": "x" } }))
+                .unwrap();
+        assert!(matches!(
+            legacy,
+            Event::AgentStartupError { cause: None, .. }
+        ));
+        for (event, wire) in [
+            (
+                Event::startup_error("x"),
+                serde_json::json!({ "AgentStartupError": { "message": "x" } }),
+            ),
+            (
+                Event::AgentStartupError {
+                    message: "x".into(),
+                    cause: Some(StartupCause::ContainerMissing),
+                },
+                serde_json::json!({ "AgentStartupError": {
+                    "message": "x", "cause": { "kind": "container_missing" }
+                } }),
+            ),
+        ] {
+            assert_eq!(serde_json::to_value(&event).unwrap(), wire);
+        }
+
         for (json, want) in [
             ("\"model\"", ConfigOptionCategory::Model),
             ("\"thought_level\"", ConfigOptionCategory::ThoughtLevel),
@@ -2256,9 +2376,7 @@ mod tests {
         assert!(!s.turn_active && s.thinking.is_none());
 
         for terminal in [
-            Event::AgentStartupError {
-                message: "boom".into(),
-            },
+            Event::startup_error("boom"),
             Event::PromptRuntimeError {
                 message: "boom".into(),
                 evidence: None,
@@ -2640,8 +2758,10 @@ mod tests {
                 description: None,
                 state,
                 stop_reason: stop_reason.map(str::to_owned),
+                error: None,
                 cancel_capable: true,
                 model: None,
+                background: false,
             },
             at: Utc::now(),
         }
@@ -2660,6 +2780,12 @@ mod tests {
                 SubagentState::Idle,
                 Some("error"),
                 BackgroundAgentStatus::Error,
+                true,
+            ),
+            (
+                SubagentState::Idle,
+                Some("cancelled"),
+                BackgroundAgentStatus::Stopped,
                 true,
             ),
             (
@@ -2728,6 +2854,32 @@ mod tests {
         }
         assert_eq!(s.subagents.len(), 1, "snapshots upsert by session id");
         assert_eq!(s.subagents[0].stop_reason.as_deref(), Some("error"));
+    }
+
+    /// A child with no `BackgroundAgentLaunched` record keeps the row busy past
+    /// the root's terminal without reopening the main turn.
+    #[test]
+    fn a_working_child_holds_the_sidebar_past_the_root_terminal() {
+        for (state, reason, busy) in [
+            (SubagentState::Running, None, true),
+            (SubagentState::RequiresAction, None, true),
+            (SubagentState::Unknown, None, false),
+            (SubagentState::Idle, Some("end_turn"), false),
+        ] {
+            let mut s = applied([
+                prompt("go"),
+                subagent(SubagentState::Running, None),
+                stopped("end_turn"),
+            ]);
+            assert!(!s.turn_active);
+            assert_eq!(s.sidebar_status(), Status::Running);
+            s.apply_event(s.last_seq + 1, subagent(state, reason))
+                .unwrap();
+            assert!(!s.turn_active, "{state:?}");
+            assert_eq!(s.has_active_background_agent(), busy, "{state:?}");
+            let want = if busy { Status::Running } else { Status::Idle };
+            assert_eq!(s.sidebar_status(), want, "{state:?}");
+        }
     }
 
     fn bg_progress(status: BackgroundAgentStatus, tool_count: u32) -> Event {

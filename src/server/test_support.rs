@@ -271,6 +271,7 @@ pub(crate) fn build_test_app_state_impl_with_event_store(
         session_service,
         token_manager: Arc::new(TokenManager::new(token, Duration::from_secs(3600))),
         login_manager: Arc::new(login::LoginManager::new(None)),
+        mcp_session_secret: None,
         passkey_manager: Arc::new(super::passkeys::PasskeyManager::in_memory()),
         rate_limiter: Arc::new(RateLimiter::new()),
         behind_tunnel: false,
@@ -661,4 +662,17 @@ pub fn capture_log(f: impl FnOnce()) -> String {
     );
     let out = buf.lock().unwrap().clone();
     String::from_utf8(out).unwrap()
+}
+
+/// A launcher whose agent rejects `initialize` for want of a login, as the connection task
+/// reports it before the handshake completes.
+#[cfg(test)]
+pub(crate) fn unauthenticated_launcher() -> crate::acp::supervisor::Launcher {
+    Arc::new(|_config, _id| {
+        Box::pin(async {
+            Err::<crate::acp::acp_client::AcpClient, _>(crate::acp::acp_client::AcpError::Spawn(
+                "ACP connection failed: Authentication required".into(),
+            ))
+        })
+    })
 }
