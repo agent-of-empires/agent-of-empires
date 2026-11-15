@@ -4602,7 +4602,7 @@
       "risk": "medium",
       "specs": ["src/hooks/__tests__/useAcpQueueCount.test.tsx", "src/hooks/useAcpSession.test.ts"],
       "components": ["web/src/components/WorkspaceSidebar.tsx"],
-      "notes": "The count is the open session's live queue while it holds one, else the server's queued_count; a stored count never wins."
+      "notes": "The count is the open session's live queue while it holds one, else the server's queued_count; a stored count or a failed queue list never wins, and a changed polled count re-lists."
     },
     {
       "id": "sidebar.queued-chip-reason",

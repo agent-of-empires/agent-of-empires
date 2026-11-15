@@ -70,6 +70,7 @@ interface Props {
   onStartSession?: () => void;
   archivedAt: string | null;
   snoozedUntil: string | null;
+  queuedCount?: number;
   /** Trashed sessions are read-only: no composer or queue strips. */
   trashedAt: string | null;
   /** Restore the trashed workspace; resolves false on failure. */
@@ -105,6 +106,7 @@ export function StructuredView(props: Props) {
     compactAliases,
     archivedAt,
     snoozedUntil,
+    queuedCount,
     onOpenFileRef,
     fileRefSession,
   } = props;
@@ -120,6 +122,7 @@ export function StructuredView(props: Props) {
               acpWorkerState={acpWorkerState}
               archivedAt={archivedAt}
               snoozedUntil={snoozedUntil}
+              queuedCount={queuedCount}
               showClearedTurns={showClearedTurns}
             >
               {(ctx) => (

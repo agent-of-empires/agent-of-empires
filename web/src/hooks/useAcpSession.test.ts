@@ -5,7 +5,8 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import { emptyAcpState } from "../lib/acpTypes";
 import { STATE_TTL_MS, STORAGE_KEY_PREFIX, getLiveQueueCount } from "../lib/acpStateStorage";
-import { reportAcpInteraction, type ServerQueuedPrompt } from "../lib/api";
+import { listServerQueue, reportAcpInteraction, type ServerQueuedPrompt } from "../lib/api";
+import type { SessionResponse } from "../lib/types";
 import { ACP_DIAL_TIMEOUT_MS, ACP_MAX_RETRIES, ACP_WS_STALE_MS, acpRetryDelayMs } from "./acpSession/useAcpConnection";
 import {
   FakeWebSocket,
@@ -18,12 +19,13 @@ import {
   type Call,
   type Route,
 } from "./__tests__/acpHarness";
+import { useQueuedCounts } from "./useAcpQueueCount";
 import { clearAcpCache, useAcpSession } from "./useAcpSession";
 
-vi.mock("../lib/api", async (importActual) => ({
-  ...(await importActual<typeof import("../lib/api")>()),
-  reportAcpInteraction: vi.fn(),
-}));
+vi.mock("../lib/api", async (importActual) => {
+  const actual = await importActual<typeof import("../lib/api")>();
+  return { ...actual, reportAcpInteraction: vi.fn(), listServerQueue: vi.fn(actual.listServerQueue) };
+});
 
 type HookArgs = Parameters<typeof useAcpSession>;
 
@@ -733,6 +735,8 @@ describe("server queue", () => {
   let workerDown: boolean;
   // Set to hold the queue list's response until it resolves.
   let queueListHeld: Promise<void> | null;
+  let queueListStarted: (() => void) | null;
+  let queueListFails: boolean;
   const row = (id: string, text: string, extra: Partial<ServerQueuedPrompt> = {}): ServerQueuedPrompt => ({
     id,
     seq: serverQueue.size,
@@ -746,11 +750,16 @@ describe("server queue", () => {
     serverBusy = false;
     workerDown = false;
     queueListHeld = null;
+    queueListStarted = null;
+    queueListFails = false;
     vi.mocked(reportAcpInteraction).mockClear();
+    vi.mocked(listServerQueue).mockClear();
     calls = installAcpFakes(({ url, method, body }) => {
       if (url.includes("/queue")) {
         const item = url.match(/\/queue\/([^/?]+)/)?.[1];
         if (method === "GET") {
+          queueListStarted?.();
+          if (queueListFails) return new Response("unavailable", { status: 503 });
           const list = () => json([...serverQueue.values()].sort((a, b) => a.seq - b.seq));
           return queueListHeld ? queueListHeld.then(list) : list();
         }
@@ -807,15 +816,16 @@ describe("server queue", () => {
     expect(getLiveQueueCount(id)).toBeUndefined();
 
     const list = Promise.withResolvers<void>();
+    const started = Promise.withResolvers<void>();
     queueListHeld = list.promise;
+    queueListStarted = started.resolve;
     lastSocket().open();
-    await flushAsync();
+    await started.promise;
     // Open, but the Daemon's list hasn't arrived: the persisted copy still isn't lent.
     expect(getLiveQueueCount(id)).toBeUndefined();
     queueListHeld = null;
     list.resolve();
-    await flushAsync();
-    expect(getLiveQueueCount(id)).toBe(1);
+    await waitFor(() => expect(getLiveQueueCount(id)).toBe(1));
 
     // A row queued here counts before any session list could report it.
     serverBusy = true;
@@ -834,6 +844,47 @@ describe("server queue", () => {
     expect(getLiveQueueCount(id)).toBe(2);
     hook.unmount();
     expect(getLiveQueueCount(id)).toBeUndefined();
+  });
+
+  it("keeps the Daemon's count when a queue list fails, and re-lists when the polled count changes", async () => {
+    const id = "sess-polled";
+    const persisted = ["p1", "p2"].map((pid) => ({ id: pid, text: pid, queuedAt: "2026-01-01T00:00:00.000Z" }));
+    localStorage.setItem(
+      `${STORAGE_KEY_PREFIX}${id}`,
+      JSON.stringify({ savedAt: Date.now(), state: { ...emptyAcpState(), queuedPrompts: persisted } }),
+    );
+    serverQueue.set("q1", row("q1", "first"));
+    queueListFails = true;
+    const hook = renderHook(
+      ({ polled }: { polled: number }) => ({
+        acp: useAcpSession(id, "running", null, null, polled),
+        chip: useQueuedCounts([{ id, queued_count: polled } as SessionResponse]),
+      }),
+      { wrapper: profileWrapper, initialProps: { polled: 1 } },
+    );
+    await flushAsync();
+    lastSocket().open();
+    await waitFor(() => expect(listServerQueue).toHaveBeenCalledTimes(1));
+    // The hook's continuation was registered on this promise first, so it has run once this settles.
+    await act(async () => {
+      await vi.mocked(listServerQueue).mock.results[0]!.value;
+    });
+    expect(getLiveQueueCount(id)).toBeUndefined();
+    expect(hook.result.current.chip).toEqual([1]);
+    // The rows on screen are still the persisted copy, so changing them lends no count either.
+    expect(hook.result.current.acp.state.queuedPrompts.map((q) => q.id)).toEqual(["p1", "p2"]);
+    act(() => hook.result.current.acp.removeQueuedPrompt("p1"));
+    expect(getLiveQueueCount(id)).toBeUndefined();
+    expect(hook.result.current.chip).toEqual([1]);
+
+    // Another tab queues a row; the next poll reports it and this tab re-lists.
+    queueListFails = false;
+    serverQueue.set("q2", row("q2", "from another tab"));
+    hook.rerender({ polled: 2 });
+    await waitFor(() => expect(getLiveQueueCount(id)).toBe(2));
+    expect(hook.result.current.chip).toEqual([2]);
+    expect(hook.result.current.acp.state.queuedPrompts.map((q) => q.text)).toEqual(["first", "from another tab"]);
+    hook.unmount();
   });
 
   it("shows the row the daemon reports when it parks a busy-turn prompt", async () => {

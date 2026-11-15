@@ -117,6 +117,8 @@ export function useAcpSession(
   workerState: "absent" | "resuming" | "running" | "stopping" = "running",
   archivedAt: string | null = null,
   snoozedUntil: string | null = null,
+  /** The session list's `queued_count`; a change means another client may have changed the queue. */
+  polledQueuedCount?: number,
 ) {
   sweepExpiredStorage();
   const [state, dispatch] = useReducer(reducer, sessionId, initialState);
@@ -308,9 +310,10 @@ export function useAcpSession(
     [sessionId, archivedAtRef, snoozedUntilRef, dispatchPromptNow, enqueueServer, showServerQueued],
   );
 
-  // The daemon owns and drains the queue; re-list on connect and at each turn change. The first
-  // list per session re-sends rows the server never confirmed; a confirmed row missing from the
-  // server was drained and must not be re-created.
+  // The daemon owns and drains the queue; re-list on connect, at each turn change, and when the
+  // polled count changes (not whenever it differs: optimistic rows here differ until the next
+  // poll). The first list per session re-sends rows the server never confirmed; a confirmed row
+  // missing from the server was drained and must not be re-created.
   const queueMigratedRef = useRef<Set<string>>(new Set());
   // The sidebar badge takes this browser's count only between the first queue list after an open and the close.
   const queueListedRef = useRef(false);
@@ -343,14 +346,15 @@ export function useAcpSession(
         }
       }
       const rows = await listServerQueue(sessionId);
-      if (cancelled) return;
+      // A failed list must not lend the sidebar a count, or replace the rows on screen.
+      if (cancelled || rows === null) return;
       queueListedRef.current = true;
       dispatch({ kind: "hydrate_server_queue", rows });
     })();
     return () => {
       cancelled = true;
     };
-  }, [sessionId, status, state.turnActive, queuedPromptsRef]);
+  }, [sessionId, status, state.turnActive, queuedPromptsRef, polledQueuedCount]);
 
   // Queue mutations are optimistic; a failed server call is corrected by the next hydrate.
   const removeQueuedPrompt = useCallback(

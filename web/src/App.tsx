@@ -2132,6 +2132,7 @@ function AppContent({
                             onStartSession={() => void handleStartSession(session.id)}
                             archivedAt={session.archived_at ?? null}
                             snoozedUntil={session.snoozed_until ?? null}
+                            queuedCount={session.queued_count}
                             trashedAt={session.trashed_at ?? null}
                             onRestore={
                               session.trashed_at
