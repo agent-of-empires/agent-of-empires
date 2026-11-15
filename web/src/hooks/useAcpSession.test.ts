@@ -937,6 +937,91 @@ describe("server queue", () => {
     hook.unmount();
   });
 
+  it("retries a failed queue list a bounded number of times, and stops on success or cleanup", async () => {
+    vi.useFakeTimers();
+    const id = "sess-list-retry";
+    const lists = () => calls.filter((c) => c.method === "GET" && c.url.includes("/queue")).length;
+    queueListFails = true;
+    const hook = renderHook(({ polled }: { polled: number }) => useAcpSession(id, "running", null, null, polled), {
+      wrapper: profileWrapper,
+      initialProps: { polled: 1 },
+    });
+    await flushAsync();
+    lastSocket().open();
+    await flushAsync();
+    expect(lists()).toBe(1);
+    // The server recovers while the poll keeps reporting the same count.
+    await act(() => vi.advanceTimersByTimeAsync(1999));
+    expect(lists()).toBe(1);
+    await act(() => vi.advanceTimersByTimeAsync(1));
+    expect(lists()).toBe(2);
+    queueListFails = false;
+    serverQueue.set("q1", row("q1", "recovered"));
+    await act(() => vi.advanceTimersByTimeAsync(5000));
+    expect(lists()).toBe(3);
+    expect(hook.result.current.state.queuedPrompts.map((q) => q.text)).toEqual(["recovered"]);
+    expect(getLiveQueueCount(id)).toBe(1);
+    // Past every delay, but short of the socket's staleness timeout.
+    await act(() => vi.advanceTimersByTimeAsync(20_000));
+    expect(lists()).toBe(3);
+
+    // Failing every time, it gives up after its last delay until the next trigger.
+    queueListFails = true;
+    hook.rerender({ polled: 2 });
+    await flushAsync();
+    expect(lists()).toBe(4);
+    await act(() => vi.advanceTimersByTimeAsync(2000 + 5000 + 15000));
+    expect(lists()).toBe(7);
+    await act(() => vi.advanceTimersByTimeAsync(20_000));
+    expect(lists()).toBe(7);
+
+    // A pending retry ends with the effect.
+    hook.rerender({ polled: 3 });
+    await flushAsync();
+    expect(lists()).toBe(8);
+    hook.unmount();
+    await act(() => vi.advanceTimersByTimeAsync(60_000));
+    expect(lists()).toBe(8);
+  });
+
+  it("confirms a re-sent row in its Session's stored state when the user has left it", async () => {
+    const a = "sess-left";
+    const queuedAt = "2026-01-01T00:00:00.000Z";
+    const state = {
+      ...emptyAcpState(),
+      queuedPrompts: [{ id: "u1", text: "u1", queuedAt, pending: true }],
+    };
+    localStorage.setItem(`${STORAGE_KEY_PREFIX}${a}`, JSON.stringify({ savedAt: Date.now(), state }));
+    const first = renderHook(({ id }: { id: string }) => useAcpSession(id, "running"), {
+      wrapper: profileWrapper,
+      initialProps: { id: a },
+    });
+    await flushAsync();
+    const post = Promise.withResolvers<void>();
+    const started = Promise.withResolvers<void>();
+    queuePostHeld = post.promise;
+    queuePostStarted = started.resolve;
+    lastSocket().open();
+    await started.promise;
+    // The user opens another Session; the Daemon then delivers u1 before its response arrives.
+    first.rerender({ id: "sess-elsewhere" });
+    await flushAsync();
+    serverQueue.delete("u1");
+    queuePostHeld = null;
+    post.resolve();
+    await flushAsync();
+    first.unmount();
+
+    const again = render(a);
+    await flushAsync();
+    lastSocket().open();
+    await flushAsync();
+    expect(posts("/queue").map((c) => JSON.parse(c.body!).id)).toEqual(["u1"]);
+    expect(serverQueue.has("u1")).toBe(false);
+    expect(again.result.current.state.queuedPrompts).toEqual([]);
+    again.unmount();
+  });
+
   it("shows the row the daemon reports when it parks a busy-turn prompt", async () => {
     const { result } = await openBusy("sess-busy");
     expect(posts("/acp/prompt").map((c) => JSON.parse(c.body!).text)).toEqual(["follow-up"]);

@@ -99,6 +99,9 @@ async function postReportingErrors(
   }
 }
 
+/** Waits before re-listing after a failed queue list; then the next poll change or turn retries. */
+const QUEUE_LIST_RETRY_MS = [2000, 5000, 15000];
+
 // A UUID v4 even on plain-HTTP LAN hosts, where `crypto.randomUUID` is unavailable.
 function optimisticPromptId(): string {
   const c = globalThis.crypto;
@@ -339,31 +342,45 @@ export function useAcpSession(
       migration = (async () => {
         for (const q of pending) {
           const saved = await enqueueServerPrompt(sessionId, { id: q.id, text: q.text, attachments: q.attachments });
+          if (!saved) continue;
           // Confirmed, so a list that no longer has it (delivered) drops it instead of keeping it to re-send.
-          if (saved) dispatch({ kind: "confirm_queued_prompt", id: q.id });
+          const confirm: Action = { kind: "confirm_queued_prompt", id: q.id };
+          if (sessionIdRef.current === sessionId) {
+            dispatch(confirm);
+          } else {
+            // Left meanwhile: confirm into the Session's stored state, which a later open restores.
+            const stored = cacheGet(sessionId);
+            if (stored) cacheSet(sessionId, reducer(stored, confirm));
+          }
         }
       })();
       queueMigrationRef.current.set(sessionId, migration);
     }
     const migrated = migration;
+    let retry: ReturnType<typeof setTimeout> | undefined;
     void (async () => {
       await migrated;
-      const rows = await listServerQueue(sessionId);
-      if (cancelled) return;
-      // A failed list must not replace the rows on screen. The sidebar falls back to the polled
-      // count, whose next change lists again.
-      if (rows === null) {
+      for (const delay of [...QUEUE_LIST_RETRY_MS, null]) {
+        const rows = await listServerQueue(sessionId);
+        if (cancelled) return;
+        if (rows !== null) {
+          queueListedRef.current = true;
+          dispatch({ kind: "hydrate_server_queue", rows });
+          return;
+        }
+        // A failed list must not replace the rows on screen. The sidebar falls back to the polled
+        // count while this retries, then waits for the next trigger.
         queueListedRef.current = false;
         setLiveQueueCount(sessionId, null);
-        return;
+        if (delay === null) return;
+        await new Promise((resolve) => (retry = setTimeout(resolve, delay)));
       }
-      queueListedRef.current = true;
-      dispatch({ kind: "hydrate_server_queue", rows });
     })();
     return () => {
       cancelled = true;
+      clearTimeout(retry);
     };
-  }, [sessionId, status, state.turnActive, queuedPromptsRef, polledQueuedCount]);
+  }, [sessionId, status, state.turnActive, queuedPromptsRef, sessionIdRef, polledQueuedCount]);
 
   // Queue mutations are optimistic; a failed server call is corrected by the next hydrate.
   const removeQueuedPrompt = useCallback(
