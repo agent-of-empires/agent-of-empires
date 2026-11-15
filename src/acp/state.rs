@@ -889,7 +889,11 @@ impl CurrentNativeAvailability {
                     && self.scope.choice.as_deref() == Some(&expected.destination)
                     && expected
                         .matches_pending(row, storage)
-                        .map_err(|_| EstablishmentRefusal::Unconfirmed)?
+                        .map_err(|_| {
+                            tracing::warn!(target: "acp.initial_host_diagnostic",
+                                disposition = "pending_comparison_error", "temporary Q initial-host refusal");
+                            EstablishmentRefusal::Unconfirmed
+                        })?
             }
             Some(AcpEstablishment::Applied { attempt_id }) if *attempt_id == expected.id => {
                 expected.profile == row.source_profile
@@ -903,7 +907,11 @@ impl CurrentNativeAvailability {
                         .as_ref()
                         .is_some_and(|choice| choice.matches(row))
                     && NativeEventContext::capture(row, storage)
-                        .map_err(|_| EstablishmentRefusal::Unconfirmed)?
+                        .map_err(|_| {
+                            tracing::warn!(target: "acp.initial_host_diagnostic",
+                                disposition = "applied_context_error", "temporary Q initial-host refusal");
+                            EstablishmentRefusal::Unconfirmed
+                        })?
                         == self.scope.context
                     && self
                         .client
@@ -922,12 +930,24 @@ impl CurrentNativeAvailability {
         if !matches
             || !self
                 .refresh(&row.id, matches)
-                .map_err(|_| EstablishmentRefusal::Unconfirmed)?
+                .map_err(|_| {
+                    tracing::warn!(target: "acp.initial_host_diagnostic",
+                        disposition = "initial_refresh_wait", "temporary Q initial-host refusal");
+                    EstablishmentRefusal::Unconfirmed
+                })?
             || self.unavailable.is_some()
             || !self
                 .qualify_owner(&row.id)
-                .map_err(|_| EstablishmentRefusal::Unconfirmed)?
+                .map_err(|_| {
+                    tracing::warn!(target: "acp.initial_host_diagnostic",
+                        disposition = "initial_owner_wait", "temporary Q initial-host refusal");
+                    EstablishmentRefusal::Unconfirmed
+                })?
         {
+            tracing::warn!(target: "acp.initial_host_diagnostic",
+                disposition = "initial_attempt_ineligible", comparison_matches = matches,
+                ready = self.ready, unavailable = self.unavailable.is_some(),
+                "temporary Q initial-host refusal");
             return Ok(None);
         }
         Ok(Some(expected))

@@ -31,7 +31,9 @@ for (const c of [
       .poll(async () => (await assignedIds(serve, sessionId)).length, { timeout: 45_000, intervals: [500] })
       .toBeGreaterThan(0);
     const [firstId] = await assignedIds(serve, sessionId);
-    expect((await postPrompt(serve.baseUrl, sessionId, c.command)).status).toBe(202);
+    const resetResponse = await postPrompt(serve.baseUrl, sessionId, c.command);
+    const resetFailure = resetResponse.status === 202 ? "" : (await resetResponse.text()).slice(0, 4096);
+    expect(resetResponse.status, resetFailure).toBe(202);
 
     const resetDone = async () => {
       const freshId = (await assignedIds(serve, sessionId)).at(-1);

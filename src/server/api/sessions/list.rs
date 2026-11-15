@@ -1303,12 +1303,11 @@ mod shared_recovery_tests {
     }
 
     async fn background_agent(
-        live: &crate::server::test_support::ManagedControlSession,
+        live: &mut crate::server::test_support::ManagedControlSession,
         agent_id: &str,
         output_file: &str,
     ) {
-        live.native
-            .send(serde_json::json!({
+        let notification = serde_json::json!({
                 "jsonrpc":"2.0","method":"session/update","params":{
                     "sessionId":live.sid,"update":{
                         "sessionUpdate":"tool_call_update","toolCallId":format!("{agent_id}-tool"),
@@ -1319,10 +1318,23 @@ mod shared_recovery_tests {
                         }}}
                     }
                 }
-            }))
-            .await;
+            });
         tokio::time::timeout(std::time::Duration::from_secs(10), async {
             loop {
+                live.native.send(notification.clone()).await;
+                loop {
+                    let event = live
+                        .client
+                        .next_event()
+                        .await
+                        .expect("actual original resource publication");
+                    if matches!(&event, crate::acp::Event::BackgroundAgentLaunched {
+                        agent_id: observed, ..
+                    } if observed == agent_id)
+                    {
+                        break;
+                    }
+                }
                 let folded = live
                     .state
                     .session_service
@@ -1465,21 +1477,26 @@ mod shared_recovery_tests {
         with_managed(|scope| {
             Box::pin(async move {
                 let mut live =
-                    managed_control_session(scope, "shared-recovery-current-background", "claude", None).await;
+                    managed_control_session(scope, "shared-recovery-current-background", "codex", None).await;
                 let id = live.id().to_owned();
                 let state = live.state.clone();
                 let prompt = live.start_prompt("failed main turn").await;
                 live.finish_prompt(&prompt, Some("provider_failure")).await;
-                let actual = live.client.actual();
-                let store = actual.native_store.as_ref().unwrap().stores[0].clone();
-                let project = store.join("projects/-managed");
-                std::fs::create_dir_all(project.join("subagents")).unwrap();
-                std::fs::write(project.join(format!("{}.jsonl", live.sid)), "").unwrap();
-                let transcript = project.join("subagents/current-background.jsonl");
+                let output = scope.tempdir();
+                let transcript = output.path().join("current-background.jsonl");
                 std::fs::write(&transcript, "").unwrap();
-                background_agent(&live, "current-background", transcript.to_str().unwrap()).await;
+                background_agent(&mut live, "current-background", transcript.to_str().unwrap()).await;
                 let folded = state.session_service.fold_control_state(&id).await.unwrap();
                 assert!(!folded.turn_active && folded.has_qualified_background_work());
+                assert!(state
+                    .acp_event_store
+                    .unresolved_background_agent_launches(&id)
+                    .unwrap()
+                    .iter()
+                    .find(|launch| launch.agent_id == "current-background")
+                    .expect("actual durable original launch")
+                    .witness
+                    .is_some());
                 let recovery = projected(&state, &id).await.recovery.unwrap();
                 assert!(
                     recovery.work_in_progress && recovery.actions.attach && recovery.actions.stop
@@ -1631,7 +1648,7 @@ mod shared_recovery_tests {
                 partial_output(&live).await;
                 live.finish_prompt(&prompt, Some("provider_failure")).await;
                 if action == SessionRecoveryAction::Same {
-                    background_agent(&live, "historical-untracked-launch", "").await;
+                    background_agent(&mut live, "historical-untracked-launch", "").await;
                     let folded = state.session_service.fold_control_state(&id).await.unwrap();
                     assert!(folded.has_active_background_agent());
                     assert!(!folded.has_qualified_background_work());

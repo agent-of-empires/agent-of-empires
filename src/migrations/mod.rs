@@ -449,6 +449,9 @@ fn run_migrations_inner(
     };
     // Another migrator may have completed while we acquired its transaction.
     let current = ensure_schema_supported()?;
+    let requires_exclusion = current < CURRENT_VERSION
+        || announce
+        || (current == CURRENT_VERSION && v059_reconcile_acp_lineages::autonomous_pending()?);
     let owned_serve;
     let serve = if requires_exclusion && serve.is_none() {
         owned_serve = crate::cli::serve::try_lock_serve()?.ok_or(DaemonBlocksMigration(

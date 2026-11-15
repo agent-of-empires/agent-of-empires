@@ -191,7 +191,11 @@ impl<S: BroadcastSink> Supervisor<S> {
                         {
                             return Ok(expected);
                         }
-                        row.require_resolved_acp_selection()?;
+                        row.require_resolved_acp_selection().map_err(|error| {
+                            tracing::warn!(target: "acp.initial_host_diagnostic",
+                                disposition = "fallback_selection_unresolved", "temporary Q initial-host refusal");
+                            error
+                        })?;
                         let selected = current
                             .scope
                             .choice
@@ -199,12 +203,23 @@ impl<S: BroadcastSink> Supervisor<S> {
                             .is_some_and(|choice| choice.matches(row));
                         if !current
                             .refresh(session_id, selected)
-                            .map_err(|_| EstablishmentRefusal::Unconfirmed)?
+                            .map_err(|_| {
+                                tracing::warn!(target: "acp.initial_host_diagnostic",
+                                    disposition = "fallback_refresh_wait", "temporary Q initial-host refusal");
+                                EstablishmentRefusal::Unconfirmed
+                            })?
                             || !current.ready
                             || !current
                                 .qualify_owner(session_id)
-                                .map_err(|_| EstablishmentRefusal::Unconfirmed)?
+                                .map_err(|_| {
+                                    tracing::warn!(target: "acp.initial_host_diagnostic",
+                                        disposition = "fallback_owner_wait", "temporary Q initial-host refusal");
+                                    EstablishmentRefusal::Unconfirmed
+                                })?
                         {
+                            tracing::warn!(target: "acp.initial_host_diagnostic",
+                                disposition = "fallback_not_ready", ready = current.ready,
+                                "temporary Q initial-host refusal");
                             anyhow::bail!(EstablishmentRefusal::Unconfirmed);
                         }
                         Ok(None)
@@ -219,6 +234,8 @@ impl<S: BroadcastSink> Supervisor<S> {
                         })
                 })?;
             let Some((_guard, expected)) = observed else {
+                tracing::warn!(target: "acp.initial_host_diagnostic",
+                    disposition = "observation_fence_busy", "temporary Q initial-host refusal");
                 return Err(SupervisorError::Acp(AcpError::Establishment(
                     EstablishmentRefusal::Unconfirmed,
                 )));

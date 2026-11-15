@@ -166,9 +166,18 @@ async fn agent_request_during_session_new_does_not_deadlock_the_runner() {
             assert!(receipt.owner.birth_fingerprint.is_some());
             assert!(*original_delivery);
             assert!(receipt.replay.closed && !receipt.replay.lost);
-            let record = crate::process::worker_registry::load_strict(&client.id)
-                .unwrap()
-                .unwrap();
+            let record = control_deadline(async {
+                loop {
+                    match crate::process::worker_registry::load_strict(&client.id) {
+                        Ok(record) => break record.expect("actual original registry record"),
+                        Err(error) if error.is::<crate::process::worker_registry::RegistryBusy>() => {
+                            tokio::task::yield_now().await;
+                        }
+                        Err(error) => panic!("original registry observation failed: {error}"),
+                    }
+                }
+            })
+            .await;
             assert_eq!(
                 record.stored_acp_session_id.as_deref(),
                 Some("callback-native")
