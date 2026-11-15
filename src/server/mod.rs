@@ -34,6 +34,7 @@ pub(crate) mod runtime;
 pub(crate) mod runtime_ws;
 mod secure_store;
 pub(crate) mod serve_snapshot;
+pub(crate) mod session_credential;
 pub(crate) mod session_identity;
 pub(crate) mod session_service;
 pub(crate) mod session_spawn;
