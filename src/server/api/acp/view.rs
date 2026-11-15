@@ -568,6 +568,15 @@ fn handoff_unavailable(error: &anyhow::Error) -> Response {
     terminal_refusal(TerminalSwitchReason::HandoffPending, "")
 }
 
+/// A failure before any switch is reserved. No switch code: none is in flight.
+fn switch_unavailable(error: &anyhow::Error, message: &'static str) -> Response {
+    tracing::warn!(target: "acp.switch", %error, "{message}");
+    (StatusCode::SERVICE_UNAVAILABLE, message).into_response()
+}
+
+const CHECK_UNAVAILABLE: &str = "Couldn't check the switch to Terminal view; retry shortly";
+const SWITCH_UNAVAILABLE: &str = "Couldn't start the switch to Terminal view; retry shortly";
+
 /// A coded refusal, so a client can show the matching dialog state. The body
 /// stays plain text because the current web client shows it as it is.
 fn terminal_refusal(reason: TerminalSwitchReason, agent: &str) -> Response {
@@ -589,6 +598,7 @@ fn terminal_refusal(reason: TerminalSwitchReason, agent: &str) -> Response {
         }
         ContextUnconfirmed => "The conversation is still being saved; retry shortly".into(),
         SessionChanged => "The Session changed during the switch; retry".into(),
+        NotStructured => "This Session isn't in Structured view".into(),
     };
     crate::server::api::text_error_with_code_header(
         crate::daemon::ApiErrorCode::TerminalSwitchRefused(reason),
@@ -726,7 +736,7 @@ pub async fn acp_terminal_check(
         return session_not_found();
     };
     if !instance.is_structured() {
-        return terminal_refusal(TerminalSwitchReason::SessionChanged, "");
+        return terminal_refusal(TerminalSwitchReason::NotStructured, "");
     }
     let agent = pick_agent(&state, &instance, instance.agent_name.as_deref()).await;
     let plan = if instance.terminal_handoff.is_some() {
@@ -734,11 +744,11 @@ pub async fn acp_terminal_check(
     } else {
         let source_event_seq = match state.acp_event_store.highest_seq_checked(&id) {
             Ok(seq) => seq,
-            Err(error) => return handoff_unavailable(&error),
+            Err(error) => return switch_unavailable(&error, CHECK_UNAVAILABLE),
         };
         match terminal_plan(&state, &id, &instance, &agent, source_event_seq).await {
             Ok(plan) => plan,
-            Err(error) => return handoff_unavailable(&error),
+            Err(error) => return switch_unavailable(&error, CHECK_UNAVAILABLE),
         }
     };
     let (context, reason) = match plan {
@@ -1256,12 +1266,12 @@ async fn terminal_handoff_request(
         Ok(None) => {
             return handoff_unavailable(&anyhow::anyhow!("terminal handoff driver is active"))
         }
-        Err(error) => return handoff_unavailable(&error),
+        Err(error) => return switch_unavailable(&error, SWITCH_UNAVAILABLE),
     };
     let exclusion = match HandoffExclusion::acquire(&state, &id).await {
         Ok(exclusion) => exclusion,
         Err(error) if error.is::<crate::session::SessionGone>() => return session_not_found(),
-        Err(error) => return handoff_unavailable(&error),
+        Err(error) => return switch_unavailable(&error, SWITCH_UNAVAILABLE),
     };
     let Some(cached) = find_instance(&state, &id).await else {
         return session_not_found();
@@ -1269,12 +1279,12 @@ async fn terminal_handoff_request(
     let profile = cached.source_profile.clone();
     let source_event_seq = match state.acp_event_store.highest_seq_checked(&id) {
         Ok(seq) => seq,
-        Err(error) => return handoff_unavailable(&error),
+        Err(error) => return switch_unavailable(&error, SWITCH_UNAVAILABLE),
     };
     let (native, durable) = match load_handoff_row(&state, &profile, &id).await {
         Ok(loaded) => loaded,
         Err(error) if error.is::<crate::session::SessionGone>() => return session_not_found(),
-        Err(error) => return handoff_unavailable(&error),
+        Err(error) => return switch_unavailable(&error, SWITCH_UNAVAILABLE),
     };
     let Some(cached) = find_instance(&state, &id).await else {
         return session_not_found();
@@ -1318,7 +1328,7 @@ async fn terminal_handoff_request(
         let agent = pick_agent(&state, &instance, instance.agent_name.as_deref()).await;
         let plan = match terminal_plan(&state, &id, &instance, &agent, source_event_seq).await {
             Ok(plan) => plan,
-            Err(error) => return handoff_unavailable(&error),
+            Err(error) => return switch_unavailable(&error, SWITCH_UNAVAILABLE),
         };
         // An earlier conversation retires as `Discard`, so reservation records whether it continues.
         let recorded = match (&plan, conversation) {
@@ -4047,7 +4057,7 @@ mod tests {
             (
                 &terminal,
                 StatusCode::CONFLICT,
-                serde_json::json!({"error": "session_changed"}),
+                serde_json::json!({"error": "not_structured"}),
             ),
         ];
         let rows: Vec<Instance> = cases.iter().map(|(row, _, _)| (*row).clone()).collect();
@@ -4209,6 +4219,48 @@ mod tests {
             assert_eq!(stored.view, View::Structured);
             assert!(stored.terminal_handoff.is_none());
         }
+        Ok(())
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn a_storage_error_before_any_switch_is_not_reported_as_one_in_flight(
+    ) -> anyhow::Result<()> {
+        let _home = crate::session::test_support::isolate_app_dir();
+        let project = tempfile::tempdir()?;
+        let path = project.path().to_str().unwrap();
+        let mut row = structured_claude_row("store down", path, Some("sid-down"));
+        row.resume_intent = ResumeIntent::Use("sid-down".into());
+        row.resume_binding = Some(asserted_claude_binding("sid-down", path));
+        crate::server::test_support::seed_instances_on_disk_for_test("default", vec![row.clone()]);
+        let state = crate::server::test_support::build_test_app_state(vec![row.clone()]);
+        crate::server::test_support::refresh_canonical_metadata_for_test(&state).await;
+        let checked = acp_terminal_check(State(state.clone()), Path(row.id.clone())).await;
+        assert_eq!(response_json(checked).await?.0, StatusCode::OK);
+
+        state.acp_event_store.test_set_unavailable(true);
+        let checked = acp_terminal_check(State(state.clone()), Path(row.id.clone())).await;
+        let switched = acp_disable(
+            State(state.clone()),
+            Path(row.id.clone()),
+            axum::body::Bytes::new(),
+        )
+        .await
+        .into_response();
+        state.acp_event_store.test_set_unavailable(false);
+        for (response, message) in [(checked, CHECK_UNAVAILABLE), (switched, SWITCH_UNAVAILABLE)] {
+            assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+            assert!(response
+                .headers()
+                .get(crate::daemon::ERROR_CODE_HEADER)
+                .is_none());
+            let body = axum::body::to_bytes(response.into_body(), usize::MAX).await?;
+            assert_eq!(&body[..], message.as_bytes());
+        }
+        let stored = crate::session::Storage::open_unwatched("default")?.load()?;
+        let stored = stored.iter().find(|r| r.id == row.id).unwrap();
+        assert_eq!(stored.view, View::Structured);
+        assert!(stored.terminal_handoff.is_none());
         Ok(())
     }
 

@@ -290,12 +290,14 @@ pub enum TerminalSwitchReason {
     HandoffPending,
     NoTerminalTool,
     ContextUnconfirmed,
-    /// Refusal only: the Session left Structured view or changed during the switch.
+    /// Refusal only: the Session changed during the switch.
     SessionChanged,
+    /// Check only: the Session isn't in Structured view.
+    NotStructured,
 }
 
 impl TerminalSwitchReason {
-    pub const ALL: [Self; 9] = [
+    pub const ALL: [Self; 10] = [
         Self::AgentNotResumable,
         Self::NoConversationYet,
         Self::EarlierConversation,
@@ -305,6 +307,7 @@ impl TerminalSwitchReason {
         Self::NoTerminalTool,
         Self::ContextUnconfirmed,
         Self::SessionChanged,
+        Self::NotStructured,
     ];
 
     pub const fn as_str(self) -> &'static str {
@@ -318,6 +321,7 @@ impl TerminalSwitchReason {
             Self::NoTerminalTool => "no_terminal_tool",
             Self::ContextUnconfirmed => "context_unconfirmed",
             Self::SessionChanged => "session_changed",
+            Self::NotStructured => "not_structured",
         }
     }
 }

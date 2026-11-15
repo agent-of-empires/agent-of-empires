@@ -318,23 +318,6 @@ mod tests {
                 false,
                 Some(ApiErrorCode::AccountSwapUnavailable),
             ),
-            (
-                StatusCode::CONFLICT,
-                "conversation_not_bound",
-                false,
-                Some(ApiErrorCode::TerminalSwitchRefused(
-                    TerminalSwitchReason::ConversationNotBound,
-                )),
-            ),
-            (
-                StatusCode::SERVICE_UNAVAILABLE,
-                "handoff_pending",
-                false,
-                Some(ApiErrorCode::TerminalSwitchRefused(
-                    TerminalSwitchReason::HandoffPending,
-                )),
-            ),
-            (StatusCode::CONFLICT, "handoff_pending", false, None),
         ] {
             let mut headers = HeaderMap::new();
             headers.insert(ERROR_CODE_HEADER, HeaderValue::from_static(value));
@@ -346,6 +329,55 @@ mod tests {
             assert_eq!(
                 ApiErrorCode::from_headers(status, &headers, resolving),
                 None
+            );
+        }
+    }
+
+    #[test]
+    fn every_terminal_switch_reason_decodes_only_with_its_status() {
+        use serde::Deserialize;
+        use TerminalSwitchReason::*;
+        // Every variant in declaration order, from the derived Deserialize, so `ALL` can't drop one.
+        let variants: Vec<_> = (0..)
+            .map_while(|index| {
+                TerminalSwitchReason::deserialize(serde::de::value::U32Deserializer::<
+                    serde::de::value::Error,
+                >::new(index))
+                .ok()
+            })
+            .collect();
+        assert_eq!(variants, TerminalSwitchReason::ALL);
+        for reason in variants {
+            let (wire, status) = match reason {
+                AgentNotResumable => ("agent_not_resumable", StatusCode::CONFLICT),
+                NoConversationYet => ("no_conversation_yet", StatusCode::CONFLICT),
+                EarlierConversation => ("earlier_conversation", StatusCode::CONFLICT),
+                ConversationNotBound => ("conversation_not_bound", StatusCode::CONFLICT),
+                Sandboxed => ("sandboxed", StatusCode::CONFLICT),
+                HandoffPending => ("handoff_pending", StatusCode::SERVICE_UNAVAILABLE),
+                NoTerminalTool => ("no_terminal_tool", StatusCode::CONFLICT),
+                ContextUnconfirmed => ("context_unconfirmed", StatusCode::SERVICE_UNAVAILABLE),
+                SessionChanged => ("session_changed", StatusCode::CONFLICT),
+                NotStructured => ("not_structured", StatusCode::CONFLICT),
+            };
+            assert_eq!(reason.as_str(), wire);
+            let code = ApiErrorCode::TerminalSwitchRefused(reason);
+            let mut headers = HeaderMap::new();
+            headers.insert(ERROR_CODE_HEADER, HeaderValue::from_static(wire));
+            assert_eq!(
+                ApiErrorCode::from_headers(status, &headers, false),
+                Some(code),
+                "{wire}"
+            );
+            let other = if status == StatusCode::CONFLICT {
+                StatusCode::SERVICE_UNAVAILABLE
+            } else {
+                StatusCode::CONFLICT
+            };
+            assert_eq!(
+                ApiErrorCode::from_headers(other, &headers, false),
+                None,
+                "{wire}"
             );
         }
     }
