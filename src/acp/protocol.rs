@@ -272,6 +272,8 @@ pub enum TerminalContext {
     Continues,
     StartsFresh,
     Blocked,
+    /// The Session's own command selects the conversation, so only a switch with no choice runs.
+    CommandDecides,
 }
 
 /// Why a switch to Terminal view starts fresh, can't happen yet, or continues a
@@ -294,10 +296,12 @@ pub enum TerminalSwitchReason {
     SessionChanged,
     /// Check only: the Session isn't in Structured view.
     NotStructured,
+    /// With `command_decides`: the launch command carries a native session selector.
+    CommandSelectsConversation,
 }
 
 impl TerminalSwitchReason {
-    pub const ALL: [Self; 10] = [
+    pub const ALL: [Self; 11] = [
         Self::AgentNotResumable,
         Self::NoConversationYet,
         Self::EarlierConversation,
@@ -308,6 +312,7 @@ impl TerminalSwitchReason {
         Self::ContextUnconfirmed,
         Self::SessionChanged,
         Self::NotStructured,
+        Self::CommandSelectsConversation,
     ];
 
     pub const fn as_str(self) -> &'static str {
@@ -322,6 +327,7 @@ impl TerminalSwitchReason {
             Self::ContextUnconfirmed => "context_unconfirmed",
             Self::SessionChanged => "session_changed",
             Self::NotStructured => "not_structured",
+            Self::CommandSelectsConversation => "command_selects_conversation",
         }
     }
 }

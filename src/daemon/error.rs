@@ -359,6 +359,9 @@ mod tests {
                 ContextUnconfirmed => ("context_unconfirmed", StatusCode::SERVICE_UNAVAILABLE),
                 SessionChanged => ("session_changed", StatusCode::CONFLICT),
                 NotStructured => ("not_structured", StatusCode::CONFLICT),
+                CommandSelectsConversation => {
+                    ("command_selects_conversation", StatusCode::CONFLICT)
+                }
             };
             assert_eq!(reason.as_str(), wire);
             let code = ApiErrorCode::TerminalSwitchRefused(reason);

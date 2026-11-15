@@ -729,6 +729,14 @@ impl Instance {
         }
     }
 
+    /// The native session selector in this row's own command or arguments. An unmanaged
+    /// launch then runs it instead of injecting AoE's own (see `apply_session_flags_in`).
+    pub(crate) fn command_session_selector(&self) -> Option<String> {
+        let mut words = parse_launch_command(&self.get_tool_command())?.words;
+        words.extend(shell_words::split(&self.extra_args).ok()?);
+        self.existing_session_selector(&words, self.default_selector_agent())
+    }
+
     fn existing_session_selector(
         &self,
         words: &[String],
