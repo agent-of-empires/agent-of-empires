@@ -2927,6 +2927,27 @@ pub(super) mod tests {
                         assert_ne!(replacement_owner, owner);
                         let replacement_lease = supervisor.running_lease(&id).unwrap();
                         assert_ne!(replacement_lease, lease);
+                        // Native usability precedes these final SDK publications.
+                        tokio::time::timeout(Duration::from_secs(10), async {
+                            let mut assigned = false;
+                            let mut capabilities = false;
+                            while !assigned || !capabilities {
+                                let frame = frames.recv().await.expect("actual replacement publication");
+                                if frame.session_id != id
+                                    || frame.worker_generation != Some(replacement_lease.epoch())
+                                {
+                                    continue;
+                                }
+                                match frame.event.as_ref() {
+                                    Event::AcpSessionAssigned { acp_session_id, .. }
+                                        if acp_session_id == "deadline-original-native" => assigned = true,
+                                    Event::PromptCapabilities { .. } => capabilities = true,
+                                    _ => {}
+                                }
+                            }
+                        }).await.expect("the exact replacement's assignment and capabilities are durable");
+                        let flush = supervisor.sink.clone();
+                        tokio::task::spawn_blocking(move || flush.flush()).await.unwrap();
                         let prefix = store.highest_seq(&id).unwrap();
                         let bytes = std::fs::read(worker_registry::record_path(&id).unwrap()).unwrap();
                         assert!(!supervisor.resume_deferred(&id).await.unwrap());
