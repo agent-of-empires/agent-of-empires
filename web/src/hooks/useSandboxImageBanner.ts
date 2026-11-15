@@ -106,8 +106,10 @@ export function useSandboxImageBanner(): SandboxImageBannerView | null {
     const offServerDown = onServerDownChange((down) => {
       if (!down) pollNow.current();
     });
-    // The create's pull supersedes a refused "Update now".
+    // The create's pull supersedes any "Update now", refused or still awaiting its reply.
     const offPulled = onSandboxImagePulled(() => {
+      attempt.current++;
+      replyPendingSince.current = null;
       setRefusal(null);
       pollNow.current();
     });

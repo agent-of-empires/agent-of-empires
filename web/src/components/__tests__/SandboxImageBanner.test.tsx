@@ -503,6 +503,21 @@ describe("SandboxImageBanner", () => {
     }
   });
 
+  it("ignores a late refusal of an Update now that a create's pull superseded", async () => {
+    await mount(status());
+    let reply!: (r: { ok: boolean; message?: string }) => void;
+    pullSandboxImage.mockImplementationOnce(() => new Promise((resolve) => (reply = resolve)));
+    fireEvent.click(screen.getByRole("button", { name: "Update now" }));
+    fetchSandboxImageStatus.mockResolvedValue(status({ state: "current" } as Partial<SandboxImageStatus>));
+    act(() => notifySandboxImagePulled());
+    await pollAfter(0);
+    // Not "Downloading": the pending Update now no longer stands in for the status.
+    expect(banner()).toBeNull();
+    await act(async () => reply({ ok: false, message: "Pulling is off on this server." }));
+    await pollAfter(0);
+    expect(banner()).toBeNull();
+  });
+
   it("keeps text at text contrast on the tints, with the state colour on the dot", async () => {
     await mount(status());
     fireEvent.click(screen.getByRole("button", { name: "Update now" }));
