@@ -63,8 +63,7 @@ Open the PR against `main` and complete the template. Include:
 - how it was tested;
 - related issues.
 
-Reviewers may ask for a screenshot or recording of a UI change; attach one when
-asked.
+If it's a UI change, consider attaching screenshot(s), or certainly provide them if requested by the reviewer.
 
 AI agents propose; humans approve scope and implementation, review changes, and
 decide issue disposition or merge. You remain responsible for AI-assisted work:
