@@ -600,14 +600,21 @@ async fn download_asset(url: &str, dest: &Path) -> Result<()> {
     let mut file = tokio::fs::File::create(dest)
         .await
         .with_context(|| format!("creating {}", dest.display()))?;
-    while let Some(chunk) = response.chunk().await? {
-        file.write_all(&chunk)
-            .await
-            .with_context(|| format!("writing {url} to {}", dest.display()))?;
+    let result: Result<()> = async {
+        while let Some(chunk) = response.chunk().await? {
+            file.write_all(&chunk)
+                .await
+                .with_context(|| format!("writing {url} to {}", dest.display()))?;
+        }
+        Ok(())
     }
-    file.flush()
+    .await;
+    let flush = file
+        .flush()
         .await
-        .with_context(|| format!("writing {url} to {}", dest.display()))
+        .with_context(|| format!("writing {url} to {}", dest.display()));
+    result?;
+    flush
 }
 
 fn sha256_file(path: &Path) -> Result<String> {
