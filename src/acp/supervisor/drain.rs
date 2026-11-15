@@ -2411,6 +2411,21 @@ mod tests {
                         client.ready().await;
                         assert_eq!(client.actual().connected_runner(), owner);
                         assert_eq!(peer.requests().iter().filter(|method| method.as_str() == "session/prompt").count(), 1);
+                        // Usability precedes the retained SDK's final publications.
+                        // Do not trap one ahead of the diagnostic whose flock wait we observe.
+                        tokio::time::timeout(Duration::from_secs(10), async {
+                            let (mut assigned, mut capabilities) = (false, false);
+                            while !assigned || !capabilities {
+                                match client.next_event().await.expect("actual retained handshake publication") {
+                                    Event::AcpSessionAssigned { acp_session_id, .. }
+                                        if acp_session_id == "contention-native" => assigned = true,
+                                    Event::PromptCapabilities { .. } => capabilities = true,
+                                    Event::AgentStartupError { message, .. } => panic!("{message}"),
+                                    Event::AcpConnectionUnavailable { .. } => panic!("the retained original channel stays live"),
+                                    _ => {}
+                                }
+                            }
+                        }).await.expect("the retained handshake is durable before diagnostic-only exclusion");
                     }
                     let supervisor = client.app_state().acp_supervisor.clone();
                     let mut frames = client.subscribe_publications();
