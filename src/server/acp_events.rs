@@ -4512,6 +4512,12 @@ mod tests {
                         crate::acp::protocol::AcpEventScope::HistoryOnly,
                         "read-only attach does not create an Original constructor observation"
                     );
+                    // Assignment usability precedes the final SDK capability publication.
+                    // Finish that real frontier before pausing and taking a fenced seed.
+                    let capabilities = observed_frame(&mut attached_publications, &id, |event| {
+                        matches!(event, Event::PromptCapabilities { .. })
+                    }).await;
+                    assert_eq!(capabilities.worker_generation, Some(attached.lease.epoch()));
                     assert!(attached.connection_ready());
                     assert!(attached.connection_unavailable().is_none());
                     assert_eq!(
