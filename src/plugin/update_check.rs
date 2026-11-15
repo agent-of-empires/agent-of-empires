@@ -50,7 +50,10 @@ async fn check_one(target: &Target, lock: Result<&Lockfile, &anyhow::Error>) -> 
         available,
         error,
     };
-    let err = |msg: String| status(String::new(), None, Some(crate::logging::redact(&msg)));
+    let err = |msg: String| {
+        tracing::warn!(target: "plugin.install", plugin = %target.id, error = %msg, "plugin update check failed");
+        status(String::new(), None, Some(crate::logging::redact(&msg)))
+    };
 
     let lock = match lock {
         Ok(lock) => lock,
