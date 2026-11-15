@@ -449,7 +449,7 @@ After AoE merges the MCP layers and before it hands the set to the agent, on eve
 
 A server a plugin contributed carries `"plugin": "<plugin id>"`, so a hook can filter by who contributed it. AoE sets it, never a reply: on entries from `mcp.session.servers` (the serving plugin), and on entries an earlier hook added, full definitions and `serve` markers alike (that hook's plugin). A later hook that replaces the entry by name becomes its contributor, and a dropped entry loses it. User, project, agent-native and built-in servers never carry it, so the first hook sees it only on `mcp.session.servers` entries. `plugin` is accepted back on an `add` entry and ignored.
 
-The hook request is built per hook, so every `mcp.rewrite` plugin sees the `mcp.session.servers` entries, not only the serving plugin. Their credential is a `${AOE_PLUGIN_MCP_CRED_<id>}` reference, never the value, and a reference only works in the entry AoE minted it for (see [Serving MCP servers](#serving-mcp-servers-api_version--22)), so a hook cannot obtain a working credential by copying, modifying or re-adding entries. `mcp.rewrite` is still a high-trust grant: a hook can add a stdio command that runs as you, or in the container, and read the agent's environment. This is defense in depth, not a boundary. Entries added with `serve` (below) are likewise never shown to any hook with a credential.
+The hook request is built per hook, so every `mcp.rewrite` plugin sees the `mcp.session.servers` entries, not only the serving plugin. Their credential is a `${AOE_PLUGIN_MCP_CRED_<id>}` reference, never the value, and a reference only works in the entry AoE minted it for (see [Serving MCP servers](#serving-mcp-servers-api_version--24)), so a hook cannot obtain a working credential by copying, modifying or re-adding entries. `mcp.rewrite` is still a high-trust grant: a hook can add a stdio command that runs as you, or in the container, and read the agent's environment. This is defense in depth, not a boundary. Entries added with `serve` (below) are likewise never shown to any hook with a credential.
 
 The `result` is an edit; unknown fields are rejected:
 
@@ -471,17 +471,17 @@ A plugin holding both `mcp.rewrite` and `mcp.serve` can also add a server it ser
 ```
 
 - A `serve` entry has only `name` and `serve`, and `serve` only `prefix`; any other field, or any of `type`, `url`, `headers`, `command`, `args` or `env` next to it, makes the reply invalid. So does a `serve` entry from a plugin without both capabilities, or a `name` that is not a valid MCP server name.
-- The entry key is `<prefix>__<name>` with `"prefix": true` (the default), as for [served servers](#serving-mcp-servers-api_version--23), and the bare `<name>` with `"prefix": false`. Like any added server it replaces an entry of the same key, without a notification.
+- The entry key is `<prefix>__<name>` with `"prefix": true` (the default), as for [served servers](#serving-mcp-servers-api_version--24), and the bare `<name>` with `"prefix": false`. Like any added server it replaces an entry of the same key, without a notification.
 - Later hooks see the entry as `{ "name": "<key>", "serve": { "prefix": … }, "plugin": "<plugin id>" }`, without `url` or `headers`, and can drop or replace it by name like any entry. A hook keeps a marker by leaving it alone; echoing it back in `add` is a new `serve` entry of the replying plugin (its `plugin` is ignored), and the reply is invalid if that plugin lacks `mcp.serve`.
 - After the last hook, AoE turns each remaining `serve` entry into the same `http` entry a served server gets: `/mcp/plugins/<plugin id>/<name>` with the unprefixed `<name>`, a credential reference for that session and server, and `X-AoE-Session`. No hook ever sees the credential value.
-- For a sandboxed session that reaches the daemon over its socket, the entry is the stdio forwarder entry described under [Serving MCP servers](#serving-mcp-servers-api_version--22) instead.
+- For a sandboxed session that reaches the daemon over its socket, the entry is the stdio forwarder entry described under [Serving MCP servers](#serving-mcp-servers-api_version--24) instead.
 - When the session has no route to the daemon, the entry is omitted together with any entry of the same key, so nothing falls back to the server it replaced, and AoE raises one notification attributed to the plugin naming the cause, unless the launch already did.
 
 A sandboxed session whose hook fails (no worker within the timeout, error reply, invalid reply) is given **no** MCP servers, and AoE raises a notification attributed to the plugin. A sandboxed session with an applicable hook also gets no servers when the plugin host could not start. An `error` reply is reported as a rejection without the worker's text, so a worker cannot write into AoE's logs or notifications through it. Other sessions keep their resolved set.
 
 AoE does not copy host MCP definitions into a Claude sandbox's agent store, though `.mcp.json` files inside the copied Claude `plugins/` directory are copied as they are. Other agents' MCP-bearing config files are still copied into their sandbox stores verbatim, so for those agents the hook alone does not keep host MCP secrets out of the sandbox.
 
-## Serving MCP servers (`api_version >= 23`)
+## Serving MCP servers (`api_version >= 24`)
 
 A plugin with the `mcp.serve` capability and a `[runtime]` worker can offer MCP servers to agent sessions without running a process per server: the agent connects to the daemon, and the daemon forwards each request to the worker. No manifest table is needed. The user-facing view is in the [MCP servers guide](guides/mcp-servers.md#plugin-served-servers).
 
@@ -489,7 +489,7 @@ The host sends the worker these requests. All carry host-allocated string ids of
 
 | Method | Params | Result |
 |---|---|---|
-| `mcp.session.servers` | `{ session_id, agent, sandboxed, profile, cwd, sandbox? }` (same fields as the [`mcp.rewrite`](#hooksmcp_rewrite-api_version--22) request, without `servers`) | `[ { "name": "<server>", "prefix": true } ]` |
+| `mcp.session.servers` | `{ session_id, agent, sandboxed, profile, cwd, sandbox? }` (same fields as the [`mcp.rewrite`](#hooksmcp_rewrite-api_version--23) request, without `servers`) | `[ { "name": "<server>", "prefix": true } ]` |
 | `mcp.tools.list` | `{ server, session_id, cursor? }` | An MCP `ListToolsResult` |
 | `mcp.tools.call` | `{ server, session_id, name, arguments }` | An MCP `CallToolResult` |
 
@@ -513,7 +513,7 @@ Limits:
 - A daemon in CityHall mode serves no plugin MCP servers: it refuses the endpoints on every listener, binds no socket, and records no endpoint, so sessions get no entries and the no-endpoint notification below.
 - A session with no route gets none of a plugin's servers, and AoE raises one notification per plugin and launch naming the cause: no endpoint, no socket on this platform, a socket that did not start, a container without this daemon's mount (recreate it), a VM-backed runtime, or a container that could not be checked. The workers are still asked `mcp.session.servers`, so only plugins that offered servers are told.
 
-Any plugin holding `mcp.rewrite` sees the entries from `mcp.session.servers`, with credential references instead of values and `plugin` set. For an agent that does not expand references, AoE substitutes the literal values after the last hook; a hook can replace them by key like any entry. Entries a hook adds with `serve` get their credential only after the last hook. See [Hooks](#hooksmcp_rewrite-api_version--22). If that hook fails for a sandboxed session, the session gets no MCP servers at all, plugin-served ones included.
+Any plugin holding `mcp.rewrite` sees the entries from `mcp.session.servers`, with credential references instead of values and `plugin` set. For an agent that does not expand references, AoE substitutes the literal values after the last hook; a hook can replace them by key like any entry. Entries a hook adds with `serve` get their credential only after the last hook. See [Hooks](#hooksmcp_rewrite-api_version--23). If that hook fails for a sandboxed session, the session gets no MCP servers at all, plugin-served ones included.
 
 ## Plugin storage
 

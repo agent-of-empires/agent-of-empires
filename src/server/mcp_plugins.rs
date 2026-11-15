@@ -793,7 +793,7 @@ mod tests {
 
     fn manifest(id: &str, caps: &str) -> PluginManifest {
         PluginManifest::from_toml_str(&format!(
-            "id = \"{id}\"\nname = \"N\"\nversion = \"1.0.0\"\napi_version = 22\ncapabilities = [{caps}]\n\n[runtime]\nkind = \"command\"\ncommand = [\"bin/w\"]\n"
+            "id = \"{id}\"\nname = \"N\"\nversion = \"1.0.0\"\napi_version = 24\ncapabilities = [{caps}]\n\n[runtime]\nkind = \"command\"\ncommand = [\"bin/w\"]\n"
         ))
         .unwrap()
     }
@@ -829,7 +829,7 @@ mod tests {
         let worker = r#"["sleep", "600"]"#;
         crate::plugin::install_test_plugin(
             "acme.serve",
-            22,
+            24,
             &["runtime.worker", "mcp.serve"],
             worker,
         );
@@ -1022,7 +1022,9 @@ mod tests {
         };
         let app = axum::Router::new().route(
             "/mcp/plugins/{plugin}/{server}",
-            any(move |req: axum::extract::Request| forward(worker.clone(), caller.clone(), FAKE_HASH.to_string(), req)),
+            any(move |req: axum::extract::Request| {
+                forward(worker.clone(), caller.clone(), FAKE_HASH.to_string(), req)
+            }),
         );
         Fake { app, calls, notes }
     }

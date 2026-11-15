@@ -13,7 +13,7 @@ use serde_json::Value;
 
 use crate::acp::mcp_rewrite::{context_params, McpCredentialVar, McpRewriteContext, PluginServed};
 use crate::plugin::worker_call::WorkerCall;
-use crate::plugin::worker_requests::WorkerRequestError;
+use crate::plugin::worker_requests::{WorkerRef, WorkerRequestError};
 use crate::server::daemon_endpoint::{plugin_route, PluginRoute};
 use crate::server::plugin_mcp_socket as socket;
 use crate::server::session_credential::McpSessionSecret;
@@ -31,7 +31,7 @@ pub struct ServedServer {
 
 pub async fn servers_for_session<'a>(
     caller: Option<&dyn WorkerCall>,
-    manifests: impl Iterator<Item = &'a PluginManifest>,
+    manifests: impl Iterator<Item = (&'a PluginManifest, &'a str)>,
     ctx: &McpRewriteContext,
 ) -> Vec<ServedServer> {
     servers_with_timeout(caller, manifests, ctx, CALLBACK_TIMEOUT).await
@@ -73,6 +73,13 @@ struct Entry {
 
 /// One plugin's entries with valid names, in reply order.
 fn parse_names(reply: Value) -> Result<Vec<Entry>, serde_json::Error> {
+    // A derived struct also accepts a positional array, so require objects explicitly.
+    if reply
+        .as_array()
+        .is_some_and(|l| l.iter().any(|e| !e.is_object()))
+    {
+        return Err(serde::de::Error::custom("entries must be objects"));
+    }
     let entries: Vec<Entry> = serde_json::from_value(reply)?;
     Ok(entries
         .into_iter()
@@ -101,14 +108,14 @@ fn served_by_key(plugin_id: &str, entries: Vec<Entry>) -> Vec<ServedServer> {
 
 async fn ask(
     caller: &dyn WorkerCall,
-    plugin_id: &str,
+    worker: WorkerRef<'_>,
     ctx: &McpRewriteContext,
     timeout: Duration,
 ) -> Option<Vec<Entry>> {
     // The outer timeout bounds a caller that ignores the `call` argument.
     let reply = tokio::time::timeout(
         timeout,
-        caller.call(plugin_id, METHOD, context_params(ctx), timeout),
+        caller.call(worker, METHOD, context_params(ctx), timeout),
     )
     .await;
     let names = match reply {
@@ -118,7 +125,7 @@ async fn ask(
     };
     if names.is_none() {
         caller.report_serve_failure(
-            plugin_id,
+            worker.plugin_id,
             "The plugin did not return a valid MCP server list; its servers are skipped for this session.",
         );
     }
@@ -127,28 +134,35 @@ async fn ask(
 
 async fn servers_with_timeout<'a>(
     caller: Option<&dyn WorkerCall>,
-    manifests: impl Iterator<Item = &'a PluginManifest>,
+    manifests: impl Iterator<Item = (&'a PluginManifest, &'a str)>,
     ctx: &McpRewriteContext,
     timeout: Duration,
 ) -> Vec<ServedServer> {
     let Some(caller) = caller else {
         return Vec::new();
     };
-    let mut ids: Vec<&str> = manifests
-        .filter(|m| m.runtime.is_some())
-        .filter(|m| {
+    let mut ids: Vec<(&str, &str)> = manifests
+        .filter(|(m, _)| m.runtime.is_some())
+        .filter(|(m, _)| {
             m.capabilities
                 .iter()
                 .any(|c| c.as_str() == MCP_SERVE_CAPABILITY)
         })
-        .map(|m| m.id.as_str())
+        .map(|(m, hash)| (m.id.as_str(), hash))
         .collect();
     ids.sort_unstable();
-    ids.dedup();
+    ids.dedup_by_key(|(id, _)| *id);
 
-    let replies = join_all(ids.iter().map(|id| ask(caller, id, ctx, timeout))).await;
+    let replies = join_all(ids.iter().map(|&(plugin_id, manifest_hash)| {
+        let worker = WorkerRef {
+            plugin_id,
+            manifest_hash,
+        };
+        ask(caller, worker, ctx, timeout)
+    }))
+    .await;
     let mut served: Vec<ServedServer> = Vec::new();
-    for (id, entries) in ids.iter().zip(replies) {
+    for ((id, _), entries) in ids.iter().zip(replies) {
         served.extend(served_by_key(id, entries.unwrap_or_default()));
     }
 
@@ -323,12 +337,14 @@ pub(crate) mod test_support {
     impl WorkerCall for FakeCaller {
         fn call<'a>(
             &'a self,
-            plugin_id: &'a str,
+            worker: WorkerRef<'a>,
             method: &'a str,
             params: Value,
             _timeout: Duration,
         ) -> BoxFuture<'a, Reply> {
             assert_eq!(method, "mcp.session.servers");
+            assert_eq!(worker.manifest_hash, "sha256:h");
+            let plugin_id = worker.plugin_id;
             self.calls.lock().unwrap().push((plugin_id.into(), params));
             match self.replies.lock().unwrap().remove(plugin_id) {
                 Some(reply) => Box::pin(async move { reply }),
@@ -343,7 +359,7 @@ pub(crate) mod test_support {
         fn call_as<'a>(
             &'a self,
             _id: &'a str,
-            _plugin_id: &'a str,
+            _worker: WorkerRef<'a>,
             _method: &'a str,
             _params: Value,
             _start_wait: Duration,
@@ -385,7 +401,7 @@ pub(crate) mod test_support {
             "\"runtime.worker\""
         };
         PluginManifest::from_toml_str(&format!(
-            "id = \"{id}\"\nname = \"N\"\nversion = \"1.0.0\"\napi_version = 22\ncapabilities = [{caps}]\n\n[runtime]\nkind = \"command\"\ncommand = [\"bin/w\"]\n"
+            "id = \"{id}\"\nname = \"N\"\nversion = \"1.0.0\"\napi_version = 24\ncapabilities = [{caps}]\n\n[runtime]\nkind = \"command\"\ncommand = [\"bin/w\"]\n"
         ))
         .unwrap()
     }
@@ -486,7 +502,7 @@ pub(crate) mod test_support {
         ) -> BoxFuture<'a, Vec<ServedServer>> {
             Box::pin(servers_for_session(
                 Some(&self.caller),
-                self.manifests.iter(),
+                self.manifests.iter().map(|m| (m, "sha256:h")),
                 ctx,
             ))
         }
@@ -532,7 +548,13 @@ mod tests {
         manifests: &[PluginManifest],
         timeout: Duration,
     ) -> Vec<ServedServer> {
-        servers_with_timeout(Some(caller), manifests.iter(), &ctx(false), timeout).await
+        servers_with_timeout(
+            Some(caller),
+            manifests.iter().map(|m| (m, "sha256:h")),
+            &ctx(false),
+            timeout,
+        )
+        .await
     }
 
     const SHORT: Duration = Duration::from_millis(50);
@@ -637,6 +659,7 @@ mod tests {
         let cases: Vec<(&str, Option<Reply>)> = vec![
             ("error", Some(Err(WorkerRequestError::Rejected))),
             ("no worker", Some(Err(WorkerRequestError::NoWorker))),
+            ("superseded", Some(Err(WorkerRequestError::Superseded))),
             ("timeout", None),
             ("not an array", Some(Ok(json!({"name": "a"})))),
             ("string entries", Some(Ok(json!(["a"])))),
@@ -644,6 +667,7 @@ mod tests {
                 "unknown field",
                 Some(Ok(json!([{"name": "a", "url": "x"}]))),
             ),
+            ("positional entry", Some(Ok(json!([["a", false]])))),
             ("missing name", Some(Ok(json!([{}])))),
             (
                 "shadow is no longer a field",
@@ -696,7 +720,13 @@ mod tests {
     async fn request_params_describe_the_session() {
         let caller = FakeCaller::with(vec![("acme.a", names(&[]))]);
         let ms = [manifest("acme.a", true)];
-        servers_with_timeout(Some(&caller), ms.iter(), &ctx(true), CALLBACK_TIMEOUT).await;
+        servers_with_timeout(
+            Some(&caller),
+            ms.iter().map(|m| (m, "sha256:h")),
+            &ctx(true),
+            CALLBACK_TIMEOUT,
+        )
+        .await;
         let (plugin, params) = caller.calls.lock().unwrap()[0].clone();
         assert_eq!(plugin, "acme.a");
         assert_eq!(
@@ -978,8 +1008,10 @@ mod tests {
     #[tokio::test]
     async fn no_caller_gives_nothing() {
         let ms = [manifest("acme.a", true)];
-        assert!(servers_for_session(None, ms.iter(), &ctx(false))
-            .await
-            .is_empty());
+        assert!(
+            servers_for_session(None, ms.iter().map(|m| (m, "sha256:h")), &ctx(false))
+                .await
+                .is_empty()
+        );
     }
 }

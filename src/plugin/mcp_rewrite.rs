@@ -316,7 +316,7 @@ mod tests {
     #[test]
     fn hooks_for_marks_plugins_that_also_serve() {
         let serving = PluginManifest::from_toml_str(
-            "id = \"acme.s\"\nname = \"N\"\nversion = \"1.0.0\"\napi_version = 22\ncapabilities = [\"runtime.worker\", \"mcp.rewrite\", \"mcp.serve\"]\n\n[runtime]\nkind = \"command\"\ncommand = [\"bin/w\"]\n\n[hooks.mcp_rewrite]\n",
+            "id = \"acme.s\"\nname = \"N\"\nversion = \"1.0.0\"\napi_version = 24\ncapabilities = [\"runtime.worker\", \"mcp.rewrite\", \"mcp.serve\"]\n\n[runtime]\nkind = \"command\"\ncommand = [\"bin/w\"]\n\n[hooks.mcp_rewrite]\n",
         )
         .unwrap();
         let ms = [serving, manifest("acme.r", "sandbox", true, true)];
