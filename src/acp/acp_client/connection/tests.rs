@@ -662,13 +662,16 @@ async fn correlated_config_result_survives_eof_while_public_queue_is_full() {
 
 #[tokio::test]
 async fn rate_limit_on_an_agent_initiated_turn_preserves_the_connection() {
-    crate::acp::supervisor::test_support::managed::with_managed(|scope| Box::pin(async move { let mut fake = spawn_fake_connection(scope, "s-limit", None, false, |id| {
-    vec![
-        serde_json::json!({"jsonrpc":"2.0","id":id,"result":{"stopReason":"end_turn"}})
-            .to_string(),
-    ]
-})
-.await;
+    crate::acp::supervisor::test_support::managed::with_managed(|scope| Box::pin(async move {
+let prompts = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+let observed = Arc::clone(&prompts);
+let mut fake = spawn_fake_connection(scope, "s-limit", None, false, move |id| {
+    if observed.fetch_add(1, Ordering::SeqCst) == 0 {
+        Vec::new()
+    } else {
+        vec![serde_json::json!({"jsonrpc":"2.0","id":id,"result":{"stopReason":"end_turn"}}).to_string()]
+    }
+}).await;
 
 tokio::time::timeout(Duration::from_secs(10), async {
     while !matches!(
@@ -709,7 +712,28 @@ let seen = tokio::time::timeout(Duration::from_secs(10), async {
 assert!(!seen.iter().any(|event| matches!(event,
     Event::RateLimit { .. } | Event::Stopped { .. } | Event::AcpSessionAssigned { .. }
 )));
+// Ambient accounting supplies no cancellable main. Issue a genuine Native
+// prompt before exercising the unchanged positive cancellation assertion.
+fake.cmd_tx.send(ClientCmd::Prompt(Vec::new())).await.unwrap();
+let native_prompt = tokio::time::timeout(Duration::from_secs(10), async {
+    loop {
+        let id = fake.native_prompt_id.load(Ordering::Acquire);
+        if id > 0 { break id; }
+        tokio::task::yield_now().await;
+    }
+}).await.expect("the actual Native peer receives the cancellable prompt");
 fake.cmd_tx.send(ClientCmd::Cancel).await.unwrap();
+tokio::time::timeout(Duration::from_secs(10), async {
+    loop {
+        if fake.received.lock().await.iter().any(|frame|
+            frame["method"] == "session/cancel" && frame["params"]["sessionId"] == "s-limit"
+        ) { break; }
+        tokio::task::yield_now().await;
+    }
+}).await.expect("cancellation reaches the same actual Native session");
+write_line(&fake.agent_write, &serde_json::json!({
+    "jsonrpc":"2.0","id":native_prompt,"result":{"stopReason":"cancelled"}
+}).to_string()).await;
 let cancelled = collect_terminal(&mut fake).await;
 assert!(matches!(cancelled.last(), Some(Event::Stopped { reason }) if reason == "cancelled"));
 fake.cmd_tx

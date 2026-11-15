@@ -1377,6 +1377,21 @@ mod tests {
                 live.client = scope.adopt(live.client, false).await;
                 live.client.ready().await;
                 live.state = live.client.app_state();
+                // Usability precedes the final assignment/capability publications.
+                // Observe those actual durable frames before the no-auto-resume frontier.
+                tokio::time::timeout(Duration::from_secs(10), async {
+                    let (mut assigned, mut capabilities) = (false, false);
+                    while !assigned || !capabilities {
+                        match live.client.next_event().await.expect("actual retained handshake publication") {
+                            Event::AcpSessionAssigned { acp_session_id, .. }
+                                if acp_session_id == live.sid => assigned = true,
+                            Event::PromptCapabilities { .. } => capabilities = true,
+                            Event::AgentStartupError { message, .. } => panic!("{message}"),
+                            Event::AcpConnectionUnavailable { .. } => panic!("the original retained channel stays live"),
+                            _ => {}
+                        }
+                    }
+                }).await.expect("the retained handshake publications precede its negative frontier");
                 let attached = live
                     .state
                     .acp_supervisor

@@ -4946,11 +4946,14 @@ mod durable_stop_tests {
                 assert_eq!(original_native.requests(), ["initialize", "session/new"]);
                 assert_eq!(load_native.requests(), ["initialize", "session/load"]);
                 assert_ne!(resumed.lease.spawned_runner(), Some(owner));
+                let record = {
+                    let registry = worker_registry::registry_lock_until(
+                        &id, tokio::time::Instant::now() + std::time::Duration::from_secs(10),
+                    ).await.expect("the actual runner releases registry publication");
+                    registry.record().unwrap().expect("the actual resumed runner remains registered")
+                };
                 assert_eq!(
-                    worker_registry::load_strict(&id)
-                        .unwrap()
-                        .unwrap()
-                        .stored_acp_session_id
+                    record.stored_acp_session_id
                         .as_deref(),
                     Some(sid)
                 );
