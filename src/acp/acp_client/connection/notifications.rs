@@ -480,15 +480,71 @@ impl Shared {
         update: IngressUpdate,
         local_prompt_signals: bool,
     ) {
-        if self.control.is_none() {
-            self.handle_sdk_notification(update.notification, local_prompt_signals)
-                .await;
-            return;
+        let (update, local_prompt_signals) = if self.control.is_some() {
+            let Some(update) = self.prepare_native_notification(update).await else {
+                return;
+            };
+            let local_prompt_signals = local_prompt_signals && update.current_scope.is_some();
+            (update, local_prompt_signals)
+        } else {
+            (update, local_prompt_signals)
+        };
+        self.ingest_notification(update, local_prompt_signals).await;
+    }
+
+    async fn prepare_native_notification(&self, mut update: IngressUpdate) -> Option<IngressUpdate> {
+        // Child traffic is never interpreted by the root contract or ordering gate.
+        update.child_route = update.child_route.take().filter(|(_, route)| {
+            route.source == update.original_source
+                && route.source == update.evidence.physical_source.map(|physical| physical.witness)
+                && route.provenance.as_ref()
+                    .is_some_and(|proof| Some(proof.origin) == update.original_source)
+        });
+        if let Some(route) = &update.child_route {
+            let mut metadata = EventMetadata::history();
+            metadata.native_origin = update.evidence.physical_source.map(|source| source.witness);
+            metadata.reported_session_id = Some(update.notification.session_id.clone());
+            metadata.prompt_observation = update.evidence.prompt_observation;
+            metadata.child_provenance = route.1.provenance.clone();
+            let sender = match update.current_scope.as_ref() {
+                Some(context) => {
+                    metadata.scope = EventScope::SessionCurrent;
+                    self.event_tx.with_scoped_metadata(metadata, Some(Arc::clone(context)))
+                }
+                None => self.event_tx.with_metadata(metadata),
+            };
+            match update.notification.update {
+                SessionUpdate::SubagentUpdate(child) => {
+                    self.handle_subagent_update(&sender, route, update.notification.session_id, child).await;
+                    return None;
+                }
+                SessionUpdate::SessionMessage(message) => {
+                    self.handle_session_message(&sender, route, update.notification.session_id, message).await;
+                    return None;
+                }
+                SessionUpdate::SessionMessageChunk(_) => return None,
+                child if route.0 == update.notification.session_id => {
+                    self.handle_child_notification(&sender, route, update.notification.session_id, child).await;
+                    return None;
+                }
+                other => update.notification.update = other,
+            }
+        } else if matches!(
+            update.notification.update,
+            SessionUpdate::SubagentUpdate(_)
+                | SessionUpdate::SessionMessage(_)
+                | SessionUpdate::SessionMessageChunk(_)
+        ) {
+            return None;
         }
+        Some(update)
+    }
+
+    async fn handle_native_notification(&self, update: IngressUpdate) {
         let IngressUpdate {
             mut notification,
             evidence,
-            original_source,
+            original_source: _,
             child_route,
             current_scope,
             metadata_scope,
@@ -504,52 +560,7 @@ impl Shared {
         metadata.native_origin = evidence.physical_source.map(|source| source.witness);
         metadata.reported_session_id = Some(notification.session_id.clone());
         metadata.prompt_observation = evidence.prompt_observation;
-        let child_route = child_route.filter(|(_, route)| {
-            route.source == original_source
-                && route.source == evidence.physical_source.map(|physical| physical.witness)
-                && route
-                    .provenance
-                    .as_ref()
-                    .is_some_and(|proof| Some(proof.origin) == original_source)
-        });
-        if let Some(route) = &child_route {
-            metadata.child_provenance = route.1.provenance.clone();
-            let sender = match current_scope.as_ref() {
-                Some(context) => {
-                    let mut metadata = metadata.clone();
-                    metadata.scope = EventScope::SessionCurrent;
-                    self.event_tx
-                        .with_scoped_metadata(metadata, Some(Arc::clone(context)))
-                }
-                None => self.event_tx.with_metadata(metadata.clone()),
-            };
-            match notification.update {
-                SessionUpdate::SubagentUpdate(update) => {
-                    return self
-                        .handle_subagent_update(&sender, route, notification.session_id, update)
-                        .await;
-                }
-                SessionUpdate::SessionMessage(message) => {
-                    return self
-                        .handle_session_message(&sender, route, notification.session_id, message)
-                        .await;
-                }
-                SessionUpdate::SessionMessageChunk(_) => return,
-                update if route.0 == notification.session_id => {
-                    return self
-                        .handle_child_notification(&sender, route, notification.session_id, update)
-                        .await;
-                }
-                update => notification.update = update,
-            }
-        } else if matches!(
-            notification.update,
-            SessionUpdate::SubagentUpdate(_)
-                | SessionUpdate::SessionMessage(_)
-                | SessionUpdate::SessionMessageChunk(_)
-        ) {
-            return;
-        }
+        metadata.child_provenance = child_route.and_then(|(_, route)| route.provenance);
         let historical = self.event_tx.with_metadata(metadata.clone());
         if let Some(history) = &history {
             if !suppress_replay
@@ -832,9 +843,9 @@ impl Shared {
     /// `local_prompt_signals` is false for a replayed update committed with
     /// the session: it belongs to no local prompt, so it must not reach the
     /// per-prompt watchdog.
-    async fn handle_sdk_notification(
+    async fn ingest_notification(
         &self,
-        notification: SessionNotification,
+        notification: IngressUpdate,
         local_prompt_signals: bool,
     ) {
         // A frame the contract consumes without delivering (a lease renewal)
@@ -866,12 +877,15 @@ impl Shared {
             Ingested::DeliverThenLost(frames, reason) => (frames, Some(reason)),
         };
         for frame in frames {
-            self.handle_adapter_notification(
-                frame.notification,
-                frame.local_prompt_signals,
-                frame.epoch,
-            )
-            .await;
+            if self.control.is_some() {
+                self.handle_native_notification(frame.notification).await;
+            } else {
+                self.handle_adapter_notification(
+                    frame.notification.notification,
+                    frame.local_prompt_signals,
+                    frame.epoch,
+                ).await;
+            }
         }
         if let Some(reason) = lost {
             tracing::warn!(
@@ -1187,8 +1201,11 @@ mod tests {
     ) -> Vec<Event> {
         let chunk = ContentChunk::new(ContentBlock::Text(TextContent::new("hello")));
         shared
-            .handle_sdk_notification(
-                SessionNotification::new("native", SessionUpdate::UserMessageChunk(chunk)),
+            .ingest_notification(
+                crate::acp::acp_client::session_identity::SessionIngressNotification::decode_update(
+                    serde_json::to_value(SessionNotification::new("native", SessionUpdate::UserMessageChunk(chunk))).unwrap(),
+                    false,
+                ).unwrap().0,
                 local_prompt_signals,
             )
             .await;

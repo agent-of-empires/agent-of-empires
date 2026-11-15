@@ -515,7 +515,10 @@ impl DaemonControlClient {
     }
 
     pub(super) fn install_original_ingress(&self) -> agent_client_protocol::Result<()> {
-        let Some(attempt) = self.projection.attempt() else {
+        // A read-only canonical attempt may have been generation-rebased.
+        // Only the actual Original invocation or receipt identifies its physical source.
+        let Some(attempt) = self.projection.original_window().map(|(attempt, _)| attempt)
+            .or_else(|| self.projection.receipt_snapshot().map(|receipt| Arc::clone(&receipt.attempt))) else {
             return Ok(());
         };
         let (store, constructor) = {

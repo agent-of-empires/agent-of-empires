@@ -14080,6 +14080,8 @@ async fn an_account_swap_out_of_a_rate_limit_park_continues_the_interrupted_prom
                 let id = live.id().to_owned();
                 let state = live.state.clone();
                 if case == "unparked" {
+                    let request = live.start_prompt("complete without a quota pause").await;
+                    live.finish_prompt(&request, None).await;
                     assert_eq!(
                         crate::server::api::acp::rate_limit_resume_probe(&state, &id)
                             .await
