@@ -393,7 +393,7 @@ impl BroadcastSink for VecSink {
         generation: u64,
         subject: Option<crate::acp::state::NativeEventSubject>,
         replay: Option<(u64, &mut crate::acp::event_store::ReplayCommit)>,
-    ) -> bool {
+    ) -> (u64, bool) {
         let probe = self.before_replay.lock().unwrap().clone();
         if let Some(probe) = probe {
             probe(data.event.as_ref());

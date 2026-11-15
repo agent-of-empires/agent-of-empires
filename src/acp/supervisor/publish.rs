@@ -115,7 +115,7 @@ impl<S: BroadcastSink> Supervisor<S> {
                             epoch,
                             Some(subject),
                             None,
-                        ),
+                        ).1,
                         None => sink.publish_persisted(&session_id, seq, &data),
                     };
                     Some(persisted)

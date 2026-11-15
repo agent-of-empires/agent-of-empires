@@ -1112,7 +1112,7 @@ fn sequence_slot(next_seqs: &SeqMap, session_id: &str) -> Arc<std::sync::Mutex<S
 fn with_session_sequence<T>(
     next_seqs: &SeqMap,
     session_id: &str,
-    publish: impl FnOnce(&mut u64) -> T,
+    publish: impl FnOnce(&Arc<std::sync::Mutex<SessionSequence>>, &mut u64) -> T,
 ) -> T {
     // Both store I/O and waiters leave the async worker while publication is serialized.
     sink::blocking_io(|| loop {
@@ -1121,7 +1121,7 @@ fn with_session_sequence<T>(
         if sequence.retired {
             continue;
         }
-        return publish(&mut sequence.seq);
+        return publish(&slot, &mut sequence.seq);
     })
 }
 
@@ -1130,7 +1130,7 @@ fn with_publication_seq<T>(
     session_id: &str,
     publish: impl FnOnce(u64) -> T,
 ) -> T {
-    with_session_sequence(next_seqs, session_id, |current| {
+    with_session_sequence(next_seqs, session_id, |_slot, current| {
         *current = current.saturating_add(1);
         publish(*current)
     })

@@ -1570,6 +1570,8 @@ mod tests {
             }).await.expect("only this autonomous original's own typed terminal releases its live-work hold");
             assert_eq!(live.state.acp_event_store.holds_live_work(&id).unwrap(), Known(false));
             let completed = live.state.acp_event_store.replay_from(&id, 0).unwrap();
+            assert!(completed.windows(2).all(|pair| pair[0].seq.checked_add(1) == Some(pair[1].seq)),
+                "replayed committed phases must not consume unused journal sequence candidates");
             assert_eq!(completed.iter().filter(|stored| matches!(stored.event.as_ref(), Event::Stopped { .. })).count(), 2);
             let terminal = completed.iter().find(|stored| stored.metadata.native_autonomous.as_ref()
                 .is_some_and(|autonomous| autonomous.identity.run_id == run_id

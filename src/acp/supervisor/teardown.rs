@@ -4047,7 +4047,7 @@ mod tests {
             generation: u64,
             native_subject: Option<crate::acp::state::NativeEventSubject>,
             replay: Option<(u64, &mut crate::acp::event_store::ReplayCommit)>,
-        ) -> bool {
+        ) -> (u64, bool) {
             let parked = self.park(data.event.as_ref());
             let persisted = self.inner.publish_replay_from_worker(
                 session_id,

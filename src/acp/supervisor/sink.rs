@@ -28,7 +28,7 @@ pub trait BroadcastSink: Send + Sync + 'static {
         data: AcpEventData,
         expected_seq: Option<u64>,
     ) -> Persisted {
-        let seq = super::with_session_sequence(&next_seqs, session_id, |current| {
+        let seq = super::with_session_sequence(&next_seqs, session_id, |_slot, current| {
             if expected_seq.is_some_and(|expected| expected != *current) {
                 return None;
             }
@@ -62,8 +62,8 @@ pub trait BroadcastSink: Send + Sync + 'static {
         Some(publication)
     }
 
-    /// Called only inside ordered completion, while replay and processing remain local.
-    /// A sink without the actual journal cannot certify original replay.
+    /// Called only inside ordered completion, returning the actual durable seq and outcome.
+    /// A duplicate retains its committed seq; no journal means no replay certification.
     fn publish_replay_from_worker(
         &self,
         session_id: &str,
@@ -72,13 +72,13 @@ pub trait BroadcastSink: Send + Sync + 'static {
         _generation: u64,
         _native_subject: Option<crate::acp::state::NativeEventSubject>,
         replay: Option<(u64, &mut crate::acp::event_store::ReplayCommit)>,
-    ) -> bool {
+    ) -> (u64, bool) {
         if let Some((_, replay)) = replay {
             replay.reject();
             self.publish(session_id, seq, data);
-            false
+            (seq, false)
         } else {
-            self.publish_persisted(session_id, seq, data)
+            (seq, self.publish_persisted(session_id, seq, data))
         }
     }
 
@@ -487,7 +487,7 @@ impl BroadcastSink for ChannelSink {
         generation: u64,
         native_subject: Option<crate::acp::state::NativeEventSubject>,
         replay: Option<(u64, &mut crate::acp::event_store::ReplayCommit)>,
-    ) -> bool {
+    ) -> (u64, bool) {
         self.persister.publish_tagged(
             session_id,
             seq,
@@ -529,7 +529,7 @@ impl BroadcastSink for ChannelSink {
 
     fn publish_persisted(&self, session_id: &str, seq: u64, data: &AcpEventData) -> bool {
         self.persister
-            .publish_tagged(session_id, seq, data, None, None, None)
+            .publish_tagged(session_id, seq, data, None, None, None).1
     }
 
     fn queue_persisted(
@@ -658,19 +658,27 @@ impl Persister {
                     attachments,
                     persisted,
                 } = *publication;
-                let seq = super::with_session_sequence(&next_seqs, &session_id, |current| {
+                let candidate = super::with_session_sequence(&next_seqs, &session_id, |slot, current| {
                     if expected_seq.is_some_and(|expected| expected != *current) {
                         return None;
                     }
                     *current = current.saturating_add(1);
-                    Some(*current)
+                    Some((Arc::clone(slot), *current))
                 });
-                let outcome = seq.map(|seq| {
-                    let stored = attachments
-                        .iter()
-                        .all(|blob| self.event_store.record_attachment(&session_id, seq, blob))
-                        && self.publish_tagged(&session_id, seq, &data, None, None, None);
-                    (seq, stored)
+                let outcome = candidate.map(|(slot, seq)| {
+                    let outcome = if attachments.iter()
+                        .all(|blob| self.event_store.record_attachment(&session_id, seq, blob)) {
+                        self.publish_tagged(&session_id, seq, &data, None, None, None)
+                    } else {
+                        (seq, false)
+                    };
+                    if outcome.1 && outcome.0 < seq {
+                        let mut current = super::lock_recover(&slot);
+                        if !current.retired && current.seq == seq {
+                            current.seq = seq - 1;
+                        }
+                    }
+                    outcome
                 });
                 let _ = persisted.send(outcome);
             }
@@ -724,7 +732,7 @@ impl Persister {
         worker_generation: Option<u64>,
         native_subject: Option<crate::acp::state::NativeEventSubject>,
         replay: Option<(u64, &mut crate::acp::event_store::ReplayCommit)>,
-    ) -> bool {
+    ) -> (u64, bool) {
         let inherited = match data.event.as_ref() {
             Event::RateLimit { info }
                 if info.resets_at.is_none()
@@ -766,7 +774,7 @@ impl Persister {
         }) {
             Ok(RecordDisposition::Existing { seq: stored_seq }) => {
                 self.bind_pending_publication(session_id, stored_seq, data);
-                return true;
+                return (stored_seq, true);
             }
             Ok(RecordDisposition::Inserted) => {
                 self.bind_pending_publication(session_id, seq, data);
@@ -825,7 +833,7 @@ impl Persister {
                 if persisted { native_subject } else { None },
                 sidebar_status,
             ));
-        persisted
+        (seq, persisted)
     }
 }
 
@@ -864,7 +872,7 @@ mod tests {
                         Some(7),
                         None,
                         None
-                    ));
+                    ).1);
                 })
             };
             assert!(sink.publish_from_worker(publication).is_none());
@@ -979,7 +987,7 @@ mod tests {
                         Some(1),
                         None,
                         None
-                    ));
+                    ).1);
                 })
             };
             assert!(

@@ -559,11 +559,14 @@ impl<S: BroadcastSink> Drain<S> {
             }
         }
         let native_subject = data.event.native_subject();
-        let seq = with_publication_seq(&self.next_seqs, &self.session_id, |seq| seq);
+        let (slot, seq) = super::with_session_sequence(&self.next_seqs, &self.session_id, |slot, current| {
+            *current = current.saturating_add(1);
+            (Arc::clone(slot), *current)
+        });
         drop(lifecycle);
         drop(workers);
         // The original native/request/history exclusions survive the append.
-        let persisted = self.sink.publish_replay_from_worker(
+        let (stored_seq, persisted) = self.sink.publish_replay_from_worker(
             &self.session_id,
             seq,
             data,
@@ -571,6 +574,12 @@ impl<S: BroadcastSink> Drain<S> {
             native_subject,
             replay,
         );
+        if persisted && stored_seq < seq {
+            let mut current = lock_recover(&slot);
+            if !current.retired && current.seq == seq {
+                current.seq = seq - 1;
+            }
+        }
         Ok(if persisted {
             OwnedPublication::Published { current }
         } else {
