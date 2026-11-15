@@ -82,15 +82,7 @@
   --color-text-primary: #e4e4e7;
   --color-text-secondary: #a1a1aa;
   --color-text-muted: #71717a;
-  /* Body text using the dim slot must stay legible against
-     surface-900 (#1c1c1f) and surface-800 (#2e2e31); the previous
-     value (#52525b ≈ 2.6:1 vs surface-900) failed both AA body and
-     AA large. Bumped to ~5.0:1 vs surface-900 / ~4.0:1 vs surface-800
-     so per-setting descriptions and similar tertiary copy stay
-     legible. Decorative uses (separator hairlines, etc.) that need
-     to read as quieter can drop to surface-700 directly. See #1105. */
-  --color-text-dim: #8b8b94;
-  /* text-dim lifted to AA on surface-900 and -850 (see resolved.rs). Zinc default. */
+  --color-text-dim: #97979f;
   --color-text-subtle: #97979f;
   --color-text-bright: #fafafa;
 
