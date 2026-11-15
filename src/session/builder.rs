@@ -778,6 +778,40 @@ pub(crate) fn plan_instance(
         std::path::PathBuf::from(&params.path)
     };
     let mut config = super::config::repo_config::resolve_config_with_repo(profile, &config_path)?;
+    let overridden = config
+        .session
+        .agent_command_override
+        .get(&params.tool)
+        .is_some_and(|command| !command.trim().is_empty());
+    if !overridden && crate::agents::get_agent(&params.tool).is_none() {
+        let declared = crate::plugin::agent_integration::declared_agent(
+            crate::plugin::registry(),
+            &params.tool,
+            config
+                .session
+                .custom_agents
+                .iter()
+                .filter(|(_, command)| !command.trim().is_empty())
+                .map(|(name, _)| name.as_str()),
+        );
+        if declared.as_ref().is_some_and(|agent| {
+            agent
+                .contribution()
+                .launch
+                .as_ref()
+                .is_some_and(|launch| launch.host_only)
+        }) {
+            if params.sandbox {
+                bail!(
+                    "{} can only run on the host, not in a sandbox.",
+                    params.tool
+                );
+            }
+            if params.worktree_enabled {
+                bail!("{} does not support worktree mode.", params.tool);
+            }
+        }
+    }
     if params.no_submodules {
         config.worktree.init_submodules = false;
     }

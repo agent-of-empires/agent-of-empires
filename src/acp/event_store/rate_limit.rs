@@ -66,7 +66,7 @@ impl EventStore {
             return None;
         }
         match decode_logged(&json, session_id, "unassigned_startup_error")? {
-            Event::AgentStartupError { message } => Some((message, created_at)),
+            Event::AgentStartupError { message, .. } => Some((message, created_at)),
             _ => None,
         }
     }
@@ -196,8 +196,7 @@ impl EventStore {
                 "SELECT event_json FROM acp_events
                  WHERE session_id = ?1
                    AND seq > ?2
-                   AND (json_extract(event_json, '$.Stopped') IS NOT NULL
-                     OR json_extract(event_json, '$.AgentStartupError') IS NOT NULL)
+                   AND discriminant IN ('Stopped', 'AgentStartupError')
                  ORDER BY seq ASC
                  LIMIT 1",
                 params![session_id, prompt_seq],
@@ -227,6 +226,7 @@ impl EventStore {
             conn.query_row(
                 "SELECT MAX(seq) FROM acp_events
                  WHERE session_id = ?1
+                   AND discriminant = 'Stopped'
                    AND json_extract(event_json, '$.Stopped.reason') = 'rate_limited'",
                 params![session_id],
                 |row| row.get::<_, Option<i64>>(0),
@@ -471,12 +471,7 @@ mod tests {
             ("bare park", vec![], true, false),
             (
                 "failed resume",
-                vec![
-                    auto_resume(),
-                    Event::AgentStartupError {
-                        message: "spawn failed".into(),
-                    },
-                ],
+                vec![auto_resume(), Event::startup_error("spawn failed")],
                 true,
                 false,
             ),
@@ -696,9 +691,7 @@ mod tests {
                 rate_limit_event(0),
                 stopped("rate_limited"),
                 auto_resume(),
-                Event::AgentStartupError {
-                    message: "boom".into(),
-                },
+                Event::startup_error("boom"),
             ],
         );
         assert_eq!(streak(), 1, "a resume whose spawn failed spends nothing");

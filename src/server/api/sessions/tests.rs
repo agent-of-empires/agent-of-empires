@@ -5557,6 +5557,17 @@ fn public_create_session_error_forwards_typed_causes_as_fixed_templates() {
             ),
         ),
         (
+            "latest image pull",
+            anyhow::Error::new(crate::server::session_spawn::ImageUpdateFailed {
+                image: "ghcr.io/acme/sandbox:1".into(),
+                detail: format!("denied: token {SECRET} at /root/.docker/config.json"),
+            }),
+            (
+                "sandbox_image_update_failed",
+                "Couldn't pull the latest Sandbox image ghcr.io/acme/sandbox:1.".into(),
+            ),
+        ),
+        (
             "working dir missing",
             BuildRefusal::WorkingDirMissing("/home/alice/secret-project".into()).into(),
             (
@@ -7267,6 +7278,8 @@ mod open_file {
         let (state, id) = (State(state.clone()), Path(id.to_string()));
         let query = Query(SessionFileQuery {
             path: path.to_string(),
+            version_only: false,
+            editing: false,
         });
         if raw {
             session_file_raw(state, id, query).await.into_response()
@@ -8034,6 +8047,106 @@ async fn archive_persists_under_the_lifecycle_lock() -> anyhow::Result<()> {
         .expect("archive request");
     assert_eq!(response.status(), StatusCode::OK);
     assert!(stored_archived(&id)?);
+    Ok(())
+}
+
+/// #5346: a stale client can archive a session after a peer completed its Trash. The locked
+/// canonical row refuses it and leaves the flags Trash preserves for restore; an active
+/// pinned row still archives and drops its pin.
+#[tokio::test]
+#[serial_test::serial]
+async fn archive_refuses_trashed_row_and_keeps_preserved_flags() -> anyhow::Result<()> {
+    use axum::body::to_bytes;
+
+    let _home = crate::session::test_support::isolate_app_dir();
+    let profile = "archive-trashed";
+    let mut trashed = make_test_instance();
+    trashed.source_profile = profile.to_string();
+    trashed.status = Status::Stopped;
+    trashed.pinned_at = Some(chrono::Utc::now());
+    trashed.trash();
+    let mut active = make_test_instance();
+    active.source_profile = profile.to_string();
+    active.status = Status::Stopped;
+    active.pinned_at = Some(chrono::Utc::now());
+    let mut pending = make_test_instance();
+    pending.source_profile = profile.to_string();
+    pending.status = Status::Stopped;
+    pending.try_acquire_lifecycle_reservation(
+        crate::session::LifecycleOperation::Trash,
+        Instance::LIFECYCLE_RESERVATION_TTL,
+        chrono::Utc::now() - Instance::LIFECYCLE_RESERVATION_TTL - chrono::Duration::seconds(1),
+    )?;
+    pending.trash();
+    assert!(pending.has_pending_trash());
+    let (trashed_id, active_id, pending_id) =
+        (trashed.id.clone(), active.id.clone(), pending.id.clone());
+    let state = crate::server::test_support::build_test_app_state(vec![
+        trashed.clone(),
+        active.clone(),
+        pending.clone(),
+    ]);
+    let storage = Storage::new(profile, state.file_watch.clone())?;
+    storage.update(|rows, _| {
+        rows.push(trashed);
+        rows.push(active);
+        rows.push(pending);
+        Ok(())
+    })?;
+    *state.canonical_metadata.write().await =
+        crate::server::reload::load_all_profiles(&state.file_watch)?.metadata;
+    state.runtime.publish(&state).await?;
+    let set_archived = |id: String, archived: bool| {
+        let state = state.clone();
+        async move {
+            update_session_archive(
+                State(state),
+                Path(id),
+                Ok(Json(UpdateArchiveBody {
+                    archived,
+                    kill_pane: false,
+                })),
+            )
+            .await
+            .into_response()
+        }
+    };
+    let stored = |id: &str| -> anyhow::Result<Instance> {
+        Ok(storage
+            .load()?
+            .into_iter()
+            .find(|row| row.id == id)
+            .expect("the stored row"))
+    };
+
+    for archived in [true, false] {
+        let response = set_archived(trashed_id.clone(), archived).await;
+        assert_eq!(
+            response.status(),
+            StatusCode::CONFLICT,
+            "archived={archived}"
+        );
+        let body: serde_json::Value =
+            serde_json::from_slice(&to_bytes(response.into_body(), 1024).await?)?;
+        assert_eq!(body["error"], "session_trashed", "archived={archived}");
+        let row = stored(&trashed_id)?;
+        assert!(row.is_trashed());
+        assert!(!row.is_archived());
+        assert!(row.pinned_at.is_some());
+    }
+
+    let response = set_archived(pending_id.clone(), true).await;
+    assert_eq!(response.status(), StatusCode::CONFLICT);
+    let body: serde_json::Value =
+        serde_json::from_slice(&to_bytes(response.into_body(), 1024).await?)?;
+    assert_eq!(body["error"], "trash_incomplete");
+    assert!(!stored(&pending_id)?.is_archived());
+
+    let response = set_archived(active_id.clone(), true).await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let row = stored(&active_id)?;
+    assert!(row.is_archived());
+    assert!(row.pinned_at.is_none());
     Ok(())
 }
 
@@ -9849,6 +9962,169 @@ async fn post_create_raw(
         .unwrap();
     (status, code, serde_json::from_slice(&bytes).unwrap())
 }
+#[test]
+fn only_a_local_owner_sees_why_the_latest_image_pull_failed() {
+    let error = anyhow::Error::new(crate::server::session_spawn::ImageUpdateFailed {
+        image: "img:1".into(),
+        detail: "manifest unknown".into(),
+    });
+    let stage = crate::server::create_progress::CreateStage::PullingImage;
+    let public = create_failure(&error, stage, "ref").unwrap();
+    assert_eq!(
+        public.message,
+        "Couldn't pull the latest Sandbox image img:1."
+    );
+    for (local_owner, message) in [
+        (false, "Couldn't pull the latest Sandbox image img:1."),
+        (
+            true,
+            "Couldn't pull the latest Sandbox image img:1. manifest unknown",
+        ),
+    ] {
+        let shown = with_local_pull_detail(public.clone(), &error, local_owner);
+        assert_eq!(shown.message, message, "local_owner={local_owner}");
+        assert_eq!(
+            (shown.code, shown.stage),
+            ("sandbox_image_update_failed", stage)
+        );
+    }
+}
+
+#[tokio::test]
+async fn create_refuses_pull_latest_image_when_it_cannot_pull() {
+    use axum::http::StatusCode;
+    // None: CityHall strips the operator-owned Sandbox fields, the pull included.
+    for (label, sandbox, cityhall, allow_image_pull, expected) in [
+        (
+            "unsandboxed",
+            false,
+            false,
+            true,
+            Some((StatusCode::BAD_REQUEST, "validation_failed")),
+        ),
+        (
+            "pull gate off",
+            true,
+            false,
+            false,
+            Some((StatusCode::FORBIDDEN, "pull_disabled")),
+        ),
+        ("cityhall", true, true, true, None),
+    ] {
+        let _home = crate::session::test_support::isolate_app_dir();
+        crate::session::config::update_config(|config| {
+            config.sandbox.allow_image_pull = allow_image_pull;
+        })
+        .unwrap();
+        let project = tempfile::tempdir().unwrap();
+        // CityHall forces Structured view, so its create needs an adapter the host may lack.
+        let _adapter =
+            cityhall.then(crate::session::test_support::stub_claude_adapter_on_agent_path);
+        if cityhall {
+            crate::session::projects::add(
+                "default",
+                crate::session::ProjectScope::Global,
+                crate::session::Project::new(
+                    "cityhall",
+                    project.path().to_string_lossy(),
+                    crate::session::ProjectScope::Global,
+                ),
+                false,
+            )
+            .unwrap();
+        }
+        let state = crate::server::test_support::build_test_app_state_impl(
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            None,
+            cityhall,
+            |_| {},
+            |supervisor| supervisor,
+        );
+        let (got, body) = post_create(
+            &state,
+            serde_json::json!({
+                "title": "pull", "path": "", "tool": "claude", "scratch": true,
+                "view": "terminal", "sandbox": sandbox, "pull_latest_image": true,
+            }),
+        )
+        .await;
+        match expected {
+            Some((status, code)) => {
+                assert_eq!(
+                    (got, body["error"].as_str()),
+                    (status, Some(code)),
+                    "{label}: {body}"
+                );
+                assert!(state.instances.read().await.is_empty(), "{label}");
+            }
+            // Only a failure inside the spawn carries a stage.
+            None => assert!(
+                body.get("error").is_none() || body["stage"].is_string(),
+                "{label}: {got} {body}"
+            ),
+        }
+    }
+    // An allowed create would spawn a real pull, so check its gate directly.
+    let _home = crate::session::test_support::isolate_app_dir();
+    crate::session::config::update_config(|config| config.sandbox.allow_image_pull = true).unwrap();
+    let state = crate::server::test_support::build_test_app_state_configured(Vec::new(), |_| {});
+    let default_image = crate::session::Config::load()
+        .unwrap()
+        .sandbox
+        .default_image;
+    for (requested, refused) in [
+        (None, None),
+        (Some(default_image.as_str()), None),
+        (
+            Some("registry.example/other:latest"),
+            Some(StatusCode::BAD_REQUEST),
+        ),
+    ] {
+        let refusal = crate::server::api::create_pull_refusal(&state, requested).await;
+        assert_eq!(refusal.map(|r| r.status()), refused, "{requested:?}");
+    }
+}
+
+/// The dashboard pulls only a configured image; a create that pulls must not reach further.
+#[tokio::test]
+async fn create_refuses_to_pull_an_unconfigured_image() {
+    use std::os::unix::fs::PermissionsExt;
+    let _home = crate::session::test_support::isolate_app_dir();
+    crate::session::config::update_config(|config| config.sandbox.allow_image_pull = true).unwrap();
+    let dir = tempfile::tempdir().unwrap();
+    let calls = dir.path().join("calls");
+    let script = format!(
+        "#!/bin/sh\nprintf '%s\\n' \"$*\" >> '{}'\nexit 0\n",
+        calls.display()
+    );
+    for runtime in ["docker", "podman", "container"] {
+        let path = dir.path().join(runtime);
+        std::fs::write(&path, &script).unwrap();
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+    let _path = crate::session::test_support::path_prepended(dir.path());
+    let state = crate::server::test_support::build_test_app_state_configured(Vec::new(), |_| {});
+    let (got, body) = post_create(
+        &state,
+        serde_json::json!({
+            "title": "pull", "path": "", "tool": "claude", "scratch": true, "view": "terminal",
+            "sandbox": true, "sandbox_image": "registry.example/other:latest",
+            "pull_latest_image": true,
+        }),
+    )
+    .await;
+    assert_eq!(
+        (got, body["error"].as_str()),
+        (axum::http::StatusCode::BAD_REQUEST, Some("unknown_image")),
+        "{body}"
+    );
+    assert!(state.instances.read().await.is_empty());
+    let ran = std::fs::read_to_string(&calls).unwrap_or_default();
+    assert!(!ran.lines().any(|line| line.starts_with("pull")), "{ran}");
+}
+
 #[tokio::test]
 async fn create_rejects_hook_env_without_sandbox() {
     let _home = crate::session::test_support::isolate_app_dir();
@@ -13689,6 +13965,104 @@ async fn an_explicit_wake_discards_a_stale_continuation_before_the_worker_can_dr
 
 #[tokio::test]
 #[serial_test::serial]
+async fn account_targets_list_only_names_that_keep_the_conversation() {
+    let _app = crate::session::test_support::isolate_app_dir();
+    let stub = tempfile::tempdir().unwrap();
+    let _claude = crate::session::test_support::install_login_shell_path_command(
+        stub.path(),
+        "claude",
+        "#!/bin/sh\nexit 1\n",
+    );
+    let home = dirs::home_dir().unwrap();
+    let app = crate::session::get_app_dir().unwrap();
+    std::fs::create_dir_all(&app).unwrap();
+    std::fs::write(
+        app.join("config.toml"),
+        "[session.custom_agents]\na = \"claude\"\nb = \"claude\"\nother = \"opaque-wrapper\"\n\
+         [session.agent_detect_as]\na = \"claude\"\nb = \"claude\"\nc = \"claude\"\n\
+         [session.agent_config_dir]\na = \"~/dir-a\"\nb = \"~/dir-b\"\nc = \"~/dir-c\"\n",
+    )
+    .unwrap();
+    let profile = crate::session::config::effective_profile("");
+    let _registry = crate::tmux::status_rules::ProfileRegistryGuard::take(&profile);
+    crate::session::config::profile_config::resolve_config_or_warn(&profile);
+
+    let project = home.join("project");
+    let sid = "11111111-2222-3333-4444-555555555555";
+    let transcript = home
+        .join("dir-a/projects")
+        .join(crate::session::capture::encode_claude_project_path(
+            &project.to_string_lossy(),
+        ))
+        .join(format!("{sid}.jsonl"));
+    std::fs::create_dir_all(transcript.parent().unwrap()).unwrap();
+    std::fs::write(&transcript, "conversation\n").unwrap();
+
+    let mut row = Instance::new("accounts", project.to_str().unwrap());
+    row.id = "accounts".into();
+    row.source_profile = profile;
+    row.tool = "a".into();
+    row.command = "claude".into();
+    row.detect_as = "claude".into();
+    row.view = crate::session::View::Structured;
+    row.agent_session_id = Some(sid.into());
+    row.agent_session_binding = Some(crate::session::ConversationBinding {
+        session_id: sid.into(),
+        provenance: crate::session::ConversationProvenance::Asserted,
+        transcript_path: None,
+        execution: Some(crate::session::ExecutionBinding {
+            agent: "claude".into(),
+            stores: vec![home.join("dir-a")],
+            configuration: vec![],
+            cwd: project,
+            cwd_filesystem: "host".into(),
+            filesystem: "host".into(),
+            exported_default_store: None,
+        }),
+    });
+
+    // The other claude accounts and the built-in qualify, `c` having no `custom_agents` entry;
+    // the opaque wrapper and the session's own tool do not.
+    assert_eq!(lifecycle::account_targets(&row), ["b", "c", "claude"]);
+
+    let mut plain = row.clone();
+    plain.view = crate::session::View::Terminal;
+    assert!(lifecycle::account_targets(&plain).is_empty());
+    let mut fresh = row;
+    fresh.agent_session_id = None;
+    fresh.agent_session_binding = None;
+    assert!(lifecycle::account_targets(&fresh).is_empty());
+}
+
+#[tokio::test]
+#[serial_test::serial]
+async fn account_targets_route_honours_the_guards() {
+    let _app = crate::session::test_support::isolate_app_dir();
+    let project = tempfile::tempdir().unwrap();
+    let mut inst = Instance::new("targets-guard", project.path().to_str().unwrap());
+    inst.id = "targets-guard".into();
+    inst.view = crate::session::View::Structured;
+    let read_only =
+        crate::server::test_support::build_test_app_state_configured(vec![inst.clone()], |state| {
+            state.read_only = true
+        });
+    let cityhall = crate::server::test_support::build_test_app_state_cityhall(vec![inst.clone()]);
+    let open = crate::server::test_support::build_test_app_state(vec![inst]);
+    for (state, id, expected) in [
+        (read_only, "targets-guard", StatusCode::FORBIDDEN),
+        (cityhall, "targets-guard", StatusCode::FORBIDDEN),
+        (open.clone(), "missing", StatusCode::NOT_FOUND),
+        (open, "targets-guard", StatusCode::OK),
+    ] {
+        let response =
+            session_account_targets(axum::extract::State(state), axum::extract::Path(id.into()))
+                .await;
+        assert_eq!(response.status(), expected, "{id}");
+    }
+}
+
+#[tokio::test]
+#[serial_test::serial]
 async fn a_failover_swap_refuses_once_the_park_moved_on() {
     use crate::acp::Event;
 
@@ -13726,7 +14100,7 @@ async fn a_failover_swap_refuses_once_the_park_moved_on() {
     let head = state.acp_event_store.highest_seq("failover-cas");
 
     // The decision was made on an older head: a prompt landed since.
-    let error = lifecycle::failover_account_swap(&state, "failover-cas", "claude-b", head - 1)
+    let error = lifecycle::failover_account_swap(&state, "failover-cas", "claude-b", head - 1, 0)
         .await
         .unwrap_err();
     assert!(error.message.contains("moved on"), "{error:?}");
@@ -13737,7 +14111,7 @@ async fn a_failover_swap_refuses_once_the_park_moved_on() {
 
     // On the current head the guard passes and the swap's own refusal answers
     // (no recorded conversation), still before anything stops.
-    let error = lifecycle::failover_account_swap(&state, "failover-cas", "claude-b", head)
+    let error = lifecycle::failover_account_swap(&state, "failover-cas", "claude-b", head, 0)
         .await
         .unwrap_err();
     assert!(
@@ -13795,9 +14169,10 @@ async fn a_failed_failover_swap_leaves_the_row_on_its_account() {
     let head = state.acp_event_store.highest_seq(&row.id);
 
     // The source account holds no transcript, so the carry fails once the row has moved.
-    let error = lifecycle::failover_account_swap(&state, &row.id, "b", head)
-        .await
-        .expect_err("the carry has nothing to copy");
+    let error =
+        lifecycle::failover_account_swap(&state, &row.id, "b", head, row.lifecycle_generation)
+            .await
+            .expect_err("the carry has nothing to copy");
     assert!(
         !error.permanent,
         "a failed carry may clear by itself: {error:?}"
@@ -13947,9 +14322,16 @@ async fn a_failed_failover_rollback_leaves_a_newer_stop_alone() {
         }
     };
 
-    lifecycle::failover_account_swap_with(&state, &row.id, "b", head, newer)
-        .await
-        .expect_err("the carry has nothing to copy");
+    lifecycle::failover_account_swap_with(
+        &state,
+        &row.id,
+        "b",
+        head,
+        row.lifecycle_generation,
+        newer,
+    )
+    .await
+    .expect_err("the carry has nothing to copy");
 
     let live = state.instances.read().await[0].clone();
     assert!(
@@ -13977,9 +14359,16 @@ async fn a_failed_failover_rollback_leaves_a_newer_restart_alone() {
         }
     };
 
-    lifecycle::failover_account_swap_with(&state, &row.id, "b", head, newer)
-        .await
-        .expect_err("the carry has nothing to copy");
+    lifecycle::failover_account_swap_with(
+        &state,
+        &row.id,
+        "b",
+        head,
+        row.lifecycle_generation,
+        newer,
+    )
+    .await
+    .expect_err("the carry has nothing to copy");
 
     let live = state.instances.read().await[0].clone();
     assert_eq!(live.tool, "b", "the newer restart's account stands");
@@ -13992,12 +14381,13 @@ async fn a_failed_failover_rollback_leaves_a_newer_restart_alone() {
 #[serial_test::serial]
 async fn a_failed_failover_rolls_back_to_the_account_it_found_under_its_locks() {
     let (state, row, head, _a, _b, _c) = failing_failover_swap_fixture(None).await;
+    let generation = row.lifecycle_generation;
     let (entered, release) =
         lifecycle::launch_hook_gate::arm(&row.id, lifecycle::launch_hook_gate::Stage::BeforeLocks);
     let swap = tokio::spawn({
         let state = state.clone();
         let id = row.id.clone();
-        async move { lifecycle::failover_account_swap(&state, &id, "b", head).await }
+        async move { lifecycle::failover_account_swap(&state, &id, "b", head, generation).await }
     });
     entered.await.expect("the failover waits for its locks");
 
@@ -14041,9 +14431,10 @@ async fn a_login_failure_at_initialize_is_reported_by_the_failed_swap() {
     ))
     .await;
 
-    let error = lifecycle::failover_account_swap(&state, &row.id, "b", head)
-        .await
-        .expect_err("the target cannot log in");
+    let error =
+        lifecycle::failover_account_swap(&state, &row.id, "b", head, row.lifecycle_generation)
+            .await
+            .expect_err("the target cannot log in");
 
     assert!(
         error.message.to_lowercase().contains("authentic"),
@@ -14231,13 +14622,14 @@ async fn a_newer_launch_limited_during_an_old_failover_hook_still_parks() {
     let (launcher, launches) = rate_limited_then_working_launcher(1);
     let (state, row, _home, _a, _b, _c) = failover_pool_fixture(launcher).await;
     let head = state.acp_event_store.highest_seq(&row.id);
+    let generation = row.lifecycle_generation;
     let (entered, release) =
         lifecycle::launch_hook_gate::arm(&row.id, lifecycle::launch_hook_gate::Stage::BeforeHooks);
 
     let old = tokio::spawn({
         let state = state.clone();
         let id = row.id.clone();
-        async move { lifecycle::failover_account_swap(&state, &id, "b", head).await }
+        async move { lifecycle::failover_account_swap(&state, &id, "b", head, generation).await }
     });
     entered.await.expect("the failover reached its hook");
 
@@ -14301,6 +14693,73 @@ async fn a_newer_launch_limited_during_an_old_failover_hook_still_parks() {
     );
 }
 
+/// An owner stop of the workerless parked row that completes before the failover takes its
+/// locks leaves a newer stopped, dormant row. The failover decided on the row before it, so it
+/// neither launches nor consumes that stop.
+#[tokio::test]
+#[serial_test::serial]
+async fn a_failover_leaves_an_owner_stop_that_landed_before_its_locks() {
+    let (launcher, launches) = rate_limited_then_working_launcher(0);
+    let (state, row, _home, _a, _b, _c) = failover_pool_fixture(launcher).await;
+    let head = state.acp_event_store.highest_seq(&row.id);
+    let generation = row.lifecycle_generation;
+    let (entered, release) =
+        lifecycle::launch_hook_gate::arm(&row.id, lifecycle::launch_hook_gate::Stage::BeforeLocks);
+    let swap = tokio::spawn({
+        let state = state.clone();
+        let id = row.id.clone();
+        async move { lifecycle::failover_account_swap(&state, &id, "b", head, generation).await }
+    });
+    entered.await.expect("the failover waits for its locks");
+
+    let stopped = super::stop_session(
+        axum::extract::State(state.clone()),
+        axum::extract::Path(row.id.clone()),
+    )
+    .await
+    .into_response();
+    assert!(stopped.status().is_success(), "{}", stopped.status());
+    let stop = state.instances.read().await[0].clone();
+    assert!(stop.is_idle_dormant(), "a stop leaves the row dormant");
+
+    release.send(()).unwrap();
+    swap.await
+        .unwrap()
+        .expect_err("the failover decided before the stop");
+
+    assert_eq!(launches.load(std::sync::atomic::Ordering::SeqCst), 0);
+    let live = state.instances.read().await[0].clone();
+    let on_disk = crate::session::Storage::open_unwatched(&row.source_profile)
+        .unwrap()
+        .load()
+        .unwrap()
+        .remove(0);
+    for (place, found) in [("memory", &live), ("disk", &on_disk)] {
+        assert_eq!(
+            (found.lifecycle_generation, found.is_idle_dormant()),
+            (stop.lifecycle_generation, true),
+            "{place}: the owner's stop stands"
+        );
+        assert_eq!(found.tool, "a", "{place}");
+    }
+}
+
+/// The control for the stop above: with nothing in between, the same failover launches.
+#[tokio::test]
+#[serial_test::serial]
+async fn a_failover_with_no_stop_in_between_launches() {
+    let (launcher, launches) = rate_limited_then_working_launcher(0);
+    let (state, row, _home, _a, _b, _c) = failover_pool_fixture(launcher).await;
+    let head = state.acp_event_store.highest_seq(&row.id);
+
+    lifecycle::failover_account_swap(&state, &row.id, "b", head, row.lifecycle_generation)
+        .await
+        .expect("nothing moved the row");
+
+    assert_eq!(launches.load(std::sync::atomic::Ordering::SeqCst), 1);
+    assert_eq!(state.instances.read().await[0].tool, "b");
+}
+
 /// Every other account limited at `initialize`: attempts stop, and the session stays on A's park.
 #[tokio::test]
 #[serial_test::serial]
@@ -14322,4 +14781,216 @@ async fn an_entirely_limited_pool_is_attempted_once_per_account() {
     let live = state.instances.read().await[0].clone();
     assert_eq!(live.tool, "a");
     assert!(!live.is_idle_dormant());
+}
+
+// A projection must resolve each profile's config once, not once per row (#5665).
+#[tokio::test]
+#[serial_test::serial]
+async fn project_sessions_resolves_profile_config_once_per_profile() {
+    let _home = crate::session::test_support::isolate_app_dir();
+    let terminal_rows = |count: usize| -> Vec<Instance> {
+        (0..count)
+            .map(|i| {
+                let mut inst = Instance::new(&format!("row-{i}"), "/tmp/projection-resolves");
+                inst.id = format!("row-{i}");
+                inst.tool = "claude".to_string();
+                inst.source_profile = "projection-resolves".to_string();
+                inst
+            })
+            .collect()
+    };
+    let resolves_for = |rows: Vec<Instance>| async move {
+        let state = crate::server::test_support::build_test_app_state(rows);
+        crate::session::config::profile_config::RESOLVES.with(|n| n.set(0));
+        project_sessions(&state).await;
+        crate::session::config::profile_config::RESOLVES.with(|n| n.get())
+    };
+    let one = resolves_for(terminal_rows(1)).await;
+    let five = resolves_for(terminal_rows(5)).await;
+    assert!(one >= 1, "the projection must resolve the row's profile");
+    assert_eq!(one, five, "config resolves grew with row count");
+}
+
+// Archived and trashed rows render stopped, so they skip resume availability (#5665).
+#[tokio::test]
+#[serial_test::serial]
+async fn project_sessions_omits_context_resume_for_archived_and_trashed_rows() {
+    let _home = crate::session::test_support::isolate_app_dir();
+    let row = |id: &str| {
+        let mut inst = Instance::new(id, "/tmp/projection-sunk");
+        inst.id = id.to_string();
+        inst.tool = "claude".to_string();
+        inst
+    };
+    let live = row("live");
+    let mut archived = row("archived");
+    archived.archived_at = Some(chrono::Utc::now());
+    let mut trashed = row("trashed");
+    trashed.trashed_at = Some(chrono::Utc::now());
+    let state = crate::server::test_support::build_test_app_state(vec![live, archived, trashed]);
+    let response = project_sessions(&state).await;
+    let resume = |id: &str| {
+        response
+            .iter()
+            .find(|s| s.id == id)
+            .expect("projected row")
+            .context_resume
+    };
+    assert!(resume("live").is_some());
+    assert_eq!(resume("archived"), None);
+    assert_eq!(resume("trashed"), None);
+}
+
+/// The list says how many messages each daemon queue holds and what it waits on, as a prompt
+/// sent now would be told, so a sidebar row shows both without the session being opened.
+#[tokio::test]
+async fn the_list_projects_each_queues_count_and_what_it_waits_on() {
+    use crate::acp::dispatch::QueueReason;
+    use crate::acp::Event;
+    use crate::daemon::QueuedPromptEntry;
+
+    let entry = |seq: u64, text: &str| QueuedPromptEntry {
+        id: format!("prompt-{seq}"),
+        seq,
+        text: text.into(),
+        attachments: Vec::new(),
+        created_at: "2026-01-01T00:00:00Z".into(),
+        origin_device: None,
+        origin_plugin: None,
+    };
+    // (id, queued texts, worker running, turn running, steerable, expected reason).
+    // "parked" has no worker but a rate-limit park, so a prompt sent now would go out.
+    // "resuming" has its worker mid-respawn, which a prompt counts as running.
+    let cases: [(&str, &[&str], bool, bool, bool, Option<QueueReason>); 7] = [
+        (
+            "busy",
+            &["next"],
+            true,
+            true,
+            false,
+            Some(QueueReason::TurnActive),
+        ),
+        (
+            "solo-first",
+            &["/compact", "then this"],
+            true,
+            true,
+            true,
+            Some(QueueReason::TurnActive),
+        ),
+        ("steerable", &["next"], true, true, true, None),
+        (
+            "no-worker",
+            &["next"],
+            false,
+            false,
+            false,
+            Some(QueueReason::WorkerDown),
+        ),
+        ("empty", &[], true, true, false, None),
+        ("parked", &["next"], false, false, false, None),
+        (
+            "resuming",
+            &["next"],
+            true,
+            true,
+            false,
+            Some(QueueReason::TurnActive),
+        ),
+    ];
+    let rows: Vec<Instance> = cases
+        .iter()
+        .map(|(id, texts, ..)| {
+            let mut inst = Instance::new(id, "/tmp/queued");
+            inst.id = (*id).into();
+            inst.view = crate::session::View::Structured;
+            inst.tool = "claude".into();
+            inst.agent_name = Some("claude".into());
+            inst.queued_prompts = texts
+                .iter()
+                .zip(1..)
+                .map(|(t, seq)| entry(seq, t))
+                .collect();
+            inst
+        })
+        .collect();
+    let state = crate::server::test_support::build_test_app_state(rows);
+    for (id, _, running, turn, steerable, _) in &cases {
+        if *running {
+            state.acp_supervisor.test_insert_worker(id).await;
+        }
+        if *id == "resuming" {
+            state.acp_supervisor.test_begin_respawn(id).await;
+        }
+        let capabilities = Event::PromptCapabilities {
+            image: false,
+            audio: false,
+            embedded_context: false,
+            load_session: None,
+            steering: *steerable,
+        };
+        state.acp_event_store.record(id, 1, &capabilities).unwrap();
+        if *turn {
+            let prompt = Event::UserPromptSent {
+                text: "working".into(),
+                attachments: Vec::new(),
+                merged_prompt_ids: Vec::new(),
+                prompt_id: None,
+                synthesized: false,
+                origin_plugin: None,
+            };
+            state.acp_event_store.record(id, 2, &prompt).unwrap();
+        }
+        if *id == "parked" {
+            let limit = Event::RateLimit {
+                info: crate::acp::state::RateLimitInfo {
+                    status: "limited".into(),
+                    resets_at: Some(chrono::Utc::now() + chrono::Duration::hours(1)),
+                    kind: "usage".into(),
+                },
+            };
+            let stopped = Event::Stopped {
+                reason: "rate_limited".into(),
+            };
+            state.acp_event_store.record(id, 2, &limit).unwrap();
+            state.acp_event_store.record(id, 3, &stopped).unwrap();
+        }
+        // The fold is the one seeded here, so a reason below is the projection's own.
+        let fold = state.session_service.fold_control_state(id).await;
+        assert_eq!(
+            (fold.turn_active, fold.steering),
+            (*turn, *steerable),
+            "{id}"
+        );
+    }
+
+    let response = project_sessions(&state).await;
+    assert!(response[5].rate_limit.is_some(), "the park is projected");
+    assert_eq!(
+        response[6].acp_worker_state,
+        crate::daemon::AcpWorkerState::Resuming
+    );
+    for ((id, texts, .., expected), row) in cases.iter().zip(&response) {
+        assert_eq!(row.id, *id);
+        assert_eq!(row.queued_count, texts.len(), "{id}");
+        assert_eq!(row.queue_reason, *expected, "{id}");
+    }
+    let json = serde_json::to_value(&response[4]).unwrap();
+    assert!(json.get("queued_count").is_none() && json.get("queue_reason").is_none());
+    let json = serde_json::to_value(&response[0]).unwrap();
+    assert_eq!(
+        (json["queued_count"].as_u64(), json["queue_reason"].as_str()),
+        (Some(1), Some("turn_active"))
+    );
+    // A daemon client decodes what the list sends, absent fields included.
+    for row in &response {
+        let decoded: crate::daemon::SessionResponse =
+            serde_json::from_value(serde_json::to_value(row).unwrap()).unwrap();
+        assert_eq!(
+            (decoded.queued_count, decoded.queue_reason),
+            (row.queued_count, row.queue_reason),
+            "{}",
+            row.id
+        );
+    }
 }

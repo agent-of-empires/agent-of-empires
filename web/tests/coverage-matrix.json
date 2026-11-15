@@ -3,6 +3,59 @@
   "description": "Surface/flow coverage matrix for the agent-of-empires web dashboard. Every component file under web/src/components/** must appear in at least one entry's `components` list (covered, deferred, or out-of-scope), or in coverage-matrix.exempt.json. CI validates this on every PR via tests/validate-coverage-matrix.mjs.",
   "surfaces": [
     {
+      "id": "files.edit-eligibility-recovery",
+      "kind": "vitest",
+      "risk": "high",
+      "specs": [
+        "src/components/diff/__tests__/TextFileEditor.test.tsx",
+        "src/components/diff/__tests__/FileContentViewer.test.tsx"
+      ],
+      "components": ["web/src/components/diff/TextFileEditor.tsx", "web/src/components/diff/FileContentViewer.tsx"],
+      "notes": "Sandbox and unsupported-filesystem restrictions disable button and keyboard saves without latching a conflict; eligibility recovery preserves the draft. The viewer explains why atomic replacement is unavailable. Disabling editing hides the editor and restores the same draft and opened version when re-enabled. Pending saves and their results survive remounts without duplicate requests. Session-removal checks include parked drafts. Downloads and new-tab links keep a dirty editor without asking; page links ask."
+    },
+    {
+      "id": "files.edit-existing-text",
+      "kind": "live-playwright",
+      "risk": "high",
+      "specs": ["tests/live/file-editing.spec.ts"],
+      "components": [
+        "web/src/App.tsx",
+        "web/src/components/diff/TextFileEditor.tsx",
+        "web/src/components/diff/FileContentViewer.tsx",
+        "web/src/components/FilesPane.tsx",
+        "web/src/components/settings/PanelsSettings.tsx",
+        "web/src/components/MobileMainPane.tsx",
+        "web/src/components/acp/Composer.tsx"
+      ],
+      "notes": "Opt-in setting, exact saved bytes and mode, conflicts, dirty pane navigation, refusal of active-session Trash and permanent deletion when file discard is declined, read-only refusal, and mobile controls."
+    },
+    {
+      "id": "settings.plugin-agent-consent",
+      "kind": "vitest",
+      "risk": "high",
+      "specs": [
+        "src/components/settings/__tests__/PluginConsentModals.test.tsx",
+        "src/components/settings/__tests__/agentIntegrationDetails.test.ts"
+      ],
+      "components": [
+        "web/src/components/settings/PluginInstallConsentModal.tsx",
+        "web/src/components/settings/PluginUpdateConsentModal.tsx",
+        "web/src/components/settings/agentIntegrationDetails.ts"
+      ],
+      "notes": "Install and update consent expose agent launch, detection and reply declarations as text with control and format characters made visible."
+    },
+    {
+      "id": "settings.plugin-agent-consent-browser",
+      "kind": "mocked-playwright",
+      "risk": "high",
+      "specs": ["tests/plugin-agent-consent.spec.ts"],
+      "components": [
+        "web/src/components/settings/PluginInstallConsentModal.tsx",
+        "web/src/components/settings/PluginUpdateConsentModal.tsx"
+      ],
+      "notes": "Marketplace install and installed-plugin update previews display agent declarations and escape hostile text before approval."
+    },
+    {
       "id": "trash.unfinished-recovery",
       "kind": "live-playwright",
       "risk": "high",
@@ -859,11 +912,12 @@
       ]
     },
     {
-      "id": "settings.tui-shortcut-bar",
+      "id": "settings.tui-only-toggles",
       "kind": "live-playwright",
       "risk": "medium",
       "specs": ["tests/live/settings-persistence.spec.ts"],
-      "components": ["web/src/components/SettingsView.tsx", "web/src/components/settings/SchemaSection.tsx"]
+      "components": ["web/src/components/SettingsView.tsx", "web/src/components/settings/SchemaSection.tsx"],
+      "notes": "The Terminal UI fold's Shortcut bar and Show Structured view badge switches default on, save off, and stay off after reload and restart. Shortcut bar is global-only: it saves machine-wide and a profile override is refused. Show Structured view badge is profile-overridable: the switch writes a profile override while the machine layer keeps the default."
     },
     {
       "id": "settings.tmux-persistence",
@@ -924,7 +978,7 @@
       "risk": "medium",
       "specs": ["src/components/__tests__/SettingsView.folds.test.tsx"],
       "components": ["web/src/components/SettingsView.tsx", "web/src/components/settings/FormFields.tsx"],
-      "notes": "The Updates tab shows the Daemon port (`serve.port`) under a Daemon heading; editing it saves `{ serve: { port } }` through the normal settings path. Global only; a new value applies after a stop and start."
+      "notes": "The Updates tab shows the Daemon port (`serve.port`) under a Daemon heading; editing it saves `{ serve: { port } }` through the normal settings path. Global only; a new value applies after a stop and start. The same block renders the Funnel port select (`serve.funnel_port`) from the schema with no web code of its own."
     },
     {
       "id": "settings.global-migration-and-persistence",
@@ -1472,6 +1526,45 @@
       ]
     },
     {
+      "id": "wizard.sandbox-image-status",
+      "kind": "mocked-playwright",
+      "risk": "medium",
+      "specs": [
+        "tests/wizard.spec.ts",
+        "src/components/session-wizard/__tests__/useSandboxImageRowStatus.test.tsx",
+        "src/components/session-wizard/__tests__/SessionWizard.test.tsx",
+        "src/lib/api.test.ts"
+      ],
+      "components": [
+        "web/src/components/session-wizard/SessionWizard.tsx",
+        "web/src/components/session-wizard/useSandboxImageRowStatus.ts",
+        "web/src/lib/api.ts"
+      ],
+      "notes": "With Sandbox on and available, the row leads with /api/sandbox/image-status for the image the wizard will use (sandboxImage, seeded from the Profile's sandbox.default_image; empty asks for the default): Update available, Up to date, Couldn't check for updates (check_failed), Downloads on launch (unknown with reason not_pulled), and Update status unknown for any other unknown reason, a refusal such as unknown_image for an edited image that isn't configured, or no answer; then ' · <image>'. The first answered check of an opening sends fresh=true; an edit waits 500 ms after the last keystroke and asks from the cache, and a late answer for a previous image is dropped. Off, blocked or before the Profile's defaults settle, the row asks nothing. At 375px the status stays whole and only the image truncates."
+    },
+    {
+      "id": "wizard.pull-latest-image",
+      "kind": "mocked-playwright",
+      "risk": "medium",
+      "specs": [
+        "tests/wizard.spec.ts",
+        "src/components/session-wizard/__tests__/SessionWizard.test.tsx",
+        "src/components/session-wizard/pullLatestImage.test.ts",
+        "src/components/session-wizard/createRequest.test.ts",
+        "src/components/session-wizard/createFailureView.test.ts",
+        "src/components/session-wizard/wizardReducer.test.ts",
+        "src/components/session-wizard/__tests__/CreateProgressView.test.tsx"
+      ],
+      "components": [
+        "web/src/components/session-wizard/SessionWizard.tsx",
+        "web/src/components/session-wizard/pullLatestImage.ts",
+        "web/src/components/session-wizard/createRequest.ts",
+        "web/src/components/session-wizard/createFailureView.ts",
+        "web/src/components/session-wizard/CreateProgressView.tsx"
+      ],
+      "notes": "\"Pull latest image first\" shows under the rows only for a Structured view Sandbox whose image status is available; Terminal view, other states and refusals show the row status only. It is checked by default, unchecked once the update was dismissed, and Launch sends pull_latest_image only while it is checked. When the Daemon won't pull (pull_blocked), it is disabled and shows pull_command with Copy and 'Run this on the Daemon's machine, then reopen this dialog.' The create shows 'Pulling latest image' with a few-minutes hint. A failed pull (sandbox_image_update_failed), or a create-time refusal because pulling was turned off (pull_disabled) or the image is no longer configured (unknown_image), shows 'Couldn't pull the latest image', 'The session wasn't created.' and the server's message, with 'Launch with current image', which unchecks the box and resends under a new key; unchecking it by hand also clears the box. After a failed pull, at 375px and 1280px, the relaunch action and the whole checkbox stay in view."
+    },
+    {
       "id": "wizard.agent-lifecycle",
       "kind": "vitest",
       "risk": "low",
@@ -1730,7 +1823,7 @@
       "id": "wizard.import-session.unit",
       "kind": "vitest",
       "risk": "high",
-      "notes": "Generic ACP import reads the acknowledged served or explicitly selected profile, waits while Server default is unresolved, never writes the implicit profile choice into the form, clears worktree/container/branch/attach/scratch/extra-repo state, and ignores late registry and profile defaults.",
+      "notes": "Generic ACP import reads the acknowledged served or explicitly selected profile, waits while Server default is unresolved, never writes the implicit profile choice into the form, clears worktree/container/branch/attach/scratch/extra-repo state, and ignores late registry and profile defaults. A plugin-provided tool is importable only while the host still reports its ACP adapter, and a configured custom adapter never qualifies.",
       "specs": [
         "src/components/session-wizard/__tests__/ProjectStep.test.tsx",
         "src/components/session-wizard/__tests__/SessionWizard.test.tsx",
@@ -1856,6 +1949,14 @@
         "web/src/components/sidebar/SidebarGroupHeader.tsx",
         "web/src/components/sidebar/GroupLists.tsx"
       ]
+    },
+    {
+      "id": "sidebar.label-contrast",
+      "kind": "mocked-playwright",
+      "risk": "medium",
+      "specs": ["tests/sidebar-chrome.spec.ts"],
+      "components": ["web/src/components/sidebar/SessionRow.tsx"],
+      "notes": "Archived and snoozed Idle labels retain italic styling and full effective opacity so their theme text contrast is preserved."
     },
     {
       "id": "sidebar.compact-mode",
@@ -3628,6 +3729,24 @@
       "components": ["web/src/components/WorkspaceSidebar.tsx", "web/src/components/acp/Composer.tsx"]
     },
     {
+      "id": "acp.switch-account",
+      "kind": "mocked-playwright",
+      "risk": "medium",
+      "specs": [
+        "tests/acp-usage-limit.spec.ts",
+        "src/components/acp/SwitchAccountModal.test.tsx",
+        "src/components/acp/UsageLimitBanner.test.tsx",
+        "src/components/__tests__/SessionRowTriage.test.tsx",
+        "src/lib/api.test.ts"
+      ],
+      "components": [
+        "web/src/components/acp/SwitchAccountModal.tsx",
+        "web/src/components/acp/UsageLimitBanner.tsx",
+        "web/src/components/sidebar/SessionRowMenu.tsx",
+        "web/src/lib/switchAccountTrigger.ts"
+      ]
+    },
+    {
       "id": "acp.switch-view-ui",
       "kind": "mocked-playwright",
       "risk": "medium",
@@ -4133,8 +4252,12 @@
       "kind": "vitest",
       "risk": "high",
       "specs": ["src/components/acp/__tests__/StartupErrorScreen.test.tsx", "tests/acp-startup-error-screen.spec.ts"],
-      "components": ["web/src/components/acp/StartupErrorScreen.tsx", "web/src/components/acp/RecoveryActionRow.tsx"],
-      "notes": "Steps follow install-info: installs allowed, read-only or CityHall, sandboxed, a stopped container (whose manual steps start with Check again, which starts it), npm-installable. Re-reads it on focus so a setting turned on in the TUI unlocks Update; the in-container command comes from the Daemon. Descriptive text uses text-text-subtle, with no text-text-secondary or text-text-dim classes, asserted across install-off, allowed, sandboxed, non-npm and protocol states."
+      "components": [
+        "web/src/components/acp/StartupErrorScreen.tsx",
+        "web/src/components/acp/RecoveryActionRow.tsx",
+        "web/src/components/sidebar/RecreateContainerDialog.tsx"
+      ],
+      "notes": "Steps follow install-info: installs allowed, read-only or CityHall, sandboxed, a stopped container (whose manual steps start with Check again, which starts it), npm-installable. Re-reads it on focus so a setting turned on in the TUI unlocks Update; the in-container command comes from the Daemon. Descriptive text uses text-text-subtle, with no text-text-secondary or text-text-dim classes, asserted across install-off, allowed, sandboxed, non-npm and protocol states. A sandboxed Session the Session menu could recreate (shared canRecreateContainer) gets Recreate container in every state once install-info confirms the Sandbox, never on read-only or CityHall; it opens the menu's confirmation, which fits at 375px, and Details describes it in the dialog's terms only where it's offered."
     },
     {
       "id": "acp.startup-error-banner",
@@ -4160,7 +4283,59 @@
         "web/src/components/acp/adapterRecovery.ts",
         "web/src/App.tsx"
       ],
-      "notes": "Retry restarts through /acp/restart while a Worker is present and spawns through /acp/spawn when it is absent. A retry failing with the same cause, after spawn failed: or restart spawn failed: and any reason code, reads as the same error. When a restart from the startup line stopped a sent message, also when its answer arrives after the startup error, the banner says to send it again."
+      "notes": "Retry restarts through /acp/restart while a Worker is present and spawns through /acp/spawn when it is absent. What follows a Retry is in acp.startup-error-banner-retry-same-cause and -changed-cause. When a restart from the startup line stopped a sent message, also when its answer arrives after the startup error, the banner says to send it again."
+    },
+    {
+      "id": "acp.startup-error-banner-retry-same-cause",
+      "kind": "mocked-playwright",
+      "risk": "medium",
+      "specs": [
+        "tests/acp-startup-error-banner.spec.ts",
+        "src/components/acp/__tests__/SessionBanners.test.tsx",
+        "src/components/acp/__tests__/StartupErrorBanner.test.tsx",
+        "src/hooks/acpSession/reducer.test.ts",
+        "src/components/acp/startupWait.test.ts"
+      ],
+      "components": [
+        "web/src/components/acp/StartupErrorBanner.tsx",
+        "web/src/components/acp/SessionBanners.tsx",
+        "web/src/components/acp/startupWait.ts",
+        "web/src/components/acp/adapterRecovery.ts",
+        "web/src/hooks/acpSession/reducer.ts",
+        "web/src/hooks/acpSession/stateCache.ts",
+        "web/src/lib/acpTypes.ts"
+      ],
+      "notes": "Retry, and Install and retry once its install succeeds, replace the banner with the startup line (Starting <Agent>\u2026, with its elapsed count and Restart after 30s), also for a Session that ran before, and never show both; the Agent starting ends the line and shows the transcript. A startup error that ends the Retry with the same cause, after spawn failed: or restart spawn failed: and any reason code, brings the banner back as <Agent> still couldn't start with Same error as before., then the cause's own fix and actions. A refused Retry request fails the same way without its HTTP status. A reload, or a later error with no Retry, reads as a first failure again."
+    },
+    {
+      "id": "acp.startup-error-banner-retry-changed-cause",
+      "kind": "mocked-playwright",
+      "risk": "medium",
+      "specs": [
+        "tests/acp-startup-error-banner.spec.ts",
+        "src/components/acp/__tests__/SessionBanners.test.tsx",
+        "src/components/acp/__tests__/StartupErrorBanner.test.tsx",
+        "src/hooks/acpSession/reducer.test.ts",
+        "src/components/acp/startupWait.test.ts"
+      ],
+      "components": [
+        "web/src/components/acp/StartupErrorBanner.tsx",
+        "web/src/components/acp/SessionBanners.tsx",
+        "web/src/components/acp/startupWait.ts",
+        "web/src/components/acp/adapterRecovery.ts",
+        "web/src/hooks/acpSession/reducer.ts",
+        "web/src/hooks/acpSession/stateCache.ts",
+        "web/src/lib/acpTypes.ts"
+      ],
+      "notes": "Retry, and Install and retry once its install succeeds, replace the banner with the startup line (Starting <Agent>\u2026, with its elapsed count and Restart after 30s), also for a Session that ran before, and never show both; the Agent starting ends the line and shows the transcript. A startup error, or a refused Retry request, with a different cause brings the banner back as <Agent> still couldn't start with It failed differently this time: and the new cause's first line, then the new cause's fix and actions. Details hold the full error with Copy."
+    },
+    {
+      "id": "acp.empty-state-not-running",
+      "kind": "mocked-playwright",
+      "risk": "low",
+      "specs": ["tests/acp-startup-error-banner.spec.ts", "tests/acp-structured-view.spec.ts"],
+      "components": ["web/src/components/acp/StructuredView.tsx"],
+      "notes": "An empty transcript under a startup error says <Agent> isn't running. and, during a Retry, <Agent> isn't running yet., with no starter prompts either way; the hint and starter prompts come back once the Agent starts. Archived and trashed Sessions show neither."
     },
     {
       "id": "acp.startup-error-banner-live",
@@ -5522,6 +5697,55 @@
       "risk": "high",
       "specs": ["tests/live/session-lifecycle.spec.ts"],
       "components": ["web/src/components/WorkspaceSidebar.tsx"]
+    },
+    {
+      "id": "sessions.error-recorded",
+      "kind": "mocked-playwright",
+      "risk": "medium",
+      "specs": [
+        "tests/session-error.spec.ts",
+        "src/components/__tests__/SessionErrorPanel.test.tsx",
+        "src/components/__tests__/LiveTerminalView.errorHold.test.tsx"
+      ],
+      "components": ["web/src/components/SessionErrorPanel.tsx", "web/src/components/LiveTerminalView.tsx"],
+      "notes": "Opening a Terminal view Error Session shows <Session> reported an error with AoE's last_error verbatim, Copy error and Restart, instead of ensuring it, which would restart it and clear the error (#5055). Tapping the row reaches it on a phone. Restart starts the terminal once the Session leaves Error; read-only shows no Restart."
+    },
+    {
+      "id": "sessions.error-none-recorded",
+      "kind": "mocked-playwright",
+      "risk": "low",
+      "specs": ["tests/session-error.spec.ts", "src/components/__tests__/SessionErrorPanel.test.tsx"],
+      "components": ["web/src/components/SessionErrorPanel.tsx"],
+      "notes": "An Error Session without a last_error (or a whitespace-only one) says No details were recorded. Restart to try again. and offers no Copy."
+    },
+    {
+      "id": "sessions.error-deleting",
+      "kind": "vitest",
+      "risk": "low",
+      "specs": [
+        "src/components/__tests__/SessionErrorPanel.test.tsx",
+        "src/components/__tests__/LiveTerminalView.errorHold.test.tsx",
+        "src/components/__tests__/SessionRowTriage.test.tsx"
+      ],
+      "components": ["web/src/components/SessionErrorPanel.tsx", "web/src/components/sidebar/SessionRow.tsx"],
+      "notes": "An Error Session deleted from its panel keeps the panel without Restart. A Deleting row's glyph tooltip reads Deleting…."
+    },
+    {
+      "id": "sidebar.error-tooltip-and-badge",
+      "kind": "mocked-playwright",
+      "risk": "low",
+      "specs": [
+        "tests/session-error.spec.ts",
+        "src/components/__tests__/SessionRowTriage.test.tsx",
+        "src/components/__tests__/SidebarGroupHeader.test.tsx",
+        "src/lib/__tests__/statusLegend.test.ts"
+      ],
+      "components": [
+        "web/src/components/sidebar/SessionRow.tsx",
+        "web/src/components/sidebar/SidebarGroupHeader.tsx",
+        "web/src/lib/statusLegend.ts"
+      ],
+      "notes": "A Terminal view Error row's glyph tooltip reads Error plus the first line of last_error, or Error · no details recorded, and the glyph is described by that line. A Structured view Error row keeps its generic meaning. The Group badge says 3 Sessions need attention · 2 have errors, or 2 Sessions have errors when all are errors."
     },
     {
       "id": "settings.plugins",

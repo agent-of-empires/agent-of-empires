@@ -13,6 +13,7 @@ import { useUnreadIndicatorEnabled } from "../../lib/unreadIndicator";
 import { useSessionColorsEnabled } from "../../lib/sessionColors";
 import { enterFocusWindow, openFocusWindow, requestOpenSession } from "../../lib/sessionRoute";
 import { useIsCoarsePointer } from "../../hooks/useIsCoarsePointer";
+import { requestSwitchAccount } from "../../lib/switchAccountTrigger";
 import { requestSwitchAgent } from "../../lib/switchAgentTrigger";
 import { reportError, reportInfo } from "../../lib/toastBus";
 import { ContextMenu } from "../ContextMenu";
@@ -219,6 +220,10 @@ function buildRowActions(
     switchAgent: afterTarget("switchAgent", (s) => {
       requestOpenSession(s.id);
       requestSwitchAgent(s.id);
+    }),
+    switchAccount: afterTarget("switchAccount", (s) => {
+      requestOpenSession(s.id);
+      requestSwitchAccount(s.id);
     }),
     fork: afterTarget("fork", async (s) => {
       const result = await createSession({

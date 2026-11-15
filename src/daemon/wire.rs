@@ -99,6 +99,9 @@ pub struct CreateSessionBody {
     pub extra_args: String,
     #[serde(default)]
     pub sandbox_image: Option<String>,
+    /// Force-pull the Sandbox image before the create hooks, even when it exists locally.
+    #[serde(default)]
+    pub pull_latest_image: bool,
     #[serde(default)]
     pub extra_env: Vec<String>,
     /// Host-only env for `host_hooks.before_start`; never enters the container. Sandbox only.
@@ -901,6 +904,10 @@ pub enum RestoreOutcome {
     AlreadyRestored,
 }
 
+fn is_zero(n: &usize) -> bool {
+    *n == 0
+}
+
 /// One session from the daemon. Only `id` is required when decoding.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
 pub struct SessionResponse {
@@ -1152,6 +1159,14 @@ pub struct SessionResponse {
     /// failover off or already tried, or no pool account has headroom. Set by the list handler.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub rate_limit_failover_to: Option<String>,
+    /// Messages on the daemon's queue for this session, so a client that never opened it
+    /// can still show them.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub queued_count: usize,
+    /// What the queue is waiting on, as a prompt sent now would be told. Absent when the
+    /// queue is empty or nothing holds it. Set by the list handler.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub queue_reason: Option<crate::acp::dispatch::QueueReason>,
     /// True when this session's agent can run in structured view: a built-in
     /// with an ACP adapter, or a custom agent whose profile config
     /// declares a valid `agent_acp_cmd`. The web terminal view reads

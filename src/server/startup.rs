@@ -5,6 +5,7 @@ use crate::cli::serve::AuthMode;
 use crate::file_watch::FileWatchService;
 use crate::server::push::{PushState, STATUS_CHANNEL_CAPACITY};
 use crate::server::rate_limit::RateLimiter;
+use crate::server::tunnel::FunnelReach;
 use anyhow::Context;
 use std::future::Future;
 use std::net::SocketAddr;
@@ -14,7 +15,7 @@ use tokio::sync::{broadcast, RwLock};
 use tokio_util::sync::CancellationToken;
 use tracing::info;
 
-use super::access::{host_from_url, resolve_access_policy};
+use super::access::{authority_from_url, resolve_access_policy};
 use super::acp_events::{acp_event_listener, seed_acp_statuses};
 use super::disk_watch::{disk_watcher_consumer, init_disk_watch_subscriptions};
 use super::ip_discovery::{local_published_hosts, IpKind};
@@ -58,13 +59,29 @@ pub(super) fn remote_serve_url_contents(
     format!("{remote_url}\nlocalhost\t{loopback_url}\n")
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum PublishStep {
+    Marker,
+    Url,
+}
+
+/// Back to ours, the public URL goes first and the old marker still says it isn't; any other
+/// change marks first and then drops the public URL.
+fn publish_order(reach: FunnelReach) -> [PublishStep; 2] {
+    if reach == FunnelReach::Ours {
+        [PublishStep::Url, PublishStep::Marker]
+    } else {
+        [PublishStep::Marker, PublishStep::Url]
+    }
+}
+
 /// The remote daemon's `serve.url`. Token rotation and a Funnel takeover both rewrite it, one at a
 /// time and from the current token, so neither restores the other's stale contents.
 pub(super) struct RemoteServeUrl {
     base_url: String,
     local_port: u16,
-    /// Tailscale only: false while `/` on :443 routes elsewhere, which drops the public URL.
-    reach: Option<tokio::sync::watch::Receiver<bool>>,
+    /// Tailscale only: anything but `Ours` drops the public URL.
+    reach: Option<tokio::sync::watch::Receiver<FunnelReach>>,
     write: tokio::sync::Mutex<()>,
 }
 
@@ -72,7 +89,7 @@ impl RemoteServeUrl {
     fn new(
         base_url: String,
         local_port: u16,
-        reach: Option<tokio::sync::watch::Receiver<bool>>,
+        reach: Option<tokio::sync::watch::Receiver<FunnelReach>>,
     ) -> Self {
         Self {
             base_url,
@@ -82,8 +99,14 @@ impl RemoteServeUrl {
         }
     }
 
-    fn contents(&self, token: Option<&str>) -> String {
-        if self.reach.as_ref().is_none_or(|reach| *reach.borrow()) {
+    fn reach(&self) -> FunnelReach {
+        self.reach
+            .as_ref()
+            .map_or(FunnelReach::Ours, |reach| *reach.borrow())
+    }
+
+    fn contents(&self, reach: FunnelReach, token: Option<&str>) -> String {
+        if reach == FunnelReach::Ours {
             return remote_serve_url_contents(&self.base_url, self.local_port, token);
         }
         let base = format!("http://127.0.0.1:{}", self.local_port);
@@ -93,11 +116,38 @@ impl RemoteServeUrl {
         }
     }
 
+    /// Writes `serve.funnel` (absent while the Funnel is ours) and `serve.url` in
+    /// `publish_order`, so a read between the two writes never shows a loopback-only URL
+    /// without the marker that says why.
     async fn publish(&self, tokens: &TokenManager) {
         let _write = self.write.lock().await;
         let token = tokens.current_token().await;
-        if let Ok(app_dir) = crate::session::get_app_dir() {
-            write_secret_file(&app_dir.join("serve.url"), &self.contents(token.as_deref())).await;
+        let reach = self.reach();
+        let Ok(app_dir) = crate::session::get_app_dir() else {
+            return;
+        };
+        for step in publish_order(reach) {
+            match step {
+                PublishStep::Marker => {
+                    let marker = app_dir.join("serve.funnel");
+                    match reach.marker() {
+                        Some(contents) => write_secret_file(&marker, contents).await,
+                        None => match tokio::fs::remove_file(&marker).await {
+                            Err(error) if error.kind() != std::io::ErrorKind::NotFound => {
+                                tracing::debug!(target: "serve.tunnel", %error, "failed to remove serve.funnel");
+                            }
+                            _ => {}
+                        },
+                    }
+                }
+                PublishStep::Url => {
+                    write_secret_file(
+                        &app_dir.join("serve.url"),
+                        &self.contents(reach, token.as_deref()),
+                    )
+                    .await
+                }
+            }
         }
     }
 
@@ -244,6 +294,8 @@ pub(crate) struct ServerConfig<'a> {
     pub tunnel_name: Option<&'a str>,
     pub tunnel_url: Option<&'a str>,
     pub no_tailscale: bool,
+    /// The public HTTPS port a Tailscale Funnel listens on.
+    pub funnel_port: u16,
     pub is_daemon: bool,
     pub passphrase: Option<&'a str>,
     /// True when the server sits behind an external reverse proxy
@@ -444,6 +496,7 @@ pub(crate) async fn start_server(
         tunnel_name,
         tunnel_url,
         no_tailscale,
+        funnel_port,
         is_daemon,
         passphrase,
         behind_proxy,
@@ -607,6 +660,33 @@ pub(crate) async fn start_server(
         None
     };
 
+    // Session-scoped `/mcp` credential secret. Only generated when `/mcp` is actually
+    // mounted, so a daemon that never enables it never gets this file on disk.
+    let mcp_session_secret = if config.web.mcp_enabled {
+        match crate::session::get_app_dir() {
+            Ok(dir) => {
+                match crate::server::session_credential::McpSessionSecret::load_or_generate(
+                    &dir.join("mcp_session_secret"),
+                ) {
+                    Ok(secret) => Some(Arc::new(secret)),
+                    Err(e) => {
+                        tracing::warn!(target: "http.middleware",
+                            error = %e,
+                            "/mcp session credentials disabled: failed to load secret"
+                        );
+                        None
+                    }
+                }
+            }
+            Err(e) => {
+                tracing::warn!(target: "http.middleware", error = %e, "/mcp session credentials disabled: app_dir unavailable");
+                None
+            }
+        }
+    } else {
+        None
+    };
+
     let acp_events_tx = broadcast::channel(ACP_CHANNEL_CAPACITY).0;
     let acp_event_store = {
         let app_dir = crate::session::get_app_dir().context("acp event store: resolve app dir")?;
@@ -753,7 +833,7 @@ pub(crate) async fn start_server(
             } else if tailscale_ok {
                 info!("Tailscale detected; using Tailscale Funnel for stable HTTPS origin");
                 // Do NOT fall back to Cloudflare on Tailscale failure.
-                tunnel::TunnelHandle::spawn_tailscale(local_port)
+                tunnel::TunnelHandle::spawn_tailscale(local_port, funnel_port)
                     .await
                     .map_err(|e| {
                         anyhow::anyhow!(
@@ -939,7 +1019,9 @@ pub(crate) async fn start_server(
         .unwrap_or("local");
 
     // DNS-rebinding gate.
-    let tunnel_host: Option<String> = tunnel_handle.as_ref().and_then(|h| host_from_url(&h.url));
+    let tunnel_host: Option<String> = tunnel_handle
+        .as_ref()
+        .and_then(|h| authority_from_url(&h.url));
     let (allowed_hosts, allowed_origins) = resolve_access_policy(
         host,
         local_port,
@@ -1002,6 +1084,7 @@ pub(crate) async fn start_server(
         session_service,
         token_manager: Arc::clone(&token_manager),
         login_manager: Arc::clone(&login_manager),
+        mcp_session_secret,
         passkey_manager,
         rate_limiter: Arc::clone(&rate_limiter),
         behind_tunnel: remote || behind_proxy,
@@ -1705,6 +1788,27 @@ mod tests {
         );
     }
 
+    /// Between the two writes of any change, a reader never finds the loopback-only URL with
+    /// no marker, the pair Remote Access can only show as unknown.
+    #[test]
+    fn no_write_order_leaves_a_loopback_url_without_its_marker() {
+        let all = [FunnelReach::Ours, FunnelReach::Lost, FunnelReach::Unknown];
+        // (marker present, URL public) once `step` of a publish for `to` has landed.
+        let after = |(marker, public): (bool, bool), to: FunnelReach, step| match step {
+            PublishStep::Marker => (to.marker().is_some(), public),
+            PublishStep::Url => (marker, to == FunnelReach::Ours),
+        };
+        for from in all {
+            for to in all {
+                let mut files = (from.marker().is_some(), from == FunnelReach::Ours);
+                for step in publish_order(to) {
+                    files = after(files, to, step);
+                    assert_ne!(files, (false, false), "{from:?} -> {to:?} after {step:?}");
+                }
+            }
+        }
+    }
+
     /// A Funnel takeover drops the public line, rotation keeps it dropped, and a returned route
     /// restores it, each from the current token.
     #[tokio::test]
@@ -1718,7 +1822,17 @@ mod tests {
             Some("t1".to_string()),
             Duration::from_secs(3600),
         ));
-        let (reach, rx) = tokio::sync::watch::channel(true);
+        let marker = || {
+            std::fs::read_to_string(crate::session::get_app_dir().unwrap().join("serve.funnel"))
+                .ok()
+        };
+        // A crashed daemon's marker is gone after the next start's first publish.
+        std::fs::write(
+            crate::session::get_app_dir().unwrap().join("serve.funnel"),
+            "lost\n",
+        )
+        .unwrap();
+        let (reach, rx) = tokio::sync::watch::channel(FunnelReach::Ours);
         let url = Arc::new(RemoteServeUrl::new(
             "https://node.ts.net".to_string(),
             8080,
@@ -1729,6 +1843,7 @@ mod tests {
             read(),
             "https://node.ts.net/?token=t1\nlocalhost\thttp://127.0.0.1:8080/?token=t1\n"
         );
+        assert_eq!(marker(), None);
 
         let shutdown = CancellationToken::new();
         let follow = tokio::spawn(url.clone().follow_funnel(tokens.clone(), shutdown.clone()));
@@ -1741,9 +1856,10 @@ mod tests {
             .await
             .unwrap_or_else(|_| panic!("serve.url never started with {want}: {:?}", read()));
         };
-        reach.send_replace(false);
+        reach.send_replace(FunnelReach::Lost);
         wait_for("http://127.0.0.1:8080/?token=t1").await;
         assert!(!read().contains("ts.net"), "{}", read());
+        assert_eq!(marker().as_deref(), Some("lost\n"));
 
         tokens.rotate().await;
         url.publish(&tokens).await;
@@ -1751,9 +1867,27 @@ mod tests {
         let rotated = tokens.current_token().await.unwrap();
         assert_eq!(read(), format!("http://127.0.0.1:8080/?token={rotated}\n"));
 
-        reach.send_replace(true);
+        reach.send_replace(FunnelReach::Unknown);
+        tokio::time::timeout(Duration::from_secs(10), async {
+            while marker().as_deref() != Some("unknown\n") {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("an unanswered status is marked");
+        assert!(!read().contains("ts.net"), "{}", read());
+
+        reach.send_replace(FunnelReach::Ours);
         wait_for("https://node.ts.net/?token=").await;
         assert!(read().contains(&rotated), "{}", read());
+        // Back to ours the URL lands before the marker goes (`publish_order`).
+        tokio::time::timeout(Duration::from_secs(10), async {
+            while marker().is_some() {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("the marker is removed once the Funnel is back");
 
         shutdown.cancel();
         follow.await.unwrap();

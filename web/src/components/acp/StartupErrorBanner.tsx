@@ -2,6 +2,7 @@ import { useEffect, useState } from "react";
 
 import { useRespawnSession } from "../../hooks/useRespawnSession";
 import { fetchAgentInstallInfo, type AgentInstallInfo } from "../../lib/api";
+import { writeClipboard } from "../../lib/clipboard";
 import type { AcpWorkerState } from "../../lib/types";
 import { splitInstallHint, startupErrorCause, useAdapterInstall } from "./adapterRecovery";
 import { CommandBlock, RecoveryActionRow, type RecoveryAction } from "./RecoveryActionRow";
@@ -145,6 +146,10 @@ export function StartupErrorBanner({
   message,
   acpWorkerState,
   sentStopped = false,
+  retriedError = null,
+  restartEpoch = 0,
+  onRetryStarted,
+  onRetryFailed,
   onSwitchToTerminal,
 }: {
   sessionId: string;
@@ -152,25 +157,29 @@ export function StartupErrorBanner({
   acpWorkerState: AcpWorkerState;
   /** A restart stopped the sent message and it hasn't been sent again. */
   sentStopped?: boolean;
+  /** The error a Retry was for, when this error ended that Retry. */
+  retriedError?: string | null;
+  restartEpoch?: number;
+  /** Hands the Retry to the startup line, which replaces this banner until the Agent starts or fails again. */
+  onRetryStarted?: (epoch: number, message: string) => void;
+  /** The Retry's request failed: its full detail, which becomes the next startup error. */
+  onRetryFailed?: (epoch: number, detail: string) => void;
   /** Opens the switch-view confirmation; omitted where the Session can't switch. */
   onSwitchToTerminal?: () => void;
 }) {
   const [info, setInfo] = useState<AgentInstallInfo | null>(null);
   const [infoRequest, setInfoRequest] = useState(0);
   const [detailsOpen, setDetailsOpen] = useState(false);
+  const [copied, setCopied] = useState<string | null>(null);
   // A Worker still present would refuse a spawn, so Retry replaces it instead.
-  const {
-    state: retryState,
-    detail: retryDetail,
-    respawn,
-  } = useRespawnSession(sessionId, null, {
+  const { state: retryState, respawn } = useRespawnSession(sessionId, null, {
     restart: acpWorkerState !== "absent",
+    onFailed: (_status, _error, detail) => onRetryFailed?.(restartEpoch, detail),
   });
-  // A failed respawn opens Details, where its failure line is, whichever button started it.
+  // Install and retry also ends here, once its install succeeds.
   const respawnOrShow = async () => {
-    const ok = await respawn();
-    if (!ok) setDetailsOpen(true);
-    return ok;
+    onRetryStarted?.(restartEpoch, message);
+    return respawn();
   };
   const install = useAdapterInstall(sessionId, respawnOrShow);
 
@@ -220,12 +229,16 @@ export function StartupErrorBanner({
     ? [{ label: "Use Terminal view", onClick: onSwitchToTerminal, testId: "startup-error-banner-terminal" }]
     : [];
 
-  const retryFailure =
-    retryState === "failed" && retryDetail !== null
-      ? startupErrorCause(retryDetail) === startupErrorCause(message)
-        ? "Retry failed: same error"
-        : `Retry failed: ${startupErrorCause(retryDetail)}`
-      : null;
+  const cause = startupErrorCause(message);
+  const changed =
+    retriedError === null
+      ? null
+      : cause === startupErrorCause(retriedError)
+        ? "Same error as before."
+        : `It failed differently this time: ${cause.split("\n")[0]}`;
+  const copy = async () => {
+    if (await writeClipboard(message)) setCopied(message);
+  };
 
   return (
     <section
@@ -234,7 +247,14 @@ export function StartupErrorBanner({
       className="border-b border-status-error/40 bg-status-error/10 px-4 py-3 text-text-primary"
     >
       <div role="alert">
-        <h2 className="text-sm font-semibold">{name} couldn't start in Structured view</h2>
+        <h2 className="text-sm font-semibold">
+          {retriedError === null ? `${name} couldn't start in Structured view` : `${name} still couldn't start`}
+        </h2>
+        {changed && (
+          <div data-testid="startup-error-banner-changed" className="mt-1 text-xs wrap-anywhere text-text-primary">
+            {changed}
+          </div>
+        )}
         <div className="mt-1 text-xs text-text-subtle">
           {specific ??
             (ADAPTER_NOT_FOUND.test(message) ? (
@@ -258,9 +278,6 @@ export function StartupErrorBanner({
           The message you sent was stopped. Send it again once {name} is ready.
         </div>
       )}
-      {retryState === "ok" && (
-        <div className="mt-2 text-xs text-text-subtle">Retrying. Events will appear when {name} starts.</div>
-      )}
       <div className="mt-3 border-t border-status-error/30 pt-2">
         <button
           type="button"
@@ -274,7 +291,14 @@ export function StartupErrorBanner({
         {detailsOpen && (
           <div className="mt-2" data-testid="startup-error-banner-details-body">
             <pre className="whitespace-pre-wrap break-all font-mono text-xs text-text-subtle">{message}</pre>
-            {retryFailure && <div className="mt-1 font-mono text-xs text-text-subtle">{retryFailure}</div>}
+            <button
+              type="button"
+              data-testid="startup-error-banner-copy"
+              onClick={() => void copy()}
+              className="mt-1 text-xs font-medium text-text-primary underline-offset-2 hover:underline"
+            >
+              {copied === message ? "Copied" : "Copy"}
+            </button>
             <AgentLogDisclosure sessionId={sessionId} />
           </div>
         )}

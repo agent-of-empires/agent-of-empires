@@ -198,7 +198,7 @@ async fn assigned(client: &mut AcpClient) {
                     assert_eq!(acp_session_id, "native");
                     return;
                 }
-                Event::AgentStartupError { message } => panic!("{message}"),
+                Event::AgentStartupError { message, .. } => panic!("{message}"),
                 _ => {}
             }
         }
@@ -212,7 +212,7 @@ async fn stopped(client: &mut AcpClient) -> String {
         loop {
             match client.next_event().await.unwrap() {
                 Event::Stopped { reason } => return reason,
-                Event::AgentStartupError { message } => panic!("{message}"),
+                Event::AgentStartupError { message, .. } => panic!("{message}"),
                 _ => {}
             }
         }
@@ -618,7 +618,7 @@ async fn recovered_completion_orders_updates_and_applies_rate_limit_parking() {
                     );
                     break;
                 }
-                Event::AgentStartupError { message } => panic!("{message}"),
+                Event::AgentStartupError { message, .. } => panic!("{message}"),
                 _ => {}
             }
         }

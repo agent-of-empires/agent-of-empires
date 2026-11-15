@@ -5,8 +5,10 @@ import { TerminalSessionStack } from "./TerminalSessionStack";
 import { PairedShellPane, type ShellMode } from "./PairedTerminal";
 import { BackgroundAgentsPanel, type AgentFocus } from "./acp/BackgroundAgentsPanel";
 import { hasStartedBefore } from "./acp/startupWait";
+import { recreateContainerTitle } from "./sidebar/sessionActionTargets";
 import { FilesPane } from "./FilesPane";
 import { DiffFileList } from "./diff/DiffFileList";
+import { FileContentViewer } from "./diff/FileContentViewer";
 import { DiffFileViewer } from "./diff/DiffFileViewer";
 import { CommentsBanner } from "./diff/comments/CommentsBanner";
 import { SendCommentsDialog } from "./diff/comments/SendCommentsDialog";
@@ -49,6 +51,7 @@ interface Props {
     "persistentTerminals" | "maxPersistentTerminals" | "persistentStructuredViews" | "maxPersistentStructuredViews"
   >;
   selectedFilePath: string | null;
+  selectedFileExternal?: boolean;
   selectedRepoName: string | undefined;
   selectedFileLine: number | undefined;
   revision: number;
@@ -99,6 +102,7 @@ export function MobileMainPane({
   sessions,
   webSettings,
   selectedFilePath,
+  selectedFileExternal,
   selectedRepoName,
   selectedFileLine,
   revision,
@@ -164,6 +168,7 @@ export function MobileMainPane({
                     sessionId={session.id}
                     acpWorkerState={session.acp_worker_state ?? "absent"}
                     rateLimitAutoResume={session.rate_limit_auto_resume}
+                    rateLimitFailoverTo={session.rate_limit_failover_to}
                     settingsHref={autoResumeSettingsHref(session.profile, serverAbout)}
                     tool={session.tool}
                     acpAgent={session.acp_agent ?? null}
@@ -180,6 +185,7 @@ export function MobileMainPane({
                     onOpenAgentsPane={onOpenAgentsPane}
                     serverReadOnly={readOnly}
                     isSandboxed={session.is_sandboxed}
+                    recreateContainerTitle={recreateContainerTitle(session)}
                     onSwitchToTerminal={onSwitchToTerminal ? () => onSwitchToTerminal(session.id) : undefined}
                     onOpenTerminal={onOpenTerminal ? (mode) => onOpenTerminal(session.id, mode) : undefined}
                     canRestartAgent={canRestartAgent}
@@ -228,16 +234,25 @@ export function MobileMainPane({
             style={{ paddingBottom: "env(safe-area-inset-bottom)" }}
           >
             {selectedFilePath && activeSessionId ? (
-              <DiffFileViewer
-                sessionId={activeSessionId}
-                filePath={selectedFilePath}
-                repoName={selectedRepoName}
-                targetLine={selectedFileLine}
-                revision={revision}
-                onClose={onCloseFile}
-                commentsEnabled={commentsEnabled}
-                commentsStore={diffComments}
-              />
+              selectedFileExternal ? (
+                <FileContentViewer
+                  sessionId={activeSessionId}
+                  filePath={selectedFilePath}
+                  structured={activeSession?.view === "structured"}
+                  onBack={onCloseFile}
+                />
+              ) : (
+                <DiffFileViewer
+                  sessionId={activeSessionId}
+                  filePath={selectedFilePath}
+                  repoName={selectedRepoName}
+                  targetLine={selectedFileLine}
+                  revision={revision}
+                  onClose={onCloseFile}
+                  commentsEnabled={commentsEnabled}
+                  commentsStore={diffComments}
+                />
+              )
             ) : (
               <div className="flex-1 flex flex-col min-h-0 overflow-hidden">
                 {commentsEnabled && diffComments.count > 0 && (
@@ -286,7 +301,11 @@ export function MobileMainPane({
             className="absolute inset-0 z-10 flex flex-col min-h-0 overflow-hidden bg-surface-900"
             style={{ paddingBottom: "env(safe-area-inset-bottom)" }}
           >
-            <FilesPane key={activeSessionId ?? "none"} sessionId={activeSessionId} />
+            <FilesPane
+              key={activeSessionId ?? "none"}
+              sessionId={activeSessionId}
+              structured={activeSession?.view === "structured"}
+            />
           </div>
         )}
 

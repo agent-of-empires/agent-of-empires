@@ -208,7 +208,9 @@ With `[acp] rate_limit_auto_resume`, the reconciler resumes the same worker once
 
 ## Crash-loop park
 
-A worker that exits within ~10s (broken command, missing adapter, failed handshake) logs a `warn` on the `acp.runner` target and counts against a respawn budget: more than 5 spawns in a rolling 60s parks the session, publishes one `AgentStartupError`, and stops auto-respawning. Recovery is a dashboard retry, `aoe acp restart <session>`, or an `aoe serve` restart.
+A worker that exits within ~10s (broken command, missing adapter, failed handshake) logs a `warn` on the `acp.runner` target and counts against a respawn budget: more than 3 spawns in a rolling 60s parks the session, publishes one `AgentStartupError`, and stops auto-respawning. Recovery is a dashboard retry, `aoe acp restart <session>`, or an `aoe serve` restart.
+
+A respawn reuses the stored launch, which can't rebuild a sandbox container. During the respawn backoff the drain asks the runtime whether the container exists; when the runtime says it is gone, the session parks at once with `AgentStartupError` whose `cause` is `{"kind": "container_missing"}`. A runtime error, or no answer within the backoff, lets the respawn go ahead.
 
 ## Restart
 

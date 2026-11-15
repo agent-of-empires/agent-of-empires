@@ -436,9 +436,8 @@ impl Persister {
                     seq,
                     "event store write failed; substituting AgentStartupError so the gap is visible: {e}"
                 );
-                failure = Event::AgentStartupError {
-                    message: format!("event store write failed at seq {seq}: {e}"),
-                };
+                failure =
+                    Event::startup_error(format!("event store write failed at seq {seq}: {e}"));
                 (&failure, false)
             }
         };

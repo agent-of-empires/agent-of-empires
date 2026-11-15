@@ -33,6 +33,8 @@ pub(crate) async fn project_sessions(state: &Arc<AppState>) -> Vec<SessionRespon
         // CityHall cannot expose terminal sessions.
         .filter(|inst| !state.cityhall_mode || inst.is_structured())
         .collect();
+    let mut resume_configs: std::collections::HashMap<String, crate::session::ResumeProfileConfig> =
+        std::collections::HashMap::new();
     let mut sessions: Vec<SessionResponse> = scoped_instances
         .iter()
         .copied()
@@ -77,6 +79,16 @@ pub(crate) async fn project_sessions(state: &Arc<AppState>) -> Vec<SessionRespon
                 active_monitor,
             );
             session.acp_worker_start = acp_worker_start;
+            // Archived and trashed rows render stopped; skip the resume check.
+            if !inst.is_archived() && !inst.is_trashed() {
+                session.context_resume = Some(context_resume_with(inst, || {
+                    resume_configs
+                        .entry(inst.source_profile.clone())
+                        .or_insert_with(|| {
+                            crate::session::resume_profile_config(&inst.source_profile)
+                        })
+                }));
+            }
             if structured_live && acp_worker_state == crate::daemon::AcpWorkerState::Running {
                 // Gate on a live worker: a pending nonce only exists on a
                 // running worker, and spawn/attach sweep orphaned nonces out of
@@ -226,7 +238,7 @@ pub(crate) async fn project_sessions(state: &Arc<AppState>) -> Vec<SessionRespon
     // indicator cannot drift from the runtime gate.
     {
         use crate::session::smart_rename::{
-            check_eligible_resolved, resolve_smart_rename_config, SmartRenameState,
+            check_eligible_with_declarations, resolve_smart_rename_config, SmartRenameState,
         };
         use std::collections::HashSet;
         let inflight: HashSet<String> = state
@@ -261,7 +273,7 @@ pub(crate) async fn project_sessions(state: &Arc<AppState>) -> Vec<SessionRespon
                 session_cfg,
             );
             let cfg = resolve_smart_rename_config(session_cfg, smart_rename_override);
-            let eligible = check_eligible_resolved(
+            let eligible = check_eligible_with_declarations(
                 inst.is_structured(),
                 cfg.setting_on,
                 false,
@@ -270,7 +282,7 @@ pub(crate) async fn project_sessions(state: &Arc<AppState>) -> Vec<SessionRespon
                 cfg.rename_agent,
                 inst.is_sandboxed(),
                 &inst.command,
-                cfg.overrides,
+                session_cfg,
             )
             .is_ok();
             if eligible {
@@ -290,6 +302,24 @@ pub(crate) async fn project_sessions(state: &Arc<AppState>) -> Vec<SessionRespon
         resolver_misses,
         "list_sessions resolved session config once per unique profile/project pair"
     );
+
+    // Sessions whose daemon queue holds messages, with what decides why it waits.
+    let queue_probes: Vec<(usize, String, String, String, bool)> = scoped_instances
+        .iter()
+        .enumerate()
+        .filter(|(_, inst)| inst.is_structured() && !inst.is_archived() && !inst.is_trashed())
+        .filter_map(|(i, inst)| {
+            let first = inst.queued_prompts.first()?;
+            let agent_key = inst.agent_name.clone().unwrap_or_else(|| inst.tool.clone());
+            Some((
+                i,
+                inst.id.clone(),
+                first.text.clone(),
+                agent_key,
+                inst.is_idle_dormant(),
+            ))
+        })
+        .collect();
 
     // The park probe touches config files and SQLite, so it runs with the
     // session registry unlocked rather than holding writers behind it.
@@ -348,6 +378,20 @@ pub(crate) async fn project_sessions(state: &Arc<AppState>) -> Vec<SessionRespon
             sessions[i].rate_limit = park;
             sessions[i].rate_limit_failover_to = failover_to;
         }
+    }
+
+    // After the park overlay, which is one of its inputs, and unlocked, because the fold
+    // takes the registry lock itself.
+    for (i, id, first, agent_key, idle_dormant) in queue_probes {
+        use crate::daemon::AcpWorkerState::{Resuming, Running};
+        let worker = crate::acp::dispatch::WorkerLiveness {
+            running: matches!(sessions[i].acp_worker_state, Resuming | Running),
+            idle_dormant,
+            rate_limit_parked: sessions[i].rate_limit.is_some(),
+        };
+        let control = state.session_service.fold_control_state(&id).await;
+        let solo = crate::acp::agent_profiles::resolve(&agent_key).is_solo_command(&first);
+        sessions[i].queue_reason = crate::acp::dispatch::queue_hold(&control, worker, solo);
     }
 
     // Resolve remote owners with a permanent cache on AppState
@@ -796,6 +840,8 @@ mod workspace_ordering_tests {
             rate_limit: None,
             rate_limit_auto_resume: None,
             rate_limit_failover_to: None,
+            queued_count: 0,
+            queue_reason: None,
             acp_capable: false,
             acp_session_id: None,
             import_pending: false,

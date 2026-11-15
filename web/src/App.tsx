@@ -10,6 +10,14 @@ import {
   type ReactNode,
 } from "react";
 import { Puzzle } from "lucide-react";
+import {
+  confirmFileEditNavigation,
+  confirmFileEditPanes,
+  confirmFileEditRemoval,
+  isFileEditorOpen,
+  rememberFileEditLocation,
+} from "./lib/fileEditGuard";
+import type { NavigateOptions, To } from "react-router-dom";
 import { Navigate, useLocation, useMatch, useNavigate, useSearchParams } from "react-router-dom";
 import { IDLE_DECAY_WINDOW_MS } from "./lib/session";
 import { diffSelectionStale } from "./lib/diffSelection";
@@ -28,6 +36,7 @@ import { clearDraft } from "./lib/acpDrafts";
 import { useOrphanSweep } from "./hooks/useOrphanSweep";
 import { AcpPrefsProvider } from "./lib/acpPrefs";
 import { SessionActionProvider } from "./components/sidebar/SessionActionProvider";
+import { recreateContainerTitle } from "./components/sidebar/sessionActionTargets";
 import { safeGetItem, safeRemoveItem } from "./lib/safeStorage";
 import { isAutomatedSession } from "./lib/onboarding";
 import { useWorkspaces } from "./hooks/useWorkspaces";
@@ -64,7 +73,7 @@ import { useIsCoarsePointer } from "./hooks/useIsCoarsePointer";
 import { useMobileViewportLock } from "./hooks/useMobileViewportLock";
 import { useIsWideViewport } from "./hooks/useIsWideViewport";
 import type { RightPanelView } from "./lib/rightPanelView";
-import { usePaneLayout, dockTabs, dockGroups, dockOf, isDockCollapsed } from "./lib/paneLayout";
+import { usePaneLayout, dockTabs, dockGroups, dockOf, isDockCollapsed, renderedGroups } from "./lib/paneLayout";
 import { isPluginPaneId, resolvePaneIcon, usePluginPanes, type PluginPane } from "./lib/pluginPanes";
 import { PluginPaneBody } from "./components/plugin/PluginPane";
 import { PluginPageView } from "./components/plugin/PluginPageView";
@@ -372,7 +381,15 @@ function AppContent({
   }, []);
 
   const location = useLocation();
-  const navigate = useNavigate();
+  const rawNavigate = useNavigate();
+  const navigate = useCallback(
+    (to: To | number, options?: NavigateOptions) => {
+      if (!confirmFileEditNavigation()) return;
+      return typeof to === "number" ? rawNavigate(to) : rawNavigate(to, options);
+    },
+    [rawNavigate],
+  );
+  useEffect(rememberFileEditLocation, [location]);
   const [searchParams, setSearchParams] = useSearchParams();
   const { settings: webSettings } = useWebSettings();
   const sessionMatch = useMatch("/session/:sessionId");
@@ -388,7 +405,8 @@ function AppContent({
   // A plugin page's split pane shows `?session=` as the routed session, docks and all.
   const activeSessionId = sessionMatch?.params.sessionId ?? (pluginPageMatch ? searchParams.get("session") : null);
   const selectPluginPageSession = useCallback(
-    (id: string | null) =>
+    (id: string | null) => {
+      if (!confirmFileEditNavigation()) return;
       setSearchParams(
         (prev) => {
           const next = new URLSearchParams(prev);
@@ -397,7 +415,8 @@ function AppContent({
           return next;
         },
         { replace: true },
-      ),
+      );
+    },
     [setSearchParams],
   );
   // Off a removed session: back to the dashboard, or on a plugin page just out of its split pane. A focus window
@@ -657,6 +676,18 @@ function AppContent({
   // Null until the active Session's row loads, so nothing is seeded from a guess.
   const activeRow = sessions.find((s) => s.id === activeSessionId);
   const activeOutsideRepository = activeRow ? Boolean(activeRow.outside_repository) : null;
+  const pluginPanes = usePluginPanes(activeSessionId);
+  const pluginPaneById = useMemo(() => {
+    const m = new Map<string, PluginPane>();
+    for (const p of pluginPanes) m.set(p.id, p);
+    return m;
+  }, [pluginPanes]);
+  // A persisted tab is visible only if its backing pane currently exists: diff
+  // and terminals always do; a plugin tab does only while its plugin is loaded.
+  const tabAvailable = useCallback(
+    (id: string) => !id.startsWith("plugin:") || pluginPaneById.has(id),
+    [pluginPaneById],
+  );
   const {
     layout: paneLayout,
     openTab,
@@ -669,13 +700,7 @@ function AppContent({
     togglePlugin,
     syncPlugins,
     setDockCollapsed,
-  } = usePaneLayout(activeSessionId, activeOutsideRepository);
-  const pluginPanes = usePluginPanes(activeSessionId);
-  const pluginPaneById = useMemo(() => {
-    const m = new Map<string, PluginPane>();
-    for (const p of pluginPanes) m.set(p.id, p);
-    return m;
-  }, [pluginPanes]);
+  } = usePaneLayout(activeSessionId, activeOutsideRepository, tabAvailable);
 
   // Auto-add newly available plugin panes as tabs in their default dock; the
   // layout suppresses any the user explicitly closed. With plugin auto-open
@@ -730,24 +755,8 @@ function AppContent({
     [pluginPaneById, pluginIdentityById],
   );
 
-  // A persisted tab is visible only if its backing pane currently exists: diff
-  // and terminals always do; a plugin tab does only while its plugin is loaded.
-  const tabAvailable = useCallback(
-    (id: string) => !id.startsWith("plugin:") || pluginPaneById.has(id),
-    [pluginPaneById],
-  );
-  // A dock's groups reduced to what's actually shown: each surviving group keeps
-  // its persisted index (so a drop addresses the right group) and a valid active
-  // tab. Groups with no visible tab (only unloaded plugins) are not rendered.
   const renderGroups = useCallback(
-    (dock: DockLocation): DockGroupView[] =>
-      dockGroups(paneLayout, dock)
-        .map((g, group) => {
-          const tabs = g.tabs.filter(tabAvailable);
-          const active = g.active && tabs.includes(g.active) ? g.active : (tabs[0] ?? null);
-          return { group, tabs, active };
-        })
-        .filter((g) => g.tabs.length > 0),
+    (dock: DockLocation): DockGroupView[] => renderedGroups(paneLayout, dock, tabAvailable),
     [paneLayout, tabAvailable],
   );
 
@@ -812,11 +821,7 @@ function AppContent({
           // Remove the tab only once the shell is actually killed; if the
           // DELETE fails, keep the tab so the user can retry instead of
           // silently leaking the shell with no way to close it.
-          if (activeSessionId) {
-            void killTerminal(activeSessionId, idx).then((ok) => {
-              if (ok) closeTab(id);
-            });
-          }
+          if (activeSessionId) closeTab(id, () => killTerminal(activeSessionId, idx));
           return;
         }
       }
@@ -1297,9 +1302,15 @@ function AppContent({
     [sessions],
   );
 
+  const confirmRemovingSessions = useCallback(
+    (candidates: readonly SessionResponse[]) => confirmFileEditRemoval(candidates.map((session) => session.id)),
+    [],
+  );
+
   const handleConfirmDelete = async (options: DeleteSessionOptions) => {
     if (deletingSessions.length === 0) return;
     setDeletingSessions([]);
+    if (!confirmRemovingSessions(deletingSessions)) return;
     await deleteWorkspaceSessions(deletingSessions, options, activeSessionId, {
       setStatus: setSessionStatus,
       clearDeleting: clearDeletingStatus,
@@ -1319,6 +1330,7 @@ function AppContent({
   const handleEmptyTrash = useCallback(
     async (confirmed: Workspace[]) => {
       if (confirmed.length === 0 || emptyingTrashRef.current) return;
+      if (!confirmRemovingSessions(confirmed.flatMap((workspace) => workspace.sessions))) return;
       emptyingTrashRef.current = true;
       let anyFailed = false;
       let anyBusy = false;
@@ -1365,7 +1377,7 @@ function AppContent({
               : "Emptied trash",
       );
     },
-    [activeSessionId, setSessionStatus, clearDeletingStatus, leaveActiveSession],
+    [activeSessionId, setSessionStatus, clearDeletingStatus, leaveActiveSession, confirmRemovingSessions],
   );
 
   // Move-to-trash path (#2489): the safe default. Unlike permanent delete it
@@ -1378,6 +1390,7 @@ function AppContent({
     const wasActive = activeSessionId != null && ids.includes(activeSessionId);
 
     setDeletingSessions([]);
+    if (!confirmRemovingSessions(deletingSessions)) return;
     for (const id of ids) setSessionStatus(id, "Stopped");
     if (wasActive) {
       leaveActiveSession();
@@ -1519,8 +1532,8 @@ function AppContent({
       setWizardPrefill({
         path: repoPath,
         tool: latest?.tool,
-        yoloMode: latest?.yolo_mode ?? false,
-        sandboxEnabled: latest?.is_sandboxed ?? false,
+        yoloMode: latest?.yolo_mode,
+        sandboxEnabled: latest?.is_sandboxed,
         profile,
         group: latest?.group_path || undefined,
         worktreeEnabled: registered?.overrides?.worktree_enabled,
@@ -1665,14 +1678,16 @@ function AppContent({
 
   const handlePickView = useCallback(
     (view: RightPanelView) => {
+      if (view !== rightPanelView && !confirmFileEditPanes([null])) return;
       transitionKeyboardProxy(activeSessionId, view);
       setRightPanelView(view);
       setPickerOpen(false);
     },
-    [activeSessionId, transitionKeyboardProxy],
+    [activeSessionId, rightPanelView, transitionKeyboardProxy],
   );
 
   const handleSelectFile = useCallback((path: string, repoName?: string, line?: number) => {
+    if (!confirmFileEditPanes([null])) return;
     setSelectedFile({ path, repoName, line });
   }, []);
 
@@ -1692,6 +1707,7 @@ function AppContent({
       // provenance-confined /file viewer, as does any out-of-repo absolute path
       // the agent touched this session (a plan in /tmp, ~/.claude, etc.). #3088.
       if (resolved && !activeSession.scratch) {
+        if (!confirmFileEditPanes([null])) return;
         setSelectedFile({
           path: resolved.relativePath,
           repoName: resolved.repoName,
@@ -1701,6 +1717,7 @@ function AppContent({
         return;
       }
       if (resolved || isAbsolutePath(ref.path)) {
+        if (!confirmFileEditPanes([null])) return;
         setSelectedFile({
           path: resolved?.relativePath ?? ref.path,
           line: ref.line,
@@ -1715,12 +1732,12 @@ function AppContent({
   );
 
   const handleCloseFile = useCallback(() => {
+    if (!confirmFileEditPanes([null])) return;
     setSelectedFile(null);
   }, []);
 
   const handleGoDashboard = useCallback(() => {
     navigate("/");
-    setSelectedFile(null);
   }, [navigate]);
 
   const handleOpenSettings = useCallback(() => {
@@ -1853,6 +1870,7 @@ function AppContent({
       return;
     }
     if (singlePane) {
+      if (!confirmFileEditPanes([null])) return;
       setRightPanelView("agent");
       requestAnimationFrame(() => dispatchFocusTerminal("agent"));
       return;
@@ -1861,6 +1879,7 @@ function AppContent({
       // Agent terminal is hidden under the diff viewer; close the diff first
       // so the wrapper un-hides, then dispatch on the next frame because
       // focus() on a display:none element is a no-op.
+      if (!confirmFileEditPanes([null])) return;
       setSelectedFile(null);
       requestAnimationFrame(() => dispatchFocusTerminal("agent"));
       return;
@@ -1922,7 +1941,7 @@ function AppContent({
           // Settings dialogs handle Escape after this capture-phase shortcut.
           if (showSettings && !document.querySelector('[aria-modal="true"]')) handleCloseSettings();
           setShowAbout(false);
-          setSelectedFile(null);
+          if (!isFileEditorOpen()) setSelectedFile(null);
         },
         onHelp: () => setShowHelp((h) => !h),
         onSettings: () => (showSettings ? handleCloseSettings() : handleOpenSettings()),
@@ -1961,6 +1980,7 @@ function AppContent({
         setSnoozeTargetId(id);
         return;
       }
+      if (action === "trash" && !confirmFileEditRemoval([id])) return;
       if (action === "untrash") {
         await handleRestoreSession([id]);
         return;
@@ -2060,7 +2080,13 @@ function AppContent({
         // Remount on session switch so the selected file (and any in-flight
         // read) resets instead of requesting the old path from the new
         // session. See #3088 review.
-        return <FilesPane key={activeSessionId ?? "none"} sessionId={activeSessionId} />;
+        return (
+          <FilesPane
+            key={activeSessionId ?? "none"}
+            sessionId={activeSessionId}
+            structured={activeSession?.view === "structured"}
+          />
+        );
       }
       if (id === "diff") {
         return (
@@ -2120,6 +2146,7 @@ function AppContent({
                             sessionId={session.id}
                             acpWorkerState={session.acp_worker_state ?? "absent"}
                             rateLimitAutoResume={session.rate_limit_auto_resume}
+                            rateLimitFailoverTo={session.rate_limit_failover_to}
                             settingsHref={autoResumeSettingsHref(session.profile, serverAbout)}
                             tool={session.tool}
                             acpAgent={session.acp_agent ?? null}
@@ -2141,6 +2168,7 @@ function AppContent({
                             onOpenAgentsPane={openAgentsPane}
                             serverReadOnly={caps.readOnly}
                             isSandboxed={session.is_sandboxed}
+                            recreateContainerTitle={recreateContainerTitle(session)}
                             onSwitchToTerminal={
                               canSwitchToTerminal ? () => handleSwitchView(session.id, false) : undefined
                             }
@@ -2167,6 +2195,7 @@ function AppContent({
                   activeSessionId &&
                   (selectedFileExternal ? (
                     <FileContentViewer
+                      structured={activeSession?.view === "structured"}
                       sessionId={activeSessionId}
                       filePath={selectedFilePath}
                       onBack={handleCloseFile}
@@ -2404,6 +2433,7 @@ function AppContent({
           sessions={sessions}
           webSettings={webSettings}
           selectedFilePath={selectedFilePath}
+          selectedFileExternal={selectedFileExternal}
           selectedRepoName={selectedRepoName}
           selectedFileLine={selectedFileLine}
           revision={revision}
@@ -2423,7 +2453,7 @@ function AppContent({
           sendDialogOpen={sendDialogOpen}
           onOpenSendDialog={() => setSendDialogOpen(true)}
           onCloseSendDialog={() => setSendDialogOpen(false)}
-          onClearSelectedFile={() => setSelectedFile(null)}
+          onClearSelectedFile={handleCloseFile}
           serverAbout={serverAbout}
         />
       );

@@ -6,7 +6,7 @@ use std::time::{Duration, Instant};
 use serial_test::parallel;
 
 use crate::harness::{
-    app_dir_in, pick_free_port, require_node, require_tmux, wait_for_port, wait_until,
+    app_dir_in, pick_free_port, pid_alive, require_node, require_tmux, wait_for_port, wait_until,
     TuiTestHarness,
 };
 
@@ -20,11 +20,6 @@ fn daemon_pid_path(h: &TuiTestHarness) -> PathBuf {
 /// isolated home.
 fn daemon_launch_path(h: &TuiTestHarness) -> PathBuf {
     crate::harness::app_dir_in(h.home_path()).join("serve.launch")
-}
-
-/// True iff the kernel still has a process with this PID.
-fn pid_alive(pid: i32) -> bool {
-    nix::sys::signal::kill(nix::unistd::Pid::from_raw(pid), None).is_ok()
 }
 
 fn daemon_pid(h: &TuiTestHarness) -> Option<u32> {

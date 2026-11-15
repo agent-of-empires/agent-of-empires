@@ -3,13 +3,20 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import * as api from "./api";
 import type { ServerAbout } from "./api";
+import { reportError } from "./logger";
 import { onSettingsChanged } from "./settingsEvents";
 import type { CreateSessionRequest, SettingsFieldDescriptor } from "./types";
+
+vi.mock("./logger", async (importOriginal) => ({
+  ...(await importOriginal<typeof import("./logger")>()),
+  reportError: vi.fn(),
+}));
 
 const fetchSpy = vi.fn<typeof fetch>();
 
 beforeEach(() => {
   fetchSpy.mockReset();
+  vi.mocked(reportError).mockClear();
   vi.stubGlobal("fetch", fetchSpy);
 });
 
@@ -103,6 +110,19 @@ const requestCases: RequestCase[] = [
   ["GET /api/sessions/s1/diff/file?path=src%2Fa+b.ts", () => api.getSessionFileContents("s1", "src/a b.ts")],
   ["GET /api/sessions/s1/diff/file?path=a.ts&repo=myrepo", () => api.getSessionFileContents("s1", "a.ts", "myrepo")],
   ["GET /api/sessions/s1/file?path=a+b.ts", () => api.getSessionFile("s1", "a b.ts")],
+  [
+    "GET /api/sessions/s1/file?path=a+b.ts&version_only=true",
+    () => api.getSessionFile("s1", "a b.ts", { versionOnly: true }),
+  ],
+  [
+    "PUT /api/sessions/s1/file",
+    () => api.saveSessionFile("s1", "a.ts", "v1", "updated"),
+    {
+      body: { path: "a.ts", version: "v1", content: "updated" },
+      respond: new Response(null, { status: 204 }),
+      result: { ok: true, status: 204, error: undefined },
+    },
+  ],
   ["GET /api/settings", () => api.fetchSettings()],
   ["GET /api/settings?profile=my%20profile", () => api.fetchSettings("my profile")],
   ["GET /api/settings?layer=machine", () => api.fetchMachineSettings()],
@@ -1181,6 +1201,27 @@ describe("fetchProfileAgents", () => {
   });
 });
 
+describe("fetchSandboxImageStatus", () => {
+  it.each([
+    ["the default image, cached", undefined, {}, "/api/sandbox/image-status"],
+    [
+      "an image, fresh",
+      "ghcr.io/x/sb:1",
+      { fresh: true },
+      "/api/sandbox/image-status?image=ghcr.io%2Fx%2Fsb%3A1&fresh=true",
+    ],
+  ] as const)("asks for %s", async (_name, image, opts, url) => {
+    fetchSpy.mockResolvedValueOnce(json({ state: "current" }));
+    await api.fetchSandboxImageStatus(image, opts);
+    expect(lastCall().url).toBe(url);
+  });
+
+  it("names a refusal such as an image that isn't configured", async () => {
+    fetchSpy.mockResolvedValueOnce(json({ error: "unknown_image", message: "no" }, 400));
+    expect(await api.fetchSandboxImageStatus("mine:latest")).toEqual({ error: "unknown_image" });
+  });
+});
+
 describe("createSession errors", () => {
   const body = { path: "/repo", tool: "claude" } as CreateSessionRequest;
 
@@ -1845,6 +1886,41 @@ describe("restartSession", () => {
 
     offline();
     expect(await api.restartSession("s1")).toEqual({ ok: false });
+  });
+});
+
+describe("account switching", () => {
+  it("lists target names and null when they can't be read", async () => {
+    fetchSpy.mockResolvedValueOnce(json({ targets: ["claude-b"] }));
+    expect(await api.fetchAccountTargets("s 1")).toEqual(["claude-b"]);
+    expect(lastCall().url).toBe("/api/sessions/s%201/account-targets");
+
+    expect(reportError).not.toHaveBeenCalled();
+
+    fetchSpy.mockResolvedValueOnce(json({ error: "read_only" }, 403));
+    expect(await api.fetchAccountTargets("s1")).toBeNull();
+    expect(reportError).toHaveBeenCalledWith(expect.any(String), {
+      level: "warn",
+      target: "web.client.api",
+      sessionId: "s1",
+    });
+  });
+
+  it("restarts with the tool and demands the conversation carry, surfacing a 409 reason", async () => {
+    fetchSpy.mockResolvedValueOnce(empty());
+    expect(await api.switchSessionAccount("s1", "claude-b")).toEqual({ ok: true });
+    const { url, init } = lastCall();
+    expect(url).toBe("/api/sessions/s1/restart");
+    expect(init?.method).toBe("POST");
+    expect(bodyOf(init)).toEqual({ tool: "claude-b", require_account_carry: true });
+
+    fetchSpy.mockResolvedValueOnce(
+      json({ error: "account_swap_unavailable", message: "Cannot switch. Nothing changed." }, 409),
+    );
+    expect(await api.switchSessionAccount("s1", "claude-b")).toEqual({
+      ok: false,
+      message: "Cannot switch. Nothing changed.",
+    });
   });
 });
 

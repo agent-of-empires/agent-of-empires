@@ -3795,3 +3795,159 @@ async fn keyboard_palette_recovery_executes_captured_commands_and_preserves_file
         assert_eq!(std::fs::read(sentinel).unwrap(), b"keep recovery files");
     }
 }
+
+/// A committed deletion reports its cleanup notes without a modal: the delete
+/// already happened, and an InfoDialog here can land underneath a permission or
+/// question dialog and swallow every keystroke until it is acknowledged.
+#[test]
+#[serial]
+fn purge_cleanup_messages_flash_instead_of_opening_a_modal() {
+    let mut env = create_test_env_with_sessions(1);
+    let id = env.view.instance_at(0).id.clone();
+    let mut notes = Vec::new();
+    env.view.record_purge_outcome(
+        &id,
+        crate::daemon::PurgeOutcome::Deleted {
+            messages: vec!["Branch 'aoe/work' deleted".to_string()],
+            cleanup_errors: Vec::new(),
+        },
+        &mut notes,
+    );
+    assert!(env.view.info_dialog.is_none());
+    assert_eq!(
+        super::super::status::purge_flash_text(&notes),
+        format!("{id}: Branch 'aoe/work' deleted")
+    );
+
+    env.view.record_purge_outcome(
+        &id,
+        crate::daemon::PurgeOutcome::Deleted {
+            messages: Vec::new(),
+            cleanup_errors: vec!["Branch: not fully merged".to_string()],
+        },
+        &mut Vec::new(),
+    );
+    assert!(
+        env.view.info_dialog.is_none(),
+        "the modal opens on the next apply_session_feed"
+    );
+    env.view.apply_session_feed();
+    assert_eq!(
+        env.view.info_dialog.as_ref().map(|d| d.title()),
+        Some("Runtime change"),
+        "an incomplete cleanup still needs an acknowledgement"
+    );
+}
+
+/// A group delete reports one note per session in one pass. Every note has to
+/// reach the single status line that replaces the old modal, with the session
+/// it belongs to, so nothing is lost to the last write winning.
+#[test]
+#[serial]
+fn purge_cleanup_notes_survive_a_multi_session_delete_in_one_flash() {
+    let mut env = create_test_env_with_sessions(2);
+    let first = env.view.instance_at(0).id.clone();
+    let second = env.view.instance_at(1).id.clone();
+    let mut notes = Vec::new();
+    for id in [&first, &second] {
+        env.view.record_purge_outcome(
+            id,
+            crate::daemon::PurgeOutcome::Deleted {
+                messages: vec![
+                    "Worktree removed".to_string(),
+                    format!("Branch 'aoe/{id}' deleted"),
+                ],
+                cleanup_errors: Vec::new(),
+            },
+            &mut notes,
+        );
+    }
+    assert_eq!(
+        super::super::status::purge_flash_text(&notes),
+        format!(
+            "{first}, {second}: Worktree removed; {first}: Branch 'aoe/{first}' deleted; \
+             {second}: Branch 'aoe/{second}' deleted"
+        ),
+        "a shared note names both sessions and no session's note is dropped"
+    );
+}
+
+/// The flash window measures time on screen. A takeover view renders before the
+/// status bar, so a note that arrives behind settings must not count down there
+/// and expire before it is ever shown.
+#[test]
+#[serial]
+fn status_flash_window_starts_when_the_bar_is_drawn() {
+    let mut env = create_test_env_with_sessions(1);
+    env.view.flash_status("Copied selection");
+    assert!(
+        env.view.status_flash.as_ref().unwrap().until.is_none(),
+        "a fresh flash has not started counting down"
+    );
+    assert!(!env.view.expire_status_flash());
+
+    env.view.settings_view = Some(crate::tui::settings::SettingsView::new("test", None).unwrap());
+    render_home_to_string(&mut env.view, 120, 24);
+    assert!(
+        env.view.status_flash.as_ref().unwrap().until.is_none(),
+        "settings covers the status bar, so the window cannot have started"
+    );
+
+    env.view.settings_view = None;
+    render_home_to_string(&mut env.view, 120, 24);
+    assert!(
+        env.view.status_flash.as_ref().unwrap().until.is_some(),
+        "the bar is drawn, so the window starts now"
+    );
+    assert_eq!(env.view.status_flash_text(), Some("Copied selection"));
+    assert!(!env.view.expire_status_flash());
+}
+
+/// A dialog promoted while a key event is being handled would consume that same
+/// key before the user ever sees it. Only the tick path promotes, and it always
+/// draws first.
+#[test]
+#[serial]
+fn runtime_change_dialog_is_promoted_only_before_a_draw() {
+    let mut env = create_test_env_with_sessions(1);
+    env.view
+        .record_runtime_message("Reveal cancelled: no such session".to_string());
+    env.view.apply_session_feed_before_input();
+    assert!(
+        env.view.info_dialog.is_none(),
+        "the key that woke the loop must reach the view, not a dialog"
+    );
+    assert_eq!(
+        env.view.runtime_outcome_messages.len(),
+        1,
+        "the note waits for a draw instead of being dropped"
+    );
+
+    env.view.apply_session_feed();
+    assert_eq!(
+        env.view.info_dialog.as_ref().map(|dialog| dialog.title()),
+        Some("Runtime change")
+    );
+    assert!(env.view.runtime_outcome_messages.is_empty());
+
+    // A dialog that already owns the keyboard holds the note back, and the note
+    // survives until that dialog closes.
+    env.view.info_dialog = None;
+    env.view
+        .record_runtime_message("Reveal cancelled: still open".to_string());
+    env.view.confirm_dialog = Some(crate::tui::home::ConfirmDialog::new(
+        "Delete",
+        "Delete it?",
+        "delete",
+    ));
+    env.view.apply_session_feed();
+    assert!(env.view.info_dialog.is_none());
+    assert_eq!(env.view.runtime_outcome_messages.len(), 1);
+    env.view.confirm_dialog = None;
+    env.view.apply_session_feed();
+    assert_eq!(
+        env.view.info_dialog.as_ref().map(|dialog| dialog.title()),
+        Some("Runtime change"),
+        "the note was held, not dropped"
+    );
+}

@@ -270,20 +270,16 @@ impl Instance {
             self.tool,
             self.has_command_override()
         );
-        let integration_configured = crate::plugin::agent_integration::configured(self);
-        let integration_snapshot = integration_configured
-            .then(|| crate::plugin::agent_integration::snapshot(self))
-            .flatten();
-        if let Some(status) = crate::plugin::agent_integration::session_status_override(
-            integration_configured,
-            is_dead,
-            integration_snapshot
-                .as_ref()
-                .map(|snapshot| snapshot.status),
-        ) {
+        if let Some((status, reported)) =
+            crate::plugin::agent_integration::owned_status(self, is_dead)
+        {
             self.status = status;
             self.detection.pending = None;
-            self.detection.rule = Some("agent_integration");
+            self.detection.rule = Some(if reported {
+                crate::plugin::agent_integration::OWNED_RULE
+            } else {
+                crate::plugin::agent_integration::OWNED_UNAVAILABLE_RULE
+            });
             if self.status == Status::Error {
                 if is_dead {
                     self.explain_error_from_pane(&session);
@@ -459,6 +455,16 @@ impl Instance {
         session: &tmux::Session,
         reuse: Option<(&str, usize)>,
     ) -> Option<(Option<Status>, &'static str)> {
+        if let Some((status, reported)) =
+            crate::plugin::agent_integration::owned_status(self, session.is_pane_dead())
+        {
+            let rule = if reported {
+                crate::plugin::agent_integration::OWNED_RULE
+            } else {
+                crate::plugin::agent_integration::OWNED_UNAVAILABLE_RULE
+            };
+            return Some((Some(status), rule));
+        }
         let alias = tmux::status_rules::effective_detect_as(profile, &self.tool, &self.detect_as);
         let manifest_tool: &str = if alias.is_empty() { &self.tool } else { &alias };
         let rules_tool = tmux::status_rules::detection_tool(profile, &self.tool, &self.detect_as);

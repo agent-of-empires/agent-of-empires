@@ -107,20 +107,51 @@ pub(super) fn rename_exclusive(
     destination_dir: &std::os::fd::OwnedFd,
     destination: &std::ffi::OsStr,
 ) -> std::io::Result<()> {
+    rename_with_flags(
+        source_dir,
+        source,
+        destination_dir,
+        destination,
+        libc::RENAME_EXCL,
+    )
+}
+
+pub(super) fn rename_exchange(
+    source_dir: &std::os::fd::OwnedFd,
+    source: &std::ffi::OsStr,
+    destination_dir: &std::os::fd::OwnedFd,
+    destination: &std::ffi::OsStr,
+) -> std::io::Result<()> {
+    rename_with_flags(
+        source_dir,
+        source,
+        destination_dir,
+        destination,
+        libc::RENAME_SWAP,
+    )
+}
+
+fn rename_with_flags(
+    source_dir: &std::os::fd::OwnedFd,
+    source: &std::ffi::OsStr,
+    destination_dir: &std::os::fd::OwnedFd,
+    destination: &std::ffi::OsStr,
+    flags: libc::c_uint,
+) -> std::io::Result<()> {
     use nix::NixPath;
     use std::os::fd::AsRawFd;
 
     let result = source.with_nix_path(|source| {
         destination.with_nix_path(|destination| {
             // SAFETY: both descriptors remain owned for the call and NixPath
-            // supplies live NUL-terminated names. RENAME_EXCL never replaces.
+            // supplies live NUL-terminated names. Flags select the atomic rename policy.
             nix::errno::Errno::result(unsafe {
                 libc::renameatx_np(
                     source_dir.as_raw_fd(),
                     source.as_ptr(),
                     destination_dir.as_raw_fd(),
                     destination.as_ptr(),
-                    libc::RENAME_EXCL,
+                    flags,
                 )
             })
             .map(|_| ())
@@ -358,6 +389,11 @@ fn audit_start_id(token: &AuditToken) -> String {
 
 pub(super) fn process_start_id(pid: u32) -> anyhow::Result<Option<String>> {
     Ok(audit_token(pid)?.as_ref().map(audit_start_id))
+}
+
+/// False once `pid` is gone, or exited and not yet reaped (SZOMB).
+pub(super) fn process_executing(pid: u32) -> anyhow::Result<bool> {
+    Ok(process_membership(pid)?.is_some_and(|info| info.pbi_status != libc::SZOMB))
 }
 
 pub(super) struct ProcessHandle(AuditToken);

@@ -532,6 +532,6 @@ async fn report_connection_error(
             })
             .await;
     } else {
-        let _ = event_tx.send(Event::AgentStartupError { message }).await;
+        let _ = event_tx.send(Event::startup_error(message)).await;
     }
 }

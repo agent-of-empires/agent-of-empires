@@ -350,6 +350,18 @@ pub(super) async fn acp_event_listener(state: Arc<AppState>) {
                 &inflight,
             )
         };
+        // `try_smart_rename` refuses these too, but only after the history read.
+        let should_rename = should_rename
+            && state
+                .instances
+                .read()
+                .await
+                .iter()
+                .find(|i| i.id == frame.session_id)
+                .is_some_and(|i| {
+                    i.is_structured()
+                        && crate::session::civilizations::is_default_civ_name(&i.title)
+                });
         if should_rename {
             if let Some((first_user_prompt, agent_prose)) =
                 state.acp_event_store.first_turn_context(
@@ -2183,9 +2195,9 @@ mod tests {
             .send(AcpBroadcastFrame {
                 session_id: id.clone(),
                 seq: 7,
-                event: Arc::new(crate::acp::Event::AgentStartupError {
-                    message: "event store write failed at seq 7".into(),
-                }),
+                event: Arc::new(crate::acp::Event::startup_error(
+                    "event store write failed at seq 7",
+                )),
                 worker_generation: None,
                 sidebar_status: None,
             })
@@ -2687,12 +2699,7 @@ mod tests {
             (chunk("x"), Some(Authoritative)),
             (Event::ThinkingStarted, Some(Authoritative)),
             (stopped("prompt_complete"), Some(Authoritative)),
-            (
-                Event::AgentStartupError {
-                    message: "boom".into(),
-                },
-                Some(Authoritative),
-            ),
+            (Event::startup_error("boom"), Some(Authoritative)),
             (
                 Event::ApprovalResolved {
                     nonce: Nonce("x".into()),

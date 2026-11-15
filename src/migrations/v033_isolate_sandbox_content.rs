@@ -1017,8 +1017,10 @@ fn row_roots(
     } else {
         config.session.custom_agents.get(tool).map(String::as_str)
     };
+    // A row stored without a command keeps the identity its tool's own contract
+    // names, which an approved takeover does not move.
     let command = command
-        .or_else(|| crate::agents::get_agent(tool).map(|agent| agent.binary))
+        .or_else(|| crate::agents::native_definition(tool).map(|agent| agent.binary))
         .unwrap_or("bash");
     container_config::sandbox_content_roots(tool, Some(command), &config.session, home, id)
 }
@@ -2582,7 +2584,7 @@ pub(crate) fn instance_roots(instance: &crate::session::Instance) -> Result<Vec<
         crate::session::config::profile_config::resolve_config(&instance.effective_profile())?;
     container_config::sandbox_content_roots(
         &instance.tool,
-        Some(instance.get_tool_command()),
+        Some(&instance.get_tool_command()),
         &config.session,
         &home,
         &instance.id,

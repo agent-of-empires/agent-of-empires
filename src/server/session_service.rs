@@ -549,6 +549,7 @@ impl SessionService {
                 cancelled: false,
             },
             published_at: std::time::Instant::now(),
+            cancel: tokio_util::sync::CancellationToken::new(),
         }));
         {
             let mut active = self
@@ -570,7 +571,8 @@ impl SessionService {
     }
 
     /// Refuse a cancellation the creation can no longer honor. Accepted
-    /// requests only mark the in-flight phase; the rollback still owns cleanup.
+    /// requests mark the in-flight phase and stop an image pull; the rollback
+    /// still owns cleanup.
     pub(crate) fn cancel_creation(&self, id: &str) -> bool {
         let entry = {
             let active = self
@@ -589,6 +591,7 @@ impl SessionService {
                 CreationLifecycle::Running | CreationLifecycle::Cancelled => {
                     entry.lifecycle = CreationLifecycle::Cancelled;
                     entry.progress.cancelled = true;
+                    entry.cancel.cancel();
                 }
             }
         }
@@ -1887,7 +1890,10 @@ impl SessionService {
                 || inst.is_archived()
                 || inst.is_snoozed()
                 || inst.is_trashed()
-                || inst.status != crate::session::Status::Idle
+                || !matches!(
+                    inst.status,
+                    crate::session::Status::Idle | crate::session::Status::Running
+                )
             {
                 return;
             }
@@ -1906,16 +1912,17 @@ impl SessionService {
             (caller, agent_key, queue)
         };
 
-        // `Status::Idle` above is a mirror the broadcast listener applies one serial task
-        // behind every session's events, so it still reads Idle for as long as that task is
-        // behind.
-        if self.fold_control_state(id).await.turn_active {
+        let control = self.fold_control_state(id).await;
+        if !control.accepts_queue_drain() {
             return;
         }
 
         // Leading batch up to a clear or compact boundary.
         let profile = crate::acp::agent_profiles::resolve(&agent_key);
         let (sub, combined) = queue_drain_batch(&queue, profile);
+        if profile.is_clear_command(&combined) && control.has_active_background_agent() {
+            return;
+        }
         let caller = match &sub[0].origin_plugin {
             Some(plugin_id) => SessionCaller::PluginMessage {
                 plugin_id: plugin_id.clone(),
@@ -2407,6 +2414,8 @@ struct CreationEntry {
     lifecycle: CreationLifecycle,
     progress: CreationProgress,
     published_at: std::time::Instant,
+    /// Fired by a cancel, for work that can stop early, such as an image pull.
+    cancel: tokio_util::sync::CancellationToken,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -2420,6 +2429,15 @@ pub(super) struct CreationGuard {
 }
 
 impl CreationGuard {
+    /// Fires when the creation is cancelled.
+    pub(super) fn cancellation(&self) -> tokio_util::sync::CancellationToken {
+        self.entry
+            .lock()
+            .expect("creation entry poisoned")
+            .cancel
+            .clone()
+    }
+
     pub(super) fn check(&self) -> Result<(), CreationCancelled> {
         if matches!(
             self.entry
@@ -2639,6 +2657,9 @@ fn spec_payload_hash(spec: &StructuredSessionSpec) -> String {
     if let Some(binding) = &spec.import_binding {
         field("import_binding", &format!("{binding:?}"));
     }
+    if spec.pull_latest_image {
+        field("pull_latest_image", "true");
+    }
     use std::fmt::Write;
     let digest = hasher.finalize();
     let mut out = String::with_capacity(digest.len() * 2);
@@ -2721,6 +2742,7 @@ mod tests {
             base_branch: None,
             sandbox: false,
             sandbox_image: None,
+            pull_latest_image: false,
             yolo_mode: false,
             extra_env: Vec::new(),
             before_start_hook_env: Vec::new(),
@@ -3001,6 +3023,14 @@ mod tests {
             a,
             spec_payload_hash(&with_turn),
             "the initial turn is part of the request identity"
+        );
+
+        let mut pulling = test_spec();
+        pulling.pull_latest_image = true;
+        assert_ne!(
+            a,
+            spec_payload_hash(&pulling),
+            "a pull is part of the request identity"
         );
 
         // Adjacent-field concatenation must not collide.

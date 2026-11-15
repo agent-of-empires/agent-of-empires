@@ -1541,7 +1541,7 @@ mod tests {
                 assert_eq!(command, base_command, "{tool}: rejected command changed");
             }
             assert_eq!(
-                build_resume_flags(tool, sid, true).is_empty(),
+                build_resume_flags(crate::agents::get_agent(tool), sid, true).is_empty(),
                 !resume_supported,
                 "{tool}: direct resume flags"
             );

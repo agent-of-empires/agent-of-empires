@@ -794,7 +794,7 @@ pub(crate) fn carry_fork_parent(instance: &mut Instance) -> Result<()> {
 /// Whether AoE knows where this agent keeps one conversation inside its config
 /// root. Teaching another agent to carry means giving it a locator alongside
 /// [`claude_transcripts_for`].
-fn carries_transcript(agent: &'static AgentDef) -> bool {
+fn carries_transcript(agent: &'static AgentDef<'static>) -> bool {
     agent
         .session_support
         .as_ref()
@@ -830,7 +830,7 @@ fn config_root(
     instance: &Instance,
     profile: &str,
     tool: &str,
-    agent: &'static AgentDef,
+    agent: &'static AgentDef<'static>,
     home: &Path,
 ) -> Option<PathBuf> {
     let declared = resolve_config_or_warn(profile)

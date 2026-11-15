@@ -82,7 +82,7 @@ describe("Session menu tiers", () => {
         [{ status: "Idle", view: "structured", acp_session_id: "x", acp_can_fork: true }],
         {},
         "Idle · Structured view",
-        `${quick} | rename | stop switch-view | fork | ${more} summarize auto-name switch-agent | edit-group add-project | ${tail}`,
+        `${quick} | rename | stop switch-view | fork | ${more} summarize auto-name switch-agent switch-account | edit-group add-project | ${tail}`,
       ],
       // Several Sessions: a count, and the targeted items keep their pickers.
       [

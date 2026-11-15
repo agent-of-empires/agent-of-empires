@@ -49,14 +49,7 @@ impl Instance {
     ) -> (Option<String>, bool, bool) {
         let backend = execution.map_or_else(
             || self.default_selector_backend(),
-            |execution| {
-                execution
-                    .agent
-                    .session_support
-                    .as_ref()
-                    .and_then(|support| support.capture.as_ref())
-                    .map(|capture| capture.backend)
-            },
+            |execution| execution.agent.capture_backend(),
         );
         let preassign = backend == Some(crate::agents::SessionCaptureBackend::OpenCode)
             && execution.map_or_else(
@@ -136,14 +129,7 @@ impl Instance {
     ) -> (Option<String>, bool) {
         let backend = execution.map_or_else(
             || self.default_selector_backend(),
-            |execution| {
-                execution
-                    .agent
-                    .session_support
-                    .as_ref()
-                    .and_then(|support| support.capture.as_ref())
-                    .map(|capture| capture.backend)
-            },
+            |execution| execution.agent.capture_backend(),
         );
         match self.resume_intent.clone() {
             ResumeIntent::Use(sid) => {
@@ -396,9 +382,12 @@ impl Instance {
     ) -> bool {
         match execution {
             Some(execution) => {
-                execution.agent.name == "opencode"
+                execution.binding.agent == "opencode"
                     && execution.inputs.container.is_none()
-                    && self.launch_invokes_resolved_agent_directly(execution.agent)
+                    && execution
+                        .agent
+                        .builtin()
+                        .is_some_and(|agent| self.launch_invokes_resolved_agent_directly(agent))
             }
             None => false,
         }
@@ -609,7 +598,7 @@ impl Instance {
     ) -> bool {
         let takes_pinning_arm = execution.map_or_else(
             || self.resolved_capture_backend() == Some(SessionCaptureBackend::Pi),
-            |execution| execution.agent.name == "pi",
+            |execution| execution.binding.agent == "pi",
         ) && pi_pinnable
             && !explicitly_pinned
             && session_id.is_some_and(|sid| uuid::Uuid::parse_str(sid).is_ok());
@@ -621,20 +610,38 @@ impl Instance {
     /// refuses, so the availability the API and TUI render cannot drift from
     /// the launch line.
     fn terminal_resume_static_unavailable(&self) -> Option<ResumeStaticUnavailable> {
-        // One resolve serves every check; a projection runs this per session.
-        let profile = self.effective_profile();
-        let resolved = crate::session::config::profile_config::resolve_config(&profile);
-        let fallback;
-        let config = match &resolved {
-            Ok(config) => &config.session,
-            Err(_) => {
-                fallback = crate::session::config::profile_config::resolve_config_or_warn(&profile);
-                &fallback.session
-            }
-        };
-        let native = resolved.as_ref().ok().and_then(|resolved| {
-            Self::execution_agent_for(&self.tool, self.get_tool_command(), &resolved.session).ok()
-        });
+        let mut resolved = None;
+        self.terminal_resume_static_unavailable_with(|| {
+            resolved.insert(resume_profile_config(&self.source_profile))
+        })
+    }
+
+    /// `profile_config` runs only past the declared-agent check, which needs no config.
+    fn terminal_resume_static_unavailable_with<'a>(
+        &self,
+        profile_config: impl FnOnce() -> &'a ResumeProfileConfig,
+    ) -> Option<ResumeStaticUnavailable> {
+        if let Some(declared) = self.declared_agent() {
+            return declared
+                .with_definition(|agent| {
+                    if agent.session_support.is_none() {
+                        Some(ResumeStaticUnavailable::Agent)
+                    } else if !self.launch_invokes_resolved_agent_directly(agent)
+                        || self.managed_user_argv(agent).is_err()
+                    {
+                        Some(ResumeStaticUnavailable::Command)
+                    } else {
+                        None
+                    }
+                })
+                .unwrap_or(Some(ResumeStaticUnavailable::Agent));
+        }
+        let resolved = profile_config();
+        let config = &resolved.config.session;
+        let native = resolved
+            .resolved
+            .then(|| Self::execution_agent_for(&self.tool, &self.get_tool_command(), config).ok())
+            .flatten();
         let Some(agent) = native
             .or_else(|| self.legacy_default_selector_agent_in(config))
             .filter(|agent| agent.session_support.is_some())
@@ -665,18 +672,31 @@ impl Instance {
     }
 
     pub(crate) fn terminal_context_resume_cached(&self) -> TerminalContextResume {
-        self.terminal_context_resume_with_runtime_source(|| {
+        let mut resolved = None;
+        self.terminal_context_resume_cached_with(|| {
+            resolved.insert(resume_profile_config(&self.source_profile))
+        })
+    }
+
+    /// [`Self::terminal_context_resume_cached`] with the profile config resolved
+    /// by the caller, so a projection resolves once per profile.
+    pub(crate) fn terminal_context_resume_cached_with<'a>(
+        &self,
+        profile_config: impl FnOnce() -> &'a ResumeProfileConfig,
+    ) -> TerminalContextResume {
+        self.terminal_context_resume_with_runtime_source(profile_config, || {
             self.tmux_session()
                 .map(|session| crate::tmux::cached_session_existence(session.name()))
                 .unwrap_or(crate::tmux::SessionExistence::Unknown)
         })
     }
 
-    fn terminal_context_resume_with_runtime_source(
+    fn terminal_context_resume_with_runtime_source<'a>(
         &self,
+        profile_config: impl FnOnce() -> &'a ResumeProfileConfig,
         runtime_source: impl FnOnce() -> crate::tmux::SessionExistence,
     ) -> TerminalContextResume {
-        if let Some(unavailable) = self.terminal_resume_static_unavailable() {
+        if let Some(unavailable) = self.terminal_resume_static_unavailable_with(profile_config) {
             return match unavailable {
                 ResumeStaticUnavailable::Agent => TerminalContextResume::AgentUnsupported,
                 ResumeStaticUnavailable::Sandbox => TerminalContextResume::SandboxUnsupported,
@@ -709,10 +729,18 @@ impl Instance {
         }
     }
 
-    fn existing_session_selector(&self, words: &[String]) -> Option<String> {
-        let agent = self.default_selector_agent()?;
+    fn existing_session_selector(
+        &self,
+        words: &[String],
+        agent: Option<&crate::agents::AgentDef>,
+    ) -> Option<String> {
+        let agent = agent?;
         let strategy = agent.session_support.as_ref()?.resume;
-        if words.first() != parse_launch_command(self.get_tool_command())?.words.first() {
+        if words.first()
+            != parse_launch_command(&self.get_tool_command())?
+                .words
+                .first()
+        {
             return None;
         }
         let flag_present = |flag: &str| {
@@ -763,7 +791,7 @@ impl Instance {
     pub(super) fn apply_session_flags(
         &mut self,
         cmd: &mut String,
-        agent: Option<&'static crate::agents::AgentDef>,
+        agent: Option<&crate::agents::AgentDef>,
         execution: Option<&super::execution::NativeExecution>,
         launch_context: &super::execution::AgentLaunchContext<'_>,
         expected: &mut ConversationState,
@@ -783,7 +811,7 @@ impl Instance {
         &mut self,
         stores: CaptureStorage<'_>,
         cmd: &mut String,
-        agent: Option<&'static crate::agents::AgentDef>,
+        agent: Option<&crate::agents::AgentDef>,
         execution: Option<&super::execution::NativeExecution>,
         launch_context: &super::execution::AgentLaunchContext<'_>,
         expected: &mut ConversationState,
@@ -796,7 +824,7 @@ impl Instance {
             "host custom"
         };
         let agent = execution
-            .map(|execution| execution.agent)
+            .and_then(|execution| execution.agent.builtin())
             .or(agent)
             .or_else(|| self.default_selector_agent());
         let Some(parsed_command) = parse_launch_command(cmd) else {
@@ -804,7 +832,7 @@ impl Instance {
         };
         if let Some(selector) = execution
             .is_none()
-            .then(|| self.existing_session_selector(&parsed_command.words))
+            .then(|| self.existing_session_selector(&parsed_command.words, agent))
             .flatten()
         {
             let aoe_has_state = self.agent_session_id.is_some()
@@ -871,7 +899,7 @@ impl Instance {
                         .with_context(|| format!("{} could not fork this conversation, so the fork was refused rather than started as a fresh session", agent.name))?;
                 }
                 append_resume_flags(
-                    agent.name,
+                    Some(agent),
                     self.agent_session_id.as_deref(),
                     false,
                     cmd,
@@ -975,7 +1003,9 @@ impl Instance {
                         == Some(crate::agents::SessionCaptureBackend::Pi)
                         && self.pi_recorded_transcript_missing()
                 },
-                |execution| execution.agent.name == "pi" && execution.pi_transcript_path.is_none(),
+                |execution| {
+                    execution.binding.agent == "pi" && execution.pi_transcript_path.is_none()
+                },
             )
         {
             tracing::info!(
@@ -988,9 +1018,8 @@ impl Instance {
             );
             session_id = None;
         }
-        let resume_tool = agent.map_or(self.tool.as_str(), |agent| agent.name);
         let emitted = append_resume_flags(
-            resume_tool,
+            agent,
             session_id.as_deref(),
             flag_arm_is_existing,
             cmd,
@@ -1687,7 +1716,9 @@ work-opencode = "opencode"
             identity_extension: None,
         };
         let execution = super::execution::NativeExecution {
-            agent: crate::agents::get_agent("opencode").unwrap(),
+            agent: super::execution::NativeAgent::Builtin(
+                crate::agents::get_agent("opencode").unwrap(),
+            ),
             binding: crate::session::ExecutionBinding {
                 agent: "opencode".into(),
                 stores: Vec::new(),
@@ -1917,7 +1948,7 @@ work-opencode = "opencode"
         assert!(is_existing);
         assert_eq!(
             crate::session::instance::launch_command::build_resume_flags(
-                "claude",
+                crate::agents::get_agent("claude"),
                 session_id.as_deref().unwrap(),
                 is_existing,
             ),
@@ -2341,22 +2372,26 @@ work-opencode = "opencode"
     fn terminal_context_resume_matches_emission_constraints() {
         let sid = "44444444-4444-4444-8444-444444444444".to_string();
         let mut inst = tool_instance("claude", "/tmp/context");
+        let config = resume_profile_config(&inst.source_profile);
         assert_eq!(
-            inst.terminal_context_resume_with_runtime_source(|| {
-                crate::tmux::SessionExistence::Absent
-            }),
+            inst.terminal_context_resume_with_runtime_source(
+                || &config,
+                || { crate::tmux::SessionExistence::Absent }
+            ),
             TerminalContextResume::NoTarget
         );
         assert_eq!(
-            inst.terminal_context_resume_with_runtime_source(|| {
-                crate::tmux::SessionExistence::Present
-            }),
+            inst.terminal_context_resume_with_runtime_source(
+                || &config,
+                || { crate::tmux::SessionExistence::Present }
+            ),
             TerminalContextResume::RuntimeCheckRequired
         );
         assert_eq!(
-            inst.terminal_context_resume_with_runtime_source(|| {
-                crate::tmux::SessionExistence::Unknown
-            }),
+            inst.terminal_context_resume_with_runtime_source(
+                || &config,
+                || { crate::tmux::SessionExistence::Unknown }
+            ),
             TerminalContextResume::RuntimeCheckRequired
         );
         inst.agent_session_id = Some(sid.clone());
@@ -2738,7 +2773,7 @@ work-opencode = "opencode"
             assert_eq!(acquired, (Some(pinned.to_string()), false));
             assert_eq!(inst.agent_session_id.as_deref(), Some(pinned));
             assert_eq!(
-                build_resume_flags("pi", pinned, false),
+                build_resume_flags(crate::agents::get_agent("pi"), pinned, false),
                 format!("--session-id {pinned}")
             );
 

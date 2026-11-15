@@ -507,6 +507,7 @@ async fn admit_and_create(
         // the agent, so it rides on session.create.
         sandbox: req.sandbox,
         sandbox_image: None,
+        pull_latest_image: false,
         yolo_mode: false,
         extra_env: Vec::new(),
         before_start_hook_env: Vec::new(),

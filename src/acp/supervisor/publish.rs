@@ -18,7 +18,7 @@ impl<S: BroadcastSink> Supervisor<S> {
 
     /// Publish an `AgentStartupError` for a session whose worker never came online.
     pub fn publish_startup_error(&self, session_id: &str, message: String) {
-        self.publish_next(session_id, &Event::AgentStartupError { message });
+        self.publish_next(session_id, &Event::startup_error(message));
     }
 
     /// Publish `Stopped { reason }` only if `expected_seq` is still the

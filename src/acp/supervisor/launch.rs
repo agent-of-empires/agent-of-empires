@@ -1055,9 +1055,7 @@ pub(super) fn publish_rejection(err: &AcpError, mut publish: impl FnMut(Event)) 
             publish(Event::IncompatibleAgent {
                 detail: payload.detail.clone(),
             });
-            publish(Event::AgentStartupError {
-                message: payload.message.clone(),
-            });
+            publish(Event::startup_error(payload.message.clone()));
         }
         // The provider limit parks the session rather than reporting a crash.
         AcpError::RateLimited(info) => {

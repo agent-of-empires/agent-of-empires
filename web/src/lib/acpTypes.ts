@@ -619,6 +619,9 @@ export interface AcpState {
   restartStoppedSent: boolean;
   /** Why a restart failed after its stop, which unmounts the startup line; the stopped banner shows it. Not persisted. */
   restartFailure: string | null;
+  /** The startup error a Retry is retrying, kept while it runs and on the error that ends it, so its banner
+   *  can say whether the cause changed. Not persisted. */
+  retriedError: string | null;
   /** Lowest loaded seq; older history pages load with `?before=<oldestSeq>`. */
   oldestSeq: number;
   lagged: boolean;
@@ -1029,6 +1032,7 @@ export function emptyAcpState(): AcpState {
     restartEpoch: 0,
     restartStoppedSent: false,
     restartFailure: null,
+    retriedError: null,
     oldestSeq: 0,
     lagged: false,
     startupError: null,
@@ -1080,6 +1084,7 @@ function isSteeredContinuation(state: AcpState): boolean {
 
 function applyNewTurnResets(next: AcpState): void {
   next.startupError = null;
+  if (!next.restartInFlight) next.retriedError = null;
   next.lastError = null;
   // The cancel phase is server-owned; only the escalation deadline is ours.
   next.cancelEscalatesAt = null;
@@ -1296,7 +1301,9 @@ export function applyEvent(state: AcpState, frame: AcpFrame): AcpState {
   }
   if ("AgentStartupError" in event) {
     next.startupError = event.AgentStartupError.message;
+    const retried = state.restartInFlight ? state.retriedError : null;
     endRestart(next);
+    next.retriedError = retried;
     next.agentUnresponsive = false;
     closeTurn(next);
     return next;
@@ -1405,6 +1412,7 @@ export function applyEvent(state: AcpState, frame: AcpFrame): AcpState {
     next.sessionUsage = null;
     next.usageBaseline = null;
     next.startupError = null;
+    next.retriedError = null;
     next.lastAgentSwitch = { from, to, reason, at: now };
     // The switch emits Stopped { user_stopped } first; keep its banner hidden through the handshake.
     next.workerStopped = false;
@@ -1575,6 +1583,7 @@ function endRestart(next: AcpState): void {
   next.restartInFlight = false;
   next.restartEpoch += 1;
   next.restartFailure = null;
+  next.retriedError = null;
 }
 
 /** Fold a self-contained run of frames from an empty state, e.g. an older history page. */

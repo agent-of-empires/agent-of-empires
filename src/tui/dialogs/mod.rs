@@ -15,6 +15,7 @@ mod command_palette;
 mod confirm;
 mod connections;
 mod context_menu;
+mod create_hook_failed;
 mod custom_instruction;
 mod delete_options;
 mod group_delete_options;
@@ -51,6 +52,7 @@ pub use command_palette::{
 pub use confirm::ConfirmDialog;
 pub use connections::{ConnectionsView, DaemonAttention, WebState};
 pub use context_menu::{ContextMenuAction, ContextMenuDialog};
+pub use create_hook_failed::{CreateHookFailedAction, CreateHookFailedDialog};
 pub use custom_instruction::CustomInstructionDialog;
 pub use delete_options::{DeleteDialogConfig, DeleteOptions, UnifiedDeleteDialog};
 pub use group_delete_options::{GroupDeleteAction, GroupDeleteOptions, GroupDeleteOptionsDialog};

@@ -173,7 +173,7 @@ impl EventStore {
                 .query_row(
                     "SELECT event_json FROM acp_events
                      WHERE session_id = ?1
-                       AND json_extract(event_json, '$.UserPromptSent') IS NOT NULL
+                       AND discriminant = 'UserPromptSent'
                      ORDER BY seq ASC
                      LIMIT 1",
                     params![session_id],
@@ -197,19 +197,28 @@ impl EventStore {
         session_id: &str,
         max_agent_bytes: usize,
     ) -> Option<(String, String)> {
-        let rows = query_strings(
-            &self.conn(),
-            "SELECT event_json FROM acp_events
-             WHERE session_id = ?1
-             ORDER BY seq ASC",
-            "first_turn_context",
+        // Streamed, so the read ends with the first turn rather than loading the whole history.
+        let conn = self.conn();
+        let what = "first_turn_context";
+        let mut stmt = logged(
+            conn.prepare(
+                "SELECT event_json FROM acp_events
+                 WHERE session_id = ?1
+                 ORDER BY seq ASC",
+            ),
+            what,
             session_id,
-        );
+        )?;
+        let rows = logged(
+            stmt.query_map(params![session_id], |row| row.get::<_, String>(0)),
+            what,
+            session_id,
+        )?;
         let mut first_prompt: Option<String> = None;
         let mut agent = String::new();
         for event in rows
-            .iter()
-            .filter_map(|json| decode_logged(json, session_id, "first_turn_context"))
+            .filter_map(|row| row.ok())
+            .filter_map(|json| decode_logged(&json, session_id, what))
         {
             match event {
                 Event::UserPromptSent { text, .. } if first_prompt.is_none() => {
@@ -439,12 +448,12 @@ impl EventStore {
             "SELECT json_extract(event_json, '$.ElicitationRequested.elicitation.nonce') AS nonce
              FROM acp_events
              WHERE session_id = ?1
-               AND json_extract(event_json, '$.ElicitationRequested') IS NOT NULL
+               AND discriminant = 'ElicitationRequested'
                AND json_extract(event_json, '$.ElicitationRequested.elicitation.nonce') NOT IN (
                    SELECT json_extract(event_json, '$.ElicitationResolved.nonce')
                    FROM acp_events
                    WHERE session_id = ?1
-                     AND json_extract(event_json, '$.ElicitationResolved') IS NOT NULL
+                     AND discriminant = 'ElicitationResolved'
                )",
             "unresolved_elicitation_nonces",
             session_id,
@@ -526,7 +535,7 @@ impl EventStore {
             conn.query_row(
                 "SELECT MAX(seq) FROM acp_events
                  WHERE session_id = ?1
-                   AND json_extract(event_json, '$.UserPromptSent') IS NOT NULL",
+                   AND discriminant = 'UserPromptSent'",
                 params![session_id],
                 |row| row.get::<_, Option<i64>>(0),
             ),
@@ -541,8 +550,7 @@ impl EventStore {
                 "SELECT MIN(seq) FROM acp_events
                  WHERE session_id = ?1
                    AND seq > ?2
-                   AND (json_extract(event_json, '$.Stopped') IS NOT NULL
-                     OR json_extract(event_json, '$.AgentStartupError') IS NOT NULL)",
+                   AND discriminant IN ('Stopped', 'AgentStartupError')",
                 params![session_id, prompt_seq],
                 |row| row.get::<_, Option<i64>>(0),
             ),
@@ -576,12 +584,12 @@ impl EventStore {
                          SELECT json_extract(event_json, '$.BackgroundAgentLaunched.agent_id') AS aid,
                                 created_at
                            FROM acp_events WHERE session_id = ?1
-                             AND json_extract(event_json, '$.BackgroundAgentLaunched') IS NOT NULL
+                             AND discriminant = 'BackgroundAgentLaunched'
                          UNION ALL
                          SELECT json_extract(event_json, '$.BackgroundAgentProgress.agent_id'),
                                 created_at
                            FROM acp_events WHERE session_id = ?1
-                             AND json_extract(event_json, '$.BackgroundAgentProgress') IS NOT NULL
+                             AND discriminant = 'BackgroundAgentProgress'
                      )
                      WHERE aid IS NOT NULL
                      GROUP BY aid
@@ -590,7 +598,7 @@ impl EventStore {
                    AND started.aid NOT IN (
                      SELECT json_extract(event_json, '$.BackgroundAgentCompleted.agent_id')
                        FROM acp_events WHERE session_id = ?1
-                         AND json_extract(event_json, '$.BackgroundAgentCompleted') IS NOT NULL
+                         AND discriminant = 'BackgroundAgentCompleted'
                    )",
                 params![session_id, stale_cutoff],
                 |row| row.get(0),
@@ -614,23 +622,17 @@ impl EventStore {
             session_id,
         )
         .flatten()?;
-        let clauses = NON_SUBSTANTIVE_EVENT_DISCRIMINANTS
-            .iter()
-            .map(|_| "AND event_json NOT LIKE ?")
+        let placeholders = std::iter::repeat_n("?", NON_SUBSTANTIVE_EVENT_DISCRIMINANTS.len())
             .collect::<Vec<_>>()
-            .join("\n                   ");
+            .join(",");
         let sql = format!(
             "SELECT event_json, created_at FROM acp_events
-                 WHERE session_id = ?
-                   {clauses}
+                 WHERE session_id = ? AND discriminant NOT IN ({placeholders})
                  ORDER BY seq DESC
                  LIMIT 1"
         );
-        let bind = std::iter::once(session_id.to_string()).chain(
-            NON_SUBSTANTIVE_EVENT_DISCRIMINANTS
-                .iter()
-                .map(|name| format!("{{\"{name}\":%")),
-        );
+        let bind =
+            std::iter::once(session_id).chain(NON_SUBSTANTIVE_EVENT_DISCRIMINANTS.iter().copied());
         let (json, substantive_at_ms): (String, i64) = logged(
             conn.query_row(&sql, rusqlite::params_from_iter(bind), |row| {
                 Ok((row.get(0)?, row.get(1)?))
@@ -655,8 +657,7 @@ impl EventStore {
             conn.query_row(
                 "SELECT MAX(seq) FROM acp_events
                  WHERE session_id = ?1
-                   AND (json_extract(event_json, '$.Stopped') IS NOT NULL
-                     OR json_extract(event_json, '$.AgentStartupError') IS NOT NULL)",
+                   AND discriminant IN ('Stopped', 'AgentStartupError')",
                 params![session_id],
                 |row| row.get::<_, Option<i64>>(0),
             ),
@@ -670,13 +671,13 @@ impl EventStore {
                 "SELECT 1 FROM acp_events
                  WHERE session_id = ?1
                    AND seq > ?2
-                   AND json_extract(event_json, '$.ToolCallStarted') IS NOT NULL
+                   AND discriminant = 'ToolCallStarted'
                    AND json_extract(event_json, '$.ToolCallStarted.tool_call.id') NOT IN (
                        SELECT json_extract(event_json, '$.ToolCallCompleted.tool_call_id')
                          FROM acp_events
                         WHERE session_id = ?1
                           AND seq > ?2
-                          AND json_extract(event_json, '$.ToolCallCompleted') IS NOT NULL
+                          AND discriminant = 'ToolCallCompleted'
                           -- `x NOT IN (a, NULL)` is NULL, which would hide every open call.
                           AND json_extract(event_json, '$.ToolCallCompleted.tool_call_id') IS NOT NULL
                    )
@@ -780,9 +781,7 @@ mod tests {
             last_text: None,
             at: chrono::Utc::now(),
         };
-        let startup_error = Event::AgentStartupError {
-            message: "boom".into(),
-        };
+        let startup_error = Event::startup_error("boom");
         // (events, in flight)
         let cases = [
             (vec![], false),
@@ -1605,6 +1604,81 @@ mod tests {
             store.unresolved_background_agent_ids("s-1"),
             ["a2", "other-run", "plain"].map(String::from)
         );
+    }
+
+    /// Probes find event types through the indexed `discriminant` column, never by
+    /// parsing every row. Each assertion fails if its query parses the malformed row.
+    #[test]
+    fn probes_do_not_parse_unrelated_rows() {
+        use crate::acp::elicitations::Elicitation;
+        let (_tmp, store) = open_store(0);
+        let nonce = Nonce::new();
+        let elicitation = Event::ElicitationRequested {
+            elicitation: Elicitation {
+                nonce: nonce.clone(),
+                message: "Pick".into(),
+                title: None,
+                description: None,
+                tool_call_id: None,
+                questions: Vec::new(),
+                requested_at: chrono::Utc::now(),
+                resolved: None,
+            },
+        };
+        let tool_done = |id: &str| Event::ToolCallCompleted {
+            tool_call_id: id.into(),
+            is_error: false,
+            content: String::new(),
+            output: Vec::new(),
+            completed_at: chrono::Utc::now(),
+            async_subagent: false,
+        };
+        record_from(
+            &store,
+            "s-1",
+            1,
+            [
+                user_prompt("first"),
+                agent_chunk("first turn"),
+                stopped("prompt_complete"),
+                user_prompt("second"),
+                bg_launched("bg-1", ""),
+                elicitation,
+                Event::ToolCallStarted {
+                    tool_call: tool_call("tc-open"),
+                },
+                Event::ToolCallStarted {
+                    tool_call: tool_call("tc-done"),
+                },
+                tool_done("tc-done"),
+            ],
+        );
+        // An unprompted turn the rate limit interrupted.
+        record_from(
+            &store,
+            "s-2",
+            1,
+            [agent_chunk("work"), stopped("rate_limited")],
+        );
+        {
+            let conn = store.hold_writer();
+            for id in ["s-1", "s-2"] {
+                events::insert_event(&conn, &store.schema, id, 100, "{\"Opaque\":{", 0).unwrap();
+            }
+        }
+
+        assert_eq!(store.unresolved_elicitation_nonces("s-1"), [nonce]);
+        assert_eq!(store.try_in_flight_turn("s-1"), Some(true));
+        assert!(store.rate_limit_interrupted_agent_turn("s-2"));
+        // Fails closed (true) if a tool filter parses the malformed row, still in this epoch.
+        assert!(store.has_open_tool_call_in_epoch("s-1"));
+        store.record("s-1", 101, &tool_done("tc-open")).unwrap();
+        assert!(!store.has_open_tool_call_in_epoch("s-1"));
+        // A closed prompt leaves the background agent as the open work.
+        store
+            .record("s-1", 102, &stopped("prompt_complete"))
+            .unwrap();
+        assert_eq!(store.try_in_flight_turn("s-1"), Some(true));
     }
 
     fn bg_launched(agent_id: &str, output_file: &str) -> Event {

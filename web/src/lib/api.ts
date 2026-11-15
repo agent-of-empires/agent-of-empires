@@ -1,6 +1,7 @@
 import type { AgentLifecycleInfo } from "./agentProfiles";
 import { notifySettingsChanged } from "./settingsEvents";
 import { clientFormFactor } from "./formFactor";
+import { reportError } from "./logger";
 import type { SchemaSettings } from "./generated/settingsKeys";
 import type {
   SessionResponse,
@@ -450,6 +451,13 @@ export interface SessionFileResponse {
   content: string;
   is_binary: boolean;
   truncated: boolean;
+  version?: string | null;
+  edit_disabled_reason?: string | null;
+}
+
+export async function saveSessionFile(id: string, path: string, version: string, content: string) {
+  const response = await send(`/api/sessions/${id}/file`, jsonInit("PUT", { path, version, content }));
+  return { ok: response.ok, status: response.status, error: stringField(response.payload, "message") };
 }
 
 /**
@@ -457,8 +465,14 @@ export interface SessionFileResponse {
  * or an absolute path the agent touched this session; the server enforces
  * provenance confinement. See `GET /api/sessions/{id}/file`.
  */
-export function getSessionFile(id: string, filePath: string): Promise<SessionFileResponse | null> {
+export function getSessionFile(
+  id: string,
+  filePath: string,
+  options: { editing?: boolean; versionOnly?: boolean } = {},
+): Promise<SessionFileResponse | null> {
   const params = new URLSearchParams({ path: filePath });
+  if (options.editing) params.set("editing", "true");
+  if (options.versionOnly) params.set("version_only", "true");
   return fetchJson<SessionFileResponse>(`/api/sessions/${id}/file?${params.toString()}`);
 }
 
@@ -817,9 +831,39 @@ export interface PluginUpdateChangelog {
   more_url: string | null;
 }
 
+export interface PluginAgentKey {
+  kind: "literal" | "named";
+  value: string;
+}
+
+export interface PluginAgentLaunch {
+  aliases?: string[];
+  oneshot_flag?: string;
+  instruction_flag?: string;
+  model_flag?: string;
+  yolo?: { kind: "flag"; flag: string } | { kind: "always" } | { kind: "env"; key: string; value: string };
+  container_env?: Record<string, string>;
+  install_hint?: string;
+  host_only?: boolean;
+  resume?:
+    | { kind: "flag"; flag: string }
+    | { kind: "flag_pair"; existing: string; new_session: string }
+    | { kind: "subcommand"; command: string };
+  capture?: {
+    backend: "omp";
+    host: "pane_scoped" | "unsupported";
+    sandbox: "pane_scoped" | "unsupported";
+  };
+}
+
 export interface PluginAgentIntegration {
   tool: string;
   command?: string;
+  provider_versions?: string[];
+  replies?: boolean;
+  launch?: PluginAgentLaunch;
+  detection?: { mode: "native_only" };
+  reply_fallback?: { allow: PluginAgentKey[]; deny: PluginAgentKey[]; allow_always?: PluginAgentKey[] };
 }
 
 /** Structured disclosure for a capability-expanding plugin update, mirroring the
@@ -1636,9 +1680,18 @@ export type SandboxImageStatus = SandboxImageState & {
   runtime: string;
 };
 
-/** The status, `{ error }` when the Daemon refuses (`config_unreadable`, for one), or null offline. */
-export async function fetchSandboxImageStatus(): Promise<SandboxImageStatus | { error: string } | null> {
-  const reply = await send("/api/sandbox/image-status").catch(() => null);
+/** The status of `image` (default: the configured default image), `{ error }` when the Daemon
+ *  refuses (`config_unreadable`, or `unknown_image` for one that isn't configured), or null
+ *  offline. `fresh` skips the Daemon's cache. */
+export async function fetchSandboxImageStatus(
+  image?: string,
+  opts: { fresh?: boolean } = {},
+): Promise<SandboxImageStatus | { error: string } | null> {
+  const query = new URLSearchParams();
+  if (image) query.set("image", image);
+  if (opts.fresh) query.set("fresh", "true");
+  const qs = query.toString();
+  const reply = await send(`/api/sandbox/image-status${qs ? `?${qs}` : ""}`).catch(() => null);
   if (!reply) return null;
   if (reply.ok) return reply.payload as SandboxImageStatus | null;
   return { error: stringField(reply.payload, "error") ?? `http_${reply.status}` };
@@ -2735,6 +2788,27 @@ export async function restartSession(id: string): Promise<{ ok: boolean; message
   } catch {
     return { ok: false };
   }
+}
+
+/** Tool names this session can swap to without losing its conversation; null when they can't be listed. */
+export async function fetchAccountTargets(id: string): Promise<string[] | null> {
+  const body = await fetchJson<{ targets?: string[] }>(`/api/sessions/${encodeURIComponent(id)}/account-targets`);
+  if (!body?.targets) {
+    reportError("could not list the accounts a session can switch to", {
+      level: "warn",
+      target: "web.client.api",
+      sessionId: id,
+    });
+  }
+  return body?.targets ?? null;
+}
+
+/** Restarts the session as another account of the same agent. The server refuses with a message, changing nothing, when the conversation would not carry over. */
+export async function switchSessionAccount(id: string, tool: string): Promise<{ ok: boolean; message?: string }> {
+  return okWithMessage(
+    `/api/sessions/${encodeURIComponent(id)}/restart`,
+    jsonInit("POST", { tool, require_account_carry: true }),
+  );
 }
 
 /** The server re-checks eligibility; a 409 means the session got busy or is no longer out of date. */
