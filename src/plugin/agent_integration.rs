@@ -51,6 +51,23 @@ static RESERVED_WARNED: std::sync::LazyLock<
     std::sync::Mutex<std::collections::HashSet<(String, String)>>,
 > = std::sync::LazyLock::new(|| std::sync::Mutex::new(std::collections::HashSet::new()));
 
+/// Tools already reported as ambiguously claimed, so poll-time lookups warn
+/// once per process rather than on every tick.
+static AMBIGUOUS_WARNED: std::sync::LazyLock<std::sync::Mutex<std::collections::HashSet<String>>> =
+    std::sync::LazyLock::new(|| std::sync::Mutex::new(std::collections::HashSet::new()));
+
+/// An ambiguity is a configuration fault with no report to read, so a session
+/// it affects stays plugin-owned `Unknown`; say which name collided.
+fn warn_ambiguous(tool: &str, error: &anyhow::Error) {
+    let mut warned = AMBIGUOUS_WARNED
+        .lock()
+        .unwrap_or_else(|error| error.into_inner());
+    if warned.insert(tool.to_owned()) {
+        tracing::warn!(target: "plugin.agents", %tool, %error,
+            "approved integrations claim this tool ambiguously; leaving its status to pane rules");
+    }
+}
+
 fn warn_reserved(plugin: &str, tool: &str, builtin: &str) {
     let mut warned = RESERVED_WARNED
         .lock()
@@ -86,7 +103,7 @@ fn unique_candidates<'a, 'b, 'c>(
         candidate_counts.remove(name);
     }
     for (plugin, tool, _) in &candidates {
-        if let Some(builtin) = crate::agents::resolve_tool_name(tool) {
+        if let Some(builtin) = crate::agents::resolve_builtin_tool_name(tool) {
             warn_reserved(plugin, tool, builtin);
             candidate_counts.remove(tool);
         }
@@ -114,6 +131,12 @@ pub fn catalog<'a, 'b, 'c>(
             .manifest
             .agent_integrations
             .iter()
+            .filter(move |entry| {
+                // Only the fallback's own tool is gated: the bundled contract is
+                // replaced solely by an API 21 launch declaration for that name.
+                !super::bundled_agents::contains(&entry.tool)
+                    || (plugin.manifest.api_version >= 21 && entry.launch.is_some())
+            })
             .filter_map(move |entry| {
                 entry
                     .command
@@ -228,122 +251,14 @@ impl DeclaredAgent {
         &self,
         use_agent: impl FnOnce(&crate::agents::AgentDef) -> R,
     ) -> Option<R> {
-        use crate::agents::{
-            AgentDef, AgentLifecycle, DetectionMethod, ForkStrategy, KeyToken, PermissionResponse,
-            ResumeStrategy, SessionCaptureBackend, SessionCaptureContext, SessionCaptureSpec,
-            SessionSupport, YoloMode,
-        };
-        use aoe_plugin_api::agent_integration::{
-            AgentCaptureBackend, AgentCaptureContext, AgentKeyDeclaration, AgentResumeDeclaration,
-            AgentYoloDeclaration,
-        };
-        fn key(key: &AgentKeyDeclaration) -> KeyToken<'_> {
-            match key {
-                AgentKeyDeclaration::Literal { value } => KeyToken::Literal(value),
-                AgentKeyDeclaration::Named { value } => KeyToken::Named(value),
-            }
-        }
         let entry = self.contribution();
-        let command = entry.command.as_deref()?;
-        let (prefix, _) = aoe_plugin_api::agent_integration::launch_prefix(command)?;
-        let binary = *prefix.last()?;
-        let default_launch = Default::default();
-        let launch = entry.launch.as_ref().unwrap_or(&default_launch);
-        let aliases: Vec<&str> = launch.aliases.iter().map(String::as_str).collect();
-        let environment: Vec<(&str, &str)> = launch
-            .container_env
-            .iter()
-            .map(|(key, value)| (key.as_str(), value.as_str()))
-            .collect();
-        let yolo = launch.yolo.as_ref().map(|yolo| match yolo {
-            AgentYoloDeclaration::Flag { flag } => YoloMode::CliFlag(flag),
-            AgentYoloDeclaration::Always => YoloMode::AlwaysYolo,
-            AgentYoloDeclaration::Env { key, value } => YoloMode::EnvVar(key, value),
-        });
-        let support = launch.resume.as_ref().map(|resume| {
-            let resume = match resume {
-                AgentResumeDeclaration::Flag { flag } => ResumeStrategy::Flag(flag),
-                AgentResumeDeclaration::FlagPair {
-                    existing,
-                    new_session,
-                } => ResumeStrategy::FlagPair {
-                    existing,
-                    new_session,
-                },
-                AgentResumeDeclaration::Subcommand { command } => {
-                    ResumeStrategy::Subcommand(command)
-                }
-            };
-            let capture = launch.capture.as_ref().and_then(|capture| {
-                let context = |context| match context {
-                    AgentCaptureContext::PaneScoped => Some(SessionCaptureContext::PaneScoped),
-                    AgentCaptureContext::Unsupported => Some(SessionCaptureContext::Unsupported),
-                    _ => None,
-                };
-                if capture.backend != AgentCaptureBackend::Omp {
-                    return None;
-                }
-                Some(SessionCaptureSpec {
-                    backend: SessionCaptureBackend::Omp,
-                    host: context(capture.host)?,
-                    sandbox: context(capture.sandbox)?,
-                })
-            });
-            SessionSupport { resume, capture }
-        });
-        let allow: Vec<_> = entry
-            .reply_fallback
-            .as_ref()
-            .map_or_else(Vec::new, |r| r.allow.iter().map(key).collect());
-        let always: Option<Vec<_>> = entry.reply_fallback.as_ref().and_then(|r| {
-            r.allow_always
-                .as_ref()
-                .map(|keys| keys.iter().map(key).collect())
-        });
-        let deny: Vec<_> = entry
-            .reply_fallback
-            .as_ref()
-            .map_or_else(Vec::new, |r| r.deny.iter().map(key).collect());
-        let permission_response = entry.reply_fallback.as_ref().map(|_| PermissionResponse {
-            allow: &allow,
-            allow_always: always.as_deref(),
-            deny: &deny,
-        });
+        let data = super::agent_definition::DefinitionData::new(entry);
         let status = self.registry.all()[self.plugin_index]
             .manifest
             .capabilities
             .iter()
             .any(|capability| capability.as_str() == "session.integration");
-        let definition = AgentDef {
-            name: &entry.tool,
-            binary,
-            launch_subcommand: None,
-            aliases: &aliases,
-            detection: DetectionMethod::Which(binary),
-            yolo,
-            spans_agent_generations: false,
-            instruction_flag: launch.instruction_flag.as_deref(),
-            oneshot_flag: launch.oneshot_flag.as_deref(),
-            model_flag: launch.model_flag.as_deref(),
-            set_default_command: false,
-            detect_status: if status || entry.detection.is_some() {
-                crate::tmux::status_detection::detect_native_only_status
-            } else {
-                crate::tmux::status_detection::detect_hook_only_status
-            },
-            container_env: &environment,
-            hook_config: None,
-            sidecar_hooks: None,
-            session_support: support,
-            fork_strategy: ForkStrategy::Unsupported,
-            host_only: launch.host_only,
-            send_keys_enter_delay_ms: 0,
-            ready_marker: None,
-            install_hint: launch.install_hint.as_deref().unwrap_or(&entry.tool),
-            permission_response,
-            lifecycle: AgentLifecycle::Active,
-        };
-        Some(use_agent(&definition))
+        Some(use_agent(&data.definition(entry, status)?))
     }
 
     fn plugin_id(&self) -> &str {
@@ -372,7 +287,7 @@ pub(crate) fn declared_agent<'a>(
     if custom_names.into_iter().any(|name| name == tool) {
         return None;
     }
-    if let Some(builtin) = crate::agents::resolve_tool_name(tool) {
+    if let Some(builtin) = crate::agents::resolve_builtin_tool_name(tool) {
         for plugin in registry.active().filter(|plugin| {
             plugin
                 .manifest
@@ -390,6 +305,11 @@ pub(crate) fn declared_agent<'a>(
             continue;
         }
         for (entry_index, entry) in plugin.manifest.agent_integrations.iter().enumerate() {
+            if super::bundled_agents::contains(tool)
+                && (plugin.manifest.api_version < 21 || entry.launch.is_none())
+            {
+                continue;
+            }
             if entry.tool == tool && entry.command.is_some() {
                 if selected.is_some() {
                     return None;
@@ -608,8 +528,164 @@ pub fn replies_configured(instance: &Instance) -> bool {
     configured_for(instance, true)
 }
 
+/// Where the session's effective configuration leaves a tool name.
+///
+/// A blank command is not a selection: the plugin still supplies the launch.
+/// An unreadable configuration is neither state, and must fail closed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CustomOwnership {
+    /// The configuration launches a custom command under this name.
+    Custom,
+    /// The configuration leaves the name to the plugin.
+    Plugin,
+    /// The configuration could not be read.
+    Unavailable,
+}
+
+fn custom_ownership(instance: &Instance, tool: &str) -> CustomOwnership {
+    match effective_config(instance) {
+        Ok(config) => {
+            if config
+                .session
+                .custom_agents
+                .get(tool)
+                .is_some_and(|command| !command.trim().is_empty())
+            {
+                CustomOwnership::Custom
+            } else {
+                CustomOwnership::Plugin
+            }
+        }
+        Err(()) => CustomOwnership::Unavailable,
+    }
+}
+
+/// Changes to these files invalidate the cached effective configuration.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+enum ConfigStamp {
+    /// No directory entry, which a reader resolves as no file at all.
+    Absent,
+    /// An entry whose target cannot be read: a dangling symlink or an
+    /// unreadable path. The reader attempts it and fails, so it must not share
+    /// `Absent`'s key with a deleted file.
+    Unreadable,
+    /// Target metadata of the file the reader opens.
+    Readable {
+        dev: u64,
+        ino: u64,
+        mtime: i64,
+        mtime_nsec: i64,
+        ctime: i64,
+        ctime_nsec: i64,
+        mode: u32,
+    },
+}
+
+fn stamp(path: &std::path::Path) -> ConfigStamp {
+    use std::os::unix::fs::MetadataExt;
+    // Entry presence is stamped separately from target metadata: `chmod 000`
+    // makes a fresh read fail while mtime can stay untouched, so mode and ctime
+    // are part of it, and a dangling symlink has no target metadata to stamp.
+    match std::fs::symlink_metadata(path) {
+        Ok(_) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return ConfigStamp::Absent;
+        }
+        // A denied directory hides whether the reader's file exists at all, so
+        // it must not share `Absent`'s key with a deleted file.
+        Err(_) => return ConfigStamp::Unreadable,
+    }
+    match std::fs::metadata(path) {
+        Ok(meta) => ConfigStamp::Readable {
+            dev: meta.dev(),
+            ino: meta.ino(),
+            mtime: meta.mtime(),
+            mtime_nsec: meta.mtime_nsec(),
+            ctime: meta.ctime(),
+            ctime_nsec: meta.ctime_nsec(),
+            mode: meta.mode(),
+        },
+        Err(_) => ConfigStamp::Unreadable,
+    }
+}
+
+/// Global, state and profile config, resolved once per file-state change.
+/// The status poll runs this per session per tick, so an uncached read would
+/// reparse every TOML file each time.
+///
+/// One entry per configuration identity: a stamp change replaces the previous
+/// snapshot rather than accumulating one full `Config` per historical edit.
+///
+/// The repo layer is deliberately absent. Repo `custom_agents` merges to empty,
+/// so it cannot change ownership, while reading it opens a git repository per
+/// call and would let a malformed repo file fail a proven decision closed.
+fn effective_config(instance: &Instance) -> Result<std::sync::Arc<crate::session::Config>, ()> {
+    type Identity = (std::path::PathBuf, String);
+    type CacheKey = (Identity, Vec<ConfigStamp>);
+    static CACHE: std::sync::LazyLock<
+        std::sync::Mutex<
+            std::collections::HashMap<CacheKey, std::sync::Arc<crate::session::Config>>,
+        >,
+    > = std::sync::LazyLock::new(|| std::sync::Mutex::new(std::collections::HashMap::new()));
+
+    let profile = instance.effective_profile();
+    let global_path = crate::session::config::config_path().map_err(|_| ())?;
+    let profile_dir = crate::session::get_profile_dir_path(&profile).map_err(|_| ())?;
+    let identity = (global_path.clone(), profile.clone());
+    let stamps = config_stamps(&global_path, &profile_dir);
+    let key = (identity.clone(), stamps.clone());
+
+    {
+        let cache = CACHE.lock().unwrap_or_else(|error| error.into_inner());
+        if let Some(config) = cache.get(&key) {
+            return Ok(config.clone());
+        }
+    }
+
+    let resolved = (|| {
+        let global = crate::session::Config::load().ok()?;
+        let overrides =
+            crate::session::config::profile_config::load_profile_config(&profile).ok()?;
+        Some(crate::session::config::profile_config::merge_configs(
+            global, &overrides,
+        ))
+    })()
+    .ok_or(())?;
+
+    let resolved = std::sync::Arc::new(resolved);
+    let mut cache = CACHE.lock().unwrap_or_else(|error| error.into_inner());
+    // A concurrent resolver may have cached this identity against different file
+    // stamps while this call was loading. Compare the stamps again now that the
+    // lock is held: if the files moved, this snapshot is stale, so serve it to
+    // this caller without displacing the newer entry.
+    if config_stamps(&global_path, &profile_dir) != stamps {
+        return Ok(resolved);
+    }
+    if let Some(existing) = cache.get(&key) {
+        return Ok(existing.clone());
+    }
+    cache.retain(|(cached, _), _| cached != &identity);
+    cache.insert(key, resolved.clone());
+    Ok(resolved)
+}
+
+/// The config files ownership actually reads: the global config, the state file
+/// and the profile override.
+fn config_stamps(global_path: &std::path::Path, profile_dir: &std::path::Path) -> Vec<ConfigStamp> {
+    vec![
+        stamp(global_path),
+        stamp(&crate::session::config::state_path().unwrap_or_default()),
+        stamp(&profile_dir.join("config.toml")),
+    ]
+}
+
+/// Whether an approved integration owns replies. Only a readable configuration
+/// that leaves the name to the plugin grants them: with an unreadable profile a
+/// same-name custom wrapper must keep its terminal approval keys.
 fn configured_for(instance: &Instance, replies: bool) -> bool {
     eligible(instance)
+        // The registry decides whether any plugin can want this session, so the
+        // configuration is only read once one does.
         && super::registry().active().any(|plugin| {
             plugin
                 .manifest
@@ -622,6 +698,7 @@ fn configured_for(instance: &Instance, replies: bool) -> bool {
                     .iter()
                     .any(|entry| entry.tool == instance.tool && (!replies || entry.replies))
         })
+        && custom_ownership(instance, &instance.tool) == CustomOwnership::Plugin
 }
 
 /// Return a fresh verified provider snapshot when available.
@@ -673,32 +750,71 @@ pub(crate) fn owned_status(
         return None;
     }
     let registry = super::registry();
-    let configured = registry.active().any(|plugin| {
-        plugin
-            .manifest
-            .capabilities
-            .iter()
-            .any(|c| c.as_str() == "session.integration")
-            && plugin
-                .manifest
-                .agent_integrations
-                .iter()
-                .any(|entry| entry.tool == instance.tool)
-    });
-    if !configured {
+    let own_claim = provider(&registry, &instance.tool);
+    let alias = crate::tmux::status_rules::detection_tool(
+        &instance.source_profile,
+        &instance.tool,
+        &instance.detect_as,
+    );
+    let alias_claim = match own_claim {
+        Ok(None) => provider(&registry, &alias),
+        _ => Ok(None),
+    };
+    // Report each ambiguous name once, whichever branch consumes it.
+    if let Err(error) = &own_claim {
+        warn_ambiguous(&instance.tool, error);
+    }
+    if let Err(error) = &alias_claim {
+        warn_ambiguous(&alias, error);
+    }
+    if matches!(&own_claim, Ok(None)) && matches!(&alias_claim, Ok(None)) {
+        // No plugin claims this session under either name, so nothing can grant
+        // it status: the per-tick path for an undeclared session reads no
+        // configuration at all.
         return None;
     }
+    let own = custom_ownership(instance, &instance.tool);
+    // A custom wrapper is a different program from the declaration, so a plugin
+    // claiming its own name has no report to give, and two claims on its
+    // detection alias leave nothing to read either. Both keep the wrapper's
+    // pane rules rather than reading as plugin-owned `Unknown`. A wrapper
+    // detected as another, unambiguous provider still answers through that alias.
+    if own == CustomOwnership::Custom && (!matches!(&own_claim, Ok(None)) || alias_claim.is_err()) {
+        return None;
+    }
+    let (tool, plugin) = match own_claim {
+        Ok(Some(plugin)) => (instance.tool.as_str(), Ok(Some(plugin))),
+        Ok(None) => match alias_claim {
+            // A `custom_agents` entry names the sessions it applies to, so one for
+            // the alias selects a command for sessions *named* that alias, not for
+            // this differently named session. Alias authority is status-only, and
+            // the own-name collision was already rejected above.
+            Ok(Some(plugin)) => (alias.as_ref(), Ok(Some(plugin))),
+            Ok(None) => (instance.tool.as_str(), Ok(None)),
+            Err(error) => (instance.tool.as_str(), Err(error)),
+        },
+        Err(error) => (instance.tool.as_str(), Err(error)),
+    };
+    if own == CustomOwnership::Unavailable {
+        // An unreadable configuration may hide a same-name custom wrapper, so a
+        // real claim stays owned-but-unavailable instead of reaching the pane.
+        return match plugin {
+            Ok(Some(_)) | Err(_) => {
+                session_status_override(true, pane_dead, None).map(|status| (status, false))
+            }
+            Ok(None) => None,
+        };
+    }
+    let plugin = match plugin {
+        Ok(Some(plugin)) => Some(plugin),
+        Ok(None) => return None,
+        // Ambiguous claims are owned but unreadable.
+        Err(_) => None,
+    };
     let report = if pane_dead {
         None
     } else {
-        provider(&registry, &instance.tool)
-            .ok()
-            .flatten()
-            .and_then(|plugin| {
-                read_report(&instance.id, &instance.tool, plugin)
-                    .ok()
-                    .flatten()
-            })
+        plugin.and_then(|plugin| read_report(&instance.id, tool, plugin).ok().flatten())
     };
     session_status_override(true, pane_dead, report.as_ref().map(|report| report.status))
         .map(|status| (status, report.is_some()))
@@ -923,6 +1039,18 @@ pub fn respond(
     let registry = super::registry();
     let plugin = provider(&registry, &instance.tool)?
         .context("provider integration is not enabled and approved")?;
+    // The dialog may have opened while the plugin still owned this name. Only a
+    // configuration that still leaves the name to the plugin may send keys.
+    let own = custom_ownership(instance, &instance.tool);
+    ensure!(
+        own == CustomOwnership::Plugin,
+        "{} so the provider integration does not own its replies",
+        // An unreadable configuration may hide a custom program; say only that.
+        match own {
+            CustomOwnership::Custom => "a custom program now runs this agent",
+            _ => "the configuration is unreadable, so a custom program may now run this agent",
+        }
+    );
     let current = read_report(&instance.id, &instance.tool, plugin)?
         .context("provider integration report is unavailable")?;
     ensure!(
@@ -1285,6 +1413,92 @@ replies = true
 
     #[test]
     #[serial_test::serial]
+    fn a_launch_only_declaration_keeps_the_fallback_identity_and_detector() {
+        let temp = tempfile::tempdir().unwrap();
+        let _reload = super::super::ReloadRegistryOnDrop;
+        let _env = crate::session::test_support::EnvGuard::set(&[
+            ("HOME", temp.path()),
+            ("XDG_CONFIG_HOME", temp.path()),
+            ("USERPROFILE", temp.path()),
+        ]);
+        let _featured = crate::session::test_support::EnvGuard::unset(&["AOE_FEATURED_INDEX_PATH"]);
+        let _rules = crate::tmux::status_rules::ProfileRegistryGuard::take("default");
+        let manifest = r#"
+id = "acme.omp"
+name = "OMP"
+version = "2.0.0"
+api_version = 21
+[[agent_integrations]]
+tool = "omp"
+command = "omp-next"
+[agent_integrations.launch]
+oneshot_flag = "-p"
+"#;
+        let dir = super::super::plugins_dir().unwrap().join("acme.omp");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("aoe-plugin.toml"), manifest).unwrap();
+        crate::session::update_config(|config| {
+            config.plugins.insert(
+                "acme.omp".into(),
+                crate::session::PluginConfig {
+                    grant: Some(crate::session::CapabilityGrant {
+                        manifest_hash: aoe_plugin_api::PluginManifest::hash_bytes(
+                            manifest.as_bytes(),
+                        ),
+                        capabilities: Vec::new(),
+                        granted_at: chrono::Utc::now(),
+                    }),
+                    ..Default::default()
+                },
+            );
+        })
+        .unwrap();
+        super::super::reload_registry();
+
+        // The declaration owns new launches, so the listing drops the fallback.
+        assert!(crate::agents::get_agent("omp").is_none());
+        let session = crate::session::config::SessionConfig::default();
+        // A session stored with the fallback's own command keeps its native
+        // identity, which admission, mounts, resume and purge all resolve.
+        let agent = crate::session::Instance::execution_agent_for("omp", "omp", &session)
+            .expect("a stored fallback command keeps its native identity");
+        assert_eq!(agent.name, "omp");
+        assert_eq!(
+            crate::session::config::container_config::resolve_active_agent(
+                "omp",
+                Some("omp"),
+                &session
+            )
+            .map(|agent| agent.name),
+            Some("omp"),
+            "purge and mounts must still resolve the stored fallback"
+        );
+        let roots = crate::session::config::container_config::sandbox_content_roots(
+            "omp",
+            Some("omp"),
+            &session,
+            temp.path(),
+            "11111111-2222-3333-4444-555555555555",
+        )
+        .unwrap();
+        assert!(
+            !roots.is_empty(),
+            "a fresh sandbox must still own its native content roots"
+        );
+        // And the pane detector still sees a running turn, so Smart rename does
+        // not fire its one-shot before the turn finishes.
+        assert_eq!(
+            crate::tmux::detect_status_from_content_in(
+                "",
+                "⠋ Working… ⟦esc⟧\n╭── π ─╮\n╰─ ─╯",
+                "omp"
+            ),
+            crate::session::Status::Running
+        );
+    }
+
+    #[test]
+    #[serial_test::serial]
     fn always_yolo_does_not_persist_after_declaration_update() {
         let temp = tempfile::tempdir().unwrap();
         let _reload = super::super::ReloadRegistryOnDrop;
@@ -1413,6 +1627,130 @@ replies = true
 
     #[test]
     #[serial_test::serial]
+    fn approved_omp_declaration_supersedes_bundled_contract_and_revocation_restores_it() {
+        let temp = tempfile::tempdir().unwrap();
+        let _reload = super::super::ReloadRegistryOnDrop;
+        let _env = crate::session::test_support::EnvGuard::set(&[
+            ("HOME", temp.path()),
+            ("XDG_CONFIG_HOME", temp.path()),
+            ("USERPROFILE", temp.path()),
+        ]);
+        let _featured = crate::session::test_support::EnvGuard::unset(&["AOE_FEATURED_INDEX_PATH"]);
+        let manifest = r#"
+id = "acme.omp-owner"
+name = "OMP integration"
+version = "1.0.0"
+api_version = 21
+capabilities = ["session.integration"]
+[[agent_integrations]]
+tool = "omp"
+command = "OMP_MODE=plugin omp-next --verbose"
+provider_versions = ["^18"]
+replies = true
+[agent_integrations.launch]
+oneshot_flag = "--print"
+model_flag = "--model"
+container_env = { PI_CODING_AGENT_DIR = "/root/plugin-omp" }
+[agent_integrations.launch.yolo]
+kind = "flag"
+flag = "--plugin-auto"
+[agent_integrations.launch.resume]
+kind = "flag"
+flag = "--continue"
+[agent_integrations.launch.capture]
+backend = "omp"
+host = "pane_scoped"
+sandbox = "unsupported"
+[agent_integrations.detection]
+mode = "native_only"
+"#;
+        let dir = super::super::plugins_dir().unwrap().join("acme.omp-owner");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("aoe-plugin.toml"), manifest).unwrap();
+        let mut instance = Instance::new("omp-declaration", temp.path().to_str().unwrap());
+        instance.tool = "omp".into();
+        instance.status = crate::session::Status::Running;
+        assert!(
+            instance.command.is_empty(),
+            "legacy rows have no stored command"
+        );
+        let fallback = || {
+            let agent = crate::agents::get_agent("omp").expect("bundled fallback");
+            assert_eq!(agent.oneshot_flag, Some("-p"));
+            assert_eq!(
+                agent.container_env,
+                &[("PI_CODING_AGENT_DIR", "/root/.omp/agent")]
+            );
+            assert_eq!(
+                (agent.detect_status)("plain command output"),
+                crate::session::Status::Idle
+            );
+            assert!(agent.session_support.unwrap().capture.is_some());
+            assert_eq!(instance.get_tool_command(), "omp");
+            assert!(instance.declared_agent().is_none());
+        };
+        super::super::reload_registry();
+        fallback(); // Present but not approved.
+        crate::session::update_config(|config| {
+            config.plugins.insert(
+                "acme.omp-owner".into(),
+                crate::session::PluginConfig {
+                    grant: Some(crate::session::CapabilityGrant {
+                        manifest_hash: aoe_plugin_api::PluginManifest::hash_bytes(
+                            manifest.as_bytes(),
+                        ),
+                        capabilities: vec!["session.integration".into()],
+                        granted_at: chrono::Utc::now(),
+                    }),
+                    ..Default::default()
+                },
+            );
+        })
+        .unwrap();
+        super::super::reload_registry();
+        assert!(crate::agents::get_agent("omp").is_none());
+        assert_eq!(
+            instance.get_tool_command(),
+            "OMP_MODE=plugin omp-next --verbose"
+        );
+        assert_eq!(
+            instance.launch_executable_token().as_deref(),
+            Some("omp-next")
+        );
+        assert!(instance.supports_native_resume());
+        let declared = instance.declared_agent().expect("approved declaration");
+        declared.with_definition(|agent| {
+            assert!(instance.launch_invokes_resolved_agent_directly(agent));
+            assert_eq!(agent.oneshot_flag, Some("--print"));
+            assert_eq!(agent.container_env, &[("PI_CODING_AGENT_DIR", "/root/plugin-omp")]);
+            assert!(matches!(agent.yolo.as_ref(), Some(crate::agents::YoloMode::CliFlag(flag)) if *flag == "--plugin-auto"));
+            assert!(matches!(agent.session_support.unwrap().resume, crate::agents::ResumeStrategy::Flag("--continue")));
+            assert_eq!(agent.session_support.unwrap().capture.unwrap().sandbox, crate::agents::SessionCaptureContext::Unsupported);
+        }).unwrap();
+        assert!(replies_configured(&instance));
+        assert_eq!(
+            owned_status(&instance, false),
+            Some((crate::session::Status::Unknown, false))
+        );
+        crate::session::update_config(|config| {
+            config.plugins.get_mut("acme.omp-owner").unwrap().enabled = false;
+        })
+        .unwrap();
+        super::super::reload_registry();
+        assert!(declared.while_current(|| ()).is_none());
+        fallback();
+        crate::session::update_config(|config| {
+            let plugin = config.plugins.get_mut("acme.omp-owner").unwrap();
+            plugin.enabled = true;
+            plugin.grant = None;
+        })
+        .unwrap();
+        super::super::reload_registry();
+        fallback(); // Revoked approval must not authorize the declaration.
+    }
+
+    #[test]
+    #[serial_test::serial]
     fn api21_generic_capture_stops_when_plugin_is_disabled_without_removing_omp() {
         let temp = tempfile::tempdir().unwrap();
         let _reload = super::super::ReloadRegistryOnDrop;
@@ -1477,6 +1815,635 @@ sandbox = "unsupported"
             (omp.detect_status)("plain command output"),
             crate::session::Status::Idle
         );
+    }
+
+    #[test]
+    #[serial_test::serial(hook_base)]
+    fn status_prefers_own_provider_then_detection_alias() {
+        let (_base, _, _tmp) = crate::hooks::test_support::BaseGuard::ready();
+        let temp = tempfile::tempdir().unwrap();
+        let _reload = super::super::ReloadRegistryOnDrop;
+        let _env = crate::session::test_support::EnvGuard::set(&[
+            ("HOME", temp.path()),
+            ("XDG_CONFIG_HOME", temp.path()),
+            ("USERPROFILE", temp.path()),
+        ]);
+        let _featured = crate::session::test_support::EnvGuard::unset(&["AOE_FEATURED_INDEX_PATH"]);
+        let _rules = crate::tmux::status_rules::ProfileRegistryGuard::take("alias-ownership");
+        let mut config = crate::session::Config::default();
+        config
+            .session
+            .agent_detect_as
+            .insert("own-agent".into(), "alias-agent".into());
+        config
+            .session
+            .agent_detect_as
+            .insert("unclaimed-agent".into(), "alias-agent".into());
+        crate::tmux::status_rules::install_from_config("alias-ownership", &config);
+        install_test_integration("acme.alias", "alias-agent");
+        super::super::reload_registry();
+
+        let mut instance = Instance::new("alias-report", "/tmp");
+        instance.tool = "own-agent".into();
+        instance.source_profile = "alias-ownership".into();
+        instance.status = crate::session::Status::Running;
+        assert_eq!(
+            owned_status(&instance, false),
+            Some((crate::session::Status::Unknown, false))
+        );
+        let dir = dir_guard::open_instance_dir(&instance.id).unwrap();
+        let mut report = snapshot();
+        report.instance_id = instance.id.clone();
+        dir_guard::write_atomic(
+            dir.as_fd(),
+            "integration-acme.alias.json",
+            &serde_json::to_vec(&report).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            owned_status(&instance, false),
+            Some((crate::session::Status::Waiting, true))
+        );
+
+        install_test_integration("acme.own", "own-agent");
+        super::super::reload_registry();
+        assert_eq!(
+            owned_status(&instance, false),
+            Some((crate::session::Status::Unknown, false))
+        );
+        report.status = AgentIntegrationStatus::Running;
+        dir_guard::write_atomic(
+            dir.as_fd(),
+            "integration-acme.own.json",
+            &serde_json::to_vec(&report).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            owned_status(&instance, false),
+            Some((crate::session::Status::Running, true))
+        );
+        install_test_integration("acme.duplicate", "own-agent");
+        super::super::reload_registry();
+        assert_eq!(
+            owned_status(&instance, false),
+            Some((crate::session::Status::Unknown, false))
+        );
+
+        // Two claims on the detection alias leave a session whose own name no
+        // plugin claims owned but unreadable.
+        install_test_integration("acme.alias-two", "alias-agent");
+        super::super::reload_registry();
+        let mut wrapper = Instance::new("alias-ambiguity", "/tmp");
+        wrapper.tool = "unclaimed-agent".into();
+        wrapper.source_profile = "alias-ownership".into();
+        assert_eq!(
+            owned_status(&wrapper, false),
+            Some((crate::session::Status::Unknown, false))
+        );
+    }
+
+    #[test]
+    #[serial_test::serial(hook_base)]
+    fn configured_custom_agent_name_owns_no_plugin_status() {
+        // The report lives under the hook base, so isolate it before the temp HOME.
+        let (_base, _, _tmp) = crate::hooks::test_support::BaseGuard::ready();
+        let temp = tempfile::tempdir().unwrap();
+        let _reload = super::super::ReloadRegistryOnDrop;
+        let _env = crate::session::test_support::EnvGuard::set(&[
+            ("HOME", temp.path()),
+            ("XDG_CONFIG_HOME", temp.path()),
+            ("USERPROFILE", temp.path()),
+        ]);
+        let _featured = crate::session::test_support::EnvGuard::unset(&["AOE_FEATURED_INDEX_PATH"]);
+        let _rules = crate::tmux::status_rules::ProfileRegistryGuard::take("custom-shadow");
+        install_test_integration("acme.shadow-provider", "shadow-agent");
+        crate::session::update_config(|config| {
+            config
+                .session
+                .custom_agents
+                .insert("shadow-agent".into(), "/opt/custom/shadow --serve".into());
+        })
+        .unwrap();
+        let registry = super::super::reload_registry();
+
+        let mut instance = Instance::new("custom-shadow", "/tmp");
+        instance.tool = "shadow-agent".into();
+        instance.source_profile = "custom-shadow".into();
+        instance.status = crate::session::Status::Running;
+        let dir = dir_guard::open_instance_dir(&instance.id).unwrap();
+        let mut report = snapshot();
+        report.instance_id = instance.id.clone();
+        dir_guard::write_atomic(
+            dir.as_fd(),
+            "integration-acme.shadow-provider.json",
+            &serde_json::to_vec(&report).unwrap(),
+        )
+        .unwrap();
+
+        // The custom wrapper owns its own program, so the plugin claims neither
+        // its status nor its replies even with a matching report present.
+        assert!(!configured(&instance));
+        assert!(!replies_configured(&instance));
+        assert_eq!(owned_status(&instance, false), None);
+        assert!(declared_agent(registry, "shadow-agent", std::iter::empty()).is_none());
+    }
+
+    /// A configured custom agent names its own program, so the same name must not
+    /// resolve a declaration's launch or reply contract. The declared tool keeps it.
+    #[test]
+    #[serial_test::serial]
+    fn a_configured_custom_name_gets_no_plugin_declarations() {
+        let temp = tempfile::tempdir().unwrap();
+        let _reload = super::super::ReloadRegistryOnDrop;
+        let _env = crate::session::test_support::EnvGuard::set(&[
+            ("HOME", temp.path()),
+            ("XDG_CONFIG_HOME", temp.path()),
+            ("USERPROFILE", temp.path()),
+        ]);
+        let _featured = crate::session::test_support::EnvGuard::unset(&["AOE_FEATURED_INDEX_PATH"]);
+        install_test_integration("acme.wrapped-provider", "wrapped-tool");
+        super::super::reload_registry();
+
+        let instance = || {
+            let mut instance = Instance::new("custom-name", temp.path().to_str().unwrap());
+            instance.tool = "wrapped-tool".into();
+            instance
+        };
+
+        // The declared tool resolves the approved declaration.
+        assert!(instance().declared_agent().is_some());
+
+        // A configured custom agent of the same name does not.
+        crate::session::update_config(|config| {
+            config.session.custom_agents.insert(
+                "wrapped-tool".into(),
+                "/opt/wrappers/wrapped --serve".into(),
+            );
+        })
+        .unwrap();
+        assert!(instance().declared_agent().is_none());
+    }
+
+    /// Two approved providers make the own-name claim ambiguous. A readable
+    /// custom selection still owns its program, so ambiguity must not hand it to
+    /// the plugins and report `Unknown` over the wrapper's pane rules.
+    #[test]
+    #[serial_test::serial(hook_base)]
+    fn an_ambiguous_claim_does_not_take_a_configured_custom_program() {
+        let (_base, _, _tmp) = crate::hooks::test_support::BaseGuard::ready();
+        let temp = tempfile::tempdir().unwrap();
+        let _reload = super::super::ReloadRegistryOnDrop;
+        let _env = crate::session::test_support::EnvGuard::set(&[
+            ("HOME", temp.path()),
+            ("XDG_CONFIG_HOME", temp.path()),
+            ("USERPROFILE", temp.path()),
+        ]);
+        let _featured = crate::session::test_support::EnvGuard::unset(&["AOE_FEATURED_INDEX_PATH"]);
+        let _rules = crate::tmux::status_rules::ProfileRegistryGuard::take("custom-ambiguous");
+        install_test_integration("acme.ambiguous-one", "shadow-agent");
+        install_test_integration("acme.ambiguous-two", "shadow-agent");
+        crate::session::update_config(|config| {
+            config
+                .session
+                .custom_agents
+                .insert("shadow-agent".into(), "/opt/custom/shadow --serve".into());
+        })
+        .unwrap();
+        let registry = super::super::reload_registry();
+        assert!(
+            provider(&registry, "shadow-agent").is_err(),
+            "the fixture must present an ambiguous claim"
+        );
+
+        let mut instance = Instance::new("custom-ambiguous", "/tmp");
+        instance.tool = "shadow-agent".into();
+        instance.source_profile = "custom-ambiguous".into();
+        instance.status = crate::session::Status::Running;
+
+        assert_eq!(
+            custom_ownership(&instance, "shadow-agent"),
+            CustomOwnership::Custom
+        );
+        assert_eq!(owned_status(&instance, false), None);
+        assert!(!replies_configured(&instance));
+
+        // An ambiguity on the detection alias alone leaves a readable wrapper
+        // its pane rules too, rather than reading as plugin-owned `Unknown`.
+        crate::session::update_config(|config| {
+            config
+                .session
+                .custom_agents
+                .insert("alias-shadow".into(), "/opt/custom/shadow --serve".into());
+        })
+        .unwrap();
+        let mut wrapper = Instance::new("custom-alias-ambiguous", "/tmp");
+        wrapper.tool = "alias-shadow".into();
+        wrapper.detect_as = "shadow-agent".into();
+        wrapper.source_profile = "custom-ambiguous".into();
+        wrapper.status = crate::session::Status::Running;
+        assert_eq!(
+            custom_ownership(&wrapper, "alias-shadow"),
+            CustomOwnership::Custom
+        );
+        assert_eq!(owned_status(&wrapper, false), None);
+    }
+
+    /// Repo config cannot select a custom command, so a malformed one must not
+    /// move a proven decision: the user's own configuration keeps deciding
+    /// whether the plugin or a custom program owns the name.
+    #[test]
+    #[serial_test::serial]
+    fn a_broken_repo_config_leaves_ownership_unchanged() {
+        let temp = tempfile::tempdir().unwrap();
+        let _app = crate::session::test_support::isolate_app_dir_at(temp.path());
+        let _featured = crate::session::test_support::EnvGuard::unset(&["AOE_FEATURED_INDEX_PATH"]);
+        let project = temp.path().join("repo");
+        std::fs::create_dir_all(project.join(".agent-of-empires")).unwrap();
+        std::fs::write(project.join(".agent-of-empires/config.toml"), "[session\n").unwrap();
+
+        let mut instance = Instance::new("repo-config", project.to_str().unwrap());
+        instance.tool = "shadow-agent".into();
+        instance.source_profile = "repo-config".into();
+
+        assert_eq!(
+            custom_ownership(&instance, "shadow-agent"),
+            CustomOwnership::Plugin
+        );
+
+        crate::session::update_config(|config| {
+            config
+                .session
+                .custom_agents
+                .insert("shadow-agent".into(), "/opt/custom/shadow --serve".into());
+        })
+        .unwrap();
+        assert_eq!(
+            custom_ownership(&instance, "shadow-agent"),
+            CustomOwnership::Custom
+        );
+    }
+
+    /// A reply dialog can open while the plugin owns the name. Adding a custom
+    /// command for that tool withdraws the authority the dialog was opened
+    /// under, so the sink must refuse instead of sending keys to the custom
+    /// program's pane.
+    #[test]
+    #[serial_test::serial(hook_base)]
+    fn respond_refuses_after_a_custom_program_takes_the_name() {
+        let (_base, _, _tmp) = crate::hooks::test_support::BaseGuard::ready();
+        let temp = tempfile::tempdir().unwrap();
+        let _reload = super::super::ReloadRegistryOnDrop;
+        let _env = crate::session::test_support::EnvGuard::set(&[
+            ("HOME", temp.path()),
+            ("XDG_CONFIG_HOME", temp.path()),
+            ("USERPROFILE", temp.path()),
+        ]);
+        let _featured = crate::session::test_support::EnvGuard::unset(&["AOE_FEATURED_INDEX_PATH"]);
+        install_test_integration("acme.stale-reply", "reply-agent");
+        super::super::reload_registry();
+
+        let mut instance = Instance::new("stale-reply-test", "/tmp");
+        instance.tool = "reply-agent".into();
+        instance.status = crate::session::Status::Running;
+        assert_eq!(
+            custom_ownership(&instance, "reply-agent"),
+            CustomOwnership::Plugin
+        );
+
+        crate::session::update_config(|config| {
+            config
+                .session
+                .custom_agents
+                .insert("reply-agent".into(), "/opt/custom/reply --serve".into());
+        })
+        .unwrap();
+        let mut retained = snapshot();
+        retained.instance_id = instance.id.clone();
+        let error = respond(
+            &instance,
+            &retained,
+            AgentIntegrationResponse::Approval {
+                choice: IntegrationApprovalChoice::Allow,
+            },
+        )
+        .unwrap_err();
+        assert!(
+            error.to_string().contains("does not own its replies"),
+            "the reply must be refused on ownership, got {error}"
+        );
+        assert!(
+            error
+                .to_string()
+                .contains("a custom program now runs this agent"),
+            "the refusal must name the custom program, got {error}"
+        );
+
+        // An unreadable configuration is not evidence of a custom program, and
+        // the refusal must say so rather than claim one runs the agent.
+        use std::os::unix::fs::PermissionsExt as _;
+        struct Restore<'a> {
+            path: &'a std::path::Path,
+            mode: u32,
+        }
+        impl Drop for Restore<'_> {
+            fn drop(&mut self) {
+                let _ =
+                    std::fs::set_permissions(self.path, std::fs::Permissions::from_mode(self.mode));
+            }
+        }
+        let config = crate::session::config::config_path().unwrap();
+        let mode = std::fs::metadata(&config).unwrap().permissions().mode();
+        std::fs::set_permissions(&config, std::fs::Permissions::from_mode(0o000)).unwrap();
+        let _restore = Restore {
+            path: &config,
+            mode,
+        };
+        if nix::unistd::geteuid().is_root() {
+            return;
+        }
+        let unreadable = respond(
+            &instance,
+            &retained,
+            AgentIntegrationResponse::Approval {
+                choice: IntegrationApprovalChoice::Allow,
+            },
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(
+            unreadable.contains("the configuration is unreadable")
+                && unreadable.contains("does not own its replies"),
+            "a config that cannot be read must not be called a custom program, got {unreadable}"
+        );
+    }
+
+    /// A configured wrapper is its own program, but a session detected as
+    /// another provider still reads that provider's report. Only the own-name
+    /// declaration collision voids the claim.
+    #[test]
+    #[serial_test::serial(hook_base)]
+    fn a_configured_wrapper_keeps_its_detected_provider_report() {
+        let (_base, _, _tmp) = crate::hooks::test_support::BaseGuard::ready();
+        let temp = tempfile::tempdir().unwrap();
+        let _reload = super::super::ReloadRegistryOnDrop;
+        let _env = crate::session::test_support::EnvGuard::set(&[
+            ("HOME", temp.path()),
+            ("XDG_CONFIG_HOME", temp.path()),
+            ("USERPROFILE", temp.path()),
+        ]);
+        let _featured = crate::session::test_support::EnvGuard::unset(&["AOE_FEATURED_INDEX_PATH"]);
+        let _rules = crate::tmux::status_rules::ProfileRegistryGuard::take("custom-alias");
+        let mut config = crate::session::Config::default();
+        config
+            .session
+            .agent_detect_as
+            .insert("my-acme".into(), "acme".into());
+        crate::tmux::status_rules::install_from_config("custom-alias", &config);
+        crate::session::update_config(|config| {
+            config
+                .session
+                .custom_agents
+                .insert("my-acme".into(), "/opt/wrappers/my-acme --serve".into());
+        })
+        .unwrap();
+        install_test_integration("acme.provider", "acme");
+        super::super::reload_registry();
+
+        let mut instance = Instance::new("custom-alias-report", "/tmp");
+        instance.tool = "my-acme".into();
+        instance.source_profile = "custom-alias".into();
+        instance.status = crate::session::Status::Running;
+        let dir = dir_guard::open_instance_dir(&instance.id).unwrap();
+        let mut report = snapshot();
+        report.instance_id = instance.id.clone();
+        dir_guard::write_atomic(
+            dir.as_fd(),
+            "integration-acme.provider.json",
+            &serde_json::to_vec(&report).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            owned_status(&instance, false),
+            Some((crate::session::Status::Waiting, true))
+        );
+    }
+
+    #[test]
+    #[serial_test::serial(hook_base)]
+    fn unreadable_config_keeps_an_alias_claim_owned() {
+        let temp = tempfile::tempdir().unwrap();
+        let _reload = super::super::ReloadRegistryOnDrop;
+        // The app-dir guard owns HOME/XDG for the whole test, so the malformed
+        // write and the assertion both target the isolated directory.
+        let _app = crate::session::test_support::isolate_app_dir_at(temp.path());
+        let _featured = crate::session::test_support::EnvGuard::unset(&["AOE_FEATURED_INDEX_PATH"]);
+        install_test_integration("acme.alias-unreadable", "alias-only");
+        super::super::reload_registry();
+        // A malformed global config makes every effective read fail.
+        std::fs::write(crate::session::config::config_path().unwrap(), "[session\n").unwrap();
+
+        let mut instance = Instance::new("unreadable-alias", "/tmp");
+        instance.tool = "own-name".into();
+        instance.detect_as = "alias-only".into();
+        instance.status = crate::session::Status::Running;
+
+        // The provider claim is real, so the session stays owned and Unknown
+        // instead of falling through to pane detection.
+        assert_eq!(
+            owned_status(&instance, false),
+            Some((crate::session::Status::Unknown, false))
+        );
+    }
+
+    /// A metadata-only change (`chmod`) must invalidate a warm entry for a
+    /// non-root user: content, mtime and size are unchanged, but a fresh read
+    /// now fails, so ownership must stop granting the cached answer.
+    #[test]
+    #[serial_test::serial]
+    fn a_metadata_only_config_change_invalidates_the_cache() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        /// Restore the original mode even if an assertion panics.
+        struct Restore<'a> {
+            path: &'a std::path::Path,
+            mode: u32,
+        }
+        impl Drop for Restore<'_> {
+            fn drop(&mut self) {
+                let _ =
+                    std::fs::set_permissions(self.path, std::fs::Permissions::from_mode(self.mode));
+            }
+        }
+
+        let temp = tempfile::tempdir().unwrap();
+        let _app = crate::session::test_support::isolate_app_dir_at(temp.path());
+        let path = crate::session::config::config_path().unwrap();
+        std::fs::write(&path, "[session]\ncustom_agents = { wrapped = \"true\" }\n").unwrap();
+        let mut instance = Instance::new("metadata-invalidation", "/tmp");
+        instance.tool = "wrapped".into();
+        instance.status = crate::session::Status::Running;
+        // Warm the cache: the readable config selects a custom command, which
+        // means a plugin must NOT claim the session.
+        assert_eq!(
+            custom_ownership(&instance, "wrapped"),
+            CustomOwnership::Custom
+        );
+
+        let mode = std::fs::metadata(&path).unwrap().permissions().mode();
+        let readable = stamp(&path);
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o000)).unwrap();
+        let _restore = Restore { path: &path, mode };
+        // The stamp must move on mode alone, which is what invalidates the entry.
+        let unreadable = stamp(&path);
+        assert_ne!(
+            readable, unreadable,
+            "the stamp must move on a metadata-only change"
+        );
+        let after = custom_ownership(&instance, "wrapped");
+
+        if nix::unistd::geteuid().is_root() {
+            // Root reads a mode-000 file, so the loaded value is legitimately
+            // unchanged; only the stamp guarantee applies here.
+            assert_eq!(after, CustomOwnership::Custom);
+            return;
+        }
+        assert_eq!(
+            after,
+            CustomOwnership::Unavailable,
+            "a metadata-only change must invalidate the warm entry, not preserve its grant"
+        );
+        drop(_restore);
+        // Restored readability resumes the same answer.
+        assert_eq!(
+            custom_ownership(&instance, "wrapped"),
+            CustomOwnership::Custom
+        );
+    }
+
+    /// A warm `Absent` profile override must not survive its directory becoming
+    /// unsearchable: the reader then rejects the path, so absence cannot share
+    /// the key that keeps the cached grant.
+    #[test]
+    #[serial_test::serial]
+    fn an_unreadable_profile_directory_invalidates_a_warm_absent_entry() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        struct Restore<'a> {
+            path: &'a std::path::Path,
+            mode: u32,
+        }
+        impl Drop for Restore<'_> {
+            fn drop(&mut self) {
+                let _ =
+                    std::fs::set_permissions(self.path, std::fs::Permissions::from_mode(self.mode));
+            }
+        }
+
+        let temp = tempfile::tempdir().unwrap();
+        let _app = crate::session::test_support::isolate_app_dir_at(temp.path());
+        let _featured = crate::session::test_support::EnvGuard::unset(&["AOE_FEATURED_INDEX_PATH"]);
+        let mut instance = Instance::new("unreadable-profile", "/tmp");
+        instance.tool = "wrapped".into();
+        instance.status = crate::session::Status::Running;
+        let profile_dir =
+            crate::session::get_profile_dir_path(&instance.effective_profile()).unwrap();
+        std::fs::create_dir_all(&profile_dir).unwrap();
+        let config = profile_dir.join("config.toml");
+        assert!(!config.exists());
+        // Warm the cache with no profile override present at all.
+        assert_eq!(
+            custom_ownership(&instance, "wrapped"),
+            CustomOwnership::Plugin
+        );
+
+        let mode = std::fs::metadata(&profile_dir)
+            .unwrap()
+            .permissions()
+            .mode();
+        let absent = stamp(&config);
+        std::fs::set_permissions(&profile_dir, std::fs::Permissions::from_mode(0o000)).unwrap();
+        let _restore = Restore {
+            path: &profile_dir,
+            mode,
+        };
+
+        // Root reads through the mode, so every assertion below is non-root only.
+        if nix::unistd::geteuid().is_root() {
+            return;
+        }
+        assert_ne!(
+            absent,
+            stamp(&config),
+            "a denied directory must not stamp as an absent file"
+        );
+        assert_eq!(
+            custom_ownership(&instance, "wrapped"),
+            CustomOwnership::Unavailable,
+            "the cached grant must not outlive an unreadable configuration"
+        );
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn bundled_fallback_gates_only_its_own_tool_name() {
+        let temp = tempfile::tempdir().unwrap();
+        let _reload = super::super::ReloadRegistryOnDrop;
+        let _env = crate::session::test_support::EnvGuard::set(&[
+            ("HOME", temp.path()),
+            ("XDG_CONFIG_HOME", temp.path()),
+            ("USERPROFILE", temp.path()),
+        ]);
+        let _featured = crate::session::test_support::EnvGuard::unset(&["AOE_FEATURED_INDEX_PATH"]);
+        let manifest = r#"
+id = "acme.name-contains-omp"
+name = "Name contains omp"
+version = "1.0.0"
+api_version = 20
+[[agent_integrations]]
+tool = "prompt-helper"
+command = "prompt-helper"
+
+[[agent_integrations]]
+tool = "omp"
+command = "acme-omp-shim"
+"#;
+        let dir = super::super::plugins_dir()
+            .unwrap()
+            .join("acme.name-contains-omp");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("aoe-plugin.toml"), manifest).unwrap();
+        crate::session::update_config(|config| {
+            config.plugins.insert(
+                "acme.name-contains-omp".into(),
+                crate::session::PluginConfig {
+                    grant: Some(crate::session::CapabilityGrant {
+                        manifest_hash: aoe_plugin_api::PluginManifest::hash_bytes(
+                            manifest.as_bytes(),
+                        ),
+                        capabilities: Vec::new(),
+                        granted_at: chrono::Utc::now(),
+                    }),
+                    ..Default::default()
+                },
+            );
+        })
+        .unwrap();
+        let registry = super::super::reload_registry();
+
+        // An unrelated tool whose name merely contains `omp` keeps its own declaration.
+        assert!(declared_agent(registry.clone(), "prompt-helper", std::iter::empty()).is_some());
+        let cataloged = catalog(&registry, std::iter::empty(), std::iter::empty());
+        assert!(
+            cataloged.iter().any(|agent| agent.tool == "prompt-helper"),
+            "catalog must keep a declaration whose name only contains the fallback name: {cataloged:?}"
+        );
+        // An API 20 `omp` entry cannot replace the bundled contract: it stays out
+        // of the catalog and declaration lookup keeps `omp` on the fallback.
+        assert!(
+            !cataloged.iter().any(|agent| agent.tool == "omp"),
+            "an API 20 omp entry must not replace the bundled contract: {cataloged:?}"
+        );
+        assert!(declared_agent(registry, "omp", std::iter::empty()).is_none());
     }
 
     #[test]

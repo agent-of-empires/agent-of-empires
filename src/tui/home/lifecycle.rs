@@ -106,6 +106,7 @@ impl HomeView {
             show_activity_age: resolved.session.show_activity_age,
             show_structured_badge: resolved.session.show_structured_badge,
             sidebar_position: resolved.session.sidebar_position,
+            narrow_layout: resolved.session.narrow_layout,
             agent_clipboard_forward: resolved.tmux.clipboard
                 != crate::session::config::TmuxSettingMode::Disabled,
             hyperlink_cells: crate::tui::hyperlink::SharedHyperlinks::default(),

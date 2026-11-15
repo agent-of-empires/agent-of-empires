@@ -8048,6 +8048,106 @@ async fn archive_persists_under_the_lifecycle_lock() -> anyhow::Result<()> {
     Ok(())
 }
 
+/// #5346: a stale client can archive a session after a peer completed its Trash. The locked
+/// canonical row refuses it and leaves the flags Trash preserves for restore; an active
+/// pinned row still archives and drops its pin.
+#[tokio::test]
+#[serial_test::serial]
+async fn archive_refuses_trashed_row_and_keeps_preserved_flags() -> anyhow::Result<()> {
+    use axum::body::to_bytes;
+
+    let _home = crate::session::test_support::isolate_app_dir();
+    let profile = "archive-trashed";
+    let mut trashed = make_test_instance();
+    trashed.source_profile = profile.to_string();
+    trashed.status = Status::Stopped;
+    trashed.pinned_at = Some(chrono::Utc::now());
+    trashed.trash();
+    let mut active = make_test_instance();
+    active.source_profile = profile.to_string();
+    active.status = Status::Stopped;
+    active.pinned_at = Some(chrono::Utc::now());
+    let mut pending = make_test_instance();
+    pending.source_profile = profile.to_string();
+    pending.status = Status::Stopped;
+    pending.try_acquire_lifecycle_reservation(
+        crate::session::LifecycleOperation::Trash,
+        Instance::LIFECYCLE_RESERVATION_TTL,
+        chrono::Utc::now() - Instance::LIFECYCLE_RESERVATION_TTL - chrono::Duration::seconds(1),
+    )?;
+    pending.trash();
+    assert!(pending.has_pending_trash());
+    let (trashed_id, active_id, pending_id) =
+        (trashed.id.clone(), active.id.clone(), pending.id.clone());
+    let state = crate::server::test_support::build_test_app_state(vec![
+        trashed.clone(),
+        active.clone(),
+        pending.clone(),
+    ]);
+    let storage = Storage::new(profile, state.file_watch.clone())?;
+    storage.update(|rows, _| {
+        rows.push(trashed);
+        rows.push(active);
+        rows.push(pending);
+        Ok(())
+    })?;
+    *state.canonical_metadata.write().await =
+        crate::server::reload::load_all_profiles(&state.file_watch)?.metadata;
+    state.runtime.publish(&state).await?;
+    let set_archived = |id: String, archived: bool| {
+        let state = state.clone();
+        async move {
+            update_session_archive(
+                State(state),
+                Path(id),
+                Ok(Json(UpdateArchiveBody {
+                    archived,
+                    kill_pane: false,
+                })),
+            )
+            .await
+            .into_response()
+        }
+    };
+    let stored = |id: &str| -> anyhow::Result<Instance> {
+        Ok(storage
+            .load()?
+            .into_iter()
+            .find(|row| row.id == id)
+            .expect("the stored row"))
+    };
+
+    for archived in [true, false] {
+        let response = set_archived(trashed_id.clone(), archived).await;
+        assert_eq!(
+            response.status(),
+            StatusCode::CONFLICT,
+            "archived={archived}"
+        );
+        let body: serde_json::Value =
+            serde_json::from_slice(&to_bytes(response.into_body(), 1024).await?)?;
+        assert_eq!(body["error"], "session_trashed", "archived={archived}");
+        let row = stored(&trashed_id)?;
+        assert!(row.is_trashed());
+        assert!(!row.is_archived());
+        assert!(row.pinned_at.is_some());
+    }
+
+    let response = set_archived(pending_id.clone(), true).await;
+    assert_eq!(response.status(), StatusCode::CONFLICT);
+    let body: serde_json::Value =
+        serde_json::from_slice(&to_bytes(response.into_body(), 1024).await?)?;
+    assert_eq!(body["error"], "trash_incomplete");
+    assert!(!stored(&pending_id)?.is_archived());
+
+    let response = set_archived(active_id.clone(), true).await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let row = stored(&active_id)?;
+    assert!(row.is_archived());
+    assert!(row.pinned_at.is_none());
+    Ok(())
+}
+
 /// #4116: a group archive reaches the runtime as one archive per member, so the ordering
 /// invariant the TUI's sorted multi-lock test pinned has no multi-lock holder left to speak
 /// of. What replaced it: each member's stamp is gated by that member's own lifecycle lock,
@@ -14737,4 +14837,158 @@ async fn project_sessions_omits_context_resume_for_archived_and_trashed_rows() {
     assert!(resume("live").is_some());
     assert_eq!(resume("archived"), None);
     assert_eq!(resume("trashed"), None);
+}
+
+/// The list says how many messages each daemon queue holds and what it waits on, as a prompt
+/// sent now would be told, so a sidebar row shows both without the session being opened.
+#[tokio::test]
+async fn the_list_projects_each_queues_count_and_what_it_waits_on() {
+    use crate::acp::dispatch::QueueReason;
+    use crate::acp::Event;
+    use crate::daemon::QueuedPromptEntry;
+
+    let entry = |seq: u64, text: &str| QueuedPromptEntry {
+        id: format!("prompt-{seq}"),
+        seq,
+        text: text.into(),
+        attachments: Vec::new(),
+        created_at: "2026-01-01T00:00:00Z".into(),
+        origin_device: None,
+        origin_plugin: None,
+    };
+    // (id, queued texts, worker running, turn running, steerable, expected reason).
+    // "parked" has no worker but a rate-limit park, so a prompt sent now would go out.
+    // "resuming" has its worker mid-respawn, which a prompt counts as running.
+    let cases: [(&str, &[&str], bool, bool, bool, Option<QueueReason>); 7] = [
+        (
+            "busy",
+            &["next"],
+            true,
+            true,
+            false,
+            Some(QueueReason::TurnActive),
+        ),
+        (
+            "solo-first",
+            &["/compact", "then this"],
+            true,
+            true,
+            true,
+            Some(QueueReason::TurnActive),
+        ),
+        ("steerable", &["next"], true, true, true, None),
+        (
+            "no-worker",
+            &["next"],
+            false,
+            false,
+            false,
+            Some(QueueReason::WorkerDown),
+        ),
+        ("empty", &[], true, true, false, None),
+        ("parked", &["next"], false, false, false, None),
+        (
+            "resuming",
+            &["next"],
+            true,
+            true,
+            false,
+            Some(QueueReason::TurnActive),
+        ),
+    ];
+    let rows: Vec<Instance> = cases
+        .iter()
+        .map(|(id, texts, ..)| {
+            let mut inst = Instance::new(id, "/tmp/queued");
+            inst.id = (*id).into();
+            inst.view = crate::session::View::Structured;
+            inst.tool = "claude".into();
+            inst.agent_name = Some("claude".into());
+            inst.queued_prompts = texts
+                .iter()
+                .zip(1..)
+                .map(|(t, seq)| entry(seq, t))
+                .collect();
+            inst
+        })
+        .collect();
+    let state = crate::server::test_support::build_test_app_state(rows);
+    for (id, _, running, turn, steerable, _) in &cases {
+        if *running {
+            state.acp_supervisor.test_insert_worker(id).await;
+        }
+        if *id == "resuming" {
+            state.acp_supervisor.test_begin_respawn(id).await;
+        }
+        let capabilities = Event::PromptCapabilities {
+            image: false,
+            audio: false,
+            embedded_context: false,
+            load_session: None,
+            steering: *steerable,
+        };
+        state.acp_event_store.record(id, 1, &capabilities).unwrap();
+        if *turn {
+            let prompt = Event::UserPromptSent {
+                text: "working".into(),
+                attachments: Vec::new(),
+                merged_prompt_ids: Vec::new(),
+                prompt_id: None,
+                synthesized: false,
+                origin_plugin: None,
+            };
+            state.acp_event_store.record(id, 2, &prompt).unwrap();
+        }
+        if *id == "parked" {
+            let limit = Event::RateLimit {
+                info: crate::acp::state::RateLimitInfo {
+                    status: "limited".into(),
+                    resets_at: Some(chrono::Utc::now() + chrono::Duration::hours(1)),
+                    kind: "usage".into(),
+                },
+            };
+            let stopped = Event::Stopped {
+                reason: "rate_limited".into(),
+            };
+            state.acp_event_store.record(id, 2, &limit).unwrap();
+            state.acp_event_store.record(id, 3, &stopped).unwrap();
+        }
+        // The fold is the one seeded here, so a reason below is the projection's own.
+        let fold = state.session_service.fold_control_state(id).await;
+        assert_eq!(
+            (fold.turn_active, fold.steering),
+            (*turn, *steerable),
+            "{id}"
+        );
+    }
+
+    let response = project_sessions(&state).await;
+    assert!(response[5].rate_limit.is_some(), "the park is projected");
+    assert_eq!(
+        response[6].acp_worker_state,
+        crate::daemon::AcpWorkerState::Resuming
+    );
+    for ((id, texts, .., expected), row) in cases.iter().zip(&response) {
+        assert_eq!(row.id, *id);
+        assert_eq!(row.queued_count, texts.len(), "{id}");
+        assert_eq!(row.queue_reason, *expected, "{id}");
+    }
+    let json = serde_json::to_value(&response[4]).unwrap();
+    assert!(json.get("queued_count").is_none() && json.get("queue_reason").is_none());
+    let json = serde_json::to_value(&response[0]).unwrap();
+    assert_eq!(
+        (json["queued_count"].as_u64(), json["queue_reason"].as_str()),
+        (Some(1), Some("turn_active"))
+    );
+    // A daemon client decodes what the list sends, absent fields included.
+    for row in &response {
+        let decoded: crate::daemon::SessionResponse =
+            serde_json::from_value(serde_json::to_value(row).unwrap()).unwrap();
+        assert_eq!(
+            (decoded.queued_count, decoded.queue_reason),
+            (row.queued_count, row.queue_reason),
+            "{}",
+            row.id
+        );
+    }
 }

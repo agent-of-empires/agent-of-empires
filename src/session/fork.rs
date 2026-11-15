@@ -254,7 +254,7 @@ pub(crate) fn apply_terminal_fork_seed(
     if let Some(parent_agent) = unattributed_parent_agent {
         let launched = crate::session::Instance::execution_agent_for(
             &instance.tool,
-            instance.get_tool_command(),
+            &instance.get_tool_command(),
             session,
         )?;
         ensure_child_matches_parent_agent(Some(parent_agent), launched.name)

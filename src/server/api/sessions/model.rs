@@ -146,6 +146,9 @@ pub(super) fn session_response_from_instance_with_plan(
         rate_limit: None,
         rate_limit_auto_resume: None,
         rate_limit_failover_to: None,
+        queued_count: inst.queued_prompts.len(),
+        // Overlaid in list_sessions; single-session responses omit it.
+        queue_reason: None,
         // Built-in ACP capability resolves here from a process-wide
         // registry (no IO). Custom agents depend on profile config, which
         // the list and create handlers overlay without a per-row read.

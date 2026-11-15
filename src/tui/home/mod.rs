@@ -376,6 +376,8 @@ pub struct HomeView {
     pub(super) live_takeover: Option<live_send::TakenLive>,
     pub(super) sidebar_collapsed: bool,
     pub(super) sidebar_position: crate::session::config::SidebarPosition,
+
+    pub(super) narrow_layout: crate::session::config::NarrowLayout,
     pub(super) passive_pane_synced: std::collections::HashMap<String, PassiveSynced>,
     pub(super) passive_pane_declined:
         std::collections::HashMap<String, ((u16, u16), std::time::Instant)>,
