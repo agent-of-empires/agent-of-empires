@@ -15,26 +15,19 @@ impl HomeView {
         self.save_list_width();
     }
 
-    /// The narrow layout to render now. `OnePane` swaps the list for the preview in live
-    /// mode, so a Session whose preview cannot go live keeps the stack instead: a Structured
-    /// view Session has no live mode there, and a trashed Session shows a retained
-    /// transcript. Hiding either would leave no way back to it. A System Health takeover
-    /// already replaces the preview, so it can use the full screen.
-    pub(super) fn narrow_layout_for_render(&self) -> crate::session::config::NarrowLayout {
-        use crate::session::config::NarrowLayout;
-        let no_live_pane = self.retained_reader_focused()
-            || self
-                .selected_session
-                .as_deref()
-                .is_some_and(|id| self.live_key(id).is_none());
-        if matches!(self.narrow_layout, NarrowLayout::OnePane)
-            && no_live_pane
-            && !self.system_health_open
-        {
-            NarrowLayout::Stacked
-        } else {
-            self.narrow_layout
-        }
+    /// Whether the preview pane owns the keyboard right now: live-send is relaying keys, a
+    /// System Health takeover is showing, a Session's retained transcript is being read, or
+    /// the embedded structured view is interactive. `one_pane` gives this pane the whole
+    /// narrow screen; the list keeps it otherwise. A Structured view Session has no
+    /// live-send, so its transcript counts here only while it is interactive: the stack
+    /// would hide the list, and hiding the pane instead would leave no way into it.
+    pub(super) fn preview_pane_active(&self) -> bool {
+        self.live_send.is_some()
+            || self.system_health_open
+            || self.retained_reader_focused()
+            || self.structured_preview.as_ref().is_some_and(|view| {
+                view.is_active() && Some(view.session_id()) == self.selected_session.as_deref()
+            })
     }
 
     pub fn toggle_sidebar_collapsed(&mut self) {

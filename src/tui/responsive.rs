@@ -78,7 +78,8 @@ pub enum NarrowArrangement {
 
 /// Arrange a narrow (below [`STACKED_BREAKPOINT`]) home view for `layout`.
 /// `preview_active` says the preview is the pane being worked in: live-send is
-/// relaying keys, or a System Health takeover is showing.
+/// relaying keys, a transcript is being read, or a System Health takeover is
+/// showing.
 pub fn narrow_arrangement(
     layout: NarrowLayout,
     main_height: u16,

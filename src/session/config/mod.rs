@@ -2254,11 +2254,12 @@ pub enum NarrowLayout {
     /// List above the preview, splitting the height (the historical behavior).
     #[default]
     Stacked,
-    /// One pane at a time: the list, and the preview while live-send is relaying
-    /// keys.
+    /// One pane at a time: the list, and the preview while it is the pane being
+    /// worked in (live-send, an interactive structured transcript, a retained
+    /// trashed transcript, or System Health).
     OnePane,
-    /// List above the preview, with the list squeezed to its minimum while
-    /// live-send is relaying keys so the preview gets the rest.
+    /// List above the preview, with the list squeezed to its minimum while the
+    /// preview is the pane being worked in, so it gets the rest of the height.
     BigPreview,
 }
 

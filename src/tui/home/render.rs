@@ -1220,7 +1220,7 @@ impl HomeView {
         self.main_area_height = content_area.height;
         // `one_pane` already gives the narrow screen to a single pane, so a collapsed
         // sidebar there would only shrink it to a three-column strip plus preview.
-        let narrow_layout = self.narrow_layout_for_render();
+        let narrow_layout = self.narrow_layout;
         let single_pane_narrow = available_width < responsive::STACKED_BREAKPOINT
             && matches!(narrow_layout, NarrowLayout::OnePane);
         // A collapsed strip leaves enough preview space even on narrow terminals.
@@ -1244,7 +1244,7 @@ impl HomeView {
                 narrow_layout,
                 content_area.height,
                 self.list_height,
-                self.live_send.is_some() || self.system_health_open,
+                self.preview_pane_active(),
             ) {
                 responsive::NarrowArrangement::ListOnly => {
                     self.hide_preview();

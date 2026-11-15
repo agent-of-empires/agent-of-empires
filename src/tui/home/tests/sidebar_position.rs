@@ -253,11 +253,11 @@ fn narrow_one_pane_shows_the_system_health_takeover() {
     assert_eq!(env.view.list_area, Rect::default());
 }
 
-/// A Structured view Session's transcript has no live mode, so `one_pane` keeps the
-/// stack rather than hiding the transcript with no way back to it.
+/// A Structured view Session has no live mode, so its interactive transcript is the signal
+/// that swaps `one_pane` over to the preview, the same way live-send is for a terminal.
 #[test]
 #[serial]
-fn narrow_one_pane_keeps_the_stack_for_a_structured_session() {
+fn narrow_one_pane_swaps_to_an_interactive_structured_session() {
     let mut inst = Instance::new("acp", "/tmp/acp");
     inst.view = crate::session::View::Structured;
     let mut env = seeded_env(test_home(), &[inst.clone()], true);
@@ -266,18 +266,29 @@ fn narrow_one_pane_keeps_the_stack_for_a_structured_session() {
     env.view.narrow_layout = NarrowLayout::OnePane;
     let width = 60;
     render(&mut env.view, width);
-    assert_eq!(env.view.list_area.x, 4);
     assert_eq!(env.view.list_area.width, width);
     assert_eq!(
-        env.view.list_area.bottom(),
-        env.view.preview_outer_area.y,
-        "the transcript stays on screen"
+        env.view.preview_outer_area,
+        Rect::default(),
+        "a read-only transcript does not take the screen"
     );
-    assert_eq!(env.view.preview_outer_area.width, width);
+
+    let mut structured = crate::tui::structured_view::embedded::EmbeddedView::for_test(&inst.id);
+    structured.activate();
+    env.view.structured_preview = Some(structured);
+    render(&mut env.view, width);
+    let height = env.view.main_area_height;
+    assert_eq!(env.view.preview_outer_area, Rect::new(4, 2, width, height));
+    assert_eq!(env.view.list_area, Rect::default());
+
+    env.view.structured_preview.as_mut().unwrap().deactivate();
+    render(&mut env.view, width);
+    assert_eq!(env.view.list_area.width, width);
+    assert_eq!(env.view.preview_outer_area, Rect::default());
 }
 
-/// Enter on a trashed Session opens its retained transcript in the preview, so `one_pane`
-/// keeps the stack rather than hiding the pane the reader just asked for.
+/// Enter on a trashed Session opens its retained transcript, which takes the `one_pane`
+/// screen until Esc hands it back to the list.
 #[test]
 #[serial]
 fn narrow_one_pane_keeps_the_stack_for_a_retained_reader() {
@@ -302,13 +313,15 @@ fn narrow_one_pane_keeps_the_stack_for_a_retained_reader() {
     env.view.activate_selected_session();
     assert!(env.view.retained_reader_focused());
     render(&mut env.view, width);
+    let height = env.view.main_area_height;
+    assert_eq!(env.view.preview_outer_area, Rect::new(4, 2, width, height));
+    assert_eq!(env.view.list_area, Rect::default());
+
+    env.view.handle_key(key(KeyCode::Esc), None);
+    assert!(!env.view.retained_reader_focused());
+    render(&mut env.view, width);
     assert_eq!(env.view.list_area.width, width);
-    assert_eq!(
-        env.view.list_area.bottom(),
-        env.view.preview_outer_area.y,
-        "the retained transcript stays on screen"
-    );
-    assert_eq!(env.view.preview_outer_area.width, width);
+    assert_eq!(env.view.preview_outer_area, Rect::default());
 }
 
 /// `big_preview` squeezes the stacked list to its minimum while live mode relays keys.
