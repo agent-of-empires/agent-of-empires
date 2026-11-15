@@ -381,9 +381,12 @@ fn session_meta_set(
 /// Adopt a session id the declaring plugin captured for one of its rows.
 ///
 /// The plugin owns the provider's store, so it reports what it found; the host
-/// keeps the write on the same guarded path as every other capture, which
-/// refuses a sid another row owns, honours capture excludes and the launch pin,
-/// and records the conversation binding alongside the id.
+/// keeps the write on the capture path the pollers use, which refuses a sid
+/// another row owns, honours capture excludes and the launch pin.
+///
+/// The report names no execution and no launch, so the id is stored unscoped
+/// and a late report for an earlier launch is applied to whatever the row holds
+/// now. See `docs/plugin-api.md` for the contract this places on a worker.
 fn session_capture_set(
     state: &HostApiState,
     ctx: &PluginRpcContext,
