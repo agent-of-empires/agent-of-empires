@@ -1,5 +1,6 @@
 import { useCallback, useEffect, useMemo, useState } from "react";
 
+import { confirmFileEditPanes } from "./fileEditGuard";
 import { useLatestRef } from "../hooks/useLatestRef";
 import { getWebSettingsSnapshot, useWebSettings } from "../hooks/useWebSettings";
 import { safeGetItem, safeSetItem } from "./safeStorage";
@@ -81,6 +82,34 @@ export function dockOf(layout: DockLayout, tabId: TabId): DockLocation | null {
 
 export function isDockCollapsed(layout: DockLayout, dock: DockLocation): boolean {
   return layout.collapsed[dock] === true;
+}
+
+/** A dock's groups reduced to what's actually shown: each surviving group keeps its persisted index (so a drop
+ *  addresses the right group) and a valid active tab. Groups with no available tab are not rendered. */
+export function renderedGroups(
+  layout: DockLayout,
+  dock: DockLocation,
+  tabAvailable: (id: TabId) => boolean,
+): { group: number; tabs: TabId[]; active: TabId | null }[] {
+  return layout[dock]
+    .map((g, group) => {
+      const tabs = g.tabs.filter(tabAvailable);
+      const active = g.active && tabs.includes(g.active) ? g.active : (tabs[0] ?? null);
+      return { group, tabs, active };
+    })
+    .filter((g) => g.tabs.length > 0);
+}
+
+/** Tabs shown before a change that are hidden or remounted after it: Dock instances are keyed by dock and group. */
+function leftTabs(before: DockLayout, after: DockLayout, tabAvailable: (id: TabId) => boolean): TabId[] {
+  const shown = (layout: DockLayout) =>
+    DOCKS.flatMap((dock) =>
+      isDockCollapsed(layout, dock)
+        ? []
+        : renderedGroups(layout, dock, tabAvailable).map((g) => ({ id: g.active, at: `${dock}:${g.group}` })),
+    );
+  const next = new Set(shown(after).map(({ id, at }) => `${at}:${id}`));
+  return shown(before).flatMap(({ id, at }) => (id && !next.has(`${at}:${id}`) ? [id] : []));
 }
 
 function clone(layout: DockLayout): DockLayout {
@@ -360,7 +389,8 @@ export interface PaneLayoutApi {
   /** No-op if already open anywhere. */
   openTab: (tabId: TabId, dock: DockLocation) => void;
   addTerminal: (dock: DockLocation) => void;
-  closeTab: (tabId: TabId) => void;
+  /** Asks first, so an irreversible `before` (a shell kill) never runs for a declined close; closes once it resolves true. */
+  closeTab: (tabId: TabId, before?: () => Promise<boolean>) => void;
   activateTab: (dock: DockLocation, tabId: TabId) => void;
   moveTab: (tabId: TabId, toDock: DockLocation) => void;
   placeTab: (tabId: TabId, target: PlaceTarget) => void;
@@ -420,7 +450,11 @@ function restoreDiff(stored: DockLayout, template: DockLayout, terminal: boolean
 }
 
 /** `outsideRepository` drops Diff from the seed only, so a Diff tab the user opened stays; `null` (not yet known) seeds no Diff. */
-export function usePaneLayout(sessionId: string | null, outsideRepository: boolean | null = false): PaneLayoutApi {
+export function usePaneLayout(
+  sessionId: string | null,
+  outsideRepository: boolean | null = false,
+  tabAvailable: (id: TabId) => boolean = () => true,
+): PaneLayoutApi {
   const [store, setStore] = useState(loadStore);
   const { settings } = useWebSettings();
   const { autoOpenDiffPane, autoOpenTerminalPane } = settings;
@@ -491,38 +525,62 @@ export function usePaneLayout(sessionId: string | null, outsideRepository: boole
   }, [outsideRepository, sessionId, isProvisional]);
   /* eslint-enable react-you-might-not-need-an-effect/no-event-handler, react-you-might-not-need-an-effect/no-derived-state, react-you-might-not-need-an-effect/no-chain-state-updates */
 
+  const shownRef = useLatestRef({ layout, tabAvailable });
+  const confirmLeaving = useCallback(
+    (fn: (l: DockLayout) => DockLayout) => {
+      const { layout: current, tabAvailable: available } = shownRef.current;
+      return confirmFileEditPanes(leftTabs(current, fn(current), available));
+    },
+    [shownRef],
+  );
+  const guardedMutate = useCallback(
+    (fn: (l: DockLayout) => DockLayout) => {
+      if (confirmLeaving(fn)) mutate(fn);
+    },
+    [mutate, confirmLeaving],
+  );
   const openTab = useCallback(
-    (tabId: TabId, dock: DockLocation) => mutate((l) => openOrRevealTab(l, tabId, dock)),
-    [mutate],
+    (tabId: TabId, dock: DockLocation) => guardedMutate((l) => openOrRevealTab(l, tabId, dock)),
+    [guardedMutate],
   );
   const addTerminalCb = useCallback(
-    (dock: DockLocation) => mutate((l) => revealDock(addTerminal(l, dock).layout, dock)),
-    [mutate],
+    (dock: DockLocation) => guardedMutate((l) => revealDock(addTerminal(l, dock).layout, dock)),
+    [guardedMutate],
   );
-  const closeTab = useCallback((tabId: TabId) => mutate((l) => removeTab(l, tabId)), [mutate]);
+  const closeTab = useCallback(
+    (tabId: TabId, before?: () => Promise<boolean>) => {
+      const close = (l: DockLayout) => removeTab(l, tabId);
+      if (!before) return guardedMutate(close);
+      if (!confirmLeaving(close)) return;
+      void before().then((ok) => {
+        if (ok) mutate(close);
+      });
+    },
+    [mutate, guardedMutate, confirmLeaving],
+  );
   const activateTab = useCallback(
-    (dock: DockLocation, tabId: TabId) => mutate((l) => activateOrRevealTab(l, dock, tabId)),
-    [mutate],
+    (dock: DockLocation, tabId: TabId) => guardedMutate((l) => activateOrRevealTab(l, dock, tabId)),
+    [guardedMutate],
   );
   const moveTabCb = useCallback(
     (tabId: TabId, toDock: DockLocation) =>
-      mutate((l) => {
+      guardedMutate((l) => {
         const next = moveTab(l, tabId, toDock);
         return dockOf(next, tabId) === toDock ? revealDock(next, toDock) : next;
       }),
-    [mutate],
+    [guardedMutate],
   );
   const placeTabCb = useCallback(
     (tabId: TabId, target: PlaceTarget) =>
-      mutate((l) => {
+      guardedMutate((l) => {
         const next = placeTab(l, tabId, target);
         return dockOf(next, tabId) === target.dock ? revealDock(next, target.dock) : next;
       }),
-    [mutate],
+    [guardedMutate],
   );
   const toggleKind = useCallback(
     (kind: "diff" | "terminal" | "agents" | "files", defaultDock: DockLocation) =>
-      mutate((l) => {
+      guardedMutate((l) => {
         // Single-instance panes toggle their tab; terminals toggle the whole group.
         if (kind === "diff" || kind === "agents" || kind === "files") {
           const at = findTab(l, kind);
@@ -536,24 +594,24 @@ export function usePaneLayout(sessionId: string | null, outsideRepository: boole
         const first = terminals[0]!;
         return activateOrRevealTab(l, first.dock, first.id);
       }),
-    [mutate],
+    [guardedMutate],
   );
   const togglePlugin = useCallback(
     (id: TabId, defaultDock: DockLocation) =>
-      mutate((l) => {
+      guardedMutate((l) => {
         const at = findTab(l, id);
         if (at) return isDockCollapsed(l, at.dock) ? openOrRevealTab(l, id, defaultDock) : removeTab(l, id);
         return openOrRevealTab(l, id, defaultDock);
       }),
-    [mutate],
+    [guardedMutate],
   );
   const syncPlugins = useCallback(
     (available: { id: TabId; defaultDock: DockLocation }[]) => mutate((l) => syncPluginTabs(l, available)),
     [mutate],
   );
   const setDockCollapsedCb = useCallback(
-    (dock: DockLocation, collapsed: boolean) => mutate((l) => setDockCollapsed(l, dock, collapsed)),
-    [mutate],
+    (dock: DockLocation, collapsed: boolean) => guardedMutate((l) => setDockCollapsed(l, dock, collapsed)),
+    [guardedMutate],
   );
 
   return {

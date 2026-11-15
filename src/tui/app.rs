@@ -785,9 +785,12 @@ impl App {
         let mut last_telemetry_snapshot = std::time::Instant::now();
 
         loop {
+            // Paint the redraw now: clearing alone leaves a blank screen until the
+            // next event arrives, which never comes while the loop is parked.
             if self.needs_redraw {
                 super::terminal_output::request_redraw();
                 self.needs_redraw = false;
+                self.draw(terminal)?;
             }
 
             let post_key_deadline = last_live_key_at.map(|t| t + POST_KEY_WAKE_DELAY);

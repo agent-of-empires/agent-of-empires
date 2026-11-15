@@ -1,7 +1,9 @@
 //! Plugin registry, installation, contributions, discovery, and worker host.
 
+mod agent_definition;
 pub mod agent_integration;
 pub mod auto_update;
+pub(crate) mod bundled_agents;
 pub mod changelog;
 pub mod contributions;
 pub mod discover;

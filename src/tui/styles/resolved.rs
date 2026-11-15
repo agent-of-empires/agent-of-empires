@@ -251,8 +251,6 @@ fn web_projection(theme: &Theme, appearance: ThemeAppearance) -> CssVarProjectio
     );
     css.insert("--color-accent-700".into(), hex(mix(secondary, BLACK, 0.3)));
 
-    // Text ramp. text-bright is the most readable; dim is the WCAG-AA
-    // floor for descriptive copy (validated by the issue #1105 work).
     // Body text sits on surface-900, -850, the modal surface-800, the code-block
     // surface-950 and the startup error banner's tint.
     let text_surfaces = [
@@ -271,17 +269,14 @@ fn web_projection(theme: &Theme, appearance: ThemeAppearance) -> CssVarProjectio
     css.insert("--color-text-primary".into(), hex(theme.text));
     css.insert("--color-text-secondary".into(), lifted_hint.clone());
     css.insert("--color-text-muted".into(), lifted_hint);
-    css.insert("--color-text-dim".into(), hex(theme.dimmed));
-    // Dimmed lifted for small text that cannot use the raw slot.
-    css.insert(
-        "--color-text-subtle".into(),
-        hex(lift_until(
-            theme.dimmed,
-            bg,
-            &text_surfaces,
-            TEXT_CONTRAST_RATIO,
-        )),
-    );
+    let lifted_dimmed = hex(lift_until(
+        theme.dimmed,
+        bg,
+        &text_surfaces,
+        TEXT_CONTRAST_RATIO,
+    ));
+    css.insert("--color-text-dim".into(), lifted_dimmed.clone());
+    css.insert("--color-text-subtle".into(), lifted_dimmed);
     css.insert("--color-text-bright".into(), hex(theme.title));
 
     // Status colors map directly onto the TUI's semantic fields.
@@ -706,8 +701,11 @@ mod tests {
                     "{name}: {fg} on {label} is {ratio:.2}, below body-text AA"
                 );
             }
-            // Secondary and muted body text, on every body-text surface.
-            for fg in ["--color-text-secondary", "--color-text-muted"] {
+            for fg in [
+                "--color-text-secondary",
+                "--color-text-muted",
+                "--color-text-dim",
+            ] {
                 for (surface, label) in [
                     (var("--color-surface-900"), "surface-900"),
                     (var("--color-surface-850"), "surface-850"),

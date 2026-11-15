@@ -43,7 +43,7 @@ describe("useSandboxImageRowStatus", () => {
     });
     await settle();
     expect(fetchStatus.mock.calls).toEqual([["sb:1", { fresh: true }]]);
-    expect(result.current).toBe("Up to date");
+    expect(result.current?.label).toBe("Up to date");
 
     fetchStatus.mockResolvedValue({ error: "unknown_image" });
     rerender({ image: "sb:2" });
@@ -54,7 +54,7 @@ describe("useSandboxImageRowStatus", () => {
     expect(fetchStatus).toHaveBeenCalledTimes(1);
     await act(async () => vi.advanceTimersByTime(1));
     expect(fetchStatus.mock.calls.slice(1)).toEqual([["sb:22", { fresh: false }]]);
-    expect(result.current).toBe("Update status unknown");
+    expect(result.current?.label).toBe("Update status unknown");
   });
 
   it("asks for the default image when none is set, and not at all while disabled", async () => {
@@ -66,7 +66,7 @@ describe("useSandboxImageRowStatus", () => {
     rerender({ enabled: true });
     await settle();
     expect(fetchStatus.mock.calls).toEqual([[undefined, { fresh: true }]]);
-    expect(result.current).toBe("Up to date");
+    expect(result.current?.label).toBe("Up to date");
   });
 
   it("waits for typing to stop while the first check is pending, and drops that late answer", async () => {
@@ -81,9 +81,9 @@ describe("useSandboxImageRowStatus", () => {
     await act(async () => vi.advanceTimersByTime(IMAGE_RECHECK_MS));
     // Nothing was answered yet, so the one re-check still skips the cache.
     expect(fetchStatus.mock.calls.slice(1)).toEqual([["sb:222", { fresh: true }]]);
-    expect(result.current).toBe("Up to date");
+    expect(result.current?.label).toBe("Up to date");
     // The first image's answer lands last and changes nothing.
     await act(async () => answerFirst(status({ state: "available", remote_digest: "sha256:b" })));
-    expect(result.current).toBe("Up to date");
+    expect(result.current?.label).toBe("Up to date");
   });
 });

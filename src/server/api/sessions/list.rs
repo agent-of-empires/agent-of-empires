@@ -303,6 +303,24 @@ pub(crate) async fn project_sessions(state: &Arc<AppState>) -> Vec<SessionRespon
         "list_sessions resolved session config once per unique profile/project pair"
     );
 
+    // Sessions whose daemon queue holds messages, with what decides why it waits.
+    let queue_probes: Vec<(usize, String, String, String, bool)> = scoped_instances
+        .iter()
+        .enumerate()
+        .filter(|(_, inst)| inst.is_structured() && !inst.is_archived() && !inst.is_trashed())
+        .filter_map(|(i, inst)| {
+            let first = inst.queued_prompts.first()?;
+            let agent_key = inst.agent_name.clone().unwrap_or_else(|| inst.tool.clone());
+            Some((
+                i,
+                inst.id.clone(),
+                first.text.clone(),
+                agent_key,
+                inst.is_idle_dormant(),
+            ))
+        })
+        .collect();
+
     // The park probe touches config files and SQLite, so it runs with the
     // session registry unlocked rather than holding writers behind it.
     drop(scoped_instances);
@@ -360,6 +378,20 @@ pub(crate) async fn project_sessions(state: &Arc<AppState>) -> Vec<SessionRespon
             sessions[i].rate_limit = park;
             sessions[i].rate_limit_failover_to = failover_to;
         }
+    }
+
+    // After the park overlay, which is one of its inputs, and unlocked, because the fold
+    // takes the registry lock itself.
+    for (i, id, first, agent_key, idle_dormant) in queue_probes {
+        use crate::daemon::AcpWorkerState::{Resuming, Running};
+        let worker = crate::acp::dispatch::WorkerLiveness {
+            running: matches!(sessions[i].acp_worker_state, Resuming | Running),
+            idle_dormant,
+            rate_limit_parked: sessions[i].rate_limit.is_some(),
+        };
+        let control = state.session_service.fold_control_state(&id).await;
+        let solo = crate::acp::agent_profiles::resolve(&agent_key).is_solo_command(&first);
+        sessions[i].queue_reason = crate::acp::dispatch::queue_hold(&control, worker, solo);
     }
 
     // Resolve remote owners with a permanent cache on AppState
@@ -808,6 +840,8 @@ mod workspace_ordering_tests {
             rate_limit: None,
             rate_limit_auto_resume: None,
             rate_limit_failover_to: None,
+            queued_count: 0,
+            queue_reason: None,
             acp_capable: false,
             acp_session_id: None,
             import_pending: false,

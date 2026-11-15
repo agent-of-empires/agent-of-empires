@@ -22,6 +22,11 @@ const UNIT_PREFIX: &str = "aoe-session-";
 pub(crate) const INJECTED_VAR: &str = "INVOCATION_ID";
 /// systemd's limit for a unit name.
 const UNIT_NAME_MAX: usize = 255;
+/// How long a stopped scope may keep draining its last processes.
+#[cfg(not(test))]
+const SCOPE_DRAIN_WINDOW: Duration = Duration::from_secs(5);
+#[cfg(test)]
+const SCOPE_DRAIN_WINDOW: Duration = Duration::from_millis(500);
 
 /// Escapes every character outside `[A-Za-z0-9:.]` as `_xx` per byte. `-`
 /// and `_` are escaped too, so the encoding is injective, never nests a slice
@@ -826,7 +831,14 @@ pub(crate) fn retire_scope(
     command.args(["--user", "stop", unit]);
     let output = crate::process::run_with_timeout(&mut command, Duration::from_secs(3))?
         .ok_or_else(|| anyhow::anyhow!("scope stop timed out"))?;
-    let proven_empty = scope_stopped(session_id, scope)?;
+    let mut proven_empty = scope_stopped(session_id, scope)?;
+    if output.status.success() {
+        let deadline = std::time::Instant::now() + SCOPE_DRAIN_WINDOW;
+        while !proven_empty && std::time::Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(50));
+            proven_empty = scope_stopped(session_id, scope)?;
+        }
+    }
     anyhow::ensure!(
         output.status.success() || proven_empty,
         "scope stop rejected: {}",
@@ -1060,6 +1072,15 @@ case "$2" in
       collected) printf 'LoadState=not-found\nActiveState=inactive\nControlGroup=\n' ;;
       nonempty) printf 'LoadState=loaded\nActiveState=inactive\nControlGroup=/owned\n' ;;
       unknown) printf 'LoadState=loaded\nControlGroup=\n' ;;
+      settling)
+        n=$(cat "$root/n")
+        if [ "$n" -gt 0 ]; then
+          echo $((n - 1)) > "$root/n"
+          printf 'LoadState=loaded\nActiveState=inactive\nControlGroup=/owned\n'
+        else
+          printf 'LoadState=not-found\nActiveState=inactive\nControlGroup=\n'
+        fi
+        ;;
       unavailable) exit 7 ;;
       *) exit 2 ;;
     esac
@@ -1073,6 +1094,11 @@ case "$2" in
         ;;
       nonempty)
         printf 'nonempty\n' > "$root/$unit"
+        exit 0
+        ;;
+      settling)
+        printf 'settling\n' > "$root/$unit"
+        echo 2 > "$root/n"
         exit 0
         ;;
       active) exit 1 ;;
@@ -1092,6 +1118,7 @@ esac
         let scope = ScopeOwnership::Owned { unit: unit.clone() };
         for (mode, succeeds, expected) in [
             ("collected", true, "collected\n"),
+            ("settling", true, "settling\n"),
             ("active", false, "active\n"),
             ("nonempty", false, "nonempty\n"),
             ("unknown", false, "unknown\n"),

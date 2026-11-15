@@ -15,7 +15,7 @@ use tokio::sync::{broadcast, RwLock};
 use tokio_util::sync::CancellationToken;
 use tracing::info;
 
-use super::access::{host_from_url, resolve_access_policy};
+use super::access::{authority_from_url, resolve_access_policy};
 use super::acp_events::{acp_event_listener, seed_acp_statuses};
 use super::disk_watch::{disk_watcher_consumer, init_disk_watch_subscriptions};
 use super::ip_discovery::{local_published_hosts, IpKind};
@@ -294,6 +294,8 @@ pub(crate) struct ServerConfig<'a> {
     pub tunnel_name: Option<&'a str>,
     pub tunnel_url: Option<&'a str>,
     pub no_tailscale: bool,
+    /// The public HTTPS port a Tailscale Funnel listens on.
+    pub funnel_port: u16,
     pub is_daemon: bool,
     pub passphrase: Option<&'a str>,
     /// True when the server sits behind an external reverse proxy
@@ -494,6 +496,7 @@ pub(crate) async fn start_server(
         tunnel_name,
         tunnel_url,
         no_tailscale,
+        funnel_port,
         is_daemon,
         passphrase,
         behind_proxy,
@@ -657,6 +660,33 @@ pub(crate) async fn start_server(
         None
     };
 
+    // Session-scoped `/mcp` credential secret. Only generated when `/mcp` is actually
+    // mounted, so a daemon that never enables it never gets this file on disk.
+    let mcp_session_secret = if config.web.mcp_enabled {
+        match crate::session::get_app_dir() {
+            Ok(dir) => {
+                match crate::server::session_credential::McpSessionSecret::load_or_generate(
+                    &dir.join("mcp_session_secret"),
+                ) {
+                    Ok(secret) => Some(Arc::new(secret)),
+                    Err(e) => {
+                        tracing::warn!(target: "http.middleware",
+                            error = %e,
+                            "/mcp session credentials disabled: failed to load secret"
+                        );
+                        None
+                    }
+                }
+            }
+            Err(e) => {
+                tracing::warn!(target: "http.middleware", error = %e, "/mcp session credentials disabled: app_dir unavailable");
+                None
+            }
+        }
+    } else {
+        None
+    };
+
     let acp_events_tx = broadcast::channel(ACP_CHANNEL_CAPACITY).0;
     let acp_event_store = {
         let app_dir = crate::session::get_app_dir().context("acp event store: resolve app dir")?;
@@ -803,7 +833,7 @@ pub(crate) async fn start_server(
             } else if tailscale_ok {
                 info!("Tailscale detected; using Tailscale Funnel for stable HTTPS origin");
                 // Do NOT fall back to Cloudflare on Tailscale failure.
-                tunnel::TunnelHandle::spawn_tailscale(local_port)
+                tunnel::TunnelHandle::spawn_tailscale(local_port, funnel_port)
                     .await
                     .map_err(|e| {
                         anyhow::anyhow!(
@@ -989,7 +1019,9 @@ pub(crate) async fn start_server(
         .unwrap_or("local");
 
     // DNS-rebinding gate.
-    let tunnel_host: Option<String> = tunnel_handle.as_ref().and_then(|h| host_from_url(&h.url));
+    let tunnel_host: Option<String> = tunnel_handle
+        .as_ref()
+        .and_then(|h| authority_from_url(&h.url));
     let (allowed_hosts, allowed_origins) = resolve_access_policy(
         host,
         local_port,
@@ -1052,6 +1084,7 @@ pub(crate) async fn start_server(
         session_service,
         token_manager: Arc::clone(&token_manager),
         login_manager: Arc::clone(&login_manager),
+        mcp_session_secret,
         passkey_manager,
         rate_limiter: Arc::clone(&rate_limiter),
         behind_tunnel: remote || behind_proxy,

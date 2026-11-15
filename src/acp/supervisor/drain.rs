@@ -834,7 +834,7 @@ impl<S: BroadcastSink> Drain<S> {
             );
             if lock_recover(&self.lifecycle).convert_to_stopping(&respawn_lease) {
                 self.publish(Event::AgentStartupError {
-                    message: "This Session's sandbox container was removed. Start the Session again to create a new one."
+                    message: "This Session's sandbox container is gone. Recreate it or start a new Session and container."
                         .into(),
                     cause: Some(StartupCause::ContainerMissing),
                 });
@@ -2501,22 +2501,25 @@ mod tests {
                 usize::from(!parks),
                 "{mode}"
             );
-            let typed = sink
+            let typed: Vec<String> = sink
                 .frames
                 .lock()
                 .unwrap()
                 .iter()
-                .filter(|(_, _, event)| {
-                    matches!(
-                        event,
-                        Event::AgentStartupError {
-                            cause: Some(StartupCause::ContainerMissing),
-                            ..
-                        }
-                    )
+                .filter_map(|(_, _, event)| match event {
+                    Event::AgentStartupError {
+                        message,
+                        cause: Some(StartupCause::ContainerMissing),
+                    } => Some(message.clone()),
+                    _ => None,
                 })
-                .count();
-            assert_eq!(typed, usize::from(parks), "{mode}");
+                .collect();
+            let expected: &[&str] = if parks {
+                &["This Session's sandbox container is gone. Recreate it or start a new Session and container."]
+            } else {
+                &[]
+            };
+            assert_eq!(typed, expected, "{mode}");
             assert_eq!(
                 sup.worker_state(&id).await,
                 AcpWorkerState::Absent,
