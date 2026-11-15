@@ -89,7 +89,10 @@ pub(super) async fn fetch(
             Some(RuntimeSpec::ReleaseBinary { .. })
         )
     {
-        download_release_binary(fetched, operation).await
+        // Keep staging and the lease until asynchronous file operations finish.
+        tokio::spawn(download_release_binary(fetched, operation))
+            .await
+            .context("plugin asset download task failed")?
     } else {
         Ok(fetched)
     }
@@ -1021,6 +1024,13 @@ mod tests {
         run_git(&repo, &["tag", "v1"]);
         let bytes = Arc::new(Mutex::new(b"#!/bin/sh\nexit 0\n".to_vec()));
         let download = bytes.clone();
+        let pause = Arc::new(Mutex::new(
+            None::<(
+                tokio::sync::oneshot::Sender<()>,
+                tokio::sync::oneshot::Receiver<()>,
+            )>,
+        ));
+        let pause_download = pause.clone();
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let base = format!("http://{}", listener.local_addr().unwrap());
         let release_base = base.clone();
@@ -1032,7 +1042,14 @@ mod tests {
             }))
             .route("/asset", axum::routing::get(move || {
                 let download = download.clone();
-                async move { download.lock().unwrap().clone() }
+                let pause = pause_download.lock().unwrap().take();
+                async move {
+                    if let Some((entered, release)) = pause {
+                        let _ = entered.send(());
+                        let _ = release.await;
+                    }
+                    download.lock().unwrap().clone()
+                }
             }));
         let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
         let _env = EnvGuard::set(&[
@@ -1044,6 +1061,38 @@ mod tests {
         ]);
         let source = PluginSource::parse("gh:acme/bin@v1").unwrap();
         let plugins = crate::plugin::plugins_dir().unwrap();
+        let (entered, waiting) = tokio::sync::oneshot::channel();
+        let (release, released) = tokio::sync::oneshot::channel();
+        *pause.lock().unwrap() = Some((entered, released));
+        let operation = crate::plugin::install::begin_operation().unwrap();
+        let staged_source = source.clone();
+        let task = tokio::spawn(async move { fetch(&staged_source, Some(operation)).await });
+        tokio::time::timeout(Duration::from_secs(5), waiting)
+            .await
+            .unwrap()
+            .unwrap();
+        task.abort();
+        assert!(matches!(task.await, Err(error) if error.is_cancelled()));
+        assert!(crate::plugin::install::begin_operation().is_err());
+        release.send(()).unwrap();
+        let operation = tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                if let Ok(operation) = crate::plugin::install::begin_operation() {
+                    break operation;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        assert!(!std::fs::read_dir(&plugins).unwrap().any(|entry| {
+            entry
+                .unwrap()
+                .file_name()
+                .to_string_lossy()
+                .starts_with(".staging-")
+        }));
+        drop(operation);
         let mut gate = test_gate::install(&plugins, "asset");
         let operation = crate::plugin::install::begin_operation().unwrap();
         let staged_source = source.clone();
