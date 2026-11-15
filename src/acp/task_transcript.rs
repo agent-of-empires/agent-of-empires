@@ -185,7 +185,13 @@ impl ActiveTasks {
     pub(crate) fn is_empty(&self) -> bool {
         self.lock().is_empty()
     }
-
+    pub(crate) fn clear(&self) {
+        let mut owners = self.lock();
+        for owner in owners.values() {
+            owner.cancellation.cancel();
+        }
+        owners.clear();
+    }
     /// Ends `task_id` because `TaskStop` killed it. A following tailer
     /// publishes the end itself; with none, the stop is kept for the resumed
     /// tailer that registers next.
@@ -206,13 +212,6 @@ impl ActiveTasks {
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
             .remove(task_id)
-    }
-    pub(crate) fn clear(&self) {
-        let mut owners = self.lock();
-        for owner in owners.values() {
-            owner.cancellation.cancel();
-        }
-        owners.clear();
     }
 }
 #[derive(Clone)]
@@ -503,15 +502,21 @@ impl TaskTailer {
                 let _ = journal.await;
             }
             let _publication = self.active.publication.lock().await;
-            let _ = access
-                .publish(
-                    &self.event_tx,
-                    Event::BackgroundTaskFinished {
-                        task_id: self.task_id.clone(),
-                        ended_at,
-                    },
-                )
-                .await;
+            let observed_end = ended_at.is_some();
+            let event = Event::BackgroundTaskFinished {
+                task_id: self.task_id.clone(),
+                ended_at,
+            };
+            if observed_end {
+                let _ = access.publish(&self.event_tx, event).await;
+            } else if let Some(events) = self.event_tx.upgrade() {
+                // Losing the reader ends host tracking, not the Native task.
+                let mut metadata = crate::acp::event_sender::EventMetadata::host(&event);
+                metadata.resource_ref = owner.authority.witness().map(|witness| witness.allocation);
+                let _ = access
+                    .publish_with(events.with_metadata(metadata), event)
+                    .await;
+            }
         }))
     }
 }
@@ -991,7 +996,7 @@ mod tests {
             FixtureSource::BashPair | FixtureSource::Workflow => None,
         };
         let selected_task = "t-1";
-        let mut native = super::resource_test_support::NativeBootstrap::new(scope).await;
+        let mut native = super::resource_test_support::NativeBootstrap::new(scope, "claude").await;
         let home = native.home.clone();
         let session_id = native.session_id.clone();
         let transcript = native.transcript.clone();
@@ -1408,7 +1413,12 @@ mod tests {
                     .fold_control_state(&f._managed.id)
                     .await
                     .unwrap();
-                let seq = scope.state.acp_event_store.highest_seq(&f._managed.id) + 1;
+                let seq = scope
+                    .state
+                    .acp_event_store
+                    .highest_seq(&f._managed.id)
+                    .unwrap()
+                    + 1;
                 assert_eq!(state.sidebar_status(), Status::Running);
                 f.active.stop("t-1");
                 f.spawn(TailerStart::Resumed).await;
@@ -1446,7 +1456,12 @@ mod tests {
                     .fold_control_state(&f._managed.id)
                     .await
                     .unwrap();
-                let seq = scope.state.acp_event_store.highest_seq(&f._managed.id) + 1;
+                let seq = scope
+                    .state
+                    .acp_event_store
+                    .highest_seq(&f._managed.id)
+                    .unwrap()
+                    + 1;
                 assert_eq!(state.sidebar_status(), Status::Running);
                 let watch = FileWatchService::new().unwrap();
                 f.spawn_with(watch.clone(), TailerStart::Live).await;
@@ -1962,7 +1977,7 @@ pub(crate) mod resource_test_support {
     }
 
     impl NativeBootstrap {
-        pub(crate) async fn new(scope: &mut ManagedScope) -> Self {
+        pub(crate) async fn new(scope: &mut ManagedScope, agent_key: &str) -> Self {
             let workdir = scope.tempdir();
             let (queue_tx, queue_rx) = oneshot::channel();
             let (tracking_tx, tracking_rx) = oneshot::channel();
@@ -1973,8 +1988,8 @@ pub(crate) mod resource_test_support {
             });
             let (config, peer) = scope.native_peer(
                 workdir.path().to_path_buf(),
-                "claude",
-                "claude",
+                agent_key,
+                agent_key,
                 |request| {
                     let result = match request["method"].as_str()? {
                         "initialize" => {
@@ -1998,21 +2013,33 @@ pub(crate) mod resource_test_support {
                 .receipt_snapshot()
                 .unwrap();
             let session_id = receipt.session_id().unwrap().to_owned();
-            let home = managed
-                .actual()
-                .native_store
-                .as_ref()
-                .filter(|binding| binding.agent == "claude" && binding.filesystem == "host")
-                .and_then(|binding| binding.stores.first())
-                .expect("actual host Claude store")
-                .clone();
-            assert!(home.starts_with(PathBuf::from(
-                std::env::var_os("HOME").expect("isolated HOME")
-            )));
-            std::fs::create_dir_all(home.join("projects/-enc")).unwrap();
-            let transcript = home
-                .join("projects/-enc")
-                .join(format!("{session_id}.jsonl"));
+            let home = if agent_key == "claude" {
+                managed
+                    .actual()
+                    .native_store
+                    .as_ref()
+                    .filter(|binding| binding.agent == agent_key && binding.filesystem == "host")
+                    .and_then(|binding| binding.stores.first())
+                    .expect("the actual original declares its host Claude store")
+                    .clone()
+            } else {
+                workdir.path().to_path_buf()
+            };
+            if agent_key == "claude" {
+                assert!(home.starts_with(PathBuf::from(
+                    std::env::var_os("HOME").expect("isolated HOME")
+                )));
+            }
+            let project = if agent_key == "claude" {
+                let encoded = crate::session::capture::encode_claude_project_path(
+                    &workdir.path().to_string_lossy(),
+                );
+                home.join("projects").join(encoded)
+            } else {
+                home.clone()
+            };
+            std::fs::create_dir_all(&project).unwrap();
+            let transcript = project.join(format!("{session_id}.jsonl"));
             std::fs::write(&transcript, "").unwrap();
             Self {
                 home,
@@ -2130,7 +2157,7 @@ pub(crate) mod resource_test_support {
 
     impl AgentFixture {
         pub(crate) async fn new(scope: &mut ManagedScope) -> Self {
-            let mut native = NativeBootstrap::new(scope).await;
+            let mut native = NativeBootstrap::new(scope, "codex").await;
             let path = native.home.join("agent.jsonl");
             std::fs::write(&path, "").unwrap();
             native
@@ -2236,7 +2263,7 @@ pub(crate) mod resource_test_support {
             completed: &[&str],
             path: JournalPath,
         ) -> Self {
-            let mut native = NativeBootstrap::new(scope).await;
+            let mut native = NativeBootstrap::new(scope, "claude").await;
             let inside = native.home.join("projects/-enc/subagents/workflows/wf_1");
             std::fs::create_dir_all(&inside).unwrap();
             let outside = match path {

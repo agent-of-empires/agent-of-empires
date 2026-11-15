@@ -1126,8 +1126,15 @@ done
     #[tokio::test]
     async fn native_identity_accepted_callback_does_not_strand_reset_deadline_or_stop() {
         crate::acp::supervisor::test_support::managed::with_managed(|scope| Box::pin(async move { let temp = scope.tempdir();
+    let (reverse_entered, reverse_wait) = oneshot::channel();
+    let (_release_reverse, reverse_release) = oneshot::channel();
+    scope.configure_sdk(crate::acp::acp_client::SdkTestOptions {
+        reverse_send: Some((reverse_entered, reverse_release)), ..Default::default()
+    });
     let (script, capture) = FakeAgent::default().write(temp.path());
-    let callback = serde_json::json!({"jsonrpc":"2.0","id":"pending-permission","method":"session/request_permission","params":{"sessionId":"sid-1","toolCall":{"toolCallId":"own-tool","title":"Wait for user"},"options":[{"optionId":"allow","name":"Allow","kind":"allow_once"}]}});
+    let read_path = temp.path().join("accepted-original-read");
+    std::fs::write(&read_path, "original callback content").unwrap();
+    let callback = serde_json::json!({"jsonrpc":"2.0","id":"accepted-original-read","method":"fs/read_text_file","params":{"sessionId":"sid-1","path":read_path}});
     let source = std::fs::read_to_string(&script).unwrap().replace(
         "    *'\"method\":\"session/prompt\"'*)",
         &format!("    *'\"method\":\"session/prompt\"'*)\n      if [ \"$count\" -eq 1 ]; then printf '%s\\n' '{}'; fi", callback.to_string().replace('\'', "'\"'\"'")),
@@ -1137,18 +1144,17 @@ done
     .await
     .unwrap();
     client.ready().await;
-    client.send_prompt("request a Current decision", &[]).await.unwrap();
+    client.send_prompt("request actual Original IO", &[]).await.unwrap();
     let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
-    let mut approval = false;
-    let mut stopped = false;
-    while !approval || !stopped {
-        let event = tokio::time::timeout_at(deadline, client.next_event())
-            .await
-            .unwrap()
-            .expect("Current callback and its prompt remain observable");
-        approval |= matches!(event, Event::ApprovalRequested { .. });
-        stopped |= matches!(event, Event::Stopped { .. });
-    }
+    tokio::time::timeout_at(deadline, async {
+        loop {
+            if matches!(client.next_event().await.expect("the genuine prompt remains observable"),
+                Event::Stopped { .. }) { break; }
+        }
+    }).await.unwrap();
+    tokio::time::timeout_at(deadline, reverse_wait)
+        .await.unwrap().expect("the completed Original read retains genuine relay admission until Native write");
+    assert!(!client.actual().test_control().ingress.has_parked());
     let (write_pending, writing) = oneshot::channel();
     *client.actual().test_connection_state().test_fresh_write_pending.lock().unwrap() = Some(write_pending);
     let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
@@ -1253,155 +1259,155 @@ done
         Box::pin(crate::acp::supervisor::test_support::managed::with_managed(|scope| Box::pin(async move {
     use crate::acp::transcript::{TranscriptModel, TranscriptRowKind};
     for (name, stored, load_capable, load_fails, new_fails, fork) in [
-        ("unavailable", true, false, false, false, false),
-        ("initial", false, false, false, false, false),
-        ("loaded", true, true, false, false, false),
-        ("load_failed", true, true, true, false, false),
-        ("initial_new_failed", false, false, false, true, false),
-        ("unavailable_new_failed", true, false, false, true, false),
-        ("load_and_new_failed", true, true, true, true, false),
-        ("fork_unsupported", true, false, false, false, true),
-        ("fork_unsupported_load_failed", true, true, true, false, true),
-    ] {
-        let tmp = scope.tempdir();
-        let script = tmp.path().join("resume-agent.sh");
-        let capture = tmp.path().join("resume-capture.ndjson");
-        let error = r#""error":{"code":-32603,"message":"fixture refused establishment"}"#;
-        let new_ok = r#""result":{"sessionId":"replacement-session"}"#;
-        let script_body = r#"#!/bin/sh
+            ("unavailable", true, false, false, false, false),
+            ("initial", false, false, false, false, false),
+            ("loaded", true, true, false, false, false),
+            ("load_failed", true, true, true, false, false),
+            ("initial_new_failed", false, false, false, true, false),
+            ("unavailable_new_failed", true, false, false, true, false),
+            ("load_and_new_failed", true, true, true, true, false),
+            ("fork_unsupported", true, false, false, false, true),
+            ("fork_unsupported_load_failed", true, true, true, false, true),
+        ] {
+            let tmp = scope.tempdir();
+            let script = tmp.path().join("resume-agent.sh");
+            let capture = tmp.path().join("resume-capture.ndjson");
+            let error = r#""error":{"code":-32603,"message":"fixture refused establishment"}"#;
+            let new_ok = r#""result":{"sessionId":"replacement-session"}"#;
+            let script_body = r#"#!/bin/sh
     while IFS= read -r line; do
       printf '%s\n' "$line" >> '__CAPTURE__'
       id=$(printf '%s' "$line" | sed -En 's/.*"id":("[^"]*"|[0-9]+).*/\1/p')
       case $line in
-        *'"method":"initialize"'*)
-          printf '{"jsonrpc":"2.0","id":%s,"result":{"protocolVersion":1,"agentCapabilities":{"loadSession":__LOAD_CAPABLE__}}}\n' "$id" ;;
-        *'"method":"session/load"'*)
-          printf '{"jsonrpc":"2.0","id":%s,__LOAD_REPLY__}\n' "$id" ;;
-        *'"method":"session/new"'*)
-          printf '{"jsonrpc":"2.0","id":%s,__NEW_REPLY__}\n' "$id" ;;
-        *'"method":"session/prompt"'*)
-          printf '{"jsonrpc":"2.0","id":%s,"result":{"stopReason":"end_turn"}}\n' "$id" ;;
+            *'"method":"initialize"'*)
+              printf '{"jsonrpc":"2.0","id":%s,"result":{"protocolVersion":1,"agentCapabilities":{"loadSession":__LOAD_CAPABLE__}}}\n' "$id" ;;
+            *'"method":"session/load"'*)
+              printf '{"jsonrpc":"2.0","id":%s,__LOAD_REPLY__}\n' "$id" ;;
+            *'"method":"session/new"'*)
+              printf '{"jsonrpc":"2.0","id":%s,__NEW_REPLY__}\n' "$id" ;;
+            *'"method":"session/prompt"'*)
+              printf '{"jsonrpc":"2.0","id":%s,"result":{"stopReason":"end_turn"}}\n' "$id" ;;
       esac
     done
     "#
-        .replace("__CAPTURE__", capture.to_str().unwrap())
-        .replace("__LOAD_CAPABLE__", &load_capable.to_string())
-        .replace("__LOAD_REPLY__", if load_fails { error } else { r#""result":{}"# })
-        .replace("__NEW_REPLY__", if new_fails { error } else { new_ok });
-        std::fs::write(&script, script_body).unwrap();
-        let mut config = reset_fake_spawn_config(&script, tmp.path());
-        if fork {
-            config.agent_key = "claude".into();
-            config.tool = "claude".into();
-        }
-        let mut selected_source = None;
-        let mut client = if stored || fork {
-            let (original_script, _) = FakeAgent::default().write(tmp.path());
-            let mut original_config = reset_fake_spawn_config(&original_script, tmp.path());
-            original_config.agent_key = config.agent_key.clone();
-            original_config.tool = config.tool.clone();
-            let mut original = scope.spawn(original_config, format!("{name}-original")).await.unwrap();
-            original.ready().await;
-            use axum::response::IntoResponse;
-            let response = crate::server::api::acp_prompt(
-                axum::extract::State(original.app_state()),
-                axum::extract::Path(original.id.clone()),
-                Ok(axum::Json(crate::acp::protocol::PromptRequest {
-                    text: "prior user turn".into(),
-                    attachments: Vec::new(),
-                    prompt_id: None,
-                    no_revive: false,
-                    queued_prompt_id: None,
-                })),
-            )
-            .await
-            .into_response();
-            assert_eq!(response.status(), axum::http::StatusCode::ACCEPTED);
-            identity_events_until_stop(&mut original).await;
-            selected_source = Some(original.selected_native_session());
+            .replace("__CAPTURE__", capture.to_str().unwrap())
+            .replace("__LOAD_CAPABLE__", &load_capable.to_string())
+            .replace("__LOAD_REPLY__", if load_fails { error } else { r#""result":{}"# })
+            .replace("__NEW_REPLY__", if new_fails { error } else { new_ok });
+            std::fs::write(&script, script_body).unwrap();
+            let mut config = reset_fake_spawn_config(&script, tmp.path());
             if fork {
-                Box::pin(scope.fork_after(original, config, name)).await
+                config.agent_key = "claude".into();
+                config.tool = "claude".into();
+            }
+            let mut selected_source = None;
+            let mut client = if stored || fork {
+                let (original_script, _) = FakeAgent::default().write(tmp.path());
+                let mut original_config = reset_fake_spawn_config(&original_script, tmp.path());
+                original_config.agent_key = config.agent_key.clone();
+                original_config.tool = config.tool.clone();
+                let mut original = scope.spawn(original_config, format!("{name}-original")).await.unwrap();
+                original.ready().await;
+                use axum::response::IntoResponse;
+                let response = crate::server::api::acp_prompt(
+                    axum::extract::State(original.app_state()),
+                    axum::extract::Path(original.id.clone()),
+                    Ok(axum::Json(crate::acp::protocol::PromptRequest {
+                        text: "prior user turn".into(),
+                        attachments: Vec::new(),
+                        prompt_id: None,
+                        no_revive: false,
+                        queued_prompt_id: None,
+                    })),
+                )
+                .await
+                .into_response();
+                assert_eq!(response.status(), axum::http::StatusCode::ACCEPTED);
+                identity_events_until_stop(&mut original).await;
+                selected_source = Some(original.selected_native_session());
+                if fork {
+                    Box::pin(scope.fork_after(original, config, name)).await
+                } else {
+                    Box::pin(scope.retained_after(original, config, name)).await
+                }
             } else {
-                Box::pin(scope.retained_after(original, config, name)).await
+                scope.spawn(config, name).await.unwrap()
+            };
+            let succeeds = !new_fails && !fork && (!stored || (load_capable && !load_fails));
+            let mut events = events_until(&mut client, |event| matches!(
+                event, Event::AcpSessionAssigned { .. } | Event::AgentStartupError { .. }
+            )).await;
+            if succeeds {
+                client.ready().await;
+                client.send_prompt("continue", &[]).await.unwrap();
+                events.extend(identity_events_until_stop(&mut client).await);
+            } else {
+                assert!(client.send_prompt("do not replace a blocked conversation", &[]).await.is_err());
+                let rows = crate::session::Storage::open_unwatched("test").unwrap()
+                    .load_instances_complete().unwrap();
+                let row = rows.iter().find(|row| row.id == client.id).unwrap();
+                assert!(matches!(&row.acp_establishment,
+                    Some(crate::acp::establishment::AcpEstablishment::Blocked { .. })),
+                    "{name}: the actual durable postimage is {:?}", row.acp_establishment);
+                if stored && !fork {
+                    assert_eq!(
+                        row.selected_acp_target().unwrap(),
+                        crate::acp::establishment::EstablishmentTarget::Load {
+                            session_id: selected_source.clone().unwrap(),
+                            import: false,
+                        },
+                        "{name}: failed resume must retain the exact durable Load target"
+                    );
+                }
             }
-        } else {
-            scope.spawn(config, name).await.unwrap()
-        };
-        let succeeds = !new_fails && !fork && (!stored || (load_capable && !load_fails));
-        let mut events = events_until(&mut client, |event| matches!(
-            event, Event::AcpSessionAssigned { .. } | Event::AgentStartupError { .. }
-        )).await;
-        if succeeds {
-            client.ready().await;
-            client.send_prompt("continue", &[]).await.unwrap();
-            events.extend(identity_events_until_stop(&mut client).await);
-        } else {
-            assert!(client.send_prompt("do not replace a blocked conversation", &[]).await.is_err());
-            let rows = crate::session::Storage::open_unwatched("test").unwrap()
-                .load_instances_complete().unwrap();
-            let row = rows.iter().find(|row| row.id == client.id).unwrap();
-            assert!(matches!(&row.acp_establishment,
-                Some(crate::acp::establishment::AcpEstablishment::Blocked { .. })),
-                "{name}: the actual durable postimage is {:?}", row.acp_establishment);
+            let position = |pred: fn(&Event) -> bool| events.iter().position(pred);
+            let assignment = position(|e| matches!(e, Event::AcpSessionAssigned { .. }));
+            assert_eq!(assignment.is_some(), succeeds, "{name}");
+            assert_eq!(
+                position(|event| matches!(event, Event::AgentStartupError { .. })).is_some(),
+                !succeeds, "{name}"
+            );
+            assert_eq!(position(|event| matches!(event, Event::Stopped { .. })).is_some(), succeeds, "{name}");
+            assert!(!events.iter().any(|event| matches!(event, Event::SessionContextReset { .. } | Event::SessionCleared)), "{name}");
+
+            let mut transcript = TranscriptModel::new();
+            for stored in scope.state.acp_event_store.replay_from(&client.id, 0).unwrap() {
+                transcript.apply_scoped_event(stored.seq, stored.event.as_ref(), &stored.metadata);
+            }
+            let rows = transcript.rows();
+            let dividers = rows
+                .iter()
+                .filter(|row| row.kind == TranscriptRowKind::ContextReset)
+                .count();
+            assert_eq!(dividers, 0, "{name}");
             if stored && !fork {
-                assert_eq!(
-                    row.selected_acp_target().unwrap(),
-                    crate::acp::establishment::EstablishmentTarget::Load {
-                        session_id: selected_source.clone().unwrap(),
-                        import: false,
-                    },
-                    "{name}: failed resume must retain the exact durable Load target"
-                );
+                for text in ["prior user turn", "working"] {
+                    assert!(rows.iter().any(|row| row.text.contains(text)), "{name}: {text}");
+                }
             }
-        }
-        let position = |pred: fn(&Event) -> bool| events.iter().position(pred);
-        let assignment = position(|e| matches!(e, Event::AcpSessionAssigned { .. }));
-        assert_eq!(assignment.is_some(), succeeds, "{name}");
-        assert_eq!(
-            position(|event| matches!(event, Event::AgentStartupError { .. })).is_some(),
-            !succeeds, "{name}"
-        );
-        assert_eq!(position(|event| matches!(event, Event::Stopped { .. })).is_some(), succeeds, "{name}");
-        assert!(!events.iter().any(|event| matches!(event, Event::SessionContextReset { .. } | Event::SessionCleared)), "{name}");
 
-        let mut transcript = TranscriptModel::new();
-        for stored in scope.state.acp_event_store.replay_from(&client.id, 0).unwrap() {
-            transcript.apply_scoped_event(stored.seq, stored.event.as_ref(), &stored.metadata);
-        }
-        let rows = transcript.rows();
-        let dividers = rows
-            .iter()
-            .filter(|row| row.kind == TranscriptRowKind::ContextReset)
-            .count();
-        assert_eq!(dividers, 0, "{name}");
-        if stored && !fork {
-            for text in ["prior user turn", "working"] {
-                assert!(rows.iter().any(|row| row.text.contains(text)), "{name}: {text}");
+            let requests: Vec<serde_json::Value> = std::fs::read_to_string(capture)
+                .unwrap()
+                .lines()
+                .map(|line| serde_json::from_str(line).unwrap())
+                .collect();
+            let loads: Vec<_> = requests
+                .iter()
+                .filter(|r| r["method"] == "session/load")
+                .collect();
+            assert_eq!(loads.len(), usize::from(stored && !fork && load_capable), "{name}");
+            if let Some(load) = loads.first() {
+                assert_eq!(load["params"]["sessionId"].as_str(), selected_source.as_deref(), "{name}");
             }
-        }
-
-        let requests: Vec<serde_json::Value> = std::fs::read_to_string(capture)
-            .unwrap()
-            .lines()
-            .map(|line| serde_json::from_str(line).unwrap())
-            .collect();
-        let loads: Vec<_> = requests
-            .iter()
-            .filter(|r| r["method"] == "session/load")
-            .collect();
-        assert_eq!(loads.len(), usize::from(stored && !fork && load_capable), "{name}");
-        if let Some(load) = loads.first() {
-            assert_eq!(load["params"]["sessionId"].as_str(), selected_source.as_deref(), "{name}");
-        }
-        let news = requests
-            .iter()
-            .filter(|r| r["method"] == "session/new")
-            .count();
-        assert_eq!(news, usize::from(!stored && !fork), "{name}");
-        assert!(!requests.iter().any(|request| request["method"] == "session/fork"), "{name}");
-        client.shutdown().await.unwrap();
-        scope.finish_conversation_case().await;
-    } }))).await;
+            let news = requests
+                .iter()
+                .filter(|r| r["method"] == "session/new")
+                .count();
+            assert_eq!(news, usize::from(!stored && !fork), "{name}");
+            assert!(!requests.iter().any(|request| request["method"] == "session/fork"), "{name}");
+            client.shutdown().await.unwrap();
+            scope.finish_conversation_case().await;
+        } }))).await;
     }
 
     /// The deadline starts before enqueueing, so an expired command never
@@ -1455,7 +1461,8 @@ done
         scope.configure_sdk(crate::acp::acp_client::SdkTestOptions {
             tracking: Some(observe), ..Default::default()
         });
-        let (config, peer) = scope.native_peer(dir.path().into(), "claude", "claude", move |request| {
+        let agent_key = if kind == "agent" { "codex" } else { "claude" };
+        let (config, peer) = scope.native_peer(dir.path().into(), agent_key, agent_key, move |request| {
             let id = request.get("id")?;
             Some(match request["method"].as_str().unwrap() {
                 "initialize" => serde_json::json!({"jsonrpc":"2.0","id":id,"result":{"protocolVersion":1,"agentCapabilities":{}}}),
@@ -1475,10 +1482,18 @@ done
             .expect("the actual SDK exposes its existing resource trackers").unwrap();
         let selected = client.selected_native_session();
         let actual = client.actual();
-        let store = actual.native_store.as_ref().expect("actual pinned Claude store").stores[0].clone();
-        let project = store.join("projects/-managed");
+        let project = if kind == "task" {
+            let store = actual.native_store.as_ref()
+                .filter(|store| store.agent == "claude" && store.filesystem == "host")
+                .and_then(|store| store.stores.first()).expect("the actual Claude Bash namespace");
+            store.join("projects").join(crate::session::capture::encode_claude_project_path(&dir.path().to_string_lossy()))
+        } else {
+            dir.path().to_path_buf()
+        };
         std::fs::create_dir_all(project.join("subagents")).unwrap();
-        std::fs::write(project.join(format!("{selected}.jsonl")), "").unwrap();
+        if kind == "task" {
+            std::fs::write(project.join(format!("{selected}.jsonl")), "").unwrap();
+        }
         let transcript = project.join("subagents/between-prompt-agent.jsonl");
         std::fs::write(&transcript, "").unwrap();
         let (update, is_started): (serde_json::Value, fn(&Event) -> bool) = match kind {

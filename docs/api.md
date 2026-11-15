@@ -653,6 +653,14 @@ without requiring a response body. See
 [Native Session Resume](guides/session-resume.md#pinning-or-resetting-a-conversation)
 for preservation and inspection guidance.
 
+A terminal resume or fresh-pinned readiness probe can return HTTP `409` with
+`aoe-error-code: launch_indeterminate` and a finite `cause`: `command_timed_out`,
+`observation_failed`, `stabilization_expired`, or `ownership_unproven`. This is
+not a ready target or a confirmed Agent exit. The response retains a mutation
+receipt when launch state was committed; no wake message or pending send is
+delivered. See [Native Session Resume](guides/session-resume.md#pinning-or-resetting-a-conversation)
+for preservation and inspection guidance.
+
 ## POST /api/sessions/{id}/send
 
 Type a message into the agent and press Enter, the same way the TUI's
@@ -733,6 +741,26 @@ curl -sS \
   "http://localhost:7777/api/sessions/abc123/output?lines=80&format=text"
 ```
 
+## GET /api/sessions/{id}/acp/replay?view=retained
+
+Read durable ACP history without starting a worker or preparing a pane. Missing
+events remain missing; this endpoint does not import native agent histories.
+
+Retained responses include an opaque `history_identity` for that session's stored
+content. The identity changes on inserts, replacements, deletion, and backfill,
+even when sequence bounds stay unchanged. Unrelated sessions do not change it.
+
+For a consistent multi-page read, pass the first page's `history_identity` on
+subsequent requests, alongside the usual `since`, `before`, and `limit` parameters.
+Each page binds its events, coverage, and identity to one database snapshot.
+A mismatched identity returns `409`: discard the staged pages and restart the
+read. Keep the previous complete transcript visible if the replacement read fails.
+
+Raw retained pages preserve the scanned rows and cursor; backward pages need not
+start at a turn boundary. Keep reducer state across forward retained pages.
+Ordinary backward replay, including `view=rows`, still trims a leading partial
+turn when older rows remain.
+
 ## Native session freshness and disconnection
 
 The Daemon owns native session status. The experimental TUI consumes its
@@ -782,7 +810,11 @@ message delivery. Transport loss, local request-task failure, or malformed
 mutation receipts remain unknown; effect-free daemon refusals do not acknowledge
 a commit.
 
-A `launch_indeterminate` response with a valid committed receipt is a known refusal, not an unknown RPC outcome. It stays fenced until its snapshot is applied. The TUI then displays the refusal without quarantining the row or automatically attaching, sending, or replaying input; a new operation requires explicit user submission. Readiness itself remains unconfirmed.
+A `launch_indeterminate` response with a valid committed receipt is a known
+refusal, not an unknown RPC outcome. It stays fenced until its snapshot is
+applied. The TUI then displays the refusal without quarantining the row or
+automatically attaching, sending, or replaying input; a new operation requires
+explicit user submission. Readiness itself remains unconfirmed.
 
 `409 managed_resume_refused` preserves the managed conversation. Its finite
 `aoe-managed-resume-cause` header supplies an application-owned recovery reason,
@@ -879,6 +911,10 @@ original locations, and filesystem lookup errors keep the transition protected.
 Admitted stop work survives HTTP cancellation; its committed native fence survives daemon reconstruction. Automatic reconciliation does not resume a committed stop. A later explicit spawn, start, restart, backend/provider switch or accepted prompt proves original retirement before consuming only its observed stop generation and token; a newer stop wins. A `no_revive` prompt cannot clear the stop.
 
 If a write commits but canonical publication fails, the stop remains durable and the response reports an unconfirmed outcome. Unproven retirement remains pending rather than reporting success. Daemon detach, idle shutdown and internal provider teardown do not independently create user-stop intent. Reversible stop preserves native transcript history.
+
+## POST /api/sessions/{id}/acp/subagents/{child_id}/cancel
+
+Stops one Claude subagent session without ending the root turn. `202` when `session/cancel` was sent to the child, `409` when the child is unknown or did not announce the `cancel` capability (`SubagentRecord.cancel_capable`). `POST /api/sessions/{id}/acp/cancel` still cancels the whole turn.
 
 ## DELETE /api/workspaces
 

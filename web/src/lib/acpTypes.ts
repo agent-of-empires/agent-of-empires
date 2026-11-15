@@ -29,6 +29,8 @@ export interface ToolCall {
   /** ACP ToolKind, lowercased. */
   kind: string;
   args_preview: string;
+  /** The `prompt` argument in full, present only when `args_preview` was cut at the ingest cap. */
+  prompt?: string;
   started_at: string; // ISO-8601 from chrono
   /** Parent `Task` call for sub-agent tool calls. */
   parent_tool_call_id?: string;
@@ -93,6 +95,8 @@ export interface AvailableCommand {
   description: string;
   /** The command takes free-form arguments after the name. */
   accepts_input: boolean;
+  /** Argument hint the agent advertises, e.g. `[reconnect|enable|disable]`. */
+  input_hint?: string;
 }
 
 /** Unknown categories arrive as bare strings (Rust `Other` is untagged). */
@@ -289,7 +293,17 @@ export type IncompatibleAgentDetail =
       kind: "unsupported_protocol_version";
       expected: string;
       received: string;
+    }
+  | {
+      kind: "invalid_proxy_hello";
+      reason: string;
     };
+
+/** Mirror of `IntegrationLostReason` in src/acp/state.rs. */
+export type IntegrationLostReason =
+  | { kind: "contract_violation"; detail: string }
+  | { kind: "hold_overflow" }
+  | { kind: "lease_overflow" };
 
 export interface OperationErrorEvidence {
   source: "terminal_text" | "tmux_observation" | "local_prompt_result" | "runner_completion" | "transcript_recovery";
@@ -352,6 +366,8 @@ export type AcpEvent =
         tool_call_id: string;
         title: string | null;
         args_preview: string | null;
+        /** The `prompt` argument in full when `args_preview` was cut. */
+        prompt?: string | null;
         /** Re-stamped when the tool actually starts running, so durations exclude scheduling time. */
         started_at?: string | null;
         /** A non-empty list replaces the card's diffs; null leaves them untouched. */
@@ -377,7 +393,14 @@ export type AcpEvent =
   | "ThinkingEnded"
   | { RateLimit: { info: RateLimitInfo } }
   | { RateLimitAutoResumed: { resets_at: string; manual?: boolean } }
-  | { SessionNotice: { severity: string; title: string; description?: string | null; key?: string | null } }
+  | {
+      SessionNotice: {
+        severity: string;
+        title: string;
+        description?: string | null;
+        key?: string | null;
+      };
+    }
   | { UsageUpdated: { usage: SessionUsage } }
   | { ModeChanged: { mode: SessionMode } }
   | {
@@ -431,6 +454,7 @@ export type AcpEvent =
         ended_at: string;
       };
     }
+  | { SubagentUpdated: { subagent: SubagentRecord; at: string } }
   | { AgentMessageChunk: { text: string; message_id?: string } }
   | { AgentThoughtChunk: { text: string; message_id?: string } }
   | { CancelRequested: { escalates_at: string } }
@@ -438,12 +462,15 @@ export type AcpEvent =
   | { AgentStartupError: { message: string } }
   | { PromptRuntimeError: { message: string; evidence?: OperationErrorEvidence | null } }
   | { IncompatibleAgent: { detail: IncompatibleAgentDetail } }
+  | { IntegrationLost: { reason: IntegrationLostReason } }
   | {
       UserPromptSent: {
         text: string;
         attachments?: PromptAttachmentRefWire[];
         /** Client-minted id echoed back so the optimistic row reconciles by id. */
         prompt_id?: string | null;
+        /** Other queued rows folded into this turn (queue drain or send-now); each one's optimistic row is retired too. */
+        merged_prompt_ids?: string[];
       };
     }
   | {
@@ -474,6 +501,7 @@ export type AcpEvent =
         tool_call_id?: string;
         description: string;
         workflow?: { run_id: string; name: string; summary?: string | null } | null;
+        started_at?: string | null;
       };
     }
   | { BackgroundTaskFinished: { task_id: string; ended_at?: string | null } }
@@ -535,7 +563,19 @@ export interface AuthStatus {
   /** Usable as a UI string on its own ("Claude Max", "Anthropic API key"). */
   label: string;
   detail?: string | null;
-  account?: { email?: string | null; organization?: string | null; plan?: string | null } | null;
+  account?: {
+    email?: string | null;
+    organization?: string | null;
+    plan?: string | null;
+  } | null;
+}
+
+/** Stateless comparison digest, never Native authority or a callback capability. */
+export type EstablishmentRevision = readonly number[];
+
+export interface EstablishmentRecovery {
+  revision: EstablishmentRevision;
+  action: "same" | "fresh";
 }
 
 /** Fields this client adopts from the daemon's folded `AcpState`. */
@@ -552,7 +592,11 @@ export interface ReducedState {
   /** Canonical quota park projection; null/omitted means unknown, never confirmed absence. */
   rate_limit_park?: "none" | "armed" | "exhausted" | null;
   available_commands: AvailableCommand[];
-  available_modes: Array<{ id: string; name: string; description?: string | null }>;
+  available_modes: Array<{
+    id: string;
+    name: string;
+    description?: string | null;
+  }>;
   current_mode_id: string | null;
   auth_status?: AuthStatus | null;
   turn_active: boolean;
@@ -563,13 +607,27 @@ export interface ReducedState {
   /** Open background task ids; the daemon omits the field when none are open. */
   background_tasks?: string[];
   operation_error?: OperationErrorEvidence | null;
+  /** Current daemons send null to clear; absence belongs to an older wire. */
+  integration_lost?: IntegrationLostReason | null;
   connection_unavailable?: AcpConnectionUnavailability | null;
   connection_ready?: boolean | null;
   original_decision_nonces?: string[];
   /** Existing current WorkerDown queue/wake eligibility, not native health. */
   prompt_wake_eligible?: boolean | null;
+  host_prompt_intent?: string | null;
+  establishment_revision?: EstablishmentRevision | null;
   last_seq?: number;
+  /** Background shells, running and recently finished; omitted when there are none. */
+  background_shells?: {
+    task_id: string;
+    command: string;
+    started_at?: string | null;
+    ended_at?: string | null;
+    finished?: boolean;
+  }[];
   /** The session's workflow runs; omitted when there are none. */
+  /** The subagent roster; the Web projection keeps it for children older than the replay tail. */
+  subagents?: SubagentRecord[];
   workflow_runs?: {
     task_id: string;
     tool_call_id: string;
@@ -623,6 +681,9 @@ export interface AcpState {
   oldestSeq: number;
   lagged: boolean;
   startupError: string | null;
+  integrationLost: IntegrationLostReason | null;
+  /** The accepted diagnostic boundary, independent of native-input authority. */
+  integrationLostSnapshotSeq: number | null;
   /** Adapter compatibility failure; replaces the session view with `StartupErrorScreen`. */
   incompatibleAgent: IncompatibleAgentDetail | null;
   lastError: string | null;
@@ -636,6 +697,9 @@ export interface AcpState {
   /** Live canonical per-request authority; never restored from history or cache. */
   originalDecisionNonces: string[];
   promptWakeEligible: boolean;
+  /** Live actor-local cancellation identity; never restored from history or cache. */
+  hostPromptIntent: string | null;
+  establishmentRevision: EstablishmentRevision | null;
   interactionError: InteractionError | null;
   /** Derived from `serverTurnActive || inflightPromptIds.length > 0`; never written directly. */
   turnActive: boolean;
@@ -702,8 +766,12 @@ export interface AcpState {
   agentOrphaned: boolean;
   /** Async sub-agents launched this session, oldest first. */
   backgroundAgents: BackgroundAgent[];
+  /** Subagent roster from the ACP subagents RFD, one record per child session. */
+  subagents: SubagentRecord[];
   /** Ids of running background tasks that are not sub-agents (backgrounded commands, workflow runs). */
   backgroundTasks: string[];
+  /** Backgrounded shell commands, running and recently finished, oldest first. */
+  backgroundShells: BackgroundShell[];
   /** Workflow runs by the `Workflow` tool call that launched them. */
   workflowRuns: Record<string, WorkflowRun>;
   /** Runs explicitly covered by the latest current daemon snapshot. */
@@ -723,13 +791,40 @@ export interface SessionNotice {
   description?: string | null;
 }
 
-export type BackgroundAgentStatus = "running" | "stalled" | "completed" | "detached" | "error";
+export type BackgroundAgentStatus =
+  | "running"
+  | "stalled"
+  | "completed"
+  | "detached"
+  | "error"
+  | "requires_action"
+  | "unknown";
+
+export type SubagentState = "running" | "requires_action" | "idle" | "unknown";
+
+/** Wire mirror of the Rust `SubagentRecord` (src/acp/state.rs). */
+export interface SubagentRecord {
+  session_id: string;
+  parent_session_id: string;
+  parent_tool_call_id?: string | null;
+  title?: string | null;
+  description?: string | null;
+  state: SubagentState;
+  stop_reason?: string | null;
+  cancel_capable: boolean;
+  model?: string | null;
+}
 
 export interface BackgroundAgentTool {
+  /** The transcript's tool_use id; absent on events from before it was recorded. */
+  id?: string;
   name: string;
   title?: string | null;
   /** Undefined while running. */
   ok?: boolean | null;
+  /** Transcript timestamps; absent when the transcript line carried none. */
+  started_at?: string | null;
+  ended_at?: string | null;
 }
 
 /** The workflow run and phase a background sub-agent belongs to. */
@@ -737,6 +832,23 @@ export interface WorkflowRef {
   run_id: string;
   name: string;
   phase: string;
+}
+
+/** Mirrors the daemon's cap on finished shells kept per session. */
+export const MAX_FINISHED_BACKGROUND_SHELLS = 20;
+
+export interface BackgroundShell {
+  taskId: string;
+  command: string;
+  startedAt: string | null;
+  endedAt: string | null;
+  finished: boolean;
+}
+
+/** Drops the oldest finished shells beyond the cap. */
+function capFinishedShells(shells: BackgroundShell[]): BackgroundShell[] {
+  let drop = shells.filter((s) => s.finished).length - MAX_FINISHED_BACKGROUND_SHELLS;
+  return drop > 0 ? shells.filter((s) => !(s.finished && drop-- > 0)) : shells;
 }
 
 export interface WorkflowRun {
@@ -797,7 +909,6 @@ export interface ActivityRow {
     | "user_prompt"
     | "user_diff_comments"
     | "elicitation_answered"
-    | "empty_output"
     | "context_reset"
     | "notice"
     | "advisory"
@@ -820,6 +931,8 @@ export interface ActivityRow {
   attachments?: AcpAttachment[];
   /** Plugin that sent a `user_prompt` row; unset when the user typed it. */
   originPlugin?: string;
+  /** Other queued rows folded into this `user_prompt` row; their optimistic rows are retired with it. */
+  mergedPromptIds?: string[];
   output?: ToolOutputBlock[];
   elicitationAnswers?: ElicitationAnswer[];
   asyncSubagent?: boolean;
@@ -842,6 +955,7 @@ export interface TranscriptRow {
   output?: ToolOutputBlock[];
   attachments?: PromptAttachmentRefWire[];
   origin_plugin?: string;
+  merged_prompt_ids?: string[];
   diff_comments?: {
     intro: string;
     outro: string;
@@ -895,6 +1009,7 @@ export function transcriptRowToActivity(row: TranscriptRow, sessionId: string): 
     ...(row.output && row.output.length > 0 ? { output: row.output } : {}),
     ...(attachments ? { attachments } : {}),
     ...(row.origin_plugin ? { originPlugin: row.origin_plugin } : {}),
+    ...(row.merged_prompt_ids && row.merged_prompt_ids.length > 0 ? { mergedPromptIds: row.merged_prompt_ids } : {}),
     ...(row.diff_comments
       ? {
           diffComments: {
@@ -936,7 +1051,12 @@ export function mergeServerRows(existing: ActivityRow[], incoming: ActivityRow[]
       const merged = mergeToolStart(prev.tool, row.tool);
       // Keep the earliest raw_name across a retitling merge for subagent classification.
       if (prev.tool.raw_name) merged.raw_name = prev.tool.raw_name;
-      out[idx] = { ...prev, tool: merged, text: merged.name, at: merged.started_at };
+      out[idx] = {
+        ...prev,
+        tool: merged,
+        text: merged.name,
+        at: merged.started_at,
+      };
     } else {
       out[idx] = row;
     }
@@ -1015,6 +1135,7 @@ export function emptyAcpState(): AcpState {
     backgroundAgents: [],
     backgroundTasks: [],
     workflowRuns: {},
+    workflowSnapshotKeys: [],
     modeSwitchFailed: null,
     lastAgentSwitch: null,
     configOptions: [],
@@ -1024,7 +1145,6 @@ export function emptyAcpState(): AcpState {
     dismissedNoticeIds: [],
     connectionUnavailableNotice: null,
     replayTurnActive: false,
-    workflowSnapshotKeys: [],
     rateLimitRetriesExhausted: null,
     rateLimitParked: null,
     connectionUnavailable: null,
@@ -1032,7 +1152,13 @@ export function emptyAcpState(): AcpState {
     nativeSnapshotSeq: null,
     originalDecisionNonces: [],
     promptWakeEligible: false,
+    hostPromptIntent: null,
+    establishmentRevision: null,
     inflightPromptIds: [],
+    integrationLost: null,
+    integrationLostSnapshotSeq: null,
+    subagents: [],
+    backgroundShells: [],
   };
 }
 
@@ -1073,6 +1199,8 @@ export function revokeNativeAuthority(state: AcpState): AcpState {
     !state.connectionReady &&
     !state.promptWakeEligible &&
     state.nativeSnapshotSeq == null &&
+    state.hostPromptIntent == null &&
+    state.establishmentRevision == null &&
     state.connectionUnavailable === null &&
     state.rateLimitRetriesExhausted === null &&
     state.rateLimitParked === null
@@ -1084,6 +1212,8 @@ export function revokeNativeAuthority(state: AcpState): AcpState {
     nativeSnapshotSeq: null,
     originalDecisionNonces: [],
     promptWakeEligible: false,
+    hostPromptIntent: null,
+    establishmentRevision: null,
     connectionUnavailableNotice: state.connectionUnavailable ?? state.connectionUnavailableNotice,
     connectionUnavailable: null,
     rateLimitRetriesExhausted: null,
@@ -1206,9 +1336,13 @@ export function applyEvent(state: AcpState, frame: AcpFrame): AcpState {
   // Raw callback resolutions settle only their unique matching nonce; unlike a
   // historical turn reset, that acknowledgement may clear its transient error.
   if (!acknowledgesOwnPrompt && !callbackResolution) next.interactionError = state.interactionError;
-  // Positive current readiness heals old worker/compatibility chrome. Qualified
-  // loss likewise cannot be rewritten as process death by a prior owner's stop.
-  if (nativeInputAvailable(state) || state.connectionUnavailable) {
+  // Live input or a fenced pending constructor heals old lifecycle chrome only.
+  // Neither the comparison revision nor governed wake is Native input authority.
+  if (
+    nativeInputAvailable(state) ||
+    state.connectionUnavailable ||
+    (state.promptWakeEligible && state.establishmentRevision !== null)
+  ) {
     next.workerStopped = state.workerStopped;
     next.workerRestarting = state.workerRestarting;
     next.workerIdleStopped = state.workerIdleStopped;
@@ -1241,6 +1375,11 @@ function applyRawEvent(state: AcpState, frame: AcpFrame, rawTurnActive: boolean,
       const priorBaseline = state.usageBaseline?.cost ?? 0;
       next.usageBaseline = { cost: priorUsage + priorBaseline };
       next.sessionUsage = null;
+    }
+    if (event === "SessionCleared") {
+      next.lastError = null;
+      next.lastErrorEvidence = null;
+      next.interactionError = null;
     }
     if (event === "SessionCleared") {
       next.lastError = null;
@@ -1353,6 +1492,8 @@ function applyRawEvent(state: AcpState, frame: AcpFrame, rawTurnActive: boolean,
     return next;
   }
   if ("Stopped" in event) {
+    // A raw stop has no host-intent identity and may belong to prior history.
+    // Only a canonical snapshot or management boundary revokes live comparison data.
     // Whether this `Stopped` ends the turn is the daemon's call (see closeTurn); the escalation deadline is ours.
     next.cancelEscalatesAt = null;
     closeTurn(next);
@@ -1399,7 +1540,17 @@ function applyRawEvent(state: AcpState, frame: AcpFrame, rawTurnActive: boolean,
     next.agentUnresponsive = false;
     return next;
   }
+  if ("IntegrationLost" in event) {
+    if (state.integrationLostSnapshotSeq == null || frame.seq > state.integrationLostSnapshotSeq) {
+      next.integrationLost = event.IntegrationLost.reason;
+    }
+    next.agentUnresponsive = false;
+    closeTurn(next);
+    return next;
+  }
   if ("AgentStartupError" in event) {
+    next.hostPromptIntent = null;
+    next.establishmentRevision = null;
     next.startupError = event.AgentStartupError.message;
     endRestart(next);
     next.agentUnresponsive = false;
@@ -1407,6 +1558,8 @@ function applyRawEvent(state: AcpState, frame: AcpFrame, rawTurnActive: boolean,
     return next;
   }
   if ("PromptRuntimeError" in event) {
+    next.hostPromptIntent = null;
+    next.establishmentRevision = null;
     next.lastError = event.PromptRuntimeError.message;
     next.lastErrorEvidence = event.PromptRuntimeError.evidence ?? null;
     closeTurn(next);
@@ -1416,6 +1569,8 @@ function applyRawEvent(state: AcpState, frame: AcpFrame, rawTurnActive: boolean,
     next.connectionUnavailableNotice = event.AcpConnectionUnavailable;
     next.connectionReady = false;
     next.promptWakeEligible = false;
+    next.hostPromptIntent = null;
+    next.establishmentRevision = null;
     return next;
   }
   if ("ApprovalResolved" in event || "ElicitationResolved" in event) {
@@ -1441,10 +1596,15 @@ function applyRawEvent(state: AcpState, frame: AcpFrame, rawTurnActive: boolean,
     // Opening the turn here keeps `turnActive` from flickering between settling the id and the `reduced_state` frame.
     const pid = event.UserPromptSent.prompt_id;
     const wasInflight = pid != null && pid.length > 0 && next.inflightPromptIds.includes(pid);
+    const merged = event.UserPromptSent.merged_prompt_ids ?? [];
     if (wasInflight) {
       next.inflightPromptIds = next.inflightPromptIds.filter((id) => id !== pid);
     } else {
       next.promptSeq += 1;
+    }
+    if (merged.length > 0) {
+      next.inflightPromptIds = next.inflightPromptIds.filter((id) => !merged.includes(id));
+      next.optimisticRows = next.optimisticRows.filter((r) => !merged.includes(r.id));
     }
     next.serverTurnActive = !next.connectionUnavailable;
     next.turnActive = deriveTurnActive(next);
@@ -1468,6 +1628,8 @@ function applyRawEvent(state: AcpState, frame: AcpFrame, rawTurnActive: boolean,
     return next;
   }
   if ("SessionContextReset" in event) {
+    next.hostPromptIntent = null;
+    next.establishmentRevision = null;
     next.sessionUsage = null;
     next.usageBaseline = null;
     // A session/load failure before any prompt is expected; no primer to offer.
@@ -1514,6 +1676,7 @@ function applyRawEvent(state: AcpState, frame: AcpFrame, rawTurnActive: boolean,
     next.configOptions = [];
     next.configOptionSwitchFailed = null;
     next.pendingConfigOption = null;
+    next.subagents = [];
     return next;
   }
   if ("PromptRejected" in event) {
@@ -1547,6 +1710,9 @@ function applyRawEvent(state: AcpState, frame: AcpFrame, rawTurnActive: boolean,
       result: null,
       warning: null,
     };
+    // A child's snapshot may predate the launch event.
+    const child = next.subagents.find((s) => s.parent_tool_call_id === e.tool_call_id);
+    if (child) Object.assign(record, reconcileChild(record, child, e.started_at));
     // Idempotent on replay.
     const i = next.backgroundAgents.findIndex((a) => a.agentId === e.agent_id);
     next.backgroundAgents =
@@ -1592,14 +1758,38 @@ function applyRawEvent(state: AcpState, frame: AcpFrame, rawTurnActive: boolean,
     );
     return next;
   }
+  if ("SubagentUpdated" in event) {
+    const { subagent, at } = event.SubagentUpdated;
+    const parent = subagent.parent_tool_call_id;
+    if (parent) {
+      next.backgroundAgents = next.backgroundAgents.map((a) =>
+        a.toolCallId === parent ? reconcileChild(a, subagent, at) : a,
+      );
+    }
+    const i = next.subagents.findIndex((s) => s.session_id === subagent.session_id);
+    next.subagents =
+      i >= 0 ? next.subagents.map((s, idx) => (idx === i ? subagent : s)) : [...next.subagents, subagent];
+    return next;
+  }
   if ("BackgroundTaskStarted" in event) {
-    const { task_id: id, tool_call_id: toolCallId, workflow } = event.BackgroundTaskStarted;
+    const { task_id: id, tool_call_id: toolCallId, workflow, description, started_at } = event.BackgroundTaskStarted;
     if (!next.backgroundTasks.includes(id)) next.backgroundTasks = [...next.backgroundTasks, id];
+    next.backgroundShells = next.backgroundShells.filter((s) => s.taskId !== id);
+    if (!workflow) {
+      next.backgroundShells = [
+        ...next.backgroundShells,
+        { taskId: id, command: description, startedAt: started_at ?? null, endedAt: null, finished: false },
+      ];
+    }
     next.workflowRuns = closeWorkflowRun(next.workflowRuns, id, null);
     if (workflow && toolCallId) {
       next.workflowRuns = {
         ...next.workflowRuns,
-        [toolCallId]: { taskId: id, name: workflow.name, summary: workflow.summary ?? null },
+        [toolCallId]: {
+          taskId: id,
+          name: workflow.name,
+          summary: workflow.summary ?? null,
+        },
       };
     }
     return next;
@@ -1607,11 +1797,27 @@ function applyRawEvent(state: AcpState, frame: AcpFrame, rawTurnActive: boolean,
   if ("BackgroundTaskFinished" in event) {
     const { task_id: id, ended_at: endedAt } = event.BackgroundTaskFinished;
     next.backgroundTasks = next.backgroundTasks.filter((t) => t !== id);
+    next.backgroundShells = capFinishedShells(
+      next.backgroundShells.map((s) => (s.taskId === id ? { ...s, finished: true, endedAt: endedAt ?? null } : s)),
+    );
     next.workflowRuns = closeWorkflowRun(next.workflowRuns, id, endedAt ?? null);
     return next;
   }
   // Remaining events carry no client control state.
   return next;
+}
+
+/** Fold a child's state; only a raw update's timestamp may supply a new end. */
+function reconcileChild(a: BackgroundAgent, child: SubagentRecord, at?: string): BackgroundAgent {
+  const status = subagentStatus(child);
+  const endedAt = at === undefined ? a.endedAt : child.state === "idle" ? (a.endedAt ?? at) : null;
+  return a.status === status && a.endedAt === endedAt ? a : { ...a, status, endedAt };
+}
+
+/** The agent status a child's session state stands for. */
+export function subagentStatus(child: SubagentRecord): BackgroundAgentStatus {
+  if (child.state !== "idle") return child.state;
+  return child.stop_reason === "error" ? "error" : "completed";
 }
 
 /** Task ids can be reused, so only the run still open on `taskId` is closed. */
@@ -1635,6 +1841,23 @@ export function reduceFrames(frames: AcpFrame[]): AcpState {
   return frames.reduce(applyEvent, emptyAcpState());
 }
 
+/**
+ * A snapshot at or past `lastSeq` refreshes held records, which may have missed frames after a lag; an older one
+ * (a replay already folded past it) only adds records we lack. Local-only records always stay.
+ */
+function mergeSubagents(
+  held: SubagentRecord[],
+  snapshot: SubagentRecord[],
+  snapshotIsNewer: boolean,
+): SubagentRecord[] {
+  const fromSnapshot = new Map(snapshot.map((r) => [r.session_id, r]));
+  const heldIds = new Set(held.map((r) => r.session_id));
+  return [
+    ...held.map((r) => (snapshotIsNewer ? (fromSnapshot.get(r.session_id) ?? r) : r)),
+    ...snapshot.filter((r) => !heldIds.has(r.session_id)),
+  ];
+}
+
 /** Adopt the daemon's folded control state. Leaves `lastSeq` to the raw frames that dedupe replays. */
 export function applyReducedState(
   state: AcpState,
@@ -1655,6 +1878,17 @@ export function applyReducedState(
   ]);
   const locallyResolved = state.locallyResolved.filter((nonce) => stillPending.has(nonce));
   const resolved = new Set(locallyResolved);
+  let backgroundAgents = state.backgroundAgents;
+  if (reduced.subagents?.length && backgroundAgents.length) {
+    const children = new Map<string, SubagentRecord>();
+    for (const child of reduced.subagents) {
+      if (child.parent_tool_call_id) children.set(child.parent_tool_call_id, child);
+    }
+    backgroundAgents = backgroundAgents.map((agent) => {
+      const child = children.get(agent.toolCallId);
+      return child ? reconcileChild(agent, child) : agent;
+    });
+  }
   const next: AcpState = {
     ...state,
     replayTurnActive: state.replayTurnActive ?? state.serverTurnActive,
@@ -1678,6 +1912,15 @@ export function applyReducedState(
     originalDecisionNonces:
       authoritative && connectionUnavailable === null ? [...(reduced.original_decision_nonces ?? [])] : [],
     promptWakeEligible: authoritative && reduced.prompt_wake_eligible === true && connectionUnavailable === null,
+    hostPromptIntent:
+      authoritative && connectionUnavailable === null && typeof reduced.host_prompt_intent === "string"
+        ? reduced.host_prompt_intent
+        : null,
+    establishmentRevision: authoritative
+      ? holds("establishment_revision")
+        ? state.establishmentRevision
+        : (reduced.establishment_revision ?? null)
+      : null,
     availableCommands: holds("available_commands") ? state.availableCommands : reduced.available_commands,
     availableModes: holds("available_modes") ? state.availableModes : reduced.available_modes,
     currentModeId: reduced.current_mode_id,
@@ -1697,10 +1940,29 @@ export function applyReducedState(
     // Likewise authoritative: a task that started before the replay window
     // has no start event here, yet the session is still busy.
     backgroundTasks: reduced.background_tasks ?? [],
+    backgroundShells: restoreBackgroundShells(state.backgroundShells, reduced.background_shells ?? []),
     workflowRuns: restoreWorkflowRuns(state.workflowRuns, reduced.workflow_runs ?? []),
     workflowSnapshotKeys: reduced.workflow_runs?.map((run) => run.tool_call_id) ?? [],
+    backgroundAgents,
+    subagents: mergeSubagents(
+      state.subagents,
+      reduced.subagents ?? [],
+      snapshotSeq === undefined || snapshotSeq >= state.lastSeq,
+    ),
     locallyResolved,
   };
+  if (
+    authoritative &&
+    reduced.integration_lost !== undefined &&
+    (state.integrationLostSnapshotSeq == null || snapshotSeq >= state.integrationLostSnapshotSeq)
+  ) {
+    next.integrationLost = reduced.integration_lost;
+    next.integrationLostSnapshotSeq = snapshotSeq;
+  }
+  if (authoritative && next.promptWakeEligible && next.establishmentRevision !== null) {
+    // The same fenced observation still has a pending actor, not a retired worker.
+    next.workerStopped = false;
+  }
   if (connectionReady) {
     next.sessionAssigned = true;
     endRestart(next);
@@ -1713,6 +1975,26 @@ export function applyReducedState(
   }
   if (next.connectionUnavailable) closeUnavailableConnection(next);
   return next;
+}
+
+/** A snapshot older than a finish already applied must not reopen the shell.
+ *  A reused task id has a different start time, so it still replaces the run. */
+function restoreBackgroundShells(
+  local: BackgroundShell[],
+  records: NonNullable<ReducedState["background_shells"]>,
+): BackgroundShell[] {
+  return records.map((r) => {
+    const startedAt = r.started_at ?? null;
+    const done = local.find((s) => s.taskId === r.task_id && s.finished && s.startedAt === startedAt);
+    if (done && !r.finished) return done;
+    return {
+      taskId: r.task_id,
+      command: r.command,
+      startedAt,
+      endedAt: r.ended_at ?? null,
+      finished: r.finished ?? false,
+    };
+  });
 }
 
 /** The replay window can miss a run's launch or finish. Adopts runs it
@@ -1731,7 +2013,10 @@ function restoreWorkflowRuns(
       taskId: record.task_id,
       name: record.name,
       summary: local?.summary ?? record.summary ?? null,
-      ...(record.finished && { finished: true, endedAt: record.ended_at ?? null }),
+      ...(record.finished && {
+        finished: true,
+        endedAt: record.ended_at ?? null,
+      }),
     };
   }
   return next;
@@ -1781,7 +2066,12 @@ export function mergePrependedActivity(olderRows: ActivityRow[], tailRows: Activ
       // The placeholder carried the completion time, which would zero the duration.
       if (row.tool.started_at) merged.started_at = row.tool.started_at;
       tail = tail.slice();
-      tail[idx] = { ...existing, tool: merged, text: merged.name, at: merged.started_at };
+      tail[idx] = {
+        ...existing,
+        tool: merged,
+        text: merged.name,
+        at: merged.started_at,
+      };
     }
   }
   return prepended.concat(tail);
@@ -1837,6 +2127,7 @@ function closeTurn(next: AcpState): void {
 }
 
 function closeUnavailableConnection(next: AcpState): void {
+  next.hostPromptIntent = null;
   // A refused management attachment grants no controls, but does not prove
   // that the retained native turn, tool or callbacks ended.
   if (next.connectionUnavailable?.source === "runner_record") return;
@@ -1895,6 +2186,8 @@ export function normaliseTurnState(
     connectionReady?: boolean;
     nativeSnapshotSeq?: number | null;
     promptWakeEligible?: boolean;
+    integrationLost?: IntegrationLostReason | null;
+    integrationLostSnapshotSeq?: number | null;
   },
 ): AcpState {
   const serverTurnActive =
@@ -1924,13 +2217,21 @@ export function normaliseTurnState(
       : 0;
   const next: AcpState = {
     ...state,
-    oldestSeq,
     connectionUnavailable: state.connectionUnavailable ?? null,
     connectionUnavailableNotice: state.connectionUnavailableNotice ?? state.connectionUnavailable ?? null,
     connectionReady: state.connectionReady === true,
     nativeSnapshotSeq: typeof state.nativeSnapshotSeq === "number" ? state.nativeSnapshotSeq : null,
     originalDecisionNonces: [],
     promptWakeEligible: state.promptWakeEligible === true,
+    turnActive: serverTurnActive,
+    oldestSeq,
+    integrationLost: state.integrationLost ?? null,
+    integrationLostSnapshotSeq:
+      typeof state.integrationLostSnapshotSeq === "number" &&
+      Number.isFinite(state.integrationLostSnapshotSeq) &&
+      state.integrationLostSnapshotSeq >= 0
+        ? state.integrationLostSnapshotSeq
+        : null,
     rejectedPrompts,
     agentUnresponsive,
     agentOrphaned,
@@ -1944,7 +2245,6 @@ export function normaliseTurnState(
     serverTurnActive,
     promptSeq,
     inflightPromptIds: [],
-    turnActive: serverTurnActive,
   };
   if (next.connectionUnavailable) closeUnavailableConnection(next);
   return next;

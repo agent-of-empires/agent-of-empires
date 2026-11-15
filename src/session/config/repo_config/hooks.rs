@@ -306,7 +306,8 @@ const PROMPT_SUPPRESS_ENV: &[(&str, &str)] = &[
 ];
 
 /// Local hooks run in `$SHELL`, container hooks in `bash` via `exec`, where env
-/// must be passed as `-e` because host env does not propagate.
+/// must be named with `-e` because host env does not propagate. The runtime reads
+/// each value from its own env, keeping it out of argv.
 fn build_hook_command(
     cmd: &str,
     target: &HookTarget,
@@ -347,10 +348,10 @@ fn build_hook_command(
             command.arg("exec").arg("--workdir").arg(workdir);
             let pairs = extra_env
                 .iter()
-                .map(|(k, v)| format!("{}={}", k, v))
-                .chain(prompt_env.map(|(k, v)| format!("{}={}", k, v)));
-            for pair in pairs {
-                command.arg("-e").arg(pair);
+                .map(|(k, v)| (*k, v.as_str()))
+                .chain(prompt_env.map(|(k, v)| (*k, *v)));
+            for (key, value) in pairs {
+                command.arg("-e").arg(key).env(key, value);
             }
             command
                 .arg(container_name)
@@ -913,12 +914,19 @@ mod tests {
         items.iter().map(|s| s.to_string()).collect()
     }
 
-    fn container_args(opts: HookSpawnOpts, env: &[(&'static str, String)]) -> Vec<String> {
+    fn container_command(
+        opts: HookSpawnOpts,
+        env: &[(&'static str, String)],
+    ) -> std::process::Command {
         let target = HookTarget::Container {
             container_name: "test_container",
             workdir: "/work",
         };
         build_hook_command("true", &target, opts, env)
+    }
+
+    fn container_args(opts: HookSpawnOpts, env: &[(&'static str, String)]) -> Vec<String> {
+        container_command(opts, env)
             .get_args()
             .map(|a| a.to_string_lossy().into_owned())
             .collect()
@@ -1245,22 +1253,29 @@ mod tests {
     }
 
     #[test]
-    fn container_hook_forwards_env_as_single_dash_e_args() {
-        let has_pair =
-            |args: &[String], pair: &str| args.windows(2).any(|w| w[0] == "-e" && w[1] == pair);
-        let detached = container_args(
-            HookSpawnOpts {
-                merge_stderr: true,
-                detach_tty: true,
-            },
-            &[],
-        );
-        for pair in [
-            "GIT_TERMINAL_PROMPT=0",
-            "GIT_ASKPASS=true",
-            "SSH_ASKPASS=true",
+    fn container_hook_names_env_in_argv_and_carries_values_on_the_child() {
+        let has_name =
+            |args: &[String], name: &str| args.windows(2).any(|w| w[0] == "-e" && w[1] == name);
+        let child_value = |command: &std::process::Command, name: &str| {
+            command
+                .get_envs()
+                .find(|(key, _)| *key == name)
+                .and_then(|(_, value)| value)
+                .map(|value| value.to_string_lossy().into_owned())
+        };
+        let detach = HookSpawnOpts {
+            merge_stderr: true,
+            detach_tty: true,
+        };
+        let detached = container_args(detach, &[]);
+        let command = container_command(detach, &[]);
+        for (name, value) in [
+            ("GIT_TERMINAL_PROMPT", "0"),
+            ("GIT_ASKPASS", "true"),
+            ("SSH_ASKPASS", "true"),
         ] {
-            assert!(has_pair(&detached, pair), "{pair}: {detached:?}");
+            assert!(has_name(&detached, name), "{name}: {detached:?}");
+            assert_eq!(child_value(&command, name).as_deref(), Some(value));
         }
         let attached = container_args(HookSpawnOpts::default(), &[]);
         assert!(!attached.iter().any(|a| a == "-e"), "{attached:?}");
@@ -1270,8 +1285,12 @@ mod tests {
             ("AOE_SESSION_TITLE", "My Title".to_string()),
         ];
         let args = container_args(HookSpawnOpts::default(), &env);
-        assert!(has_pair(&args, "AOE_SESSION_ID=s_abc"), "{args:?}");
-        assert!(has_pair(&args, "AOE_SESSION_TITLE=My Title"), "{args:?}");
+        let command = container_command(HookSpawnOpts::default(), &env);
+        for (name, value) in &env {
+            assert!(has_name(&args, name), "{args:?}");
+            assert!(!args.iter().any(|a| a.contains(value.as_str())), "{args:?}");
+            assert_eq!(child_value(&command, name).as_deref(), Some(value.as_str()));
+        }
     }
 
     #[test]

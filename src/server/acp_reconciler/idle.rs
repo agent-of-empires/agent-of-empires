@@ -160,7 +160,8 @@ pub(super) async fn reap_idle_workers(state: &Arc<AppState>) {
             let _ = release.await;
         }
         if !matches!(
-            query_store(
+            super::query_flushed(
+                &state.acp_supervisor,
                 &state.acp_event_store,
                 &id,
                 "idle-reap quota hold",
@@ -178,7 +179,9 @@ pub(super) async fn reap_idle_workers(state: &Arc<AppState>) {
         let Some(scope) = lease.native_scope().ok().flatten() else {
             continue;
         };
-        let probe = query_store(
+        // Re-check after queued events reach the store; a failed probe is busy.
+        let probe = super::query_flushed(
+            &state.acp_supervisor,
             &state.acp_event_store,
             &id,
             "idle-reap eligibility",
@@ -187,7 +190,7 @@ pub(super) async fn reap_idle_workers(state: &Arc<AppState>) {
                     store
                         .last_event_at_for_sessions(&[id.to_owned()])
                         .remove(id),
-                    store.has_in_flight_turn(id),
+                    store.holds_live_work(id),
                     store.has_open_tool_call_in_epoch(id),
                     !store.unresolved_approval_nonces(id).is_empty()
                         || !store.unresolved_elicitation_nonces(id).is_empty(),
@@ -195,7 +198,7 @@ pub(super) async fn reap_idle_workers(state: &Arc<AppState>) {
             },
         )
         .await;
-        let Some((latest, in_flight, open_tool, awaiting_user)) = probe else {
+        let Some((latest, holds_live_work, open_tool, awaiting_user)) = probe else {
             continue;
         };
         let last_ms = latest.map(|last| last.max(lease.idle_baseline_ms()));
@@ -205,7 +208,7 @@ pub(super) async fn reap_idle_workers(state: &Arc<AppState>) {
                 chrono::Utc::now().timestamp_millis(),
                 last_ms,
                 idle_secs,
-                !matches!(in_flight, Ok(Known(false))),
+                !matches!(holds_live_work, Ok(Known(false))),
             )
         {
             continue;
@@ -334,7 +337,7 @@ mod tests {
                     } else if case == "prompt_pending" {
                         live.state.acp_supervisor.test_note_admission(&id);
                     } else if case == "unknown" {
-                        let retained = live.state.acp_event_store.highest_seq(&id);
+                        let retained = live.state.acp_event_store.highest_seq(&id).unwrap();
                         live.state
                             .acp_event_store
                             .test_conn()
@@ -411,9 +414,9 @@ mod tests {
                     .await
                     .unwrap()
                     .unwrap();
-                let before = live.state.acp_event_store.highest_seq(&id);
+                let before = live.state.acp_event_store.highest_seq(&id).unwrap();
                 live.state.acp_supervisor.test_note_admission(&id);
-                assert_eq!(live.state.acp_event_store.highest_seq(&id), before);
+                assert_eq!(live.state.acp_event_store.highest_seq(&id).unwrap(), before);
                 assert!(release.release());
                 reaper.await.unwrap();
                 assert_eq!(live.state.acp_supervisor.current_lease(&id), Some(lease));
@@ -459,7 +462,7 @@ mod tests {
             let old_stamp = live.state.instances.read().await.iter().find(|row| row.id == id).unwrap().idle_dormant_since.unwrap();
             let storage = crate::session::Storage::open_reference("test").unwrap();
             assert_eq!(storage.load().unwrap().iter().find(|row| row.id == id).unwrap().idle_dormant_since, Some(old_stamp));
-            let before = live.state.acp_event_store.highest_seq(&id);
+            let before = live.state.acp_event_store.highest_seq(&id).unwrap();
             live.native.send(serde_json::json!({"jsonrpc":"2.0","method":"session/update","params":{
                 "sessionId":live.sid,"update":{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"late native output"}}
             }})).await;
@@ -723,7 +726,7 @@ mod tests {
                 if case != "fresh" { live.make_quota_due(); }
                 live.state.instances.write().await.iter_mut().find(|row| row.id == id).unwrap().status =
                     if case == "waiting" { crate::session::Status::Waiting } else { crate::session::Status::Running };
-                let before = live.state.acp_event_store.highest_seq(&id);
+                let before = live.state.acp_event_store.highest_seq(&id).unwrap();
                 if case == "unknown" {
                     live.state.acp_event_store.test_conn().execute("DELETE FROM acp_events WHERE session_id=?1 AND seq<?2",
                         rusqlite::params![id, i64::try_from(before).unwrap()]).unwrap();
@@ -751,7 +754,9 @@ mod tests {
         crate::session::config::update_config(|config| config.acp.auto_stop_idle_secs = 60)
             .unwrap();
         crate::server::test_support::refresh_canonical_metadata_for_test(&scope.state).await;
-        let mut live = crate::server::test_support::managed_control_session(scope, label).await;
+        let mut live =
+            crate::server::test_support::managed_control_session(scope, label, "claude", None)
+                .await;
         let request = live.start_prompt("establish a real completed turn").await;
         live.finish_prompt(&request, None).await;
         live.make_quota_due();

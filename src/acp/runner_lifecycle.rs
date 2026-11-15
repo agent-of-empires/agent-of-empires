@@ -169,6 +169,7 @@ impl Default for Construction {
             id: uuid::Uuid::new_v4(),
             cancellation: CancellationToken::new(),
             retirement_authorized: std::sync::atomic::AtomicBool::new(true),
+            constructor_finished: std::sync::atomic::AtomicBool::new(false),
             runner: Mutex::default(),
             scopes: Mutex::default(),
             admission: Mutex::default(),
@@ -184,13 +185,12 @@ impl Default for Construction {
             idle_baseline_ms: std::sync::atomic::AtomicI64::new(
                 chrono::Utc::now().timestamp_millis(),
             ),
-            admissions: std::sync::atomic::AtomicU64::new(0),
-            constructor_finished: std::sync::atomic::AtomicBool::new(false),
-            owned_child_wait_pending: std::sync::atomic::AtomicBool::new(false),
             #[cfg(test)]
             child_wait_completed: tokio::sync::watch::channel(None).0,
             original_constructor_obligations: std::sync::atomic::AtomicUsize::new(usize::MAX),
             original_constructor_notify: std::sync::OnceLock::new(),
+            admissions: std::sync::atomic::AtomicU64::new(0),
+            owned_child_wait_pending: std::sync::atomic::AtomicBool::new(false),
         }
     }
 }
@@ -298,12 +298,6 @@ impl Lease {
             .load(std::sync::atomic::Ordering::Acquire)
     }
 
-    pub(crate) fn owned_child_wait_pending(&self) -> bool {
-        self.construction
-            .owned_child_wait_pending
-            .load(std::sync::atomic::Ordering::Acquire)
-    }
-
     /// Arm one actual admitted original; aliases and captured-stop recreation never arm it.
     pub(crate) fn begin_original_constructor(
         &self,
@@ -348,12 +342,6 @@ impl Lease {
         self.construction
             .idle_baseline_ms
             .load(std::sync::atomic::Ordering::Relaxed)
-    }
-
-    pub(crate) fn admissions(&self) -> u64 {
-        self.construction
-            .admissions
-            .load(std::sync::atomic::Ordering::Acquire)
     }
 
     #[cfg(test)]
@@ -801,6 +789,18 @@ impl Lease {
         admission.generation = generation;
         admission.native_scope = Some(destination);
         true
+    }
+
+    pub(crate) fn owned_child_wait_pending(&self) -> bool {
+        self.construction
+            .owned_child_wait_pending
+            .load(std::sync::atomic::Ordering::Acquire)
+    }
+
+    pub(crate) fn admissions(&self) -> u64 {
+        self.construction
+            .admissions
+            .load(std::sync::atomic::Ordering::Acquire)
     }
 
     pub(crate) fn record_scope(&self, scope: crate::process::worker_registry::ScopeOwnership) {

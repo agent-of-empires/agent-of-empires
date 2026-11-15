@@ -179,7 +179,6 @@ mod tests {
             (4, 1, 0)
         );
         assert_eq!(crate::session::migration_backups(&path).unwrap().len(), 1);
-        EventStore::open(&path, 100).unwrap();
         let reopened = Connection::open(&path).unwrap();
         assert_eq!(
             reopened

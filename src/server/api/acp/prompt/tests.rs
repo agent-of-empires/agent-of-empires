@@ -88,6 +88,257 @@ fn published(state: &AppState, id: &str, pred: impl Fn(&Event) -> bool) -> bool 
         .any(|stored| pred(stored.event.as_ref()))
 }
 
+struct PendingInitialSession {
+    client: crate::acp::supervisor::test_support::managed::ManagedClient,
+    native: crate::acp::supervisor::test_support::managed::NativePeer,
+    state: Arc<AppState>,
+    requests: tokio::sync::mpsc::UnboundedReceiver<serde_json::Value>,
+    new_request: serde_json::Value,
+    sid: String,
+}
+
+impl PendingInitialSession {
+    async fn new(
+        scope: &mut crate::acp::supervisor::test_support::managed::ManagedScope,
+        label: &str,
+    ) -> Self {
+        let project = scope.tempdir();
+        let store = crate::session::get_app_dir().unwrap().join(label);
+        std::fs::create_dir_all(&store).unwrap();
+        scope.save_environment(&["CLAUDE_CONFIG_DIR"]);
+        std::env::set_var("CLAUDE_CONFIG_DIR", &store);
+        let (sent, mut requests) = tokio::sync::mpsc::unbounded_channel();
+        let (config, native) =
+            scope.native_peer(project.path().into(), "claude", "claude", move |request| {
+                match request["method"].as_str().unwrap() {
+                    "initialize" => Some(serde_json::json!({
+                        "jsonrpc": "2.0", "id": request["id"],
+                        "result": {"protocolVersion": 1, "agentCapabilities": {"loadSession": true}}
+                    })),
+                    "session/new" | "session/prompt" | "session/cancel" => {
+                        sent.send(request.clone()).unwrap();
+                        None
+                    }
+                    other => panic!("unexpected actual Native method: {other}"),
+                }
+            });
+        let client = scope.spawn(config, label).await.unwrap();
+        let new_request = tokio::time::timeout(Duration::from_secs(10), requests.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(new_request["method"], "session/new");
+        let state = scope.state.clone();
+        crate::server::test_support::accept_runtime_read_cache_for_test(&state).await;
+        tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                if state
+                    .instances
+                    .read()
+                    .await
+                    .iter()
+                    .any(|row| row.id == client.id && row.launch_is_finalized())
+                {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("actual creation is finalized while Native New remains held");
+        drop(
+            tokio::time::timeout(
+                Duration::from_secs(10),
+                state.session_service.prompt_submission(&client.id),
+            )
+            .await
+            .expect("actual creator releases its submission"),
+        );
+        assert_ne!(
+            client.lease.spawned_runner().unwrap().pid,
+            std::process::id()
+        );
+        Self {
+            client,
+            native,
+            state,
+            requests,
+            new_request,
+            sid: format!("{label}-native"),
+        }
+    }
+
+    async fn release_new(&mut self) {
+        self.native
+            .send(serde_json::json!({
+                "jsonrpc": "2.0", "id": self.new_request["id"],
+                "result": {"sessionId": self.sid}
+            }))
+            .await;
+        self.client.ready().await;
+    }
+
+    async fn next_request(&mut self, method: &str) -> serde_json::Value {
+        let request = tokio::time::timeout(Duration::from_secs(10), self.requests.recv())
+            .await
+            .expect("actual Native FIFO advances")
+            .unwrap();
+        assert_eq!(request["method"], method);
+        request
+    }
+
+    async fn finish(&mut self, request: &serde_json::Value) {
+        self.native
+            .send(serde_json::json!({
+                "jsonrpc": "2.0", "id": request["id"], "result": {"stopReason": "end_turn"}
+            }))
+            .await;
+        self.wait_stopped("prompt_complete").await;
+    }
+
+    async fn wait_stopped(&mut self, reason: &str) {
+        tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                let event = self
+                    .client
+                    .next_event()
+                    .await
+                    .expect("actual drain remains open");
+                if matches!(&event, Event::Stopped { reason: got } if got == reason) {
+                    break;
+                }
+                assert!(!matches!(
+                    event,
+                    Event::AgentStartupError { .. } | Event::AcpConnectionUnavailable { .. }
+                ));
+            }
+        })
+        .await
+        .expect("actual publication settles this turn");
+    }
+
+    async fn submit(&self, text: &str) {
+        let response = acp_prompt(
+            State(self.state.clone()),
+            Path(self.client.id.clone()),
+            prompt_req(text),
+        )
+        .await
+        .into_response();
+        let status = response.status();
+        let body = axum::body::to_bytes(response.into_body(), 4096)
+            .await
+            .unwrap();
+        assert_eq!(
+            status,
+            StatusCode::ACCEPTED,
+            "{}",
+            String::from_utf8_lossy(&body)
+        );
+        let body: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(body["disposition"], "sent");
+        assert!(body["queued_id"].is_null());
+    }
+
+    async fn cancel(&self, intent: Option<uuid::Uuid>) -> StatusCode {
+        let body = intent
+            .map(|id| {
+                axum::body::Bytes::from(
+                    serde_json::to_vec(&serde_json::json!({"host_prompt_intent": id})).unwrap(),
+                )
+            })
+            .unwrap_or_default();
+        acp_cancel(
+            State(self.state.clone()),
+            Path(self.client.id.clone()),
+            body,
+        )
+        .await
+        .into_response()
+        .status()
+    }
+}
+
+#[tokio::test]
+#[serial_test::serial]
+async fn initial_host_intent_obeys_applied_and_stop_before_native_issue() {
+    use crate::acp::supervisor::test_support::managed::with_managed;
+    for mode in 0..3 {
+        with_managed(|scope| Box::pin(async move {
+            let gate = if mode == 2 {
+                let (gate, release, entered) = scope.gate();
+                scope.configure_sdk(crate::acp::acp_client::SdkTestOptions {
+                    prompt_admission: Some(gate), ..Default::default()
+                });
+                Some((release, entered))
+            } else { None };
+            let mut live = PendingInitialSession::new(scope, "initial-host-intent").await;
+            let owner = live.client.lease.spawned_runner().unwrap();
+            live.submit("original first host intent").await;
+            let reduced = live.state.session_service.fold_control_state(&live.client.id).await.unwrap();
+            let projected = live.state.session_service.native_control_projection(
+                &live.client.id, None, reduced.last_seq).await;
+            assert!(!projected.ready);
+            let original_intent = projected.host_prompt_intent.expect("live host-only cancellation identity");
+            assert_eq!(live.client.initial_prompt_identity(), Some(original_intent));
+            assert!(!live.native.requests().iter().any(|method|
+                method == "session/prompt" || method == "session/cancel"));
+            assert!(live.state.instances.read().await.iter().find(|row|
+                row.id == live.client.id).unwrap().pending_initial_turn.is_none());
+            if mode == 1 {
+                assert_eq!(live.cancel(Some(original_intent)).await, StatusCode::ACCEPTED);
+                live.wait_stopped("user_stopped").await;
+            }
+            live.release_new().await;
+            if let Some((release, entered)) = gate {
+                tokio::time::timeout(Duration::from_secs(10), entered).await.unwrap().unwrap();
+                assert_eq!(live.cancel(Some(original_intent)).await, StatusCode::ACCEPTED);
+                live.wait_stopped("user_stopped").await;
+                release.release();
+            }
+            if mode == 0 {
+                let original = live.next_request("session/prompt").await;
+                assert_eq!(original["params"]["sessionId"], live.sid);
+                assert_eq!(original["params"]["prompt"][0]["text"], "original first host intent");
+                live.finish(&original).await;
+                let reset = live.client.reset_session("/clear");
+                tokio::pin!(reset);
+                let request = tokio::select! {
+                    request = live.requests.recv() => request.unwrap(),
+                    result = &mut reset => panic!("reset answered before its actual Native New: {result:?}"),
+                };
+                assert_eq!(request["method"], "session/new");
+                let replacement = "replacement-native-attempt";
+                live.native.send(serde_json::json!({
+                    "jsonrpc": "2.0", "id": request["id"], "result": {"sessionId": replacement}
+                })).await;
+                reset.await.unwrap();
+                live.sid = replacement.into();
+            }
+            assert_eq!(live.client.initial_prompt_identity(), None);
+            live.submit("explicit replacement input").await;
+            let replacement = live.next_request("session/prompt").await;
+            assert_eq!(replacement["params"]["sessionId"], live.sid);
+            assert_eq!(replacement["params"]["prompt"][0]["text"], "explicit replacement input");
+            assert_eq!(live.cancel(Some(original_intent)).await, StatusCode::CONFLICT);
+            assert_eq!(live.client.lease.spawned_runner(), Some(owner));
+            assert_eq!(live.cancel(None).await, StatusCode::ACCEPTED);
+            let cancel = live.next_request("session/cancel").await;
+            assert_eq!(cancel["params"]["sessionId"], live.sid);
+            let requests = live.native.requests();
+            assert_eq!(requests.iter().filter(|method| *method == "session/prompt").count(),
+                if mode == 0 { 2 } else { 1 });
+            assert_eq!(requests.iter().filter(|method| *method == "session/cancel").count(), 1);
+            let replay = live.state.acp_event_store.replay_from(&live.client.id, 0).unwrap();
+            assert_eq!(replay.iter().filter(|stored| matches!(stored.event.as_ref(),
+                Event::Stopped { reason } if reason == "user_stopped")).count(),
+                if mode == 0 { 0 } else { 1 });
+            live.finish(&replacement).await;
+            live.client.shutdown().await.unwrap();
+        })).await;
+    }
+}
+
 /// A structured session whose worker starts fail: on the provider limit when
 /// `rate_limited`, otherwise as a generic launch failure. The count proves a
 /// case reached the start it forced.
@@ -201,9 +452,13 @@ async fn a_rejected_enqueue_keeps_the_pending_turn_and_an_accepted_one_clears_it
     use crate::acp::supervisor::test_support::managed::with_managed;
     with_managed(|scope| {
         Box::pin(async move {
-            let mut live =
-                crate::server::test_support::managed_control_session(scope, "sess-5253-enqueue")
-                    .await;
+            let mut live = crate::server::test_support::managed_control_session(
+                scope,
+                "sess-5253-enqueue",
+                "claude",
+                None,
+            )
+            .await;
             let id = live.id().to_owned();
             let state = live.state.clone();
             let _active_request = live.start_prompt("actual active input").await;
@@ -281,7 +536,11 @@ async fn cancel_waits_for_an_in_flight_prompt_submission() {
     let cancel = {
         let state = Arc::clone(&state);
         let id = id.clone();
-        async move { acp_cancel(State(state), Path(id)).await.into_response() }
+        async move {
+            acp_cancel(State(state), Path(id), axum::body::Bytes::new())
+                .await
+                .into_response()
+        }
     };
     tokio::pin!(cancel);
     assert!(futures_util::poll!(&mut cancel).is_pending());
@@ -433,6 +692,8 @@ async fn turn_on_a_park_attaches_the_retained_actor_then_delivers_only_new_expli
                     } else {
                         "quota-explicit-text"
                     },
+                    "claude",
+                    None,
                 )
                 .await;
                 live.park("old interrupted input must not replay").await;
@@ -444,7 +705,7 @@ async fn turn_on_a_park_attaches_the_retained_actor_then_delivers_only_new_expli
                     .await
                     .unwrap()
                     .owner;
-                let frontier = live.state.acp_event_store.highest_seq(&id);
+                let frontier = live.state.acp_event_store.highest_seq(&id).unwrap();
                 live.client = scope
                     .reconcile_after(live.client, |state, id| async move {
                         let response = if diff_comments {
@@ -536,6 +797,8 @@ async fn no_revive_preserves_workerless_parked_or_active_work_without_side_effec
                     } else {
                         "no-revive-active"
                     },
+                    "claude",
+                    None,
                 )
                 .await;
                 let active = live.start_prompt("original governed work").await;
@@ -550,7 +813,7 @@ async fn no_revive_preserves_workerless_parked_or_active_work_without_side_effec
                 let native_methods = live.native.requests();
                 live.client = scope
                     .reconcile_after(live.client, |state, id| async move {
-                        let before = state.acp_event_store.highest_seq(&id);
+                        let before = state.acp_event_store.highest_seq(&id).unwrap();
                         let budget = state
                             .acp_event_store
                             .rate_limit_redelivery_streak(&id)
@@ -567,7 +830,7 @@ async fn no_revive_preserves_workerless_parked_or_active_work_without_side_effec
                         .await
                         .into_response();
                         assert_eq!(response.status(), StatusCode::CONFLICT);
-                        assert_eq!(state.acp_event_store.highest_seq(&id), before);
+                        assert_eq!(state.acp_event_store.highest_seq(&id).unwrap(), before);
                         assert_eq!(
                             state
                                 .acp_event_store
@@ -614,9 +877,13 @@ async fn a_direct_prompt_and_the_queue_drain_cannot_both_own_the_same_turn() {
     use crate::acp::supervisor::test_support::managed::with_managed;
     with_managed(|scope| {
         Box::pin(async move {
-            let mut live =
-                crate::server::test_support::managed_control_session(scope, "queue-direct-race")
-                    .await;
+            let mut live = crate::server::test_support::managed_control_session(
+                scope,
+                "queue-direct-race",
+                "claude",
+                None,
+            )
+            .await;
             let id = live.id().to_owned();
             let state = live.state.clone();
             state
@@ -757,6 +1024,8 @@ async fn queued_explicit_work_follows_a_failed_prompt_but_not_a_failed_runtime()
                 let mut live = crate::server::test_support::managed_control_session(
                     scope,
                     "queue-after-failure",
+                    "claude",
+                    None,
                 )
                 .await;
                 let id = live.id().to_owned();
@@ -934,9 +1203,13 @@ async fn diff_comments_refuse_to_open_a_turn_another_submission_started() {
     use crate::acp::supervisor::test_support::managed::with_managed;
     with_managed(|scope| {
         Box::pin(async move {
-            let mut live =
-                crate::server::test_support::managed_control_session(scope, "queue-diff-race")
-                    .await;
+            let mut live = crate::server::test_support::managed_control_session(
+                scope,
+                "queue-diff-race",
+                "claude",
+                None,
+            )
+            .await;
             let id = live.id().to_owned();
             let state = live.state.clone();
 
@@ -967,7 +1240,7 @@ async fn diff_comments_refuse_to_open_a_turn_another_submission_started() {
                         text: "the winning turn",
                         attachments: &[],
                         woke_idle_dormant: false,
-                        prompt_id: None,
+                        prompt_ids: Vec::new(),
                         synthesized: false,
                         no_revive: false,
                     },
@@ -1054,6 +1327,8 @@ async fn a_manual_prompt_cannot_overtake_a_continuation_install() {
             let mut live = crate::server::test_support::managed_control_session(
                 scope,
                 "continuation-install-race",
+                "claude",
+                None,
             )
             .await;
             live.park("interrupted prompt A").await;
@@ -1153,9 +1428,13 @@ async fn sending_a_queued_plugin_row_now_keeps_its_stored_sender() {
     use crate::acp::supervisor::test_support::managed::with_managed;
     with_managed(|scope| {
         Box::pin(async move {
-            let mut live =
-                crate::server::test_support::managed_control_session(scope, "queue-plugin-sender")
-                    .await;
+            let mut live = crate::server::test_support::managed_control_session(
+                scope,
+                "queue-plugin-sender",
+                "claude",
+                None,
+            )
+            .await;
             let owned_id = live.id().to_owned();
             let id = owned_id.as_str();
             let state = live.state.clone();
@@ -1230,9 +1509,13 @@ async fn send_now_refuses_text_that_differs_from_the_stored_plugin_row() {
     use crate::acp::supervisor::test_support::managed::with_managed;
     with_managed(|scope| {
         Box::pin(async move {
-            let live =
-                crate::server::test_support::managed_control_session(scope, "queue-plugin-spoof")
-                    .await;
+            let live = crate::server::test_support::managed_control_session(
+                scope,
+                "queue-plugin-spoof",
+                "claude",
+                None,
+            )
+            .await;
             let owned_id = live.id().to_owned();
             let id = owned_id.as_str();
             let state = live.state.clone();
@@ -1282,9 +1565,13 @@ async fn send_now_refuses_text_that_differs_from_a_user_row_too() {
     use crate::acp::supervisor::test_support::managed::with_managed;
     with_managed(|scope| {
         Box::pin(async move {
-            let live =
-                crate::server::test_support::managed_control_session(scope, "queue-user-stale")
-                    .await;
+            let live = crate::server::test_support::managed_control_session(
+                scope,
+                "queue-user-stale",
+                "claude",
+                None,
+            )
+            .await;
             let owned_id = live.id().to_owned();
             let id = owned_id.as_str();
             let state = live.state.clone();
@@ -1414,9 +1701,13 @@ async fn send_now_delivers_the_rows_stored_attachments_not_the_requests() {
     use base64::Engine;
     with_managed(|scope| {
         Box::pin(async move {
-            let mut live =
-                crate::server::test_support::managed_control_session(scope, "queue-attachments")
-                    .await;
+            let mut live = crate::server::test_support::managed_control_session(
+                scope,
+                "queue-attachments",
+                "claude",
+                None,
+            )
+            .await;
             let owned_id = live.id().to_owned();
             let id = owned_id.as_str();
             let state = live.state.clone();
@@ -1502,6 +1793,8 @@ async fn send_now_keeps_a_row_whose_attachment_bytes_are_gone() {
             let live = crate::server::test_support::managed_control_session(
                 scope,
                 "queue-attachment-expired",
+                "claude",
+                None,
             )
             .await;
             let owned_id = live.id().to_owned();
@@ -1575,9 +1868,13 @@ async fn send_now_behind_a_busy_agent_keeps_the_one_queued_row() {
     use crate::acp::supervisor::test_support::managed::with_managed;
     with_managed(|scope| {
         Box::pin(async move {
-            let mut live =
-                crate::server::test_support::managed_control_session(scope, "queue-send-now-busy")
-                    .await;
+            let mut live = crate::server::test_support::managed_control_session(
+                scope,
+                "queue-send-now-busy",
+                "claude",
+                None,
+            )
+            .await;
             let owned_id = live.id().to_owned();
             let id = owned_id.as_str();
             let state = live.state.clone();
@@ -1748,9 +2045,13 @@ async fn native_loss_and_legacy_refusal_precede_prompt_touch_queue_or_launch() {
     use crate::acp::supervisor::test_support::managed::with_managed;
     Box::pin(with_managed(|scope| {
         Box::pin(async move {
-            let live =
-                crate::server::test_support::managed_control_session(scope, "refused-native-loss")
-                    .await;
+            let live = crate::server::test_support::managed_control_session(
+                scope,
+                "refused-native-loss",
+                "claude",
+                None,
+            )
+            .await;
             let id = live.id().to_owned();
             let state = live.state.clone();
             state
@@ -1788,6 +2089,11 @@ async fn native_loss_and_legacy_refusal_precede_prompt_touch_queue_or_launch() {
             })
             .await
             .expect("actual assignment reaches the status mirror before the refusal window");
+            let original_lease = state
+                .acp_supervisor
+                .current_lease(&id)
+                .expect("the original Native owns the running lease before EOF");
+            let mut completion = original_lease.test_child_wait_completed();
             let _pause = live.client.pause_drain().await;
             let row = {
                 let mut rows = state.instances.write().await;
@@ -1821,13 +2127,42 @@ async fn native_loss_and_legacy_refusal_precede_prompt_touch_queue_or_launch() {
             })
             .await
             .expect("actual Native EOF is qualified before any gesture");
+            let settled = tokio::time::timeout(Duration::from_secs(5), async {
+                loop {
+                    let result = *completion.borrow_and_update();
+                    if result.is_some() {
+                        break result;
+                    }
+                    completion
+                        .changed()
+                        .await
+                        .expect("the original Child wait publishes its outcome");
+                }
+            })
+            .await
+            .expect("the original Child wait completes before the refusal window");
+            assert_eq!(
+                settled,
+                Some(true),
+                "the original Child was actually waited"
+            );
+            let registry = crate::process::worker_registry::record_path(&id).unwrap();
+            assert_eq!(
+                std::fs::read(&registry).unwrap_err().kind(),
+                std::io::ErrorKind::NotFound,
+                "the original runner retires its record before any gesture"
+            );
+            assert!(state
+                .session_service
+                .prompt_native_unavailability(&id)
+                .await
+                .unwrap()
+                .is_some());
             let before = serde_json::to_value(&row).unwrap();
             let storage = crate::session::Storage::open_unwatched(&row.source_profile).unwrap();
             let disk_before = std::fs::read(storage.sessions_path()).unwrap();
-            let registry = crate::process::worker_registry::record_path(&id).unwrap();
-            let record_before = std::fs::read(&registry).ok();
             let methods_before = live.native.requests();
-            let frontier = state.acp_event_store.highest_seq(&id);
+            let frontier = state.acp_event_store.highest_seq(&id).unwrap();
             for diff_comments in [false, true] {
                 let response = if diff_comments {
                     acp_prompt_diff_comments(
@@ -1861,7 +2196,10 @@ async fn native_loss_and_legacy_refusal_precede_prompt_touch_queue_or_launch() {
                     before,
                 );
                 assert_eq!(std::fs::read(storage.sessions_path()).unwrap(), disk_before);
-                assert_eq!(std::fs::read(&registry).ok(), record_before);
+                assert_eq!(
+                    std::fs::read(&registry).unwrap_err().kind(),
+                    std::io::ErrorKind::NotFound
+                );
                 assert_eq!(live.native.requests(), methods_before);
             }
             state
@@ -1883,7 +2221,10 @@ async fn native_loss_and_legacy_refusal_precede_prompt_touch_queue_or_launch() {
                 before,
             );
             assert_eq!(std::fs::read(storage.sessions_path()).unwrap(), disk_before);
-            assert_eq!(std::fs::read(&registry).ok(), record_before);
+            assert_eq!(
+                std::fs::read(&registry).unwrap_err().kind(),
+                std::io::ErrorKind::NotFound
+            );
             assert_eq!(live.native.requests(), methods_before);
             assert!(!state
                 .acp_event_store
@@ -1905,8 +2246,13 @@ async fn current_owned_native_receipt_needs_no_historical_ready_and_refreshes_be
     use crate::acp::supervisor::test_support::managed::with_managed;
     with_managed(|scope| {
         Box::pin(async move {
-            let mut live =
-                crate::server::test_support::managed_control_session(scope, "current-native").await;
+            let mut live = crate::server::test_support::managed_control_session(
+                scope,
+                "current-native",
+                "claude",
+                None,
+            )
+            .await;
             let session_id = live.id().to_owned();
             let id = session_id.as_str();
             let state = live.state.clone();
@@ -2024,7 +2370,7 @@ async fn current_owned_native_receipt_needs_no_historical_ready_and_refreshes_be
                         )),
                         Some(carried.clone()),
                     ) {
-                        Ok(projection) => {
+                        Ok((projection, _expected)) => {
                             assert!(!projection.ready, "latched loss cannot become Ready");
                             if projection.unavailable.is_some() {
                                 break projection;
@@ -2160,6 +2506,8 @@ async fn native_loss_after_publication_consumes_pending_but_preserves_named_queu
                     } else {
                         "late-loss-prompt"
                     },
+                    "claude",
+                    None,
                 )
                 .await;
                 let id = live.id().to_owned();
@@ -2348,4 +2696,89 @@ async fn a_prompt_reports_its_dispatch_and_the_seq_it_was_recorded_at() {
             }
         })
     }).await;
+}
+
+/// #5401: a queue drain publishes the first row's id as `prompt_id` and the
+/// rest as `merged_prompt_ids`, so the web client settles every optimistic row.
+#[tokio::test]
+async fn queue_drain_publishes_row_ids_as_prompt_and_merged_ids() {
+    crate::acp::supervisor::test_support::managed::with_managed(|scope| {
+        Box::pin(async move {
+            let mut live = crate::server::test_support::managed_control_session(
+                scope,
+                "queue-drain-ids",
+                "claude",
+                None,
+            )
+            .await;
+            let id = live.id().to_owned();
+            let state = live.state.clone();
+            for (row, text) in [("q1", "first"), ("q2", "second")] {
+                state
+                    .session_service
+                    .enqueue_prompt(&id, row.into(), text.into(), vec![], None, None)
+                    .await
+                    .expect("the actual original's session exists");
+            }
+            state.session_service.drain_queued_prompts_once(&id).await;
+            let request = live.next_prompt().await;
+            assert!(published(&state, &id, |event| matches!(
+                event, Event::UserPromptSent { prompt_id: Some(id), merged_prompt_ids, .. }
+                    if id == "q1" && merged_prompt_ids == &["q2".to_string()]
+            )));
+            live.finish_prompt(&request, None).await;
+        })
+    })
+    .await;
+}
+
+/// Another tab's optimistic row carries the queued row id, so it must settle too.
+#[tokio::test]
+async fn send_now_publishes_the_request_id_then_the_queued_row_id() {
+    crate::acp::supervisor::test_support::managed::with_managed(|scope| {
+        Box::pin(async move {
+            let mut live = crate::server::test_support::managed_control_session(
+                scope,
+                "queue-send-now-ids",
+                "claude",
+                None,
+            )
+            .await;
+            let id = live.id().to_owned();
+            let state = live.state.clone();
+            state
+                .session_service
+                .enqueue_prompt(
+                    &id,
+                    "q1".into(),
+                    "PR #7 was merged".into(),
+                    vec![],
+                    None,
+                    Some("cron".into()),
+                )
+                .await
+                .expect("the actual original's plugin row exists");
+            let response = acp_prompt(
+                State(Arc::clone(&state)),
+                Path(id.clone()),
+                Ok(Json(PromptRequest {
+                    text: "PR #7 was merged".to_string(),
+                    attachments: Vec::new(),
+                    prompt_id: Some("req-1".to_string()),
+                    no_revive: false,
+                    queued_prompt_id: Some("q1".to_string()),
+                })),
+            )
+            .await
+            .into_response();
+            assert_eq!(response.status(), StatusCode::ACCEPTED);
+            let request = live.next_prompt().await;
+            assert!(published(&state, &id, |event| matches!(
+                event, Event::UserPromptSent { prompt_id: Some(id), merged_prompt_ids, .. }
+                    if id == "req-1" && merged_prompt_ids == &["q1".to_string()]
+            )));
+            live.finish_prompt(&request, None).await;
+        })
+    })
+    .await;
 }

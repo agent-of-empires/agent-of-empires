@@ -3,7 +3,7 @@
 //! mid-turn steering.
 
 use crate::acp::state::{AcpConnectionSource, Event, RateLimitInfo};
-use agent_client_protocol::v1::schema::{PromptRequest, PromptResponse, StopReason};
+use agent_client_protocol::v1::schema::{ContentBlock, PromptRequest, PromptResponse, StopReason};
 use std::collections::VecDeque;
 use std::future::Future;
 use std::pin::Pin;
@@ -48,9 +48,17 @@ type PromptFut = Pin<
 type SteerFut =
     Pin<Box<dyn Future<Output = (QueuedPrompt, OrderedRequestResult<serde_json::Value>)> + Send>>;
 
+async fn initial_prompt_cancelled(cancellation: Option<&tokio_util::sync::CancellationToken>) {
+    match cancellation {
+        Some(cancellation) => cancellation.cancelled().await,
+        None => std::future::pending::<()>().await,
+    }
+}
+
 struct LocalPromptScope {
     shared: std::sync::Arc<super::notifications::Shared>,
     terminal_epoch: u64,
+    correlation: Option<NativeOperationCorrelation>,
 }
 
 impl Drop for LocalPromptScope {
@@ -60,6 +68,9 @@ impl Drop for LocalPromptScope {
             .with_current_epoch(self.terminal_epoch, || {
                 self.shared.prompt_in_flight.store(false, Ordering::Release);
                 self.shared.local_prompt_settled.notify_waiters();
+                self.shared
+                    .connection_state
+                    .finish_initial_prompt_operation(self.correlation);
             });
     }
 }
@@ -169,6 +180,32 @@ fn simulate_orphan(session_label: &str) -> bool {
 }
 
 impl Session {
+    async fn settle_initial_prompt(
+        &self,
+        scope: &Option<NativeRequestContext>,
+        correlation: Option<NativeOperationCorrelation>,
+        admitted: bool,
+    ) {
+        let event = Event::Stopped {
+            reason: "user_stopped".into(),
+        };
+        if admitted {
+            let native = self.control.is_some();
+            let sender = scoped_sender(&self.shared, native, scope);
+            publish_scoped(&self.shared, native, scope, &sender, event, true).await;
+        } else {
+            let _ = self
+                .shared
+                .event_tx
+                .with_metadata(crate::acp::event_sender::EventMetadata::host(&event))
+                .send(event)
+                .await;
+        }
+        self.shared
+            .connection_state
+            .finish_initial_prompt_operation(correlation);
+    }
+
     async fn reject_prompt_not_issued(
         &self,
         message: String,
@@ -202,6 +239,9 @@ impl Session {
         } = prompt;
         let shared = self.shared.clone();
         let native = self.control.is_some();
+        let cancellation = shared
+            .connection_state
+            .initial_prompt_cancellation(correlation);
 
         if let Err(error) = require_operation(&scope, correlation, native) {
             self.reject_prompt_not_issued(error.to_string(), &scope)
@@ -210,8 +250,16 @@ impl Session {
         }
         let sender = scoped_sender(&shared, native, &scope);
         let (started, journaled) = if native {
-            let Ok(permit) = sender.reserve().await else {
-                return Ok(false);
+            let permit = tokio::select! {
+                biased;
+                _ = initial_prompt_cancelled(cancellation.as_ref()) => {
+                    self.settle_initial_prompt(&scope, correlation, false).await;
+                    return Ok(false);
+                }
+                permit = sender.reserve() => match permit {
+                    Ok(permit) => permit,
+                    Err(_) => return Ok(false),
+                },
             };
             let (confirmation, journaled) = tokio::sync::oneshot::channel();
             (Some((permit, confirmation)), Some(journaled))
@@ -231,14 +279,23 @@ impl Session {
                 let _ = entered.send(());
                 tokio::select! {
                     biased;
+                    _ = initial_prompt_cancelled(cancellation.as_ref()) => {
+                        self.settle_initial_prompt(&scope, correlation, false).await;
+                        return Ok(false);
+                    }
                     _ = shared.connection_state.wait_callback_end() => return Ok(false),
                     _ = release => {}
                 }
             }
         }
 
-        let admission =
-            current_effect_wait(scope.as_ref(), native, &shared.connection_state, || {
+        let admission = tokio::select! {
+            biased;
+            _ = initial_prompt_cancelled(cancellation.as_ref()) => {
+                self.settle_initial_prompt(&scope, correlation, false).await;
+                return Ok(false);
+            }
+            admitted = current_effect_wait(scope.as_ref(), native, &shared.connection_state, || {
                 let _admission = shared
                     .connection_state
                     .admission
@@ -246,6 +303,9 @@ impl Session {
                     .expect("connection admission lock");
                 if shared.connection_state.loss().is_some() || shared.connection_state.is_stopping()
                 {
+                    return None;
+                }
+                if cancellation.as_ref().is_some_and(|cancellation| cancellation.is_cancelled()) {
                     return None;
                 }
 
@@ -268,6 +328,22 @@ impl Session {
                     .prompt_sent_since_attach
                     .store(true, Ordering::Relaxed);
                 shared.adopted_turn_active.store(false, Ordering::Relaxed);
+                *shared
+                    .last_prompt
+                    .lock()
+                    .expect("last prompt mutex poisoned") = (
+                    blocks
+                        .iter()
+                        .filter_map(|block| match block {
+                            ContentBlock::Text(text) => Some(text.text.as_str()),
+                            _ => None,
+                        })
+                        .collect::<Vec<_>>()
+                        .join("\n")
+                        .trim()
+                        .to_owned(),
+                    0,
+                );
                 let terminal_epoch = shared.terminal_claim.begin_turn();
                 shared.prompt_in_flight.store(true, Ordering::Release);
                 if !native {
@@ -279,12 +355,20 @@ impl Session {
                     started.send_logical_admission(confirmation);
                 }
                 Some((epoch, terminal_epoch))
-            })
-            .await;
+            }) => admitted,
+        };
 
         let (epoch, terminal_epoch) = match admission {
             Ok(Some(admitted)) => admitted,
-            Ok(None) => return Ok(false),
+            Ok(None) => {
+                if cancellation
+                    .as_ref()
+                    .is_some_and(|cancellation| cancellation.is_cancelled())
+                {
+                    self.settle_initial_prompt(&scope, correlation, false).await;
+                }
+                return Ok(false);
+            }
             Err(error) => {
                 self.reject_prompt_not_issued(error.to_string(), &scope)
                     .await;
@@ -297,6 +381,7 @@ impl Session {
         let _local_scope = LocalPromptScope {
             shared: shared.clone(),
             terminal_epoch,
+            correlation,
         };
         while self.lifecycle_rx.try_recv().is_ok() {}
 
@@ -327,6 +412,10 @@ impl Session {
         if let Some(journaled) = journaled {
             let durable = tokio::select! {
                 biased;
+                _ = initial_prompt_cancelled(cancellation.as_ref()) => {
+                    self.settle_initial_prompt(&scope, correlation, true).await;
+                    return Ok(false);
+                }
                 _ = shared.connection_state.wait_callback_end() => false,
                 result = journaled => matches!(result, Ok(true)),
             };
@@ -347,6 +436,13 @@ impl Session {
                 return Ok(self.finish_turn(turn, prompt_started_at_ms).await);
             }
         }
+        if cancellation
+            .as_ref()
+            .is_some_and(|cancellation| cancellation.is_cancelled())
+        {
+            self.settle_initial_prompt(&scope, correlation, true).await;
+            return Ok(false);
+        }
         let mut prompt_fut = self
             .send_prompt(QueuedPrompt {
                 blocks,
@@ -354,6 +450,15 @@ impl Session {
                 correlation,
             })
             .await;
+        if cancellation
+            .as_ref()
+            .is_some_and(|cancellation| cancellation.is_cancelled())
+            && !shared.connection_state.initial_prompt_issued(correlation)
+        {
+            self.settle_initial_prompt(&turn.scope, correlation, true)
+                .await;
+            return Ok(false);
+        }
         let simulate_orphan = !native && simulate_orphan(&shared.session_label);
 
         loop {
@@ -753,6 +858,17 @@ impl Session {
         command: Option<QueuedClientCmd>,
     ) -> AcpResult<Flow> {
         let mut command = command;
+        if matches!(
+            command.as_ref().map(|queued| &queued.command),
+            Some(ClientCmd::InitialPromptIntent(_))
+        ) {
+            command = self
+                .resolve_initial_command(command.take().expect("initial host intent"))
+                .await;
+            if command.is_none() {
+                return Ok(Flow::Continue);
+            }
+        }
         if self.refuse_unavailable_command(&mut command) {
             return Ok(Flow::Continue);
         }
@@ -767,8 +883,30 @@ impl Session {
         };
         let native = self.control.is_some();
 
+        if let ClientCmd::CancelInitialPrompt { id, expected } = &command {
+            if turn.correlation != Some(*expected)
+                || !self
+                    .shared
+                    .connection_state
+                    .initial_prompt_matches(*id, *expected)
+                || current_effect(&turn.scope, native, || ()).is_err()
+            {
+                return Ok(Flow::Continue);
+            }
+        }
         match command {
-            ClientCmd::Cancel => {
+            ClientCmd::CancelChild {
+                session_id,
+                respond_to,
+            } => {
+                let sent = if require_operation(&scope, correlation, native).is_ok() {
+                    self.cancel_child(session_id, scope).await
+                } else {
+                    false
+                };
+                let _ = respond_to.send(sent);
+            }
+            ClientCmd::Cancel | ClientCmd::CancelInitialPrompt { .. } => {
                 if let Err(error) = require_operation(&scope, correlation, native) {
                     debug!(target: "acp.protocol", %error, "cancel not issued");
                     return Ok(Flow::Continue);
@@ -803,8 +941,22 @@ impl Session {
             }
             ClientCmd::ForceStop => {
                 if require_operation(&scope, correlation, native).is_err()
-                    || current_effect(&scope, native, || ()).is_err()
-                    || current_effect(&turn.scope, native, || ()).is_err()
+                    || current_effect_wait(
+                        scope.as_ref(),
+                        native,
+                        &self.shared.connection_state,
+                        || (),
+                    )
+                    .await
+                    .is_err()
+                    || current_effect_wait(
+                        turn.scope.as_ref(),
+                        native,
+                        &self.shared.connection_state,
+                        || (),
+                    )
+                    .await
+                    .is_err()
                 {
                     return Ok(Flow::Continue);
                 }
@@ -815,8 +967,13 @@ impl Session {
                 turn.flags.shutdown = true;
                 return Ok(Flow::Break);
             }
-            ClientCmd::SetConfigOption { config_id, value } => {
-                self.dispatch_config_option(config_id, value, scope).await;
+            ClientCmd::SetConfigOption {
+                config_id,
+                value,
+                remember,
+            } => {
+                self.dispatch_config_option(config_id, value, remember, scope)
+                    .await;
             }
             ClientCmd::SetMode(mode_id) => self.dispatch_mode(mode_id, true, scope),
             ClientCmd::DeleteSession {
@@ -866,6 +1023,9 @@ impl Session {
                         },
                     )
                     .await);
+            }
+            ClientCmd::InitialPromptIntent(_) => {
+                unreachable!("host intent resolved before Native dispatch");
             }
             ClientCmd::ResetSession {
                 text, respond_to, ..
@@ -966,7 +1126,8 @@ impl Session {
             return Flow::Continue;
         }
 
-        let fire = turn.watchdog.should_fire(Instant::now(), turn.cfg);
+        let fire = turn.watchdog.should_fire(Instant::now(), turn.cfg)
+            && !self.shared.aoe.leases.working(now_ms());
         let off_protocol = turn.watchdog.off_protocol_work_seen();
         if fire && turn.watchdog.cost_seen() && off_protocol.is_none() {
             // The turn finished but the PromptResponse never came: end cleanly
@@ -1141,6 +1302,11 @@ impl Session {
                                 shared.between_prompt.deactivate();
                             }
                             shared.reset_message_dedup();
+                            shared
+                                .last_prompt
+                                .lock()
+                                .expect("last prompt mutex poisoned")
+                                .1 = now_ms();
                         });
                 });
             }
@@ -1160,7 +1326,6 @@ impl Session {
                 return false;
             }
         }
-
         info!(
             target: "acp.protocol",
             session = %shared.session_label,

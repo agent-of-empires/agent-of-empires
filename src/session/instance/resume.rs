@@ -1675,7 +1675,6 @@ mod tests {
             Some("11111111-2222-4333-8444-555555555555")
         );
     }
-
     #[test]
     #[serial]
     #[serial(hook_base)]
@@ -2847,7 +2846,6 @@ mod tests {
             }
         }
     }
-
     pub(super) fn post_shell_observed(session: &crate::tmux::Session) {
         let observer = POST_SHELL_OBSERVER.with(|slot| slot.borrow_mut().take());
         if let Some(observer) = observer {

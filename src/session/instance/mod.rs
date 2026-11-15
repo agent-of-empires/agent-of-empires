@@ -840,6 +840,13 @@ pub struct Instance {
     /// new one. Additive: absent in older rows, no migration.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub acp_effort: Option<String>,
+    /// Picks on `category:"model_config"` on/off options (Fast mode,
+    /// Ultracode), keyed by option id and re-applied after the model and
+    /// effort on every worker (re)spawn. An option the current model does not
+    /// advertise is skipped, not dropped. Cleared on an agent switch. Additive:
+    /// absent in older rows, no migration.
+    #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub acp_model_config: std::collections::BTreeMap<String, String>,
     /// Native ACP identity selected only by a correlated establishment commit.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub acp_session_id: Option<String>,

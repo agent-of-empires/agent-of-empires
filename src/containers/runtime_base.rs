@@ -1,4 +1,6 @@
-use super::container_interface::{docker_env_args, ContainerConfig, RunFlag, CGROUP_PARENT_LABEL};
+use super::container_interface::{
+    docker_env_args, ContainerConfig, RunFlag, TargetEnvFile, CGROUP_PARENT_LABEL,
+};
 use super::error::{sanitize_stderr, DockerError, Result};
 use std::collections::HashSet;
 use std::process::{Command, Stdio};
@@ -466,8 +468,7 @@ impl RuntimeBase {
             }
         }
 
-        let (env_argv, _inherit) = docker_env_args(&config.environment);
-        args.extend(env_argv);
+        args.extend(docker_env_args(&config.environment).argv);
 
         let network = match config.network.as_deref() {
             Some(n) if !self.supports_network_mode => {
@@ -599,7 +600,8 @@ impl RuntimeBase {
 
     pub fn run_create(&self, name: &str, image: &str, config: &ContainerConfig) -> Result<String> {
         // Inherited values reach docker via the child env, keeping them out of argv.
-        let (_, inherit) = docker_env_args(&config.environment);
+        let environment = docker_env_args(&config.environment);
+        let inherit = environment.inherit;
         let explicit_mode = explicit_cgroups_mode(&config.run_policy.extra_run_args).is_some();
         let cgroup_parent = self.cgroup_placement(config, || {
             self.can_join_user_slice(&inherit)
@@ -612,6 +614,9 @@ impl RuntimeBase {
         cmd.args(&args);
         for (key, value) in inherit {
             cmd.env(key, value);
+        }
+        if let Some(file) = TargetEnvFile::create(&environment.target_env)? {
+            file.attach(&mut cmd)?;
         }
         let output = self.probe_output(&mut cmd)?;
 
@@ -1212,7 +1217,8 @@ mod tests {
             args[..6],
             strings(&["run", "-d", "--name", "c", "-w", "/workspace"])
         );
-        assert_eq!(values_of(&args, "-e"), ["GH_TOKEN", "TERM=xterm"]);
+        assert_eq!(values_of(&args, "-e"), ["GH_TOKEN"]);
+        assert_eq!(arg_after(&args, "--env-file"), Some("/dev/fd/9"));
         assert!(!args.iter().any(|a| a.contains("ghp_secret123")));
         assert_eq!(arg_after(&args, "--cpus"), Some("2"));
         assert_eq!(arg_after(&args, "-m"), Some("4g"));
@@ -1548,6 +1554,80 @@ mod tests {
 
         fn ran(&self, prefix: &str) -> bool {
             self.log().iter().any(|line| line.starts_with(prefix))
+        }
+    }
+
+    /// Literals and target proxies reach the container through the env-file. The
+    /// client process keeps the host's own values, or none.
+    #[cfg(unix)]
+    #[test]
+    #[serial_test::serial]
+    fn run_create_keeps_container_values_off_the_client() {
+        use crate::containers::EnvEntry;
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let log = dir.path().join("log");
+        let shim = dir.path().join("docker");
+        std::fs::write(
+            &shim,
+            format!(
+                "#!/bin/sh\n{{ echo \"client=$HTTP_PROXY|$HOME|$SSL_CERT_FILE|$DOCKER_DEFAULT_PLATFORM|$LD_PRELOAD\"; \
+                 cat /dev/fd/9; echo \"argv=$*\"; }} > '{}'\necho fake-id\n",
+                log.display()
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(&shim, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let runtime = RuntimeBase {
+            binary: Box::leak(shim.to_string_lossy().into_owned().into_boxed_str()),
+            ..RuntimeBase::DOCKER
+        };
+        let _env = crate::session::test_support::EnvGuard::set(&[
+            ("HTTP_PROXY", "http://host-proxy.example:3128"),
+            ("HOME", "/host-home"),
+            ("SSL_CERT_FILE", "/host/ca.pem"),
+            ("DOCKER_DEFAULT_PLATFORM", "linux/host"),
+        ]);
+        let literals = [
+            ("HTTP_PROXY", "http://proxy.container.internal:3128"),
+            ("HOME", "/container-home"),
+            ("SSL_CERT_FILE", "/container/ca.pem"),
+            ("LD_PRELOAD", "/container/hook.so"),
+            ("DOCKER_DEFAULT_PLATFORM", "linux/arm64"),
+        ];
+        let config = ContainerConfig {
+            environment: literals
+                .iter()
+                .map(|(key, value)| EnvEntry::Literal {
+                    key: key.to_string(),
+                    value: value.to_string(),
+                })
+                .collect(),
+            ..Default::default()
+        };
+
+        assert_eq!(
+            runtime.run_create("sandbox", "image", &config).unwrap(),
+            "fake-id"
+        );
+
+        let log = std::fs::read_to_string(log).unwrap();
+        let mut lines = log.lines();
+        let client = lines.next().unwrap();
+        assert!(
+            client.starts_with(
+                "client=http://host-proxy.example:3128|/host-home|/host/ca.pem|linux/host|"
+            ) && !client.contains("/container/hook.so"),
+            "{client}"
+        );
+        for (key, value) in literals {
+            assert_eq!(lines.next(), Some(format!("{key}={value}").as_str()));
+        }
+        let argv = lines.next().unwrap();
+        assert!(argv.contains("--env-file /dev/fd/9"), "{argv}");
+        for (key, value) in literals {
+            assert!(!argv.contains(key) && !argv.contains(value), "{argv}");
         }
     }
 

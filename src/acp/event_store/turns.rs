@@ -403,6 +403,12 @@ impl EventStore {
     }
 
     pub fn has_unresolved_background_tasks(&self, session_id: &str) -> bool {
+        self.try_has_unresolved_background_tasks(session_id)
+            .unwrap_or(false)
+    }
+
+    /// `None` when the query failed.
+    fn try_has_unresolved_background_tasks(&self, session_id: &str) -> Option<bool> {
         logged(
             self.conn()
                 .prepare_cached(UNRESOLVED_BACKGROUND_TASKS_SQL)
@@ -410,7 +416,6 @@ impl EventStore {
             "has_unresolved_background_tasks",
             session_id,
         )
-        .unwrap_or(false)
     }
 
     pub fn unresolved_background_task_launches(
@@ -608,6 +613,80 @@ impl EventStore {
         self.with_control_snapshot(session_id, |_, cursor| Ok(cursor.projection.main_open))
     }
 
+    /// Qualified agent output since the last actual turn boundary, including a
+    /// turn started by the agent without a host prompt.
+    pub(crate) fn has_open_agent_turn(&self, session_id: &str) -> Result<ControlKnowledge<bool>> {
+        self.with_control_snapshot(session_id, |_, cursor| {
+            use ControlKnowledge::{Indeterminate, Known};
+            Ok(
+                match (
+                    cursor.projection.agent_open,
+                    cursor.projection.autonomous_open,
+                ) {
+                    (Known(true), _) | (_, Known(true)) => Known(true),
+                    (Known(false), Known(false)) => Known(false),
+                    _ => Indeterminate,
+                },
+            )
+        })
+    }
+
+    pub fn has_open_turn(&self, session_id: &str) -> Result<ControlKnowledge<bool>> {
+        use ControlKnowledge::{Indeterminate, Known};
+        let main = self.has_in_flight_turn(session_id)?;
+        if main == Known(true) {
+            return Ok(main);
+        }
+        Ok(match (main, self.has_open_agent_turn(session_id)?) {
+            (_, Known(true)) => Known(true),
+            (Known(false), Known(false)) => Known(false),
+            _ => Indeterminate,
+        })
+    }
+
+    /// A recent background finish also holds the actor until its follow-up
+    /// reaches a real turn boundary. Unknown control never authorizes retirement.
+    pub fn holds_live_work(&self, session_id: &str) -> Result<ControlKnowledge<bool>> {
+        use ControlKnowledge::{Indeterminate, Known};
+        let open = self.has_open_turn(session_id)?;
+        if open == Known(true) {
+            return Ok(open);
+        }
+        Ok(match (open, self.has_unhandled_finish(session_id)?) {
+            (_, Known(true)) => Known(true),
+            (Known(false), Known(false)) => Known(false),
+            _ => Indeterminate,
+        })
+    }
+
+    fn has_unhandled_finish(&self, session_id: &str) -> Result<ControlKnowledge<bool>> {
+        use ControlKnowledge::{Indeterminate, Known};
+        let stale_cutoff = chrono::Utc::now().timestamp_millis() - BACKGROUND_AGENT_STALE_AFTER_MS;
+        self.with_control_snapshot(session_id, |conn, cursor| {
+            let stopped = match cursor.projection.stopped_through {
+                Known(seq) => Some(i64::try_from(seq)?),
+                Indeterminate => None,
+            };
+            let recent: bool = conn.query_row(
+                "SELECT EXISTS (
+                     SELECT 1 FROM acp_events
+                     WHERE session_id = ?1
+                       AND discriminant IN ('BackgroundTaskFinished', 'BackgroundAgentCompleted')
+                       AND created_at >= ?3
+                       AND (?2 IS NULL OR seq > ?2))",
+                params![session_id, stopped, stale_cutoff],
+                |row| row.get(0),
+            )?;
+            Ok(if !recent {
+                Known(false)
+            } else if stopped.is_some() {
+                Known(true)
+            } else {
+                Indeterminate
+            })
+        })
+    }
+
     pub fn has_unsuccessful_main_outcome(
         &self,
         session_id: &str,
@@ -619,14 +698,18 @@ impl EventStore {
 
     /// True while a main turn, background task, or recently reporting background agent is open.
     pub fn has_in_flight_turn(&self, session_id: &str) -> Result<ControlKnowledge<bool>> {
-        if self.has_unresolved_background_tasks(session_id) {
+        if self
+            .reader()
+            .prepare_cached(UNRESOLVED_BACKGROUND_TASKS_SQL)?
+            .exists(params![session_id])?
+        {
             return Ok(ControlKnowledge::Known(true));
         }
         let main = self.has_in_flight_main_turn(session_id)?;
         if main == ControlKnowledge::Known(true) {
             return Ok(main);
         }
-        let conn = self.conn();
+        let conn = self.reader();
         let stale_cutoff = chrono::Utc::now().timestamp_millis() - BACKGROUND_AGENT_STALE_AFTER_MS;
         let bg_in_flight: i64 = conn.query_row(
                 "SELECT COUNT(*) FROM (
@@ -1045,6 +1128,221 @@ mod tests {
     }
 
     #[test]
+    fn a_background_finish_holds_live_work_until_the_agent_answers() {
+        let (_tmp, store) = open_store(1000);
+        let started = Event::BackgroundTaskStarted {
+            task_id: "t".into(),
+            tool_call_id: None,
+            description: "sleep".into(),
+            workflow: None,
+            started_at: None,
+        };
+        let finished = Event::BackgroundTaskFinished {
+            task_id: "t".into(),
+            ended_at: None,
+        };
+        // (events, holds live work)
+        let cases = [
+            (vec![user_prompt("go"), stopped("prompt_complete")], false),
+            (
+                vec![
+                    user_prompt("go"),
+                    started.clone(),
+                    stopped("prompt_complete"),
+                    finished.clone(),
+                ],
+                true,
+            ),
+            (
+                vec![
+                    user_prompt("go"),
+                    started,
+                    stopped("prompt_complete"),
+                    finished,
+                    agent_chunk("done"),
+                    stopped("prompt_complete"),
+                ],
+                false,
+            ),
+        ];
+        for (i, (events, holds)) in cases.into_iter().enumerate() {
+            let id = format!("s-{i}");
+            record_projection(&store, &id, 1, events);
+            assert_eq!(
+                store.holds_live_work(&id).unwrap(),
+                ControlKnowledge::Known(holds),
+                "case {i}"
+            );
+        }
+    }
+
+    /// An agent-initiated turn (a Monitor or background finish waking the
+    /// agent) opens with no `UserPromptSent`, so only its own events show it.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn an_agent_initiated_turn_without_a_stop_is_open_work() {
+        use crate::acp::supervisor::test_support::managed::with_managed;
+        for (work, closed, open) in [
+            ("none", false, false),
+            ("tool", false, true),
+            ("thought", false, true),
+            ("tool", true, false),
+            ("unadmitted", false, false),
+        ] {
+            with_managed(|scope| Box::pin(async move {
+                let mut live = crate::server::test_support::managed_control_session(
+                    scope, "agent-initiated-work", "claude", None,
+                ).await;
+                let id = live.id().to_owned();
+                let store = live.state.acp_event_store.clone();
+                let prompt = live.start_prompt("go").await;
+                live.finish_prompt(&prompt, None).await;
+                let run = matches!(work, "tool" | "thought").then(uuid::Uuid::new_v4);
+                if let Some(run) = run {
+                    live.native.send(serde_json::json!({
+                        "jsonrpc":"2.0","method":"_omp/autonomous_turn/start",
+                        "params":{"version":1,"sessionId":live.sid,"runId":run,"source":"irc"}
+                    })).await;
+                }
+                if work == "tool" {
+                    live.native.send(serde_json::json!({
+                        "jsonrpc":"2.0","method":"session/update","params":{"sessionId":live.sid,
+                            "update":{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"woken"}}}
+                    })).await;
+                }
+                let update = match work {
+                    "tool" => Some(serde_json::json!({"sessionUpdate":"tool_call","toolCallId":"t",
+                        "title":"Bash","kind":"execute","status":"in_progress","rawInput":{}})),
+                    "thought" => Some(serde_json::json!({"sessionUpdate":"agent_thought_chunk",
+                        "content":{"type":"text","text":"hmm"}})),
+                    "unadmitted" => Some(serde_json::json!({"sessionUpdate":"agent_message_chunk",
+                        "content":{"type":"text","text":"unadmitted operation"}})),
+                    _ => None,
+                };
+                if let Some(update) = update {
+                    live.native.send(serde_json::json!({
+                        "jsonrpc":"2.0","method":"session/update","params":{"sessionId":live.sid,"update":update}
+                    })).await;
+                    tokio::time::timeout(std::time::Duration::from_secs(10), async {
+                        loop {
+                            let event = live.client.next_event().await.expect("actual original publication");
+                            if match event {
+                                Event::ToolCallStarted { tool_call } => work == "tool" && tool_call.id == "t",
+                                Event::AgentThoughtChunk { text, .. } => work == "thought" && text == "hmm",
+                                Event::AgentMessageChunk { text, .. } => work == "unadmitted" && text == "unadmitted operation",
+                                _ => false,
+                            } { break; }
+                        }
+                    }).await.expect("the actual body closes the observation interval");
+                }
+                if closed {
+                    live.native.send(serde_json::json!({
+                        "jsonrpc":"2.0","method":"_omp/autonomous_turn/end",
+                        "params":{"version":1,"sessionId":live.sid,"runId":run.unwrap(),"source":"irc","stopReason":"end_turn"}
+                    })).await;
+                    tokio::time::timeout(std::time::Duration::from_secs(10), async {
+                        while !matches!(live.client.next_event().await.expect("own terminal"),
+                            Event::Stopped { reason } if reason == "agent_idle") {}
+                    }).await.unwrap();
+                }
+                assert_eq!(store.has_in_flight_main_turn(&id).unwrap(), ControlKnowledge::Known(false), "{work}, closed={closed}");
+                assert_eq!(store.holds_live_work(&id).unwrap(), ControlKnowledge::Known(open), "{work}, closed={closed}");
+                if let Some(run) = run.filter(|_| !closed) {
+                    live.native.send(serde_json::json!({
+                        "jsonrpc":"2.0","method":"_omp/autonomous_turn/end",
+                        "params":{"version":1,"sessionId":live.sid,"runId":run,"source":"irc","stopReason":"end_turn"}
+                    })).await;
+                    tokio::time::timeout(std::time::Duration::from_secs(10), async {
+                        while !matches!(live.client.next_event().await.expect("cleanup own terminal"),
+                            Event::Stopped { reason } if reason == "agent_idle") {}
+                    }).await.unwrap();
+                }
+            })).await;
+        }
+        let (_tmp, store) = open_store(1000);
+        record_projection(
+            &store,
+            "unmatched-operation",
+            1,
+            [
+                user_prompt("go"),
+                stopped("prompt_complete"),
+                agent_chunk("unadmitted operation"),
+            ],
+        );
+        assert_eq!(
+            store
+                .has_in_flight_main_turn("unmatched-operation")
+                .unwrap(),
+            ControlKnowledge::Known(false)
+        );
+        assert_eq!(
+            store.holds_live_work("unmatched-operation").unwrap(),
+            ControlKnowledge::Known(false)
+        );
+    }
+
+    /// A failed query is an error, never "no live work"; every aggregate
+    /// preserves the failure and recovers after the store becomes readable.
+    #[test]
+    fn a_failed_query_is_unknown_not_idle() {
+        let (_tmp, store) = open_store(1000);
+        record_projection(
+            &store,
+            "s",
+            1,
+            vec![user_prompt("go"), stopped("prompt_complete")],
+        );
+        assert_eq!(
+            store.holds_live_work("s").unwrap(),
+            ControlKnowledge::Known(false)
+        );
+
+        store.test_set_unavailable(true);
+        assert!(store.has_in_flight_main_turn("s").is_err());
+        assert!(store.has_open_agent_turn("s").is_err());
+        assert!(store.has_open_turn("s").is_err());
+        assert!(store.holds_live_work("s").is_err());
+        assert!(store.has_in_flight_turn("s").is_err());
+
+        store.test_set_unavailable(false);
+        assert_eq!(
+            store.holds_live_work("s").unwrap(),
+            ControlKnowledge::Known(false)
+        );
+    }
+
+    /// An unhandled finish whose follow-up turn never came does not hold the
+    /// runner forever.
+    #[test]
+    fn an_old_unhandled_finish_no_longer_holds_live_work() {
+        let (_tmp, store) = open_store(1000);
+        let old =
+            chrono::Utc::now().timestamp_millis() - (BACKGROUND_AGENT_STALE_AFTER_MS + 60_000);
+        let finished = Event::BackgroundTaskFinished {
+            task_id: "t".into(),
+            ended_at: None,
+        };
+        record_projection(
+            &store,
+            "s",
+            1,
+            [user_prompt("go"), stopped("prompt_complete"), finished],
+        );
+        store
+            .conn()
+            .execute(
+                "UPDATE acp_events SET created_at=?2 WHERE session_id=?1",
+                params!["s", old],
+            )
+            .unwrap();
+        assert_eq!(
+            store.holds_live_work("s").unwrap(),
+            ControlKnowledge::Known(false)
+        );
+    }
+
+    #[test]
     fn snapshot_queries_read_the_latest_event() {
         use crate::acp::state::{PlanStep, PlanStepStatus};
         let (_tmp, store) = open_store(1000);
@@ -1407,6 +1705,7 @@ mod tests {
             tool_call_id: None,
             description: "sleep".into(),
             workflow: None,
+            started_at: None,
         };
         let chunk = || Event::AgentMessageChunk {
             text: "x".into(),
@@ -1472,8 +1771,8 @@ mod tests {
             )
             .unwrap();
         assert_eq!(
-            lifecycle_rows, 3,
-            "completed pairs age out; only the open starts stay"
+            lifecycle_rows, 7,
+            "completed agents age out; recent task pairs stay for the shell panel"
         );
         let mut state = AcpState::new(AcpSessionId("s-1".into()), AgentName("claude".into()), None);
         for stored in store.replay_from("s-1", 0).unwrap() {
@@ -1491,6 +1790,142 @@ mod tests {
         );
     }
 
+    /// A finished shell stays replayable until it falls out of the newest
+    /// `MAX_FINISHED_BACKGROUND_SHELLS`, even past the retention cap.
+    #[test]
+    fn finished_shells_beyond_the_keep_count_age_out_of_the_log() {
+        use crate::acp::state::MAX_FINISHED_BACKGROUND_SHELLS;
+
+        let (_tmp, store) = open_store(3);
+        let mut seq = 0;
+        let mut record = |event: Event| {
+            seq += 1;
+            store
+                .record(
+                    "s-1",
+                    seq,
+                    &event,
+                    &crate::acp::event_sender::EventMetadata::history(),
+                )
+                .unwrap();
+        };
+        let total = MAX_FINISHED_BACKGROUND_SHELLS + 5;
+        for i in 0..total {
+            record(Event::BackgroundTaskStarted {
+                task_id: format!("t{i}"),
+                tool_call_id: None,
+                description: "sleep".into(),
+                workflow: None,
+                started_at: None,
+            });
+            record(Event::BackgroundTaskFinished {
+                task_id: format!("t{i}"),
+                ended_at: None,
+            });
+        }
+        // Open shells newer than every finished one must not use up kept slots.
+        for i in 0..3 {
+            record(Event::BackgroundTaskStarted {
+                task_id: format!("open{i}"),
+                tool_call_id: None,
+                description: "sleep".into(),
+                workflow: None,
+                started_at: None,
+            });
+        }
+        for _ in 0..150 {
+            record(Event::AgentMessageChunk {
+                text: "x".into(),
+                message_id: None,
+            });
+        }
+
+        let kept: Vec<String> = store
+            .replay_from("s-1", 0)
+            .expect("read retained events")
+            .into_iter()
+            .filter_map(
+                |stored| match std::sync::Arc::unwrap_or_clone(stored.event) {
+                    Event::BackgroundTaskStarted { task_id, .. } => Some(task_id),
+                    _ => None,
+                },
+            )
+            .collect();
+        let expected: Vec<String> = (total - MAX_FINISHED_BACKGROUND_SHELLS..total)
+            .map(|i| format!("t{i}"))
+            .chain((0..3).map(|i| format!("open{i}")))
+            .collect();
+        assert_eq!(kept, expected);
+        assert_eq!(store.unresolved_background_task_ids("s-1").len(), 3);
+    }
+
+    /// Workflows share the task events but must not use up the shells' kept
+    /// slots, on replay or in the folded state.
+    #[test]
+    fn finished_workflows_do_not_displace_a_finished_shell() {
+        use crate::acp::state::{
+            AcpSessionId, AcpState, AgentName, WorkflowLaunch, MAX_FINISHED_BACKGROUND_SHELLS,
+        };
+
+        let (_tmp, store) = open_store(3);
+        let mut seq = 0;
+        let mut record = |event: Event| {
+            seq += 1;
+            store
+                .record(
+                    "s-1",
+                    seq,
+                    &event,
+                    &crate::acp::event_sender::EventMetadata::history(),
+                )
+                .unwrap();
+        };
+        let finish = |id: &str| Event::BackgroundTaskFinished {
+            task_id: id.into(),
+            ended_at: None,
+        };
+        record(Event::BackgroundTaskStarted {
+            task_id: "shell".into(),
+            tool_call_id: None,
+            description: "make build".into(),
+            workflow: None,
+            started_at: None,
+        });
+        record(finish("shell"));
+        for i in 0..MAX_FINISHED_BACKGROUND_SHELLS + 5 {
+            record(Event::BackgroundTaskStarted {
+                task_id: format!("wf{i}"),
+                tool_call_id: Some(format!("call-{i}")),
+                description: "drafts".into(),
+                workflow: Some(WorkflowLaunch {
+                    run_id: format!("wf_{i}"),
+                    name: "drafts".into(),
+                    summary: None,
+                    transcript_dir: String::new(),
+                }),
+                started_at: None,
+            });
+            record(finish(&format!("wf{i}")));
+        }
+        for _ in 0..150 {
+            record(Event::AgentMessageChunk {
+                text: "x".into(),
+                message_id: None,
+            });
+        }
+
+        let mut state = AcpState::new(AcpSessionId("s-1".into()), AgentName("claude".into()), None);
+        for stored in store.replay_from("s-1", 0).unwrap() {
+            state
+                .apply_scoped_event(stored.seq, &stored.event, &stored.metadata)
+                .unwrap();
+        }
+        assert_eq!(state.background_shells.len(), 1);
+        assert_eq!(state.background_shells[0].command, "make build");
+        assert!(state.background_shells[0].finished);
+        assert_eq!(state.workflow_runs.len(), MAX_FINISHED_BACKGROUND_SHELLS);
+    }
+
     /// Nothing guarantees an adapter task id stays unique for a session, so a
     /// finish only closes the starts before it.
     #[test]
@@ -1501,6 +1936,7 @@ mod tests {
             tool_call_id: Some(tool_call_id.into()),
             description: "sleep".into(),
             workflow: None,
+            started_at: None,
         };
         let finished = || Event::BackgroundTaskFinished {
             task_id: "t".into(),
@@ -1583,6 +2019,7 @@ mod tests {
             tool_call_id: None,
             description: "sleep".into(),
             workflow: None,
+            started_at: None,
         };
         store
             .record(
@@ -1653,6 +2090,7 @@ mod tests {
                     tool_call_id: Some("toolu_wf".into()),
                     description: "drafts".into(),
                     workflow: Some(launch.clone()),
+                    started_at: None,
                 },
                 workflow_agent("a1", "wf_1"),
                 workflow_agent("a2", "wf_1"),

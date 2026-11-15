@@ -12,9 +12,6 @@ on:
 
 env:
   CARGO_TERM_COLOR: always
-  # .cargo/config.toml caps jobs at 4 for shared dev machines; CI runners are
-  # single-tenant, so use every vCPU.
-  CARGO_BUILD_JOBS: default
   # Centralizes the "which ref do we operate on" rule so every job's checkout
   # stays in sync. Without this, workflow_dispatch silently fell back to main:
   # checkout's default ref ignored the `tag` input, so validation read main's
@@ -52,174 +49,17 @@ jobs:
           echo "Cargo.toml version: $CARGO_VERSION"
           if [ "$CARGO_VERSION" != "$TAG_VERSION" ]; then
             echo "::error::Version mismatch! Cargo.toml has $CARGO_VERSION but tag is $TAG"
-            echo "Use the 'Prepare Release' workflow to bump the version automatically."
-            echo "Or manually update Cargo.toml and Cargo.lock to version $TAG_VERSION before tagging."
+            echo "Release tags come from merging the release-plz PR, which bumps Cargo.toml first."
             exit 1
           fi
           echo "✓ Versions match"
 
   build:
-    name: Build ${{ matrix.target }}
     needs: validate
-    runs-on: ${{ matrix.os }}
-    # Linux jobs build inside manylinux_2_28 containers (AlmaLinux 8 base,
-    # glibc 2.28) so the released binary runs on every common server distro
-    # from RHEL 8 / Ubuntu 20.04 / Debian 11 / Amazon Linux 2 forward, instead
-    # of failing on anything older than ubuntu-24.04's glibc 2.39. macOS jobs
-    # leave `matrix.container` unset and run directly on the runner host.
-    # See issue #1578 and Kobzol's "Building Rust binaries in CI that work
-    # with older GLIBC" for context. If the manylinux base is ever bumped,
-    # bump LINUX_GLIBC_FLOOR below, MIN_GLIBC in scripts/install.sh, and the
-    # Prerequisites note in docs/installation.md in the same PR.
-    container: ${{ matrix.container }}
-    env:
-      LINUX_GLIBC_FLOOR: '2.28'
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - target: x86_64-apple-darwin
-            os: macos-latest
-            name: aoe-darwin-amd64
-          - target: aarch64-apple-darwin
-            os: macos-latest
-            name: aoe-darwin-arm64
-          - target: x86_64-unknown-linux-gnu
-            os: ubuntu-latest
-            container: quay.io/pypa/manylinux_2_28_x86_64
-            name: aoe-linux-amd64
-          - target: aarch64-unknown-linux-gnu
-            # GitHub-hosted arm64 runner (free for public repos since 2025-08).
-            # Building natively here means we don't need a cross-toolchain
-            # inside the container.
-            os: ubuntu-24.04-arm
-            container: quay.io/pypa/manylinux_2_28_aarch64
-            name: aoe-linux-arm64
-
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        with:
-          ref: ${{ env.RELEASE_REF }}
-          persist-credentials: false
-
-      - name: Install container build dependencies (Linux)
-        if: matrix.container != ''
-        run: |
-          # manylinux_2_28 is AlmaLinux 8 (dnf-based). The image ships gcc,
-          # binutils, make, and core perl already; we add git for cargo's
-          # git deps, xz for tarball decompression, and three perl pieces
-          # that AlmaLinux 8's minimal perl install does NOT include but
-          # this workflow needs:
-          #   perl-IPC-Cmd     - openssl-src Configure step (config.pm)
-          #   perl-Time-Piece  - openssl-src Makefile.in line 37
-          #   perl-Digest-SHA  - provides the `shasum` command used to
-          #                      write the .sha256 file in Package step
-          # All three are in Ubuntu's perl-base by default, which is why
-          # the previous ubuntu-latest runner build didn't trip on any
-          # of them. FindBin and other standard Perl modules are in the
-          # base `perl` package on AlmaLinux 8, no separate install.
-          dnf install -y --setopt=install_weak_deps=False \
-            git curl tar gzip xz \
-            perl-IPC-Cmd perl-Time-Piece perl-Digest-SHA
-          # Node 22 via NodeSource. Node 22 requires glibc 2.28+, which is
-          # exactly what manylinux_2_28 ships, so this resolves cleanly.
-          curl -fsSL https://rpm.nodesource.com/setup_22.x | bash -
-          dnf install -y nodejs
-
-      - name: Setup Node.js (macOS)
-        if: matrix.container == ''
-        uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
-        with:
-          node-version: '22'
-
-      - name: Install web frontend dependencies
-        working-directory: web
-        run: npm install
-      - name: Build web frontend
-        working-directory: web
-        run: npm run build
-
-      - name: Read release toolchain
-        id: toolchain
-        shell: bash
-        env:
-          PYTHON: ${{ matrix.container != '' && '/opt/python/cp312-cp312/bin/python3' || 'python3' }}
-        run: |
-          set -euo pipefail
-          channel="$("$PYTHON" - <<'PY'
-          import re
-          import tomllib
-          with open("rust-toolchain.toml", "rb") as f:
-              channel = tomllib.load(f)["toolchain"]["channel"]
-          # Historical tags predate the local helper and numeric pin.
-          if not isinstance(channel, str) or not re.fullmatch(r"stable|[0-9]+\.[0-9]+\.[0-9]+", channel):
-              raise SystemExit(f"::error::Unexpected release toolchain {channel!r}")
-          print(channel)
-          PY
-          )"
-          echo "channel=$channel" >> "$GITHUB_OUTPUT"
-
-      - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
-        with:
-          toolchain: ${{ steps.toolchain.outputs.channel }}
-          targets: ${{ matrix.target }}
-
-      - name: Build
-        run: cargo build --release --features web --target ${{ matrix.target }}
-
-      - name: Verify Linux binary glibc floor
-        if: matrix.container != ''
-        run: |
-          # Hard CI guard against the same regression that produced #1578:
-          # if the binary ever requires GLIBC symbols newer than the
-          # manylinux base ships, fail the release before publishing.
-          # objdump ships in binutils, already present in manylinux_2_28.
-          BIN="target/${{ matrix.target }}/release/aoe"
-          REQUIRED=$(objdump -T "$BIN" \
-              | grep -oE 'GLIBC_[0-9]+\.[0-9]+' \
-              | sed 's/GLIBC_//' \
-              | sort -uV \
-              | tail -1)
-          echo "Highest GLIBC symbol required: ${REQUIRED:-<none>}"
-          echo "Configured floor:              ${LINUX_GLIBC_FLOOR}"
-          if [ -z "$REQUIRED" ]; then
-              echo "::warning::No GLIBC symbols found; binary may be statically linked"
-              exit 0
-          fi
-          if [ "$(printf '%s\n%s\n' "$LINUX_GLIBC_FLOOR" "$REQUIRED" | sort -V | tail -1)" != "$LINUX_GLIBC_FLOOR" ]; then
-              echo "::error::Binary requires GLIBC_${REQUIRED} but floor is ${LINUX_GLIBC_FLOOR}. The container image or build deps likely changed; bump LINUX_GLIBC_FLOOR + scripts/install.sh MIN_GLIBC + docs/installation.md together, or fix the regression."
-              exit 1
-          fi
-
-      - name: Package
-        run: |
-          mkdir -p dist
-          cp target/${{ matrix.target }}/release/aoe dist/${{ matrix.name }}
-          # Ship the license texts beside the binary. aoe is MIT, and
-          # src/tui/hyperlink.rs carries Apache-2.0 derived code whose
-          # section 4(a) requires that recipients get a copy of that license,
-          # which a bare binary did not provide. `scripts/install.sh` moves the binary
-          # out by name, so the extra files are inert for installers.
-          cp LICENSE THIRD_PARTY_NOTICES.md dist/
-          cp -R licenses dist/licenses
-          cd dist
-          tar -czvf ${{ matrix.name }}.tar.gz \
-            ${{ matrix.name }} LICENSE THIRD_PARTY_NOTICES.md licenses
-          # shasum is a perl script that ships in macOS by default and is
-          # provided on Linux by perl-Digest-SHA (installed above for the
-          # manylinux jobs). Using shasum keeps the command identical on
-          # all four matrix entries; sha256sum would work on Linux but is
-          # not installed on macOS by default.
-          shasum -a 256 ${{ matrix.name }}.tar.gz > ${{ matrix.name }}.tar.gz.sha256
-
-      - name: Upload artifact
-        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
-        with:
-          name: ${{ matrix.name }}
-          path: |
-            dist/${{ matrix.name }}.tar.gz
-            dist/${{ matrix.name }}.tar.gz.sha256
+    uses: ./.github/workflows/build-binaries.yml
+    with:
+      # RELEASE_REF; `env` is not available to a reusable workflow call.
+      ref: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.tag || github.ref }}
 
   release:
     name: Create Release
@@ -232,13 +72,6 @@ jobs:
         with:
           ref: ${{ env.RELEASE_REF }}
           persist-credentials: false
-          # git cliff --current walks tag-to-tag history; needs full clone.
-          fetch-depth: 0
-
-      - name: Install git-cliff
-        uses: taiki-e/install-action@86f7a0ffb25f40114606501a311ebcfaf882ea32 # v2.88.0
-        with:
-          tool: git-cliff
 
       - name: Download all artifacts
         uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
@@ -262,29 +95,19 @@ jobs:
             echo "version=${GITHUB_REF#refs/tags/}" >> $GITHUB_OUTPUT
           fi
 
-      - name: Generate release notes
+      - name: Extract release notes
         env:
-          # git-cliff hits the GitHub API to resolve commit -> PR -> author
-          # for the "by @user in #N" lines and the "New Contributors" section.
-          # Without a token the calls are unauthenticated and rate-limited to
-          # 60/hr, which silently strips attribution when a release has many
-          # commits.
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          VERSION: ${{ steps.version.outputs.version }}
+        # release-plz wrote this version's section into CHANGELOG.md in the release PR.
         run: |
-          git cliff --config cliff.toml --current --strip header > release-notes.md 2> cliff-stderr.log
-          echo "=== release-notes.md ==="
-          cat release-notes.md
-          echo "=== cliff stderr ==="
-          cat cliff-stderr.log
-          # Belt-and-braces: cliff.toml already routes unmatched commits to
-          # the "Other" group via a catch-all parser. If git-cliff still
-          # flags a parse-error skip, something fell through the safety net
-          # (regex change, parser-order regression, etc.) and we want the
-          # release to fail loudly rather than silently lose commits.
-          if grep -q "skipped due to parse error" cliff-stderr.log; then
-            echo "::error::git-cliff skipped commits due to parse errors. Either fix the offending commit messages or extend cliff.toml's catch-all parser."
-            exit 1
+          awk -v heading="## [${VERSION#v}]" '
+            index($0, "## [") == 1 { if (found) exit; found = index($0, heading) == 1; next }
+            found
+          ' CHANGELOG.md > release-notes.md
+          if ! grep -q '[^[:space:]]' release-notes.md; then
+            echo "No user-facing changes." > release-notes.md
           fi
+          cat release-notes.md
 
       - name: Create Release
         uses: softprops/action-gh-release@efb35369e0ad2afab669f228072c1b0d510eae64 # v3.0.3

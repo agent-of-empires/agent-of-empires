@@ -1,13 +1,15 @@
 // @vitest-environment jsdom
 
-import { act, renderHook, waitFor } from "@testing-library/react";
-import { useLayoutEffect } from "react";
+import { act, fireEvent, render as renderView, renderHook, waitFor, within } from "@testing-library/react";
+import { createElement, useLayoutEffect } from "react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
-import { emptyAcpState, nativeInputAvailable } from "../lib/acpTypes";
+import { emptyAcpState, nativeInputAvailable, type SubagentRecord } from "../lib/acpTypes";
 import { STATE_TTL_MS, STORAGE_KEY_PREFIX } from "../lib/acpStateStorage";
 import { reportAcpInteraction, type ServerQueuedPrompt } from "../lib/api";
 import { useCancelEscalation } from "../components/acp/useCancelEscalation";
+import { BackgroundAgentsPanel } from "../components/acp/BackgroundAgentsPanel";
+import { StopSession } from "../components/acp/subagents/StopSession";
 import { ACP_DIAL_TIMEOUT_MS, ACP_MAX_RETRIES, ACP_WS_STALE_MS, acpRetryDelayMs } from "./acpSession/useAcpConnection";
 import {
   FakeWebSocket,
@@ -1100,6 +1102,87 @@ describe("setConfigOption", () => {
 });
 
 describe("current native admission", () => {
+  it.each(["composer", "panel"] as const)(
+    "cancels only the live host intent through the %s gesture while Native remains Unknown",
+    async (consumer) => {
+      const id = "sess-pending-host";
+      const intent = "5fdcc941-9be3-4f26-ab31-21b612084392";
+      const hook = renderHook(
+        () => {
+          const acp = useAcpSession(id);
+          const escalation = useCancelEscalation(
+            id,
+            acp.state.promptSeq,
+            acp.state.cancelling,
+            acp.cancelPrompt,
+            acp.forceEndTurn,
+          );
+          return { acp, escalation };
+        },
+        { wrapper: profileWrapper },
+      );
+      await flushAsync();
+      lastSocket().open();
+      await flushAsync();
+      lastSocket().message({
+        session_id: id,
+        seq: 1,
+        event: { UserPromptSent: { text: "accepted host intent" } },
+      });
+      const snapshot = currentControlSnapshot(hook.result.current.acp.state, { ready: false }, 1);
+      snapshot.state.host_prompt_intent = intent;
+      lastSocket().message(snapshot);
+      await flushAsync();
+      expect(nativeInputAvailable(hook.result.current.acp.state)).toBe(false);
+      expect(hook.result.current.acp.state.turnActive).toBe(true);
+      expect(hook.result.current.acp.state.hostPromptIntent).toBe(intent);
+      const panel =
+        consumer === "panel"
+          ? renderView(createElement(StopSession, { sessionId: id, running: 1 }), { wrapper: profileWrapper })
+          : null;
+      if (panel) {
+        fireEvent.click(panel.getByRole("button", { name: "Stop", exact: true }));
+        expect(posts("/acp/cancel")).toEqual([]);
+        fireEvent.click(panel.getByRole("button", { name: "Interrupt session" }));
+        await flushAsync();
+      } else {
+        await act(() => hook.result.current.escalation.onCancel());
+      }
+      const cancels = posts("/acp/cancel");
+      expect(cancels).toHaveLength(1);
+      expect(cancels[0]).toMatchObject({
+        method: "POST",
+        url: `/api/sessions/${id}/acp/cancel`,
+      });
+      expect(JSON.parse(cancels[0]!.body as string)).toEqual({ host_prompt_intent: intent });
+      await act(async () => {
+        await hook.result.current.acp.cancelSubagent("child");
+        await hook.result.current.acp.setConfigOption("model", "not-authorized");
+        await hook.result.current.acp.forceEndTurn();
+      });
+      expect(posts("/subagents/")).toEqual([]);
+      expect(posts("/config-option")).toEqual([]);
+      expect(posts("/force_end_turn")).toEqual([]);
+      expect(nativeInputAvailable(hook.result.current.acp.state)).toBe(false);
+      const cleared = currentControlSnapshot(hook.result.current.acp.state, { ready: false }, 2);
+      cleared.state.host_prompt_intent = null;
+      lastSocket().message(cleared);
+      lastSocket().message(snapshot);
+      await flushAsync();
+      expect(hook.result.current.acp.state.hostPromptIntent).toBeNull();
+      await act(() => hook.result.current.acp.cancelPrompt());
+      expect(posts("/acp/cancel")).toHaveLength(1);
+      panel?.unmount();
+      hook.unmount();
+      const restored = render(id);
+      await flushAsync();
+      expect(restored.result.current.state.hostPromptIntent).toBeNull();
+      await act(() => restored.result.current.cancelPrompt());
+      expect(posts("/acp/cancel")).toHaveLength(1);
+      restored.unmount();
+    },
+  );
+
   it.each([
     [false, true, 1],
     [true, false, 0],
@@ -1293,4 +1376,267 @@ describe("current native admission", () => {
     expect(result.current.state.queuedPrompts.map((row) => row.text)).toEqual(["initial explicit intent"]);
     expect(result.current.state.connectionReady).toBe(false);
   });
+});
+
+describe("live panel cancellation authority", () => {
+  const childId = "panel-child";
+  const startedAt = "2026-01-01T00:00:00Z";
+  const panelElements = (sessionId: string) =>
+    createElement(
+      "div",
+      null,
+      ...["desktop background work", "mobile background work"].map((name) =>
+        createElement(
+          "section",
+          { key: name, "aria-label": name },
+          createElement(BackgroundAgentsPanel, { sessionId }),
+        ),
+      ),
+    );
+  const seedChild = (socket: FakeWebSocket, sessionId: string, seq = 0) => {
+    const child: SubagentRecord = {
+      session_id: childId,
+      parent_session_id: sessionId,
+      parent_tool_call_id: "panel-tool",
+      state: "running",
+      cancel_capable: true,
+    };
+    socket.message({
+      session_id: sessionId,
+      seq: seq + 1,
+      event: {
+        BackgroundAgentLaunched: {
+          agent_id: "panel-agent",
+          tool_call_id: "panel-tool",
+          description: "Linked panel child",
+          prompt: "Retained child instructions",
+          model: "test-model",
+          started_at: startedAt,
+        },
+      },
+    });
+    socket.message({
+      session_id: sessionId,
+      seq: seq + 2,
+      event: { SubagentUpdated: { subagent: child, at: startedAt } },
+    });
+  };
+
+  it.each(["native revocation", "runtime unmount"] as const)(
+    "rechecks whole-session authority when confirmation opens before %s",
+    async (transition) => {
+      const id = "sess-panel-confirmation";
+      const hook = await openSession(id);
+      seedChild(lastSocket(), id);
+      await flushAsync();
+      const view = renderView(panelElements(id), { wrapper: profileWrapper });
+      const regions = view.getAllByRole("region", { name: /^(desktop|mobile) background work$/ });
+      expect(regions).toHaveLength(2);
+      for (const region of regions) {
+        fireEvent.click(within(region).getByRole("button", { name: "Stop", exact: true }));
+        expect(within(region).getByRole("alertdialog")).toBeTruthy();
+      }
+      expect(posts("/cancel")).toEqual([]);
+
+      if (transition === "native revocation") {
+        await act(async () => {
+          lastSocket().message(currentControlSnapshot(hook.result.current.state, { ready: false }, 20));
+        });
+        expect(nativeInputAvailable(hook.result.current.state)).toBe(false);
+      } else {
+        hook.unmount();
+      }
+      for (const region of regions) {
+        fireEvent.click(within(region).getByRole("button", { name: "Interrupt session" }));
+      }
+      await flushAsync();
+      expect(posts("/cancel")).toEqual([]);
+      for (const region of regions) {
+        expect(within(region).queryByRole("alertdialog")).toBeNull();
+      }
+      expect(sockets).toHaveLength(1);
+      view.unmount();
+      if (transition === "native revocation") hook.unmount();
+    },
+  );
+
+  it.each(["unknown", "disconnected"] as const)(
+    "refuses child and whole-turn gestures from both cached panels while %s",
+    async (phase) => {
+      const id = "sess-panel-refused";
+      const hook = await openSessionWithReceipt({ ready: phase !== "unknown" }, id);
+      seedChild(lastSocket(), id);
+      await flushAsync();
+      if (phase === "disconnected") lastSocket().drop();
+      expect(nativeInputAvailable(hook.result.current.state)).toBe(false);
+      const view = renderView(panelElements(id), { wrapper: profileWrapper });
+      const regions = view.getAllByRole("region", { name: /^(desktop|mobile) background work$/ });
+      expect(regions).toHaveLength(2);
+      for (const region of regions) {
+        fireEvent.click(within(region).getByRole("button", { name: "Stop sub-agent" }));
+        const previousRootPosts = posts("/acp/cancel").length;
+        fireEvent.click(within(region).getByRole("button", { name: "Stop", exact: true }));
+        expect(posts("/acp/cancel")).toHaveLength(previousRootPosts);
+        expect(within(region).getByRole("alertdialog").textContent).toContain("interrupts the main agent");
+        fireEvent.click(within(region).getByRole("button", { name: "Interrupt session" }));
+      }
+      await flushAsync();
+      expect(posts("/cancel")).toEqual([]);
+      for (const region of regions) {
+        await waitFor(() => expect(region.textContent).toContain("Native input is not currently confirmed"));
+      }
+      expect(sockets).toHaveLength(1);
+      view.unmount();
+      hook.unmount();
+    },
+  );
+
+  it("checks the committed runtime before cached panel publication and permits a fresh Available gesture", async () => {
+    const id = "sess-panel-layout";
+    let clickAtCommit: (() => void) | undefined;
+    const hook = renderHook(
+      () => {
+        const session = useAcpSession(id);
+        useLayoutEffect(() => {
+          if (!clickAtCommit || nativeInputAvailable(session.state)) return;
+          const click = clickAtCommit;
+          clickAtCommit = undefined;
+          click();
+        }, [session.state, session.status]);
+        return session;
+      },
+      { wrapper: profileWrapper },
+    );
+    await flushAsync();
+    lastSocket().open();
+    lastSocket().message(currentControlSnapshot(hook.result.current.state, { ready: true }));
+    seedChild(lastSocket(), id);
+    await flushAsync();
+    const view = renderView(panelElements(id), { wrapper: profileWrapper });
+    const region = view.getByRole("region", { name: "desktop background work" });
+    const stop = within(region).getByRole("button", { name: "Stop sub-agent" });
+    clickAtCommit = () => stop.click();
+    await act(async () => {
+      lastSocket().message(currentControlSnapshot(hook.result.current.state, { ready: false }, 20));
+    });
+    expect(clickAtCommit).toBeUndefined();
+    await flushAsync();
+    expect(posts("/cancel")).toEqual([]);
+    await waitFor(() => expect(region.textContent).toContain("Native input is not currently confirmed"));
+
+    await act(async () => {
+      lastSocket().message(currentControlSnapshot(hook.result.current.state, { ready: true }, 20));
+    });
+    expect(nativeInputAvailable(hook.result.current.state)).toBe(true);
+    await act(async () => {
+      fireEvent.click(within(region).getByRole("button", { name: "Stop sub-agent" }));
+    });
+    await flushAsync();
+    expect(posts("/cancel")).toEqual([
+      { method: "POST", url: `/api/sessions/${id}/acp/subagents/${childId}/cancel`, body: null },
+    ]);
+    await waitFor(() => expect(region.textContent).not.toContain("Native input is not currently confirmed"));
+    expect(sockets).toHaveLength(1);
+    view.unmount();
+    hook.unmount();
+  });
+
+  it("uses exactly the selected child and root routes from both Available panels without a second socket", async () => {
+    const id = "sess-panel-available";
+    const hook = await openSession(id);
+    seedChild(lastSocket(), id);
+    await flushAsync();
+    const view = renderView(panelElements(id), { wrapper: profileWrapper });
+    for (const region of view.getAllByRole("region", { name: /^(desktop|mobile) background work$/ })) {
+      fireEvent.click(within(region).getByRole("button", { name: "Stop sub-agent" }));
+      const previousRootPosts = posts("/acp/cancel").length;
+      fireEvent.click(within(region).getByRole("button", { name: "Stop", exact: true }));
+      expect(posts("/acp/cancel")).toHaveLength(previousRootPosts);
+      expect(within(region).getByRole("alertdialog").textContent).toContain("interrupts the main agent");
+      fireEvent.click(within(region).getByRole("button", { name: "Interrupt session" }));
+    }
+    await flushAsync();
+    expect(posts(`/acp/subagents/${childId}/cancel`)).toEqual([
+      { method: "POST", url: `/api/sessions/${id}/acp/subagents/${childId}/cancel`, body: null },
+      { method: "POST", url: `/api/sessions/${id}/acp/subagents/${childId}/cancel`, body: null },
+    ]);
+    expect(posts("/acp/cancel")).toEqual([
+      { method: "POST", url: `/api/sessions/${id}/acp/cancel`, body: null },
+      { method: "POST", url: `/api/sessions/${id}/acp/cancel`, body: null },
+    ]);
+    expect(sockets).toHaveLength(1);
+    view.unmount();
+    hook.unmount();
+  });
+
+  it("keeps a refused current child cancellation visible in each sibling panel", async () => {
+    calls = installAcpFakes(({ method, url }) =>
+      method === "POST" && url.endsWith(`/subagents/${childId}/cancel`)
+        ? new Response("subagent cannot be cancelled", { status: 409 })
+        : undefined,
+    );
+    const id = "sess-panel-error";
+    const hook = await openSession(id);
+    seedChild(lastSocket(), id);
+    await flushAsync();
+    const view = renderView(panelElements(id), { wrapper: profileWrapper });
+    for (const region of view.getAllByRole("region", { name: /^(desktop|mobile) background work$/ })) {
+      fireEvent.click(within(region).getByRole("button", { name: "Stop sub-agent" }));
+      expect(await within(region).findByText(/Could not stop subagent \(409\)/)).toBeTruthy();
+    }
+    expect(posts(`/subagents/${childId}/cancel`)).toHaveLength(2);
+    view.unmount();
+    hook.unmount();
+  });
+
+  it.each(["target replacement", "runtime unmount"] as const)(
+    "invalidates saved child and whole-turn callbacks after %s without redirecting them",
+    async (transition) => {
+      const oldId = "sess-panel-old";
+      const nextId = transition === "target replacement" ? "sess-panel-new" : oldId;
+      const previous = renderHook(({ id }) => useAcpSession(id), {
+        initialProps: { id: oldId },
+        wrapper: profileWrapper,
+      });
+      await flushAsync();
+      lastSocket().open();
+      lastSocket().message(currentControlSnapshot(previous.result.current.state, { ready: true }));
+      seedChild(lastSocket(), oldId);
+      await flushAsync();
+      const savedChild = previous.result.current.cancelSubagent;
+      const savedRoot = previous.result.current.cancelPrompt;
+      const view = renderView(panelElements(oldId), { wrapper: profileWrapper });
+      let current = previous;
+      if (transition === "target replacement") {
+        previous.rerender({ id: nextId });
+      } else {
+        previous.unmount();
+        current = renderHook(({ id }) => useAcpSession(id), {
+          initialProps: { id: nextId },
+          wrapper: profileWrapper,
+        });
+      }
+      await flushAsync();
+      lastSocket().open();
+      lastSocket().message(currentControlSnapshot(current.result.current.state, { ready: true }));
+      seedChild(lastSocket(), nextId, current.result.current.state.lastSeq);
+      await flushAsync();
+      expect(nativeInputAvailable(current.result.current.state)).toBe(true);
+      await act(async () => {
+        await savedChild(childId);
+        await savedRoot();
+      });
+      expect(posts("/cancel")).toEqual([]);
+
+      view.rerender(panelElements(nextId));
+      const region = view.getByRole("region", { name: "mobile background work" });
+      fireEvent.click(within(region).getByRole("button", { name: "Stop sub-agent" }));
+      await flushAsync();
+      expect(posts("/cancel")).toEqual([
+        { method: "POST", url: `/api/sessions/${nextId}/acp/subagents/${childId}/cancel`, body: null },
+      ]);
+      view.unmount();
+      current.unmount();
+    },
+  );
 });

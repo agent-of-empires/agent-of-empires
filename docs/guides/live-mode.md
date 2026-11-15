@@ -4,11 +4,11 @@ Live mode is a "feels attached" alternative to a full tmux attach: the home view
 
 ## Entering and leaving
 
-Press `Tab` on a runnable session, or set live mode as your default so `Enter` and a click drop straight into it. **New Session Mode** makes new sessions open in live mode without changing what `Enter` does. `Ctrl+Q` always leaves, in a single press, independent of the leader below. The status bar shows a `● LIVE → <session>` banner with the exit chord while you are relayed.
+Press `Tab` on a runnable session, or set live mode as your default so `Enter` and a click drop straight into it. **Open a new Session with** makes new sessions open in live mode without changing what `Enter` does. `Ctrl+Q` always leaves, in a single press, independent of the leader below. The status bar shows a `● LIVE → <session>` banner with the exit chord while you are relayed.
 
 Control chords reach the agent: `Ctrl+C` interrupts it rather than quitting AoE, and the banner flashes a brief reminder on each press. To quit AoE, leave live mode first.
 
-Live send works for the Terminal and Tool views too, not just the agent pane: whichever pane is on screen is what your keystrokes reach. Turning on **Auto Live-Send On View Switch** (Interaction settings, off by default) starts the relay as soon as you switch views.
+Live send works for the Terminal and Tool views too, not just the agent pane: whichever pane is on screen is what your keystrokes reach. Turning on **Live-send when switching view** (Interaction settings, off by default) starts the relay as soon as you switch views.
 
 A foreground pane preparation may wait behind that session's accepted access
 stamp or unread clearing. It is submitted once after the write is acknowledged
@@ -75,6 +75,28 @@ A native generation can change while the Agent PTY survives, for example when an
 
 These fences cover AoE-managed replacement and queued actions. They do not promise protection against arbitrary external `respawn-pane`, external hooks that redirect input, or every externally linked window surviving `kill-session`.
 
+## Captured input scope
+
+An error banner is not evidence that a native agent died. Opening or sending to an already-live pane preserves that runtime; an uncertain pane observation refuses the operation rather than choosing Restart. Confirmed missing or dead panes use the governed launch path. Dead-pane cleanup removes the exact owned corpse directly, without briefly respawning a shell or traversing a defunct process tree.
+
+A dead observation can legitimately report an empty PID after a live birth. Cleanup carries that freshly validated dead snapshot forward, correlated to the birth's server incarnation, session and pane; the native removal command still checks the exact current PID/dead state. It never treats an arbitrary missing PID as permission to remove a pane.
+
+Live input is bound when it enters the queue: the native instance's creation and generation, physical profile, original tmux server and pane, and captured transport. Each input batch checks current native authority under lifecycle exclusion. Body, paste and a delayed Enter keep that same target and are checked separately. A failed socket write is not replayed through another channel or a freshly looked-up name. Native effect acknowledgement means transport acceptance, not that the application has read or acted on the bytes.
+
+Preparation also retains its original row and physical profile before it waits. An already-live Agent keeps that physical owner; a missing/dead Agent can use only the selected context captured for that preparation, checked again after launch hooks. The returned target is that operation's own result, never a replacement found by looking up the row after the wait. Unknown or changed preconditions refuse the old action; a new explicit action can capture the current scope. These equality checks do not grant fresh-conversation or retry permission.
+
+The original selected-context digest and physical profile are captured before a send waits for admission. A title or tmux-name change alone does not revoke an otherwise unchanged live physical owner: captured input and Agent readiness query the original server/session/pane IDs, not a newly resolved name. A transport that actually closes still refuses delivery without replay.
+
+After launch exclusions are reacquired, the internal Created receipt retains its own physical observation and is checked against durable creation/generation, never a replacement seen through a stale daemon cache. Created is not a public `/ensure` status: HTTP returns `restarted` after launch and `alive` when reusing the captured runtime.
+
+If required conversation publication is known to have been refused after a new native birth, cleanup is limited to that owned birth under its current reservation and creation/generation fences; peer conversation pins are preserved. An uncertain commit is different: the exact bound store must be reconciled, and a possibly applied or unreadable publication does not authorize destroying the native runtime or replaying the request.
+
+Successful input bookkeeping only updates recency for the captured creation, generation and physical profile. It is not the explicit Access gesture: it does not clear archive, snooze, dormancy, a newer error, or a newer lifecycle state. Restart completion likewise does not merge an old lifecycle snapshot over a peer's newer state.
+
+A native generation can change while the Agent PTY survives, for example when another session-owned terminal is launched or stopped. A stale view therefore stops accepting input even if its output remains live; a freshly captured action can use the surviving runtime. Already accepted bytes are not retracted. The raw `pipe-pane -I` transport and its native mode behavior remain unchanged; fallback sends retain their original physical target.
+
+These fences cover AoE-managed replacement and queued actions. They do not promise protection against arbitrary external `respawn-pane`, external hooks that redirect input, or every externally linked window surviving `kill-session`.
+
 ## Split windows
 
 If the session's tmux window is split, by hand or by an agent that spawns a pane per teammate, the preview composites every pane onto the window grid with borders in the gaps, so nothing is hidden. Two things change while it is split: scrolling history is unavailable, because panes keep independent scrollbacks with no coherent way to stack them, and input still goes to the first pane, so a click or wheel aimed at a neighbouring pane does nothing. Attach to the session to interact with the other panes.
@@ -85,7 +107,7 @@ The TUI's agent preview and the dashboard's agent terminal render through a pers
 
 The channel needs tmux 3.4 or newer. A pane that cannot arm one, a grid that could not be seeded or is catching up with a resize, an older tmux, or a non-Unix host falls back to polling automatically: everything still works, with more latency and no synchronized-output hold. A split window is composited from `capture-pane` snapshots, with the TUI preview keeping pane 0 on its VT grid. The paired host and container shells always poll.
 
-To rule the transport in or out while troubleshooting, toggle **VT Live Transport** under Settings (Tmux tab, Advanced) or set `[tmux] vt_live = false`. The TUI applies a change on its next capture cycle; web connections pick it up when they reconnect.
+To rule the transport in or out while troubleshooting, toggle **Live terminal stream** under Settings (Tmux tab, Advanced) or set `[tmux] vt_live = false`. The TUI applies a change on its next capture cycle; web connections pick it up when they reconnect.
 
 ## Configuration
 

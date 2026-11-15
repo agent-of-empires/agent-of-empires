@@ -464,6 +464,7 @@ impl NativeRuntime {
             authorize(local, Capability::NativeInteraction);
         RuntimeInfo {
             protocol_version: RUNTIME_PROTOCOL_VERSION,
+            app_version: Some(env!("CARGO_PKG_VERSION").into()),
             cli_creation: true,
             epoch: self.epoch.clone(),
             namespace: self.namespace.clone(),
@@ -813,56 +814,76 @@ pub(crate) async fn publish_loop(state: Arc<AppState>) {
 mod tests {
     use super::*;
 
-    #[test]
-    fn sandbox_progress_poison_keeps_last_activity_without_publishing() {
-        use crate::migrations::progress::{ConsoleProgress, Event};
-
-        let initial = crate::daemon::SandboxProgress {
-            operation_id: "copy".into(),
-            session_id: "session".into(),
-            profile: "test".into(),
-            activity: "starting".into(),
-        };
-        let (progress, mut receiver) = watch::channel(vec![initial]);
-        let console = std::sync::Mutex::new(ConsoleProgress::default());
-        update_sandbox_progress(
-            &progress,
-            "copy",
-            &console,
-            Event::Started {
-                version: 27,
-                name: "isolate_sandbox_stores",
-                position: 1,
-                total: 1,
-            },
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn cached_status_poll_publishes_disk_change_on_the_next_tick() {
+        let _home = crate::session::test_support::isolate_app_dir();
+        crate::tmux::tool_retirement::initialize(&crate::session::get_app_dir().unwrap()).unwrap();
+        let storage = crate::session::Storage::new_unwatched("test").unwrap();
+        let mut row = crate::session::Instance::new("before", "/repo");
+        row.source_profile = "test".into();
+        row.status = crate::session::Status::Stopped;
+        storage
+            .update(|rows, _| {
+                rows.push(row.clone());
+                Ok(())
+            })
+            .unwrap();
+        let state = crate::server::test_support::build_test_app_state(vec![row.clone()]);
+        let (_health_tx, health_rx) = tokio::sync::watch::channel(Arc::default());
+        let mut snapshots = state.runtime.snapshots.subscribe();
+        let (completed_tx, mut completed_rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut polling = Box::pin(super::super::status_poll::status_poll_loop_observed(
+            state.clone(),
+            health_rx,
+            Some(completed_tx),
+        ));
+        tokio::time::timeout(Duration::from_secs(10), async {
+            tokio::select! {
+                _ = &mut polling => panic!("poll loop stopped"),
+                result = completed_rx.recv() => result.unwrap(),
+            }
+        })
+        .await
+        .unwrap();
+        assert_eq!(
+            snapshots
+                .borrow_and_update()
+                .as_ref()
+                .unwrap()
+                .value
+                .contents
+                .sessions[0]
+                .title,
+            "before"
         );
-        update_sandbox_progress(
-            &progress,
-            "copy",
-            &console,
-            Event::Step("copying store".into()),
+        storage
+            .update(|rows, _| {
+                rows[0].title = "after".into();
+                rows[0].status = crate::session::Status::Creating;
+                Ok(())
+            })
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(10), async {
+            tokio::select! {
+                _ = &mut polling => panic!("poll loop stopped"),
+                result = completed_rx.recv() => result.unwrap(),
+            }
+        })
+        .await
+        .unwrap();
+        assert!(
+            completed_rx.try_recv().is_err(),
+            "exactly one tick ran after the write"
         );
-        let previous = receiver.borrow_and_update().clone();
-        assert!(previous[0].activity.starts_with("copying store ("));
-        let poisoned = std::panic::catch_unwind(|| {
-            let _guard = console.lock().unwrap();
-            panic!("poison progress renderer");
-        });
-        assert!(poisoned.is_err());
-        assert!(console.is_poisoned());
-
-        for event in [
-            Event::Progress("discarded update".into()),
-            Event::Finished {
-                version: 27,
-                elapsed: Duration::from_secs(1),
-            },
-        ] {
-            update_sandbox_progress(&progress, "copy", &console, event);
-            assert_eq!(*receiver.borrow(), previous);
-            assert!(!receiver.has_changed().unwrap());
-        }
+        let snapshot = snapshots.borrow_and_update().clone().unwrap();
+        let published = &snapshot.value.contents.sessions[0];
+        assert_eq!(published.title, "after");
+        assert_eq!(published.status, "Creating");
+        state.shutdown.cancel();
+        polling.await;
     }
+
     #[tokio::test]
     #[serial_test::serial]
     async fn worker_snapshot_precedes_publication_and_instance_exclusion() {
@@ -1096,30 +1117,6 @@ mod tests {
         Ok(())
     }
 
-    /// Only kernel-authenticated Unix owners receive hook output.
-    #[test]
-    fn if_none_match_compares_weakly_across_a_list() {
-        let etag = "\"e.1.None\"";
-        for (header, expected) in [
-            ("\"e.1.None\"", true),
-            ("W/\"e.1.None\"", true),
-            ("\"x\", W/\"e.1.None\"", true),
-            ("*", true),
-            ("\"a,*,b\"", false),
-            ("\"a,e.1.None\"", false),
-            ("\"e.2.None\"", false),
-            ("", false),
-        ] {
-            let mut headers = axum::http::HeaderMap::new();
-            headers.append(
-                axum::http::header::IF_NONE_MATCH,
-                axum::http::HeaderValue::from_str(header).unwrap(),
-            );
-            assert_eq!(if_none_match(&headers, etag), expected, "{header:?}");
-        }
-        assert!(!if_none_match(&axum::http::HeaderMap::new(), etag));
-    }
-
     #[test]
     fn creation_progress_is_granted_only_to_the_local_owner() {
         assert!(creation_progress_granted(Some(&Principal::LocalPeer {
@@ -1172,6 +1169,7 @@ mod tests {
                     .runtime
                     .info(&state, authorization.as_ref(), &snapshot.value);
                 let encoded = serde_json::to_string(&info).unwrap();
+                assert_eq!(info.app_version.as_deref(), Some(env!("CARGO_PKG_VERSION")));
                 assert!(!encoded.contains("SECRET_DIAGNOSTIC_PAYLOAD_DO_NOT_RENDER"));
                 assert_eq!(!info.owner_diagnostics.is_empty(), owner);
                 if !owner {
@@ -1183,6 +1181,81 @@ mod tests {
                 None => std::fs::remove_file(&path).unwrap(),
             }
         }
+    }
+
+    #[test]
+    fn sandbox_progress_poison_keeps_last_activity_without_publishing() {
+        use crate::migrations::progress::{ConsoleProgress, Event};
+
+        let initial = crate::daemon::SandboxProgress {
+            operation_id: "copy".into(),
+            session_id: "session".into(),
+            profile: "test".into(),
+            activity: "starting".into(),
+        };
+        let (progress, mut receiver) = watch::channel(vec![initial]);
+        let console = std::sync::Mutex::new(ConsoleProgress::default());
+        update_sandbox_progress(
+            &progress,
+            "copy",
+            &console,
+            Event::Started {
+                version: 27,
+                name: "isolate_sandbox_stores",
+                position: 1,
+                total: 1,
+            },
+        );
+        update_sandbox_progress(
+            &progress,
+            "copy",
+            &console,
+            Event::Step("copying store".into()),
+        );
+        let previous = receiver.borrow_and_update().clone();
+        assert!(previous[0].activity.starts_with("copying store ("));
+        let poisoned = std::panic::catch_unwind(|| {
+            let _guard = console.lock().unwrap();
+            panic!("poison progress renderer");
+        });
+        assert!(poisoned.is_err());
+        assert!(console.is_poisoned());
+
+        for event in [
+            Event::Progress("discarded update".into()),
+            Event::Finished {
+                version: 27,
+                elapsed: Duration::from_secs(1),
+            },
+        ] {
+            update_sandbox_progress(&progress, "copy", &console, event);
+            assert_eq!(*receiver.borrow(), previous);
+            assert!(!receiver.has_changed().unwrap());
+        }
+    }
+
+    /// Only kernel-authenticated Unix owners receive hook output.
+    #[test]
+    fn if_none_match_compares_weakly_across_a_list() {
+        let etag = "\"e.1.None\"";
+        for (header, expected) in [
+            ("\"e.1.None\"", true),
+            ("W/\"e.1.None\"", true),
+            ("\"x\", W/\"e.1.None\"", true),
+            ("*", true),
+            ("\"a,*,b\"", false),
+            ("\"a,e.1.None\"", false),
+            ("\"e.2.None\"", false),
+            ("", false),
+        ] {
+            let mut headers = axum::http::HeaderMap::new();
+            headers.append(
+                axum::http::header::IF_NONE_MATCH,
+                axum::http::HeaderValue::from_str(header).unwrap(),
+            );
+            assert_eq!(if_none_match(&headers, etag), expected, "{header:?}");
+        }
+        assert!(!if_none_match(&axum::http::HeaderMap::new(), etag));
     }
 
     #[tokio::test]

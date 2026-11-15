@@ -407,6 +407,7 @@ pub(super) const CITYHALL_MUTATION_ALLOW: &[(&str, &str)] = &[
     ("POST", "/api/sessions/{id}/acp/prompt"),
     ("POST", "/api/sessions/{id}/acp/prompt/diff-comments"),
     ("POST", "/api/sessions/{id}/acp/cancel"),
+    ("POST", "/api/sessions/{id}/acp/subagents/{child_id}/cancel"),
     ("POST", "/api/sessions/{id}/acp/force_end_turn"),
     ("POST", "/api/sessions/{id}/acp/approvals/{nonce}"),
     ("POST", "/api/sessions/{id}/acp/elicitations/{nonce}"),

@@ -35,6 +35,143 @@ fn minimal_manifest_parses_and_round_trips() {
 }
 
 #[test]
+fn future_agent_declarations_are_rejected_until_the_host_supports_them() {
+    let declarations = [
+        "[agent_integrations.launch]\noneshot_flag = \"-p\"\n",
+        "[agent_integrations.detection]\nmode = \"native_only\"\n",
+        "[agent_integrations.reply_fallback]\nallow = []\ndeny = []\n",
+    ];
+    for declaration in declarations {
+        let body = format!(
+            "[[agent_integrations]]\ntool = \"example\"\ncommand = \"example\"\n{declaration}"
+        );
+        let errors = invalid(20, &body);
+        assert!(
+            errors
+                .iter()
+                .any(|error| error.contains("api_version >= 21")),
+            "{errors:?}"
+        );
+        assert!(matches!(
+            PluginManifest::from_toml_str(&manifest(21, &body)),
+            Err(ManifestError::UnsupportedApiVersion { found: 21, .. })
+        ));
+    }
+    parse(
+        20,
+        "[[agent_integrations]]\ntool = \"example\"\ncommand = \"example\"\n",
+    );
+}
+
+#[test]
+fn future_agent_contract_rejects_unsafe_or_unsupported_declarations() {
+    let valid = r#"
+capabilities = ["session.integration"]
+[[agent_integrations]]
+tool = "example"
+command = "example"
+provider_versions = ["^1"]
+[agent_integrations.launch]
+oneshot_flag = "-p"
+instruction_flag = "--instruction {}"
+[agent_integrations.launch.container_env]
+EXAMPLE_HOME = "/state"
+[agent_integrations.launch.resume]
+kind = "flag"
+flag = "--resume"
+[agent_integrations.launch.capture]
+backend = "omp"
+host = "pane_scoped"
+sandbox = "pane_scoped"
+[agent_integrations.detection]
+mode = "native_only"
+[agent_integrations.reply_fallback]
+allow = [{ kind = "named", value = "Enter" }]
+deny = [{ kind = "literal", value = "n" }]
+"#;
+    let check = |body: &str| {
+        let parsed: PluginManifest = toml::from_str(&manifest(21, body)).unwrap();
+        match parsed.validate() {
+            Err(ManifestError::Invalid(errors)) => errors,
+            result => panic!("expected unsupported API version: {result:?}"),
+        }
+    };
+    let errors = check(valid);
+    assert_eq!(errors.len(), 1, "{errors:?}");
+    assert!(errors[0].contains("api_version"), "{errors:?}");
+    for body in [
+        valid.replace("host = \"pane_scoped\"", "host = \"unsupported\""),
+        valid.replace("sandbox = \"pane_scoped\"", "sandbox = \"unsupported\""),
+    ] {
+        let errors = check(&body);
+        assert_eq!(errors.len(), 1, "{errors:?}");
+        assert!(errors[0].contains("api_version"), "{errors:?}");
+    }
+    for (body, expected) in [
+        (
+            valid.replace("--instruction {}", "--instruction '{}'"),
+            "instruction_flag",
+        ),
+        (
+            valid.replace("--instruction {}", "--instruction {}suffix"),
+            "instruction_flag",
+        ),
+        (
+            valid.replace("oneshot_flag = \"-p\"", "oneshot_flag = \"-p\u{202e}\""),
+            "oneshot_flag",
+        ),
+        (
+            valid.replace("--instruction {}", "--instruction\u{200b} {}"),
+            "instruction_flag",
+        ),
+        (
+            valid.replace("flag = \"--resume\"", "flag = \"--resume\u{200b}\""),
+            "launch.resume",
+        ),
+        (
+            valid.replace("value = \"n\"", "value = \"n\u{202e}\""),
+            "invalid key",
+        ),
+        (valid.replace("EXAMPLE_HOME", "HOME"), "container_env"),
+        (
+            valid.replace(
+                "[agent_integrations.launch.capture]\nbackend = \"omp\"\nhost = \"pane_scoped\"\nsandbox = \"pane_scoped\"\n",
+                "",
+            ),
+            "resume requires OMP capture",
+        ),
+        (
+            valid.replace(
+                "host = \"pane_scoped\"\nsandbox = \"pane_scoped\"",
+                "host = \"unsupported\"\nsandbox = \"unsupported\"",
+            ),
+            "resume requires OMP capture",
+        ),
+        (
+            valid.replace("backend = \"omp\"", "backend = \"codex\""),
+            "capture combination",
+        ),
+        (
+            valid.replace(
+                "sandbox = \"pane_scoped\"",
+                "sandbox = \"managed_exclusive_store\"",
+            ),
+            "capture combination",
+        ),
+        (
+            valid.replace("value = \"Enter\"", "value = \"F01\""),
+            "invalid key",
+        ),
+    ] {
+        let errors = check(&body);
+        assert!(
+            errors.iter().any(|error| error.contains(expected)),
+            "{expected}: {errors:?}"
+        );
+    }
+}
+
+#[test]
 fn agent_integrations_require_api_capability_and_unique_valid_tools() {
     let base = r#"
 id = "acme.session-agent"
@@ -256,12 +393,22 @@ id = "nolabel"
     assert_eq!(m.status[1].label, "");
 
     assert!(m.host_compat("0.11.0").is_ok());
+    assert!(m.host_compat("0.11.1-nightly.20261108").is_ok());
+    assert!(m.host_compat("0.13.0-nightly.20261108").is_err());
+    assert!(m.host_compat("0.10.0-rc.1").is_err());
+    assert!(m.host_compat("0.11.0-rc.1").is_err());
+    assert!(m.host_compat("0.12.0-nightly.20261108").is_err());
+    assert!(m.host_compat("0.12.1-nightly.20261108").is_err());
     let err = m.host_compat("0.13.0").unwrap_err();
     assert!(
         err.contains("plugin requires aoe") && err.contains("0.13.0"),
         "{err}"
     );
     assert!(parse(4, "").host_compat("99.0.0").is_ok());
+    // A nightly is the stable it builds on, not the unreleased next patch.
+    let next = parse(4, "aoe_version = \">=0.11.1\"\n");
+    assert!(next.host_compat("0.11.1-nightly.20261108").is_err());
+    assert!(next.host_compat("0.11.2-nightly.20261108").is_ok());
 }
 
 #[test]

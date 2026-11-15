@@ -38,9 +38,9 @@ const SCHEMA = [
     { profile_overridable: false },
   ),
   ...[
-    ["split_terminal_height_percent", "Split Terminal Height (%)", 1, 99],
-    ["split_terminal_min_width", "Split Terminal Minimum Width", 0, 1000],
-    ["split_terminal_min_height", "Split Terminal Minimum Height", 0, 1000],
+    ["split_terminal_height_percent", "Paired terminal share of the split (%)", 1, 99],
+    ["split_terminal_min_width", "Split only when at least this wide", 0, 1000],
+    ["split_terminal_min_height", "Split only when at least this tall", 0, 1000],
   ].map(([name, label, min, max]) =>
     field(
       "session",
@@ -196,12 +196,12 @@ describe("schema-driven settings field PATCH payloads", () => {
     const { container } = renderTab("session");
     await screen.findByText("Snooze Duration (minutes)");
     const fold = screen.getByRole("button", { name: /Terminal UI/ });
-    expect(screen.queryByText("Split Terminal Height (%)")).toBeNull();
+    expect(screen.queryByText("Paired terminal share of the split (%)")).toBeNull();
     fireEvent.click(fold);
     for (const [name, label, min, max, value] of [
-      ["split_terminal_height_percent", "Split Terminal Height (%)", "1", "99", "30"],
-      ["split_terminal_min_width", "Split Terminal Minimum Width", "0", "1000", "110"],
-      ["split_terminal_min_height", "Split Terminal Minimum Height", "0", "1000", "35"],
+      ["split_terminal_height_percent", "Paired terminal share of the split (%)", "1", "99", "30"],
+      ["split_terminal_min_width", "Split only when at least this wide", "0", "1000", "110"],
+      ["split_terminal_min_height", "Split only when at least this tall", "0", "1000", "35"],
     ]) {
       const input = numberInputByLabel(container, label);
       expect(input.min).toBe(min);

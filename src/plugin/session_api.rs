@@ -521,6 +521,7 @@ async fn admit_and_create(
         extra_args: String::new(),
         command_override: String::new(),
         extra_repo_paths,
+        workspace: false,
         // A plugin cannot request a worktree, so there is no branch to fork and
         // no per-repo base to honor.
         repo_base_branches: Vec::new(),
@@ -815,7 +816,7 @@ async fn sessions_turn_send(
                 SendTurnRequest { resume_reservation, resume_authority: crate::process::worker_registry::ResumeAuthority::Explicit, text: &req.text,
                 attachments: &[],
                 woke_idle_dormant,
-                prompt_id: None,
+                prompt_ids: Vec::new(),
                 synthesized: false,
                 no_revive: false, },
             )
@@ -1063,7 +1064,7 @@ async fn deliver_structured(
                 text: &req.message,
                 attachments: &[],
                 woke_idle_dormant,
-                prompt_id: None,
+                prompt_ids: Vec::new(),
                 synthesized: false,
                 no_revive: false,
             },
@@ -1789,7 +1790,8 @@ mod tests {
         use crate::server::test_support::managed_control_session;
         with_managed(|scope| {
             Box::pin(async move {
-                let mut live = managed_control_session(scope, "plugin-message").await;
+                let mut live =
+                    managed_control_session(scope, "plugin-message", "claude", None).await;
                 let id = live.id().to_owned();
                 let dir = scope.tempdir();
                 let deps = Arc::new(SessionRpcDeps {
@@ -1977,7 +1979,7 @@ mod tests {
         use crate::acp::Event;
         use crate::server::test_support::managed_control_session;
         with_managed(|scope| Box::pin(async move {
-                let original = managed_control_session(scope, "plugin-retained").await;
+                let original = managed_control_session(scope, "plugin-retained", "claude", None).await;
                 let state = original.state.clone();
                 let sid = original.sid.clone();
                 let response_sid = sid.clone();
@@ -2174,9 +2176,13 @@ mod tests {
         use crate::acp::supervisor::test_support::managed::with_managed;
         with_managed(|scope| {
             Box::pin(async move {
-                let mut live =
-                    crate::server::test_support::managed_control_session(scope, "plugin-turn-race")
-                        .await;
+                let mut live = crate::server::test_support::managed_control_session(
+                    scope,
+                    "plugin-turn-race",
+                    "claude",
+                    None,
+                )
+                .await;
                 let id = live.id().to_owned();
                 let state = live.state.clone();
                 state
@@ -2229,7 +2235,7 @@ mod tests {
                             text: "the winning turn",
                             attachments: &[],
                             woke_idle_dormant: false,
-                            prompt_id: None,
+                            prompt_ids: Vec::new(),
                             synthesized: false,
                             no_revive: false,
                         },
@@ -2295,6 +2301,7 @@ mod tests {
         foreign.view = crate::session::View::Structured;
         foreign.created_by_plugin = Some("other-plugin".into());
         let (deps, state, _dir) = test_deps(vec![foreign]);
+
         let ctx = ctx_with(&["session.prompt"]);
         for sql_failure in [false, true] {
             if sql_failure {

@@ -1,4 +1,5 @@
 import { useState } from "react";
+import type { EstablishmentRecovery } from "../lib/acpTypes";
 
 export type RespawnState = "idle" | "retrying" | "ok" | "failed";
 
@@ -50,7 +51,7 @@ export function useRespawnSession(
   const error = isCurrent ? snapshot.error : null;
   const detail = isCurrent ? snapshot.detail : null;
 
-  const respawn = async (): Promise<boolean> => {
+  const respawn = async (recovery?: EstablishmentRecovery): Promise<boolean> => {
     const activeResetKey = resetKey;
     const activeIncident = snapshot.incident;
     // A request can outlive its incident; don't let it write into the next one.
@@ -65,7 +66,7 @@ export function useRespawnSession(
       const res = await fetch(`/api/sessions/${encodeURIComponent(sessionId)}/acp/${restart ? "restart" : "spawn"}`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({}),
+        body: recovery ? JSON.stringify({ recovery }) : "{}",
       });
       if (res.ok) {
         settle("ok", null);
@@ -73,7 +74,7 @@ export function useRespawnSession(
       }
       const body = failureText(await res.text().catch(() => ""));
       // Another Device's restart is already doing this one's job.
-      if (restart && res.status === 409 && body.startsWith("restart_in_progress")) {
+      if (!recovery && restart && res.status === 409 && body.startsWith("restart_in_progress")) {
         settle("ok", null);
         return true;
       }

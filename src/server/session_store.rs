@@ -1353,7 +1353,6 @@ mod tests {
         );
         Ok(())
     }
-
     #[test]
     #[serial_test::serial]
     fn native_profile_adoption_keeps_acknowledged_queue_updates() {

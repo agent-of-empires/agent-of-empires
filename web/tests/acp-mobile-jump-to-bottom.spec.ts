@@ -16,6 +16,12 @@ async function userScroll(viewport: Locator, top: number) {
   }, top);
 }
 
+async function waitForInitialPin(viewport: Locator) {
+  await expect
+    .poll(() => viewport.evaluate((el) => el.scrollTop > 0 && el.scrollHeight - el.clientHeight - el.scrollTop <= 1))
+    .toBe(true);
+}
+
 // On a coarse pointer a jump-to-latest button appears while scrolled up.
 test.use({ ...devices["iPhone 13"] });
 
@@ -35,6 +41,7 @@ test.describe("mobile jump-to-bottom", () => {
     await expect(button).toBeHidden();
 
     const readingTop = 240;
+    await waitForInitialPin(viewport);
     await userScroll(viewport, readingTop);
     await expect(button).toBeVisible();
     await expect.poll(() => viewport.evaluate((el) => el.scrollTop)).toBe(readingTop);
@@ -66,6 +73,7 @@ test.describe("mobile jump-to-bottom", () => {
     const viewport = page.getByTestId("acp-viewport");
     const button = page.getByTestId("acp-jump-to-bottom");
     const distanceToBottom = () => viewport.evaluate((el) => el.scrollHeight - el.clientHeight - el.scrollTop);
+    await waitForInitialPin(viewport);
     await userScroll(viewport, 0);
     await expect(button).toBeVisible();
     await observeFor(page, 300, async () => {
@@ -171,12 +179,46 @@ test.describe("mobile jump-to-bottom", () => {
     });
     await expect.poll(isPinned).toBe(true);
 
+    const regionId = await page.getByTestId("composer-collapse-toggle").getAttribute("aria-controls");
+    expect(regionId).not.toBeNull();
+    const region = page.getByTestId(regionId!);
+    const composerSettled = () =>
+      region.evaluate((el) => {
+        const inner = el.firstElementChild!;
+        return (
+          el.getAnimations().every((animation) => animation.playState !== "running") &&
+          Math.abs(el.getBoundingClientRect().height - inner.scrollHeight) <= 1
+        );
+      });
+    await expect.poll(composerSettled).toBe(true);
+    // Observe the existing 500ms chrome-follow window ending before testing textarea growth.
+    await observeFor(page, 500, async () => {
+      expect(await isPinned()).toBe(true);
+    });
+
     // A growing composer shrinks the transcript but keeps it pinned; typing is not a scroll gesture.
     const textarea = page.getByRole("textbox").first();
     const beforeHeight = await textarea.evaluate((el) => el.getBoundingClientRect().height);
     await textarea.fill(Array.from({ length: 8 }, (_, i) => `draft line ${i}`).join("\n"));
     await expect.poll(() => textarea.evaluate((el) => el.getBoundingClientRect().height)).toBeGreaterThan(beforeHeight);
+    await expect
+      .poll(() =>
+        textarea.evaluate((el) => {
+          const target = Math.min(el.scrollHeight, Number.parseFloat(getComputedStyle(el).maxHeight));
+          return Math.abs(el.getBoundingClientRect().height - target) <= 1;
+        }),
+      )
+      .toBe(true);
+    await expect.poll(composerSettled).toBe(true);
     await expect.poll(isPinned).toBe(true);
+    await expect(page.getByTestId("acp-jump-to-bottom")).toBeHidden();
+    await observeFor(page, 500, async () => {
+      expect(await isPinned()).toBe(true);
+      await expect(page.getByTestId("acp-jump-to-bottom")).toBeHidden();
+    });
+    const screenshot = test.info().outputPath("composer-grown-pinned.png");
+    await page.screenshot({ path: screenshot, fullPage: true });
+    await test.info().attach("composer-grown-pinned", { path: screenshot, contentType: "image/png" });
   });
 
   test("reopening a session with loadable earlier history still lands at the bottom", async ({ page }) => {

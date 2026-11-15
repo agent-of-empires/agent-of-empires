@@ -73,39 +73,50 @@ describe("UpdateBanner", () => {
     const restart = "aoe serve --restart";
     const cargo = "cargo install --git https://github.com/agent-of-empires/agent-of-empires aoe";
     const nix = "nix run github:agent-of-empires/agent-of-empires";
-    // (install_method, update_command, text that must show, second line, commands with a copy button)
+    const instruction = (command: string) => `On the machine running AoE, run ${command}`;
+    // (install_method, update_command, first line after the version, second line, commands with a copy button)
     const cases: [InstallMethod | undefined, string | undefined, string, string | null, string[]][] = [
       [
         "homebrew",
         "aoe update",
-        "",
+        instruction("aoe update"),
         "then run aoe serve --restart or restart it through your service manager",
         ["aoe update", restart],
       ],
-      ["release", "aoe update", "", "It offers to restart the Daemon for you when it's done.", ["aoe update"]],
-      ["cargo", cargo, "", "then run aoe serve --restart or restart it through your service manager", [cargo, restart]],
+      // #5514: `aoe update` asks about the restart itself on a release install.
+      ["release", "aoe update", instruction("aoe update"), null, ["aoe update"]],
+      [
+        "cargo",
+        cargo,
+        instruction(cargo),
+        "then run aoe serve --restart or restart it through your service manager",
+        [cargo, restart],
+      ],
       [
         "nix",
         nix,
-        "or rebuild your flake input",
+        `${instruction(nix)} or rebuild your flake input`,
         "then run aoe serve --restart or restart it through your service manager",
         [nix, restart],
       ],
-      ["unknown", "aoe update", "to see how to update this install.", null, ["aoe update"]],
+      // #5514: an unknown install gets just the command; `aoe update` prints its own steps.
+      ["unknown", "aoe update", "Run aoe update on the machine running AoE.", null, ["aoe update"]],
       // A Daemon older than the field.
-      [undefined, undefined, "to see how to update this install.", null, ["aoe update"]],
+      [undefined, undefined, "Run aoe update on the machine running AoE.", null, ["aoe update"]],
     ];
-    for (const [install_method, update_command, extra, second, commands] of cases) {
+    for (const [install_method, update_command, first, second, commands] of cases) {
       const { container, unmount } = render(
-        <UpdateBanner status={makeStatus({ install_method, update_command })} onDismiss={() => {}} />,
+        <UpdateBanner
+          status={makeStatus({ install_method, update_command, release_url: null })}
+          onDismiss={() => {}}
+        />,
       );
       // Each line's pieces are flex items, so join them the way they read.
-      const lines = Array.from(container.querySelectorAll("[aria-label^='Update available'] > div > div")).map((line) =>
+      const lines = Array.from(container.querySelectorAll("[data-banner-line]")).map((line) =>
         Array.from(line.children, (piece) => piece.textContent).join(" "),
       );
       const label = String(install_method);
-      expect(lines[0], label).toContain("Update available: v1.0.0 → v1.1.0 On the machine running AoE, run");
-      expect(lines[0], label).toContain(`run ${commands[0]}${extra ? ` ${extra}` : ""}`);
+      expect(lines[0], label).toBe(`Update available: v1.0.0 → v1.1.0 ${first}`);
       expect(lines[1] ?? null, label).toBe(second);
       const copies = Array.from(container.querySelectorAll("button[aria-label^='Copy ']")).map((b) =>
         b.getAttribute("aria-label"),

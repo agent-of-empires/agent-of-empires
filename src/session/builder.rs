@@ -82,6 +82,10 @@ pub struct InstanceParams {
     pub command_override: String,
     /// Additional repository paths for multi-repo workspace mode
     pub extra_repo_paths: Vec<String>,
+    /// Create the worktree inside a workspace directory even with no
+    /// `extra_repo_paths`, so more projects can be attached later without
+    /// moving the session's cwd. Requires worktree mode.
+    pub workspace: bool,
     /// Per-repo base branches as `(selector, base)` pairs, from
     /// `aoe add --repo-base <selector>=<ref>` or the web wizard. The
     /// selector is a repo directory name or one of the paths in `path` /
@@ -747,6 +751,12 @@ pub(crate) fn plan_instance(
         if !params.extra_repo_paths.is_empty() {
             bail!("Cannot combine --scratch with extra repository paths");
         }
+        if params.workspace {
+            bail!("Cannot combine --scratch with workspace mode");
+        }
+    }
+    if params.workspace && !params.worktree_enabled {
+        bail!("Workspace mode requires worktree mode");
     }
 
     if params.sandbox {
@@ -847,7 +857,7 @@ pub(crate) fn plan_instance(
     };
 
     if let Some(branch) = &effective_worktree_branch {
-        if !params.extra_repo_paths.is_empty() {
+        if params.workspace || !params.extra_repo_paths.is_empty() {
             let primary_path = PathBuf::from(&params.path)
                 .canonicalize()
                 .unwrap_or_else(|_| PathBuf::from(&params.path));
@@ -1464,14 +1474,13 @@ pub mod structured {
     }
 
     /// Whether `agent` is ACP-capable and its adapter passes the create check, for the agent
-    /// list. There is no project to search from, so relative PATH entries pass. With
-    /// `count_profile_hooks`, `config`'s own hooks may install the adapter first; the
-    /// repository's depend on the project.
+    /// list. No launch directory is searched, so relative PATH entries pass and the list is
+    /// never stricter than a create. `preparation_hooks` is the create's hook question.
     pub fn adapter_installed(
         agent: &str,
         config: &crate::session::Config,
         host_environment: &[(String, String)],
-        count_profile_hooks: bool,
+        preparation_hooks: &dyn Fn() -> bool,
     ) -> bool {
         let choice = StructuredChoice {
             tool: agent,
@@ -1479,7 +1488,7 @@ pub mod structured {
             command_override: "",
             sandboxed: false,
             project_path: None,
-            preparation_hooks: &|| count_profile_hooks && prepares(&config.hooks),
+            preparation_hooks,
         };
         validate_structured_choice_with(
             &choice,
@@ -1563,7 +1572,7 @@ pub mod structured {
     pub fn apply_structured_choice(instance: &mut Instance) {
         let config = crate::session::config::repo_config::resolve_config_with_repo_or_warn(
             &instance.source_profile,
-            std::path::Path::new(&instance.project_path),
+            instance.repo_config_path(),
         );
         if !tool_acp_capable(&instance.tool, &config) {
             tracing::warn!(
@@ -2129,54 +2138,6 @@ mod tests {
                     "{label}: asked about hooks for a reachable adapter"
                 );
             }
-        }
-    }
-
-    /// Only the create-ready answer counts the profile's own preparation hooks, as the create
-    /// check does; the strict one reports whether the adapter runs now.
-    #[test]
-    #[serial_test::serial]
-    fn adapter_installed_counts_profile_preparation_hooks_only_when_asked() {
-        use crate::session::HooksConfig;
-        let _home = crate::session::test_support::isolate_app_dir();
-        // Absolute, so no PATH is searched: a relative entry in the caller's PATH would pass.
-        let dir = tempfile::tempdir().unwrap();
-        let missing = dir.path().join("missing-adapter");
-        let hook = || vec!["npm install".to_string()];
-        for (label, hooks, create_ready) in [
-            ("no hooks", HooksConfig::default(), false),
-            (
-                "on_create",
-                HooksConfig {
-                    on_create: hook(),
-                    ..Default::default()
-                },
-                true,
-            ),
-            (
-                "on_launch",
-                HooksConfig {
-                    on_launch: hook(),
-                    ..Default::default()
-                },
-                true,
-            ),
-        ] {
-            let mut config = crate::session::Config::default();
-            config
-                .session
-                .agent_acp_cmd
-                .insert("fake".into(), missing.display().to_string());
-            config.hooks = hooks;
-            assert!(
-                !structured::adapter_installed("fake", &config, &[], false),
-                "{label}: strict"
-            );
-            assert_eq!(
-                structured::adapter_installed("fake", &config, &[], true),
-                create_ready,
-                "{label}: create-ready"
-            );
         }
     }
 
@@ -3138,6 +3099,7 @@ mod tests {
             extra_args: String::new(),
             command_override: String::new(),
             extra_repo_paths: Vec::new(),
+            workspace: false,
             repo_base_branches: Vec::new(),
             scratch: false,
             fork_seed: None,
@@ -3145,6 +3107,43 @@ mod tests {
             no_submodules: false,
             tie_workdir_to_name: false,
             worktree_path_id: None,
+        }
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn workspace_without_extra_repos_builds_a_single_repo_workspace() {
+        let _home = crate::session::test_support::isolate_app_dir();
+        let _registry = crate::tmux::status_rules::ProfileRegistryGuard::take("default");
+        let parent = init_repo_with_commit("solo");
+        let project = parent.path().join("solo");
+        let mut params = custom_agent_params(&project, "claude");
+        params.workspace = true;
+        params.worktree_enabled = true;
+        params.worktree_branch = Some("solo-ws".into());
+        params.create_new_branch = true;
+
+        let instance = build_instance(params.clone(), &[], &[], "default")
+            .unwrap()
+            .instance;
+        let workspace = instance.workspace_info.as_ref().expect("workspace_info");
+        assert_eq!(instance.project_path, workspace.workspace_dir);
+        assert_eq!(workspace.repos.len(), 1);
+        assert_eq!(workspace.repos[0].name, "solo");
+        assert!(std::path::Path::new(&workspace.repos[0].worktree_path).is_dir());
+        assert!(instance.worktree_info.is_none());
+
+        for (worktree_enabled, scratch, expected) in [
+            (false, false, "Workspace mode requires worktree mode"),
+            (false, true, "Cannot combine --scratch with workspace mode"),
+        ] {
+            let mut params = params.clone();
+            params.worktree_enabled = worktree_enabled;
+            params.scratch = scratch;
+            let Err(err) = build_instance(params, &[], &[], "default") else {
+                panic!("{expected}: must error");
+            };
+            assert!(err.to_string().contains(expected), "{err:#}");
         }
     }
 
@@ -3412,6 +3411,7 @@ mod tests {
             extra_args: String::new(),
             command_override: String::new(),
             extra_repo_paths: vec![],
+            workspace: false,
             repo_base_branches: Vec::new(),
             scratch: false,
             fork_seed: Some(ForkSeed::Structured {
@@ -3489,6 +3489,7 @@ mod tests {
             extra_args: String::new(),
             command_override: String::new(),
             extra_repo_paths: vec![],
+            workspace: false,
             repo_base_branches: Vec::new(),
             scratch: false,
             fork_seed: Some(ForkSeed::Terminal {

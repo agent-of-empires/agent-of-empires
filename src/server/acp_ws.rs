@@ -238,7 +238,7 @@ async fn handle(
                         if frame.session_id != session_id {
                             continue;
                         }
-                        if forward_frames {
+                        if forward_frames && frame.native_autonomous.is_none() {
                             let payload = match serde_json::to_string(&frame) {
                                 Ok(s) => s,
                                 Err(e) => {
@@ -297,12 +297,16 @@ async fn handle(
                         );
                         let store = Arc::clone(&state.acp_event_store);
                         let session_for_read = session_id.clone();
-                        let entries = match tokio::task::spawn_blocking(move || {
-                            store.replay_from(&session_for_read, 0)
+                        let page = match tokio::task::spawn_blocking(move || {
+                            store.replay_page(&session_for_read, 0, None)
                         }).await {
-                            Ok(Ok(entries)) => entries,
-                            result => {
-                                warn!(target: "acp.ws", session = %session_id, ?result, "replay rebuild failed");
+                            Ok(Ok(page)) => page,
+                            Ok(Err(error)) => {
+                                warn!(target: "acp.ws", session = %session_id, %error, "replay rebuild failed");
+                                break;
+                            }
+                            Err(error) => {
+                                warn!(target: "acp.ws", session = %session_id, %error, "replay read task failed");
                                 break;
                             }
                         };
@@ -313,10 +317,14 @@ async fn handle(
                             cold: &mut cold,
                             last_applied_seq: 0,
                         };
-                        if let Err(error) = fold_connect_history(entries, since, &mut folds, false) {
+                        if let Err(error) = fold_connect_history(page.events, since, &mut folds, false) {
                             warn!(target: "acp.ws", session = %session_id, %error, "replay folds failed");
                             break;
                         }
+                        if let Some(fact) = page.autonomous {
+                            fact.restore_state(folds.reduced);
+                        }
+                        folds.last_applied_seq = folds.last_applied_seq.max(page.highest_seq);
                         let highest = folds.last_applied_seq;
                         reduced = rebuilt;
                         transcript = rebuilt_transcript;
@@ -381,13 +389,17 @@ async fn drain_replay_into_socket(
     let store = Arc::clone(&state.acp_event_store);
     let session_id_owned = session_id.to_string();
     // Read from seq 0, not from `since`.
-    let entries =
-        tokio::task::spawn_blocking(move || store.replay_from(&session_id_owned, 0)).await??;
+    let page = tokio::task::spawn_blocking(move || store.replay_page(&session_id_owned, 0, None))
+        .await??;
     let mut sent = 0usize;
-    let to_forward = fold_connect_history(entries, since, folds, forward_frames)?;
+    let to_forward = fold_connect_history(page.events, since, folds, forward_frames)?;
+    if let Some(fact) = page.autonomous {
+        fact.restore_state(folds.reduced);
+    }
+    folds.last_applied_seq = folds.last_applied_seq.max(page.highest_seq);
     let snapshot_seq = folds.last_applied_seq.max(since);
     for stored in to_forward {
-        if !forward_frames {
+        if !forward_frames || stored.metadata.native_autonomous.is_some() {
             continue;
         }
         let frame = AcpBroadcastFrame::from_qualified(
@@ -427,13 +439,14 @@ async fn drain_replay_into_socket(
 
 /// State fields large enough, and static enough, to be worth suppressing when they have not
 /// changed since the last frame on this connection.
-const COLD_STATE_FIELDS: [&str; 5] = [
+const COLD_STATE_FIELDS: [&str; 6] = [
     "available_commands",
     "available_modes",
     "config_options",
     // Not static, but big and bursty.
     "recent_diffs",
     "background_agents",
+    "establishment_revision",
 ];
 
 /// Fold a session's stored history into the connection's projections and return the entries
@@ -492,6 +505,7 @@ struct ConnectionFolds<'a> {
 struct ColdFieldCache {
     hashes: std::collections::HashMap<&'static str, u64>,
     native: Option<crate::acp::state::NativeAvailabilityProjection>,
+    establishment_revision: Option<crate::acp::establishment::EstablishmentRevision>,
     rate_limit_park: Option<&'static str>,
     original_decision_nonces: Vec<crate::acp::approvals::Nonce>,
     snapshot_seq: u64,
@@ -533,6 +547,8 @@ fn project_control_state(
     let mut state = serde_json::to_value(reduced)?;
     if projection == SnapshotProjection::Web {
         if let Some(object) = state.as_object_mut() {
+            // The web client rebuilds this from the raw events. `subagents` stays: a
+            // cold open replays a bounded tail that can miss a live child's last update.
             object.remove("background_agents");
         }
     }
@@ -588,6 +604,7 @@ async fn send_native_state(
     if contended {
         let original = crate::acp::control_cache::OriginalDecisions::default();
         if (cold.native != Some(observation.projection)
+            || cold.establishment_revision != observation.establishment_revision
             || cold.rate_limit_park != park
             || !cold.original_decision_nonces.is_empty())
             && !send_projected_reduced_state(
@@ -598,6 +615,7 @@ async fn send_native_state(
                 cold,
                 LiveControlProjection {
                     native: observation.projection,
+                    establishment_revision: None,
                     rate_limit_park: park,
                     original: &original,
                 },
@@ -622,12 +640,13 @@ async fn send_native_state(
     if !contended
         && only_if_changed
         && cold.native == Some(observation.projection)
+        && cold.establishment_revision == observation.establishment_revision
         && cold.rate_limit_park == park
         && cold.original_decision_nonces == original.nonces
     {
         return true;
     }
-    let native = owner
+    let (native, establishment_revision) = owner
         .session_service
         .settle_native_control_observation(session_id, observation)
         .await;
@@ -655,6 +674,7 @@ async fn send_native_state(
         cold,
         LiveControlProjection {
             native,
+            establishment_revision,
             rate_limit_park: park,
             original: &original,
         },
@@ -681,6 +701,7 @@ fn projected_rate_limit_park(
 
 struct LiveControlProjection<'a> {
     native: crate::acp::state::NativeAvailabilityProjection,
+    establishment_revision: Option<crate::acp::establishment::EstablishmentRevision>,
     rate_limit_park: Option<&'static str>,
     original: &'a crate::acp::control_cache::OriginalDecisions,
 }
@@ -695,6 +716,7 @@ async fn send_projected_reduced_state(
 ) -> bool {
     let LiveControlProjection {
         native,
+        establishment_revision,
         rate_limit_park,
         original,
     } = projection;
@@ -708,6 +730,8 @@ async fn send_projected_reduced_state(
     state["connection_ready"] = serde_json::json!(native.ready);
     state["connection_unavailable"] = serde_json::json!(native.unavailable);
     state["prompt_wake_eligible"] = serde_json::json!(native.prompt_wake_eligible);
+    state["host_prompt_intent"] = serde_json::json!(native.host_prompt_intent);
+    state["establishment_revision"] = serde_json::json!(establishment_revision);
     state["rate_limit_park"] = serde_json::json!(rate_limit_park);
     let channel_loss = native
         .unavailable
@@ -753,6 +777,7 @@ async fn send_projected_reduced_state(
     }
     cold.original_decision_nonces.clone_from(&original.nonces);
     cold.native = Some(native);
+    cold.establishment_revision = establishment_revision;
     cold.rate_limit_park = rate_limit_park;
     let seq = seq.max(cold.snapshot_seq).max(reduced.last_seq);
     cold.snapshot_seq = seq;
@@ -1003,8 +1028,183 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
-
     use crate::acp::state::Event;
+
+    fn sensitive_recovery_row() -> crate::session::Instance {
+        let mut row = crate::session::Instance::new("recovery privacy", "/tmp/recovery-privacy");
+        row.id = "recovery-privacy".into();
+        row.source_profile = "default".into();
+        row.view = crate::session::View::Structured;
+        crate::server::test_support::select_retained_for_test(&mut row);
+        let binding = serde_json::json!({
+            "agent": "claude", "stores": ["SENSITIVE_REVISION_STORE"],
+            "configuration": [{"filesystem":"host","path":"SENSITIVE_REVISION_CONFIG"}],
+            "cwd":"SENSITIVE_REVISION_CWD", "cwd_filesystem":"host", "filesystem":"host",
+            "exported_default_store": false
+        });
+        let runtime = serde_json::json!({
+            "kind": crate::session::ContainerRuntimeName::Docker,
+            "program":"SENSITIVE_REVISION_PROGRAM", "cwd":"SENSITIVE_REVISION_RUNTIME_CWD",
+            "endpoint":"ssh://user:SENSITIVE_REVISION_PASSWORD@example",
+            "local_mounts":false,
+            "routing":[["DOCKER_HOST","SENSITIVE_REVISION_ROUTE"],
+                ["CONTAINER_SSHKEY","SENSITIVE_REVISION_KEY"],
+                ["SSH_AUTH_SOCK","SENSITIVE_REVISION_SOCKET"]],
+            "global_arguments":["--config","SENSITIVE_REVISION_ARGUMENT"]
+        });
+        row.active_execution = Some(serde_json::from_value(serde_json::json!({
+            "launch_id":"SENSITIVE_REVISION_LAUNCH", "binding":binding,
+            "capture":{"PrimeStatus":{
+                "directory":"SENSITIVE_REVISION_PRIME_DIRECTORY",
+                "program":"SENSITIVE_REVISION_PRIME_PROGRAM",
+                "agent_dir":"SENSITIVE_REVISION_PRIME_AGENT",
+                "proof_path":"SENSITIVE_REVISION_PRIME_PROOF",
+                "container":{"transport":runtime,"id":"SENSITIVE_REVISION_PRIME_CONTAINER",
+                    "cwd":"SENSITIVE_REVISION_PRIME_CWD"}
+            }},
+            "container":{"runtime":runtime,"name":"SENSITIVE_REVISION_CONTAINER_NAME",
+                "id":"SENSITIVE_REVISION_CONTAINER_ID",
+                "mounts":[{"host_path":"SENSITIVE_REVISION_MOUNT","container_path":"/project","read_only":false}],
+                "shadow_mounts":["SENSITIVE_REVISION_SHADOW"]}
+        })).unwrap());
+        let session_id = match &row.resume_intent {
+            crate::session::ResumeIntent::Use(session_id) => session_id.clone(),
+            _ => panic!("the comparison fixture selects an existing retained session"),
+        };
+        row.agent_session_id = Some(session_id.clone());
+        row.agent_session_binding = Some(crate::session::ConversationBinding {
+            session_id,
+            execution: Some(row.active_execution.as_ref().unwrap().binding.clone()),
+            provenance: crate::session::ConversationProvenance::Observed,
+            transcript_path: Some("SENSITIVE_REVISION_TRANSCRIPT".into()),
+        });
+        row.resume_binding = row.agent_session_binding.clone();
+        row
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn public_recovery_revision_hides_complete_container_and_prime_comparison() {
+        use crate::acp::establishment::{
+            EstablishmentExpected, EstablishmentRecoveryAction, EstablishmentRecoveryRequest,
+        };
+        let _home = crate::session::test_support::isolate_app_dir();
+        // Comparison-only metadata: this fixture never creates a Native receipt or Current source.
+        let row = sensitive_recovery_row();
+        crate::server::test_support::seed_instances_on_disk_for_test("default", vec![row.clone()]);
+        let storage = crate::session::Storage::open_reference("default").unwrap();
+        let expected = EstablishmentExpected::capture(&row, &storage).unwrap();
+        let revision = expected.revision().unwrap();
+        let recovery = EstablishmentRecoveryRequest {
+            revision,
+            action: EstablishmentRecoveryAction::Fresh,
+        };
+        assert!(recovery
+            .resolve(&row, &storage)
+            .unwrap()
+            .expected
+            .matches(&row, &storage)
+            .unwrap());
+        let wire = serde_json::to_value(recovery).unwrap();
+        assert!(!wire.to_string().contains("SENSITIVE_REVISION_"));
+        assert!(wire.get("expected").is_none());
+        assert!(serde_json::from_value::<EstablishmentRecoveryRequest>(
+            serde_json::json!({"expected":expected,"action":"fresh"})
+        )
+        .is_err());
+        assert!(serde_json::from_value::<EstablishmentRecoveryRequest>(
+            serde_json::json!({"revision":revision,"expected":expected,"action":"fresh"})
+        )
+        .is_err());
+        for target in 0..3 {
+            let mut changed = expected.clone();
+            let execution = match target {
+                0 => changed
+                    .choice
+                    .choice
+                    .binding
+                    .as_mut()
+                    .unwrap()
+                    .execution
+                    .as_mut()
+                    .unwrap(),
+                1 => changed
+                    .choice
+                    .choice
+                    .resume_binding
+                    .as_mut()
+                    .unwrap()
+                    .execution
+                    .as_mut()
+                    .unwrap(),
+                _ => &mut changed.choice.choice.active.as_mut().unwrap().binding,
+            };
+            execution.exported_default_store = None;
+            assert_ne!(
+                changed.revision().unwrap(),
+                revision,
+                "checkpoint namespace marker {target}"
+            );
+            let stale = EstablishmentRecoveryRequest {
+                revision: changed.revision().unwrap(),
+                action: EstablishmentRecoveryAction::Fresh,
+            };
+            assert!(stale.resolve(&row, &storage).is_err());
+        }
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let router = axum::Router::new().route(
+            "/",
+            axum::routing::get(move |ws: WebSocketUpgrade| async move {
+                ws.on_upgrade(move |mut socket| async move {
+                    let mut cold = ColdFieldCache {
+                        projection: SnapshotProjection::Web,
+                        ..Default::default()
+                    };
+                    let original = crate::acp::control_cache::OriginalDecisions::default();
+                    let reduced = AcpState::new(
+                        AcpSessionId("recovery-privacy".into()),
+                        AgentName("claude".into()),
+                        None,
+                    );
+                    assert!(
+                        send_projected_reduced_state(
+                            &mut socket,
+                            "recovery-privacy",
+                            0,
+                            &reduced,
+                            &mut cold,
+                            LiveControlProjection {
+                                native: Default::default(),
+                                establishment_revision: Some(revision),
+                                rate_limit_park: None,
+                                original: &original,
+                            },
+                        )
+                        .await
+                    );
+                })
+            }),
+        );
+        let server = tokio::spawn(async move {
+            axum::serve(listener, router).await.unwrap();
+        });
+        let (mut socket, _) = tokio_tungstenite::connect_async(format!("ws://{addr}/"))
+            .await
+            .unwrap();
+        let public = receive_kind(&mut socket, "reduced_state").await;
+        drop(socket);
+        server.abort();
+        assert_eq!(
+            public["state"]["establishment_revision"],
+            serde_json::json!(revision)
+        );
+        assert!(public["state"].get("establishment_expected").is_none());
+        assert!(!public.to_string().contains("SENSITIVE_REVISION_"));
+        assert_eq!(public["state"]["connection_ready"], false);
+        assert!(public["state"]["host_prompt_intent"].is_null());
+    }
+
     fn background_launch() -> Event {
         Event::BackgroundAgentLaunched {
             agent_id: "background-1".into(),
@@ -1019,7 +1219,8 @@ mod tests {
     }
 
     #[test]
-    fn web_projection_excludes_only_the_duplicate_background_field() {
+    fn web_projection_omits_background_agents_but_keeps_subagents() {
+        use crate::acp::state::{SubagentRecord, SubagentState};
         let mut reduced =
             AcpState::new(AcpSessionId("s-1".into()), AgentName("claude".into()), None);
         reduced
@@ -1029,16 +1230,36 @@ mod tests {
                 &crate::acp::event_sender::EventMetadata::history(),
             )
             .unwrap();
+        let subagent = Event::SubagentUpdated {
+            subagent: SubagentRecord {
+                session_id: "child".into(),
+                parent_session_id: "s-1".into(),
+                provenance: None,
+                parent_tool_call_id: Some("launch-1".into()),
+                title: None,
+                description: None,
+                state: SubagentState::Running,
+                stop_reason: None,
+                cancel_capable: true,
+                model: None,
+            },
+            at: chrono::DateTime::from_timestamp(0, 0).unwrap(),
+        };
+        reduced
+            .apply_scoped_event(
+                2,
+                &subagent,
+                &crate::acp::event_sender::EventMetadata::history(),
+            )
+            .unwrap();
         let full = serde_json::to_value(&reduced).unwrap();
         assert_eq!(
             project_control_state(&reduced, SnapshotProjection::Full).unwrap(),
             full
         );
         let mut expected = full.clone();
-        expected
-            .as_object_mut()
-            .unwrap()
-            .remove("background_agents");
+        let object = expected.as_object_mut().unwrap();
+        assert!(object.remove("background_agents").is_some());
         let mut web = project_control_state(&reduced, SnapshotProjection::Web).unwrap();
         assert_eq!(web, expected);
         let mut cold = ColdFieldCache::default();
@@ -1089,6 +1310,7 @@ mod tests {
         let approval = crate::acp::approvals::Approval {
             nonce: crate::acp::approvals::Nonce("n-1".into()),
             tool_call: crate::acp::state::ToolCall {
+                prompt: None,
                 id: "t-1".into(),
                 name: "Edit".into(),
                 kind: "edit".into(),
@@ -1121,6 +1343,7 @@ mod tests {
                         name: "review".into(),
                         description: "Review".into(),
                         accepts_input: false,
+                        input_hint: None,
                     }],
                 },
             ),
@@ -1193,9 +1416,12 @@ mod tests {
     fn retained_notice_keeps_its_dismissal_identity_after_reconnect() {
         let directory = tempfile::tempdir().unwrap();
         let id = "notice-retention";
-        let store =
-            crate::acp::event_store::EventStore::open(&directory.path().join("events.db"), 2)
-                .unwrap();
+        let store = crate::acp::event_store::EventStore::open(
+            &directory.path().join("events.db"),
+            2,
+            Default::default(),
+        )
+        .unwrap();
         store
             .record(
                 id,
@@ -1302,6 +1528,7 @@ mod tests {
                         name: "Bash".into(),
                         kind: "execute".into(),
                         args_preview: "{}".into(),
+                        prompt: None,
                         started_at: at,
                         parent_tool_call_id: None,
                         memory_recall: None,
@@ -1399,6 +1626,7 @@ mod tests {
         let at = chrono::Utc::now();
         let started = |id: &str| Event::ToolCallStarted {
             tool_call: ToolCall {
+                prompt: None,
                 id: id.into(),
                 name: id.into(),
                 kind: "read".into(),
@@ -1590,11 +1818,24 @@ mod tests {
         .await
         .expect("expected websocket frame")
     }
+    #[test]
+    fn quota_snapshot_never_claims_knowledge_at_a_different_frontier() {
+        use crate::acp::event_store::ControlKnowledge::{Indeterminate, Known};
+        for park in [
+            Known(None),
+            Known(Some(false)),
+            Known(Some(true)),
+            Indeterminate,
+        ] {
+            assert_eq!(projected_rate_limit_park(21, 20, park), None);
+            assert_eq!(projected_rate_limit_park(19, 20, park), None);
+        }
+        assert_eq!(projected_rate_limit_park(20, 20, Indeterminate), None);
+    }
 
     #[tokio::test]
     async fn web_projection_survives_reconnect_without_losing_raw_details() {
         use crate::acp::state::{BackgroundAgentStatus, BackgroundAgentTool};
-
         let _home = crate::session::test_support::isolate_app_dir();
         for (projection, omitted) in [
             ("", false),
@@ -1625,9 +1866,12 @@ mod tests {
             receive_kind(&mut socket, "transcript_snapshot").await;
 
             let tools = vec![BackgroundAgentTool {
+                id: None,
                 name: "Read".into(),
                 title: Some("complete/file/path".into()),
                 ok: Some(true),
+                started_at: None,
+                ended_at: None,
             }];
             for (seq, kind, event) in [
                 (
@@ -1708,21 +1952,6 @@ mod tests {
             }
         }
     }
-    #[test]
-    fn quota_snapshot_never_claims_knowledge_at_a_different_frontier() {
-        use crate::acp::event_store::ControlKnowledge::{Indeterminate, Known};
-        for park in [
-            Known(None),
-            Known(Some(false)),
-            Known(Some(true)),
-            Indeterminate,
-        ] {
-            assert_eq!(projected_rate_limit_park(21, 20, park), None);
-            assert_eq!(projected_rate_limit_park(19, 20, park), None);
-        }
-        assert_eq!(projected_rate_limit_park(20, 20, Indeterminate), None);
-    }
-
     #[tokio::test]
     async fn quota_snapshots_ignore_history_and_follow_real_host_boundaries() {
         use crate::acp::event_sender::EventMetadata;
@@ -1768,6 +1997,7 @@ mod tests {
             (
                 5,
                 Event::UserPromptSent {
+                    merged_prompt_ids: Vec::new(),
                     text: "new explicit input".into(),
                     prompt_id: None,
                     origin_plugin: None,
@@ -1838,6 +2068,8 @@ mod tests {
                     let live = crate::server::test_support::managed_control_session(
                         managed,
                         "contended-ws",
+                        "claude",
+                        None,
                     )
                     .await;
                     let state = live.state.clone();
@@ -1870,7 +2102,7 @@ mod tests {
                     );
                     let scope = original.scope.clone();
                     let drain_pause = live.client.pause_drain().await;
-                    let frontier = state.acp_event_store.highest_seq(&id);
+                    let frontier = state.acp_event_store.highest_seq(&id).unwrap();
                     let native_requests = live.native.requests();
                     let (entered_tx, entered) = tokio::sync::oneshot::channel();
                     let (release, released) = std::sync::mpsc::channel();
@@ -2104,7 +2336,7 @@ mod tests {
                         "same-frontier qualification must issue no Native RPC"
                     );
                     assert_eq!(settled["seq"], frontier, "qualification needs no new event");
-                    assert_eq!(state.acp_event_store.highest_seq(&id), frontier);
+                    assert_eq!(state.acp_event_store.highest_seq(&id).unwrap(), frontier);
                     assert_eq!(settled["state"]["prompt_wake_eligible"], false);
                     match change {
                         Change::None => assert_eq!(settled["state"]["connection_ready"], true),
@@ -2173,9 +2405,13 @@ mod tests {
         use crate::process::worker_registry;
         with_managed(|managed| {
             Box::pin(async move {
-                let mut live =
-                    crate::server::test_support::managed_control_session(managed, "physical-ws")
-                        .await;
+                let mut live = crate::server::test_support::managed_control_session(
+                    managed,
+                    "physical-ws",
+                    "claude",
+                    None,
+                )
+                .await;
                 let state = live.state.clone();
                 let id = live.id().to_owned();
                 crate::session::set_unread_enabled(true);
@@ -2198,7 +2434,7 @@ mod tests {
                         .ready
                 );
                 let drain_pause = live.client.pause_drain().await;
-                let frontier = state.acp_event_store.highest_seq(&id);
+                let frontier = state.acp_event_store.highest_seq(&id).unwrap();
                 let held_scope = current.scope.clone();
                 let (entered_tx, entered) = tokio::sync::oneshot::channel();
                 let (release, released) = std::sync::mpsc::channel();
@@ -2237,7 +2473,7 @@ mod tests {
                 assert_eq!(invalidated["seq"], frontier);
                 assert_eq!(invalidated["state"]["connection_ready"], false);
                 assert_eq!(invalidated["state"]["prompt_wake_eligible"], false);
-                assert_eq!(state.acp_event_store.highest_seq(&id), frontier);
+                assert_eq!(state.acp_event_store.highest_seq(&id).unwrap(), frontier);
                 assert!(state.acp_supervisor.current_lease(&id) == Some(current.lease.clone()));
                 assert!(
                     worker_registry::is_record_live(&original_record),
@@ -2327,14 +2563,16 @@ mod tests {
         use crate::acp::supervisor::test_support::managed::with_managed;
         with_managed(|scope| {
             Box::pin(async move {
-                let mut live =
-                    crate::server::test_support::managed_control_session(scope, "ws-loss").await;
+                let mut live = crate::server::test_support::managed_control_session(
+                    scope, "ws-loss", "claude", None,
+                )
+                .await;
                 let state = live.state.clone();
                 let id = live.id().to_owned();
                 let request = live.start_prompt("original").await;
                 request_native_attention(&mut live, true).await;
                 live.finish_prompt(&request, Some("request_failed")).await;
-                let frontier = state.acp_event_store.highest_seq(&id);
+                let frontier = state.acp_event_store.highest_seq(&id).unwrap();
                 let (mut socket, server) = connect_test_socket(state.clone(), &id).await;
                 let initial = receive_kind(&mut socket, "reduced_state").await;
                 assert_eq!(initial["seq"], frontier);
@@ -2381,7 +2619,7 @@ mod tests {
                 assert_eq!(lost["state"]["pending_elicitations"], serde_json::json!([]));
                 assert_eq!(lost["state"]["turn_active"], false);
                 assert_eq!(
-                    state.acp_event_store.highest_seq(&id),
+                    state.acp_event_store.highest_seq(&id).unwrap(),
                     frontier,
                     "retiring controls synthesizes no human decisions"
                 );
@@ -2409,6 +2647,8 @@ mod tests {
                         } else {
                             "websocket-final-ready"
                         },
+                        "claude",
+                        None,
                     )
                     .await;
                     let id = live.id().to_owned();
@@ -2437,7 +2677,7 @@ mod tests {
                         .unwrap();
                     assert!(applied.matches(&preimage, &disk).unwrap());
                     let preimage = serde_json::to_value(preimage).unwrap();
-                    let frontier = state.acp_event_store.highest_seq(&id);
+                    let frontier = state.acp_event_store.highest_seq(&id).unwrap();
                     let requests = live.native.requests();
                     let mut events = state.acp_events_tx.subscribe();
                     let scope = current.scope.clone();
@@ -2496,7 +2736,7 @@ mod tests {
                             "only the frozen actual selection may regain Ready"
                         );
                         assert!(settled["state"]["connection_unavailable"].is_null());
-                        assert_eq!(state.acp_event_store.highest_seq(&id), frontier);
+                        assert_eq!(state.acp_event_store.highest_seq(&id).unwrap(), frontier);
                         assert_eq!(live.native.requests(), requests);
                         assert!(matches!(
                             events.try_recv(),
@@ -2589,11 +2829,13 @@ mod tests {
                 let mut live = crate::server::test_support::managed_control_session(
                     scope,
                     "websocket-native-loss",
+                    "claude",
+                    None,
                 )
                 .await;
                 let id = live.id().to_owned();
                 let _request = live.start_prompt("original retained work").await;
-                let before = live.state.acp_event_store.highest_seq(&id);
+                let before = live.state.acp_event_store.highest_seq(&id).unwrap();
                 let budget = live
                     .state
                     .acp_event_store
@@ -2619,7 +2861,7 @@ mod tests {
                 .await
                 .into_response();
                 assert_eq!(response.status(), axum::http::StatusCode::CONFLICT);
-                assert_eq!(live.state.acp_event_store.highest_seq(&id), before);
+                assert_eq!(live.state.acp_event_store.highest_seq(&id).unwrap(), before);
                 assert_eq!(
                     live.state
                         .acp_event_store
@@ -2653,8 +2895,13 @@ mod tests {
         use crate::acp::supervisor::test_support::managed::with_managed;
         with_managed(|scope| {
             Box::pin(async move {
-                let mut live =
-                    crate::server::test_support::managed_control_session(scope, "ws-overlap").await;
+                let mut live = crate::server::test_support::managed_control_session(
+                    scope,
+                    "ws-overlap",
+                    "claude",
+                    None,
+                )
+                .await;
                 let state = live.state.clone();
                 let id = live.id().to_owned();
                 let mut publications = live.client.subscribe_publications();
@@ -2672,7 +2919,7 @@ mod tests {
                 })
                 .await
                 .expect("capture the genuine published callback before replay overlap");
-                let frontier = state.acp_event_store.highest_seq(&id);
+                let frontier = state.acp_event_store.highest_seq(&id).unwrap();
                 let (mut socket, server) = connect_test_socket(state.clone(), &id).await;
                 let initial = receive_kind(&mut socket, "reduced_state").await;
                 assert_eq!(
@@ -2799,6 +3046,7 @@ mod tests {
         for (seq, id) in [(1, "missed"), (2, "queued")] {
             let event = Event::ToolCallStarted {
                 tool_call: ToolCall {
+                    prompt: None,
                     id: id.into(),
                     name: id.into(),
                     kind: "read".into(),

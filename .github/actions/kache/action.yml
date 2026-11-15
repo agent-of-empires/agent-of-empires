@@ -2,7 +2,8 @@ name: Kache build cache
 description: >
   Wraps rustc with kache backed by the shared S3 bucket. main pushes write
   `artifacts/`; same-repo PRs read it and write `artifacts-pr/`; fork PRs get
-  no OIDC token and build without a remote. The calling job needs
+  no OIDC token and build without a remote, as does every job while the
+  RUNS_ON_DISABLED killswitch is on. The calling job needs
   `id-token: write`.
 
 inputs:
@@ -20,7 +21,9 @@ runs:
         HEAD_REPO: ${{ github.event.pull_request.head.repo.full_name }}
       run: |
         set -euo pipefail
-        if [ -n "$HEAD_REPO" ] && [ "$HEAD_REPO" != "$GITHUB_REPOSITORY" ]; then
+        if [ "${RUNS_ON_DISABLED:-}" = true ]; then
+          echo "role=" >> "$GITHUB_OUTPUT"
+        elif [ -n "$HEAD_REPO" ] && [ "$HEAD_REPO" != "$GITHUB_REPOSITORY" ]; then
           echo "role=" >> "$GITHUB_OUTPUT"
         elif [ "$GITHUB_EVENT_NAME" = push ] && [ "$GITHUB_REF" = refs/heads/main ]; then
           echo "role=aoe-kache-ci-main" >> "$GITHUB_OUTPUT"

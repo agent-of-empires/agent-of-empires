@@ -1326,7 +1326,6 @@ Esc to cancel \u{b7} Tab to amend \u{b7} ctrl+e to explain\n\
         assert!(stored.get("last_error").is_none());
         assert!(stored.get("last_error_evidence").is_none());
     }
-
     /// A turn's running and idle frames can share tmux's activity second.
     #[test]
     #[serial_test::serial]

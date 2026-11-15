@@ -239,23 +239,15 @@ pub(crate) fn build_test_app_state_with_event_capacity(
         -> crate::acp::supervisor::Supervisor<crate::acp::supervisor::ChannelSink>,
 ) -> Arc<AppState> {
     let (event_store, event_capacity) = events;
-    let app_dir = event_store
-        .is_none()
-        .then(|| tempfile::tempdir().expect("tempdir"));
     let event_store = event_store.unwrap_or_else(|| {
-        let acp_db = app_dir
-            .as_ref()
-            .expect("default store directory")
-            .path()
-            .join("acp_events.db");
-        Arc::new(crate::acp::event_store::EventStore::open(&acp_db, 100).expect("event store"))
+        Arc::new(crate::acp::event_store::EventStore::temporary_for_test(100).expect("event store"))
     });
     let acp_events_tx = broadcast::channel::<AcpBroadcastFrame>(event_capacity).0;
     let acp_control_cache = Arc::clone(event_store.control_cache());
-    let sink = std::sync::Arc::new(crate::acp::supervisor::ChannelSink {
-        tx: acp_events_tx.clone(),
-        event_store: event_store.clone(),
-    });
+    let sink = Arc::new(crate::acp::supervisor::ChannelSink::new(
+        acp_events_tx.clone(),
+        Arc::clone(&event_store),
+    ));
     let supervisor = std::sync::Arc::new(
         customize(crate::acp::supervisor::Supervisor::with_capacity(sink, 1))
             .with_native_admission(),
@@ -730,7 +722,7 @@ impl ManagedControlSession {
                     text,
                     attachments: &[],
                     woke_idle_dormant: false,
-                    prompt_id: None,
+                    prompt_ids: Vec::new(),
                     synthesized: false,
                     no_revive: false,
                 },
@@ -835,6 +827,8 @@ impl ManagedControlSession {
 pub(crate) async fn managed_control_session(
     scope: &mut crate::acp::supervisor::test_support::managed::ManagedScope,
     label: &str,
+    agent_key: &str,
+    options: Option<serde_json::Value>,
 ) -> ManagedControlSession {
     let project = scope.tempdir();
     let native_store = crate::session::get_app_dir()
@@ -846,14 +840,16 @@ pub(crate) async fn managed_control_session(
     let sid = uuid::Uuid::new_v4().to_string();
     let response_sid = sid.clone();
     let (sent, prompts) = tokio::sync::mpsc::unbounded_channel();
-    let mut config_options = serde_json::json!([{
-        "id": "model", "name": "Model", "category": "model", "type": "select",
-        "currentValue": "old-model", "options": [
-            {"value": "old-model", "name": "Old model"},
-            {"value": "new-model", "name": "New model"},
-            {"value": "plan", "name": "Plan"}
-        ]
-    }]);
+    let mut config_options = options.unwrap_or_else(|| {
+        serde_json::json!([{
+            "id": "model", "name": "Model", "category": "model", "type": "select",
+            "currentValue": "old-model", "options": [
+                {"value": "old-model", "name": "Old model"},
+                {"value": "new-model", "name": "New model"},
+                {"value": "plan", "name": "Plan"}
+            ]
+        }])
+    });
     let mut modes = serde_json::json!({
         "currentModeId": "old-mode", "availableModes": [
             {"id": "old-mode", "name": "Old mode"},
@@ -863,11 +859,12 @@ pub(crate) async fn managed_control_session(
     });
     let (config, native) = scope.native_peer(
         project.path().into(),
-        "claude",
-        "claude",
+        agent_key,
+        agent_key,
         move |request| match request["method"].as_str().unwrap() {
             "initialize" => Some(serde_json::json!({"jsonrpc":"2.0","id":request["id"],
-                "result":{"protocolVersion":1,"agentCapabilities":{"loadSession":true}}})),
+                "result":{"protocolVersion":1,"agentCapabilities":{"loadSession":true},
+                    "_meta":{"ompAutonomousTurns":{"version":1}}}})),
             "session/new" | "session/load" => {
                 let sid = if request["method"] == "session/new" {
                     serde_json::Value::String(response_sid.clone())
@@ -882,8 +879,13 @@ pub(crate) async fn managed_control_session(
                 Some(serde_json::json!({"jsonrpc":"2.0","id":request["id"],"result":{}}))
             }
             "session/set_config_option" => {
-                assert_eq!(request["params"]["configId"], "model");
-                config_options[0]["currentValue"] = request["params"]["value"].clone();
+                let selected = config_options
+                    .as_array_mut()
+                    .unwrap()
+                    .iter_mut()
+                    .find(|option| option["id"] == request["params"]["configId"])
+                    .expect("the actual Native peer accepts only its advertised options");
+                selected["currentValue"] = request["params"]["value"].clone();
                 Some(serde_json::json!({"jsonrpc":"2.0","id":request["id"],
                     "result":{"configOptions":config_options}}))
             }

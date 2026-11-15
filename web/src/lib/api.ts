@@ -331,21 +331,45 @@ export async function ensureSession(id: string, signal?: AbortSignal): Promise<E
   }
 }
 
-export async function ensureTerminal(id: string, index = 0, container = false): Promise<EnsureSessionResult> {
+const TERMINAL_BUSY_BUDGET_MS = 30_000;
+
+// A launch holds the lifecycle reservation, so a terminal opened meanwhile gets 409 lifecycle_busy until it ends.
+// Only a launch is waited out: other busy operations (stop, purge, ...) are refused at once.
+export async function ensureTerminal(
+  id: string,
+  index = 0,
+  container = false,
+  signal?: AbortSignal,
+): Promise<EnsureSessionResult> {
   const path = container ? "container-terminal" : "terminal";
-  try {
-    const res = await fetch(`/api/sessions/${id}/${path}?index=${index}`, {
-      method: "POST",
-    });
-    if (res.ok) return { ok: true };
-    const body = await res.json().catch(() => ({}));
-    return {
-      ok: false,
-      error: typeof body.error === "string" ? body.error : undefined,
-      message: typeof body.message === "string" ? body.message : `Server error (${res.status})`,
-    };
-  } catch (e) {
-    return { ok: false, message: e instanceof Error ? e.message : "Network error" };
+  const deadline = Date.now() + TERMINAL_BUSY_BUDGET_MS;
+  for (let delay = 250; ; delay = Math.min(delay * 2, 1000)) {
+    if (signal?.aborted) return { ok: false, error: "aborted" };
+    let result: EnsureSessionResult;
+    let launching: boolean;
+    try {
+      const res = await fetch(`/api/sessions/${id}/${path}?index=${index}`, {
+        method: "POST",
+        signal,
+      });
+      if (res.ok) return { ok: true };
+      const body = await res.json().catch(() => ({}));
+      if (signal?.aborted) return { ok: false, error: "aborted" };
+      launching = body.error === "lifecycle_busy" && body.operation === "launch";
+      result = {
+        ok: false,
+        error: typeof body.error === "string" ? body.error : undefined,
+        message: typeof body.message === "string" ? body.message : `Server error (${res.status})`,
+      };
+    } catch (e) {
+      if (signal?.aborted) return { ok: false, error: "aborted" };
+      return { ok: false, message: e instanceof Error ? e.message : "Network error" };
+    }
+    const remaining = deadline - Date.now();
+    if (!launching || remaining <= 0) return result;
+    await new Promise((resolve) => setTimeout(resolve, Math.min(delay, remaining)));
+    if (signal?.aborted) return { ok: false, error: "aborted" };
+    if (Date.now() >= deadline) return result;
   }
 }
 
@@ -1791,6 +1815,19 @@ export async function acpDisable(
   }
 }
 
+/** Stop one subagent without ending the root turn. Resolves to an error message, or null on success. */
+export async function cancelSubagent(sessionId: string, childId: string): Promise<string | null> {
+  const url = `/api/sessions/${encodeURIComponent(sessionId)}/acp/subagents/${encodeURIComponent(childId)}/cancel`;
+  try {
+    const res = await fetch(url, { method: "POST" });
+    if (res.ok) return null;
+    const detail = (await res.text().catch(() => "")).slice(0, 200);
+    return `Could not stop subagent (${res.status}). ${detail}`.trim();
+  } catch (e) {
+    return `Network error stopping subagent: ${e instanceof Error ? e.message : String(e)}`;
+  }
+}
+
 // The daemon owns the structured-view prompt queue; /queue reads it on demand.
 // Queued follow-ups survive client reloads and drain server-side.
 
@@ -1995,11 +2032,19 @@ export async function fetchAgents(profile?: string): Promise<AgentInfo[] | null>
   return Array.isArray(agents) ? agents : null;
 }
 
-/** Like `fetchAgents`, but says when the Daemon has no such profile, which no retry fixes. */
-export async function fetchProfileAgents(profile?: string): Promise<AgentInfo[] | "profile_not_found" | null> {
-  const query = profile ? `?profile=${encodeURIComponent(profile)}` : "";
+/** Like `fetchAgents`, but says when the Daemon has no such profile, which no retry fixes.
+ *  With a `project`, `acp_create_ready` also counts that project's repository config and hooks. */
+export async function fetchProfileAgents(
+  profile?: string,
+  project?: { path: string; scratch: boolean },
+): Promise<AgentInfo[] | "profile_not_found" | null> {
+  const params = new URLSearchParams();
+  if (profile) params.set("profile", profile);
+  if (project?.scratch) params.set("scratch", "true");
+  else if (project?.path) params.set("path", project.path);
+  const query = params.toString();
   try {
-    const res = await fetch(`/api/agents${query}`);
+    const res = await fetch(`/api/agents${query ? `?${query}` : ""}`);
     if (res.ok) return (await res.json()) as AgentInfo[];
     if (res.status !== 404) return null;
     const body = (await res.json().catch(() => null)) as { error?: unknown } | null;
@@ -3287,4 +3332,20 @@ export async function syncSkills(options?: {
       error: `Network error: ${error instanceof Error ? error.message : "connection failed"}`,
     };
   }
+}
+
+export interface TaskOutput {
+  exists: boolean;
+  output: string;
+  truncated: boolean;
+}
+
+const TASK_OUTPUT_TIMEOUT_MS = 10_000;
+
+/** Tail of a background shell's output; null when the request fails or times out. */
+export async function fetchTaskOutput(sessionId: string, taskId: string): Promise<TaskOutput | null> {
+  return fetchJson<TaskOutput>(
+    `/api/sessions/${encodeURIComponent(sessionId)}/acp/tasks/${encodeURIComponent(taskId)}/output`,
+    { signal: AbortSignal.timeout(TASK_OUTPUT_TIMEOUT_MS) },
+  );
 }

@@ -140,7 +140,10 @@ pub(crate) async fn probe_option_catalog(
                 // Reuse client identity, but advertise no authority to serve agent requests.
                 connection
                     .send_request(
-                        build_initialize_request().client_capabilities(ClientCapabilities::new()),
+                        build_initialize_request(crate::acp::agent_profiles::resolve(
+                            &config.agent_key,
+                        ))
+                        .client_capabilities(ClientCapabilities::new()),
                     )
                     .block_task()
                     .await?;
@@ -241,7 +244,9 @@ async fn list_pages(
     let init: InitializeResponse = tokio::time::timeout(
         step_timeout,
         connection
-            .send_request(build_initialize_request())
+            .send_request(build_initialize_request(
+                &crate::acp::agent_profiles::DEFAULT,
+            ))
             .block_task(),
     )
     .await

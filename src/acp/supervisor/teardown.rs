@@ -33,13 +33,13 @@ type RetiringDrain = Arc<tokio::sync::Mutex<Option<tokio::task::JoinHandle<()>>>
 struct StopFence<'a> {
     observed: Option<&'a Lease>,
     activity_seq: Option<u64>,
-    admissions: Option<u64>,
     preserve_restart: bool,
     claim: Option<(
         &'a worker_registry::StopIntent,
         &'a worker_registry::WorkerRecord,
     )>,
     dormancy_stamp: Option<chrono::DateTime<chrono::Utc>>,
+    admissions: Option<u64>,
 }
 
 pub(crate) struct IdleRetirement {
@@ -639,7 +639,11 @@ pub(super) async fn retire_registered_clients(
     retire_registered_clients_locked(lifecycle, lease).await;
 }
 
-fn finish_stop_completion<S: BroadcastSink>(sink: &S, seqs: &super::SeqMap, lease: &Lease) -> bool {
+fn finish_stop_completion<S: BroadcastSink>(
+    sink: &S,
+    seqs: &Arc<super::SeqMap>,
+    lease: &Lease,
+) -> bool {
     let Some(debt) = lease.pending_stop_completion() else {
         return true;
     };
@@ -653,13 +657,14 @@ fn finish_stop_completion<S: BroadcastSink>(sink: &S, seqs: &super::SeqMap, leas
             return false;
         }
         if let Some(reason) = debt.reason {
-            if !super::with_publication_seq(seqs, id, |seq| {
-                sink.publish_persisted(
-                    id,
-                    seq,
-                    &crate::acp::event_sender::AcpEventData::from_host(Event::Stopped { reason }),
-                )
-            }) {
+            if !super::publish_next_persisted(
+                sink,
+                seqs,
+                id,
+                crate::acp::event_sender::AcpEventData::from_host(Event::Stopped { reason }),
+            )
+            .1
+            {
                 return false;
             }
         }
@@ -911,6 +916,7 @@ impl<S: BroadcastSink> Supervisor<S> {
         {
             return Err(SupervisorError::TeardownPending(session_id.to_owned()));
         }
+        drop(workers);
         if !super::publish::complete_stopped_worker_work(
             &*self.sink,
             &self.next_seqs,
@@ -920,15 +926,15 @@ impl<S: BroadcastSink> Supervisor<S> {
             return Err(SupervisorError::TeardownPending(session_id.to_owned()));
         }
         if !stopped_already_persisted
-            && !super::with_publication_seq(&self.next_seqs, session_id, |seq| {
-                self.sink.publish_persisted(
-                    session_id,
-                    seq,
-                    &crate::acp::event_sender::AcpEventData::from_host(Event::Stopped {
-                        reason: "user_stopped".to_owned(),
-                    }),
-                )
-            })
+            && !super::publish_next_persisted(
+                self.sink.as_ref(),
+                &self.next_seqs,
+                session_id,
+                crate::acp::event_sender::AcpEventData::from_host(Event::Stopped {
+                    reason: "user_stopped".to_owned(),
+                }),
+            )
+            .1
         {
             return Err(SupervisorError::TeardownPending(session_id.to_owned()));
         }
@@ -2474,7 +2480,7 @@ pub(super) fn settle_lease(
 pub(super) struct StopPublication<'a, S> {
     pub(super) workers: &'a super::Workers,
     pub(super) sink: &'a S,
-    pub(super) seqs: &'a super::SeqMap,
+    pub(super) seqs: &'a Arc<super::SeqMap>,
 }
 
 /// Scope retirement precedes Proven; a failed stop preserves cleanup debt and authority.
@@ -2516,7 +2522,7 @@ pub(super) async fn settle_sweeping_if_owed<S: BroadcastSink>(
     if matches!(publisher, CompletionPublisher::JoinDrain) {
         quiesce_retained_drain(lease).await;
     }
-    // Share admission's workers gate; call the sink without the lifecycle mutex.
+    // The retirement driver retains this lease; global admission guards never wait on its writer.
     let workers_gate = workers.lock().await;
     if lock_recover(lifecycle)
         .current_lease(lease.session_id())
@@ -2538,8 +2544,8 @@ pub(super) async fn settle_sweeping_if_owed<S: BroadcastSink>(
         );
         return;
     }
+    drop(workers_gate);
     if !finish_stop_completion(sink, seqs, lease) {
-        drop(workers_gate);
         settle_lease(
             lifecycle,
             notify,
@@ -2548,7 +2554,6 @@ pub(super) async fn settle_sweeping_if_owed<S: BroadcastSink>(
         );
         return;
     }
-    drop(workers_gate);
     // Logical completion is final even if a physical proof needs another tick.
     if settlement != Settlement::Proven {
         settle_lease(lifecycle, notify, lease, settlement);
@@ -2688,6 +2693,7 @@ mod tests {
                     tool_call_id: None,
                     description: "work".into(),
                     workflow: None,
+                    started_at: None,
                 },
             );
             sup.publish_next(
@@ -2862,6 +2868,7 @@ mod tests {
                 tool_call_id: None,
                 description: "work".into(),
                 workflow: None,
+                started_at: None,
             });
         // Only the join is parked, not publication.
         super::super::with_publication_seq(&p.sup.next_seqs, id, |seq| {
@@ -3016,6 +3023,7 @@ mod tests {
                         tool_call_id: None,
                         description: "new work".into(),
                         workflow: None,
+                        started_at: None,
                     },
                 ),
             );
@@ -3333,41 +3341,39 @@ mod tests {
     #[tokio::test]
     #[serial_test::serial]
     async fn shutdown_detaches_outstanding_background_agents_before_stopped() {
-        let (_home, tmp) = isolate_home();
-        let sink = VecSink::new();
-        *sink.stale_background_agent_ids.lock().unwrap() = vec!["bg-1".into(), "bg-2".into()];
-        let sup = Supervisor::new(sink.clone());
-        sup.test_install_runner(
-            "s-detach",
-            runner_config(tmp.path().join("dummy.sock")),
-            None,
-        )
-        .await;
-
-        sup.shutdown("s-detach").await.expect("shutdown");
-
-        let frames = sink.frames.lock().unwrap().clone();
-        let mine: Vec<&(String, u64, Event)> = frames
-            .iter()
-            .filter(|(id, _, _)| id == "s-detach")
-            .collect();
-        assert_eq!(mine.len(), 3, "two detach completions plus the Stopped");
-        for (idx, expected) in [(0, "bg-1"), (1, "bg-2")] {
-            match &mine[idx].2 {
-                Event::BackgroundAgentCompleted {
-                    agent_id, status, ..
-                } => assert_eq!(
-                    (agent_id.as_str(), *status),
-                    (expected, BackgroundAgentStatus::Detached)
-                ),
-                other => panic!("expected a Detached completion, got {other:?}"),
+        super::super::test_support::managed::with_managed(|scope| Box::pin(async move {
+            let native = crate::acp::task_transcript::resource_test_support::NativeBootstrap::new(scope, "codex").await;
+            let id = native.managed.id.clone();
+            for agent in ["bg-1", "bg-2"] {
+                let path = native.home.join(format!("{agent}.jsonl"));
+                std::fs::write(&path, "").unwrap();
+                native.tool(scope, agent, "Agent", serde_json::json!({
+                    "agentId":agent,"description":"keep working","prompt":"continue",
+                    "outputFile":path,"status":"async_launched"
+                })).await;
             }
-        }
-        assert!(matches!(&mine[2].2, Event::Stopped { reason } if reason == "user_stopped"));
-        assert!(
-            mine[0].1 < mine[1].1 && mine[1].1 < mine[2].1,
-            "detach completions must be seq-ordered ahead of Stopped"
-        );
+            let store = scope.state.acp_event_store.clone();
+            let prefix = store.highest_seq(&id).unwrap();
+            native.managed.shutdown().await.expect("retire the actual original with both live resources");
+            let mine = store.replay_from(&id, prefix).unwrap();
+            assert_eq!(mine.len(), 3, "two detach completions plus the Stopped");
+            let mut detached = Vec::new();
+            for stored in &mine[..2] {
+                match stored.event.as_ref() {
+                    Event::BackgroundAgentCompleted { agent_id, status, .. } => {
+                        assert_eq!(*status, BackgroundAgentStatus::Detached);
+                        detached.push(agent_id.as_str());
+                    }
+                    other => panic!("expected a Detached completion, got {other:?}"),
+                }
+                assert!(stored.metadata.resource_ref.is_some(), "completion retains its actual allocation");
+            }
+            detached.sort_unstable();
+            assert_eq!(detached, ["bg-1", "bg-2"]);
+            assert!(matches!(mine[2].event.as_ref(), Event::Stopped { reason } if reason == "user_stopped"));
+            assert!(mine[0].seq < mine[1].seq && mine[1].seq < mine[2].seq,
+                "detach completions must be seq-ordered ahead of Stopped");
+        })).await;
     }
 
     #[tokio::test]
@@ -3500,6 +3506,7 @@ mod tests {
                     tool_call_id: None,
                     description: "sleep".into(),
                     workflow: None,
+                    started_at: None,
                 },
                 &crate::acp::event_sender::EventMetadata::history(),
             )
@@ -3963,6 +3970,7 @@ mod tests {
                     tool_call_id: None,
                     description: "sleep".into(),
                     workflow: None,
+                    started_at: None,
                 },
                 &crate::acp::event_sender::EventMetadata::history(),
             )
@@ -4029,22 +4037,31 @@ mod tests {
             }
             persisted
         }
-        fn publish_from_worker(
+        fn publish_replay_from_worker(
             &self,
             session_id: &str,
             seq: u64,
             data: &crate::acp::event_sender::AcpEventData,
             generation: u64,
             native_subject: Option<crate::acp::state::NativeEventSubject>,
-        ) -> bool {
+            replay: Option<(u64, &mut crate::acp::event_store::ReplayCommit)>,
+        ) -> (u64, bool) {
             let parked = self.park(data.event.as_ref());
-            let persisted =
-                self.inner
-                    .publish_from_worker(session_id, seq, data, generation, native_subject);
+            let persisted = self.inner.publish_replay_from_worker(
+                session_id,
+                seq,
+                data,
+                generation,
+                native_subject,
+                replay,
+            );
             if parked {
                 let _ = self.done.send(());
             }
             persisted
+        }
+        fn establishment_store(&self) -> Option<Arc<crate::acp::event_store::EventStore>> {
+            self.inner.establishment_store()
         }
         fn unresolved_background_task_ids(&self, session_id: &str) -> Vec<String> {
             self.inner.unresolved_background_task_ids(session_id)
@@ -4157,6 +4174,7 @@ mod tests {
                                 tool_call_id: None,
                                 description: "activity".into(),
                                 workflow: None,
+                                started_at: None,
                             },
                         ),
                     )
@@ -4239,7 +4257,9 @@ mod tests {
             .await;
         let (inbound_tx, inbound_rx) =
             tokio::sync::mpsc::channel::<crate::acp::event_sender::SdkEvent>(16);
-        let drain = p.sup.start_drain_task(id.into(), lease, inbound_rx, None);
+        let drain = p
+            .sup
+            .start_drain_task(id.into(), lease.clone(), inbound_rx, None);
         {
             let mut workers = p.sup.workers.lock().await;
             let handle = workers.get_mut(id).expect("installed worker");
@@ -4254,6 +4274,7 @@ mod tests {
                         tool_call_id: None,
                         description: "sleep".into(),
                         workflow: None,
+                        started_at: None,
                     },
                 ),
             ))
@@ -4261,26 +4282,49 @@ mod tests {
             .unwrap();
         p.entered().await;
         assert!(
-            p.sup.workers.try_lock().is_err(),
-            "publication retains its installed worker"
+            p.sup
+                .workers
+                .try_lock()
+                .expect("store IO releases the workers mutex")
+                .contains_key(id),
+            "the installed worker remains in actual publication custody"
+        );
+        assert_eq!(
+            {
+                let Ok(lifecycle) = p.sup.lifecycle.try_lock() else {
+                    panic!("store IO releases the lifecycle mutex");
+                };
+                lifecycle.current_lease(id)
+            }
+            .as_ref(),
+            Some(&lease),
+            "publication retains the same lifecycle owner without retaining its global mutex"
+        );
+        let (observed, activity) = p
+            .sup
+            .idle_observation(id)
+            .expect("the try-only observer need not retain another publication's mutex");
+        assert_eq!(observed, lease);
+        assert_eq!(
+            Some(activity),
+            super::super::try_activity_seq(&p.sup.next_seqs, id)
+        );
+        let reaping = Arc::clone(&p.sup);
+        let reaper = reaping.reap_user_stopped();
+        tokio::pin!(reaper);
+        assert!(
+            futures_util::poll!(reaper.as_mut()).is_pending(),
+            "the real reaper cannot finish while its original publication is owed"
         );
         assert!(
-            p.sup.lifecycle.try_lock().is_err(),
-            "publication retains its lifecycle fence"
+            lock_recover(&p.sup.lifecycle)
+                .admit(id, ResumeKind::Spawn)
+                .is_err(),
+            "a replacement remains fenced before the final publication sweep"
         );
-        assert!(
-            p.sup.idle_observation(id).is_none(),
-            "idle observation must not wait on the real worker publication's lifecycle fence"
-        );
-
-        let reaper = {
-            let sup = Arc::clone(&p.sup);
-            tokio::spawn(async move { sup.reap_user_stopped().await })
-        };
         p.release_and_wait().await;
         tokio::time::timeout(Duration::from_secs(5), reaper)
             .await
-            .unwrap()
             .unwrap();
 
         assert!(
@@ -4340,6 +4384,7 @@ mod tests {
                     tool_call_id: None,
                     description: "sleep".into(),
                     workflow: None,
+                    started_at: None,
                 },
                 &crate::acp::event_sender::EventMetadata::history(),
             )
@@ -4541,7 +4586,7 @@ mod tests {
             "the parked finish has not extended the durable prefix"
         );
         let stopping_supervisor = Arc::clone(&p.sup);
-        let shutdown = stopping_supervisor.shutdown(id);
+        let shutdown = stopping_supervisor.shutdown_and_wait(id, Duration::from_secs(5));
         tokio::pin!(shutdown);
         assert!(
             futures_util::poll!(&mut shutdown).is_pending(),

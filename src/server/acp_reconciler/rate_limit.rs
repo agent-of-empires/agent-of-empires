@@ -342,7 +342,8 @@ pub(crate) async fn resume_rate_limited(
                 |store, id| store.highest_seq(id),
             )
             .await
-            .ok_or(SupervisorError::NativeStoreUnavailable)?;
+            .ok_or(SupervisorError::NativeStoreUnavailable)?
+            .map_err(|_| SupervisorError::NativeStoreUnavailable)?;
             if state.acp_supervisor.publish_stopped_if_seq(
                 id,
                 RATE_LIMIT_EXHAUSTED_RETRIES_REASON,
@@ -797,11 +798,12 @@ mod tests {
     async fn rate_limit_resume_backs_off_after_a_failed_attempt() {
         with_managed(|scope| {
             Box::pin(async move {
-                let mut live = managed_control_session(scope, "quota-backoff").await;
+                let mut live =
+                    managed_control_session(scope, "quota-backoff", "claude", None).await;
                 let id = live.id().to_owned();
                 enable_auto_resume(true);
                 live.park("run the nightly task").await;
-                let before = live.state.acp_event_store.highest_seq(&id);
+                let before = live.state.acp_event_store.highest_seq(&id).unwrap();
                 let requests = live.native.requests();
                 let submission = live.state.session_service.prompt_submission(&id).await;
                 resume_rate_limited(
@@ -814,7 +816,7 @@ mod tests {
                 )
                 .await
                 .unwrap();
-                assert_eq!(live.state.acp_event_store.highest_seq(&id), before);
+                assert_eq!(live.state.acp_event_store.highest_seq(&id).unwrap(), before);
                 assert_eq!(live.native.requests(), requests);
                 live.make_quota_due();
                 let submission = live.state.session_service.prompt_submission(&id).await;
@@ -841,12 +843,15 @@ mod tests {
                         .unwrap(),
                     Known(1)
                 );
-                let frontier = live.state.acp_event_store.highest_seq(&id);
+                let frontier = live.state.acp_event_store.highest_seq(&id).unwrap();
                 let mut attempted = HashSet::from([id.clone()]);
                 reap_rate_limit_resumes(&live.state, &mut attempted, &HashSet::new()).await;
                 settle_delivery(&live.state, &id).await;
                 assert!(attempted.contains(&id));
-                assert_eq!(live.state.acp_event_store.highest_seq(&id), frontier);
+                assert_eq!(
+                    live.state.acp_event_store.highest_seq(&id).unwrap(),
+                    frontier
+                );
                 enable_auto_resume(false);
                 live.state
                     .acp_supervisor
@@ -868,7 +873,7 @@ mod tests {
     async fn rate_limit_reap_resumes_below_the_cap_and_parks_at_it() {
         with_managed(|scope| {
             Box::pin(async move {
-                let mut live = managed_control_session(scope, "quota-cap").await;
+                let mut live = managed_control_session(scope, "quota-cap", "claude", None).await;
                 let id = live.id().to_owned();
                 let owner = live
                     .state
@@ -900,7 +905,7 @@ mod tests {
                     );
                 }
                 live.make_quota_due();
-                let frontier = live.state.acp_event_store.highest_seq(&id);
+                let frontier = live.state.acp_event_store.highest_seq(&id).unwrap();
                 let held = live.state.session_service.prompt_submission(&id).await;
                 let mut attempted = HashSet::from([id.clone()]);
                 tokio::time::timeout(
@@ -910,7 +915,10 @@ mod tests {
                 .await
                 .unwrap();
                 assert!(attempted.contains(&id));
-                assert_eq!(live.state.acp_event_store.highest_seq(&id), frontier);
+                assert_eq!(
+                    live.state.acp_event_store.highest_seq(&id).unwrap(),
+                    frontier
+                );
                 drop(held);
                 reap_rate_limit_resumes(&live.state, &mut attempted, &HashSet::new()).await;
                 settle_delivery(&live.state, &id).await;
@@ -931,10 +939,13 @@ mod tests {
                     Known(0)
                 );
                 enable_auto_resume(false);
-                let cap_frontier = live.state.acp_event_store.highest_seq(&id);
+                let cap_frontier = live.state.acp_event_store.highest_seq(&id).unwrap();
                 reap_rate_limit_resumes(&live.state, &mut attempted, &HashSet::new()).await;
                 settle_delivery(&live.state, &id).await;
-                assert_eq!(live.state.acp_event_store.highest_seq(&id), cap_frontier);
+                assert_eq!(
+                    live.state.acp_event_store.highest_seq(&id).unwrap(),
+                    cap_frontier
+                );
                 live.state
                     .session_service
                     .enqueue_prompt(
@@ -994,7 +1005,7 @@ mod tests {
                     ("queued-before", false, Some(-1000), false),
                     ("queued-unreadable", false, None, false),
                 ] {
-                    let mut live = managed_control_session(scope, label).await;
+                    let mut live = managed_control_session(scope, label, "claude", None).await;
                     let id = live.id().to_owned();
                     enable_auto_resume(true);
                     live.park("run the nightly task").await;
@@ -1028,7 +1039,7 @@ mod tests {
                         .unwrap()
                         .queued_prompts
                         .push(queued);
-                    let frontier = live.state.acp_event_store.highest_seq(&id);
+                    let frontier = live.state.acp_event_store.highest_seq(&id).unwrap();
                     let mut attempted = HashSet::from([id.clone()]);
                     reap_rate_limit_resumes(&live.state, &mut attempted, &HashSet::new()).await;
                     settle_delivery(&live.state, &id).await;
@@ -1061,7 +1072,7 @@ mod tests {
     async fn unavailable_control_queries_preserve_intent_and_refuse_automation() {
         with_managed(|scope| Box::pin(async move {
             for fault in ["sql", "ownership", "budget"] {
-                let mut live = managed_control_session(scope, fault).await;
+                let mut live = managed_control_session(scope, fault, "claude", None).await;
                 let id = live.id().to_owned();
                 enable_auto_resume(true);
                 live.park("original interrupted work").await;
@@ -1070,7 +1081,7 @@ mod tests {
                 let park = known_park(&live.state, &id);
                 let before = live.state.instances.read().await.iter().find(|row| row.id == id).unwrap().clone();
                 let requests = live.native.requests();
-                let frontier = live.state.acp_event_store.highest_seq(&id);
+                let frontier = live.state.acp_event_store.highest_seq(&id).unwrap();
                 let hidden = if fault == "sql" {
                     live.state.acp_event_store.test_conn().execute_batch("ALTER TABLE acp_rate_limit_budgets RENAME TO hidden_quota_budgets").unwrap();
                     Some(HiddenBudgetTable(live.state.acp_event_store.clone()))
@@ -1104,7 +1115,7 @@ mod tests {
                 let mut attempted = HashSet::from([id.clone()]);
                 reap_rate_limit_resumes(&live.state, &mut attempted, &HashSet::new()).await;
                 settle_delivery(&live.state, &id).await;
-                assert_eq!(live.state.acp_event_store.highest_seq(&id), frontier);
+                assert_eq!(live.state.acp_event_store.highest_seq(&id).unwrap(), frontier);
                 assert_eq!(live.native.requests(), requests);
                 let after = live.state.instances.read().await.iter().find(|row| row.id == id).unwrap().clone();
                 assert_eq!(serde_json::to_value(&after.pending_initial_turn).unwrap(), serde_json::to_value(&before.pending_initial_turn).unwrap());
@@ -1125,14 +1136,11 @@ mod tests {
         with_managed(|scope| {
             Box::pin(async move {
                 for pending in [false, true] {
-                    let mut live = managed_control_session(
-                        scope,
-                        if pending {
-                            "quota-io-existing-pending"
-                        } else {
-                            "quota-io-no-pending"
-                        },
-                    )
+                    let mut live = managed_control_session(scope, if pending {
+                        "quota-io-existing-pending"
+                    } else {
+                        "quota-io-no-pending"
+                    }, "claude", None)
                     .await;
                     let id = live.id().to_owned();
                     enable_auto_resume(true);
@@ -1154,9 +1162,12 @@ mod tests {
                         .acp_event_store
                         .rate_limit_redelivery_streak(&id)
                         .unwrap();
-                    let original = crate::process::worker_registry::load_strict(&id)
-                        .unwrap()
-                        .unwrap();
+                    let original = {
+                        let registry = crate::process::worker_registry::registry_lock_until(
+                            &id, tokio::time::Instant::now() + Duration::from_secs(10),
+                        ).await.expect("the actual runner releases registry admission");
+                        registry.record().unwrap().expect("the original runner remains registered")
+                    };
                     let original_identity =
                         crate::acp::runner_lifecycle::RunnerIdentity::from_record(&original);
                     let original_birth = crate::process::process_birth_identity(original.pid)
@@ -1192,9 +1203,12 @@ mod tests {
                                 Some(&original_lease)
                             );
                             assert!(original_actual.ensure_available().is_err());
-                            let retained = crate::process::worker_registry::load_strict(&id)
-                                .unwrap()
-                                .unwrap();
+                            let retained = {
+                                let registry = crate::process::worker_registry::registry_lock_until(
+                                    &id, tokio::time::Instant::now() + Duration::from_secs(10),
+                                ).await.expect("the actual runner releases registry admission");
+                                registry.record().unwrap().expect("the original runner remains registered")
+                            };
                             assert_eq!(
                                 crate::acp::runner_lifecycle::RunnerIdentity::from_record(&retained),
                                 original_identity
@@ -1210,7 +1224,7 @@ mod tests {
                                 )
                             );
                             let requests = live.native.requests();
-                            let frontier = live.state.acp_event_store.highest_seq(&id);
+                            let frontier = live.state.acp_event_store.highest_seq(&id).unwrap();
                             assert_eq!(
                                 live.state
                                     .instances
@@ -1297,7 +1311,7 @@ mod tests {
                                 );
                                 assert_eq!(live.native.requests(), requests,
                         "failed publication must neither attach nor deliver autonomous input");
-                                assert_eq!(live.state.acp_event_store.highest_seq(&id), frontier);
+                                assert_eq!(live.state.acp_event_store.highest_seq(&id).unwrap(), frontier);
                                 assert_eq!(
                                     live.state
                                         .acp_event_store
@@ -1307,9 +1321,12 @@ mod tests {
                                 );
                                 assert_eq!(known_park(&live.state, &id).seq, park.seq);
                                 assert_eq!(auto_resumed_breadcrumbs(&live.state, &id), 0);
-                                let retained = crate::process::worker_registry::load_strict(&id)
-                                    .unwrap()
-                                    .unwrap();
+                                let retained = {
+                                    let registry = crate::process::worker_registry::registry_lock_until(
+                                        &id, tokio::time::Instant::now() + Duration::from_secs(10),
+                                    ).await.expect("the actual runner releases registry admission");
+                                    registry.record().unwrap().expect("the original runner remains registered")
+                                };
                                 assert_eq!(
                                     crate::acp::runner_lifecycle::RunnerIdentity::from_record(
                                         &retained
@@ -1347,7 +1364,8 @@ mod tests {
     async fn retained_unknown_history_allows_only_read_only_attach_then_distinct_explicit_input() {
         with_managed(|scope| {
             Box::pin(async move {
-                let mut live = managed_control_session(scope, "quota-unknown-retained").await;
+                let mut live =
+                    managed_control_session(scope, "quota-unknown-retained", "claude", None).await;
                 let id = live.id().to_owned();
                 live.park("old work must not replay").await;
                 let original = live
@@ -1379,6 +1397,33 @@ mod tests {
                 live.client = scope.adopt(live.client, false).await;
                 live.client.ready().await;
                 live.state = live.client.app_state();
+                // Usability precedes the final assignment/capability publications.
+                // Observe those actual durable frames before the no-auto-resume frontier.
+                tokio::time::timeout(Duration::from_secs(10), async {
+                    let (mut assigned, mut capabilities) = (false, false);
+                    while !assigned || !capabilities {
+                        match live
+                            .client
+                            .next_event()
+                            .await
+                            .expect("actual retained handshake publication")
+                        {
+                            Event::AcpSessionAssigned { acp_session_id, .. }
+                                if acp_session_id == live.sid =>
+                            {
+                                assigned = true
+                            }
+                            Event::PromptCapabilities { .. } => capabilities = true,
+                            Event::AgentStartupError { message, .. } => panic!("{message}"),
+                            Event::AcpConnectionUnavailable { .. } => {
+                                panic!("the original retained channel stays live")
+                            }
+                            _ => {}
+                        }
+                    }
+                })
+                .await
+                .expect("the retained handshake publications precede its negative frontier");
                 let attached = live
                     .state
                     .acp_supervisor
@@ -1401,10 +1446,13 @@ mod tests {
                         .unwrap(),
                     durable_budget
                 );
-                let frontier = live.state.acp_event_store.highest_seq(&id);
+                let frontier = live.state.acp_event_store.highest_seq(&id).unwrap();
                 let mut attempted = HashSet::from([id.clone()]);
                 reap_rate_limit_resumes(&live.state, &mut attempted, &HashSet::new()).await;
-                assert_eq!(live.state.acp_event_store.highest_seq(&id), frontier);
+                assert_eq!(
+                    live.state.acp_event_store.highest_seq(&id).unwrap(),
+                    frontier
+                );
                 assert_eq!(auto_resumed_breadcrumbs(&live.state, &id), 0);
                 let request = live
                     .start_prompt("a distinct explicit input after readiness")
@@ -1456,14 +1504,15 @@ mod tests {
     async fn qualified_native_loss_preserves_quota_pending_queue_and_budget_before_delivery() {
         with_managed(|scope| {
             Box::pin(async move {
-                let mut live = managed_control_session(scope, "quota-native-loss").await;
+                let mut live =
+                    managed_control_session(scope, "quota-native-loss", "claude", None).await;
                 let id = live.id().to_owned();
                 live.park("original work").await;
                 live.state
                     .session_service
                     .set_pending_initial_turn(&id, "original work".into(), Vec::new())
                     .await;
-                let before = live.state.acp_event_store.highest_seq(&id);
+                let before = live.state.acp_event_store.highest_seq(&id).unwrap();
                 let budget = live
                     .state
                     .acp_event_store
@@ -1486,7 +1535,7 @@ mod tests {
                             crate::acp::acp_client::AcpError::ConnectionUnavailable(_)
                         ))
                     ));
-                    assert_eq!(live.state.acp_event_store.highest_seq(&id), before);
+                    assert_eq!(live.state.acp_event_store.highest_seq(&id).unwrap(), before);
                     assert_eq!(
                         live.state
                             .acp_event_store
@@ -1509,7 +1558,8 @@ mod tests {
             Box::pin(async move {
                 for automatic in [false, true] {
                     let mut live =
-                        managed_control_session(scope, "quota-loss-during-prepare").await;
+                        managed_control_session(scope, "quota-loss-during-prepare", "claude", None)
+                            .await;
                     let id = live.id().to_owned();
                     enable_auto_resume(true);
                     live.park("preserve original work").await;
@@ -1535,7 +1585,7 @@ mod tests {
                         drop(submission);
                     }
                     let park_seq = known_park(&live.state, &id).seq;
-                    let frontier = live.state.acp_event_store.highest_seq(&id);
+                    let frontier = live.state.acp_event_store.highest_seq(&id).unwrap();
                     let budget = live
                         .state
                         .acp_event_store
@@ -1591,7 +1641,10 @@ mod tests {
                         .find(|row| row.id == id)
                         .unwrap()
                         .clone();
-                    assert_eq!(live.state.acp_event_store.highest_seq(&id), frontier);
+                    assert_eq!(
+                        live.state.acp_event_store.highest_seq(&id).unwrap(),
+                        frontier
+                    );
                     assert_eq!(
                         live.state
                             .acp_event_store
@@ -1623,7 +1676,8 @@ mod tests {
     async fn an_aged_quota_hold_prevents_idle_reaping_without_spending_retry_budget() {
         with_managed(|scope| {
             Box::pin(async move {
-                let mut live = managed_control_session(scope, "quota-idle-hold").await;
+                let mut live =
+                    managed_control_session(scope, "quota-idle-hold", "claude", None).await;
                 let id = live.id().to_owned();
                 live.park("original work").await;
                 std::fs::write(
@@ -1635,10 +1689,13 @@ mod tests {
                     (Utc::now() - chrono::Duration::days(1)).timestamp_millis(),
                 );
                 live.make_quota_due();
-                let frontier = live.state.acp_event_store.highest_seq(&id);
+                let frontier = live.state.acp_event_store.highest_seq(&id).unwrap();
                 let requests = live.native.requests();
                 super::super::idle::reap_idle_workers(&live.state).await;
-                assert_eq!(live.state.acp_event_store.highest_seq(&id), frontier);
+                assert_eq!(
+                    live.state.acp_event_store.highest_seq(&id).unwrap(),
+                    frontier
+                );
                 assert_eq!(live.native.requests(), requests);
                 assert_eq!(
                     live.state.acp_supervisor.current_lease(&id),
@@ -1766,6 +1823,8 @@ mod tests {
                         } else {
                             "quota-background-manual"
                         },
+                        "claude",
+                        None,
                     )
                     .await;
                     let id = live.id().to_owned();
@@ -1787,7 +1846,7 @@ mod tests {
                         .acp_event_store
                         .record(
                             &id,
-                            live.state.acp_event_store.highest_seq(&id) + 1,
+                            live.state.acp_event_store.highest_seq(&id).unwrap() + 1,
                             &history,
                             &crate::acp::event_sender::EventMetadata::history(),
                         )
@@ -1864,12 +1923,15 @@ mod tests {
                             .queued_prompts
                             .push(queued);
                     }
-                    let frontier = live.state.acp_event_store.highest_seq(&id);
+                    let frontier = live.state.acp_event_store.highest_seq(&id).unwrap();
                     live.state
                         .session_service
                         .drain_queued_prompts_once(&id)
                         .await;
-                    assert_eq!(live.state.acp_event_store.highest_seq(&id), frontier);
+                    assert_eq!(
+                        live.state.acp_event_store.highest_seq(&id).unwrap(),
+                        frontier
+                    );
                     let submission = live.state.session_service.prompt_submission(&id).await;
                     let kind = if automatic {
                         QuotaResume::Automatic { park_seq: park.seq }

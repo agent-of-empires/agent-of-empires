@@ -32,7 +32,7 @@ use crate::tmux::PaneCursor;
 /// bytes anyway, and an unbounded accumulator would let a malformed stream
 /// grow it forever).
 const OSC52_MAX_PAYLOAD: usize = 2 * 1024 * 1024;
-
+const INPUT_WRITE_BUDGET: Duration = Duration::from_secs(5);
 fn new_parser(rows: u16, cols: u16, scrollback: usize) -> vt100::Parser {
     vt100::Parser::new(
         NonZeroU16::new(rows).unwrap_or(NonZeroU16::MIN),
@@ -40,7 +40,6 @@ fn new_parser(rows: u16, cols: u16, scrollback: usize) -> vt100::Parser {
         scrollback,
     )
 }
-const INPUT_WRITE_BUDGET: Duration = Duration::from_secs(5);
 
 #[derive(Clone, Copy, PartialEq)]
 enum Osc52State {

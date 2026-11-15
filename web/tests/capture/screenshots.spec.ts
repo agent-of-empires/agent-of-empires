@@ -106,6 +106,41 @@ base("web dashboard surfaces", async ({ page }, testInfo) => {
   }
 });
 
+base("sidebar grouped by session status", async ({ page }, testInfo) => {
+  const serve = await spawnAoeServe({
+    authMode: "none",
+    workerIndex: testInfo.workerIndex,
+    parallelIndex: testInfo.parallelIndex,
+    seedFn: ({ home, env }) => {
+      for (const title of ["auth-service", "web-frontend", "api-server"] as const) {
+        const dir = join(home, title);
+        initWorkingRepo(dir, env);
+        writeFiles(dir, { "README.md": `# ${title}\n` });
+        commitAll(dir, "init", env);
+        const res = spawnSync(resolveAoeBinary(), ["add", dir, "-t", title, "-c", "claude"], { env });
+        if (res.status !== 0) {
+          throw new Error(`aoe add ${title} failed: ${res.stderr?.toString() ?? "<none>"}`);
+        }
+      }
+    },
+  });
+
+  try {
+    await page.emulateMedia({ reducedMotion: "reduce" });
+    await page.setViewportSize(DESKTOP);
+    await page.goto(`${serve.baseUrl}/`);
+    await page.getByRole("link").filter({ hasText: "api-server" }).first().waitFor({ timeout: 15_000 });
+
+    // Status grouping renders one bucket per execution status, each holding its own session.
+    await page.getByTestId("sidebar-axis-toggle").click();
+    await page.getByTestId("sidebar-axis-option-status").click();
+    await page.getByTestId("sidebar-group-header").first().waitFor({ timeout: 10_000 });
+    await shot(page, "web/sidebar-grouping.png");
+  } finally {
+    await serve.stop();
+  }
+});
+
 const ACP_SCRIPT = {
   turns: [
     {

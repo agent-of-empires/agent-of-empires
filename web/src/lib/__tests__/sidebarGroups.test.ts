@@ -7,17 +7,19 @@ import {
   buildNestedSidebarGroups,
   buildOrgGroups,
   buildSessionGroups,
+  buildStatusGroups,
   nestedSidebarGroupHasLiveWorkspace,
   NO_ORG_GROUP_ID,
   repoGroupToSidebarGroup,
   sidebarGroupHasLiveWorkspace,
+  statusGroupId,
   UNGROUPED_GROUP_ID,
   type SidebarGroup,
 } from "../sidebarGroups";
 import { MULTI_REPO_GROUP_ID, SCRATCH_GROUP_ID } from "../../hooks/useRepoGroups";
 import type { SidebarSortMode } from "../sidebarSort";
 import { IDLE_DECAY_WINDOW_MS } from "../session";
-import type { RepoGroup, SessionResponse, Workspace } from "../types";
+import type { RepoGroup, SessionResponse, SessionStatus, Workspace } from "../types";
 
 function session(over: Partial<SessionResponse> = {}): SessionResponse {
   return {
@@ -284,6 +286,58 @@ describe("buildOrgGroups", () => {
     const [org] = buildOrg([repoGroup("/a", { remoteOwner: "acme" }), repoGroup("/b", { remoteOwner: "acme" })]);
     expect(org!.repos[0]!.capabilities).toMatchObject({ reorder: false, appearance: true });
     expect(wsIds(org!.org)).toEqual(["/a-w", "/b-w"]);
+  });
+});
+
+describe("buildStatusGroups", () => {
+  const buildStatus = (workspaces: Workspace[], isCollapsed: (groupId: string) => boolean = () => false) =>
+    buildStatusGroups(workspaces, {
+      idleDecayWindowMs: IDLE_DECAY_WINDOW_MS,
+      sortMode: "lastActivity",
+      isCollapsed,
+    });
+
+  it("buckets by status in the Attention sort's order", () => {
+    const groups = buildStatus([
+      ws("w-idle", "", { status: "Idle" }),
+      ws("w-waiting", "", { status: "Waiting" }),
+      ws("w-running", "", { status: "Running" }),
+      ws("w-error", "", { status: "Error" }),
+    ]);
+    expect(groups.map((g) => [g.id, g.displayName, g.kind])).toEqual([
+      ["status:Waiting", "Waiting", "status"],
+      ["status:Error", "Error", "status"],
+      ["status:Idle", "Idle", "status"],
+      ["status:Running", "Running", "status"],
+    ]);
+    expect(groups.map(wsIds)).toEqual([["w-waiting"], ["w-error"], ["w-idle"], ["w-running"]]);
+  });
+
+  it("ranks an unrecognised status with Unknown and transients last", () => {
+    const fromNewerServer = workspace("w-new", [session({ id: "n", status: "Paused" as SessionStatus })]);
+    const groups = buildStatus([
+      ws("w-starting", "", { status: "Starting" }),
+      fromNewerServer,
+      ws("w-idle", "", { status: "Idle" }),
+    ]);
+    expect(groups.map((g) => g.displayName)).toEqual(["Idle", "Paused", "Starting"]);
+  });
+
+  it("splits a workspace whose sessions span statuses, keeping its real id", () => {
+    const [waiting, running] = buildStatus([
+      workspace("w1", [session({ id: "a", status: "Waiting" }), session({ id: "b", status: "Running" })]),
+    ]);
+    expect([waiting!.id, running!.id]).toEqual(["status:Waiting", "status:Running"]);
+    expect([wsIds(waiting!), wsIds(running!)]).toEqual([["w1"], ["w1"]]);
+    expect(waiting!.workspaces[0]!.key).not.toBe(running!.workspaces[0]!.key);
+    expect(waiting!.workspaces[0]!.workspace.sessions.map((s) => s.id)).toEqual(["a"]);
+    expect(running!.workspaces[0]!.workspace.sessions.map((s) => s.id)).toEqual(["b"]);
+  });
+
+  it("reflects collapse state and exposes no repo-only affordances", () => {
+    const [group] = buildStatus([ws("w1", "", { status: "Waiting" })], (id) => id === statusGroupId("Waiting"));
+    expect(group!.collapsed).toBe(true);
+    expect(group!.capabilities).toEqual({ appearance: false, reorder: false, create: "generic" });
   });
 });
 

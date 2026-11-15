@@ -8,7 +8,7 @@ aoe
 
 The TUI starts or reuses the local Daemon through its private Unix socket and reads canonical session rows from it. Starting the TUI does not open a web listener. The shared Daemon keeps running when you quit the TUI; `aoe serve --stop` stops it.
 
-If startup or connection fails, the TUI shows the diagnostic and masks daemon-owned session state. Press `r` to reconnect or retry local startup after fixing the cause, or `q` to quit.
+If startup or connection fails, the TUI shows the diagnostic and masks daemon-owned session state. Press `r` to reconnect or retry local startup after fixing the cause, or `q` to quit. A Daemon left over from before an upgrade shows as **Outdated** instead: when aoe can restart it, `r` does so in place and reconnects; otherwise the dialog says how and `r` checks again. See [Starting the server](guides/web-dashboard.md#starting-the-server).
 
 | Key | Action |
 |-----|--------|

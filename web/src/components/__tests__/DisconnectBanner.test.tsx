@@ -42,7 +42,7 @@ describe("DisconnectBanner", () => {
     const { container } = render(<Banner />);
     expect(container.firstChild).toBeNull();
     act(() => setServerDown(true));
-    expect(screen.getByRole("alert").textContent).toContain("Server unreachable");
+    expect(screen.getByRole("alert").textContent).toBe("Daemon unreachable. Reconnecting…");
     act(() => setServerDown(false));
 
     const status = screen.getByRole("status");

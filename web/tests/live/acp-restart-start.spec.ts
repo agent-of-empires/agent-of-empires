@@ -4,7 +4,7 @@ import { existsSync, readFileSync } from "node:fs";
 import { join } from "node:path";
 import { test, expect } from "../helpers/liveTest";
 import { listSessions, waitForSessions } from "../helpers/aoeServe";
-import { replayJson } from "../helpers/acp";
+import { replayJson, waitForAcpReady } from "../helpers/acp";
 
 test("Restart on the startup line replaces a start stuck in session/new, again if the replacement stalls too", async ({
   page,
@@ -41,12 +41,15 @@ test("Restart on the startup line replaces a start stuck in session/new, again i
   const line = page.getByTestId("startup-wait-line");
   await expect(line).toBeVisible({ timeout: 15_000 });
   await expect.poll(stalls, { timeout: 15_000 }).toBe(1);
-  const restart = line.getByRole("button", { name: "Restart Claude Code" });
+  const restart = line.getByTestId("startup-wait-restart");
   await expect(restart).toHaveCount(0);
 
-  // The line says the composer is open; a prompt the daemon accepts now is stopped by a restart.
+  // Wait for current governed prompt-intent admission, not Native readiness.
   const composer = page.locator('textarea[name="input"]');
   await composer.fill(PROMPT);
+  await expect(page.getByRole("button", { name: "Pending until Claude Code is ready", exact: true })).toBeEnabled({
+    timeout: 15_000,
+  });
   // Stop and the caption are optimistic; the response proves the daemon took the prompt before Restart.
   const admitted = page.waitForResponse(
     (r) => r.url().endsWith("/acp/prompt") && r.request().postDataJSON()?.text === PROMPT,
@@ -66,8 +69,11 @@ test("Restart on the startup line replaces a start stuck in session/new, again i
   );
   const restarted = page.waitForResponse((r) => r.url().endsWith("/acp/restart") && r.request().method() === "POST");
   await restart.click();
+  await page.getByTestId("startup-fresh-confirm").click();
   const res = await restarted;
-  expect(res.request().postDataJSON()).toEqual({});
+  const firstRecovery = res.request().postDataJSON();
+  expect(firstRecovery).toMatchObject({ recovery: { action: "fresh", revision: expect.any(Array) } });
+  expect(firstRecovery.recovery.revision).toHaveLength(32);
   expect(res.status(), await res.text()).toBe(200);
 
   // The restart's own stop has reached this dashboard, and the replacement is stuck as well.
@@ -83,7 +89,13 @@ test("Restart on the startup line replaces a start stuck in session/new, again i
   );
   const again = page.waitForResponse((r) => r.url().endsWith("/acp/restart") && r.request().method() === "POST");
   await restart.click();
-  expect((await again).status()).toBe(200);
+  await page.getByTestId("startup-fresh-confirm").click();
+  const second = await again;
+  expect(second.status(), await second.text()).toBe(200);
+  const secondRecovery = second.request().postDataJSON();
+  expect(secondRecovery).toMatchObject({ recovery: { action: "fresh", revision: expect.any(Array) } });
+  expect(secondRecovery.recovery.revision).toHaveLength(32);
+  expect(secondRecovery.recovery.revision).not.toEqual(firstRecovery.recovery.revision);
 
   await expect
     .poll(async () => (await listSessions(serve.baseUrl)).find((s) => s.id === session!.id)?.acp_worker_state, {
@@ -98,6 +110,7 @@ test("Restart on the startup line replaces a start stuck in session/new, again i
   expect(status).not.toBe("error");
   await expect(page.getByText(PROMPT)).toBeVisible();
   await expect(composer).toBeEnabled();
+  await waitForAcpReady(serve.baseUrl, session!.id);
   // The transcript's row for that empty turn doesn't carry the stop reason, so the event log is the check.
   const events = (JSON.parse(await replayJson(serve.baseUrl, session!.id)) as { event: Record<string, unknown> }[]).map(
     ({ event }) => event,

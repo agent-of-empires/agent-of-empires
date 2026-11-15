@@ -28,6 +28,9 @@ pub struct AgentProfile {
     pub yolo_mode_id: Option<&'static str>,
     /// Native agent whose on-disk configuration carries conversation state.
     pub native_config_agent: Option<&'static str>,
+    /// When true, the agent implements the ACP subagents RFD, so aoe declares
+    /// the client capability and each subagent arrives as a child session.
+    pub supports_subagents: bool,
 }
 
 fn matches_alias(aliases: &[&str], text: &str) -> bool {
@@ -100,6 +103,7 @@ pub const DEFAULT: AgentProfile = AgentProfile {
     emits_heartbeat_keepalives: false,
     yolo_mode_id: None,
     native_config_agent: None,
+    supports_subagents: false,
 };
 
 /// Claude via `claude-agent-acp`.
@@ -114,6 +118,7 @@ pub const CLAUDE: AgentProfile = AgentProfile {
     emits_heartbeat_keepalives: true,
     yolo_mode_id: Some("bypassPermissions"),
     native_config_agent: Some("claude"),
+    supports_subagents: true,
 };
 
 /// Legacy alias key carried by older session records (`agent_name="claude-code"`).

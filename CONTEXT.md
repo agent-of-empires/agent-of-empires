@@ -129,6 +129,16 @@ Agent Client Protocol. The JSON-RPC protocol AoE speaks to an Agent in Structure
 The ACP-speaking program for an Agent, either native or a bundled shim.
 _Avoid_: ACP server, agent (for the adapter process)
 
+**Proxy**:
+A plugin-shipped per-session process between the Worker and an ACP adapter that translates the adapter's own `_meta` into Primitives. It announces itself with a hello on `initialize`.
+
+**Primitive**:
+A generic, versioned `_meta.aoe` annotation core consumes in place of any agent-specific `_meta`.
+
+**Lease**:
+An expiring hold in a Primitive that keeps a Session working with no further frames; it drains on its own if the Proxy dies.
+_Avoid_: lock
+
 **Agent capability**:
 A feature an Agent advertises over ACP: models, modes, thinking levels.
 _Avoid_: capability (unqualified; that is the plugin permission)

@@ -2857,7 +2857,7 @@ async fn set_session_id(profile: &str, args: SetSessionIdArgs) -> Result<()> {
                             "terminal handoff pane is live; close it explicitly in tmux before selecting a target");
                     }
                 } else {
-                    complete.ensure_only_preexisting_live_panes(
+                    complete.ensure_only_preexisting_panes(
                         launch.birth_inventory.as_ref().context("missing pre-birth physical inventory")?,
                     )?;
                 }
@@ -2905,7 +2905,7 @@ async fn set_session_id(profile: &str, args: SetSessionIdArgs) -> Result<()> {
                 if stage == crate::session::TerminalHandoffStage::ProjectionCleanupOwed {
                     pending.stage = crate::session::TerminalHandoffStage::TerminalLaunchOwed;
                 }
-                // Retain the prior attempt as evidence, never as proof of an unrecorded birth.
+                // Keep pending.launch as prior-attempt evidence, not proof of an unrecorded birth.
             }
             Ok(inst.title.clone())
         })
@@ -3116,15 +3116,22 @@ fn resolve_base_target(inst: &crate::session::Instance, repo: Option<&str>) -> R
             ),
             None => bail!("Unknown repo '{}'. This session has: {}", name, names()),
         },
-        None if inst.workspace_info.is_some() => bail!(
-            "This session is a multi-repo workspace, and each repo has its own diff base.\nPass \
-             --repo <name> to pick one. Available: {}",
-            names()
-        ),
-        None => Ok(BaseTarget {
-            repo_name: None,
-            validate_path: inst.project_path.clone(),
-        }),
+        None => match inst.all_repos() {
+            // A single-repo workspace has one unambiguous entry.
+            [only] => Ok(BaseTarget {
+                repo_name: Some(only.name.clone()),
+                validate_path: only.worktree_path.clone(),
+            }),
+            _ if inst.workspace_info.is_some() => bail!(
+                "This session is a multi-repo workspace, and each repo has its own diff base.\nPass \
+                 --repo <name> to pick one. Available: {}",
+                names()
+            ),
+            _ => Ok(BaseTarget {
+                repo_name: None,
+                validate_path: inst.project_path.clone(),
+            }),
+        },
     }
 }
 
@@ -3290,6 +3297,15 @@ mod set_base_target_tests {
             err.contains("--repo") && err.contains("api, web"),
             "should demand a repo and list them, got: {err}"
         );
+    }
+
+    #[test]
+    fn single_repo_workspace_needs_no_repo_name() {
+        let mut inst = workspace_instance();
+        inst.workspace_info.as_mut().unwrap().repos.truncate(1);
+        let target = resolve_base_target(&inst, None).expect("the only repo resolves");
+        assert_eq!(target.repo_name.as_deref(), Some("api"));
+        assert_eq!(target.validate_path, "/ws/api");
     }
 
     #[test]

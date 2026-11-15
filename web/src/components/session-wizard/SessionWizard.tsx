@@ -28,7 +28,7 @@ import {
 } from "../../lib/api";
 import { VolumeIgnoresGlobDialog } from "./VolumeIgnoresGlobDialog";
 import { HooksTrustDialog } from "./HooksTrustDialog";
-import { ACP_CAPABLE_TOOLS, isAcpEligible } from "../../lib/acpCapableTools";
+import { ACP_CAPABLE_TOOLS, acpAdapterMissing, isAcpEligible, structuredAvailable } from "../../lib/acpCapableTools";
 import { safeGetItem, safeSetItem } from "../../lib/safeStorage";
 import { toastBus } from "../../lib/toastBus";
 import { normalizeProjectPathKey, overridesForPath } from "../../lib/registeredProjects";
@@ -127,6 +127,9 @@ const PANEL_TITLE: Record<Panel, string> = {
 
 // Hook output appears only for creates slow enough to notice.
 const PROGRESS_DELAY_MS = 800;
+const PROJECT_FETCH_DELAY_MS = 300;
+/** The agent-list project key of a scratch create; NUL can't occur in a path. */
+const SCRATCH_PROJECT = "\0scratch";
 const PROGRESS_POLL_MS = 700;
 // Retries after a dropped connection; the idempotency key makes them join the running create.
 const NETWORK_RETRIES = 3;
@@ -167,7 +170,8 @@ function waitUntilVisible(): Promise<void> {
 function worktreeSummary(data: WizardData): string {
   const name = data.worktreeBranch.trim() || "auto";
   if (data.attachExisting) return `${name}, existing branch`;
-  return data.baseBranch.trim() ? `${name}, new from ${data.baseBranch.trim()}` : `${name}, new branch`;
+  const branch = data.baseBranch.trim() ? `${name}, new from ${data.baseBranch.trim()}` : `${name}, new branch`;
+  return data.useWorkspace || data.extraRepoPaths.length > 0 ? `${branch}, workspace` : branch;
 }
 
 const basename = (path: string) => path.replace(/\/+$/, "").split("/").pop() || path;
@@ -216,6 +220,7 @@ export function SessionWizard({
     agents: [],
     agentsStatus: "loading",
     agentsFor: null,
+    agentsProject: null,
     groups: [],
     groupsFor: null,
     profiles: [],
@@ -231,6 +236,7 @@ export function SessionWizard({
   // A Retry found the Container runtime still down after a sandbox_unavailable failure.
   const [runtimeDown, setRuntimeDown] = useState(false);
   const [rechecking, setRechecking] = useState(false);
+  const viewGroupRef = useRef<HTMLDivElement>(null);
   const offline = useServerDown();
   const [progress, setProgress] = useState<CreateProgress | null>(null);
   const [progressKey, setProgressKey] = useState<string | null>(null);
@@ -318,21 +324,32 @@ export function SessionWizard({
     };
   }, [state.data.profile, groupsKey]);
 
-  // A custom agent's base comes from the profile the session is created in. Like Groups, a list
-  // is read only for the profile it was fetched for, so a switch never shows the last one as ready.
+  // A list is read only for the profile it was fetched for, and its `acp_create_ready` only for
+  // the live project; until the debounced fetch answers, Structured view stays available.
   const agentsProfile = state.data.profile || servedProfile;
   const agentsKey = agentsProfile ?? "";
-  const { agents, agentsStatus } = useMemo(() => agentsView(state, agentsKey), [state, agentsKey]);
+  const projectKey = state.data.scratch ? SCRATCH_PROJECT : state.data.path;
+  const [fetchProjectKey, setFetchProjectKey] = useState(projectKey);
+  useEffect(() => {
+    const delay = setTimeout(() => setFetchProjectKey(projectKey), PROJECT_FETCH_DELAY_MS);
+    return () => clearTimeout(delay);
+  }, [projectKey]);
+  const { agents, agentsStatus } = useMemo(
+    () => agentsView(state, agentsKey, projectKey),
+    [state, agentsKey, projectKey],
+  );
   useEffect(() => {
     let alive = true;
     let retry: ReturnType<typeof setTimeout> | undefined;
+    const scratch = fetchProjectKey === SCRATCH_PROJECT;
+    const project = { path: scratch ? "" : fetchProjectKey, scratch };
     const load = (attempt: number) =>
-      void fetchProfileAgents(agentsProfile || undefined).then((list) => {
+      void fetchProfileAgents(agentsProfile || undefined, project).then((list) => {
         if (!alive) return;
         if (Array.isArray(list)) {
-          // The app-wide names describe the served profile, not the one being created in.
+          // The app-wide names describe the served profile; the project doesn't change them.
           if (agentsProfile === servedProfile) setAgentNames(list);
-          return dispatch({ type: "SET_AGENTS", agents: list, agentsFor: agentsKey });
+          return dispatch({ type: "SET_AGENTS", agents: list, agentsFor: agentsKey, agentsProject: fetchProjectKey });
         }
         const missing = list === "profile_not_found";
         dispatch({ type: "AGENTS_FAILED", agentsFor: agentsKey, missing });
@@ -343,7 +360,7 @@ export function SessionWizard({
       alive = false;
       clearTimeout(retry);
     };
-  }, [agentsProfile, agentsKey, servedProfile]);
+  }, [agentsProfile, agentsKey, servedProfile, fetchProjectKey]);
 
   useEffect(() => {
     const generations = defaultsGeneration;
@@ -439,9 +456,9 @@ export function SessionWizard({
     };
   }, [probePath]);
 
-  const directEdits = useRef({ sandboxEnabled: 0, useWorktree: 0 });
+  const directEdits = useRef({ sandboxEnabled: 0, useWorktree: 0, useWorkspace: 0 });
   const handleChange = useCallback((field: string, value: unknown) => {
-    if (field === "sandboxEnabled" || field === "useWorktree") directEdits.current[field]++;
+    if (field === "sandboxEnabled" || field === "useWorktree" || field === "useWorkspace") directEdits.current[field]++;
     dispatch({ type: "SET_FIELD", field, value });
   }, []);
 
@@ -523,7 +540,7 @@ export function SessionWizard({
           commandMaps: commandMapsFromSettings(settings),
         });
         // The confirmation resets earlier edits, not choices made while this read was pending.
-        for (const field of ["sandboxEnabled", "useWorktree"] as const) {
+        for (const field of ["sandboxEnabled", "useWorktree", "useWorkspace"] as const) {
           if (directEdits.current[field] !== editsAtSelection[field]) {
             dispatch({ type: "SET_FIELD", field, value: latest[field] });
           }
@@ -697,9 +714,10 @@ export function SessionWizard({
     const body = {
       ...buildCreateRequest(
         d,
-        isAcpEligible(
+        structuredAvailable(
           d.tool,
           agents.find((a) => a.name === d.tool),
+          d,
         ),
       ),
       idempotency_key: newIdempotencyKey(),
@@ -789,11 +807,26 @@ export function SessionWizard({
         await handleSubmit({}, true);
         return;
       }
-      case "launch_without_sandbox":
+      case "launch_without_sandbox": {
+        const sent = state.data;
+        const agent = agents.find((a) => a.name === sent.tool);
         handleChange("sandboxEnabled", false);
+        // On the host a missing adapter turns Structured into Terminal, so show that rather than send it.
+        if (
+          sent.useStructuredView &&
+          structuredAvailable(sent.tool, agent, sent) &&
+          !structuredAvailable(sent.tool, agent, { ...sent, sandboxEnabled: false })
+        ) {
+          // The box held focus and is gone, so focus the row that explains why nothing launched.
+          requestAnimationFrame(() =>
+            viewGroupRef.current?.querySelector<HTMLElement>('[aria-checked="true"]')?.focus(),
+          );
+          return;
+        }
         // A relaunch, not a retry: handleSubmit sends it under a new key.
         await handleSubmit({ sandboxEnabled: false });
         return;
+      }
       case "change_image":
         setPanel("sandbox");
         return;
@@ -828,6 +861,9 @@ export function SessionWizard({
   };
   const selectedAgent = agents.find((a) => a.name === d.tool);
   const acpCapable = isAcpEligible(d.tool, selectedAgent);
+  // `agents` is the list loaded for the selected Profile and project, whose hooks `acp_create_ready` counts.
+  const adapterMissing = acpCapable && acpAdapterMissing(selectedAgent, d);
+  const structuredOn = acpCapable && !adapterMissing && d.useStructuredView;
   const isHostOnly = selectedAgent?.host_only ?? false;
   const hostOnlyReason = `${d.tool} runs on the host only`;
   const worktreeBlocked = d.scratch
@@ -843,8 +879,7 @@ export function SessionWizard({
       ? `${state.dockerRuntimeName ?? "Container runtime"} is not running`
       : null;
   // Locked on without touching the stored value, so another agent gets it back.
-  const alwaysYolo =
-    (acpCapable && d.useStructuredView ? selectedAgent?.acp_always_yolo : selectedAgent?.always_yolo) === true;
+  const alwaysYolo = (structuredOn ? selectedAgent?.acp_always_yolo : selectedAgent?.always_yolo) === true;
   const agentCustomized = !!(d.extraArgs || d.commandOverride || d.customInstruction);
   const openPanel = (next: Panel) => () => setPanel(next);
   const effectiveProfile = d.profile || servedProfile;
@@ -978,10 +1013,16 @@ export function SessionWizard({
           <SegmentedRow
             label="View"
             testId="wizard-view-row"
-            value={acpCapable && d.useStructuredView ? "structured" : "terminal"}
+            groupRef={viewGroupRef}
+            value={structuredOn ? "structured" : "terminal"}
             onChange={(v) => handleChange("useStructuredView", v === "structured")}
             options={[
-              { value: "structured", label: "Structured", name: "Structured view", disabled: !acpCapable },
+              {
+                value: "structured",
+                label: "Structured",
+                name: "Structured view",
+                disabled: !acpCapable || adapterMissing,
+              },
               { value: "terminal", label: "Terminal", name: "Terminal view" },
             ]}
             summary={
@@ -991,9 +1032,11 @@ export function SessionWizard({
                   : selectedAgent?.kind === "custom"
                     ? "needs agent_acp_cmd"
                     : "no ACP adapter, terminal only"
-                : d.useStructuredView
-                  ? "plan, tool calls and diffs as cards"
-                  : "the Agent's own terminal UI"
+                : adapterMissing
+                  ? "ACP adapter not installed"
+                  : d.useStructuredView
+                    ? "plan, tool calls and diffs as cards"
+                    : "the Agent's own terminal UI"
             }
           />
         )}

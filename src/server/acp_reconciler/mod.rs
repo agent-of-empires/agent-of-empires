@@ -15,7 +15,7 @@ use tokio::task::JoinSet;
 
 use super::AppState;
 use crate::acp::event_store::ControlKnowledge::{Indeterminate, Known};
-use crate::acp::event_store::EventStore;
+use crate::acp::event_store::{ControlKnowledge, EventStore};
 use crate::daemon::AcpWorkerState;
 use crate::session::Instance;
 
@@ -215,6 +215,35 @@ fn is_untriaged_structured(i: &Instance) -> bool {
 /// Eligible for a reconciler-driven worker.
 pub(super) fn is_resumable(i: &Instance) -> bool {
     is_untriaged_structured(i) && !i.is_idle_dormant() && i.launch_is_finalized()
+}
+
+/// Scoped `(user-prompt turn, agent-initiated turn)` knowledge in the log.
+/// Only the first goes to attach: cached prompt completion cannot close an agent turn.
+fn open_turn_kinds(store: &EventStore, id: &str) -> anyhow::Result<ControlKnowledge<(bool, bool)>> {
+    match (
+        store.has_in_flight_turn(id)?,
+        store.has_open_agent_turn(id)?,
+    ) {
+        (Known(prompt), Known(agent)) => Ok(Known((prompt, agent))),
+        _ => Ok(Indeterminate),
+    }
+}
+
+/// `query_store` after the writer has stored every queued worker event: a probe that
+/// gates a stop or replacement must not miss work still in the write queue.
+async fn query_flushed<T: Send + 'static>(
+    supervisor: &Arc<crate::acp::supervisor::Supervisor<crate::acp::supervisor::ChannelSink>>,
+    store: &Arc<EventStore>,
+    id: &str,
+    what: &str,
+    f: impl FnOnce(&EventStore, &str) -> T + Send + 'static,
+) -> Option<T> {
+    let supervisor = Arc::clone(supervisor);
+    query_store(store, id, what, move |s, id| {
+        supervisor.flush_events();
+        f(s, id)
+    })
+    .await
 }
 
 /// Runs a blocking event-store query for `id` off the runtime; `None` (logged) if the task panicked.
@@ -506,17 +535,45 @@ pub async fn reconcile_acp_workers(
             attempted.insert(id);
             continue;
         }
-        match query_control(
+        match query_flushed(
+            &state.acp_supervisor,
             &state.acp_event_store,
             &id,
-            "in-flight turn",
-            |store, id| store.has_in_flight_turn(id),
+            "open turn",
+            open_turn_kinds,
         )
         .await
         {
-            Ok(Known(in_flight)) => target.in_flight_turn = in_flight,
-            Ok(Indeterminate) => target.historical_control_known = false,
-            Err(_) => continue,
+            Some(Ok(Known((prompt, agent)))) => {
+                target.in_flight_turn = prompt;
+                target.agent_turn_open = agent;
+            }
+            Some(Ok(Indeterminate)) => target.historical_control_known = false,
+            Some(Err(error)) => {
+                tracing::warn!(target: "acp.supervisor", session = %id, %error, "open turn query refused");
+                continue;
+            }
+            None => continue,
+        }
+        match query_flushed(
+            &state.acp_supervisor,
+            &state.acp_event_store,
+            &id,
+            "live work",
+            |store, id| store.holds_live_work(id),
+        )
+        .await
+        {
+            Some(Ok(Known(live))) => target.holds_live_work = live,
+            Some(Ok(Indeterminate)) => {
+                target.historical_control_known = false;
+                target.holds_live_work = true;
+            }
+            Some(Err(error)) => {
+                tracing::warn!(target: "acp.supervisor", session = %id, %error, "live work query refused");
+                continue;
+            }
+            None => continue,
         }
         if target.historical_control_known
             && record_and_check_respawn_budget(respawn_history, &id, Instant::now())
@@ -548,18 +605,9 @@ pub async fn reconcile_acp_workers(
         return;
     }
 
-    // Live served-profile config bounds cold resumes; the supervisor owns the total cap.
-    let namespace = state.profile_namespace.read().await;
-    let served = state.served_profile().to_string();
-    let live_max_workers = tokio::task::spawn_blocking(move || {
-        crate::session::config::profile_config::resolve_config_or_warn(&served)
-            .acp
-            .max_concurrent_workers
-    })
-    .await
-    .unwrap_or_else(|_| state.acp_supervisor.max_concurrent_workers());
-    drop(namespace);
-    let resume_limit = MAX_CONCURRENT_RESUMES.min(live_max_workers).max(1);
+    let resume_limit = MAX_CONCURRENT_RESUMES
+        .min(state.acp_supervisor.max_concurrent_workers())
+        .max(1);
     let semaphore = Arc::new(Semaphore::new(resume_limit as usize));
     let mut set: JoinSet<(String, ResumeOutcome)> = JoinSet::new();
     #[cfg(test)]
@@ -841,6 +889,7 @@ mod tests {
             extra_args: String::new(),
             command_override: String::new(),
             extra_repo_paths: Vec::new(),
+            workspace: false,
             repo_base_branches: Vec::new(),
             scratch: false,
             trust_hooks: None,
@@ -1642,8 +1691,10 @@ mod tests {
         with_managed(|scope| {
             Box::pin(async move {
                 for shape in ["missing", "null", "v3"] {
-                    let mut live =
-                        crate::server::test_support::managed_control_session(scope, shape).await;
+                    let mut live = crate::server::test_support::managed_control_session(
+                        scope, shape, "claude", None,
+                    )
+                    .await;
                     let id = live.id().to_owned();
                     live.park("interrupted explicit intent").await;
                     let park = match live.state.acp_event_store.rate_limit_park(&id).unwrap() {
@@ -1810,6 +1861,75 @@ mod tests {
         }
     }
 
+    /// An unreadable event log neither spawns nor pins the session: it stays
+    /// eligible, uncharged, and resumes on the first pass after the log recovers.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn a_failed_open_turn_probe_retries_after_recovery() {
+        let id = "s-probe-fails";
+        let (_home, state, _project) = test_state(id);
+        let mut tick = Tick::default();
+
+        state.acp_event_store.test_set_unavailable(true);
+        tick.run(&state).await;
+        assert!(
+            !tick.attempted.contains(id),
+            "a failed probe is not an attempt"
+        );
+        assert!(
+            !tick.respawn_history.contains_key(id),
+            "and charges no budget"
+        );
+
+        state.acp_event_store.test_set_unavailable(false);
+        tick.run(&state).await;
+        assert!(tick.attempted.contains(id), "the next pass resumes it");
+    }
+
+    /// A runner retains the completion of its last user prompt and replays it on attach. An
+    /// agent-initiated turn after that prompt must not be classified as a prompt in flight
+    /// (which would let the replay close it), and only its own terminal releases the hold.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn an_agent_turn_after_a_completed_prompt_is_not_a_prompt_in_flight() {
+        use crate::acp::Event;
+        crate::acp::supervisor::test_support::managed::with_managed(|scope| Box::pin(async move {
+            let mut live = crate::server::test_support::managed_control_session(
+                scope, "independent-agent-turn", "claude", None,
+            ).await;
+            let id = live.id().to_owned();
+            let state = live.state.clone();
+            let store = &state.acp_event_store;
+            let prompt = live.start_prompt("go").await;
+            live.finish_prompt(&prompt, None).await;
+            let run = uuid::Uuid::new_v4();
+            live.native.send(serde_json::json!({
+                "jsonrpc":"2.0","method":"_omp/autonomous_turn/start",
+                "params":{"version":1,"sessionId":live.sid,"runId":run,"source":"irc"}
+            })).await;
+            live.native.send(serde_json::json!({
+                "jsonrpc":"2.0","method":"session/update","params":{"sessionId":live.sid,
+                    "update":{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"woken"}}}
+            })).await;
+            tokio::time::timeout(Duration::from_secs(10), async {
+                while !matches!(live.client.next_event().await.expect("genuine own output"),
+                    Event::AgentMessageChunk { text, .. } if text == "woken") {}
+            }).await.unwrap();
+            assert_eq!(open_turn_kinds(store, &id).unwrap(), Known((false, true)));
+            assert_eq!(store.holds_live_work(&id).unwrap(), Known(true));
+            live.native.send(serde_json::json!({
+                "jsonrpc":"2.0","method":"_omp/autonomous_turn/end",
+                "params":{"version":1,"sessionId":live.sid,"runId":run,"source":"irc","stopReason":"end_turn"}
+            })).await;
+            tokio::time::timeout(Duration::from_secs(10), async {
+                while !matches!(live.client.next_event().await.expect("genuine own terminal"),
+                    Event::Stopped { reason } if reason == "agent_idle") {}
+            }).await.unwrap();
+            assert_eq!(open_turn_kinds(store, &id).unwrap(), Known((false, false)));
+            assert_eq!(store.holds_live_work(&id).unwrap(), Known(false));
+        })).await;
+    }
+
     #[tokio::test]
     #[serial_test::serial]
     async fn a_startup_failure_rearms_the_pinned_session_under_budget() {
@@ -1927,8 +2047,13 @@ mod tests {
                 })
                 .unwrap();
                 test_support::refresh_canonical_metadata_for_test(&scope.state).await;
-                let mut original =
-                    test_support::managed_control_session(scope, "queue-drain-wake").await;
+                let mut original = test_support::managed_control_session(
+                    scope,
+                    "queue-drain-wake",
+                    "claude",
+                    None,
+                )
+                .await;
                 let id = original.id().to_owned();
                 let state = original.state.clone();
                 let sid = original.sid.clone();
@@ -2168,6 +2293,7 @@ mod tests {
         let stopped = {
             let mut instances = state.instances.write().await;
             instances[0].status = Status::Stopped;
+            crate::server::test_support::select_retained_for_test(&mut instances[0]);
             instances[0].clone()
         };
         crate::server::test_support::seed_instances_on_disk_for_test(
@@ -2182,7 +2308,27 @@ mod tests {
             "stopped admission was attempted"
         );
         assert_eq!(test_fixtures::startup_errors(&state, id), 0);
+        {
+            let instances = state.instances.read().await;
+            assert_eq!(
+                instances[0].lifecycle_generation,
+                stopped.lifecycle_generation
+            );
+            assert_eq!(instances[0].resume_intent, stopped.resume_intent);
+            assert_eq!(instances[0].acp_establishment, stopped.acp_establishment);
+        }
+        let persisted = crate::session::Storage::new_unwatched(&stopped.source_profile)
+            .unwrap()
+            .load_instances_complete()
+            .unwrap()
+            .into_iter()
+            .find(|row| row.id == id)
+            .unwrap();
+        assert_eq!(persisted.lifecycle_generation, stopped.lifecycle_generation);
+        assert_eq!(persisted.resume_intent, stopped.resume_intent);
+        assert_eq!(persisted.acp_establishment, stopped.acp_establishment);
 
+        let mut publications = state.acp_events_tx.subscribe();
         let response = crate::server::api::sessions::start_session(
             State(Arc::clone(&state)),
             Path(id.to_string()),
@@ -2192,11 +2338,47 @@ mod tests {
         .into_response();
         assert_eq!(response.status(), axum::http::StatusCode::OK);
         tick.run(&state).await;
+        let startup = tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                let frame = publications
+                    .recv()
+                    .await
+                    .expect("actual startup publication");
+                if frame.session_id == id
+                    && matches!(frame.event.as_ref(), Event::AgentStartupError { .. })
+                {
+                    break frame;
+                }
+            }
+        })
+        .await
+        .expect("the explicit background attempt reports its real startup failure");
+        let Event::AgentStartupError { message, .. } = startup.event.as_ref() else {
+            unreachable!("selected the actual startup failure");
+        };
+        let expected_error = crate::acp::supervisor::SupervisorError::UnknownAgent(
+            stopped
+                .agent_name
+                .clone()
+                .expect("the fixture selects an unknown agent"),
+        )
+        .to_string();
+        assert!(
+            message.contains(&expected_error),
+            "explicit start must reach agent resolution, not a selection refusal: {message}"
+        );
         assert_eq!(
             test_fixtures::startup_errors(&state, id),
             1,
             "explicit start must retry the fake agent without a queued prompt"
         );
+        tokio::time::timeout(Duration::from_secs(10), async {
+            while state.acp_supervisor.worker_state(id).await != AcpWorkerState::Absent {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("the explicit construction settles before checking the no-loop tick");
         tick.run(&state).await;
         assert_eq!(
             test_fixtures::startup_errors(&state, id),

@@ -17,6 +17,7 @@ export function buildCreateRequest(d: WizardData, acpCapable: boolean): CreateSe
     worktree_enabled: worktree,
     worktree_branch: worktree && d.worktreeBranchDirty && d.worktreeBranch.trim() ? d.worktreeBranch.trim() : undefined,
     create_new_branch: newBranch,
+    workspace: (newBranch && d.useWorkspace) || undefined,
     base_branch: newBranch && d.baseBranch.trim() ? d.baseBranch.trim() : undefined,
     sandbox: d.sandboxEnabled,
     sandbox_image: d.sandboxEnabled ? d.sandboxImage : undefined,

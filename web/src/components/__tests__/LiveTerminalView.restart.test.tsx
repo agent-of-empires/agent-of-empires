@@ -151,7 +151,7 @@ describe("read-only live consumers with the real socket and terminal", () => {
       socket.deliver({ type: "size_owner", is_owner: false });
       socket.deliver(frame(`passive-${surface}`));
       expect(await screen.findByText(`passive-${surface}`)).toBeTruthy();
-      expect(screen.queryByRole("button", { name: /Take over/ })).toBeNull();
+      expect(screen.queryByRole("button", { name: "Take control" })).toBeNull();
       expect(screen.queryByRole("button", { name: "Compose" })).toBeNull();
       expect(screen.queryByRole("button", { name: "Open keyboard" })).toBeNull();
       const input = screen.getByLabelText<HTMLTextAreaElement>("Live terminal input");
@@ -194,7 +194,7 @@ describe("read-only live consumers with the real socket and terminal", () => {
     expect(screen.getByRole<HTMLButtonElement>("button", { name: "Insert" }).disabled).toBe(true);
     fireEvent.keyDown(screen.getByLabelText("Message"), { key: "Enter", ctrlKey: true });
     expect(socket.sent).toHaveLength(sent);
-    expect(screen.queryByRole("button", { name: /Take over/ })).toBeNull();
+    expect(screen.queryByRole("button", { name: "Take control" })).toBeNull();
     expect(ensureSession).toHaveBeenCalledTimes(1);
     view.rerender(<TerminalView session={session} readOnly={false} />);
     expect(socket.sent).toHaveLength(sent);
@@ -202,8 +202,9 @@ describe("read-only live consumers with the real socket and terminal", () => {
     expect(socket.controls().filter(({ type }) => type === "paste")).toEqual([]);
     expect(screen.getByLabelText<HTMLTextAreaElement>("Message").value).toBe("keep this draft");
     fireEvent.click(screen.getByRole("button", { name: "Close" }));
-    fireEvent.click(screen.getByRole("button", { name: /Take over/ }));
-    expect(socket.controls().at(-1)).toEqual({ type: "claim" });
+    fireEvent.click(screen.getByRole("button", { name: "Take control" }));
+    // jsdom reports no size, so the view sends no new grid and the claim waits for its deadline.
+    await waitFor(() => expect(socket.controls().at(-1)).toEqual({ type: "claim" }), { timeout: 2000 });
     socket.deliver({ type: "size_owner", is_owner: true });
     fireEvent.click(screen.getByRole("button", { name: "Compose" }));
     expect(screen.getByLabelText<HTMLTextAreaElement>("Message").value).toBe("keep this draft");

@@ -21,6 +21,8 @@ enum Commands {
     GenSettingsKeys,
     /// Generate the web dashboard's live-stream wire types from the Rust ones
     GenLiveWire,
+    /// Generate the published `_meta.aoe` JSON Schema from the Rust types
+    GenMetaSchema,
     /// Check that contrib skill files reference valid CLI commands
     CheckSkill,
     /// Run the web dashboard backend and Vite dev server together (Ctrl-C stops both)
@@ -52,6 +54,7 @@ fn main() {
         Commands::GenDocs => generate_cli_docs(),
         Commands::GenSettingsKeys => generate_settings_keys(),
         Commands::GenLiveWire => generate_live_wire(),
+        Commands::GenMetaSchema => generate_meta_schema(),
         Commands::CheckSkill => check_skill(),
         Commands::Dev(dev) => run_dev(dev),
     }
@@ -344,6 +347,17 @@ fn generate_live_wire() {
     )
     .expect("Failed to write live wire types");
     println!("Generated live wire types at {}", path.display());
+}
+
+const META_SCHEMA_PATH: &str = "assets/aoe-meta-v1.schema.json";
+
+fn generate_meta_schema() {
+    fs::write(
+        META_SCHEMA_PATH,
+        agent_of_empires::acp::aoe_meta::schema_json(),
+    )
+    .expect("Failed to write the _meta.aoe schema");
+    println!("Generated _meta.aoe schema at {META_SCHEMA_PATH}");
 }
 
 const SETTINGS_KEYS_PATH: &str = "web/src/lib/generated/settingsKeys.ts";

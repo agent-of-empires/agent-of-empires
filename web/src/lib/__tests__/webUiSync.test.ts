@@ -8,8 +8,9 @@ vi.mock("../api", () => ({
   patchWebUiState: (...args: unknown[]) => patchWebUiState(...args),
 }));
 
-import { hydrateWebUiStateFromServer, isSyncedKey } from "../webUiSync";
+import { hydrateWebUiStateFromServer, initWebUiSync, isSyncedKey } from "../webUiSync";
 import { configureStorageSync, safeRemoveItem, safeSetItem } from "../safeStorage";
+import { STATUS_COLLAPSE_PREFIX } from "../../hooks/useStatusGroups";
 
 beforeEach(() => {
   localStorage.clear();
@@ -40,6 +41,7 @@ describe("isSyncedKey", () => {
       "aoe-repo-collapsed-/home/me/repo",
       "aoe-group-collapsed-feature",
       "aoe-nested-group-collapsed-x",
+      "aoe-status-collapsed-Waiting",
       "aoe-settings-intro-worktree", // folded Settings tab intro
     ]) {
       expect(isSyncedKey(k), k).toBe(true);
@@ -58,6 +60,13 @@ describe("isSyncedKey", () => {
     ]) {
       expect(isSyncedKey(k), k).toBe(false);
     }
+  });
+});
+
+describe("status collapse keys", () => {
+  it("syncs the prefix the status axis writes collapse state under", () => {
+    expect(STATUS_COLLAPSE_PREFIX).toBe("aoe-status-collapsed-");
+    expect(isSyncedKey(`${STATUS_COLLAPSE_PREFIX}status:Waiting`)).toBe(true);
   });
 });
 
@@ -108,5 +117,27 @@ describe("hydrateWebUiStateFromServer", () => {
 
     expect(localStorage.getItem("aoe-sidebar-axis")).toBe("repo");
     expect(patchWebUiState).not.toHaveBeenCalled();
+  });
+});
+
+// Last in the file: `initWebUiSync` is one-shot per module, so this is the only case that arms it.
+describe("status collapse sync write", () => {
+  it("sends a status-collapse write to the server after the debounce", () => {
+    vi.useFakeTimers();
+    try {
+      initWebUiSync();
+      safeSetItem(`${STATUS_COLLAPSE_PREFIX}status:Waiting`, "1");
+      expect(patchWebUiState).not.toHaveBeenCalled();
+      safeSetItem(`${STATUS_COLLAPSE_PREFIX}status:Idle`, "1");
+      expect(patchWebUiState).not.toHaveBeenCalled();
+      vi.advanceTimersByTime(400);
+      expect(patchWebUiState).toHaveBeenCalledTimes(1);
+      expect(patchWebUiState).toHaveBeenCalledWith({
+        "aoe-status-collapsed-status:Waiting": "1",
+        "aoe-status-collapsed-status:Idle": "1",
+      });
+    } finally {
+      vi.useRealTimers();
+    }
   });
 });

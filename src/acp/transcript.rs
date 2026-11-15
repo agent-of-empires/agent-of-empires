@@ -7,7 +7,9 @@ use indexmap::IndexMap;
 use serde::{Deserialize, Serialize};
 
 use super::elicitations::ElicitationAnswer;
-use super::state::{notice_id, DiffComment, DiffPreview, Event, ToolCall, ToolOutputBlock};
+use super::state::{
+    notice_id, DiffComment, DiffPreview, Event, ToolCall, ToolOutputBlock, ARGS_CUT_MARKER,
+};
 use crate::daemon::PromptAttachmentRef;
 
 /// Reasons with this prefix are hidden before the first prompt, since a never-prompted
@@ -43,6 +45,10 @@ pub struct TranscriptRow {
     /// Plugin that sent a `user_prompt` row; absent when the user typed it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub origin_plugin: Option<String>,
+    /// Ids of other queued rows folded into a `user_prompt` row, so a client that
+    /// only sees this row (snapshot or replay) still settles their optimistic rows.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub merged_prompt_ids: Vec<String>,
     /// Structured payload on a `user_diff_comments` row; `text` holds the markdown.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub diff_comments: Option<DiffCommentsPayload>,
@@ -70,7 +76,6 @@ pub enum TranscriptRowKind {
     UserPrompt,
     UserDiffComments,
     ElicitationAnswered,
-    EmptyOutput,
     ContextReset,
     SessionCleared,
     Compacted,
@@ -173,7 +178,9 @@ pub(crate) fn closes_tool_lifecycle(
         Event::AgentStartupError { .. }
             | Event::IncompatibleAgent { .. }
             | Event::AgentSwitched { .. }
-    ) || (matches!(event, Event::Stopped { .. }) && metadata.operation.is_none())
+    ) || (matches!(event, Event::Stopped { .. })
+        && metadata.operation.is_none()
+        && metadata.native_autonomous.is_none())
 }
 
 /// Folds the ACP `Event` stream into an ordered [`TranscriptRow`] list.
@@ -297,6 +304,7 @@ impl TranscriptModel {
             Event::UserPromptSent { .. } | Event::UserDiffCommentsPrompt { .. } => {
                 self.last_message_id = None;
                 self.last_thought_id = None;
+                self.thought_start_pending = false;
             }
             Event::Stopped { .. }
             | Event::AgentStartupError { .. }
@@ -410,10 +418,13 @@ impl TranscriptModel {
                 text,
                 attachments,
                 prompt_id,
+                merged_prompt_ids,
                 synthesized,
                 origin_plugin,
             } => {
-                self.begin_turn();
+                self.last_message_id = None;
+                self.last_thought_id = None;
+                self.thought_start_pending = false;
                 // A rate-limit resume continuation replays a prompt the user
                 // already saw once, before the park; render nothing so the
                 // transcript reads as an uninterrupted continuation instead
@@ -428,7 +439,16 @@ impl TranscriptModel {
                     let mut row = self.grouped_row(id, TranscriptRowKind::UserPrompt, text.clone());
                     row.attachments = attachments.clone();
                     row.origin_plugin = origin_plugin.clone();
-                    vec![self.append(row)]
+                    row.merged_prompt_ids = merged_prompt_ids.clone();
+                    // A queue drain that failed after publishing retries with the same ids.
+                    match self.rows.iter_mut().find(|r| r.id == row.id) {
+                        Some(existing) => {
+                            row.group_id = existing.group_id.clone();
+                            *existing = row;
+                            vec![patch(existing)]
+                        }
+                        None => vec![self.append(row)],
+                    }
                 }
             }
             Event::UserDiffCommentsPrompt {
@@ -438,7 +458,9 @@ impl TranscriptModel {
                 comments,
                 assembled_markdown,
             } => {
-                self.begin_turn();
+                self.last_message_id = None;
+                self.last_thought_id = None;
+                self.thought_start_pending = false;
                 let mut row = self.grouped_row(
                     format!("user-seq-{seq}"),
                     TranscriptRowKind::UserDiffComments,
@@ -471,7 +493,7 @@ impl TranscriptModel {
                 ) {
                     Vec::new()
                 } else {
-                    self.ensure_tool_start(tool_call_id, None, None, *completed_at, None)
+                    self.ensure_tool_start(tool_call_id, None, None, None, *completed_at, None)
                 };
                 self.turn_has_output = true;
                 let mut row = self.completion_row(seq, tool_call_id, *is_error, content);
@@ -504,12 +526,14 @@ impl TranscriptModel {
                 tool_call_id,
                 title,
                 args_preview,
+                prompt,
                 started_at,
                 diffs,
             } => self.on_tool_updated(
                 tool_call_id,
                 title.as_deref(),
                 args_preview.as_deref(),
+                prompt.as_deref(),
                 *started_at,
                 diffs.as_deref(),
             ),
@@ -679,6 +703,9 @@ impl TranscriptModel {
                 text.clone(),
             )],
             Event::ThinkingStarted => {
+                if metadata.native_autonomous.is_some() {
+                    return Vec::new();
+                }
                 self.turn_active = true;
                 self.turn_has_output = true;
                 if current {
@@ -782,6 +809,7 @@ impl TranscriptModel {
         tool_call_id: &str,
         title: Option<&str>,
         args_preview: Option<&str>,
+        prompt: Option<&str>,
         started_at: Option<DateTime<Utc>>,
         diffs: Option<&[DiffPreview]>,
     ) -> Vec<TranscriptDelta> {
@@ -799,6 +827,7 @@ impl TranscriptModel {
             tool_call_id,
             title,
             args_preview,
+            prompt,
             started_at.unwrap_or_else(Utc::now),
             diffs,
         );
@@ -817,6 +846,9 @@ impl TranscriptModel {
                 tool.name = title.to_string();
             }
             if let Some(args_preview) = args_preview {
+                if prompt.is_some() || !args_preview.ends_with(ARGS_CUT_MARKER) {
+                    tool.prompt = prompt.map(str::to_string);
+                }
                 tool.args_preview = args_preview.to_string();
             }
             if let Some(started_at) = started_at {
@@ -835,6 +867,7 @@ impl TranscriptModel {
         tool_call_id: &str,
         name: Option<&str>,
         args_preview: Option<&str>,
+        prompt: Option<&str>,
         started_at: DateTime<Utc>,
         diffs: Option<&[DiffPreview]>,
     ) -> Vec<TranscriptDelta> {
@@ -844,6 +877,7 @@ impl TranscriptModel {
         self.track_tool_start(tool_call_id, false);
         self.turn_has_output = true;
         let tool = ToolCall {
+            prompt: prompt.map(str::to_string),
             id: tool_call_id.to_string(),
             name: name
                 .filter(|n| !n.is_empty())
@@ -892,36 +926,6 @@ impl TranscriptModel {
         let mut row = TranscriptRow::new(row_id, format!("tool-{tool_call_id}"), kind, text);
         row.tool_call_id = Some(tool_call_id.to_string());
         row
-    }
-
-    /// Close every `tool_start` without a terminal row with a `tool_stopped`
-    /// carrying any buffered output.
-    fn sweep_open_tools(&mut self, seq: u64) -> Vec<TranscriptDelta> {
-        let now = Utc::now();
-        let mut deltas = Vec::new();
-        for index in 0..self.tools.len() {
-            let (id, tool) = self.tools.get_index_mut(index).expect("tool index");
-            if !matches!(tool, ToolLifecycle::Open(_)) {
-                if matches!(tool, ToolLifecycle::Buffered(_)) {
-                    if let Some(output) = tool.finish().into_unfinished(id) {
-                        self.retained_orphans.push(output);
-                    }
-                }
-                continue;
-            }
-            let buffered = tool.finish().text;
-            let id = id.clone();
-            let mut row = TranscriptRow::new(
-                format!("stopped-{id}-{seq}"),
-                format!("tool-{id}"),
-                TranscriptRowKind::ToolStopped,
-                buffered,
-            );
-            row.at = now;
-            row.tool_call_id = Some(id);
-            deltas.push(self.append(row));
-        }
-        deltas
     }
 
     fn remove_rows_for_tool(&mut self, tool_call_id: &str) -> Vec<TranscriptDelta> {
@@ -975,15 +979,34 @@ impl TranscriptModel {
         format!("g{}", self.group_counter)
     }
 
-    fn begin_turn(&mut self) {
-        self.last_message_id = None;
-        self.last_thought_id = None;
-        self.thought_start_pending = false;
-        let steered_continuation = self.turn_active && self.steering;
-        self.turn_active = true;
-        if !steered_continuation {
-            self.turn_has_output = false;
+    /// Close every `tool_start` without a terminal row with a `tool_stopped`
+    /// carrying any buffered output.
+    fn sweep_open_tools(&mut self, seq: u64) -> Vec<TranscriptDelta> {
+        let now = Utc::now();
+        let mut deltas = Vec::new();
+        for index in 0..self.tools.len() {
+            let (id, tool) = self.tools.get_index_mut(index).expect("tool index");
+            if !matches!(tool, ToolLifecycle::Open(_)) {
+                if matches!(tool, ToolLifecycle::Buffered(_)) {
+                    if let Some(output) = tool.finish().into_unfinished(id) {
+                        self.retained_orphans.push(output);
+                    }
+                }
+                continue;
+            }
+            let buffered = tool.finish().text;
+            let id = id.clone();
+            let mut row = TranscriptRow::new(
+                format!("stopped-{id}-{seq}"),
+                format!("tool-{id}"),
+                TranscriptRowKind::ToolStopped,
+                buffered,
+            );
+            row.at = now;
+            row.tool_call_id = Some(id);
+            deltas.push(self.append(row));
         }
+        deltas
     }
 
     fn find_tool_start(&self, tool_call_id: &str) -> Option<usize> {
@@ -1032,6 +1055,7 @@ impl TranscriptRow {
             output: Vec::new(),
             attachments: Vec::new(),
             origin_plugin: None,
+            merged_prompt_ids: Vec::new(),
             diff_comments: None,
             elicitation_answers: Vec::new(),
             async_subagent: false,
@@ -1078,6 +1102,12 @@ pub(crate) fn merge_tool_start(prev: &ToolCall, incoming: &ToolCall) -> ToolCall
             &incoming.args_preview,
             &prev.args_preview,
         ),
+        // A repeat that carries no `prompt` of its own (sparse, or bookkeeping-only
+        // args) keeps the earlier one; a repeat with its own prompt replaces it.
+        prompt: incoming.prompt.clone().or_else(|| {
+            let restates = incoming.args_preview.contains(r#""prompt""#);
+            prev.prompt.clone().filter(|_| !restates)
+        }),
         started_at: incoming.started_at.max(prev.started_at),
         parent_tool_call_id: incoming
             .parent_tool_call_id
@@ -1208,6 +1238,7 @@ mod tests {
 
     fn tool(id: &str, name: &str) -> ToolCall {
         ToolCall {
+            prompt: None,
             id: id.into(),
             name: name.into(),
             kind: "execute".into(),
@@ -1217,6 +1248,54 @@ mod tests {
             memory_recall: None,
             diffs: Vec::new(),
         }
+    }
+
+    #[test]
+    fn a_repeated_start_keeps_the_full_prompt_unless_it_restates_a_prompt() {
+        let mut prev = tool("t", "Task");
+        prev.args_preview = r#"{"prompt":"cut"#.into();
+        prev.prompt = Some("full prompt".into());
+        let mut sparse = tool("t", "Task");
+        sparse.args_preview = String::new();
+        assert_eq!(
+            merge_tool_start(&prev, &sparse).prompt.as_deref(),
+            Some("full prompt")
+        );
+        let mut changed = tool("t", "Task");
+        changed.args_preview = r#"{"prompt":"other"}"#.into();
+        assert_eq!(merge_tool_start(&prev, &changed).prompt, None);
+        let mut bookkeeping = tool("t", "Task");
+        bookkeeping.args_preview = r#"{"_aoe_title":"external_directory"}"#.into();
+        assert_eq!(
+            merge_tool_start(&prev, &bookkeeping).prompt.as_deref(),
+            Some("full prompt")
+        );
+    }
+
+    #[test]
+    fn an_update_keeps_the_stored_prompt_only_while_the_preview_stays_cut() {
+        let mut start = tool("t", "Task");
+        start.args_preview = "{\"prompt\":\"cut\u{2026}[truncated]".into();
+        start.prompt = Some("full prompt".into());
+        let m = fold([
+            started(start.clone()),
+            updated("t", None, Some(&start.args_preview), None),
+        ]);
+        assert_eq!(
+            tool_of(&m, "start-t").prompt.as_deref(),
+            Some("full prompt"),
+            "a deduplicated repeat of the cut call"
+        );
+
+        let m = fold([
+            started(start),
+            updated("t", None, Some(r#"{"prompt":"B"}"#), None),
+        ]);
+        assert_eq!(
+            tool_of(&m, "start-t").prompt,
+            None,
+            "an explicit short replacement drops the old prompt"
+        );
     }
 
     fn started(tool_call: ToolCall) -> Event {
@@ -1241,6 +1320,7 @@ mod tests {
         diffs: Option<Vec<DiffPreview>>,
     ) -> Event {
         Event::ToolCallUpdated {
+            prompt: None,
             tool_call_id: id.into(),
             title: title.map(Into::into),
             args_preview: args.map(Into::into),
@@ -1708,6 +1788,7 @@ mod tests {
         assert_eq!((m.rows().len(), m.last_seq()), (1, 1));
 
         let with_attachment = Event::UserPromptSent {
+            merged_prompt_ids: Vec::new(),
             text: "look".into(),
             attachments: vec![PromptAttachmentRef {
                 id: "att-1".into(),
@@ -1740,6 +1821,7 @@ mod tests {
             m.apply_scoped_event(
                 7,
                 &Event::UserPromptSent {
+                    merged_prompt_ids: Vec::new(),
                     text: "hi".into(),
                     attachments: Vec::new(),
                     prompt_id: prompt_id.map(Into::into),
@@ -1750,6 +1832,39 @@ mod tests {
             );
             assert_eq!(m.rows()[0].id, want, "prompt_id={prompt_id:?}");
         }
+
+        let mut m = TranscriptModel::new();
+        m.apply_scoped_event(
+            8,
+            &Event::UserPromptSent {
+                merged_prompt_ids: vec!["q2".into()],
+                text: "a\n\nb".into(),
+                attachments: Vec::new(),
+                prompt_id: Some("q1".into()),
+                synthesized: false,
+                origin_plugin: None,
+            },
+            &crate::acp::event_sender::EventMetadata::history(),
+        );
+        assert_eq!(m.rows()[0].id, "q1");
+        assert_eq!(m.rows()[0].merged_prompt_ids, ["q2"]);
+
+        // A drain retry republishes the same ids: one row, patched in place.
+        let retry = Event::UserPromptSent {
+            merged_prompt_ids: vec!["q2".into()],
+            text: "a\n\nb".into(),
+            attachments: Vec::new(),
+            prompt_id: Some("q1".into()),
+            synthesized: false,
+            origin_plugin: None,
+        };
+        let deltas = m.apply_scoped_event(
+            9,
+            &retry,
+            &crate::acp::event_sender::EventMetadata::history(),
+        );
+        assert!(matches!(deltas.as_slice(), [TranscriptDelta::Patch { id, .. }] if id == "q1"));
+        assert_eq!(m.rows().len(), 1);
 
         let m = fold([Event::UserDiffCommentsPrompt {
             intro: "look".into(),
@@ -1785,6 +1900,7 @@ mod tests {
 
         // Synthesized resume prompts are not transcript rows.
         let ev = Event::UserPromptSent {
+            merged_prompt_ids: Vec::new(),
             text: "run the nightly task".into(),
             attachments: Vec::new(),
             prompt_id: None,
@@ -1799,6 +1915,7 @@ mod tests {
 
         // A plugin-sent message keeps its sender on the row.
         let ev = Event::UserPromptSent {
+            merged_prompt_ids: Vec::new(),
             text: "PR #7 was merged".into(),
             attachments: Vec::new(),
             prompt_id: None,
@@ -2877,188 +2994,6 @@ mod tests {
     }
 
     #[test]
-    fn turn_endings_sweep_open_tools_once() {
-        let m = fold([
-            prompt("run"),
-            started(tool("open-1", "LongTask")),
-            content("open-1", "partial out"),
-            stopped("prompt_complete"),
-        ]);
-        let swept = row(&m, "stopped-open-1-4");
-        assert_eq!(
-            (swept.kind, swept.text.as_str()),
-            (TranscriptRowKind::ToolStopped, "partial out")
-        );
-        assert!(
-            matches!(m.tools.get("open-1"), Some(ToolLifecycle::Terminal(output)) if output.text.is_empty())
-        );
-        let mut m = fold([
-            started(tool("a", "A")),
-            started(tool("b", "B")),
-            completed("a", false, ""),
-            stopped("user_stopped"),
-        ]);
-        m.apply_scoped_event(
-            10,
-            &stopped("prompt_complete"),
-            &crate::acp::event_sender::EventMetadata::history(),
-        );
-        let swept: Vec<&str> = m
-            .rows()
-            .iter()
-            .filter(|r| r.kind == TranscriptRowKind::ToolStopped)
-            .filter_map(|r| r.tool_call_id.as_deref())
-            .collect();
-        assert_eq!(swept, ["b"], "only the open tool is swept, and only once");
-
-        let closers = [
-            stopped("cancelled"),
-            Event::AgentStartupError {
-                message: "boom".into(),
-                native_subject: None,
-            },
-            Event::IncompatibleAgent {
-                detail: crate::acp::state::StartupErrorDetail::UnsupportedProtocolVersion {
-                    expected: "1".into(),
-                    received: "2".into(),
-                },
-            },
-            Event::AgentSwitched {
-                from: "claude".into(),
-                to: "codex".into(),
-                reason: "rate_limit".into(),
-            },
-        ];
-        for closer in closers {
-            let label = format!("{closer:?}");
-            let m = fold([started(tool("t1", "T")), closer.clone()]);
-            assert_eq!(count(&m, TranscriptRowKind::ToolStopped), 1, "{label}");
-            let mut partial = TranscriptModel::new();
-            partial.observe_prior(
-                1,
-                &started(tool("t1", "T")),
-                &crate::acp::event_sender::EventMetadata::history(),
-            );
-            partial.observe_prior(
-                2,
-                &content("t1", "buffered before cursor"),
-                &crate::acp::event_sender::EventMetadata::history(),
-            );
-            assert!(partial.rows().is_empty(), "{label}");
-            partial.apply_scoped_event(
-                10,
-                &closer,
-                &crate::acp::event_sender::EventMetadata::history(),
-            );
-            let stopped_rows = partial
-                .rows()
-                .iter()
-                .filter(|row| row.kind == TranscriptRowKind::ToolStopped)
-                .collect::<Vec<_>>();
-            assert_eq!(stopped_rows.len(), 1, "{label}");
-            assert_eq!(
-                stopped_rows[0].tool_call_id.as_deref(),
-                Some("t1"),
-                "{label}"
-            );
-            assert_eq!(stopped_rows[0].text, "buffered before cursor", "{label}");
-            assert!(
-                partial.into_retained().unfinished_outputs.is_empty(),
-                "{label}"
-            );
-            let mut closed_prefix = TranscriptModel::new();
-            closed_prefix.observe_prior(
-                1,
-                &started(tool("t1", "T")),
-                &crate::acp::event_sender::EventMetadata::history(),
-            );
-            closed_prefix.observe_prior(
-                2,
-                &content("t1", "discarded before cursor"),
-                &crate::acp::event_sender::EventMetadata::history(),
-            );
-            closed_prefix.observe_prior(
-                3,
-                &closer,
-                &crate::acp::event_sender::EventMetadata::history(),
-            );
-            assert!(closed_prefix.rows().is_empty(), "{label}");
-            assert!(
-                closed_prefix
-                    .apply_scoped_event(
-                        10,
-                        &stopped("cancelled"),
-                        &crate::acp::event_sender::EventMetadata::history(),
-                    )
-                    .is_empty(),
-                "{label}"
-            );
-            assert!(
-                closed_prefix.into_retained().unfinished_outputs.is_empty(),
-                "{label}"
-            );
-        }
-    }
-
-    #[test]
-    fn empty_output_notice_needs_an_output_less_unsteered_turn() {
-        let caps = Event::PromptCapabilities {
-            image: false,
-            audio: false,
-            embedded_context: false,
-            load_session: None,
-            steering: true,
-        };
-        let runtime_error = Event::PromptRuntimeError {
-            message: "boom".into(),
-            evidence: None,
-            native_subject: None,
-        };
-        // (events between the prompt and its stop, notice expected)
-        let cases = [
-            (vec![], true),
-            (vec![chunk("hi")], false),
-            (vec![Event::ThinkingStarted], false),
-            (vec![runtime_error], false),
-            // A typed `/compact` streams no text; its divider is the output.
-            (vec![Event::ConversationCompacted], false),
-            (
-                vec![Event::SessionNotice {
-                    severity: "error".into(),
-                    title: "Compaction failed".into(),
-                    description: None,
-                    key: None,
-                }],
-                false,
-            ),
-        ];
-        for (i, (mid, notice)) in cases.into_iter().enumerate() {
-            let mut events = vec![prompt("/usage")];
-            events.extend(mid);
-            events.push(stopped("prompt_complete"));
-            assert_eq!(
-                count(&fold(events), TranscriptRowKind::EmptyOutput) == 1,
-                notice,
-                "case {i}"
-            );
-        }
-
-        let m = fold([
-            caps,
-            prompt("read src/acp"),
-            chunk("on it"),
-            prompt("just acp_client.rs"),
-            stopped("prompt_complete"),
-        ]);
-        assert_eq!(
-            count(&m, TranscriptRowKind::EmptyOutput),
-            0,
-            "a steered prompt keeps the turn's output"
-        );
-        assert_eq!(count(&m, TranscriptRowKind::UserPrompt), 2);
-    }
-
-    #[test]
     fn matching_local_terminal_settles_only_its_operation_and_keeps_partial_tools() {
         use crate::acp::establishment::NativeOperationCorrelation;
         use crate::acp::event_sender::{EventMetadata, EventScope};
@@ -3099,5 +3034,170 @@ mod tests {
         assert_eq!(partial.kind, TranscriptRowKind::ToolStart);
         assert!(matches!(partial.output.as_slice(),
             [ToolOutputBlock::Text { text }] if text == "partial output"));
+    }
+
+    #[test]
+    fn output_diagnostics_require_an_original_result_and_matching_written_window() {
+        use crate::acp::establishment::NativeOperationCorrelation;
+        use crate::acp::event_sender::{EventMetadata, EventScope};
+        use crate::acp::protocol::{
+            AcpOperationMetadata, AcpOriginalRequestResult, AcpPromptObservation, AcpPromptWindowId,
+        };
+
+        let cases = [
+            ("silence", vec![]),
+            ("output", vec![chunk("hi")]),
+            ("thinking", vec![Event::ThinkingStarted]),
+            (
+                "error",
+                vec![Event::PromptRuntimeError {
+                    message: "boom".into(),
+                    evidence: None,
+                    native_subject: None,
+                }],
+            ),
+            ("compaction", vec![Event::ConversationCompacted]),
+            (
+                "notice",
+                vec![Event::SessionNotice {
+                    severity: "error".into(),
+                    title: "Compaction failed".into(),
+                    description: None,
+                    key: None,
+                }],
+            ),
+        ];
+        for (label, mid) in cases {
+            let mut model = fold([prompt("/usage")]);
+            let mut seq = 2;
+            for event in mid {
+                model.apply_scoped_event(seq, &event, &EventMetadata::history());
+                seq += 1;
+            }
+            let rows_before = model.rows().len();
+            let notices_before = count(&model, TranscriptRowKind::Notice);
+            let deltas = model.apply_scoped_event(
+                seq,
+                &stopped("prompt_complete"),
+                &EventMetadata::history(),
+            );
+            assert!(
+                deltas.is_empty(),
+                "{label}: history cannot invent an output diagnosis"
+            );
+            assert_eq!(model.rows().len(), rows_before, "{label}");
+            assert_eq!(
+                count(&model, TranscriptRowKind::Notice),
+                notices_before,
+                "{label}"
+            );
+        }
+
+        let steered = fold([
+            Event::PromptCapabilities {
+                image: false,
+                audio: false,
+                embedded_context: false,
+                load_session: None,
+                steering: true,
+            },
+            prompt("read src/acp"),
+            chunk("on it"),
+            prompt("just acp_client.rs"),
+            stopped("prompt_complete"),
+        ]);
+        assert_eq!(count(&steered, TranscriptRowKind::UserPrompt), 2);
+        assert!(steered
+            .rows()
+            .iter()
+            .any(|row| { row.kind == TranscriptRowKind::Message && row.text == "on it" }));
+        assert_eq!(count(&steered, TranscriptRowKind::Notice), 0);
+
+        let window = AcpPromptWindowId::new();
+        let other_window = AcpPromptWindowId::new();
+        let written = Some(AcpPromptObservation::Written { window_id: window });
+        for (label, outcome, observation, uncertainty, expected) in [
+            (
+                "original succeeded",
+                Some(AcpOriginalRequestResult::Succeeded),
+                written,
+                Some(window),
+                true,
+            ),
+            (
+                "original failed",
+                Some(AcpOriginalRequestResult::Failed),
+                written,
+                Some(window),
+                true,
+            ),
+            (
+                "different window",
+                Some(AcpOriginalRequestResult::Succeeded),
+                written,
+                Some(other_window),
+                false,
+            ),
+            ("no original result", None, written, Some(window), false),
+            (
+                "no written observation",
+                Some(AcpOriginalRequestResult::Succeeded),
+                None,
+                Some(window),
+                false,
+            ),
+            (
+                "ambiguous observation",
+                Some(AcpOriginalRequestResult::Succeeded),
+                Some(AcpPromptObservation::Ambiguous),
+                Some(window),
+                false,
+            ),
+            (
+                "nothing written",
+                Some(AcpOriginalRequestResult::Succeeded),
+                Some(AcpPromptObservation::NoWrittenPrompt),
+                Some(window),
+                false,
+            ),
+            (
+                "no uncertainty",
+                Some(AcpOriginalRequestResult::Succeeded),
+                written,
+                None,
+                false,
+            ),
+        ] {
+            let correlation = NativeOperationCorrelation::new(None);
+            let progress = EventMetadata {
+                scope: EventScope::OperationCurrent,
+                operation: Some(AcpOperationMetadata {
+                    correlation,
+                    outcome: None,
+                }),
+                prompt_observation: written,
+                ..EventMetadata::history()
+            };
+            let mut model = fold([prompt("a written operation")]);
+            model.apply_scoped_event(2, &Event::ThinkingStarted, &progress);
+            let terminal = EventMetadata {
+                operation: Some(AcpOperationMetadata {
+                    correlation,
+                    outcome,
+                }),
+                prompt_observation: observation,
+                output_uncertainty: uncertainty,
+                ..EventMetadata::history()
+            };
+            let reason = if outcome == Some(AcpOriginalRequestResult::Failed) {
+                "prompt_failed"
+            } else {
+                "prompt_complete"
+            };
+            let deltas = model.apply_scoped_event(3, &stopped(reason), &terminal);
+            let notices = if expected { 1 } else { 0 };
+            assert_eq!(deltas.len(), notices, "{label}");
+            assert_eq!(count(&model, TranscriptRowKind::Notice), notices, "{label}");
+        }
     }
 }

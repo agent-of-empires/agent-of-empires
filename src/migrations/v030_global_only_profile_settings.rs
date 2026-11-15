@@ -5,10 +5,11 @@ use anyhow::{Context, Result};
 use std::{collections::HashSet, fs, io::ErrorKind, path::Path};
 use tracing::info;
 
+use super::v055_global_max_concurrent_workers::WORKER_CAP_FIELD;
 use crate::session::{
     acquire_storage_flock, atomic_write,
     config::{
-        settings_schema::{merge_json, schema_ref},
+        settings_schema::{merge_json, schema_ref, FieldDescriptor},
         CONFIG_LOCK_FILENAME,
     },
     list_profile_names_in, Config,
@@ -24,13 +25,27 @@ fn read_config(path: &Path) -> Result<Option<toml::Table>> {
         Err(error) if error.kind() == ErrorKind::NotFound => return Ok(None),
         Err(error) => return Err(error).with_context(|| format!("Read {}", path.display())),
     };
-    content
-        .parse()
-        .map(Some)
-        .with_context(|| format!("Parse {} during v030 migration", path.display()))
+    content.parse().map(Some).with_context(|| {
+        format!(
+            "Parse {} during global-only settings migration",
+            path.display()
+        )
+    })
 }
 
-fn run_in(app_dir: &Path, mut write: impl FnMut(&Path, &[u8]) -> Result<()>) -> Result<()> {
+fn run_in(app_dir: &Path, write: impl FnMut(&Path, &[u8]) -> Result<()>) -> Result<()> {
+    // v055 owns this field: it must still be in the profiles when v055 picks the served one.
+    promote_fields(app_dir, write, None, |field| {
+        !field.profile_overridable && field.path() != WORKER_CAP_FIELD
+    })
+}
+
+pub(super) fn promote_fields(
+    app_dir: &Path,
+    mut write: impl FnMut(&Path, &[u8]) -> Result<()>,
+    preferred: Option<String>,
+    selected: impl Fn(&FieldDescriptor) -> bool,
+) -> Result<()> {
     let _lock = acquire_storage_flock(app_dir, CONFIG_LOCK_FILENAME)?;
     let global_path = app_dir.join("config.toml");
     let mut global = read_config(&global_path)?.unwrap_or_default();
@@ -40,28 +55,33 @@ fn run_in(app_dir: &Path, mut write: impl FnMut(&Path, &[u8]) -> Result<()>) -> 
     } else {
         Vec::new()
     };
-    // Same rule as `resolve_default_profile`: the configured name, else the first profile.
-    let default_path = global
-        .get("default_profile")
-        .and_then(toml::Value::as_str)
-        .filter(|name| !name.is_empty())
-        .map(str::to_owned)
+    // An existing `preferred` profile wins; otherwise the same rule as
+    // `resolve_default_profile`: the configured name, else the first profile.
+    let winner_path = preferred
+        .filter(|name| names.contains(name))
+        .or_else(|| {
+            global
+                .get("default_profile")
+                .and_then(toml::Value::as_str)
+                .filter(|name| !name.is_empty())
+                .map(str::to_owned)
+        })
         .or_else(|| names.first().cloned())
         .map(|name| profiles_dir.join(name).join("config.toml"));
-    let paths = default_path.iter().cloned().chain(
+    let paths = winner_path.iter().cloned().chain(
         names
             .iter()
             .map(|name| profiles_dir.join(name).join("config.toml")),
     );
 
-    // Only the default profile's values move, so the profile users launch by
-    // default keeps its effective settings. A profile aliasing the global
+    // Only the winning profile's values move, so the profile users launch
+    // keeps its effective settings. A profile aliasing the global
     // config is skipped: its values are already global.
     let mut seen = HashSet::new();
     if global_path.exists() {
         seen.insert(fs::canonicalize(&global_path)?);
     }
-    let mut default_identity = None;
+    let mut winner_identity = None;
     let mut promoted = false;
     let mut profiles = Vec::new();
     for path in paths {
@@ -70,10 +90,10 @@ fn run_in(app_dir: &Path, mut write: impl FnMut(&Path, &[u8]) -> Result<()>) -> 
             Err(error) if error.kind() == ErrorKind::NotFound => continue,
             Err(error) => return Err(error).with_context(|| format!("Resolve {}", path.display())),
         };
-        if default_path.as_ref() == Some(&path) {
-            default_identity = Some(target.clone());
+        if winner_path.as_ref() == Some(&path) {
+            winner_identity = Some(target.clone());
         }
-        let is_default = default_identity.as_ref() == Some(&target);
+        let is_winner = winner_identity.as_ref() == Some(&target);
         if !seen.insert(target) {
             continue;
         }
@@ -81,10 +101,7 @@ fn run_in(app_dir: &Path, mut write: impl FnMut(&Path, &[u8]) -> Result<()>) -> 
             continue;
         };
         let mut moved = Vec::new();
-        for field in schema_ref()
-            .iter()
-            .filter(|field| !field.profile_overridable)
-        {
+        for field in schema_ref().iter().filter(|field| selected(field)) {
             let Some(section) = profile
                 .get_mut(&field.section)
                 .and_then(toml::Value::as_table_mut)
@@ -98,7 +115,7 @@ fn run_in(app_dir: &Path, mut write: impl FnMut(&Path, &[u8]) -> Result<()>) -> 
                 profile.remove(&field.section);
             }
             moved.push(field.path());
-            if !is_default {
+            if !is_winner {
                 continue;
             }
             let global_section = global
@@ -118,7 +135,7 @@ fn run_in(app_dir: &Path, mut write: impl FnMut(&Path, &[u8]) -> Result<()>) -> 
             promoted = true;
         }
         if !moved.is_empty() {
-            profiles.push((path, is_default, moved, toml::to_string_pretty(&profile)?));
+            profiles.push((path, is_winner, moved, toml::to_string_pretty(&profile)?));
         }
     }
     if profiles.is_empty() {
@@ -131,12 +148,12 @@ fn run_in(app_dir: &Path, mut write: impl FnMut(&Path, &[u8]) -> Result<()>) -> 
             .context("Invalid global config after migrating profile settings")?;
         write(&global_path, toml::to_string_pretty(&global)?.as_bytes())?;
     }
-    for (path, is_default, fields, content) in profiles {
+    for (path, is_winner, fields, content) in profiles {
         write(&path, content.as_bytes())?;
-        if is_default {
-            info!(path = %path.display(), ?fields, "v030: moved default profile's global-only settings to global config");
+        if is_winner {
+            info!(path = %path.display(), ?fields, "moved winning profile's global-only settings to global config");
         } else {
-            info!(path = %path.display(), ?fields, "v030: dropped global-only settings from non-default profile");
+            info!(path = %path.display(), ?fields, "dropped global-only settings from other profile");
         }
     }
     Ok(())

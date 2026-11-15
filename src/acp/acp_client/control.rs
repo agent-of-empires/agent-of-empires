@@ -228,6 +228,7 @@ enum ForwardTicket {
 struct ReverseTicket {
     call_id: u64,
     _publication: Option<super::connection::CallbackDuration>,
+    _parked: Option<super::session_identity::ParkedRequest>,
     admitted: bool,
     reply_started: bool,
     callback: Option<Arc<super::session_identity::CapturedCallback>>,
@@ -514,7 +515,18 @@ impl DaemonControlClient {
     }
 
     pub(super) fn install_original_ingress(&self) -> agent_client_protocol::Result<()> {
-        let Some(attempt) = self.projection.attempt() else {
+        // A read-only canonical attempt may have been generation-rebased.
+        // Only the actual Original invocation or receipt identifies its physical source.
+        let Some(attempt) = self
+            .projection
+            .original_window()
+            .map(|(attempt, _)| attempt)
+            .or_else(|| {
+                self.projection
+                    .receipt_snapshot()
+                    .map(|receipt| Arc::clone(&receipt.attempt))
+            })
+        else {
             return Ok(());
         };
         let (store, constructor) = {
@@ -547,15 +559,23 @@ impl DaemonControlClient {
                 "original ingress custody is unavailable".into(),
             ));
         }
-        if self.projection.original_window().is_some() {
-            let (context, fence) = constructor.ok_or_else(|| {
-                acp_internal_error("original constructor has no retained native fence".into())
-            })?;
-            if !self.ingress.authorize_constructor(&attempt, context, fence) {
+        match constructor {
+            Some((context, fence)) if context == attempt.context => {
+                if !self.ingress.authorize_constructor(&attempt, context, fence) {
+                    return Err(acp_internal_error(
+                        "original constructor custody is unavailable".into(),
+                    ));
+                }
+            }
+            // A rebased canonical destination is not this physical constructor.
+            // Keep its authenticated Original/replay custody, without granting Current.
+            Some(_) => {}
+            None if self.projection.original_window().is_some() => {
                 return Err(acp_internal_error(
-                    "original constructor custody is unavailable".into(),
+                    "original constructor has no retained native fence".into(),
                 ));
             }
+            None => {}
         }
         Ok(())
     }
@@ -641,7 +661,6 @@ impl DaemonControlClient {
         settle_unreachable_sdk_route(&self.settled, &self.connection_state, source, cause);
         self.shutdown();
     }
-
     pub(super) fn shutdown(&self) {
         self.connection_state.observe(
             AcpConnectionSource::Control,
@@ -663,7 +682,7 @@ impl DaemonControlClient {
             warn!(target: "acp.protocol", ?error, "control request encoding refused");
             AcpError::Protocol("request exceeds runner control capacity".into())
         })?;
-        let result = self.send_encoded(&wire, cached_management).await;
+        let result = self.send_encoded(&wire, cached_management, None).await;
         #[cfg(test)]
         if result.is_ok() {
             if let Some(observer) = self
@@ -688,11 +707,23 @@ impl DaemonControlClient {
                 .is_some_and(|loss| loss.source == AcpConnectionSource::Native)
     }
 
-    async fn send_encoded(&self, wire: &[u8], cached_management: bool) -> Result<(), AcpError> {
+    async fn send_encoded(
+        &self,
+        wire: &[u8],
+        cached_management: bool,
+        prompt: Option<crate::acp::establishment::NativeOperationCorrelation>,
+    ) -> Result<(), AcpError> {
+        let cancellation = self.connection_state.initial_prompt_cancellation(prompt);
         let lock = self.write.lock();
         tokio::pin!(lock);
         let mut writer = tokio::select! {
             biased;
+            _ = async {
+                match cancellation.as_ref() {
+                    Some(cancellation) => cancellation.cancelled().await,
+                    None => std::future::pending::<()>().await,
+                }
+            } => return Err(AcpError::NotRunning),
             writer = &mut lock => writer,
             loss = self.connection_state.wait_unavailable() => {
                 if !self.may_report_cache(cached_management) {
@@ -723,6 +754,9 @@ impl DaemonControlClient {
                             observation,
                         )));
                     }
+                }
+                if prompt.is_some() && !self.connection_state.begin_initial_prompt_write(prompt) {
+                    return std::task::Poll::Ready(Err(AcpError::NotRunning));
                 }
                 // Finish an admitted control frame rather than corrupting its
                 // length framing on partial writes. The runner separately
@@ -1009,6 +1043,7 @@ impl DaemonControlClient {
         scope: crate::acp::establishment::NativeRequestScope,
     ) -> Result<oneshot::Receiver<ControlPromptResult>, AcpError> {
         self.connection_state.admit(|| ())?;
+        let correlation = scope.correlation();
         let pending_scope = scope.clone();
         let wire = control_protocol::encode_frame(&ControlBody::Prompt { request, scope })
             .map_err(|error| {
@@ -1032,7 +1067,7 @@ impl DaemonControlClient {
             Ok(rx)
         })??;
         debug!(target: "acp.protocol", "prompt completion waiter installed");
-        if self.send_encoded(&wire, false).await.is_err() {
+        if self.send_encoded(&wire, false, correlation).await.is_err() {
             let mut completion = self.completion.lock().expect("completion mutex poisoned");
             if matches!(*completion, PromptCompletion::Pending { .. }) {
                 *completion = PromptCompletion::LocalIdle;
@@ -1046,6 +1081,21 @@ impl DaemonControlClient {
         scope: crate::acp::establishment::NativeRequestScope,
     ) -> Result<(), AcpError> {
         self.send(ControlBody::Cancel { scope }).await
+    }
+
+    pub(super) async fn cancel_session(
+        &self,
+        parent_session_id: String,
+        session_id: String,
+        scope: crate::acp::establishment::NativeRequestScope,
+    ) -> bool {
+        self.send(ControlBody::CancelSession {
+            parent_session_id,
+            session_id,
+            scope,
+        })
+        .await
+        .is_ok()
     }
 }
 
@@ -1174,17 +1224,36 @@ pub(super) async fn connect_runner_control(
             })?
             .ok_or_else(unconfirmed)?;
         let (mut read_half, mut write_half) = stream.into_split();
-        let prompt_head = match control_protocol::read_frame(&mut read_half).await {
+        let (prompt_head, native_autonomous) = match control_protocol::read_frame(&mut read_half)
+            .await
+        {
             Ok(Some(ControlBody::Hello {
                 control_protocol_version,
                 session_id,
                 prompt_head,
+                native_autonomous,
             })) if control_protocol_version == control_protocol::CONTROL_PROTOCOL_VERSION
                 && session_id == session_label =>
             {
-                prompt_head.filter(|head| {
-                    head.scope.owner() == Some(expected_owner) && head.scope.correlation().is_some()
-                })
+                if let Some(snapshot) = &native_autonomous {
+                    snapshot.validate().map_err(|_| unconfirmed())?;
+                    if snapshot
+                        .started
+                        .evidence
+                        .physical_source
+                        .and_then(|source| source.witness.owner)
+                        != Some(expected_owner)
+                    {
+                        return Err(unconfirmed());
+                    }
+                }
+                (
+                    prompt_head.filter(|head| {
+                        head.scope.owner() == Some(expected_owner)
+                            && head.scope.correlation().is_some()
+                    }),
+                    native_autonomous,
+                )
             }
             Ok(Some(ControlBody::Hello {
                 control_protocol_version,
@@ -1220,11 +1289,18 @@ pub(super) async fn connect_runner_control(
             warn!(target: "acp.protocol", ?error, "runner Attach write failed");
             unconfirmed()
         })?;
-        Ok((read_half, write_half, peer_process, prompt_head))
+        Ok((
+            read_half,
+            write_half,
+            peer_process,
+            prompt_head,
+            native_autonomous,
+        ))
     };
-    let (mut read_half, write_half, peer_process, prompt_head) = tokio::time::timeout(bound, dial)
-        .await
-        .map_err(|_| unconfirmed())??;
+    let (mut read_half, write_half, peer_process, prompt_head, mut native_autonomous) =
+        tokio::time::timeout(bound, dial)
+            .await
+            .map_err(|_| unconfirmed())??;
 
     info!(
         target: "acp.protocol",
@@ -1404,14 +1480,33 @@ pub(super) async fn connect_runner_control(
                         }
                         match &frame {
                             ControlBody::SessionReady { receipt, postimage, .. } => {
-                                if !reader_ingress.authorize_original(
+                                let authorized = reader_ingress.authorize_original(
                                     Arc::clone(&receipt.attempt), receipt.owner,
                                     receipt.store.clone(), postimage.clone(),
-                                ) && !reader_ingress.failed_original_matches(
+                                );
+                                if !authorized && !reader_ingress.failed_original_matches(
                                     &receipt.attempt, receipt.owner, receipt.store.as_ref(),
                                 ) {
                                     reader_projection.lost();
                                     return;
+                                }
+                                if authorized {
+                                    let constructor = {
+                                        let context = reader_establishment_context.lock()
+                                            .expect("native establishment context");
+                                        context.1.as_ref()
+                                            .map(|scope| (scope.context, Arc::clone(&scope.fence)))
+                                    };
+                                    if let Some((context, fence)) = constructor
+                                        .filter(|(context, _)| *context == receipt.attempt.context)
+                                    {
+                                        if !reader_ingress.authorize_constructor(
+                                            &receipt.attempt, context, fence,
+                                        ) {
+                                            reader_projection.lost();
+                                            return;
+                                        }
+                                    }
                                 }
                             }
                             ControlBody::EstablishmentFailed { .. } => {
@@ -1445,8 +1540,32 @@ pub(super) async fn connect_runner_control(
                                 }
                             }
                         }
+                        let replay_autonomous = if let ControlBody::SessionReady { receipt, .. } = &frame {
+                            native_autonomous.take().filter(|snapshot| {
+                                receipt.session_id() == Some(snapshot.started.notification.session_id.as_str())
+                                    && snapshot.started.evidence.physical_source.map(|physical| physical.witness)
+                                        == crate::acp::state::NativeEventOrigin::owned_attempt(
+                                            &receipt.attempt, Some(receipt.owner),
+                                        )
+                            })
+                        } else { None };
                         if hs_tx.send(frame).await.is_err() {
                             return;
+                        }
+                        if let Some(snapshot) = replay_autonomous {
+                            let Ok(wire_bytes) = snapshot.encoded_bytes() else {
+                                reader_projection.lost();
+                                return;
+                            };
+                            let envelope = control_protocol::NativeAutonomousSnapshotEnvelope { snapshot, wire_bytes };
+                            let line = serde_json::json!({
+                                "jsonrpc": "2.0",
+                                "method": control_protocol::NATIVE_AUTONOMOUS_SNAPSHOT_METHOD,
+                                "params": envelope,
+                            });
+                            if !shim_write_line_releasing(
+                                &reader_shim_write, &line, &reader_settled, &reader_connection_state,
+                            ).await { return; }
                         }
                     }
                     Ok(Some((
@@ -1647,6 +1766,10 @@ pub(super) async fn connect_runner_control(
                             c.reverse.insert(id, ReverseTicket {
                                 call_id,
                                 _publication: publication,
+                                _parked: (admitted && (method == "session/request_permission"
+                                    || (method == "elicitation/create"
+                                        && control_protocol::session_scoped_callback(&method, &params))))
+                                    .then(|| reader_ingress.park()),
                                 admitted,
                                 reply_started: false,
                                 callback,
@@ -1686,6 +1809,7 @@ pub(super) async fn connect_runner_control(
                         // Only this daemon mints completion barriers and their classified payload.
                         if PromptCompletedMarker::matches_method(&method)
                             || NativeChannelLostMarker::matches_method(&method)
+                            || method == control_protocol::NATIVE_AUTONOMOUS_SNAPSHOT_METHOD
                         {
                             continue;
                         }
@@ -1705,7 +1829,8 @@ pub(super) async fn connect_runner_control(
                             } else {
                                 None
                             };
-                        if method == "session/update" || method == crate::acp::state::AUTH_STATUS_UPDATE_METHOD {
+                        if method == "session/update" || method == crate::acp::state::AUTH_STATUS_UPDATE_METHOD
+                            || crate::acp::control_protocol::NativeAutonomousPhase::from_method(&method).is_some() {
                             let metadata = serde_json::to_value(ControlIngressMetadata { wire_bytes, evidence })
                                 .expect("private ingress metadata serializes");
                             match &mut params {
@@ -2037,7 +2162,7 @@ pub(super) async fn connect_runner_control(
                     }
                 }
             }
-            if pump_control.send_encoded(&wire, false).await.is_err() {
+            if pump_control.send_encoded(&wire, false, None).await.is_err() {
                 if let Some((sdk_id, call_id)) = forward {
                     pump_control.cancel_forward(&sdk_id, call_id);
                 }
@@ -2840,7 +2965,7 @@ mod tests {
                     assert!(head.scope.correlation().is_some());
                     assert_ne!(control.peer_identity().pid, std::process::id());
                     let turn = terminal.current_turn();
-                    let before = fixture.store.highest_seq(&fixture.client.id);
+                    let before = fixture.store.highest_seq(&fixture.client.id).unwrap();
                     assert!(!terminal.claimed());
                     assert!(in_flight.load(AtomicOrdering::Acquire));
                     case.reply(&fixture, &request).await;
@@ -2902,7 +3027,7 @@ mod tests {
                         &head.scope,
                         head.window_id,
                     );
-                    let before_next = fixture.store.highest_seq(&fixture.client.id);
+                    let before_next = fixture.store.highest_seq(&fixture.client.id).unwrap();
                     let next = fixture
                         .start_prompt("next explicit original after native result")
                         .await;
@@ -2965,7 +3090,7 @@ mod tests {
                 let old_marker = real_completion_marker(&mut observed, TestRelayStage::Relayed, &original).await;
                 assert_eq!(old_marker.adopted.is_some(), adopt_original);
                 real_events_until_stopped(&mut fixture, "prompt_complete").await;
-                let before = fixture.store.highest_seq(&fixture.client.id);
+                let before = fixture.store.highest_seq(&fixture.client.id).unwrap();
                 let next = fixture.start_prompt("second real original").await;
                 let (next_scope, next_window) = real_pending_scope(&control, &next).await;
                 let next_turn = terminal.current_turn();
@@ -3025,7 +3150,7 @@ mod tests {
         with_managed(|scope| {
             Box::pin(async move {
                 let mut fixture = ManagedControlFixture::new(scope).await;
-                let before = fixture.store.highest_seq(&fixture.client.id);
+                let before = fixture.store.highest_seq(&fixture.client.id).unwrap();
                 let request = fixture
                     .start_prompt("only this original may reach native stdin")
                     .await;
@@ -3077,23 +3202,16 @@ mod tests {
         LaterWriteFails,
         ControlEofBeforeResult,
     }
-    #[tokio::test]
-    #[serial_test::serial]
-    async fn managed_prompt_relays_preserve_results_and_fence_eof() {
+    async fn run_managed_prompt_relay(name: &'static str, timing: RealRelayTiming) {
         use crate::acp::supervisor::test_support::managed::with_managed;
         use tokio::io::AsyncWriteExt as _;
-        const NAME: &str =
-            "acp::acp_client::control::tests::managed_prompt_relays_preserve_results_and_fence_eof";
-        if crate::process::runner::test_support::managed_runner::child_if_requested(NAME).await {
+        if crate::process::runner::test_support::managed_runner::child_if_requested(name).await {
             return;
         }
         with_managed(|scope| Box::pin(async move {
-            for timing in [RealRelayTiming::MarkerWriteFails, RealRelayTiming::ControlEofAfterMarker,
-                RealRelayTiming::LaterWriteFails, RealRelayTiming::ControlEofBeforeResult]
-            {
-                let inspection = scope.inspect_next_runner(NAME);
+                let inspection = scope.inspect_next_runner(name);
                 let mut fixture = ManagedControlFixture::new(scope).await;
-                let before = fixture.store.highest_seq(&fixture.client.id);
+                let before = fixture.store.highest_seq(&fixture.client.id).unwrap();
                 let request = fixture.start_prompt("real local original held for relay timing").await;
                 let actual = fixture.client.actual();
                 let control = actual.test_control();
@@ -3229,8 +3347,45 @@ mod tests {
                 assert_eq!(fixture.native.requests(), native_requests,
                     "physical cleanup cannot send native input after observed loss");
                 assert_eq!(state.loss(), Some(loss));
-            }
         })).await;
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn managed_prompt_relays_preserve_results_and_fence_eof() {
+        run_managed_prompt_relay(
+            "acp::acp_client::control::tests::managed_prompt_relays_preserve_results_and_fence_eof",
+            RealRelayTiming::ControlEofBeforeResult,
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn failed_marker_relay_preserves_completed_result_without_further_native_controls() {
+        run_managed_prompt_relay(
+            "acp::acp_client::control::tests::failed_marker_relay_preserves_completed_result_without_further_native_controls",
+            RealRelayTiming::MarkerWriteFails,
+        ).await;
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn runner_hangup_still_delivers_a_relayed_outcome() {
+        run_managed_prompt_relay(
+            "acp::acp_client::control::tests::runner_hangup_still_delivers_a_relayed_outcome",
+            RealRelayTiming::ControlEofAfterMarker,
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn failed_relay_after_a_relayed_marker_preserves_completed_result() {
+        run_managed_prompt_relay(
+            "acp::acp_client::control::tests::failed_relay_after_a_relayed_marker_preserves_completed_result",
+            RealRelayTiming::LaterWriteFails,
+        ).await;
     }
 
     #[tokio::test]
@@ -3313,6 +3468,7 @@ mod tests {
             control_protocol_version: version,
             session_id: session.into(),
             prompt_head: None,
+            native_autonomous: None,
         };
         let _ = control_protocol::write_frame(&mut peer, &hello).await;
         peer
@@ -3488,7 +3644,7 @@ mod tests {
                 assert_eq!(terminal.current_turn(), turn);
                 assert!(!terminal.claimed());
                 assert!(in_flight.load(AtomicOrdering::Acquire));
-                let before = fixture.store.highest_seq(&fixture.client.id);
+                let before = fixture.store.highest_seq(&fixture.client.id).unwrap();
                 fixture.complete(&next, "end_turn").await;
                 own_stop(&fixture, &next).await;
                 assert_one_real_stopped(&fixture, before, &next, &next_scope, next_window);
@@ -4552,7 +4708,7 @@ mod tests {
             let turn = terminal.current_turn();
             assert!(!terminal.claimed());
             assert!(in_flight.load(AtomicOrdering::Acquire));
-            let before = fixture.store.highest_seq(&fixture.client.id);
+            let before = fixture.store.highest_seq(&fixture.client.id).unwrap();
             fixture.native.send(serde_json::json!({
                 "jsonrpc":"2.0","method":PromptCompletedMarker::default().method(),
                 "params":{"adopted":{
@@ -4627,7 +4783,7 @@ mod tests {
                     let state = actual.test_connection_state();
                     let terminal = state.test_terminal.get().unwrap().clone();
                     let in_flight = state.test_in_flight.get().unwrap().clone();
-                    let before = fixture.store.highest_seq(&fixture.client.id);
+                    let before = fixture.store.highest_seq(&fixture.client.id).unwrap();
                     let new = fixture.start_prompt("actual new local request").await;
                     assert_ne!(old["id"], new["id"]);
                     let (new_scope, new_window) = real_pending_scope(&control, &new).await;
@@ -4724,5 +4880,36 @@ mod tests {
             })
         })
         .await;
+    }
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn a_runner_on_another_protocol_version_fails_with_a_mismatch_error() {
+        use crate::process::worker_registry::ControlRefusalReason;
+        for version in [5, 6, control_protocol::CONTROL_PROTOCOL_VERSION + 1] {
+            let tmp = tempfile::Builder::new()
+                .prefix("aoe-protocol-refusal-")
+                .tempdir_in("/tmp")
+                .unwrap();
+            let (socket, listener) = bind(&tmp);
+            let peer = tokio::spawn(async move {
+                let mut stream = accept_hello(&listener, "s", version).await;
+                assert!(
+                    matches!(control_protocol::read_frame(&mut stream).await, Ok(None)),
+                    "an incompatible Hello cannot receive Attach or a Native mutation"
+                );
+            });
+            let terminal = Arc::new(TerminalClaim::new());
+            let error = match connect(&socket, "s", terminal.clone(), false).await {
+                Err(error) => error,
+                Ok(_) => panic!("protocol {version} must be refused before attachment"),
+            };
+            let AcpError::RetainedRuntimeUnavailable(refusal) = error else {
+                panic!("protocol mismatch must preserve typed non-destructive refusal");
+            };
+            assert_eq!(refusal.reason, ControlRefusalReason::ProtocolIncompatible);
+            assert_eq!(refusal.owner, Some(fixture_owner()));
+            assert!(!terminal.claimed());
+            peer.await.unwrap();
+        }
     }
 }

@@ -430,7 +430,7 @@ async fn committed_purge_preserves_a_reused_rows_structured_projection() -> anyh
         let _instance = next_instance.await;
         let _submission = next_submission.await;
         assert_eq!(
-            state.acp_event_store.highest_seq(&row.id),
+            state.acp_event_store.highest_seq(&row.id).unwrap(),
             17,
             "original purge erased replacement event counter"
         );
@@ -1201,6 +1201,82 @@ async fn an_always_yolo_agent_records_yolo_mode_whatever_the_request_says() -> a
         let row: SessionResponse = serde_json::from_slice(&bytes)?;
         assert_eq!(row.yolo_mode, expected, "{label}");
     }
+    Ok(())
+}
+
+#[tokio::test]
+#[serial_test::serial]
+async fn a_workspace_keeps_its_launch_repo_agent_detect_as() -> anyhow::Result<()> {
+    if !crate::tmux::is_tmux_available() {
+        return Ok(());
+    }
+    let _home = crate::session::test_support::isolate_app_dir();
+    crate::session::config::update_app_state(|state| {
+        state.has_acknowledged_agent_hooks = true;
+    })?;
+    let adapters = crate::session::test_support::stub_claude_adapter_on_agent_path();
+    crate::session::test_support::write_stub_adapter(adapters.path(), "pi-acp");
+    let workspaces = tempfile::tempdir()?;
+    crate::session::config::update_config(|config| {
+        config
+            .session
+            .custom_agents
+            .insert("my-pi".into(), "pi".into());
+        config.worktree.workspace_path_template =
+            format!("{}/{{session-id}}", workspaces.path().display());
+    })?;
+    let (project, _repo) = crate::git::test_support::init_repo();
+    std::fs::create_dir(project.path().join(".agent-of-empires"))?;
+    std::fs::write(
+        project.path().join(".agent-of-empires/config.toml"),
+        "[session.agent_detect_as]\nmy-pi = \"pi\"\n",
+    )?;
+    let (launched_tx, mut launched) = tokio::sync::mpsc::unbounded_channel();
+    let launcher: crate::acp::supervisor::Launcher = Arc::new(move |config, _id| {
+        let _ = launched_tx.send(config);
+        Box::pin(async {
+            Err::<crate::acp::acp_client::AcpClient, _>(crate::acp::acp_client::AcpError::Spawn(
+                "test launcher".into(),
+            ))
+        })
+    });
+    let state =
+        crate::server::test_support::build_test_app_state_with_launcher(Vec::new(), launcher);
+    let _storage = Storage::new("detect", state.file_watch.clone())?;
+    *state.canonical_metadata.write().await =
+        crate::server::reload::load_all_profiles(&state.file_watch)?.metadata;
+
+    let (status, json) = post_create(
+        &state,
+        serde_json::json!({
+            "title": "detect", "path": project.path(), "tool": "my-pi", "view": "structured",
+            "profile": "detect",
+            "worktree_branch": "feat/detect", "create_new_branch": true, "workspace": true,
+        }),
+    )
+    .await;
+    let instance = state.instances.read().await.first().cloned();
+    if let Some(instance) = &instance {
+        let _pane = crate::tmux::test_helpers::TmuxTestSession::from_name(
+            crate::tmux::Session::generate_name(&instance.id, &instance.title),
+        );
+    }
+    assert_eq!(status, StatusCode::CREATED, "{json}");
+    let instance = instance.expect("created row");
+    let checkout = &instance.workspace_info.as_ref().expect("workspace").repos[0].worktree_path;
+    assert_eq!(instance.view, crate::session::View::Structured, "{json}");
+    let launch = tokio::time::timeout(std::time::Duration::from_secs(30), launched.recv())
+        .await?
+        .expect("structured creation launches the agent");
+    assert_eq!(launch.agent_key, "pi");
+    assert_eq!(
+        launch.wrapper_substitution,
+        Some(("my-pi".to_string(), "pi".to_string()))
+    );
+    assert_eq!(launch.cwd, std::path::Path::new(&instance.project_path));
+    assert_eq!(launch.config_path, std::path::Path::new(checkout));
+    let restart = crate::server::api::acp::spawn_request_for(&instance, "pi".into(), None);
+    assert_eq!(restart.config_path, std::path::Path::new(checkout));
     Ok(())
 }
 
@@ -5100,6 +5176,27 @@ fn create_body_flags_resolve_worktree_scratch_and_seed_conflicts() {
     }
 }
 
+#[tokio::test]
+#[serial_test::serial]
+async fn create_rejects_a_workspace_without_a_worktree() {
+    let _home = crate::session::test_support::isolate_app_dir();
+    let project = tempfile::tempdir().unwrap();
+    let state = crate::server::test_support::build_test_app_state(Vec::new());
+    let (status, json) = post_create(
+        &state,
+        serde_json::json!({
+            "path": project.path().to_string_lossy(),
+            "tool": "claude",
+            "title": "ws",
+            "workspace": true,
+        }),
+    )
+    .await;
+    assert_eq!(status, axum::http::StatusCode::BAD_REQUEST, "{json}");
+    assert_eq!(json["message"], "Workspace mode requires worktree mode");
+    assert!(state.instances.read().await.is_empty());
+}
+
 #[test]
 fn fork_from_rejects_ambiguous_parent_session_id() {
     let binding = |store: &str| crate::session::ConversationBinding {
@@ -5786,6 +5883,49 @@ fn apply_diff_base_override_writes_only_the_named_repo() {
     // The unnamed target is the session's own checkout.
     apply_diff_base_override(&mut inst, None, Some("develop".to_string()));
     assert_eq!(inst.base_branch_override.as_deref(), Some("develop"));
+}
+
+#[test]
+fn diff_base_target_defaults_only_an_unambiguous_workspace_repo() {
+    let with_repos = |names: &[&str]| {
+        let mut inst = make_test_instance();
+        if !names.is_empty() {
+            inst.workspace_info = Some(crate::session::WorkspaceInfo {
+                branch: "feature/x".to_string(),
+                workspace_dir: "/ws".to_string(),
+                repos: names
+                    .iter()
+                    .map(|n| crate::session::WorkspaceRepo {
+                        name: n.to_string(),
+                        source_path: format!("/src/{n}"),
+                        branch: "feature/x".to_string(),
+                        worktree_path: format!("/ws/{n}"),
+                        main_repo_path: format!("/src/{n}"),
+                        managed_by_aoe: true,
+                        branch_preexisting: false,
+                        base_branch: None,
+                        base_branch_override: None,
+                    })
+                    .collect(),
+                created_at: chrono::Utc::now(),
+                cleanup_on_delete: true,
+            });
+        }
+        inst
+    };
+    let named = |n: &str| Some(n.to_string());
+    let cases: &[(&[&str], Option<String>, Result<Option<String>, ()>)] = &[
+        (&[], None, Ok(None)),
+        (&["api"], None, Ok(named("api"))),
+        (&["api"], named("api"), Ok(named("api"))),
+        (&["api"], named("web"), Err(())),
+        (&["api", "web"], None, Err(())),
+        (&["api", "web"], named("web"), Ok(named("web"))),
+    ];
+    for (repos, requested, want) in cases {
+        let got = diff_base_target(&with_repos(repos), requested.clone()).map_err(|_| ());
+        assert_eq!(&got, want, "{repos:?} {requested:?}");
+    }
 }
 
 /// An expired snooze stays on disk for the next mutation to rewrite, but the
@@ -7252,6 +7392,7 @@ mod open_file {
         std::fs::write(&page, "<script>alert(1)</script>").unwrap();
         let state = state_for(single_repo(dir.path()), false);
         let tool_call = crate::acp::state::ToolCall {
+            prompt: None,
             id: "t1".to_string(),
             name: "Write".to_string(),
             kind: "edit".to_string(),
@@ -10094,6 +10235,7 @@ async fn list_sessions_projects_pending_approvals_only_for_running_workers() {
     let state = crate::server::test_support::build_test_app_state(vec![inst]);
     let approval = build_approval(
         ToolCall {
+            prompt: None,
             id: "tool-1".to_string(),
             name: "shell".to_string(),
             kind: "execute".to_string(),
@@ -13934,10 +14076,12 @@ async fn an_account_swap_out_of_a_rate_limit_park_continues_the_interrupted_prom
                 "unparked",
             ] {
                 let mut live =
-                    crate::server::test_support::managed_control_session(scope, case).await;
+                    crate::server::test_support::managed_control_session(scope, case, "claude", None).await;
                 let id = live.id().to_owned();
                 let state = live.state.clone();
                 if case == "unparked" {
+                    let request = live.start_prompt("complete without a quota pause").await;
+                    live.finish_prompt(&request, None).await;
                     assert_eq!(
                         crate::server::api::acp::rate_limit_resume_probe(&state, &id)
                             .await
@@ -13951,6 +14095,10 @@ async fn an_account_swap_out_of_a_rate_limit_park_continues_the_interrupted_prom
                 if matches!(case, "nothing-to-replay" | "pending-only") {
                     // A real runner operation without a daemon user-prompt record has no
                     // interrupted user input to redeliver.
+                    assert!(matches!(
+                        live.client.reset_session("/new").await.unwrap(),
+                        crate::acp::acp_client::ResetSessionOutcome::Reset { .. }
+                    ), "a genuine clear establishes the absence of any earlier interrupted user input");
                     live.client
                         .send_prompt("Native operation without user journal input", &[])
                         .await
@@ -14083,8 +14231,10 @@ async fn the_selected_work_verdict_survives_a_concurrent_pending_turn_drain() {
     use crate::acp::supervisor::test_support::managed::with_managed;
     with_managed(|scope| {
         Box::pin(async move {
-            let mut live =
-                crate::server::test_support::managed_control_session(scope, "drained").await;
+            let mut live = crate::server::test_support::managed_control_session(
+                scope, "drained", "claude", None,
+            )
+            .await;
             live.park("finish the migration").await;
             let id = live.id().to_owned();
             let state = live.state.clone();
@@ -14153,6 +14303,8 @@ async fn prepared_restart_uses_current_queue_after_original_detaches() {
                 let mut live = crate::server::test_support::managed_control_session(
                     scope,
                     "restart-current-queue",
+                    "claude",
+                    None,
                 )
                 .await;
                 live.park("original interrupted work").await;
@@ -14188,9 +14340,18 @@ async fn prepared_restart_uses_current_queue_after_original_detaches() {
                     .lifecycle_generation;
                 drop(submission);
                 let requests = live.native.requests();
-                let original = crate::process::worker_registry::load_strict(&id)
-                    .unwrap()
-                    .unwrap();
+                let original = {
+                    let registry = crate::process::worker_registry::registry_lock_until(
+                        &id,
+                        tokio::time::Instant::now() + std::time::Duration::from_secs(10),
+                    )
+                    .await
+                    .expect("the actual runner releases registry admission");
+                    registry
+                        .record()
+                        .unwrap()
+                        .expect("the original runner remains registered")
+                };
                 let original_identity =
                     crate::acp::runner_lifecycle::RunnerIdentity::from_record(&original);
                 let original_birth = crate::process::process_birth_identity(original.pid)
@@ -14224,9 +14385,18 @@ async fn prepared_restart_uses_current_queue_after_original_detaches() {
                             Some(&original_lease)
                         );
                         assert!(original_actual.ensure_available().is_err());
-                        let retained = crate::process::worker_registry::load_strict(&id)
-                            .unwrap()
-                            .unwrap();
+                        let retained = {
+                            let registry = crate::process::worker_registry::registry_lock_until(
+                                &id,
+                                tokio::time::Instant::now() + std::time::Duration::from_secs(10),
+                            )
+                            .await
+                            .expect("the actual runner releases registry admission");
+                            registry
+                                .record()
+                                .unwrap()
+                                .expect("the original runner remains registered")
+                        };
                         assert_eq!(
                             crate::acp::runner_lifecycle::RunnerIdentity::from_record(&retained),
                             original_identity
@@ -14312,9 +14482,18 @@ async fn prepared_restart_uses_current_queue_after_original_detaches() {
                             Some(&original_lease)
                         );
                         assert!(original_actual.ensure_available().is_err());
-                        let retained = crate::process::worker_registry::load_strict(&id)
-                            .unwrap()
-                            .unwrap();
+                        let retained = {
+                            let registry = crate::process::worker_registry::registry_lock_until(
+                                &id,
+                                tokio::time::Instant::now() + std::time::Duration::from_secs(10),
+                            )
+                            .await
+                            .expect("the actual runner releases registry admission");
+                            registry
+                                .record()
+                                .unwrap()
+                                .expect("the original runner remains registered")
+                        };
                         assert_eq!(
                             crate::acp::runner_lifecycle::RunnerIdentity::from_record(&retained),
                             original_identity
@@ -14340,9 +14519,13 @@ async fn quota_breadcrumb_write_failure_does_not_install_pending_input() {
     use crate::acp::supervisor::test_support::managed::with_managed;
     with_managed(|scope| {
         Box::pin(async move {
-            let mut live =
-                crate::server::test_support::managed_control_session(scope, "quota-write-refused")
-                    .await;
+            let mut live = crate::server::test_support::managed_control_session(
+                scope,
+                "quota-write-refused",
+                "claude",
+                None,
+            )
+            .await;
             live.park("finish the migration").await;
             let id = live.id().to_owned();
             let state = live.state.clone();

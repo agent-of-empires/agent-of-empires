@@ -180,7 +180,10 @@ const ATTENTION_SINK_RANK = 99;
 /** Plugin attention ranks with Error: behind Waiting, which needs input right now. */
 const PLUGIN_ATTENTION_RANK = 1;
 
-function statusAttentionRank(status: SessionStatus): number {
+/** Sidebar attention order for a bare status: Waiting, Error, Idle, Unknown, Running,
+ *  Stopped, then the transients. The Attention sort and the status grouping axis both
+ *  read it, and it matches the Board's within-column card order. */
+export function statusAttentionRank(status: SessionStatus): number {
   switch (status) {
     case "Waiting":
       return 0;

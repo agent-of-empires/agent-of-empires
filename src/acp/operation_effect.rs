@@ -65,7 +65,9 @@ impl<'a> ControlKind<'a> {
             Event::RateLimit { .. } => Self::Quota,
             Event::UserPromptSent { .. } => Self::Prompt,
             Event::UserDiffCommentsPrompt { .. } => Self::DiffPrompt,
-            Event::AgentMessageChunk { .. } | Event::ToolCallStarted { .. } => Self::AgentWork,
+            Event::AgentMessageChunk { .. }
+            | Event::AgentThoughtChunk { .. }
+            | Event::ToolCallStarted { .. } => Self::AgentWork,
             Event::AgentSwitched { .. } => Self::Switched,
             Event::SessionCleared => Self::Cleared,
             Event::SessionContextReset { .. } => Self::ContextReset,
@@ -107,6 +109,8 @@ pub(crate) enum ControlEffect {
     HostBoundary,
     Historical,
     Indeterminate,
+    AutonomousStarted,
+    AutonomousEnded,
 }
 
 impl ControlEffect {
@@ -124,11 +128,21 @@ enum Diagnostic {
     Sdk(Option<NativeOperationCorrelation>),
 }
 
+#[derive(Debug, Clone, Copy)]
+struct AutonomousControl {
+    origin: crate::acp::state::NativeEventOrigin,
+    run_id: uuid::Uuid,
+    ordinal: u64,
+    source: crate::acp::control_protocol::NativeAutonomousSource,
+    active: bool,
+}
+
 #[derive(Debug, Clone, Copy, Default)]
 pub(crate) struct OperationEffects {
     active: Option<NativeOperationCorrelation>,
     last_admission: Option<NativeOperationCorrelation>,
     diagnostic: Option<Diagnostic>,
+    autonomous: Option<AutonomousControl>,
 }
 
 impl OperationEffects {
@@ -136,11 +150,77 @@ impl OperationEffects {
         self.active
     }
 
+    pub(crate) fn autonomous_open(&self) -> bool {
+        self.autonomous.is_some_and(|control| control.active)
+    }
+
+    pub(crate) fn restore_autonomous(
+        &mut self,
+        identity: &crate::acp::event_sender::NativeAutonomousIdentity,
+        active: bool,
+    ) {
+        self.autonomous = Some(AutonomousControl {
+            origin: identity.origin,
+            run_id: identity.run_id,
+            ordinal: identity.ordinal,
+            source: identity.source,
+            active,
+        });
+    }
+
     pub(crate) fn apply(
         &mut self,
         kind: ControlKind<'_>,
         metadata: &EventMetadata,
     ) -> ControlEffect {
+        if let Some(autonomous) = metadata.native_autonomous.as_deref() {
+            use crate::acp::control_protocol::NativeAutonomousPhase;
+            if !autonomous.qualified {
+                return ControlEffect::Historical;
+            }
+            let identity = &autonomous.identity;
+            if let Some(previous) = self
+                .autonomous
+                .filter(|previous| previous.origin == identity.origin)
+            {
+                if identity.ordinal < previous.ordinal {
+                    return ControlEffect::Historical;
+                }
+                if identity.ordinal == previous.ordinal {
+                    if identity.run_id != previous.run_id || identity.source != previous.source {
+                        return ControlEffect::Indeterminate;
+                    }
+                    return match autonomous.phase {
+                        NativeAutonomousPhase::Started => ControlEffect::Historical,
+                        NativeAutonomousPhase::Ended if previous.active => {
+                            self.restore_autonomous(identity, false);
+                            ControlEffect::AutonomousEnded
+                        }
+                        NativeAutonomousPhase::Ended => ControlEffect::Historical,
+                    };
+                }
+                if previous.active {
+                    return ControlEffect::Indeterminate;
+                }
+            }
+            if autonomous.phase != NativeAutonomousPhase::Started {
+                return ControlEffect::Indeterminate;
+            }
+            self.restore_autonomous(identity, true);
+            return ControlEffect::AutonomousStarted;
+        }
+        if (kind.changes_conversation()
+            && (metadata.host_action
+                || matches!(
+                    metadata.scope,
+                    EventScope::SessionCurrent | EventScope::OperationCurrent
+                )))
+            || (metadata.host_action && matches!(kind, ControlKind::Stopped("orphaned_at_restart")))
+        {
+            if let Some(autonomous) = self.autonomous.as_mut() {
+                autonomous.active = false;
+            }
+        }
         let current = matches!(
             metadata.scope,
             EventScope::SessionCurrent | EventScope::OperationCurrent

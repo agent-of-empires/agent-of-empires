@@ -135,7 +135,10 @@ pub(crate) async fn project_sessions(
     // the shared cache.
     for (resp, inst) in sessions.iter_mut().zip(scoped_instances.iter().copied()) {
         if !resp.acp_capable {
-            let cfg = session_cfg_cache.resolve(&inst.source_profile, &inst.project_path);
+            let cfg = session_cfg_cache.resolve(
+                &inst.source_profile,
+                &inst.repo_config_path().to_string_lossy(),
+            );
             // The key the constructor resolved built-ins with: `agent_name`, else `tool`.
             let agent_key = inst
                 .agent_name
@@ -147,7 +150,10 @@ pub(crate) async fn project_sessions(
         // Only a terminal session that could switch needs the setting resolved.
         if resp.acp_capable && !inst.is_structured() {
             resp.structured_view_off = !session_cfg_cache
-                .structured_view(&inst.source_profile, &inst.project_path)
+                .structured_view(
+                    &inst.source_profile,
+                    &inst.repo_config_path().to_string_lossy(),
+                )
                 .is_offered();
         }
     }
@@ -243,7 +249,10 @@ pub(crate) async fn project_sessions(
             if attempted.contains(&inst.id) {
                 continue;
             }
-            let session_cfg = session_cfg_cache.resolve(&inst.source_profile, &inst.project_path);
+            let session_cfg = session_cfg_cache.resolve(
+                &inst.source_profile,
+                &inst.repo_config_path().to_string_lossy(),
+            );
             let smart_rename_override = project_override_cache.smart_rename_override(
                 &inst.source_profile,
                 inst.scratch,
@@ -965,7 +974,7 @@ mod workspace_ordering_tests {
                     false
                 );
                 assert_eq!(unknown[0].status, row.status.wire_str());
-                let next = state.acp_event_store.highest_seq(&row.id) + 1;
+                let next = state.acp_event_store.highest_seq(&row.id).unwrap() + 1;
                 let new_input = prompt("new explicit main intent");
                 state
                     .acp_event_store

@@ -13,7 +13,7 @@ use super::agents::log_wrapper_substitution;
 use super::launch::{
     admit_stored_row, apply_claude_store_pin, apply_declared_config_dir,
     await_resume_to_completion, before_session_env, discovery_key, overlay_env, publish_rejection,
-    refresh_spawn_model_effort, resolve_mcp_servers,
+    refresh_spawn_model_effort, resolve_mcp_servers, McpPaths,
 };
 use super::teardown::{settle_sweeping_if_owed, tear_down_runner, wait_for_exit};
 use super::{
@@ -168,6 +168,13 @@ struct StreamEnd {
     superseded: bool,
 }
 
+/// Mutable stream effects have exactly one owner in ordered completion.
+struct DrainCompletion<S> {
+    drain: Option<Drain<S>>,
+    end: StreamEnd,
+    established: bool,
+}
+
 enum OwnedPublication {
     Published { current: bool },
     Discarded,
@@ -252,15 +259,18 @@ enum RestartDecision {
 
 impl<S: BroadcastSink> Drain<S> {
     fn publish(&self, event: Event) {
-        with_publication_seq(&self.next_seqs, &self.session_id, |seq| {
-            self.sink
-                .publish(&self.session_id, seq, &AcpEventData::from_host(event));
-        });
+        let _receipt = self.sink.queue_persisted(
+            &self.session_id,
+            Arc::clone(&self.next_seqs),
+            AcpEventData::from_host(event),
+            None,
+        );
     }
 
     async fn run(mut self, mut lease: Lease, mut inbound: mpsc::Receiver<SdkEvent>) {
         loop {
-            let end = self.pump(&mut inbound, &lease).await;
+            let (returned, end) = self.pump(&mut inbound, &lease).await;
+            self = returned;
             if self.identity_only
                 || lease.retirement().binding_checkpoint().is_some()
                 || end.superseded
@@ -312,7 +322,9 @@ impl<S: BroadcastSink> Drain<S> {
                 self.drop_handle(&lease).await;
                 return;
             }
-            let Some(config) = self.approve_respawn(&lease).await else {
+            let (returned, config) = self.approve_respawn(&lease).await;
+            self = returned;
+            let Some(config) = config else {
                 return;
             };
             match self.respawn(&lease, config).await {
@@ -349,6 +361,45 @@ impl<S: BroadcastSink> Drain<S> {
                 .await
             {
                 Ok(result) => {
+                    if matches!(result, OwnedPublication::Published { current: true }) {
+                        if let Event::AcpSessionAssigned { acp_session_id, .. } =
+                            data.event.as_ref()
+                        {
+                            let mut workers = self.workers.lock().await;
+                            let lifecycle = lock_recover(&self.lifecycle);
+                            if lifecycle.current_lease(&self.session_id).as_ref() == Some(lease) {
+                                if let Some(handle) = workers
+                                    .get_mut(&self.session_id)
+                                    .filter(|handle| handle.lease == *lease)
+                                {
+                                    let certified = handle
+                                        .client
+                                        .establishment_projection()
+                                        .and_then(|projection| projection.applied())
+                                        .is_some_and(|postimage| {
+                                            postimage.choice.acp_session_id.as_deref()
+                                                == Some(acp_session_id.as_str())
+                                                && data.metadata.native_origin.is_some_and(
+                                                    |origin| {
+                                                        origin.attempt_id == postimage.attempt_id
+                                                    },
+                                                )
+                                        });
+                                    if certified {
+                                        handle.native_session_id = Some(acp_session_id.clone());
+                                        if let WorkerKind::Runner { spawn_config } =
+                                            &mut handle.kind
+                                        {
+                                            spawn_config.stored_acp_session_id =
+                                                Some(acp_session_id.clone());
+                                            spawn_config.seed_history_replay = false;
+                                            spawn_config.fork_from = None;
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
                     if !matches!(result, OwnedPublication::Published { .. }) {
                         if let Some(publication) = &data.pending_request {
                             publication.abandon_unpublished().await;
@@ -392,7 +443,7 @@ impl<S: BroadcastSink> Drain<S> {
         data: &mut AcpEventData,
         replay: Option<(u64, &mut crate::acp::event_store::ReplayCommit)>,
     ) -> Result<OwnedPublication, PublicationWait> {
-        let mut workers = self.workers.lock().await;
+        let workers = self.workers.lock().await;
         let installed = lock_recover(&self.lifecycle)
             .current_lease(&self.session_id)
             .as_ref()
@@ -406,6 +457,9 @@ impl<S: BroadcastSink> Drain<S> {
         let request = data.current_scope.clone();
         let constructor = data.constructor_scope.clone();
         let pending_request = data.pending_request.clone();
+        if !installed && pending_request.is_none() && data.metadata.native_origin.is_none() {
+            return Ok(OwnedPublication::Superseded);
+        }
         let pending_guard = if let Some(publication) = &pending_request {
             if !Arc::ptr_eq(publication.event(), &data.event)
                 || publication.metadata() != data.metadata
@@ -428,10 +482,15 @@ impl<S: BroadcastSink> Drain<S> {
         };
         let current_guard = if pending_request.is_none()
             && installed
-            && matches!(
+            && (matches!(
                 data.metadata.scope,
                 EventScope::SessionCurrent | EventScope::OperationCurrent
-            ) {
+            ) || data
+                .metadata
+                .native_autonomous
+                .as_ref()
+                .is_some_and(|autonomous| autonomous.qualified))
+        {
             match (request.as_ref(), constructor.as_ref()) {
                 (Some(request), None) => match request.try_effect_guard() {
                     Ok(guard) => Some(guard),
@@ -490,28 +549,6 @@ impl<S: BroadcastSink> Drain<S> {
                 None => Ok(OwnedPublication::Superseded),
             };
         }
-        if current {
-            if let Some(handle) = workers.get_mut(&self.session_id) {
-                if let Event::AcpSessionAssigned { acp_session_id, .. } = data.event.as_ref() {
-                    let certified = handle
-                        .client
-                        .establishment_projection()
-                        .and_then(|projection| projection.applied())
-                        .is_some_and(|postimage| {
-                            postimage.choice.acp_session_id.as_deref()
-                                == Some(acp_session_id.as_str())
-                        });
-                    if certified {
-                        handle.native_session_id = Some(acp_session_id.clone());
-                        if let WorkerKind::Runner { spawn_config } = &mut handle.kind {
-                            spawn_config.stored_acp_session_id = Some(acp_session_id.clone());
-                            spawn_config.seed_history_replay = false;
-                            spawn_config.fork_from = None;
-                        }
-                    }
-                }
-            }
-        }
         if let Event::PromptRuntimeError {
             evidence: Some(_), ..
         } = data.event.as_ref()
@@ -527,24 +564,28 @@ impl<S: BroadcastSink> Drain<S> {
             }
         }
         let native_subject = data.event.native_subject();
-        let persisted =
-            with_publication_seq(&self.next_seqs, &self.session_id, |seq| match replay {
-                Some(replay) => self.sink.publish_replay_from_worker(
-                    &self.session_id,
-                    seq,
-                    data,
-                    lease.epoch(),
-                    native_subject,
-                    replay,
-                ),
-                None => self.sink.publish_from_worker(
-                    &self.session_id,
-                    seq,
-                    data,
-                    lease.epoch(),
-                    native_subject,
-                ),
+        let (slot, seq) =
+            super::with_session_sequence(&self.next_seqs, &self.session_id, |slot, current| {
+                *current = current.saturating_add(1);
+                (Arc::clone(slot), *current)
             });
+        drop(lifecycle);
+        drop(workers);
+        // The original native/request/history exclusions survive the append.
+        let (stored_seq, persisted) = self.sink.publish_replay_from_worker(
+            &self.session_id,
+            seq,
+            data,
+            lease.epoch(),
+            native_subject,
+            replay,
+        );
+        if persisted && stored_seq < seq {
+            let mut current = lock_recover(&slot);
+            if !current.retired && current.seq == seq {
+                current.seq = seq - 1;
+            }
+        }
         Ok(if persisted {
             OwnedPublication::Published { current }
         } else {
@@ -655,15 +696,17 @@ impl<S: BroadcastSink> Drain<S> {
         data.metadata.scope = EventScope::SessionCurrent;
         data.metadata.availability_denial = true;
         data.metadata.native_origin = Some(origin);
-        with_publication_seq(&self.next_seqs, &self.session_id, |seq| {
-            self.sink.publish_from_worker(
-                &self.session_id,
-                seq,
-                &data,
-                lease.epoch(),
-                Some(subject),
-            );
-        });
+        let seq = with_publication_seq(&self.next_seqs, &self.session_id, |seq| seq);
+        drop(lifecycle);
+        drop(workers);
+        self.sink.publish_replay_from_worker(
+            &self.session_id,
+            seq,
+            &data,
+            lease.epoch(),
+            Some(subject),
+            None,
+        );
         Ok(())
     }
 
@@ -901,13 +944,30 @@ impl<S: BroadcastSink> Drain<S> {
         )
     }
 
-    async fn pump(&mut self, inbound: &mut mpsc::Receiver<SdkEvent>, lease: &Lease) -> StreamEnd {
-        use crate::acp::event_sender::EstablishmentResolution;
-        let mut end = StreamEnd::default();
-        let mut established = false;
+    async fn pump(
+        self,
+        inbound: &mut mpsc::Receiver<SdkEvent>,
+        lease: &Lease,
+    ) -> (Self, StreamEnd) {
+        #[cfg(test)]
+        let (self_owned, receive_owner) = {
+            let mut drain = self;
+            let receive_owner = drain.receive_owner.take();
+            (drain, receive_owner)
+        };
+        #[cfg(not(test))]
+        let self_owned = self;
+        let sink = Arc::clone(&self_owned.sink);
+        #[cfg(test)]
+        let submission_session = self_owned.session_id.clone();
+        let completion = Arc::new(tokio::sync::Mutex::new(DrainCompletion {
+            drain: Some(self_owned),
+            end: StreamEnd::default(),
+            established: false,
+        }));
         while let Some(incoming) = {
             #[cfg(test)]
-            let incoming = match self.receive_owner.as_ref() {
+            let incoming = match receive_owner.as_ref() {
                 Some(owner) => owner.recv(inbound).await,
                 None => inbound.recv().await,
             };
@@ -915,89 +975,163 @@ impl<S: BroadcastSink> Drain<S> {
             let incoming = inbound.recv().await;
             incoming
         } {
-            let mut data = match incoming {
-                SdkEvent::EstablishmentClosed { delivery } => {
-                    let mut resolution = self.resolve_establishment(lease, &delivery).await;
-                    if let EstablishmentResolution::Applied(postimage) = &resolution {
-                        if !self
-                            .acknowledge_original_context_reset(lease, &delivery, postimage)
-                            .await
-                        {
-                            resolution = EstablishmentResolution::Unconfirmed;
-                            end.startup_failed = true;
-                        }
-                    }
-                    delivery.resolve(resolution);
-                    continue;
-                }
-                SdkEvent::ControlPlaneLoss(loss) => {
-                    self.publish_connection_loss(lease, &loss).await;
-                    continue;
-                }
-                SdkEvent::Data(data) => data,
-            };
-            let projection = lease.retirement().establishment_projection();
-            let mut processed = projection
-                .as_deref()
-                .and_then(|state| state.received_event());
-            let ordinal = processed.as_ref().map(|event| event.ordinal());
-            let mut replay =
-                projection.as_ref().and_then(|state| {
-                    let (attempt, first) = state.original_window()?;
-                    if !ordinal.is_some_and(|ordinal| state.original_range_contains(ordinal)) {
-                        return None;
-                    }
-                    Some(state.take_replay().unwrap_or_else(|| {
-                        crate::acp::event_store::ReplayCommit::new(attempt, first)
-                    }))
-                });
-            let publication = self
-                .publish_owned(lease, &mut data, ordinal.zip(replay.as_mut()))
-                .await;
-            if let Some(journal_publication) = data.journal_publication.take() {
-                let _ = journal_publication.send(matches!(
-                    publication,
-                    OwnedPublication::Published { current: true }
-                ));
-            }
-            if let (Some(projection), Some(mut replay)) = (&projection, replay) {
-                if !matches!(publication, OwnedPublication::Published { .. }) {
-                    replay.reject();
-                    projection.lost();
-                }
-                projection.retain_replay(Some(replay));
-            }
-            if let Some(processed) = processed.as_mut() {
-                processed.complete();
-            }
-            drop(processed);
-            match publication {
-                OwnedPublication::Published { current: true } => {}
-                OwnedPublication::Published { current: false }
-                | OwnedPublication::Discarded
-                | OwnedPublication::Failed => continue,
-                OwnedPublication::Superseded => {
-                    end.superseded = true;
-                    continue;
-                }
-            }
-            match data.event.as_ref() {
-                Event::Stopped { reason } => match reason.as_str() {
-                    "agent_unresponsive" | "prompt_orphaned" | "user_forced" => {
-                        end.agent_unresponsive = true
-                    }
-                    "rate_limited" if !established => end.startup_rate_limited = true,
-                    _ => {}
-                },
-                Event::AgentStartupError { .. } if !established => end.startup_failed = true,
-                Event::AcpSessionAssigned { .. } => {
-                    established = true;
-                    end.startup_rate_limited = false;
-                }
-                _ => {}
+            #[cfg(test)]
+            let submission =
+                super::sink::TestSdkSubmission::from_incoming(&submission_session, &incoming);
+            let completion = Arc::clone(&completion);
+            let lease = lease.clone();
+            let publication = super::WorkerPublication::new(async move {
+                let mut completion = completion.lock().await;
+                let DrainCompletion {
+                    drain,
+                    end,
+                    established,
+                } = &mut *completion;
+                drain
+                    .as_mut()
+                    .expect("SDK item after ordered EOF")
+                    .complete_incoming(incoming, &lease, end, established)
+                    .await;
+            });
+            #[cfg(test)]
+            let publication = publication.with_test_submission(submission);
+            if let Some(publication) = sink.publish_from_worker(publication) {
+                publication.complete().await;
             }
         }
-        end
+        let (done, finished) = tokio::sync::oneshot::channel();
+        let publication = super::WorkerPublication::new(async move {
+            let mut completion = completion.lock().await;
+            let drain = completion.drain.take().expect("ordered EOF delivered once");
+            let end = std::mem::take(&mut completion.end);
+            let _ = done.send((drain, end));
+        });
+        if let Some(publication) = sink.publish_from_worker(publication) {
+            publication.complete().await;
+        }
+        let (drain, end) = finished
+            .await
+            .expect("ordered worker completion ended before EOF");
+        #[cfg(test)]
+        let drain = {
+            let mut drain = drain;
+            drain.receive_owner = receive_owner;
+            drain
+        };
+        (drain, end)
+    }
+
+    async fn complete_incoming(
+        &mut self,
+        incoming: SdkEvent,
+        lease: &Lease,
+        end: &mut StreamEnd,
+        established: &mut bool,
+    ) {
+        use crate::acp::event_sender::EstablishmentResolution;
+        let mut data = match incoming {
+            SdkEvent::EstablishmentClosed { delivery } => {
+                let mut resolution = self.resolve_establishment(lease, &delivery).await;
+                if let EstablishmentResolution::Applied(postimage) = &resolution {
+                    if !self
+                        .acknowledge_original_context_reset(lease, &delivery, postimage)
+                        .await
+                    {
+                        resolution = EstablishmentResolution::Unconfirmed;
+                        end.startup_failed = true;
+                    }
+                }
+                delivery.resolve(resolution);
+                return;
+            }
+            SdkEvent::ControlPlaneLoss(loss) => {
+                self.publish_connection_loss(lease, &loss).await;
+                return;
+            }
+            SdkEvent::Data(data) => data,
+        };
+        let projection = lease.retirement().establishment_projection();
+        let mut processed = projection
+            .as_deref()
+            .and_then(|state| state.received_event());
+        let ordinal = processed.as_ref().map(|event| event.ordinal());
+        let mut replay = projection.as_ref().and_then(|state| {
+            let (attempt, first) = state.original_window()?;
+            if !ordinal.is_some_and(|ordinal| state.original_range_contains(ordinal)) {
+                return None;
+            }
+            Some(
+                state
+                    .take_replay()
+                    .unwrap_or_else(|| crate::acp::event_store::ReplayCommit::new(attempt, first)),
+            )
+        });
+        let publication = if matches!(data.event.as_ref(), Event::AgentStartupError { .. })
+            && self.restart_intended()
+        {
+            OwnedPublication::Discarded
+        } else {
+            self.publish_owned(lease, &mut data, ordinal.zip(replay.as_mut()))
+                .await
+        };
+        if let Some(journal) = data.journal_publication.take() {
+            let _ = journal.send(matches!(
+                publication,
+                OwnedPublication::Published { current: true }
+            ));
+        }
+        if let (Some(projection), Some(mut replay)) = (&projection, replay) {
+            if !matches!(publication, OwnedPublication::Published { .. }) {
+                replay.reject();
+                projection.lost();
+            }
+            projection.retain_replay(Some(replay));
+        }
+        if let Some(processed) = processed.as_mut() {
+            processed.complete();
+        }
+        drop(processed);
+        match publication {
+            OwnedPublication::Published { current: true } => {}
+            OwnedPublication::Published { current: false }
+            | OwnedPublication::Discarded
+            | OwnedPublication::Failed => return,
+            OwnedPublication::Superseded => {
+                end.superseded = true;
+                return;
+            }
+        }
+        if data.metadata.native_autonomous.is_some() {
+            return;
+        }
+        match data.event.as_ref() {
+            Event::Stopped { reason } => match reason.as_str() {
+                "agent_unresponsive" | "prompt_orphaned" | "user_forced" => {
+                    end.agent_unresponsive = true
+                }
+                "rate_limited" if !*established => end.startup_rate_limited = true,
+                _ => {}
+            },
+            Event::AgentStartupError { .. } if !*established => end.startup_failed = true,
+            Event::AcpSessionAssigned { .. } => {
+                *established = true;
+                end.startup_rate_limited = false;
+            }
+            _ => {}
+        }
+    }
+
+    /// Whether a restart is pending for the runner on record. A marker naming another
+    /// generation belongs to a different runner, so a replacement's genuine error passes.
+    fn restart_intended(&self) -> bool {
+        let Some(marker) = worker_registry::peek_restart_marker(&self.session_id) else {
+            return false;
+        };
+        let generation = worker_registry::load(&self.session_id)
+            .ok()
+            .flatten()
+            .map_or(0, |record| record.generation);
+        marker == generation
     }
 
     fn clear_pending_context_reset(&self) -> bool {
@@ -1168,7 +1302,7 @@ impl<S: BroadcastSink> Drain<S> {
     }
 
     /// Decide whether the closed worker respawns, publishing why when it does not.
-    async fn approve_respawn(&self, lease: &Lease) -> Option<SpawnConfig> {
+    async fn approve_respawn(self, lease: &Lease) -> (Self, Option<SpawnConfig>) {
         let session_id = &self.session_id;
         match restart_decision(&self.workers, &self.lifecycle, session_id, lease).await {
             RestartDecision::Respawn(config) => {
@@ -1180,7 +1314,7 @@ impl<S: BroadcastSink> Drain<S> {
                     "respawn approved; sleeping {}ms before restart",
                     RESPAWN_BACKOFF.as_millis()
                 );
-                return Some(*config);
+                return (self, Some(*config));
             }
             RestartDecision::BudgetBurned => {
                 warn!(
@@ -1199,12 +1333,26 @@ impl<S: BroadcastSink> Drain<S> {
                         MAX_RESPAWNS_IN_WINDOW, RESTART_WINDOW.as_secs(),
                     )),
                 });
-                if !matches!(
-                    self.publish_owned(lease, &mut error, None).await,
-                    OwnedPublication::Published { .. }
-                ) {
-                    return None;
+                let sink = Arc::clone(&self.sink);
+                let original = lease.clone();
+                let (done, finished) = tokio::sync::oneshot::channel();
+                let publication = super::WorkerPublication::new(async move {
+                    let published = matches!(
+                        self.publish_owned(&original, &mut error, None).await,
+                        OwnedPublication::Published { .. }
+                    );
+                    let _ = done.send((self, published));
+                });
+                if let Some(publication) = sink.publish_from_worker(publication) {
+                    publication.complete().await;
                 }
+                let (drain, published) = finished
+                    .await
+                    .expect("ordered budget publication completed");
+                if published {
+                    drain.drop_handle(lease).await;
+                }
+                return (drain, None);
             }
             RestartDecision::LeaveToReconciler => {
                 info!(
@@ -1219,16 +1367,18 @@ impl<S: BroadcastSink> Drain<S> {
                         .get(session_id)
                         .is_some_and(|handle| handle.lease == *lease)
                 {
-                    return None;
+                    drop(lifecycle);
+                    drop(workers);
+                    return (self, None);
                 }
                 lock_recover(&self.startup_requeues).insert(session_id.clone());
             }
-            RestartDecision::Gone => return None,
+            RestartDecision::Gone => return (self, None),
             RestartDecision::Fenced => {
                 // Kernel-qualified exit can retire its own custody, not grant
                 // the unreadable or missing file authority over a live runner.
                 self.drop_handle(lease).await;
-                return None;
+                return (self, None);
             }
             RestartDecision::UserStopped => {
                 info!(
@@ -1237,11 +1387,11 @@ impl<S: BroadcastSink> Drain<S> {
                     "worker stop requested; settling its handle without respawn"
                 );
                 self.drop_handle(lease).await;
-                return None;
+                return (self, None);
             }
         }
         self.drop_handle(lease).await;
-        None
+        (self, None)
     }
 
     /// Relaunch the worker under a fresh respawn epoch; returns the new lease
@@ -1613,9 +1763,12 @@ impl<S: BroadcastSink> Drain<S> {
     async fn refresh_launch_env(session_id: &str, config: &mut SpawnConfig) {
         let agent = config.agent_key.clone();
         let profile = config.source_profile.clone().unwrap_or_default();
-        let cwd = config.cwd.clone();
+        let config_path = config.config_path.clone();
         let resolved = tokio::task::spawn_blocking(move || {
-            crate::session::config::repo_config::resolve_config_with_repo_or_warn(&profile, &cwd)
+            crate::session::config::repo_config::resolve_config_with_repo_or_warn(
+                &profile,
+                &config_path,
+            )
         })
         .await;
         match &resolved {
@@ -1682,7 +1835,10 @@ impl<S: BroadcastSink> Drain<S> {
             discovery_key(config.sandbox_info.is_some(), &config.agent_key, native),
             session_id,
             config.source_profile.clone(),
-            config.cwd.clone(),
+            McpPaths {
+                cwd: config.cwd.clone(),
+                config_path: config.config_path.clone(),
+            },
             config.host_environment.clone(),
             claude_config_dir,
             "MCP re-resolution on respawn failed",
@@ -1907,6 +2063,202 @@ mod tests {
     use super::*;
     use crate::daemon::AcpWorkerState;
 
+    async fn budget_publication_probe(supersede: bool) {
+        #[derive(Debug)]
+        enum Reached {
+            Queued,
+            Inline,
+        }
+        let (_home, _tmp) = isolate_home();
+        let sink = VecSink::new();
+        let supervisor = Arc::new(Supervisor::new(Arc::clone(&sink)));
+        let id = "ordered-restart-budget";
+        let original = supervisor.test_install_stdio(id).await;
+        supervisor
+            .workers
+            .lock()
+            .await
+            .get_mut(id)
+            .unwrap()
+            .restart_history = vec![Instant::now(); MAX_RESPAWNS_IN_WINDOW as usize];
+        let drain = Drain {
+            session_id: id.into(),
+            identity_only: false,
+            history_scope: None,
+            sink: Arc::clone(&supervisor.sink),
+            workers: Arc::clone(&supervisor.workers),
+            next_seqs: Arc::clone(&supervisor.next_seqs),
+            incompatible_binaries: Arc::clone(&supervisor.incompatible_binaries),
+            lifecycle: Arc::clone(&supervisor.lifecycle),
+            process_control: Arc::clone(&supervisor.process_control),
+            launcher: Arc::clone(&supervisor.launcher),
+            notify: Arc::clone(&supervisor.worker_notify),
+            startup_requeues: Arc::clone(&supervisor.startup_requeues),
+            pending_context_resets: Arc::clone(&supervisor.pending_context_resets),
+            context_reset: None,
+            respawned_in_place: Arc::clone(&supervisor.respawned_in_place),
+            receive_owner: None,
+        };
+        let mut frames = sink.completed.lock().unwrap().resubscribe();
+        let (entered, entering) = tokio::sync::oneshot::channel();
+        let (release_writer, writer_released) = tokio::sync::oneshot::channel();
+        assert!(sink
+            .durable
+            .publish_from_worker(super::super::WorkerPublication::new(async move {
+                let _ = entered.send(());
+                writer_released
+                    .await
+                    .expect("release the actual ordered writer");
+            }))
+            .is_none());
+        tokio::time::timeout(Duration::from_secs(10), entering)
+            .await
+            .unwrap()
+            .unwrap();
+        let (reached, position) = std::sync::mpsc::channel();
+        let queued = reached.clone();
+        *sink.worker_queued.lock().unwrap() = Some(Box::new(move || {
+            queued.send(Reached::Queued).unwrap();
+        }));
+        let (release_budget, budget_released) = std::sync::mpsc::channel();
+        let budget_released = std::sync::Mutex::new(budget_released);
+        *sink.before_replay.lock().unwrap() = Some(Arc::new(move |event| {
+            if matches!(event, Event::SessionNotice { key: Some(key), .. } if key == "restart-budget")
+            {
+                let _ = reached.send(Reached::Inline);
+                budget_released
+                    .lock()
+                    .unwrap()
+                    .recv_timeout(Duration::from_secs(10))
+                    .expect("release the original budget publication");
+            }
+        }));
+        let approval = {
+            let original = original.clone();
+            tokio::spawn(async move { drain.approve_respawn(&original).await.1 })
+        };
+        let reached = tokio::time::timeout(
+            Duration::from_secs(10),
+            tokio::task::spawn_blocking(move || position.recv_timeout(Duration::from_secs(10))),
+        )
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+        let replacement = if supersede {
+            supervisor.test_respawn_worker(id).await;
+            Some(supervisor.running_lease(id).unwrap())
+        } else {
+            None
+        };
+        let host = sink.durable.queue_persisted(
+            id,
+            Arc::clone(&supervisor.next_seqs),
+            AcpEventData::from_host(Event::SessionNotice {
+                key: Some("host-after-budget".into()),
+                severity: "info".into(),
+                title: "later host publication".into(),
+                description: None,
+            }),
+            None,
+        );
+        let mut delivered = Vec::new();
+        match reached {
+            Reached::Inline => {
+                release_writer.send(()).unwrap();
+                delivered.push(
+                    tokio::time::timeout(Duration::from_secs(10), frames.recv())
+                        .await
+                        .unwrap()
+                        .unwrap(),
+                );
+                release_budget.send(()).unwrap();
+            }
+            Reached::Queued => {
+                release_budget.send(()).unwrap();
+                release_writer.send(()).unwrap();
+            }
+        }
+        assert!(tokio::time::timeout(Duration::from_secs(10), approval)
+            .await
+            .unwrap()
+            .unwrap()
+            .is_none());
+        let host = tokio::task::spawn_blocking(move || host.wait())
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(host.1, "the real writer must persist the host publication");
+        let flush_sink = Arc::clone(&sink);
+        tokio::time::timeout(
+            Duration::from_secs(10),
+            tokio::task::spawn_blocking(move || {
+                flush_sink.durable.flush();
+            }),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        while let Ok(frame) = frames.try_recv() {
+            delivered.push(frame);
+        }
+        let stored = sink
+            .establishment_store()
+            .unwrap()
+            .replay_from(id, 0)
+            .unwrap();
+        let current = supervisor.running_lease(id);
+        supervisor.test_remove_worker(id).await;
+        let mut transcript = crate::acp::transcript::TranscriptModel::new();
+        for frame in &delivered {
+            transcript.apply_scoped_event(frame.seq, &frame.event, &frame.view_metadata());
+        }
+        let broadcast_seqs: Vec<_> = delivered.iter().map(|frame| frame.seq).collect();
+        let durable_seqs: Vec<_> = stored.iter().map(|event| event.seq).collect();
+        if let Some(replacement) = replacement {
+            assert_eq!(current, Some(replacement));
+            assert_eq!(
+                broadcast_seqs,
+                [1],
+                "a superseded budget notice must allocate no sequence"
+            );
+            assert_eq!(durable_seqs, [1]);
+            assert!(delivered.iter().all(|frame| !matches!(frame.event.as_ref(),
+                Event::SessionNotice { key: Some(key), .. } if key == "restart-budget")));
+        } else {
+            assert!(
+                current.is_none(),
+                "the exhausted original must settle without respawning"
+            );
+            assert_eq!(
+                broadcast_seqs,
+                [1, 2],
+                "live delivery must follow actual writer sequence order"
+            );
+            assert_eq!(broadcast_seqs, durable_seqs);
+            assert_eq!(delivered[0].worker_generation, Some(original.epoch()));
+            assert!(
+                transcript
+                    .rows()
+                    .iter()
+                    .any(|row| row.text.contains("Automatic restart budget exhausted")),
+                "the actual live transcript must retain the budget advisory"
+            );
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[serial_test::serial]
+    async fn restart_budget_advisory_and_host_publications_share_writer_order() {
+        budget_publication_probe(false).await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[serial_test::serial]
+    async fn superseded_queued_restart_budget_advisory_allocates_no_sequence() {
+        budget_publication_probe(true).await;
+    }
+
     #[tokio::test]
     #[serial_test::serial]
     async fn registry_contention_at_channel_close_eventually_settles_the_dead_original() {
@@ -1916,21 +2268,26 @@ mod tests {
                 DEFERRED_REGISTRY_OBSERVED.lock().unwrap().take();
             }
         }
-        super::super::test_support::managed::with_managed(|scope| Box::pin(async move {
+        for open_task in [None, Some("pending-task")] {
+            super::super::test_support::managed::with_managed(|scope| Box::pin(async move {
                 let directory = scope.tempdir();
                 let transcript = directory.path().join("agent.jsonl");
                 std::fs::write(&transcript, "").unwrap();
                 let mut fixture = super::super::launch::tests::managed_background_original(
-                    scope, "drain-observation-recovery", transcript.to_str().unwrap(), Some("pending-task"), false).await;
+                    scope, "drain-observation-recovery", transcript.to_str().unwrap(), open_task, false).await;
                 fixture.client = scope.adopt(fixture.client, false).await;
                 fixture.client.ready().await;
                 let id = fixture.client.id.clone();
-                let agent_allocation = fixture.store.unresolved_background_agent_launches(&id).unwrap()
-                    .into_iter().find(|launch| launch.agent_id == "sub-1").unwrap()
-                    .witness.unwrap().allocation;
-                let task_allocation = fixture.store.unresolved_background_task_launches(&id).unwrap()
-                    .into_iter().find(|launch| launch.task_id == "pending-task").unwrap()
-                    .witness.unwrap().allocation;
+                let agent = open_task.is_none();
+                let allocation = if agent {
+                    fixture.store.unresolved_background_agent_launches(&id).unwrap()
+                        .into_iter().find(|launch| launch.agent_id == "sub-1").unwrap()
+                        .witness.unwrap().allocation
+                } else {
+                    fixture.store.unresolved_background_task_launches(&id).unwrap()
+                        .into_iter().find(|launch| launch.task_id == "pending-task").unwrap()
+                        .witness.unwrap().allocation
+                };
                 // A later legacy history row may reuse an ID without superseding its Native allocation.
                 let legacy_launches: Vec<_> = fixture.store.replay_from(&id, 0).unwrap()
                     .into_iter().filter(|stored| matches!(stored.event.as_ref(),
@@ -1940,8 +2297,8 @@ mod tests {
                 for launch in legacy_launches {
                     supervisor.publish_next(&id, launch);
                 }
-                assert_eq!(fixture.store.unresolved_background_agent_tracking_launches(&id).unwrap().len(), 2);
-                assert_eq!(fixture.store.unresolved_background_task_launches(&id).unwrap().len(), 2);
+                assert_eq!(fixture.store.unresolved_background_agent_tracking_launches(&id).unwrap().len(), if agent { 2 } else { 0 });
+                assert_eq!(fixture.store.unresolved_background_task_launches(&id).unwrap().len(), if agent { 0 } else { 2 });
                 let sid = fixture.client.actual().establishment_projection().unwrap().receipt_snapshot().unwrap()
                     .session_id().unwrap().to_owned();
                 fixture.peer.send(serde_json::json!({"jsonrpc":"2.0","method":"session/update","params":{
@@ -1951,7 +2308,7 @@ mod tests {
                     while !matches!(fixture.client.recv().await.expect("attached original history observer remains open"),
                         Event::AgentMessageChunk { text, .. } if text == "history before registry refusal") {}
                 }).await.expect("real Native history is committed before contention");
-                let prefix = fixture.store.highest_seq(&id);
+                let prefix = fixture.store.highest_seq(&id).unwrap();
                 let mut publication = fixture.client.subscribe_publications();
                 let identity = fixture.client.actual().connected_runner().expect("actual original runner");
                 let birth = crate::process::process_birth_identity(identity.pid).unwrap()
@@ -1969,7 +2326,7 @@ mod tests {
                     .expect("the actual closed-channel drain reaches registry contention").unwrap();
                 assert!(tokio::time::timeout(Duration::from_millis(100), publication.recv()).await.is_err(),
                     "actual original loss cannot publish through held registry exclusion");
-                assert_eq!(fixture.store.highest_seq(&id), prefix, "registry contention cannot authorize a terminal publication");
+                assert_eq!(fixture.store.highest_seq(&id).unwrap(), prefix, "registry contention cannot authorize a terminal publication");
                 drop(registry);
                 tokio::time::timeout(Duration::from_secs(15), async {
                     while fixture.client.recv().await.is_some() {}
@@ -1980,7 +2337,6 @@ mod tests {
                 let state = super::super::launch::tests::fold_background_journal(&fixture.store, &id);
                 assert!(!state.has_active_background_agent());
                 let events = fixture.store.replay_from(&id, 0).expect("durable replay");
-                for (allocation, agent) in [(agent_allocation, true), (task_allocation, false)] {
                     let ends: Vec<_> = events.iter().filter(|stored| {
                         stored.metadata.resource_ref == Some(allocation)
                             && if agent {
@@ -1995,17 +2351,17 @@ mod tests {
                     assert!(ends[0].metadata.host_action);
                     assert!(ends[0].metadata.native_origin.is_none());
                     assert!(ends[0].metadata.resource_witness.is_none());
-                }
                 assert_eq!(events.iter().filter(|stored|
                     stored.metadata.resource_ref.is_none() && matches!(stored.event.as_ref(),
-                        Event::BackgroundAgentCompleted { agent_id, .. } if agent_id == "sub-1")).count(), 1);
+                        Event::BackgroundAgentCompleted { agent_id, .. } if agent_id == "sub-1")).count(), usize::from(agent));
                 assert_eq!(events.iter().filter(|stored|
                     stored.metadata.resource_ref.is_none() && matches!(stored.event.as_ref(),
-                        Event::BackgroundTaskFinished { task_id, .. } if task_id == "pending-task")).count(), 1);
+                        Event::BackgroundTaskFinished { task_id, .. } if task_id == "pending-task")).count(), usize::from(!agent));
                 assert!(events.iter().any(|stored| matches!(stored.event.as_ref(),
                     Event::AgentMessageChunk { text, .. } if text == "history before registry refusal")));
                 assert!(!events.iter().any(|stored| matches!(stored.event.as_ref(), Event::SessionContextReset { .. })));
             })).await;
+        }
     }
 
     #[tokio::test]
@@ -2062,12 +2418,36 @@ mod tests {
                         client.ready().await;
                         assert_eq!(client.actual().connected_runner(), owner);
                         assert_eq!(peer.requests().iter().filter(|method| method.as_str() == "session/prompt").count(), 1);
+                        // Usability precedes the retained SDK's final publications.
+                        // Do not trap one ahead of the diagnostic whose flock wait we observe.
+                        tokio::time::timeout(Duration::from_secs(10), async {
+                            let (mut assigned, mut capabilities) = (false, false);
+                            while !assigned || !capabilities {
+                                match client.next_event().await.expect("actual retained handshake publication") {
+                                    Event::AcpSessionAssigned { acp_session_id, .. }
+                                        if acp_session_id == "contention-native" => assigned = true,
+                                    Event::PromptCapabilities { .. } => capabilities = true,
+                                    Event::AgentStartupError { message, .. } => panic!("{message}"),
+                                    Event::AcpConnectionUnavailable { .. } => panic!("the retained original channel stays live"),
+                                    _ => {}
+                                }
+                            }
+                        }).await.expect("the retained handshake is durable before diagnostic-only exclusion");
                     }
                     let supervisor = client.app_state().acp_supervisor.clone();
                     let mut frames = client.subscribe_publications();
                     let store = scope.state.acp_event_store.clone();
-                    let prefix = store.highest_seq(&client.id);
+                    let prefix = store.highest_seq(&client.id).unwrap();
                     let storage = crate::session::Storage::open_reference("test").unwrap();
+                    let mut preceding_lifecycle = if profile_writer {
+                        Some((
+                            storage.sessions_path().parent().unwrap().join(
+                                format!(".instance-lifecycle-{}.lock", client.id)),
+                            storage.acquire_instance_lifecycle_lock(&client.id).unwrap(),
+                        ))
+                    } else {
+                        None
+                    };
                     let native = if profile_writer {
                         crate::session::acquire_storage_flock(storage.sessions_path().parent().unwrap(), crate::session::STORAGE_LOCK_FILENAME).unwrap()
                     } else {
@@ -2130,7 +2510,21 @@ mod tests {
                         else { format!(".instance-lifecycle-{}.lock", client.id) });
                     tokio::time::timeout(Duration::from_secs(10),
                         tokio::task::spawn_blocking(move || {
-                            while contended_rx.recv()? != held_path {}
+                            loop {
+                                let reported_path = contended_rx.recv()?;
+                                if preceding_lifecycle.as_ref()
+                                    .is_some_and(|(path, _)| path == &reported_path)
+                                {
+                                    drop(preceding_lifecycle.take());
+                                }
+                                if reported_path == held_path {
+                                    if profile_writer {
+                                        assert!(preceding_lifecycle.is_none(),
+                                            "profile contention follows the actual lifecycle wait");
+                                    }
+                                    break;
+                                }
+                            }
                             Ok::<(), std::sync::mpsc::RecvError>(())
                         }))
                         .await.expect("the captured diagnostic reaches the held flock")
@@ -2322,7 +2716,7 @@ mod tests {
         }
     }
 
-    #[tokio::test(start_paused = true)]
+    #[tokio::test]
     #[serial_test::serial]
     async fn native_respawn_retains_unresolved_ownership_when_its_record_disappears() {
         let _home = isolate_home();
@@ -2353,9 +2747,11 @@ mod tests {
             .await
             .expect("the qualified original reaches the actual respawn backoff")
             .unwrap();
+        tokio::time::pause();
         // The route disappears after approval, before the post-backoff recheck.
         std::fs::remove_file(worker_registry::record_path(id).unwrap()).unwrap();
         tokio::time::advance(RESPAWN_BACKOFF).await;
+        tokio::time::resume();
         tokio::time::timeout(Duration::from_secs(5), drain)
             .await
             .expect("respawn drain must reach its terminal ownership decision")
@@ -2413,6 +2809,35 @@ mod tests {
         assert!(
             matches!(decision, RestartDecision::Fenced),
             "missing ownership is not a user-stop receipt: {decision:?}"
+        );
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn a_live_model_config_pick_reaches_the_respawn_config() {
+        let (_home, tmp) = isolate_home();
+        let sup = Supervisor::new(VecSink::new());
+        let socket = tmp.path().join("pick.sock");
+        worker_registry::save(&worker_record("s-pick", std::process::id(), socket.clone()))
+            .unwrap();
+        let lease = sup
+            .test_install_runner("s-pick", runner_config(socket), None)
+            .await;
+
+        sup.refresh_cached_model_config("s-pick", "ultracode", "on")
+            .await;
+
+        let RestartDecision::Respawn(config) =
+            restart_decision(&sup.workers, &sup.lifecycle, "s-pick", &lease).await
+        else {
+            panic!("a runner worker respawns");
+        };
+        assert_eq!(
+            config
+                .default_model_config
+                .get("ultracode")
+                .map(String::as_str),
+            Some("on")
         );
     }
 
@@ -2729,7 +3154,7 @@ mod tests {
 
     /// A stop arriving after a failed respawn began its own teardown gets
     /// `AlreadyStopping`; the teardown still releases the scope before the settle.
-    #[tokio::test(start_paused = true)]
+    #[tokio::test]
     #[serial_test::serial]
     async fn a_stop_during_a_failed_respawn_teardown_releases_the_scope() {
         use crate::acp::runner_lifecycle::WorkerPhase;
@@ -2770,8 +3195,8 @@ mod tests {
         let drain = sup.start_drain_task("s-late-respawn".into(), lease, inbound_rx, None);
         drop(inbound_tx);
 
-        // Paused time only advances once this task idles, so the teardown
-        // waits out its grace until the replacement exits below.
+        // External writer completion uses the real clock. The captured TERM and
+        // immortal replacement keep teardown open until the explicit exit below.
         tokio::time::timeout(Duration::from_secs(5), control.terminated())
             .await
             .expect("the failed replacement enters captured TERM teardown");
@@ -3247,6 +3672,43 @@ mod tests {
 
     #[tokio::test]
     #[serial_test::serial]
+    async fn respawn_forwards_a_workspace_launch_repo_project_mcp_servers() {
+        let (_home, temp) = isolate_home();
+        let _env = crate::session::test_support::EnvGuard::unset(&["CLAUDE_CONFIG_DIR"]);
+        let repo = temp.path().join("repo");
+        let workspace = temp.path().join("workspace");
+        std::fs::create_dir_all(&repo).unwrap();
+        std::fs::create_dir_all(&workspace).unwrap();
+        std::fs::write(
+            repo.join(".mcp.json"),
+            r#"{ "mcpServers": { "project-only": { "command": "pl" } } }"#,
+        )
+        .unwrap();
+        let servers = crate::session::mcp::project_mcp::load_project_mcp_servers(&repo).unwrap();
+        let hash = crate::session::mcp::project_mcp::fingerprint(&servers);
+        crate::session::config::repo_config::trust_repo(&repo, None, Some(&hash)).unwrap();
+
+        let mut config = runner_config(worker_registry::socket_path_for("s-ws-mcp").unwrap());
+        config.cwd = workspace;
+        config.config_path = repo;
+        config.base_host_environment = vec![("HOME".into(), temp.path().display().to_string())];
+        config.host_environment = config.base_host_environment.clone();
+
+        Drain::<VecSink>::refresh_launch_env("s-ws-mcp", &mut config).await;
+
+        let forwarded = serde_json::to_value(&config.mcp_servers).unwrap();
+        assert!(
+            forwarded
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|server| server["name"] == "project-only"),
+            "{forwarded}"
+        );
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
     async fn respawn_discovers_declared_codex_wrapper_store_on_host_only() {
         let (_home, _temp, account) = codex_wrapper_fixture();
         // A sandbox applies no override, so it must not read the base store.
@@ -3430,5 +3892,251 @@ mod tests {
             .await
             .expect("drain should stop")
             .unwrap();
+    }
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn an_absent_worker_without_retained_custody_cannot_publish() {
+        use super::super::test_support::managed::with_managed;
+        for stopping in [false, true] {
+            with_managed(|scope| {
+                Box::pin(async move {
+                    let live = crate::server::test_support::managed_control_session(
+                        scope,
+                        "absent-publication-owner",
+                        "claude",
+                        None,
+                    )
+                    .await;
+                    let id = live.id().to_owned();
+                    let supervisor = live.state.acp_supervisor.clone();
+                    let store = live.state.acp_event_store.clone();
+                    let cache = live.state.acp_control_cache.clone();
+                    assert!(Arc::ptr_eq(&cache, store.control_cache()));
+                    let lease = live.client.lease.clone();
+                    let owner = live.client.actual().connected_runner().unwrap();
+                    if stopping {
+                        live.client.stop_session().await;
+                    } else {
+                        live.client
+                            .shutdown()
+                            .await
+                            .expect("complete the actual captured retirement");
+                    }
+                    supervisor.sink.flush();
+                    assert!(!supervisor.workers.lock().await.contains_key(&id));
+                    assert!(lock_recover(&supervisor.lifecycle)
+                        .current_lease(&id)
+                        .is_none());
+                    assert!(!lease.retirement().retains_original_client(owner));
+                    let before = live
+                        .state
+                        .session_service
+                        .fold_control_state(&id)
+                        .await
+                        .unwrap();
+                    let prefix = store.highest_seq(&id).unwrap();
+                    let mut frames = live.state.acp_events_tx.subscribe();
+                    let drain = Drain {
+                        session_id: id.clone(),
+                        identity_only: false,
+                        history_scope: lease.native_scope().unwrap(),
+                        sink: Arc::clone(&supervisor.sink),
+                        workers: Arc::clone(&supervisor.workers),
+                        next_seqs: Arc::clone(&supervisor.next_seqs),
+                        incompatible_binaries: Arc::clone(&supervisor.incompatible_binaries),
+                        lifecycle: Arc::clone(&supervisor.lifecycle),
+                        process_control: Arc::clone(&supervisor.process_control),
+                        launcher: Arc::clone(&supervisor.launcher),
+                        notify: Arc::clone(&supervisor.worker_notify),
+                        startup_requeues: Arc::clone(&supervisor.startup_requeues),
+                        pending_context_resets: Arc::clone(&supervisor.pending_context_resets),
+                        context_reset: None,
+                        respawned_in_place: Arc::clone(&supervisor.respawned_in_place),
+                        receive_owner: None,
+                    };
+                    let mut data = AcpEventData::from_history(Event::AcpSessionAssigned {
+                        acp_session_id: "uncaptured-native-sid".into(),
+                        connection_ready: false,
+                        native_subject: None,
+                    });
+                    assert!(matches!(
+                        drain.publish_owned(&lease, &mut data, None).await,
+                        OwnedPublication::Superseded
+                    ));
+                    supervisor.sink.flush();
+                    assert!(store.replay_from(&id, prefix).unwrap().is_empty());
+                    assert_eq!(store.highest_seq(&id).unwrap(), prefix);
+                    assert_eq!(
+                        super::super::try_activity_seq(&supervisor.next_seqs, &id)
+                            .expect("a superseded publication cannot retain sequence exclusion"),
+                        prefix
+                    );
+                    assert!(matches!(
+                        frames.try_recv(),
+                        Err(tokio::sync::broadcast::error::TryRecvError::Empty)
+                    ));
+                    let after = cache
+                        .get_or_hydrate(&id, || panic!("the same warm state must survive"))
+                        .unwrap();
+                    assert_eq!(after.last_seq, before.last_seq);
+                    assert_eq!(after.operation_error, before.operation_error);
+                    assert_eq!(after.session_id, before.session_id);
+                })
+            })
+            .await;
+        }
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn superseded_worker_errors_never_allocate_persist_or_fold() {
+        use super::super::test_support::managed::with_managed;
+        use crate::daemon::AcpWorkerState;
+        use crate::session::{
+            ErrorEvidenceGeneration, ErrorEvidenceSource, ErrorOperation, OperationErrorEvidence,
+            Status,
+        };
+        with_managed(|scope| Box::pin(async move {
+                let mut live = crate::server::test_support::managed_control_session(scope, "superseded-publication-owner", "claude", None).await;
+                let id = live.id().to_owned();
+                let old = live.client.lease.clone();
+                live.client = scope.adopt(live.client, false).await;
+                live.client.ready().await;
+                live.state = live.client.app_state();
+                let replacement = live.client.lease.clone();
+                assert_ne!(old, replacement);
+                // Readiness precedes these legitimate replacement publications.
+                // Settle them before capturing both the warm fold and durable prefix.
+                tokio::time::timeout(Duration::from_secs(10), async {
+                    let (mut assigned, mut capabilities) = (false, false);
+                    while !assigned || !capabilities {
+                        match live.client.next_event().await.expect("actual replacement handshake publication") {
+                            Event::AcpSessionAssigned { acp_session_id, .. }
+                                if acp_session_id == live.sid => assigned = true,
+                            Event::PromptCapabilities { .. } => capabilities = true,
+                            Event::AgentStartupError { message, .. } => panic!("{message}"),
+                            Event::AcpConnectionUnavailable { .. } => panic!("the replacement original channel stays live"),
+                            _ => {}
+                        }
+                    }
+                }).await.expect("the replacement handshake precedes the no-old-worker baseline");
+                let supervisor = live.state.acp_supervisor.clone();
+                let store = live.state.acp_event_store.clone();
+                let cache = live.state.acp_control_cache.clone();
+                assert!(Arc::ptr_eq(&cache, store.control_cache()));
+                let before = live.state.session_service.fold_control_state(&id).await.unwrap();
+                let prefix = store.highest_seq(&id).unwrap();
+                let mut frames = live.state.acp_events_tx.subscribe();
+                let error = || Event::PromptRuntimeError {
+                    message: "operation failed".into(),
+                    evidence: Some(OperationErrorEvidence::new(ErrorEvidenceSource::LocalPromptResult, ErrorOperation::Prompt)),
+                    native_subject: None,
+                };
+                let drain = Drain {
+                        session_id: id.clone(), identity_only: false, history_scope: old.native_scope().unwrap(),
+                        sink: Arc::clone(&supervisor.sink), workers: Arc::clone(&supervisor.workers),
+                        next_seqs: Arc::clone(&supervisor.next_seqs), incompatible_binaries: Arc::clone(&supervisor.incompatible_binaries),
+                        lifecycle: Arc::clone(&supervisor.lifecycle), process_control: Arc::clone(&supervisor.process_control),
+                        launcher: Arc::clone(&supervisor.launcher), notify: Arc::clone(&supervisor.worker_notify),
+                        startup_requeues: Arc::clone(&supervisor.startup_requeues),
+                        pending_context_resets: Arc::clone(&supervisor.pending_context_resets), context_reset: None,
+                        respawned_in_place: Arc::clone(&supervisor.respawned_in_place), receive_owner: None,
+                    };
+                for event in [error(), Event::Stopped { reason: "prompt_failed".into() }] {
+                    let mut data = AcpEventData::from_history(event);
+                    assert!(matches!(drain.publish_owned(&old, &mut data, None).await, OwnedPublication::Superseded));
+                }
+                let (closed, inbound) = mpsc::channel(1);
+                drop(closed);
+                let empty = supervisor.start_drain_task(id.clone(), old, inbound, None);
+                tokio::time::timeout(Duration::from_secs(10), empty).await.unwrap().unwrap();
+                supervisor.sink.flush();
+                assert!(supervisor.workers.lock().await.get(&id).unwrap().restart_history.is_empty());
+                assert!(store.replay_from(&id, prefix).unwrap().is_empty());
+                assert_eq!(store.highest_seq(&id).unwrap(), prefix);
+                assert_eq!(super::super::try_activity_seq(&supervisor.next_seqs, &id).expect("the unchanged sequence remains observable"), prefix);
+                assert!(matches!(frames.try_recv(), Err(tokio::sync::broadcast::error::TryRecvError::Empty)));
+                let unchanged = cache.get_or_hydrate(&id, || panic!("the warm fold must survive")).unwrap();
+                assert_eq!(unchanged.last_seq, before.last_seq);
+                assert_eq!(unchanged.operation_error, None);
+                assert_eq!(supervisor.worker_state(&id).await, AcpWorkerState::Running);
+                assert!(supervisor.take_startup_requeues().is_empty());
+                let request = live.start_prompt("distinct actual replacement input").await;
+                live.native.send(serde_json::json!({"jsonrpc":"2.0","id":request["id"],
+                    "error":{"code":-32603,"message":"operation failed"}})).await;
+                let terminal = tokio::time::timeout(Duration::from_secs(10), async {
+                    loop {
+                        let frame = frames.recv().await.unwrap();
+                        if matches!(frame.event.as_ref(), Event::Stopped { reason } if reason == "prompt_failed") { break frame; }
+                    }
+                }).await.expect("the real replacement Native request produces its own durable failure and terminal");
+                assert_eq!(terminal.seq, prefix + 4, "the stale diagnostics consume no seq before the actual prompt/thinking/error/stop interval");
+                assert_eq!(terminal.worker_generation, Some(replacement.epoch()));
+                let state = cache.get_or_hydrate(&id, || panic!("the same fold remains warm")).unwrap();
+                assert_eq!(state.sidebar_status(), Status::Error);
+                assert!(!state.turn_active);
+                assert_eq!(state.operation_error.unwrap().generation, Some(ErrorEvidenceGeneration::AcpWorker(replacement.epoch())));
+                let suffix = store.replay_from(&id, prefix).unwrap();
+                assert_eq!(suffix.len(), 4);
+                assert!(suffix.iter().any(|stored| matches!(stored.event.as_ref(), Event::PromptRuntimeError { message, .. } if message == "operation failed")
+                    && stored.metadata.native_prompt_id == request["id"].as_i64() && stored.metadata.native_origin.is_some()));
+                assert_eq!(supervisor.worker_state(&id).await, AcpWorkerState::Running);
+                assert!(supervisor.workers.lock().await.get(&id).unwrap().restart_history.is_empty());
+            })).await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[serial_test::serial]
+    async fn a_stalled_event_save_does_not_stop_the_drain_reading_frames() {
+        let _home = crate::session::test_support::isolate_app_dir();
+        let (sink, store, _rx, tmp) = super::super::test_support::channel_sink();
+        let supervisor = Supervisor::new(Arc::clone(&sink));
+        let id = "s-stalled-save";
+        let lease = supervisor.test_install_stdio(id).await;
+        assert!(
+            lease.retirement().establishment_projection().is_none(),
+            "this descriptive transport fixture cannot advance a real Native SDK frontier"
+        );
+        let blocker = rusqlite::Connection::open(tmp.path().join("acp.db")).unwrap();
+        blocker.execute_batch("BEGIN IMMEDIATE").unwrap();
+        let (inbound_tx, inbound_rx) = mpsc::channel(64);
+        let drain = supervisor.start_drain_task(id.into(), lease, inbound_rx, None);
+        let frames = 256_u64;
+        let sent = tokio::time::timeout(Duration::from_secs(2), async {
+            for _ in 0..frames {
+                inbound_tx
+                    .send(SdkEvent::Data(AcpEventData::from_history(
+                        Event::ThinkingStarted,
+                    )))
+                    .await
+                    .unwrap();
+            }
+        })
+        .await;
+        blocker.execute_batch("COMMIT").unwrap();
+        sent.expect(
+            "the owned drain must keep reading frames while an actual SQLite save is stalled",
+        );
+        drop(inbound_tx);
+        tokio::time::timeout(Duration::from_secs(10), drain)
+            .await
+            .expect("ordered completion reaches EOF after every queued DATA frame")
+            .unwrap();
+        sink.flush();
+        let stored: Vec<_> = store
+            .replay_from(id, 0)
+            .unwrap()
+            .into_iter()
+            .filter(|stored| matches!(stored.event.as_ref(), Event::ThinkingStarted))
+            .map(|stored| {
+                assert_eq!(stored.metadata.scope, EventScope::HistoryOnly);
+                stored.seq
+            })
+            .collect();
+        assert_eq!(
+            stored,
+            (1..=frames).collect::<Vec<_>>(),
+            "every descriptive frame is stored once, in order, without Native authority"
+        );
     }
 }

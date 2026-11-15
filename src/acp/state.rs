@@ -48,6 +48,9 @@ pub struct Todo {
     pub completed: bool,
 }
 
+/// Ends an `args_preview` that was cut at the ingest cap.
+pub(crate) const ARGS_CUT_MARKER: &str = "\u{2026}[truncated]";
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ToolCall {
     pub id: String,
@@ -57,6 +60,9 @@ pub struct ToolCall {
     pub kind: String,
     /// Capped at 16 KB at ingest, control chars stripped.
     pub args_preview: String,
+    /// The `prompt` argument in full, set only when `args_preview` was cut.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub prompt: Option<String>,
     pub started_at: DateTime<Utc>,
     /// The sub-agent `Task` call this call runs under, from `_meta.claudeCode.parentToolUseId`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -264,7 +270,13 @@ pub struct AvailableCommand {
     pub description: String,
     #[serde(default)]
     pub accepts_input: bool,
+    /// Argument hint the agent advertises, e.g. `[reconnect|enable|disable]`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub input_hint: Option<String>,
 }
+
+/// The `Other` category claude-agent-acp uses for Fast mode and Ultracode.
+pub const MODEL_CONFIG_CATEGORY: &str = "model_config";
 
 /// Semantic category of an ACP `SessionConfigOption`; unknown values round-trip as `Other`.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -295,6 +307,16 @@ pub struct ConfigOptionDescriptor {
     pub category: ConfigOptionCategory,
     pub current_value: String,
     pub options: Vec<ConfigOptionChoice>,
+}
+
+impl ConfigOptionDescriptor {
+    /// A `model_config` option whose only choices are `on` and `off`.
+    pub fn is_model_config_toggle(&self) -> bool {
+        let mut values: Vec<&str> = self.options.iter().map(|o| o.value.as_str()).collect();
+        values.sort_unstable();
+        self.category == ConfigOptionCategory::Other(MODEL_CONFIG_CATEGORY.into())
+            && values == ["off", "on"]
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -342,6 +364,22 @@ pub enum StartupErrorDetail {
         expected: String,
         received: String,
     },
+    /// The adapter's proxy sent a `_meta.aoe.proxy` hello core cannot accept.
+    InvalidProxyHello {
+        reason: String,
+    },
+}
+
+/// Why a proxied session's integration was lost mid-session.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum IntegrationLostReason {
+    /// A `_meta.aoe` frame broke the contract.
+    ContractViolation { detail: String },
+    /// Too many frames waited on an adapter sequence that never arrived.
+    HoldOverflow,
+    /// The proxy held more leases than any real agent does.
+    LeaseOverflow,
 }
 
 /// This daemon's local setup/initialize, assignment, and established-command phases.
@@ -802,6 +840,98 @@ impl CurrentNativeAvailability {
                 .flatten()
                 .is_some_and(|birth| Some(birth.fingerprint()) == owner.birth_fingerprint))
     }
+    pub(crate) fn initial_prompt_attempt(
+        &mut self,
+        row: &crate::session::Instance,
+        storage: &crate::session::Storage,
+    ) -> Result<
+        Option<Arc<crate::acp::establishment::EstablishmentAttempt>>,
+        crate::acp::establishment::EstablishmentRefusal,
+    > {
+        use crate::acp::establishment::{
+            AcpEstablishment, CreationStage, EstablishmentAttempt, EstablishmentOrigin,
+            EstablishmentRefusal,
+        };
+        if !row.is_structured()
+            || !row.launch_is_finalized()
+            || row.archived_at.is_some()
+            || row.trashed_at.is_some()
+            || row.terminal_handoff.is_some()
+            || row.status == crate::session::Status::Stopped
+            || row.is_idle_dormant()
+            || self.lease.cancellation().is_cancelled()
+        {
+            return Ok(None);
+        }
+        let Some(admission) = self.lease.admission() else {
+            return Ok(None);
+        };
+        let Some(expected) = admission.establishment else {
+            return Ok(None);
+        };
+        if !matches!(
+            expected.origin,
+            EstablishmentOrigin::Creation {
+                stage: CreationStage::Admitted
+            }
+        ) || expected.producer != Some(self.lease.producer_id())
+            || admission.generation != expected.generation
+        {
+            return Ok(None);
+        }
+        let Some(scope) = admission.native_scope else {
+            return Ok(None);
+        };
+        self.scope = scope;
+        let matches = match row.acp_establishment.as_ref() {
+            Some(AcpEstablishment::Pending { .. }) => {
+                self.scope.context == expected.context
+                    && self.scope.choice.as_deref() == Some(&expected.destination)
+                    && expected
+                        .matches_pending(row, storage)
+                        .map_err(|_| EstablishmentRefusal::Unconfirmed)?
+            }
+            Some(AcpEstablishment::Applied { attempt_id }) if *attempt_id == expected.id => {
+                expected.profile == row.source_profile
+                    && expected.profile == storage.profile()
+                    && expected.session_id == row.id
+                    && expected.created_at == row.created_at
+                    && expected.generation == row.lifecycle_generation
+                    && self
+                        .scope
+                        .choice
+                        .as_ref()
+                        .is_some_and(|choice| choice.matches(row))
+                    && NativeEventContext::capture(row, storage)
+                        .map_err(|_| EstablishmentRefusal::Unconfirmed)?
+                        == self.scope.context
+                    && self
+                        .client
+                        .establishment_projection()
+                        .is_some_and(|projection| {
+                            projection
+                                .applied()
+                                .is_some_and(|applied| applied.attempt_id == expected.id)
+                                && projection.receipt_snapshot().is_some_and(|receipt| {
+                                    EstablishmentAttempt::eq(&receipt.attempt, &expected)
+                                })
+                        })
+            }
+            _ => false,
+        };
+        if !matches
+            || !self
+                .refresh(&row.id, matches)
+                .map_err(|_| EstablishmentRefusal::Unconfirmed)?
+            || self.unavailable.is_some()
+            || !self
+                .qualify_owner(&row.id)
+                .map_err(|_| EstablishmentRefusal::Unconfirmed)?
+        {
+            return Ok(None);
+        }
+        Ok(Some(expected))
+    }
 }
 
 pub(crate) struct NativeObservationWait {
@@ -851,6 +981,7 @@ pub(crate) struct NativeAvailabilityProjection {
     pub unavailable: Option<AcpConnectionUnavailability>,
     pub control_failure: Option<(u64, NativeControlFailure)>,
     pub prompt_wake_eligible: bool,
+    pub host_prompt_intent: Option<uuid::Uuid>,
     context: Option<NativeEventContext>,
     owner: Option<crate::acp::runner_lifecycle::RunnerIdentity>,
 }
@@ -880,6 +1011,7 @@ impl NativeAvailabilityProjection {
                 prompt_wake_eligible: !current.ready
                     && current.unavailable.is_none()
                     && current.client.initial_prompt_intent_available(),
+                host_prompt_intent: current.client.initial_prompt_identity(),
                 context: Some(context),
                 owner: current.owner,
             };
@@ -905,6 +1037,7 @@ impl NativeAvailabilityProjection {
             control_failure: None,
             context: Some(context),
             prompt_wake_eligible: false,
+            host_prompt_intent: None,
             owner: current_refusal
                 .and_then(|refusal| refusal.owner)
                 .or_else(|| historical.and_then(|(_, subject)| subject.owner)),
@@ -950,7 +1083,6 @@ impl Event {
         }
     }
 }
-
 /// Lifecycle status of an async background sub-agent.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -958,6 +1090,10 @@ pub enum BackgroundAgentStatus {
     Running,
     /// No transcript growth for the idle window.
     Stalled,
+    /// A subagent session is blocked on the user (RFD `requires_action`).
+    RequiresAction,
+    /// The agent cannot say what the subagent is doing (RFD `unknown`).
+    Unknown,
     Completed,
     /// The parent session ended before the agent finished.
     Detached,
@@ -1020,6 +1156,22 @@ pub struct WorkflowRunRecord {
     pub ended_at: Option<DateTime<Utc>>,
 }
 
+/// Finished shells kept for the Background panel's Recent group.
+pub const MAX_FINISHED_BACKGROUND_SHELLS: usize = 20;
+
+/// A Bash `run_in_background` task.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BackgroundShellRecord {
+    pub task_id: String,
+    pub command: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub started_at: Option<DateTime<Utc>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ended_at: Option<DateTime<Utc>>,
+    #[serde(default)]
+    pub finished: bool,
+}
+
 /// The workflow run and phase a background sub-agent belongs to.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct WorkflowRef {
@@ -1028,9 +1180,54 @@ pub struct WorkflowRef {
     pub phase: String,
 }
 
+/// Work state of a subagent session, from the ACP subagents RFD snapshot.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SubagentState {
+    Running,
+    RequiresAction,
+    /// Ready for another prompt; `SubagentRecord::stop_reason` says why.
+    Idle,
+    /// Also the state before the agent has reported one.
+    #[default]
+    Unknown,
+}
+
+/// One subagent session announced by its parent. The event carries the whole
+/// merged snapshot, so replay is last-write-wins.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SubagentRecord {
+    pub session_id: String,
+    pub parent_session_id: String,
+    #[serde(skip)]
+    pub(crate) provenance: Option<Arc<crate::acp::event_sender::NativeChildProvenance>>,
+    /// The card for the delegation message that launched it (its message id).
+    /// Unset renders the child in a flat roster.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub parent_tool_call_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub title: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+    #[serde(default)]
+    pub state: SubagentState,
+    /// Open string: the RFD reserves values for future stop reasons.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stop_reason: Option<String>,
+    /// Whether `session/cancel` may target this child.
+    #[serde(default)]
+    pub cancel_capable: bool,
+    /// Read-only: the child's own model selector, never set by aoe.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
+}
+
 /// One tool call a background sub-agent made, parsed from its transcript.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct BackgroundAgentTool {
+    /// The transcript's `tool_use` id, a stable key while the list grows.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub id: Option<String>,
     pub name: String,
     /// Short label from the tool input (command, file path, pattern).
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1038,6 +1235,12 @@ pub struct BackgroundAgentTool {
     /// `None` while running, then whether it succeeded.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub ok: Option<bool>,
+    /// Transcript timestamp of the call; `None` when the line carried none.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub started_at: Option<DateTime<Utc>>,
+    /// Transcript timestamp of the matching result.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ended_at: Option<DateTime<Utc>>,
 }
 
 /// One async background sub-agent, built up from `BackgroundAgent*` events.
@@ -1046,6 +1249,8 @@ pub struct BackgroundAgentRecord {
     pub agent_id: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub resource_ref: Option<uuid::Uuid>,
+    #[serde(skip)]
+    pub(crate) resource_witness: Option<Arc<crate::acp::establishment::NativeResourceWitness>>,
     /// The parent `Task` tool call that launched this agent.
     pub tool_call_id: String,
     pub description: String,
@@ -1120,6 +1325,9 @@ pub struct AcpState {
     pub historical_usage: Option<SessionUsage>,
     #[serde(skip)]
     operation_effects: crate::acp::operation_effect::OperationEffects,
+    /// Separately owned Native root activity; never a main input/callback grant.
+    #[serde(default)]
+    pub native_autonomous_active: bool,
     #[serde(default)]
     pub available_commands: Vec<AvailableCommand>,
     /// Modes the adapter advertised; adapter-scoped, so they survive `/clear`.
@@ -1149,10 +1357,15 @@ pub struct AcpState {
     /// field. Missing/null is unknown; history/cache serialization omits it.
     #[serde(default, skip_serializing)]
     pub(crate) prompt_wake_eligible: Option<bool>,
+    /// Exact host cancellation identity from the live envelope only; never Native authority.
+    #[serde(default, skip_serializing)]
+    pub(crate) host_prompt_intent: Option<uuid::Uuid>,
     #[serde(skip)]
     pub(crate) native_availability: Option<(u64, NativeEventSubject)>,
     #[serde(skip)]
     pub(crate) native_control_seq: u64,
+    #[serde(default)]
+    pub integration_lost: Option<IntegrationLostReason>,
     /// Full snapshot of the adapter's per-session selectors.
     #[serde(default)]
     pub config_options: Vec<ConfigOptionDescriptor>,
@@ -1164,9 +1377,14 @@ pub struct AcpState {
     pub session_notices: Vec<SessionNotice>,
     #[serde(default)]
     pub background_agents: Vec<BackgroundAgentRecord>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub subagents: Vec<SubagentRecord>,
     /// Ids of running background tasks that are not sub-agents.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub background_tasks: Vec<BackgroundTaskRecord>,
+    /// Background shells, running and recently finished, oldest first.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub background_shells: Vec<BackgroundShellRecord>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub workflow_runs: Vec<WorkflowRunRecord>,
 
@@ -1275,6 +1493,9 @@ pub enum Event {
         title: Option<String>,
         #[serde(default)]
         args_preview: Option<String>,
+        /// The `prompt` argument in full when `args_preview` was cut.
+        #[serde(default)]
+        prompt: Option<String>,
         #[serde(default)]
         started_at: Option<DateTime<Utc>>,
         /// Replaces the call's diffs when present (Codex sends them on updates).
@@ -1404,6 +1625,11 @@ pub enum Event {
         warning: Option<String>,
         ended_at: DateTime<Utc>,
     },
+    /// A subagent session was announced or its snapshot changed.
+    SubagentUpdated {
+        subagent: SubagentRecord,
+        at: DateTime<Utc>,
+    },
     /// A background task that is not a sub-agent (Bash `run_in_background`, or
     /// a `Workflow` run) started, from the tool result's `toolResponse`. Its
     /// end is read from the session transcript (`acp::task_transcript`).
@@ -1411,9 +1637,12 @@ pub enum Event {
         task_id: String,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         tool_call_id: Option<String>,
+        /// The Bash command, or the workflow's name.
         description: String,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         workflow: Option<WorkflowLaunch>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        started_at: Option<DateTime<Utc>>,
     },
     /// A background task reached a terminal state.
     BackgroundTaskFinished {
@@ -1468,6 +1697,11 @@ pub enum Event {
     IncompatibleAgent {
         detail: StartupErrorDetail,
     },
+    /// A proxied agent broke the `_meta.aoe` contract mid-session; core stops
+    /// interpreting its frames.
+    IntegrationLost {
+        reason: IntegrationLostReason,
+    },
     UserPromptSent {
         text: String,
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -1475,6 +1709,10 @@ pub enum Event {
         /// Client-minted id so a web client reconciles its optimistic row.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         prompt_id: Option<String>,
+        /// Ids of the other queued rows folded into this turn (queue drain or
+        /// send-now), so a web client settles each of their optimistic rows.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        merged_prompt_ids: Vec<String>,
         /// True when the daemon queued this turn itself (a rate-limit resume
         /// continuation) rather than the user typing it just now. The
         /// transcript model skips rendering a row for it: the user already
@@ -1654,7 +1892,11 @@ impl AcpState {
             SidebarPhase::Error | SidebarPhase::PromptFailed => Status::Error,
             SidebarPhase::Waiting => Status::Waiting,
             SidebarPhase::Active => Status::Running,
-            SidebarPhase::Idle if self.has_qualified_background_work() => Status::Running,
+            SidebarPhase::Idle
+                if self.has_qualified_background_work() || self.native_autonomous_active =>
+            {
+                Status::Running
+            }
             SidebarPhase::Idle => Status::Idle,
         }
     }
@@ -1669,6 +1911,15 @@ impl AcpState {
                 .any(|agent| agent.resource_ref.is_some() && agent.ended_at.is_none())
     }
 
+    pub(crate) fn restore_autonomous(
+        &mut self,
+        identity: &crate::acp::event_sender::NativeAutonomousIdentity,
+        active: bool,
+    ) {
+        self.operation_effects.restore_autonomous(identity, active);
+        self.native_autonomous_active = active;
+    }
+
     pub(crate) fn apply_scoped_event(
         &mut self,
         seq: u64,
@@ -1676,9 +1927,23 @@ impl AcpState {
         metadata: &crate::acp::event_sender::EventMetadata,
     ) -> Result<u64, StateError> {
         use crate::acp::operation_effect::ControlKind;
+        if let Event::SubagentUpdated { subagent, at } = event {
+            let mut record = subagent.clone();
+            record.provenance = metadata.child_provenance.clone();
+            self.apply_subagent(record, *at);
+            self.last_seq = seq;
+            self.updated_at = Utc::now();
+            return Ok(seq);
+        }
         let previous = self.operation_effects.active();
         let kind = ControlKind::from_event(event);
         let effect = self.operation_effects.apply(kind, metadata);
+        self.native_autonomous_active = self.operation_effects.autonomous_open();
+        if metadata.native_autonomous.is_some() {
+            self.last_seq = seq;
+            self.updated_at = Utc::now();
+            return Ok(seq);
+        }
         if effect.applies_state() {
             if matches!(kind, ControlKind::Admission)
                 && self.operation_effects.active().is_some()
@@ -1730,8 +1995,20 @@ impl AcpState {
                             metadata.native_origin,
                             metadata.clear_after_seq,
                         )?;
-                        if let Some(agent) = self.background_agent(agent_id) {
+                        if let Some(agent) = self
+                            .background_agents
+                            .iter_mut()
+                            .find(|agent| agent.agent_id == *agent_id)
+                        {
                             agent.resource_ref = metadata.resource_ref;
+                            agent.resource_witness = metadata.resource_witness.clone();
+                            if let Some(child) = self
+                                .subagents
+                                .iter()
+                                .find(|child| agent.accepts_child(child))
+                            {
+                                agent.reconcile(child, agent.started_at);
+                            }
                         }
                         if metadata.resource_ref.is_some() {
                             self.sidebar_observation_seq = seq;
@@ -1871,6 +2148,7 @@ impl AcpState {
                 tool_call_id,
                 title,
                 args_preview,
+                prompt,
                 started_at,
                 diffs,
             } => {
@@ -1883,6 +2161,11 @@ impl AcpState {
                         tool.name = title.clone();
                     }
                     if let Some(args_preview) = args_preview {
+                        // An uncut preview means the prompt is no longer oversized; a cut
+                        // one with no prompt is a deduplicated repeat of the stored prompt.
+                        if prompt.is_some() || !args_preview.ends_with(ARGS_CUT_MARKER) {
+                            tool.prompt.clone_from(prompt);
+                        }
                         tool.args_preview = args_preview.clone();
                     }
                     if let Some(started_at) = started_at {
@@ -2091,6 +2374,12 @@ impl AcpState {
                 self.startup_error = Some(detail.clone());
                 self.sidebar_phase = SidebarPhase::Error;
             }
+            Event::IntegrationLost { reason } => {
+                self.integration_lost = Some(reason.clone());
+                self.turn_active = false;
+                self.cancelling = false;
+                self.sidebar_phase = SidebarPhase::Error;
+            }
             Event::UserPromptSent { .. } | Event::UserDiffCommentsPrompt { .. } => self.open_turn(),
             Event::PromptCapabilities { steering, .. } => self.steering = *steering,
             Event::AcpSessionAssigned {
@@ -2105,6 +2394,7 @@ impl AcpState {
                     self.connection_unavailable = None;
                     self.native_availability = native_subject.map(|subject| (seq, subject));
                     self.startup_error = None;
+                    self.integration_lost = None;
                     self.rate_limit = None;
                     self.heal_sidebar_phase();
                 }
@@ -2151,24 +2441,28 @@ impl AcpState {
                 output_file: _,
                 workflow,
                 started_at,
-            } => self.launch_background_agent(BackgroundAgentRecord {
-                agent_id: agent_id.clone(),
-                resource_ref: None,
-                tool_call_id: tool_call_id.clone(),
-                description: description.clone(),
-                prompt: prompt.clone(),
-                model: model.clone(),
-                workflow: workflow.clone(),
-                status: BackgroundAgentStatus::Running,
-                started_at: *started_at,
-                ended_at: None,
-                tool_count: 0,
-                tools: Vec::new(),
-                last_tool: None,
-                last_text: None,
-                result: None,
-                warning: None,
-            }),
+            } => {
+                let record = BackgroundAgentRecord {
+                    agent_id: agent_id.clone(),
+                    resource_ref: None,
+                    resource_witness: None,
+                    tool_call_id: tool_call_id.clone(),
+                    description: description.clone(),
+                    prompt: prompt.clone(),
+                    model: model.clone(),
+                    workflow: workflow.clone(),
+                    status: BackgroundAgentStatus::Running,
+                    started_at: *started_at,
+                    ended_at: None,
+                    tool_count: 0,
+                    tools: Vec::new(),
+                    last_tool: None,
+                    last_text: None,
+                    result: None,
+                    warning: None,
+                };
+                self.launch_background_agent(record);
+            }
             Event::BackgroundAgentProgress {
                 agent_id,
                 status,
@@ -2210,14 +2504,26 @@ impl AcpState {
                     }
                 }
             }
+            Event::SubagentUpdated { subagent, at } => self.apply_subagent(subagent.clone(), *at),
             Event::BackgroundTaskStarted {
                 task_id,
                 tool_call_id,
+                description,
                 workflow,
-                ..
+                started_at,
             } => {
                 // A reused task id replaces whatever run held it.
                 self.close_workflow_run(task_id, None);
+                self.background_shells.retain(|s| s.task_id != *task_id);
+                if workflow.is_none() {
+                    self.background_shells.push(BackgroundShellRecord {
+                        task_id: task_id.clone(),
+                        command: description.clone(),
+                        started_at: *started_at,
+                        ended_at: None,
+                        finished: false,
+                    });
+                }
                 if let (Some(workflow), Some(tool_call_id)) = (workflow, tool_call_id) {
                     self.workflow_runs.push(WorkflowRunRecord {
                         task_id: task_id.clone(),
@@ -2243,6 +2549,20 @@ impl AcpState {
                 self.close_workflow_run(task_id, *ended_at);
                 self.background_tasks
                     .retain(|task| task.task_id != *task_id);
+                if let Some(shell) = self
+                    .background_shells
+                    .iter_mut()
+                    .find(|s| s.task_id == *task_id)
+                {
+                    shell.finished = true;
+                    shell.ended_at = *ended_at;
+                }
+                let finished = self.background_shells.iter().filter(|s| s.finished).count();
+                for _ in MAX_FINISHED_BACKGROUND_SHELLS..finished {
+                    if let Some(i) = self.background_shells.iter().position(|s| s.finished) {
+                        self.background_shells.remove(i);
+                    }
+                }
             }
             // Titles live on `Instance`; wakeups and monitors are read from the log.
             Event::AgentMessageChunk { .. } => {
@@ -2352,13 +2672,16 @@ impl AcpState {
     /// The turn is over however it ended, so every in-turn phase clears.
     fn end_turn(&mut self, reason: &str) {
         self.turn_active = false;
-        self.sidebar_phase = if reason == "prompt_failed" || reason == "aborted" {
-            SidebarPhase::PromptFailed
-        } else if reason == "session_reset_failed" {
-            SidebarPhase::Error
-        } else {
-            SidebarPhase::Idle
-        };
+        // A lost integration is an error until a new connection restores it.
+        if self.integration_lost.is_none() {
+            self.sidebar_phase = if reason == "prompt_failed" || reason == "aborted" {
+                SidebarPhase::PromptFailed
+            } else if reason == "session_reset_failed" {
+                SidebarPhase::Error
+            } else {
+                SidebarPhase::Idle
+            };
+        }
         self.cancelling = false;
         self.compacting = false;
         self.compaction_tool_id = None;
@@ -2393,6 +2716,7 @@ impl AcpState {
         self.mode = SessionMode::Default;
         self.config_options = Vec::new();
         self.config_option_switch_failed = None;
+        self.subagents = Vec::new();
         self.last_agent_switch = Some(AgentSwitchInfo {
             from,
             to,
@@ -2409,10 +2733,66 @@ impl AcpState {
         }
     }
 
+    /// The RFD snapshot is authoritative for the async agent that child
+    /// belongs to, so it replaces the transcript tailer's heuristics and,
+    /// unlike them, may reopen an idle agent that was messaged again.
+    fn apply_subagent(&mut self, subagent: SubagentRecord, at: DateTime<Utc>) {
+        if let Some(tool_call_id) = subagent.parent_tool_call_id.as_deref() {
+            if let Some(agent) = self
+                .background_agents
+                .iter_mut()
+                .find(|a| a.tool_call_id == tool_call_id && a.accepts_child(&subagent))
+            {
+                agent.reconcile(&subagent, at);
+            }
+        }
+        match self
+            .subagents
+            .iter_mut()
+            .find(|s| s.session_id == subagent.session_id)
+        {
+            Some(existing) => *existing = subagent,
+            None => self.subagents.push(subagent),
+        }
+    }
+
     fn background_agent(&mut self, agent_id: &str) -> Option<&mut BackgroundAgentRecord> {
         self.background_agents
             .iter_mut()
             .find(|a| a.agent_id == agent_id)
+    }
+}
+
+impl BackgroundAgentRecord {
+    fn accepts_child(&self, child: &SubagentRecord) -> bool {
+        let (Some(resource), Some(provenance)) = (
+            self.resource_witness.as_deref(),
+            child.provenance.as_deref(),
+        ) else {
+            return false;
+        };
+        self.resource_ref == Some(resource.allocation)
+            && resource.origin == provenance.origin
+            && &resource.native_session_id == provenance.root()
+            && &resource.native_session_id == provenance.parent()
+            && child.session_id == provenance.child().0.as_ref()
+            && child.parent_session_id == provenance.parent().0.as_ref()
+            && child.parent_tool_call_id.as_deref() == Some(self.tool_call_id.as_str())
+    }
+
+    /// Folds a child's RFD snapshot in; `at` stamps a newly ended agent.
+    fn reconcile(&mut self, child: &SubagentRecord, at: DateTime<Utc>) {
+        let (status, ended) = match child.state {
+            SubagentState::Running => (BackgroundAgentStatus::Running, false),
+            SubagentState::RequiresAction => (BackgroundAgentStatus::RequiresAction, false),
+            SubagentState::Unknown => (BackgroundAgentStatus::Unknown, false),
+            SubagentState::Idle if child.stop_reason.as_deref() == Some("error") => {
+                (BackgroundAgentStatus::Error, true)
+            }
+            SubagentState::Idle => (BackgroundAgentStatus::Completed, true),
+        };
+        self.status = status;
+        self.ended_at = ended.then(|| self.ended_at.unwrap_or(at));
     }
 }
 
@@ -2429,6 +2809,7 @@ pub(crate) mod test_support {
 
     pub(crate) fn prompt(text: &str) -> Event {
         Event::UserPromptSent {
+            merged_prompt_ids: Vec::new(),
             prompt_id: None,
             text: text.into(),
             attachments: Vec::new(),
@@ -2590,6 +2971,7 @@ mod tests {
         });
         let approval = crate::acp::permissions::build_approval(
             ToolCall {
+                prompt: None,
                 id: "pending".into(),
                 name: "shell".into(),
                 kind: "execute".into(),
@@ -2658,6 +3040,7 @@ mod tests {
                         tool_call_id: Some("background-tool".into()),
                         description: "background activity remains observed".into(),
                         workflow: None,
+                        started_at: None,
                     },
                     &crate::acp::event_sender::EventMetadata::history(),
                 )
@@ -3028,6 +3411,7 @@ mod tests {
         use super::test_support::chunk;
         use crate::acp::permissions::build_approval;
         let tool = || ToolCall {
+            prompt: None,
             id: "t".into(),
             name: "shell".into(),
             kind: "execute".into(),
@@ -3180,6 +3564,7 @@ mod tests {
                         tool_call_id: None,
                         description: "sleep".into(),
                         workflow: None,
+                        started_at: None,
                     },
                     stopped("end_turn"),
                     launched(),
@@ -3407,6 +3792,7 @@ mod tests {
 
     fn tool_call(id: &str) -> ToolCall {
         ToolCall {
+            prompt: None,
             id: id.into(),
             name: "Read".into(),
             kind: "read".into(),
@@ -3429,6 +3815,7 @@ mod tests {
 
     fn tool_update(title: Option<&str>, diffs: Option<Vec<DiffPreview>>) -> Event {
         Event::ToolCallUpdated {
+            prompt: None,
             tool_call_id: "tc-1".into(),
             title: title.map(Into::into),
             args_preview: None,
@@ -3583,6 +3970,7 @@ mod tests {
             "another tool's completion leaves it set"
         );
         let retitle = Event::ToolCallUpdated {
+            prompt: None,
             tool_call_id: "tc-compact".into(),
             title: Some("Compacting context".into()),
             args_preview: None,
@@ -3735,6 +4123,47 @@ mod tests {
         assert_eq!(tool.name, "Edit src/foo.rs");
         assert_eq!(tool.diffs.len(), 1, "a text-only update keeps the diffs");
 
+        let mut restated = s.clone();
+        restated.in_flight_tool.as_mut().unwrap().prompt = Some("full prompt".into());
+        restated
+            .apply_scoped_event(
+                restated.last_seq.saturating_add(1),
+                &Event::ToolCallUpdated {
+                    prompt: None,
+                    tool_call_id: "tc-1".into(),
+                    title: None,
+                    args_preview: Some("{\"prompt\":\"cut\u{2026}[truncated]".into()),
+                    started_at: None,
+                    diffs: None,
+                },
+                &current_session_metadata(),
+            )
+            .unwrap();
+        assert_eq!(
+            restated.in_flight_tool.as_ref().unwrap().prompt.as_deref(),
+            Some("full prompt"),
+            "a cut preview without its own prompt keeps the stored one"
+        );
+        restated
+            .apply_scoped_event(
+                restated.last_seq.saturating_add(1),
+                &Event::ToolCallUpdated {
+                    prompt: None,
+                    tool_call_id: "tc-1".into(),
+                    title: None,
+                    args_preview: Some("{\"prompt\":\"B\"}".into()),
+                    started_at: None,
+                    diffs: None,
+                },
+                &current_session_metadata(),
+            )
+            .unwrap();
+        assert_eq!(
+            restated.in_flight_tool.unwrap().prompt,
+            None,
+            "an uncut preview means the prompt was replaced by a short one"
+        );
+
         let mut richer = tool_call("tc-1");
         richer.name = "Write src/foo.rs".into();
         s.apply_scoped_event(
@@ -3804,9 +4233,12 @@ mod tests {
             progress(
                 3,
                 vec![BackgroundAgentTool {
+                    id: None,
                     name: "Read".into(),
                     title: Some("x.rs".into()),
                     ok: Some(true),
+                    started_at: None,
+                    ended_at: None,
                 }],
             ),
         ]);
@@ -3880,6 +4312,358 @@ mod tests {
         }
     }
 
+    async fn native_subagent_fixture(
+        scope: &mut crate::acp::supervisor::test_support::managed::ManagedScope,
+    ) -> (
+        crate::server::test_support::ManagedControlSession,
+        Event,
+        crate::acp::event_sender::EventMetadata,
+        crate::acp::event_sender::EventMetadata,
+    ) {
+        use crate::acp::establishment::{
+            NativeRequestContext, NativeResourceAuthority, NativeResourceLocation,
+            NativeResourceSelector, NativeResourceStartContext, NativeSessionPermission,
+        };
+        use crate::acp::event_sender::EventMetadata;
+        let mut session = crate::server::test_support::managed_control_session(
+            scope,
+            "child-resource-provenance",
+            "claude",
+            None,
+        )
+        .await;
+        for update in [
+            serde_json::json!({
+                "sessionUpdate": "subagent_update", "sessionId": "child",
+                "title": "map backend", "state": {"state": "running"},
+                "capabilities": {"cancel": {}}
+            }),
+            serde_json::json!({
+                "sessionUpdate": "session_message", "messageId": "tc1",
+                "senderSessionId": session.sid, "recipientSessionId": "child",
+                "recipientMessageId": "tc1",
+                "content": [{"type": "text", "text": "map backend"}]
+            }),
+        ] {
+            session
+                .native
+                .send(serde_json::json!({
+                    "jsonrpc": "2.0", "method": "session/update",
+                    "params": {"sessionId": session.sid, "update": update}
+                }))
+                .await;
+        }
+        session
+            .native
+            .send(serde_json::json!({
+                "jsonrpc": "2.0", "method": "session/update",
+                "params": {"sessionId": "child", "update": {
+                    "sessionUpdate": "config_option_update",
+                    "configOptions": [{
+                        "id": "model", "name": "Model", "category": "model", "type": "select",
+                        "currentValue": "child-model",
+                        "options": [{"value": "child-model", "name": "Child model"}]
+                    }]
+                }}
+            }))
+            .await;
+        tokio::time::timeout(std::time::Duration::from_secs(10), async {
+            loop {
+                let event = session
+                    .client
+                    .next_event()
+                    .await
+                    .expect("Native remains connected");
+                if matches!(event, Event::SubagentUpdated { subagent, .. }
+                    if subagent.parent_tool_call_id.as_deref() == Some("tc1")
+                        && subagent.model.as_deref() == Some("Child model"))
+                {
+                    break;
+                }
+            }
+        })
+        .await
+        .expect("the real Native delegation publishes its linked child");
+        let child_metadata = session
+            .state
+            .acp_event_store
+            .replay_from(session.id(), 0)
+            .unwrap()
+            .into_iter()
+            .rev()
+            .find(|stored| {
+                matches!(stored.event.as_ref(), Event::SubagentUpdated { subagent, .. }
+                if subagent.parent_tool_call_id.as_deref() == Some("tc1")
+                    && subagent.model.as_deref() == Some("Child model"))
+            })
+            .expect("the actual child publication is durable")
+            .metadata;
+        let actual = session.client.actual();
+        let receipt = actual
+            .establishment_projection()
+            .unwrap()
+            .receipt_snapshot()
+            .unwrap();
+        let storage = crate::session::Storage::open_unwatched(&receipt.attempt.profile).unwrap();
+        let row = storage
+            .load_instances_complete()
+            .unwrap()
+            .into_iter()
+            .find(|row| row.id == session.id())
+            .unwrap();
+        let postimage = Arc::new(receipt.postimage(receipt.attempt.context).unwrap());
+        let stamp =
+            NativeSessionPermission::capture_stamp(&receipt, &postimage, &row, &storage).unwrap();
+        let context =
+            Arc::new(NativeRequestContext::session_observation(receipt, postimage, stamp).unwrap());
+        let file = scope.tempdir().path().join("child-resource.output");
+        std::fs::write(&file, "owned child resource fixture").unwrap();
+        let authority = NativeResourceAuthority::start(
+            Arc::new(
+                NativeResourceStartContext::from_frame(context, session.sid.clone().into())
+                    .unwrap(),
+            ),
+            NativeResourceSelector::Agent {
+                agent_id: "a1".into(),
+                tool_call_id: "tc1".into(),
+                output_file: file.to_string_lossy().into_owned(),
+                source: NativeResourceLocation::Host,
+            },
+        )
+        .unwrap()
+        .for_tracking_allocation(uuid::Uuid::new_v4())
+        .unwrap();
+        authority.with_read(|| Ok(std::fs::read(&file)?)).unwrap();
+        let witness = authority
+            .witness()
+            .expect("the real read established original custody");
+        let resource_metadata = EventMetadata {
+            native_origin: Some(witness.origin),
+            resource_ref: Some(witness.allocation),
+            resource_witness: Some(witness),
+            ..EventMetadata::history()
+        };
+        let mut launch = launched();
+        if let Event::BackgroundAgentLaunched { output_file, .. } = &mut launch {
+            *output_file = file.to_string_lossy().into_owned();
+        }
+        resource_metadata.validate_for_event(&launch).unwrap();
+        (session, launch, resource_metadata, child_metadata)
+    }
+
+    fn subagent(state: SubagentState, stop_reason: Option<&str>, parent: &str) -> Event {
+        Event::SubagentUpdated {
+            subagent: SubagentRecord {
+                session_id: "child".into(),
+                parent_session_id: parent.into(),
+                provenance: None,
+                parent_tool_call_id: Some("tc1".into()),
+                title: Some("map backend".into()),
+                description: None,
+                state,
+                stop_reason: stop_reason.map(str::to_owned),
+                cancel_capable: true,
+                model: None,
+            },
+            at: Utc::now(),
+        }
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn launch_reconciles_a_child_snapshot_that_arrived_first() {
+        crate::acp::supervisor::test_support::managed::with_managed(|scope| {
+            Box::pin(async move {
+                let (session, launch, resource, child) = native_subagent_fixture(scope).await;
+                let cases = [
+                    (
+                        SubagentState::Idle,
+                        Some("end_turn"),
+                        BackgroundAgentStatus::Completed,
+                        true,
+                    ),
+                    (
+                        SubagentState::Idle,
+                        Some("error"),
+                        BackgroundAgentStatus::Error,
+                        true,
+                    ),
+                    (
+                        SubagentState::RequiresAction,
+                        None,
+                        BackgroundAgentStatus::RequiresAction,
+                        false,
+                    ),
+                ];
+                for (state, stop, expected, ended) in cases {
+                    let mut s = session
+                        .state
+                        .session_service
+                        .fold_control_state(session.id())
+                        .await
+                        .unwrap();
+                    s.apply_scoped_event(
+                        s.last_seq + 1,
+                        &subagent(state, stop, &session.sid),
+                        &child,
+                    )
+                    .unwrap();
+                    s.apply_scoped_event(s.last_seq + 1, &launch, &resource)
+                        .unwrap();
+                    let agent = &s.background_agents[0];
+                    assert_eq!(agent.status, expected);
+                    assert_eq!(agent.ended_at.is_some(), ended);
+                }
+            })
+        })
+        .await;
+    }
+
+    /// The RFD snapshot replaces the tailer's heuristics, and an idle child that
+    /// is messaged again runs again, which no tailer status could express.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn subagent_state_drives_the_async_agent_it_belongs_to() {
+        crate::acp::supervisor::test_support::managed::with_managed(|scope| {
+            Box::pin(async move {
+                let (session, launch, resource, child) = native_subagent_fixture(scope).await;
+                let mut s = session
+                    .state
+                    .session_service
+                    .fold_control_state(session.id())
+                    .await
+                    .unwrap();
+                s.apply_scoped_event(s.last_seq + 1, &launch, &resource)
+                    .unwrap();
+                let steps = [
+                    (
+                        SubagentState::Running,
+                        None,
+                        BackgroundAgentStatus::Running,
+                        true,
+                    ),
+                    (
+                        SubagentState::RequiresAction,
+                        None,
+                        BackgroundAgentStatus::RequiresAction,
+                        true,
+                    ),
+                    (
+                        SubagentState::Unknown,
+                        None,
+                        BackgroundAgentStatus::Unknown,
+                        true,
+                    ),
+                    (
+                        SubagentState::Idle,
+                        Some("end_turn"),
+                        BackgroundAgentStatus::Completed,
+                        false,
+                    ),
+                    (
+                        SubagentState::Running,
+                        None,
+                        BackgroundAgentStatus::Running,
+                        true,
+                    ),
+                    (
+                        SubagentState::Idle,
+                        Some("error"),
+                        BackgroundAgentStatus::Error,
+                        false,
+                    ),
+                ];
+                for (state, reason, status, active) in steps {
+                    s.apply_scoped_event(
+                        s.last_seq + 1,
+                        &subagent(state, reason, &session.sid),
+                        &child,
+                    )
+                    .unwrap();
+                    assert_eq!(s.background_agents[0].status, status, "{state:?}");
+                    assert_eq!(s.has_active_background_agent(), active, "{state:?}");
+                }
+                assert_eq!(s.subagents.len(), 1, "snapshots upsert by session id");
+                assert_eq!(s.subagents[0].stop_reason.as_deref(), Some("error"));
+            })
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn uncertain_same_id_child_history_cannot_mutate_a_current_resource() {
+        crate::acp::supervisor::test_support::managed::with_managed(|scope| {
+            Box::pin(async move {
+                let (session, launch, resource, child) = native_subagent_fixture(scope).await;
+                for case in ["absent", "other-source", "other-parent"] {
+                    let mut s = session
+                        .state
+                        .session_service
+                        .fold_control_state(session.id())
+                        .await
+                        .unwrap();
+                    s.apply_scoped_event(s.last_seq + 1, &launch, &resource)
+                        .unwrap();
+                    let before = (
+                        s.turn_active,
+                        s.native_control_seq,
+                        s.connection_ready,
+                        s.connection_unavailable,
+                        s.sidebar_status(),
+                        s.operation_effects.active(),
+                    );
+                    let mut uncertain = child.clone();
+                    match case {
+                        "absent" => uncertain.child_provenance = None,
+                        "other-source" => {
+                            let mut proof = uncertain.child_provenance.as_deref().unwrap().clone();
+                            proof.origin.producer = uuid::Uuid::new_v4();
+                            uncertain.native_origin = Some(proof.origin);
+                            uncertain.child_provenance = Some(Arc::new(proof));
+                        }
+                        "other-parent" => {
+                            let mut proof = uncertain.child_provenance.as_deref().unwrap().clone();
+                            proof.ancestry = vec!["other-parent".into(), "child".into()].into();
+                            uncertain.reported_session_id = Some("other-parent".into());
+                            uncertain.child_provenance = Some(Arc::new(proof));
+                        }
+                        _ => unreachable!(),
+                    }
+                    let parent = if case == "other-parent" {
+                        "other-parent"
+                    } else {
+                        &session.sid
+                    };
+                    let event = subagent(SubagentState::Idle, Some("error"), parent);
+                    uncertain.validate_for_event(&event).unwrap();
+                    s.apply_scoped_event(s.last_seq + 1, &event, &uncertain)
+                        .unwrap();
+                    assert_eq!(s.subagents[0].state, SubagentState::Idle, "{case}");
+                    assert_eq!(
+                        s.background_agents[0].status,
+                        BackgroundAgentStatus::Running,
+                        "{case}"
+                    );
+                    assert!(s.background_agents[0].ended_at.is_none(), "{case}");
+                    assert_eq!(
+                        (
+                            s.turn_active,
+                            s.native_control_seq,
+                            s.connection_ready,
+                            s.connection_unavailable,
+                            s.sidebar_status(),
+                            s.operation_effects.active(),
+                        ),
+                        before,
+                        "{case}"
+                    );
+                }
+            })
+        })
+        .await;
+    }
+
     fn bg_progress(status: BackgroundAgentStatus, tool_count: u32) -> Event {
         Event::BackgroundAgentProgress {
             agent_id: "a1".into(),
@@ -3946,6 +4730,7 @@ mod tests {
             tool_call_id: None,
             description: "sleep".into(),
             workflow: None,
+            started_at: None,
         };
         let finished = |id: &str| Event::BackgroundTaskFinished {
             task_id: id.into(),
@@ -3972,6 +4757,64 @@ mod tests {
     }
 
     #[test]
+    fn background_shells_keep_command_and_outlive_their_task() {
+        let started = |id: &str, workflow: Option<WorkflowLaunch>| Event::BackgroundTaskStarted {
+            task_id: id.into(),
+            tool_call_id: None,
+            description: format!("cmd {id}"),
+            workflow,
+            started_at: None,
+        };
+        let finished = |id: &str| Event::BackgroundTaskFinished {
+            task_id: id.into(),
+            ended_at: None,
+        };
+        let wf = WorkflowLaunch {
+            run_id: "wf_1".into(),
+            name: "drafts".into(),
+            summary: None,
+            transcript_dir: String::new(),
+        };
+        let mut s = applied([started("a", None), started("wf", Some(wf))]);
+        assert_eq!(s.background_shells.len(), 1, "workflows are not shells");
+        assert_eq!(s.background_shells[0].command, "cmd a");
+        assert!(!s.background_shells[0].finished);
+
+        s.apply_scoped_event(
+            s.last_seq + 1,
+            &finished("a"),
+            &crate::acp::event_sender::EventMetadata::history(),
+        )
+        .unwrap();
+        assert!(s.background_tasks.iter().all(|task| task.task_id != "a"));
+        assert!(
+            s.background_shells[0].finished,
+            "finished shell stays listed"
+        );
+
+        for i in 0..MAX_FINISHED_BACKGROUND_SHELLS + 3 {
+            let id = format!("t{i}");
+            s.apply_scoped_event(
+                s.last_seq + 1,
+                &started(&id, None),
+                &crate::acp::event_sender::EventMetadata::history(),
+            )
+            .unwrap();
+            s.apply_scoped_event(
+                s.last_seq + 1,
+                &finished(&id),
+                &crate::acp::event_sender::EventMetadata::history(),
+            )
+            .unwrap();
+        }
+        assert_eq!(s.background_shells.len(), MAX_FINISHED_BACKGROUND_SHELLS);
+        assert_eq!(
+            s.background_shells[0].task_id, "t3",
+            "oldest finished dropped first"
+        );
+    }
+
+    #[test]
     fn workflow_runs_keep_their_end_after_their_task() {
         let workflow = |id: &str, call: &str| Event::BackgroundTaskStarted {
             task_id: id.into(),
@@ -3983,6 +4826,7 @@ mod tests {
                 summary: None,
                 transcript_dir: "/home/u/.claude/wf".into(),
             }),
+            started_at: None,
         };
         let runs = |s: &AcpState| {
             s.workflow_runs
@@ -4011,6 +4855,7 @@ mod tests {
                 tool_call_id: Some("toolu_bash".into()),
                 description: "sleep".into(),
                 workflow: None,
+                started_at: None,
             },
             Event::BackgroundTaskFinished {
                 task_id: "wfy".into(),
@@ -4158,6 +5003,7 @@ mod tests {
                         name: "review".into(),
                         description: "Review".into(),
                         accepts_input: true,
+                        input_hint: None,
                     }],
                 },
                 Event::ModesAvailable {
@@ -4217,6 +5063,13 @@ mod tests {
         .unwrap();
         s.apply_scoped_event(
             s.last_seq.saturating_add(1),
+            &subagent(SubagentState::Running, None, "root"),
+            &crate::acp::event_sender::EventMetadata::history(),
+        )
+        .unwrap();
+        assert_eq!(s.subagents.len(), 1);
+        s.apply_scoped_event(
+            s.last_seq.saturating_add(1),
             &switch_agent(),
             &current_session_metadata(),
         )
@@ -4225,6 +5078,7 @@ mod tests {
         assert!(s.available_commands.is_empty() && s.available_modes.is_empty());
         assert_eq!(s.current_mode_id, None);
         assert_eq!(s.agent.0, "codex");
+        assert!(s.subagents.is_empty());
     }
 
     #[test]
@@ -4305,5 +5159,54 @@ mod tests {
                 "{case}: later clear removes prior plan"
             );
         }
+    }
+    /// The turn that ends after an integration loss must not heal the Error
+    /// phase; a new connection (`AcpSessionAssigned`) does.
+    #[test]
+    fn integration_loss_keeps_the_error_phase_until_a_new_session() {
+        let mut state = AcpState::new(AcpSessionId("s".into()), AgentName("claude".into()), None);
+        let lost = Event::IntegrationLost {
+            reason: IntegrationLostReason::HoldOverflow,
+        };
+        let stopped = Event::Stopped {
+            reason: "end_turn".into(),
+        };
+        let unqualified = Event::AcpSessionAssigned {
+            acp_session_id: "s2".into(),
+            connection_ready: true,
+            native_subject: None,
+        };
+        for (seq, event) in [lost, stopped].into_iter().enumerate() {
+            state
+                .apply_scoped_event(seq as u64 + 1, &event, &current_session_metadata())
+                .unwrap();
+        }
+        assert_eq!(state.sidebar_phase, SidebarPhase::Error);
+        assert_eq!(
+            serde_json::to_value(&state)
+                .unwrap()
+                .get("integration_lost"),
+            Some(&serde_json::json!({"kind": "hold_overflow"}))
+        );
+        state
+            .apply_scoped_event(3, &unqualified, &current_session_metadata())
+            .unwrap();
+        assert!(state.integration_lost.is_some());
+        assert_eq!(state.sidebar_phase, SidebarPhase::Error);
+        state
+            .apply_scoped_event(
+                4,
+                &observed_channel_ready("s2"),
+                &current_session_metadata(),
+            )
+            .unwrap();
+        assert!(state.integration_lost.is_none());
+        assert_ne!(state.sidebar_phase, SidebarPhase::Error);
+        assert_eq!(
+            serde_json::to_value(&state)
+                .unwrap()
+                .get("integration_lost"),
+            Some(&serde_json::Value::Null)
+        );
     }
 }

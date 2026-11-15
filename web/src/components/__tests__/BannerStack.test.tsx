@@ -35,7 +35,10 @@ vi.mock("../../hooks/useConnectionBanner", async (importOriginal) => {
 });
 vi.mock("../../hooks/useDashboardUpdate", async (importOriginal) => {
   const mod = await importOriginal<typeof import("../../hooks/useDashboardUpdate")>();
-  return { ...mod, useDashboardUpdate: () => (forced ? forced.dashboard : mod.useDashboardUpdate()) };
+  return {
+    ...mod,
+    useDashboardUpdate: () => (forced ? (forced.dashboard ? "1.22.3" : null) : mod.useDashboardUpdate()),
+  };
 });
 vi.mock("../../hooks/useUpdateBanner", async (importOriginal) => {
   const mod = await importOriginal<typeof import("../../hooks/useUpdateBanner")>();
@@ -79,7 +82,7 @@ function about(webBuildId: string): ServerAbout {
 }
 
 const NAMES: [RegExp, string][] = [
-  [/Server unreachable/, "disconnected"],
+  [/Daemon unreachable/, "disconnected"],
   [/server's settings/, "server settings"],
   [/Dashboard updated/, "dashboard updated"],
   [/Reconnected/, "reconnected"],

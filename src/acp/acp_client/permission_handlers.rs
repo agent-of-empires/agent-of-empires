@@ -28,7 +28,7 @@ use super::pending::{
 };
 use super::plan::approval_plan_text;
 use super::tool_context::{permission_raw_input_with_context, ToolContextCache};
-use super::tool_output::{preview_optional_args, tool_kind_str};
+use super::tool_output::{full_prompt, preview_optional_args, tool_kind_str};
 
 /// A kind we cannot map back is dropped rather than guessed at, so no client
 /// offers a button whose meaning is unknown.
@@ -184,6 +184,7 @@ pub(super) async fn handle_permission_request(
     );
     let args_preview = preview_optional_args(enriched_raw_input.as_ref());
     let tool_call = ToolCall {
+        prompt: enriched_raw_input.as_ref().and_then(full_prompt),
         id: request.tool_call.tool_call_id.0.to_string(),
         name: title,
         kind: request
@@ -284,6 +285,7 @@ pub(super) async fn handle_permission_request(
         ));
     }
 
+    // The wait is on the human, so it must not stall the dispatch loop.
     // #1147: comparing this against the exit trace shows how long approval
     // blocked the agent's turn.
     let await_enter_ns = enter_timestamp_ns();
@@ -872,7 +874,7 @@ mod tests {
                             let actual = client.actual();
                             let owner = actual.connected_runner().unwrap();
                             let pause = client.pause_drain().await;
-                            let prefix = state.acp_event_store.highest_seq(&client.id);
+                            let prefix = state.acp_event_store.highest_seq(&client.id).unwrap();
                             let params = if question {
                                 serde_json::to_value(CreateElicitationRequest::new(
                                     agent_client_protocol::v1::schema::ElicitationFormMode::new(

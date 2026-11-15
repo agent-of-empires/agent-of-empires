@@ -141,6 +141,9 @@ pub struct ChoicePicker {
 pub enum ChoicePurpose {
     /// Accepting POSTs `session/set_mode` with the chosen mode id.
     Mode,
+    /// Accepting POSTs `session/set_config_option` with the row's
+    /// `<config_id>=<value>`, flipping a Fast mode / Ultracode toggle.
+    Toggle,
     /// A numbered plugin-link picker: the option `value` is the URL to open.
     /// Shown when an `open-ui-link` chord resolves to more than one link.
     OpenLink,
@@ -405,6 +408,17 @@ impl StructuredViewState {
             && self.transcript.connection_unavailable.is_none()
     }
 
+    pub fn host_prompt_intent(&self) -> Option<uuid::Uuid> {
+        if self.ws.is_some()
+            && self.transcript.native_snapshot_seq.is_some()
+            && self.transcript.connection_unavailable.is_none()
+        {
+            self.transcript.host_prompt_intent
+        } else {
+            None
+        }
+    }
+
     /// Reply authority is request-specific while Original establishment is pending.
     /// Transport and a fresh canonical snapshot remain mandatory for both sources.
     pub fn can_decide(&self, nonce: &str) -> bool {
@@ -430,7 +444,7 @@ impl StructuredViewState {
             .as_ref()
             .is_none_or(|choice| match &choice.purpose {
                 ChoicePurpose::OpenLink => true,
-                ChoicePurpose::Mode => self.native_input_available(),
+                ChoicePurpose::Mode | ChoicePurpose::Toggle => self.native_input_available(),
                 ChoicePurpose::Approval { nonce } => {
                     self.can_decide(nonce)
                         && self
@@ -789,6 +803,7 @@ mod tests {
             name: name.to_string(),
             description: String::new(),
             accepts_input: false,
+            input_hint: None,
         }
     }
 

@@ -7,7 +7,7 @@ INSTALL_DIR="${INSTALL_DIR:-$DEFAULT_INSTALL_DIR}"
 BINARY_NAME="aoe"
 
 # Matches the manylinux_2_28 container the release workflow builds in
-# (.github/workflows/release.yml, env.LINUX_GLIBC_FLOOR). Bump together.
+# (.github/workflows/build-binaries.yml, env.LINUX_GLIBC_FLOOR). Bump together.
 MIN_GLIBC="2.28"
 
 info() { printf "\033[34m[info]\033[0m %s\n" "$1"; }
@@ -60,6 +60,23 @@ get_latest_version() {
         | sed -E 's/.*"([^"]+)".*/\1/'
 }
 
+# The releases list is newest first; nightly tags are `nightly-YYYYMMDD`.
+get_latest_nightly() {
+    curl -fsSL "https://api.github.com/repos/${REPO}/releases?per_page=30" \
+        | grep -oE '"tag_name": *"nightly-[0-9]+"' \
+        | head -1 \
+        | sed -E 's/.*"([^"]+)"$/\1/'
+}
+
+usage() {
+    cat <<EOF
+Usage: install.sh [--channel stable|nightly] [--version TAG]
+
+  --channel   stable (default) or nightly, a daily prerelease build of main
+  --version   install a specific release tag, e.g. v1.22.1 or nightly-20261108
+EOF
+}
+
 # Pick the right shell rc file for PATH guidance. Mirrors what most
 # install scripts (rustup, bun, deno) do.
 detect_shell_rc() {
@@ -78,18 +95,42 @@ detect_shell_rc() {
 }
 
 main() {
+    channel="stable"
+    version=""
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            --channel|--version)
+                [ $# -ge 2 ] || { usage >&2; error "Missing value for $1"; }
+                if [ "$1" = --channel ]; then channel="$2"; else version="$2"; fi
+                shift 2 ;;
+            -h|--help) usage; exit 0 ;;
+            *) usage >&2; error "Unknown argument: $1" ;;
+        esac
+    done
+    case "$channel" in
+        stable|nightly) ;;
+        *) error "Unknown channel: $channel (expected stable or nightly)" ;;
+    esac
+
     info "Detecting platform..."
     platform=$(detect_platform)
     success "Platform: $platform"
 
     check_glibc
 
-    info "Fetching latest version..."
-    version=$(get_latest_version)
     if [ -z "$version" ]; then
-        error "Failed to fetch latest version"
+        info "Fetching latest $channel version..."
+        if [ "$channel" = "nightly" ]; then
+            version=$(get_latest_nightly)
+        else
+            version=$(get_latest_version)
+        fi
+        [ -n "$version" ] || error "Failed to fetch latest $channel version"
     fi
-    success "Latest version: $version"
+    success "Version: $version"
+    case "$version" in
+        nightly-*) warn "Nightly builds may migrate your data so that stable cannot read it until the next stable release." ;;
+    esac
 
     download_url="https://github.com/${REPO}/releases/download/${version}/aoe-${platform}.tar.gz"
     info "Downloading from: $download_url"

@@ -363,11 +363,11 @@ impl Instance {
 
         if self.is_sandboxed() {
             self.ensure_container_in(store, launch_generation)?;
-            if let (Some(hook_cmds), Some(sandbox)) =
+            if let (Some((hook_cmds, from_repo)), Some(sandbox)) =
                 (on_launch_hooks.as_ref(), self.sandbox_info.as_ref())
             {
                 let hook_env = crate::session::config::repo_config::lifecycle_env_vars(self);
-                let workdir = self.container_workdir();
+                let workdir = self.hook_container_workdir(*from_repo);
                 let result = match progress {
                     Some(progress) => {
                         crate::session::config::repo_config::execute_hooks_in_container_streamed(
@@ -400,20 +400,18 @@ impl Instance {
                     );
                 }
             }
-        } else if let Some(hook_cmds) = on_launch_hooks.as_ref() {
+        } else if let Some((hook_cmds, from_repo)) = on_launch_hooks.as_ref() {
             let hook_env = crate::session::config::repo_config::lifecycle_env_vars(self);
-            let project_path = Path::new(&self.project_path);
+            let hook_path = self.hook_workdir(*from_repo);
             let result = match progress {
                 Some(progress) => crate::session::config::repo_config::execute_hooks_streamed(
                     hook_cmds,
-                    project_path,
+                    hook_path,
                     Some(progress),
                     &hook_env,
                 ),
                 None => crate::session::config::repo_config::execute_hooks(
-                    hook_cmds,
-                    project_path,
-                    &hook_env,
+                    hook_cmds, hook_path, &hook_env,
                 ),
             };
             if let Err(error) = result {
@@ -430,16 +428,52 @@ impl Instance {
         Ok(())
     }
 
-    /// Trusted repository hooks can replace the selected global/profile hooks.
+    /// A workspace directory holds no repo config, so a workspace reads it from the
+    /// launch repo's checkout, which stays first as projects are added.
+    pub(crate) fn repo_config_path(&self) -> &Path {
+        let launch_repo = self.workspace_info.as_ref().and_then(|w| w.repos.first());
+        Path::new(launch_repo.map_or(&self.project_path, |repo| &repo.worktree_path))
+    }
+
+    /// Repo hooks run where their config lives; global and profile hooks run in the
+    /// session directory.
+    pub(crate) fn hook_workdir(&self, from_repo: bool) -> &Path {
+        if from_repo {
+            self.repo_config_path()
+        } else {
+            Path::new(&self.project_path)
+        }
+    }
+
+    pub(crate) fn hook_container_workdir(&self, from_repo: bool) -> String {
+        let workdir = self.container_workdir();
+        let relative = self
+            .workspace_info
+            .as_ref()
+            .filter(|_| from_repo)
+            .and_then(|w| self.repo_config_path().strip_prefix(&w.workspace_dir).ok());
+        match relative {
+            Some(relative) => Path::new(&workdir)
+                .join(relative)
+                .to_string_lossy()
+                .into_owned(),
+            None => workdir,
+        }
+    }
+
+    /// Trusted repository hooks can replace the selected global/profile hooks; the flag
+    /// reports whether they did.
     pub(crate) fn resolve_on_launch_hooks(
         &self,
         mut resolved_on_launch: Vec<String>,
-    ) -> Option<Vec<String>> {
-        match crate::session::config::repo_config::check_repo_trust(Path::new(&self.project_path)) {
+    ) -> Option<(Vec<String>, bool)> {
+        let mut from_repo = false;
+        match crate::session::config::repo_config::check_repo_trust(self.repo_config_path()) {
             Ok(trust) => {
                 if let Some(hooks) = trust.hooks.trusted() {
                     if !hooks.on_launch.is_empty() {
                         resolved_on_launch = hooks.on_launch;
+                        from_repo = true;
                     }
                 }
             }
@@ -453,7 +487,7 @@ impl Instance {
         if resolved_on_launch.is_empty() {
             None
         } else {
-            Some(resolved_on_launch)
+            Some((resolved_on_launch, from_repo))
         }
     }
 

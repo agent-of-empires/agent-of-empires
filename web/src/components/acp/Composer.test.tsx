@@ -56,6 +56,7 @@ function Harness({
         authStatus={null}
         availableCommands={[]}
         connected
+        canCancelHostIntent={false}
         canForceEndTurn={false}
         stopTurn={() => {}}
         canSubmit
@@ -331,6 +332,20 @@ describe("slash command popover", () => {
     expect(textarea().value).toBe("/address-pr-comments ");
     expect(selectionChanges, "jsdom now resyncs the caret; this test no longer reproduces #3418").toBe(0);
     expect(option(/address-pr-comments/)).toHaveLength(0);
+  });
+
+  it("shows the advertised argument hint without changing the inserted command", async () => {
+    const { textarea } = mount({
+      availableCommands: [
+        { name: "mcp", description: "MCP servers", accepts_input: true, input_hint: "[reconnect|enable|disable]" },
+        COMMANDS[1]!,
+      ],
+    });
+    fireEvent.change(textarea(), { target: { value: "/mc" } });
+    await waitFor(() => expect(option(/\/mcp/)).toHaveLength(1));
+    expect(option(/\/mcp/)[0]!.textContent).toContain("[reconnect|enable|disable]");
+    await pick(/\/mcp/);
+    expect(textarea().value).toBe("/mcp ");
   });
 
   it("badges a skill-backed command and leaves a plain one unbadged", async () => {
