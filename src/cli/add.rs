@@ -179,8 +179,10 @@ pub struct AddArgs {
     structured_view: bool,
 
     /// First turn sent to the agent once it is ready. Needs --structured-view
-    /// or --agent; delivered when `aoe serve` starts the worker. A session that
-    /// falls back to the terminal view is typed into the pane instead.
+    /// or --agent; delivered when `aoe serve` starts the worker. If the
+    /// session falls back to the terminal view, the prompt is typed only into an
+    /// agent with a ready marker; otherwise nothing is typed and the session
+    /// row carries `initial_prompt_error`.
     #[arg(long, conflicts_with = "prompt_file")]
     prompt: Option<String>,
 
