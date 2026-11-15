@@ -44,6 +44,14 @@ impl Fixture {
             .env("XDG_CACHE_HOME", self.home.path().join(".cache"))
             .env("XDG_RUNTIME_DIR", self.home.path().join("run"))
             .env("AOE_TMUX_SOCKET", self.home.path().join("tmux.sock"))
+            .env(
+                "DOCKER_HOST",
+                format!(
+                    "unix://{}",
+                    self.home.path().join("no-docker.sock").display()
+                ),
+            )
+            .env("DOCKER_CONFIG", self.home.path().join(".docker"))
             .env("NO_COLOR", "1")
             .current_dir(self.home.path())
             .args(args);

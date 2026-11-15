@@ -12,6 +12,10 @@ pub enum ApiErrorCode {
     ElevationRequired,
     AccessPolicyDenied,
     CityhallMode,
+    LocalPluginSourceRequired,
+    PluginPreviewFailed,
+    PluginJobActive,
+    PluginAlreadyInstalled,
     LifecycleLocked,
     TrashIncomplete,
     LifecycleSuperseded,
@@ -48,6 +52,10 @@ impl ApiErrorCode {
             Self::ElevationRequired => "elevation_required",
             Self::AccessPolicyDenied => "access_policy_denied",
             Self::CityhallMode => "cityhall_mode",
+            Self::LocalPluginSourceRequired => "local_plugin_source_required",
+            Self::PluginPreviewFailed => "preview_failed",
+            Self::PluginJobActive => "plugin_job_active",
+            Self::PluginAlreadyInstalled => "plugin_already_installed",
             Self::LifecycleLocked => "lifecycle_locked",
             Self::TrashIncomplete => "trash_incomplete",
             Self::LifecycleSuperseded => "lifecycle_superseded",
@@ -83,6 +91,7 @@ impl ApiErrorCode {
             Self::ReadOnly
             | Self::ElevationRequired
             | Self::AccessPolicyDenied
+            | Self::LocalPluginSourceRequired
             | Self::CityhallMode => StatusCode::FORBIDDEN,
             Self::LifecycleLocked
             | Self::TrashIncomplete
@@ -98,6 +107,8 @@ impl ApiErrorCode {
             | Self::CreationNotPending
             | Self::CreateOutcomeUnknown
             | Self::AgentHooksNotApproved
+            | Self::PluginJobActive
+            | Self::PluginAlreadyInstalled
             | Self::GroupNotEmpty
             | Self::SessionNotRunning
             | Self::SessionArchived
@@ -107,7 +118,7 @@ impl ApiErrorCode {
             Self::TlsRequired => StatusCode::UPGRADE_REQUIRED,
             Self::CreateHookFailed => StatusCode::BAD_REQUEST,
             Self::SmartRenameSkipped => StatusCode::CONFLICT,
-            Self::SmartRenameFailed => StatusCode::BAD_GATEWAY,
+            Self::SmartRenameFailed | Self::PluginPreviewFailed => StatusCode::BAD_GATEWAY,
             Self::SmartRenameTimeout => StatusCode::GATEWAY_TIMEOUT,
             Self::StartFailed | Self::SandboxMigrationFailed => StatusCode::INTERNAL_SERVER_ERROR,
         }
@@ -145,6 +156,10 @@ impl ApiErrorCode {
             b"elevation_required" => Self::ElevationRequired,
             b"access_policy_denied" => Self::AccessPolicyDenied,
             b"cityhall_mode" => Self::CityhallMode,
+            b"local_plugin_source_required" => Self::LocalPluginSourceRequired,
+            b"preview_failed" => Self::PluginPreviewFailed,
+            b"plugin_job_active" => Self::PluginJobActive,
+            b"plugin_already_installed" => Self::PluginAlreadyInstalled,
             b"lifecycle_locked" => Self::LifecycleLocked,
             b"trash_incomplete" => Self::TrashIncomplete,
             b"lifecycle_superseded" => Self::LifecycleSuperseded,
@@ -301,6 +316,20 @@ mod tests {
                 Some(ApiErrorCode::GroupNotEmpty),
             ),
             (StatusCode::FORBIDDEN, "group_not_empty", false, None),
+            (
+                StatusCode::BAD_GATEWAY,
+                "preview_failed",
+                false,
+                Some(ApiErrorCode::PluginPreviewFailed),
+            ),
+            (StatusCode::CONFLICT, "preview_failed", false, None),
+            (
+                StatusCode::CONFLICT,
+                "plugin_job_active",
+                false,
+                Some(ApiErrorCode::PluginJobActive),
+            ),
+            (StatusCode::BAD_GATEWAY, "plugin_job_active", false, None),
             (
                 StatusCode::CONFLICT,
                 "account_swap_unavailable",

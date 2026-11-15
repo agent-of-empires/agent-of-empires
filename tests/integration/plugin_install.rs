@@ -1350,14 +1350,15 @@ async fn preview_reports_consent_required_for_capability_change() {
     let _home = isolate();
     let _base = install_then_push_cap_update().await;
 
-    match install::preview_update("acme.upd").await.unwrap() {
-        UpdatePreview::ConsentRequired { consent, dismissed } => {
+    match install::preview_update("acme.upd", true).await.unwrap() {
+        UpdatePreview::ConsentRequired {
+            consent, dismissed, ..
+        } => {
             assert_eq!(consent.from_version, "1.0.0");
             assert_eq!(consent.to_version, "2.0.0");
             assert_eq!(consent.added_capabilities, vec!["net".to_string()]);
             assert!(consent.removed_capabilities.is_empty());
             assert!(!dismissed, "a fresh update is not pre-dismissed");
-            assert!(!consent.fingerprint.is_empty());
         }
         other => panic!("expected consent_required, got {other:?}"),
     }
@@ -1371,7 +1372,7 @@ async fn apply_update_grants_the_new_capability_set() {
     let _home = isolate();
     let _base = install_then_push_cap_update().await;
 
-    let fingerprint = match install::preview_update("acme.upd").await.unwrap() {
+    let fingerprint = match install::preview_update("acme.upd", true).await.unwrap() {
         UpdatePreview::ConsentRequired { consent, .. } => consent.fingerprint,
         other => panic!("expected consent_required, got {other:?}"),
     };
@@ -1379,7 +1380,8 @@ async fn apply_update_grants_the_new_capability_set() {
     install::apply_update(
         "acme.upd",
         Some(fingerprint),
-        &install::OperationLog::Inherit,
+        true,
+        install::OperationLog::Inherit,
     )
     .await
     .unwrap();
@@ -1406,7 +1408,8 @@ async fn apply_update_rejects_a_stale_fingerprint() {
     let err = install::apply_update(
         "acme.upd",
         Some("sha256:stale||community".to_string()),
-        &install::OperationLog::Inherit,
+        true,
+        install::OperationLog::Inherit,
     )
     .await
     .unwrap_err()
@@ -1427,7 +1430,7 @@ async fn declining_keeps_the_prior_version_and_stops_nagging() {
     let _home = isolate();
     let _base = install_then_push_cap_update().await;
 
-    let fingerprint = match install::preview_update("acme.upd").await.unwrap() {
+    let fingerprint = match install::preview_update("acme.upd", true).await.unwrap() {
         UpdatePreview::ConsentRequired { consent, .. } => consent.fingerprint,
         other => panic!("expected consent_required, got {other:?}"),
     };
@@ -1445,7 +1448,7 @@ async fn declining_keeps_the_prior_version_and_stops_nagging() {
     );
 
     // A re-preview now flags the dismissal so the surfaces stop re-prompting.
-    match install::preview_update("acme.upd").await.unwrap() {
+    match install::preview_update("acme.upd", true).await.unwrap() {
         UpdatePreview::ConsentRequired { dismissed, .. } => {
             assert!(dismissed, "the declined fingerprint is remembered");
         }
@@ -1483,7 +1486,7 @@ async fn sweep_notifies_then_respects_a_dismissal() {
     let _home = isolate();
     let _base = install_then_push_cap_update().await;
 
-    let fingerprint = match install::preview_update("acme.upd").await.unwrap() {
+    let fingerprint = match install::preview_update("acme.upd", true).await.unwrap() {
         UpdatePreview::ConsentRequired { consent, .. } => consent.fingerprint,
         other => panic!("expected consent_required, got {other:?}"),
     };
@@ -1522,4 +1525,137 @@ async fn sweep_notifies_then_respects_a_dismissal() {
     );
 
     std::env::remove_var("AOE_GITHUB_CLONE_BASE");
+}
+
+#[tokio::test]
+#[serial]
+async fn unchanged_sources_repair_missing_or_stale_approval() {
+    let _home = isolate();
+    enum Damage {
+        MissingGrant,
+        ModifiedManifest,
+        PartialGrant,
+    }
+    for (index, (capabilities, damage)) in [
+        ("[\"net\"]", Damage::MissingGrant),
+        ("[]", Damage::MissingGrant),
+        ("[\"net\"]", Damage::ModifiedManifest),
+        ("[\"net\"]", Damage::PartialGrant),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let id = format!("acme.repair{index}");
+        let source = tempfile::tempdir().unwrap();
+        let manifest = format!(
+            "id = \"{id}\"\nname = \"Repair\"\nversion = \"1.0.0\"\napi_version = 2\ncapabilities = {capabilities}\n"
+        );
+        let dir = write_plugin_dir(source.path(), &manifest);
+        let worker = dir.join("worker.js");
+        if index == 0 {
+            std::fs::write(&worker, b"original worker bytes").unwrap();
+        }
+        let dev = index == 0;
+        install::install(dir.to_str().unwrap(), true, dev)
+            .await
+            .unwrap();
+        assert!(matches!(
+            install::preview_update(&id, true).await.unwrap(),
+            UpdatePreview::NoUpdate { .. }
+        ));
+        install::set_enabled(&id, false).unwrap();
+        let preview = install::preview_update(&id, true).await.unwrap();
+        if index == 0 {
+            let UpdatePreview::NoUpdate { fingerprint, .. } = preview else {
+                panic!("unchanged source should remain current");
+            };
+            let installed_worker = agent_of_empires::plugin::plugins_dir()
+                .unwrap()
+                .join(&id)
+                .join("worker.js");
+            std::fs::remove_file(&installed_worker).unwrap();
+            install::apply_update(&id, Some(fingerprint), true, install::OperationLog::Inherit)
+                .await
+                .unwrap();
+            assert_eq!(
+                std::fs::read(installed_worker).unwrap(),
+                b"original worker bytes"
+            );
+        } else {
+            assert!(matches!(preview, UpdatePreview::NoUpdate { .. }));
+        }
+        assert!(!Config::load().unwrap().plugins[&id].enabled);
+        install::set_enabled(&id, true).unwrap();
+
+        let installed = agent_of_empires::plugin::plugins_dir()
+            .unwrap()
+            .join(&id)
+            .join("aoe-plugin.toml");
+        match damage {
+            Damage::MissingGrant | Damage::PartialGrant => {
+                agent_of_empires::session::update_config(|config| {
+                    let grant = &mut config.plugins.get_mut(&id).unwrap().grant;
+                    if matches!(damage, Damage::PartialGrant) {
+                        grant.as_mut().unwrap().capabilities.clear();
+                    } else {
+                        *grant = None;
+                    }
+                })
+                .unwrap();
+            }
+            Damage::ModifiedManifest => {
+                std::fs::write(&installed, format!("{manifest}\n# changed locally\n")).unwrap();
+            }
+        }
+        assert!(load_registry().get(&id).unwrap().needs_reapproval());
+        let before_manifest = std::fs::read(&installed).unwrap();
+        let before_entry = serde_json::to_value(&Config::load().unwrap().plugins[&id]).unwrap();
+        let fingerprint = match install::preview_update(&id, true).await.unwrap() {
+            UpdatePreview::ConsentRequired { consent, .. } => {
+                assert!(!consent.stays_active_if_declined);
+                assert_eq!(consent.added_capabilities, consent.new_capabilities);
+                consent.fingerprint
+            }
+            other => panic!("repair needs explicit approval: {other:?}"),
+        };
+        assert!(matches!(
+            install::update_clean(&id).await.unwrap(),
+            install::UpdateOutcome::Skipped { .. }
+        ));
+        for fingerprint in [None, Some("stale".to_string())] {
+            assert!(
+                install::apply_update(&id, fingerprint, true, install::OperationLog::Inherit,)
+                    .await
+                    .is_err()
+            );
+        }
+        assert_eq!(std::fs::read(&installed).unwrap(), before_manifest);
+        assert_eq!(
+            serde_json::to_value(&Config::load().unwrap().plugins[&id]).unwrap(),
+            before_entry
+        );
+
+        let report =
+            install::apply_update(&id, Some(fingerprint), true, install::OperationLog::Inherit)
+                .await
+                .unwrap();
+        assert!(report.granted);
+        assert!(load_registry().get(&id).unwrap().active());
+        assert_eq!(std::fs::read(&installed).unwrap(), manifest.as_bytes());
+        let config = Config::load().unwrap();
+        assert_eq!(
+            config.plugins[&id].grant.as_ref().unwrap().capabilities,
+            serde_json::from_str::<Vec<String>>(capabilities).unwrap()
+        );
+        assert_eq!(
+            config.plugins[&id].source.as_deref(),
+            dir.canonicalize().unwrap().to_str()
+        );
+        assert_eq!(config.plugins[&id].dev, dev);
+        assert!(matches!(
+            install::preview_update(&id, true).await.unwrap(),
+            UpdatePreview::NoUpdate { .. }
+        ));
+        install::uninstall(&id).unwrap();
+    }
 }
