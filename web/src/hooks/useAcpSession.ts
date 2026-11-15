@@ -99,6 +99,43 @@ async function postReportingErrors(
   }
 }
 
+// Re-sends of rows the server never confirmed belong to the Session, not to a mounted hook. They
+// run one after another, and a later one skips rows an earlier one already posted.
+const queueMigrations = new Map<string, { tail: Promise<void>; posted: Set<string> }>();
+// The mounted hooks showing each Session; with none, an acknowledgment goes to its stored state.
+const queueAckTargets = new Map<string, Set<Dispatch<Action>>>();
+
+function acknowledgeQueued(sessionId: string, action: Action): void {
+  const targets = queueAckTargets.get(sessionId);
+  if (targets?.size) {
+    for (const target of targets) target(action);
+    return;
+  }
+  const stored = cacheGet(sessionId);
+  if (stored) cacheSet(sessionId, reducer(stored, action));
+}
+
+function migrateQueue(sessionId: string, rows: QueuedPrompt[]): Promise<void> {
+  const entry = queueMigrations.get(sessionId) ?? { tail: Promise.resolve(), posted: new Set<string>() };
+  const run = entry.tail.then(async () => {
+    for (const q of rows) {
+      if (entry.posted.has(q.id)) continue;
+      const saved = await enqueueServerPrompt(sessionId, { id: q.id, text: q.text, attachments: q.attachments });
+      if (!saved) continue;
+      entry.posted.add(q.id);
+      // Confirmed, so a list that no longer has it (delivered) drops it instead of keeping it to re-send.
+      acknowledgeQueued(sessionId, { kind: "confirm_queued_prompt", id: q.id });
+    }
+  });
+  entry.tail = run;
+  queueMigrations.set(sessionId, entry);
+  const settle = () => {
+    if (queueMigrations.get(sessionId)?.tail === run) queueMigrations.delete(sessionId);
+  };
+  run.then(settle, settle);
+  return run;
+}
+
 /** Waits before re-listing after a failed queue list; then the next poll change or turn retries. */
 const QUEUE_LIST_RETRY_MS = [2000, 5000, 15000];
 
@@ -319,13 +356,15 @@ export function useAcpSession(
   // once each; a rerun must not cancel that. A confirmed row missing from the server was
   // drained and must not be re-created.
   const queueMigrationRef = useRef<Map<string, Promise<void>>>(new Map());
-  const mountedRef = useRef(true);
   useEffect(() => {
-    mountedRef.current = true;
+    if (!sessionId) return;
+    const targets = queueAckTargets.get(sessionId) ?? new Set<Dispatch<Action>>();
+    queueAckTargets.set(sessionId, targets.add(dispatch));
     return () => {
-      mountedRef.current = false;
+      targets.delete(dispatch);
+      if (!targets.size && queueAckTargets.get(sessionId) === targets) queueAckTargets.delete(sessionId);
     };
-  }, []);
+  }, [sessionId]);
   // The sidebar badge takes this browser's count only between the first queue list after an open and the close.
   const queueListedRef = useRef(false);
   useEffect(() => {
@@ -345,22 +384,10 @@ export function useAcpSession(
     let cancelled = false;
     let migration = queueMigrationRef.current.get(sessionId);
     if (!migration) {
-      const pending = queuedPromptsRef.current.filter((q) => q.pending);
-      migration = (async () => {
-        for (const q of pending) {
-          const saved = await enqueueServerPrompt(sessionId, { id: q.id, text: q.text, attachments: q.attachments });
-          if (!saved) continue;
-          // Confirmed, so a list that no longer has it (delivered) drops it instead of keeping it to re-send.
-          const confirm: Action = { kind: "confirm_queued_prompt", id: q.id };
-          if (mountedRef.current && sessionIdRef.current === sessionId) {
-            dispatch(confirm);
-          } else {
-            // Left or closed meanwhile: confirm into the Session's stored state, which a later open restores.
-            const stored = cacheGet(sessionId);
-            if (stored) cacheSet(sessionId, reducer(stored, confirm));
-          }
-        }
-      })();
+      migration = migrateQueue(
+        sessionId,
+        queuedPromptsRef.current.filter((q) => q.pending),
+      );
       queueMigrationRef.current.set(sessionId, migration);
     }
     const migrated = migration;
@@ -387,7 +414,7 @@ export function useAcpSession(
       cancelled = true;
       clearTimeout(retry);
     };
-  }, [sessionId, status, state.turnActive, queuedPromptsRef, sessionIdRef, polledQueuedCount]);
+  }, [sessionId, status, state.turnActive, queuedPromptsRef, polledQueuedCount]);
 
   // Queue mutations are optimistic; a failed server call is corrected by the next hydrate.
   const removeQueuedPrompt = useCallback(

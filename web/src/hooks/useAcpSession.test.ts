@@ -741,6 +741,8 @@ describe("server queue", () => {
   // Set to hold each queue POST's response until it resolves.
   let queuePostHeld: Promise<void> | null;
   let queuePostStarted: (() => void) | null;
+  // Rows the Daemon delivers as soon as their first POST commits.
+  let deliveredOnPost: Set<string>;
   const row = (id: string, text: string, extra: Partial<ServerQueuedPrompt> = {}): ServerQueuedPrompt => ({
     id,
     seq: serverQueue.size,
@@ -758,6 +760,7 @@ describe("server queue", () => {
     queueListFails = false;
     queuePostHeld = null;
     queuePostStarted = null;
+    deliveredOnPost = new Set();
     vi.mocked(reportAcpInteraction).mockClear();
     vi.mocked(listServerQueue).mockClear();
     calls = installAcpFakes(({ url, method, body }) => {
@@ -774,6 +777,7 @@ describe("server queue", () => {
           serverQueue.set(parsed.id, row(parsed.id, parsed.text));
           queuePostStarted?.();
           const saved = serverQueue.get(parsed.id);
+          if (deliveredOnPost.delete(parsed.id)) serverQueue.delete(parsed.id);
           return queuePostHeld ? queuePostHeld.then(() => json(saved)) : json(saved);
         }
         if (method === "DELETE" && item && !serverQueue.delete(decodeURIComponent(item))) {
@@ -1026,6 +1030,43 @@ describe("server queue", () => {
     await waitFor(() => expect(again.result.current.state.queuedPrompts).toEqual([]));
     expect(posts("/queue").map((c) => JSON.parse(c.body!).id)).toEqual(["u1"]);
     expect(serverQueue.has("u1")).toBe(false);
+    again.unmount();
+  });
+
+  it("runs one re-send per Session across a close and reopen mid-POST, so a delivered row isn't posted again", async () => {
+    const a = "sess-remount";
+    const queuedAt = "2026-01-01T00:00:00.000Z";
+    const pending = ["A", "B", "C"].map((id) => ({ id, text: id, queuedAt, pending: true }));
+    const state = { ...emptyAcpState(), queuedPrompts: pending };
+    localStorage.setItem(`${STORAGE_KEY_PREFIX}${a}`, JSON.stringify({ savedAt: Date.now(), state }));
+    const postIds = () => posts("/queue").map((c) => JSON.parse(c.body!).id as string);
+    const lists = () => calls.filter((c) => c.method === "GET" && c.url.includes("/queue") && c.url.includes(a)).length;
+    deliveredOnPost.add("B");
+    const first = render(a);
+    await flushAsync();
+    const post = Promise.withResolvers<void>();
+    const started = Promise.withResolvers<void>();
+    queuePostHeld = post.promise;
+    queuePostStarted = started.resolve;
+    lastSocket().open();
+    await started.promise;
+    queuePostHeld = null;
+    queuePostStarted = null;
+    // The user closes and reopens A while A's first POST is held.
+    first.unmount();
+    const again = render(a);
+    await flushAsync();
+    lastSocket().open();
+    await flushAsync();
+    const listed = lists();
+    post.resolve();
+    // The reopened hook lists only after every re-send for A has settled.
+    await waitFor(() => expect(lists()).toBeGreaterThan(listed));
+    const shown = () => again.result.current.state.queuedPrompts;
+    await waitFor(() => expect(shown().map((q) => q.id)).toEqual(["A", "C"]));
+    expect(shown().some((q) => q.pending)).toBe(false);
+    expect(postIds()).toEqual(["A", "B", "C"]);
+    expect([...serverQueue.keys()]).toEqual(["A", "C"]);
     again.unmount();
   });
 
