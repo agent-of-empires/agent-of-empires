@@ -706,8 +706,12 @@ mod tests {
                     "{name}: {fg} on {label} is {ratio:.2}, below body-text AA"
                 );
             }
-            // Secondary and muted body text, on every body-text surface.
-            for fg in ["--color-text-secondary", "--color-text-muted"] {
+            // Secondary, muted and dim body text, on every body-text surface.
+            for fg in [
+                "--color-text-secondary",
+                "--color-text-muted",
+                "--color-text-dim",
+            ] {
                 for (surface, label) in [
                     (var("--color-surface-900"), "surface-900"),
                     (var("--color-surface-850"), "surface-850"),
