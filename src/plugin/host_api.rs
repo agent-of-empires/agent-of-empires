@@ -415,6 +415,10 @@ fn session_capture_set(
     let expected = instance.conversation_state();
     let mut observation =
         crate::session::poller::SessionIdObservation::unguarded(captured.to_string());
+    // The report carries no launch identity, so stamp the row's current launch:
+    // the observation's own launch check would otherwise refuse every row that
+    // has an active execution. The transaction CAS against `expected` still
+    // covers a relaunch that lands between this read and the write.
     observation.execution = expected.active.clone();
     let commit = crate::session::persist_session_with_storage(
         &storage,
@@ -1623,9 +1627,13 @@ method = "{tool}.session_id"
         crate::plugin::reload_registry();
     }
 
-    /// Seed one row for `tool` and return its id.
-    fn seed_row(tool: &str, f: &dyn Fn(&mut crate::session::Instance)) -> String {
-        let mut inst = crate::session::Instance::new("capture", "/tmp/plugin-host-capture");
+    /// Seed one row for `tool` in `cwd` and return its id.
+    fn seed_row(
+        cwd: &std::path::Path,
+        tool: &str,
+        f: &dyn Fn(&mut crate::session::Instance),
+    ) -> String {
+        let mut inst = crate::session::Instance::new("capture", &cwd.to_string_lossy());
         inst.tool = tool.to_string();
         f(&mut inst);
         let id = inst.id.clone();
@@ -1656,7 +1664,7 @@ method = "{tool}.session_id"
         let _reload = crate::plugin::ReloadRegistryOnDrop;
         let _home = crate::session::test_support::isolate_app_dir_at(tmp.path());
         install_capture_plugin("acme.capture", "capture-helper");
-        let id = seed_row("capture-helper", &|_| {});
+        let id = seed_row(tmp.path(), "capture-helper", &|_| {});
         let state = state(tmp.path());
 
         let set = |sid: &str| {
@@ -1670,6 +1678,10 @@ method = "{tool}.session_id"
 
         assert_eq!(set("session-abc").unwrap(), json!({ "applied": true }));
         assert_eq!(row(&id).agent_session_id.as_deref(), Some("session-abc"));
+        assert!(
+            row(&id).agent_session_binding.is_none(),
+            "a bare report names no execution, so the id is stored unscoped"
+        );
         assert_eq!(
             set("session-abc").unwrap(),
             json!({ "applied": true }),
@@ -1690,12 +1702,12 @@ method = "{tool}.session_id"
         let _reload = crate::plugin::ReloadRegistryOnDrop;
         let _home = crate::session::test_support::isolate_app_dir_at(tmp.path());
         install_capture_plugin("acme.capture", "capture-helper");
-        let owned = seed_row("capture-helper", &|_| {});
-        let pinned = seed_row("capture-helper", &|inst| {
+        let owned = seed_row(tmp.path(), "capture-helper", &|_| {});
+        let pinned = seed_row(tmp.path(), "capture-helper", &|inst| {
             inst.resume_intent = crate::session::ResumeIntent::Use("pinned-sid".into());
             inst.agent_session_id = Some("pinned-sid".into());
         });
-        let undeclared = seed_row("other-tool", &|_| {});
+        let undeclared = seed_row(tmp.path(), "other-tool", &|_| {});
         let state = state(tmp.path());
 
         let set = |plugin: &str, caps: &[&str], id: &str| {
@@ -1738,12 +1750,59 @@ method = "{tool}.session_id"
 
     #[test]
     #[serial_test::serial]
+    fn capture_refuses_a_peer_owned_or_excluded_id() {
+        let tmp = tempfile::tempdir().unwrap();
+        let _reload = crate::plugin::ReloadRegistryOnDrop;
+        let _home = crate::session::test_support::isolate_app_dir_at(tmp.path());
+        install_capture_plugin("acme.capture", "capture-helper");
+        let holder = seed_row(tmp.path(), "capture-helper", &|inst| {
+            inst.agent_session_id = Some("session-peer".into());
+        });
+        let target = seed_row(tmp.path(), "capture-helper", &|inst| {
+            inst.retroactive_capture_excludes
+                .insert(crate::session::ConversationBinding::unknown(
+                    "session-excluded",
+                ));
+        });
+        let state = state(tmp.path());
+
+        let set = |id: &str, sid: &str| {
+            dispatch(
+                &state,
+                &ctx_for("acme.capture", &[CAP_SESSION_WRITE]),
+                "session.capture.set",
+                &json!({ "session_id": id, "agent_session_id": sid }),
+            )
+            .unwrap()
+        };
+
+        assert_eq!(
+            set(&target, "session-peer"),
+            json!({ "applied": false, "reason": "owned_elsewhere" }),
+            "a peer row durably owns the id"
+        );
+        assert_eq!(
+            row(&holder).agent_session_id.as_deref(),
+            Some("session-peer")
+        );
+        assert_eq!(row(&target).agent_session_id, None);
+
+        assert_eq!(
+            set(&target, "session-excluded"),
+            json!({ "applied": false, "reason": "stale" }),
+            "the row refuses this id through a capture exclude"
+        );
+        assert_eq!(row(&target).agent_session_id, None);
+    }
+
+    #[test]
+    #[serial_test::serial]
     fn capture_rejects_a_malformed_session_id() {
         let tmp = tempfile::tempdir().unwrap();
         let _reload = crate::plugin::ReloadRegistryOnDrop;
         let _home = crate::session::test_support::isolate_app_dir_at(tmp.path());
         install_capture_plugin("acme.capture", "capture-helper");
-        let id = seed_row("capture-helper", &|_| {});
+        let id = seed_row(tmp.path(), "capture-helper", &|_| {});
         let state = state(tmp.path());
 
         for agent_session_id in ["--resume", "", &"s".repeat(257)] {
