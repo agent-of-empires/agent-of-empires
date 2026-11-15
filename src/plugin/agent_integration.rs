@@ -211,6 +211,18 @@ pub(crate) fn resolve_declared_tool<'a>(
     }
 }
 
+/// The Enter delay the active declaration for `tool` asks for, if any.
+///
+/// Send paths hold a tool name, not a registry, so they resolve the pause
+/// here: the declaration is the only place a plugin can state it.
+pub(crate) fn declared_send_keys_enter_delay(tool: &str) -> Option<u64> {
+    declared_agent(super::registry(), tool, std::iter::empty())?
+        .contribution()
+        .launch
+        .as_ref()?
+        .send_keys_enter_delay_ms
+}
+
 /// An agent identity bound to one immutable registry snapshot.
 #[derive(Clone)]
 pub(crate) struct DeclaredAgent {
