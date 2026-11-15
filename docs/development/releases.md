@@ -59,12 +59,17 @@ The first nightly appears after the next scheduled run, or `gh workflow run nigh
 - **ClawHub** (`contrib/openclaw-skill/`) is published automatically by `release.yml` on every release. Its frontmatter must carry no top-level `version:`; ClawHub's `_meta.json` and the `--version` flag are the source of truth.
 - **Hermes** (`contrib/hermes-skill/`) is PR-based and published by hand, so the in-repo copy is the source of truth and the hub copy drifts until you re-publish. Its frontmatter must carry a `version:`. Bump it, then run `hermes skills publish contrib/hermes-skill --to github --repo NousResearch/hermes-agent` (needs the `hermes` CLI and a GitHub token with fork permissions). Cadence is on change, not every release.
 
-## Vendored terminal dependency
+## Experimental terminal dependency
 
-Repository maintainers own the Crossterm patch, security updates, and upstreaming
-decision; the release approver owns its checks. Review upstream releases and
-advisories at each weekly release review and immediately for a relevant advisory.
-Dependency-update PRs do not update path-patched source.
+The Crossterm patch is an experiment in [draft PR #5593](https://github.com/agent-of-empires/agent-of-empires/pull/5593),
+not an approved fork or supported-release commitment.
+[Upstream report #1173](https://github.com/crossterm-rs/crossterm/issues/1173)
+links a standalone reproduction and the candidate implementation.
+Keep the PR draft until maintainers choose an official dependency that satisfies
+the required behavior, redesign the affected change without the patch, or approve
+a separate temporary exception. An exception must name a willing owner, exact
+scope, expiry date or release, security obligations, and removal trigger.
+Upstream silence does not create or renew a maintenance commitment.
 
 `vendor/crossterm` comes from the published
 [`crossterm-0.29.0.crate`](https://static.crates.io/crates/crossterm/crossterm-0.29.0.crate)
@@ -88,15 +93,14 @@ blocking read.
 The patch reevaluates readiness through the existing registration and poll.
 It does not eliminate every race with a concurrent competing input consumer.
 
-For an update, extract the new archive independently, record its checksum here,
-replay only the reviewed delta, and compare the pristine and patched trees.
-Review upstream release notes, Rust requirements and advisories. Keep the full
-MIT copyright notice in both the fork and `licenses/`, and update
-`THIRD_PARTY_NOTICES.md`. Propose the reusable consumer correction upstream;
-retire the patch only when the upstream version passes the same live, stale,
-control-order and zero-time regressions without changing backends.
+Preserve the complete MIT notices while this source is present. When selecting
+an official replacement, verify the relevant behavior rather than requiring the
+same implementation. Remove the path patch, vendor tree, vendor-only CI/helper,
+packaging references, and notices needed only by that source in the same cutover.
+Abandoning the experiment or reaching an unrenewed exception deadline also
+requires removal; do not make retirement depend solely on an upstream merge.
 
-Run these checks sequentially before release on Linux and native macOS:
+For experimental validation on Linux and native macOS:
 
 ```sh
 python3 .github/scripts/test-vendored-crossterm.py
@@ -120,21 +124,22 @@ one actual 1024-byte read, and original one-byte tail. Their writer stays open
 through the final zero-time poll. These two cases do **not** prove a 1024-byte
 terminal read on Darwin; the other 16 cases retain their real terminal-mode checks.
 
-Release archives carry `LICENSE`, `THIRD_PARTY_NOTICES.md`, and all of `licenses/`.
-Both Nix packages include the fork's notice and install complete notices under
+The prototype release archives carry `LICENSE`, `THIRD_PARTY_NOTICES.md`, and all of `licenses/`.
+Both prototype Nix packages include the patch's notice and install complete notices under
 `$out/share/licenses/aoe`. Crane dependency builds restore real vendor sources and
 original manifests after generating workspace stubs, using vendor-only copy
 inputs so application edits do not invalidate the dependency cache. Dependency
 metadata and Cargo vendoring come from the original manifest and lock, not dummy
-sources. Check `nix build` and `nix build .#aoe-with-web`, installed notices, and a
-generated release archive before approval.
+sources. These packaging changes are not release approval. An approved temporary
+exception would also require checking `nix build`, `nix build .#aoe-with-web`,
+installed notices, and a generated release archive.
 
 Before release, evaluate both configured packages and the development shell for
 every system advertised by the Nix CI matrix with
 `--option allow-import-from-derivation false`; evaluation must not realize foreign
 generated sources.
 
-Supported source installation uses the Git checkout and project lockfile
-(`cargo install --path . --locked`, or the Git-based installer). Ordinary registry
-packaging strips patches and nested packages and is not a supported source
-distribution for this fork.
+To inspect the experiment, use a Git checkout and project lockfile
+(`cargo install --path . --locked`). Ordinary registry packaging strips patches
+and nested packages; it does not reproduce this draft. Neither route establishes
+a supported distribution of the experimental patch.
