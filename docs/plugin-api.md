@@ -155,7 +155,7 @@ Capabilities gate plugin resource access and host interactions. They are prompte
 | Capability | Grants |
 |---|---|
 | `runtime.worker` | Launching a plugin worker and using its base host RPCs. Required for either runtime kind. |
-| `session.read` | Reading sessions of the host's profile: the attached session, `sessions.list`, `projects.list` (`api_version >= 22`, the registered projects), and the `session.status.changed` (`api_version >= 14`) and `session.lifecycle.changed` (`api_version >= 19`) notifications. |
+| `session.read` | Reading sessions of the host's profile: the attached session, `sessions.list`, `projects.list` (`api_version >= 23`, the registered projects), and the `session.status.changed` (`api_version >= 14`) and `session.lifecycle.changed` (`api_version >= 19`) notifications. |
 | `session.write` | Mutating any session of the profile: `session.meta.set`/`cas`, `session.capture.set` for a tool the plugin owns and declares `session_id` for, and archive/trash from a plugin page. |
 | `config.read` | Reading host or other-plugin configuration (not the plugin's own settings). |
 | `config.write` | Writing host or other-plugin configuration. |
@@ -351,8 +351,8 @@ With `api_version >= 9` a worker can discover ACP capabilities and create host-o
 | `sessions.turn.send` | `session.prompt` | Deliver a turn to a session **this plugin created**. |
 | `sessions.message.send` | `session.message` | Deliver a short text message to **any** session, like `aoe send`. See [Messaging any session](#messaging-any-session). `api_version >= 15`. |
 | `plugin.storage.get` / `set` / `cas` / `remove` | `runtime.worker` | Plugin-private durable key/value storage (see [Plugin storage](#plugin-storage)). |
-| `suggestions.set` / `error` / `sources` / `checks.set` | `runtime.worker` | Publish suggested sessions (see [Suggested sessions](#suggested-sessions)). `api_version >= 22`. Not served until the store layer lands. |
-| `projects.list` | `session.read` | Registered projects of the host profile, `{ projects: [{ name, path }] }`. `api_version >= 22`. |
+| `suggestions.set` / `error` / `sources` / `checks.set` | `runtime.worker` | Publish suggested sessions (see [Suggested sessions](#suggested-sessions)). `api_version >= 23`. Not served until the store layer lands. |
+| `projects.list` | `session.read` | Registered projects of the host profile, `{ projects: [{ name, path }] }`. `api_version >= 23`. |
 
 **Project selection (`api_version >= 11`).** `sessions.create` takes an optional `project_path` (the trust-checked primary repo) and `extra_project_paths` (the other repos of a multi-repo session). Omitting `project_path` creates a **scratch** session: a throwaway directory with no repository, so extras alongside it are refused. Every path is canonicalized and existence-checked host-side, fail-closed and capped per call.
 
