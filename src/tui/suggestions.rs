@@ -184,6 +184,7 @@ impl Res {
 
 enum ResKind {
     Snapshot,
+    Prepare,
     Other,
 }
 
@@ -592,7 +593,11 @@ impl SuggestionsView {
         }
         if let Some(error) = polled.error.take() {
             match self.preparing.take() {
-                Some(key) => self.failed = Some((key, error)),
+                Some(key) if polled.prepare_failed => self.failed = Some((key, error)),
+                Some(key) => {
+                    self.preparing = Some(key);
+                    self.error = Some(error);
+                }
                 None => self.error = Some(error),
             }
             changed = true;
@@ -918,6 +923,8 @@ pub(super) struct FeedPoll {
     pub start: Option<(ItemKey, Start, PrepareTarget)>,
     /// Failure of a user-initiated request; background reloads only log.
     pub error: Option<String>,
+    /// `error` belongs to a prepare, not to a reload, refresh or dismiss.
+    pub prepare_failed: bool,
 }
 
 /// The one suggestions store, owned by `HomeView`: snapshot, worker and
@@ -1326,6 +1333,7 @@ impl SuggestionsFeed {
             refreshed: false,
             start: None,
             error: None,
+            prepare_failed: false,
         };
         let res = match self.worker.try_recv() {
             Ok(res) => res,
@@ -1342,6 +1350,7 @@ impl SuggestionsFeed {
         let in_flight_dismiss = self.in_flight_dismiss.take();
         let req_kind = match &res {
             Res::Snapshot(_) => ResKind::Snapshot,
+            Res::Prepared(_) => ResKind::Prepare,
             _ => ResKind::Other,
         };
         match res {
@@ -1370,10 +1379,17 @@ impl SuggestionsFeed {
                 if let Some(key) = self.prepare_key.take() {
                     let start = start_for(self.snapshot.as_ref(), &key, prepared);
                     out.start = Some((key, start, self.prepare_target));
+                } else {
+                    // A profile switch dropped the request this answers.
+                    out.error = Some("Profile changed, suggestion not started".into());
+                    out.prepare_failed = true;
                 }
             }
             Res::Snapshot(Err(e)) | Res::Refreshed(Err(e)) | Res::Prepared(Err(e)) => {
-                self.prepare_key = None;
+                if matches!(req_kind, ResKind::Prepare) {
+                    self.prepare_key = None;
+                    out.prepare_failed = true;
+                }
                 if let (ResKind::Snapshot, Some((key, dismissed))) = (req_kind, in_flight_dismiss) {
                     // A failed dismiss or restore leaves the undo window as it was.
                     let pending = if dismissed {
@@ -1754,6 +1770,7 @@ mod tests {
             refreshed: false,
             start: None,
             error: None,
+            prepare_failed: false,
         }
     }
 
@@ -1825,6 +1842,7 @@ mod tests {
             refreshed: false,
             start: None,
             error: None,
+            prepare_failed: false,
         };
         for _ in 0..200 {
             failed = rig.store.poll();
@@ -1910,6 +1928,47 @@ mod tests {
         );
         assert!(render_text(&rig).contains("Couldn't start: branch already exists"));
         assert!(rig.view.failed.is_some());
+    }
+
+    #[test]
+    fn a_reload_failure_during_a_queued_prepare_stays_off_the_row() {
+        let worker = Worker::spawn("t", |req| match req {
+            Req::Load => Res::Snapshot(Err("reload boom".into())),
+            Req::Prepare { .. } => Res::Prepared(Ok(prepared(Some("/repo")))),
+            _ => unreachable!("no other request expected"),
+        });
+        let mut rig = view_with(vec![item("a", Some("repo"), false)], worker);
+        press(&mut rig, KeyCode::Char('l'), true);
+        press(&mut rig, KeyCode::Enter, true);
+        let mut error_seen = None;
+        for _ in 0..200 {
+            let mut polled = rig.store.poll();
+            rig.view.apply(&rig.store, &mut polled);
+            error_seen = error_seen.or_else(|| rig.view.error.clone());
+            if rig.view.prepared.is_some() {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        assert_eq!(error_seen.as_deref(), Some("reload boom"));
+        assert!(
+            rig.view.failed.is_none(),
+            "the reload error is not the row's"
+        );
+        assert!(rig.view.prepared.is_some(), "the prepare still completes");
+    }
+
+    #[test]
+    fn a_prepare_answered_after_a_profile_switch_reports_instead_of_vanishing() {
+        let worker = Worker::seeded_for_test("t", Res::Prepared(Ok(prepared(Some("/repo")))));
+        let mut rig = view_with(vec![item("a", Some("repo"), false)], worker);
+        rig.store.profile = Some("default".into());
+        press(&mut rig, KeyCode::Enter, true);
+        rig.store.set_profile(Some("work".into()));
+        assert!(poll_until_settled(&mut rig));
+        assert!(rig.view.prepared.is_none());
+        assert!(rig.view.preparing.is_none());
+        assert!(render_text(&rig).contains("Profile changed, suggestion not started"));
     }
 
     #[test]
