@@ -3244,6 +3244,14 @@
       ]
     },
     {
+      "id": "settings.persistent-terminals",
+      "kind": "vitest",
+      "risk": "low",
+      "description": "Kept terminals stay attached across session switches, so each keeps its scroll position.",
+      "specs": ["src/components/__tests__/TerminalSessionStack.test.tsx"],
+      "components": ["web/src/components/TerminalSessionStack.tsx"]
+    },
+    {
       "id": "settings.persistent-structured-views",
       "kind": "vitest",
       "risk": "low",
