@@ -90,7 +90,8 @@ pub(crate) use resume::{
     LaunchReservation, ManagedResumeRefused, ResumeAttemptPolicy, ResumeLaunchOptions,
 };
 pub(crate) use sid_persist::{
-    persist_session_to_storage, CaptureCommit, SidPersistOutcome, SidWrite,
+    persist_session_to_storage, persist_session_with_storage, CaptureCommit, SidPersistOutcome,
+    SidWrite,
 };
 pub use start::{LaunchSidOutcome, StartOutcome};
 pub(crate) use status::PassiveStatusPatch;
