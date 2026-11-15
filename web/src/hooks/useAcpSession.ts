@@ -319,6 +319,13 @@ export function useAcpSession(
   // once each; a rerun must not cancel that. A confirmed row missing from the server was
   // drained and must not be re-created.
   const queueMigrationRef = useRef<Map<string, Promise<void>>>(new Map());
+  const mountedRef = useRef(true);
+  useEffect(() => {
+    mountedRef.current = true;
+    return () => {
+      mountedRef.current = false;
+    };
+  }, []);
   // The sidebar badge takes this browser's count only between the first queue list after an open and the close.
   const queueListedRef = useRef(false);
   useEffect(() => {
@@ -345,10 +352,10 @@ export function useAcpSession(
           if (!saved) continue;
           // Confirmed, so a list that no longer has it (delivered) drops it instead of keeping it to re-send.
           const confirm: Action = { kind: "confirm_queued_prompt", id: q.id };
-          if (sessionIdRef.current === sessionId) {
+          if (mountedRef.current && sessionIdRef.current === sessionId) {
             dispatch(confirm);
           } else {
-            // Left meanwhile: confirm into the Session's stored state, which a later open restores.
+            // Left or closed meanwhile: confirm into the Session's stored state, which a later open restores.
             const stored = cacheGet(sessionId);
             if (stored) cacheSet(sessionId, reducer(stored, confirm));
           }

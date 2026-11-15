@@ -7,6 +7,7 @@ import { emptyAcpState } from "../lib/acpTypes";
 import { STATE_TTL_MS, STORAGE_KEY_PREFIX, getLiveQueueCount } from "../lib/acpStateStorage";
 import { listServerQueue, reportAcpInteraction, type ServerQueuedPrompt } from "../lib/api";
 import type { SessionResponse } from "../lib/types";
+import { cacheGet } from "./acpSession/stateCache";
 import { ACP_DIAL_TIMEOUT_MS, ACP_MAX_RETRIES, ACP_WS_STALE_MS, acpRetryDelayMs } from "./acpSession/useAcpConnection";
 import {
   FakeWebSocket,
@@ -984,8 +985,11 @@ describe("server queue", () => {
     expect(lists()).toBe(8);
   });
 
-  it("confirms a re-sent row in its Session's stored state when the user has left it", async () => {
-    const a = "sess-left";
+  it.each([
+    ["opens another Session", "switch"],
+    ["closes it", "unmount"],
+  ] as const)("confirms a re-sent row in its Session's stored state when the user %s mid-POST", async (_, leave) => {
+    const a = `sess-left-${leave}`;
     const queuedAt = "2026-01-01T00:00:00.000Z";
     const state = {
       ...emptyAcpState(),
@@ -1003,23 +1007,53 @@ describe("server queue", () => {
     queuePostStarted = started.resolve;
     lastSocket().open();
     await started.promise;
-    // The user opens another Session; the Daemon then delivers u1 before its response arrives.
-    first.rerender({ id: "sess-elsewhere" });
+    // The user leaves A; the Daemon then delivers u1 before its response arrives.
+    if (leave === "switch") first.rerender({ id: "sess-elsewhere" });
+    else first.unmount();
     await flushAsync();
     serverQueue.delete("u1");
     queuePostHeld = null;
     post.resolve();
-    await flushAsync();
-    first.unmount();
+    await waitFor(() => expect(cacheGet(a)?.queuedPrompts).toMatchObject([{ id: "u1", pending: false }]));
+    if (leave === "switch") first.unmount();
 
+    const lists = () => calls.filter((c) => c.method === "GET" && c.url.includes("/queue") && c.url.includes(a)).length;
+    const listed = lists();
     const again = render(a);
     await flushAsync();
     lastSocket().open();
-    await flushAsync();
+    await waitFor(() => expect(lists()).toBeGreaterThan(listed));
+    await waitFor(() => expect(again.result.current.state.queuedPrompts).toEqual([]));
     expect(posts("/queue").map((c) => JSON.parse(c.body!).id)).toEqual(["u1"]);
     expect(serverQueue.has("u1")).toBe(false);
-    expect(again.result.current.state.queuedPrompts).toEqual([]);
     again.unmount();
+  });
+
+  it("confirms a re-sent row in the open hook under StrictMode, so a delivered one is dropped", async () => {
+    const a = "sess-strict";
+    const queuedAt = "2026-01-01T00:00:00.000Z";
+    const state = {
+      ...emptyAcpState(),
+      queuedPrompts: [{ id: "u1", text: "u1", queuedAt, pending: true }],
+    };
+    localStorage.setItem(`${STORAGE_KEY_PREFIX}${a}`, JSON.stringify({ savedAt: Date.now(), state }));
+    const hook = renderHook(() => useAcpSession(a, "running"), { wrapper: profileWrapper, reactStrictMode: true });
+    await flushAsync();
+    const post = Promise.withResolvers<void>();
+    const started = Promise.withResolvers<void>();
+    queuePostHeld = post.promise;
+    queuePostStarted = started.resolve;
+    lastSocket().open();
+    await started.promise;
+    serverQueue.delete("u1");
+    queuePostHeld = null;
+    const lists = () => calls.filter((c) => c.method === "GET" && c.url.includes("/queue") && c.url.includes(a)).length;
+    const listed = lists();
+    post.resolve();
+    await waitFor(() => expect(lists()).toBeGreaterThan(listed));
+    await waitFor(() => expect(hook.result.current.state.queuedPrompts).toEqual([]));
+    expect(posts("/queue").map((c) => JSON.parse(c.body!).id)).toEqual(["u1"]);
+    hook.unmount();
   });
 
   it("shows the row the daemon reports when it parks a busy-turn prompt", async () => {
