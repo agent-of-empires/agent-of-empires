@@ -5,7 +5,7 @@
 state = "waiting"
 region = "whole_recent"
 visible = true
-contains_any = ["(y/n)", "[y/n]", "approve", "allow"]
+contains_any = ["(y/n)", "[y/n]", "allow once", "allow always"]
 
 # A braille spinner frame anywhere in the window.
 [templates.spinner]

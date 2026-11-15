@@ -814,7 +814,7 @@ To continue this session, run codex resume 019e270b-5139-7752-ac61-86fe4bb5170c
             Status::Waiting,
             &[
                 "run this command? (y/n)",
-                "approve changes?",
+                "\u{25cf} 1. Allow once\n  2. Allow always",
                 "execute this action? [y/n]",
                 r#"
 ■ Conversation interrupted - tell the model what to do differently. Something went wrong? Hit `/feedback` to report the issue.
@@ -962,7 +962,7 @@ run this command? (y/n)
             Status::Waiting,
             &[
                 "run this command? (y/n)",
-                "approve changes?",
+                "\u{25cf} 1. Allow once\n  2. Allow always",
                 "execute this action? [y/n]",
                 "ready\n>",
             ],
@@ -1059,7 +1059,7 @@ run this command? (y/n)
             Status::Waiting,
             &[
                 "run this command? (y/n)",
-                "approve changes?",
+                "\u{25cf} 1. Allow once\n  2. Allow always",
                 "execute this action? [y/n]",
                 "ready\ndroid>",
                 "done\n>",
@@ -1117,7 +1117,7 @@ run this command? (y/n)
             Status::Waiting,
             &[
                 "run command? (y/n)",
-                "Allow this tool to run?",
+                "Allow execution of: 'ls'?\n\u{25cf} 1. Yes, allow once",
                 "pick an option\nenter to select",
                 "done\n>",
                 "done\nqwen>",
@@ -2465,10 +2465,22 @@ Writes are allowed once the lock is released.
         let cursor_prompt = "Run this command?\n\n> Allow this command\n  Deny\n\n\
 enter to select · esc to cancel";
         for (agent, cleared, kept) in [
-            ("codex", "file saved", "approve changes?"),
+            (
+                "codex",
+                "file saved",
+                "\u{25cf} 1. Allow once\n  2. Allow always",
+            ),
             ("cursor", "→ add a follow-up", cursor_prompt),
-            ("qwen", "random output text", "Allow this tool to run?"),
-            ("gemini", "file saved", "approve changes?"),
+            (
+                "qwen",
+                "random output text",
+                "Allow execution of: 'ls'?\n\u{25cf} 1. Yes, allow once",
+            ),
+            (
+                "gemini",
+                "file saved",
+                "\u{25cf} 1. Allow once\n  2. Allow always",
+            ),
         ] {
             assert_hook_all(agent, stale_wait(), Status::Idle, &[cleared]);
             assert_hook_all(agent, stale_wait(), Status::Waiting, &[kept]);
