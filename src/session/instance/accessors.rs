@@ -105,6 +105,7 @@ impl Instance {
             capture_started_at: None,
             started_at: None,
             launch_executable: None,
+            launch_resolved_executable: None,
             pi_extension_launched: false,
             identity_publisher_launched: false,
             pi_session_path: None,
