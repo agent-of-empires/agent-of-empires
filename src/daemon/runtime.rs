@@ -209,7 +209,7 @@ pub struct CreationProgress {
     pub command: Option<String>,
     /// Bounded tail of the current phase output, oldest first.
     pub output: Vec<String>,
-    /// A cancellation request is pending; the phase in flight still finishes.
+    /// A cancellation request is pending; the phase in flight still finishes, but an image pull stops.
     pub cancelled: bool,
 }
 

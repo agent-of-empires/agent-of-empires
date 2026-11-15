@@ -667,7 +667,7 @@ pub(crate) fn remove_stores_for(
     );
     let Some(agent) = crate::session::config::container_config::resolve_active_agent(
         &instance.tool,
-        Some(instance.get_tool_command()),
+        Some(&instance.get_tool_command()),
         &config.session,
     ) else {
         return Ok((Vec::new(), 0));
@@ -1194,6 +1194,73 @@ mod tests {
         assert_eq!(removed, vec![link.clone()]);
         assert!(!link.exists());
         assert_eq!(fs::read(target.join("keep")).unwrap(), b"keep");
+    }
+
+    /// A declaration supersedes the bundled OMP listing, but the tool keeps the
+    /// identity its own contract names: the declaration's command still owns
+    /// OMP's store, `agent_execution_as` still names it, and purge still
+    /// reaches the certified store.
+    #[test]
+    #[serial_test::serial]
+    fn declared_omp_keeps_the_identity_its_stores_and_wrappers_resolve() {
+        let dir = tempfile::tempdir().unwrap();
+        // Declared first so it reloads after the app directory is restored.
+        let _reload = crate::plugin::ReloadRegistryOnDrop;
+        let _app = crate::session::test_support::isolate_app_dir_at(dir.path());
+        crate::session::test_support::install_omp_takeover("omp-next");
+        let resolve =
+            |tool: &str, command: &str, session: &crate::session::config::SessionConfig| {
+                crate::session::config::container_config::resolve_active_agent(
+                    tool,
+                    Some(command),
+                    session,
+                )
+                .map(|agent| agent.name)
+            };
+        let default = crate::session::config::SessionConfig::default();
+        assert_eq!(resolve("omp", "omp-next", &default), Some("omp"));
+        let mut wrapper = crate::session::config::SessionConfig::default();
+        wrapper
+            .agent_execution_as
+            .insert("wrapper".into(), "omp".into());
+        wrapper
+            .agent_config_dir
+            .insert("wrapper".into(), "~/.wrapper".into());
+        assert_eq!(resolve("wrapper", "wrapper-next", &wrapper), Some("omp"));
+
+        let mut instance = crate::session::Instance::new("t", "/tmp/p");
+        instance.tool = "omp".into();
+        instance.command = "omp-next".into();
+        instance.sandbox_info = Some(crate::session::SandboxInfo {
+            provider: None,
+            enabled: true,
+            container_id: None,
+            image: "test:latest".into(),
+            container_name: "aoe-sandbox-omp-takeover".into(),
+            extra_env: None,
+            custom_instruction: None,
+            container_workdir: None,
+            before_start_env: Vec::new(),
+            before_start_hook_env: Vec::new(),
+        });
+        instance.sandbox_store_generation =
+            crate::session::config::container_config::CURRENT_SANDBOX_STORE_GENERATION;
+        // Real admission, not a hand-made certificate: the takeover must not
+        // block the store the tool's own identity owns.
+        drop(
+            crate::migrations::v033_isolate_sandbox_content::admit_fresh_instance(&instance)
+                .expect("an approved takeover must still admit omp's own store"),
+        );
+        let store = dir
+            .path()
+            .join(".omp")
+            .join("sandbox-v2")
+            .join(&instance.id);
+        assert!(store.exists(), "admission must create the isolated store");
+        let (removed, _) =
+            remove_stores_for(&instance, &crate::session::config::Config::default()).unwrap();
+        assert_eq!(removed, vec![store.clone()]);
+        assert!(!store.exists(), "the certified store was left behind");
     }
 
     /// Removing one store takes time, and a container for a later candidate

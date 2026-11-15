@@ -46,6 +46,7 @@ pub use execution::{
 mod flags;
 mod hooks;
 pub(crate) use hooks::HostHookApprovalRequired;
+pub(crate) use status_update::CAPTURE_FAILED_RULE;
 mod identity_sidecar;
 mod kill;
 mod launch_command;
@@ -90,7 +91,8 @@ pub(crate) use resume::{
 };
 pub use resume::{LaunchIndeterminateCause, ManagedResumeCause};
 pub(crate) use sid_persist::{
-    persist_session_to_storage, CaptureCommit, SidPersistOutcome, SidWrite,
+    persist_session_to_storage, persist_session_with_storage, CaptureCommit, SidPersistOutcome,
+    SidWrite,
 };
 pub use start::{LaunchSidOutcome, StartOutcome};
 pub(crate) use status::PassiveStatusPatch;
@@ -113,6 +115,28 @@ enum ResumeStaticUnavailable {
     Agent,
     Sandbox,
     Command,
+}
+
+/// A profile's config as the resume check reads it. When resolution failed,
+/// `config` is the warn fallback, which answers legacy selectors but no native agent.
+pub(crate) struct ResumeProfileConfig {
+    config: crate::session::Config,
+    resolved: bool,
+}
+
+/// Resolve `source_profile` for [`Instance::terminal_context_resume_cached_with`].
+pub(crate) fn resume_profile_config(source_profile: &str) -> ResumeProfileConfig {
+    let profile = crate::session::config::effective_profile(source_profile);
+    match crate::session::config::profile_config::resolve_config(&profile) {
+        Ok(config) => ResumeProfileConfig {
+            config,
+            resolved: true,
+        },
+        Err(_) => ResumeProfileConfig {
+            config: crate::session::config::profile_config::resolve_config_or_warn(&profile),
+            resolved: false,
+        },
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -471,6 +495,10 @@ pub struct Instance {
     /// a path only; hook output is never recorded here.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub launch_executable: Option<std::path::PathBuf>,
+    /// `launch_executable` with symlinks resolved at launch, to tell a switched link from a
+    /// re-created one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub launch_resolved_executable: Option<std::path::PathBuf>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub archived_at: Option<DateTime<Utc>>,
 
@@ -658,6 +686,9 @@ pub struct Instance {
     /// See `src/session/scratch.rs`.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub scratch: bool,
+    /// Created with its `on_create` hooks skipped (`skip_on_create`), so their setup never ran.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub created_without_setup: bool,
 
     // Git worktree integration
     #[serde(default, skip_serializing_if = "Option::is_none")]

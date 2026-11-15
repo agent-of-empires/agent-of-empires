@@ -520,6 +520,149 @@ fn footer_advertises_tab_as_attach_when_default_is_live_send() {
     );
 }
 
+/// After a takeover the footer names the key that enters live mode, which is Enter once
+/// live-send owns it; Tab keeps its attach hint.
+#[test]
+#[serial]
+fn takeover_footer_names_enter_when_enter_is_live() {
+    let mut env = create_test_env_empty();
+    write_global_default_attach_mode(AttachMode::LiveSend);
+    let id = add_session(&mut env.view, "session-one");
+    env.view.flat_items = env.view.build_flat_items();
+    env.view.cursor = 0;
+    env.view.update_selected();
+    env.view.live_takeover = Some(crate::tui::home::live_send::TakenLive {
+        session_id: id,
+        tmux_name: "aoe_taken".into(),
+        taker: crate::tui::home::live_send::LiveTakeover::Web,
+    });
+    let out = render_home(&mut env);
+    let footer = out.lines().last().unwrap_or_default();
+    assert!(
+        footer.contains("Web dashboard took control · ↵ take control"),
+        "{footer}"
+    );
+    assert!(footer.contains("⇥  Attach"), "{footer}");
+    assert!(!footer.contains("Live"), "{footer}");
+}
+
+/// With the shortcut bar hidden the takeover line never shows, so a flash says who took
+/// control and names the live key; with the bar shown the footer line names it instead.
+/// A structured Session's Terminal and Tool views go live on Tab like any other row.
+#[test]
+#[serial]
+fn a_takeover_names_the_live_key_in_a_flash_or_the_footer() {
+    use crate::tui::home::live_send::{LiveTakeover, TakenLive};
+    use crate::tui::home::ViewMode;
+    // (default attach mode, structured Session's pane, shortcut bar shown, live key)
+    for (mode, structured_pane, bar, live_key) in [
+        (AttachMode::Tmux, None, false, Some("Tab")),
+        (AttachMode::LiveSend, None, false, Some("Enter")),
+        (AttachMode::Tmux, None, true, Some("Tab")),
+        (
+            AttachMode::Tmux,
+            Some(ViewMode::Terminal),
+            false,
+            Some("Tab"),
+        ),
+        (
+            AttachMode::Tmux,
+            Some(ViewMode::Tool("probe".into())),
+            true,
+            Some("Tab"),
+        ),
+        (
+            AttachMode::LiveSend,
+            Some(ViewMode::Structured),
+            false,
+            None,
+        ),
+    ] {
+        let case = format!("{mode:?} {structured_pane:?} bar={bar}");
+        let mut env = create_test_env_empty();
+        write_global_default_attach_mode(mode);
+        let id = add_session(&mut env.view, "session-one");
+        if let Some(pane) = structured_pane {
+            env.view.instances.get_mut(&id).unwrap().view = crate::session::View::Structured;
+            env.view.view_mode = pane;
+        }
+        env.view.flat_items = env.view.build_flat_items();
+        env.view.cursor = 0;
+        env.view.update_selected();
+        env.view.show_shortcut_bar = bar;
+        let taken = TakenLive {
+            session_id: id,
+            tmux_name: "aoe_taken".into(),
+            taker: LiveTakeover::Web,
+        };
+        env.view.note_live_takeover(taken.clone());
+        assert_eq!(env.view.live_takeover, Some(taken), "{case}");
+        let flash = match live_key {
+            Some(key) => format!("Web dashboard took control: {key} to take it back"),
+            None => "Web dashboard took control".to_string(),
+        };
+        let footer_hint = match live_key {
+            Some("Tab") => "Tab take control",
+            _ => "↵ take control",
+        };
+        let out = render_home(&mut env);
+        let footer = out.lines().last().unwrap_or_default();
+        if bar {
+            assert_eq!(env.view.status_flash_text(), None, "{case}");
+            assert!(footer.contains(footer_hint), "{case}: {footer}");
+        } else {
+            assert_eq!(env.view.status_flash_text(), Some(flash.as_str()), "{case}");
+            assert!(footer.contains(&flash), "{case}: {footer}");
+        }
+    }
+}
+
+/// A takeover in a structured Session's Terminal pane, then the view toggle: in Structured
+/// view neither key enters live mode, so the footer keeps the status and names no key.
+#[test]
+#[serial]
+fn a_takeover_names_no_key_where_neither_key_takes_control() {
+    use crate::tui::home::live_send::{LiveTakeover, TakenLive};
+    use crate::tui::home::ViewMode;
+    for mode in [AttachMode::Tmux, AttachMode::LiveSend] {
+        let mut env = create_test_env_empty();
+        write_global_default_attach_mode(mode);
+        let id = add_session(&mut env.view, "session-one");
+        env.view.instances.get_mut(&id).unwrap().view = crate::session::View::Structured;
+        env.view.view_mode = ViewMode::Terminal;
+        env.view.flat_items = env.view.build_flat_items();
+        env.view.cursor = 0;
+        env.view.update_selected();
+        env.view.note_live_takeover(TakenLive {
+            session_id: id.clone(),
+            tmux_name: "aoe_taken".into(),
+            taker: LiveTakeover::Web,
+        });
+        env.view.handle_key(key(KeyCode::Char('t')), None);
+        assert_eq!(env.view.view_mode, ViewMode::Structured, "{mode:?}");
+        assert!(env.view.live_takeover.is_some(), "{mode:?}");
+        let out = render_home(&mut env);
+        let footer = out.lines().last().unwrap_or_default();
+        assert!(
+            footer.contains("Web dashboard took control"),
+            "{mode:?}: {footer}"
+        );
+        assert!(!footer.contains("take control"), "{mode:?}: {footer}");
+        assert!(footer.contains("↵ Attach"), "{mode:?}: {footer}");
+        // Neither key takes control: Enter opens the structured view and Tab is refused.
+        let enter = env.view.handle_key(key(KeyCode::Enter), None);
+        assert!(
+            matches!(&enter, Some(Action::OpenStructuredView(opened)) if opened == &id),
+            "{mode:?}: {enter:?}"
+        );
+        let tab = env.view.handle_key(key(KeyCode::Tab), None);
+        assert!(
+            matches!(tab, Some(Action::SetTransientStatus(_))),
+            "{mode:?}: {tab:?}"
+        );
+    }
+}
+
 /// Structured rows have no distinct Tab action to advertise.
 #[test]
 #[serial]

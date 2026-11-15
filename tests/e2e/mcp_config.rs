@@ -14,9 +14,24 @@ fn block_on<F: std::future::Future>(f: F) -> F::Output {
 
 /// POST one JSON-RPC message to `url` with `headers`; returns the status and the parsed body.
 async fn rpc(url: &str, headers: &[(String, String)], body: Value) -> (StatusCode, Value) {
+    rpc_within(url, headers, body, std::time::Duration::from_secs(5)).await
+}
+
+/// [`rpc`] for a terminal `create_session` with a prompt, which waits (up to 30 s) for the agent's
+/// input prompt before it answers.
+async fn rpc_create(url: &str, body: Value) -> (StatusCode, Value) {
+    rpc_within(url, &[], body, std::time::Duration::from_secs(60)).await
+}
+
+async fn rpc_within(
+    url: &str,
+    headers: &[(String, String)],
+    body: Value,
+    timeout: std::time::Duration,
+) -> (StatusCode, Value) {
     let mut req = Client::builder()
         .no_proxy()
-        .timeout(std::time::Duration::from_secs(5))
+        .timeout(timeout)
         .build()
         .unwrap()
         .post(url)
@@ -625,4 +640,225 @@ fn configured_mcp_respects_disabled_web_across_acquisition_and_reconnect() {
     h.run_cli_ok(&["profile", "list"]);
     assert_mcp_connects(&h);
     assert!(std::net::TcpStream::connect(("192.0.2.1", port)).is_err());
+}
+
+/// A terminal `create_session` with a prompt waits for the agent, then types the prompt into
+/// its pane, where `read_output` reads it back. The prompt carries a paste delimiter, which
+/// is stripped as `send` strips it; typed raw, the agent would receive it.
+#[test]
+#[parallel]
+fn mcp_create_session_types_a_terminal_prompt_into_the_agents_pane() {
+    crate::harness::require_tmux!();
+    let mut h = TuiTestHarness::new("mcp_terminal_prompt");
+    // Stands in for `claude`: draws its input prompt (a bare `❯` line, which Claude's status
+    // rules read as Idle), then prints what it is typed, with control bytes made visible
+    // (`cat -v` shows ESC as `^[`). The tty's own echo is off, so the pane holds only that.
+    let bin = h.home_path().join("fake-agent-bin");
+    std::fs::create_dir_all(&bin).unwrap();
+    crate::harness::write_executable(
+        &bin.join("claude"),
+        "#!/bin/sh\nstty -echo\nprintf '\\n\\342\\235\\257\\n'\nexec cat -v\n",
+    );
+    h.add_path_dir(&bin);
+    h.append_config("[web]\nmcp_enabled = true");
+    h.stop_daemon_on_drop();
+    let port = h.start_daemon();
+    let url = format!("http://127.0.0.1:{port}/mcp");
+    let call = |name: &str, arguments: Value| {
+        json!({
+            "jsonrpc": "2.0", "id": 3, "method": "tools/call",
+            "params": {"name": name, "arguments": arguments},
+        })
+    };
+
+    block_on(async {
+        let create = call(
+            "create_session",
+            json!({
+                "path": h.project_path(), "tool": "claude", "title": "mcp-terminal",
+                "prompt": "typed-into\u{1b}[201~-the-agent",
+            }),
+        );
+        let (status, body) = rpc_create(&url, create).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let created = &body["result"]["structuredContent"];
+        assert_eq!(created["prompt_delivery"], "sent", "{body}");
+        assert_eq!(created["prompt_sent"], true, "{body}");
+        let id = created["session"]["id"]
+            .as_str()
+            .expect("session id")
+            .to_string();
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        loop {
+            let read = call("read_output", json!({"session_id": id, "lines": 20}));
+            let (_, body) = rpc(&url, &[], read).await;
+            let text = body["result"]["structuredContent"]["text"]
+                .as_str()
+                .unwrap_or("");
+            assert!(
+                !text.contains("^["),
+                "the agent received a raw escape: {text}"
+            );
+            if text.contains("typed-into-the-agent") {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the prompt never reached the pane: {body}"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        }
+    });
+}
+
+/// Neither a terminal `create_session` prompt nor `send` is typed into a dialog: with Claude's
+/// folder-trust question on screen the create reports `blocked_waiting`, `send` is refused with
+/// `waiting`, and the agent receives no keystroke at all, so no Enter can accept the folder.
+/// Once the session is stopped, `send` is refused with `not_running` rather than restarting the
+/// agent into the same dialog.
+#[test]
+#[parallel]
+fn mcp_never_types_into_claudes_folder_trust_dialog() {
+    crate::harness::require_tmux!();
+    let mut h = TuiTestHarness::new("mcp_trust_dialog");
+    // Stands in for `claude` on a folder it has never seen: it shows the trust dialog, then
+    // writes every byte it is sent to a file. Raw mode delivers a keystroke without Enter too.
+    // The file is created only once raw mode is on, so its existence proves the recorder runs.
+    let typed = h.home_path().join("typed-into-the-dialog");
+    let bin = h.home_path().join("fake-agent-bin");
+    std::fs::create_dir_all(&bin).unwrap();
+    crate::harness::write_executable(
+        &bin.join("claude"),
+        &format!(
+            "#!/bin/sh\nprintf 'Do you trust the files in this folder?\\n\\nIs this a project you created or one you trust?\\n\\n\\342\\235\\257 1. Yes, I trust this folder\\n  2. No, exit\\n'\nstty raw -echo\n: > '{typed}'\nexec cat >> '{typed}'\n",
+            typed = typed.display()
+        ),
+    );
+    h.add_path_dir(&bin);
+    h.append_config("[web]\nmcp_enabled = true");
+    h.stop_daemon_on_drop();
+    let port = h.start_daemon();
+    let url = format!("http://127.0.0.1:{port}/mcp");
+
+    let id = block_on(async {
+        let create = json!({
+            "jsonrpc": "2.0", "id": 3, "method": "tools/call",
+            "params": {"name": "create_session", "arguments": {
+                "path": h.project_path(), "tool": "claude", "title": "mcp-trust",
+                "prompt": "summarize the repository",
+            }},
+        });
+        let (status, body) = rpc_create(&url, create).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let created = &body["result"]["structuredContent"];
+        assert_eq!(created["prompt_delivery"], "blocked_waiting", "{body}");
+        assert_eq!(created["prompt_sent"], false, "{body}");
+        assert!(
+            created["prompt_error"]
+                .as_str()
+                .unwrap_or("")
+                .contains("dialog"),
+            "{body}"
+        );
+        let id = created["session"]["id"]
+            .as_str()
+            .expect("session id")
+            .to_string();
+        // The negative check below means nothing unless the recorder is running.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while !typed.exists() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the fake agent never started recording"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+
+        let send = json!({
+            "jsonrpc": "2.0", "id": 4, "method": "tools/call",
+            "params": {"name": "send", "arguments": {"session_id": id, "message": "1"}},
+        });
+        let (status, body) = rpc(&url, &[], send).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body["result"]["isError"], true, "{body}");
+        assert_eq!(
+            body["result"]["structuredContent"]["code"], "waiting",
+            "{body}"
+        );
+        // `tmux send-keys` returns before the pane reads the bytes, so a keystroke that did go
+        // out lands within this window; nothing else types into the pane afterwards.
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+        id
+    });
+    let received = std::fs::read(&typed).expect("the recorder's file");
+    assert!(
+        received.is_empty(),
+        "the dialog received keystrokes: {:?}",
+        String::from_utf8_lossy(&received)
+    );
+
+    h.run_cli_ok(&["session", "stop", &id]);
+    let stopped = session_row(&h.read_sessions(), &id);
+    assert_eq!(stopped["status"], "stopped", "{stopped}");
+    // A restarted fake recreates this file, so its absence afterwards shows no restart.
+    std::fs::remove_file(&typed).unwrap();
+    block_on(async {
+        // `send` must see the stop itself, not a row the daemon has yet to reload.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        loop {
+            let list = json!({
+                "jsonrpc": "2.0", "id": 6, "method": "tools/call",
+                "params": {"name": "list_sessions", "arguments": {"state": "all"}},
+            });
+            let (_, body) = rpc(&url, &[], list).await;
+            let row = find_session(&body["result"]["structuredContent"], &id);
+            if row.is_some_and(|row| row["lifecycle_generation"] == stopped["lifecycle_generation"])
+            {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the daemon never saw the stop: {body}"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        }
+        let send = json!({
+            "jsonrpc": "2.0", "id": 5, "method": "tools/call",
+            "params": {"name": "send", "arguments": {"session_id": id, "message": "1"}},
+        });
+        let (status, body) = rpc_within(&url, &[], send, std::time::Duration::from_secs(30)).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(
+            body["result"]["structuredContent"]["code"], "not_running",
+            "{body}"
+        );
+        // A restart started by the send would have run the fake within this window.
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+    });
+    assert!(!typed.exists(), "send restarted the agent into the dialog");
+    let row = session_row(&h.read_sessions(), &id);
+    assert_eq!(row["status"], "stopped", "{row}");
+    assert_eq!(
+        row["lifecycle_generation"], stopped["lifecycle_generation"],
+        "{row}"
+    );
+}
+
+fn session_row(sessions: &Value, id: &str) -> Value {
+    sessions
+        .as_array()
+        .and_then(|rows| rows.iter().find(|row| row["id"] == id))
+        .cloned()
+        .unwrap_or_else(|| panic!("session {id} in {sessions}"))
+}
+
+/// The session object with `id` anywhere in an MCP `list_sessions` result.
+fn find_session<'a>(value: &'a Value, id: &str) -> Option<&'a Value> {
+    match value {
+        Value::Object(map) if map.get("id").and_then(Value::as_str) == Some(id) => Some(value),
+        Value::Object(map) => map.values().find_map(|v| find_session(v, id)),
+        Value::Array(items) => items.iter().find_map(|v| find_session(v, id)),
+        _ => None,
+    }
 }

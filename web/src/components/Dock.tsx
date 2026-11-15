@@ -4,6 +4,7 @@ import { useDroppable } from "@dnd-kit/core";
 import { SortableContext, horizontalListSortingStrategy, useSortable } from "@dnd-kit/sortable";
 import { CSS } from "@dnd-kit/utilities";
 
+import { FileEditorPaneContext } from "../lib/fileEditGuard";
 import type { DockLocation } from "../lib/panes";
 import { usePaneDnd, type PaneTabData, type SplitDropData } from "./paneDnd";
 import { PaneIcon } from "./PaneIcon";
@@ -216,7 +217,7 @@ export function Dock({
         </div>
       </div>
       <div className="relative flex-1 flex flex-col min-h-0 overflow-hidden">
-        {renderBody(activeId)}
+        <FileEditorPaneContext.Provider value={activeId}>{renderBody(activeId)}</FileEditorPaneContext.Provider>
         {activeTab && (
           <>
             <SplitDropZone location={location} groupIndex={groupIndex} side="before" />

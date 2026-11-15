@@ -34,22 +34,11 @@ pub const MAX_CONTROL_QUEUE_BYTES: usize = 128 * 1024 * 1024;
 pub struct SessionReplayed {}
 
 /// Daemon-minted completion barrier, ordered behind preceding SDK notifications.
-/// Adopted payloads contain the bounded public diagnostic, never raw error envelopes.
 #[derive(
     Debug, Clone, Default, Serialize, Deserialize, agent_client_protocol::JsonRpcNotification,
 )]
 #[notification(method = "_aoe/prompt_completed")]
-pub(crate) struct PromptCompletedMarker {
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub adopted: Option<Box<AdoptedPromptCompletion>>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub(crate) struct AdoptedPromptCompletion {
-    pub turn: u64,
-    pub diagnostic: Option<crate::acp::state::Event>,
-    pub reason: String,
-}
+pub(crate) struct PromptCompletedMarker {}
 
 /// A single control frame.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]

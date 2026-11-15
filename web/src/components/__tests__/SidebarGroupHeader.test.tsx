@@ -94,13 +94,48 @@ describe("SidebarGroupHeader", () => {
   });
 
   it.each([
-    ["Waiting and Error sessions", views(workspace("a", ["Waiting", "Running"]), workspace("b", ["Error"])), "2"],
-    ["nothing needing attention", views(workspace("w1", idle(3))), undefined],
+    [
+      "Waiting and Error sessions",
+      views(workspace("a", ["Waiting", "Running"]), workspace("b", ["Error"])),
+      "2",
+      "2 Sessions need attention · 1 has an error",
+    ],
+    [
+      "mixed, with two errors",
+      views(workspace("a", ["Waiting", "Error"]), workspace("b", ["Error"])),
+      "3",
+      "3 Sessions need attention · 2 have errors",
+    ],
+    ["one Error session", views(workspace("b", ["Error"])), "1", "1 Session has an error"],
+    [
+      "only Error sessions",
+      views(workspace("a", ["Error", "Idle"]), workspace("b", ["Error"])),
+      "2",
+      "2 Sessions have errors",
+    ],
+    ["only Waiting sessions", views(workspace("a", ["Waiting", "Waiting"])), "2", "2 Sessions need attention"],
+    // An archived Error session counts toward neither.
+    [
+      "Waiting plus an archived Error",
+      views(workspace("a", ["Waiting"]), workspace("arch", ["Error"], "archived")),
+      "1",
+      "1 Session needs attention",
+    ],
+    ["nothing needing attention", views(workspace("w1", idle(3))), undefined, undefined],
     // Sunk wins over Waiting.
-    ["waiting but archived sessions", views(workspace("arch", ["Waiting", "Waiting"], "archived")), undefined],
-  ])("attention badge for %s is %s", (_n, workspaces, badge) => {
+    [
+      "waiting but archived sessions",
+      views(workspace("arch", ["Waiting", "Waiting"], "archived")),
+      undefined,
+      undefined,
+    ],
+  ])("attention badge for %s is %s", (_n, workspaces, badge, tooltip) => {
     renderHeader({ group: group({ workspaces }) });
     expect(text("sidebar-group-attention-badge")).toBe(badge);
+    if (tooltip) {
+      fireEvent.mouseEnter(screen.getByTestId("sidebar-group-attention-badge").parentElement!);
+      expect(screen.getByRole("tooltip").textContent).toBe(tooltip);
+    }
   });
 
   it.each([

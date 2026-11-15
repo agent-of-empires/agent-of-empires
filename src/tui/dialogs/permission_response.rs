@@ -111,10 +111,7 @@ const ALL_CHOICES: [(&str, PermissionResponseChoice); 3] = [
 ];
 
 impl PermissionResponseDialog {
-    pub fn new(
-        session_title: &str,
-        allow_always: Option<&'static [crate::agents::KeyToken<'static>]>,
-    ) -> Self {
+    pub fn new(session_title: &str, allow_always: Option<&[crate::agents::KeyToken<'_>]>) -> Self {
         Self::build(session_title, allow_always.is_some(), None)
     }
 

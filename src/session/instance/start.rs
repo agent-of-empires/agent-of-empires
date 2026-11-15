@@ -1128,6 +1128,10 @@ impl Instance {
             .as_ref()
             .filter(|execution| execution.inputs.container.is_none())
             .map(|execution| execution.program.clone());
+        self.launch_resolved_executable = self
+            .launch_executable
+            .as_deref()
+            .and_then(|program| std::fs::canonicalize(program).ok());
         if let Some(execution) = prepared.execution.take() {
             let attested = self.attested_claude_store_route(&execution);
             self.active_execution = Some(ActiveExecution {
@@ -2437,7 +2441,9 @@ else:
             shadow_mounts: Vec::new(),
         };
         let launch = |inputs_container: Option<ContainerExecutionSnapshot>| NativeExecution {
-            agent: crate::agents::get_agent("claude").expect("claude is a known agent"),
+            agent: crate::session::instance::execution::NativeAgent::Builtin(
+                crate::agents::get_agent("claude").expect("claude is a known agent"),
+            ),
             binding: ExecutionBinding {
                 agent: "claude".into(),
                 stores: vec![store.clone()],

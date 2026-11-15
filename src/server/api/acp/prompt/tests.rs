@@ -871,6 +871,27 @@ async fn queued_explicit_work_follows_a_failed_prompt_but_not_a_failed_runtime()
             inject(event);
         }
         if let Some(event) = resolved {
+            state.instances.write().await[0].status = crate::session::Status::Error;
+            let control = state.session_service.fold_control_state(&id).await;
+            assert!(
+                !control.accepts_queue_drain(),
+                "{interaction:?}, late={late}"
+            );
+            assert_eq!(
+                control.pending_approvals.len() + control.pending_elicitations.len(),
+                1
+            );
+            state.session_service.drain_queued_prompts_once(&id).await;
+            state.acp_supervisor.test_flush_worker_commands(&id).await;
+            assert_eq!(commands.lock().unwrap().len(), 1);
+            assert_eq!(
+                state
+                    .session_service
+                    .queued_prompts_snapshot(&id)
+                    .await
+                    .len(),
+                1
+            );
             inject(event);
         }
         let control = state.session_service.fold_control_state(&id).await;

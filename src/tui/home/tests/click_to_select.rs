@@ -331,6 +331,7 @@ fn trash_transition_discards_edit_dialog_and_stale_menu_actions() {
         assert!(env.view.context_menu.is_none());
         env.view.context_menu = Some(crate::tui::dialogs::ContextMenuDialog::for_trashed_session(
             (1, 1),
+            false,
         ));
         env.view.enforce_trash_read_only();
         assert!(
