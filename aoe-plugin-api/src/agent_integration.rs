@@ -24,6 +24,34 @@ pub struct AgentIntegrationContribution {
     pub detection: Option<AgentDetectionDeclaration>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reply_fallback: Option<AgentReplyDeclaration>,
+    /// Requires API 22 and a host that implements the capture protocol.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session_id: Option<AgentSessionIdDeclaration>,
+}
+
+/// Session-id capture the host asks the plugin worker to perform.
+///
+/// The host owns the call protocol only: it passes a fixed context and accepts a
+/// shape-checked reply, so the provider's stores and wire formats stay in the
+/// plugin instead of in the host.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AgentSessionIdDeclaration {
+    /// Worker RPC returning `{ session_id, generation }` for one poll.
+    pub method: String,
+    /// Worker RPC returning the launch wrapper and the tmux env it publishes.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub launch_method: Option<String>,
+    /// Deadline for one call. A timeout means no capture for that poll.
+    #[serde(default = "default_session_id_timeout_ms")]
+    pub timeout_ms: u64,
+}
+
+pub const SESSION_ID_TIMEOUT_MS_MIN: u64 = 250;
+pub const SESSION_ID_TIMEOUT_MS_MAX: u64 = 30_000;
+
+fn default_session_id_timeout_ms() -> u64 {
+    5_000
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
