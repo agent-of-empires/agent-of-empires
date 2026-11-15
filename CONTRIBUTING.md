@@ -108,8 +108,10 @@ Every requested change states what would satisfy it.
 
 When the findings are few, none blocks under this rubric, and each fix is small,
 the reviewer may push the fixes to the PR branch instead of waiting on the
-contributor. Push a normal commit on top of the branch, never a force-push or
-rebase, and say in the review what was pushed. This needs the PR's "Allow edits
-by maintainers" setting, which organisation-owned forks lack; for those, request
-changes as usual. Contributors on the [exclusion list](MAINTAINERS.md#reviewer-
-push-exclusions) never get reviewer pushes; reviewers request changes instead.
+contributor. Push a normal commit on top of the branch and say in the review
+what was pushed. If the branch is behind `main` or conflicts, merge `main` into
+it with a merge commit. Never rebase or force-push. Pushing needs the PR's
+"Allow edits by maintainers" setting, which organisation-owned forks lack. For
+those forks, and for contributors on the [exclusion
+list](MAINTAINERS.md#reviewer-push-exclusions), leave the fixes to the
+contributor and apply the rubric as usual.
