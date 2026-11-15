@@ -338,7 +338,9 @@ export function useAcpSession(
       const pending = queuedPromptsRef.current.filter((q) => q.pending);
       migration = (async () => {
         for (const q of pending) {
-          await enqueueServerPrompt(sessionId, { id: q.id, text: q.text, attachments: q.attachments });
+          const saved = await enqueueServerPrompt(sessionId, { id: q.id, text: q.text, attachments: q.attachments });
+          // Confirmed, so a list that no longer has it (delivered) drops it instead of keeping it to re-send.
+          if (saved) dispatch({ kind: "confirm_queued_prompt", id: q.id });
         }
       })();
       queueMigrationRef.current.set(sessionId, migration);

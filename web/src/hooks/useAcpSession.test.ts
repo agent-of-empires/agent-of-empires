@@ -772,8 +772,8 @@ describe("server queue", () => {
           const parsed = JSON.parse(body!) as { id: string; text: string };
           serverQueue.set(parsed.id, row(parsed.id, parsed.text));
           queuePostStarted?.();
-          const saved = () => json(serverQueue.get(parsed.id));
-          return queuePostHeld ? queuePostHeld.then(saved) : saved();
+          const saved = serverQueue.get(parsed.id);
+          return queuePostHeld ? queuePostHeld.then(() => json(saved)) : json(saved);
         }
         if (method === "DELETE" && item && !serverQueue.delete(decodeURIComponent(item))) {
           return new Response("queued prompt not found", { status: 404 });
@@ -905,7 +905,7 @@ describe("server queue", () => {
     hook.unmount();
   });
 
-  it("re-sends each unconfirmed row once when the polled count changes mid-migration", async () => {
+  it("re-sends each unconfirmed row once when the polled count changes mid-migration, and drops one delivered meanwhile", async () => {
     const id = "sess-migrating";
     const queuedAt = "2026-01-01T00:00:00.000Z";
     const state = {
@@ -924,14 +924,16 @@ describe("server queue", () => {
     queuePostStarted = started.resolve;
     lastSocket().open();
     await started.promise;
-    // The first POST commits, which moves the poll, before its response arrives.
+    // The first POST commits, which moves the poll, and the Daemon delivers it before its response arrives.
     hook.rerender({ polled: 1 });
     await flushAsync();
+    serverQueue.delete("u1");
     queuePostHeld = null;
     post.resolve();
-    await waitFor(() => expect(hook.result.current.state.queuedPrompts.every((q) => !q.pending)).toBe(true));
+    await waitFor(() => expect(hook.result.current.state.queuedPrompts.map((q) => q.id)).toEqual(["u2", "u3"]));
     expect(posts("/queue").map((c) => JSON.parse(c.body!).id)).toEqual(["u1", "u2", "u3"]);
-    expect(hook.result.current.state.queuedPrompts.map((q) => q.id)).toEqual(["u1", "u2", "u3"]);
+    expect(serverQueue.has("u1")).toBe(false);
+    expect(hook.result.current.state.queuedPrompts.every((q) => !q.pending)).toBe(true);
     hook.unmount();
   });
 
