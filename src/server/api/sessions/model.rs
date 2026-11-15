@@ -11,7 +11,7 @@ pub(crate) fn session_response_from_instance(
     inst: &Instance,
     claude_fullscreen: bool,
 ) -> SessionResponse {
-    session_response_from_instance_with_plan(
+    let mut response = session_response_from_instance_with_plan(
         inst,
         claude_fullscreen,
         None,
@@ -19,7 +19,9 @@ pub(crate) fn session_response_from_instance(
         None,
         None,
         None,
-    )
+    );
+    response.context_resume = Some(context_resume_for(inst));
+    response
 }
 
 /// Convert backend session facts with the request's plan and runtime snapshots.
@@ -99,6 +101,7 @@ pub(super) fn session_response_from_instance_with_plan(
             && inst.workspace_info.is_none()
             && outside_repository_cached(&inst.project_path),
         scratch: inst.scratch,
+        created_without_setup: inst.created_without_setup,
         favorited: inst.is_favorited(),
         favorited_at: inst.favorited_at.map(|t| t.to_rfc3339()),
         color: inst.color.clone(),
@@ -134,13 +137,18 @@ pub(super) fn session_response_from_instance_with_plan(
         notify_on_idle: inst.notify_on_idle,
         notify_on_error: inst.notify_on_error,
         view: inst.view,
-        context_resume: Some(context_resume_for(inst)),
+        // Overlaid by callers, which resolve each profile's config once.
+        context_resume: None,
         acp_worker_state,
         acp_worker_start: None,
         update_restart: false,
         pending_approvals: Vec::new(),
         rate_limit: None,
         rate_limit_auto_resume: None,
+        rate_limit_failover_to: None,
+        queued_count: inst.queued_prompts.len(),
+        // Overlaid in list_sessions; single-session responses omit it.
+        queue_reason: None,
         // Built-in ACP capability resolves here from a process-wide
         // registry (no IO). Custom agents depend on profile config, which
         // the list and create handlers overlay without a per-row read.
@@ -303,6 +311,18 @@ pub(super) fn update_restart_resumable(
 }
 
 pub(super) fn context_resume_for(inst: &Instance) -> ContextResumeAvailability {
+    let mut resolved = None;
+    context_resume_with(inst, || {
+        resolved.insert(crate::session::resume_profile_config(&inst.source_profile))
+    })
+}
+
+/// [`context_resume_for`] reading a terminal row's profile config from the
+/// caller, which a projection resolves once per profile.
+pub(super) fn context_resume_with<'a>(
+    inst: &Instance,
+    profile_config: impl FnOnce() -> &'a crate::session::ResumeProfileConfig,
+) -> ContextResumeAvailability {
     if inst.is_structured() {
         return if inst.fork_pending.is_some() {
             ContextResumeAvailability::Unavailable {
@@ -325,7 +345,7 @@ pub(super) fn context_resume_for(inst: &Instance) -> ContextResumeAvailability {
         };
     }
 
-    match inst.terminal_context_resume_cached() {
+    match inst.terminal_context_resume_cached_with(profile_config) {
         TerminalContextResume::Available => ContextResumeAvailability::Available,
         TerminalContextResume::RuntimeCheckRequired => ContextResumeAvailability::Indeterminate {
             reason: ContextResumeIndeterminateReason::RuntimeCheckRequired,
@@ -380,11 +400,15 @@ pub(super) fn custom_agent_acp_capable(
         || crate::acp::inherited_acp_base(tool, &session.agent_detect_as).is_some()
 }
 
-/// Per-request cache for `(profile, project_path)` config resolution, shared
+/// Per-request cache for `(profile, repo config source)` config resolution, shared
 /// across the `list_sessions` overlays so a repo-local override is read from
 /// disk once per unique pair rather than once per row. See #2603.
 pub(super) struct SessionCfgCache<'a> {
-    entries: HashMap<(String, String), crate::session::config::Config>,
+    entries: HashMap<(String, std::path::PathBuf), crate::session::config::Config>,
+    /// `project_path` to its repo config source; discovery can open the repo through libgit2.
+    sources: HashMap<String, std::path::PathBuf>,
+    #[cfg(test)]
+    pub(super) discoveries: usize,
     /// Where this cache reports its disk reads. The counter belongs to the
     /// request, not to the cache, so every cache the request opens adds to
     /// one total: splitting the shared cache per overlay then shows up as
@@ -397,9 +421,29 @@ impl<'a> SessionCfgCache<'a> {
     pub(super) fn new(misses: &'a std::sync::atomic::AtomicUsize) -> Self {
         Self {
             entries: HashMap::new(),
+            sources: HashMap::new(),
+            #[cfg(test)]
+            discoveries: 0,
             misses,
         }
     }
+
+    fn source(&mut self, project_path: &str) -> std::path::PathBuf {
+        if let Some(source) = self.sources.get(project_path) {
+            return source.clone();
+        }
+        #[cfg(test)]
+        {
+            self.discoveries += 1;
+        }
+        let source = crate::session::config::repo_config::repo_config_source_path(
+            std::path::Path::new(project_path),
+        );
+        self.sources
+            .insert(project_path.to_string(), source.clone());
+        source
+    }
+
     /// Resolve `(profile, project_path)`, reading from disk on first miss only.
     pub(super) fn config(
         &mut self,
@@ -407,8 +451,10 @@ impl<'a> SessionCfgCache<'a> {
         project_path: &str,
     ) -> &crate::session::config::Config {
         let misses = self.misses;
+        // Linked worktrees read their repo config from the main repo, so they share an entry.
+        let source = self.source(project_path);
         self.entries
-            .entry((profile.to_string(), project_path.to_string()))
+            .entry((profile.to_string(), source))
             .or_insert_with(|| {
                 misses.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 crate::session::config::repo_config::resolve_config_with_repo_or_warn(

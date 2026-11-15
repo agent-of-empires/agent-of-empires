@@ -1733,10 +1733,10 @@ impl ToolBlocks<'_> {
                     }
                     SubagentState::Idle if card.completed.is_none() || stopped => {
                         card.completed = Some(ToolCompletion {
-                            outcome: if record.stop_reason.as_deref() == Some("error") {
-                                ToolOutcome::Error
-                            } else {
-                                ToolOutcome::Ok
+                            outcome: match record.stop_reason.as_deref() {
+                                Some("error") => ToolOutcome::Error,
+                                Some("cancelled") => ToolOutcome::Stopped,
+                                _ => ToolOutcome::Ok,
                             },
                             content: String::new(),
                         });
@@ -3069,6 +3069,7 @@ mod tests {
                 name: name.into(),
                 kind: "other".into(),
                 args_preview: String::new(),
+                prompt: None,
                 started_at: chrono::Utc::now(),
                 parent_tool_call_id: parent.map(Into::into),
                 memory_recall: None,
@@ -3131,6 +3132,14 @@ mod tests {
                     "  (tool failed; press `o` for details)",
                 ],
             ),
+            (
+                Idle,
+                Some("cancelled"),
+                vec![
+                    "tool ◼ · Explore repo · idle",
+                    "  (stopped when the turn ended)",
+                ],
+            ),
             (Unknown, None, vec!["tool ▶ · Explore repo · unknown"]),
         ];
         for (state, stop_reason, head) in cases {
@@ -3147,8 +3156,10 @@ mod tests {
                 description: None,
                 state,
                 stop_reason: stop_reason.map(Into::into),
+                error: None,
                 cancel_capable: true,
                 model: None,
+                background: false,
             }];
             let mut want: Vec<String> = head.into_iter().map(Into::into).collect();
             want.push("  tool ▶ · Read".into());
@@ -3185,8 +3196,10 @@ mod tests {
                 description: None,
                 state,
                 stop_reason: None,
+                error: None,
                 cancel_capable: true,
                 model: None,
+                background: false,
             }];
             let lines = tool_lines(&t);
             assert_eq!(lines[0], head);

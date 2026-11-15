@@ -1,6 +1,7 @@
 //! The bounded per-tool-call context cache that fills in permission requests
 //! whose raw input arrived empty.
 
+use super::tool_output::full_prompt;
 use crate::acp::acp_client::update_events::is_wake_tool_title;
 use crate::acp::state::Event;
 use agent_client_protocol::v1::schema::{SessionUpdate, ToolCallStatus};
@@ -114,7 +115,7 @@ pub(super) fn shell_command(cache: &ToolContextCache, tool_call_id: &str) -> Opt
 
 pub(super) fn update_tool_context_cache(
     cache: &ToolContextCache,
-    event: &Event,
+    event: &mut Event,
     source_update: &SessionUpdate,
 ) {
     match event {
@@ -126,12 +127,20 @@ pub(super) fn update_tool_context_cache(
                     .record(tool_call.id.clone(), raw_input);
             }
         }
-        Event::ToolCallUpdated { tool_call_id, .. } => {
+        Event::ToolCallUpdated {
+            tool_call_id,
+            prompt,
+            ..
+        } => {
             if let Some(raw_input) = raw_input_for_tool_event(source_update, tool_call_id) {
-                cache
-                    .lock()
-                    .expect("tool context cache mutex poisoned")
-                    .record(tool_call_id.clone(), raw_input);
+                let mut cache = cache.lock().expect("tool context cache mutex poisoned");
+                // The log already holds this prompt from an earlier frame.
+                if prompt.is_some()
+                    && cache.get(tool_call_id).as_ref().and_then(full_prompt) == *prompt
+                {
+                    *prompt = None;
+                }
+                cache.record(tool_call_id.clone(), raw_input);
             }
         }
         Event::ToolCallCompleted { tool_call_id, .. } => {
@@ -312,5 +321,36 @@ mod tests {
                 .get(&format!("tc-{TOOL_CONTEXT_CACHE_LIMIT}"))
                 .is_some());
         }
+    }
+
+    #[test]
+    fn an_update_repeating_the_cached_prompt_does_not_carry_it_again() {
+        let cache: ToolContextCache = Default::default();
+        let big = |prompt: &str| json!({ "prompt": prompt.repeat(20_000) });
+        let update = |raw: serde_json::Value| {
+            SessionUpdate::ToolCallUpdate(ToolCallUpdate::new(
+                "tc-1",
+                ToolCallUpdateFields::new().raw_input(raw),
+            ))
+        };
+        let updated = |raw: &serde_json::Value| Event::ToolCallUpdated {
+            tool_call_id: "tc-1".into(),
+            title: None,
+            args_preview: None,
+            prompt: full_prompt(raw),
+            started_at: None,
+            diffs: None,
+        };
+        let prompt_after = |raw: serde_json::Value| {
+            let mut event = updated(&raw);
+            update_tool_context_cache(&cache, &mut event, &update(raw));
+            let Event::ToolCallUpdated { prompt, .. } = event else {
+                unreachable!()
+            };
+            prompt
+        };
+        assert!(prompt_after(big("a")).is_some());
+        assert_eq!(prompt_after(big("a")), None);
+        assert!(prompt_after(big("b")).is_some());
     }
 }

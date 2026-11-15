@@ -44,6 +44,7 @@ fn spawn_config(
             env_allowlist: None,
         },
         cwd: std::env::temp_dir(),
+        config_path: std::env::temp_dir(),
         additional_dirs: vec![],
         provider_env: env,
         host_environment: vec![],

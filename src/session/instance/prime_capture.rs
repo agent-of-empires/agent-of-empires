@@ -251,7 +251,7 @@ impl Instance {
     }
 
     pub(super) fn prime_agent_launch_options(&self) -> Option<PrimeAgentLaunchOptions> {
-        let parsed = parse_launch_command(self.get_tool_command())?;
+        let parsed = parse_launch_command(&self.get_tool_command())?;
         let mut words = parsed.words;
         words.extend(shell_words::split(&self.extra_args).ok()?);
         let options = parse_prime_agent_launch_options(&words)?;
@@ -276,10 +276,8 @@ impl Instance {
         let store = self
             .sandbox_capture_store_dir()
             .context("managed Prime store is unavailable")?;
-        let launch_config = stores.launch_configuration(
-            &self.effective_profile(),
-            std::path::Path::new(&self.project_path),
-        )?;
+        let launch_config =
+            stores.launch_configuration(&self.effective_profile(), self.repo_config_path())?;
         let config = self
             .build_container_config(&launch_config)
             .context("cannot build Prime container configuration")?;

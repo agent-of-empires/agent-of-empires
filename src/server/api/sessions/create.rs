@@ -555,10 +555,22 @@ pub(crate) struct CreateHookPlan {
     pub(crate) trust_write: Option<(Option<String>, Option<String>)>,
     /// Repo hooks replace global and profile ones per type, so this is per type too.
     pub(crate) on_create_from_repo: bool,
+    /// The caller chose to create without setup: no `on_create` hook runs.
+    skip_on_create: bool,
 }
 
 impl CreateHookPlan {
+    /// Applies the caller's skip choice; true when it skips `on_create` commands.
+    pub(crate) fn apply_skip_on_create(&mut self, skip: bool) -> bool {
+        let skipped = skip && !self.on_create().is_empty();
+        self.skip_on_create = skip;
+        skipped
+    }
+
     pub(crate) fn on_create(&self) -> &[String] {
+        if self.skip_on_create {
+            return &[];
+        }
         self.hooks
             .as_ref()
             .map_or(&[], |hooks| &hooks.hooks().on_create)
@@ -636,6 +648,7 @@ pub(crate) fn resolve_create_hook_plan(
         hooks,
         trust_write,
         on_create_from_repo,
+        skip_on_create: false,
     })
 }
 
@@ -658,7 +671,7 @@ pub(crate) fn run_create_hooks(
     let hook_env = repo_config::lifecycle_env_vars(instance);
     if instance.sandbox_info.is_some() {
         instance.ensure_container_in(store, None)?;
-        let workdir = instance.container_workdir();
+        let workdir = instance.hook_container_workdir(plan.on_create_from_repo);
         if let Some(sandbox) = instance.sandbox_info.as_ref() {
             repo_config::execute_hooks_in_container_streamed(
                 plan.on_create(),
@@ -671,7 +684,7 @@ pub(crate) fn run_create_hooks(
     } else {
         repo_config::execute_hooks_streamed(
             plan.on_create(),
-            std::path::Path::new(&instance.project_path),
+            instance.hook_workdir(plan.on_create_from_repo),
             progress,
             &hook_env,
         )?;
@@ -954,13 +967,16 @@ pub(crate) async fn create_session_with(
         body.base_branch = None;
         body.sandbox = false;
         body.sandbox_image = None;
-        // Hook approval remains operator-owned.
+        body.pull_latest_image = false;
+        // Hook approval and skipping setup remain operator-owned.
         body.trust_hooks = None;
         body.trust_review = None;
+        body.skip_on_create = false;
         // Registry order selects the primary project.
         let mut paths = projects.into_iter().map(|p| p.path);
         body.path = paths.next().unwrap();
         body.extra_repo_paths = paths.collect();
+        body.workspace = false;
         body.view = crate::session::View::Structured;
         // Fork and import resume an existing agent session and would bypass the
         // server-derived path and ACP gate, so they are not honored here.
@@ -1005,6 +1021,13 @@ pub(crate) async fn create_session_with(
             "Cannot combine scratch with extra_repo_paths",
         );
     }
+    if body.workspace && !create_body_uses_worktree(&body) {
+        return api_error(
+            StatusCode::BAD_REQUEST,
+            "validation_failed",
+            "Workspace mode requires worktree mode",
+        );
+    }
     // The builder ignores `path` in scratch mode, but accepting both silently
     // can make repo-aware tool validation consult config from a repo the session
     // never uses. Fail loudly.
@@ -1022,6 +1045,20 @@ pub(crate) async fn create_session_with(
             "validation_failed",
             "hook_env requires sandbox; host_hooks.before_start only runs for sandboxed sessions",
         );
+    }
+    if body.pull_latest_image {
+        if !body.sandbox {
+            return api_error(
+                StatusCode::BAD_REQUEST,
+                "validation_failed",
+                "pull_latest_image requires sandbox",
+            );
+        }
+        if let Some(refusal) =
+            crate::server::api::create_pull_refusal(&state, body.sandbox_image.as_deref()).await
+        {
+            return refusal;
+        }
     }
 
     // Only the authenticated Unix owner may bypass the shell-metacharacter policy.
@@ -1130,7 +1167,8 @@ pub(crate) async fn create_session_with(
             || !body.extra_repo_paths.is_empty());
         let (tool, agent_name) = (body.tool.clone(), body.agent_name.clone());
         let (command_override, sandboxed) = (body.command_override.clone(), body.sandbox);
-        let (scratch, trust_hooks) = (body.scratch, body.trust_hooks);
+        let (scratch, trust_hooks, skip_on_create) =
+            (body.scratch, body.trust_hooks, body.skip_on_create);
         let missing = tokio::task::spawn_blocking(move || {
             use crate::session::builder::structured::{
                 preparation_hooks_apply, validate_structured_choice, StructuredChoice,
@@ -1154,6 +1192,7 @@ pub(crate) async fn create_session_with(
                         &project_path,
                         scratch,
                         trust_hooks,
+                        skip_on_create,
                     )
                 },
             };
@@ -1400,12 +1439,14 @@ pub(crate) async fn create_session_with(
         base_branch: body.base_branch,
         sandbox: body.sandbox,
         sandbox_image: body.sandbox_image,
+        pull_latest_image: body.pull_latest_image,
         yolo_mode: body.yolo_mode,
         extra_env: body.extra_env,
         before_start_hook_env: body.hook_env,
         extra_args: body.extra_args,
         command_override: body.command_override,
         extra_repo_paths: body.extra_repo_paths,
+        workspace: body.workspace,
         repo_base_branches: body
             .repo_bases
             .into_iter()
@@ -1414,6 +1455,7 @@ pub(crate) async fn create_session_with(
         scratch: body.scratch,
         trust_hooks: body.trust_hooks,
         trust_review: body.trust_review,
+        skip_on_create: body.skip_on_create,
         custom_instruction: body.custom_instruction,
         callback_url: body.callback_url,
         idempotency_key: body.idempotency_key.clone(),
@@ -1536,7 +1578,9 @@ pub(crate) async fn create_session_with(
                 return response;
             }
             match failure {
-                Some(failure) => create_failure_response(failure),
+                Some(failure) => {
+                    create_failure_response(with_local_pull_detail(failure, &e, local_owner))
+                }
                 None => StatusCode::INTERNAL_SERVER_ERROR.into_response(),
             }
         }
@@ -1687,6 +1731,29 @@ pub async fn create_session_progress(
         None => bare_not_found(),
     }
 }
+/// A local owner also sees why a requested image pull failed; the replayed failure stays public.
+pub(super) fn with_local_pull_detail(
+    failure: crate::server::create_progress::CreateFailure,
+    error: &anyhow::Error,
+    local_owner: bool,
+) -> crate::server::create_progress::CreateFailure {
+    let detail = error
+        .chain()
+        .find_map(|cause| cause.downcast_ref::<crate::server::session_spawn::ImageUpdateFailed>())
+        .map(|failed| failed.detail.as_str())
+        .filter(|detail| local_owner && !detail.is_empty());
+    match detail {
+        Some(detail) => crate::server::create_progress::CreateFailure::new(
+            failure.status,
+            failure.code,
+            &format!("{} {detail}", failure.message),
+            failure.stage,
+            &failure.reference,
+        ),
+        None => failure,
+    }
+}
+
 pub(super) fn local_create_hook_error_response(
     error: &anyhow::Error,
     local_owner: bool,
@@ -1776,6 +1843,14 @@ pub(super) fn public_create_session_error(e: &anyhow::Error) -> (&'static str, S
                     "The Working directory doesn't exist where the Daemon runs.".to_string(),
                 ),
             };
+        }
+        if let Some(failed) =
+            cause.downcast_ref::<crate::server::session_spawn::ImageUpdateFailed>()
+        {
+            return (
+                "sandbox_image_update_failed",
+                format!("Couldn't pull the latest Sandbox image {}.", failed.image),
+            );
         }
         match cause.downcast_ref::<DockerError>() {
             Some(DockerError::NotInstalled) => return unavailable(not_installed(runtime())),

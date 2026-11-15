@@ -34,8 +34,8 @@ pub(super) struct SilentOrphanWatchdogConfig {
 /// Per-prompt silent-orphan state machine. Time is injected for tests.
 ///
 /// An open tool call or a future wake always suppresses firing. Off-protocol
-/// work uses the grace floor; `cost_seen` switches to the fast grace until the
-/// next non-accounting signal clears it.
+/// work and a running subagent use the grace floor; otherwise `cost_seen`
+/// switches to the fast grace until the next non-accounting signal clears it.
 #[derive(Debug, Default)]
 pub(super) struct SilentOrphanWatchdog {
     saw_first_progress: bool,
@@ -67,6 +67,10 @@ impl SilentOrphanWatchdog {
     ) {
         match sig {
             LifecycleSignal::Progress => self.refresh(now, true),
+            LifecycleSignal::SubagentActivity => {
+                self.saw_first_progress = true;
+                self.last_progress_at = Some(now);
+            }
             LifecycleSignal::CompactionStarted => {
                 self.refresh(now, true);
                 self.off_protocol_work_seen = Some(OffProtocolWorkKind::Compaction);
@@ -129,13 +133,19 @@ impl SilentOrphanWatchdog {
         }
     }
 
-    pub(super) fn effective_grace(&self, cfg: SilentOrphanWatchdogConfig) -> Duration {
+    /// `subagents_active`: a child session is still running; the adapter
+    /// hides the parent's Agent call, so no tool call holds the turn open.
+    pub(super) fn effective_grace(
+        &self,
+        cfg: SilentOrphanWatchdogConfig,
+        subagents_active: bool,
+    ) -> Duration {
         // A background command whose last refresh was stream output is a dead
         // stream, not a quietly running command (#2645).
         let background_stream_stall = self.off_protocol_work_seen
             == Some(OffProtocolWorkKind::BackgroundCommand)
             && self.last_refresh_was_progress;
-        if self.off_protocol_work_seen.is_some() && !background_stream_stall {
+        if subagents_active || (self.off_protocol_work_seen.is_some() && !background_stream_stall) {
             cfg.base_grace.max(cfg.off_protocol_grace_floor)
         } else if self.cost_seen && cfg.fast_grace > Duration::ZERO {
             cfg.fast_grace
@@ -145,16 +155,21 @@ impl SilentOrphanWatchdog {
     }
 
     /// Clears an expired wake deadline as a side effect.
-    pub(super) fn should_fire(&mut self, now: Instant, cfg: SilentOrphanWatchdogConfig) -> bool {
+    pub(super) fn should_fire(
+        &mut self,
+        now: Instant,
+        cfg: SilentOrphanWatchdogConfig,
+        subagents_active: bool,
+    ) -> bool {
         if self.wakeup_suppress_until.is_some_and(|d| now >= d) {
             self.wakeup_suppress_until = None;
         }
         self.saw_first_progress
             && self.tool_calls_in_flight.is_empty()
             && self.wakeup_suppress_until.is_none()
-            && self
-                .last_progress_at
-                .is_some_and(|t| now.duration_since(t) >= self.effective_grace(cfg))
+            && self.last_progress_at.is_some_and(|t| {
+                now.duration_since(t) >= self.effective_grace(cfg, subagents_active)
+            })
     }
 
     pub(super) fn tool_calls_in_flight_len(&self) -> usize {
@@ -302,6 +317,8 @@ mod tests {
         Fires(u64, bool),
         Off(Option<K>),
         Cost(bool),
+        /// Whether a subagent is running from here on.
+        Child(bool),
     }
     use Step::*;
 
@@ -544,6 +561,34 @@ mod tests {
                     Fires(125 * S, true),
                 ],
             ),
+            // #5611: the adapter hides the Agent call, so only the child's
+            // state keeps the parent's turn open.
+            (
+                "running subagent holds the floor over fast grace",
+                vec![
+                    At(0, L::Progress),
+                    At(S, L::TerminalUsage),
+                    Child(true),
+                    Fires(25 * S, false),
+                    Fires(125 * S, false),
+                    At(200 * S, L::SubagentActivity),
+                    Cost(true),
+                    Fires(200 * S + 30 * 60 * S - S, false),
+                    Fires(200 * S + 30 * 60 * S, true),
+                    Child(false),
+                    Fires(210 * S, false),
+                    Fires(220 * S, true),
+                ],
+            ),
+            (
+                "running subagent without accounting fires at floor",
+                vec![
+                    At(0, L::SubagentActivity),
+                    Child(true),
+                    Fires(125 * S, false),
+                    Fires(30 * 60 * S, true),
+                ],
+            ),
             (
                 "later in-progress keeps background flag",
                 vec![
@@ -559,6 +604,7 @@ mod tests {
         let wall = chrono::Utc::now();
         for (name, steps) in cases {
             let mut w = SilentOrphanWatchdog::default();
+            let mut child = false;
             for step in steps {
                 match step {
                     At(ms, sig) => w.apply_signal(sig, t0 + Duration::from_millis(ms), wall, CFG),
@@ -571,12 +617,13 @@ mod tests {
                         CFG,
                     ),
                     Fires(ms, want) => assert_eq!(
-                        w.should_fire(t0 + Duration::from_millis(ms), CFG),
+                        w.should_fire(t0 + Duration::from_millis(ms), CFG, child),
                         want,
                         "{name}: should_fire at {ms}ms"
                     ),
                     Off(want) => assert_eq!(w.off_protocol_work_seen(), want, "{name}"),
                     Cost(want) => assert_eq!(w.cost_seen(), want, "{name}"),
+                    Child(active) => child = active,
                 }
             }
         }
@@ -586,7 +633,7 @@ mod tests {
             let mut w = SilentOrphanWatchdog::default();
             let sig = classify_lifecycle_signal(&text_chunk("Compacting...", Some("m1"))).unwrap();
             w.apply_signal(sig, t0, chrono::Utc::now(), CFG);
-            assert!(!w.should_fire(t0 + Duration::from_millis(120_400), CFG));
+            assert!(!w.should_fire(t0 + Duration::from_millis(120_400), CFG, false));
         }
     }
 

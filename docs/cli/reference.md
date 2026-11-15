@@ -231,11 +231,14 @@ Add a new session
 * `-r`, `--repo <EXTRA_REPOS>` — Additional repositories for multi-repo workspace (use with --worktree)
 * `--project <PROJECTS>` — Names of registered projects to include as extra repos (use with --worktree). Resolves against the union of global + profile project registries
 * `--no-submodules` — Skip `git submodule update --init --recursive` after creating the worktree, overriding the `worktree.init_submodules` config (default true). Useful for repos with large or deeply nested submodule trees that you don't need inside the agent session
+* `--workspace` — Create the worktree inside a workspace directory (from `worktree.workspace_path_template`) even with no `--repo`/`--project`, so more projects can be attached later without moving the session (use with --worktree). Overrides `worktree.workspace_by_default`
+* `--no-workspace` — Create a plain worktree even when `worktree.workspace_by_default` is on. Ignored when `--repo`/`--project` make a multi-repo workspace
 * `-s`, `--sandbox` — Run session in a container sandbox
 * `--sandbox-image <SANDBOX_IMAGE>` — Custom container image for sandbox (implies --sandbox)
 * `--hook-env <KEY[=VALUE]>` — Env var for the host `before_start` hook only, never the container (`KEY=VALUE` or `KEY`; repeatable; requires --sandbox)
 * `-y`, `--yolo` — Enable YOLO mode (skip permission prompts)
 * `--trust-hooks` — Automatically trust this repository's hooks and project-local MCP servers without prompting
+* `--skip-on-create` — Create the session without running its on_create hooks, so a failing setup script does not roll the session back. on_launch hooks still run
 * `--extra-args <EXTRA_ARGS>` — Extra arguments to append after the agent binary
 * `--cmd-override <CMD_OVERRIDE>` — Override the agent binary command
 * `--structured-view` — Render this session in the structured view (ACP-based native rendering) instead of the default terminal view. `aoe add` defaults to the terminal (raw tmux/PTY) so the CLI matches the TUI; pass this (or `--agent`) to opt into the structured rendering. Ignored for tools with no ACP adapter
@@ -1773,7 +1776,7 @@ Start the aoe daemon: REST/WebSocket API, plus the web dashboard in builds that 
 ###### **Options:**
 
 * `--core-only` — Serve the private local API without opening TCP or a dashboard
-* `--port <PORT>` — Port to listen on (default: 8080; debug builds default to 8081 so a `cargo run` instance does not collide with an installed release `aoe`)
+* `--port <PORT>` — Port to listen on. Falls back to the `AOE_SERVE_PORT` environment variable, then `[serve] port` in config.toml, then 8080 (debug builds default to 8081 so a `cargo run` instance does not collide with an installed release `aoe`)
 * `--host <HOST>` — Host/IP to bind to (use 0.0.0.0 for LAN/VPN access)
 
   Default value: `127.0.0.1`
@@ -1792,11 +1795,15 @@ Start the aoe daemon: REST/WebSocket API, plus the web dashboard in builds that 
 * `--tunnel-name <TUNNEL_NAME>` — Use a named Cloudflare Tunnel (requires prior `cloudflared tunnel create`). Takes precedence over Tailscale auto-detection
 * `--no-tailscale` — Skip Tailscale Funnel auto-detection and go straight to Cloudflare. Useful if you have Tailscale installed for unrelated reasons
 * `--tunnel-url <TUNNEL_URL>` — Hostname for a named tunnel (e.g., aoe.example.com)
+* `--funnel-port <PORT>` — Public HTTPS port for Tailscale Funnel: 443, 8443 or 10000, so a second daemon on this machine can have its own Funnel. Falls back to `[serve] funnel_port`, then 443
+
+  Possible values: `443`, `8443`, `10000`
+
 * `--daemon` — Run as a background daemon (detach from terminal)
 * `--stop` — Stop a running daemon
 * `--status` — Print the local daemon's PID, mode, URLs, and log path. With `AOE_DAEMON_URL` set, report the remote daemon's reachability and token state instead. Exits non-zero when no daemon is running. Useful for shell scripts that want to know whether a daemon is up without parsing `ps`.
 
-   `--status` is read-only and incompatible with every flag that would change daemon state (`--stop`, `--daemon`, `--remote`) or the bind config of a fresh daemon (`--no-auth`, `--auth`, `--behind-proxy`, `--read-only`, `--passphrase`, `--port`, `--tunnel-name`, `--no-tailscale`, `--tunnel-url`, `--open`, `--allowed-host`, `--allowed-origin`). Clap reports the misuse instead of silently ignoring the extras.
+   `--status` is read-only and incompatible with every flag that would change daemon state (`--stop`, `--daemon`, `--remote`) or the bind config of a fresh daemon (`--no-auth`, `--auth`, `--behind-proxy`, `--read-only`, `--passphrase`, `--port`, `--tunnel-name`, `--no-tailscale`, `--tunnel-url`, `--funnel-port`, `--open`, `--allowed-host`, `--allowed-origin`). Clap reports the misuse instead of silently ignoring the extras.
 * `--passphrase <PASSPHRASE>` — Require a passphrase for login (second-factor auth). Can also be set via AOE_SERVE_PASSPHRASE environment variable
 * `--open` — Open the dashboard URL in the default browser once the server is ready. Ignored in a build with no dashboard bundle, under --daemon or --remote, and whenever no browser the user could see is reachable (see `tui::open_url`): over SSH without a forwarded display, or on Linux/BSD with no display server. `BROWSER` overrides the check on platforms whose launcher reads it, which excludes macOS
 * `--restart` — Restart the running managed daemon with its recorded policy. Missing credentials are rejected before stopping it

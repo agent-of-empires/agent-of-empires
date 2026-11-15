@@ -251,30 +251,32 @@ fn web_projection(theme: &Theme, appearance: ThemeAppearance) -> CssVarProjectio
     );
     css.insert("--color-accent-700".into(), hex(mix(secondary, BLACK, 0.3)));
 
-    // Text ramp. text-bright is the most readable; dim is the WCAG-AA
-    // floor for descriptive copy (validated by the issue #1105 work).
+    // Body text sits on surface-900, -850, the modal surface-800, the code-block
+    // surface-950 and the startup error banner's tint.
+    let text_surfaces = [
+        bg,
+        elevated_1,
+        elevated_2,
+        deeper,
+        composite(theme.error, bg, 0.1),
+    ];
+    let lifted_hint = hex(lift_until(
+        theme.hint,
+        bg,
+        &text_surfaces,
+        TEXT_CONTRAST_RATIO,
+    ));
     css.insert("--color-text-primary".into(), hex(theme.text));
-    css.insert("--color-text-secondary".into(), hex(theme.hint));
-    css.insert("--color-text-muted".into(), hex(theme.hint));
-    css.insert("--color-text-dim".into(), hex(theme.dimmed));
-    // Dimmed lifted to body-text AA on surface-900, -850, the modal surface-800, the
-    // code-block surface-950 and the startup error banner's tint, for small text that
-    // cannot use the raw slot.
-    css.insert(
-        "--color-text-subtle".into(),
-        hex(lift_until(
-            theme.dimmed,
-            bg,
-            &[
-                bg,
-                elevated_1,
-                elevated_2,
-                deeper,
-                composite(theme.error, bg, 0.1),
-            ],
-            TEXT_CONTRAST_RATIO,
-        )),
-    );
+    css.insert("--color-text-secondary".into(), lifted_hint.clone());
+    css.insert("--color-text-muted".into(), lifted_hint);
+    let lifted_dimmed = hex(lift_until(
+        theme.dimmed,
+        bg,
+        &text_surfaces,
+        TEXT_CONTRAST_RATIO,
+    ));
+    css.insert("--color-text-dim".into(), lifted_dimmed.clone());
+    css.insert("--color-text-subtle".into(), lifted_dimmed);
     css.insert("--color-text-bright".into(), hex(theme.title));
 
     // Status colors map directly onto the TUI's semantic fields.
@@ -456,13 +458,26 @@ fn active_frame(accent: Color, bg: Color, fill: Color) -> Color {
 }
 
 /// `color` mixed toward `bg`'s readable pole in 10% steps until it clears
-/// `floor` against every surface.
+/// `floor` against every surface. When no step does (surfaces on both sides of
+/// mid-grey), it returns the step whose worst surface reads best.
 fn lift_until(color: Color, bg: Color, surfaces: &[Color], floor: f32) -> Color {
     let pole = readable_on(bg);
-    (0..=10)
-        .map(|step| mix(color, pole, step as f32 / 10.0))
-        .find(|c| surfaces.iter().all(|s| contrast_ratio(*c, *s) >= floor))
-        .unwrap_or(pole)
+    let worst = |c: Color| {
+        surfaces
+            .iter()
+            .map(|s| contrast_ratio(c, *s))
+            .fold(f32::INFINITY, f32::min)
+    };
+    let steps: [Color; 11] = std::array::from_fn(|step| mix(color, pole, step as f32 / 10.0));
+    steps
+        .into_iter()
+        .find(|c| worst(*c) >= floor)
+        .unwrap_or_else(|| {
+            steps
+                .into_iter()
+                .max_by(|a, b| worst(*a).total_cmp(&worst(*b)))
+                .expect("eleven steps")
+        })
 }
 
 /// `fg` at `alpha` over an opaque `bg`, matching how the browser composites
@@ -592,6 +607,29 @@ mod tests {
     }
 
     #[test]
+    fn a_lift_that_cannot_clear_every_surface_keeps_the_best_worst_case() {
+        // A mid-grey background puts surface-950 on the far side from the pole.
+        let bg = Color::Rgb(128, 128, 128);
+        let surfaces = [bg, mix(bg, BLACK, 0.45)];
+        let worst = |c: Color| {
+            surfaces
+                .iter()
+                .map(|s| contrast_ratio(c, *s))
+                .fold(f32::INFINITY, f32::min)
+        };
+        let lifted = lift_until(WHITE, bg, &surfaces, TEXT_CONTRAST_RATIO);
+        assert!(
+            worst(WHITE) < TEXT_CONTRAST_RATIO,
+            "raw white must miss the floor for the fallback to run"
+        );
+        assert!(
+            worst(BLACK) < worst(WHITE),
+            "the pole must read worse than raw white on the worst surface"
+        );
+        assert_eq!(lifted, WHITE, "raw white reads best on the worst surface");
+    }
+
+    #[test]
     fn builtins_clear_contrast_floors() {
         let latte = resolve_theme("catppuccin-latte");
         let fg = color_from_hex(latte.web.css_vars.get("--color-brand-100").unwrap());
@@ -662,6 +700,25 @@ mod tests {
                     ratio >= TEXT_CONTRAST_RATIO,
                     "{name}: {fg} on {label} is {ratio:.2}, below body-text AA"
                 );
+            }
+            for fg in [
+                "--color-text-secondary",
+                "--color-text-muted",
+                "--color-text-dim",
+            ] {
+                for (surface, label) in [
+                    (var("--color-surface-900"), "surface-900"),
+                    (var("--color-surface-850"), "surface-850"),
+                    (var("--color-surface-800"), "surface-800"),
+                    (var("--color-surface-950"), "surface-950"),
+                    (tint, "bg-status-error/10"),
+                ] {
+                    let ratio = contrast_ratio(var(fg), surface);
+                    assert!(
+                        ratio >= TEXT_CONTRAST_RATIO,
+                        "{name}: {fg} on {label} is {ratio:.2}, below body-text AA"
+                    );
+                }
             }
             // Dialog hints, such as the onboarding footer and the tour's Skip button, sit on the
             // modal surface.

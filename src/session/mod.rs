@@ -79,10 +79,12 @@ pub use groups::{
 #[cfg(test)]
 pub(crate) use instance::install_aliases;
 pub(crate) use instance::resolved_agent_for;
+pub(crate) use instance::resume_profile_config;
 #[cfg(test)]
 pub(crate) use instance::test_helpers::publish_host_pi_transcript;
 #[cfg(test)]
 pub(crate) use instance::ActiveExecution;
+pub(crate) use instance::CAPTURE_FAILED_RULE;
 pub(crate) use instance::{
     duplicate_session_error, is_duplicate_session, HostHookApprovalRequired, PassiveStatusPatch,
     ResumeIntent, SidWrite, ToolLaunchUnavailable,
@@ -103,7 +105,7 @@ pub use instance::{
 };
 pub(crate) use instance::{
     ConversationState, LaunchReservation, ManagedResumeRefused, ResumeAttemptPolicy,
-    ResumeLaunchOptions, TerminalContextResume,
+    ResumeLaunchOptions, ResumeProfileConfig, TerminalContextResume,
 };
 pub(crate) use instance::{Handoff, Held, SandboxPin, Unserved};
 pub(crate) use instance::{

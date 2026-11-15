@@ -462,6 +462,7 @@ mod tests {
 
     fn tool_call(id: &str, name: &str, kind: &str, args: &str) -> ToolCall {
         ToolCall {
+            prompt: None,
             id: id.to_string(),
             name: name.to_string(),
             kind: kind.to_string(),
@@ -606,9 +607,7 @@ mod tests {
         }
 
         // An unprocessed prompt is split out only when the agent never answered.
-        let startup_error = Event::AgentStartupError {
-            message: "ACP connection failed".into(),
-        };
+        let startup_error = Event::startup_error("ACP connection failed");
         // (events, unprocessed prompt, rendered turns)
         let cases = [
             (
@@ -676,6 +675,7 @@ mod tests {
     #[test]
     fn tool_lines_merge_lifecycle_and_describe_arguments_without_bulk() {
         let updated = Event::ToolCallUpdated {
+            prompt: None,
             tool_call_id: "t1".into(),
             title: Some("Edit".into()),
             args_preview: Some(

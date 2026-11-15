@@ -326,10 +326,17 @@ impl<S: BroadcastSink> Supervisor<S> {
                 if matches!(err, AcpError::IncompatibleAgent(_)) {
                     self.mark_incompatible_binary(session_id, &config.spec.command);
                 }
-                publish_rejection(&err, |event| {
-                    self.publish_next(session_id, &event);
-                });
+                let deferred =
+                    matches!(err, AcpError::RateLimited(_)) && lease.defers_rate_limit_rejection();
+                if !deferred {
+                    publish_rejection(&err, |event| {
+                        self.publish_next(session_id, &event);
+                    });
+                }
                 self.reap_failed_launch(&lease).await;
+                if matches!(err, AcpError::RateLimited(_)) && !deferred {
+                    self.rate_limit_wake.notify_one();
+                }
                 return Err(SupervisorError::Acp(err));
             }
         };
@@ -424,10 +431,10 @@ impl<S: BroadcastSink> Supervisor<S> {
         generation: u64,
     ) -> Result<(SpawnConfig, Option<PendingContextReset>), SupervisorError> {
         let profile = req.source_profile.clone().unwrap_or_default();
-        let cwd = req.cwd.clone();
+        let config_path = req.config_path.clone();
         let (resolved_cfg, policy) = tokio::task::spawn_blocking(move || {
             (
-                resolve_config_with_repo_or_warn(&profile, &cwd),
+                resolve_config_with_repo_or_warn(&profile, &config_path),
                 AgentPolicy::load(),
             )
         })
@@ -514,7 +521,10 @@ impl<S: BroadcastSink> Supervisor<S> {
             discovery_key(req.sandbox_info.is_some(), &req.agent, native),
             &req.session_id,
             req.source_profile.clone(),
-            req.cwd.clone(),
+            McpPaths {
+                cwd: req.cwd.clone(),
+                config_path: req.config_path.clone(),
+            },
             host_environment.clone(),
             claude_config_dir,
             "MCP resolution task failed",
@@ -585,6 +595,7 @@ impl<S: BroadcastSink> Supervisor<S> {
                 tool: req.tool.clone(),
                 spec,
                 cwd: req.cwd.clone(),
+                config_path: req.config_path.clone(),
                 additional_dirs: req.additional_dirs.clone(),
                 provider_env,
                 host_environment,
@@ -816,13 +827,14 @@ impl<S: BroadcastSink> Supervisor<S> {
     }
 
     /// Reattach to a runner left by a previous daemon by dialing its socket.
+    /// `sandbox` pairs the session's sandbox with its repo config path (`SpawnRequest::config_path`).
     pub async fn attach(
         &self,
         session_id: String,
         cwd: PathBuf,
         additional_dirs: Vec<PathBuf>,
         in_flight_turn: bool,
-        sandbox: Option<SandboxInfo>,
+        sandbox: Option<(SandboxInfo, PathBuf)>,
     ) -> Result<(), SupervisorError> {
         match self
             .begin_resume(
@@ -849,7 +861,7 @@ impl<S: BroadcastSink> Supervisor<S> {
         cwd: PathBuf,
         additional_dirs: Vec<PathBuf>,
         in_flight_turn: bool,
-        sandbox: Option<SandboxInfo>,
+        sandbox: Option<(SandboxInfo, PathBuf)>,
         mut reservation: ResumeReservation,
     ) -> Result<(), SupervisorError> {
         let record = match reservation.attach_record.take() {
@@ -896,8 +908,8 @@ impl<S: BroadcastSink> Supervisor<S> {
             )));
         };
         let sandbox_resources = match sandbox.as_ref() {
-            Some(info) => {
-                let info = info.clone();
+            Some((info, config_path)) => {
+                let (info, config_path) = (info.clone(), config_path.clone());
                 let cwd = cwd.clone();
                 let profile = record.source_profile.clone();
                 Some(
@@ -905,6 +917,7 @@ impl<S: BroadcastSink> Supervisor<S> {
                         crate::acp::acp_client::SessionSandbox::from_info(
                             &info,
                             cwd.as_path(),
+                            &config_path,
                             profile,
                         )
                     })
@@ -916,7 +929,7 @@ impl<S: BroadcastSink> Supervisor<S> {
             }
             None => None,
         };
-        let context_reset = if sandbox.as_ref().is_some_and(|info| info.enabled) {
+        let context_reset = if sandbox.as_ref().is_some_and(|(info, _)| info.enabled) {
             let profile = record.source_profile.clone().unwrap_or_default();
             let id = session_id.clone();
             let native_agent = if record.prime_runtime.is_some() {
@@ -1042,9 +1055,7 @@ pub(super) fn publish_rejection(err: &AcpError, mut publish: impl FnMut(Event)) 
             publish(Event::IncompatibleAgent {
                 detail: payload.detail.clone(),
             });
-            publish(Event::AgentStartupError {
-                message: payload.message.clone(),
-            });
+            publish(Event::startup_error(payload.message.clone()));
         }
         // The provider limit parks the session rather than reporting a crash.
         AcpError::RateLimited(info) => {
@@ -1409,11 +1420,17 @@ pub(super) fn discovery_key<'a>(sandboxed: bool, agent: &'a str, native: &'a str
     }
 }
 
+/// `cwd` keys the native per-project lookup; project-local servers load from `config_path`.
+pub(super) struct McpPaths {
+    pub(super) cwd: PathBuf,
+    pub(super) config_path: PathBuf,
+}
+
 pub(super) async fn resolve_mcp_servers(
     agent_key: &str,
     session_id: &str,
     profile: Option<String>,
-    cwd: PathBuf,
+    paths: McpPaths,
     session_env: Vec<(String, String)>,
     native_config_override: Option<PathBuf>,
     failure: &'static str,
@@ -1425,7 +1442,8 @@ pub(super) async fn resolve_mcp_servers(
             &agent_key,
             &session,
             profile.as_deref(),
-            &cwd,
+            &paths.cwd,
+            &paths.config_path,
             &session_env,
             native_config_override.as_deref(),
         )
@@ -1447,12 +1465,20 @@ fn resolve_mcp_layers(
     session_id: &str,
     profile: Option<&str>,
     cwd: &std::path::Path,
+    config_path: &std::path::Path,
     session_env: &[(String, String)],
     native_config_override: Option<&std::path::Path>,
 ) -> Vec<agent_client_protocol::v1::schema::McpServer> {
     use crate::session::mcp::mcp_model::{resolve_effective, summarize};
 
-    let merged = resolve_effective(agent_key, profile, cwd, session_env, native_config_override);
+    let merged = resolve_effective(
+        agent_key,
+        profile,
+        cwd,
+        config_path,
+        session_env,
+        native_config_override,
+    );
     if !merged.is_empty() {
         info!(
             target: "acp.mcp",
@@ -2009,6 +2035,34 @@ time.sleep(60)
         });
         let (config, _) = supervisor.spawn_config(&request, 1).await.unwrap();
         assert_eq!(exported(&config), Some(recorded));
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn first_launch_forwards_a_workspace_launch_repo_project_mcp_servers() {
+        let (_home, temp) = isolate_home();
+        let _env = crate::session::test_support::EnvGuard::unset(&["CLAUDE_CONFIG_DIR"]);
+        let repo = temp.path().join("repo");
+        let workspace = temp.path().join("workspace");
+        std::fs::create_dir_all(&repo).unwrap();
+        std::fs::create_dir_all(&workspace).unwrap();
+        std::fs::write(
+            repo.join(".mcp.json"),
+            r#"{ "mcpServers": { "project-only": { "command": "pl" } } }"#,
+        )
+        .unwrap();
+        let servers = crate::session::mcp::project_mcp::load_project_mcp_servers(&repo).unwrap();
+        let hash = crate::session::mcp::project_mcp::fingerprint(&servers);
+        crate::session::config::repo_config::trust_repo(&repo, None, Some(&hash)).unwrap();
+
+        let supervisor = Supervisor::new(VecSink::new());
+        let mut request = spawn_request("workspace-mcp");
+        request.cwd = workspace;
+        request.config_path = repo;
+
+        let (config, _) = supervisor.spawn_config(&request, 1).await.unwrap();
+
+        assert!(mcp_names(&config.mcp_servers).contains(&"project-only"));
     }
 
     #[tokio::test]
@@ -2642,9 +2696,19 @@ time.sleep(60)
             r#""project-only": { "command": "pl" }, "shared": { "command": "from-project" }"#,
         );
 
-        let resolve = |profile: Option<&'static str>, cwd: std::path::PathBuf| async move {
+        let resolve = |profile: Option<&'static str>,
+                       cwd: std::path::PathBuf,
+                       config_path: std::path::PathBuf| async move {
             let merged = tokio::task::spawn_blocking(move || {
-                resolve_mcp_layers("claude", "resolve-test", profile, &cwd, &[], None)
+                resolve_mcp_layers(
+                    "claude",
+                    "resolve-test",
+                    profile,
+                    &cwd,
+                    &config_path,
+                    &[],
+                    None,
+                )
             })
             .await
             .unwrap();
@@ -2665,7 +2729,12 @@ time.sleep(60)
             (names, shared)
         };
 
-        let (names, shared) = resolve(Some("work"), tmp.path().to_path_buf()).await;
+        let (names, shared) = resolve(
+            Some("work"),
+            tmp.path().to_path_buf(),
+            tmp.path().to_path_buf(),
+        )
+        .await;
         assert_eq!(
             names,
             ["global-only", "native-only", "profile-only", "shared"],
@@ -2677,7 +2746,7 @@ time.sleep(60)
         // against the global layer: with no profile argument at all,
         // `resolve_default_profile` would pick "work" (the only profile on
         // disk) and its `shared` would win.
-        let (names, shared) = resolve(Some("empty"), repo.clone()).await;
+        let (names, shared) = resolve(Some("empty"), repo.clone(), repo.clone()).await;
         assert!(
             !names.contains(&"project-only".to_string()),
             "untrusted project is skipped"
@@ -2687,7 +2756,7 @@ time.sleep(60)
         let servers = crate::session::mcp::project_mcp::load_project_mcp_servers(&repo).unwrap();
         let hash = crate::session::mcp::project_mcp::fingerprint(&servers);
         crate::session::config::repo_config::trust_repo(&repo, None, Some(&hash)).unwrap();
-        let (names, shared) = resolve(Some("empty"), repo).await;
+        let (names, shared) = resolve(Some("empty"), repo.clone(), repo.clone()).await;
         assert!(
             names.contains(&"project-only".to_string()),
             "trusted project is forwarded"
@@ -2696,6 +2765,19 @@ time.sleep(60)
             shared.as_deref(),
             Some("from-project"),
             "trusted project wins"
+        );
+
+        let workspace = tmp.path().join("workspace");
+        std::fs::create_dir_all(&workspace).unwrap();
+        let (names, _) = resolve(Some("empty"), workspace.clone(), repo.clone()).await;
+        assert!(
+            names.contains(&"project-only".to_string()),
+            "a workspace forwards its launch repo's servers"
+        );
+        let (names, _) = resolve(Some("empty"), repo, workspace).await;
+        assert!(
+            !names.contains(&"project-only".to_string()),
+            "project servers come from config_path, not cwd"
         );
     }
 
@@ -2710,6 +2792,7 @@ time.sleep(60)
         let approval = |nonce: &str| Approval {
             nonce: Nonce(nonce.into()),
             tool_call: ToolCall {
+                prompt: None,
                 id: nonce.into(),
                 name: "Bash".into(),
                 kind: "execute".into(),

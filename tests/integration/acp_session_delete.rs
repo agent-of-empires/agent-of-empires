@@ -38,6 +38,7 @@ fn spawn_config_with_shim_env(shim: PathBuf, env: Vec<(String, String)>) -> Spaw
             env_allowlist: None,
         },
         cwd: std::env::temp_dir(),
+        config_path: std::env::temp_dir(),
         additional_dirs: vec![],
         provider_env: env,
         host_environment: vec![],

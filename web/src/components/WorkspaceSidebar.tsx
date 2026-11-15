@@ -3,6 +3,7 @@ import { usePluginUiEntries } from "../lib/pluginUiContext";
 import { pluginSortSpecs } from "../lib/pluginUi";
 import type { ProjectInfo, RepoGroup, Workspace } from "../lib/types";
 import type { RuntimeCursor, SessionMutation } from "../lib/api";
+import type { TrashRecoveryTarget } from "../lib/trashActions";
 import { SidebarSystemHealth } from "./SystemHealthStrip";
 import { axisDrawsRepoHeaders, type SidebarAxis } from "../lib/sidebarAxis";
 import {
@@ -75,7 +76,7 @@ interface Props {
   onSelect: (workspaceId: string, sessionId: string | null) => void;
   onToggleGroup: (groupId: string) => void;
   onUpdateRepoAppearance: (repoId: string, update: RepoAppearanceUpdate) => void;
-  onNew: () => void;
+  onNew: (prefill?: { group?: string }) => void;
   onCreateSession: (repoPath: string) => void;
   onPinProject?: (repoPath: string) => void;
   onUnpinProject?: (group: SidebarGroup) => void;
@@ -91,6 +92,7 @@ interface Props {
   /** Receives every session id of the trashed workspace. */
   onRestoreSession?: (sessionIds: string[]) => void;
   onEmptyTrash?: (workspaces: Workspace[]) => void;
+  onRetryTrash: (target: TrashRecoveryTarget) => Promise<void>;
   onStopSession?: (sessionId: string) => void;
   onStartSession?: (sessionId: string) => void;
   onRestartForUpdate?: (sessionId: string) => void;
@@ -328,7 +330,7 @@ export function WorkspaceSidebar(props: Props) {
           filterOpen={filterOpen}
           onToggleFilter={toggleFilter}
           offline={offline}
-          onNew={props.onNew}
+          onNew={() => props.onNew()}
           onToggleCompact={() => updateWebSettings({ sidebarCompact: !compact })}
           onClose={props.onToggle}
         />
@@ -440,7 +442,7 @@ export function WorkspaceSidebar(props: Props) {
               <p className="text-sm font-medium text-text-secondary">No sessions yet</p>
               <p className="mt-1 text-[13px] text-text-muted">Create a session to start working in a repo.</p>
               <button
-                onClick={props.onNew}
+                onClick={() => props.onNew()}
                 disabled={offline}
                 className="mt-4 inline-flex items-center gap-1.5 rounded-md bg-brand-600 px-3 py-1.5 text-[13px] font-medium text-white hover:bg-brand-500 cursor-pointer transition-colors disabled:opacity-40 disabled:cursor-not-allowed disabled:hover:bg-brand-600"
               >
@@ -461,6 +463,8 @@ export function WorkspaceSidebar(props: Props) {
               loaded={props.trashLoaded ?? true}
               onLoad={() => props.onLoadTrash?.()}
               readOnly={readOnly}
+              runtimeEpoch={props.runtimeEpoch}
+              onRetryTrash={props.onRetryTrash}
               onOpen={selection.handleRowActivate}
               onRestore={(ids) => props.onRestoreSession?.(ids)}
               onDelete={(ids) => props.onDeleteSession?.(ids)}

@@ -170,6 +170,16 @@ impl<S: BroadcastSink> Supervisor<S> {
         respawn.epoch()
     }
 
+    /// Leave a running fixture part-way through a respawn, so it reports `Resuming`.
+    pub(crate) async fn test_begin_respawn(&self, session_id: &str) {
+        let mut workers = self.workers.lock().await;
+        let handle = workers.get_mut(session_id).expect("test worker");
+        let (respawn, _) = lock_recover(&self.lifecycle)
+            .begin_respawn(&handle.lease)
+            .expect("fixture is running");
+        handle.lease = respawn;
+    }
+
     /// A fake worker whose command loop records every command it receives.
     pub(crate) async fn test_insert_worker_cmd_recording(
         &self,
@@ -390,6 +400,7 @@ pub(crate) fn spawn_request(session_id: &str) -> SpawnRequest {
         agent: "claude-code".into(),
         tool: "claude-code".into(),
         cwd: std::env::temp_dir(),
+        config_path: std::env::temp_dir(),
         additional_dirs: vec![],
         provider_env: vec![],
         model: None,
@@ -424,6 +435,7 @@ pub(super) fn runner_config(socket_path: PathBuf) -> SpawnConfig {
             env_allowlist: None,
         },
         cwd: std::env::temp_dir(),
+        config_path: std::env::temp_dir(),
         additional_dirs: vec![],
         provider_env: vec![],
         host_environment: vec![],

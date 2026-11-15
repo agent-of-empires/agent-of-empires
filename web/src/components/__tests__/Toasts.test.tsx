@@ -53,6 +53,17 @@ describe("ToastProvider", () => {
     expect(screen.queryByRole("alert")).toBeNull();
   });
 
+  it("keeps an action toast usable when its action returns false", () => {
+    renderProvider();
+    const reopen = vi.fn().mockReturnValueOnce(false).mockReturnValueOnce(true);
+    act(() => toastBus.handler?.action("Session was not created", "Reopen", reopen));
+    fireEvent.click(screen.getByRole("button", { name: "Reopen" }));
+    expect(screen.getByRole("alert").textContent).toContain("Session was not created");
+    fireEvent.click(screen.getByRole("button", { name: "Reopen" }));
+    expect(reopen).toHaveBeenCalledTimes(2);
+    expect(screen.queryByRole("alert")).toBeNull();
+  });
+
   it("keeps an action toast past a plain toast's lifetime until it is dismissed", () => {
     renderProvider();
     act(() => {
@@ -184,6 +195,86 @@ describe("click-to-open (ui.open_url) toast", () => {
   });
 });
 
+// #5344: a linked toast opened only through the outer div's pointer handler.
+describe("linked toasts from the keyboard", () => {
+  it("open through a focusable button once, before Dismiss in tab order; Dismiss never navigates", () => {
+    const open = vi.spyOn(window, "open").mockReturnValue(null);
+    const onOpen = vi.fn();
+    window.addEventListener(OPEN_SESSION_EVENT, onOpen);
+    renderProvider();
+    // (how the toast arrives, its message, what opening it must do)
+    const cases: [() => void, string, () => void][] = [
+      [
+        () => dispatchPush({ type: "aoe-push", payload: { title: "Done", session_id: "sess-1" } }),
+        "Done",
+        () => expect((onOpen.mock.calls.at(-1)![0] as CustomEvent).detail).toEqual({ sessionId: "sess-1" }),
+      ],
+      [
+        () => act(() => toastBus.handler?.openLink("Review PR", "https://example.com/pr/1")),
+        "Review PR",
+        () => expect(open).toHaveBeenLastCalledWith("https://example.com/pr/1", "_blank", "noopener,noreferrer"),
+      ],
+    ];
+    for (const [arrive, message, opened] of cases) {
+      const before = onOpen.mock.calls.length + open.mock.calls.length;
+      arrive();
+      const toast = screen.getByText(message).closest("[role]") as HTMLElement;
+      const buttons = within(toast).getAllByRole("button");
+      const opener = within(toast).getByRole("button", { name: message });
+      expect(buttons.indexOf(opener), message).toBe(0);
+      expect(buttons.at(-1)?.getAttribute("aria-label"), message).toBe("Dismiss");
+      opener.focus();
+      expect(document.activeElement, message).toBe(opener);
+      // Enter or Space on a native button is a click.
+      act(() => fireEvent.click(opener));
+      expect(onOpen.mock.calls.length + open.mock.calls.length - before, message).toBe(1);
+      opened();
+      expect(screen.queryByText(message), message).toBeNull();
+
+      arrive();
+      const again = screen.getByText(message).closest("[role]") as HTMLElement;
+      act(() => fireEvent.click(within(again).getByRole("button", { name: "Dismiss" })));
+      expect(onOpen.mock.calls.length + open.mock.calls.length - before, `${message}: Dismiss`).toBe(1);
+      expect(screen.queryByText(message), message).toBeNull();
+    }
+    window.removeEventListener(OPEN_SESSION_EVENT, onOpen);
+    open.mockRestore();
+  });
+
+  it("names a blank message's opener after its target and opens it once", () => {
+    const open = vi.spyOn(window, "open").mockReturnValue(null);
+    const onOpen = vi.fn();
+    window.addEventListener(OPEN_SESSION_EVENT, onOpen);
+    renderProvider();
+    // (how the blank toast arrives, the opener's name, what opening it must do)
+    const cases: [() => void, string, () => void][] = [
+      [
+        () => act(() => toastBus.handler?.openLink("   ", "https://example.com/pr/1")),
+        "Open link",
+        () => expect(open).toHaveBeenLastCalledWith("https://example.com/pr/1", "_blank", "noopener,noreferrer"),
+      ],
+      [
+        () => dispatchPush({ type: "aoe-push", payload: { title: "  ", session_id: "sess-1" } }),
+        "Open session",
+        () => expect((onOpen.mock.calls.at(-1)![0] as CustomEvent).detail).toEqual({ sessionId: "sess-1" }),
+      ],
+    ];
+    for (const [arrive, name, opened] of cases) {
+      const before = onOpen.mock.calls.length + open.mock.calls.length;
+      arrive();
+      const opener = screen.getByRole("button", { name });
+      const toast = opener.closest("[role]") as HTMLElement;
+      expect(within(toast).getAllByRole("button").indexOf(opener), name).toBe(0);
+      act(() => fireEvent.click(opener));
+      expect(onOpen.mock.calls.length + open.mock.calls.length - before, name).toBe(1);
+      opened();
+      expect(screen.queryByRole("button", { name }), name).toBeNull();
+    }
+    window.removeEventListener(OPEN_SESSION_EVENT, onOpen);
+    open.mockRestore();
+  });
+});
+
 describe("timed toast lifetime", () => {
   const LIFETIME = 6000;
   const GRACE = 2000;
@@ -253,7 +344,7 @@ describe("timed toast lifetime", () => {
     advance(5000);
     const dismiss = dismissOf("focus");
     fireEvent.focusIn(dismiss);
-    fireEvent.focusOut(dismiss, { relatedTarget: toastFor("focus").querySelector("span") });
+    fireEvent.focusOut(dismiss, { relatedTarget: within(toastFor("focus")).getByRole("button", { name: "focus" }) });
     advance(60_000);
     expect(present("focus")).toBe(true);
     fireEvent.focusOut(dismiss, { relatedTarget: document.body });

@@ -71,6 +71,9 @@ pub struct Config {
     pub web: WebConfig,
 
     #[serde(default)]
+    pub serve: ServeConfig,
+
+    #[serde(default)]
     pub auth: AuthConfig,
 
     #[serde(default)]
@@ -658,6 +661,31 @@ pub struct AcpConfig {
         summary = "When an Agent hits its usage limit, pick up again on its own once the limit resets. It stops trying after a few attempts in a row."
     )]
     pub rate_limit_auto_resume: bool,
+    /// Opt-in account failover. When a host structured session parks on a
+    /// rate limit and another account in `rate_limit_failover_accounts` has
+    /// headroom, the session continues there instead of waiting for the reset:
+    /// the conversation is carried to that account and the interrupted prompt
+    /// is re-sent once. Needs the same agent behind both accounts and a
+    /// carryable conversation, otherwise the normal banner stays. You are
+    /// responsible for complying with the agent provider's terms for the
+    /// accounts you configure.
+    #[serde(default)]
+    #[setting(
+        label = "Fail over to another account on rate limit",
+        widget = "toggle",
+        web = "local_only:moves a session's transcript between configured accounts"
+    )]
+    pub rate_limit_failover: bool,
+    /// Ordered failover pool: tool names, each an account declared under
+    /// `[session.agent_config_dir]`. Only names running the same built-in agent
+    /// as the session are used; others are ignored with a warning.
+    #[serde(default)]
+    #[setting(
+        label = "Failover accounts",
+        widget = "list",
+        web = "local_only:names accounts whose config directories hold credentials"
+    )]
+    pub rate_limit_failover_accounts: Vec<String>,
     /// Allow the web dashboard's "Update & restart" control to run the
     /// agent's `npm install -g <pkg>` on the host and respawn the worker.
     /// Off by default: the daemon executing a global package install is a
@@ -737,6 +765,8 @@ impl Default for AcpConfig {
             silent_orphan_grace_secs: default_silent_orphan_grace_secs(),
             auto_stop_idle_secs: default_acp_auto_stop_idle_secs(),
             rate_limit_auto_resume: false,
+            rate_limit_failover: false,
+            rate_limit_failover_accounts: Vec::new(),
             allow_agent_install: false,
             acp_defaults: HashMap::new(),
         }
@@ -1032,6 +1062,22 @@ pub struct AppStateConfig {
     #[serde(default)]
     pub used_system_health: bool,
 
+    /// Web setup wizard steps the user chose to skip. See `GET /api/setup`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub setup_skipped_steps: Vec<String>,
+    /// Optional web setup steps whose defaults the user kept.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub setup_confirmed_steps: Vec<String>,
+    /// The user finished the web setup wizard.
+    #[serde(default)]
+    pub setup_finished: bool,
+    /// The user left the wizard for the dashboard, so `/` stops redirecting.
+    #[serde(default)]
+    pub setup_deferred: bool,
+    /// The user closed the dashboard's "Finish setting up" banner.
+    #[serde(default)]
+    pub setup_banner_dismissed: bool,
+
     /// Server-side mirror of the web dashboard's syncable UI state, keyed by
     /// the frontend's localStorage key (the value is the opaque string the
     /// browser stored). Single-tenant: there is one user, so these prefs
@@ -1144,6 +1190,23 @@ pub struct SessionConfig {
         tui_only
     )]
     pub sidebar_position: SidebarPosition,
+
+    /// What the TUI does with the list and preview once the terminal is too
+    /// narrow for them to sit side by side (below 80 columns). `Stacked` keeps
+    /// the historical list-above-preview split, `OnePane` shows only one at a
+    /// time (the list, or the preview in live mode), and `BigPreview` keeps the
+    /// split but shrinks the list to its minimum while live mode is relaying
+    /// keys.
+    #[serde(default)]
+    #[setting(
+        label = "Narrow terminal layout",
+        widget = "select",
+        options = "stacked:Stacked,one_pane:One pane at a time,big_preview:Big live preview",
+        global_only,
+        tui_only,
+        summary = "On narrow terminals: stack the list over the preview, show one at a time, or give live mode most of the screen."
+    )]
+    pub narrow_layout: NarrowLayout,
 
     /// Percentage of split preview rows allocated to the paired terminal.
     #[serde(default = "default_split_terminal_height_percent")]
@@ -1702,6 +1765,18 @@ pub struct SessionConfig {
     )]
     pub show_activity_age: bool,
 
+    /// Show the `[structured]` badge on Structured view rows in the TUI
+    /// session list. Hiding it returns that width to the title and plugin row
+    /// badges; the row still opens the Structured view.
+    #[serde(default = "default_true")]
+    #[setting(
+        label = "Show Structured view badge",
+        widget = "toggle",
+        tui_only,
+        summary = "The [structured] marker on Structured view rows in the session list."
+    )]
+    pub show_structured_badge: bool,
+
     /// Comma-separated chord specs that exit live-send mode. Tmux-style: C-q,
     /// M-x, F12. The first chord in the list that matches an event ends live
     /// mode. Default `C-q` works in every terminal we ship to; add entries for
@@ -2186,6 +2261,23 @@ pub enum SidebarPosition {
     Right,
 }
 
+/// How the TUI arranges the session list and preview on a narrow terminal, below
+/// 80 columns. See `SessionConfig::narrow_layout`.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum NarrowLayout {
+    /// List above the preview, splitting the height (the historical behavior).
+    #[default]
+    Stacked,
+    /// One pane at a time: the list, and the preview while it is the pane being
+    /// worked in (live-send, an interactive structured transcript, a retained
+    /// trashed transcript, or System Health).
+    OnePane,
+    /// List above the preview, with the list squeezed to its minimum while the
+    /// preview is the pane being worked in, so it gets the rest of the height.
+    BigPreview,
+}
+
 /// What to render in the per-row tag slot next to the session title.
 ///
 /// Defaults to `Branch` to preserve worktree branch visibility. Users can pick
@@ -2216,6 +2308,7 @@ impl Default for SessionConfig {
             pre_trust_agent_folders: false,
             show_diagnostics_pane: false,
             sidebar_position: SidebarPosition::default(),
+            narrow_layout: NarrowLayout::default(),
             split_terminal_height_percent: default_split_terminal_height_percent(),
             split_terminal_min_width: default_split_terminal_min_width(),
             split_terminal_min_height: default_split_terminal_min_height(),
@@ -2253,6 +2346,7 @@ impl Default for SessionConfig {
             startup_recovery_wake: false,
             row_tag: RowTagMode::default(),
             show_activity_age: true,
+            show_structured_badge: true,
             live_send_exit_chord: default_live_send_exit_chord(),
             live_send_leader: default_live_send_leader(),
             default_attach_mode: AttachMode::default(),
@@ -2681,6 +2775,137 @@ impl Default for AuthConfig {
     }
 }
 
+/// Debug builds use 8081 so a `cargo run` daemon does not collide with an
+/// installed release `aoe` on 8080.
+pub(crate) const DEFAULT_SERVE_PORT: u16 = if cfg!(debug_assertions) { 8081 } else { 8080 };
+
+const fn default_serve_port() -> u16 {
+    DEFAULT_SERVE_PORT
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, SettingsSection)]
+#[setting_section(name = "serve", category = "Web")]
+pub struct ServeConfig {
+    /// TCP port for a newly started `aoe serve` daemon. `--port` and the
+    /// `AOE_SERVE_PORT` environment variable take precedence. A running daemon
+    /// keeps its recorded port across `--restart`.
+    #[serde(default = "default_serve_port")]
+    #[setting(
+        label = "Daemon port",
+        widget = "number",
+        min = 1,
+        max = 65535,
+        validate = "range:1:65535",
+        global_only,
+        summary = "Port for a newly started Daemon. A restart keeps the running Daemon's port."
+    )]
+    pub port: u16,
+
+    /// Public HTTPS port for a Tailscale Funnel started by `aoe serve --remote` or Remote
+    /// Access. `--funnel-port` takes precedence. A quoted string in `config.toml`:
+    /// `funnel_port = "8443"`.
+    #[serde(default)]
+    #[setting(
+        label = "Funnel port",
+        widget = "select",
+        options = "443:443,8443:8443,10000:10000",
+        global_only,
+        summary = "Public port for a Tailscale Funnel, so two Daemons on one machine can each have one. In config.toml write it quoted, as funnel_port = \"8443\"."
+    )]
+    pub funnel_port: FunnelPort,
+}
+
+impl Default for ServeConfig {
+    fn default() -> Self {
+        Self {
+            port: DEFAULT_SERVE_PORT,
+            funnel_port: FunnelPort::default(),
+        }
+    }
+}
+
+/// The ports Tailscale Funnel can listen on.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, clap::ValueEnum)]
+pub enum FunnelPort {
+    #[default]
+    #[serde(rename = "443")]
+    #[value(name = "443")]
+    Port443,
+    #[serde(rename = "8443")]
+    #[value(name = "8443")]
+    Port8443,
+    #[serde(rename = "10000")]
+    #[value(name = "10000")]
+    Port10000,
+}
+
+impl<'de> Deserialize<'de> for FunnelPort {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        struct Visitor;
+        impl serde::de::Visitor<'_> for Visitor {
+            type Value = FunnelPort;
+            fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+                f.write_str(r#"a quoted Funnel port: "443", "8443" or "10000""#)
+            }
+            fn visit_str<E: serde::de::Error>(self, value: &str) -> Result<FunnelPort, E> {
+                FunnelPort::ALL
+                    .into_iter()
+                    .find(|port| port.number().to_string() == value)
+                    .ok_or_else(|| E::invalid_value(serde::de::Unexpected::Str(value), &self))
+            }
+            fn visit_i64<E: serde::de::Error>(self, value: i64) -> Result<FunnelPort, E> {
+                Err(E::custom(format!(
+                    r#"funnel_port must be quoted, as funnel_port = "{value}""#
+                )))
+            }
+            fn visit_u64<E: serde::de::Error>(self, value: u64) -> Result<FunnelPort, E> {
+                Err(E::custom(format!(
+                    r#"funnel_port must be quoted, as funnel_port = "{value}""#
+                )))
+            }
+        }
+        deserializer.deserialize_any(Visitor)
+    }
+}
+
+impl FunnelPort {
+    pub const ALL: [FunnelPort; 3] = [Self::Port443, Self::Port8443, Self::Port10000];
+
+    pub fn number(self) -> u16 {
+        match self {
+            Self::Port443 => 443,
+            Self::Port8443 => 8443,
+            Self::Port10000 => 10000,
+        }
+    }
+}
+
+impl ServeConfig {
+    /// Read only `[serve]`, so an error in another section cannot block `aoe serve`.
+    pub(crate) fn load() -> Result<Self> {
+        match Config::load_raw_table() {
+            Ok(table) => Self::from_table(&table),
+            Err(e) => {
+                tracing::warn!(target: "session.store", "Failed to read config, using default [serve]: {e}");
+                Ok(Self::default())
+            }
+        }
+    }
+
+    fn from_table(table: &toml::Table) -> Result<Self> {
+        let Some(serve) = table.get("serve") else {
+            return Ok(Self::default());
+        };
+        serve.clone().try_into().map_err(|error: toml::de::Error| {
+            let error = anyhow::Error::new(error);
+            match config_path() {
+                Ok(path) => error.context(crate::session::LoadSource(path)),
+                Err(_) => error,
+            }
+        })
+    }
+}
+
 /// Serde default for `Config.default_profile`. Empty means "not explicitly
 /// chosen"; the active profile is then resolved at runtime by
 /// `resolve_default_profile`, which picks the first existing profile or
@@ -2958,6 +3183,18 @@ pub struct WorktreeConfig {
     )]
     pub workspace_path_template: String,
 
+    /// Create new worktree sessions inside a workspace directory even with one
+    /// repository, so more projects can be attached later without moving the
+    /// session.
+    #[serde(default)]
+    #[setting(
+        label = "Workspace by Default",
+        widget = "toggle",
+        web = "elevation:worktree config affects host filesystem",
+        repo = "deny"
+    )]
+    pub workspace_by_default: bool,
+
     /// Run `git submodule update --init --recursive` after creating a worktree
     /// when the checkout contains a `.gitmodules` file. Disable for repos with
     /// large or deeply-nested submodule trees that you don't need inside agent
@@ -3007,6 +3244,7 @@ impl Default for WorktreeConfig {
             auto_cleanup: true,
             delete_branch_on_cleanup: false,
             workspace_path_template: default_workspace_template(),
+            workspace_by_default: false,
             init_submodules: true,
             default_base_branch: None,
         }
@@ -4435,6 +4673,37 @@ mod tests {
                 (agent == "own").then_some(crate::acp::agent_profiles::CUSTOM_CLEAR.key),
                 "{agent}"
             );
+        }
+    }
+
+    #[test]
+    fn serve_config_ignores_errors_outside_serve_table() {
+        let parse = |toml: &str| ServeConfig::from_table(&toml::from_str(toml).unwrap());
+        let unrelated = parse("[updates]\nupdate_check_mode = 5").unwrap();
+        assert_eq!(unrelated.port, DEFAULT_SERVE_PORT);
+        assert_eq!(parse("[serve]\nport = 9000").unwrap().port, 9000);
+        assert!(parse("[serve]\nport = \"x\"").is_err());
+    }
+
+    #[test]
+    fn funnel_port_reads_only_a_quoted_funnel_port() {
+        // (config.toml [serve] body, the port, or a phrase the error must hold)
+        for (body, want) in [
+            ("", Ok(FunnelPort::Port443)),
+            ("funnel_port = \"8443\"", Ok(FunnelPort::Port8443)),
+            ("funnel_port = \"10000\"", Ok(FunnelPort::Port10000)),
+            (
+                "funnel_port = 8443",
+                Err(r#"funnel_port must be quoted, as funnel_port = "8443""#),
+            ),
+            ("funnel_port = \"8080\"", Err(r#""443", "8443" or "10000""#)),
+        ] {
+            let got = toml::from_str::<ServeConfig>(body).map(|serve| serve.funnel_port);
+            match (got, want) {
+                (Ok(got), Ok(want)) => assert_eq!(got, want, "{body}"),
+                (Err(e), Err(phrase)) => assert!(e.to_string().contains(phrase), "{body}: {e}"),
+                (got, _) => panic!("{body}: {got:?}"),
+            }
         }
     }
 

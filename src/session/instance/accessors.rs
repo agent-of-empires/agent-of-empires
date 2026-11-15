@@ -56,6 +56,7 @@ impl Instance {
             acp_mode_id: None,
             prior_tool_session_ids: HashMap::new(),
             scratch: false,
+            created_without_setup: false,
             worktree_info: None,
             workspace_info: None,
             sandbox_info: None,
@@ -104,6 +105,7 @@ impl Instance {
             capture_started_at: None,
             started_at: None,
             launch_executable: None,
+            launch_resolved_executable: None,
             pi_extension_launched: false,
             identity_publisher_launched: false,
             pi_session_path: None,
@@ -208,11 +210,77 @@ impl Instance {
     }
 
     /// Native execution identity; explicit targets never trust status aliases.
-    pub(crate) fn resolved_agent(&self) -> Option<&'static crate::agents::AgentDef> {
+    pub(crate) fn resolved_agent(&self) -> Option<&'static crate::agents::AgentDef<'static>> {
+        if self.declared_agent().is_some() {
+            return None;
+        }
         self.execution_agent().ok()
     }
 
-    pub(crate) fn status_agent(&self) -> Option<&'static crate::agents::AgentDef> {
+    pub(crate) fn declared_agent(&self) -> Option<crate::plugin::agent_integration::DeclaredAgent> {
+        if crate::agents::get_agent(&self.tool).is_some() {
+            return None;
+        }
+        // Rule out the common no-declaration case before resolving config so a
+        // wrapper tool costs one resolve per session, not two.
+        if !crate::plugin::agent_integration::registry_declares(
+            &crate::plugin::registry(),
+            &self.tool,
+        ) {
+            return None;
+        }
+        let config = crate::session::config::repo_config::resolve_config_with_repo(
+            &self.effective_profile(),
+            Path::new(&self.project_path),
+        )
+        .ok()?;
+        if config
+            .session
+            .agent_command_override
+            .get(&self.tool)
+            .is_some_and(|command| !command.trim().is_empty())
+        {
+            return None;
+        }
+        crate::plugin::agent_integration::declared_agent(
+            crate::plugin::registry(),
+            &self.tool,
+            config
+                .session
+                .custom_agents
+                .iter()
+                .filter(|(_, command)| !command.trim().is_empty())
+                .map(|(name, _)| name.as_str()),
+        )
+        .filter(|agent| {
+            self.command.is_empty()
+                || agent.contribution().command.as_deref() == Some(self.command.as_str())
+        })
+    }
+
+    fn declared_session_support(
+        &self,
+        sandboxed: bool,
+    ) -> Option<(
+        crate::agents::SessionCaptureSpec,
+        crate::agents::SessionCaptureContext,
+    )> {
+        self.declared_agent()?
+            .with_definition(|agent| {
+                let capture = agent.session_support?.capture?;
+                let context = if sandboxed {
+                    capture.sandbox
+                } else {
+                    capture.host
+                };
+                (context != crate::agents::SessionCaptureContext::Unsupported
+                    && self.launch_invokes_resolved_agent_directly(agent))
+                .then_some((capture, context))
+            })
+            .flatten()
+    }
+
+    pub(crate) fn status_agent(&self) -> Option<&'static crate::agents::AgentDef<'static>> {
         self.resolved_agent()
             .or_else(|| crate::agents::get_agent(&self.tool))
             .or_else(|| crate::agents::get_agent(&self.effective_detect_as()))
@@ -235,7 +303,7 @@ impl Instance {
     pub(super) fn resolved_agent_in(
         &self,
         config: &crate::session::config::SessionConfig,
-    ) -> Option<&'static crate::agents::AgentDef> {
+    ) -> Option<&'static crate::agents::AgentDef<'static>> {
         crate::agents::get_agent(&self.tool)
             .or_else(|| crate::agents::get_agent(self.effective_detect_as_in(config)))
     }
@@ -297,12 +365,12 @@ impl Instance {
             self.extra_args.clone()
         };
         if raw_command.trim().is_empty()
-            || contains_active_shell_syntax(raw_command)
+            || contains_active_shell_syntax(&raw_command)
             || contains_active_shell_syntax(&launch_extra_args)
         {
             return false;
         }
-        let Some(parsed_command) = parse_launch_command(raw_command) else {
+        let Some(parsed_command) = parse_launch_command(&raw_command) else {
             return false;
         };
         let mut words = parsed_command.words;
@@ -326,7 +394,7 @@ impl Instance {
     /// `AOE_INSTANCE_ID` because [`status_hook_env_prefix`] injects the marker
     /// on hook presence alone.
     pub(crate) fn launch_executable_token(&self) -> Option<String> {
-        let words = parse_launch_command(self.get_tool_command())?.words;
+        let words = parse_launch_command(&self.get_tool_command())?.words;
         Path::new(words.first()?)
             .file_name()?
             .to_str()
@@ -336,8 +404,16 @@ impl Instance {
     /// Whether a resume selector appended to this launch reaches the agent.
     /// Only a verified direct invocation or an explicit wrapper contract carries selectors.
     pub(crate) fn launch_can_carry_resume_selector(&self, agent: &crate::agents::AgentDef) -> bool {
-        self.execution_agent()
-            .is_ok_and(|actual| actual.name == agent.name)
+        self.launch_carries_selector(self.resolved_agent(), agent)
+    }
+
+    /// [`Self::launch_can_carry_resume_selector`] for a caller that already holds the execution identity.
+    pub(super) fn launch_carries_selector(
+        &self,
+        native: Option<&crate::agents::AgentDef>,
+        agent: &crate::agents::AgentDef,
+    ) -> bool {
+        native.is_some_and(|actual| actual.name == agent.name)
             && self.managed_user_argv(agent).is_ok()
     }
 
@@ -359,7 +435,7 @@ impl Instance {
         {
             return true;
         }
-        let Some(parsed_command) = parse_launch_command(self.get_tool_command()) else {
+        let Some(parsed_command) = parse_launch_command(&self.get_tool_command()) else {
             return false;
         };
         let mut words = parsed_command.words;
@@ -404,13 +480,18 @@ impl Instance {
     pub(super) fn resolved_session_support(
         &self,
     ) -> Option<(
-        &'static crate::agents::SessionCaptureSpec,
+        crate::agents::SessionCaptureSpec,
         crate::agents::SessionCaptureContext,
     )> {
+        if self.declared_agent().is_some() {
+            return self.declared_session_support(self.is_sandboxed());
+        }
         let native = self.resolved_agent();
-        let agent = native.or_else(|| self.legacy_default_selector_agent())?;
+        let Some(agent) = native.or_else(|| self.legacy_default_selector_agent()) else {
+            return self.declared_session_support(self.is_sandboxed());
+        };
         let support = agent.session_support.as_ref()?;
-        let capture = support.capture.as_ref()?;
+        let capture = support.capture?;
         let context = if self.is_sandboxed() {
             capture.sandbox
         } else {
@@ -432,17 +513,19 @@ impl Instance {
     pub(super) fn source_session_support(
         &self,
     ) -> Option<(
-        &'static crate::agents::SessionCaptureSpec,
+        crate::agents::SessionCaptureSpec,
         crate::agents::SessionCaptureContext,
     )> {
         let Some(active) = &self.active_execution else {
             return self.resolved_session_support();
         };
-        let capture = crate::agents::get_agent(&active.binding.agent)?
-            .session_support
-            .as_ref()?
-            .capture
-            .as_ref()?;
+        let Some(native) = crate::agents::native_definition(&active.binding.agent) else {
+            if active.binding.agent != self.tool {
+                return None;
+            }
+            return self.declared_session_support(active.container.is_some());
+        };
+        let capture = native.session_support?.capture?;
         let context = if active.container.is_some() {
             capture.sandbox
         } else {
@@ -469,7 +552,19 @@ impl Instance {
     }
 
     /// Bare wrappers can receive fresh-session selectors without attesting execution.
-    pub(super) fn legacy_default_selector_agent(&self) -> Option<&'static crate::agents::AgentDef> {
+    pub(super) fn legacy_default_selector_agent(
+        &self,
+    ) -> Option<&'static crate::agents::AgentDef<'static>> {
+        let config = crate::session::config::profile_config::resolve_config_or_warn(
+            &self.effective_profile(),
+        );
+        self.legacy_default_selector_agent_in(&config.session)
+    }
+
+    pub(super) fn legacy_default_selector_agent_in(
+        &self,
+        config: &crate::session::config::SessionConfig,
+    ) -> Option<&'static crate::agents::AgentDef<'static>> {
         if matches!(
             self.resume_intent,
             ResumeIntent::Use(_) | ResumeIntent::Fork { .. }
@@ -477,20 +572,16 @@ impl Instance {
             return None;
         }
         let agent = resolved_agent_for(&self.effective_profile(), &self.tool, &self.detect_as)?;
-        if crate::session::config::profile_config::resolve_config_or_warn(&self.effective_profile())
-            .session
-            .agent_execution_as
-            .contains_key(&self.tool)
-        {
+        if config.agent_execution_as.contains_key(&self.tool) {
             return None;
         }
         let command = self.get_tool_command();
-        if Self::contains_active_shell_syntax(command)
+        if Self::contains_active_shell_syntax(&command)
             || Self::contains_active_shell_syntax(&self.extra_args)
         {
             return None;
         }
-        let parsed = parse_launch_command(command)?;
+        let parsed = parse_launch_command(&command)?;
         let [program] = parsed.words.as_slice() else {
             return None;
         };
@@ -504,6 +595,7 @@ impl Instance {
         }
         if crate::agents::AGENTS
             .iter()
+            .chain(crate::plugin::bundled_agents::definitions())
             .any(|other| other.binary == program && other.name != agent.name)
         {
             return None;
@@ -520,7 +612,9 @@ impl Instance {
         Some(agent)
     }
 
-    pub(super) fn default_selector_agent(&self) -> Option<&'static crate::agents::AgentDef> {
+    pub(super) fn default_selector_agent(
+        &self,
+    ) -> Option<&'static crate::agents::AgentDef<'static>> {
         self.resolved_agent()
             .or_else(|| self.legacy_default_selector_agent())
     }
@@ -538,6 +632,15 @@ impl Instance {
     }
 
     pub fn supports_native_resume(&self) -> bool {
+        if let Some(declared) = self.declared_agent() {
+            return declared
+                .with_definition(|agent| {
+                    agent.session_support.is_some()
+                        && self.launch_invokes_resolved_agent_directly(agent)
+                        && self.managed_user_argv(agent).is_ok()
+                })
+                .unwrap_or(false);
+        }
         let native = self.resolved_agent();
         let Some(agent) = native.or_else(|| self.legacy_default_selector_agent()) else {
             return false;
@@ -707,6 +810,17 @@ impl Instance {
 
     pub fn is_yolo_mode(&self) -> bool {
         self.yolo_mode
+            || (!self.is_structured()
+                && self.declared_agent().is_some_and(|agent| {
+                    matches!(
+                        agent
+                            .contribution()
+                            .launch
+                            .as_ref()
+                            .and_then(|launch| launch.yolo.as_ref()),
+                        Some(aoe_plugin_api::agent_integration::AgentYoloDeclaration::Always)
+                    )
+                }))
     }
 
     /// True when this session renders in the structured (ACP) view. Rows
@@ -904,7 +1018,7 @@ pub(crate) fn resolved_agent_for(
     profile: &str,
     tool: &str,
     detect_as: &str,
-) -> Option<&'static crate::agents::AgentDef> {
+) -> Option<&'static crate::agents::AgentDef<'static>> {
     crate::agents::get_agent(tool).or_else(|| {
         crate::agents::get_agent(&tmux::status_rules::effective_detect_as(
             profile, tool, detect_as,
@@ -916,6 +1030,60 @@ pub(crate) fn resolved_agent_for(
 mod tests {
     use super::*;
     use crate::session::instance::test_helpers::*;
+
+    /// A session stored with the fallback's own command keeps its capture after
+    /// an approved declaration takes over the OMP listing.
+    #[test]
+    #[serial_test::serial]
+    fn recorded_native_omp_identity_keeps_its_capture_after_takeover() {
+        let dir = tempfile::tempdir().unwrap();
+        // Declared first so it reloads after the app directory is restored.
+        let _reload = crate::plugin::ReloadRegistryOnDrop;
+        let _app = crate::session::test_support::isolate_app_dir_at(dir.path());
+        crate::session::test_support::install_omp_takeover("omp-next");
+        assert!(crate::agents::get_agent("omp").is_none());
+
+        let mut instance = Instance::new("recorded", dir.path().to_str().unwrap());
+        instance.tool = "omp".into();
+        instance.command = "omp-next".into();
+        instance.active_execution = Some(crate::session::instance::execution::ActiveExecution {
+            launch_id: "fixture-launch".into(),
+            binding: crate::session::instance::execution::ExecutionBinding {
+                agent: "omp".into(),
+                stores: vec![dir.path().join(".omp")],
+                configuration: Vec::new(),
+                cwd: dir.path().to_path_buf(),
+                cwd_filesystem: "host".into(),
+                filesystem: "host".into(),
+                exported_default_store: None,
+            },
+            capture: None,
+            container: None,
+        });
+
+        let (capture, context) = instance
+            .source_session_support()
+            .expect("a recorded native omp execution keeps its capture");
+        assert_eq!(capture.backend, crate::agents::SessionCaptureBackend::Omp);
+        assert_eq!(context, crate::agents::SessionCaptureContext::PaneScoped);
+    }
+
+    /// A wrapper whose bare command is another native agent's binary is not a
+    /// bare wrapper of its own tool. The bundled definitions count: `omp` left
+    /// the native table, and a wrapper naming it must not become a `claude`
+    /// selector just because only `AGENTS` was searched.
+    #[test]
+    fn a_bare_command_naming_the_bundled_omp_binary_is_not_this_tool() {
+        let mut inst = Instance::new("claude", "/tmp");
+        inst.command = "omp".into();
+        assert!(inst.legacy_default_selector_agent().is_none());
+
+        inst.command = "claude".into();
+        assert!(
+            inst.legacy_default_selector_agent().is_some(),
+            "a bare native wrapper keeps its selector"
+        );
+    }
 
     fn worktree(main_repo_path: &str) -> WorktreeInfo {
         WorktreeInfo {

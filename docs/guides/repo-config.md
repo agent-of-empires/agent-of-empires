@@ -13,7 +13,7 @@ on_launch  = "npm install"                   # a single command may be a string
 on_destroy = ["docker-compose down"]
 ```
 
-- **`on_create`** runs once, when the session is first created. A failing command aborts creation, so use it for one-time setup.
+- **`on_create`** runs once, when the session is first created. A failing command aborts creation and rolls the session back, so use it for one-time setup. To keep the session anyway, rerun with `aoe add --skip-on-create`: no `on_create` hook runs, `on_launch` still does, and the session is marked as created without setup.
 - **`on_launch`** runs on every start, including restarts. Failures are logged as warnings and do not prevent a user-initiated start, though during startup recovery a timed-out hook marks the recovered session as errored rather than launching with partial setup.
 
 Native starts release their API locks while pre-launch hooks run, so hooks can call the daemon. The session keeps its lifecycle reservation: a competing start or stop returns a conflict rather than taking ownership. The launcher revalidates that reservation after the hook, before spawning the agent.
@@ -21,14 +21,14 @@ Native starts release their API locks while pre-launch hooks run, so hooks can c
 - **`on_destroy`** runs before worktree and sandbox cleanup, while their resources remain available. Failures warn without preventing deletion.
 For a host-side equivalent that always runs outside the container, see [`host_hooks.before_destroy`](configuration.md#host-hooks).
 
-Hooks run inside the container for a sandboxed session and in your host shell otherwise, so a path can resolve in one mode and not the other. An absolute host path fails in the container unless `sandbox.extra_volumes` mounts it, and a repo cannot set that key. Guard optional scripts on their presence only, so a real failure still aborts creation:
+Hooks run inside the container for a sandboxed session and in your host shell otherwise, so a path can resolve in one mode and not the other. In a [workspace](multi-repo-workspaces.md), repo hooks come from and run in the checkout of the repo the session started from, even after more projects are added; global and profile hooks run in the workspace directory. An absolute host path fails in the container unless `sandbox.extra_volumes` mounts it, and a repo cannot set that key. Guard optional scripts on their presence only, so a real failure still aborts creation:
 
 ```toml
 [hooks]
 on_create = ["sh -c '[ -x /opt/setup.sh ] || exit 0; exec /opt/setup.sh'"]
 ```
 
-Keep environment-specific hooks out of global config. A global `on_create` applies to every repo that does not declare its own, so one unresolvable path there blocks session creation in projects that never mention it. When `on_create` fails, the TUI and `aoe add` name the config file that declared it; the web dashboard shows a generic error and logs the file to the `aoe serve` log.
+Keep environment-specific hooks out of global config. A global `on_create` applies to every repo that does not declare its own, so one unresolvable path there blocks session creation in projects that never mention it. When `on_create` fails, the TUI and `aoe add` name the config file that declared it; the web dashboard shows a generic error and logs the file to the `aoe serve` log. The TUI then offers Retry, Create without setup, or Cancel. Create without setup skips every `on_create` hook, and the session's row shows `[no setup]`.
 
 #### Available environment variables
 
@@ -51,7 +51,7 @@ A repo config is code you did not write, so the keys that decide what AoE launch
 | `[hooks]` | everything, behind the trust prompt | |
 | `[session]` | `agent_detect_as` | `custom_agents`, `default_tool`, `agent_command_override`, `agent_extra_args`, `agent_acp_cmd`, `yolo_mode_default`, and the rest |
 | `[sandbox]` | `volume_ignores`, `port_mappings`, `cpu_limit`, `memory_limit`, `auto_cleanup`, `default_terminal_mode` | `enabled_by_default`, `default_image`, `container_runtime`, `environment`, `extra_volumes`, `mount_ssh`, `selinux_relabel`, `privileged`, `cap_add`, `cap_drop`, `security_opt`, `extra_run_args` |
-| `[worktree]` | `auto_cleanup`, `delete_branch_on_cleanup` | `enabled`, `path_template`, `bare_repo_path_template`, `workspace_path_template` |
+| `[worktree]` | `auto_cleanup`, `delete_branch_on_cleanup` | `enabled`, `path_template`, `bare_repo_path_template`, `workspace_path_template`, `workspace_by_default` |
 
 `[tmux]`, `[sound]`, `[updates]`, and `[diff]` are personal settings and are not read from a repo at all. `sandbox.environment` is denied because its bare `KEY` and `KEY=$VAR` forms copy host variables into the container, and `default_tool` because session launch prefers an exact `custom_agents` match, which would let a repo select a user-defined host command. `container_runtime` is global-only everywhere.
 

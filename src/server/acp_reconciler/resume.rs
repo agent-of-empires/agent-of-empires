@@ -223,10 +223,10 @@ pub(super) async fn resume_one(state: Arc<AppState>, target: ResumeTarget) -> Re
                 }
                 let sandbox = {
                     let instances = state.instances.read().await;
-                    instances
-                        .iter()
-                        .find(|i| i.id == id)
-                        .and_then(|i| i.sandbox_info.clone())
+                    instances.iter().find(|i| i.id == id).and_then(|i| {
+                        let config_path = i.repo_config_path().to_path_buf();
+                        i.sandbox_info.clone().map(|info| (info, config_path))
+                    })
                 };
                 let attach = state.acp_supervisor.attach_inner(
                     id.clone(),
@@ -469,12 +469,13 @@ async fn build_spawn_request(
                 && (inst.agent_session_id.is_some() || inst.pi_session_path.is_some()),
         )
     };
+    let config_path = instance.repo_config_path().to_path_buf();
     let agent = supervisor
         .pick_agent_for_tool(
             &target.tool,
             target.agent_override.as_deref(),
             &target.source_profile,
-            &cwd,
+            &config_path,
         )
         .await;
     let (native, exclusion) = crate::server::session_store::NativeSessionStore::open_for_launch(
@@ -522,6 +523,7 @@ async fn build_spawn_request(
         agent,
         tool: target.tool.clone(),
         cwd,
+        config_path,
         additional_dirs: vec![],
         provider_env: vec![],
         provider: agent_provider,

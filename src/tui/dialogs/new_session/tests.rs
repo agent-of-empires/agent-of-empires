@@ -995,6 +995,50 @@ fn a_custom_agent_locks_yolo_only_in_the_views_that_run_an_always_yolo_base() {
 
 #[test]
 #[serial_test::serial]
+fn declared_always_yolo_does_not_overwrite_the_submitted_preference() {
+    let home = tempfile::tempdir().unwrap();
+    // Declared first so it drops last: the registry reloads after HOME is
+    // restored, never while it still points at the temporary fixture.
+    let _reload = crate::plugin::ReloadRegistryOnDrop;
+    let _home = crate::session::test_support::isolate_home(home.path());
+    let manifest = r#"
+id = "acme.yolo"
+name = "Yolo"
+version = "1.0.0"
+api_version = 21
+[[agent_integrations]]
+tool = "yolo-helper"
+command = "yolo-helper"
+[agent_integrations.launch.yolo]
+kind = "always"
+"#;
+    let dir = crate::plugin::plugins_dir().unwrap().join("acme.yolo");
+    fs::create_dir_all(&dir).unwrap();
+    fs::write(dir.join("aoe-plugin.toml"), manifest).unwrap();
+    crate::session::update_config(|config| {
+        config.plugins.insert(
+            "acme.yolo".into(),
+            crate::session::PluginConfig {
+                grant: Some(crate::session::CapabilityGrant {
+                    manifest_hash: aoe_plugin_api::PluginManifest::hash_bytes(manifest.as_bytes()),
+                    capabilities: Vec::new(),
+                    granted_at: chrono::Utc::now(),
+                }),
+                ..Default::default()
+            },
+        );
+    })
+    .unwrap();
+    crate::plugin::reload_registry();
+    let mut dialog = NewSessionDialog::new_with_tools(vec!["yolo-helper"], TEST_PATH.to_string());
+    dialog.yolo_mode_default = false;
+    dialog.reset_yolo();
+    assert_eq!(dialog.field_indices().yolo, FieldIndices::ABSENT);
+    assert!(!submitted(dialog.build_submit_result()).yolo_mode);
+}
+
+#[test]
+#[serial_test::serial]
 fn moving_between_repos_that_map_the_agent_differently_refreshes_its_lock_and_view() {
     let temp_home = tempfile::tempdir().expect("temp home");
     let _home = crate::session::test_support::isolate_home(temp_home.path());
@@ -2141,4 +2185,87 @@ fn inherited_modes_stop_where_the_form_does() {
         !dialog.sandbox_enabled,
         "no container runtime to sandbox in"
     );
+}
+
+#[test]
+fn workspace_toggle_follows_config_and_is_forced_by_extra_repos() {
+    for default in [false, true] {
+        let mut config = Config::default();
+        config.worktree.enabled = true;
+        config.worktree.workspace_by_default = default;
+        let dialog = NewSessionDialog::new_with_config(vec!["claude"], TEST_PATH.into(), config);
+        assert_eq!(dialog.workspace, default);
+    }
+
+    let mut dialog = worktree_config_dialog(TEST_PATH.to_string());
+    for _ in 0..WT_WORKSPACE_FIELD {
+        dialog.handle_key(key(KeyCode::Tab));
+    }
+    assert_eq!(dialog.worktree_config_focused_field, WT_WORKSPACE_FIELD);
+    dialog.handle_key(key(KeyCode::Char(' ')));
+    assert!(screen_text(&draw(&mut dialog)).contains("Workspace: [x]"));
+    dialog.handle_key(key(KeyCode::Esc));
+    let data = submitted(dialog.handle_key(key(KeyCode::Enter)));
+    assert!(data.workspace);
+    assert!(data.extra_repo_paths.is_empty());
+
+    let mut dialog = worktree_config_dialog(TEST_PATH.to_string());
+    let (col, row) = find(&draw(&mut dialog), "Workspace:");
+    dialog.handle_click(col, row);
+    assert!(dialog.workspace);
+    dialog.handle_click(col, row);
+    assert!(!dialog.workspace);
+
+    // Extra repos need a workspace, so the toggle reads on and ignores input.
+    dialog.workspace_repos = vec!["/repo/one".into()];
+    dialog.worktree_config_focused_field = WT_WORKSPACE_FIELD;
+    dialog.handle_key(key(KeyCode::Char(' ')));
+    assert!(!dialog.workspace);
+    assert!(screen_text(&draw(&mut dialog)).contains("required by extra repos"));
+    dialog.handle_key(key(KeyCode::Esc));
+    let data = submitted(dialog.handle_key(key(KeyCode::Enter)));
+    assert!(data.workspace);
+
+    // Without a worktree there is no workspace to make.
+    let mut dialog = single_tool_dialog();
+    dialog.workspace = true;
+    dialog.title = Input::new("t".to_string());
+    let data = submitted(dialog.handle_key(key(KeyCode::Enter)));
+    assert!(!data.workspace);
+}
+
+#[test]
+fn workspace_is_unavailable_when_attaching_an_existing_branch() {
+    let mut dialog = worktree_config_dialog(TEST_PATH.to_string());
+    dialog.workspace = true;
+    dialog.create_new_branch = false;
+    dialog.worktree_config_focused_field = WT_WORKSPACE_FIELD;
+    dialog.handle_key(key(KeyCode::Char(' ')));
+    assert!(dialog.workspace, "the toggle ignores input while attaching");
+    let screen = screen_text(&draw(&mut dialog));
+    assert!(screen.contains("Workspace: [ ]"), "{screen}");
+    assert!(screen.contains("new branches only"), "{screen}");
+    dialog.handle_key(key(KeyCode::Esc));
+    assert!(!screen_text(&draw(&mut dialog)).contains("workspace)"));
+    dialog.worktree_branch = Input::new("feat/existing".to_string());
+    let data = submitted(dialog.handle_key(key(KeyCode::Enter)));
+    assert!(!data.workspace);
+
+    // Extra repos make a fresh worktree per repo, so they still need one.
+    let mut dialog = worktree_config_dialog(TEST_PATH.to_string());
+    dialog.create_new_branch = false;
+    dialog.workspace_repos = vec!["/repo/one".into()];
+    dialog.worktree_branch = Input::new("feat/existing".to_string());
+    assert!(screen_text(&draw(&mut dialog)).contains("Workspace: [x]"));
+    dialog.handle_key(key(KeyCode::Esc));
+    let data = submitted(dialog.handle_key(key(KeyCode::Enter)));
+    assert!(data.workspace);
+
+    // The choice comes back with New Branch.
+    let mut dialog = worktree_config_dialog(TEST_PATH.to_string());
+    dialog.workspace = true;
+    dialog.create_new_branch = false;
+    assert!(screen_text(&draw(&mut dialog)).contains("Workspace: [ ]"));
+    dialog.create_new_branch = true;
+    assert!(screen_text(&draw(&mut dialog)).contains("Workspace: [x]"));
 }

@@ -65,6 +65,7 @@ type Workers = Arc<Mutex<HashMap<String, WorkerHandle>>>;
 /// Each session's last allocated seq, under its own lock so sessions publish independently.
 type SeqMap = std::sync::Mutex<HashMap<String, Arc<std::sync::Mutex<u64>>>>;
 type SharedSet = Arc<std::sync::Mutex<HashSet<String>>>;
+
 type RestartRequests = Arc<std::sync::Mutex<HashMap<String, (u64, CancellationToken)>>>;
 type SpawnRequests = Arc<std::sync::Mutex<SpawnRequestState>>;
 
@@ -232,6 +233,8 @@ pub struct Supervisor<S: BroadcastSink> {
     force_respawn: SharedSet,
     /// Sessions whose worker failed before establishing a session.
     startup_failures: SharedSet,
+    /// Signalled once a worker has ended on a provider rate limit, so the reconciler reacts at once.
+    rate_limit_wake: Arc<tokio::sync::Notify>,
     /// Sessions whose isolated native identity is not durable yet.
     pending_context_resets: SharedSet,
     /// Sessions whose crashed worker the drain task relaunched in place.
@@ -426,6 +429,8 @@ pub struct SpawnRequest {
     /// The session's logical tool (`Instance.tool`); host hooks see this as `AOE_TOOL`.
     pub tool: String,
     pub cwd: PathBuf,
+    /// Where repo config is read; a workspace's `cwd` holds none (`Instance::repo_config_path`).
+    pub config_path: PathBuf,
     pub additional_dirs: Vec<PathBuf>,
     pub provider_env: Vec<(String, String)>,
     /// LLM backend pinned on the session row, one of
@@ -509,6 +514,7 @@ impl<S: BroadcastSink> Supervisor<S> {
             incompatible_binaries: Arc::default(),
             force_respawn: Arc::default(),
             startup_failures: Arc::default(),
+            rate_limit_wake: Arc::default(),
             pending_context_resets: Arc::default(),
             respawned_in_place: Arc::default(),
             max_concurrent_workers,
@@ -556,6 +562,11 @@ impl<S: BroadcastSink> Supervisor<S> {
 
     pub fn take_respawn_requests(&self) -> Vec<String> {
         lock_recover(&self.force_respawn).drain().collect()
+    }
+
+    /// Resolves after a worker ended on a rate limit; one wake is kept if nobody was waiting.
+    pub async fn rate_limit_parked(&self) {
+        self.rate_limit_wake.notified().await;
     }
 
     pub fn take_startup_failures(&self) -> Vec<String> {

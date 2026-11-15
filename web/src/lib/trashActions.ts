@@ -1,20 +1,84 @@
 // Trash, restore, and confirmed-deletion transitions.
 
 import { deleteWorkspace, restoreSession, trashSession } from "./api";
-import type { DeleteSessionOptions, DeleteWorkspaceResult, TrashPurgeConsent } from "./api";
+import type {
+  DeleteSessionOptions,
+  DeleteWorkspaceResult,
+  SessionMutation,
+  TrashRetryConsent,
+  TrashPurgeConsent,
+} from "./api";
 import type { SessionResponse, SessionStatus, Workspace } from "./types";
 
 const BUSY_MESSAGE = "Some sessions are busy with another operation and were not changed; retry them when it finishes";
 
-/** A workspace is only trashed as a whole, so restore every session of the workspace containing `sessionId`. */
+/** Restore only trashed members of the workspace containing `sessionId`; live siblings stay untouched. */
 export function trashedWorkspaceRestoreIds(workspaces: Workspace[], sessionId: string): string[] {
   const ws = workspaces.find((w) => w.sessions.some((s) => s.id === sessionId));
-  return ws ? ws.sessions.map((s) => s.id) : [sessionId];
+  return ws ? ws.sessions.filter((session) => session.trashed_at != null).map((session) => session.id) : [sessionId];
 }
 
 export interface Notifier {
   error?: (message: string) => void;
   info?: (message: string) => void;
+}
+
+export interface TrashRecoveryTarget extends TrashRetryConsent {
+  id: string;
+  title: string;
+  created_at: string;
+  epoch: string;
+  expected_trashed_at: string;
+  expected_trash_lifecycle_id: string;
+}
+
+export function hasPendingTrash(session: SessionResponse): boolean {
+  return Boolean(
+    session.trashed_at &&
+    session.lifecycle_reservation?.op === "trash" &&
+    session.lifecycle_reservation.generation === session.lifecycle_generation,
+  );
+}
+
+export function trashRecoveryTarget(session: SessionResponse, epoch: string | null): TrashRecoveryTarget | null {
+  if (
+    !epoch ||
+    !hasPendingTrash(session) ||
+    !session.trashed_at ||
+    !session.trash_lifecycle_id ||
+    !session.profile ||
+    !Number.isSafeInteger(session.lifecycle_generation) ||
+    session.lifecycle_generation < 0
+  )
+    return null;
+  return {
+    id: session.id,
+    title: session.title,
+    created_at: session.created_at,
+    epoch,
+    expected_profile: session.profile,
+    expected_generation: session.lifecycle_generation,
+    expected_trashed_at: session.trashed_at,
+    expected_trash_lifecycle_id: session.trash_lifecycle_id,
+  };
+}
+
+export function trashRecoveryTargetIsCurrent(
+  session: SessionResponse | undefined,
+  target: TrashRecoveryTarget,
+  epoch: string | null,
+): boolean {
+  return Boolean(
+    session &&
+    hasPendingTrash(session) &&
+    epoch === target.epoch &&
+    session.id === target.id &&
+    session.profile === target.expected_profile &&
+    session.created_at === target.created_at &&
+    session.lifecycle_generation === target.expected_generation &&
+    session.trashed_at === target.expected_trashed_at &&
+    session.trash_lifecycle_id === target.expected_trash_lifecycle_id,
+  );
 }
 
 /** Cleanup flags are on when any session in the workspace opts in; shared by the delete dialog and Empty Trash. */
@@ -160,13 +224,16 @@ export async function deleteWorkspaceSessions(
 }
 
 /** Returns true iff all succeeded. */
-export async function restoreSessions(ids: string[], deps: TrashDeps): Promise<boolean> {
+export async function restoreSessions(
+  ids: string[],
+  deps: { applySessionMutation: (mutation: SessionMutation) => void; notify: Notifier | null },
+): Promise<boolean> {
   let anyFailed = false;
   for (const id of ids) {
     const res = await restoreSession(id);
     if (res) {
-      deps.applySession(res);
-      res.warnings?.forEach((warning) => deps.notify?.info?.(warning));
+      deps.applySessionMutation(res);
+      res.session.warnings?.forEach((warning) => deps.notify?.info?.(warning));
     } else {
       anyFailed = true;
     }

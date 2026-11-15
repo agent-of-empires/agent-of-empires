@@ -325,6 +325,11 @@ fn chrome_rows(window_height: u16, pane_height: u16) -> u16 {
     }
 }
 
+/// A `capture-pane` result: its output, or `None` when tmux reported failure.
+fn capture_output(success: bool, stdout: &[u8]) -> Option<String> {
+    success.then(|| String::from_utf8_lossy(stdout).into_owned())
+}
+
 impl Session {
     pub fn new(id: &str, title: &str) -> Result<Self> {
         Ok(Self {
@@ -812,11 +817,23 @@ impl Session {
         Ok(tty)
     }
 
+    /// The pane's last `lines` of history, or `""` when the session is gone or tmux could not
+    /// capture it. Use [`Self::try_capture_pane`] where that failure must not read as a blank pane.
     pub fn capture_pane(&self, lines: usize) -> Result<String> {
-        if !self.exists() {
-            return Ok(String::new());
-        }
+        Ok(self.capture(lines)?.unwrap_or_default())
+    }
 
+    /// Like [`Self::capture_pane`], but a missing session or a failed `capture-pane` is an error.
+    pub fn try_capture_pane(&self, lines: usize) -> Result<String> {
+        self.capture(lines)?
+            .ok_or_else(|| anyhow::anyhow!("could not capture tmux session '{}'", self.name))
+    }
+
+    /// `None` when the session is gone or `capture-pane` failed; `Err` when tmux could not run.
+    fn capture(&self, lines: usize) -> Result<Option<String>> {
+        if !self.exists() {
+            return Ok(None);
+        }
         let target =
             self.live_pane_target_with_deadline(&crate::tmux::TmuxCommandDeadline::new())?;
         let output = crate::tmux::tmux_command()
@@ -830,12 +847,7 @@ impl Session {
                 &format!("-{}", lines),
             ])
             .output()?;
-
-        if output.status.success() {
-            Ok(String::from_utf8_lossy(&output.stdout).to_string())
-        } else {
-            Ok(String::new())
-        }
+        Ok(capture_output(output.status.success(), &output.stdout))
     }
 
     /// Wait for a known marker, or for two stable captures when no marker exists.
@@ -2935,6 +2947,35 @@ mod tests {
             "{what} for {} never painted {needle:?}; last seen: {last:?}",
             session.name
         );
+    }
+
+    /// A failed `capture-pane` is no output at all, while a successful empty one is a blank pane.
+    #[test]
+    fn a_failed_capture_is_kept_apart_from_a_blank_pane() {
+        for (success, stdout, expected) in [
+            (true, "x", Some("x")),
+            (true, "", Some("")),
+            (false, "junk", None),
+        ] {
+            assert_eq!(
+                capture_output(success, stdout.as_bytes()).as_deref(),
+                expected,
+                "{success} {stdout:?}"
+            );
+        }
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn only_the_strict_capture_reports_a_missing_session() {
+        if !tmux_available() {
+            eprintln!("Skipping test: tmux not available");
+            return;
+        }
+        let missing =
+            Session::from_name(&format!("aoe_test_no_such_session_{}", std::process::id()));
+        assert!(missing.try_capture_pane(10).is_err());
+        assert_eq!(missing.capture_pane(10).unwrap(), "");
     }
 
     #[test]

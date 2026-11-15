@@ -24,7 +24,7 @@ use super::pending::{
 };
 use super::plan::approval_plan_text;
 use super::tool_context::{permission_raw_input_with_context, ToolContextCache};
-use super::tool_output::{preview_optional_args, tool_kind_str};
+use super::tool_output::{full_prompt, preview_optional_args, tool_kind_str};
 
 /// A kind we cannot map back is dropped rather than guessed at, so no client
 /// offers a button whose meaning is unknown.
@@ -177,6 +177,7 @@ pub(super) async fn handle_permission_request(
     );
     let args_preview = preview_optional_args(enriched_raw_input.as_ref());
     let tool_call = ToolCall {
+        prompt: enriched_raw_input.as_ref().and_then(full_prompt),
         id: request.tool_call.tool_call_id.0.to_string(),
         name: title,
         kind: request

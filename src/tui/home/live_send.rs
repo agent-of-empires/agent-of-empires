@@ -267,6 +267,50 @@ pub(in crate::tui) struct LiveSendState {
     pub leader: Option<(KeyCode, KeyModifiers)>,
 }
 
+/// A Session whose live control another window took. The footer names `taker`, and the
+/// preview reads `tmux_name` through capture-pane so the new owner can arm its VT pipe.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(in crate::tui) struct TakenLive {
+    pub session_id: String,
+    pub tmux_name: String,
+    pub taker: LiveTakeover,
+}
+
+/// The key that enters live mode on a Session's row: Tab, or Enter under
+/// `default_attach_mode = LiveSend`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(in crate::tui) enum LiveKey {
+    Tab,
+    Enter,
+}
+
+/// Which kind of window took a Session's live control from this TUI, read from the
+/// size-owner id: the Web dashboard registers `live-*`, a TUI `tui-*`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(in crate::tui) enum LiveTakeover {
+    Web,
+    Tui,
+    Other,
+}
+
+impl LiveTakeover {
+    pub(in crate::tui) fn from_owner_id(id: Option<&str>) -> Self {
+        match id {
+            Some(id) if id.starts_with("live-") => Self::Web,
+            Some(id) if id.starts_with("tui-") => Self::Tui,
+            _ => Self::Other,
+        }
+    }
+
+    pub(in crate::tui) fn label(self) -> &'static str {
+        match self {
+            Self::Web => "Web dashboard took control",
+            Self::Tui => "Another TUI took control",
+            Self::Other => "Another window took control",
+        }
+    }
+}
+
 /// Which paired tmux pane a live-send dispatch targets: the agent pane is the historical
 /// default, and the host and container terminal panes reuse the same machinery.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]

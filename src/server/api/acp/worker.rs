@@ -625,11 +625,7 @@ async fn validate_restart_agent(
 ) -> Result<(), Response> {
     if !state
         .acp_supervisor
-        .agent_is_valid_switch_target(
-            agent,
-            &instance.source_profile,
-            std::path::Path::new(&instance.project_path),
-        )
+        .agent_is_valid_switch_target(agent, &instance.source_profile, instance.repo_config_path())
         .await
     {
         return Err((
@@ -797,7 +793,7 @@ async fn check_switch_target(
         .agent_is_valid_switch_target(
             target,
             &instance.source_profile,
-            std::path::Path::new(&instance.project_path),
+            instance.repo_config_path(),
         )
         .await
     {
@@ -1309,6 +1305,50 @@ mod tests {
     use super::*;
     use crate::acp::agent_policy::AgentPolicy;
     use crate::acp::state::RateLimitInfo;
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn restart_and_switch_accept_a_workspace_launch_repo_agent() {
+        let _home = crate::session::test_support::isolate_app_dir();
+        crate::session::config::update_config(|config| {
+            config
+                .session
+                .custom_agents
+                .insert("my-pi".into(), "pi".into());
+        })
+        .unwrap();
+        let workspace = tempfile::tempdir().unwrap();
+        let checkout = workspace.path().join("repo");
+        std::fs::create_dir_all(checkout.join(".agent-of-empires")).unwrap();
+        std::fs::write(
+            checkout.join(".agent-of-empires/config.toml"),
+            "[session.agent_detect_as]\nmy-pi = \"pi\"\n",
+        )
+        .unwrap();
+        let mut row = crate::session::Instance::new("ws", workspace.path().to_str().unwrap());
+        row.source_profile = "default".into();
+        row.workspace_info = Some(crate::session::WorkspaceInfo {
+            branch: "feat".into(),
+            workspace_dir: row.project_path.clone(),
+            repos: vec![crate::session::WorkspaceRepo {
+                name: "repo".into(),
+                source_path: checkout.to_string_lossy().into_owned(),
+                branch: "feat".into(),
+                worktree_path: checkout.to_string_lossy().into_owned(),
+                main_repo_path: checkout.to_string_lossy().into_owned(),
+                managed_by_aoe: true,
+                branch_preexisting: false,
+                base_branch: None,
+                base_branch_override: None,
+            }],
+            created_at: chrono::Utc::now(),
+            cleanup_on_delete: true,
+        });
+        let state = crate::server::test_support::build_test_app_state(vec![row.clone()]);
+
+        assert!(validate_restart_agent(&state, &row, "my-pi").await.is_ok());
+        assert!(check_switch_target(&state, &row, "my-pi").await.is_ok());
+    }
 
     async fn durable_stop_state(row: crate::session::Instance) -> Arc<AppState> {
         crate::server::test_support::seed_instances_on_disk_for_test("default", vec![row.clone()]);

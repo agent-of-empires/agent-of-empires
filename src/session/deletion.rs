@@ -519,7 +519,7 @@ impl<S: SessionStore + 'static> PurgeTransaction<S> {
         let instance = &self.request().instance;
         let config = self.store().configuration(Some(&instance.source_profile))?;
         let mut config = match repo_config::load_repo_config(
-            &repo_config::repo_config_source_path(Path::new(&instance.project_path)),
+            &repo_config::repo_config_source_path(instance.repo_config_path()),
         )? {
             Some(repo) => repo_config::merge_repo_config(config, &repo),
             None => config,
@@ -2485,9 +2485,9 @@ fn run_before_destroy_hooks(instance: &Instance, detach: bool, commands: &[Strin
 
 /// Hooks are best-effort; unapproved repository hooks never override host hooks.
 fn run_on_destroy_hooks(instance: &Instance, detach: bool, configured_hooks: &[String]) {
-    let project_path = Path::new(&instance.project_path);
     let mut resolved_on_destroy = std::borrow::Cow::Borrowed(configured_hooks);
-    match repo_config::check_repo_trust(project_path) {
+    let mut from_repo = false;
+    match repo_config::check_repo_trust(instance.repo_config_path()) {
         Ok(trust) if trust.hooks.needs_trust() => {
             tracing::warn!(target: "session.delete",
                 "Repo hooks changed since last trust approval; skipping repo on_destroy hooks"
@@ -2497,6 +2497,7 @@ fn run_on_destroy_hooks(instance: &Instance, detach: bool, configured_hooks: &[S
             if let Some(hooks) = trust.hooks.trusted() {
                 if !hooks.on_destroy.is_empty() {
                     resolved_on_destroy = std::borrow::Cow::Owned(hooks.on_destroy);
+                    from_repo = true;
                 }
             }
         }
@@ -2520,7 +2521,7 @@ fn run_on_destroy_hooks(instance: &Instance, detach: bool, configured_hooks: &[S
     // (see issue); CLI passes detach=false so interactive prompts work.
     let errors = if is_sandboxed {
         if let Some(ref sandbox) = instance.sandbox_info {
-            let workdir = instance.container_workdir();
+            let workdir = instance.hook_container_workdir(from_repo);
             repo_config::execute_hooks_in_container_best_effort(
                 &resolved_on_destroy,
                 &sandbox.container_name,
@@ -2534,7 +2535,7 @@ fn run_on_destroy_hooks(instance: &Instance, detach: bool, configured_hooks: &[S
     } else {
         repo_config::execute_hooks_best_effort(
             &resolved_on_destroy,
-            project_path,
+            instance.hook_workdir(from_repo),
             detach,
             &hook_env,
         )
@@ -2639,6 +2640,53 @@ mod tests {
         let mut instance = Instance::new("Test", worktree.to_str().unwrap());
         instance.worktree_info = Some(test_worktree_info(branch, &main_repo));
         (temp, main_repo, worktree, instance)
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn cleanup_defaults_read_a_workspace_launch_repo_config() {
+        let _home = crate::session::test_support::isolate_app_dir();
+        let storage = Storage::new_unwatched("default").unwrap();
+        let workspace = tempfile::tempdir().unwrap();
+        let checkout = workspace.path().join("repo");
+        std::fs::create_dir_all(checkout.join(".agent-of-empires")).unwrap();
+        std::fs::write(
+            checkout.join(".agent-of-empires/config.toml"),
+            "[worktree]\nauto_cleanup = false\n",
+        )
+        .unwrap();
+        let mut row = Instance::new("ws", workspace.path().to_str().unwrap());
+        let checkout = checkout.to_string_lossy().into_owned();
+        row.workspace_info = Some(crate::session::WorkspaceInfo {
+            branch: "feat".into(),
+            workspace_dir: row.project_path.clone(),
+            repos: vec![crate::session::WorkspaceRepo {
+                name: "repo".into(),
+                source_path: checkout.clone(),
+                branch: "feat".into(),
+                worktree_path: checkout.clone(),
+                main_repo_path: checkout,
+                managed_by_aoe: true,
+                branch_preexisting: false,
+                base_branch: None,
+                base_branch_override: None,
+            }],
+            created_at: chrono::Utc::now(),
+            cleanup_on_delete: true,
+        });
+        storage
+            .update(|rows, _| {
+                rows.push(row.clone());
+                Ok(())
+            })
+            .unwrap();
+
+        let transaction = PurgeTransaction::reserve(storage, test_request(row), None)
+            .unwrap()
+            .unwrap_or_else(|result| panic!("purge refused: {result:?}"))
+            .resolve_cleanup_defaults()
+            .unwrap();
+        assert!(!transaction.request().delete_worktree);
     }
 
     fn test_request(instance: Instance) -> DeletionRequest {

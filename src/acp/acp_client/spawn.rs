@@ -21,6 +21,8 @@ pub struct SpawnConfig {
     pub tool: String,
     pub spec: AgentSpec,
     pub cwd: PathBuf,
+    /// Where repo config is re-read on respawn; see `SpawnRequest::config_path`.
+    pub config_path: PathBuf,
     pub additional_dirs: Vec<PathBuf>,
     /// Request-sourced provider env, filtered by `provider_env_denyreason`.
     pub provider_env: Vec<(String, String)>,
@@ -1102,7 +1104,7 @@ mod tests {
                 Event::SessionContextReset { reason } => kinds.push(format!("reset:{reason}")),
                 Event::RateLimit { info } => kinds.push(format!("rate_limit:{}", info.kind)),
                 Event::Stopped { reason } => kinds.push(format!("stopped:{reason}")),
-                Event::AgentStartupError { message } => {
+                Event::AgentStartupError { message, .. } => {
                     panic!("recoverable failure surfaced a startup error: {message}")
                 }
                 _ => {}

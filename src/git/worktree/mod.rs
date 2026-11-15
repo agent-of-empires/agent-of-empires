@@ -127,10 +127,12 @@ impl GitWorktree {
     }
 
     pub fn find_main_repo(path: &Path) -> Result<PathBuf> {
-        let Ok(repo) = open_repo_at(path) else {
-            return Self::find_main_repo_from_linked_worktree_gitfile(path)
-                .ok_or(GitError::NotAGitRepo);
-        };
+        // Opening a linked worktree parses the shared repo config, which is costly in a repo
+        // with many worktrees, so read the gitdir file first.
+        if let Some(main_repo) = Self::find_main_repo_from_linked_worktree_gitfile(path) {
+            return Ok(main_repo);
+        }
+        let repo = open_repo_at(path).map_err(|_| GitError::NotAGitRepo)?;
         if let Some(main_repo) = Self::find_main_repo_from_worktree_gitdir(repo.path()) {
             return Ok(main_repo);
         }

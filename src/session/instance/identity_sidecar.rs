@@ -87,7 +87,7 @@ impl Instance {
         let bind_dir = self.sandbox_capture_store_dir()?;
         let launch_config = crate::session::storage::local_launch_configuration(
             &self.effective_profile(),
-            Path::new(&self.project_path),
+            self.repo_config_path(),
         );
         let config = self.build_container_config(&launch_config).ok()?;
         let (container_root, flag, sidecar_root) = match backend {

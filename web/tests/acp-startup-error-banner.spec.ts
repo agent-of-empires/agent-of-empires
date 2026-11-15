@@ -83,3 +83,62 @@ test.describe("at 375px", () => {
     expect(overflow).toBeLessThanOrEqual(0);
   });
 });
+
+test.describe("Retry", () => {
+  const CHIP = "Explain this codebase";
+  const HINT = "Ask the agent anything about this workspace.";
+
+  /** A Session that ran before, so only the Retry can put up the startup line. */
+  async function retryFailedSession(page: Page) {
+    const mock = await mockAcpSession(page, {
+      title: "story-startup-error-retry",
+      acpSessionId: "acp-1",
+      initialEvents: [{ AgentStartupError: { message: MESSAGE } }],
+    });
+    for (const path of ["spawn", "restart"])
+      await page.route(`**/api/sessions/*/acp/${path}`, (r) => r.fulfill({ json: {} }));
+    await page.route("**/api/sessions/*/acp/install-info", (r) =>
+      r.fulfill({ json: { agent: "claude", display_name: "Claude", npm_installable: true, install_allowed: false } }),
+    );
+    await openStructuredSession(page, mock);
+    const banner = page.getByTestId("startup-error-banner");
+    const line = page.getByTestId("startup-wait-line");
+    await expect(page.getByText(/isn't running\.$/)).toBeVisible();
+    await expect(page.getByText(CHIP)).toHaveCount(0);
+
+    await banner.getByRole("button", { name: "Retry" }).click();
+    await expect(line).toContainText("Starting");
+    await expect(banner).toHaveCount(0);
+    await expect(page.getByText(/isn't running yet\.$/)).toBeVisible();
+    await expect(page.getByText(CHIP)).toHaveCount(0);
+    return { mock, banner, line };
+  }
+
+  test("shows the startup line in place of the banner, then the transcript once the Agent starts", async ({ page }) => {
+    const { mock, banner, line } = await retryFailedSession(page);
+    mock.pushEvents([{ AcpSessionAssigned: { acp_session_id: "acp-2" } }]);
+    await expect(line).toHaveCount(0);
+    await expect(banner).toHaveCount(0);
+    await expect(page.getByText(HINT)).toBeVisible();
+    await expect(page.getByText(CHIP)).toBeVisible();
+  });
+
+  for (const [label, message, changed] of [
+    ["the same error", MESSAGE, "Same error as before."],
+    [
+      "a changed error",
+      'Failed to start structured view agent "claude": capacity full',
+      "It failed differently this time: capacity full",
+    ],
+  ]) {
+    test(`brings the banner back for ${label}, saying how it compares`, async ({ page }) => {
+      const { mock, banner, line } = await retryFailedSession(page);
+      mock.pushEvents([{ AgentStartupError: { message } }]);
+      await expect(banner.getByRole("heading", { name: "Claude still couldn't start" })).toBeVisible();
+      await expect(banner.getByTestId("startup-error-banner-changed")).toHaveText(changed);
+      await expect(line).toHaveCount(0);
+      await expect(page.getByText(/isn't running\.$/)).toBeVisible();
+      await expect(page.getByText(CHIP)).toHaveCount(0);
+    });
+  }
+});
