@@ -14333,9 +14333,12 @@ async fn prepared_restart_uses_current_queue_after_original_detaches() {
                     .lifecycle_generation;
                 drop(submission);
                 let requests = live.native.requests();
-                let original = crate::process::worker_registry::load_strict(&id)
-                    .unwrap()
-                    .unwrap();
+                let original = {
+                    let registry = crate::process::worker_registry::registry_lock_until(
+                        &id, tokio::time::Instant::now() + std::time::Duration::from_secs(10),
+                    ).await.expect("the actual runner releases registry admission");
+                    registry.record().unwrap().expect("the original runner remains registered")
+                };
                 let original_identity =
                     crate::acp::runner_lifecycle::RunnerIdentity::from_record(&original);
                 let original_birth = crate::process::process_birth_identity(original.pid)
@@ -14369,9 +14372,12 @@ async fn prepared_restart_uses_current_queue_after_original_detaches() {
                             Some(&original_lease)
                         );
                         assert!(original_actual.ensure_available().is_err());
-                        let retained = crate::process::worker_registry::load_strict(&id)
-                            .unwrap()
-                            .unwrap();
+                        let retained = {
+                            let registry = crate::process::worker_registry::registry_lock_until(
+                                &id, tokio::time::Instant::now() + std::time::Duration::from_secs(10),
+                            ).await.expect("the actual runner releases registry admission");
+                            registry.record().unwrap().expect("the original runner remains registered")
+                        };
                         assert_eq!(
                             crate::acp::runner_lifecycle::RunnerIdentity::from_record(&retained),
                             original_identity
@@ -14457,9 +14463,12 @@ async fn prepared_restart_uses_current_queue_after_original_detaches() {
                             Some(&original_lease)
                         );
                         assert!(original_actual.ensure_available().is_err());
-                        let retained = crate::process::worker_registry::load_strict(&id)
-                            .unwrap()
-                            .unwrap();
+                        let retained = {
+                            let registry = crate::process::worker_registry::registry_lock_until(
+                                &id, tokio::time::Instant::now() + std::time::Duration::from_secs(10),
+                            ).await.expect("the actual runner releases registry admission");
+                            registry.record().unwrap().expect("the original runner remains registered")
+                        };
                         assert_eq!(
                             crate::acp::runner_lifecycle::RunnerIdentity::from_record(&retained),
                             original_identity

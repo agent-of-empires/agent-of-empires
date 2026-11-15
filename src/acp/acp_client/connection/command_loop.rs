@@ -658,7 +658,9 @@ impl Session {
                 }
                 ClientCmd::ForceStop => {
                     if require_operation(&scope, correlation, self.control.is_some()).is_err()
-                        || current_effect(&scope, self.control.is_some(), || ()).is_err()
+                        || current_effect_wait(
+                            scope.as_ref(), self.control.is_some(), &self.shared.connection_state, || (),
+                        ).await.is_err()
                     {
                         continue;
                     }

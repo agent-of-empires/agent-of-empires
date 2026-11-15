@@ -502,15 +502,19 @@ impl TaskTailer {
                 let _ = journal.await;
             }
             let _publication = self.active.publication.lock().await;
-            let _ = access
-                .publish(
-                    &self.event_tx,
-                    Event::BackgroundTaskFinished {
-                        task_id: self.task_id.clone(),
-                        ended_at,
-                    },
-                )
-                .await;
+            let observed_end = ended_at.is_some();
+            let event = Event::BackgroundTaskFinished {
+                task_id: self.task_id.clone(),
+                ended_at,
+            };
+            if observed_end {
+                let _ = access.publish(&self.event_tx, event).await;
+            } else if let Some(events) = self.event_tx.upgrade() {
+                // Losing the reader ends host tracking, not the Native task.
+                let mut metadata = crate::acp::event_sender::EventMetadata::host(&event);
+                metadata.resource_ref = owner.authority.witness().map(|witness| witness.allocation);
+                let _ = access.publish_with(events.with_metadata(metadata), event).await;
+            }
         }))
     }
 }

@@ -1152,9 +1152,12 @@ mod tests {
                         .acp_event_store
                         .rate_limit_redelivery_streak(&id)
                         .unwrap();
-                    let original = crate::process::worker_registry::load_strict(&id)
-                        .unwrap()
-                        .unwrap();
+                    let original = {
+                        let registry = crate::process::worker_registry::registry_lock_until(
+                            &id, tokio::time::Instant::now() + Duration::from_secs(10),
+                        ).await.expect("the actual runner releases registry admission");
+                        registry.record().unwrap().expect("the original runner remains registered")
+                    };
                     let original_identity =
                         crate::acp::runner_lifecycle::RunnerIdentity::from_record(&original);
                     let original_birth = crate::process::process_birth_identity(original.pid)
@@ -1190,9 +1193,12 @@ mod tests {
                                 Some(&original_lease)
                             );
                             assert!(original_actual.ensure_available().is_err());
-                            let retained = crate::process::worker_registry::load_strict(&id)
-                                .unwrap()
-                                .unwrap();
+                            let retained = {
+                                let registry = crate::process::worker_registry::registry_lock_until(
+                                    &id, tokio::time::Instant::now() + Duration::from_secs(10),
+                                ).await.expect("the actual runner releases registry admission");
+                                registry.record().unwrap().expect("the original runner remains registered")
+                            };
                             assert_eq!(
                                 crate::acp::runner_lifecycle::RunnerIdentity::from_record(&retained),
                                 original_identity
@@ -1305,9 +1311,12 @@ mod tests {
                                 );
                                 assert_eq!(known_park(&live.state, &id).seq, park.seq);
                                 assert_eq!(auto_resumed_breadcrumbs(&live.state, &id), 0);
-                                let retained = crate::process::worker_registry::load_strict(&id)
-                                    .unwrap()
-                                    .unwrap();
+                                let retained = {
+                                    let registry = crate::process::worker_registry::registry_lock_until(
+                                        &id, tokio::time::Instant::now() + Duration::from_secs(10),
+                                    ).await.expect("the actual runner releases registry admission");
+                                    registry.record().unwrap().expect("the original runner remains registered")
+                                };
                                 assert_eq!(
                                     crate::acp::runner_lifecycle::RunnerIdentity::from_record(
                                         &retained
