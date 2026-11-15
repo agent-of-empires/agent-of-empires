@@ -99,10 +99,17 @@ async function postReportingErrors(
   }
 }
 
-// Re-sends of rows the server never confirmed belong to the Session, not to a mounted hook. They
-// run one after another, and a later one skips rows an earlier one already posted. A row the user
-// removes meanwhile is not posted, or is deleted again if its POST was already in flight.
-const queueMigrations = new Map<string, { tail: Promise<void>; posted: Set<string>; removed: Set<string> }>();
+// POSTs of queued rows belong to the Session, not to a mounted hook. Re-sends of rows the server
+// never confirmed and prompts queued while open run one after another, and each skips a row an
+// earlier one posted. A removal or edit meanwhile finds no row on the server yet, so it is applied
+// to the POST, or after it when the POST was already in flight.
+interface QueuePosts {
+  tail: Promise<void>;
+  posted: Set<string>;
+  removed: Set<string>;
+  edited: Map<string, string>;
+}
+const queuePosts = new Map<string, QueuePosts>();
 // The mounted hooks showing each Session; with none, an acknowledgment goes to its stored state.
 const queueAckTargets = new Map<string, Set<Dispatch<Action>>>();
 
@@ -116,39 +123,65 @@ function acknowledgeQueued(sessionId: string, action: Action): void {
   if (stored) cacheSet(sessionId, reducer(stored, action));
 }
 
-function migrateQueue(sessionId: string, rows: QueuedPrompt[]): Promise<void> {
-  const entry = queueMigrations.get(sessionId) ?? {
+function postQueuedInOrder(sessionId: string, task: (entry: QueuePosts) => Promise<void>): Promise<void> {
+  const entry = queuePosts.get(sessionId) ?? {
     tail: Promise.resolve(),
     posted: new Set<string>(),
     removed: new Set<string>(),
+    edited: new Map<string, string>(),
   };
-  const run = entry.tail.then(async () => {
-    for (const q of rows) {
-      if (entry.posted.has(q.id) || entry.removed.has(q.id)) continue;
-      const saved = await enqueueServerPrompt(sessionId, { id: q.id, text: q.text, attachments: q.attachments });
-      if (!saved) continue;
-      if (entry.removed.has(q.id)) {
-        // Its DELETE may have reached the server before this POST committed.
-        await removeServerQueuedPrompt(sessionId, q.id);
-        continue;
-      }
-      entry.posted.add(q.id);
-      // Confirmed, so a list that no longer has it (delivered) drops it instead of keeping it to re-send.
-      acknowledgeQueued(sessionId, { kind: "confirm_queued_prompt", id: q.id });
-    }
-  });
+  const run = entry.tail.then(() => task(entry));
   entry.tail = run;
-  queueMigrations.set(sessionId, entry);
+  queuePosts.set(sessionId, entry);
   const settle = () => {
-    if (queueMigrations.get(sessionId)?.tail === run) queueMigrations.delete(sessionId);
+    if (queuePosts.get(sessionId)?.tail === run) queuePosts.delete(sessionId);
   };
   run.then(settle, settle);
   return run;
 }
 
+/** Posts one row and confirms it; false only when its POST failed. */
+async function postQueuedRow(
+  sessionId: string,
+  entry: QueuePosts,
+  row: Parameters<typeof enqueueServerPrompt>[1],
+): Promise<boolean> {
+  if (entry.posted.has(row.id) || entry.removed.has(row.id)) return true;
+  let sent = entry.edited.get(row.id) ?? row.text;
+  const saved = await enqueueServerPrompt(sessionId, { ...row, text: sent });
+  if (!saved) return false;
+  // A DELETE or PATCH sent while this POST was in flight may have reached the server first.
+  if (entry.removed.has(row.id)) {
+    await removeServerQueuedPrompt(sessionId, row.id);
+    return true;
+  }
+  let latest = entry.edited.get(row.id);
+  while (latest !== undefined && latest !== sent) {
+    sent = latest;
+    await editServerQueuedPrompt(sessionId, row.id, sent);
+    latest = entry.edited.get(row.id);
+  }
+  entry.posted.add(row.id);
+  // Confirmed, so a list that no longer has it (delivered) drops it instead of keeping it to re-send.
+  acknowledgeQueued(sessionId, { kind: "confirm_queued_prompt", id: row.id });
+  return true;
+}
+
+function migrateQueue(sessionId: string, rows: QueuedPrompt[]): Promise<void> {
+  return postQueuedInOrder(sessionId, async (entry) => {
+    for (const q of rows) {
+      await postQueuedRow(sessionId, entry, { id: q.id, text: q.text, attachments: q.attachments });
+    }
+  });
+}
+
 function markQueuedRemoved(sessionId: string, ids: Iterable<string>): void {
-  const entry = queueMigrations.get(sessionId);
+  const entry = queuePosts.get(sessionId);
   if (entry) for (const id of ids) entry.removed.add(id);
+}
+
+function markQueuedEdited(sessionId: string, id: string, text: string): void {
+  queuePosts.get(sessionId)?.edited.set(id, text);
 }
 
 /** Waits before re-listing after a failed queue list; then the next poll change or turn retries. */
@@ -314,17 +347,13 @@ export function useAcpSession(
       const id = `q-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
       dispatch({ kind: "enqueue_prompt", id, text, attachments });
       reportAcpInteraction("prompt_queued");
-      void (async () => {
-        const row = await enqueueServerPrompt(sessionId, { id, text, attachments });
-        if (row) {
-          acknowledgeQueued(sessionId, { kind: "confirm_queued_prompt", id });
-          return;
-        }
+      void postQueuedInOrder(sessionId, async (entry) => {
+        if (await postQueuedRow(sessionId, entry, { id, text, attachments })) return;
         dispatch({
           kind: "error",
           message: "Couldn't queue your message on the server; it may not send. Remove it and try again.",
         });
-      })();
+      });
     },
     [sessionId],
   );
@@ -445,7 +474,9 @@ export function useAcpSession(
   const editQueuedPrompt = useCallback(
     (id: string, text: string) => {
       dispatch({ kind: "edit_queued_prompt", id, text });
-      if (sessionId) void editServerQueuedPrompt(sessionId, id, text);
+      if (!sessionId) return;
+      markQueuedEdited(sessionId, id, text);
+      void editServerQueuedPrompt(sessionId, id, text);
     },
     [sessionId],
   );

@@ -795,6 +795,12 @@ describe("server queue", () => {
           if (deliveredOnPost.delete(parsed.id)) serverQueue.delete(parsed.id);
           return queuePostHeld ? queuePostHeld.then(() => json(saved)) : json(saved);
         }
+        if (method === "PATCH" && item) {
+          const existing = serverQueue.get(decodeURIComponent(item));
+          if (!existing) return new Response("queued prompt not found", { status: 404 });
+          existing.text = (JSON.parse(body!) as { text: string }).text;
+          return new Response(null, { status: 204 });
+        }
         if (method === "DELETE" && item && queueDeleteHeld) {
           return queueDeleteHeld.then(() =>
             serverQueue.delete(decodeURIComponent(item))
@@ -1207,6 +1213,83 @@ describe("server queue", () => {
     expect(serverQueue.has("B")).toBe(false);
     expect(hook.result.current.state.queuedPrompts).toEqual([]);
     expect(posts("/queue").map((c) => JSON.parse(c.body!).id)).toEqual(["B"]);
+    hook.unmount();
+  });
+
+  it.each([
+    ["before its POST runs", "before"],
+    ["while its POST is in flight", "in-flight"],
+  ] as const)("re-sends the latest text of a row the user edits %s", async (_, when) => {
+    const a = `sess-edited-${when}`;
+    const queuedAt = "2026-01-01T00:00:00.000Z";
+    const pending = ["A", "B"].map((id) => ({ id, text: id, queuedAt, pending: true }));
+    localStorage.setItem(
+      `${STORAGE_KEY_PREFIX}${a}`,
+      JSON.stringify({ savedAt: Date.now(), state: { ...emptyAcpState(), queuedPrompts: pending } }),
+    );
+    const lists = () => calls.filter((c) => c.method === "GET" && c.url.includes("/queue") && c.url.includes(a)).length;
+    const hook = render(a);
+    await flushAsync();
+    const release = Promise.withResolvers<void>();
+    const started = Promise.withResolvers<void>();
+    // Before: A's POST is held after it commits. In flight: B's own POST is held before it commits,
+    // so the edit's PATCH finds nothing.
+    if (when === "before") queuePostHeld = release.promise;
+    else {
+      queuePostStarted = () => {
+        if (posts("/queue").length === 1) queuePostUncommitted = release.promise;
+      };
+    }
+    const bStarted = () => posts("/queue").some((c) => JSON.parse(c.body!).id === "B");
+    if (when === "before") queuePostStarted = started.resolve;
+    lastSocket().open();
+    if (when === "before") await started.promise;
+    else await waitFor(() => expect(bStarted()).toBe(true));
+    queuePostHeld = null;
+    queuePostStarted = null;
+    queuePostUncommitted = null;
+    act(() => hook.result.current.editQueuedPrompt("B", "B edited"));
+    await waitFor(() => expect(calls.some((c) => c.method === "PATCH")).toBe(true));
+    const listed = lists();
+    release.resolve();
+    await waitFor(() => expect(lists()).toBeGreaterThan(listed));
+    expect(serverQueue.get("B")?.text).toBe("B edited");
+    // An edit before the POST runs is posted as is; one in flight is patched after the save.
+    const postedB = posts("/queue").filter((c) => JSON.parse(c.body!).id === "B");
+    expect(postedB.map((c) => JSON.parse(c.body!).text)).toEqual([when === "before" ? "B edited" : "B"]);
+    expect(hook.result.current.state.queuedPrompts.map((q) => q.text)).toEqual(["A", "B edited"]);
+    hook.unmount();
+  });
+
+  it("deletes a prompt queued while open again when the user removes it before its POST commits", async () => {
+    const a = "sess-queued-removed";
+    const lists = () => calls.filter((c) => c.method === "GET" && c.url.includes("/queue") && c.url.includes(a)).length;
+    const hook = await openSession(a);
+    const commit = Promise.withResolvers<void>();
+    const started = Promise.withResolvers<void>();
+    queuePostUncommitted = commit.promise;
+    queuePostStarted = started.resolve;
+    workerDown = true;
+    await act(() => hook.result.current.sendPrompt("later"));
+    await started.promise;
+    queuePostUncommitted = null;
+    queuePostStarted = null;
+    workerDown = false;
+    const id = hook.result.current.state.queuedPrompts[0]!.id;
+    const deletes = () => calls.filter((c) => c.method === "DELETE" && c.url.includes(`/queue/${id}`)).length;
+    act(() => hook.result.current.removeQueuedPrompt(id));
+    await waitFor(() => expect(deletes()).toBe(1));
+    commit.resolve();
+    await waitFor(() => expect(deletes()).toBe(2));
+    expect(serverQueue.has(id)).toBe(false);
+    // The next list doesn't bring it back.
+    const listed = lists();
+    hook.rerender();
+    act(() => hook.result.current.manualReconnect());
+    await flushAsync();
+    lastSocket().open();
+    await waitFor(() => expect(lists()).toBeGreaterThan(listed));
+    expect(hook.result.current.state.queuedPrompts).toEqual([]);
     hook.unmount();
   });
 
