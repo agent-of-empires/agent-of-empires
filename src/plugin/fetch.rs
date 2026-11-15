@@ -584,7 +584,7 @@ pub(super) fn render_asset_template<'a>(
 }
 
 async fn download_asset(url: &str, dest: &Path) -> Result<()> {
-    use std::io::Write;
+    use tokio::io::AsyncWriteExt;
     let client = reqwest::Client::builder()
         .user_agent(DEFAULT_USER_AGENT)
         .timeout(Duration::from_secs(300))
@@ -594,13 +594,16 @@ async fn download_asset(url: &str, dest: &Path) -> Result<()> {
     if !status.is_success() {
         bail!("downloading {url} failed: HTTP {status}");
     }
-    let mut file =
-        std::fs::File::create(dest).with_context(|| format!("creating {}", dest.display()))?;
+    let mut file = tokio::fs::File::create(dest)
+        .await
+        .with_context(|| format!("creating {}", dest.display()))?;
     while let Some(chunk) = response.chunk().await? {
         file.write_all(&chunk)
+            .await
             .with_context(|| format!("writing {url} to {}", dest.display()))?;
     }
     file.flush()
+        .await
         .with_context(|| format!("writing {url} to {}", dest.display()))
 }
 
