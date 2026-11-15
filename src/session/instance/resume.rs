@@ -5214,7 +5214,9 @@ exec sleep 60
                     other => panic!("the failed probe must refuse revival: {other:?}"),
                 };
                 assert_eq!(
-                    error.downcast_ref::<ManagedResumeRefused>().map(|refusal| refusal.0),
+                    error
+                        .downcast_ref::<ManagedResumeRefused>()
+                        .map(|refusal| refusal.0),
                     Some(ManagedResumeCause::PreviousProbeFailed)
                 );
                 let unchanged = storage.load().unwrap().remove(0);

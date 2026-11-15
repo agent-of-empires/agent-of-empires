@@ -3393,8 +3393,8 @@ async fn prepare_agent_session_inner(
         physical: mut captured_physical,
     } = input;
     if preparation == AgentPreparation::Ensure && state.cityhall_mode {
-    return crate::server::api::cityhall_response();
-}
+        return crate::server::api::cityhall_response();
+    }
     if state.read_only && preparation == AgentPreparation::Ensure {
         return super::ensure::agent_target_response(&state, &id, None).await;
     }
