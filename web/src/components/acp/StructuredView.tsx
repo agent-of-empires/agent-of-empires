@@ -529,11 +529,13 @@ function ComposerDock({
         onDismiss={ctx.dismissPrimer}
       />
 
-      <CompactionReminderBanner
-        state={state}
-        onCompact={() => ctx.sendPrompt("/compact")}
-        onDismiss={ctx.dismissCompactionReminder}
-      />
+      {!blockedReason && (
+        <CompactionReminderBanner
+          state={state}
+          onCompact={() => ctx.sendPrompt("/compact")}
+          onDismiss={ctx.dismissCompactionReminder}
+        />
+      )}
 
       {collapsible && (
         <ChromeCollapseHandle

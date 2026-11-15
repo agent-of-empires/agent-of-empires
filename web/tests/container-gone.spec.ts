@@ -8,15 +8,23 @@ import { wizard } from "./helpers/wizard";
 
 const TITLE = "story-container-gone";
 const MESSAGE = "This Session's sandbox container is gone. Recreate it or start a new Session and container.";
+// A Session that ran before, past the compaction reminder's threshold.
+const REMINDER_ABOUT = { acp_compaction_reminder: true, acp_compaction_reminder_percent: 75 };
+const WITH_COMPACT = { available_commands: [{ name: "compact", description: "compact", accepts_input: false }] };
+const NEAR_FULL = [{ UsageUpdated: { usage: { used: 180_000, size: 200_000, cost: null } } }];
 
-async function openGoneSession(page: Page, { readOnly = false, queued = false } = {}) {
+async function openGoneSession(page: Page, { readOnly = false, queued = false, nearFull = false } = {}) {
   const mock = await mockAcpSession(page, {
     title: TITLE,
-    about: readOnly ? { read_only: true } : {},
+    about: { ...(readOnly ? { read_only: true } : {}), ...(nearFull ? REMINDER_ABOUT : {}) },
+    reducedState: nearFull ? WITH_COMPACT : undefined,
     workerState: "absent",
     acpSessionId: "acp-1",
     sessionFields: { is_sandboxed: true, group_path: "infra", acp_agent: "claude" },
-    initialEvents: [{ AgentStartupError: { message: MESSAGE, cause: { kind: "container_missing" } } }],
+    initialEvents: [
+      ...(nearFull ? NEAR_FULL : []),
+      { AgentStartupError: { message: MESSAGE, cause: { kind: "container_missing" } } },
+    ],
   });
   const recreates: string[] = [];
   await page.route("**/api/sessions/*/recreate-container", (r) => {
@@ -124,15 +132,24 @@ test("a queued message can't start the Session either", async ({ page }) => {
   await expect(action).toHaveAttribute("aria-label", "Recreate the container to send messages.");
 });
 
-test("an untyped startup error keeps the composer, as on main", async ({ page }) => {
+test("the compaction reminder's Compact now can't start the Session", async ({ page }) => {
+  await openGoneSession(page, { nearFull: true });
+  // The untyped case below shows the reminder from the same events, so its absence here is the block.
+  await expect(page.getByTestId("compaction-reminder")).toHaveCount(0);
+});
+
+test("an untyped startup error keeps the composer and the compaction reminder, as on main", async ({ page }) => {
   const mock = await mockAcpSession(page, {
     title: TITLE,
+    about: REMINDER_ABOUT,
+    reducedState: WITH_COMPACT,
     workerState: "absent",
     acpSessionId: "acp-1",
     sessionFields: { is_sandboxed: true, acp_agent: "claude" },
-    initialEvents: [{ AgentStartupError: { message: MESSAGE } }],
+    initialEvents: [...NEAR_FULL, { AgentStartupError: { message: MESSAGE } }],
   });
   await openStructuredSession(page, mock);
   await expect(page.getByTestId("startup-error-banner")).toBeVisible();
   await expect(composer(page)).toBeEnabled();
+  await expect(page.getByTestId("compaction-reminder").getByRole("button", { name: "Compact now" })).toBeVisible();
 });
