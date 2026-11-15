@@ -254,7 +254,7 @@ pub(crate) fn terminal_recovery_observation(row: &Instance) -> RecoveryObservati
         && row.agent_pane.legacy_tool.is_none();
     let runtime = match row.agent_pane.state {
         PanePresence::Alive if owned => RuntimeEvidence::PaneAlive,
-        PanePresence::Dead | PanePresence::Absent => {
+        PanePresence::Dead => {
             RuntimeEvidence::PaneExited { exit_code: None }
         }
         _ => RuntimeEvidence::Unknown,
@@ -289,7 +289,8 @@ pub(crate) fn terminal_recovery_observation(row: &Instance) -> RecoveryObservati
         owned_input: owned,
         owned_runtime: owned,
         same_qualified,
-        replacement_qualified: owned || matches!(runtime, RuntimeEvidence::PaneExited { .. }),
+        replacement_qualified: owned
+            || matches!(row.agent_pane.state, PanePresence::Dead | PanePresence::Absent),
         channel_unavailable: false,
     }
 }
@@ -545,6 +546,11 @@ mod recovery_tests {
     fn confirmed_terminal_exit_offers_explicit_fresh_without_inventing_same_or_stop_authority() {
         let mut row = Instance::new("exited recovery", "/tmp/project");
         row.status = Status::Stopped;
+        row.agent_pane.state = PanePresence::Absent;
+        let absent = terminal_recovery_observation(&row);
+        assert_eq!(absent.runtime, RuntimeEvidence::Unknown);
+        assert!(!absent.owned_input && !absent.owned_runtime);
+        assert!(SessionRecovery::project(&row, absent, "opaque".into(), true).is_none());
         row.agent_pane.state = PanePresence::Dead;
         row.agent_session_id = Some("unqualified-history".into());
         let recovery = SessionRecovery::project(
