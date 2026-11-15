@@ -294,6 +294,26 @@ pub(crate) fn first_pane_id_with_deadline(
         .next()
 }
 
+/// An empty tmux server answers session-scoped commands with `no current
+/// target`; a successful `list-sessions` that omits `name` proves absence.
+fn no_current_target_proves_absent(
+    stderr: &str,
+    name: &str,
+    deadline: &crate::tmux::TmuxCommandDeadline,
+) -> bool {
+    stderr
+        .lines()
+        .any(|line| line.trim() == "no current target")
+        && deadline
+            .run(crate::tmux::tmux_query_command().args(["list-sessions", "-F", "#{session_name}"]))
+            .is_ok_and(|inventory| {
+                inventory.status.success()
+                    && std::str::from_utf8(&inventory.stdout).is_ok_and(|names| {
+                        !names.split_terminator('\n').any(|session| session == name)
+                    })
+            })
+}
+
 enum PaneListLookup {
     Panes(Vec<String>),
     Missing,
@@ -318,10 +338,12 @@ fn first_window_pane_ids_classified(
         return PaneListLookup::Unknown;
     };
     if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
         return if tmux_no_server_running(&output.stderr)
-            || String::from_utf8_lossy(&output.stderr)
+            || stderr
                 .lines()
                 .any(|line| line.trim().starts_with("can't find session:"))
+            || no_current_target_proves_absent(&stderr, session_name, deadline)
         {
             PaneListLookup::Missing
         } else {
@@ -574,22 +596,11 @@ pub(crate) fn kill_session_if_present(name: &str) -> Result<()> {
                 .lines()
                 .any(|line| line.trim().starts_with("can't find session:"));
         if !absent {
-            let confirmed_missing = stderr
-                .lines()
-                .any(|line| line.trim() == "no current target")
-                && crate::tmux::run_tmux_command_with_timeout(
-                    crate::tmux::tmux_query_command().args([
-                        "list-sessions",
-                        "-F",
-                        "#{session_name}",
-                    ]),
-                )
-                .is_ok_and(|inventory| {
-                    inventory.status.success()
-                        && std::str::from_utf8(&inventory.stdout).is_ok_and(|names| {
-                            !names.split_terminator('\n').any(|session| session == name)
-                        })
-                });
+            let confirmed_missing = no_current_target_proves_absent(
+                &stderr,
+                name,
+                &crate::tmux::TmuxCommandDeadline::new(),
+            );
             if !confirmed_missing {
                 bail!("Failed to kill tmux session '{}': {}", name, stderr);
             }
@@ -1244,6 +1255,16 @@ mod tests {
                 "the private server must be live and empty"
             );
             kill_session_if_present("missing|proof").unwrap();
+            assert!(
+                matches!(
+                    first_window_pane_ids_classified(
+                        "missing|proof",
+                        &crate::tmux::TmuxCommandDeadline::new()
+                    ),
+                    PaneListLookup::Missing
+                ),
+                "an empty server must classify the pane list as Missing"
+            );
             let still_empty = inventory();
             assert!(still_empty.status.success() && still_empty.stdout.is_empty());
             assert!(

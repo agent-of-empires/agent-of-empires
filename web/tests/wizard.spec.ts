@@ -127,6 +127,24 @@ test.describe("essentials", () => {
   });
 });
 
+test.describe("panels focus their first field", () => {
+  test("Worktree focuses the branch name, Sandbox the image, Agent the selected agent", async ({ page }) => {
+    await startWizard(page, {
+      docker: true,
+      settings: { worktree: { enabled: true }, sandbox: { enabled_by_default: true } },
+    });
+    const w = wizard(page);
+    await openPanel(page, "Worktree");
+    await expect(w.getByPlaceholder(BRANCH_PLACEHOLDER)).toBeFocused();
+    await closePanel(page);
+    await openPanel(page, "Sandbox");
+    await expect(w.getByLabel("Container image")).toBeFocused();
+    await closePanel(page);
+    await openPanel(page, "Agent");
+    await expect(w.getByRole("button", { name: "claude", exact: true })).toBeFocused();
+  });
+});
+
 test.describe("create progress", () => {
   test("a slow create shows the running hook and its output, and can continue in the background", async ({ page }) => {
     let release!: () => void;
@@ -725,6 +743,80 @@ test.describe("Sandbox row", () => {
       });
     }
   });
+
+  for (const width of [375, 1280]) {
+    test(`pulls the latest image first, and a failed pull relaunches with both in view, at ${width}px`, async ({
+      page,
+    }) => {
+      const image = "ghcr.io/example-org/sandbox:2026.11";
+      await page.route("**/api/sandbox/image-status**", (r) =>
+        r.fulfill({
+          json: {
+            image,
+            state: "available",
+            remote_digest: "sha256:b",
+            dismissed: false,
+            pull_blocked: null,
+            pull_command: `docker pull ${image}`,
+          },
+        }),
+      );
+      await page.route("**/api/sandbox/volume-ignores-preview**", (r) =>
+        r.fulfill({ json: { acknowledged: true, globs: [] } }),
+      );
+      await page.route("**/api/sessions/create-progress/**", (r) =>
+        r.fulfill({ json: { stage: "pulling_image", hook: null, output: [] } }),
+      );
+      let release!: () => void;
+      const held = new Promise<void>((resolve) => (release = resolve));
+      const created = await startWizard(page, {
+        docker: true,
+        settings: { sandbox: { enabled_by_default: true, default_image: image } },
+        onCreate: async (_body, route) => {
+          if (created.length > 1) return undefined;
+          await held;
+          await route.fulfill({
+            status: 400,
+            json: {
+              error: "sandbox_image_update_failed",
+              message: `Couldn't pull the latest Sandbox image ${image}.`,
+              stage: "pulling_image",
+              reference: "3f9c1a2b-77d0-4e0b-9b1f-0d3b5c2a11a1",
+            },
+          });
+          return true;
+        },
+      });
+      await page.setViewportSize({ width, height: width === 375 ? 812 : 800 });
+      const w = wizard(page);
+      const box = w.getByRole("checkbox", { name: "Pull latest image first" });
+      await expect(box).toBeChecked();
+      await expect(box).toBeInViewport();
+      await launch(page);
+
+      await expect(w.getByTestId("create-progress")).toContainText("Pulling latest image");
+      await expect(w.getByText("A large image can take a few minutes to download.")).toBeVisible();
+      expect(created[0]!.pull_latest_image).toBe(true);
+      release();
+
+      const failure = w.getByRole("alert").filter({ hasText: "Couldn't pull the latest image" });
+      await expect(failure).toContainText("The session wasn't created.");
+      const relaunch = failure.getByRole("button", { name: "Launch with current image" });
+      await expect(relaunch).toBeInViewport();
+      // The failure box grows the footer; the box it blames stays readable above it.
+      await expect(w.getByTestId("wizard-pull-latest")).toBeInViewport({ ratio: 1 });
+      const overflow = await page.evaluate(
+        () => document.documentElement.scrollWidth - document.documentElement.clientWidth,
+      );
+      expect(overflow).toBeLessThanOrEqual(0);
+
+      await relaunch.click();
+      await expect.poll(() => created.length).toBe(2);
+      expect(created[1]!.pull_latest_image).toBeUndefined();
+      expect(created[1]!.sandbox).toBe(true);
+      expect(created[1]!.idempotency_key).not.toBe(created[0]!.idempotency_key);
+    });
+  }
 
   // The longest cue and status together are wider than the md+ modal's 256px summary.
   for (const width of [1280, 375]) {

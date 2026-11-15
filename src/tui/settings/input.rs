@@ -893,7 +893,8 @@ fn validate_agent_key_value(text: &str) -> Result<(), String> {
         return Err("Value cannot be empty".to_string());
     }
 
-    if crate::agents::get_agent(key).is_none() {
+    // A retained native identity stays addressable while a declaration offers it.
+    if crate::agents::get_agent(key).is_none() && crate::agents::native_definition(key).is_none() {
         let names = crate::agents::agent_names().join(", ");
         return Err(format!(
             "'{}' is not a known agent. Known agents: {}",
@@ -962,7 +963,9 @@ fn validate_detect_as_entry(text: &str) -> Result<(), String> {
     if value.is_empty() {
         return Err("Built-in agent name cannot be empty".to_string());
     }
-    if crate::agents::get_agent(value).is_none() {
+    if crate::agents::get_agent(value).is_none()
+        && crate::agents::native_definition(value).is_none()
+    {
         let names = crate::agents::agent_names().join(", ");
         return Err(format!(
             "'{}' is not a known built-in agent. Known agents: {}",
@@ -975,6 +978,25 @@ fn validate_detect_as_entry(text: &str) -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Entries naming a tool a declaration took over stay editable, while
+    /// genuinely unknown tools are still refused.
+    #[test]
+    #[serial_test::serial]
+    fn retained_native_identities_stay_valid_after_takeover() {
+        let dir = tempfile::tempdir().unwrap();
+        // Declared first so it reloads after the app directory is restored.
+        let _reload = crate::plugin::ReloadRegistryOnDrop;
+        let _app = crate::session::test_support::isolate_app_dir_at(dir.path());
+        crate::session::test_support::install_omp_takeover("omp-next");
+        assert!(crate::agents::get_agent("omp").is_none());
+
+        assert_eq!(validate_agent_key_value("omp=--verbose"), Ok(()));
+        assert_eq!(validate_agent_key_value("omp=omp-next --verbose"), Ok(()));
+        assert_eq!(validate_detect_as_entry("my-wrapper=omp"), Ok(()));
+        assert!(validate_agent_key_value("not-a-tool=--verbose").is_err());
+        assert!(validate_detect_as_entry("my-wrapper=not-a-tool").is_err());
+    }
 
     #[test]
     fn list_entry_validators() {

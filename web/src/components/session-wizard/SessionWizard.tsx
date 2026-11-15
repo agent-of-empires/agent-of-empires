@@ -54,7 +54,7 @@ import { SandboxPanel } from "./steps/SandboxPanel";
 import { ProfilePresetPicker } from "./steps/ProfilePresetPicker";
 import { GroupCombobox } from "./steps/GroupCombobox";
 import { CreateFailureBox } from "./CreateFailureBox";
-import { failureView, type FailureAction } from "./createFailureView";
+import { failureFields, failureView, type FailureAction } from "./createFailureView";
 import { CreateProgressView } from "./CreateProgressView";
 import { FieldRow, NavRow, PanelHeader, ROW_INPUT, RowGroup, SegmentedRow, SwitchRow } from "./WizardRows";
 import { LaunchFooter } from "./LaunchFooter";
@@ -63,6 +63,10 @@ import { buildCreateRequest, launchEligible } from "./createRequest";
 import { commandMapsFromSettings, EMPTY_COMMAND_MAPS, type CommandMaps } from "./commandMaps";
 import { profileDefaults, type ProfileDefaults } from "./profileDefaults";
 import { useSandboxImageRowStatus } from "./useSandboxImageRowStatus";
+import { useLatestRef } from "../../hooks/useLatestRef";
+import { PULL_GATED_HINT, PULL_LATEST_HINT, pullLatestChecked, pullLatestOffer } from "./pullLatestImage";
+import { CopyCommand } from "../SandboxImageBanner";
+import { notifySandboxImagePulled } from "../../lib/sandboxImageEvents";
 
 // Validated against ACP_CAPABLE_TOOLS on read, since another install may have written it.
 const LAST_USED_TOOL_KEY = "aoe-acp-last-tool";
@@ -269,6 +273,12 @@ export function SessionWizard({
   const [runtimeDown, setRuntimeDown] = useState(false);
   const [rechecking, setRechecking] = useState(false);
   const viewGroupRef = useRef<HTMLDivElement>(null);
+  const pullLatestRef = useRef<HTMLDivElement>(null);
+  // The failure box grows the footer and shrinks the form above it; keep the pull box it blames in view.
+  useEffect(() => {
+    if (state.failure && failureFields(state.failure).includes("pullLatestImage"))
+      pullLatestRef.current?.scrollIntoView({ block: "nearest" });
+  }, [state.failure]);
   const offline = useServerDown();
   const [progress, setProgress] = useState<CreateProgress | null>(restore?.progress ?? null);
   // The latest snapshot, which a backgrounded create keeps polling once the wizard is gone.
@@ -719,6 +729,7 @@ export function SessionWizard({
         safeSetItem(LAST_USED_INSTRUCTION_KEY, body.custom_instruction ?? "");
         if (body.path.startsWith("/")) safeSetItem(LAST_USED_PROJECT_KEY, body.path);
         for (const w of result.session?.warnings ?? []) toastBus.handler?.error(w);
+        if (body.pull_latest_image) notifySandboxImagePulled();
         if (background) onCreatedInBackground?.(result.session);
         else onCreated(result.session);
       } else if (background) {
@@ -788,7 +799,7 @@ export function SessionWizard({
           agents.find((a) => a.name === d.tool),
           d,
         ),
-        { skipOnCreate },
+        { skipOnCreate, pullLatest: pullLatestChecked(pullOfferRef.current, d.pullLatestImage) },
       ),
       idempotency_key: newIdempotencyKey(),
     };
@@ -912,6 +923,10 @@ export function SessionWizard({
       case "choose_project":
         setPanel("project");
         return;
+      case "launch_with_current_image":
+        handleChange("pullLatestImage", false);
+        await handleSubmit({ pullLatestImage: false });
+        return;
       case "try_again":
         await handleSubmit();
         return;
@@ -967,6 +982,11 @@ export function SessionWizard({
       ? `${state.dockerRuntimeName ?? "Container runtime"} is not running`
       : null;
   const imageStatus = useSandboxImageRowStatus(d.sandboxImage, defaultsReady && d.sandboxEnabled && !sandboxBlocked);
+  const pullOffer = pullLatestOffer(imageStatus?.reply, {
+    sandbox: d.sandboxEnabled && !sandboxBlocked,
+    structured: structuredOn,
+  });
+  const pullOfferRef = useLatestRef(pullOffer);
   // Locked on without touching the stored value, so another agent gets it back.
   const alwaysYolo = (structuredOn ? selectedAgent?.acp_always_yolo : selectedAgent?.always_yolo) === true;
   const agentCustomized = !!(d.extraArgs || d.commandOverride || d.customInstruction);
@@ -1167,7 +1187,7 @@ export function SessionWizard({
           highlight={failed?.row === "sandbox" ? "error" : undefined}
           summary={
             sandboxBlocked == null && d.sandboxEnabled ? (
-              <SandboxImageSummary cue={sandboxCue} status={imageStatus} image={d.sandboxImage} />
+              <SandboxImageSummary cue={sandboxCue} status={imageStatus?.label ?? null} image={d.sandboxImage} />
             ) : (
               <>
                 {sandboxCue && <span className="text-status-error">{sandboxCue} · </span>}
@@ -1186,6 +1206,33 @@ export function SessionWizard({
           />
         </FieldRow>
       </RowGroup>
+      {pullOffer && (
+        <div ref={pullLatestRef} className="mt-3 flex flex-col gap-1" data-testid="wizard-pull-latest">
+          <label className={`flex items-center gap-2 ${pullOffer.command ? "" : "cursor-pointer"}`}>
+            <input
+              type="checkbox"
+              className="accent-brand-600"
+              checked={pullLatestChecked(pullOffer, d.pullLatestImage)}
+              disabled={!!pullOffer.command}
+              onChange={(e) => handleChange("pullLatestImage", e.target.checked)}
+              aria-describedby="wizard-pull-latest-hint"
+            />
+            <span className={`text-sm ${pullOffer.command ? "text-text-dim" : "text-text-secondary"}`}>
+              Pull latest image first
+            </span>
+          </label>
+          <div id="wizard-pull-latest-hint" className="pl-6 text-xs text-text-secondary" aria-live="polite">
+            {pullOffer.command ? (
+              <>
+                <CopyCommand command={pullOffer.command} />
+                <span className="block">{PULL_GATED_HINT}</span>
+              </>
+            ) : (
+              PULL_LATEST_HINT
+            )}
+          </div>
+        </div>
+      )}
     </div>
   );
 

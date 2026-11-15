@@ -1185,6 +1185,23 @@ pub struct SessionConfig {
     )]
     pub sidebar_position: SidebarPosition,
 
+    /// What the TUI does with the list and preview once the terminal is too
+    /// narrow for them to sit side by side (below 80 columns). `Stacked` keeps
+    /// the historical list-above-preview split, `OnePane` shows only one at a
+    /// time (the list, or the preview in live mode), and `BigPreview` keeps the
+    /// split but shrinks the list to its minimum while live mode is relaying
+    /// keys.
+    #[serde(default)]
+    #[setting(
+        label = "Narrow terminal layout",
+        widget = "select",
+        options = "stacked:Stacked,one_pane:One pane at a time,big_preview:Big live preview",
+        global_only,
+        tui_only,
+        summary = "On narrow terminals: stack the list over the preview, show one at a time, or give live mode most of the screen."
+    )]
+    pub narrow_layout: NarrowLayout,
+
     /// Percentage of split preview rows allocated to the paired terminal.
     #[serde(default = "default_split_terminal_height_percent")]
     #[setting(
@@ -2223,6 +2240,23 @@ pub enum SidebarPosition {
     Right,
 }
 
+/// How the TUI arranges the session list and preview on a narrow terminal, below
+/// 80 columns. See `SessionConfig::narrow_layout`.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum NarrowLayout {
+    /// List above the preview, splitting the height (the historical behavior).
+    #[default]
+    Stacked,
+    /// One pane at a time: the list, and the preview while it is the pane being
+    /// worked in (live-send, an interactive structured transcript, a retained
+    /// trashed transcript, or System Health).
+    OnePane,
+    /// List above the preview, with the list squeezed to its minimum while the
+    /// preview is the pane being worked in, so it gets the rest of the height.
+    BigPreview,
+}
+
 /// What to render in the per-row tag slot next to the session title.
 ///
 /// Defaults to `Branch` to preserve worktree branch visibility. Users can pick
@@ -2253,6 +2287,7 @@ impl Default for SessionConfig {
             pre_trust_agent_folders: false,
             show_diagnostics_pane: false,
             sidebar_position: SidebarPosition::default(),
+            narrow_layout: NarrowLayout::default(),
             split_terminal_height_percent: default_split_terminal_height_percent(),
             split_terminal_min_width: default_split_terminal_min_width(),
             split_terminal_min_height: default_split_terminal_min_height(),
@@ -2710,12 +2745,82 @@ pub struct ServeConfig {
         summary = "Port for a newly started Daemon. A restart keeps the running Daemon's port."
     )]
     pub port: u16,
+
+    /// Public HTTPS port for a Tailscale Funnel started by `aoe serve --remote` or Remote
+    /// Access. `--funnel-port` takes precedence. A quoted string in `config.toml`:
+    /// `funnel_port = "8443"`.
+    #[serde(default)]
+    #[setting(
+        label = "Funnel port",
+        widget = "select",
+        options = "443:443,8443:8443,10000:10000",
+        global_only,
+        summary = "Public port for a Tailscale Funnel, so two Daemons on one machine can each have one. In config.toml write it quoted, as funnel_port = \"8443\"."
+    )]
+    pub funnel_port: FunnelPort,
 }
 
 impl Default for ServeConfig {
     fn default() -> Self {
         Self {
             port: DEFAULT_SERVE_PORT,
+            funnel_port: FunnelPort::default(),
+        }
+    }
+}
+
+/// The ports Tailscale Funnel can listen on.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, clap::ValueEnum)]
+pub enum FunnelPort {
+    #[default]
+    #[serde(rename = "443")]
+    #[value(name = "443")]
+    Port443,
+    #[serde(rename = "8443")]
+    #[value(name = "8443")]
+    Port8443,
+    #[serde(rename = "10000")]
+    #[value(name = "10000")]
+    Port10000,
+}
+
+impl<'de> Deserialize<'de> for FunnelPort {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        struct Visitor;
+        impl serde::de::Visitor<'_> for Visitor {
+            type Value = FunnelPort;
+            fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+                f.write_str(r#"a quoted Funnel port: "443", "8443" or "10000""#)
+            }
+            fn visit_str<E: serde::de::Error>(self, value: &str) -> Result<FunnelPort, E> {
+                FunnelPort::ALL
+                    .into_iter()
+                    .find(|port| port.number().to_string() == value)
+                    .ok_or_else(|| E::invalid_value(serde::de::Unexpected::Str(value), &self))
+            }
+            fn visit_i64<E: serde::de::Error>(self, value: i64) -> Result<FunnelPort, E> {
+                Err(E::custom(format!(
+                    r#"funnel_port must be quoted, as funnel_port = "{value}""#
+                )))
+            }
+            fn visit_u64<E: serde::de::Error>(self, value: u64) -> Result<FunnelPort, E> {
+                Err(E::custom(format!(
+                    r#"funnel_port must be quoted, as funnel_port = "{value}""#
+                )))
+            }
+        }
+        deserializer.deserialize_any(Visitor)
+    }
+}
+
+impl FunnelPort {
+    pub const ALL: [FunnelPort; 3] = [Self::Port443, Self::Port8443, Self::Port10000];
+
+    pub fn number(self) -> u16 {
+        match self {
+            Self::Port443 => 443,
+            Self::Port8443 => 8443,
+            Self::Port10000 => 10000,
         }
     }
 }
@@ -2730,6 +2835,12 @@ impl ServeConfig {
                 Ok(Self::default())
             }
         }
+    }
+
+    /// Like [`ServeConfig::load`], but propagates read and parse errors, for callers that act on
+    /// the result destructively. An absent config.toml still yields the defaults.
+    pub(crate) fn load_strict() -> Result<Self> {
+        Self::from_table(&Config::load_raw_table()?)
     }
 
     fn from_table(table: &toml::Table) -> Result<Self> {
@@ -4490,6 +4601,28 @@ mod tests {
         assert_eq!(unrelated.port, DEFAULT_SERVE_PORT);
         assert_eq!(parse("[serve]\nport = 9000").unwrap().port, 9000);
         assert!(parse("[serve]\nport = \"x\"").is_err());
+    }
+
+    #[test]
+    fn funnel_port_reads_only_a_quoted_funnel_port() {
+        // (config.toml [serve] body, the port, or a phrase the error must hold)
+        for (body, want) in [
+            ("", Ok(FunnelPort::Port443)),
+            ("funnel_port = \"8443\"", Ok(FunnelPort::Port8443)),
+            ("funnel_port = \"10000\"", Ok(FunnelPort::Port10000)),
+            (
+                "funnel_port = 8443",
+                Err(r#"funnel_port must be quoted, as funnel_port = "8443""#),
+            ),
+            ("funnel_port = \"8080\"", Err(r#""443", "8443" or "10000""#)),
+        ] {
+            let got = toml::from_str::<ServeConfig>(body).map(|serve| serve.funnel_port);
+            match (got, want) {
+                (Ok(got), Ok(want)) => assert_eq!(got, want, "{body}"),
+                (Err(e), Err(phrase)) => assert!(e.to_string().contains(phrase), "{body}: {e}"),
+                (got, _) => panic!("{body}: {got:?}"),
+            }
+        }
     }
 
     #[test]

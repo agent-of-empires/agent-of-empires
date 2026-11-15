@@ -3,6 +3,33 @@
   "description": "Surface/flow coverage matrix for the agent-of-empires web dashboard. Every component file under web/src/components/** must appear in at least one entry's `components` list (covered, deferred, or out-of-scope), or in coverage-matrix.exempt.json. CI validates this on every PR via tests/validate-coverage-matrix.mjs.",
   "surfaces": [
     {
+      "id": "files.edit-eligibility-recovery",
+      "kind": "vitest",
+      "risk": "high",
+      "specs": [
+        "src/components/diff/__tests__/TextFileEditor.test.tsx",
+        "src/components/diff/__tests__/FileContentViewer.test.tsx"
+      ],
+      "components": ["web/src/components/diff/TextFileEditor.tsx", "web/src/components/diff/FileContentViewer.tsx"],
+      "notes": "Sandbox and unsupported-filesystem restrictions disable button and keyboard saves without latching a conflict; eligibility recovery preserves the draft. The viewer explains why atomic replacement is unavailable. Disabling editing hides the editor and restores the same draft and opened version when re-enabled. Pending saves and their results survive remounts without duplicate requests. Session-removal checks include parked drafts. Downloads and new-tab links keep a dirty editor without asking; page links ask."
+    },
+    {
+      "id": "files.edit-existing-text",
+      "kind": "live-playwright",
+      "risk": "high",
+      "specs": ["tests/live/file-editing.spec.ts"],
+      "components": [
+        "web/src/App.tsx",
+        "web/src/components/diff/TextFileEditor.tsx",
+        "web/src/components/diff/FileContentViewer.tsx",
+        "web/src/components/FilesPane.tsx",
+        "web/src/components/settings/PanelsSettings.tsx",
+        "web/src/components/MobileMainPane.tsx",
+        "web/src/components/acp/Composer.tsx"
+      ],
+      "notes": "Opt-in setting, exact saved bytes and mode, conflicts, dirty pane navigation, refusal of active-session Trash and permanent deletion when file discard is declined, read-only refusal, and mobile controls."
+    },
+    {
       "id": "settings.plugin-agent-consent",
       "kind": "vitest",
       "risk": "high",
@@ -951,7 +978,7 @@
       "risk": "medium",
       "specs": ["src/components/__tests__/SettingsView.folds.test.tsx"],
       "components": ["web/src/components/SettingsView.tsx", "web/src/components/settings/FormFields.tsx"],
-      "notes": "The Updates tab shows the Daemon port (`serve.port`) under a Daemon heading; editing it saves `{ serve: { port } }` through the normal settings path. Global only; a new value applies after a stop and start."
+      "notes": "The Updates tab shows the Daemon port (`serve.port`) under a Daemon heading; editing it saves `{ serve: { port } }` through the normal settings path. Global only; a new value applies after a stop and start. The same block renders the Funnel port select (`serve.funnel_port`) from the schema with no web code of its own."
     },
     {
       "id": "settings.global-migration-and-persistence",
@@ -1516,6 +1543,28 @@
       "notes": "With Sandbox on and available, the row leads with /api/sandbox/image-status for the image the wizard will use (sandboxImage, seeded from the Profile's sandbox.default_image; empty asks for the default): Update available, Up to date, Couldn't check for updates (check_failed), Downloads on launch (unknown with reason not_pulled), and Update status unknown for any other unknown reason, a refusal such as unknown_image for an edited image that isn't configured, or no answer; then ' · <image>'. The first answered check of an opening sends fresh=true; an edit waits 500 ms after the last keystroke and asks from the cache, and a late answer for a previous image is dropped. Off, blocked or before the Profile's defaults settle, the row asks nothing. At 375px the status stays whole and only the image truncates."
     },
     {
+      "id": "wizard.pull-latest-image",
+      "kind": "mocked-playwright",
+      "risk": "medium",
+      "specs": [
+        "tests/wizard.spec.ts",
+        "src/components/session-wizard/__tests__/SessionWizard.test.tsx",
+        "src/components/session-wizard/pullLatestImage.test.ts",
+        "src/components/session-wizard/createRequest.test.ts",
+        "src/components/session-wizard/createFailureView.test.ts",
+        "src/components/session-wizard/wizardReducer.test.ts",
+        "src/components/session-wizard/__tests__/CreateProgressView.test.tsx"
+      ],
+      "components": [
+        "web/src/components/session-wizard/SessionWizard.tsx",
+        "web/src/components/session-wizard/pullLatestImage.ts",
+        "web/src/components/session-wizard/createRequest.ts",
+        "web/src/components/session-wizard/createFailureView.ts",
+        "web/src/components/session-wizard/CreateProgressView.tsx"
+      ],
+      "notes": "\"Pull latest image first\" shows under the rows only for a Structured view Sandbox whose image status is available; Terminal view, other states and refusals show the row status only. It is checked by default, unchecked once the update was dismissed, and Launch sends pull_latest_image only while it is checked. When the Daemon won't pull (pull_blocked), it is disabled and shows pull_command with Copy and 'Run this on the Daemon's machine, then reopen this dialog.' The create shows 'Pulling latest image' with a few-minutes hint. A failed pull (sandbox_image_update_failed), or a create-time refusal because pulling was turned off (pull_disabled) or the image is no longer configured (unknown_image), shows 'Couldn't pull the latest image', 'The session wasn't created.' and the server's message, with 'Launch with current image', which unchecks the box and resends under a new key; unchecking it by hand also clears the box. After a failed pull, at 375px and 1280px, the relaunch action and the whole checkbox stay in view."
+    },
+    {
       "id": "wizard.agent-lifecycle",
       "kind": "vitest",
       "risk": "low",
@@ -1698,6 +1747,41 @@
       ]
     },
     {
+      "id": "wizard.first-field-autofocus",
+      "kind": "mocked-playwright",
+      "risk": "low",
+      "specs": ["tests/wizard-project.spec.ts", "tests/wizard.spec.ts"],
+      "components": [
+        "web/src/components/DirectoryBrowser.tsx",
+        "web/src/components/session-wizard/steps/AgentPickerEssentials.tsx",
+        "web/src/components/session-wizard/steps/CloneRepoForm.tsx",
+        "web/src/components/session-wizard/steps/ExtraReposPicker.tsx",
+        "web/src/components/session-wizard/steps/ImportSessionPicker.tsx",
+        "web/src/components/session-wizard/steps/LaunchFields.tsx",
+        "web/src/components/session-wizard/steps/ProjectSearchList.tsx",
+        "web/src/components/session-wizard/steps/ProjectStep.tsx",
+        "web/src/components/session-wizard/steps/SandboxPanel.tsx",
+        "web/src/components/session-wizard/steps/WorktreePanel.tsx"
+      ],
+      "notes": "On a fine-pointer device each wizard sub-panel focuses its first editable control on open: the Project and Extra repos search, the Browse filter, the Clone URL, the Import agent select, the Worktree branch name, the Sandbox image, and the selected agent. Fields that appear when projects finish loading keep any focus the user chose meanwhile. A touch device focuses nothing."
+    },
+    {
+      "id": "modals.first-field-autofocus",
+      "kind": "mocked-playwright",
+      "risk": "low",
+      "specs": [
+        "tests/modal-autofocus.spec.ts",
+        "tests/diff-comments.spec.ts",
+        "tests/sidebar-project-settings.spec.ts"
+      ],
+      "components": [
+        "web/src/components/McpServerForm.tsx",
+        "web/src/components/ProjectFormModal.tsx",
+        "web/src/components/diff/comments/SendCommentsDialog.tsx"
+      ],
+      "notes": "On a fine-pointer device the MCP server form focuses Name when adding and Transport when editing, the project form focuses Path when adding and the base branch when editing, and Send diff comments focuses the intro. A touch device focuses nothing."
+    },
+    {
       "id": "wizard.scratch-toggle-visible",
       "kind": "mocked-playwright",
       "risk": "medium",
@@ -1774,7 +1858,7 @@
       "id": "wizard.import-session.unit",
       "kind": "vitest",
       "risk": "high",
-      "notes": "Generic ACP import reads the acknowledged served or explicitly selected profile, waits while Server default is unresolved, never writes the implicit profile choice into the form, clears worktree/container/branch/attach/scratch/extra-repo state, and ignores late registry and profile defaults.",
+      "notes": "Generic ACP import reads the acknowledged served or explicitly selected profile, waits while Server default is unresolved, never writes the implicit profile choice into the form, clears worktree/container/branch/attach/scratch/extra-repo state, and ignores late registry and profile defaults. A plugin-provided tool is importable only while the host still reports its ACP adapter, and a configured custom adapter never qualifies.",
       "specs": [
         "src/components/session-wizard/__tests__/ProjectStep.test.tsx",
         "src/components/session-wizard/__tests__/SessionWizard.test.tsx",
@@ -5648,6 +5732,55 @@
       "risk": "high",
       "specs": ["tests/live/session-lifecycle.spec.ts"],
       "components": ["web/src/components/WorkspaceSidebar.tsx"]
+    },
+    {
+      "id": "sessions.error-recorded",
+      "kind": "mocked-playwright",
+      "risk": "medium",
+      "specs": [
+        "tests/session-error.spec.ts",
+        "src/components/__tests__/SessionErrorPanel.test.tsx",
+        "src/components/__tests__/LiveTerminalView.errorHold.test.tsx"
+      ],
+      "components": ["web/src/components/SessionErrorPanel.tsx", "web/src/components/LiveTerminalView.tsx"],
+      "notes": "Opening a Terminal view Error Session shows <Session> reported an error with AoE's last_error verbatim, Copy error and Restart, instead of ensuring it, which would restart it and clear the error (#5055). Tapping the row reaches it on a phone. Restart starts the terminal once the Session leaves Error; read-only shows no Restart."
+    },
+    {
+      "id": "sessions.error-none-recorded",
+      "kind": "mocked-playwright",
+      "risk": "low",
+      "specs": ["tests/session-error.spec.ts", "src/components/__tests__/SessionErrorPanel.test.tsx"],
+      "components": ["web/src/components/SessionErrorPanel.tsx"],
+      "notes": "An Error Session without a last_error (or a whitespace-only one) says No details were recorded. Restart to try again. and offers no Copy."
+    },
+    {
+      "id": "sessions.error-deleting",
+      "kind": "vitest",
+      "risk": "low",
+      "specs": [
+        "src/components/__tests__/SessionErrorPanel.test.tsx",
+        "src/components/__tests__/LiveTerminalView.errorHold.test.tsx",
+        "src/components/__tests__/SessionRowTriage.test.tsx"
+      ],
+      "components": ["web/src/components/SessionErrorPanel.tsx", "web/src/components/sidebar/SessionRow.tsx"],
+      "notes": "An Error Session deleted from its panel keeps the panel without Restart. A Deleting row's glyph tooltip reads Deleting…."
+    },
+    {
+      "id": "sidebar.error-tooltip-and-badge",
+      "kind": "mocked-playwright",
+      "risk": "low",
+      "specs": [
+        "tests/session-error.spec.ts",
+        "src/components/__tests__/SessionRowTriage.test.tsx",
+        "src/components/__tests__/SidebarGroupHeader.test.tsx",
+        "src/lib/__tests__/statusLegend.test.ts"
+      ],
+      "components": [
+        "web/src/components/sidebar/SessionRow.tsx",
+        "web/src/components/sidebar/SidebarGroupHeader.tsx",
+        "web/src/lib/statusLegend.ts"
+      ],
+      "notes": "A Terminal view Error row's glyph tooltip reads Error plus the first line of last_error, or Error · no details recorded, and the glyph is described by that line. A Structured view Error row keeps its generic meaning. The Group badge says 3 Sessions need attention · 2 have errors, or 2 Sessions have errors when all are errors."
     },
     {
       "id": "settings.plugins",

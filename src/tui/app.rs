@@ -624,8 +624,6 @@ impl App {
         crate::tmux::spawn_snapshot_poller();
 
         crate::tui::clear_terminal(terminal)?;
-        // This clear satisfies any pending redraw; honoring it on the first tick
-        // would blank the first frame until the next paint.
         self.needs_redraw = false;
         self.sync_mouse_capture(terminal)?;
         self.draw(terminal)?;
@@ -710,9 +708,12 @@ impl App {
         let mut last_telemetry_snapshot = std::time::Instant::now();
 
         loop {
+            // Paint the redraw now: clearing alone leaves a blank screen until the
+            // next event arrives, which never comes while the loop is parked.
             if self.needs_redraw {
                 crate::tui::clear_terminal(terminal)?;
                 self.needs_redraw = false;
+                self.draw(terminal)?;
             }
 
             let post_key_deadline = last_live_key_at.map(|t| t + POST_KEY_WAKE_DELAY);
