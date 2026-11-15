@@ -836,6 +836,7 @@ export interface PluginAgentIntegration {
   command?: string;
   provider_versions?: string[];
   replies?: boolean;
+  send_keys_enter_delay_ms?: number;
   launch?: PluginAgentLaunch;
   detection?: { mode: "native_only" };
   reply_fallback?: { allow: PluginAgentKey[]; deny: PluginAgentKey[]; allow_always?: PluginAgentKey[] };

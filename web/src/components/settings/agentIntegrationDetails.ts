@@ -51,6 +51,9 @@ export function agentIntegrationDetails(agent: PluginAgentIntegration): string[]
   if (agent.detection) details.push(`detection: ${agent.detection.mode}`);
   if (agent.provider_versions?.length) details.push(`provider versions: ${agent.provider_versions.join(", ")}`);
   details.push(`native replies: ${agent.replies ? "yes" : "no"}`);
+  if (agent.send_keys_enter_delay_ms) {
+    details.push(`send Enter delay: ${agent.send_keys_enter_delay_ms} ms`);
+  }
   if (agent.reply_fallback) {
     const label = (key: { kind: string; value: string }) =>
       key.kind === "named" ? key.value : JSON.stringify(key.value);

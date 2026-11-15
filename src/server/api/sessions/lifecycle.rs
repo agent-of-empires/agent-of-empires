@@ -3519,6 +3519,7 @@ async fn prepare_agent_session_inner(
                     row.title.clone(),
                     row.tool.clone(),
                     wake_message,
+                    crate::plugin::agent_integration::send_keys_enter_delay(row),
                     Some((profile.clone(), generation)),
                 );
             }

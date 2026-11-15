@@ -988,6 +988,11 @@ impl NewSessionDialog {
         self.agent_detect_as = config.session.agent_detect_as.clone();
         self.custom_agents = config.session.custom_agents.clone();
         self.agent_command_override = config.session.agent_command_override.clone();
+        if self.selected_tool_host_only() {
+            self.sandbox_enabled = false;
+            self.worktree_enabled = false;
+            self.worktree_branch.reset();
+        }
         self.structured_capable = !self.terminal_fork()
             && compute_structured_capable(&self.available_tools[self.tool_index], config);
         self.apply_structured_default();
@@ -1136,6 +1141,9 @@ impl NewSessionDialog {
             ProjectOverridesLookup::Known(overrides) => overrides,
             ProjectOverridesLookup::Unknown => None,
         };
+        self.agent_detect_as = config.session.agent_detect_as.clone();
+        self.custom_agents = config.session.custom_agents.clone();
+        self.agent_command_override = config.session.agent_command_override.clone();
         self.sandbox_enabled = self.docker_available
             && overrides
                 .as_ref()
@@ -1179,9 +1187,6 @@ impl NewSessionDialog {
         self.structured_capable =
             !self.terminal_fork() && compute_structured_capable(selected_tool, &config);
         self.agent_acp_cmd = config.session.agent_acp_cmd.clone();
-        self.agent_detect_as = config.session.agent_detect_as.clone();
-        self.custom_agents = config.session.custom_agents.clone();
-        self.agent_command_override = config.session.agent_command_override.clone();
         self.apply_structured_default();
         self.tool_config_mode = false;
         self.tool_config_focused_field = 0;

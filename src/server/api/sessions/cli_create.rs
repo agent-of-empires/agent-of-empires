@@ -257,6 +257,19 @@ fn resolve_host_creation(
     if let Some(command) = options.command.as_deref() {
         body.tool = crate::agents::resolve_tool_name(command)
             .map(str::to_owned)
+            .or_else(|| {
+                let words = shell_words::split(command).ok()?;
+                let executable = aoe_plugin_api::agent_integration::launch_prefix(command)
+                    .and_then(|(words, _)| words.last().copied())
+                    .or_else(|| words.first().map(String::as_str))?;
+                let name = std::path::Path::new(executable).file_name()?.to_str()?;
+                config
+                    .session
+                    .custom_agents
+                    .get(name)
+                    .filter(|command| !command.trim().is_empty())
+                    .map(|_| name.to_owned())
+            })
             .or_else(|| plugin_tool(command))
             .with_context(|| unknown_tool(&format!("Unknown tool in command: {command}")))?;
         if command.trim().contains(' ')

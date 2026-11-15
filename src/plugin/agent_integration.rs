@@ -136,12 +136,16 @@ pub(crate) fn resolve_declared_tool<'a>(
         .and_then(|(words, _)| words.last().copied())
         .or_else(|| words.first().map(String::as_str))?;
     let basename = std::path::Path::new(executable).file_name()?.to_str()?;
+    let custom_names: Vec<_> = custom_names.into_iter().collect();
+    if custom_names.contains(&basename) {
+        return None;
+    }
     let mut best: Option<(&str, usize)> = None;
     let mut ambiguous = false;
     for candidate in catalog(
         registry,
         crate::agents::AGENTS.iter().map(|agent| agent.name),
-        custom_names,
+        custom_names.iter().copied(),
     ) {
         let plugin = registry.get(candidate.plugin)?;
         let entry = plugin
@@ -551,6 +555,10 @@ pub fn consent_lines(integration: &AgentIntegrationContribution) -> Vec<String> 
     lines.push(format!(
         "  native replies: {}",
         if integration.replies { "yes" } else { "no" }
+    ));
+    lines.push(format!(
+        "  send_keys_enter_delay_ms: {} ms",
+        integration.send_keys_enter_delay_ms
     ));
     if let Some(reply) = &integration.reply_fallback {
         let labels = |keys: &[AgentKeyDeclaration]| {
@@ -1058,6 +1066,10 @@ deny = [{ kind = "literal", value = "n" }]
         );
         assert_eq!(
             resolve_declared_tool(&registry, "unrelated other-helper", std::iter::empty()),
+            None
+        );
+        assert_eq!(
+            resolve_declared_tool(&registry, "/opt/other-helper --flag", ["other-helper"]),
             None
         );
         let models = [("example-helper".to_string(), "model x".to_string())]
@@ -1685,6 +1697,22 @@ sandbox = "unsupported"
         assert_eq!(display_command("x\u{202e}tail"), "x\\u{202e}tail");
         // Any Unicode Format character, including tag characters, is escaped.
         assert_eq!(display_command("x\u{E0001}tail"), "x\\u{e0001}tail");
+    }
+
+    #[test]
+    fn consent_lines_disclose_enter_delay() {
+        let mut integration = AgentIntegrationContribution {
+            tool: "helper".into(),
+            command: Some("helper".into()),
+            ..Default::default()
+        };
+        let before = consent_lines(&integration);
+        integration.send_keys_enter_delay_ms = 275;
+        let after = consent_lines(&integration);
+        assert_ne!(before, after);
+        assert!(after
+            .iter()
+            .any(|line| line.contains("send_keys_enter_delay_ms: 275 ms")));
     }
 
     #[test]

@@ -183,6 +183,9 @@ impl Instance {
         let Some(row) = storage.load()?.into_iter().find(|row| row.id == self.id) else {
             return Err(SessionGone.into());
         };
+        if row.lifecycle_generation != self.lifecycle_generation {
+            return Err(SessionGone.into());
+        }
         row.ensure_startable()?;
         Ok(lock)
     }
@@ -225,6 +228,34 @@ impl Instance {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    #[serial_test::serial]
+    fn input_lock_rejects_a_replaced_generation() {
+        let home = tempfile::tempdir().unwrap();
+        let _home = crate::session::test_support::isolate_home(home.path());
+        let storage = crate::session::Storage::new_unwatched("default").unwrap();
+        let mut instance = Instance::new("input", "/tmp/test");
+        instance.source_profile = "default".into();
+        storage
+            .update(|rows, _| {
+                rows.push(instance.clone());
+                Ok(())
+            })
+            .unwrap();
+        drop(instance.lock_for_input().unwrap());
+        storage
+            .update(|rows, _| {
+                rows[0].lifecycle_generation += 1;
+                Ok(())
+            })
+            .unwrap();
+        let error = instance
+            .lock_for_input()
+            .err()
+            .expect("stale input must be refused");
+        assert!(error.is::<SessionGone>());
+    }
 
     #[test]
     fn test_ensure_pane_ready_bails_on_creating() {

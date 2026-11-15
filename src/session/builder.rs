@@ -795,11 +795,17 @@ pub(crate) fn plan_instance(
                 .map(|(name, _)| name.as_str()),
         );
         if declared.as_ref().is_some_and(|agent| {
-            agent
-                .contribution()
-                .launch
-                .as_ref()
-                .is_some_and(|launch| launch.host_only)
+            let command = if params.command_override.is_empty() {
+                config.session.resolve_tool_command(&params.tool)
+            } else {
+                params.command_override.clone()
+            };
+            agent.contribution().command.as_deref() == Some(command.as_str())
+                && agent
+                    .contribution()
+                    .launch
+                    .as_ref()
+                    .is_some_and(|launch| launch.host_only)
         }) {
             if params.sandbox {
                 bail!(

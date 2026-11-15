@@ -75,7 +75,7 @@ fn resolved_yolo<'a>(
 /// shell operator instead of the agent, because the command is not a plain
 /// invocation. Every such argument is positional argv for the agent.
 fn declared_args_need_direct_launch(command: &str) -> bool {
-    aoe_plugin_api::agent_integration::direct_launch_words(command).is_none()
+    Instance::contains_active_shell_syntax(command) || parse_launch_command(command).is_none()
 }
 
 /// Refuse an agent-supplied argument the shell would consume before the agent
@@ -1649,6 +1649,7 @@ impl Instance {
                     }
                     if host_command.is_none() {
                         if let Some(yolo) = yolo {
+                            ensure_declared_argument_reaches_the_agent(&cmd, &self.tool)?;
                             apply_yolo_mode(&mut cmd, yolo, false);
                         }
                     }
@@ -1748,6 +1749,7 @@ impl Instance {
             }
             if host_command.is_none() {
                 if let Some(yolo) = yolo {
+                    ensure_declared_argument_reaches_the_agent(&cmd, &self.tool)?;
                     apply_yolo_mode(&mut cmd, yolo, false);
                 }
             }
@@ -1844,18 +1846,21 @@ tool = "zzalpha"
 command = "helper | tee log"
 [agent_integrations.launch]
 instruction_flag = "--prompt={}"
+yolo = { kind = "flag", flag = "--yes" }
 
 [[agent_integrations]]
 tool = "zzbeta"
 command = "helper # trailing"
 [agent_integrations.launch]
 instruction_flag = "--prompt={}"
+yolo = { kind = "flag", flag = "--yes" }
 
 [[agent_integrations]]
 tool = "zzgamma"
 command = "helper"
 [agent_integrations.launch]
 instruction_flag = "--prompt={}"
+yolo = { kind = "flag", flag = "--yes" }
 "#;
         let dir = crate::plugin::plugins_dir()
             .unwrap()
@@ -1944,9 +1949,27 @@ instruction_flag = "--prompt={}"
             );
         }
 
+        for (tool, command, rejected) in [
+            ("zzalpha", "helper | tee log", true),
+            ("zzgamma", "helper", false),
+        ] {
+            let mut host = declared(tool, command);
+            host.sandbox_info = None;
+            host.yolo_mode = true;
+            host.extra_args = "--label 'a b'".into();
+            match host.prepare_launch_command(host.conversation_state()) {
+                Err(error) if rejected => assert!(error
+                    .to_string()
+                    .contains("reach the shell instead of the agent")),
+                Ok(prepared) if !rejected => assert!(prepared.command.unwrap().contains("--yes")),
+                _ => panic!("unexpected host YOLO result for {command}"),
+            }
+        }
+
         // YOLO off and a bare command: the instruction is appended as argv. The
         // transport is fixtures so the launch does not depend on a host runtime.
         let mut direct = declared("zzgamma", "helper");
+        direct.extra_args = "--label 'a b'".into();
         let config = direct.build_container_config_for_test().unwrap();
         let _transport = install_container_transport(temp.path(), "zzgamma", &config.volumes);
         let prepared = direct
@@ -1962,6 +1985,10 @@ instruction_flag = "--prompt={}"
     fn declared_arguments_require_a_direct_agent_invocation() {
         for (command, needs) in [
             ("helper --verbose", false),
+            ("helper --label 'a b'", false),
+            ("helper --label \"a b\"", false),
+            ("helper --label 'a | b'", false),
+            ("helper --label \"$(bad)\"", true),
             // A prefix stays inside the pipeline's first command.
             ("TOKEN=local helper", false),
             ("helper | tee /tmp/helper.log", true),

@@ -301,31 +301,51 @@ fn removed_integration_session_reports_response_not_sent() {
 #[test]
 #[serial]
 fn declared_response_reports_missing_or_changed_session() {
-    let manifest: aoe_plugin_api::PluginManifest = toml::from_str(
-        "id = \"acme.reply\"\nname = \"Reply\"\nversion = \"1.0.0\"\napi_version = 21\n[[agent_integrations]]\ntool = \"reply-helper\"\ncommand = \"reply-helper\"\n",
-    )
-    .unwrap();
-    let registry = std::sync::Arc::new(crate::plugin::registry::PluginRegistry::from_test_plugins(
-        vec![crate::plugin::registry::LoadedPlugin {
-            manifest,
-            enabled: true,
-            trust: aoe_plugin_api::TrustLevel::Community,
-            validation: crate::plugin::registry::ValidationState::Local,
-            source: None,
-            dir: None,
-            manifest_hash: String::new(),
-            granted: true,
-        }],
-    ));
-    let agent = crate::plugin::agent_integration::declared_agent(
-        registry,
-        "reply-helper",
-        std::iter::empty(),
-    )
-    .unwrap();
+    let _reload = crate::plugin::ReloadRegistryOnDrop;
     let mut env = create_test_env_empty();
+    let manifest = r#"
+id = "acme.reply"
+name = "Reply"
+version = "1.0.0"
+api_version = 21
+[[agent_integrations]]
+tool = "reply-helper"
+command = "reply-helper"
+[agent_integrations.reply_fallback]
+allow = [{ kind = "literal", value = "y" }]
+deny = [{ kind = "literal", value = "n" }]
+"#;
+    let dir = crate::plugin::plugins_dir().unwrap().join("acme.reply");
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(dir.join("aoe-plugin.toml"), manifest).unwrap();
+    crate::session::update_config(|config| {
+        config.plugins.insert(
+            "acme.reply".into(),
+            crate::session::PluginConfig {
+                grant: Some(crate::session::CapabilityGrant {
+                    manifest_hash: aoe_plugin_api::PluginManifest::hash_bytes(manifest.as_bytes()),
+                    capabilities: Vec::new(),
+                    granted_at: chrono::Utc::now(),
+                }),
+                ..Default::default()
+            },
+        );
+    })
+    .unwrap();
+    crate::plugin::reload_registry();
     let _driver = env.view.session_feed.terminal_driver_for_test();
     let id = add_session_with_tool(&mut env.view, "session-one", "reply-helper");
+    env.view.instances.get_mut(&id).unwrap().command = "reply-helper".into();
+    let agent = env
+        .view
+        .get_instance(&id)
+        .unwrap()
+        .declared_agent()
+        .unwrap();
+    assert!(agent
+        .with_definition(|definition| definition.permission_response.is_some())
+        .unwrap());
+    env.view.instances.get_mut(&id).unwrap().command = "different-helper".into();
     env.view.execute_declared_permission_response(
         &id,
         crate::tui::dialogs::PermissionResponseChoice::Allow,
@@ -335,6 +355,19 @@ fn declared_response_reports_missing_or_changed_session() {
         env.view.info_dialog.as_ref().unwrap().title(),
         "Response Not Sent"
     );
+    assert_eq!(
+        env.view.info_dialog.as_ref().unwrap().message(),
+        "The agent declaration changed or no longer permits this response."
+    );
+    assert!(env.view.get_instance(&id).is_some());
+    env.view.instances.get_mut(&id).unwrap().command = "reply-helper".into();
+    assert!(env
+        .view
+        .get_instance(&id)
+        .unwrap()
+        .declared_agent()
+        .unwrap()
+        .same_identity(&agent));
     env.view.info_dialog = None;
     env.view.session_feed.set_native_permission_for_test(false);
     env.view.execute_declared_permission_response(
@@ -346,6 +379,11 @@ fn declared_response_reports_missing_or_changed_session() {
         env.view.info_dialog.as_ref().unwrap().title(),
         "Respond Failed"
     );
+    assert_eq!(
+        env.view.info_dialog.as_ref().unwrap().message(),
+        "Native interaction is unavailable."
+    );
+    assert!(env.view.get_instance(&id).is_some());
     env.view.session_feed.set_native_permission_for_test(true);
     env.view.info_dialog = None;
     env.view.instances.shift_remove(&id);
@@ -357,5 +395,9 @@ fn declared_response_reports_missing_or_changed_session() {
     assert_eq!(
         env.view.info_dialog.as_ref().unwrap().title(),
         "Respond Failed"
+    );
+    assert_eq!(
+        env.view.info_dialog.as_ref().unwrap().message(),
+        "Session no longer exists."
     );
 }

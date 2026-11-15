@@ -43,6 +43,15 @@ describe("agentIntegrationDetails", () => {
     expect(displayAgentText("a\u202eb\u001b")).toBe("a\\u{202e}b\\u{1b}");
   });
 
+  it("discloses nonzero Enter delays distinctly", () => {
+    const base = { tool: "agent" };
+    expect(agentIntegrationDetails(base)).toEqual(agentIntegrationDetails({ ...base, send_keys_enter_delay_ms: 0 }));
+    expect(agentIntegrationDetails({ ...base, send_keys_enter_delay_ms: 275 })).toContain("send Enter delay: 275 ms");
+    expect(agentIntegrationDetails({ ...base, send_keys_enter_delay_ms: 150 })).not.toEqual(
+      agentIntegrationDetails({ ...base, send_keys_enter_delay_ms: 275 }),
+    );
+  });
+
   it("discloses alternative launch variants", () => {
     expect(
       agentIntegrationDetails({
