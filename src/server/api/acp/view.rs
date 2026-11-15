@@ -568,7 +568,8 @@ fn handoff_unavailable(error: &anyhow::Error) -> Response {
     terminal_refusal(TerminalSwitchReason::HandoffPending, "")
 }
 
-/// A coded refusal, so a client can show the matching dialog state.
+/// A coded refusal, so a client can show the matching dialog state. The body
+/// stays plain text because the current web client shows it as it is.
 fn terminal_refusal(reason: TerminalSwitchReason, agent: &str) -> Response {
     use TerminalSwitchReason::*;
     let message = match reason {
@@ -577,9 +578,11 @@ fn terminal_refusal(reason: TerminalSwitchReason, agent: &str) -> Response {
         EarlierConversation => {
             "Terminal view resumes this Session's conversation from before Structured view".into()
         }
-        ConversationNotBound | Sandboxed => {
-            "This Session's conversation can't be carried into Terminal view".into()
-        }
+        ConversationNotBound => format!(
+            "This Session's conversation can't be carried into Terminal view: {}",
+            crate::session::UNBOUND_STORE_HINT
+        ),
+        Sandboxed => "This Session's conversation can't be carried into Terminal view".into(),
         HandoffPending => "A view switch is still finishing; retry shortly".into(),
         NoTerminalTool => {
             format!("{agent} has no terminal tool; switch to another agent before terminal view")
@@ -587,7 +590,7 @@ fn terminal_refusal(reason: TerminalSwitchReason, agent: &str) -> Response {
         ContextUnconfirmed => "The conversation is still being saved; retry shortly".into(),
         SessionChanged => "The Session changed during the switch; retry".into(),
     };
-    crate::server::api::api_error_with_code_header(
+    crate::server::api::text_error_with_code_header(
         crate::daemon::ApiErrorCode::TerminalSwitchRefused(reason),
         message,
     )
@@ -695,7 +698,7 @@ async fn terminal_plan(
     let native_store = match instance.terminal_keep_context_state(worker.as_ref()) {
         Ok(target) => target.resume_binding.and_then(|binding| binding.execution),
         Err(error) => {
-            tracing::info!(target: "acp.switch", session = %id, %error, "conversation not carried into terminal");
+            tracing::debug!(target: "acp.switch", session = %id, %error, "conversation not carried into terminal");
             None
         }
     };
@@ -1291,7 +1294,7 @@ async fn terminal_handoff_request(
                 TerminalConversation::Continue => "keeps the conversation",
                 TerminalConversation::Fresh => "starts a new conversation",
             };
-            return crate::server::api::api_error_with_code_header(
+            return crate::server::api::text_error_with_code_header(
                 crate::daemon::ApiErrorCode::TerminalSwitchRefused(
                     TerminalSwitchReason::HandoffPending,
                 ),
@@ -3943,18 +3946,27 @@ mod tests {
         row
     }
 
+    /// A success body as JSON, or a refusal as `{error: <code header>, message: <text body>}`.
+    /// Refusals must stay plain text: the current web client shows the body as it is.
     async fn response_json(response: Response) -> anyhow::Result<(StatusCode, serde_json::Value)> {
         let status = response.status();
         let code = response
             .headers()
             .get(crate::daemon::ERROR_CODE_HEADER)
             .map(|value| value.to_str().unwrap().to_string());
-        let body: serde_json::Value =
-            serde_json::from_slice(&axum::body::to_bytes(response.into_body(), usize::MAX).await?)?;
-        if let Some(code) = code {
-            assert_eq!(body["error"], code.as_str(), "header and body codes agree");
-        }
-        Ok((status, body))
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX).await?;
+        let Some(code) = code else {
+            return Ok((status, serde_json::from_slice(&bytes)?));
+        };
+        let message = String::from_utf8(bytes.to_vec())?;
+        assert!(
+            serde_json::from_str::<serde_json::Value>(&message).is_err(),
+            "a refusal body is plain text: {message}"
+        );
+        Ok((
+            status,
+            serde_json::json!({ "error": code, "message": message }),
+        ))
     }
 
     #[tokio::test]
@@ -4186,6 +4198,12 @@ mod tests {
             let (status, json) = response_json(response).await?;
             assert_eq!(status, StatusCode::CONFLICT, "{json}");
             assert_eq!(json["error"], "conversation_not_bound");
+            assert!(
+                json["message"]
+                    .as_str()
+                    .is_some_and(|m| m.contains(crate::session::UNBOUND_STORE_HINT)),
+                "{json}"
+            );
             let stored = crate::session::Storage::open_unwatched("default")?.load()?;
             let stored = stored.iter().find(|r| r.id == row.id).unwrap();
             assert_eq!(stored.view, View::Structured);

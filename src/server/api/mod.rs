@@ -196,11 +196,27 @@ pub(crate) fn api_error_with_code_header(
     message: impl Into<String>,
 ) -> axum::response::Response {
     let mut response = api_error(code.status(), code.as_str(), message);
+    insert_code_header(&mut response, code);
+    response
+}
+
+/// The code header with a plain-text body, for an endpoint whose existing
+/// clients show the body as it is.
+pub(crate) fn text_error_with_code_header(
+    code: crate::daemon::ApiErrorCode,
+    message: impl Into<String>,
+) -> axum::response::Response {
+    use axum::response::IntoResponse as _;
+    let mut response = (code.status(), message.into()).into_response();
+    insert_code_header(&mut response, code);
+    response
+}
+
+fn insert_code_header(response: &mut axum::response::Response, code: crate::daemon::ApiErrorCode) {
     let (name, value) = code.header()[0];
     if let Ok(value) = axum::http::HeaderValue::from_str(value) {
         response.headers_mut().insert(name, value);
     }
-    response
 }
 
 pub(crate) fn read_only_block(state: &AppState) -> Option<axum::response::Response> {
