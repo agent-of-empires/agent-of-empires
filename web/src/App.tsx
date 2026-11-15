@@ -185,6 +185,7 @@ import { SetupBanner } from "./components/setup/SetupBanner";
 import type { TourScope } from "./lib/tourSteps";
 import { SessionWizard } from "./components/session-wizard/SessionWizard";
 import type { WizardPrefill } from "./components/session-wizard/SessionWizard";
+import type { NewSessionLike } from "./components/acp/ContainerGoneBanner";
 import type { ProjectInfo, RepoGroup, SessionResponse, Workspace } from "./lib/types";
 import { Dashboard } from "./components/Dashboard";
 import { LoginPage } from "./components/LoginPage";
@@ -1531,6 +1532,33 @@ function AppContent({
     [sessions, projects, requireProjectProfile],
   );
 
+  // A Session like `session` in its Project: same Agent and Group in Structured view, other fields from the defaults.
+  const newSessionLike = useCallback(
+    (session: SessionResponse): NewSessionLike | undefined => {
+      if (caps.readOnly) return undefined;
+      const repoPath = session.main_repo_path || session.project_path;
+      return {
+        project: repoPath.replace(/\/+$/, "").split("/").pop() || repoPath,
+        open: () => {
+          const profile = session.profile || requireProjectProfile();
+          if (!profile) return;
+          const key = normalizeProjectPathKey(repoPath);
+          const registered = projects.find((project) => normalizeProjectPathKey(project.path) === key);
+          setWizardPrefill({
+            path: repoPath,
+            tool: session.tool,
+            profile,
+            group: session.group_path || undefined,
+            worktreeEnabled: registered?.overrides?.worktree_enabled,
+            useStructuredView: true,
+          });
+          setShowSessionWizard(true);
+        },
+      };
+    },
+    [caps.readOnly, projects, requireProjectProfile],
+  );
+
   const handlePinProject = useCallback(
     async (repoPath: string) => {
       const profile = requireProjectProfile();
@@ -2151,6 +2179,7 @@ function AppContent({
                               canSwitchToTerminal ? (mode) => handleOpenPairedTerminal(session.id, mode) : undefined
                             }
                             canRestartAgent={canRestartAgent}
+                            newSessionLike={newSessionLike(session)}
                           />
                         </Suspense>
                       )}
@@ -2399,6 +2428,7 @@ function AppContent({
           onSwitchToTerminal={canSwitchToTerminal ? (id) => handleSwitchView(id, false) : undefined}
           onOpenTerminal={canSwitchToTerminal ? handleOpenPairedTerminal : undefined}
           canRestartAgent={canRestartAgent}
+          newSessionLike={newSessionLike}
           shellMode={shellModeFor(activeSessionId, 0)}
           onShellModeChange={(mode) => activeSessionId && setShellMode(activeSessionId, 0, mode)}
           pairedMounted={pairedMounted}

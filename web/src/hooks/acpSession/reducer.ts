@@ -313,6 +313,7 @@ export function reducer(state: AcpState, action: Action): AcpState {
         ...state,
         optimisticRows: state.optimisticRows.concat(row),
         startupError: null,
+        startupCause: null,
         // A Retry still running keeps its line.
         retriedError: state.restartInFlight ? state.retriedError : null,
         lastError: null,
@@ -379,7 +380,11 @@ export function reducer(state: AcpState, action: Action): AcpState {
         restartInFlight: true,
         restartStoppedSent: state.restartStoppedSent || action.stoppedSent,
         restartFailure: null,
-        ...(action.retriedError !== undefined && { startupError: null, retriedError: action.retriedError }),
+        ...(action.retriedError !== undefined && {
+          startupError: null,
+          startupCause: null,
+          retriedError: action.retriedError,
+        }),
       };
     case "restart_failed":
       if (action.epoch !== state.restartEpoch)

@@ -28,6 +28,7 @@ import { Composer } from "./Composer";
 import { ContextPrimerBanner } from "./ContextPrimerBanner";
 import { PlanStrip } from "./PlanStrip";
 import { ModeSwitchFailedNotice, QueuedPromptsStrip, RejectedPromptsStrip, SessionNoticesStrip } from "./PromptStrips";
+import type { NewSessionLike } from "./ContainerGoneBanner";
 import { SessionBanners } from "./SessionBanners";
 import { ConfigOptionSwitchFailedNotice } from "./SessionConfigControls";
 import { StartupErrorScreen } from "./StartupErrorScreen";
@@ -88,6 +89,8 @@ interface Props {
   onOpenTerminal?: (mode: ShellMode) => void;
   /** Whether the server lets the dashboard restart the Agent. */
   canRestartAgent?: boolean;
+  /** Opens the wizard for a Session like this one; omitted on a read-only server. */
+  newSessionLike?: NewSessionLike;
 }
 
 const STARTER_PROMPTS = [
@@ -290,6 +293,8 @@ function AcpChrome({
         canRestart={!!view.canRestartAgent}
         onRestarted={ctx.markRestartStarted}
         onRestartFailed={ctx.markRestartFailed}
+        recreateContainerTitle={view.recreateContainerTitle}
+        newSession={view.newSessionLike}
       />
 
       <ThreadPrimitive.Root className="flex flex-1 flex-col min-h-0">
