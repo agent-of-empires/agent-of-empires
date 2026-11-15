@@ -3983,6 +3983,21 @@ mod tests {
                 live.state = live.client.app_state();
                 let replacement = live.client.lease.clone();
                 assert_ne!(old, replacement);
+                // Readiness precedes these legitimate replacement publications.
+                // Settle them before capturing both the warm fold and durable prefix.
+                tokio::time::timeout(Duration::from_secs(10), async {
+                    let (mut assigned, mut capabilities) = (false, false);
+                    while !assigned || !capabilities {
+                        match live.client.next_event().await.expect("actual replacement handshake publication") {
+                            Event::AcpSessionAssigned { acp_session_id, .. }
+                                if acp_session_id == live.sid => assigned = true,
+                            Event::PromptCapabilities { .. } => capabilities = true,
+                            Event::AgentStartupError { message, .. } => panic!("{message}"),
+                            Event::AcpConnectionUnavailable { .. } => panic!("the replacement original channel stays live"),
+                            _ => {}
+                        }
+                    }
+                }).await.expect("the replacement handshake precedes the no-old-worker baseline");
                 let supervisor = live.state.acp_supervisor.clone();
                 let store = live.state.acp_event_store.clone();
                 let cache = live.state.acp_control_cache.clone();

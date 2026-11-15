@@ -543,10 +543,18 @@ impl ManagedRetirement {
         )
         .await
         .into_response();
+        let status = stopped.status();
+        // Temporary failure-only capture: retain through full validation.
+        let refusal = if status != axum::http::StatusCode::OK {
+            axum::body::to_bytes(stopped.into_body(), 4096).await.expect("actual Stop refusal body")
+        } else {
+            axum::body::Bytes::new()
+        };
         assert_eq!(
-            stopped.status(),
+            status,
             axum::http::StatusCode::OK,
-            "real Stop must settle the original projection before retained Load/Fork"
+            "real Stop must settle the original projection before retained Load/Fork: {}",
+            String::from_utf8_lossy(&refusal)
         );
         self.completed
             .store(true, std::sync::atomic::Ordering::Release);
