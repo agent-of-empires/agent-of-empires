@@ -1731,15 +1731,11 @@ fn is_safe_agent_name(name: &str) -> bool {
         && !name.contains('\\')
 }
 
-/// The pause a send path must leave between typing and Enter, so an agent that
-/// reads a fast burst as a paste does not drop the Enter.
+/// The built-in pause for `tool` between typing and Enter.
 ///
-/// An active declaration wins: it knows the agent it contributes, and the
-/// built-in table is only the fallback for agents that declare nothing.
+/// A declared integration paces through `Instance::send_keys_enter_delay`,
+/// which keeps this table as the fallback for every program it does not own.
 pub fn send_keys_enter_delay(tool: &str) -> u64 {
-    if let Some(delay) = crate::plugin::agent_integration::declared_send_keys_enter_delay(tool) {
-        return delay;
-    }
     get_agent(tool)
         .map(|a| a.send_keys_enter_delay_ms)
         .unwrap_or(0)

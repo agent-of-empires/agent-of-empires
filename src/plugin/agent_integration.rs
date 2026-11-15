@@ -211,18 +211,6 @@ pub(crate) fn resolve_declared_tool<'a>(
     }
 }
 
-/// The Enter delay the active declaration for `tool` asks for, if any.
-///
-/// Send paths hold a tool name, not a registry, so they resolve the pause
-/// here: the declaration is the only place a plugin can state it.
-pub(crate) fn declared_send_keys_enter_delay(tool: &str) -> Option<u64> {
-    declared_agent(super::registry(), tool, std::iter::empty())?
-        .contribution()
-        .launch
-        .as_ref()?
-        .send_keys_enter_delay_ms
-}
-
 /// An agent identity bound to one immutable registry snapshot.
 #[derive(Clone)]
 pub(crate) struct DeclaredAgent {
@@ -413,6 +401,9 @@ pub fn consent_lines(integration: &AgentIntegrationContribution) -> Vec<String> 
         }
         if !flags.is_empty() {
             lines.push(format!("  launch flags: {}", flags.join("; ")));
+        }
+        if let Some(delay) = launch.send_keys_enter_delay_ms {
+            lines.push(format!("  enter delay: {delay} ms"));
         }
         if !launch.aliases.is_empty() {
             lines.push(format!(
@@ -731,7 +722,7 @@ pub fn snapshot(instance: &Instance) -> Option<AgentIntegrationSnapshot> {
     if !eligible(instance) {
         return None;
     }
-    let registry = super::registry();
+    let registry = crate::plugin::registry();
     let plugin = provider(&registry, &instance.tool).ok()??;
     read_report(&instance.id, &instance.tool, plugin)
         .ok()
@@ -774,7 +765,7 @@ pub(crate) fn owned_status(
     if !eligible(instance) {
         return None;
     }
-    let registry = super::registry();
+    let registry = crate::plugin::registry();
     let own_claim = provider(&registry, &instance.tool);
     let alias = crate::tmux::status_rules::detection_tool(
         &instance.source_profile,
@@ -1061,7 +1052,7 @@ pub fn respond(
         eligible(instance),
         "session does not support provider integration replies"
     );
-    let registry = super::registry();
+    let registry = crate::plugin::registry();
     let plugin = provider(&registry, &instance.tool)?
         .context("provider integration is not enabled and approved")?;
     // The dialog may have opened while the plugin still owned this name. Only a
@@ -1398,8 +1389,6 @@ oneshot_flag = "-p"
     }
 
     fn install_test_integration(plugin_id: &str, tool: &str) {
-        use crate::session::{CapabilityGrant, PluginConfig};
-
         let manifest = format!(
             r#"
 id = "{plugin_id}"
@@ -1415,9 +1404,42 @@ provider_versions = ["^18"]
 replies = true
 "#
         );
+        install_test_manifest(plugin_id, &manifest);
+    }
+
+    /// A status integration that also declares an Enter delay, so the pace
+    /// resolves through the same declaration as its other launch fields.
+    ///
+    /// Pair it with a tool name no built-in alias matches: `agent` is a cursor
+    /// alias, so a name containing it resolves as a built-in and keeps the table.
+    fn install_paced_test_integration(plugin_id: &str, tool: &str, delay_ms: u64) {
+        let manifest = format!(
+            r#"
+id = "{plugin_id}"
+name = "Integration test"
+version = "1.0.0"
+api_version = 22
+capabilities = ["session.integration"]
+
+[[agent_integrations]]
+tool = "{tool}"
+command = "{tool}"
+provider_versions = ["^18"]
+replies = true
+
+[agent_integrations.launch]
+send_keys_enter_delay_ms = {delay_ms}
+"#
+        );
+        install_test_manifest(plugin_id, &manifest);
+    }
+
+    fn install_test_manifest(plugin_id: &str, manifest: &str) {
+        use crate::session::{CapabilityGrant, PluginConfig};
+
         let dir = super::super::plugins_dir().unwrap().join(plugin_id);
         std::fs::create_dir_all(&dir).unwrap();
-        std::fs::write(dir.join("aoe-plugin.toml"), &manifest).unwrap();
+        std::fs::write(dir.join("aoe-plugin.toml"), manifest).unwrap();
         crate::session::update_config(|config| {
             config.plugins.insert(
                 plugin_id.to_string(),
@@ -2007,6 +2029,64 @@ sandbox = "unsupported"
         })
         .unwrap();
         assert!(instance().declared_agent().is_none());
+    }
+
+    /// The declared pause belongs to the program the declaration owns, so a
+    /// custom wrapper, an override or another stored command keeps the built-in
+    /// table's pace for its tool instead of inheriting that delay.
+    #[test]
+    #[serial_test::serial]
+    fn a_declared_enter_delay_paces_only_the_program_it_declares() {
+        let temp = tempfile::tempdir().unwrap();
+        let _reload = super::super::ReloadRegistryOnDrop;
+        let _env = crate::session::test_support::EnvGuard::set(&[
+            ("HOME", temp.path()),
+            ("XDG_CONFIG_HOME", temp.path()),
+            ("USERPROFILE", temp.path()),
+        ]);
+        let _featured = crate::session::test_support::EnvGuard::unset(&["AOE_FEATURED_INDEX_PATH"]);
+        install_paced_test_integration("acme.paced-provider", "pacer-helper", 150);
+        super::super::reload_registry();
+
+        let instance = |tool: &str, command: &str| {
+            let mut instance = Instance::new("paced-delay", temp.path().to_str().unwrap());
+            instance.tool = tool.into();
+            instance.command = command.into();
+            instance
+        };
+
+        // The declared program takes the declared pause.
+        assert_eq!(instance("pacer-helper", "").send_keys_enter_delay(), 150);
+
+        // A stored command that is not the declared one is another program.
+        assert_eq!(
+            instance("pacer-helper", "/opt/other/paced --serve").send_keys_enter_delay(),
+            0
+        );
+
+        // A command override replaces the declared program.
+        crate::session::update_config(|config| {
+            config
+                .session
+                .agent_command_override
+                .insert("pacer-helper".into(), "/opt/override/paced --serve".into());
+        })
+        .unwrap();
+        assert_eq!(instance("pacer-helper", "").send_keys_enter_delay(), 0);
+
+        // So does a custom agent of the same name.
+        crate::session::update_config(|config| {
+            config.session.agent_command_override.remove("pacer-helper");
+            config
+                .session
+                .custom_agents
+                .insert("pacer-helper".into(), "/opt/custom/paced --serve".into());
+        })
+        .unwrap();
+        assert_eq!(instance("pacer-helper", "").send_keys_enter_delay(), 0);
+
+        // A built-in keeps the table's pace and gains nothing from the plugin.
+        assert_eq!(instance("codex", "").send_keys_enter_delay(), 150);
     }
 
     /// Two approved providers make the own-name claim ambiguous. A readable
@@ -2658,6 +2738,29 @@ command = "acme-omp-shim"
         let lines = consent_lines(&integration).join("\n");
         assert!(!lines.contains('\u{202e}') && !lines.contains('\u{1b}'));
         assert!(lines.contains("\\u{202e}") && lines.contains("\\u{1b}"));
+    }
+
+    /// A delay-only declaration change re-prompts for consent, so the prompt
+    /// must show the pause the user is approving.
+    #[test]
+    fn consent_lines_disclose_the_enter_delay() {
+        use aoe_plugin_api::agent_integration::AgentLaunchDeclaration;
+        let integration = AgentIntegrationContribution {
+            tool: "helper".into(),
+            command: Some("helper".into()),
+            launch: Some(AgentLaunchDeclaration {
+                send_keys_enter_delay_ms: Some(150),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let lines = consent_lines(&integration);
+        assert!(
+            lines
+                .iter()
+                .any(|line| line.contains("enter delay: 150 ms")),
+            "{lines:?}"
+        );
     }
 
     #[test]
