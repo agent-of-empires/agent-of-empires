@@ -96,6 +96,16 @@ impl SandboxLayout {
         project_path: &Path,
         workspace: Option<&WorkspaceInfo>,
     ) -> Result<Self, AcpError> {
+        Self::resolve_with(sandbox, project_path, workspace, known_container_workdir)
+    }
+
+    /// [`Self::resolve`] with the workdir source chosen by the caller.
+    pub(crate) fn resolve_with(
+        sandbox: &SandboxInfo,
+        project_path: &Path,
+        workspace: Option<&WorkspaceInfo>,
+        known_workdir: impl FnOnce(&SandboxInfo) -> Option<String>,
+    ) -> Result<Self, AcpError> {
         use crate::session::config::container_config::{
             compute_volume_paths, compute_workspace_volume_paths,
         };
@@ -104,7 +114,7 @@ impl SandboxLayout {
             None => compute_volume_paths(project_path, &project_path.to_string_lossy()),
         }
         .map_err(|e| AcpError::Spawn(format!("compute container workdir: {e}")))?;
-        let container_workdir = known_container_workdir(sandbox).unwrap_or(computed_workdir);
+        let container_workdir = known_workdir(sandbox).unwrap_or(computed_workdir);
         Ok(Self {
             volumes,
             container_workdir,

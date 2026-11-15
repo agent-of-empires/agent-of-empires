@@ -798,16 +798,16 @@ impl<S: BroadcastSink> Drain<S> {
             .filter(|sandbox| sandbox.enabled)
             .map(|sandbox| sandbox.container_name.clone());
         // The probe runs inside the backoff, so a healthy respawn waits no longer.
-        let container_gone = tokio::select! {
+        let container = tokio::select! {
             biased;
-            (_, gone) = async {
+            (_, state) = async {
                 tokio::join!(tokio::time::sleep(RESPAWN_BACKOFF), async {
                     match container {
-                        Some(name) => sandbox_container_gone(name).await,
-                        None => false,
+                        Some(name) => probe_sandbox_container(name).await,
+                        None => ContainerState::Present,
                     }
                 })
-            } => gone,
+            } => state,
             _ = reservation.cancellation().cancelled() => {
                 if lock_recover(&self.lifecycle).convert_to_stopping(&respawn_lease) {
                     self.finish_cancelled(&respawn_lease, previous).await;
@@ -826,7 +826,7 @@ impl<S: BroadcastSink> Drain<S> {
             return None;
         }
         // A respawn can't reach a removed container; only an explicit start rebuilds it.
-        if container_gone {
+        if container == ContainerState::Gone {
             warn!(
                 target: "acp.supervisor",
                 session = %session_id,
@@ -879,7 +879,7 @@ impl<S: BroadcastSink> Drain<S> {
         respawn_lease.record_prime(crate::acp::runner_lifecycle::PrimeOwnership::NotPrime);
         let refreshed = await_resume_to_completion(
             reservation.cancellation(),
-            Self::refresh_launch_env(&self.session_id, &mut config),
+            Self::refresh_launch_env(&self.session_id, &mut config, container.runtime_use()),
         )
         .await
         .is_ok();
@@ -1034,7 +1034,11 @@ impl<S: BroadcastSink> Drain<S> {
 
     /// Re-resolve what may have changed since the first launch: model pins,
     /// host hook env, and MCP servers.
-    async fn refresh_launch_env(session_id: &str, config: &mut SpawnConfig) {
+    async fn refresh_launch_env(
+        session_id: &str,
+        config: &mut SpawnConfig,
+        runtime: crate::acp::mcp_rewrite::RuntimeUse,
+    ) {
         let agent = config.agent_key.clone();
         let profile = config.source_profile.clone().unwrap_or_default();
         let config_path = config.config_path.clone();
@@ -1121,6 +1125,7 @@ impl<S: BroadcastSink> Drain<S> {
             McpSandboxScope {
                 sandbox_info: config.sandbox_info.as_ref(),
                 workspace_info: config.workspace_info.as_ref(),
+                runtime,
             },
             "MCP re-resolution on respawn failed",
         )
@@ -1238,9 +1243,26 @@ impl<S: BroadcastSink> Drain<S> {
     }
 }
 
-/// Whether the sandbox container `name` is known to be gone. A runtime error, or a probe
-/// slower than the respawn backoff, is unknown rather than gone; the slow probe is killed.
-async fn sandbox_container_gone(name: String) -> bool {
+/// What the respawn probe learned about a sandbox container.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ContainerState {
+    Gone,
+    Present,
+    /// A runtime error, or a probe slower than the respawn backoff; the slow probe is killed.
+    Unknown,
+}
+
+impl ContainerState {
+    /// An unanswering runtime is not asked again while the respawn re-resolves MCP servers.
+    fn runtime_use(self) -> crate::acp::mcp_rewrite::RuntimeUse {
+        match self {
+            Self::Unknown => crate::acp::mcp_rewrite::RuntimeUse::Skip,
+            Self::Gone | Self::Present => crate::acp::mcp_rewrite::RuntimeUse::Ask,
+        }
+    }
+}
+
+async fn probe_sandbox_container(name: String) -> ContainerState {
     let cancel = tokio_util::sync::CancellationToken::new();
     // Also kills the probe when a cancelled respawn drops this future.
     let _kill = cancel.clone().drop_guard();
@@ -1248,10 +1270,11 @@ async fn sandbox_container_gone(name: String) -> bool {
         crate::containers::get_container_runtime()
             .does_container_exist_until_cancelled(&name, &cancel)
     });
-    matches!(
-        tokio::time::timeout(RESPAWN_BACKOFF, probe).await,
-        Ok(Ok(Ok(false)))
-    )
+    match tokio::time::timeout(RESPAWN_BACKOFF, probe).await {
+        Ok(Ok(Ok(false))) => ContainerState::Gone,
+        Ok(Ok(Ok(true))) => ContainerState::Present,
+        _ => ContainerState::Unknown,
+    }
 }
 
 async fn restart_decision(workers: &Workers, session_id: &str) -> RestartDecision {
@@ -2902,7 +2925,7 @@ mod tests {
             exported_default_store: Some(false),
         });
 
-        Drain::<VecSink>::refresh_launch_env("s-withdraw", &mut config).await;
+        Drain::<VecSink>::refresh_launch_env("s-withdraw", &mut config, Default::default()).await;
         assert!(!config
             .host_environment
             .iter()
@@ -2944,7 +2967,7 @@ mod tests {
         config.base_host_environment = vec![("HOME".into(), temp.path().display().to_string())];
         config.host_environment = config.base_host_environment.clone();
 
-        Drain::<VecSink>::refresh_launch_env("s-ws-mcp", &mut config).await;
+        Drain::<VecSink>::refresh_launch_env("s-ws-mcp", &mut config, Default::default()).await;
 
         let forwarded = serde_json::to_value(&config.mcp_servers).unwrap();
         assert!(
@@ -2970,7 +2993,12 @@ mod tests {
             config.wrapper_substitution = Some(("work-codex".into(), "codex".into()));
             config.sandbox_info = sandboxed.then(sandbox_info);
 
-            Drain::<VecSink>::refresh_launch_env("s-codex-wrapper", &mut config).await;
+            Drain::<VecSink>::refresh_launch_env(
+                "s-codex-wrapper",
+                &mut config,
+                Default::default(),
+            )
+            .await;
 
             let names: Vec<_> = config
                 .mcp_servers
@@ -3035,7 +3063,7 @@ mod tests {
             temp.path(),
             &[("alpha", Path::new(OUTSIDE_MAIN))],
         ));
-        Drain::<VecSink>::refresh_launch_env("s-hook", &mut config).await;
+        Drain::<VecSink>::refresh_launch_env("s-hook", &mut config, Default::default()).await;
 
         let sandboxes = rewriter.sandboxes.lock().unwrap();
         let [Some(sandbox)] = sandboxes.as_slice() else {
