@@ -1247,6 +1247,7 @@ mod tests {
                                 establishment_revision: Some(revision),
                                 rate_limit_park: None,
                                 original: &original,
+                                recovery: None,
                             },
                         )
                         .await

@@ -190,6 +190,9 @@ it("the committed Composer stops only its exact pending host message without Nat
             promptCapabilities={ctx.state.promptCapabilities}
             pendingAttachments={ctx.pendingAttachments}
             setPendingAttachments={ctx.setPendingAttachments}
+            operationRetryActive={ctx.operationRetryActive}
+            compositionControlRef={ctx.compositionControlRef}
+            attachmentReadGenerationRef={ctx.attachmentReadGenerationRef}
             queuedPrompts={ctx.state.queuedPrompts}
             editQueuedPrompt={ctx.editQueuedPrompt}
           />

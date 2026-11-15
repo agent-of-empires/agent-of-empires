@@ -3058,6 +3058,7 @@ mod tests {
                 seq,
                 state: Box::new(acp.clone()),
                 unchanged: Vec::new(),
+                recovery_present: false,
             })
         };
         let mut state = test_state();

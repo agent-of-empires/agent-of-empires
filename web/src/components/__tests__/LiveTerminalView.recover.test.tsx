@@ -199,7 +199,9 @@ describe("terminal shared recovery", () => {
         session={makeSession({ id: "paired", recovery: recovery() })}
       />,
     );
-    await waitFor(() => expect(live.ensureTerminal).toHaveBeenCalledExactlyOnceWith("paired", 2, false));
+    await waitFor(() =>
+      expect(live.ensureTerminal).toHaveBeenCalledExactlyOnceWith("paired", 2, false, expect.any(AbortSignal)),
+    );
     expect(screen.queryByTestId("session-recovery")).toBeNull();
     expect(live.ensureSession).not.toHaveBeenCalled();
     fireEvent.click(await screen.findByRole("button", { name: "Restart" }));

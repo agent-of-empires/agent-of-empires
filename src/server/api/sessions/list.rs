@@ -1348,7 +1348,8 @@ mod shared_recovery_tests {
     async fn same_refuses_unresolved_queue_without_output_uncertainty_and_preserves_all_input() {
         with_managed(|scope| {
             Box::pin(async move {
-                let mut live = managed_control_session(scope, "shared-recovery-queued-input").await;
+                let mut live =
+                    managed_control_session(scope, "shared-recovery-queued-input", "claude", None).await;
                 let id = live.id().to_owned();
                 let state = live.state.clone();
                 let prompt = live.start_prompt("failed explicit input").await;
@@ -1464,7 +1465,7 @@ mod shared_recovery_tests {
         with_managed(|scope| {
             Box::pin(async move {
                 let mut live =
-                    managed_control_session(scope, "shared-recovery-current-background").await;
+                    managed_control_session(scope, "shared-recovery-current-background", "claude", None).await;
                 let id = live.id().to_owned();
                 let state = live.state.clone();
                 let prompt = live.start_prompt("failed main turn").await;
@@ -1537,7 +1538,8 @@ mod shared_recovery_tests {
     async fn actual_prompt_failure_reaches_canonical_consumers_without_replacing_its_live_native() {
         with_managed(|scope| {
             Box::pin(async move {
-                let mut live = managed_control_session(scope, "shared-recovery-error").await;
+                let mut live =
+                    managed_control_session(scope, "shared-recovery-error", "claude", None).await;
                 let id = live.id().to_owned();
                 let state = live.state.clone();
                 let owner = live.client.actual().connected_runner();
@@ -1621,7 +1623,8 @@ mod shared_recovery_tests {
     {
         for action in [SessionRecoveryAction::Same, SessionRecoveryAction::Fresh] {
             with_managed(move |scope| Box::pin(async move {
-                let mut live = managed_control_session(scope, "shared-explicit-recovery").await;
+                let mut live =
+                    managed_control_session(scope, "shared-explicit-recovery", "claude", None).await;
                 let id = live.id().to_owned();
                 let state = live.state.clone();
                 let prompt = live.start_prompt("input that must never be replayed").await;
@@ -1740,7 +1743,8 @@ mod shared_recovery_tests {
     async fn unreadable_current_owner_revokes_actions_and_preserves_the_real_error_and_identity() {
         with_managed(|scope| {
             Box::pin(async move {
-                let mut live = managed_control_session(scope, "shared-unknown-owner").await;
+                let mut live =
+                    managed_control_session(scope, "shared-unknown-owner", "claude", None).await;
                 let id = live.id().to_owned();
                 let state = live.state.clone();
                 let prompt = live.start_prompt("one explicit input").await;
