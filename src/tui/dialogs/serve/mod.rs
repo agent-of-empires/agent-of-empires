@@ -889,6 +889,16 @@ impl ServeView {
     }
 
     pub(crate) fn for_launch(launch: DashboardLaunch, jobs: &mut ServeJobs) -> Self {
+        Self::for_launch_with(launch, jobs.submitter())
+    }
+
+    /// A launch view whose worker is already gone, so every job disconnects on the first tick.
+    #[cfg(test)]
+    pub(crate) fn for_launch_with_closed_worker(launch: DashboardLaunch) -> Self {
+        Self::for_launch_with(launch, Submitter::closed_for_test())
+    }
+
+    fn for_launch_with(launch: DashboardLaunch, submitter: Submitter) -> Self {
         let (state, running, observed_target) = match launch {
             DashboardLaunch::Running { target, started_at } => (
                 ServeViewState::Starting {
@@ -912,7 +922,7 @@ impl ServeView {
                 failure.target.or(target.observed_target),
             ),
         };
-        let mut view = Self::with_state(state, jobs.submitter());
+        let mut view = Self::with_state(state, submitter);
         view.launch_in_flight = running;
         view.target = observed_target;
         if running {
