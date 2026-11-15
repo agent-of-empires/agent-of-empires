@@ -89,6 +89,7 @@ name_agent_session = false
 auto_stop_idle_secs = 0   # 0 disables; e.g. 7200 = stop after 2h idle
 row_tag = "branch"        # none | auto | profile | sandbox | branch
 sidebar_position = "left" # left | right; TUI session list
+narrow_layout = "stacked" # stacked | one_pane | big_preview; see below
 ```
 
 After your 31st session creation, a one-time tip explains how to hide the shortcut bar.
@@ -107,7 +108,8 @@ You can browse tips from **Ctrl+K > Show tips** even with the bar hidden.
 | `row_tag` | `"branch"` | Controls the compact metadata shown next to each TUI session title: `none` shows nothing; `auto` shows the profile code only in all-profiles view; `profile` always shows the profile code; `sandbox` shows `sb` on sandboxed sessions; `branch` shows a compact worktree or workspace branch tag. |
 | `show_activity_age` | `true` | Show the age column at the right edge of each TUI session row: time since the agent stopped on `Idle` rows, time since last access on `Unknown` rows, and remaining snooze time under the Attention sort. |
 | `show_structured_badge` | `true` | Show the `[structured]` badge on Structured view rows in the TUI session list. Hiding it returns the width to the title and plugin row badges; the row still opens the Structured view. TUI only; the web session list never shows the badge. |
-| `sidebar_position` | `"left"` | Places the TUI session list on the left or right. Narrow terminals keep the list above the preview. Global only. |
+| `sidebar_position` | `"left"` | Places the TUI session list on the left or right. Below 80 columns the layout follows `narrow_layout` instead. Global only. |
+| `narrow_layout` | `"stacked"` | How the TUI lays out the session list and preview once the terminal is too narrow for them side by side (below 80 columns). `stacked` puts the list above the preview; `one_pane` shows only one pane at a time, the list normally and the preview while it is the pane being worked in (live mode relaying keys, an interactive structured transcript, a retained trashed transcript, or System Health), then Esc or Ctrl+Q returns to the list; `big_preview` keeps the stack but squeezes the list to its minimum while the preview is that active pane, giving the preview most of the height. Global only, under Settings > Global > Session. |
 | `split_terminal_height_percent` | `50` | Paired-terminal share of split preview height. Range `1` to `99`. Global only; see [Live mode](live-mode.md). |
 | `split_terminal_min_width` | `100` | Minimum whole-window width in columns for the paired-terminal split. Range `0` to `1000`. Global only. |
 | `split_terminal_min_height` | `30` | Minimum whole-window height in rows for the paired-terminal split. Range `0` to `1000`. Global only. |

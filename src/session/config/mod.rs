@@ -1191,6 +1191,23 @@ pub struct SessionConfig {
     )]
     pub sidebar_position: SidebarPosition,
 
+    /// What the TUI does with the list and preview once the terminal is too
+    /// narrow for them to sit side by side (below 80 columns). `Stacked` keeps
+    /// the historical list-above-preview split, `OnePane` shows only one at a
+    /// time (the list, or the preview in live mode), and `BigPreview` keeps the
+    /// split but shrinks the list to its minimum while live mode is relaying
+    /// keys.
+    #[serde(default)]
+    #[setting(
+        label = "Narrow terminal layout",
+        widget = "select",
+        options = "stacked:Stacked,one_pane:One pane at a time,big_preview:Big live preview",
+        global_only,
+        tui_only,
+        summary = "On narrow terminals: stack the list over the preview, show one at a time, or give live mode most of the screen."
+    )]
+    pub narrow_layout: NarrowLayout,
+
     /// Percentage of split preview rows allocated to the paired terminal.
     #[serde(default = "default_split_terminal_height_percent")]
     #[setting(
@@ -2229,6 +2246,23 @@ pub enum SidebarPosition {
     Right,
 }
 
+/// How the TUI arranges the session list and preview on a narrow terminal, below
+/// 80 columns. See `SessionConfig::narrow_layout`.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum NarrowLayout {
+    /// List above the preview, splitting the height (the historical behavior).
+    #[default]
+    Stacked,
+    /// One pane at a time: the list, and the preview while it is the pane being
+    /// worked in (live-send, an interactive structured transcript, a retained
+    /// trashed transcript, or System Health).
+    OnePane,
+    /// List above the preview, with the list squeezed to its minimum while the
+    /// preview is the pane being worked in, so it gets the rest of the height.
+    BigPreview,
+}
+
 /// What to render in the per-row tag slot next to the session title.
 ///
 /// Defaults to `Branch` to preserve worktree branch visibility. Users can pick
@@ -2259,6 +2293,7 @@ impl Default for SessionConfig {
             pre_trust_agent_folders: false,
             show_diagnostics_pane: false,
             sidebar_position: SidebarPosition::default(),
+            narrow_layout: NarrowLayout::default(),
             split_terminal_height_percent: default_split_terminal_height_percent(),
             split_terminal_min_width: default_split_terminal_min_width(),
             split_terminal_min_height: default_split_terminal_min_height(),

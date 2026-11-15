@@ -106,6 +106,7 @@ impl HomeView {
         self.show_activity_age = config.session.show_activity_age;
         self.show_structured_badge = config.session.show_structured_badge;
         self.set_sidebar_position(config.session.sidebar_position);
+        self.narrow_layout = config.session.narrow_layout;
         self.split_terminal_height_percent = config.session.split_terminal_height_percent;
         self.split_terminal_min_width = config.session.split_terminal_min_width;
         self.split_terminal_min_height = config.session.split_terminal_min_height;
