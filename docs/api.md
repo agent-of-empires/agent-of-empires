@@ -680,7 +680,7 @@ immediately and surfaces `initial_prompt_error`. On timeout nothing is typed;
 a send error can leave partial input in the pane. Either way the session row
 carries `initial_prompt_error`. A failed terminal prompt is not retried, unless
 persisting the error fails: the error then lives only in memory and a daemon
-restart retries the prompt. A crash between delivery and bookkeeping can
+restart retries the prompt. A consumed turn whose clear cannot be persisted is suppressed until a daemon restart, which can retype it. A crash between delivery and bookkeeping can
 deliver it twice. A blank or over-64 KiB (65536 bytes) value returns `400`.
 
 **Worktree fields**
