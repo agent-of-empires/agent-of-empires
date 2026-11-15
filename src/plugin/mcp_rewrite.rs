@@ -12,13 +12,13 @@ use crate::acp::mcp_rewrite::{
     RewriteFuture, METHOD,
 };
 use crate::plugin::host::PluginHost;
-use crate::plugin::worker_requests::WorkerRequestError;
+use crate::plugin::worker_requests::{WorkerRef, WorkerRequestError};
 use crate::session::mcp::project_mcp::ProjectMcpServer;
 
 pub trait WorkerCall: Send + Sync {
     fn call<'a>(
         &'a self,
-        plugin_id: &'a str,
+        worker: WorkerRef<'a>,
         method: &'a str,
         params: Value,
         timeout: Duration,
@@ -31,21 +31,24 @@ pub struct RewriteHook {
     pub plugin_id: String,
     pub timeout: Duration,
     pub order: i32,
+    /// The manifest this hook was chosen from; only a worker launched from it is asked.
+    pub manifest_hash: String,
 }
 
 /// Plugins hooked for this session kind, by ascending `order` then plugin id, so chaining is deterministic.
 pub fn hooks_for<'a>(
-    manifests: impl Iterator<Item = &'a PluginManifest>,
+    manifests: impl Iterator<Item = (&'a PluginManifest, &'a str)>,
     sandboxed: bool,
 ) -> Vec<RewriteHook> {
     let mut hooks: Vec<RewriteHook> = manifests
-        .filter(|m| m.capabilities.iter().any(|c| c.as_str() == "mcp.rewrite"))
-        .filter_map(|m| {
+        .filter(|(m, _)| m.capabilities.iter().any(|c| c.as_str() == "mcp.rewrite"))
+        .filter_map(|(m, manifest_hash)| {
             let hook = m.hooks.as_ref()?.mcp_rewrite.as_ref()?;
             (sandboxed || hook.applies_to == McpRewriteScope::All).then(|| RewriteHook {
                 plugin_id: m.id.as_str().to_string(),
                 timeout: Duration::from_millis(hook.timeout_ms),
                 order: hook.order,
+                manifest_hash: manifest_hash.to_string(),
             })
         })
         .collect();
@@ -62,7 +65,15 @@ pub async fn run_chain(
     for hook in hooks {
         let params = request_params(ctx, &servers);
         let edit = caller
-            .call(&hook.plugin_id, METHOD, params, hook.timeout)
+            .call(
+                WorkerRef {
+                    plugin_id: &hook.plugin_id,
+                    manifest_hash: &hook.manifest_hash,
+                },
+                METHOD,
+                params,
+                hook.timeout,
+            )
             .await
             .map_err(|e| e.to_string())
             .and_then(parse_edit);
@@ -83,12 +94,12 @@ pub async fn run_chain(
 impl WorkerCall for PluginHost {
     fn call<'a>(
         &'a self,
-        plugin_id: &'a str,
+        worker: WorkerRef<'a>,
         method: &'a str,
         params: Value,
         timeout: Duration,
     ) -> BoxFuture<'a, Result<Value, WorkerRequestError>> {
-        Box::pin(self.request_worker(plugin_id, method, params, timeout))
+        Box::pin(self.request_worker(worker, method, params, timeout))
     }
 
     fn report_failure(&self, plugin_id: &str, message: &str) {
@@ -138,7 +149,12 @@ impl McpRewriter for PluginMcpRewriter {
     ) -> RewriteFuture<'a> {
         Box::pin(async move {
             let registry = crate::plugin::registry();
-            let hooks = hooks_for(registry.active().map(|p| &p.manifest), ctx.sandboxed());
+            let hooks = hooks_for(
+                registry
+                    .active()
+                    .map(|p| (&p.manifest, p.manifest_hash.as_str())),
+                ctx.sandboxed(),
+            );
             let caller = self.host.as_deref().map(|h| h as &dyn WorkerCall);
             run_hooks(caller, &hooks, ctx, servers).await
         })
@@ -164,7 +180,7 @@ mod tests {
             String::new()
         };
         PluginManifest::from_toml_str(&format!(
-            "id = \"{id}\"\nname = \"N\"\nversion = \"1.0.0\"\napi_version = 21\ncapabilities = [{caps}]\n\n[runtime]\nkind = \"command\"\ncommand = [\"bin/w\"]\n{hook}"
+            "id = \"{id}\"\nname = \"N\"\nversion = \"1.0.0\"\napi_version = 23\ncapabilities = [{caps}]\n\n[runtime]\nkind = \"command\"\ncommand = [\"bin/w\"]\n{hook}"
         ))
         .unwrap()
     }
@@ -177,7 +193,7 @@ mod tests {
     fn hooks_for_sorts_by_order_then_plugin_id() {
         let with_order = |id: &str, order: i32| {
             PluginManifest::from_toml_str(&format!(
-                "id = \"{id}\"\nname = \"N\"\nversion = \"1.0.0\"\napi_version = 21\ncapabilities = [\"runtime.worker\", \"mcp.rewrite\"]\n\n[runtime]\nkind = \"command\"\ncommand = [\"bin/w\"]\n\n[hooks.mcp_rewrite]\norder = {order}\n"
+                "id = \"{id}\"\nname = \"N\"\nversion = \"1.0.0\"\napi_version = 23\ncapabilities = [\"runtime.worker\", \"mcp.rewrite\"]\n\n[runtime]\nkind = \"command\"\ncommand = [\"bin/w\"]\n\n[hooks.mcp_rewrite]\norder = {order}\n"
             ))
             .unwrap()
         };
@@ -188,7 +204,7 @@ mod tests {
             with_order("acme.early", -10),
         ];
         assert_eq!(
-            ids(&hooks_for(ms.iter(), true)),
+            ids(&hooks_for(ms.iter().map(|m| (m, "sha256:h")), true)),
             [
                 "acme.early",
                 "acme.a-default",
@@ -207,16 +223,34 @@ mod tests {
             manifest("acme.nohook", "sandbox", true, false),
             manifest("acme.nocap", "sandbox", false, false),
         ];
-        assert_eq!(ids(&hooks_for(ms.iter(), true)), ["acme.a", "acme.z"]);
         assert_eq!(
-            ids(&hooks_for(ms.iter(), false)),
+            ids(&hooks_for(ms.iter().map(|m| (m, "sha256:h")), true)),
+            ["acme.a", "acme.z"]
+        );
+        assert_eq!(
+            ids(&hooks_for(ms.iter().map(|m| (m, "sha256:h")), false)),
             ["acme.a"],
             "sandbox-scoped hook skips plain sessions"
         );
         assert_eq!(
-            hooks_for(ms.iter(), true)[0].timeout,
+            hooks_for(ms.iter().map(|m| (m, "sha256:h")), true)[0].timeout,
             Duration::from_millis(2000)
         );
+    }
+
+    #[test]
+    fn a_hook_carries_the_manifest_hash_it_was_chosen_from() {
+        let ms = [
+            manifest("acme.a", "all", true, true),
+            manifest("acme.b", "all", true, true),
+        ];
+        let hashes = ["sha256:one", "sha256:two"];
+        let hooks = hooks_for(ms.iter().zip(hashes), true);
+        let got: Vec<(&str, &str)> = hooks
+            .iter()
+            .map(|h| (h.plugin_id.as_str(), h.manifest_hash.as_str()))
+            .collect();
+        assert_eq!(got, [("acme.a", "sha256:one"), ("acme.b", "sha256:two")]);
     }
 
     struct FakeCaller {
@@ -238,7 +272,7 @@ mod tests {
     impl WorkerCall for FakeCaller {
         fn call<'a>(
             &'a self,
-            _plugin_id: &'a str,
+            _worker: WorkerRef<'a>,
             method: &'a str,
             params: Value,
             _timeout: Duration,
@@ -262,6 +296,7 @@ mod tests {
             plugin_id: id.into(),
             timeout: Duration::from_secs(1),
             order: 0,
+            manifest_hash: "sha256:h".into(),
         }
     }
 

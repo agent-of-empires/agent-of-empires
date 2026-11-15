@@ -176,7 +176,7 @@ Capabilities gate plugin resource access and host interactions. They are prompte
 | `session.unattended` | Creating a session in a host-classified *unattended* approval mode. A distinct, high-severity grant, never implied by `session.create` or `session.prompt` (`api_version >= 9`). See [Session-driving RPCs](#session-driving-rpcs). |
 | `session.message` | Pushing a text message into **any** session, including ones the plugin did not create, via `sessions.message.send`. A structured session shows the message as sent by the plugin, and the call reaches sessions the plugin did not create, so it is a separate grant, never implied by `session.prompt` (`api_version >= 15`). |
 | `session.integration` | Provider-native status and user-requested replies for an agent (`api_version >= 19`). Launch-only agent metadata does not require this capability. |
-| `mcp.rewrite` | Serving the `mcp.rewrite` hook. The worker receives each session's resolved MCP server definitions **including secret env and header values**, and returns the set AoE forwards to the agent (`api_version >= 21`). A distinct, high-severity grant, never implied by another. See [Hooks](#hooks). |
+| `mcp.rewrite` | Serving the `mcp.rewrite` hook. The worker receives each session's resolved MCP server definitions **including secret env and header values**, and returns the set AoE forwards to the agent (`api_version >= 23`). A distinct, high-severity grant, never implied by another. See [Hooks](#hooks). |
 
 A capability this host version does not recognize is rejected, not granted.
 
@@ -413,7 +413,7 @@ Status notifications follow canonical row adoption. Rejected or stale operations
 
 ## Hooks
 
-### `[hooks.mcp_rewrite]` (`api_version >= 21`)
+### `[hooks.mcp_rewrite]` (`api_version >= 23`)
 
 Lets a worker rewrite the MCP servers AoE forwards to a session's agent. Requires the `mcp.rewrite` capability and a `[runtime]` worker. The hook runs only while the plugin is active: enabled, loaded, and with a grant covering the current manifest hash. While it is inactive (disabled, failed to load, or awaiting re-approval after an update changed its manifest) no hook runs and sandboxes get the full resolved set.
 
