@@ -786,10 +786,10 @@ fn lookup(session: &str) -> Option<Arc<VtChannel>> {
         .and_then(Weak::upgrade)
 }
 
-/// Keep capture/send-keys fallbacks on the held generation's pane, including
-/// the interval after its socket dies and before its replacement is published.
-pub(crate) fn channel_pane_id(session: &str) -> Option<String> {
-    lookup(session).map(|channel| channel.target.clone())
+pub(crate) fn live_channel_pane_id(session: &str) -> Option<String> {
+    lookup(session)
+        .filter(|channel| channel.is_alive())
+        .map(|channel| channel.target.clone())
 }
 
 fn lookup_osc52(session: &str) -> Option<Arc<Osc52Channel>> {
@@ -4542,8 +4542,6 @@ mod tests {
         REGISTRY.lock().unwrap().remove(&name);
     }
 
-    /// #5694: a viewer still holding the pre-restart channel must not pin
-    /// sends to the pane that died with it.
     #[test]
     fn paste_after_recreate_reaches_the_new_pane_while_the_old_channel_is_held() {
         if !crate::tmux::test_helpers::tmux_available() {
