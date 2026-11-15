@@ -552,13 +552,16 @@ impl DaemonControlClient {
             ));
         }
         match constructor {
-            Some((context, fence)) => {
+            Some((context, fence)) if context == attempt.context => {
                 if !self.ingress.authorize_constructor(&attempt, context, fence) {
                     return Err(acp_internal_error(
                         "original constructor custody is unavailable".into(),
                     ));
                 }
             }
+            // A rebased canonical destination is not this physical constructor.
+            // Keep its authenticated Original/replay custody, without granting Current.
+            Some(_) => {}
             None if self.projection.original_window().is_some() => {
                 return Err(acp_internal_error(
                     "original constructor has no retained native fence".into(),
@@ -1468,7 +1471,9 @@ pub(super) async fn connect_runner_control(
                                         context.1.as_ref()
                                             .map(|scope| (scope.context, Arc::clone(&scope.fence)))
                                     };
-                                    if let Some((context, fence)) = constructor {
+                                    if let Some((context, fence)) = constructor
+                                        .filter(|(context, _)| *context == receipt.attempt.context)
+                                    {
                                         if !reader_ingress.authorize_constructor(
                                             &receipt.attempt, context, fence,
                                         ) {

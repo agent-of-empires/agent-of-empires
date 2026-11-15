@@ -2614,7 +2614,7 @@ async fn proxy_hello_and_primitives_shape_the_event_stream() {
             }).await.expect("the actual failed constructor reports its typed incompatibility");
             assert!(matches!(detail, StartupErrorDetail::InvalidProxyHello { .. }));
             assert_eq!(native.requests(), ["initialize"]);
-            scope.finish_conversation_case().await;
+            // Keep the row until this scope's captured retirement proves its cleanup.
 
             let (ready, mut fake) = spawn_fake_connection_raw(
                 scope,
