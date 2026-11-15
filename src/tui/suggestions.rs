@@ -1161,11 +1161,12 @@ impl SuggestionsFeed {
             .collect()
     }
 
-    /// Provider names in snapshot order, for the group preview.
+    /// Enabled provider names in snapshot order, for the group preview.
     pub(super) fn provider_names(&self) -> Vec<String> {
         self.snapshot
             .iter()
             .flat_map(|s| &s.providers)
+            .filter(|p| p.enabled)
             .map(|p| plain(&p.name))
             .collect()
     }
@@ -1953,6 +1954,20 @@ mod tests {
             !text.contains("GitHub: nothing new"),
             "no status line for a disabled provider"
         );
+    }
+
+    #[test]
+    fn the_group_preview_names_only_enabled_providers() {
+        let mut rig = view_with(vec![], idle_worker());
+        let snapshot = rig.store.snapshot.as_mut().unwrap();
+        let mut off = snapshot.providers[0].clone();
+        off.id = "q".into();
+        off.name = "Linear".into();
+        off.enabled = false;
+        snapshot.providers.push(off);
+        assert_eq!(rig.store.provider_names(), ["GitHub"]);
+        rig.store.snapshot.as_mut().unwrap().providers[0].enabled = false;
+        assert!(rig.store.provider_names().is_empty());
     }
 
     #[test]
