@@ -1845,7 +1845,7 @@ mod tests {
     fn the_session_secret_is_created_only_when_an_mcp_endpoint_is_served() {
         let manifest = |caps: &str| {
             aoe_plugin_api::PluginManifest::from_toml_str(&format!(
-                "id = \"acme.p\"\nname = \"N\"\nversion = \"1.0.0\"\napi_version = 22\ncapabilities = [{caps}]\n\n[runtime]\nkind = \"command\"\ncommand = [\"bin/w\"]\n"
+                "id = \"acme.p\"\nname = \"N\"\nversion = \"1.0.0\"\napi_version = 24\ncapabilities = [{caps}]\n\n[runtime]\nkind = \"command\"\ncommand = [\"bin/w\"]\n"
             ))
             .unwrap()
         };
