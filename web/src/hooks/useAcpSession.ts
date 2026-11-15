@@ -312,9 +312,10 @@ export function useAcpSession(
 
   // The daemon owns and drains the queue; re-list on connect, at each turn change, and when the
   // polled count changes (not whenever it differs: optimistic rows here differ until the next
-  // poll). The first list per session re-sends rows the server never confirmed; a confirmed row
-  // missing from the server was drained and must not be re-created.
-  const queueMigratedRef = useRef<Set<string>>(new Set());
+  // poll). The first list per session waits for rows the server never confirmed to be re-sent,
+  // once each; a rerun must not cancel that. A confirmed row missing from the server was
+  // drained and must not be re-created.
+  const queueMigrationRef = useRef<Map<string, Promise<void>>>(new Map());
   // The sidebar badge takes this browser's count only between the first queue list after an open and the close.
   const queueListedRef = useRef(false);
   useEffect(() => {
@@ -332,22 +333,28 @@ export function useAcpSession(
   useEffect(() => {
     if (!sessionId || status !== "open") return;
     let cancelled = false;
-    void (async () => {
-      if (!queueMigratedRef.current.has(sessionId)) {
-        queueMigratedRef.current.add(sessionId);
-        for (const q of queuedPromptsRef.current) {
-          if (cancelled) return;
-          if (!q.pending) continue;
-          await enqueueServerPrompt(sessionId, {
-            id: q.id,
-            text: q.text,
-            attachments: q.attachments,
-          });
+    let migration = queueMigrationRef.current.get(sessionId);
+    if (!migration) {
+      const pending = queuedPromptsRef.current.filter((q) => q.pending);
+      migration = (async () => {
+        for (const q of pending) {
+          await enqueueServerPrompt(sessionId, { id: q.id, text: q.text, attachments: q.attachments });
         }
-      }
+      })();
+      queueMigrationRef.current.set(sessionId, migration);
+    }
+    const migrated = migration;
+    void (async () => {
+      await migrated;
       const rows = await listServerQueue(sessionId);
-      // A failed list must not lend the sidebar a count, or replace the rows on screen.
-      if (cancelled || rows === null) return;
+      if (cancelled) return;
+      // A failed list must not replace the rows on screen. The sidebar falls back to the polled
+      // count, whose next change lists again.
+      if (rows === null) {
+        queueListedRef.current = false;
+        setLiveQueueCount(sessionId, null);
+        return;
+      }
       queueListedRef.current = true;
       dispatch({ kind: "hydrate_server_queue", rows });
     })();

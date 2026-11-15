@@ -737,6 +737,9 @@ describe("server queue", () => {
   let queueListHeld: Promise<void> | null;
   let queueListStarted: (() => void) | null;
   let queueListFails: boolean;
+  // Set to hold each queue POST's response until it resolves.
+  let queuePostHeld: Promise<void> | null;
+  let queuePostStarted: (() => void) | null;
   const row = (id: string, text: string, extra: Partial<ServerQueuedPrompt> = {}): ServerQueuedPrompt => ({
     id,
     seq: serverQueue.size,
@@ -752,6 +755,8 @@ describe("server queue", () => {
     queueListHeld = null;
     queueListStarted = null;
     queueListFails = false;
+    queuePostHeld = null;
+    queuePostStarted = null;
     vi.mocked(reportAcpInteraction).mockClear();
     vi.mocked(listServerQueue).mockClear();
     calls = installAcpFakes(({ url, method, body }) => {
@@ -766,7 +771,9 @@ describe("server queue", () => {
         if (method === "POST") {
           const parsed = JSON.parse(body!) as { id: string; text: string };
           serverQueue.set(parsed.id, row(parsed.id, parsed.text));
-          return json(serverQueue.get(parsed.id));
+          queuePostStarted?.();
+          const saved = () => json(serverQueue.get(parsed.id));
+          return queuePostHeld ? queuePostHeld.then(saved) : saved();
         }
         if (method === "DELETE" && item && !serverQueue.delete(decodeURIComponent(item))) {
           return new Response("queued prompt not found", { status: 404 });
@@ -846,7 +853,7 @@ describe("server queue", () => {
     expect(getLiveQueueCount(id)).toBeUndefined();
   });
 
-  it("keeps the Daemon's count when a queue list fails, and re-lists when the polled count changes", async () => {
+  it("falls back to the Daemon's count when a queue list fails, and re-lists when the polled count changes", async () => {
     const id = "sess-polled";
     const persisted = ["p1", "p2"].map((pid) => ({ id: pid, text: pid, queuedAt: "2026-01-01T00:00:00.000Z" }));
     localStorage.setItem(
@@ -884,6 +891,47 @@ describe("server queue", () => {
     await waitFor(() => expect(getLiveQueueCount(id)).toBe(2));
     expect(hook.result.current.chip).toEqual([2]);
     expect(hook.result.current.acp.state.queuedPrompts.map((q) => q.text)).toEqual(["first", "from another tab"]);
+
+    // A refresh that fails after a list succeeded stops lending this tab's now stale count.
+    queueListFails = true;
+    serverQueue.set("q3", row("q3", "third"));
+    hook.rerender({ polled: 3 });
+    await waitFor(() => expect(getLiveQueueCount(id)).toBeUndefined());
+    expect(hook.result.current.chip).toEqual([3]);
+    expect(hook.result.current.acp.state.queuedPrompts.map((q) => q.text)).toEqual(["first", "from another tab"]);
+    queueListFails = false;
+    hook.rerender({ polled: 4 });
+    await waitFor(() => expect(getLiveQueueCount(id)).toBe(3));
+    hook.unmount();
+  });
+
+  it("re-sends each unconfirmed row once when the polled count changes mid-migration", async () => {
+    const id = "sess-migrating";
+    const queuedAt = "2026-01-01T00:00:00.000Z";
+    const state = {
+      ...emptyAcpState(),
+      queuedPrompts: ["u1", "u2", "u3"].map((pid) => ({ id: pid, text: pid, queuedAt, pending: true })),
+    };
+    localStorage.setItem(`${STORAGE_KEY_PREFIX}${id}`, JSON.stringify({ savedAt: Date.now(), state }));
+    const hook = renderHook(({ polled }: { polled: number }) => useAcpSession(id, "running", null, null, polled), {
+      wrapper: profileWrapper,
+      initialProps: { polled: 0 },
+    });
+    await flushAsync();
+    const post = Promise.withResolvers<void>();
+    const started = Promise.withResolvers<void>();
+    queuePostHeld = post.promise;
+    queuePostStarted = started.resolve;
+    lastSocket().open();
+    await started.promise;
+    // The first POST commits, which moves the poll, before its response arrives.
+    hook.rerender({ polled: 1 });
+    await flushAsync();
+    queuePostHeld = null;
+    post.resolve();
+    await waitFor(() => expect(hook.result.current.state.queuedPrompts.every((q) => !q.pending)).toBe(true));
+    expect(posts("/queue").map((c) => JSON.parse(c.body!).id)).toEqual(["u1", "u2", "u3"]);
+    expect(hook.result.current.state.queuedPrompts.map((q) => q.id)).toEqual(["u1", "u2", "u3"]);
     hook.unmount();
   });
 
