@@ -73,6 +73,31 @@ describe("SidebarSuggestions", () => {
     expect((await screen.findByTestId("sidebar-suggested-toggle")).textContent).toBe("Suggested (4)");
   });
 
+  it("follows a refreshing provider only while the sidebar pref is on", async () => {
+    vi.useFakeTimers();
+    try {
+      for (const [sidebar, calls] of [
+        [true, 2],
+        [false, 1],
+      ] as const) {
+        cleanup();
+        fetchSuggestions.mockReset();
+        const refreshing = snap(ITEMS, sidebar);
+        refreshing.providers = [{ ...refreshing.providers[0]!, refreshing: true }];
+        fetchSuggestions.mockResolvedValue(refreshing);
+        renderIt();
+        await act(async () => {});
+        expect(fetchSuggestions).toHaveBeenCalledTimes(1);
+        await act(async () => {
+          await vi.advanceTimersByTimeAsync(2500);
+        });
+        expect(fetchSuggestions).toHaveBeenCalledTimes(calls);
+      }
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
   it("starts collapsed, then lists up to 3 items and View all", async () => {
     const preparing = new Promise(() => {});
     prepareSuggestion.mockReturnValue(preparing);

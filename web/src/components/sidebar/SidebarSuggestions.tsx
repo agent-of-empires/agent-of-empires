@@ -23,7 +23,11 @@ interface Props {
 export function SidebarSuggestions({ readOnly = false, onPrepare, onStarted, onViewAll, onOpenSession }: Props) {
   const compact = useContext(SidebarCompactContext);
   const [expanded, toggleExpanded] = usePersistedFlag("aoe-sidebar-suggested-expanded", false);
-  const { snapshot, busy, offline, failures, notice, start } = useSuggestions(onPrepare, onStarted);
+  const { snapshot, busy, offline, failures, notice, start } = useSuggestions(
+    onPrepare,
+    onStarted,
+    (s) => !s.prefs.sidebar,
+  );
 
   if (!snapshot?.prefs.sidebar) return null;
   const active = snapshot.items.filter((item) => !item.dismissed);
