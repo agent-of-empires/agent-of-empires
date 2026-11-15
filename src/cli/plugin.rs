@@ -473,7 +473,6 @@ async fn observe_job(client: &HttpClient, id: &str) -> Result<()> {
     tokio::select! {
         result = observe => result,
         _ = tokio::signal::ctrl_c() => bail!("Observation stopped; job {id} outcome unknown. Run `aoe plugin job {id}` on the same Daemon; no operation was resubmitted"),
-        _ = tokio::time::sleep(std::time::Duration::from_secs(30 * 60)) => bail!("Observation timed out; job {id} outcome unknown. Run `aoe plugin job {id}` on the same Daemon; no operation was resubmitted"),
     }
 }
 
