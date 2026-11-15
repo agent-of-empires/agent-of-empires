@@ -337,7 +337,7 @@ mod tests {
                     } else if case == "prompt_pending" {
                         live.state.acp_supervisor.test_note_admission(&id);
                     } else if case == "unknown" {
-                        let retained = live.state.acp_event_store.highest_seq(&id);
+                        let retained = live.state.acp_event_store.highest_seq(&id).unwrap();
                         live.state
                             .acp_event_store
                             .test_conn()
@@ -414,9 +414,9 @@ mod tests {
                     .await
                     .unwrap()
                     .unwrap();
-                let before = live.state.acp_event_store.highest_seq(&id);
+                let before = live.state.acp_event_store.highest_seq(&id).unwrap();
                 live.state.acp_supervisor.test_note_admission(&id);
-                assert_eq!(live.state.acp_event_store.highest_seq(&id), before);
+                assert_eq!(live.state.acp_event_store.highest_seq(&id).unwrap(), before);
                 assert!(release.release());
                 reaper.await.unwrap();
                 assert_eq!(live.state.acp_supervisor.current_lease(&id), Some(lease));
@@ -462,7 +462,7 @@ mod tests {
             let old_stamp = live.state.instances.read().await.iter().find(|row| row.id == id).unwrap().idle_dormant_since.unwrap();
             let storage = crate::session::Storage::open_reference("test").unwrap();
             assert_eq!(storage.load().unwrap().iter().find(|row| row.id == id).unwrap().idle_dormant_since, Some(old_stamp));
-            let before = live.state.acp_event_store.highest_seq(&id);
+            let before = live.state.acp_event_store.highest_seq(&id).unwrap();
             live.native.send(serde_json::json!({"jsonrpc":"2.0","method":"session/update","params":{
                 "sessionId":live.sid,"update":{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"late native output"}}
             }})).await;
@@ -726,7 +726,7 @@ mod tests {
                 if case != "fresh" { live.make_quota_due(); }
                 live.state.instances.write().await.iter_mut().find(|row| row.id == id).unwrap().status =
                     if case == "waiting" { crate::session::Status::Waiting } else { crate::session::Status::Running };
-                let before = live.state.acp_event_store.highest_seq(&id);
+                let before = live.state.acp_event_store.highest_seq(&id).unwrap();
                 if case == "unknown" {
                     live.state.acp_event_store.test_conn().execute("DELETE FROM acp_events WHERE session_id=?1 AND seq<?2",
                         rusqlite::params![id, i64::try_from(before).unwrap()]).unwrap();

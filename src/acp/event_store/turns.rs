@@ -616,7 +616,14 @@ impl EventStore {
     /// Qualified agent output since the last actual turn boundary, including a
     /// turn started by the agent without a host prompt.
     pub(crate) fn has_open_agent_turn(&self, session_id: &str) -> Result<ControlKnowledge<bool>> {
-        self.with_control_snapshot(session_id, |_, cursor| Ok(cursor.projection.agent_open))
+        self.with_control_snapshot(session_id, |_, cursor| {
+            use ControlKnowledge::{Known, Indeterminate};
+            Ok(match (cursor.projection.agent_open, cursor.projection.autonomous_open) {
+                (Known(true), _) | (_, Known(true)) => Known(true),
+                (Known(false), Known(false)) => Known(false),
+                _ => Indeterminate,
+            })
+        })
     }
 
     pub fn has_open_turn(&self, session_id: &str) -> Result<ControlKnowledge<bool>> {

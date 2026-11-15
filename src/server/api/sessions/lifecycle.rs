@@ -1738,7 +1738,7 @@ fn commit_structured_user_stop(
     // The original producer can have persisted its binding before the async
     // listener obtains instance exclusion. Preserve that qualified observation
     // while we still own its native incarnation, before Stop supersedes it.
-    let through = state.acp_event_store.highest_seq_checked(id)?;
+    let through = state.acp_event_store.highest_seq(id)?;
     let observed = state
         .acp_event_store
         .handoff_context_event(id, 0, through)?;
@@ -4875,7 +4875,7 @@ mod durable_stop_tests {
                 assert!(SystemProcessControl::default().is_alive(filler_owner));
                 let original_methods = original_native.requests();
                 let filler_methods = filler_native.requests();
-                let frontier = state.acp_event_store.highest_seq(&id);
+                let frontier = state.acp_event_store.highest_seq(&id).unwrap();
                 let (load_config, load_native) = scope.native_peer(
                     project.path().into(),
                     "codex",
@@ -4914,7 +4914,7 @@ mod durable_stop_tests {
                 assert_eq!(after.lifecycle_reservation, lifecycle_reservation);
                 assert_eq!(after.status, Status::Stopped);
                 assert_eq!(worker_registry::stop_intent(&id).unwrap(), stop);
-                assert_eq!(state.acp_event_store.highest_seq(&id), frontier);
+                assert_eq!(state.acp_event_store.highest_seq(&id).unwrap(), frontier);
                 assert!(state.acp_supervisor.current_lease(&id).is_none());
                 assert!(load_native.requests().is_empty());
                 assert_eq!(original_native.requests(), original_methods);
@@ -5877,7 +5877,7 @@ mod restart_wake_tests {
                 // alone correctly refuses Spawn while that retained physical owner stays alive.
                 live.client.shutdown().await.unwrap();
                 let requests = live.native.requests();
-                let frontier = state.acp_event_store.highest_seq(&id);
+                let frontier = state.acp_event_store.highest_seq(&id).unwrap();
                 let budget = state
                     .acp_event_store
                     .rate_limit_redelivery_streak(&id)
@@ -5968,7 +5968,7 @@ mod restart_wake_tests {
                     serde_json::to_value(current.pending_initial_turn).unwrap()
                 );
                 assert!(!state.acp_supervisor.is_running(&id).await);
-                assert_eq!(state.acp_event_store.highest_seq(&id), frontier);
+                assert_eq!(state.acp_event_store.highest_seq(&id).unwrap(), frontier);
                 assert_eq!(
                     state
                         .acp_event_store

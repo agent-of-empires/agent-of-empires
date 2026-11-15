@@ -894,7 +894,7 @@ mod tests {
             3,
             &AcpEventData::from_history(Event::ThinkingStarted)
         ));
-        assert_eq!(store.highest_seq("writer-panic"), 3);
+        assert_eq!(store.highest_seq("writer-panic").unwrap(), 3);
     }
 
     /// Stalls a save on the writer connection until the returned sender fires.
@@ -1038,15 +1038,12 @@ mod tests {
         }
         // Drop may only return once the writer has run what was queued.
         if done.recv_timeout(Duration::from_millis(200)).is_ok() {
-            assert_eq!(
-                store.highest_seq("shutdown"),
-                1,
-                "drop returned before the queued save"
-            );
+            assert_eq!(store.highest_seq("shutdown").unwrap(), 1,
+            "drop returned before the queued save");
         }
         release.send(()).unwrap();
         dropper.join().unwrap();
-        assert_eq!(store.highest_seq("shutdown"), 1);
+        assert_eq!(store.highest_seq("shutdown").unwrap(), 1);
         assert_eq!(receipt.wait(), Some((1, true)));
     }
 

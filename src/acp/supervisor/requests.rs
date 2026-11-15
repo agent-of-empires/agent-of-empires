@@ -796,7 +796,7 @@ mod tests {
                     .await
                     .unwrap()
                     .unwrap();
-                let before = state.acp_event_store.highest_seq(&client.id);
+                let before = state.acp_event_store.highest_seq(&client.id).unwrap();
                 let error = supervisor
                     .reset_session_context(&client.id, "/new", None, false)
                     .await

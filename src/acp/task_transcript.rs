@@ -1407,7 +1407,7 @@ mod tests {
                     .fold_control_state(&f._managed.id)
                     .await
                     .unwrap();
-                let seq = scope.state.acp_event_store.highest_seq(&f._managed.id) + 1;
+                let seq = scope.state.acp_event_store.highest_seq(&f._managed.id).unwrap() + 1;
                 assert_eq!(state.sidebar_status(), Status::Running);
                 f.active.stop("t-1");
                 f.spawn(TailerStart::Resumed).await;
@@ -1445,7 +1445,7 @@ mod tests {
                     .fold_control_state(&f._managed.id)
                     .await
                     .unwrap();
-                let seq = scope.state.acp_event_store.highest_seq(&f._managed.id) + 1;
+                let seq = scope.state.acp_event_store.highest_seq(&f._managed.id).unwrap() + 1;
                 assert_eq!(state.sidebar_status(), Status::Running);
                 let watch = FileWatchService::new().unwrap();
                 f.spawn_with(watch.clone(), TailerStart::Live).await;

@@ -16,7 +16,7 @@ use crate::acp::agent_profiles::AgentProfile;
 /// `client_info` is mandatory: a strict backend rejects the empty strings that
 /// omitting it serializes to (#2767).
 pub(super) fn build_initialize_request(profile: &AgentProfile) -> InitializeRequest {
-    let capabilities = ClientCapabilities::new()
+    let mut capabilities = ClientCapabilities::new()
         .fs(FileSystemCapabilities::new()
             .read_text_file(true)
             .write_text_file(true))
@@ -37,6 +37,9 @@ pub(super) fn build_initialize_request(profile: &AgentProfile) -> InitializeRequ
         )
         // Each subagent then arrives as a child session on this connection.
         .subagents(profile.supports_subagents.then(SubagentCapabilities::new));
+    capabilities.meta = Some([(
+        "ompAutonomousTurns".to_owned(), serde_json::json!({"version": 1}),
+    )].into_iter().collect());
     InitializeRequest::new(ProtocolVersion::V1)
         .client_capabilities(capabilities)
         .client_info(

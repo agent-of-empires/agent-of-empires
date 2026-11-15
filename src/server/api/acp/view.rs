@@ -1264,7 +1264,7 @@ async fn terminal_handoff_request(state: Arc<AppState>, id: String) -> Response 
         return session_not_found();
     };
     let profile = cached.source_profile.clone();
-    let source_event_seq = match state.acp_event_store.highest_seq_checked(&id) {
+    let source_event_seq = match state.acp_event_store.highest_seq(&id) {
         Ok(seq) => seq,
         Err(error) => return handoff_unavailable(&error),
     };
@@ -1572,7 +1572,7 @@ fn drive_terminal_handoff(
                             .complete_unowned_fenced_handoff(&id, already)
                             .await?;
                     }
-                    let final_seq = state.acp_event_store.highest_seq_checked(&id)?;
+                    let final_seq = state.acp_event_store.highest_seq(&id)?;
                     held.native
                         .as_mut()
                         .expect("owned store")
@@ -2938,7 +2938,7 @@ mod tests {
         let driver =
             Arc::new(crate::session::try_acquire_terminal_handoff_driver(&row.id)?.unwrap());
         let capture = capture_handoff_reservation(&state, &native, &expected).await?;
-        let floor = state.acp_event_store.highest_seq_checked(&row.id)?;
+        let floor = state.acp_event_store.highest_seq(&row.id)?;
         let owner = tokio::task::spawn_blocking(move || {
             reserve_handoff_in(
                 native,
@@ -2988,7 +2988,7 @@ mod tests {
             .iter()
             .all(|(signalled, _)| *signalled == pid));
         let completed = intent.completed_runner(&row.id, &target)?;
-        let final_seq = state.acp_event_store.highest_seq_checked(&row.id)?;
+        let final_seq = state.acp_event_store.highest_seq(&row.id)?;
         let save_id = row.id.clone();
         tokio::task::spawn_blocking(move || -> anyhow::Result<()> {
             let _title = crate::session::acquire_session_title_lock(&save_id)?;
@@ -3111,7 +3111,7 @@ mod tests {
             Default::default(),
         )?);
         let state = retired_native_handoff_with_event_store(&source, events.clone()).await?;
-        let sentinel = events.highest_seq_checked(&source.id)? + 1;
+        let sentinel = events.highest_seq(&source.id)? + 1;
         events.record(
             &source.id,
             sentinel,
@@ -3498,7 +3498,7 @@ mod tests {
             for id in [&source.id, &stopped.id] {
                 events.record(
                     id,
-                    events.highest_seq_checked(id)? + 1,
+                    events.highest_seq(id)? + 1,
                     &crate::acp::Event::Stopped {
                         reason: "projection sentinel".into(),
                     },
@@ -3833,7 +3833,7 @@ mod tests {
             assert!(complete.lifecycle_reservation.is_none());
             assert_eq!(projection_counts(&db, &source.id)?, [0; 4]);
             assert_eq!(projection_counts(&db, &stopped.id)?, control_counts);
-            assert_eq!(new_events.highest_seq_checked(&source.id)?, 0);
+            assert_eq!(new_events.highest_seq(&source.id)?, 0);
             assert_eq!(structured_launches.load(Ordering::SeqCst), 0);
             assert_eq!(crate::tmux::test_helpers::only_pane_id(&pane_name), pane_id);
             assert_eq!(

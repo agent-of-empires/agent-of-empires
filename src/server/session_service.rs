@@ -2203,10 +2203,15 @@ impl SessionService {
             cache.get_or_hydrate(&sid, || {
                 let mut reduced = AcpState::new(AcpSessionId(sid.clone()), agent, model);
                 let mut last_seq = 0;
-                for stored in store.replay_from(&sid, 0)? {
+                let page = store.replay_page(&sid, 0, None)?;
+                for stored in page.events {
                     reduced.apply_scoped_event(stored.seq, &stored.event, &stored.metadata)?;
                     last_seq = stored.seq;
                 }
+                if let Some(fact) = page.autonomous {
+                    fact.restore_state(&mut reduced);
+                }
+                last_seq = last_seq.max(page.highest_seq);
                 Ok((reduced, last_seq))
             })
         })

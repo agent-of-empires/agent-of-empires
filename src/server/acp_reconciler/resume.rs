@@ -1218,6 +1218,9 @@ mod tests {
             with_managed(|scope| Box::pin(async move {
                 let mut live = crate::server::test_support::managed_control_session(scope, "orphaned-real-turn").await;
                 if agent_initiated {
+                let run_id = uuid::Uuid::new_v4();
+                live.native.send(serde_json::json!({"jsonrpc":"2.0","method":"_omp/autonomous_turn/start",
+                    "params":{"version":1,"sessionId":live.sid,"runId":run_id,"source":"irc"}})).await;
                 live.native.send(serde_json::json!({"jsonrpc":"2.0","method":"session/update","params":{
                     "sessionId":live.sid,"update":{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"woken"}}
                 }})).await;
@@ -1226,6 +1229,8 @@ mod tests {
                         if matches!(live.client.next_event().await, Some(crate::acp::Event::AgentMessageChunk { text, .. }) if text == "woken") { break; }
                     }
                 }).await.expect("the actual Native's autonomous turn reaches its durable projection");
+                assert_eq!(live.state.acp_event_store.has_open_turn(live.id()).unwrap(), Known(true),
+                    "the negotiated original start is durably admitted before losing its observer");
                 } else {
                     let _request = live.start_prompt("keep going").await;
                 }
@@ -1268,6 +1273,9 @@ mod tests {
         use crate::acp::supervisor::test_support::managed::with_managed;
         with_managed(|scope| Box::pin(async move {
                 let mut live = crate::server::test_support::managed_control_session(scope, "unknown-orphaned-real-turn").await;
+                let run_id = uuid::Uuid::new_v4();
+                live.native.send(serde_json::json!({"jsonrpc":"2.0","method":"_omp/autonomous_turn/start",
+                    "params":{"version":1,"sessionId":live.sid,"runId":run_id,"source":"irc"}})).await;
                 live.native.send(serde_json::json!({"jsonrpc":"2.0","method":"session/update","params":{
                     "sessionId":live.sid,"update":{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"woken"}}
                 }})).await;
@@ -1276,6 +1284,8 @@ mod tests {
                         if matches!(live.client.next_event().await, Some(crate::acp::Event::AgentMessageChunk { text, .. }) if text == "woken") { break; }
                     }
                 }).await.expect("the actual Native's autonomous turn reaches its durable projection");
+                assert_eq!(live.state.acp_event_store.has_open_turn(live.id()).unwrap(), Known(true),
+                    "the original's real lifecycle, not content, establishes the open precondition");
                 let id = live.id().to_owned();
                 let owner = live.state.acp_supervisor.current_native_availability(&id)
                     .await.unwrap().owner.unwrap();
@@ -1498,6 +1508,9 @@ mod tests {
             let id = live.id().to_owned();
             let request = live.start_prompt("go").await;
             live.finish_prompt(&request, None).await;
+            let run_id = uuid::Uuid::new_v4();
+            live.native.send(serde_json::json!({"jsonrpc":"2.0","method":"_omp/autonomous_turn/start",
+                "params":{"version":1,"sessionId":live.sid,"runId":run_id,"source":"irc"}})).await;
             live.native.send(serde_json::json!({"jsonrpc":"2.0","method":"session/update","params":{
                 "sessionId":live.sid,"update":{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"woken"}}
             }})).await;
@@ -1507,6 +1520,12 @@ mod tests {
                 }
             }).await.expect("the original Native opens autonomous work after its prompt completes");
             assert_eq!(live.state.acp_event_store.holds_live_work(&id).unwrap(), Known(true));
+            let admitted = live.state.acp_event_store.replay_from(&id, 0).unwrap();
+            let start = admitted.iter().find(|stored| stored.metadata.native_autonomous.as_ref()
+                .is_some_and(|autonomous| autonomous.identity.run_id == run_id)).expect("durable original start");
+            assert!(matches!(start.event.as_ref(), Event::ThinkingStarted));
+            assert!(start.metadata.operation.is_none() && start.metadata.native_prompt_id.is_none());
+            assert_eq!(start.metadata.scope, crate::acp::event_sender::EventScope::HistoryOnly);
             let owner = live.client.actual().connected_runner();
             let methods = live.native.requests();
             live.client = scope.reconcile_after(live.client, |state, id| async move {
@@ -1533,12 +1552,30 @@ mod tests {
                 "sessionId":live.sid,"update":{"sessionUpdate":"usage_update","used":10,"size":100,
                     "cost":{"amount":0.1,"currency":"USD"}}
             }})).await;
+            tokio::time::timeout(Duration::from_secs(10), async {
+                loop {
+                    if matches!(live.client.next_event().await, Some(Event::UsageUpdated { .. })) { break; }
+                }
+            }).await.expect("the actual accounting frame reaches the durable stream");
+            assert_eq!(live.state.acp_event_store.holds_live_work(&id).unwrap(), Known(true),
+                "accounting cannot settle the independently admitted original");
+            assert_eq!(live.state.acp_event_store.replay_from(&id, 0).unwrap().iter()
+                .filter(|stored| matches!(stored.event.as_ref(), Event::Stopped { .. })).count(), 1);
+            live.native.send(serde_json::json!({"jsonrpc":"2.0","method":"_omp/autonomous_turn/end",
+                "params":{"version":1,"sessionId":live.sid,"runId":run_id,"source":"irc","stopReason":"end_turn"}})).await;
             tokio::time::timeout(Duration::from_secs(30), async {
                 loop {
                     if matches!(live.client.next_event().await, Some(Event::Stopped { reason }) if reason == "agent_idle") { break; }
                 }
-            }).await.expect("only this autonomous turn's real accounting boundary releases its live-work hold");
+            }).await.expect("only this autonomous original's own typed terminal releases its live-work hold");
             assert_eq!(live.state.acp_event_store.holds_live_work(&id).unwrap(), Known(false));
+            let completed = live.state.acp_event_store.replay_from(&id, 0).unwrap();
+            assert_eq!(completed.iter().filter(|stored| matches!(stored.event.as_ref(), Event::Stopped { .. })).count(), 2);
+            let terminal = completed.iter().find(|stored| stored.metadata.native_autonomous.as_ref()
+                .is_some_and(|autonomous| autonomous.identity.run_id == run_id
+                    && autonomous.phase == crate::acp::control_protocol::NativeAutonomousPhase::Ended))
+                .expect("the original's durable correlated terminal");
+            assert!(terminal.metadata.operation.is_none() && terminal.metadata.native_prompt_id.is_none());
         })).await;
     }
 }

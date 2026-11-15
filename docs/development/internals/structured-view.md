@@ -13,7 +13,7 @@ Each runner registers at `<app_dir>/acp-workers/<session_id>.json` (pid, socket 
 Invariants worth knowing before touching this code:
 
 - **One owner per generation.** Every spawn, attach and respawn has a local lease epoch tied to its captured runner generation. Shutdown, the reaper, the drain task and the reconciler refuse stale authority. A spawn completing after a stop tears its own runner down instead of installing it. Stop remains pending until its captured runner and scopes retire and any directly owned child is reaped, holding prompts and refusing resumes while the reconciler retries.
-- **Compatibility is not liveness.** `runner_version` is 7 and the control wire is v7. The optional registry `control_protocol_version` is a prerequisite, not proof of native usability; missing/null stays Unknown without rewriting old records. Unknown, incompatible or unconfirmed live ownership is refused before adoption, replacement, budget or queue effects. The actual connected Unix peer must match the captured PID and kernel birth before Attach. Compatible v7 workers retain the existing build-staleness replacement policy.
+- **Compatibility is not liveness.** `runner_version` is 7 and the control wire is v8. The optional registry `control_protocol_version` is a prerequisite, not proof of native usability; missing/null stays Unknown without rewriting old records. Unknown, incompatible or unconfirmed live ownership is refused before adoption, replacement, budget or queue effects. The actual connected Unix peer must match the captured PID and kernel birth before Attach. Compatible v8 workers retain the existing build-staleness replacement policy.
 - **Prompt admission responses.** HTTP refusals preserve the admission decision's status, headers and body.
 - **Process-group termination.** Runners are group leaders via `setsid`, and every termination path signals the group, so the node wrapper and SDK child die with the runner rather than reparenting to PID 1. Prefer the verbs over `kill -9`, which leaves the runner no chance to clean up.
 - **Self-termination watchdog.** A runner polls its own registry record and exits when abandoned: record gone, superseded, or detached from any daemon past a 48h retention window (reset on reattach). This is the backstop for a daemon that dies without killing its runners.
@@ -42,7 +42,7 @@ Invariants worth knowing before touching this code:
 - **Startup requeue.** Failed startup and an ended attached connection can clear the reconciler's attempted-session pin. This preserves the existing retry budget and still passes canonical admission; a requeue ID grants neither a new native invocation for Pending/Blocked authority nor permission to reset conversation selection.
 - **Managed consumer fixture custody (`cfg(test)`).** The private host re-enters its current libtest executable as the real production runner, with separate argv, socket and birth-observation files for each launch. The actual native parent records the original child's birth before waiting/reaping; cleanup may only compare that birth, never adopt the current occupant of an old PID. A helper panic remains a permanent fixture failure even if the body ignores its join result. The host completes owned cleanup and restores its environment before reporting that failure; unconfirmed cleanup still aborts before restoration. These fixtures require the original Node shim dependencies, not a separately built normal `aoe` executable.
 - **Background recovery.** Retained allocation witnesses bind only to the actual established Control receipt; adoption revalidates the original identity before transcript I/O. Retained selectors, never current configuration or paths alone, choose the source. Child progress and END retain the child's allocation without a prompt outcome or Written window. Captured teardown can publish Detached only for the exact durable allocation, including unfinished children of a finished workflow; it does not prove Native completion or success. Failed allocation reads retain cleanup debt. SDK teardown cancels local readers before joining their event drain; Native work and durable witnesses remain. Private witnesses and transcript paths never reach clients.
-- **Subagent sessions.** A profile with `supports_subagents` declares the ACP subagents capability, so each subagent is a child session on the same connection. `SessionIngress` admits a child only after a `subagent_update` on an admitted session names it, and answers its permission and elicitation requests but refuses its fs and terminal requests, which assume the root session's workspace. Child traffic takes `handle_child_notification`, never the root's dedup, compaction or watchdog path. The adapter hides the Agent/Task call, so aoe synthesizes the card from the parent-to-child delegation `session_message` (its message id is the card id and the child's `parent_tool_call_id`); the child's reply or hand-back `session_message` completes it, while a background child has none and its card follows the roster state. Only child tool calls and its model reach the transcript, and the tool calls nest under that card via `parent_tool_call_id`. `SubagentUpdated` carries a full merged snapshot, so replay is last-write-wins, and its state replaces the transcript tailer's heuristics for that agent. Stop sends `session/cancel` with the child id over `POST /api/sessions/{id}/acp/subagents/{child_id}/cancel`, or `ControlBody::CancelSession` through a runner (control protocol 7), and only for a child that announced `capabilities.cancel`. The client freezes the observed current parent and checks the child route and cancel capability. The required wire frame carries that parent, the child target and the original `NativeRequestScope`; the runner retains its attachment, owner and exact selected-parent checks through the scoped Native write. The emitted notification names only the child, not the root turn. Old protocol5/6 declarations remain incompatible rather than being restamped. A child's own delegations (grandchildren) are not rendered: their `session_message`s are dropped. A conversation reset is refused while a child runs, since it would drop the child routes. Restoring children after `session/load` is not implemented, so an async agent left open by a restart is still resolved by the resumed tailer below.
+- **Subagent sessions.** A profile with `supports_subagents` declares the ACP subagents capability, so each subagent is a child session on the same connection. `SessionIngress` admits a child only after a `subagent_update` on an admitted session names it, and answers its permission and elicitation requests but refuses its fs and terminal requests, which assume the root session's workspace. Child traffic takes `handle_child_notification`, never the root's dedup, compaction or watchdog path. The adapter hides the Agent/Task call, so aoe synthesizes the card from the parent-to-child delegation `session_message` (its message id is the card id and the child's `parent_tool_call_id`); the child's reply or hand-back `session_message` completes it, while a background child has none and its card follows the roster state. Only child tool calls and its model reach the transcript, and the tool calls nest under that card via `parent_tool_call_id`. `SubagentUpdated` carries a full merged snapshot, so replay is last-write-wins, and its state replaces the transcript tailer's heuristics for that agent. Stop sends `session/cancel` with the child id over `POST /api/sessions/{id}/acp/subagents/{child_id}/cancel`, or `ControlBody::CancelSession` through a runner (control protocol 8), and only for a child that announced `capabilities.cancel`. The client freezes the observed current parent and checks the child route and cancel capability. The required wire frame carries that parent, the child target and the original `NativeRequestScope`; the runner retains its attachment, owner and exact selected-parent checks through the scoped Native write. The emitted notification names only the child, not the root turn. Old protocol5/6/7 declarations remain incompatible rather than being restamped. A child's own delegations (grandchildren) are not rendered: their `session_message`s are dropped. A conversation reset is refused while a child runs, since it would drop the child routes. Restoring children after `session/load` is not implemented, so an async agent left open by a restart is still resolved by the resumed tailer below.
   Native ingress freezes the physical source, observed parent SID and admitted
   ancestry before queueing or pending replay. Private persisted metadata, not
   payload IDs, carries that proof. Historical child snapshots may update display
@@ -57,6 +57,43 @@ same candidate and feature set. CI builds `--no-default-features --features vend
 macOS unit tests. Targeted runs may set `AOE_TEST_ACP_RUNNER_EXE` to that matching
 binary; fixtures never build it or borrow a stale executable. The separate
 Node-free default-build proof remains independent.
+
+## Native autonomous lifecycle
+
+The optional Native ACP extension negotiates
+`_meta.ompAutonomousTurns.version = 1` in both initialize directions. Only
+positively observed `_omp/autonomous_turn/start` and its matching
+`_omp/autonomous_turn/end` establish and settle independently initiated root
+work. Ordinary content, accounting, compaction and silence remain historical;
+they cannot manufacture either boundary.
+
+The original physical actor allocates a source-local lifecycle ordinal. Its
+root SID, run identity, physical birth and original context are frozen before
+queueing. This readonly qualification stays private and `history_only`; it
+creates no Original/Written request, Native input permission, callback grant
+or child/resource authority. Main request completion and failed-main budgets
+remain independent. An autonomous terminal cannot manufacture main-idle
+knowledge when retained main history is unknown.
+
+Same-original reattachment restores the captured readonly constructor and
+revalidates its original fence. The authenticated greeting retains the latest
+actual start/end alongside the independent cached prompt result. These facts
+share the existing bootstrap slots and byte bound, not another frame allowance.
+An old main completion cannot release autonomous work, and late old-source
+boundaries cannot take ownership of replacement work.
+
+One bounded nullable `autonomous_commit_json` fact on the existing establishment
+row commits with its real event. It survives ordinary row retention and
+deduplicates already committed phases without new sequence, fold or broadcast.
+Cold replay reads events, this fact and high-water in the same read transaction.
+Missing legacy proof stays unqualified; malformed present proof is an error,
+not an empty history or zero frontier. Migration59 reconciles the nullable
+column idempotently without rewriting `seal_json` or `prompt_commit_json`,
+inventing legacy authority or renumbering Frontier60. A fenced host orphan
+boundary retires only its captured old custody; it is not a Native terminal.
+Public HTTP/WebSocket serialization omits the private lifecycle proof and run
+identity. Reduced activity does not imply current Native controls.
+
 ## Owned retirement and idle decisions
 
 Stop-intent consumers compare the complete observed intent, including its token,
@@ -753,6 +790,39 @@ worker cannot settle before the bounded shutdown wait, the endpoint returns a
 separate `409 worker_not_stopped` response is used when the worker is still
 present after a successful shutdown wait. The restart request is runtime-owned,
 so disconnecting the HTTP client does not leave the session half-restarted.
+
+### Governed initial intent and explicit Fresh
+
+While establishment is unresolved, a prompt may be accepted as a host-only
+intent in the existing bounded actor queue. Its `202` response with disposition
+`sent` and no `queued_id` proves host admission, not a Native prompt write.
+Only the same captured Original attempt, generation, profile, choice, producer
+and client may issue it after genuine Applied confirmation and ordinary Native
+operation capture. Stop before that write settles this intent once without a
+Native prompt or cancel RPC; a replacement cannot inherit its payload.
+
+The authoritative live snapshot can expose `host_prompt_intent` independently
+of Native readiness and `turn_active`. Web Stop and TUI Ctrl+C submit that exact
+UUID to the existing cancel endpoint. A supplied stale, missing or replaced
+identity refuses without falling back to whichever Native turn is current.
+After actual issue, cancellation still needs the matching original request and
+unchanged Native authority. Bodyless Native cancellation retains its own checks.
+Host-only Stop does not retire the physical worker or display worker-stopped
+chrome. Completion, Stop, Fresh, failure and supersession invalidate the host
+identity; cached/replayed state cannot restore it, and reconnect must reobserve
+the live source. Other Native and child controls inherit no host-only permission.
+
+Fresh requires explicit confirmation against the `recovery.revision` captured
+when the recovery gesture opens. The public revision is an opaque 32-byte array,
+a stateless comparison digest, not authority. It covers the complete private
+comparison state, including checkpoint namespace distinctions, without exposing
+endpoints, userinfo, routing/config/socket paths, container or Prime snapshots.
+The server compares it with the same freshly fenced canonical state before
+Stop or New, then retains the full internal Expected/CAS checks. A changed or
+missing revision requires reobservation and renewed consent, never silent
+retargeting. Successful recovery does not resend a stopped prompt; a later
+explicit send waits for actual current Native readiness.
+
 
 ## Agent switching
 

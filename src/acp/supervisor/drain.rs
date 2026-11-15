@@ -482,10 +482,10 @@ impl<S: BroadcastSink> Drain<S> {
         };
         let current_guard = if pending_request.is_none()
             && installed
-            && matches!(
+            && (matches!(
                 data.metadata.scope,
                 EventScope::SessionCurrent | EventScope::OperationCurrent
-            ) {
+            ) || data.metadata.native_autonomous.as_ref().is_some_and(|autonomous| autonomous.qualified)) {
             match (request.as_ref(), constructor.as_ref()) {
                 (Some(request), None) => match request.try_effect_guard() {
                     Ok(guard) => Some(guard),
@@ -1084,6 +1084,9 @@ impl<S: BroadcastSink> Drain<S> {
                 end.superseded = true;
                 return;
             }
+        }
+        if data.metadata.native_autonomous.is_some() {
+            return;
         }
         match data.event.as_ref() {
             Event::Stopped { reason } => match reason.as_str() {
@@ -2249,21 +2252,26 @@ mod tests {
                 DEFERRED_REGISTRY_OBSERVED.lock().unwrap().take();
             }
         }
+        for open_task in [None, Some("pending-task")] {
         super::super::test_support::managed::with_managed(|scope| Box::pin(async move {
                 let directory = scope.tempdir();
                 let transcript = directory.path().join("agent.jsonl");
                 std::fs::write(&transcript, "").unwrap();
                 let mut fixture = super::super::launch::tests::managed_background_original(
-                    scope, "drain-observation-recovery", transcript.to_str().unwrap(), Some("pending-task"), false).await;
+                    scope, "drain-observation-recovery", transcript.to_str().unwrap(), open_task, false).await;
                 fixture.client = scope.adopt(fixture.client, false).await;
                 fixture.client.ready().await;
                 let id = fixture.client.id.clone();
-                let agent_allocation = fixture.store.unresolved_background_agent_launches(&id).unwrap()
-                    .into_iter().find(|launch| launch.agent_id == "sub-1").unwrap()
-                    .witness.unwrap().allocation;
-                let task_allocation = fixture.store.unresolved_background_task_launches(&id).unwrap()
-                    .into_iter().find(|launch| launch.task_id == "pending-task").unwrap()
-                    .witness.unwrap().allocation;
+                let agent = open_task.is_none();
+                let allocation = if agent {
+                    fixture.store.unresolved_background_agent_launches(&id).unwrap()
+                        .into_iter().find(|launch| launch.agent_id == "sub-1").unwrap()
+                        .witness.unwrap().allocation
+                } else {
+                    fixture.store.unresolved_background_task_launches(&id).unwrap()
+                        .into_iter().find(|launch| launch.task_id == "pending-task").unwrap()
+                        .witness.unwrap().allocation
+                };
                 // A later legacy history row may reuse an ID without superseding its Native allocation.
                 let legacy_launches: Vec<_> = fixture.store.replay_from(&id, 0).unwrap()
                     .into_iter().filter(|stored| matches!(stored.event.as_ref(),
@@ -2273,8 +2281,8 @@ mod tests {
                 for launch in legacy_launches {
                     supervisor.publish_next(&id, launch);
                 }
-                assert_eq!(fixture.store.unresolved_background_agent_tracking_launches(&id).unwrap().len(), 2);
-                assert_eq!(fixture.store.unresolved_background_task_launches(&id).unwrap().len(), 2);
+                assert_eq!(fixture.store.unresolved_background_agent_tracking_launches(&id).unwrap().len(), if agent { 2 } else { 0 });
+                assert_eq!(fixture.store.unresolved_background_task_launches(&id).unwrap().len(), if agent { 0 } else { 2 });
                 let sid = fixture.client.actual().establishment_projection().unwrap().receipt_snapshot().unwrap()
                     .session_id().unwrap().to_owned();
                 fixture.peer.send(serde_json::json!({"jsonrpc":"2.0","method":"session/update","params":{
@@ -2284,7 +2292,7 @@ mod tests {
                     while !matches!(fixture.client.recv().await.expect("attached original history observer remains open"),
                         Event::AgentMessageChunk { text, .. } if text == "history before registry refusal") {}
                 }).await.expect("real Native history is committed before contention");
-                let prefix = fixture.store.highest_seq(&id);
+                let prefix = fixture.store.highest_seq(&id).unwrap();
                 let mut publication = fixture.client.subscribe_publications();
                 let identity = fixture.client.actual().connected_runner().expect("actual original runner");
                 let birth = crate::process::process_birth_identity(identity.pid).unwrap()
@@ -2302,7 +2310,7 @@ mod tests {
                     .expect("the actual closed-channel drain reaches registry contention").unwrap();
                 assert!(tokio::time::timeout(Duration::from_millis(100), publication.recv()).await.is_err(),
                     "actual original loss cannot publish through held registry exclusion");
-                assert_eq!(fixture.store.highest_seq(&id), prefix, "registry contention cannot authorize a terminal publication");
+                assert_eq!(fixture.store.highest_seq(&id).unwrap(), prefix, "registry contention cannot authorize a terminal publication");
                 drop(registry);
                 tokio::time::timeout(Duration::from_secs(15), async {
                     while fixture.client.recv().await.is_some() {}
@@ -2313,7 +2321,6 @@ mod tests {
                 let state = super::super::launch::tests::fold_background_journal(&fixture.store, &id);
                 assert!(!state.has_active_background_agent());
                 let events = fixture.store.replay_from(&id, 0).expect("durable replay");
-                for (allocation, agent) in [(agent_allocation, true), (task_allocation, false)] {
                     let ends: Vec<_> = events.iter().filter(|stored| {
                         stored.metadata.resource_ref == Some(allocation)
                             && if agent {
@@ -2328,17 +2335,17 @@ mod tests {
                     assert!(ends[0].metadata.host_action);
                     assert!(ends[0].metadata.native_origin.is_none());
                     assert!(ends[0].metadata.resource_witness.is_none());
-                }
                 assert_eq!(events.iter().filter(|stored|
                     stored.metadata.resource_ref.is_none() && matches!(stored.event.as_ref(),
-                        Event::BackgroundAgentCompleted { agent_id, .. } if agent_id == "sub-1")).count(), 1);
+                        Event::BackgroundAgentCompleted { agent_id, .. } if agent_id == "sub-1")).count(), usize::from(agent));
                 assert_eq!(events.iter().filter(|stored|
                     stored.metadata.resource_ref.is_none() && matches!(stored.event.as_ref(),
-                        Event::BackgroundTaskFinished { task_id, .. } if task_id == "pending-task")).count(), 1);
+                        Event::BackgroundTaskFinished { task_id, .. } if task_id == "pending-task")).count(), usize::from(!agent));
                 assert!(events.iter().any(|stored| matches!(stored.event.as_ref(),
                     Event::AgentMessageChunk { text, .. } if text == "history before registry refusal")));
                 assert!(!events.iter().any(|stored| matches!(stored.event.as_ref(), Event::SessionContextReset { .. })));
             })).await;
+        }
     }
 
     #[tokio::test]
@@ -2399,7 +2406,7 @@ mod tests {
                     let supervisor = client.app_state().acp_supervisor.clone();
                     let mut frames = client.subscribe_publications();
                     let store = scope.state.acp_event_store.clone();
-                    let prefix = store.highest_seq(&client.id);
+                    let prefix = store.highest_seq(&client.id).unwrap();
                     let storage = crate::session::Storage::open_reference("test").unwrap();
                     let mut preceding_lifecycle = if profile_writer {
                         Some((
@@ -3876,7 +3883,7 @@ mod tests {
                         .fold_control_state(&id)
                         .await
                         .unwrap();
-                    let prefix = store.highest_seq(&id);
+                    let prefix = store.highest_seq(&id).unwrap();
                     let lease = live.client.lease.clone();
                     let owner = live.client.actual().connected_runner().unwrap();
                     let removed = {
@@ -3931,7 +3938,7 @@ mod tests {
                     ));
                     supervisor.sink.flush();
                     assert!(store.replay_from(&id, prefix).unwrap().is_empty());
-                    assert_eq!(store.highest_seq(&id), prefix);
+                    assert_eq!(store.highest_seq(&id).unwrap(), prefix);
                     assert_eq!(
                         super::super::try_activity_seq(&supervisor.next_seqs, &id)
                             .expect("a superseded publication cannot retain sequence exclusion"),
@@ -3982,7 +3989,7 @@ mod tests {
                 let cache = live.state.acp_control_cache.clone();
                 assert!(Arc::ptr_eq(&cache, store.control_cache()));
                 let before = live.state.session_service.fold_control_state(&id).await.unwrap();
-                let prefix = store.highest_seq(&id);
+                let prefix = store.highest_seq(&id).unwrap();
                 let mut frames = live.state.acp_events_tx.subscribe();
                 let error = || Event::PromptRuntimeError {
                     message: "operation failed".into(),
@@ -4010,7 +4017,7 @@ mod tests {
                 supervisor.sink.flush();
                 assert!(supervisor.workers.lock().await.get(&id).unwrap().restart_history.is_empty());
                 assert!(store.replay_from(&id, prefix).unwrap().is_empty());
-                assert_eq!(store.highest_seq(&id), prefix);
+                assert_eq!(store.highest_seq(&id).unwrap(), prefix);
                 assert_eq!(super::super::try_activity_seq(&supervisor.next_seqs, &id).expect("the unchanged sequence remains observable"), prefix);
                 assert!(matches!(frames.try_recv(), Err(tokio::sync::broadcast::error::TryRecvError::Empty)));
                 let unchanged = cache.get_or_hydrate(&id, || panic!("the warm fold must survive")).unwrap();

@@ -343,6 +343,14 @@ impl Shared {
 
     async fn apply_ingress(&self, entry: PendingIngress) {
         match entry {
+            PendingIngress::Autonomous { first, second } => {
+                for notification in [Some(first), second].into_iter().flatten() {
+                    let sender = self.event_tx.with_autonomous(
+                        notification.metadata, notification.constructor_scope,
+                    );
+                    let _ = sender.send(notification.event).await;
+                }
+            }
             PendingIngress::Update(notification) => {
                 self.handle_notification(*notification, false).await
             }

@@ -238,7 +238,7 @@ async fn handle(
                         if frame.session_id != session_id {
                             continue;
                         }
-                        if forward_frames {
+                        if forward_frames && frame.native_autonomous.is_none() {
                             let payload = match serde_json::to_string(&frame) {
                                 Ok(s) => s,
                                 Err(e) => {
@@ -297,12 +297,16 @@ async fn handle(
                         );
                         let store = Arc::clone(&state.acp_event_store);
                         let session_for_read = session_id.clone();
-                        let entries = match tokio::task::spawn_blocking(move || {
-                            store.replay_from(&session_for_read, 0)
+                        let page = match tokio::task::spawn_blocking(move || {
+                            store.replay_page(&session_for_read, 0, None)
                         }).await {
-                            Ok(Ok(entries)) => entries,
-                            result => {
-                                warn!(target: "acp.ws", session = %session_id, ?result, "replay rebuild failed");
+                            Ok(Ok(page)) => page,
+                            Ok(Err(error)) => {
+                                warn!(target: "acp.ws", session = %session_id, %error, "replay rebuild failed");
+                                break;
+                            }
+                            Err(error) => {
+                                warn!(target: "acp.ws", session = %session_id, %error, "replay read task failed");
                                 break;
                             }
                         };
@@ -313,10 +317,14 @@ async fn handle(
                             cold: &mut cold,
                             last_applied_seq: 0,
                         };
-                        if let Err(error) = fold_connect_history(entries, since, &mut folds, false) {
+                        if let Err(error) = fold_connect_history(page.events, since, &mut folds, false) {
                             warn!(target: "acp.ws", session = %session_id, %error, "replay folds failed");
                             break;
                         }
+                        if let Some(fact) = page.autonomous {
+                            fact.restore_state(folds.reduced);
+                        }
+                        folds.last_applied_seq = folds.last_applied_seq.max(page.highest_seq);
                         let highest = folds.last_applied_seq;
                         reduced = rebuilt;
                         transcript = rebuilt_transcript;
@@ -381,13 +389,17 @@ async fn drain_replay_into_socket(
     let store = Arc::clone(&state.acp_event_store);
     let session_id_owned = session_id.to_string();
     // Read from seq 0, not from `since`.
-    let entries =
-        tokio::task::spawn_blocking(move || store.replay_from(&session_id_owned, 0)).await??;
+    let page =
+        tokio::task::spawn_blocking(move || store.replay_page(&session_id_owned, 0, None)).await??;
     let mut sent = 0usize;
-    let to_forward = fold_connect_history(entries, since, folds, forward_frames)?;
+    let to_forward = fold_connect_history(page.events, since, folds, forward_frames)?;
+    if let Some(fact) = page.autonomous {
+        fact.restore_state(folds.reduced);
+    }
+    folds.last_applied_seq = folds.last_applied_seq.max(page.highest_seq);
     let snapshot_seq = folds.last_applied_seq.max(since);
     for stored in to_forward {
-        if !forward_frames {
+        if !forward_frames || stored.metadata.native_autonomous.is_some() {
             continue;
         }
         let frame = AcpBroadcastFrame::from_qualified(
@@ -2034,7 +2046,7 @@ mod tests {
                     );
                     let scope = original.scope.clone();
                     let drain_pause = live.client.pause_drain().await;
-                    let frontier = state.acp_event_store.highest_seq(&id);
+                    let frontier = state.acp_event_store.highest_seq(&id).unwrap();
                     let native_requests = live.native.requests();
                     let (entered_tx, entered) = tokio::sync::oneshot::channel();
                     let (release, released) = std::sync::mpsc::channel();
@@ -2268,7 +2280,7 @@ mod tests {
                         "same-frontier qualification must issue no Native RPC"
                     );
                     assert_eq!(settled["seq"], frontier, "qualification needs no new event");
-                    assert_eq!(state.acp_event_store.highest_seq(&id), frontier);
+                    assert_eq!(state.acp_event_store.highest_seq(&id).unwrap(), frontier);
                     assert_eq!(settled["state"]["prompt_wake_eligible"], false);
                     match change {
                         Change::None => assert_eq!(settled["state"]["connection_ready"], true),
@@ -2362,7 +2374,7 @@ mod tests {
                         .ready
                 );
                 let drain_pause = live.client.pause_drain().await;
-                let frontier = state.acp_event_store.highest_seq(&id);
+                let frontier = state.acp_event_store.highest_seq(&id).unwrap();
                 let held_scope = current.scope.clone();
                 let (entered_tx, entered) = tokio::sync::oneshot::channel();
                 let (release, released) = std::sync::mpsc::channel();
@@ -2401,7 +2413,7 @@ mod tests {
                 assert_eq!(invalidated["seq"], frontier);
                 assert_eq!(invalidated["state"]["connection_ready"], false);
                 assert_eq!(invalidated["state"]["prompt_wake_eligible"], false);
-                assert_eq!(state.acp_event_store.highest_seq(&id), frontier);
+                assert_eq!(state.acp_event_store.highest_seq(&id).unwrap(), frontier);
                 assert!(state.acp_supervisor.current_lease(&id) == Some(current.lease.clone()));
                 assert!(
                     worker_registry::is_record_live(&original_record),
@@ -2498,7 +2510,7 @@ mod tests {
                 let request = live.start_prompt("original").await;
                 request_native_attention(&mut live, true).await;
                 live.finish_prompt(&request, Some("request_failed")).await;
-                let frontier = state.acp_event_store.highest_seq(&id);
+                let frontier = state.acp_event_store.highest_seq(&id).unwrap();
                 let (mut socket, server) = connect_test_socket(state.clone(), &id).await;
                 let initial = receive_kind(&mut socket, "reduced_state").await;
                 assert_eq!(initial["seq"], frontier);
@@ -2545,7 +2557,7 @@ mod tests {
                 assert_eq!(lost["state"]["pending_elicitations"], serde_json::json!([]));
                 assert_eq!(lost["state"]["turn_active"], false);
                 assert_eq!(
-                    state.acp_event_store.highest_seq(&id),
+                    state.acp_event_store.highest_seq(&id).unwrap(),
                     frontier,
                     "retiring controls synthesizes no human decisions"
                 );
@@ -2601,7 +2613,7 @@ mod tests {
                         .unwrap();
                     assert!(applied.matches(&preimage, &disk).unwrap());
                     let preimage = serde_json::to_value(preimage).unwrap();
-                    let frontier = state.acp_event_store.highest_seq(&id);
+                    let frontier = state.acp_event_store.highest_seq(&id).unwrap();
                     let requests = live.native.requests();
                     let mut events = state.acp_events_tx.subscribe();
                     let scope = current.scope.clone();
@@ -2660,7 +2672,7 @@ mod tests {
                             "only the frozen actual selection may regain Ready"
                         );
                         assert!(settled["state"]["connection_unavailable"].is_null());
-                        assert_eq!(state.acp_event_store.highest_seq(&id), frontier);
+                        assert_eq!(state.acp_event_store.highest_seq(&id).unwrap(), frontier);
                         assert_eq!(live.native.requests(), requests);
                         assert!(matches!(
                             events.try_recv(),
@@ -2757,7 +2769,7 @@ mod tests {
                 .await;
                 let id = live.id().to_owned();
                 let _request = live.start_prompt("original retained work").await;
-                let before = live.state.acp_event_store.highest_seq(&id);
+                let before = live.state.acp_event_store.highest_seq(&id).unwrap();
                 let budget = live
                     .state
                     .acp_event_store
@@ -2783,7 +2795,7 @@ mod tests {
                 .await
                 .into_response();
                 assert_eq!(response.status(), axum::http::StatusCode::CONFLICT);
-                assert_eq!(live.state.acp_event_store.highest_seq(&id), before);
+                assert_eq!(live.state.acp_event_store.highest_seq(&id).unwrap(), before);
                 assert_eq!(
                     live.state
                         .acp_event_store
@@ -2836,7 +2848,7 @@ mod tests {
                 })
                 .await
                 .expect("capture the genuine published callback before replay overlap");
-                let frontier = state.acp_event_store.highest_seq(&id);
+                let frontier = state.acp_event_store.highest_seq(&id).unwrap();
                 let (mut socket, server) = connect_test_socket(state.clone(), &id).await;
                 let initial = receive_kind(&mut socket, "reduced_state").await;
                 assert_eq!(

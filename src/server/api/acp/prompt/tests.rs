@@ -637,7 +637,7 @@ async fn turn_on_a_park_attaches_the_retained_actor_then_delivers_only_new_expli
                     .await
                     .unwrap()
                     .owner;
-                let frontier = live.state.acp_event_store.highest_seq(&id);
+                let frontier = live.state.acp_event_store.highest_seq(&id).unwrap();
                 live.client = scope
                     .reconcile_after(live.client, |state, id| async move {
                         let response = if diff_comments {
@@ -743,7 +743,7 @@ async fn no_revive_preserves_workerless_parked_or_active_work_without_side_effec
                 let native_methods = live.native.requests();
                 live.client = scope
                     .reconcile_after(live.client, |state, id| async move {
-                        let before = state.acp_event_store.highest_seq(&id);
+                        let before = state.acp_event_store.highest_seq(&id).unwrap();
                         let budget = state
                             .acp_event_store
                             .rate_limit_redelivery_streak(&id)
@@ -760,7 +760,7 @@ async fn no_revive_preserves_workerless_parked_or_active_work_without_side_effec
                         .await
                         .into_response();
                         assert_eq!(response.status(), StatusCode::CONFLICT);
-                        assert_eq!(state.acp_event_store.highest_seq(&id), before);
+                        assert_eq!(state.acp_event_store.highest_seq(&id).unwrap(), before);
                         assert_eq!(
                             state
                                 .acp_event_store
@@ -2054,7 +2054,7 @@ async fn native_loss_and_legacy_refusal_precede_prompt_touch_queue_or_launch() {
             let storage = crate::session::Storage::open_unwatched(&row.source_profile).unwrap();
             let disk_before = std::fs::read(storage.sessions_path()).unwrap();
             let methods_before = live.native.requests();
-            let frontier = state.acp_event_store.highest_seq(&id);
+            let frontier = state.acp_event_store.highest_seq(&id).unwrap();
             for diff_comments in [false, true] {
                 let response = if diff_comments {
                     acp_prompt_diff_comments(

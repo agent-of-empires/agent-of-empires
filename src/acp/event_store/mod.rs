@@ -399,6 +399,7 @@ impl EventStore {
             EventTableShape::Scoped => {
                 Self::validate_auxiliary_tables(&conn)?;
                 Self::validate_prompt_commit_schema(&conn)?;
+                Self::validate_autonomous_commit_schema(&conn)?;
                 Self::validate_budget_knowledge(&conn)?;
                 events::initialize_schema(&conn, &schema)?;
             }
@@ -574,6 +575,11 @@ impl EventStore {
             .with_context(|| format!("serialise event for {session_id}@{seq}"))?;
         let now_ms = chrono::Utc::now().timestamp_millis();
         let recorded = self.append_controlled(session_id, seq, event, metadata, now_ms, |tx| {
+            if let Some(recorded) = Self::record_autonomous_result(
+                tx, session_id, seq, &json, now_ms, metadata,
+            )? {
+                return Ok(recorded);
+            }
             match Self::record_prompt_result(tx, session_id, seq, event, &json, now_ms, metadata)? {
                 Some(recorded) => Ok(recorded),
                 None => Ok(
@@ -628,16 +634,19 @@ impl EventStore {
         Ok(())
     }
 
-    /// Highest seq stored for `session_id`, or 0.
-    pub fn highest_seq(&self, session_id: &str) -> u64 {
-        let max = events::highest_seq(&self.reader(), &self.schema, session_id);
+    /// Highest actual event or retained publication sequence; malformed facts refuse.
+    pub fn highest_seq(&self, session_id: &str) -> Result<u64> {
+        let conn = self.reader();
+        let tx = conn.unchecked_transaction()?;
+        let max = Self::highest_seq_in_snapshot(&tx, session_id)?;
+        tx.commit()?;
         trace!(
             target: "acp.event_store",
             session = %session_id,
             highest_seq = max,
             "highest_seq query"
         );
-        max
+        Ok(max)
     }
 
     /// Lowest seq still stored for `session_id`, or `None` when nothing is.
@@ -654,8 +663,11 @@ impl EventStore {
 
     /// Publication counters retain sequence IDs after ordinary result rows are pruned.
     pub fn all_session_seqs(&self) -> Result<Vec<(String, u64)>> {
-        let conn = self.conn();
-        let mut statement = conn.prepare(
+        let mut conn = self.conn();
+        let tx = conn.transaction()?;
+        Self::validate_prompt_commit_schema(&tx)?;
+        Self::validate_autonomous_commit_schema(&tx)?;
+        let mut statement = tx.prepare(
             "SELECT session_id, MAX(seq) FROM (
                 SELECT session_id, MAX(seq) AS seq FROM acp_events GROUP BY session_id
                 UNION ALL
@@ -663,6 +675,12 @@ impl EventStore {
                     COALESCE(json_extract(prompt_commit_json, '$.diagnostic.seq'), 0),
                     COALESCE(json_extract(prompt_commit_json, '$.stopped'), 0))
                 FROM acp_establishment_commit WHERE prompt_commit_json IS NOT NULL
+                UNION ALL
+                SELECT session_id, MAX(
+                    COALESCE(json_extract(autonomous_commit_json, '$.started'), 0),
+                    COALESCE(json_extract(autonomous_commit_json, '$.ended'), 0),
+                    COALESCE(json_extract(autonomous_commit_json, '$.boundary.seq'), 0))
+                FROM acp_establishment_commit WHERE autonomous_commit_json IS NOT NULL
              ) GROUP BY session_id",
         )?;
         let mut rows = statement.query([])?;
@@ -672,6 +690,9 @@ impl EventStore {
                 .context("negative ACP publication sequence")?;
             collected.push((row.get::<_, String>(0)?, seq));
         }
+        drop(rows);
+        drop(statement);
+        tx.commit()?;
         debug!(
             target: "acp.event_store",
             sessions = collected.len(),
@@ -680,16 +701,16 @@ impl EventStore {
         Ok(collected)
     }
 
-    pub(crate) fn highest_seq_checked(&self, session_id: &str) -> Result<u64> {
-        let seq: i64 = self.conn().query_row(
-            &format!(
-                "SELECT COALESCE(MAX(seq), 0) FROM {} WHERE session_id = ?1",
-                self.schema.events_table()
-            ),
-            rusqlite::params![session_id],
-            |row| row.get(0),
+    pub(super) fn highest_seq_in_snapshot(
+        conn: &rusqlite::Connection,
+        session_id: &str,
+    ) -> Result<u64> {
+        let seq: i64 = conn.query_row(
+            "SELECT COALESCE(MAX(seq),0) FROM acp_events WHERE session_id=?1",
+            rusqlite::params![session_id], |row| row.get(0),
         )?;
-        Ok(u64::try_from(seq)?)
+        let (retained, _) = Self::retained_publication_state(conn, session_id)?;
+        Ok(u64::try_from(seq)?.max(retained))
     }
 
     pub(crate) fn handoff_context_event(
@@ -1132,9 +1153,9 @@ mod tests {
         assert_eq!(store.lowest_seq("s-1"), Some(1));
 
         store.delete_session("s-1");
-        assert_eq!(store.highest_seq("s-1"), 0);
+        assert_eq!(store.highest_seq("s-1").unwrap(), 0);
         assert_eq!(store.lowest_seq("s-1"), None);
-        assert_eq!(store.highest_seq("s-2"), 1, "siblings are untouched");
+        assert_eq!(store.highest_seq("s-2").unwrap(), 1, "siblings are untouched");
 
         // Persisted prompt shapes, legacy and current, stay readable.
         use crate::acp::state::DiffComment;
@@ -1336,5 +1357,175 @@ mod tests {
             let json = serde_json::to_string(&event).unwrap();
             assert!(json.starts_with(&format!("{{\"{name}\":")), "{json}");
         }
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn native_autonomous_fact_survives_pruning_and_refuses_conflicting_replay() {
+        use crate::acp::event_store::ControlKnowledge::Known;
+        use crate::acp::supervisor::test_support::managed::with_managed;
+        with_managed(|scope| Box::pin(async move {
+            let mut live = crate::server::test_support::managed_control_session(scope, "retained-autonomous-fact").await;
+            let id = live.id().to_owned();
+            let run = uuid::Uuid::new_v4();
+            live.native.send(serde_json::json!({"jsonrpc":"2.0","method":"_omp/autonomous_turn/start",
+                "params":{"version":1,"sessionId":live.sid,"runId":run,"source":"irc"}})).await;
+            tokio::time::timeout(std::time::Duration::from_secs(10), async {
+                while !matches!(live.client.next_event().await, Some(Event::ThinkingStarted)) {}
+            }).await.expect("the genuine original start reaches its publication consumer");
+            let store = Arc::clone(&live.state.acp_event_store);
+            let start = store.replay_from(&id, 0).unwrap().into_iter().find(|stored|
+                stored.metadata.native_autonomous.as_ref().is_some_and(|autonomous|
+                    autonomous.identity.run_id == run)).expect("actual committed original start");
+            assert!(start.metadata.operation.is_none() && start.metadata.native_prompt_id.is_none());
+            let frame = crate::acp::protocol::AcpBroadcastFrame::from_qualified(
+                id.clone(), start.seq, Arc::clone(&start.event), &start.metadata, None, None, None);
+            let public = serde_json::to_value(&frame).unwrap();
+            assert!(public.get("native_autonomous").is_none());
+            assert!(public.get("native_origin").is_none());
+            assert!(!serde_json::to_string(&public).unwrap().contains(&run.to_string()));
+            assert!(frame.native_subject.is_none());
+            live.native.send(serde_json::json!({"jsonrpc":"2.0","method":"session/update","params":{
+                "sessionId":live.sid,"update":{"sessionUpdate":"agent_message_chunk",
+                    "content":{"type":"text","text":"past the original start"}}}})).await;
+            tokio::time::timeout(std::time::Duration::from_secs(10), async {
+                while !matches!(live.client.next_event().await,
+                    Some(Event::AgentMessageChunk { text, .. }) if text == "past the original start") {}
+            }).await.expect("real Native progress provides the retention cutoff");
+            {
+                let conn = store.conn();
+                crate::events::prune_retention(&conn, &store.schema, &id, 1, RETENTION_PINNED_EVENT_DISCRIMINANTS);
+            }
+            assert!(!store.replay_from(&id, 0).unwrap().iter().any(|stored| stored.seq == start.seq));
+            store.control_cache.forget(&id);
+            assert_eq!(store.holds_live_work(&id).unwrap(), Known(true),
+                "cold control hydration must retain the actual admitted original");
+            let page = store.replay_page(&id, 0, None).unwrap();
+            let mut projected = crate::acp::state::AcpState::new(
+                crate::acp::state::AcpSessionId(id.clone()),
+                crate::acp::state::AgentName("claude".into()), None);
+            page.autonomous.as_ref().expect("same-snapshot retained fact").restore_state(&mut projected);
+            assert!(projected.native_autonomous_active && !projected.turn_active);
+            let frontier = store.highest_seq(&id).unwrap();
+            assert_eq!(page.highest_seq, frontier);
+            assert_eq!(store.record(&id, frontier + 1, &start.event, &start.metadata).unwrap(),
+                RecordDisposition::Existing { seq: start.seq });
+            assert_eq!(store.highest_seq(&id).unwrap(), frontier);
+            let mut conflicting = start.metadata.clone();
+            let autonomous = Arc::make_mut(conflicting.native_autonomous.as_mut().unwrap());
+            Arc::make_mut(&mut autonomous.identity).run_id = uuid::Uuid::new_v4();
+            assert!(store.record(&id, frontier + 1, &start.event, &conflicting).is_err());
+            assert_eq!(store.highest_seq(&id).unwrap(), frontier);
+            assert_eq!(store.holds_live_work(&id).unwrap(), Known(true));
+            let retained: String = store.conn().query_row(
+                "SELECT autonomous_commit_json FROM acp_establishment_commit WHERE session_id=?1",
+                [&id], |row| row.get(0)).unwrap();
+            store.conn().execute(
+                "UPDATE acp_establishment_commit SET autonomous_commit_json='{' WHERE session_id=?1",
+                [&id]).unwrap();
+            let refused = (
+                store.highest_seq(&id).is_err(),
+                store.replay_page(&id, 0, None).is_err(),
+                store.all_session_seqs().is_err(),
+                store.holds_live_work(&id).is_err(),
+            );
+            store.conn().execute(
+                "UPDATE acp_establishment_commit SET autonomous_commit_json=?1 WHERE session_id=?2",
+                rusqlite::params![retained, id]).unwrap();
+            assert_eq!(refused, (true, true, true, true),
+                "malformed retained metadata cannot certify an empty or low-water view");
+            live.native.send(serde_json::json!({"jsonrpc":"2.0","method":"_omp/autonomous_turn/end",
+                "params":{"version":1,"sessionId":live.sid,"runId":run,"source":"irc","stopReason":"end_turn"}})).await;
+            tokio::time::timeout(std::time::Duration::from_secs(10), async {
+                while !matches!(live.client.next_event().await,
+                    Some(Event::Stopped { reason }) if reason == "agent_idle") {}
+            }).await.expect("only the actual matching terminal closes the retained original");
+            let terminal = store.replay_from(&id, 0).unwrap().into_iter().find(|stored|
+                stored.metadata.native_autonomous.as_ref().is_some_and(|autonomous|
+                    autonomous.phase == crate::acp::control_protocol::NativeAutonomousPhase::Ended))
+                .expect("real original terminal");
+            let completed = store.replay_page(&id, 0, None).unwrap();
+            assert_eq!(completed.autonomous.as_ref().unwrap().activity(), Known(false));
+            let unrelated_main = store.holds_live_work(&id).unwrap();
+            assert_eq!(unrelated_main, crate::acp::event_store::ControlKnowledge::Indeterminate,
+                "an autonomous terminal cannot manufacture main-idle knowledge after retention");
+            let frontier = store.highest_seq(&id).unwrap();
+            assert_eq!(store.record(&id, frontier + 1, &terminal.event, &terminal.metadata).unwrap(),
+                RecordDisposition::Existing { seq: terminal.seq });
+            assert_eq!(store.record(&id, frontier + 1, &start.event, &start.metadata).unwrap(),
+                RecordDisposition::Existing { seq: start.seq });
+            assert_eq!(store.highest_seq(&id).unwrap(), frontier);
+            store.control_cache.forget(&id);
+            let completed = store.replay_page(&id, 0, None).unwrap();
+            assert_eq!(completed.autonomous.as_ref().unwrap().activity(), Known(false),
+                "neither a retained start nor a duplicate terminal may reopen completed work");
+            assert_eq!(store.holds_live_work(&id).unwrap(), unrelated_main,
+                "duplicate autonomous phases must preserve independently unknown main knowledge");
+        })).await;
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn native_autonomous_terminal_keeps_an_independent_written_main_turn_open() {
+        use crate::acp::event_store::ControlKnowledge::Known;
+        use crate::acp::supervisor::test_support::managed::with_managed;
+        with_managed(|scope| Box::pin(async move {
+            let mut live = crate::server::test_support::managed_control_session(scope, "independent-native-turns").await;
+            let id = live.id().to_owned();
+            let run = uuid::Uuid::new_v4();
+            live.native.send(serde_json::json!({"jsonrpc":"2.0","method":"_omp/autonomous_turn/start",
+                "params":{"version":1,"sessionId":live.sid,"runId":run,"source":"irc"}})).await;
+            tokio::time::timeout(std::time::Duration::from_secs(10), async {
+                while !matches!(live.client.next_event().await, Some(Event::ThinkingStarted)) {}
+            }).await.expect("the actual original's autonomous admission is committed");
+            let main_request = live.start_prompt("an independently written main input").await;
+            let store = Arc::clone(&live.state.acp_event_store);
+            let fold = || {
+                let mut state = crate::acp::state::AcpState::new(
+                    crate::acp::state::AcpSessionId(id.clone()),
+                    crate::acp::state::AgentName("claude".into()), None);
+                for stored in store.replay_from(&id, 0).unwrap() {
+                    state.apply_scoped_event(stored.seq, &stored.event, &stored.metadata).unwrap();
+                }
+                state
+            };
+            let both = fold();
+            assert!(both.turn_active && both.native_autonomous_active,
+                "the actual Native request and autonomous run have independent live holds");
+            assert!(store.replay_from(&id, 0).unwrap().iter().any(|stored|
+                matches!(stored.event.as_ref(), Event::ThinkingStarted) && stored.metadata.operation.is_some()));
+            let mut historical = both.clone();
+            historical.apply_scoped_event(historical.last_seq + 1,
+                &Event::SessionCleared, &EventMetadata::history()).unwrap();
+            assert!(historical.turn_active && historical.native_autonomous_active,
+                "raw historical clear cannot retire either authenticated current owner");
+            live.native.send(serde_json::json!({"jsonrpc":"2.0","method":"_omp/autonomous_turn/end",
+                "params":{"version":1,"sessionId":live.sid,"runId":run,"source":"irc","stopReason":"end_turn"}})).await;
+            tokio::time::timeout(std::time::Duration::from_secs(10), async {
+                while !matches!(live.client.next_event().await,
+                    Some(Event::Stopped { reason }) if reason == "agent_idle") {}
+            }).await.expect("the actual autonomous terminal is independently consumed");
+            let ended = fold();
+            assert!(ended.turn_active && !ended.native_autonomous_active,
+                "the autonomous terminal cannot complete the genuinely written main request");
+            assert_eq!(store.holds_live_work(&id).unwrap(), Known(true));
+            let terminal = store.replay_from(&id, 0).unwrap().into_iter().find(|stored|
+                stored.metadata.native_autonomous.as_ref().is_some_and(|autonomous|
+                    autonomous.phase == crate::acp::control_protocol::NativeAutonomousPhase::Ended))
+                .expect("actual private original terminal");
+            assert!(terminal.metadata.operation.is_none() && terminal.metadata.native_prompt_id.is_none());
+            let mut unmatched = crate::acp::operation_effect::OperationEffects::default();
+            assert_eq!(unmatched.apply(crate::acp::operation_effect::ControlKind::Stopped("agent_idle"),
+                &terminal.metadata), crate::acp::operation_effect::ControlEffect::Indeterminate);
+            assert!(!unmatched.autonomous_open(), "a terminal alone is never positive admission");
+            live.finish_prompt(&main_request, None).await;
+            let settled = fold();
+            assert!(!settled.turn_active && !settled.native_autonomous_active);
+            assert_eq!(store.holds_live_work(&id).unwrap(), Known(false));
+            let methods = live.native.requests();
+            assert_eq!(methods.iter().filter(|method| method.as_str() == "session/new").count(), 1);
+            assert_eq!(methods.iter().filter(|method| method.as_str() == "session/prompt").count(), 1);
+            assert!(!methods.iter().any(|method| method == "session/load" || method == "session/cancel"));
+        })).await;
     }
 }

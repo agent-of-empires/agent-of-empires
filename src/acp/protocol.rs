@@ -105,6 +105,7 @@ pub struct AcpBroadcastFrame {
     pub(crate) native_origin: Option<crate::acp::state::NativeEventOrigin>,
     pub(crate) availability_denial: bool,
     pub(crate) host_action: bool,
+    pub(crate) native_autonomous: Option<Arc<crate::acp::event_sender::NativeAutonomousMetadata>>,
     /// Which installed worker produced this frame, for in-process
     /// consumers that must reject a replaced worker's queued frames. Never serialized.
     pub worker_generation: Option<u64>,
@@ -133,6 +134,9 @@ impl AcpBroadcastFrame {
             resource_ref: self.resource_ref,
             availability_denial: self.availability_denial,
             host_action: self.host_action,
+            native_autonomous: self.native_autonomous.clone(),
+            reported_session_id: self.native_autonomous.as_ref()
+                .map(|autonomous| autonomous.identity.root_session_id.clone()),
             ..EventMetadata::history()
         }
     }
@@ -160,6 +164,7 @@ impl AcpBroadcastFrame {
             native_origin: metadata.native_origin,
             availability_denial: metadata.availability_denial,
             host_action: metadata.host_action,
+            native_autonomous: metadata.native_autonomous.clone(),
             worker_generation,
             sidebar_status,
         }
@@ -233,6 +238,7 @@ impl<'de> Deserialize<'de> for AcpBroadcastFrame {
             native_origin: None,
             availability_denial: false,
             host_action: false,
+            native_autonomous: None,
             worker_generation: None,
             sidebar_status: None,
         })

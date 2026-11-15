@@ -430,7 +430,7 @@ async fn committed_purge_preserves_a_reused_rows_structured_projection() -> anyh
         let _instance = next_instance.await;
         let _submission = next_submission.await;
         assert_eq!(
-            state.acp_event_store.highest_seq(&row.id),
+            state.acp_event_store.highest_seq(&row.id).unwrap(),
             17,
             "original purge erased replacement event counter"
         );

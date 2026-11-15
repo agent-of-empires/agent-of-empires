@@ -1303,6 +1303,9 @@ pub struct AcpState {
     pub historical_usage: Option<SessionUsage>,
     #[serde(skip)]
     operation_effects: crate::acp::operation_effect::OperationEffects,
+    /// Separately owned Native root activity; never a main input/callback grant.
+    #[serde(default)]
+    pub native_autonomous_active: bool,
     #[serde(default)]
     pub available_commands: Vec<AvailableCommand>,
     /// Modes the adapter advertised; adapter-scoped, so they survive `/clear`.
@@ -1867,7 +1870,7 @@ impl AcpState {
             SidebarPhase::Error | SidebarPhase::PromptFailed => Status::Error,
             SidebarPhase::Waiting => Status::Waiting,
             SidebarPhase::Active => Status::Running,
-            SidebarPhase::Idle if self.has_qualified_background_work() => Status::Running,
+            SidebarPhase::Idle if self.has_qualified_background_work() || self.native_autonomous_active => Status::Running,
             SidebarPhase::Idle => Status::Idle,
         }
     }
@@ -1880,6 +1883,15 @@ impl AcpState {
                 .background_agents
                 .iter()
                 .any(|agent| agent.resource_ref.is_some() && agent.ended_at.is_none())
+    }
+
+    pub(crate) fn restore_autonomous(
+        &mut self,
+        identity: &crate::acp::event_sender::NativeAutonomousIdentity,
+        active: bool,
+    ) {
+        self.operation_effects.restore_autonomous(identity, active);
+        self.native_autonomous_active = active;
     }
 
     pub(crate) fn apply_scoped_event(
@@ -1900,6 +1912,12 @@ impl AcpState {
         let previous = self.operation_effects.active();
         let kind = ControlKind::from_event(event);
         let effect = self.operation_effects.apply(kind, metadata);
+        self.native_autonomous_active = self.operation_effects.autonomous_open();
+        if metadata.native_autonomous.is_some() {
+            self.last_seq = seq;
+            self.updated_at = Utc::now();
+            return Ok(seq);
+        }
         if effect.applies_state() {
             if matches!(kind, ControlKind::Admission)
                 && self.operation_effects.active().is_some()

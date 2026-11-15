@@ -974,7 +974,7 @@ mod workspace_ordering_tests {
                     false
                 );
                 assert_eq!(unknown[0].status, row.status.wire_str());
-                let next = state.acp_event_store.highest_seq(&row.id) + 1;
+                let next = state.acp_event_store.highest_seq(&row.id).unwrap() + 1;
                 let new_input = prompt("new explicit main intent");
                 state
                     .acp_event_store

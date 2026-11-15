@@ -178,7 +178,8 @@ pub(crate) fn closes_tool_lifecycle(
         Event::AgentStartupError { .. }
             | Event::IncompatibleAgent { .. }
             | Event::AgentSwitched { .. }
-    ) || (matches!(event, Event::Stopped { .. }) && metadata.operation.is_none())
+    ) || (matches!(event, Event::Stopped { .. }) && metadata.operation.is_none()
+        && metadata.native_autonomous.is_none())
 }
 
 /// Folds the ACP `Event` stream into an ordered [`TranscriptRow`] list.
@@ -701,6 +702,9 @@ impl TranscriptModel {
                 text.clone(),
             )],
             Event::ThinkingStarted => {
+                if metadata.native_autonomous.is_some() {
+                    return Vec::new();
+                }
                 self.turn_active = true;
                 self.turn_has_output = true;
                 if current {

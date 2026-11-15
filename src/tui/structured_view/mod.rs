@@ -2221,7 +2221,6 @@ mod tests {
         assert!(fixture.view.in_flight);
         let footer = native_footer(&fixture.view);
         assert!(footer.contains("Host message pending"));
-        assert!(footer.contains("Esc stops pending message"));
         assert!(!footer.contains("● Ready"));
         fixture.view.choice = Some(native_mode_choice());
         fixture.act(Intent::ChoiceAccept).await;

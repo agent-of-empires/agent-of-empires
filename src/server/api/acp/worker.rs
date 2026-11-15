@@ -1356,7 +1356,10 @@ pub async fn switch_acp_agent(
         Ok(store) => store,
         Err(response) => return response,
     };
-    let before_seq = state.acp_event_store.highest_seq(&id);
+    let before_seq = match state.acp_event_store.highest_seq(&id) {
+        Ok(seq) => seq,
+        Err(_) => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
+    };
 
     if resume_reservation.is_none() {
         if let Err(e) = async {
@@ -4648,7 +4651,7 @@ mod tests {
                     .await
                     .unwrap();
                 live.park("continue the interrupted work").await;
-                let frontier = state.acp_event_store.highest_seq(&id);
+                let frontier = state.acp_event_store.highest_seq(&id).unwrap();
                 let request = || {
                     Ok(Json(SpawnAcpRequest {
                         recovery: None,
@@ -4709,7 +4712,7 @@ mod tests {
                         .unwrap(),
                     Known(0)
                 );
-                let ordinary_before = ordinary.state.acp_event_store.highest_seq(ordinary.id());
+                let ordinary_before = ordinary.state.acp_event_store.highest_seq(ordinary.id()).unwrap();
                 let ordinary_requests = ordinary.native.requests();
                 let ordinary_response = spawn_acp(
                     State(ordinary.state.clone()),
@@ -4720,7 +4723,7 @@ mod tests {
                 .into_response();
                 assert_eq!(ordinary_response.status(), StatusCode::OK);
                 assert_eq!(
-                    ordinary.state.acp_event_store.highest_seq(ordinary.id()),
+                    ordinary.state.acp_event_store.highest_seq(ordinary.id()).unwrap(),
                     ordinary_before
                 );
                 assert_eq!(ordinary.native.requests(), ordinary_requests);
@@ -4742,7 +4745,7 @@ mod tests {
                     state.acp_event_store.rate_limit_park(&id).unwrap(),
                     Indeterminate
                 ));
-                let before = state.acp_event_store.highest_seq(&id);
+                let before = state.acp_event_store.highest_seq(&id).unwrap();
                 let methods = live.native.requests();
                 let reattached = spawn_acp(State(state.clone()), Path(id.clone()), request())
                     .await
@@ -4766,7 +4769,7 @@ mod tests {
                 .await
                 .into_response();
                 assert_eq!(refused.status(), StatusCode::SERVICE_UNAVAILABLE);
-                assert_eq!(state.acp_event_store.highest_seq(&id), before);
+                assert_eq!(state.acp_event_store.highest_seq(&id).unwrap(), before);
                 assert_eq!(live.native.requests(), methods);
                 assert_eq!(
                     state.acp_supervisor.current_lease(&id),

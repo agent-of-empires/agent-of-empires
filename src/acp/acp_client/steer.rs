@@ -289,7 +289,7 @@ done
                     let before_compaction = scope
                         .state
                         .acp_event_store
-                        .highest_seq_checked(&client.id)
+                            .highest_seq(&client.id)
                         .unwrap();
                     client
                         .send_prompt("/compact", &[])

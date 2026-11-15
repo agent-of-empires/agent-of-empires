@@ -4,7 +4,7 @@ import { existsSync, readFileSync } from "node:fs";
 import { join } from "node:path";
 import { test, expect } from "../helpers/liveTest";
 import { listSessions, waitForSessions } from "../helpers/aoeServe";
-import { replayJson } from "../helpers/acp";
+import { replayJson, waitForAcpReady } from "../helpers/acp";
 
 test("Restart on the startup line replaces a start stuck in session/new, again if the replacement stalls too", async ({
   page,
@@ -110,6 +110,7 @@ test("Restart on the startup line replaces a start stuck in session/new, again i
   expect(status).not.toBe("error");
   await expect(page.getByText(PROMPT)).toBeVisible();
   await expect(composer).toBeEnabled();
+  await waitForAcpReady(serve.baseUrl, session!.id);
   // The transcript's row for that empty turn doesn't carry the stop reason, so the event log is the check.
   const events = (JSON.parse(await replayJson(serve.baseUrl, session!.id)) as { event: Record<string, unknown> }[]).map(
     ({ event }) => event,

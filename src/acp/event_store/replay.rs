@@ -17,6 +17,7 @@ pub struct ReplayPage {
     pub has_more: bool,
     pub highest_seq: u64,
     pub lowest_seq: Option<u64>,
+    pub(crate) autonomous: Option<super::establishment::AutonomousCommit>,
 }
 
 impl EventStore {
@@ -77,7 +78,7 @@ impl EventStore {
         limit: usize,
         expected_identity: Option<&str>,
     ) -> anyhow::Result<Option<(ReplayPage, String)>> {
-        let (rows, highest_seq, lowest_seq, identity) = {
+        let (rows, highest_seq, lowest_seq, identity, autonomous) = {
             let mut conn = self.read_conn();
             let tx = conn.transaction()?;
             let identity = super::identity::read(&tx, session_id)?;
@@ -126,8 +127,10 @@ impl EventStore {
                 )?;
                 found.collect::<rusqlite::Result<Vec<_>>>()?
             };
+            let (retained_frontier, autonomous) = Self::retained_publication_state(&tx, session_id)?;
+            let highest_seq = highest_seq.max(retained_frontier);
             tx.commit()?;
-            (rows, highest_seq, lowest_seq, identity)
+            (rows, highest_seq, lowest_seq, identity, autonomous)
         };
         #[cfg(test)]
         self.pause_retained_read(
@@ -171,6 +174,7 @@ impl EventStore {
                 has_more,
                 highest_seq,
                 lowest_seq,
+                autonomous,
             },
             identity,
         )))
@@ -256,6 +260,8 @@ impl EventStore {
                 }
             },
         )?;
+        let (retained_frontier, autonomous) = Self::retained_publication_state(&tx, session_id)?;
+        let highest_seq = highest_seq.max(retained_frontier);
         tx.commit()?;
         Ok(ReplayPage {
             events,
@@ -263,6 +269,7 @@ impl EventStore {
             has_more,
             highest_seq,
             lowest_seq,
+            autonomous,
         })
     }
 }
@@ -689,7 +696,7 @@ mod tests {
             (vec![1, 2, 3], 3),
             "a row committed after the bounds must stay out of this page"
         );
-        assert_eq!(store.highest_seq("s-1"), 4, "the concurrent commit landed");
+        assert_eq!(store.highest_seq("s-1").unwrap(), 4, "the concurrent commit landed");
     }
 
     #[test]

@@ -2927,13 +2927,13 @@ pub(super) mod tests {
                         assert_ne!(replacement_owner, owner);
                         let replacement_lease = supervisor.running_lease(&id).unwrap();
                         assert_ne!(replacement_lease, lease);
-                        let prefix = store.highest_seq(&id);
+                        let prefix = store.highest_seq(&id).unwrap();
                         let bytes = std::fs::read(worker_registry::record_path(&id).unwrap()).unwrap();
                         assert!(!supervisor.resume_deferred(&id).await.unwrap());
                         supervisor.test_assert_installed_client(&id, &replacement_client).await;
                         assert_eq!(supervisor.running_lease(&id), Some(replacement_lease));
                         assert!(supervisor.process_control.is_alive(replacement_owner));
-                        assert_eq!(store.highest_seq(&id), prefix);
+                        assert_eq!(store.highest_seq(&id).unwrap(), prefix);
                         assert_eq!(std::fs::read(worker_registry::record_path(&id).unwrap()).unwrap(), bytes);
                         assert_eq!(replacement_peer.requests().iter().filter(|method| method.as_str() == "session/load").count(), 1);
                     }
@@ -4836,10 +4836,11 @@ time.sleep(60)
             .to_owned();
         let inspection = scope.inspect_next_runner(&test_name);
         let mut fail_next_prompt = failed_main;
+        let agent_key = if open_task.is_some() { "claude" } else { "codex" };
         let (config, peer) = scope.native_peer(
             workdir.path().to_path_buf(),
-            "claude",
-            "claude",
+            agent_key,
+            agent_key,
             move |request| {
                 let id = request.get("id")?;
                 let result = match request["method"].as_str()? {
@@ -4875,18 +4876,24 @@ time.sleep(60)
             .receipt_snapshot()
             .expect("actual Applied receipt");
         let native_session = receipt.session_id().expect("actual Native SID").to_owned();
-        let home = client
-            .actual()
-            .native_store
-            .as_ref()
-            .filter(|binding| binding.agent == "claude" && binding.filesystem == "host")
-            .and_then(|binding| binding.stores.first())
-            .expect("actual original host Claude store")
-            .clone();
-        let project = home.join("projects/-enc");
-        std::fs::create_dir_all(&project).unwrap();
-        let task_transcript = project.join(format!("{native_session}.jsonl"));
-        std::fs::write(&task_transcript, "").unwrap();
+        let task_transcript = if open_task.is_some() {
+            let home = client
+                .actual()
+                .native_store
+                .as_ref()
+                .filter(|binding| binding.agent == agent_key && binding.filesystem == "host")
+                .and_then(|binding| binding.stores.first())
+                .expect("the actual Claude task's original host store")
+                .clone();
+            let project = home.join("projects").join(
+                crate::session::capture::encode_claude_project_path(&workdir.path().to_string_lossy()));
+            std::fs::create_dir_all(&project).unwrap();
+            let transcript = project.join(format!("{native_session}.jsonl"));
+            std::fs::write(&transcript, "").unwrap();
+            transcript
+        } else {
+            std::path::PathBuf::from(output_file)
+        };
         if failed_main {
             scope
                 .state
@@ -4906,6 +4913,7 @@ time.sleep(60)
             .expect("original correlated Native failure is durable");
         }
         let store = scope.state.acp_event_store.clone();
+        if open_task.is_none() {
         publish_native_background_start(&mut client, &peer, &store,
             serde_json::json!({"jsonrpc":"2.0","method":"session/update","params":{
                 "sessionId":native_session,"update":{
@@ -4946,6 +4954,7 @@ time.sleep(60)
                     .as_ref()
                     .map(|witness| witness.allocation)
             );
+        }
         }
         if let Some(task_id) = open_task {
             publish_native_background_start(&mut client, &peer, &store,
@@ -5149,11 +5158,12 @@ time.sleep(60)
     #[serial_test::serial]
     async fn reattached_failed_main_keeps_its_terminal_through_ambient_accounting_and_background_work(
     ) {
+        for open_task in [None, Some("surviving-task")] {
         super::super::test_support::managed::with_managed(|scope| Box::pin(async move {
                 let dir = scope.tempdir();
                 let transcript = dir.path().join("agent.jsonl");
                 std::fs::write(&transcript, "").unwrap();
-                let mut fixture = managed_background_original(scope, "retained-failed-background", transcript.to_str().unwrap(), Some("surviving-task"), true).await;
+                let mut fixture = managed_background_original(scope, "retained-failed-background", transcript.to_str().unwrap(), open_task, true).await;
                 let failed = fold_background_journal(&fixture.store, &fixture.client.id);
                 assert!(!failed.turn_active);
                 assert_eq!(failed.sidebar_status(), crate::session::Status::Error);
@@ -5187,6 +5197,7 @@ time.sleep(60)
                 assert!(!fixture.peer.requests().iter().any(|method| method == "session/load"));
                 fixture.client.shutdown().await.expect("checked original retirement and checkpoint cleanup");
             })).await;
+        }
     }
 
     async fn await_background_agent_resolved(
@@ -5698,7 +5709,7 @@ time.sleep(60)
                     replacement.send_prompt("replacement continuation", &[]).await.unwrap();
                     let replacement_request = tokio::time::timeout(Duration::from_secs(10), replacement_rx)
                         .await.unwrap().unwrap();
-                    let prefix = store.highest_seq(&id);
+                    let prefix = store.highest_seq(&id).unwrap();
                     let replacement_pending = store.has_in_flight_turn(&id).unwrap();
                     assert_eq!(replacement_pending, crate::acp::event_store::ControlKnowledge::Known(true));
                     let record_path = worker_registry::record_path(&id).unwrap();

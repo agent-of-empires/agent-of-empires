@@ -589,7 +589,7 @@ async fn original_human_decisions_cross_pending_and_applied_without_current_auth
                             assert!(matches!(status, axum::http::StatusCode::NOT_FOUND | axum::http::StatusCode::CONFLICT),
                                 "Stop must revoke the still-unanswered Original nonce: {status}: {}",
                                 String::from_utf8_lossy(&body));
-                            let frontier = scope.state.acp_event_store.highest_seq(&client.id);
+                            let frontier = scope.state.acp_event_store.highest_seq(&client.id).unwrap();
                             assert!(cache.original_decisions(&client.id, frontier).await.unwrap().nonces.is_empty());
                             assert!(!peer.requests().iter().any(|method| method == "session/prompt"));
                             assert_eq!(peer.requests().iter().filter(|method| method.as_str() == expected_method).count(), 1);

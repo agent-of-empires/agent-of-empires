@@ -859,7 +859,8 @@ pub(crate) async fn managed_control_session(
         "claude",
         move |request| match request["method"].as_str().unwrap() {
             "initialize" => Some(serde_json::json!({"jsonrpc":"2.0","id":request["id"],
-                "result":{"protocolVersion":1,"agentCapabilities":{"loadSession":true}}})),
+                "result":{"protocolVersion":1,"agentCapabilities":{"loadSession":true},
+                    "_meta":{"ompAutonomousTurns":{"version":1}}}})),
             "session/new" | "session/load" => {
                 let sid = if request["method"] == "session/new" {
                     serde_json::Value::String(response_sid.clone())

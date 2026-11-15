@@ -548,15 +548,20 @@ impl DaemonControlClient {
                 "original ingress custody is unavailable".into(),
             ));
         }
-        if self.projection.original_window().is_some() {
-            let (context, fence) = constructor.ok_or_else(|| {
-                acp_internal_error("original constructor has no retained native fence".into())
-            })?;
-            if !self.ingress.authorize_constructor(&attempt, context, fence) {
+        match constructor {
+            Some((context, fence)) => {
+                if !self.ingress.authorize_constructor(&attempt, context, fence) {
+                    return Err(acp_internal_error(
+                        "original constructor custody is unavailable".into(),
+                    ));
+                }
+            }
+            None if self.projection.original_window().is_some() => {
                 return Err(acp_internal_error(
-                    "original constructor custody is unavailable".into(),
+                    "original constructor has no retained native fence".into(),
                 ));
             }
+            None => {}
         }
         Ok(())
     }
@@ -1205,17 +1210,25 @@ pub(super) async fn connect_runner_control(
             })?
             .ok_or_else(unconfirmed)?;
         let (mut read_half, mut write_half) = stream.into_split();
-        let prompt_head = match control_protocol::read_frame(&mut read_half).await {
+        let (prompt_head, native_autonomous) = match control_protocol::read_frame(&mut read_half).await {
             Ok(Some(ControlBody::Hello {
                 control_protocol_version,
                 session_id,
                 prompt_head,
+                native_autonomous,
             })) if control_protocol_version == control_protocol::CONTROL_PROTOCOL_VERSION
                 && session_id == session_label =>
             {
-                prompt_head.filter(|head| {
+                if let Some(snapshot) = &native_autonomous {
+                    snapshot.validate().map_err(|_| unconfirmed())?;
+                    if snapshot.started.evidence.physical_source
+                        .and_then(|source| source.witness.owner) != Some(expected_owner) {
+                        return Err(unconfirmed());
+                    }
+                }
+                (prompt_head.filter(|head| {
                     head.scope.owner() == Some(expected_owner) && head.scope.correlation().is_some()
-                })
+                }), native_autonomous)
             }
             Ok(Some(ControlBody::Hello {
                 control_protocol_version,
@@ -1251,9 +1264,9 @@ pub(super) async fn connect_runner_control(
             warn!(target: "acp.protocol", ?error, "runner Attach write failed");
             unconfirmed()
         })?;
-        Ok((read_half, write_half, peer_process, prompt_head))
+        Ok((read_half, write_half, peer_process, prompt_head, native_autonomous))
     };
-    let (mut read_half, write_half, peer_process, prompt_head) = tokio::time::timeout(bound, dial)
+    let (mut read_half, write_half, peer_process, prompt_head, mut native_autonomous) = tokio::time::timeout(bound, dial)
         .await
         .map_err(|_| unconfirmed())??;
 
@@ -1435,14 +1448,31 @@ pub(super) async fn connect_runner_control(
                         }
                         match &frame {
                             ControlBody::SessionReady { receipt, postimage, .. } => {
-                                if !reader_ingress.authorize_original(
+                                let authorized = reader_ingress.authorize_original(
                                     Arc::clone(&receipt.attempt), receipt.owner,
                                     receipt.store.clone(), postimage.clone(),
-                                ) && !reader_ingress.failed_original_matches(
+                                );
+                                if !authorized && !reader_ingress.failed_original_matches(
                                     &receipt.attempt, receipt.owner, receipt.store.as_ref(),
                                 ) {
                                     reader_projection.lost();
                                     return;
+                                }
+                                if authorized {
+                                    let constructor = {
+                                        let context = reader_establishment_context.lock()
+                                            .expect("native establishment context");
+                                        context.1.as_ref()
+                                            .map(|scope| (scope.context, Arc::clone(&scope.fence)))
+                                    };
+                                    if let Some((context, fence)) = constructor {
+                                        if !reader_ingress.authorize_constructor(
+                                            &receipt.attempt, context, fence,
+                                        ) {
+                                            reader_projection.lost();
+                                            return;
+                                        }
+                                    }
                                 }
                             }
                             ControlBody::EstablishmentFailed { .. } => {
@@ -1476,8 +1506,32 @@ pub(super) async fn connect_runner_control(
                                 }
                             }
                         }
+                        let replay_autonomous = if let ControlBody::SessionReady { receipt, .. } = &frame {
+                            native_autonomous.take().filter(|snapshot| {
+                                receipt.session_id() == Some(snapshot.started.notification.session_id.as_str())
+                                    && snapshot.started.evidence.physical_source.map(|physical| physical.witness)
+                                        == crate::acp::state::NativeEventOrigin::owned_attempt(
+                                            &receipt.attempt, Some(receipt.owner),
+                                        )
+                            })
+                        } else { None };
                         if hs_tx.send(frame).await.is_err() {
                             return;
+                        }
+                        if let Some(snapshot) = replay_autonomous {
+                            let Ok(wire_bytes) = snapshot.encoded_bytes() else {
+                                reader_projection.lost();
+                                return;
+                            };
+                            let envelope = control_protocol::NativeAutonomousSnapshotEnvelope { snapshot, wire_bytes };
+                            let line = serde_json::json!({
+                                "jsonrpc": "2.0",
+                                "method": control_protocol::NATIVE_AUTONOMOUS_SNAPSHOT_METHOD,
+                                "params": envelope,
+                            });
+                            if !shim_write_line_releasing(
+                                &reader_shim_write, &line, &reader_settled, &reader_connection_state,
+                            ).await { return; }
                         }
                     }
                     Ok(Some((
@@ -1721,6 +1775,7 @@ pub(super) async fn connect_runner_control(
                         // Only this daemon mints completion barriers and their classified payload.
                         if PromptCompletedMarker::matches_method(&method)
                             || NativeChannelLostMarker::matches_method(&method)
+                            || method == control_protocol::NATIVE_AUTONOMOUS_SNAPSHOT_METHOD
                         {
                             continue;
                         }
@@ -1740,7 +1795,8 @@ pub(super) async fn connect_runner_control(
                             } else {
                                 None
                             };
-                        if method == "session/update" || method == crate::acp::state::AUTH_STATUS_UPDATE_METHOD {
+                        if method == "session/update" || method == crate::acp::state::AUTH_STATUS_UPDATE_METHOD
+                            || crate::acp::control_protocol::NativeAutonomousPhase::from_method(&method).is_some() {
                             let metadata = serde_json::to_value(ControlIngressMetadata { wire_bytes, evidence })
                                 .expect("private ingress metadata serializes");
                             match &mut params {
@@ -2875,7 +2931,7 @@ mod tests {
                     assert!(head.scope.correlation().is_some());
                     assert_ne!(control.peer_identity().pid, std::process::id());
                     let turn = terminal.current_turn();
-                    let before = fixture.store.highest_seq(&fixture.client.id);
+                    let before = fixture.store.highest_seq(&fixture.client.id).unwrap();
                     assert!(!terminal.claimed());
                     assert!(in_flight.load(AtomicOrdering::Acquire));
                     case.reply(&fixture, &request).await;
@@ -2937,7 +2993,7 @@ mod tests {
                         &head.scope,
                         head.window_id,
                     );
-                    let before_next = fixture.store.highest_seq(&fixture.client.id);
+                    let before_next = fixture.store.highest_seq(&fixture.client.id).unwrap();
                     let next = fixture
                         .start_prompt("next explicit original after native result")
                         .await;
@@ -3000,7 +3056,7 @@ mod tests {
                 let old_marker = real_completion_marker(&mut observed, TestRelayStage::Relayed, &original).await;
                 assert_eq!(old_marker.adopted.is_some(), adopt_original);
                 real_events_until_stopped(&mut fixture, "prompt_complete").await;
-                let before = fixture.store.highest_seq(&fixture.client.id);
+                let before = fixture.store.highest_seq(&fixture.client.id).unwrap();
                 let next = fixture.start_prompt("second real original").await;
                 let (next_scope, next_window) = real_pending_scope(&control, &next).await;
                 let next_turn = terminal.current_turn();
@@ -3060,7 +3116,7 @@ mod tests {
         with_managed(|scope| {
             Box::pin(async move {
                 let mut fixture = ManagedControlFixture::new(scope).await;
-                let before = fixture.store.highest_seq(&fixture.client.id);
+                let before = fixture.store.highest_seq(&fixture.client.id).unwrap();
                 let request = fixture
                     .start_prompt("only this original may reach native stdin")
                     .await;
@@ -3121,7 +3177,7 @@ mod tests {
         with_managed(|scope| Box::pin(async move {
                 let inspection = scope.inspect_next_runner(name);
                 let mut fixture = ManagedControlFixture::new(scope).await;
-                let before = fixture.store.highest_seq(&fixture.client.id);
+                let before = fixture.store.highest_seq(&fixture.client.id).unwrap();
                 let request = fixture.start_prompt("real local original held for relay timing").await;
                 let actual = fixture.client.actual();
                 let control = actual.test_control();
@@ -3378,6 +3434,7 @@ mod tests {
             control_protocol_version: version,
             session_id: session.into(),
             prompt_head: None,
+            native_autonomous: None,
         };
         let _ = control_protocol::write_frame(&mut peer, &hello).await;
         peer
@@ -3553,7 +3610,7 @@ mod tests {
                 assert_eq!(terminal.current_turn(), turn);
                 assert!(!terminal.claimed());
                 assert!(in_flight.load(AtomicOrdering::Acquire));
-                let before = fixture.store.highest_seq(&fixture.client.id);
+                let before = fixture.store.highest_seq(&fixture.client.id).unwrap();
                 fixture.complete(&next, "end_turn").await;
                 own_stop(&fixture, &next).await;
                 assert_one_real_stopped(&fixture, before, &next, &next_scope, next_window);
@@ -4617,7 +4674,7 @@ mod tests {
             let turn = terminal.current_turn();
             assert!(!terminal.claimed());
             assert!(in_flight.load(AtomicOrdering::Acquire));
-            let before = fixture.store.highest_seq(&fixture.client.id);
+            let before = fixture.store.highest_seq(&fixture.client.id).unwrap();
             fixture.native.send(serde_json::json!({
                 "jsonrpc":"2.0","method":PromptCompletedMarker::default().method(),
                 "params":{"adopted":{
@@ -4692,7 +4749,7 @@ mod tests {
                     let state = actual.test_connection_state();
                     let terminal = state.test_terminal.get().unwrap().clone();
                     let in_flight = state.test_in_flight.get().unwrap().clone();
-                    let before = fixture.store.highest_seq(&fixture.client.id);
+                    let before = fixture.store.highest_seq(&fixture.client.id).unwrap();
                     let new = fixture.start_prompt("actual new local request").await;
                     assert_ne!(old["id"], new["id"]);
                     let (new_scope, new_window) = real_pending_scope(&control, &new).await;

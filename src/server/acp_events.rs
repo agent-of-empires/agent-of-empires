@@ -299,6 +299,18 @@ pub(super) async fn acp_event_listener(state: Arc<AppState>) {
         } else {
             false
         };
+        if frame.native_autonomous.as_ref().is_some_and(|autonomous| autonomous.qualified) {
+            let projected = match frame.sidebar_status {
+                Some(projected) => Some(projected),
+                None => state.session_service.sidebar_status_at(&frame.session_id, frame.seq).await,
+            };
+            if let Some(projected) = projected {
+                persist_native_runtime_observation(
+                    &state, &frame, None, Some((StatusPolicy::Background, projected)), None,
+                ).await;
+            }
+            continue;
+        }
         if !current
             && !frame.host_action
             && !original_terminal
@@ -659,38 +671,11 @@ pub(super) async fn acp_event_listener(state: Arc<AppState>) {
         if status_update.is_none() && acp_change.is_none() && load_session_capability.is_none() {
             continue;
         }
-        let resource_subject = resource_effect
-            .then_some(frame.native_origin)
-            .flatten()
-            .map(|origin| crate::acp::state::NativeEventSubject {
-                context: origin.context,
-                owner: origin.owner,
-                kind: crate::acp::state::NativeSubjectEvent::RuntimeObservation,
-            });
-        if let Some(subject) = native_subject.or(resource_subject) {
+        if native_subject.is_some() || (resource_effect && frame.native_origin.is_some()) {
             persist_native_runtime_observation(
                 &state,
                 &frame,
-                subject,
-                status_update,
-                load_session_capability,
-            )
-            .await;
-            continue;
-        }
-        let resource_subject = resource_effect
-            .then_some(frame.native_origin)
-            .flatten()
-            .map(|origin| crate::acp::state::NativeEventSubject {
-                context: origin.context,
-                owner: origin.owner,
-                kind: crate::acp::state::NativeSubjectEvent::RuntimeObservation,
-            });
-        if let Some(subject) = native_subject.or(resource_subject) {
-            persist_native_runtime_observation(
-                &state,
-                &frame,
-                subject,
+                native_subject,
                 status_update,
                 load_session_capability,
             )
@@ -875,7 +860,7 @@ pub(super) async fn acp_event_listener(state: Arc<AppState>) {
 async fn persist_native_runtime_observation(
     state: &Arc<AppState>,
     frame: &crate::acp::protocol::AcpBroadcastFrame,
-    subject: crate::acp::state::NativeEventSubject,
+    subject: Option<crate::acp::state::NativeEventSubject>,
     status_update: Option<(StatusPolicy, Status)>,
     load_session_capability: Option<(bool, u64)>,
 ) {
@@ -915,6 +900,12 @@ async fn persist_native_runtime_observation(
         && status_policy(frame.event.as_ref()) == Some(StatusPolicy::Background))
     .then_some(frame.native_origin)
     .flatten();
+    let autonomous = frame.native_autonomous.as_ref().filter(|autonomous| autonomous.qualified);
+    let autonomous_origin = autonomous.map(|autonomous| autonomous.identity.origin);
+    let autonomous_root = autonomous.map(|autonomous| autonomous.identity.root_session_id.clone());
+    let scoped_origin = resource_origin.or(autonomous_origin);
+    let Some(context) = subject.map(|subject| subject.context)
+        .or_else(|| scoped_origin.map(|origin| origin.context)) else { return; };
     let denial = frame.availability_denial;
     let saved = tokio::task::spawn_blocking(move || -> anyhow::Result<()> {
         let storage = crate::session::Storage::open_reference(&profile)?;
@@ -922,7 +913,7 @@ async fn persist_native_runtime_observation(
             historical_origin.is_some()
                 || crate::acp::state::NativeEventContext::capture_identity(
                     &id, created_at, generation, &storage,
-                )? == subject.context,
+                )? == context,
             crate::session::LifecycleReservationError::Superseded
         );
         let fence = crate::session::NativeInputFence::capture_route(
@@ -938,21 +929,21 @@ async fn persist_native_runtime_observation(
                 Some(origin) => origin.same_physical_row(row, &storage)?,
                 None => {
                     crate::acp::state::NativeEventContext::capture(row, &storage)?
-                        == subject.context
+                        == context
                 }
             };
-            let owner_matches = if resource_origin.is_some() {
+            let owner_matches = if scoped_origin.is_some() {
                 resource_owner_guarded
-            } else if denial {
-                subject.unavailability_still_applies(&id)
-            } else if historical_origin.is_some() {
-                subject.owner_not_replaced(&id)
-            } else {
-                subject.owner_is_current(&id)
-            };
-            let attempt_matches = resource_origin.is_none_or(|origin| {
-                origin.context == subject.context
-                    && origin.owner == subject.owner
+            } else if let Some(subject) = subject {
+                if denial { subject.unavailability_still_applies(&id) }
+                else if historical_origin.is_some() { subject.owner_not_replaced(&id) }
+                else { subject.owner_is_current(&id) }
+            } else { false };
+            let attempt_matches = scoped_origin.is_none_or(|origin| {
+                origin.context == context
+                    && subject.is_none_or(|subject| origin.owner == subject.owner)
+                    && autonomous_root.as_ref().is_none_or(|root|
+                        row.acp_session_id.as_deref() == Some(root.0.as_ref()))
                     && row.acp_establishment
                         == Some(crate::acp::establishment::AcpEstablishment::Applied {
                             attempt_id: origin.attempt_id,
@@ -961,7 +952,7 @@ async fn persist_native_runtime_observation(
             Ok(identity_matches && owner_matches && attempt_matches)
         };
         loop {
-            let native_guard = if let Some(origin) = resource_origin {
+            let native_guard = if let Some(origin) = scoped_origin {
                 fence.lock_observation_matching(|row| {
                     row.acp_establishment
                         == Some(crate::acp::establishment::AcpEstablishment::Applied {
@@ -971,7 +962,7 @@ async fn persist_native_runtime_observation(
             } else {
                 fence.lock_observation()?
             };
-            let resource_guard = if let Some(origin) = resource_origin {
+            let resource_guard = if let Some(origin) = scoped_origin {
                 let Some(registry) = crate::process::worker_registry::try_registry_lock(&id)?
                 else {
                     drop(native_guard);
@@ -2894,7 +2885,7 @@ mod tests {
                 )
                 .await;
                 assert_eq!(row.acp_load_session_capable, Some(true));
-                let before = state.acp_event_store.highest_seq(&id);
+                let before = state.acp_event_store.highest_seq(&id).unwrap();
                 let history = crate::acp::Event::PromptCapabilities {
                     image: false,
                     audio: false,
@@ -3175,7 +3166,7 @@ mod tests {
                         }})).await;
                     }
                     live.finish_prompt(&request, None).await;
-                    let frontier = live.state.acp_event_store.highest_seq(&id);
+                    let frontier = live.state.acp_event_store.highest_seq(&id).unwrap();
                     assert!(frontier > content_frames as u64);
                     drop(mirror);
                     let row = await_row(&live.state, &id, |row| row.unread,
@@ -3234,7 +3225,7 @@ mod tests {
         assert_eq!(state.instances.read().await[0].status, Status::Idle);
         gate.release.send(()).unwrap();
         gate.applied.await.unwrap();
-        assert_eq!(state.acp_event_store.highest_seq(&id), 0);
+        assert_eq!(state.acp_event_store.highest_seq(&id).unwrap(), 0);
         listener.abort();
         let _ = listener.await;
     }

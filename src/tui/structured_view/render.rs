@@ -1341,7 +1341,7 @@ fn render_status(
         " Native input not ready · Esc dismiss · Ctrl+Q exit "
     } else if active && state.host_prompt_intent().is_some()
         && matches!(state.focus, Focus::Composer | Focus::Transcript) {
-        " Esc stops pending message · Ctrl+Q exit "
+        " Ctrl+C stops pending message · Ctrl+Q exit "
     } else if active {
         help_hint(
             state.focus,

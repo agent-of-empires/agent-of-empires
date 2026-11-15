@@ -287,6 +287,41 @@ struct NativeChannelState {
     postimage: Option<Arc<EstablishmentPostimage>>,
     /// Only this original's actual collector may fill its callback postimage.
     callback_original: Option<Arc<crate::acp::establishment::NativeCallbackOriginal>>,
+    autonomous_negotiated: bool,
+    autonomous_ordinal: u64,
+    autonomous_latest: Option<control_protocol::NativeAutonomousStamp>,
+}
+
+impl NativeChannelState {
+    fn autonomous_stamp(
+        &mut self,
+        phase: control_protocol::NativeAutonomousPhase,
+        notification: &control_protocol::NativeAutonomousNotification,
+    ) -> Option<control_protocol::NativeAutonomousStamp> {
+        use control_protocol::NativeAutonomousPhase;
+        let stamp = match (phase, self.autonomous_latest) {
+            (NativeAutonomousPhase::Started, Some(previous))
+                if previous.run_id == notification.run_id && previous.source == notification.source
+                    && previous.phase == NativeAutonomousPhase::Started => previous,
+            (NativeAutonomousPhase::Started, previous) => {
+                if previous.is_some_and(|previous| previous.phase == NativeAutonomousPhase::Started
+                    || previous.run_id == notification.run_id) {
+                    return None;
+                }
+                self.autonomous_ordinal = self.autonomous_ordinal.checked_add(1)?;
+                control_protocol::NativeAutonomousStamp {
+                    run_id: notification.run_id, ordinal: self.autonomous_ordinal,
+                    source: notification.source, phase,
+                }
+            }
+            (NativeAutonomousPhase::Ended, Some(previous))
+                if previous.run_id == notification.run_id && previous.source == notification.source =>
+                    control_protocol::NativeAutonomousStamp { phase, ..previous },
+            _ => return None,
+        };
+        self.autonomous_latest = Some(stamp);
+        Some(stamp)
+    }
 }
 
 struct NativeIngressFrame {
@@ -418,6 +453,7 @@ pub(super) enum QueuedKind {
     // Not `Notify`: shedding it would leave the daemon's session/load waiting.
     SessionReplayed,
     NativeLoss,
+    AutonomousLifecycle,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -451,6 +487,8 @@ pub(super) struct ControlChannel {
     native_loss: Option<QueuedControl>,
     native_loss_delivered: Option<u64>,
     replay: Option<NativeReplayAccount>,
+    autonomous: Option<Arc<control_protocol::NativeAutonomousSnapshot>>,
+    autonomous_bytes: usize,
 }
 
 struct NativeReplayAccount {
@@ -520,6 +558,7 @@ impl ControlChannel {
                         .as_ref()
                         .map_or(0, |wire| wire.len()),
                 )
+                .saturating_add(self.autonomous_bytes)
                 > control_protocol::MAX_CONTROL_QUEUE_BYTES
                     - control_protocol::MAX_NATIVE_LOSS_FRAME_BYTES;
             if !frames_full && !bytes_full {
@@ -845,6 +884,13 @@ impl RunnerShared {
         let update_kind = update
             .and_then(|update| update.get("sessionUpdate"))
             .and_then(serde_json::Value::as_str);
+        let autonomous = notification.as_ref().and_then(|(method, params)| {
+            let phase = control_protocol::NativeAutonomousPhase::from_method(method)?;
+            let notification: control_protocol::NativeAutonomousNotification =
+                serde_json::from_value(params.clone()).ok()?;
+            notification.validate(phase).ok()?;
+            Some((phase, notification))
+        });
         let is_content = matches!(
             update_kind,
             Some(
@@ -855,7 +901,7 @@ impl RunnerShared {
                     | "plan"
             )
         );
-        let session_metadata = matches!(
+        let session_metadata = autonomous.is_some() || matches!(
             update_kind,
             Some(
                 "usage_update"
@@ -879,6 +925,7 @@ impl RunnerShared {
             || notification
                 .as_ref()
                 .is_some_and(|(method, _)| method == crate::acp::state::AUTH_STATUS_UPDATE_METHOD)
+            || autonomous.is_some()
             || request.is_some();
         let resource_start = update_kind == Some("tool_call_update")
             && notification
@@ -1105,6 +1152,12 @@ impl RunnerShared {
             },
             _ => crate::acp::protocol::AcpPromptObservation::Ambiguous,
         });
+        let autonomous_expected = native.autonomous_negotiated && source_current
+            && (session_stamp.is_some() || original_request_stamp.is_some());
+        let autonomous_stamp = autonomous.as_ref()
+            .filter(|_| autonomous_expected)
+            .and_then(|(phase, notification)| native.autonomous_stamp(*phase, notification));
+        let autonomous_conflict = autonomous.is_some() && autonomous_expected && autonomous_stamp.is_none();
         let response = response_value
             .and_then(|(id, value)| native.calls.remove(&id).map(|call| (id, call, value)));
         let premature = response
@@ -1146,6 +1199,9 @@ impl RunnerShared {
                     attachment: None,
                 })
             });
+        if autonomous_conflict {
+            self.observe_native_loss(NativeChannelLossCause::ProtocolEnded);
+        }
         if premature {
             self.observe_native_loss(NativeChannelLossCause::ProtocolEnded);
         }
@@ -1160,6 +1216,7 @@ impl RunnerShared {
                 original_request_stamp,
                 resource_start_stamp,
                 prompt_observation,
+                autonomous: autonomous_stamp,
             },
         }
     }
@@ -1272,6 +1329,7 @@ impl RunnerShared {
             if SessionReplayed::matches_method(&method)
                 || PromptCompletedMarker::matches_method(&method)
                 || NativeChannelLostMarker::matches_method(&method)
+                || method == control_protocol::NATIVE_AUTONOMOUS_SNAPSHOT_METHOD
             {
                 return;
             }
@@ -1295,10 +1353,15 @@ impl RunnerShared {
                         }
                     })
             };
+            let kind = if control_protocol::NativeAutonomousPhase::from_method(&method).is_some() {
+                QueuedKind::AutonomousLifecycle
+            } else {
+                QueuedKind::Notify
+            };
             let enqueued = self
                 .enqueue_native(
                     DeliveryScope::Persistent,
-                    QueuedKind::Notify,
+                    kind,
                     ControlBody::Notify {
                         method,
                         params,
@@ -1670,6 +1733,34 @@ impl RunnerShared {
                 return false;
             }
         };
+        let lifecycle = match &body {
+            ControlBody::Notify { params, evidence, .. } if kind == QueuedKind::AutonomousLifecycle => {
+                match serde_json::from_value::<control_protocol::NativeAutonomousNotification>(params.clone()) {
+                    Ok(notification) if evidence.autonomous.is_some() =>
+                        Some(Arc::new(control_protocol::NativeAutonomousFrame { notification, evidence: *evidence })),
+                    _ => None,
+                }
+            }
+            _ => None,
+        };
+        let retained = if let Some(frame) = &lifecycle {
+            let previous = self.control.lock().await.autonomous.clone();
+            match control_protocol::NativeAutonomousSnapshot::next(previous.as_deref(), Arc::clone(frame)) {
+                Ok(snapshot) => {
+                    let Ok(bytes) = snapshot.encoded_bytes() else { return false; };
+                    if bytes.saturating_add(wire.len()) > control_protocol::MAX_CONTROL_QUEUE_BYTES
+                        - control_protocol::MAX_NATIVE_LOSS_FRAME_BYTES {
+                        self.observe_native_loss(NativeChannelLossCause::ProtocolEnded);
+                        return false;
+                    }
+                    Some((Arc::new(snapshot), bytes))
+                }
+                Err(_) => {
+                    self.observe_native_loss(NativeChannelLossCause::ProtocolEnded);
+                    return false;
+                }
+            }
+        } else { None };
         loop {
             let space = self.control_space.notified();
             tokio::pin!(space);
@@ -1703,8 +1794,18 @@ impl RunnerShared {
                         }
                     }
                 }
-                if channel.make_room(kind, wire.len()) {
+                let retain = lifecycle.as_ref().is_some_and(|frame| native.loss.is_none()
+                    && native.receipt.as_ref().and_then(|receipt|
+                        crate::acp::state::NativePhysicalSource::from_receipt(receipt))
+                        == frame.evidence.physical_source);
+                let retained_delta = retained.as_ref().filter(|_| retain)
+                    .map_or(0, |(_, bytes)| bytes.saturating_sub(channel.autonomous_bytes));
+                if channel.make_room(kind, wire.len().saturating_add(retained_delta)) {
                     channel.push_projected(scope, kind, Arc::clone(&wire), replay);
+                    if let Some((snapshot, bytes)) = retained.as_ref().filter(|_| retain) {
+                        channel.autonomous = Some(Arc::clone(snapshot));
+                        channel.autonomous_bytes = *bytes;
+                    }
                     #[cfg(test)]
                     self.test_record_producer(|| serde_json::json!({
                         "stage": "queued",
@@ -1835,11 +1936,13 @@ impl RunnerShared {
     ) -> (
         Option<control_protocol::NativePromptHead>,
         Option<Arc<[u8]>>,
+        Option<Arc<control_protocol::NativeAutonomousSnapshot>>,
     ) {
         let channel = self.control.lock().await;
         (
             channel.prompt_head.clone(),
             channel.last_prompt_completion.clone(),
+            channel.autonomous.clone(),
         )
     }
 
@@ -1848,11 +1951,13 @@ impl RunnerShared {
         out: &mut Option<tokio::net::unix::OwnedWriteHalf>,
         session_id: &str,
         prompt_head: Option<control_protocol::NativePromptHead>,
+        native_autonomous: Option<Arc<control_protocol::NativeAutonomousSnapshot>>,
     ) -> bool {
         let hello = ControlBody::Hello {
             control_protocol_version: control_protocol::CONTROL_PROTOCOL_VERSION,
             session_id: session_id.to_string(),
             prompt_head,
+            native_autonomous,
         };
         write_control_frame(out.as_mut().expect("write half present"), &hello).await
     }
@@ -2528,6 +2633,8 @@ impl RunnerShared {
                 transport_error("native channel unavailable"),
             ));
         }
+        let autonomous_requested = request.pointer("/clientCapabilities/_meta/ompAutonomousTurns/version")
+            .and_then(serde_json::Value::as_u64) == Some(1);
         let response = self
             .agent_request(agent_stdin, "initialize", request, dispatch_release, None)
             .await
@@ -2538,6 +2645,9 @@ impl RunnerShared {
                 )
             })?;
         let result = handshake_result(response)?;
+        self.native_channel.lock().expect("native channel lock").autonomous_negotiated =
+            autonomous_requested && result.pointer("/_meta/ompAutonomousTurns/version")
+                .and_then(serde_json::Value::as_u64) == Some(1);
         self.handshake.lock().await.initialized = Some(result.clone());
         Ok(result)
     }
@@ -2764,6 +2874,7 @@ impl RunnerShared {
                     .map(|cached| Arc::clone(&cached.receipt));
                 native.history_fence = Some(Arc::clone(&fence));
                 native.postimage = None;
+                native.autonomous_latest = None;
                 let original_receipt = native.receipt.as_ref().expect("installed original receipt");
                 native.callback_original = Some(Arc::new(
                     crate::acp::establishment::NativeCallbackOriginal {
@@ -2776,6 +2887,8 @@ impl RunnerShared {
                 ));
                 channel.last_prompt_completion = None;
                 channel.prompt_head = None;
+                channel.autonomous = None;
+                channel.autonomous_bytes = 0;
                 channel.session_announced = false;
                 channel.callbacks_announced = channel.active_attachment == Some(attachment_id);
                 channel.replay = Some(NativeReplayAccount {

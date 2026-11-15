@@ -138,9 +138,9 @@ pub(super) async fn handle_control_connection(
 ) -> bool {
     let (mut read_half, write_half) = stream.into_split();
     let mut write_half = Some(write_half);
-    let (prompt_head, cached_completion) = shared.prompt_attachment_snapshot().await;
+    let (prompt_head, cached_completion, autonomous) = shared.prompt_attachment_snapshot().await;
     if !shared
-        .install_control(&mut write_half, &session_id, prompt_head)
+        .install_control(&mut write_half, &session_id, prompt_head, autonomous)
         .await
     {
         return false;

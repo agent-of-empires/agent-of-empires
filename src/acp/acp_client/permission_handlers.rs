@@ -874,7 +874,7 @@ mod tests {
                             let actual = client.actual();
                             let owner = actual.connected_runner().unwrap();
                             let pause = client.pause_drain().await;
-                            let prefix = state.acp_event_store.highest_seq(&client.id);
+                            let prefix = state.acp_event_store.highest_seq(&client.id).unwrap();
                             let params = if question {
                                 serde_json::to_value(CreateElicitationRequest::new(
                                     agent_client_protocol::v1::schema::ElicitationFormMode::new(

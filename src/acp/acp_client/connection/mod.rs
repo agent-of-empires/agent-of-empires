@@ -638,9 +638,9 @@ pub(super) async fn run_connection_task<W, R>(
         ingress.observe_projection(projection);
     }
     ingress.begin();
-    let original_ingress = match (control.as_ref(), &mode) {
-        (Some(control), ConnectMode::Fresh) => control.install_original_ingress(),
-        _ => Ok(()),
+    let original_ingress = match control.as_ref() {
+        Some(control) => control.install_original_ingress(),
+        None => Ok(()),
     };
     let shared = Arc::new(Shared::new(
         event_tx.clone(),
@@ -746,6 +746,45 @@ pub(super) async fn run_connection_task<W, R>(
                                 shared
                                     .handle_ingress_marker(PendingIngress::Auth(Box::new(auth)))
                                     .await?;
+                                return Ok(());
+                            }
+                            SessionIngressNotification::AutonomousSnapshot(params) => {
+                                if !control_notifications { return Ok(()); }
+                                let envelope: crate::acp::control_protocol::NativeAutonomousSnapshotEnvelope =
+                                    serde_json::from_value(params)
+                                        .map_err(|_| agent_client_protocol::Error::invalid_params())?;
+                                envelope.snapshot.validate()
+                                    .map_err(|_| agent_client_protocol::Error::invalid_params())?;
+                                let snapshot = envelope.snapshot;
+                                let Some(first) = shared.ingress.capture_autonomous(
+                                    crate::acp::control_protocol::NativeAutonomousPhase::Started,
+                                    snapshot.started.notification.clone(), snapshot.started.evidence,
+                                    Some(envelope.wire_bytes),
+                                ) else { return Ok(()); };
+                                let second = if let Some(ended) = &snapshot.ended {
+                                    let Some(second) = shared.ingress.capture_autonomous(
+                                        crate::acp::control_protocol::NativeAutonomousPhase::Ended,
+                                        ended.notification.clone(), ended.evidence, Some(0),
+                                    ) else { return Ok(()); };
+                                    Some(Box::new(second))
+                                } else { None };
+                                shared.handle_ingress_marker(PendingIngress::Autonomous {
+                                    first: Box::new(first), second,
+                                }).await?;
+                                return Ok(());
+                            }
+                            SessionIngressNotification::Autonomous(phase, params) => {
+                                let (notification, evidence, bytes) =
+                                    SessionIngressNotification::decode_autonomous(
+                                        phase, params, control_notifications,
+                                    )?;
+                                if let Some(notification) = shared.ingress.capture_autonomous(
+                                    phase, notification, evidence, bytes,
+                                ) {
+                                    shared.handle_ingress_marker(
+                                        PendingIngress::Autonomous { first: Box::new(notification), second: None },
+                                    ).await?;
+                                }
                                 return Ok(());
                             }
                             SessionIngressNotification::Update(params) => params,

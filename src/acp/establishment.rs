@@ -775,6 +775,7 @@ pub(crate) struct NativeConstructorObservation {
     original: std::sync::Arc<NativeCallbackOriginal>,
     fence: std::sync::Arc<crate::session::NativeInputFence>,
     origin: crate::acp::state::NativeEventOrigin,
+    autonomous: Option<NativeAutonomousConstructor>,
 }
 
 impl NativeConstructorObservation {
@@ -796,6 +797,26 @@ impl NativeConstructorObservation {
             original,
             fence,
             origin,
+            autonomous: None,
+        }))
+    }
+
+    pub(crate) fn for_autonomous(
+        &self,
+        stamp: NativeSessionStamp,
+        root_session_id: agent_client_protocol::v1::schema::SessionId,
+        projection: std::sync::Weak<crate::acp::event_sender::ProjectionState>,
+    ) -> anyhow::Result<std::sync::Arc<Self>> {
+        anyhow::ensure!(
+            stamp.context == self.original.attempt.context
+                && stamp.generation == self.original.attempt.generation,
+            EstablishmentRefusal::Superseded
+        );
+        Ok(std::sync::Arc::new(Self {
+            original: std::sync::Arc::clone(&self.original),
+            fence: std::sync::Arc::clone(&self.fence),
+            origin: self.origin,
+            autonomous: Some(NativeAutonomousConstructor { stamp, root_session_id, projection }),
         }))
     }
 
@@ -844,6 +865,21 @@ impl NativeConstructorObservation {
                             && self.original.matches_original(row, storage)?,
                         EstablishmentRefusal::Superseded
                     );
+                    if let Some(autonomous) = &self.autonomous {
+                        let projection = autonomous.projection.upgrade()
+                            .ok_or(EstablishmentRefusal::Unconfirmed)?;
+                        let receipt = projection.autonomous_receipt(
+                            self.origin, autonomous.root_session_id.0.as_ref(),
+                        ).ok_or(EstablishmentRefusal::Unconfirmed)?;
+                        let postimage = self.original.postimage.get()
+                            .ok_or(EstablishmentRefusal::Unconfirmed)?;
+                        anyhow::ensure!(
+                            NativeSessionPermission::capture_stamp(
+                                &receipt, postimage, row, storage,
+                            )? == autonomous.stamp,
+                            EstablishmentRefusal::Superseded
+                        );
+                    }
                     Ok(())
                 },
                 nonblocking,
@@ -855,6 +891,13 @@ impl NativeConstructorObservation {
         self.original.check_owner(&registry)?;
         Ok((native, registry))
     }
+}
+
+#[derive(Debug)]
+struct NativeAutonomousConstructor {
+    stamp: NativeSessionStamp,
+    root_session_id: agent_client_protocol::v1::schema::SessionId,
+    projection: std::sync::Weak<crate::acp::event_sender::ProjectionState>,
 }
 
 #[derive(Debug, Clone)]
