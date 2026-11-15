@@ -276,6 +276,41 @@ fn narrow_one_pane_keeps_the_stack_for_a_structured_session() {
     assert_eq!(env.view.preview_outer_area.width, width);
 }
 
+/// Enter on a trashed Session opens its retained transcript in the preview, so `one_pane`
+/// keeps the stack rather than hiding the pane the reader just asked for.
+#[test]
+#[serial]
+fn narrow_one_pane_keeps_the_stack_for_a_retained_reader() {
+    let mut inst = Instance::new("gone", "/tmp/gone");
+    inst.trash();
+    let mut env = seeded_env(test_home(), &[inst.clone()], true);
+    env.view.narrow_layout = NarrowLayout::OnePane;
+    env.view.trashed_section_collapsed = false;
+    env.view.flat_items = env.view.build_flat_items();
+    env.view.update_selected();
+    let width = 60;
+    render(&mut env.view, width);
+    env.view.select_session_by_id(&inst.id);
+    assert_eq!(env.view.selected_session.as_deref(), Some(inst.id.as_str()));
+    render(&mut env.view, width);
+    assert_eq!(
+        env.view.preview_outer_area,
+        Rect::default(),
+        "browsing keeps the list full screen"
+    );
+
+    env.view.activate_selected_session();
+    assert!(env.view.retained_reader_focused());
+    render(&mut env.view, width);
+    assert_eq!(env.view.list_area.width, width);
+    assert_eq!(
+        env.view.list_area.bottom(),
+        env.view.preview_outer_area.y,
+        "the retained transcript stays on screen"
+    );
+    assert_eq!(env.view.preview_outer_area.width, width);
+}
+
 /// `big_preview` squeezes the stacked list to its minimum while live mode relays keys.
 #[test]
 #[serial]

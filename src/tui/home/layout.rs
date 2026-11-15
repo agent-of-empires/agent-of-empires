@@ -16,15 +16,17 @@ impl HomeView {
     }
 
     /// The narrow layout to render now. `OnePane` swaps the list for the preview in live
-    /// mode, so a Structured view Session keeps the stack instead: its transcript has no
-    /// live mode, and hiding it would leave no way back to it. A System Health takeover
+    /// mode, so a Session whose preview cannot go live keeps the stack instead: a Structured
+    /// view Session has no live mode there, and a trashed Session shows a retained
+    /// transcript. Hiding either would leave no way back to it. A System Health takeover
     /// already replaces the preview, so it can use the full screen.
     pub(super) fn narrow_layout_for_render(&self) -> crate::session::config::NarrowLayout {
         use crate::session::config::NarrowLayout;
-        let no_live_pane = self
-            .selected_session
-            .as_deref()
-            .is_some_and(|id| self.live_key(id).is_none());
+        let no_live_pane = self.retained_reader_focused()
+            || self
+                .selected_session
+                .as_deref()
+                .is_some_and(|id| self.live_key(id).is_none());
         if matches!(self.narrow_layout, NarrowLayout::OnePane)
             && no_live_pane
             && !self.system_health_open

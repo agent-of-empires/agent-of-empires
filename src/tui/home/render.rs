@@ -1429,6 +1429,7 @@ impl HomeView {
         self.preview_pane_area = Rect::default();
         self.preview_outer_area = Rect::default();
         self.sync_preview_capture_worker(None);
+        self.sync_split_capture_worker(None);
     }
 
     /// Clear the list's rects and diagnostics strip for a layout that draws only the
