@@ -4,12 +4,7 @@ import { act, fireEvent, render as renderView, renderHook, waitFor, within } fro
 import { createElement, useLayoutEffect } from "react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
-import {
-  emptyAcpState,
-  nativeInputAvailable,
-  type SessionRecovery,
-  type SubagentRecord,
-} from "../lib/acpTypes";
+import { emptyAcpState, nativeInputAvailable, type SessionRecovery, type SubagentRecord } from "../lib/acpTypes";
 import { STATE_TTL_MS, STORAGE_KEY_PREFIX } from "../lib/acpStateStorage";
 import { reportAcpInteraction, type ServerQueuedPrompt } from "../lib/api";
 import { useCancelEscalation } from "../components/acp/useCancelEscalation";

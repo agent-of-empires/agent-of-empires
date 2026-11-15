@@ -37,7 +37,7 @@ const live = vi.hoisted(() => ({
 vi.mock("../../hooks/useLiveTerminal", () => ({
   useLiveTerminal: (_id: unknown, _readOnly: unknown, _path: unknown, _clip: unknown, onGrid: () => void) => {
     live.onGridTransport = onGrid;
-    return { ...live, maxRetries: 7, claim: vi.fn(), reconnectAndClaim: live.reconnectAndClaim, };
+    return { ...live, maxRetries: 7, claim: vi.fn(), reconnectAndClaim: live.reconnectAndClaim };
   },
 }));
 vi.mock("../../hooks/useIsCoarsePointer", () => ({ useIsCoarsePointer: () => true }));

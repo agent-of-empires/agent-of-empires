@@ -155,8 +155,11 @@ export function useSessions() {
             if (held) observedById[s.id] = held;
           }
           return {
-            sessions: [...rows, ...carried], observedById, epoch: cursor.epoch,
-            pushed: pushed ?? prev.pushed, observationCurrent: true,
+            sessions: [...rows, ...carried],
+            observedById,
+            epoch: cursor.epoch,
+            pushed: pushed ?? prev.pushed,
+            observationCurrent: true,
           };
         });
         // Ignore server ordering while a local drag's PUT may still be landing.

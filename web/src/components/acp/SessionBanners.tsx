@@ -466,7 +466,7 @@ function InteractionErrorBanner({
   children,
 }: {
   message: string;
-onDismiss?: () => void;
+  onDismiss?: () => void;
   children?: React.ReactNode;
   title?: string;
 }) {
