@@ -9,6 +9,12 @@ export function PanelsSettings() {
     <div>
       <div className="space-y-4">
         <CheckboxRow
+          title="Edit project text files"
+          description="Allow editing existing UTF-8 text files in the Files pane. Saves refuse changes made on disk since opening."
+          checked={settings.fileEditing}
+          onChange={(v) => update({ fileEditing: v })}
+        />
+        <CheckboxRow
           title="Open the diff panel in new sessions"
           description="Show the diff pane automatically when a session first opens. Turn off to start with it closed; open it any time from the activity bar."
           checked={settings.autoOpenDiffPane}
