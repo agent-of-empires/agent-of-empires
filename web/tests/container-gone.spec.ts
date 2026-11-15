@@ -9,7 +9,7 @@ import { wizard } from "./helpers/wizard";
 const TITLE = "story-container-gone";
 const MESSAGE = "This Session's sandbox container was removed. Start the Session again to create a new one.";
 
-async function openGoneSession(page: Page, { readOnly = false } = {}) {
+async function openGoneSession(page: Page, { readOnly = false, queued = false } = {}) {
   const mock = await mockAcpSession(page, {
     title: TITLE,
     about: readOnly ? { read_only: true } : {},
@@ -26,6 +26,12 @@ async function openGoneSession(page: Page, { readOnly = false } = {}) {
   await page.route("**/api/sessions/*/acp/install-info", (r) =>
     r.fulfill({ json: { agent: "claude", display_name: "Claude", sandboxed: true } }),
   );
+  if (queued) {
+    const at = new Date().toISOString();
+    await page.route("**/api/sessions/*/queue", (r) =>
+      r.fulfill({ json: [{ id: "q1", seq: 1, text: "first", created_at: at }] }),
+    );
+  }
   // The profile defaults to Terminal view, so a Structured view prefill has to survive it.
   await page.route(/\/api\/settings(\?.*)?$/, (r) => r.fulfill({ json: { acp: { structured_view: "terminal" } } }));
   await openStructuredSession(page, mock);
@@ -109,6 +115,13 @@ test("New Session names the Project as its sidebar header does", async ({ page }
   }, `/tmp/${TITLE}`);
   const { banner } = await openGoneSession(page);
   await expect(banner.getByRole("button", { name: "New Session in Infra stack" })).toBeVisible();
+});
+
+test("a queued message can't start the Session either", async ({ page }) => {
+  await openGoneSession(page, { queued: true });
+  const action = page.getByTestId("queued-send-now");
+  await expect(action).toHaveAttribute("aria-disabled", "true");
+  await expect(action).toHaveAttribute("aria-label", "Recreate the container to send messages.");
 });
 
 test("an untyped startup error keeps the composer, as on main", async ({ page }) => {

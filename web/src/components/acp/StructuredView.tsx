@@ -448,6 +448,13 @@ function ComposerDock({
   const compactAliases = useCompactAliases();
   // The Daemon's solo commands: they run as their own turn, never steered into one.
   const soloAliases = useMemo(() => [...clearAliases, ...compactAliases], [clearAliases, compactAliases]);
+  // A send would start the Session, which rebuilds the container without Recreate's warning.
+  const blockedReason =
+    state.startupError && state.startupCause?.kind === "container_missing"
+      ? view.canRestartAgent
+        ? "Recreate the container to send messages."
+        : "Ask the owner to recreate the container."
+      : null;
   return (
     <>
       <UsageLimitSection
@@ -491,6 +498,7 @@ function ComposerDock({
         })}
         onStartAndSend={view.onStartSession}
         onStopTurn={ctx.stopTurn}
+        blockedReason={blockedReason}
         soloAliases={soloAliases}
         agent={agent}
       />
@@ -546,14 +554,7 @@ function ComposerDock({
           currentAgent={state.agent ?? acpAgent}
           currentProvider={acpProvider}
           waitingFor={startingAgent}
-          // A send would start the Session, which rebuilds the container without Recreate's warning.
-          blockedReason={
-            state.startupError && state.startupCause?.kind === "container_missing"
-              ? view.canRestartAgent
-                ? "Recreate the container to send messages."
-                : "Ask the owner to recreate the container."
-              : null
-          }
+          blockedReason={blockedReason}
           connecting={connecting}
           availableModes={state.availableModes}
           currentModeId={state.currentModeId}
