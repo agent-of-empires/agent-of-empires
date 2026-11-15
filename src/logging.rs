@@ -1032,7 +1032,7 @@ static REDACTORS: LazyLock<[Regex; 5]> = LazyLock::new(|| {
 });
 
 static USERINFO: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r"([a-z][a-z0-9+.-]*://)[^/\s@]+@").expect("static redaction pattern")
+    Regex::new(r"(?i)([a-z][a-z0-9+.-]*://)[^/?#\s@]+@").expect("static redaction pattern")
 });
 
 /// Strips `user:pass@` from URLs, then secret-looking key/value pairs.
@@ -1547,6 +1547,14 @@ mod tests {
             (
                 "clone https://user:hunter2@example.com/acme failed",
                 "clone https://[REDACTED]@example.com/acme failed",
+            ),
+            (
+                "clone HTTPS://user:hunter2@example.com/acme failed",
+                "clone HTTPS://[REDACTED]@example.com/acme failed",
+            ),
+            (
+                "GET https://example.com?next=a@b#x@y",
+                "GET https://example.com?next=a@b#x@y",
             ),
             ("passphrase=hunter2 next", "passphrase=[REDACTED] next"),
             (
