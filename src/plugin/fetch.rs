@@ -178,7 +178,9 @@ const MAX_MANIFEST_BYTES: usize = 256 * 1024;
 
 fn read_manifest(tree: &Path) -> Result<(PluginManifest, Vec<u8>)> {
     let root = crate::session::AnchoredDir::open(tree)?;
-    let Some(mut file) = root.open_regular(Path::new("aoe-plugin.toml"), MAX_MANIFEST_BYTES)?
+    let Some(bytes) = root
+        .read_regular(Path::new("aoe-plugin.toml"), MAX_MANIFEST_BYTES)
+        .with_context(|| format!("reading {}", tree.join("aoe-plugin.toml").display()))?
     else {
         bail!(
             "no regular aoe-plugin.toml of at most {MAX_MANIFEST_BYTES} bytes at {}; \
@@ -187,9 +189,6 @@ fn read_manifest(tree: &Path) -> Result<(PluginManifest, Vec<u8>)> {
             tree.join("aoe-plugin.toml").display()
         );
     };
-    let mut bytes = Vec::new();
-    file.read_to_end(&mut bytes)
-        .with_context(|| format!("reading {}", tree.join("aoe-plugin.toml").display()))?;
     let text = std::str::from_utf8(&bytes).context("aoe-plugin.toml is not valid UTF-8")?;
     let manifest = PluginManifest::from_toml_str(text).map_err(|e| anyhow!("{e}"))?;
     Ok((manifest, bytes))
