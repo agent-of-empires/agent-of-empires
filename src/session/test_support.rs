@@ -454,6 +454,53 @@ pub(crate) fn launch_owed_handoff(
     }
 }
 
+/// Installs an approved API 21 declaration that takes OMP's listing the way a
+/// plugin release supersedes the bundled fallback. Bind an isolated app
+/// directory and `crate::plugin::ReloadRegistryOnDrop` around the caller.
+pub(crate) fn install_omp_takeover(command: &str) {
+    let manifest = format!(
+        r#"
+id = "acme.omp-cutover"
+name = "OMP cutover"
+version = "1.0.0"
+api_version = 21
+
+[[agent_integrations]]
+tool = "omp"
+command = "{command}"
+
+[agent_integrations.launch.resume]
+kind = "flag"
+flag = "--resume"
+
+[agent_integrations.launch.capture]
+backend = "omp"
+host = "pane_scoped"
+sandbox = "pane_scoped"
+"#
+    );
+    let dir = crate::plugin::plugins_dir()
+        .unwrap()
+        .join("acme.omp-cutover");
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(dir.join("aoe-plugin.toml"), &manifest).unwrap();
+    crate::session::update_config(|config| {
+        config.plugins.insert(
+            "acme.omp-cutover".into(),
+            crate::session::PluginConfig {
+                grant: Some(crate::session::CapabilityGrant {
+                    manifest_hash: aoe_plugin_api::PluginManifest::hash_bytes(manifest.as_bytes()),
+                    capabilities: Vec::new(),
+                    granted_at: chrono::Utc::now(),
+                }),
+                ..crate::session::PluginConfig::default()
+            },
+        );
+    })
+    .unwrap();
+    crate::plugin::reload_registry();
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

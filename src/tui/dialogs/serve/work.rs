@@ -67,7 +67,10 @@ pub(super) enum JobResult {
         target: TuiControlTarget,
     },
     Stopped,
-    Reset(Result<(), String>),
+    Reset {
+        port: Option<u16>,
+        result: Result<(), String>,
+    },
     Restart(RestartProbe),
     LaunchContext {
         persists: bool,
@@ -251,15 +254,21 @@ pub(super) fn run_job(job: Job, control: &Control, runtime: &tokio::runtime::Run
             }
         }
         Job::Reset(target) => {
+            let mut port = None;
             let reset = runtime.block_on(async {
-                let _lease = TuiControlLease::prepare(target, cancel).await?;
+                let lease = TuiControlLease::prepare(target, cancel).await?;
+                let https_port = lease.funnel_port()?.number();
+                port = Some(https_port);
                 anyhow::ensure!(control.admit(), "Funnel reset cancelled before admission");
-                run_tailscale_funnel_reset(cancel).map_err(anyhow::Error::msg)
+                run_tailscale_funnel_off(https_port, cancel).map_err(anyhow::Error::msg)
             });
             if let Err(error) = &reset {
                 tracing::warn!(target: "tui.dialog", %error, "Funnel reset did not complete");
             }
-            JobResult::Reset(reset.map_err(|error| error.to_string()))
+            JobResult::Reset {
+                port,
+                result: reset.map_err(|error| error.to_string()),
+            }
         }
         Job::Restart(mode, transport) => {
             JobResult::Restart(RestartProbe::now(mode, transport, cancel))

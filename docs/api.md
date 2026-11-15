@@ -56,10 +56,20 @@ without a token. To connect an agent, see
 | Tool | Arguments | Returns |
 | --- | --- | --- |
 | `list_sessions` | `state` (`live`, default, or `all`), `group` (exact path and descendants), `children_of` (direct parent id) | The `{sessions, workspace_ordering}` envelope from the published canonical snapshot. |
-| `whoami` | none | `null`; no session credential is currently available. |
+| `whoami` | none | The calling session (same row shape as `GET /api/sessions`) when the request carries its own session credential, `null` otherwise. |
 | `create_session` | `path`, `tool`, and optionally `title`, `view` (`terminal`, default, or `structured`), `agent_name`, `agent_model`, `agent_effort`, `group`, `worktree_enabled`, `worktree_branch`, `create_new_branch`, `base_branch`, `sandbox`, `sandbox_image`, `yolo_mode`, `profile`, `prompt`, `parent_session_id`, `idempotency_key` | `{session, fresh, prompt_sent, prompt_delivery, prompt_error?}`. `fresh` is false when `idempotency_key` matched an earlier create, whose session it returns. `prompt_delivery` is one of: `none` (no `prompt`); `pending_initial_turn` (a structured session stored it as its first turn); `sent` (typed into a terminal session once its agent's status rules show an empty or live input box); `blocked_waiting` (the terminal agent is waiting on a dialog, such as Claude's folder-trust question, so nothing was typed: a person answers it in the terminal, then `send` the prompt); `not_ready` (the terminal agent did not reach its input prompt within 30 s, so nothing was typed; an agent without a status manifest has no input-prompt rule to read, so it gets `not_ready` at once. `send` can deliver the prompt, but it has no dialog check for such an agent either, so check the pane first (`read_output`)); `not_running` (the terminal session did not start); `replayed` (a retry of an earlier create with the same key; the prompt is not delivered again, and the first create's outcome is not reported, so read it with `read_output`); `failed` (typing it failed). `prompt_error` explains `failed`, `blocked_waiting` and `not_ready`. A `prompt` that strips to nothing is refused with `invalid_request`. |
 | `send` | `session_id`, `message` | `{disposition, reason?, queued_id?, seq?}`. A structured session reports `sent`, `steered` or `queued` and the prompt's event `seq`; a terminal session reports `sent` with no seq. A message that strips to nothing is refused with `invalid_request` in either view. A terminal session is refused with `waiting`, and nothing is typed, when its agent's status rules detect a dialog or question waiting on a person (such as Claude's folder-trust question), or, for an agent with a status manifest, when its pane can't be captured. This check is only as good as those rules: a dialog they don't recognise, or any pane of an agent without a status manifest, is typed into, so `send` is not a way to keep an agent's questions or approvals for a person; explicit approval tools are #4635. HTTP `POST /send` still types into such a pane. A stopped terminal session is refused with `not_running`; `send` doesn't start it. A structured prompt that was recorded before its agent stopped is refused with `send_failed`; `read_output` shows it, so don't resend it. |
 | `read_output` | `session_id`, `since` and `raw` (structured), `lines` (terminal, 1 to 2000, default 200) | A structured session's transcript after `since` as text, or its raw events, with `next_since` and `has_more`; a terminal session's pane capture. A text page holds whole events up to 48 KB, so following `next_since` reads every event once; one event that alone renders past 48 KB comes back whole as the only event on its page. |
+
+A session can authenticate to `/mcp` as itself: a bearer equal to
+`hex(HMAC-SHA256(secret, session_id))` sent with an `X-AoE-Session` header naming
+that `session_id`. The secret is generated once per app directory and never
+rotates. The pair is accepted only on `/mcp`, and only while the session exists
+and is neither archived nor trashed; any other case reports the same `401` as a
+missing token. It never bypasses the passphrase wall for a remote caller. The
+daemon-wide bearer keeps working unchanged. A session credential has the same
+authority as the daemon-wide bearer on `/mcp`: `list_sessions` is not scoped to the
+caller, so one session can list every session.
 
 Every tool declares an `outputSchema` and returns `structuredContent`. A refusal is a
 tool error (`isError`) whose `structuredContent` carries a `code`, such as
@@ -721,6 +731,20 @@ attach only after applying a snapshot at or beyond that receipt in the same
 epoch, with matching lifecycle generation, profile, and live terminal identity.
 A successful terminal restart can still have canonical status `Starting`.
 Clients must not wait for `Idle` as an additional attachment grant.
+
+## GET and PUT /api/sessions/{id}/file
+
+GET accepts `?path=<relative-or-absolute-path>` and returns `content`, `is_binary`, `truncated`, `version`, and `edit_disabled_reason`. Add `editing=true` to request a version and edit-eligibility checks. `version_only=true` requests those checks without the content payload or an atomic-exchange probe. Reads may include out-of-project files proven by the Session's transcript; that provenance never grants writes.
+
+PUT accepts `{ "path", "version", "content" }` for an existing project UTF-8 text file up to 5 MB. Send the opened GET version. A successful verified atomic exchange returns 204.
+
+- The server rechecks the opened version before exchanging the complete stage with the target, then verifies the displaced file's full version against the original canonical path. Conflicts return 409 and retain the browser draft.
+- If the displaced version changed, the server checks that the target is still its staged inode before undoing the exchange. If another writer intervenes, displaced versions that cannot be safely removed are retained beside the file as `<filename>.aoe-conflict[.N]`, without replacing an existing recovery file. Unverified `.aoe-copy-*` staging entries can also remain; inspect recovery files before deleting them.
+- Filesystems without atomic exchange support are read-only in the editor, with an `edit_disabled_reason`; PUT returns 403. Support is probed with scratch files when opening the editor, never the real target. Successful probes are cached per filesystem for the process lifetime; polls and save checks do not probe. After a successful probe on the same filesystem, a writable file in a read-only directory opens as editable; its save fails with 500 and keeps the draft. There is no optimistic-rename fallback.
+- A writer holding an old open file handle can still write after final verification. Path-level exchange does not cover that case.
+- A failure after publication, such as a directory-sync error, returns 500 with an uncertain-save message. The write may already be applied; check the disk file before retrying.
+
+Read-only and CityHall modes return 403. Escaping paths, binary files, and unverified or separate Sandbox volumes cannot be edited. The browser's opt-in setting and workflow are described in [Editing project files](guides/web/dashboard.md#editing-project-files).
 
 ## POST /api/sessions/{id}/send
 

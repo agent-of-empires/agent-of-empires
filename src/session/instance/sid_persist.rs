@@ -484,7 +484,7 @@ impl Instance {
     }
 }
 
-pub(super) fn persist_session_with_storage(
+pub(crate) fn persist_session_with_storage(
     storage: &dyn crate::session::SessionStore,
     instance_id: &str,
     observation: &crate::session::poller::SessionIdObservation,

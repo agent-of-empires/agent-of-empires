@@ -72,7 +72,7 @@ pub struct RichFileContentsResponse {
 /// virtualized, off-main-thread highlighter, so the real cost is JSON payload
 /// size: the byte cap guards against pathological payloads and the line cap is
 /// a backstop.
-const MAX_CONTENTS_BYTES: usize = 5_000_000;
+pub(super) const MAX_CONTENTS_BYTES: usize = 5_000_000;
 const MAX_CONTENTS_LINES: usize = 200_000;
 
 /// Validate a user-supplied relative file path against a workdir.
@@ -643,28 +643,32 @@ fn open_file_mime(path: &std::path::Path, bytes: &[u8]) -> mime_guess::Mime {
 #[derive(Deserialize)]
 pub struct SessionFileQuery {
     pub path: String,
+    #[serde(default)]
+    pub version_only: bool,
+    #[serde(default)]
+    pub editing: bool,
 }
 
-/// Response for the session file-read endpoint, mirroring
-/// [`RichFileContentsResponse`]. `content` is empty for a binary or truncated
-/// file, and the client renders a notice.
+/// File preview, with optional version and eligibility checks for editing.
 #[derive(Serialize)]
 pub struct SessionFileResponse {
     pub content: String,
     pub is_binary: bool,
     pub truncated: bool,
+    pub version: Option<String>,
+    pub edit_disabled_reason: Option<String>,
 }
 
 /// What a session file read may reach, gathered before the blocking read. It is
 /// git-agnostic, so it works on non-git scratch sessions (#3088).
-struct SessionFileScope {
-    roots: Vec<std::path::PathBuf>,
+pub(super) struct SessionFileScope {
+    pub(super) roots: Vec<std::path::PathBuf>,
     store: Arc<crate::acp::event_store::EventStore>,
     session_id: String,
 }
 
 impl SessionFileScope {
-    async fn of(state: &AppState, id: &str) -> Result<Self, axum::response::Response> {
+    pub(super) async fn of(state: &AppState, id: &str) -> Result<Self, axum::response::Response> {
         let instances = state.instances.read().await;
         let inst = instances
             .iter()
@@ -685,7 +689,7 @@ impl SessionFileScope {
     }
 
     /// Admit a path under a root or one the agent touched this session. Blocks.
-    fn confine(
+    pub(super) fn confine(
         &self,
         requested: &std::path::Path,
     ) -> Result<crate::server::api::file_provenance::Confined, (StatusCode, &'static str)> {
@@ -736,15 +740,24 @@ pub async fn session_file(
         Err(resp) => return resp,
     };
 
+    let editing = query.editing || query.version_only;
+    let inst = if editing {
+        crate::server::api::find_instance(&state, &id).await
+    } else {
+        None
+    };
+    let read_only = state.read_only;
     let result = tokio::task::spawn_blocking(move || {
         let confined = scope.confine(std::path::Path::new(&query.path))?;
-        let (content, is_binary, truncated) =
-            crate::server::api::file_provenance::read_confined(&confined, MAX_CONTENTS_BYTES)?;
-        Ok::<_, (StatusCode, &'static str)>(SessionFileResponse {
-            content,
-            is_binary,
-            truncated,
-        })
+        let snapshot = super::file_edit::read_file_snapshot(
+            &scope.roots,
+            &confined,
+            inst.as_ref(),
+            read_only,
+            editing,
+            query.version_only,
+        )?;
+        Ok::<_, (StatusCode, &'static str)>(snapshot)
     })
     .await;
 

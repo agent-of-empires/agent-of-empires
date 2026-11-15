@@ -1,3 +1,4 @@
+import type { Ref } from "react";
 import type { ProjectInfo } from "../../../lib/types";
 import type { RecentProject } from "./projectPicker";
 
@@ -22,6 +23,7 @@ interface Props {
   onSelect: (path: string) => void;
   /** Shown when a query matches nothing in either list. */
   emptyMessage?: string;
+  inputRef?: Ref<HTMLInputElement>;
 }
 
 /** Search box plus saved and recent rows, shared by ProjectStep and ExtraReposPicker. */
@@ -33,10 +35,12 @@ export function ProjectSearchList({
   isSelected,
   onSelect,
   emptyMessage = "No projects match that search.",
+  inputRef,
 }: Props) {
   return (
     <div className="flex flex-col gap-4">
       <input
+        ref={inputRef}
         type="text"
         value={query}
         onChange={(e) => onQueryChange(e.target.value)}

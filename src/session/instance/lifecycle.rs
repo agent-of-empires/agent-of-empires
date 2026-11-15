@@ -296,6 +296,7 @@ impl Instance {
             stored.capture_started_at = self.capture_started_at;
             stored.started_at = self.started_at;
             stored.launch_executable = self.launch_executable.clone();
+            stored.launch_resolved_executable = self.launch_resolved_executable.clone();
             stored.active_execution = self.active_execution.clone();
             if restart && stored.agent_session_id == self.agent_session_id {
                 stored.resume_probe_failed_sid = self.resume_probe_failed_sid.clone();

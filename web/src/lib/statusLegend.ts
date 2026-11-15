@@ -1,5 +1,6 @@
 import type { SessionStatus } from "./types";
 import { STATUS_TEXT_CLASS } from "./session";
+import { meaningText } from "./sidebarMarks";
 
 /** One meaning of a status glyph, shared by the sidebar legend and the glyph's tooltip. */
 export interface StatusMeaning {
@@ -30,6 +31,37 @@ export function statusMeaning(status: SessionStatus, { fresh = false, dormant = 
   if (dormant) return DORMANT_MEANING;
   if (fresh && status === "Idle") return FRESH_IDLE_MEANING;
   return STATUS_MEANING[status];
+}
+
+/** The first non-blank line of AoE's recorded error, or null when there is none. */
+export function errorSummary(lastError: string | null | undefined): string | null {
+  return (
+    lastError
+      ?.split(/\r?\n/)
+      .map((line) => line.trim())
+      .find(Boolean) ?? null
+  );
+}
+
+/**
+ * A row glyph's tooltip. A Terminal view Error row shows what AoE recorded instead of guessing a
+ * cause (#5055); a Structured view Error row keeps its generic meaning.
+ */
+export function glyphTooltip(
+  status: SessionStatus,
+  {
+    fresh = false,
+    dormant = false,
+    lastError = null,
+    structured = false,
+  }: { fresh?: boolean; dormant?: boolean; lastError?: string | null; structured?: boolean } = {},
+): { text: string; detail: string | null } {
+  if (status === "Deleting") return { text: "Deleting…", detail: null };
+  if (status === "Error" && !structured) {
+    const summary = errorSummary(lastError);
+    return summary ? { text: "Error", detail: summary } : { text: "Error · no details recorded", detail: null };
+  }
+  return { text: meaningText(statusMeaning(status, { fresh, dormant })), detail: null };
 }
 
 /** One legend row: the statuses it stands for, how to draw its glyph, and what it means. */

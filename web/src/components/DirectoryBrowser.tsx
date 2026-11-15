@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useRef, useState, type Ref } from "react";
 import { browseFilesystem, getHomePath } from "../lib/api";
 import { safeGetItem, safeSetItem } from "../lib/safeStorage";
 import type { DirEntry } from "../lib/types";
@@ -9,9 +9,10 @@ const BROWSE_PAGE_SIZE = 100;
 interface Props {
   initialPath?: string;
   onSelect: (path: string) => void;
+  inputRef?: Ref<HTMLInputElement>;
 }
 
-export function DirectoryBrowser({ initialPath, onSelect }: Props) {
+export function DirectoryBrowser({ initialPath, onSelect, inputRef }: Props) {
   const [currentPath, setCurrentPath] = useState(initialPath || "");
   const [entries, setEntries] = useState<DirEntry[]>([]);
   const [hasMore, setHasMore] = useState(false);
@@ -205,6 +206,7 @@ export function DirectoryBrowser({ initialPath, onSelect }: Props) {
       {/* Search/filter */}
       <div className="mb-3">
         <input
+          ref={inputRef}
           type="text"
           value={filter}
           onChange={(e) => setFilter(e.target.value)}

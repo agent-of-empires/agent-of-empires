@@ -46,6 +46,13 @@ const ROWS: Row[] = [
   ["systemd", "memory_max", "Session memory limit", { kind: "optional_text" }, true, false, "memory_limit"],
   ["systemd", "tasks_max", "Session task limit", { kind: "number", min: 0 }, true],
   ["serve", "port", "Daemon port", { kind: "number", min: 1, max: 65535 }, false],
+  [
+    "serve",
+    "funnel_port",
+    "Funnel port",
+    { kind: "select", options: ["443", "8443", "10000"].map((value) => ({ value, label: value })) },
+    false,
+  ],
   ["acp", "show_tool_durations", "Show tool-call durations", { kind: "toggle" }, false],
   ["acp", "rate_limit_auto_resume", "Auto-resume after rate limit", { kind: "toggle" }, false],
   ["acp", "replay_events", "History cap (events)", { kind: "number", min: 0 }, false],
@@ -158,6 +165,21 @@ describe("Settings daemon port", () => {
     commit(fieldInputByLabel(container, "Daemon port", "number"), "8090");
 
     await waitFor(() => expect(vi.mocked(api.updateSettings)).toHaveBeenCalledWith({ serve: { port: 8090 } }, "main"));
+  });
+
+  // config.toml takes the port quoted, so the select must save a string, not a number.
+  it("saves the Funnel port as a quoted string", async () => {
+    const { container } = renderView("updates");
+    await screen.findByText("Funnel port");
+    const label = Array.from(container.querySelectorAll("label")).find((l) => l.textContent === "Funnel port");
+    const select = label?.parentElement?.querySelector("select") as HTMLSelectElement;
+    expect(select).toBeTruthy();
+
+    fireEvent.change(select, { target: { value: "8443" } });
+
+    await waitFor(() =>
+      expect(vi.mocked(api.updateSettings)).toHaveBeenCalledWith({ serve: { funnel_port: "8443" } }, "main"),
+    );
   });
 });
 

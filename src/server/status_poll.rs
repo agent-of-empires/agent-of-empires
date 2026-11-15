@@ -312,7 +312,7 @@ async fn refresh_sandbox_stores(state: &Arc<AppState>) {
             let config = store.configuration(Some(store.storage().profile()))?;
             let container = crate::containers::DockerContainer::from_session_id(&id);
             let command = row.get_tool_command();
-            if row.predates_shared_credential(&container, command, &config.session)? {
+            if row.predates_shared_credential(&container, &command, &config.session)? {
                 return Ok(());
             }
             store.check_available()?;
@@ -323,7 +323,7 @@ async fn refresh_sandbox_stores(state: &Arc<AppState>) {
                 &config,
                 &id,
                 &row.tool,
-                Some(command),
+                Some(&command),
                 CredentialFold::SeedOnly,
                 auto_propagate,
             );

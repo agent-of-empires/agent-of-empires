@@ -1,7 +1,9 @@
 //! Plugin registry, installation, contributions, discovery, and worker host.
 
+mod agent_definition;
 pub mod agent_integration;
 pub mod auto_update;
+pub(crate) mod bundled_agents;
 pub mod changelog;
 pub mod contributions;
 pub mod discover;
@@ -14,6 +16,23 @@ pub mod install;
 pub mod integrity;
 pub mod lockfile;
 pub mod registry;
+
+pub fn registry() -> Arc<PluginRegistry> {
+    if let Some(reg) = REGISTRY.read_safe().as_ref() {
+        return reg.clone();
+    }
+    let _reload = REGISTRY_RELOAD
+        .lock()
+        .unwrap_or_else(|error| error.into_inner());
+    let mut slot = REGISTRY.write_safe();
+    if let Some(reg) = slot.as_ref() {
+        return reg.clone();
+    }
+    let config = crate::session::Config::load_or_warn();
+    let reg = Arc::new(PluginRegistry::load(&config));
+    *slot = Some(reg.clone());
+    reg
+}
 pub mod source;
 pub mod update_check;
 pub mod view;
@@ -141,23 +160,6 @@ impl<T> RwLockSafe<T> for RwLock<T> {
 
 static REGISTRY: RwLock<Option<Arc<PluginRegistry>>> = RwLock::new(None);
 static REGISTRY_RELOAD: std::sync::Mutex<()> = std::sync::Mutex::new(());
-
-pub fn registry() -> Arc<PluginRegistry> {
-    if let Some(reg) = REGISTRY.read_safe().as_ref() {
-        return reg.clone();
-    }
-    let _reload = REGISTRY_RELOAD
-        .lock()
-        .unwrap_or_else(|error| error.into_inner());
-    let mut slot = REGISTRY.write_safe();
-    if let Some(reg) = slot.as_ref() {
-        return reg.clone();
-    }
-    let config = crate::session::Config::load_or_warn();
-    let reg = Arc::new(PluginRegistry::load(&config));
-    *slot = Some(reg.clone());
-    reg
-}
 
 pub fn active_plugin_themes() -> Vec<(String, PathBuf)> {
     let reg = registry();

@@ -350,6 +350,18 @@ pub(super) async fn acp_event_listener(state: Arc<AppState>) {
                 &inflight,
             )
         };
+        // `try_smart_rename` refuses these too, but only after the history read.
+        let should_rename = should_rename
+            && state
+                .instances
+                .read()
+                .await
+                .iter()
+                .find(|i| i.id == frame.session_id)
+                .is_some_and(|i| {
+                    i.is_structured()
+                        && crate::session::civilizations::is_default_civ_name(&i.title)
+                });
         if should_rename {
             if let Some((first_user_prompt, agent_prose)) =
                 state.acp_event_store.first_turn_context(

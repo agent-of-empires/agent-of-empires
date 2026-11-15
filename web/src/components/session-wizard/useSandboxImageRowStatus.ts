@@ -5,7 +5,7 @@ import { fetchSandboxImageStatus, type SandboxImageStatus } from "../../lib/api"
 export const IMAGE_RECHECK_MS = 500;
 
 /** What the Sandbox row says before the image, from a status, a refusal (`{ error }`) or null offline. */
-export function sandboxImageStatusLabel(reply: SandboxImageStatus | { error: string } | null): string {
+export function sandboxImageStatusLabel(reply: SandboxImageReply): string {
   if (!reply || !("state" in reply)) return "Update status unknown";
   switch (reply.state) {
     case "available":
@@ -19,11 +19,16 @@ export function sandboxImageStatusLabel(reply: SandboxImageStatus | { error: str
   }
 }
 
-/** The status label for `image` (empty: the default image), or null until it is answered. Only the
- *  first check runs at once; an edited image is re-checked once typing stops, even while that first
- *  check is pending. The first answered check skips the Daemon's cache. */
-export function useSandboxImageRowStatus(image: string, enabled: boolean): string | null {
-  const [answer, setAnswer] = useState<{ image: string; label: string } | null>(null);
+export type SandboxImageReply = SandboxImageStatus | { error: string } | null;
+
+/** The status label and reply for `image` (empty: the default image), or null until it is answered.
+ *  Only the first check runs at once; an edited image is re-checked once typing stops, even while that
+ *  first check is pending. The first answered check skips the Daemon's cache. */
+export function useSandboxImageRowStatus(
+  image: string,
+  enabled: boolean,
+): { label: string; reply: SandboxImageReply } | null {
+  const [answer, setAnswer] = useState<{ image: string; label: string; reply: SandboxImageReply } | null>(null);
   const started = useRef(false);
   const answered = useRef(false);
   useEffect(() => {
@@ -33,7 +38,7 @@ export function useSandboxImageRowStatus(image: string, enabled: boolean): strin
       const reply = await fetchSandboxImageStatus(image || undefined, { fresh: !answered.current });
       if (cancelled) return;
       answered.current = true;
-      setAnswer({ image, label: sandboxImageStatusLabel(reply) });
+      setAnswer({ image, label: sandboxImageStatusLabel(reply), reply });
     };
     const timer = started.current ? setTimeout(check, IMAGE_RECHECK_MS) : null;
     started.current = true;
@@ -43,5 +48,5 @@ export function useSandboxImageRowStatus(image: string, enabled: boolean): strin
       if (timer) clearTimeout(timer);
     };
   }, [image, enabled]);
-  return enabled && answer?.image === image ? answer.label : null;
+  return enabled && answer?.image === image ? { label: answer.label, reply: answer.reply } : null;
 }
