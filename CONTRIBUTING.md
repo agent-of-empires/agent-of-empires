@@ -61,8 +61,9 @@ Open the PR against `main` and complete the template. Include:
 
 - what changed and why;
 - how it was tested;
-- screenshots or recordings for UI changes;
 - related issues.
+
+If it's a UI change, consider attaching screenshot(s), or certainly provide them if requested by the reviewer.
 
 AI agents propose; humans approve scope and implementation, review changes, and
 decide issue disposition or merge. You remain responsible for AI-assisted work:
