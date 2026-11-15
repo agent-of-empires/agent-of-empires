@@ -693,14 +693,12 @@ fn handoff_outcome(
     }
 }
 
-/// Whether driving a persisted handoff gives the caller what it asked for. No choice drives any;
-/// a command that selects its own conversation honours no choice, as before reservation.
+/// Whether driving a persisted handoff gives the caller what it asked for. No choice drives any.
 fn pending_handoff_honours(
     outcome: TerminalConversation,
-    command_decides: bool,
     conversation: Option<TerminalConversation>,
 ) -> bool {
-    conversation.is_none_or(|asked| !command_decides && asked == outcome)
+    conversation.is_none_or(|asked| asked == outcome)
 }
 
 async fn terminal_plan(
@@ -1370,11 +1368,13 @@ async fn terminal_handoff_request(
     };
     let (key, owner) = if let Some(pending) = durable.terminal_handoff.as_ref() {
         // The pending switch's retirement may already be durable, so a different choice is refused, not adopted.
+        // A command that picks its own conversation refuses any choice, as before reservation.
+        if conversation.is_some() && durable.command_session_selector().is_some() {
+            return terminal_refusal(TerminalSwitchReason::CommandSelectsConversation, "");
+        }
         let outcome = handoff_outcome(&pending.context, pending.terminal.as_ref());
-        let command_decides = durable.command_session_selector().is_some();
-        if !pending_handoff_honours(outcome, command_decides, conversation) {
+        if !pending_handoff_honours(outcome, conversation) {
             let in_flight = match outcome {
-                _ if command_decides => "follows this Session's command",
                 TerminalConversation::Continue => "keeps the conversation",
                 TerminalConversation::Fresh => "starts a new conversation",
             };
@@ -4492,15 +4492,9 @@ mod tests {
                 .zip(honoured)
             {
                 assert_eq!(
-                    pending_handoff_honours(outcome, false, conversation),
+                    pending_handoff_honours(outcome, conversation),
                     honoured,
                     "{name} {conversation:?}"
-                );
-                // The Session's own command decides: only no choice drives it.
-                assert_eq!(
-                    pending_handoff_honours(outcome, true, conversation),
-                    conversation.is_none(),
-                    "{name}, command decides, {conversation:?}"
                 );
             }
         }
@@ -4720,8 +4714,8 @@ mod tests {
         ] {
             let (status, json) =
                 response_json(switch(&reserved, body).await.into_response()).await?;
-            assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{json}");
-            assert_eq!(json["error"], "handoff_pending");
+            assert_eq!(status, StatusCode::CONFLICT, "{json}");
+            assert_eq!(json["error"], "command_selects_conversation");
             assert!(stored(&reserved)?.terminal_handoff.is_some());
         }
         assert!(!argv.exists(), "a refused retry launched the agent");
@@ -4740,6 +4734,21 @@ mod tests {
         assert_eq!(switched.view, View::Terminal);
         assert!(switched.agent_session_id.is_none());
 
+        // The pending switch is still driven without a choice.
+        assert_eq!(
+            switch(&reserved, b"").await.into_response().status(),
+            StatusCode::OK
+        );
+        let launched = "--resume old-id\n--resume old-id\n";
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while std::fs::read_to_string(&argv)? != launched && std::time::Instant::now() < deadline {
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+        assert_eq!(std::fs::read_to_string(&argv)?, launched);
+        let driven = stored(&reserved)?;
+        assert_eq!(driven.view, View::Terminal);
+        assert!(driven.terminal_handoff.is_none());
+
         // As before, a launch refuses the command's selector next to AoE's own id and stays owed.
         let (status, json) = response_json(switch(&held, b"").await.into_response()).await?;
         assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{json}");
@@ -4754,7 +4763,7 @@ mod tests {
             handoff_outcome(&owed.context, owed.terminal.as_ref()),
             TerminalConversation::Continue
         );
-        assert_eq!(std::fs::read_to_string(&argv)?, "--resume old-id\n");
+        assert_eq!(std::fs::read_to_string(&argv)?, launched);
         Ok(())
     }
 
