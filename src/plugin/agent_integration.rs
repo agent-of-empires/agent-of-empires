@@ -279,6 +279,24 @@ pub(crate) fn registry_declares(registry: &super::PluginRegistry, tool: &str) ->
     })
 }
 
+/// The capture declaration `plugin` owns for `tool`, if it is active and
+/// declares session-id capture for that tool.
+pub(crate) fn capture_declaration<'a>(
+    registry: &'a super::PluginRegistry,
+    plugin: &str,
+    tool: &str,
+) -> Option<&'a aoe_plugin_api::agent_integration::AgentSessionIdDeclaration> {
+    registry
+        .all()
+        .iter()
+        .find(|candidate| candidate.active() && candidate.id() == plugin)?
+        .manifest
+        .agent_integrations
+        .iter()
+        .find(|entry| entry.tool == tool)
+        .and_then(|entry| entry.session_id.as_ref())
+}
+
 pub(crate) fn declared_agent<'a>(
     registry: std::sync::Arc<super::PluginRegistry>,
     tool: &str,

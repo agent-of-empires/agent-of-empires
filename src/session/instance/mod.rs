@@ -724,6 +724,11 @@ pub struct Instance {
     /// Poller observations must carry this through the storage CAS to update the sid.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) omp_capture_generation: Option<String>,
+    /// Generation the declaring plugin reported alongside `agent_session_id`.
+    /// Opaque to the host, compared for equality so a superseded launch's report
+    /// cannot reattribute the row.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) plugin_capture_generation: Option<String>,
     /// Monotone token for pane lifecycle commits. Async/CLI result merges may
     /// update lifecycle-owned fields only when they are at least this recent.
     #[serde(default, skip_serializing_if = "is_zero_u64")]
