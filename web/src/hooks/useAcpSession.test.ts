@@ -743,6 +743,10 @@ describe("server queue", () => {
   let queuePostStarted: (() => void) | null;
   // Rows the Daemon delivers as soon as their first POST commits.
   let deliveredOnPost: Set<string>;
+  // Holds a POST before it commits, so a DELETE meanwhile finds nothing.
+  let queuePostUncommitted: Promise<void> | null;
+  // Holds a DELETE of one row before it is applied.
+  let queueDeleteHeld: Promise<void> | null;
   const row = (id: string, text: string, extra: Partial<ServerQueuedPrompt> = {}): ServerQueuedPrompt => ({
     id,
     seq: serverQueue.size,
@@ -761,6 +765,8 @@ describe("server queue", () => {
     queuePostHeld = null;
     queuePostStarted = null;
     deliveredOnPost = new Set();
+    queuePostUncommitted = null;
+    queueDeleteHeld = null;
     vi.mocked(reportAcpInteraction).mockClear();
     vi.mocked(listServerQueue).mockClear();
     calls = installAcpFakes(({ url, method, body }) => {
@@ -772,6 +778,15 @@ describe("server queue", () => {
           const list = () => json([...serverQueue.values()].sort((a, b) => a.seq - b.seq));
           return queueListHeld ? queueListHeld.then(list) : list();
         }
+        if (method === "POST" && queuePostUncommitted) {
+          const parsed = JSON.parse(body!) as { id: string; text: string };
+          const held = queuePostUncommitted;
+          queuePostStarted?.();
+          return held.then(() => {
+            serverQueue.set(parsed.id, row(parsed.id, parsed.text));
+            return json(serverQueue.get(parsed.id));
+          });
+        }
         if (method === "POST") {
           const parsed = JSON.parse(body!) as { id: string; text: string };
           serverQueue.set(parsed.id, row(parsed.id, parsed.text));
@@ -779,6 +794,13 @@ describe("server queue", () => {
           const saved = serverQueue.get(parsed.id);
           if (deliveredOnPost.delete(parsed.id)) serverQueue.delete(parsed.id);
           return queuePostHeld ? queuePostHeld.then(() => json(saved)) : json(saved);
+        }
+        if (method === "DELETE" && item && queueDeleteHeld) {
+          return queueDeleteHeld.then(() =>
+            serverQueue.delete(decodeURIComponent(item))
+              ? new Response(null, { status: 204 })
+              : new Response("queued prompt not found", { status: 404 }),
+          );
         }
         if (method === "DELETE" && item && !serverQueue.delete(decodeURIComponent(item))) {
           return new Response("queued prompt not found", { status: 404 });
@@ -1111,6 +1133,81 @@ describe("server queue", () => {
     expect(posts("/queue")).toHaveLength(1);
     expect(serverQueue.size).toBe(0);
     again.unmount();
+  });
+
+  it.each([
+    ["removes B", "remove", ["A", "C"]],
+    ["clears the queue", "clear", []],
+  ] as const)("posts no row the user %s while an earlier re-send POST is held", async (_, action, kept) => {
+    const a = `sess-removed-${action}`;
+    const queuedAt = "2026-01-01T00:00:00.000Z";
+    const pending = ["A", "B", "C"].map((id) => ({ id, text: id, queuedAt, pending: true }));
+    localStorage.setItem(
+      `${STORAGE_KEY_PREFIX}${a}`,
+      JSON.stringify({ savedAt: Date.now(), state: { ...emptyAcpState(), queuedPrompts: pending } }),
+    );
+    const postIds = () => posts("/queue").map((c) => JSON.parse(c.body!).id as string);
+    const lists = () => calls.filter((c) => c.method === "GET" && c.url.includes("/queue") && c.url.includes(a)).length;
+    const hook = render(a);
+    await flushAsync();
+    const post = Promise.withResolvers<void>();
+    const started = Promise.withResolvers<void>();
+    queuePostHeld = post.promise;
+    queuePostStarted = started.resolve;
+    lastSocket().open();
+    await started.promise;
+    queuePostHeld = null;
+    queuePostStarted = null;
+    act(() => (action === "remove" ? hook.result.current.removeQueuedPrompt("B") : hook.result.current.clearQueue()));
+    const listed = lists();
+    post.resolve();
+    await waitFor(() => expect(lists()).toBeGreaterThan(listed));
+    await waitFor(() => expect(hook.result.current.state.queuedPrompts.map((q) => q.id)).toEqual(kept));
+    expect(postIds()).toEqual(["A", ...kept.filter((id) => id !== "A")]);
+    expect([...serverQueue.keys()]).toEqual(kept);
+    hook.unmount();
+  });
+
+  it("deletes a re-sent row again when the user removes it while its POST is in flight", async () => {
+    const a = "sess-removed-in-flight";
+    const queuedAt = "2026-01-01T00:00:00.000Z";
+    localStorage.setItem(
+      `${STORAGE_KEY_PREFIX}${a}`,
+      JSON.stringify({
+        savedAt: Date.now(),
+        state: { ...emptyAcpState(), queuedPrompts: [{ id: "B", text: "B", queuedAt, pending: true }] },
+      }),
+    );
+    const deletes = () => calls.filter((c) => c.method === "DELETE" && c.url.includes("/queue/B")).length;
+    const lists = () => calls.filter((c) => c.method === "GET" && c.url.includes("/queue") && c.url.includes(a)).length;
+    const hook = render(a);
+    await flushAsync();
+    const commit = Promise.withResolvers<void>();
+    const started = Promise.withResolvers<void>();
+    queuePostUncommitted = commit.promise;
+    queuePostStarted = started.resolve;
+    lastSocket().open();
+    await started.promise;
+    queuePostUncommitted = null;
+    queuePostStarted = null;
+    // The DELETE reaches the server before B's POST commits, so it finds nothing.
+    act(() => hook.result.current.removeQueuedPrompt("B"));
+    await waitFor(() => expect(deletes()).toBe(1));
+    const listed = lists();
+    const redelete = Promise.withResolvers<void>();
+    queueDeleteHeld = redelete.promise;
+    commit.resolve();
+    await waitFor(() => expect(deletes()).toBe(2));
+    // The list after the re-send waits for that DELETE, so it can't show B again.
+    await flushAsync();
+    expect(lists()).toBe(listed);
+    queueDeleteHeld = null;
+    redelete.resolve();
+    await waitFor(() => expect(lists()).toBeGreaterThan(listed));
+    expect(serverQueue.has("B")).toBe(false);
+    expect(hook.result.current.state.queuedPrompts).toEqual([]);
+    expect(posts("/queue").map((c) => JSON.parse(c.body!).id)).toEqual(["B"]);
+    hook.unmount();
   });
 
   it("confirms a re-sent row in the open hook under StrictMode, so a delivered one is dropped", async () => {

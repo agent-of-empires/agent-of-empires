@@ -100,8 +100,9 @@ async function postReportingErrors(
 }
 
 // Re-sends of rows the server never confirmed belong to the Session, not to a mounted hook. They
-// run one after another, and a later one skips rows an earlier one already posted.
-const queueMigrations = new Map<string, { tail: Promise<void>; posted: Set<string> }>();
+// run one after another, and a later one skips rows an earlier one already posted. A row the user
+// removes meanwhile is not posted, or is deleted again if its POST was already in flight.
+const queueMigrations = new Map<string, { tail: Promise<void>; posted: Set<string>; removed: Set<string> }>();
 // The mounted hooks showing each Session; with none, an acknowledgment goes to its stored state.
 const queueAckTargets = new Map<string, Set<Dispatch<Action>>>();
 
@@ -116,12 +117,21 @@ function acknowledgeQueued(sessionId: string, action: Action): void {
 }
 
 function migrateQueue(sessionId: string, rows: QueuedPrompt[]): Promise<void> {
-  const entry = queueMigrations.get(sessionId) ?? { tail: Promise.resolve(), posted: new Set<string>() };
+  const entry = queueMigrations.get(sessionId) ?? {
+    tail: Promise.resolve(),
+    posted: new Set<string>(),
+    removed: new Set<string>(),
+  };
   const run = entry.tail.then(async () => {
     for (const q of rows) {
-      if (entry.posted.has(q.id)) continue;
+      if (entry.posted.has(q.id) || entry.removed.has(q.id)) continue;
       const saved = await enqueueServerPrompt(sessionId, { id: q.id, text: q.text, attachments: q.attachments });
       if (!saved) continue;
+      if (entry.removed.has(q.id)) {
+        // Its DELETE may have reached the server before this POST committed.
+        await removeServerQueuedPrompt(sessionId, q.id);
+        continue;
+      }
       entry.posted.add(q.id);
       // Confirmed, so a list that no longer has it (delivered) drops it instead of keeping it to re-send.
       acknowledgeQueued(sessionId, { kind: "confirm_queued_prompt", id: q.id });
@@ -134,6 +144,11 @@ function migrateQueue(sessionId: string, rows: QueuedPrompt[]): Promise<void> {
   };
   run.then(settle, settle);
   return run;
+}
+
+function markQueuedRemoved(sessionId: string, ids: Iterable<string>): void {
+  const entry = queueMigrations.get(sessionId);
+  if (entry) for (const id of ids) entry.removed.add(id);
 }
 
 /** Waits before re-listing after a failed queue list; then the next poll change or turn retries. */
@@ -420,7 +435,9 @@ export function useAcpSession(
   const removeQueuedPrompt = useCallback(
     (id: string) => {
       dispatch({ kind: "dequeue_prompt", id });
-      if (sessionId) void removeServerQueuedPrompt(sessionId, id);
+      if (!sessionId) return;
+      markQueuedRemoved(sessionId, [id]);
+      void removeServerQueuedPrompt(sessionId, id);
     },
     [sessionId],
   );
@@ -435,8 +452,13 @@ export function useAcpSession(
 
   const clearQueue = useCallback(() => {
     dispatch({ kind: "clear_queue" });
-    if (sessionId) void clearServerQueue(sessionId);
-  }, [sessionId]);
+    if (!sessionId) return;
+    markQueuedRemoved(
+      sessionId,
+      queuedPromptsRef.current.map((q) => q.id),
+    );
+    void clearServerQueue(sessionId);
+  }, [sessionId, queuedPromptsRef]);
 
   // Never bind this to Escape: an accidental press would abort work the user meant to keep.
   const cancelPrompt = useCallback(async () => {
