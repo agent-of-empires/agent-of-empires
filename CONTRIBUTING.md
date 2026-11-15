@@ -105,3 +105,17 @@ Reviewers tag each requested change with a priority:
   follow-up issue; mention it only when useful.
 
 Every requested change states what would satisfy it.
+
+When the findings are few, none blocks under this rubric, and each fix is small,
+the reviewer may push the fixes to the PR branch instead of waiting on the
+contributor. This needs the PR's "Allow edits by maintainers" setting, which
+organisation-owned forks lack; for those, request changes as usual. Push a
+normal commit on top of the branch, never a force-push or rebase, and say in the
+review what was pushed. Contributors on the exclusion list never get reviewer
+pushes; reviewers request changes instead.
+
+Excluded from reviewer pushes:
+
+- @jerome-benoit
+
+To join, open a PR adding your handle, or ask a maintainer.
