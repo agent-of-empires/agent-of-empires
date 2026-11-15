@@ -45,6 +45,8 @@ let directStartInFlight = false;
 export function useSuggestions(
   onPrepare: (prefill: WizardPrefill) => void,
   onStarted?: (session: SessionResponse) => void,
+  // A view that renders nothing for a snapshot has no reason to follow a refreshing provider.
+  idleFor?: (snapshot: SuggestionsSnapshot) => boolean,
 ) {
   const offline = useServerDown();
   const [snapshot, setSnapshot] = useState<SuggestionsSnapshot | null>(null);
@@ -75,7 +77,7 @@ export function useSuggestions(
   }, [apply]);
 
   // While a provider refreshes, follow it until it answers.
-  const refreshingProvider = snapshot?.providers.some((p) => p.refreshing) ?? false;
+  const refreshingProvider = !!snapshot && !idleFor?.(snapshot) && snapshot.providers.some((p) => p.refreshing);
   useEffect(() => {
     if (!refreshingProvider) return;
     const timer = setTimeout(() => void load(), REFRESH_POLL_MS);
