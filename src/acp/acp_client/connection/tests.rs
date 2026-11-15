@@ -1550,6 +1550,10 @@ write_line(&fake.agent_write, &serde_json::json!({
         }
     }
 }).to_string()).await;
+fake.cmd_tx
+    .send(ClientCmd::Prompt(Vec::new()))
+    .await
+    .unwrap();
 tokio::time::timeout(Duration::from_secs(10), async {
     loop {
         if matches!(fake.event_rx.recv().await.unwrap(), Event::ThinkingStarted) {
@@ -1559,10 +1563,6 @@ tokio::time::timeout(Duration::from_secs(10), async {
 })
 .await
 .expect("intentional successful reset releases the prior failed outcome fence");
-fake.cmd_tx
-    .send(ClientCmd::Prompt(Vec::new()))
-    .await
-    .unwrap();
 assert!(
     matches!(collect_terminal(&mut fake).await.last(), Some(Event::Stopped { reason }) if reason == "prompt_complete")
 );
@@ -1874,9 +1874,14 @@ async fn parked_callback_refuses_clear_until_a_new_explicit_reset() {
             |event| matches!(event, Event::Stopped { reason } if reason == "prompt_complete"),
         )
         .await;
-        assert!(!observed.iter().any(|event| {
-            matches!(event, Event::AgentMessageChunk { text, .. } if text == "stale after explicit reset")
-        }));
+        let stale = scope.state.acp_event_store.replay_from(&fake.event_rx.id, 0).unwrap()
+            .into_iter().find(|stored| matches!(stored.event.as_ref(),
+                Event::AgentMessageChunk { text, .. } if text == "stale after explicit reset"))
+            .expect("the original's delayed text remains retained history");
+        assert_eq!(stale.metadata.scope, crate::acp::event_sender::EventScope::HistoryOnly);
+        assert!(stale.metadata.operation.is_none());
+        assert!(stale.metadata.native_autonomous.is_none());
+        assert!(!scope.state.session_service.fold_control_state(&fake.event_rx.id).await.unwrap().turn_active);
         assert!(
             observed[initial_end..]
                 .iter()
@@ -2033,7 +2038,12 @@ fn tool_call_frame(id: &str, aoe: &str) -> String {
 async fn idle_remote_control_message_records_and_returns_to_idle() {
     crate::acp::supervisor::test_support::managed::with_managed(|scope| Box::pin(async move {
 
-    let mut fake = spawn_fake_connection(scope, "s-remote", None, false, |_| Vec::new()).await;
+    let (ready, mut fake) = spawn_fake_connection_raw(
+        scope, "s-remote", None, false,
+        r#","_meta":{"ompAutonomousTurns":{"version":1}}"#,
+        (None, None), |_| Vec::new(),
+    ).await;
+    ready.expect("the actual Native agent negotiates its own root lifecycle");
     tokio::time::timeout(Duration::from_secs(10), async {
         while !matches!(
             fake.event_rx.recv().await.expect("connection remains open"),
@@ -2042,6 +2052,11 @@ async fn idle_remote_control_message_records_and_returns_to_idle() {
     })
     .await
     .expect("session commits");
+    let run = uuid::Uuid::new_v4();
+    write_line(&fake.agent_write, &serde_json::json!({
+        "jsonrpc":"2.0","method":"_omp/autonomous_turn/start",
+        "params":{"version":1,"sessionId":"s-remote","runId":run,"source":"irc"}
+    }).to_string()).await;
 
     let update = |body: &str| {
         format!(
@@ -2055,8 +2070,12 @@ async fn idle_remote_control_message_records_and_returns_to_idle() {
     ] {
         write_line(&fake.agent_write, &update(body)).await;
     }
+    write_line(&fake.agent_write, &serde_json::json!({
+        "jsonrpc":"2.0","method":"_omp/autonomous_turn/end",
+        "params":{"version":1,"sessionId":"s-remote","runId":run,"source":"irc","stopReason":"end_turn"}
+    }).to_string()).await;
 
-    // The idle grace is wall-clock, so the deadline covers it with margin.
+    // The same negotiated Native run, not an elapsed idle timer, owns its terminal.
     let mut seen = Vec::new();
     tokio::time::timeout(Duration::from_secs(30), async {
         while let Some(event) = fake.event_rx.recv().await {
@@ -2156,14 +2175,24 @@ async fn adapter_started_idle_compaction_ends_without_a_prompt() {
 
     let prompted = Arc::new(std::sync::atomic::AtomicBool::new(false));
     let seen_prompt = prompted.clone();
-    let mut fake = spawn_fake_connection(scope, "s-idle", None, false, move |id| {
-        seen_prompt.store(true, std::sync::atomic::Ordering::SeqCst);
-        vec![
-            serde_json::json!({"jsonrpc":"2.0","id":id,"result":{"stopReason":"end_turn"}})
-                .to_string(),
-        ]
-    })
-    .await;
+    let (ready, mut fake) = spawn_fake_connection_raw(
+        scope, "s-idle", None, false,
+        r#","_meta":{"ompAutonomousTurns":{"version":1}}"#,
+        (None, None), move |id| {
+            seen_prompt.store(true, std::sync::atomic::Ordering::SeqCst);
+            vec![serde_json::json!({"jsonrpc":"2.0","id":id,"result":{"stopReason":"end_turn"}}).to_string()]
+        },
+    ).await;
+    ready.expect("the actual Native agent negotiates its own root lifecycle");
+    tokio::time::timeout(Duration::from_secs(10), async {
+        while !matches!(fake.event_rx.recv().await.expect("connection remains open"),
+            Event::AcpSessionAssigned { connection_ready: true, .. }) {}
+    }).await.expect("the observed original commits before its own compaction");
+    let run = uuid::Uuid::new_v4();
+    write_line(&fake.agent_write, &serde_json::json!({
+        "jsonrpc":"2.0","method":"_omp/autonomous_turn/start",
+        "params":{"version":1,"sessionId":"s-idle","runId":run,"source":"scheduled_continuation"}
+    }).to_string()).await;
 
     for update in [
         r#"{"sessionUpdate":"compaction_update","compactionId":"c","status":"in_progress"}"#,
@@ -2178,8 +2207,12 @@ async fn adapter_started_idle_compaction_ends_without_a_prompt() {
         )
         .await;
     }
+    write_line(&fake.agent_write, &serde_json::json!({
+        "jsonrpc":"2.0","method":"_omp/autonomous_turn/end",
+        "params":{"version":1,"sessionId":"s-idle","runId":run,"source":"scheduled_continuation","stopReason":"end_turn"}
+    }).to_string()).await;
 
-    // The idle grace is wall-clock, so the deadline covers it with margin.
+    // Compaction's real own run supplies the terminal; no aoe prompt is required.
     let mut seen = Vec::new();
     tokio::time::timeout(Duration::from_secs(30), async {
         while let Some(event) = fake.event_rx.recv().await {
@@ -2557,26 +2590,31 @@ async fn child_approval_wait_does_not_stall_other_sessions() {
 async fn proxy_hello_and_primitives_shape_the_event_stream() {
     crate::acp::supervisor::test_support::managed::with_managed(|scope| {
         Box::pin(async move {
-            let (ready, fake) = spawn_fake_connection_raw(
-                scope,
-                "s-h",
-                None,
-                false,
-                BAD_HELLO,
-                (None, None),
-                |_| vec![],
-            )
-            .await;
-            assert!(
-                matches!(&ready, Err(AcpError::IncompatibleAgent(e))
-            if matches!(e.detail, StartupErrorDetail::InvalidProxyHello { .. })),
-                "{ready:?}"
+            let directory = scope.tempdir();
+            let initialize: serde_json::Value = serde_json::from_str(&format!(
+                r#"{{"protocolVersion":1,"agentCapabilities":{{}}{BAD_HELLO}}}"#
+            )).unwrap();
+            let (config, native) = scope.native_peer(
+                directory.path().into(), "gemini", "gemini", move |request| {
+                    assert_eq!(request["method"], "initialize", "a rejected hello cannot issue Native New");
+                    Some(serde_json::json!({"jsonrpc":"2.0","id":request["id"],"result":initialize}))
+                },
             );
-            fake.event_rx
-                .shutdown()
-                .await
-                .expect("retire the exact incompatible Native fixture");
-            fake.agent.abort();
+            let (id, mut publications) = scope.create_observed(config, "incompatible-proxy").await;
+            let detail = tokio::time::timeout(Duration::from_secs(10), async {
+                loop {
+                    let frame = publications.recv().await.expect("actual failed constructor publication");
+                    if frame.session_id != id { continue; }
+                    match frame.event.as_ref() {
+                        Event::IncompatibleAgent { detail } => break detail.clone(),
+                        Event::AcpSessionAssigned { .. } => panic!("an incompatible proxy cannot establish a Native session"),
+                        _ => {}
+                    }
+                }
+            }).await.expect("the actual failed constructor reports its typed incompatibility");
+            assert!(matches!(detail, StartupErrorDetail::InvalidProxyHello { .. }));
+            assert_eq!(native.requests(), ["initialize"]);
+            scope.finish_conversation_case().await;
 
             let (ready, mut fake) = spawn_fake_connection_raw(
                 scope,

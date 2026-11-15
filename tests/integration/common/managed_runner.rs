@@ -532,15 +532,16 @@ pub(crate) async fn child_if_requested(test_name: &str) -> bool {
 }
 
 async fn fill_retained_backlog(shared: &RunnerShared) -> serde_json::Value {
-    let session_id = shared
-        .handshake
-        .lock()
-        .await
-        .session
-        .as_ref()
-        .and_then(|cache| cache.receipt.session_id())
-        .expect("genuine native establishment result")
-        .to_owned();
+    let (session_id, physical_source) = {
+        let handshake = shared.handshake.lock().await;
+        let receipt = &handshake.session.as_ref()
+            .expect("genuine Native establishment result").receipt;
+        (
+            receipt.session_id().expect("observed original session identity").to_owned(),
+            crate::acp::state::NativePhysicalSource::from_receipt(receipt)
+                .expect("the actual original actor supplies frozen physical provenance"),
+        )
+    };
     let notification = |bytes: usize| {
         let mut body = ControlBody::Notify {
             method: "session/update".into(),
@@ -548,7 +549,10 @@ async fn fill_retained_backlog(shared: &RunnerShared) -> serde_json::Value {
                 "sessionUpdate":"tool_call","toolCallId":"later","title":"later update"
             },"_meta":{"pad":""}}),
             replay: None,
-            evidence: control_protocol::NativeNotifyEvidence::default(),
+            evidence: control_protocol::NativeNotifyEvidence {
+                physical_source: Some(physical_source),
+                ..Default::default()
+            },
         };
         let overhead = control_protocol::encode_frame(&body).unwrap().len();
         if let ControlBody::Notify { params, .. } = &mut body {

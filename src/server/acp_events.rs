@@ -2459,12 +2459,12 @@ mod tests {
         with_managed(|scope| {
             Box::pin(async move {
                 crate::session::set_unread_enabled(true);
-                let mut missed = test_support::managed_control_session(scope, "lag-missed").await;
+                let mut missed = test_support::managed_control_session(scope, "lag-missed", "claude", None).await;
                 let missed_id = missed.id().to_owned();
                 let request = missed.start_prompt("actual missed terminal").await;
                 missed.finish_prompt(&request, None).await;
                 let mut already =
-                    test_support::managed_control_session(scope, "lag-observed").await;
+                    test_support::managed_control_session(scope, "lag-observed", "claude", None).await;
                 let already_id = already.id().to_owned();
                 let request = already.start_prompt("already observed terminal").await;
                 already.finish_prompt(&request, None).await;
@@ -2533,7 +2533,7 @@ mod tests {
             Box::pin(async move {
                 crate::session::set_unread_enabled(true);
                 let live =
-                    test_support::managed_control_session(scope, "ready-is-not-terminal").await;
+                    test_support::managed_control_session(scope, "ready-is-not-terminal", "claude", None).await;
                 let state = live.state.clone();
                 let id = live.id().to_owned();
                 let fold = state.session_service.fold_control_state(&id).await.unwrap();
@@ -2585,7 +2585,7 @@ mod tests {
             Box::pin(async move {
                 crate::session::set_unread_enabled(true);
                 let mut live =
-                    test_support::managed_control_session(scope, "background-only-status").await;
+                    test_support::managed_control_session(scope, "background-only-status", "claude", None).await;
                 let state = live.state.clone();
                 let id = live.id().to_owned();
                 let path = start_projection_resource(&mut live, false).await;
@@ -2729,13 +2729,24 @@ mod tests {
         live: &mut crate::server::test_support::ManagedControlSession,
         agent: bool,
     ) -> std::path::PathBuf {
-        let actual = live.client.actual();
-        let store = &actual.native_store.as_ref().unwrap().stores[0];
-        let project = store.join("projects/-managed");
-        std::fs::create_dir_all(project.join("subagents")).unwrap();
-        let parent = project.join(format!("{}.jsonl", live.sid));
-        std::fs::write(&parent, "").unwrap();
-        let transcript = project.join("subagents/projection-agent.jsonl");
+        let workdir = live.state.instances.read().await.iter()
+            .find(|row| row.id == live.id()).unwrap().project_path.clone();
+        let project = if agent {
+            std::path::PathBuf::from(&workdir)
+        } else {
+            let actual = live.client.actual();
+            let home = actual.native_store.as_ref()
+                .filter(|store| store.agent == "claude" && store.filesystem == "host")
+                .and_then(|store| store.stores.first())
+                .expect("the actual Claude Bash original declares its native store");
+            home.join("projects").join(crate::session::capture::encode_claude_project_path(&workdir))
+        };
+        std::fs::create_dir_all(&project).unwrap();
+        let transcript = if agent {
+            project.join("projection-agent.jsonl")
+        } else {
+            project.join(format!("{}.jsonl", live.sid))
+        };
         std::fs::write(&transcript, "").unwrap();
         let response = if agent {
             serde_json::json!({"toolName":"Agent","toolResponse":{
@@ -2782,11 +2793,7 @@ mod tests {
             launch.metadata.resource_witness.is_some(),
             "actual first-I/O resource custody"
         );
-        if agent {
-            transcript
-        } else {
-            parent
-        }
+        transcript
     }
 
     async fn finish_projection_resource(
@@ -2826,7 +2833,7 @@ mod tests {
                 Box::pin(async move {
                     crate::session::set_unread_enabled(true);
                     let mut live =
-                        test_support::managed_control_session(scope, "lag-live-work").await;
+                        test_support::managed_control_session(scope, "lag-live-work", if background { "codex" } else { "claude" }, None).await;
                     let id = live.id().to_owned();
                     let request = live.start_prompt("go").await;
                     if background {
@@ -2871,10 +2878,7 @@ mod tests {
             Box::pin(async move {
                 let state = scope.state.clone();
                 let listener = start_managed_listener(scope, &state).await;
-                let live = crate::server::test_support::managed_control_session(
-                    scope,
-                    "listener-capability",
-                )
+                let live = crate::server::test_support::managed_control_session(scope, "listener-capability", "claude", None)
                 .await;
                 let id = live.id().to_owned();
                 let row = await_row(
@@ -2942,7 +2946,7 @@ mod tests {
             Box::pin(async move {
                 let mut publications = scope.state.acp_events_tx.subscribe();
                 let live =
-                    test_support::managed_control_session(scope, "listener-retired-identity").await;
+                    test_support::managed_control_session(scope, "listener-retired-identity", "claude", None).await;
                 let state = live.state.clone();
                 let id = live.id().to_owned();
                 await_row(
@@ -3029,7 +3033,7 @@ mod tests {
             Box::pin(async move {
                 crate::session::set_unread_enabled(true);
                 let mut live =
-                    test_support::managed_control_session(scope, "listener-approved-burst").await;
+                    test_support::managed_control_session(scope, "listener-approved-burst", "claude", None).await;
                 let state = live.state.clone();
                 let id = live.id().to_owned();
                 let listener = start_managed_listener(scope, &state).await;
@@ -3112,7 +3116,7 @@ mod tests {
             Box::pin(async move {
                 crate::session::set_unread_enabled(true);
                 let mut live =
-                    test_support::managed_control_session(scope, "listener-turn-end").await;
+                    test_support::managed_control_session(scope, "listener-turn-end", "claude", None).await;
                 let state = live.state.clone();
                 let id = live.id().to_owned();
                 let listener = start_managed_listener(scope, &state).await;
@@ -3153,7 +3157,7 @@ mod tests {
         for (retained, content_frames) in [(2000_usize, 8_usize), (2000, 24), (8, 24)] {
             with_managed_retention(retained, |scope| Box::pin(async move {
                     crate::session::set_unread_enabled(true);
-                    let mut live = crate::server::test_support::managed_control_session(scope, "listener-fold-window").await;
+                    let mut live = crate::server::test_support::managed_control_session(scope, "listener-fold-window", "claude", None).await;
                     let id = live.id().to_owned();
                     let listener = start_managed_listener(scope, &live.state).await;
                     let request = live.start_prompt("go").await;
@@ -3240,7 +3244,7 @@ mod tests {
                 Box::pin(async move {
                     crate::session::set_unread_enabled(true);
                     let mut live =
-                        test_support::managed_control_session(scope, "listener-cold").await;
+                        test_support::managed_control_session(scope, "listener-cold", "codex", None).await;
                     let state = live.state.clone();
                     let id = live.id().to_owned();
                     let mut publications = state.acp_events_tx.subscribe();
@@ -3746,7 +3750,7 @@ mod tests {
             with_managed(|scope| {
                 Box::pin(async move {
                     let mut live =
-                        test_support::managed_control_session(scope, "seed-status").await;
+                        test_support::managed_control_session(scope, "seed-status", "claude", None).await;
                     let id = live.id().to_owned();
                     let request = live.start_prompt("go").await;
                     if !running {
@@ -3795,7 +3799,7 @@ mod tests {
         for main_running in [false, true] {
             with_managed(|scope| {
                 Box::pin(async move {
-                    let mut live = test_support::managed_control_session(scope, "seed-task").await;
+                    let mut live = test_support::managed_control_session(scope, "seed-task", "claude", None).await;
                     let id = live.id().to_owned();
                     let request = live.start_prompt("go").await;
                     let path = start_projection_resource(&mut live, false).await;
@@ -3854,7 +3858,7 @@ mod tests {
         use crate::acp::supervisor::test_support::managed::with_managed;
         with_managed(|scope| {
             Box::pin(async move {
-                let live = test_support::managed_control_session(scope, "attested-reuse").await;
+                let live = test_support::managed_control_session(scope, "attested-reuse", "claude", None).await;
                 let observed_store = live
                     .client
                     .establishment_projection()
@@ -3948,7 +3952,7 @@ mod tests {
                 Box::pin(async move {
                     let mut publications = scope.state.acp_events_tx.subscribe();
                     let live =
-                        test_support::managed_control_session(scope, "delayed-assignment").await;
+                        test_support::managed_control_session(scope, "delayed-assignment", "claude", None).await;
                     let state = live.state.clone();
                     let id = live.id().to_owned();
                     await_row(
@@ -4257,7 +4261,7 @@ mod tests {
             Box::pin(async move {
                 let state = scope.state.clone();
                 let listener = start_managed_listener(scope, &state).await;
-                let mut live = test_support::managed_control_session(scope, "stale-sidebar").await;
+                let mut live = test_support::managed_control_session(scope, "stale-sidebar", "claude", None).await;
                 let id = live.id().to_owned();
                 let first = live.start_prompt("the original completed input").await;
                 live.finish_prompt(&first, None).await;
@@ -4337,7 +4341,7 @@ mod tests {
                     let initial_state = scope.state.clone();
                     let initial_listener = start_managed_listener(scope, &initial_state).await;
                     let mut live =
-                        test_support::managed_control_session(scope, "ready-repair").await;
+                        test_support::managed_control_session(scope, "ready-repair", "claude", None).await;
                     let (attached_state, reconciled_state) = tokio::sync::oneshot::channel();
                     let id = live.id().to_owned();
                     let original = load_profile_row("test", &id).unwrap();

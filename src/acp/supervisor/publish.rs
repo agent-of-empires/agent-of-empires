@@ -1017,18 +1017,25 @@ mod tests {
         );
     }
 
-    /// Records, for each broadcast, whether its session's seq counter was held.
+    /// Observes the reserved ordinal after sequence exclusion has been released for persistence.
     #[derive(Default)]
     struct LockProbeSink {
         seqs: std::sync::OnceLock<std::sync::Arc<SeqMap>>,
-        held: std::sync::Mutex<Vec<(u64, bool)>>,
+        seen: std::sync::Mutex<Vec<(u64, bool)>>,
+        durable: Arc<VecSink>,
     }
 
     impl BroadcastSink for LockProbeSink {
         fn publish(&self, session_id: &str, seq: u64, _event: &AcpEventData) {
             let counter = super::super::sequence_slot(self.seqs.get().unwrap(), session_id);
-            let held = matches!(counter.try_lock(), Err(std::sync::TryLockError::WouldBlock));
-            self.held.lock().unwrap().push((seq, held));
+            let Ok(current) = counter.try_lock() else { panic!("persistence must not retain sequence exclusion"); };
+            let allocated = current.seq == seq;
+            drop(current);
+            self.seen.lock().unwrap().push((seq, allocated));
+        }
+        fn publish_persisted(&self, session_id: &str, seq: u64, data: &AcpEventData) -> bool {
+            self.publish(session_id, seq, data);
+            self.durable.publish_persisted(session_id, seq, data)
         }
     }
 
@@ -1088,7 +1095,7 @@ mod tests {
         assert!(sup.publish_stopped_if_seq("s-1", "user_stopped", 2));
 
         assert_eq!(
-            *sink.held.lock().unwrap(),
+            *sink.seen.lock().unwrap(),
             [(1, true), (2, true), (3, true)]
         );
     }

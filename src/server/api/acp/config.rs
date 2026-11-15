@@ -537,7 +537,7 @@ mod tests {
         use crate::server::test_support as support;
         with_managed(|scope| {
             Box::pin(async move {
-                let session = support::managed_control_session(scope, "failed-config-write").await;
+                let session = support::managed_control_session(scope, "failed-config-write", "claude", None).await;
                 let id = session.id().to_owned();
                 let state = session.state.clone();
                 persist_selector(&state, &id, PersistedSelector::Model, "old-model")
@@ -614,7 +614,7 @@ mod tests {
         use crate::acp::supervisor::test_support::managed::with_managed;
         use crate::server::test_support as support;
         with_managed(|scope| Box::pin(async move {
-            let session = support::managed_control_session(scope, "retry-config-write").await;
+            let session = support::managed_control_session(scope, "retry-config-write", "claude", None).await;
             let id = session.id().to_owned();
             let state = session.state.clone();
             let original = session.client.lease.spawned_runner().expect("actual original runner");
@@ -792,55 +792,35 @@ mod tests {
     #[tokio::test]
     #[serial_test::serial]
     async fn model_config_pick_is_stored_for_respawn() {
-        let _tmp = isolate_app_dir();
-        let option = |id: &str, category| ConfigOptionDescriptor {
-            id: id.to_string(),
-            name: id.to_string(),
-            description: None,
-            category,
-            current_value: String::new(),
-            options: vec![],
-        };
-        crate::acp::option_catalog::record(
-            "claude",
-            &[
-                option(
-                    "fast",
-                    ConfigOptionCategory::Other(MODEL_CONFIG_CATEGORY.into()),
-                ),
-                option("other", ConfigOptionCategory::Other("misc".into())),
-            ],
-            "2026-07-24T00:00:00Z".to_string(),
-        )
-        .unwrap();
-
-        let mut inst = crate::session::Instance::new("claude", "/tmp");
-        inst.agent_name = Some("claude".to_string());
-        let id = inst.id.clone();
-        let state = crate::server::test_support::build_test_app_state(vec![inst]);
-        state
-            .acp_supervisor
-            .test_insert_worker_cmd_recording(&id)
-            .await;
-        for config_id in ["other", "fast"] {
-            let resp = acp_set_config_option(
-                State(state.clone()),
-                Path(id.clone()),
-                Ok(Json(SetConfigOptionRequest {
-                    config_id: config_id.to_string(),
-                    value: "on".to_string(),
-                    request_nonce: None,
-                })),
-            )
-            .await
-            .into_response();
-            assert_eq!(resp.status(), StatusCode::ACCEPTED, "{config_id}");
-        }
-        let stored = state.instances.read().await[0].acp_model_config.clone();
-        assert_eq!(
-            stored.into_iter().collect::<Vec<_>>(),
-            vec![("fast".to_string(), "on".to_string())]
-        );
+        crate::acp::supervisor::test_support::managed::with_managed(|scope| Box::pin(async move {
+            let options = serde_json::json!([
+                {"id":"fast","name":"Fast","category":"model_config","type":"select",
+                    "currentValue":"off","options":[{"value":"off","name":"Off"},{"value":"on","name":"On"}]},
+                {"id":"other","name":"Other","category":"misc","type":"select",
+                    "currentValue":"off","options":[{"value":"off","name":"Off"},{"value":"on","name":"On"}]}
+            ]);
+            let session = crate::server::test_support::managed_control_session(
+                scope, "sticky-model-config", "claude", Some(options),
+            ).await;
+            let id = session.id().to_owned();
+            let state = session.state.clone();
+            for config_id in ["other", "fast"] {
+                let resp = acp_set_config_option(
+                    State(state.clone()),
+                    Path(id.clone()),
+                    Ok(Json(SetConfigOptionRequest {
+                        config_id: config_id.to_string(),
+                        value: "on".to_string(),
+                        request_nonce: None,
+                    })),
+                ).await.into_response();
+                assert_eq!(resp.status(), StatusCode::ACCEPTED, "{config_id}");
+            }
+            let stored = state.instances.read().await.iter()
+                .find(|row| row.id == id).unwrap().acp_model_config.clone();
+            assert_eq!(stored.into_iter().collect::<Vec<_>>(),
+                vec![("fast".to_string(), "on".to_string())]);
+        })).await;
     }
 
     /// The catalog holds whichever session reported last, so a pick is
@@ -848,65 +828,28 @@ mod tests {
     #[tokio::test]
     #[serial_test::serial]
     async fn model_config_pick_is_classified_from_the_sessions_own_options() {
-        let _tmp = isolate_app_dir();
-        let option = |id: &str, category| ConfigOptionDescriptor {
-            id: id.to_string(),
-            name: id.to_string(),
-            description: None,
-            category,
-            current_value: String::new(),
-            options: vec![],
-        };
-        let toggle = ConfigOptionCategory::Other(MODEL_CONFIG_CATEGORY.into());
-        crate::acp::option_catalog::record(
-            "claude",
-            &[option("model", ConfigOptionCategory::Model)],
-            "2026-07-24T00:00:00Z".to_string(),
-        )
-        .unwrap();
-
-        let mut with_toggle = crate::session::Instance::new("claude", "/tmp");
-        with_toggle.agent_name = Some("claude".to_string());
-        let mut without = with_toggle.clone();
-        without.id = "sess-without-toggle".to_string();
-        let (with_id, without_id) = (with_toggle.id.clone(), without.id.clone());
-        let state = crate::server::test_support::build_test_app_state(vec![with_toggle, without]);
-        for (id, options) in [
-            (
-                &with_id,
-                vec![
-                    option("model", ConfigOptionCategory::Model),
-                    option("ultracode", toggle.clone()),
-                ],
-            ),
-            (
-                &without_id,
-                vec![option("model", ConfigOptionCategory::Model)],
-            ),
-        ] {
-            state
-                .acp_event_store
-                .record_at(
-                    id,
-                    1,
-                    &crate::acp::state::Event::ConfigOptionsUpdated { options },
-                    0,
-                )
-                .unwrap();
-        }
-
-        assert_eq!(
-            config_option_category(&state, &with_id, "ultracode")
-                .await
-                .unwrap(),
-            Some(toggle)
-        );
-        assert_eq!(
-            config_option_category(&state, &without_id, "ultracode")
-                .await
-                .unwrap(),
-            None
-        );
+        crate::acp::supervisor::test_support::managed::with_managed(|scope| Box::pin(async move {
+            let model = serde_json::json!({"id":"model","name":"Model","category":"model","type":"select",
+                "currentValue":"old-model","options":[{"value":"old-model","name":"Old model"}]});
+            let with_options = serde_json::json!([model, {
+                "id":"ultracode","name":"Ultracode","category":"model_config","type":"select",
+                "currentValue":"off","options":[{"value":"off","name":"Off"},{"value":"on","name":"On"}]
+            }]);
+            let with_toggle = crate::server::test_support::managed_control_session(
+                scope, "own-toggle-options", "claude", Some(with_options),
+            ).await;
+            let without = crate::server::test_support::managed_control_session(
+                scope, "own-model-options", "claude", Some(serde_json::json!([model])),
+            ).await;
+            assert_eq!(
+                config_option_category(&with_toggle.state, with_toggle.id(), "ultracode").await.unwrap(),
+                Some(ConfigOptionCategory::Other(MODEL_CONFIG_CATEGORY.into()))
+            );
+            assert_eq!(
+                config_option_category(&without.state, without.id(), "ultracode").await.unwrap(),
+                None
+            );
+        })).await;
     }
 
     #[tokio::test]

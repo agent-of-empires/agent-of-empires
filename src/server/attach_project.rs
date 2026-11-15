@@ -348,7 +348,7 @@ mod tests {
                 use crate::acp::state::Event;
                 use std::time::Duration;
 
-                let mut managed = support::managed_control_session(scope, "queued-stop").await;
+                let mut managed = support::managed_control_session(scope, "queued-stop", "claude", None).await;
                 let not_a_repo = scope.tempdir();
                 let id = managed.id().to_owned();
                 let state = Arc::clone(&managed.state);

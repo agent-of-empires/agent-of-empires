@@ -827,6 +827,8 @@ impl ManagedControlSession {
 pub(crate) async fn managed_control_session(
     scope: &mut crate::acp::supervisor::test_support::managed::ManagedScope,
     label: &str,
+    agent_key: &str,
+    options: Option<serde_json::Value>,
 ) -> ManagedControlSession {
     let project = scope.tempdir();
     let native_store = crate::session::get_app_dir()
@@ -838,14 +840,14 @@ pub(crate) async fn managed_control_session(
     let sid = uuid::Uuid::new_v4().to_string();
     let response_sid = sid.clone();
     let (sent, prompts) = tokio::sync::mpsc::unbounded_channel();
-    let mut config_options = serde_json::json!([{
+    let mut config_options = options.unwrap_or_else(|| serde_json::json!([{
         "id": "model", "name": "Model", "category": "model", "type": "select",
         "currentValue": "old-model", "options": [
             {"value": "old-model", "name": "Old model"},
             {"value": "new-model", "name": "New model"},
             {"value": "plan", "name": "Plan"}
         ]
-    }]);
+    }]));
     let mut modes = serde_json::json!({
         "currentModeId": "old-mode", "availableModes": [
             {"id": "old-mode", "name": "Old mode"},
@@ -855,8 +857,8 @@ pub(crate) async fn managed_control_session(
     });
     let (config, native) = scope.native_peer(
         project.path().into(),
-        "claude",
-        "claude",
+        agent_key,
+        agent_key,
         move |request| match request["method"].as_str().unwrap() {
             "initialize" => Some(serde_json::json!({"jsonrpc":"2.0","id":request["id"],
                 "result":{"protocolVersion":1,"agentCapabilities":{"loadSession":true},
@@ -875,8 +877,10 @@ pub(crate) async fn managed_control_session(
                 Some(serde_json::json!({"jsonrpc":"2.0","id":request["id"],"result":{}}))
             }
             "session/set_config_option" => {
-                assert_eq!(request["params"]["configId"], "model");
-                config_options[0]["currentValue"] = request["params"]["value"].clone();
+                let selected = config_options.as_array_mut().unwrap().iter_mut()
+                    .find(|option| option["id"] == request["params"]["configId"])
+                    .expect("the actual Native peer accepts only its advertised options");
+                selected["currentValue"] = request["params"]["value"].clone();
                 Some(serde_json::json!({"jsonrpc":"2.0","id":request["id"],
                     "result":{"configOptions":config_options}}))
             }

@@ -1365,7 +1365,7 @@ mod tests {
         use crate::acp::event_store::ControlKnowledge::Known;
         use crate::acp::supervisor::test_support::managed::with_managed;
         with_managed(|scope| Box::pin(async move {
-            let mut live = crate::server::test_support::managed_control_session(scope, "retained-autonomous-fact").await;
+            let mut live = crate::server::test_support::managed_control_session(scope, "retained-autonomous-fact", "claude", None).await;
             let id = live.id().to_owned();
             let run = uuid::Uuid::new_v4();
             live.native.send(serde_json::json!({"jsonrpc":"2.0","method":"_omp/autonomous_turn/start",
@@ -1470,7 +1470,7 @@ mod tests {
         use crate::acp::event_store::ControlKnowledge::Known;
         use crate::acp::supervisor::test_support::managed::with_managed;
         with_managed(|scope| Box::pin(async move {
-            let mut live = crate::server::test_support::managed_control_session(scope, "independent-native-turns").await;
+            let mut live = crate::server::test_support::managed_control_session(scope, "independent-native-turns", "claude", None).await;
             let id = live.id().to_owned();
             let run = uuid::Uuid::new_v4();
             live.native.send(serde_json::json!({"jsonrpc":"2.0","method":"_omp/autonomous_turn/start",

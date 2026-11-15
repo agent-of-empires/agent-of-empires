@@ -395,7 +395,7 @@ async fn a_rejected_enqueue_keeps_the_pending_turn_and_an_accepted_one_clears_it
     with_managed(|scope| {
         Box::pin(async move {
             let mut live =
-                crate::server::test_support::managed_control_session(scope, "sess-5253-enqueue")
+                crate::server::test_support::managed_control_session(scope, "sess-5253-enqueue", "claude", None)
                     .await;
             let id = live.id().to_owned();
             let state = live.state.clone();
@@ -619,14 +619,11 @@ async fn turn_on_a_park_attaches_the_retained_actor_then_delivers_only_new_expli
     with_managed(|scope| {
         Box::pin(async move {
             for diff_comments in [false, true] {
-                let mut live = crate::server::test_support::managed_control_session(
-                    scope,
-                    if diff_comments {
-                        "quota-explicit-review"
-                    } else {
-                        "quota-explicit-text"
-                    },
-                )
+                let mut live = crate::server::test_support::managed_control_session(scope, if diff_comments {
+                    "quota-explicit-review"
+                } else {
+                    "quota-explicit-text"
+                }, "claude", None)
                 .await;
                 live.park("old interrupted input must not replay").await;
                 let id = live.id().to_owned();
@@ -722,14 +719,11 @@ async fn no_revive_preserves_workerless_parked_or_active_work_without_side_effec
     with_managed(|scope| {
         Box::pin(async move {
             for parked in [false, true] {
-                let mut live = crate::server::test_support::managed_control_session(
-                    scope,
-                    if parked {
-                        "no-revive-park"
-                    } else {
-                        "no-revive-active"
-                    },
-                )
+                let mut live = crate::server::test_support::managed_control_session(scope, if parked {
+                    "no-revive-park"
+                } else {
+                    "no-revive-active"
+                }, "claude", None)
                 .await;
                 let active = live.start_prompt("original governed work").await;
                 if parked {
@@ -808,7 +802,7 @@ async fn a_direct_prompt_and_the_queue_drain_cannot_both_own_the_same_turn() {
     with_managed(|scope| {
         Box::pin(async move {
             let mut live =
-                crate::server::test_support::managed_control_session(scope, "queue-direct-race")
+                crate::server::test_support::managed_control_session(scope, "queue-direct-race", "claude", None)
                     .await;
             let id = live.id().to_owned();
             let state = live.state.clone();
@@ -947,10 +941,7 @@ async fn queued_explicit_work_follows_a_failed_prompt_but_not_a_failed_runtime()
     ] {
         with_managed(|scope| {
             Box::pin(async move {
-                let mut live = crate::server::test_support::managed_control_session(
-                    scope,
-                    "queue-after-failure",
-                )
+                let mut live = crate::server::test_support::managed_control_session(scope, "queue-after-failure", "claude", None)
                 .await;
                 let id = live.id().to_owned();
                 let state = live.state.clone();
@@ -1128,7 +1119,7 @@ async fn diff_comments_refuse_to_open_a_turn_another_submission_started() {
     with_managed(|scope| {
         Box::pin(async move {
             let mut live =
-                crate::server::test_support::managed_control_session(scope, "queue-diff-race")
+                crate::server::test_support::managed_control_session(scope, "queue-diff-race", "claude", None)
                     .await;
             let id = live.id().to_owned();
             let state = live.state.clone();
@@ -1244,10 +1235,7 @@ async fn a_manual_prompt_cannot_overtake_a_continuation_install() {
     use crate::acp::supervisor::test_support::managed::with_managed;
     with_managed(|scope| {
         Box::pin(async move {
-            let mut live = crate::server::test_support::managed_control_session(
-                scope,
-                "continuation-install-race",
-            )
+            let mut live = crate::server::test_support::managed_control_session(scope, "continuation-install-race", "claude", None)
             .await;
             live.park("interrupted prompt A").await;
             let state = live.state.clone();
@@ -1347,7 +1335,7 @@ async fn sending_a_queued_plugin_row_now_keeps_its_stored_sender() {
     with_managed(|scope| {
         Box::pin(async move {
             let mut live =
-                crate::server::test_support::managed_control_session(scope, "queue-plugin-sender")
+                crate::server::test_support::managed_control_session(scope, "queue-plugin-sender", "claude", None)
                     .await;
             let owned_id = live.id().to_owned();
             let id = owned_id.as_str();
@@ -1424,7 +1412,7 @@ async fn send_now_refuses_text_that_differs_from_the_stored_plugin_row() {
     with_managed(|scope| {
         Box::pin(async move {
             let live =
-                crate::server::test_support::managed_control_session(scope, "queue-plugin-spoof")
+                crate::server::test_support::managed_control_session(scope, "queue-plugin-spoof", "claude", None)
                     .await;
             let owned_id = live.id().to_owned();
             let id = owned_id.as_str();
@@ -1476,7 +1464,7 @@ async fn send_now_refuses_text_that_differs_from_a_user_row_too() {
     with_managed(|scope| {
         Box::pin(async move {
             let live =
-                crate::server::test_support::managed_control_session(scope, "queue-user-stale")
+                crate::server::test_support::managed_control_session(scope, "queue-user-stale", "claude", None)
                     .await;
             let owned_id = live.id().to_owned();
             let id = owned_id.as_str();
@@ -1608,7 +1596,7 @@ async fn send_now_delivers_the_rows_stored_attachments_not_the_requests() {
     with_managed(|scope| {
         Box::pin(async move {
             let mut live =
-                crate::server::test_support::managed_control_session(scope, "queue-attachments")
+                crate::server::test_support::managed_control_session(scope, "queue-attachments", "claude", None)
                     .await;
             let owned_id = live.id().to_owned();
             let id = owned_id.as_str();
@@ -1692,10 +1680,7 @@ async fn send_now_keeps_a_row_whose_attachment_bytes_are_gone() {
     use crate::acp::supervisor::test_support::managed::with_managed;
     with_managed(|scope| {
         Box::pin(async move {
-            let live = crate::server::test_support::managed_control_session(
-                scope,
-                "queue-attachment-expired",
-            )
+            let live = crate::server::test_support::managed_control_session(scope, "queue-attachment-expired", "claude", None)
             .await;
             let owned_id = live.id().to_owned();
             let id = owned_id.as_str();
@@ -1769,7 +1754,7 @@ async fn send_now_behind_a_busy_agent_keeps_the_one_queued_row() {
     with_managed(|scope| {
         Box::pin(async move {
             let mut live =
-                crate::server::test_support::managed_control_session(scope, "queue-send-now-busy")
+                crate::server::test_support::managed_control_session(scope, "queue-send-now-busy", "claude", None)
                     .await;
             let owned_id = live.id().to_owned();
             let id = owned_id.as_str();
@@ -1942,7 +1927,7 @@ async fn native_loss_and_legacy_refusal_precede_prompt_touch_queue_or_launch() {
     Box::pin(with_managed(|scope| {
         Box::pin(async move {
             let live =
-                crate::server::test_support::managed_control_session(scope, "refused-native-loss")
+                crate::server::test_support::managed_control_session(scope, "refused-native-loss", "claude", None)
                     .await;
             let id = live.id().to_owned();
             let state = live.state.clone();
@@ -2139,7 +2124,7 @@ async fn current_owned_native_receipt_needs_no_historical_ready_and_refreshes_be
     with_managed(|scope| {
         Box::pin(async move {
             let mut live =
-                crate::server::test_support::managed_control_session(scope, "current-native").await;
+                crate::server::test_support::managed_control_session(scope, "current-native", "claude", None).await;
             let session_id = live.id().to_owned();
             let id = session_id.as_str();
             let state = live.state.clone();
@@ -2386,14 +2371,11 @@ async fn native_loss_after_publication_consumes_pending_but_preserves_named_queu
     with_managed(|scope| {
         Box::pin(async move {
             for text in ["explicit next request", "/clear"] {
-                let live = crate::server::test_support::managed_control_session(
-                    scope,
-                    if text == "/clear" {
-                        "late-loss-reset"
-                    } else {
-                        "late-loss-prompt"
-                    },
-                )
+                let live = crate::server::test_support::managed_control_session(scope, if text == "/clear" {
+                    "late-loss-reset"
+                } else {
+                    "late-loss-prompt"
+                }, "claude", None)
                 .await;
                 let id = live.id().to_owned();
                 let state = live.state.clone();
@@ -2587,58 +2569,56 @@ async fn a_prompt_reports_its_dispatch_and_the_seq_it_was_recorded_at() {
 /// rest as `merged_prompt_ids`, so the web client settles every optimistic row.
 #[tokio::test]
 async fn queue_drain_publishes_row_ids_as_prompt_and_merged_ids() {
-    let _app_dir = crate::session::test_support::isolate_app_dir();
-    let id = "sess-5401-drain";
-    let state = structured_state(id, true).await;
-    let _cmds = state
-        .acp_supervisor
-        .test_insert_worker_cmd_recording(id)
-        .await;
-    for (row, text) in [("q1", "first"), ("q2", "second")] {
-        state
-            .session_service
-            .enqueue_prompt(id, row.into(), text.into(), vec![], None, None)
-            .await
-            .expect("session exists");
-    }
-
-    state.session_service.drain_queued_prompts_once(id).await;
-
-    assert!(published(&state, id, |e| matches!(
-        e,
-        Event::UserPromptSent { prompt_id: Some(p), merged_prompt_ids, .. }
-            if p == "q1" && merged_prompt_ids == &["q2".to_string()]
-    )));
+    crate::acp::supervisor::test_support::managed::with_managed(|scope| Box::pin(async move {
+        let mut live = crate::server::test_support::managed_control_session(
+            scope, "queue-drain-ids", "claude", None,
+        ).await;
+        let id = live.id().to_owned();
+        let state = live.state.clone();
+        for (row, text) in [("q1", "first"), ("q2", "second")] {
+            state.session_service.enqueue_prompt(
+                &id, row.into(), text.into(), vec![], None, None,
+            ).await.expect("the actual original's session exists");
+        }
+        state.session_service.drain_queued_prompts_once(&id).await;
+        let request = live.next_prompt().await;
+        assert!(published(&state, &id, |event| matches!(
+            event, Event::UserPromptSent { prompt_id: Some(id), merged_prompt_ids, .. }
+                if id == "q1" && merged_prompt_ids == &["q2".to_string()]
+        )));
+        live.finish_prompt(&request, None).await;
+    })).await;
 }
 
 /// Another tab's optimistic row carries the queued row id, so it must settle too.
 #[tokio::test]
 async fn send_now_publishes_the_request_id_then_the_queued_row_id() {
-    let _app_dir = crate::session::test_support::isolate_app_dir();
-    let id = "sess-send-now-ids";
-    let state = state_with_queued_plugin_row(id, true).await;
-    let _cmds = state
-        .acp_supervisor
-        .test_insert_worker_cmd_recording(id)
-        .await;
-
-    let response = acp_prompt(
-        State(Arc::clone(&state)),
-        Path(id.to_string()),
-        Ok(Json(PromptRequest {
-            text: "PR #7 was merged".to_string(),
-            attachments: Vec::new(),
-            prompt_id: Some("req-1".to_string()),
-            no_revive: false,
-            queued_prompt_id: Some("q1".to_string()),
-        })),
-    )
-    .await
-    .into_response();
-    assert_eq!(response.status(), StatusCode::ACCEPTED);
-    assert!(published(&state, id, |e| matches!(
-        e,
-        Event::UserPromptSent { prompt_id: Some(p), merged_prompt_ids, .. }
-            if p == "req-1" && merged_prompt_ids == &["q1".to_string()]
-    )));
+    crate::acp::supervisor::test_support::managed::with_managed(|scope| Box::pin(async move {
+        let mut live = crate::server::test_support::managed_control_session(
+            scope, "queue-send-now-ids", "claude", None,
+        ).await;
+        let id = live.id().to_owned();
+        let state = live.state.clone();
+        state.session_service.enqueue_prompt(
+            &id, "q1".into(), "PR #7 was merged".into(), vec![], None, Some("cron".into()),
+        ).await.expect("the actual original's plugin row exists");
+        let response = acp_prompt(
+            State(Arc::clone(&state)),
+            Path(id.clone()),
+            Ok(Json(PromptRequest {
+                text: "PR #7 was merged".to_string(),
+                attachments: Vec::new(),
+                prompt_id: Some("req-1".to_string()),
+                no_revive: false,
+                queued_prompt_id: Some("q1".to_string()),
+            })),
+        ).await.into_response();
+        assert_eq!(response.status(), StatusCode::ACCEPTED);
+        let request = live.next_prompt().await;
+        assert!(published(&state, &id, |event| matches!(
+            event, Event::UserPromptSent { prompt_id: Some(id), merged_prompt_ids, .. }
+                if id == "req-1" && merged_prompt_ids == &["q1".to_string()]
+        )));
+        live.finish_prompt(&request, None).await;
+    })).await;
 }

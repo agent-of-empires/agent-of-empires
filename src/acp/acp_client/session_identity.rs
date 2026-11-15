@@ -876,6 +876,11 @@ impl SessionIngress {
         if state.failed || state.callbacks_revoked {
             return None;
         }
+        self.projection
+            .lock()
+            .expect("ingress projection")
+            .upgrade()?
+            .original_window()?;
         state.history.as_ref()?.constructor.get().cloned()
     }
 

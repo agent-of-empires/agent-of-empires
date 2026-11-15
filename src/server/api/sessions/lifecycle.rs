@@ -5854,10 +5854,7 @@ mod restart_wake_tests {
         use crate::acp::supervisor::test_support::managed::with_managed;
         with_managed(|scope| {
             Box::pin(async move {
-                let mut live = crate::server::test_support::managed_control_session(
-                    scope,
-                    "restart-quota-publication-io",
-                )
+                let mut live = crate::server::test_support::managed_control_session(scope, "restart-quota-publication-io", "claude", None)
                 .await;
                 live.park("original interrupted work").await;
                 let id = live.id().to_owned();

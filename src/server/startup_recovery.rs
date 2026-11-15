@@ -858,10 +858,7 @@ mod tests {
                     ] {
                         for published in [false, true] {
                             let (state, candidate, original, launches) = if structured {
-                                let original = test_support::managed_control_session(
-                                    scope,
-                                    "shelved-recovery",
-                                )
+                                let original = test_support::managed_control_session(scope, "shelved-recovery", "claude", None)
                                 .await;
                                 original.client.stop_session().await;
                                 original.client.shutdown().await.unwrap();

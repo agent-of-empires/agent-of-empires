@@ -1216,7 +1216,7 @@ mod tests {
         use crate::acp::supervisor::test_support::managed::with_managed;
         for agent_initiated in [false, true] {
             with_managed(|scope| Box::pin(async move {
-                let mut live = crate::server::test_support::managed_control_session(scope, "orphaned-real-turn").await;
+                let mut live = crate::server::test_support::managed_control_session(scope, "orphaned-real-turn", "claude", None).await;
                 if agent_initiated {
                 let run_id = uuid::Uuid::new_v4();
                 live.native.send(serde_json::json!({"jsonrpc":"2.0","method":"_omp/autonomous_turn/start",
@@ -1272,7 +1272,7 @@ mod tests {
         use crate::acp::event_store::ControlKnowledge::Known;
         use crate::acp::supervisor::test_support::managed::with_managed;
         with_managed(|scope| Box::pin(async move {
-                let mut live = crate::server::test_support::managed_control_session(scope, "unknown-orphaned-real-turn").await;
+                let mut live = crate::server::test_support::managed_control_session(scope, "unknown-orphaned-real-turn", "claude", None).await;
                 let run_id = uuid::Uuid::new_v4();
                 live.native.send(serde_json::json!({"jsonrpc":"2.0","method":"_omp/autonomous_turn/start",
                     "params":{"version":1,"sessionId":live.sid,"runId":run_id,"source":"irc"}})).await;
@@ -1391,10 +1391,7 @@ mod tests {
         }
         with_managed(|scope| {
             Box::pin(async move {
-                let mut live = crate::server::test_support::managed_control_session(
-                    scope,
-                    "reconciler-attach-timeout",
-                )
+                let mut live = crate::server::test_support::managed_control_session(scope, "reconciler-attach-timeout", "claude", None)
                 .await;
                 let id = live.id().to_owned();
                 let pending = live.start_prompt("original turn remains busy").await;
@@ -1504,7 +1501,7 @@ mod tests {
         use crate::acp::supervisor::test_support::managed::with_managed;
         use crate::acp::Event;
         with_managed(|scope| Box::pin(async move {
-            let mut live = crate::server::test_support::managed_control_session(scope, "retained-agent-work").await;
+            let mut live = crate::server::test_support::managed_control_session(scope, "retained-agent-work", "claude", None).await;
             let id = live.id().to_owned();
             let request = live.start_prompt("go").await;
             live.finish_prompt(&request, None).await;

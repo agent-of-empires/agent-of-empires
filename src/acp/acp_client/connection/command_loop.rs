@@ -735,6 +735,9 @@ impl Session {
 
     /// Claim an idle terminal without overriding an already-completed turn.
     fn stand_down_idle_completion(&self, scope: &Option<NativeRequestContext>) -> bool {
+        if self.control.is_some() && !self.shared.adopted_turn_active.load(Ordering::Acquire) {
+            return false;
+        }
         current_effect(scope, self.control.is_some(), || {
             self.shared
                 .connection_state
@@ -1669,7 +1672,7 @@ mod tests {
                 assert!(futures_util::poll!(later.as_mut()).is_pending());
                 if expire {
                     assert!(matches!(reset.as_mut().await.unwrap(), ResetSessionOutcome::Failed { message }
-                        if message == "reset deadline expired while agent callbacks were in flight"));
+                        if message == "reset deadline expired while callbacks were in flight"));
                     assert!(held.is_some());
                     drop(later.as_mut().await);
                     native.send(serde_json::json!({"jsonrpc":"2.0","method":"session/update","params":{

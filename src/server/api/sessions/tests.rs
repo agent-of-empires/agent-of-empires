@@ -14076,7 +14076,7 @@ async fn an_account_swap_out_of_a_rate_limit_park_continues_the_interrupted_prom
                 "unparked",
             ] {
                 let mut live =
-                    crate::server::test_support::managed_control_session(scope, case).await;
+                    crate::server::test_support::managed_control_session(scope, case, "claude", None).await;
                 let id = live.id().to_owned();
                 let state = live.state.clone();
                 if case == "unparked" {
@@ -14093,6 +14093,10 @@ async fn an_account_swap_out_of_a_rate_limit_park_continues_the_interrupted_prom
                 if matches!(case, "nothing-to-replay" | "pending-only") {
                     // A real runner operation without a daemon user-prompt record has no
                     // interrupted user input to redeliver.
+                    assert!(matches!(
+                        live.client.reset_session("/new").await.unwrap(),
+                        crate::acp::acp_client::ResetSessionOutcome::Reset { .. }
+                    ), "a genuine clear establishes the absence of any earlier interrupted user input");
                     live.client
                         .send_prompt("Native operation without user journal input", &[])
                         .await
@@ -14226,7 +14230,7 @@ async fn the_selected_work_verdict_survives_a_concurrent_pending_turn_drain() {
     with_managed(|scope| {
         Box::pin(async move {
             let mut live =
-                crate::server::test_support::managed_control_session(scope, "drained").await;
+                crate::server::test_support::managed_control_session(scope, "drained", "claude", None).await;
             live.park("finish the migration").await;
             let id = live.id().to_owned();
             let state = live.state.clone();
@@ -14292,10 +14296,7 @@ async fn prepared_restart_uses_current_queue_after_original_detaches() {
     with_managed(|scope| {
         Box::pin(async move {
             for remove_during_hooks in [false, true] {
-                let mut live = crate::server::test_support::managed_control_session(
-                    scope,
-                    "restart-current-queue",
-                )
+                let mut live = crate::server::test_support::managed_control_session(scope, "restart-current-queue", "claude", None)
                 .await;
                 live.park("original interrupted work").await;
                 live.make_quota_due();
@@ -14483,7 +14484,7 @@ async fn quota_breadcrumb_write_failure_does_not_install_pending_input() {
     with_managed(|scope| {
         Box::pin(async move {
             let mut live =
-                crate::server::test_support::managed_control_session(scope, "quota-write-refused")
+                crate::server::test_support::managed_control_session(scope, "quota-write-refused", "claude", None)
                     .await;
             live.park("finish the migration").await;
             let id = live.id().to_owned();

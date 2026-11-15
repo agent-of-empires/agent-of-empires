@@ -4299,10 +4299,7 @@ mod tests {
             NativeResourceSelector, NativeResourceStartContext, NativeSessionPermission,
         };
         use crate::acp::event_sender::EventMetadata;
-        let mut session = crate::server::test_support::managed_control_session(
-            scope,
-            "child-resource-provenance",
-        )
+        let mut session = crate::server::test_support::managed_control_session(scope, "child-resource-provenance", "claude", None)
         .await;
         for update in [
             serde_json::json!({

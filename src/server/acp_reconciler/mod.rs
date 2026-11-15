@@ -1692,7 +1692,7 @@ mod tests {
             Box::pin(async move {
                 for shape in ["missing", "null", "v3"] {
                     let mut live =
-                        crate::server::test_support::managed_control_session(scope, shape).await;
+                        crate::server::test_support::managed_control_session(scope, shape, "claude", None).await;
                     let id = live.id().to_owned();
                     live.park("interrupted explicit intent").await;
                     let park = match live.state.acp_event_store.rate_limit_park(&id).unwrap() {
@@ -1887,55 +1887,45 @@ mod tests {
     /// A runner retains the completion of its last user prompt and replays it on attach. An
     /// agent-initiated turn after that prompt must not be classified as a prompt in flight
     /// (which would let the replay close it), and only its own terminal releases the hold.
-    #[test]
-    fn an_agent_turn_after_a_completed_prompt_is_not_a_prompt_in_flight() {
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn an_agent_turn_after_a_completed_prompt_is_not_a_prompt_in_flight() {
         use crate::acp::Event;
-        let (_home, state, _project) = test_state("s-reattach");
-        let id = "s-reattach";
-        let store = &state.acp_event_store;
-        let events = [
-            Event::UserPromptSent {
-                text: "go".into(),
-                attachments: Vec::new(),
-                prompt_id: None,
-                merged_prompt_ids: Vec::new(),
-                synthesized: false,
-                origin_plugin: None,
-            },
-            Event::Stopped {
-                reason: "prompt_complete".into(),
-            },
-            Event::ThinkingStarted,
-            Event::AgentMessageChunk {
-                text: "woken".into(),
-                message_id: None,
-            },
-        ];
-        let mut autonomous = crate::server::test_support::sql_projection_metadata();
-        autonomous.scope = crate::acp::event_sender::EventScope::SessionCurrent;
-        autonomous.operation = None;
-        autonomous.prompt_observation = None;
-        for (i, event) in events.iter().enumerate() {
-            let host = crate::acp::event_sender::EventMetadata::host(event);
-            let metadata = if i >= 2 { &autonomous } else { &host };
-            store.record(id, i as u64 + 1, event, metadata).unwrap();
-        }
-        assert_eq!(open_turn_kinds(store, id).unwrap(), Known((false, true)));
-        assert_eq!(store.holds_live_work(id).unwrap(), Known(true));
-
-        let stop = Event::Stopped {
-            reason: "agent_idle".into(),
-        };
-        store
-            .record(
-                id,
-                events.len() as u64 + 1,
-                &stop,
-                &autonomous,
-            )
-            .unwrap();
-        assert_eq!(open_turn_kinds(store, id).unwrap(), Known((false, false)));
-        assert_eq!(store.holds_live_work(id).unwrap(), Known(false));
+        crate::acp::supervisor::test_support::managed::with_managed(|scope| Box::pin(async move {
+            let mut live = crate::server::test_support::managed_control_session(
+                scope, "independent-agent-turn", "claude", None,
+            ).await;
+            let id = live.id().to_owned();
+            let state = live.state.clone();
+            let store = &state.acp_event_store;
+            let prompt = live.start_prompt("go").await;
+            live.finish_prompt(&prompt, None).await;
+            let run = uuid::Uuid::new_v4();
+            live.native.send(serde_json::json!({
+                "jsonrpc":"2.0","method":"_omp/autonomous_turn/start",
+                "params":{"version":1,"sessionId":live.sid,"runId":run,"source":"irc"}
+            })).await;
+            live.native.send(serde_json::json!({
+                "jsonrpc":"2.0","method":"session/update","params":{"sessionId":live.sid,
+                    "update":{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"woken"}}}
+            })).await;
+            tokio::time::timeout(Duration::from_secs(10), async {
+                while !matches!(live.client.next_event().await.expect("genuine own output"),
+                    Event::AgentMessageChunk { text, .. } if text == "woken") {}
+            }).await.unwrap();
+            assert_eq!(open_turn_kinds(store, &id).unwrap(), Known((false, true)));
+            assert_eq!(store.holds_live_work(&id).unwrap(), Known(true));
+            live.native.send(serde_json::json!({
+                "jsonrpc":"2.0","method":"_omp/autonomous_turn/end",
+                "params":{"version":1,"sessionId":live.sid,"runId":run,"source":"irc","stopReason":"end_turn"}
+            })).await;
+            tokio::time::timeout(Duration::from_secs(10), async {
+                while !matches!(live.client.next_event().await.expect("genuine own terminal"),
+                    Event::Stopped { reason } if reason == "agent_idle") {}
+            }).await.unwrap();
+            assert_eq!(open_turn_kinds(store, &id).unwrap(), Known((false, false)));
+            assert_eq!(store.holds_live_work(&id).unwrap(), Known(false));
+        })).await;
     }
 
     #[tokio::test]
@@ -2056,7 +2046,7 @@ mod tests {
                 .unwrap();
                 test_support::refresh_canonical_metadata_for_test(&scope.state).await;
                 let mut original =
-                    test_support::managed_control_session(scope, "queue-drain-wake").await;
+                    test_support::managed_control_session(scope, "queue-drain-wake", "claude", None).await;
                 let id = original.id().to_owned();
                 let state = original.state.clone();
                 let sid = original.sid.clone();

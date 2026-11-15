@@ -2151,7 +2151,7 @@ mod tests {
         for retire in [true, false] {
             with_managed(|scope| Box::pin(async move {
                 let mut publications = scope.state.acp_events_tx.subscribe();
-                let session = support::managed_control_session(scope, "late-assignment-stop").await;
+                let session = support::managed_control_session(scope, "late-assignment-stop", "claude", None).await;
                 let state = session.state.clone();
                 let id = session.id().to_owned();
                 let original = session.client.lease.spawned_runner().unwrap();
@@ -3657,7 +3657,7 @@ mod tests {
         use crate::server::test_support::managed_control_session;
         with_managed(|scope| {
             Box::pin(async move {
-                let session = managed_control_session(scope, "restart-disconnect").await;
+                let session = managed_control_session(scope, "restart-disconnect", "claude", None).await;
                 let state = session.state.clone();
                 let id = session.id().to_owned();
                 let original = session.client.lease.spawned_runner().unwrap();
@@ -3761,7 +3761,7 @@ mod tests {
             use crate::server::test_support::managed_control_session;
             with_managed(|scope| {
                 Box::pin(async move {
-                    let session = managed_control_session(scope, "restart-exclusion").await;
+                    let session = managed_control_session(scope, "restart-exclusion", "claude", None).await;
                     let state = session.state.clone();
                     let id = session.id().to_owned();
                     let lock = state.instance_lock(&id).await;
@@ -3841,7 +3841,7 @@ mod tests {
             use crate::acp::supervisor::test_support::managed::with_managed;
             use crate::server::test_support::managed_control_session;
             with_managed(|scope| Box::pin(async move {
-            let session = managed_control_session(scope, "selector-provider-order").await;
+            let session = managed_control_session(scope, "selector-provider-order", "claude", None).await;
             let state = session.state.clone();
             let id = session.id().to_owned();
             let current = find_instance(&state, &id).await.unwrap();
@@ -4210,7 +4210,7 @@ mod tests {
         use crate::acp::supervisor::test_support::managed::with_managed;
         use crate::server::test_support as support;
         with_managed(|scope| Box::pin(async move {
-            let session = support::managed_control_session(scope, "failed-backend-write").await;
+            let session = support::managed_control_session(scope, "failed-backend-write", "claude", None).await;
             let state = session.state.clone();
             let id = session.id().to_owned();
             let original = session.client.lease.spawned_runner().unwrap();
@@ -4392,7 +4392,7 @@ mod tests {
         use crate::server::test_support as support;
         with_managed(|scope| {
             Box::pin(async move {
-                let mut session = support::managed_control_session(scope, "provider-busy").await;
+                let mut session = support::managed_control_session(scope, "provider-busy", "claude", None).await;
                 let prompt = session.start_prompt("still working").await;
                 let state = session.state.clone();
                 let id = session.id().to_owned();
@@ -4641,8 +4641,8 @@ mod tests {
         use crate::server::test_support::managed_control_session;
         with_managed(|scope| {
             Box::pin(async move {
-                let mut live = managed_control_session(scope, "manual-quota-running").await;
-                let ordinary = managed_control_session(scope, "ordinary-running").await;
+                let mut live = managed_control_session(scope, "manual-quota-running", "claude", None).await;
+                let ordinary = managed_control_session(scope, "ordinary-running", "claude", None).await;
                 let id = live.id().to_owned();
                 let state = live.state.clone();
                 let original = state

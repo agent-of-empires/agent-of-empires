@@ -1725,10 +1725,13 @@ socket.on('error', error => { console.error(error); process.exit(1); });
         if attempt.as_ref() == expected.as_ref() && *actual == owner
             && issued.receipt.same_store(store.as_deref()))
         );
-        let verify_owner = || {
-            let record = crate::process::worker_registry::load_strict(&row.id)
-                .unwrap()
-                .expect("original registry custody still exists");
+        let verify_owner = || async {
+            let record = {
+                let registry = crate::process::worker_registry::registry_lock_until(
+                    &row.id, tokio::time::Instant::now() + Duration::from_secs(10),
+                ).await.expect("the actual producer releases registry admission");
+                registry.record().unwrap().expect("original registry custody still exists")
+            };
             assert_eq!(
                 crate::acp::runner_lifecycle::RunnerIdentity::from_record(&record),
                 owner
@@ -1738,14 +1741,14 @@ socket.on('error', error => { console.error(error); process.exit(1); });
                 .expect("original physical runner is still live");
             assert_eq!(Some(birth.fingerprint()), owner.birth_fingerprint);
         };
-        verify_owner();
+        verify_owner().await;
         let before: IssuedOriginal =
             serde_json::from_value(inspection.query("pending-original").await).unwrap();
         assert_eq!(before.request_id, issued.request_id);
         assert_eq!(before.scope, issued.scope);
         assert_eq!(before.receipt.as_ref(), issued.receipt.as_ref());
         original.supervisor.detach_all().await;
-        verify_owner();
+        verify_owner().await;
         let after: IssuedOriginal =
             serde_json::from_value(inspection.query("pending-original").await).unwrap();
         assert_eq!(after.request_id, issued.request_id);

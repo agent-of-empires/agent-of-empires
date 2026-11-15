@@ -1126,8 +1126,15 @@ done
     #[tokio::test]
     async fn native_identity_accepted_callback_does_not_strand_reset_deadline_or_stop() {
         crate::acp::supervisor::test_support::managed::with_managed(|scope| Box::pin(async move { let temp = scope.tempdir();
+    let (reverse_entered, reverse_wait) = oneshot::channel();
+    let (_release_reverse, reverse_release) = oneshot::channel();
+    scope.configure_sdk(crate::acp::acp_client::SdkTestOptions {
+        reverse_send: Some((reverse_entered, reverse_release)), ..Default::default()
+    });
     let (script, capture) = FakeAgent::default().write(temp.path());
-    let callback = serde_json::json!({"jsonrpc":"2.0","id":"pending-permission","method":"session/request_permission","params":{"sessionId":"sid-1","toolCall":{"toolCallId":"own-tool","title":"Wait for user"},"options":[{"optionId":"allow","name":"Allow","kind":"allow_once"}]}});
+    let read_path = temp.path().join("accepted-original-read");
+    std::fs::write(&read_path, "original callback content").unwrap();
+    let callback = serde_json::json!({"jsonrpc":"2.0","id":"accepted-original-read","method":"fs/read_text_file","params":{"sessionId":"sid-1","path":read_path}});
     let source = std::fs::read_to_string(&script).unwrap().replace(
         "    *'\"method\":\"session/prompt\"'*)",
         &format!("    *'\"method\":\"session/prompt\"'*)\n      if [ \"$count\" -eq 1 ]; then printf '%s\\n' '{}'; fi", callback.to_string().replace('\'', "'\"'\"'")),
@@ -1137,18 +1144,17 @@ done
     .await
     .unwrap();
     client.ready().await;
-    client.send_prompt("request a Current decision", &[]).await.unwrap();
+    client.send_prompt("request actual Original IO", &[]).await.unwrap();
     let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
-    let mut approval = false;
-    let mut stopped = false;
-    while !approval || !stopped {
-        let event = tokio::time::timeout_at(deadline, client.next_event())
-            .await
-            .unwrap()
-            .expect("Current callback and its prompt remain observable");
-        approval |= matches!(event, Event::ApprovalRequested { .. });
-        stopped |= matches!(event, Event::Stopped { .. });
-    }
+    tokio::time::timeout_at(deadline, async {
+        loop {
+            if matches!(client.next_event().await.expect("the genuine prompt remains observable"),
+                Event::Stopped { .. }) { break; }
+        }
+    }).await.unwrap();
+    tokio::time::timeout_at(deadline, reverse_wait)
+        .await.unwrap().expect("the completed Original read retains genuine relay admission until Native write");
+    assert!(!client.actual().test_control().ingress.has_parked());
     let (write_pending, writing) = oneshot::channel();
     *client.actual().test_connection_state().test_fresh_write_pending.lock().unwrap() = Some(write_pending);
     let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
@@ -1455,7 +1461,8 @@ done
         scope.configure_sdk(crate::acp::acp_client::SdkTestOptions {
             tracking: Some(observe), ..Default::default()
         });
-        let (config, peer) = scope.native_peer(dir.path().into(), "claude", "claude", move |request| {
+        let agent_key = if kind == "agent" { "codex" } else { "claude" };
+        let (config, peer) = scope.native_peer(dir.path().into(), agent_key, agent_key, move |request| {
             let id = request.get("id")?;
             Some(match request["method"].as_str().unwrap() {
                 "initialize" => serde_json::json!({"jsonrpc":"2.0","id":id,"result":{"protocolVersion":1,"agentCapabilities":{}}}),
@@ -1475,10 +1482,18 @@ done
             .expect("the actual SDK exposes its existing resource trackers").unwrap();
         let selected = client.selected_native_session();
         let actual = client.actual();
-        let store = actual.native_store.as_ref().expect("actual pinned Claude store").stores[0].clone();
-        let project = store.join("projects/-managed");
+        let project = if kind == "task" {
+            let store = actual.native_store.as_ref()
+                .filter(|store| store.agent == "claude" && store.filesystem == "host")
+                .and_then(|store| store.stores.first()).expect("the actual Claude Bash namespace");
+            store.join("projects").join(crate::session::capture::encode_claude_project_path(&dir.path().to_string_lossy()))
+        } else {
+            dir.path().to_path_buf()
+        };
         std::fs::create_dir_all(project.join("subagents")).unwrap();
-        std::fs::write(project.join(format!("{selected}.jsonl")), "").unwrap();
+        if kind == "task" {
+            std::fs::write(project.join(format!("{selected}.jsonl")), "").unwrap();
+        }
         let transcript = project.join("subagents/between-prompt-agent.jsonl");
         std::fs::write(&transcript, "").unwrap();
         let (update, is_started): (serde_json::Value, fn(&Event) -> bool) = match kind {

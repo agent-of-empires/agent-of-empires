@@ -990,7 +990,7 @@ mod tests {
             FixtureSource::BashPair | FixtureSource::Workflow => None,
         };
         let selected_task = "t-1";
-        let mut native = super::resource_test_support::NativeBootstrap::new(scope).await;
+        let mut native = super::resource_test_support::NativeBootstrap::new(scope, "claude").await;
         let home = native.home.clone();
         let session_id = native.session_id.clone();
         let transcript = native.transcript.clone();
@@ -1961,7 +1961,7 @@ pub(crate) mod resource_test_support {
     }
 
     impl NativeBootstrap {
-        pub(crate) async fn new(scope: &mut ManagedScope) -> Self {
+        pub(crate) async fn new(scope: &mut ManagedScope, agent_key: &str) -> Self {
             let workdir = scope.tempdir();
             let (queue_tx, queue_rx) = oneshot::channel();
             let (tracking_tx, tracking_rx) = oneshot::channel();
@@ -1972,8 +1972,8 @@ pub(crate) mod resource_test_support {
             });
             let (config, peer) = scope.native_peer(
                 workdir.path().to_path_buf(),
-                "claude",
-                "claude",
+                agent_key,
+                agent_key,
                 |request| {
                     let result = match request["method"].as_str()? {
                         "initialize" => {
@@ -1997,21 +1997,28 @@ pub(crate) mod resource_test_support {
                 .receipt_snapshot()
                 .unwrap();
             let session_id = receipt.session_id().unwrap().to_owned();
-            let home = managed
-                .actual()
-                .native_store
-                .as_ref()
-                .filter(|binding| binding.agent == "claude" && binding.filesystem == "host")
-                .and_then(|binding| binding.stores.first())
-                .expect("actual host Claude store")
-                .clone();
-            assert!(home.starts_with(PathBuf::from(
-                std::env::var_os("HOME").expect("isolated HOME")
-            )));
-            std::fs::create_dir_all(home.join("projects/-enc")).unwrap();
-            let transcript = home
-                .join("projects/-enc")
-                .join(format!("{session_id}.jsonl"));
+            let home = if agent_key == "claude" {
+                managed.actual().native_store.as_ref()
+                    .filter(|binding| binding.agent == agent_key && binding.filesystem == "host")
+                    .and_then(|binding| binding.stores.first())
+                    .expect("the actual original declares its host Claude store")
+                    .clone()
+            } else {
+                workdir.path().to_path_buf()
+            };
+            if agent_key == "claude" {
+                assert!(home.starts_with(PathBuf::from(
+                    std::env::var_os("HOME").expect("isolated HOME")
+                )));
+            }
+            let project = if agent_key == "claude" {
+                let encoded = crate::session::capture::encode_claude_project_path(&workdir.path().to_string_lossy());
+                home.join("projects").join(encoded)
+            } else {
+                home.clone()
+            };
+            std::fs::create_dir_all(&project).unwrap();
+            let transcript = project.join(format!("{session_id}.jsonl"));
             std::fs::write(&transcript, "").unwrap();
             Self {
                 home,
@@ -2129,7 +2136,7 @@ pub(crate) mod resource_test_support {
 
     impl AgentFixture {
         pub(crate) async fn new(scope: &mut ManagedScope) -> Self {
-            let mut native = NativeBootstrap::new(scope).await;
+            let mut native = NativeBootstrap::new(scope, "codex").await;
             let path = native.home.join("agent.jsonl");
             std::fs::write(&path, "").unwrap();
             native
@@ -2235,7 +2242,7 @@ pub(crate) mod resource_test_support {
             completed: &[&str],
             path: JournalPath,
         ) -> Self {
-            let mut native = NativeBootstrap::new(scope).await;
+            let mut native = NativeBootstrap::new(scope, "claude").await;
             let inside = native.home.join("projects/-enc/subagents/workflows/wf_1");
             std::fs::create_dir_all(&inside).unwrap();
             let outside = match path {

@@ -210,7 +210,7 @@ mod tests {
         second
             .conn()
             .execute(
-                "UPDATE acp_events SET event_json = ?1 WHERE session_id = 'selected'",
+                "UPDATE acp_events SET event_json = ?1, discriminant = 'ThinkingStarted' WHERE session_id = 'selected'",
                 [&replacement],
             )
             .unwrap();

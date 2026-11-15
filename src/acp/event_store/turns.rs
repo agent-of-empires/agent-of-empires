@@ -1173,103 +1173,93 @@ mod tests {
 
     /// An agent-initiated turn (a Monitor or background finish waking the
     /// agent) opens with no `UserPromptSent`, so only its own events show it.
-    #[test]
-    fn an_agent_initiated_turn_without_a_stop_is_open_work() {
-        let (_tmp, store) = open_store(1000);
-        let tool_call = || Event::ToolCallStarted {
-            tool_call: crate::acp::state::ToolCall {
-                id: "t".into(),
-                name: "Bash".into(),
-                kind: "execute".into(),
-                args_preview: "{}".into(),
-                prompt: None,
-                started_at: chrono::Utc::now(),
-                parent_tool_call_id: None,
-                memory_recall: None,
-                diffs: Vec::new(),
-            },
-        };
-        // (events, open work)
-        let cases = [
-            (vec![user_prompt("go"), stopped("prompt_complete")], false),
-            (
-                vec![
-                    user_prompt("go"),
-                    stopped("prompt_complete"),
-                    Event::ThinkingStarted,
-                    agent_chunk("woken"),
-                    tool_call(),
-                ],
-                true,
-            ),
-            // Text thinking is the only output of a thought-only turn.
-            (
-                vec![
-                    user_prompt("go"),
-                    stopped("prompt_complete"),
-                    Event::ThinkingStarted,
-                    Event::AgentThoughtChunk {
-                        text: "hmm".into(),
-                        message_id: None,
-                    },
-                ],
-                true,
-            ),
-            (
-                vec![
-                    user_prompt("go"),
-                    stopped("prompt_complete"),
-                    Event::ThinkingStarted,
-                    agent_chunk("woken"),
-                    tool_call(),
-                    stopped("agent_idle"),
-                ],
-                false,
-            ),
-            (
-                vec![
-                    user_prompt("go"),
-                    stopped("prompt_complete"),
-                    agent_chunk("unadmitted operation"),
-                ],
-                false,
-            ),
-        ];
-        for (i, (events, open)) in cases.into_iter().enumerate() {
-            let id = format!("s-{i}");
-            let origin = crate::acp::state::NativeEventOrigin {
-                context: serde_json::from_value(serde_json::to_value([31u8; 32]).unwrap()).unwrap(),
-                generation: 1,
-                attempt_id: serde_json::from_value(serde_json::json!(uuid::Uuid::new_v4())).unwrap(),
-                producer: uuid::Uuid::new_v4(),
-                owner: None,
-            };
-            let autonomous = crate::acp::event_sender::EventMetadata {
-                scope: crate::acp::event_sender::EventScope::SessionCurrent,
-                native_origin: Some(origin),
-                ..crate::acp::event_sender::EventMetadata::history()
-            };
-            let admitted = events.iter().any(|event| matches!(event, Event::ThinkingStarted));
-            if admitted {
-                for (offset, event) in events.into_iter().enumerate() {
-                    let host = crate::acp::event_sender::EventMetadata::host(&event);
-                    let metadata = if offset >= 2 { &autonomous } else { &host };
-                    store.record(&id, offset as u64 + 1, &event, metadata).unwrap();
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn an_agent_initiated_turn_without_a_stop_is_open_work() {
+        use crate::acp::supervisor::test_support::managed::with_managed;
+        for (work, closed, open) in [
+            ("none", false, false),
+            ("tool", false, true),
+            ("thought", false, true),
+            ("tool", true, false),
+            ("unadmitted", false, false),
+        ] {
+            with_managed(|scope| Box::pin(async move {
+                let mut live = crate::server::test_support::managed_control_session(
+                    scope, "agent-initiated-work", "claude", None,
+                ).await;
+                let id = live.id().to_owned();
+                let store = live.state.acp_event_store.clone();
+                let prompt = live.start_prompt("go").await;
+                live.finish_prompt(&prompt, None).await;
+                let run = matches!(work, "tool" | "thought").then(uuid::Uuid::new_v4);
+                if let Some(run) = run {
+                    live.native.send(serde_json::json!({
+                        "jsonrpc":"2.0","method":"_omp/autonomous_turn/start",
+                        "params":{"version":1,"sessionId":live.sid,"runId":run,"source":"irc"}
+                    })).await;
                 }
-            } else {
-                record_projection(&store, &id, 1, events);
-            }
-            assert_eq!(
-                store.has_in_flight_main_turn(&id).unwrap(),
-                ControlKnowledge::Known(false),
-                "case {i}"
-            );
-            assert_eq!(
-                store.holds_live_work(&id).unwrap(),
-                ControlKnowledge::Known(open),
-                "case {i}"
-            );
+                if work == "tool" {
+                    live.native.send(serde_json::json!({
+                        "jsonrpc":"2.0","method":"session/update","params":{"sessionId":live.sid,
+                            "update":{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"woken"}}}
+                    })).await;
+                }
+                let update = match work {
+                    "tool" => Some(serde_json::json!({"sessionUpdate":"tool_call","toolCallId":"t",
+                        "title":"Bash","kind":"execute","status":"in_progress","rawInput":{}})),
+                    "thought" => Some(serde_json::json!({"sessionUpdate":"agent_thought_chunk",
+                        "content":{"type":"text","text":"hmm"}})),
+                    "unadmitted" => Some(serde_json::json!({"sessionUpdate":"agent_message_chunk",
+                        "content":{"type":"text","text":"unadmitted operation"}})),
+                    _ => None,
+                };
+                if let Some(update) = update {
+                    live.native.send(serde_json::json!({
+                        "jsonrpc":"2.0","method":"session/update","params":{"sessionId":live.sid,"update":update}
+                    })).await;
+                    tokio::time::timeout(std::time::Duration::from_secs(10), async {
+                        loop {
+                            let event = live.client.next_event().await.expect("actual original publication");
+                            if match event {
+                                Event::ToolCallStarted { tool_call } => work == "tool" && tool_call.id == "t",
+                                Event::AgentThoughtChunk { text, .. } => work == "thought" && text == "hmm",
+                                Event::AgentMessageChunk { text, .. } => work == "unadmitted" && text == "unadmitted operation",
+                                _ => false,
+                            } { break; }
+                        }
+                    }).await.expect("the actual body closes the observation interval");
+                }
+                if closed {
+                    live.native.send(serde_json::json!({
+                        "jsonrpc":"2.0","method":"_omp/autonomous_turn/end",
+                        "params":{"version":1,"sessionId":live.sid,"runId":run.unwrap(),"source":"irc","stopReason":"end_turn"}
+                    })).await;
+                    tokio::time::timeout(std::time::Duration::from_secs(10), async {
+                        while !matches!(live.client.next_event().await.expect("own terminal"),
+                            Event::Stopped { reason } if reason == "agent_idle") {}
+                    }).await.unwrap();
+                }
+                assert_eq!(store.has_in_flight_main_turn(&id).unwrap(), ControlKnowledge::Known(false), "{work}, closed={closed}");
+                assert_eq!(store.holds_live_work(&id).unwrap(), ControlKnowledge::Known(open), "{work}, closed={closed}");
+                if let Some(run) = run.filter(|_| !closed) {
+                    live.native.send(serde_json::json!({
+                        "jsonrpc":"2.0","method":"_omp/autonomous_turn/end",
+                        "params":{"version":1,"sessionId":live.sid,"runId":run,"source":"irc","stopReason":"end_turn"}
+                    })).await;
+                    tokio::time::timeout(std::time::Duration::from_secs(10), async {
+                        while !matches!(live.client.next_event().await.expect("cleanup own terminal"),
+                            Event::Stopped { reason } if reason == "agent_idle") {}
+                    }).await.unwrap();
+                }
+            })).await;
         }
+        let (_tmp, store) = open_store(1000);
+        record_projection(&store, "unmatched-operation", 1, [
+            user_prompt("go"), stopped("prompt_complete"), agent_chunk("unadmitted operation"),
+        ]);
+        assert_eq!(store.has_in_flight_main_turn("unmatched-operation").unwrap(), ControlKnowledge::Known(false));
+        assert_eq!(store.holds_live_work("unmatched-operation").unwrap(), ControlKnowledge::Known(false));
     }
 
     /// A failed query is an error, never "no live work"; every aggregate

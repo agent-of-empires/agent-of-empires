@@ -2011,10 +2011,7 @@ mod tests {
         ] {
             with_managed(|managed| {
                 Box::pin(async move {
-                    let live = crate::server::test_support::managed_control_session(
-                        managed,
-                        "contended-ws",
-                    )
+                    let live = crate::server::test_support::managed_control_session(managed, "contended-ws", "claude", None)
                     .await;
                     let state = live.state.clone();
                     let id = live.id().to_owned();
@@ -2350,7 +2347,7 @@ mod tests {
         with_managed(|managed| {
             Box::pin(async move {
                 let mut live =
-                    crate::server::test_support::managed_control_session(managed, "physical-ws")
+                    crate::server::test_support::managed_control_session(managed, "physical-ws", "claude", None)
                         .await;
                 let state = live.state.clone();
                 let id = live.id().to_owned();
@@ -2504,7 +2501,7 @@ mod tests {
         with_managed(|scope| {
             Box::pin(async move {
                 let mut live =
-                    crate::server::test_support::managed_control_session(scope, "ws-loss").await;
+                    crate::server::test_support::managed_control_session(scope, "ws-loss", "claude", None).await;
                 let state = live.state.clone();
                 let id = live.id().to_owned();
                 let request = live.start_prompt("original").await;
@@ -2578,14 +2575,11 @@ mod tests {
         with_managed(|managed| {
             Box::pin(async move {
                 for uncertain_selection in [false, true] {
-                    let live = crate::server::test_support::managed_control_session(
-                        managed,
-                        if uncertain_selection {
-                            "websocket-uncertain-selection"
-                        } else {
-                            "websocket-final-ready"
-                        },
-                    )
+                    let live = crate::server::test_support::managed_control_session(managed, if uncertain_selection {
+                        "websocket-uncertain-selection"
+                    } else {
+                        "websocket-final-ready"
+                    }, "claude", None)
                     .await;
                     let id = live.id().to_owned();
                     let state = live.state.clone();
@@ -2762,10 +2756,7 @@ mod tests {
         use crate::acp::supervisor::test_support::managed::with_managed;
         with_managed(|scope| {
             Box::pin(async move {
-                let mut live = crate::server::test_support::managed_control_session(
-                    scope,
-                    "websocket-native-loss",
-                )
+                let mut live = crate::server::test_support::managed_control_session(scope, "websocket-native-loss", "claude", None)
                 .await;
                 let id = live.id().to_owned();
                 let _request = live.start_prompt("original retained work").await;
@@ -2830,7 +2821,7 @@ mod tests {
         with_managed(|scope| {
             Box::pin(async move {
                 let mut live =
-                    crate::server::test_support::managed_control_session(scope, "ws-overlap").await;
+                    crate::server::test_support::managed_control_session(scope, "ws-overlap", "claude", None).await;
                 let state = live.state.clone();
                 let id = live.id().to_owned();
                 let mut publications = live.client.subscribe_publications();

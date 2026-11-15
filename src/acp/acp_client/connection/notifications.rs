@@ -668,7 +668,9 @@ impl Shared {
                     self.event_tx
                         .with_scoped_metadata(metadata, Some(Arc::clone(context)))
                 });
-        let sender = if let (true, Some(context)) = (session_metadata, current_scope.as_ref()) {
+        let sender = if matches!(notification.update, SessionUpdate::UserMessageChunk(_)) {
+            historical
+        } else if let (true, Some(context)) = (session_metadata, current_scope.as_ref()) {
             metadata.scope = EventScope::SessionCurrent;
             metadata.native_origin = context.origin();
             self.event_tx
@@ -688,10 +690,12 @@ impl Shared {
         let mut tool_input = history
             .as_ref()
             .and_then(|_| capture_tool_context_input(&notification.update));
-        // Native history keeps its original custody, but live user echoes are
-        // already recorded by the local prompt path (#5224).
+        // A local prompt's live/late echoes are already journaled. Independent
+        // Native user text is retained by this historical sender, never admitted input.
         if matches!(notification.update, SessionUpdate::UserMessageChunk(_))
             && !(history.is_some() && self.seed_user_replay.load(Ordering::Relaxed))
+            && (self.prompt_in_flight.load(Ordering::Acquire)
+                || self.is_late_echo(&notification.update))
         {
             return;
         }

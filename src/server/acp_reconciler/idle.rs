@@ -754,7 +754,7 @@ mod tests {
         crate::session::config::update_config(|config| config.acp.auto_stop_idle_secs = 60)
             .unwrap();
         crate::server::test_support::refresh_canonical_metadata_for_test(&scope.state).await;
-        let mut live = crate::server::test_support::managed_control_session(scope, label).await;
+        let mut live = crate::server::test_support::managed_control_session(scope, label, "claude", None).await;
         let request = live.start_prompt("establish a real completed turn").await;
         live.finish_prompt(&request, None).await;
         live.make_quota_due();

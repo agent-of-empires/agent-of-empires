@@ -3341,41 +3341,39 @@ mod tests {
     #[tokio::test]
     #[serial_test::serial]
     async fn shutdown_detaches_outstanding_background_agents_before_stopped() {
-        let (_home, tmp) = isolate_home();
-        let sink = VecSink::new();
-        *sink.stale_background_agent_ids.lock().unwrap() = vec!["bg-1".into(), "bg-2".into()];
-        let sup = Supervisor::new(sink.clone());
-        sup.test_install_runner(
-            "s-detach",
-            runner_config(tmp.path().join("dummy.sock")),
-            None,
-        )
-        .await;
-
-        sup.shutdown("s-detach").await.expect("shutdown");
-
-        let frames = sink.frames.lock().unwrap().clone();
-        let mine: Vec<&(String, u64, Event)> = frames
-            .iter()
-            .filter(|(id, _, _)| id == "s-detach")
-            .collect();
-        assert_eq!(mine.len(), 3, "two detach completions plus the Stopped");
-        for (idx, expected) in [(0, "bg-1"), (1, "bg-2")] {
-            match &mine[idx].2 {
-                Event::BackgroundAgentCompleted {
-                    agent_id, status, ..
-                } => assert_eq!(
-                    (agent_id.as_str(), *status),
-                    (expected, BackgroundAgentStatus::Detached)
-                ),
-                other => panic!("expected a Detached completion, got {other:?}"),
+        super::super::test_support::managed::with_managed(|scope| Box::pin(async move {
+            let native = crate::acp::task_transcript::resource_test_support::NativeBootstrap::new(scope, "codex").await;
+            let id = native.managed.id.clone();
+            for agent in ["bg-1", "bg-2"] {
+                let path = native.home.join(format!("{agent}.jsonl"));
+                std::fs::write(&path, "").unwrap();
+                native.tool(scope, agent, "Agent", serde_json::json!({
+                    "agentId":agent,"description":"keep working","prompt":"continue",
+                    "outputFile":path,"status":"async_launched"
+                })).await;
             }
-        }
-        assert!(matches!(&mine[2].2, Event::Stopped { reason } if reason == "user_stopped"));
-        assert!(
-            mine[0].1 < mine[1].1 && mine[1].1 < mine[2].1,
-            "detach completions must be seq-ordered ahead of Stopped"
-        );
+            let store = scope.state.acp_event_store.clone();
+            let prefix = store.highest_seq(&id).unwrap();
+            native.managed.shutdown().await.expect("retire the actual original with both live resources");
+            let mine = store.replay_from(&id, prefix).unwrap();
+            assert_eq!(mine.len(), 3, "two detach completions plus the Stopped");
+            let mut detached = Vec::new();
+            for stored in &mine[..2] {
+                match stored.event.as_ref() {
+                    Event::BackgroundAgentCompleted { agent_id, status, .. } => {
+                        assert_eq!(*status, BackgroundAgentStatus::Detached);
+                        detached.push(agent_id.as_str());
+                    }
+                    other => panic!("expected a Detached completion, got {other:?}"),
+                }
+                assert!(stored.metadata.resource_ref.is_some(), "completion retains its actual allocation");
+            }
+            detached.sort_unstable();
+            assert_eq!(detached, ["bg-1", "bg-2"]);
+            assert!(matches!(mine[2].event.as_ref(), Event::Stopped { reason } if reason == "user_stopped"));
+            assert!(mine[0].seq < mine[1].seq && mine[1].seq < mine[2].seq,
+                "detach completions must be seq-ordered ahead of Stopped");
+        })).await;
     }
 
     #[tokio::test]
@@ -4259,7 +4257,7 @@ mod tests {
             .await;
         let (inbound_tx, inbound_rx) =
             tokio::sync::mpsc::channel::<crate::acp::event_sender::SdkEvent>(16);
-        let drain = p.sup.start_drain_task(id.into(), lease, inbound_rx, None);
+        let drain = p.sup.start_drain_task(id.into(), lease.clone(), inbound_rx, None);
         {
             let mut workers = p.sup.workers.lock().await;
             let handle = workers.get_mut(id).expect("installed worker");
@@ -4282,27 +4280,32 @@ mod tests {
             .unwrap();
         p.entered().await;
         assert!(
-            p.sup.workers.try_lock().is_err(),
-            "publication retains its installed worker"
+            p.sup.workers.try_lock().expect("store IO releases the workers mutex").contains_key(id),
+            "the installed worker remains in actual publication custody"
         );
-        assert!(
-            p.sup.lifecycle.try_lock().is_err(),
-            "publication retains its lifecycle fence"
+        assert_eq!(
+            {
+                let Ok(lifecycle) = p.sup.lifecycle.try_lock() else {
+                    panic!("store IO releases the lifecycle mutex");
+                };
+                lifecycle.current_lease(id)
+            }.as_ref(),
+            Some(&lease),
+            "publication retains the same lifecycle owner without retaining its global mutex"
         );
-        assert!(
-            p.sup.idle_observation(id).is_none(),
-            "idle observation must not wait on the real worker publication's lifecycle fence"
-        );
-
-        let reaper = {
-            let sup = Arc::clone(&p.sup);
-            tokio::spawn(async move { sup.reap_user_stopped().await })
-        };
+        let (observed, activity) = p.sup.idle_observation(id)
+            .expect("the try-only observer need not retain another publication's mutex");
+        assert_eq!(observed, lease);
+        assert_eq!(Some(activity), super::super::try_activity_seq(&p.sup.next_seqs, id));
+        let reaping = Arc::clone(&p.sup);
+        let reaper = reaping.reap_user_stopped();
+        tokio::pin!(reaper);
+        assert!(futures_util::poll!(reaper.as_mut()).is_pending(),
+            "the real reaper cannot finish while its original publication is owed");
+        assert!(lock_recover(&p.sup.lifecycle).admit(id, ResumeKind::Spawn).is_err(),
+            "a replacement remains fenced before the final publication sweep");
         p.release_and_wait().await;
-        tokio::time::timeout(Duration::from_secs(5), reaper)
-            .await
-            .unwrap()
-            .unwrap();
+        tokio::time::timeout(Duration::from_secs(5), reaper).await.unwrap();
 
         assert!(
             p.store.unresolved_background_task_ids(id).is_empty(),
@@ -4563,7 +4566,7 @@ mod tests {
             "the parked finish has not extended the durable prefix"
         );
         let stopping_supervisor = Arc::clone(&p.sup);
-        let shutdown = stopping_supervisor.shutdown(id);
+        let shutdown = stopping_supervisor.shutdown_and_wait(id, Duration::from_secs(5));
         tokio::pin!(shutdown);
         assert!(
             futures_util::poll!(&mut shutdown).is_pending(),

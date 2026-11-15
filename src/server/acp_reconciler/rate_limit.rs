@@ -798,7 +798,7 @@ mod tests {
     async fn rate_limit_resume_backs_off_after_a_failed_attempt() {
         with_managed(|scope| {
             Box::pin(async move {
-                let mut live = managed_control_session(scope, "quota-backoff").await;
+                let mut live = managed_control_session(scope, "quota-backoff", "claude", None).await;
                 let id = live.id().to_owned();
                 enable_auto_resume(true);
                 live.park("run the nightly task").await;
@@ -869,7 +869,7 @@ mod tests {
     async fn rate_limit_reap_resumes_below_the_cap_and_parks_at_it() {
         with_managed(|scope| {
             Box::pin(async move {
-                let mut live = managed_control_session(scope, "quota-cap").await;
+                let mut live = managed_control_session(scope, "quota-cap", "claude", None).await;
                 let id = live.id().to_owned();
                 let owner = live
                     .state
@@ -995,7 +995,7 @@ mod tests {
                     ("queued-before", false, Some(-1000), false),
                     ("queued-unreadable", false, None, false),
                 ] {
-                    let mut live = managed_control_session(scope, label).await;
+                    let mut live = managed_control_session(scope, label, "claude", None).await;
                     let id = live.id().to_owned();
                     enable_auto_resume(true);
                     live.park("run the nightly task").await;
@@ -1062,7 +1062,7 @@ mod tests {
     async fn unavailable_control_queries_preserve_intent_and_refuse_automation() {
         with_managed(|scope| Box::pin(async move {
             for fault in ["sql", "ownership", "budget"] {
-                let mut live = managed_control_session(scope, fault).await;
+                let mut live = managed_control_session(scope, fault, "claude", None).await;
                 let id = live.id().to_owned();
                 enable_auto_resume(true);
                 live.park("original interrupted work").await;
@@ -1126,14 +1126,11 @@ mod tests {
         with_managed(|scope| {
             Box::pin(async move {
                 for pending in [false, true] {
-                    let mut live = managed_control_session(
-                        scope,
-                        if pending {
-                            "quota-io-existing-pending"
-                        } else {
-                            "quota-io-no-pending"
-                        },
-                    )
+                    let mut live = managed_control_session(scope, if pending {
+                        "quota-io-existing-pending"
+                    } else {
+                        "quota-io-no-pending"
+                    }, "claude", None)
                     .await;
                     let id = live.id().to_owned();
                     enable_auto_resume(true);
@@ -1348,7 +1345,7 @@ mod tests {
     async fn retained_unknown_history_allows_only_read_only_attach_then_distinct_explicit_input() {
         with_managed(|scope| {
             Box::pin(async move {
-                let mut live = managed_control_session(scope, "quota-unknown-retained").await;
+                let mut live = managed_control_session(scope, "quota-unknown-retained", "claude", None).await;
                 let id = live.id().to_owned();
                 live.park("old work must not replay").await;
                 let original = live
@@ -1457,7 +1454,7 @@ mod tests {
     async fn qualified_native_loss_preserves_quota_pending_queue_and_budget_before_delivery() {
         with_managed(|scope| {
             Box::pin(async move {
-                let mut live = managed_control_session(scope, "quota-native-loss").await;
+                let mut live = managed_control_session(scope, "quota-native-loss", "claude", None).await;
                 let id = live.id().to_owned();
                 live.park("original work").await;
                 live.state
@@ -1510,7 +1507,7 @@ mod tests {
             Box::pin(async move {
                 for automatic in [false, true] {
                     let mut live =
-                        managed_control_session(scope, "quota-loss-during-prepare").await;
+                        managed_control_session(scope, "quota-loss-during-prepare", "claude", None).await;
                     let id = live.id().to_owned();
                     enable_auto_resume(true);
                     live.park("preserve original work").await;
@@ -1624,7 +1621,7 @@ mod tests {
     async fn an_aged_quota_hold_prevents_idle_reaping_without_spending_retry_budget() {
         with_managed(|scope| {
             Box::pin(async move {
-                let mut live = managed_control_session(scope, "quota-idle-hold").await;
+                let mut live = managed_control_session(scope, "quota-idle-hold", "claude", None).await;
                 let id = live.id().to_owned();
                 live.park("original work").await;
                 std::fs::write(
@@ -1760,14 +1757,11 @@ mod tests {
         with_managed(|scope| {
             Box::pin(async move {
                 for automatic in [false, true] {
-                    let mut live = managed_control_session(
-                        scope,
-                        if automatic {
-                            "quota-background-auto"
-                        } else {
-                            "quota-background-manual"
-                        },
-                    )
+                    let mut live = managed_control_session(scope, if automatic {
+                        "quota-background-auto"
+                    } else {
+                        "quota-background-manual"
+                    }, "claude", None)
                     .await;
                     let id = live.id().to_owned();
                     enable_auto_resume(automatic);

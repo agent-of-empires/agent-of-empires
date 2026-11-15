@@ -2694,7 +2694,7 @@ mod tests {
         }
     }
 
-    #[tokio::test(start_paused = true)]
+    #[tokio::test]
     #[serial_test::serial]
     async fn native_respawn_retains_unresolved_ownership_when_its_record_disappears() {
         let _home = isolate_home();
@@ -2725,9 +2725,11 @@ mod tests {
             .await
             .expect("the qualified original reaches the actual respawn backoff")
             .unwrap();
+        tokio::time::pause();
         // The route disappears after approval, before the post-backoff recheck.
         std::fs::remove_file(worker_registry::record_path(id).unwrap()).unwrap();
         tokio::time::advance(RESPAWN_BACKOFF).await;
+        tokio::time::resume();
         tokio::time::timeout(Duration::from_secs(5), drain)
             .await
             .expect("respawn drain must reach its terminal ownership decision")
@@ -3130,7 +3132,7 @@ mod tests {
 
     /// A stop arriving after a failed respawn began its own teardown gets
     /// `AlreadyStopping`; the teardown still releases the scope before the settle.
-    #[tokio::test(start_paused = true)]
+    #[tokio::test]
     #[serial_test::serial]
     async fn a_stop_during_a_failed_respawn_teardown_releases_the_scope() {
         use crate::acp::runner_lifecycle::WorkerPhase;
@@ -3171,8 +3173,8 @@ mod tests {
         let drain = sup.start_drain_task("s-late-respawn".into(), lease, inbound_rx, None);
         drop(inbound_tx);
 
-        // Paused time only advances once this task idles, so the teardown
-        // waits out its grace until the replacement exits below.
+        // External writer completion uses the real clock. The captured TERM and
+        // immortal replacement keep teardown open until the explicit exit below.
         tokio::time::timeout(Duration::from_secs(5), control.terminated())
             .await
             .expect("the failed replacement enters captured TERM teardown");
@@ -3876,47 +3878,26 @@ mod tests {
         for stopping in [false, true] {
             with_managed(|scope| {
                 Box::pin(async move {
-                    let live = crate::server::test_support::managed_control_session(
-                        scope,
-                        "absent-publication-owner",
-                    )
+                    let live = crate::server::test_support::managed_control_session(scope, "absent-publication-owner", "claude", None)
                     .await;
                     let id = live.id().to_owned();
                     let supervisor = live.state.acp_supervisor.clone();
                     let store = live.state.acp_event_store.clone();
                     let cache = live.state.acp_control_cache.clone();
                     assert!(Arc::ptr_eq(&cache, store.control_cache()));
-                    let before = live
-                        .state
-                        .session_service
-                        .fold_control_state(&id)
-                        .await
-                        .unwrap();
-                    let prefix = store.highest_seq(&id).unwrap();
                     let lease = live.client.lease.clone();
                     let owner = live.client.actual().connected_runner().unwrap();
-                    let removed = {
-                        let mut workers = supervisor.workers.lock().await;
-                        let removed = workers.remove(&id).unwrap();
-                        if stopping {
-                            assert!(matches!(
-                                lock_recover(&supervisor.lifecycle).begin_stop(
-                                    &id,
-                                    "user_stopped",
-                                    false
-                                ),
-                                crate::acp::runner_lifecycle::StopDecision::TearDown { .. }
-                            ));
-                        }
-                        removed
-                    };
-                    assert_eq!(
-                        lock_recover(&supervisor.lifecycle)
-                            .current_lease(&id)
-                            .as_ref(),
-                        Some(&lease)
-                    );
+                    if stopping {
+                        live.client.stop_session().await;
+                    } else {
+                        live.client.shutdown().await.expect("complete the actual captured retirement");
+                    }
+                    supervisor.sink.flush();
+                    assert!(!supervisor.workers.lock().await.contains_key(&id));
+                    assert!(lock_recover(&supervisor.lifecycle).current_lease(&id).is_none());
                     assert!(!lease.retirement().retains_original_client(owner));
+                    let before = live.state.session_service.fold_control_state(&id).await.unwrap();
+                    let prefix = store.highest_seq(&id).unwrap();
                     let mut frames = live.state.acp_events_tx.subscribe();
                     let drain = Drain {
                         session_id: id.clone(),
@@ -3963,12 +3944,6 @@ mod tests {
                     assert_eq!(after.last_seq, before.last_seq);
                     assert_eq!(after.operation_error, before.operation_error);
                     assert_eq!(after.session_id, before.session_id);
-                    assert!(supervisor
-                        .workers
-                        .lock()
-                        .await
-                        .insert(id, removed)
-                        .is_none());
                 })
             })
             .await;
@@ -3985,7 +3960,7 @@ mod tests {
             Status,
         };
         with_managed(|scope| Box::pin(async move {
-                let mut live = crate::server::test_support::managed_control_session(scope, "superseded-publication-owner").await;
+                let mut live = crate::server::test_support::managed_control_session(scope, "superseded-publication-owner", "claude", None).await;
                 let id = live.id().to_owned();
                 let old = live.client.lease.clone();
                 live.client = scope.adopt(live.client, false).await;
