@@ -98,8 +98,10 @@ Reviewers tag each requested change with a priority:
 
 - **P1**: breaks behavior, security, or stored data. Blocks merge.
 - **P2**: a correctness, test, or maintainability gap this PR should close.
-  Blocks merge.
-- **P3**: a worthwhile improvement outside this PR. Becomes a follow-up issue,
-  not a blocker.
+  Blocks merge if it risks security or data loss, mistakes a migration or
+  stored data, regresses user-visible behavior, or is one of three or more P2s
+  in the review. Otherwise the reviewer approves and lists it as non-blocking.
+- **P3**: a nit or optional improvement. Never blocks merge and needs no
+  follow-up issue; mention it only when useful.
 
 Every requested change states what would satisfy it.
