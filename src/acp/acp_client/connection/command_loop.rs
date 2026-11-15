@@ -829,11 +829,23 @@ impl Session {
     ) -> Result<(), agent_client_protocol::Error> {
         let refusal = if tokio::time::Instant::now() >= deadline {
             Some("reset deadline expired before admission".to_owned())
+        } else if let Err(error) = require_operation(&original_scope, correlation, true) {
+            Some(public_error_message(&error))
         } else {
-            require_operation(&original_scope, correlation, true)
-                .and_then(|()| current_effect(&original_scope, true, || ()))
-                .err()
-                .map(|error| public_error_message(&error))
+            match tokio::time::timeout_at(
+                deadline,
+                current_effect_wait(
+                    original_scope.as_ref(),
+                    true,
+                    &self.shared.connection_state,
+                    || (),
+                ),
+            )
+            .await
+            {
+                Ok(result) => result.err().map(|error| public_error_message(&error)),
+                Err(_) => Some("reset deadline expired before admission".to_owned()),
+            }
         };
 
         if let Some(message) = refusal {

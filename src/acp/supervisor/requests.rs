@@ -181,7 +181,8 @@ impl<S: BroadcastSink> Supervisor<S> {
             .await
             .ok_or_else(|| SupervisorError::UnknownSession(session_id.to_owned()))?;
         let fence = Arc::clone(&current.scope.fence);
-        let expected = {
+        let deadline = tokio::time::Instant::now() + WORKER_READY_TIMEOUT;
+        let expected = loop {
             let observed = fence
                 .lock_observation_project(
                     |row, storage| {
@@ -191,11 +192,7 @@ impl<S: BroadcastSink> Supervisor<S> {
                         {
                             return Ok(expected);
                         }
-                        row.require_resolved_acp_selection().map_err(|error| {
-                            tracing::warn!(target: "acp.initial_host_diagnostic",
-                                disposition = "fallback_selection_unresolved", "temporary Q initial-host refusal");
-                            error
-                        })?;
+                        row.require_resolved_acp_selection()?;
                         let selected = current
                             .scope
                             .choice
@@ -203,23 +200,12 @@ impl<S: BroadcastSink> Supervisor<S> {
                             .is_some_and(|choice| choice.matches(row));
                         if !current
                             .refresh(session_id, selected)
-                            .map_err(|_| {
-                                tracing::warn!(target: "acp.initial_host_diagnostic",
-                                    disposition = "fallback_refresh_wait", "temporary Q initial-host refusal");
-                                EstablishmentRefusal::Unconfirmed
-                            })?
+                            .map_err(|_| EstablishmentRefusal::Unconfirmed)?
                             || !current.ready
                             || !current
                                 .qualify_owner(session_id)
-                                .map_err(|_| {
-                                    tracing::warn!(target: "acp.initial_host_diagnostic",
-                                        disposition = "fallback_owner_wait", "temporary Q initial-host refusal");
-                                    EstablishmentRefusal::Unconfirmed
-                                })?
+                                .map_err(|_| EstablishmentRefusal::Unconfirmed)?
                         {
-                            tracing::warn!(target: "acp.initial_host_diagnostic",
-                                disposition = "fallback_not_ready", ready = current.ready,
-                                "temporary Q initial-host refusal");
                             anyhow::bail!(EstablishmentRefusal::Unconfirmed);
                         }
                         Ok(None)
@@ -234,13 +220,21 @@ impl<S: BroadcastSink> Supervisor<S> {
                         })
                 })?;
             let Some((_guard, expected)) = observed else {
-                tracing::warn!(target: "acp.initial_host_diagnostic",
-                    disposition = "observation_fence_busy", "temporary Q initial-host refusal");
-                return Err(SupervisorError::Acp(AcpError::Establishment(
-                    EstablishmentRefusal::Unconfirmed,
-                )));
+                // Wait without the observation guard, then recheck the same frozen actor.
+                if !tokio::time::timeout_at(
+                    deadline,
+                    crate::acp::state::NativeObservationWait::native(&current.scope).settle(),
+                )
+                .await
+                .unwrap_or(false)
+                {
+                    return Err(SupervisorError::Acp(AcpError::Establishment(
+                        EstablishmentRefusal::Unconfirmed,
+                    )));
+                }
+                continue;
             };
-            expected
+            break expected;
         };
         let Some(expected) = expected else {
             return Ok(None);
