@@ -29,20 +29,22 @@ pub struct AgentIntegrationContribution {
     pub session_id: Option<AgentSessionIdDeclaration>,
 }
 
-/// Session-id capture the host asks the plugin worker to perform.
+/// Session-id capture owned by the plugin worker.
 ///
-/// The host owns the call protocol only: it passes a fixed context and accepts a
-/// shape-checked reply, so the provider's stores and wire formats stay in the
-/// plugin instead of in the host.
+/// The host owns the write only: it accepts a shape-checked report through the
+/// guarded capture path, so the provider's stores and wire formats stay in the
+/// plugin instead of in the host. The fields below describe the host-driven
+/// polling that a later host version will add; this one validates them without
+/// calling them.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct AgentSessionIdDeclaration {
-    /// Worker RPC returning `{ session_id, generation }` for one poll.
+    /// Worker RPC that will return `{ session_id, generation }` per poll.
     pub method: String,
-    /// Worker RPC returning the launch wrapper and the tmux env it publishes.
+    /// Worker RPC that will return the launch wrapper and the tmux env it publishes.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub launch_method: Option<String>,
-    /// Deadline for one call. A timeout means no capture for that poll.
+    /// Deadline for one future call. A timeout means no capture for that poll.
     #[serde(default = "default_session_id_timeout_ms")]
     pub timeout_ms: u64,
 }

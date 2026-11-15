@@ -72,7 +72,6 @@ impl Instance {
             resume_binding: None,
             active_execution: None,
             omp_capture_generation: None,
-            plugin_capture_generation: None,
             lifecycle_generation: 0,
             resume_probe_failed_sid: None,
             resume_intent: ResumeIntent::Default,

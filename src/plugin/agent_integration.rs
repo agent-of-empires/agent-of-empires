@@ -279,22 +279,17 @@ pub(crate) fn registry_declares(registry: &super::PluginRegistry, tool: &str) ->
     })
 }
 
-/// The capture declaration `plugin` owns for `tool`, if it is active and
-/// declares session-id capture for that tool.
-pub(crate) fn capture_declaration<'a>(
-    registry: &'a super::PluginRegistry,
-    plugin: &str,
-    tool: &str,
-) -> Option<&'a aoe_plugin_api::agent_integration::AgentSessionIdDeclaration> {
-    registry
-        .all()
-        .iter()
-        .find(|candidate| candidate.active() && candidate.id() == plugin)?
-        .manifest
-        .agent_integrations
-        .iter()
-        .find(|entry| entry.tool == tool)
-        .and_then(|entry| entry.session_id.as_ref())
+/// Whether `plugin` may report a captured session id for `instance`.
+///
+/// Ownership resolves through `declared_agent`, so builtin names, custom
+/// wrappers, command overrides and ambiguous declarations grant nothing: only
+/// the plugin that provides the row's tool, and declares `session_id` for it,
+/// can attribute an id to that row.
+pub(crate) fn owns_capture(instance: &Instance, plugin: &str) -> bool {
+    instance
+        .declared_agent()
+        .filter(|agent| agent.plugin_id() == plugin)
+        .is_some_and(|agent| agent.contribution().session_id.is_some())
 }
 
 pub(crate) fn declared_agent<'a>(

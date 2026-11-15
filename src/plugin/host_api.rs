@@ -378,12 +378,12 @@ fn session_meta_set(
     Ok(json!({ "ok": true }))
 }
 
-/// Adopt an id the declaring plugin captured for one launch generation.
+/// Adopt a session id the declaring plugin captured for one of its rows.
 ///
-/// The plugin owns the provider's store layout, so it reports the id; the host
-/// keeps the write guarded: only the plugin that declares `session_id` for the
-/// row's tool may report, an explicit resume pin is never overwritten, and a
-/// report for the generation already recorded is a no-op.
+/// The plugin owns the provider's store, so it reports what it found; the host
+/// keeps the write on the same guarded path as every other capture, which
+/// refuses a sid another row owns, honours capture excludes and the launch pin,
+/// and records the conversation binding alongside the id.
 fn session_capture_set(
     state: &HostApiState,
     ctx: &PluginRpcContext,
@@ -391,53 +391,47 @@ fn session_capture_set(
 ) -> Result<Value, DispatchError> {
     let session_id = str_param(params, "session_id")?.to_string();
     let captured = str_param(params, "agent_session_id")?;
-    let generation = str_param(params, "generation")?;
     if !crate::session::capture::is_valid_session_id(captured) {
         return Err(DispatchError::invalid_params(
             "\"agent_session_id\" is not a session id",
         ));
     }
-    if generation.is_empty() || generation.len() > 128 {
-        return Err(DispatchError::invalid_params(
-            "\"generation\" must be 1..=128 bytes",
-        ));
-    }
-    let plugin_id = ctx.plugin_id.clone();
-    let captured = captured.to_string();
-    let generation = generation.to_string();
     let storage = state
         .storage()
-        .map_err(|e| DispatchError::internal(e.to_string()))?;
-    let registry = crate::plugin::registry();
-    let outcome = storage
-        .update(|instances, _groups| {
-            let Some(inst) = instances.iter_mut().find(|i| i.id == session_id) else {
-                return Ok(None);
-            };
-            if super::agent_integration::capture_declaration(&registry, &plugin_id, &inst.tool)
-                .is_none()
-            {
-                return Ok(Some(Err(
-                    "this plugin does not declare session-id capture for the tool",
-                )));
-            }
-            if !matches!(inst.resume_intent, crate::session::ResumeIntent::Default) {
-                return Ok(Some(Ok(json!({ "applied": false, "reason": "pinned" }))));
-            }
-            if inst.plugin_capture_generation.as_deref() == Some(generation.as_str()) {
-                return Ok(Some(Ok(json!({ "applied": false, "reason": "duplicate" }))));
-            }
-            inst.agent_session_id = Some(captured);
-            inst.plugin_capture_generation = Some(generation);
-            Ok(Some(Ok(json!({ "applied": true }))))
-        })
-        .map_err(|e| DispatchError::internal(e.to_string()))?;
-    match outcome {
-        Some(Ok(reply)) => Ok(reply),
-        Some(Err(message)) => Err(DispatchError::invalid_params(message)),
-        None => Err(DispatchError::invalid_params(format!(
-            "unknown session {session_id:?}"
-        ))),
+        .map_err(|error| DispatchError::internal(error.to_string()))?;
+    let instance = storage
+        .load()
+        .map_err(|error| DispatchError::internal(error.to_string()))?
+        .into_iter()
+        .find(|instance| instance.id == session_id)
+        .ok_or_else(|| DispatchError::invalid_params(format!("unknown session {session_id:?}")))?;
+    if !super::agent_integration::owns_capture(&instance, &ctx.plugin_id) {
+        return Err(DispatchError::with_kind(
+            codes::FORBIDDEN,
+            "not_capture_owner",
+            "this plugin does not own session-id capture for the session's tool",
+        ));
+    }
+    let expected = instance.conversation_state();
+    let mut observation =
+        crate::session::poller::SessionIdObservation::unguarded(captured.to_string());
+    observation.execution = expected.active.clone();
+    let commit = crate::session::persist_session_with_storage(
+        &storage,
+        &session_id,
+        &observation,
+        &expected,
+    );
+    match commit.outcome {
+        crate::session::SidWrite::Applied => Ok(json!({ "applied": true })),
+        crate::session::SidWrite::PinnedForeign => {
+            Ok(json!({ "applied": false, "reason": "pinned" }))
+        }
+        crate::session::SidWrite::OwnershipConflict => {
+            Ok(json!({ "applied": false, "reason": "owned_elsewhere" }))
+        }
+        crate::session::SidWrite::Skipped => Ok(json!({ "applied": false, "reason": "stale" })),
+        crate::session::SidWrite::Failed => Err(DispatchError::internal("capture write failed")),
     }
 }
 
@@ -1665,47 +1659,38 @@ method = "{tool}.session_id"
         let id = seed_row("capture-helper", &|_| {});
         let state = state(tmp.path());
 
-        let call = |generation: &str| {
+        let set = |sid: &str| {
             dispatch(
                 &state,
                 &ctx_for("acme.capture", &[CAP_SESSION_WRITE]),
                 "session.capture.set",
-                &json!({
-                    "session_id": id,
-                    "agent_session_id": "session-abc",
-                    "generation": generation,
-                }),
+                &json!({ "session_id": id, "agent_session_id": sid }),
             )
         };
 
-        assert_eq!(call("gen-1").unwrap(), json!({ "applied": true }));
-        let stored = row(&id);
-        assert_eq!(stored.agent_session_id.as_deref(), Some("session-abc"));
+        assert_eq!(set("session-abc").unwrap(), json!({ "applied": true }));
+        assert_eq!(row(&id).agent_session_id.as_deref(), Some("session-abc"));
         assert_eq!(
-            stored.plugin_capture_generation.as_deref(),
-            Some("gen-1"),
-            "the generation is recorded with the id"
-        );
-
-        assert_eq!(
-            call("gen-1").unwrap(),
-            json!({ "applied": false, "reason": "duplicate" })
-        );
-        assert_eq!(
-            call("gen-2").unwrap(),
+            set("session-abc").unwrap(),
             json!({ "applied": true }),
-            "a new generation may reattribute the row"
+            "a repeat of the same id is harmless"
         );
+        assert_eq!(
+            set("session-def").unwrap(),
+            json!({ "applied": true }),
+            "the owner may follow a conversation into a new store entry"
+        );
+        assert_eq!(row(&id).agent_session_id.as_deref(), Some("session-def"));
     }
 
     #[test]
     #[serial_test::serial]
-    fn capture_writes_stay_inside_the_declaration_and_the_pins() {
+    fn capture_writes_stay_inside_the_owner_and_the_pin() {
         let tmp = tempfile::tempdir().unwrap();
         let _reload = crate::plugin::ReloadRegistryOnDrop;
         let _home = crate::session::test_support::isolate_app_dir_at(tmp.path());
         install_capture_plugin("acme.capture", "capture-helper");
-        let plain = seed_row("capture-helper", &|_| {});
+        let owned = seed_row("capture-helper", &|_| {});
         let pinned = seed_row("capture-helper", &|inst| {
             inst.resume_intent = crate::session::ResumeIntent::Use("pinned-sid".into());
             inst.agent_session_id = Some("pinned-sid".into());
@@ -1713,49 +1698,47 @@ method = "{tool}.session_id"
         let undeclared = seed_row("other-tool", &|_| {});
         let state = state(tmp.path());
 
-        let set = |id: &str| {
+        let set = |plugin: &str, caps: &[&str], id: &str| {
             dispatch(
                 &state,
-                &ctx_for("acme.capture", &[CAP_SESSION_WRITE]),
+                &ctx_for(plugin, caps),
                 "session.capture.set",
-                &json!({
-                    "session_id": id,
-                    "agent_session_id": "session-abc",
-                    "generation": "gen-1",
-                }),
+                &json!({ "session_id": id, "agent_session_id": "session-abc" }),
             )
         };
 
         assert_eq!(
-            set(&pinned).unwrap(),
+            set("acme.capture", &[CAP_SESSION_WRITE], &pinned).unwrap(),
             json!({ "applied": false, "reason": "pinned" }),
-            "an explicit resume pin is never overwritten"
+            "a launch pin to another conversation is never overwritten"
         );
         assert_eq!(row(&pinned).agent_session_id.as_deref(), Some("pinned-sid"));
 
-        let err = set(&undeclared).unwrap_err();
-        assert_eq!(err.code, codes::INVALID_PARAMS);
-        assert!(
-            err.message.contains("does not declare session-id capture"),
-            "{}",
-            err.message
+        // Nothing declares `other-tool`, so no plugin owns its capture.
+        let err = set("acme.capture", &[CAP_SESSION_WRITE], &undeclared).unwrap_err();
+        assert_eq!(err.code, codes::FORBIDDEN);
+        assert_eq!(
+            err.data.as_ref().and_then(|d| d["kind"].as_str()),
+            Some("not_capture_owner")
         );
         assert_eq!(row(&undeclared).agent_session_id, None);
 
-        assert_eq!(set(&plain).unwrap(), json!({ "applied": true }));
-        let err = dispatch(
-            &state,
-            &ctx_for("acme.capture", &[CAP_SESSION_READ]),
-            "session.capture.set",
-            &json!({ "session_id": plain, "agent_session_id": "x", "generation": "g" }),
-        )
-        .unwrap_err();
+        // A second declaration for the same tool makes ownership ambiguous, so
+        // neither plugin may attribute an id.
+        install_capture_plugin("acme.rival", "capture-helper");
+        for plugin in ["acme.capture", "acme.rival"] {
+            let err = set(plugin, &[CAP_SESSION_WRITE], &owned).unwrap_err();
+            assert_eq!(err.code, codes::FORBIDDEN, "{plugin}");
+        }
+        assert_eq!(row(&owned).agent_session_id, None);
+
+        let err = set("acme.capture", &[CAP_SESSION_READ], &owned).unwrap_err();
         assert_eq!(err.code, codes::FORBIDDEN, "needs session.write");
     }
 
     #[test]
     #[serial_test::serial]
-    fn capture_rejects_a_malformed_id_or_generation() {
+    fn capture_rejects_a_malformed_session_id() {
         let tmp = tempfile::tempdir().unwrap();
         let _reload = crate::plugin::ReloadRegistryOnDrop;
         let _home = crate::session::test_support::isolate_app_dir_at(tmp.path());
@@ -1763,24 +1746,16 @@ method = "{tool}.session_id"
         let id = seed_row("capture-helper", &|_| {});
         let state = state(tmp.path());
 
-        for (agent_session_id, generation) in [
-            ("--resume", "gen-1"),
-            ("", "gen-1"),
-            ("session-abc", ""),
-            ("session-abc", &"g".repeat(129)),
-        ] {
+        for agent_session_id in ["--resume", "", &"s".repeat(257)] {
             let err = dispatch(
                 &state,
                 &ctx_for("acme.capture", &[CAP_SESSION_WRITE]),
                 "session.capture.set",
-                &json!({
-                    "session_id": id,
-                    "agent_session_id": agent_session_id,
-                    "generation": generation,
-                }),
+                &json!({ "session_id": id, "agent_session_id": agent_session_id }),
             )
             .unwrap_err();
             assert_eq!(err.code, codes::INVALID_PARAMS, "{agent_session_id:?}");
         }
+        assert_eq!(row(&id).agent_session_id, None);
     }
 }
