@@ -4,6 +4,7 @@ import { CommentMarkdown } from "./CommentMarkdown";
 import { buildCommentsMarkdown, buildDiffCommentsPrompt } from "./buildPrompt";
 import type { DiffComment } from "./types";
 import { reportTelemetrySeen } from "../../../lib/api";
+import { hasFinePointer } from "../../../lib/platform";
 
 interface Props {
   sessionId: string;
@@ -147,6 +148,7 @@ export function SendCommentsDialog({
           <section>
             <label className="block text-[11px] text-text-dim mb-1">Intro (optional)</label>
             <textarea
+              autoFocus={hasFinePointer()}
               value={introDraft}
               onChange={(e) => onChangeIntro(e.target.value)}
               placeholder="Anything you want to say before the comments..."

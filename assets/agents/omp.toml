@@ -1,0 +1,35 @@
+# Offline launch/reply contract; an approved API21 plugin declaration supersedes it.
+id = "aoe.omp-fallback"
+name = "OMP offline fallback"
+version = "1.0.0"
+api_version = 21
+
+[[agent_integrations]]
+tool = "omp"
+command = "omp"
+
+[agent_integrations.launch]
+oneshot_flag = "-p"
+instruction_flag = "--append-system-prompt {}"
+model_flag = "--model"
+install_hint = "curl -fsSL https://omp.sh/install | sh"
+
+[agent_integrations.launch.yolo]
+kind = "flag"
+flag = "--auto-approve"
+
+[agent_integrations.launch.container_env]
+PI_CODING_AGENT_DIR = "/root/.omp/agent"
+
+[agent_integrations.launch.resume]
+kind = "flag"
+flag = "--resume"
+
+[agent_integrations.launch.capture]
+backend = "omp"
+host = "pane_scoped"
+sandbox = "pane_scoped"
+
+[agent_integrations.reply_fallback]
+allow = [{ kind = "named", value = "Enter" }]
+deny = [{ kind = "named", value = "Down" }, { kind = "named", value = "Enter" }]

@@ -2147,8 +2147,12 @@ pub(crate) fn resolve_active_agent(
             return None;
         }
         match session_config.agent_detect_as.get(tool) {
-            Some(name) => crate::agents::get_agent(name),
-            None => crate::agents::get_agent(tool),
+            // A declaration takes the listing but not the detection it replaces,
+            // so this keeps mounts and stores and grants no conversation authority.
+            Some(name) => {
+                crate::agents::get_agent(name).or_else(|| crate::agents::native_definition(name))
+            }
+            None => crate::agents::native_definition(tool),
         }
     })
 }
@@ -6770,6 +6774,134 @@ codex-work = "{}"
             msg.contains("AOE_INSTANCE_ID"),
             "error must surface validator failure, got: {msg}"
         );
+    }
+
+    /// A wrapper that only detects as an agent keeps that agent's sandbox roots
+    /// whether or not a declaration takes its listing, and never gains resume
+    /// authority from the detection.
+    #[test]
+    #[serial_test::serial]
+    fn a_detected_wrapper_keeps_its_roots_through_a_takeover_and_a_revocation() {
+        let temporary = TempDir::new().unwrap();
+        let _reload = crate::plugin::ReloadRegistryOnDrop;
+        let _app = crate::session::test_support::isolate_app_dir_at(temporary.path());
+        let home = TempDir::new().unwrap();
+        let mut session = super::super::SessionConfig::default();
+        session
+            .agent_detect_as
+            .insert("wrapped-omp".into(), "omp".into());
+        let roots = || {
+            sandbox_content_roots(
+                "wrapped-omp",
+                None,
+                &session,
+                home.path(),
+                "1111111111111111",
+            )
+            .unwrap()
+        };
+
+        let detected = roots();
+        assert!(!detected.is_empty(), "the detection must name roots");
+        assert!(detected.iter().all(|root| root.host.ends_with(".omp")));
+
+        crate::session::test_support::install_omp_takeover("omp-next");
+        assert!(crate::agents::get_agent("omp").is_none());
+        assert_eq!(
+            roots(),
+            detected,
+            "a takeover must not empty a detected wrapper's roots"
+        );
+
+        let plugin = crate::plugin::plugins_dir()
+            .unwrap()
+            .join("acme.omp-cutover");
+        fs::remove_dir_all(&plugin).unwrap();
+        crate::session::update_config(|config| {
+            config.plugins.remove("acme.omp-cutover");
+        })
+        .unwrap();
+        crate::plugin::reload_registry();
+        assert_eq!(crate::agents::get_agent("omp").map(|a| a.name), Some("omp"));
+        assert_eq!(roots(), detected, "a revocation must keep the same roots");
+
+        let refused = match crate::session::Instance::execution_agent_for(
+            "wrapped-omp",
+            "wrapped-omp",
+            &session,
+        ) {
+            Ok(agent) => panic!("detection must not grant resume authority: {}", agent.name),
+            Err(error) => format!("{error:#}"),
+        };
+        assert!(
+            refused.contains("agent_detect_as is only status detection"),
+            "{refused}"
+        );
+    }
+
+    /// A stored command keeps the execution and store owner its tool's own
+    /// identity names, so a takeover of that tool cannot reattribute it to a
+    /// command that does not select the declaration.
+    #[test]
+    #[serial_test::serial]
+    fn a_takeover_cannot_reattribute_a_stored_command() {
+        let temporary = TempDir::new().unwrap();
+        let _reload = crate::plugin::ReloadRegistryOnDrop;
+        let _app = crate::session::test_support::isolate_app_dir_at(temporary.path());
+        let home = TempDir::new().unwrap();
+        let session = super::super::SessionConfig::default();
+        let roots = || {
+            sandbox_content_roots(
+                "omp",
+                Some("codex"),
+                &session,
+                home.path(),
+                "1111111111111111",
+            )
+            .unwrap()
+        };
+        let refused =
+            || match crate::session::Instance::execution_agent_for("omp", "codex", &session) {
+                Ok(agent) => panic!("a foreign command must not run as {}", agent.name),
+                Err(error) => format!("{error:#}"),
+            };
+        let stored = || {
+            crate::session::Instance::execution_agent_for("omp", "omp", &session)
+                .expect("a stored fallback command keeps its native identity")
+                .name
+        };
+
+        let before = roots();
+        assert!(refused().contains("contradicts the selected native execution identity"));
+        assert_eq!(stored(), "omp");
+        assert!(before.iter().all(|root| root.host.ends_with(".omp")));
+
+        // The takeover hides the fallback from listings without changing what
+        // either stored command means.
+        crate::session::test_support::install_omp_takeover("omp-next");
+        assert!(crate::agents::get_agent("omp").is_none());
+        assert!(refused().contains("contradicts the selected native execution identity"));
+        assert_eq!(stored(), "omp");
+        assert_eq!(roots(), before, "a takeover must not move the store owner");
+        assert_eq!(
+            crate::session::Instance::execution_agent_for("omp", "omp-next", &session)
+                .expect("the declaration's own command runs the tool's identity")
+                .name,
+            "omp"
+        );
+
+        let plugin = crate::plugin::plugins_dir()
+            .unwrap()
+            .join("acme.omp-cutover");
+        fs::remove_dir_all(&plugin).unwrap();
+        crate::session::update_config(|config| {
+            config.plugins.remove("acme.omp-cutover");
+        })
+        .unwrap();
+        crate::plugin::reload_registry();
+        assert!(refused().contains("contradicts the selected native execution identity"));
+        assert_eq!(stored(), "omp");
+        assert_eq!(roots(), before, "a revocation must keep the store owner");
     }
 
     /// The profile decides codex sandbox status hooks: disabling them drops the status writers,

@@ -17,7 +17,7 @@ use super::{
     ICON_UNREAD,
 };
 use crate::containers::image_update::ImageUpdate;
-use crate::session::config::{GroupByMode, RowTagMode, SidebarPosition, SortOrder};
+use crate::session::config::{GroupByMode, NarrowLayout, RowTagMode, SidebarPosition, SortOrder};
 use crate::session::{Item, Status};
 use crate::tui::components::preview::{self, CachedPreview};
 use crate::tui::components::{
@@ -67,12 +67,15 @@ fn compose_list_title(
 enum ListLayout {
     Horizontal(SidebarPosition),
     Stacked,
+    /// The list owns the whole content area, so it closes every border.
+    Full,
 }
 
 impl ListLayout {
     /// The preview owns the shared separator; omit the adjacent list border.
     fn list_borders(self) -> Borders {
         match self {
+            Self::Full => Borders::ALL,
             Self::Stacked => Borders::TOP | Borders::LEFT | Borders::RIGHT,
             Self::Horizontal(SidebarPosition::Left) => {
                 Borders::TOP | Borders::LEFT | Borders::BOTTOM
@@ -1223,8 +1226,13 @@ impl HomeView {
         let available_width = content_area.width;
         self.main_area_width = available_width;
         self.main_area_height = content_area.height;
+        // `one_pane` already gives the narrow screen to a single pane, so a collapsed
+        // sidebar there would only shrink it to a three-column strip plus preview.
+        let narrow_layout = self.narrow_layout;
+        let single_pane_narrow = available_width < responsive::STACKED_BREAKPOINT
+            && matches!(narrow_layout, NarrowLayout::OnePane);
         // A collapsed strip leaves enough preview space even on narrow terminals.
-        if self.sidebar_collapsed {
+        if self.sidebar_collapsed && !single_pane_narrow {
             self.divider_col = None;
             let strip_width = responsive::COLLAPSED_STRIP_WIDTH.min(available_width);
             let (strip_area, preview_area) =
@@ -1239,26 +1247,43 @@ impl HomeView {
             self.render_collapsed_strip(frame, strip_col, theme);
             self.render_preview(frame, preview_area, theme);
         } else if available_width < responsive::STACKED_BREAKPOINT {
-            let main_height = content_area.height;
-            let list_height = responsive::stacked_list_height(main_height, self.list_height);
-            let chunks = Layout::default()
-                .direction(Direction::Vertical)
-                .constraints([
-                    Constraint::Length(list_height),
-                    Constraint::Min(responsive::STACKED_PREVIEW_MIN),
-                ])
-                .split(content_area);
-
             self.divider_col = None;
-            self.divider_row =
-                (chunks[0].height > 0 && chunks[1].height > 0 && content_area.width > 0)
-                    .then_some(chunks[1].y);
+            match responsive::narrow_arrangement(
+                narrow_layout,
+                content_area.height,
+                self.list_height,
+                self.preview_pane_active(),
+            ) {
+                responsive::NarrowArrangement::ListOnly => {
+                    self.hide_preview();
+                    // The list owns the screen, so the strip docks under the full area.
+                    let list_rect = self.diagnostics_dock(frame, content_area, theme);
+                    self.render_list(frame, list_rect, theme, ListLayout::Full);
+                }
+                responsive::NarrowArrangement::PreviewOnly => {
+                    self.hide_list();
+                    self.render_preview(frame, content_area, theme);
+                }
+                responsive::NarrowArrangement::Split(list_height) => {
+                    let chunks = Layout::default()
+                        .direction(Direction::Vertical)
+                        .constraints([
+                            Constraint::Length(list_height),
+                            Constraint::Min(responsive::STACKED_PREVIEW_MIN),
+                        ])
+                        .split(content_area);
 
-            // Stacked: the list sits above the preview, so there is no column to dock
-            // under; the strip spans the list's width.
-            let list_rect = self.diagnostics_dock(frame, chunks[0], theme);
-            self.render_list(frame, list_rect, theme, ListLayout::Stacked);
-            self.render_preview(frame, chunks[1], theme);
+                    self.divider_row =
+                        (chunks[0].height > 0 && chunks[1].height > 0 && content_area.width > 0)
+                            .then_some(chunks[1].y);
+
+                    // Stacked: the list sits above the preview, so there is no column to
+                    // dock under; the strip spans the list's width.
+                    let list_rect = self.diagnostics_dock(frame, chunks[0], theme);
+                    self.render_list(frame, list_rect, theme, ListLayout::Stacked);
+                    self.render_preview(frame, chunks[1], theme);
+                }
+            }
         } else {
             // Side-by-side: cap list width so the preview pane keeps its
             // usability floor (PREVIEW_MIN_WIDTH).
@@ -1436,6 +1461,26 @@ impl HomeView {
         );
     }
 
+    /// Clear the preview's rects and stop its capture, for a layout that draws only the
+    /// list. A stale rect would keep resolving clicks and wheel scrolls at a pane that is
+    /// no longer painted.
+    fn hide_preview(&mut self) {
+        self.preview_area = Rect::default();
+        self.preview_pane_area = Rect::default();
+        self.preview_outer_area = Rect::default();
+        self.sync_preview_capture_worker(None);
+        self.sync_split_capture_worker(None);
+    }
+
+    /// Clear the list's rects and diagnostics strip for a layout that draws only the
+    /// preview.
+    fn hide_list(&mut self) {
+        self.list_area = Rect::default();
+        self.list_inner_area = Rect::default();
+        self.shelf_inner_area = Rect::default();
+        self.diagnostics_area = Rect::default();
+    }
+
     /// Dock the diagnostics strip under the session-list column: carve
     /// `DIAGNOSTICS_STRIP_HEIGHT` rows off the bottom of `column`, render there, and return
     /// the reduced rect. Returns `column` unchanged when the strip is hidden or the column
@@ -1605,7 +1650,11 @@ impl HomeView {
         // Columns kept clear for the title that shares this top border row, so
         // the collapse affordance only draws when it won't collide with it.
         const COLLAPSE_LABEL_TITLE_RESERVE: u16 = 6;
-        if area.width > COLLAPSE_LABEL_WIDTH + COLLAPSE_LABEL_TITLE_RESERVE {
+        // The full-width narrow layout already shows one pane, so it has nothing to
+        // collapse to and draws no affordance.
+        if layout != ListLayout::Full
+            && area.width > COLLAPSE_LABEL_WIDTH + COLLAPSE_LABEL_TITLE_RESERVE
+        {
             let btn_rect = Rect {
                 x: area.right()
                     - COLLAPSE_LABEL_WIDTH

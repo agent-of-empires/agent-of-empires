@@ -128,6 +128,16 @@ impl<S: BroadcastSink> Supervisor<S> {
         respawn.epoch()
     }
 
+    /// Leave a running fixture part-way through a respawn, so it reports `Resuming`.
+    pub(crate) async fn test_begin_respawn(&self, session_id: &str) {
+        let mut workers = self.workers.lock().await;
+        let handle = workers.get_mut(session_id).expect("test worker");
+        let (respawn, _) = lock_recover(&self.lifecycle)
+            .begin_respawn(&handle.lease)
+            .expect("fixture is running");
+        handle.lease = respawn;
+    }
+
     /// A fake worker whose command loop records every command it receives.
     pub(crate) async fn test_insert_worker_cmd_recording(
         &self,

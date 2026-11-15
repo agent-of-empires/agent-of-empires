@@ -1101,6 +1101,14 @@ impl AcpState {
         }
     }
 
+    /// Queue delivery ignores background work, but never overlaps a foreground turn.
+    pub fn accepts_queue_drain(&self) -> bool {
+        !self.turn_active
+            && self.sidebar_phase == SidebarPhase::Idle
+            && !self.cancelling
+            && !self.compacting
+    }
+
     /// The sidebar status this state implies. A live background agent keeps
     /// the row `Running` between main turns.
     pub fn sidebar_status(&self) -> Status {
