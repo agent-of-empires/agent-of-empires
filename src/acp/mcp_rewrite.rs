@@ -46,17 +46,32 @@ pub struct McpSandboxMount {
     pub read_only: bool,
 }
 
+/// Whether resolving a sandbox may ask the container runtime. A respawn that could not tell
+/// whether the runtime answers must not block on it again.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum RuntimeUse {
+    #[default]
+    Ask,
+    Skip,
+}
+
 impl McpSandbox {
-    /// Blocking: without a pinned workdir it asks the container runtime.
+    /// Blocking: without a pinned workdir it asks the container runtime, unless `runtime` is
+    /// [`RuntimeUse::Skip`], which leaves the workdir to the computed layout.
     pub fn resolve(
         info: &SandboxInfo,
         cwd: &Path,
         workspace: Option<&WorkspaceInfo>,
         session_id: &str,
+        runtime: RuntimeUse,
     ) -> Self {
+        let known = |info: &SandboxInfo| match runtime {
+            RuntimeUse::Ask => known_container_workdir(info),
+            RuntimeUse::Skip => info.container_workdir.clone(),
+        };
         Self::from_layout(
-            SandboxLayout::resolve(info, cwd, workspace),
-            || known_container_workdir(info),
+            SandboxLayout::resolve_with(info, cwd, workspace, known),
+            || known(info),
             session_id,
         )
     }
@@ -589,7 +604,7 @@ mod tests {
         linked_worktree(&repo, &worktree);
         let info = sandbox_info("/workspace/repo-feature");
 
-        let sandbox = McpSandbox::resolve(&info, &worktree, None, "s1");
+        let sandbox = McpSandbox::resolve(&info, &worktree, None, "s1", RuntimeUse::Ask);
 
         assert_eq!(
             sandbox,
@@ -627,7 +642,7 @@ mod tests {
         info.container_workdir = None;
         info.container_name = "aoe-sandbox-mcp-workspace-test-no-such-container".into();
 
-        let sandbox = McpSandbox::resolve(&info, &ws, Some(&workspace), "s1");
+        let sandbox = McpSandbox::resolve(&info, &ws, Some(&workspace), "s1", RuntimeUse::Ask);
 
         let (created, created_workdir) =
             crate::session::config::container_config::compute_workspace_volume_paths(

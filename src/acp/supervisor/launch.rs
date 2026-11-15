@@ -541,6 +541,7 @@ impl<S: BroadcastSink> Supervisor<S> {
             McpSandboxScope {
                 sandbox_info: req.sandbox_info.as_ref(),
                 workspace_info: req.workspace_info.as_ref(),
+                runtime: Default::default(),
             },
             "MCP resolution task failed",
         )
@@ -1449,6 +1450,7 @@ pub(super) struct McpPaths {
 pub(super) struct McpSandboxScope<'a> {
     pub sandbox_info: Option<&'a crate::session::SandboxInfo>,
     pub workspace_info: Option<&'a crate::session::WorkspaceInfo>,
+    pub runtime: crate::acp::mcp_rewrite::RuntimeUse,
 }
 
 /// The host environment MCP discovery reads from.
@@ -1474,6 +1476,7 @@ pub(super) async fn resolve_mcp_servers(
     let sandbox_info = scope.sandbox_info.filter(|info| info.enabled).cloned();
     let projection_env = session_env.clone();
     let workspace_info = scope.workspace_info.cloned();
+    let runtime = scope.runtime;
     let resolved = {
         let (agent_key, session, profile, paths) = (
             agent_key.to_string(),
@@ -1491,6 +1494,7 @@ pub(super) async fn resolve_mcp_servers(
                     &paths.cwd,
                     workspace_info.as_ref(),
                     &session,
+                    runtime,
                 )
             });
             let defs = resolve_mcp_defs(
@@ -2943,6 +2947,7 @@ time.sleep(60)
                 McpSandboxScope {
                     sandbox_info,
                     workspace_info: None,
+                    runtime: Default::default(),
                 },
                 "failed",
             )
