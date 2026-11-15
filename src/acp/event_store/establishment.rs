@@ -250,12 +250,20 @@ impl AutonomousCommit {
         );
         let fact: Self = serde_json::from_str(json)?;
         anyhow::ensure!(
-            fact.version == 1 && fact.started > 0 && fact.identity.ordinal > 0
+            fact.version == 1
+                && fact.started > 0
+                && fact.identity.ordinal > 0
                 && !fact.identity.run_id.is_nil()
                 && !fact.identity.root_session_id.0.is_empty()
-                && fact.identity.origin.owner.is_some_and(|owner| owner.birth_fingerprint.is_some())
+                && fact
+                    .identity
+                    .origin
+                    .owner
+                    .is_some_and(|owner| owner.birth_fingerprint.is_some())
                 && fact.ended.is_none_or(|ended| ended > fact.started)
-                && fact.boundary.is_none_or(|boundary| boundary.seq >= fact.started)
+                && fact
+                    .boundary
+                    .is_none_or(|boundary| boundary.seq >= fact.started)
                 && (fact.ended.is_some() || fact.stop_reason.is_none()),
             "malformed retained Native lifecycle"
         );
@@ -264,34 +272,52 @@ impl AutonomousCommit {
     }
 
     pub(super) fn frontier(&self) -> u64 {
-        self.started.max(self.ended.unwrap_or(0))
+        self.started
+            .max(self.ended.unwrap_or(0))
             .max(self.boundary.map_or(0, |boundary| boundary.seq))
     }
 
     pub(super) fn activity_before(&self, seq: u64) -> super::control::ControlKnowledge<bool> {
-        use super::control::ControlKnowledge::{Known, Indeterminate};
-        if self.started >= seq { return Known(false); }
-        if self.ended.is_some_and(|ended| ended < seq) { return Known(false); }
+        use super::control::ControlKnowledge::{Indeterminate, Known};
+        if self.started >= seq {
+            return Known(false);
+        }
+        if self.ended.is_some_and(|ended| ended < seq) {
+            return Known(false);
+        }
         match self.boundary.filter(|boundary| boundary.seq < seq) {
-            Some(AutonomousBoundary { disposition: AutonomousBoundaryDisposition::Retired, .. }) => Known(false),
-            Some(AutonomousBoundary { disposition: AutonomousBoundaryDisposition::Unavailable, .. }) => Indeterminate,
+            Some(AutonomousBoundary {
+                disposition: AutonomousBoundaryDisposition::Retired,
+                ..
+            }) => Known(false),
+            Some(AutonomousBoundary {
+                disposition: AutonomousBoundaryDisposition::Unavailable,
+                ..
+            }) => Indeterminate,
             None => Known(true),
         }
     }
 
     pub(super) fn activity(&self) -> super::control::ControlKnowledge<bool> {
-        use super::control::ControlKnowledge::{Known, Indeterminate};
+        use super::control::ControlKnowledge::{Indeterminate, Known};
         match self.boundary {
-            Some(AutonomousBoundary { disposition: AutonomousBoundaryDisposition::Retired, .. }) => Known(false),
-            Some(AutonomousBoundary { disposition: AutonomousBoundaryDisposition::Unavailable, .. })
-                if self.ended.is_none() => Indeterminate,
+            Some(AutonomousBoundary {
+                disposition: AutonomousBoundaryDisposition::Retired,
+                ..
+            }) => Known(false),
+            Some(AutonomousBoundary {
+                disposition: AutonomousBoundaryDisposition::Unavailable,
+                ..
+            }) if self.ended.is_none() => Indeterminate,
             _ => Known(self.ended.is_none()),
         }
     }
 
     pub(crate) fn restore_state(&self, state: &mut crate::acp::state::AcpState) {
-        state.restore_autonomous(&self.identity,
-            self.activity() == super::control::ControlKnowledge::Known(true));
+        state.restore_autonomous(
+            &self.identity,
+            self.activity() == super::control::ControlKnowledge::Known(true),
+        );
         state.last_seq = state.last_seq.max(self.frontier());
     }
 }
@@ -335,13 +361,18 @@ impl EventStore {
     }
 
     pub(crate) fn validate_autonomous_commit_schema(conn: &rusqlite::Connection) -> Result<()> {
-        let shape: Option<(String, bool, i64)> = conn.query_row(
-            "SELECT type,\"notnull\",pk FROM pragma_table_info('acp_establishment_commit')
-             WHERE name='autonomous_commit_json'", [],
-            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
-        ).optional()?;
+        let shape: Option<(String, bool, i64)> = conn
+            .query_row(
+                "SELECT type,\"notnull\",pk FROM pragma_table_info('acp_establishment_commit')
+             WHERE name='autonomous_commit_json'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .optional()?;
         anyhow::ensure!(
-            shape.is_some_and(|(kind, required, key)| kind.eq_ignore_ascii_case("TEXT") && !required && key == 0),
+            shape.is_some_and(|(kind, required, key)| kind.eq_ignore_ascii_case("TEXT")
+                && !required
+                && key == 0),
             "Native lifecycle metadata requires reconciliation59"
         );
         let mut statement = conn.prepare(
@@ -357,36 +388,53 @@ impl EventStore {
         conn: &rusqlite::Connection,
         session_id: &str,
     ) -> Result<Option<AutonomousCommit>> {
-        let stored: Option<(String, Option<String>)> = conn.query_row(
-            &format!("SELECT seal_json,autonomous_commit_json FROM {TABLE} WHERE session_id=?1"),
-            [session_id], |row| Ok((row.get(0)?, row.get(1)?)),
-        ).optional()?;
-        let Some((seal, Some(json))) = stored else { return Ok(None); };
+        let stored: Option<(String, Option<String>)> = conn
+            .query_row(
+                &format!(
+                    "SELECT seal_json,autonomous_commit_json FROM {TABLE} WHERE session_id=?1"
+                ),
+                [session_id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .optional()?;
+        let Some((seal, Some(json))) = stored else {
+            return Ok(None);
+        };
         let fact = AutonomousCommit::decode(&json)?;
         let base = CommitData::decode(&seal, session_id)?;
         let receipt = &base.receipt;
         let same_source = crate::acp::state::NativeEventOrigin::owned_attempt(
-            &receipt.attempt, Some(receipt.owner),
+            &receipt.attempt,
+            Some(receipt.owner),
         ) == Some(fact.identity.origin)
             && receipt.session_id() == Some(fact.identity.root_session_id.0.as_ref())
-            && receipt.replay.closed && !receipt.replay.lost;
+            && receipt.replay.closed
+            && !receipt.replay.lost;
         anyhow::ensure!(
-            same_source || fact.boundary.is_some_and(|boundary|
-                matches!(boundary.disposition, AutonomousBoundaryDisposition::Retired)),
+            same_source
+                || fact.boundary.is_some_and(|boundary| matches!(
+                    boundary.disposition,
+                    AutonomousBoundaryDisposition::Retired
+                )),
             "retained Native lifecycle differs from its original establishment"
         );
         Ok(Some(fact))
     }
 
     fn write_autonomous_commit(
-        tx: &rusqlite::Transaction<'_>, session_id: &str, fact: &AutonomousCommit,
+        tx: &rusqlite::Transaction<'_>,
+        session_id: &str,
+        fact: &AutonomousCommit,
     ) -> Result<()> {
         let encoded = serde_json::to_string(fact)?;
         AutonomousCommit::decode(&encoded)?;
-        anyhow::ensure!(tx.execute(
-            &format!("UPDATE {TABLE} SET autonomous_commit_json=?2 WHERE session_id=?1"),
-            params![session_id, encoded],
-        )? == 1, "Native lifecycle lost its original establishment row");
+        anyhow::ensure!(
+            tx.execute(
+                &format!("UPDATE {TABLE} SET autonomous_commit_json=?2 WHERE session_id=?1"),
+                params![session_id, encoded],
+            )? == 1,
+            "Native lifecycle lost its original establishment row"
+        );
         Ok(())
     }
 
@@ -394,68 +442,101 @@ impl EventStore {
         conn: &rusqlite::Connection,
         session_id: &str,
     ) -> Result<(u64, Option<AutonomousCommit>)> {
-        let prompt: Option<Option<String>> = conn.query_row(
-            &format!("SELECT prompt_commit_json FROM {TABLE} WHERE session_id=?1"),
-            [session_id], |row| row.get(0),
-        ).optional()?;
-        let prompt = prompt.flatten().as_deref().map(PromptCommit::decode).transpose()?;
-        let prompt_seq = prompt.as_ref().map_or(0, |commit|
-            commit.diagnostic.as_ref().map_or(0, |diagnostic| diagnostic.seq)
-                .max(commit.stopped.unwrap_or(0)));
+        let prompt: Option<Option<String>> = conn
+            .query_row(
+                &format!("SELECT prompt_commit_json FROM {TABLE} WHERE session_id=?1"),
+                [session_id],
+                |row| row.get(0),
+            )
+            .optional()?;
+        let prompt = prompt
+            .flatten()
+            .as_deref()
+            .map(PromptCommit::decode)
+            .transpose()?;
+        let prompt_seq = prompt.as_ref().map_or(0, |commit| {
+            commit
+                .diagnostic
+                .as_ref()
+                .map_or(0, |diagnostic| diagnostic.seq)
+                .max(commit.stopped.unwrap_or(0))
+        });
         let autonomous = Self::autonomous_commit(conn, session_id)?;
         let frontier = prompt_seq.max(autonomous.as_ref().map_or(0, AutonomousCommit::frontier));
         Ok((frontier, autonomous))
     }
 
     pub(super) fn record_autonomous_result(
-        tx: &rusqlite::Transaction<'_>, session_id: &str, seq: u64,
-        json: &str, created_at: i64, metadata: &EventMetadata,
+        tx: &rusqlite::Transaction<'_>,
+        session_id: &str,
+        seq: u64,
+        json: &str,
+        created_at: i64,
+        metadata: &EventMetadata,
     ) -> Result<Option<RecordDisposition>> {
         use crate::acp::control_protocol::NativeAutonomousPhase;
-        let Some(autonomous) = metadata.native_autonomous.as_deref().filter(|fact| fact.qualified) else {
+        let Some(autonomous) = metadata
+            .native_autonomous
+            .as_deref()
+            .filter(|fact| fact.qualified)
+        else {
             return Ok(None);
         };
         let seal: String = tx.query_row(
             &format!("SELECT seal_json FROM {TABLE} WHERE session_id=?1"),
-            [session_id], |row| row.get(0),
+            [session_id],
+            |row| row.get(0),
         )?;
         let base = CommitData::decode(&seal, session_id)?;
         anyhow::ensure!(
             crate::acp::state::NativeEventOrigin::owned_attempt(
-                &base.receipt.attempt, Some(base.receipt.owner),
+                &base.receipt.attempt,
+                Some(base.receipt.owner),
             ) == Some(autonomous.identity.origin)
-                && base.receipt.session_id() == Some(autonomous.identity.root_session_id.0.as_ref())
-                && base.receipt.replay.closed && !base.receipt.replay.lost,
+                && base.receipt.session_id()
+                    == Some(autonomous.identity.root_session_id.0.as_ref())
+                && base.receipt.replay.closed
+                && !base.receipt.replay.lost,
             EstablishmentRefusal::Superseded
         );
         let previous = Self::autonomous_commit(tx, session_id)?;
-        let older = previous.as_ref().is_some_and(|previous|
+        let older = previous.as_ref().is_some_and(|previous| {
             previous.identity.origin == autonomous.identity.origin
-                && previous.identity.ordinal > autonomous.identity.ordinal);
+                && previous.identity.ordinal > autonomous.identity.ordinal
+        });
         let mut next = match previous {
             Some(previous) if previous.identity.origin == autonomous.identity.origin => {
                 match autonomous.identity.ordinal.cmp(&previous.identity.ordinal) {
                     std::cmp::Ordering::Less => None,
                     std::cmp::Ordering::Equal => {
-                        anyhow::ensure!(previous.identity == autonomous.identity,
-                            "conflicting Native lifecycle identity");
+                        anyhow::ensure!(
+                            previous.identity == autonomous.identity,
+                            "conflicting Native lifecycle identity"
+                        );
                         let stored = match autonomous.phase {
                             NativeAutonomousPhase::Started => Some(previous.started),
                             NativeAutonomousPhase::Ended => previous.ended,
                         };
                         if let Some(seq) = stored {
                             if autonomous.phase == NativeAutonomousPhase::Ended {
-                                anyhow::ensure!(previous.stop_reason == autonomous.stop_reason,
-                                    "conflicting Native lifecycle terminal");
+                                anyhow::ensure!(
+                                    previous.stop_reason == autonomous.stop_reason,
+                                    "conflicting Native lifecycle terminal"
+                                );
                             }
                             return Ok(Some(RecordDisposition::Existing { seq }));
                         }
-                        anyhow::ensure!(previous.boundary.is_none(), EstablishmentRefusal::Superseded);
+                        anyhow::ensure!(
+                            previous.boundary.is_none(),
+                            EstablishmentRefusal::Superseded
+                        );
                         Some(previous)
                     }
                     std::cmp::Ordering::Greater => {
-                        anyhow::ensure!(previous.activity() == super::control::ControlKnowledge::Known(false),
-                            "Native lifecycle overlapped an unclosed original");
+                        anyhow::ensure!(
+                            previous.activity() == super::control::ControlKnowledge::Known(false),
+                            "Native lifecycle overlapped an unclosed original"
+                        );
                         None
                     }
                 }
@@ -465,13 +546,20 @@ impl EventStore {
         if next.is_none() && autonomous.phase == NativeAutonomousPhase::Started {
             if !older {
                 next = Some(AutonomousCommit {
-                    version: 1, identity: Arc::clone(&autonomous.identity), started: seq,
-                    ended: None, stop_reason: None, boundary: None,
+                    version: 1,
+                    identity: Arc::clone(&autonomous.identity),
+                    started: seq,
+                    ended: None,
+                    stop_reason: None,
+                    boundary: None,
                 });
             }
         } else if autonomous.phase == NativeAutonomousPhase::Ended {
             if let Some(next) = next.as_mut() {
-                anyhow::ensure!(seq > next.started, "Native terminal precedes its original start");
+                anyhow::ensure!(
+                    seq > next.started,
+                    "Native terminal precedes its original start"
+                );
                 next.ended = Some(seq);
                 next.stop_reason = autonomous.stop_reason.clone();
             } else {
@@ -479,7 +567,9 @@ impl EventStore {
             }
         }
         let inserted = Self::insert_scoped_event(tx, session_id, seq, json, created_at, metadata)?;
-        if inserted == 0 { return Ok(Some(RecordDisposition::Existing { seq })); }
+        if inserted == 0 {
+            return Ok(Some(RecordDisposition::Existing { seq }));
+        }
         if let Some(next) = next {
             Self::write_autonomous_commit(tx, session_id, &next)?;
         }
@@ -487,20 +577,32 @@ impl EventStore {
     }
 
     pub(super) fn record_autonomous_boundary(
-        tx: &rusqlite::Transaction<'_>, session_id: &str, seq: u64,
-        event: &Event, metadata: &EventMetadata,
+        tx: &rusqlite::Transaction<'_>,
+        session_id: &str,
+        seq: u64,
+        event: &Event,
+        metadata: &EventMetadata,
     ) -> Result<()> {
         use crate::acp::operation_effect::ControlKind;
-        let current = matches!(metadata.scope,
+        let current = matches!(
+            metadata.scope,
             crate::acp::event_sender::EventScope::SessionCurrent
-                | crate::acp::event_sender::EventScope::OperationCurrent);
+                | crate::acp::event_sender::EventScope::OperationCurrent
+        );
         let disposition = match ControlKind::from_event(event) {
             ControlKind::Switched | ControlKind::Cleared | ControlKind::ContextReset
-                if current || metadata.host_action => AutonomousBoundaryDisposition::Retired,
-            ControlKind::Stopped("orphaned_at_restart") if metadata.host_action =>
-                AutonomousBoundaryDisposition::Retired,
-            ControlKind::Unavailable { channel_loss: true } if current && metadata.availability_denial =>
-                AutonomousBoundaryDisposition::Unavailable,
+                if current || metadata.host_action =>
+            {
+                AutonomousBoundaryDisposition::Retired
+            }
+            ControlKind::Stopped("orphaned_at_restart") if metadata.host_action => {
+                AutonomousBoundaryDisposition::Retired
+            }
+            ControlKind::Unavailable { channel_loss: true }
+                if current && metadata.availability_denial =>
+            {
+                AutonomousBoundaryDisposition::Unavailable
+            }
             _ => return Ok(()),
         };
         if let Some(mut fact) = Self::autonomous_commit(tx, session_id)? {
@@ -697,30 +799,39 @@ impl EventStore {
         };
         let seal = EstablishmentSeal(data);
         anyhow::ensure!(seal.matches(receipt), EstablishmentRefusal::Unconfirmed);
-        self.control_cache.with_control(&receipt.attempt.session_id, |cached| -> Result<()> {
-            let mut conn = self.conn();
-            let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
-            if let Some(mut previous) = Self::autonomous_commit(&tx, &receipt.attempt.session_id)? {
-                if crate::acp::state::NativeEventOrigin::owned_attempt(
-                    &receipt.attempt, Some(receipt.owner),
-                ) != Some(previous.identity.origin)
-                    || receipt.session_id() != Some(previous.identity.root_session_id.0.as_ref()) {
-                    previous.boundary = Some(AutonomousBoundary {
-                        seq: seal.0.clear_after_seq.unwrap_or(0).max(previous.frontier()),
-                        disposition: AutonomousBoundaryDisposition::Retired,
-                    });
-                    Self::write_autonomous_commit(&tx, &receipt.attempt.session_id, &previous)?;
+        self.control_cache
+            .with_control(&receipt.attempt.session_id, |cached| -> Result<()> {
+                let mut conn = self.conn();
+                let tx =
+                    conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+                if let Some(mut previous) =
+                    Self::autonomous_commit(&tx, &receipt.attempt.session_id)?
+                {
+                    if crate::acp::state::NativeEventOrigin::owned_attempt(
+                        &receipt.attempt,
+                        Some(receipt.owner),
+                    ) != Some(previous.identity.origin)
+                        || receipt.session_id()
+                            != Some(previous.identity.root_session_id.0.as_ref())
+                    {
+                        previous.boundary = Some(AutonomousBoundary {
+                            seq: seal.0.clear_after_seq.unwrap_or(0).max(previous.frontier()),
+                            disposition: AutonomousBoundaryDisposition::Retired,
+                        });
+                        Self::write_autonomous_commit(&tx, &receipt.attempt.session_id, &previous)?;
+                    }
                 }
-            }
-            tx.execute(
-                &format!("INSERT INTO {TABLE} (session_id, seal_json) VALUES (?1, ?2)
-                    ON CONFLICT(session_id) DO UPDATE SET seal_json = excluded.seal_json"),
-                params![receipt.attempt.session_id, serde_json::to_string(&seal.0)?],
-            )?;
-            tx.commit()?;
-            *cached = None;
-            Ok(())
-        })?;
+                tx.execute(
+                    &format!(
+                        "INSERT INTO {TABLE} (session_id, seal_json) VALUES (?1, ?2)
+                    ON CONFLICT(session_id) DO UPDATE SET seal_json = excluded.seal_json"
+                    ),
+                    params![receipt.attempt.session_id, serde_json::to_string(&seal.0)?],
+                )?;
+                tx.commit()?;
+                *cached = None;
+                Ok(())
+            })?;
         Ok(seal)
     }
 

@@ -101,10 +101,14 @@ mod tests {
         assert_eq!(identity(), initial);
         let conn = rusqlite::Connection::open(&path).unwrap();
         let mut statement = conn
-            .prepare("SELECT seq, event_json FROM acp_events WHERE session_id = 'retained' ORDER BY seq")
+            .prepare(
+                "SELECT seq, event_json FROM acp_events WHERE session_id = 'retained' ORDER BY seq",
+            )
             .unwrap();
         let retained = statement
-            .query_map([], |row| Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?)))
+            .query_map([], |row| {
+                Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
+            })
             .unwrap()
             .collect::<Result<Vec<_>, _>>()
             .unwrap();

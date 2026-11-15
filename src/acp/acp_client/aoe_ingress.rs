@@ -1,11 +1,11 @@
 //! Consumes `_meta.aoe` on inbound `session/update` frames, in arrival order,
 //! before anything maps them to events.
 
+use super::session_identity::IngressUpdate;
 use crate::acp::aoe_meta::lease::LeaseTable;
 use crate::acp::aoe_meta::ordering::{Arrival, ArrivalOrder};
 use crate::acp::aoe_meta::{self, Envelope};
 use crate::acp::state::IntegrationLostReason;
-use super::session_identity::IngressUpdate;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
@@ -218,9 +218,12 @@ mod tests {
             tc.meta = json!({ "aoe": aoe }).as_object().cloned();
         }
         super::super::session_identity::SessionIngressNotification::decode_update(
-            serde_json::to_value(SessionNotification::new("s", SessionUpdate::ToolCall(tc))).unwrap(),
+            serde_json::to_value(SessionNotification::new("s", SessionUpdate::ToolCall(tc)))
+                .unwrap(),
             false,
-        ).unwrap().0
+        )
+        .unwrap()
+        .0
     }
 
     fn ids(ingested: Ingested) -> Vec<String> {

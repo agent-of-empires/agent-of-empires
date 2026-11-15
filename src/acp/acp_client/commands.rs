@@ -99,7 +99,9 @@ impl InitialPromptIntent {
     pub(super) async fn into_native(
         self,
     ) -> Result<QueuedClientCmd, (super::errors::AcpError, Self)> {
-        use crate::acp::establishment::{EstablishmentAttempt, EstablishmentRefusal, NativeOperationCorrelation};
+        use crate::acp::establishment::{
+            EstablishmentAttempt, EstablishmentRefusal, NativeOperationCorrelation,
+        };
         let Some(client) = self.client.upgrade() else {
             return Err((super::errors::AcpError::NotRunning, self));
         };

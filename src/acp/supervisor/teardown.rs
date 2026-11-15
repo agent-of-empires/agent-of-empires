@@ -4257,7 +4257,9 @@ mod tests {
             .await;
         let (inbound_tx, inbound_rx) =
             tokio::sync::mpsc::channel::<crate::acp::event_sender::SdkEvent>(16);
-        let drain = p.sup.start_drain_task(id.into(), lease.clone(), inbound_rx, None);
+        let drain = p
+            .sup
+            .start_drain_task(id.into(), lease.clone(), inbound_rx, None);
         {
             let mut workers = p.sup.workers.lock().await;
             let handle = workers.get_mut(id).expect("installed worker");
@@ -4280,7 +4282,11 @@ mod tests {
             .unwrap();
         p.entered().await;
         assert!(
-            p.sup.workers.try_lock().expect("store IO releases the workers mutex").contains_key(id),
+            p.sup
+                .workers
+                .try_lock()
+                .expect("store IO releases the workers mutex")
+                .contains_key(id),
             "the installed worker remains in actual publication custody"
         );
         assert_eq!(
@@ -4289,23 +4295,37 @@ mod tests {
                     panic!("store IO releases the lifecycle mutex");
                 };
                 lifecycle.current_lease(id)
-            }.as_ref(),
+            }
+            .as_ref(),
             Some(&lease),
             "publication retains the same lifecycle owner without retaining its global mutex"
         );
-        let (observed, activity) = p.sup.idle_observation(id)
+        let (observed, activity) = p
+            .sup
+            .idle_observation(id)
             .expect("the try-only observer need not retain another publication's mutex");
         assert_eq!(observed, lease);
-        assert_eq!(Some(activity), super::super::try_activity_seq(&p.sup.next_seqs, id));
+        assert_eq!(
+            Some(activity),
+            super::super::try_activity_seq(&p.sup.next_seqs, id)
+        );
         let reaping = Arc::clone(&p.sup);
         let reaper = reaping.reap_user_stopped();
         tokio::pin!(reaper);
-        assert!(futures_util::poll!(reaper.as_mut()).is_pending(),
-            "the real reaper cannot finish while its original publication is owed");
-        assert!(lock_recover(&p.sup.lifecycle).admit(id, ResumeKind::Spawn).is_err(),
-            "a replacement remains fenced before the final publication sweep");
+        assert!(
+            futures_util::poll!(reaper.as_mut()).is_pending(),
+            "the real reaper cannot finish while its original publication is owed"
+        );
+        assert!(
+            lock_recover(&p.sup.lifecycle)
+                .admit(id, ResumeKind::Spawn)
+                .is_err(),
+            "a replacement remains fenced before the final publication sweep"
+        );
         p.release_and_wait().await;
-        tokio::time::timeout(Duration::from_secs(5), reaper).await.unwrap();
+        tokio::time::timeout(Duration::from_secs(5), reaper)
+            .await
+            .unwrap();
 
         assert!(
             p.store.unresolved_background_task_ids(id).is_empty(),

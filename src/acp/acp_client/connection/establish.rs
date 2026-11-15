@@ -138,10 +138,14 @@ pub(super) async fn establish(
         }
     };
     shared.connection_state.initialized();
-    shared.ingress.set_autonomous_negotiated(init.meta.as_ref()
-        .and_then(|meta| meta.get("ompAutonomousTurns"))
-        .and_then(|advertised| advertised.get("version"))
-        .and_then(serde_json::Value::as_u64) == Some(1));
+    shared.ingress.set_autonomous_negotiated(
+        init.meta
+            .as_ref()
+            .and_then(|meta| meta.get("ompAutonomousTurns"))
+            .and_then(|advertised| advertised.get("version"))
+            .and_then(serde_json::Value::as_u64)
+            == Some(1),
+    );
 
     // The supervisor mirrors the typed error into events; a clean return
     // keeps the outer cleanup from adding a generic startup error.

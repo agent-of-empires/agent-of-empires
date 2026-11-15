@@ -562,7 +562,11 @@ impl HttpClient {
     }
 
     /// `POST /api/sessions/{id}/acp/cancel`.
-    pub async fn cancel(&self, session_id: &str, host_prompt_intent: Option<uuid::Uuid>) -> Result<(), HttpError> {
+    pub async fn cancel(
+        &self,
+        session_id: &str,
+        host_prompt_intent: Option<uuid::Uuid>,
+    ) -> Result<(), HttpError> {
         let url = format!(
             "{}/api/sessions/{}/acp/cancel",
             self.endpoint.base_url,

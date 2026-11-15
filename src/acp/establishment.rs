@@ -816,7 +816,11 @@ impl NativeConstructorObservation {
             original: std::sync::Arc::clone(&self.original),
             fence: std::sync::Arc::clone(&self.fence),
             origin: self.origin,
-            autonomous: Some(NativeAutonomousConstructor { stamp, root_session_id, projection }),
+            autonomous: Some(NativeAutonomousConstructor {
+                stamp,
+                root_session_id,
+                projection,
+            }),
         }))
     }
 
@@ -866,12 +870,17 @@ impl NativeConstructorObservation {
                         EstablishmentRefusal::Superseded
                     );
                     if let Some(autonomous) = &self.autonomous {
-                        let projection = autonomous.projection.upgrade()
+                        let projection = autonomous
+                            .projection
+                            .upgrade()
                             .ok_or(EstablishmentRefusal::Unconfirmed)?;
-                        let receipt = projection.autonomous_receipt(
-                            self.origin, autonomous.root_session_id.0.as_ref(),
-                        ).ok_or(EstablishmentRefusal::Unconfirmed)?;
-                        let postimage = self.original.postimage.get()
+                        let receipt = projection
+                            .autonomous_receipt(self.origin, autonomous.root_session_id.0.as_ref())
+                            .ok_or(EstablishmentRefusal::Unconfirmed)?;
+                        let postimage = self
+                            .original
+                            .postimage
+                            .get()
                             .ok_or(EstablishmentRefusal::Unconfirmed)?;
                         anyhow::ensure!(
                             NativeSessionPermission::capture_stamp(

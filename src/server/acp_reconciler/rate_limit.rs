@@ -798,7 +798,8 @@ mod tests {
     async fn rate_limit_resume_backs_off_after_a_failed_attempt() {
         with_managed(|scope| {
             Box::pin(async move {
-                let mut live = managed_control_session(scope, "quota-backoff", "claude", None).await;
+                let mut live =
+                    managed_control_session(scope, "quota-backoff", "claude", None).await;
                 let id = live.id().to_owned();
                 enable_auto_resume(true);
                 live.park("run the nightly task").await;
@@ -847,7 +848,10 @@ mod tests {
                 reap_rate_limit_resumes(&live.state, &mut attempted, &HashSet::new()).await;
                 settle_delivery(&live.state, &id).await;
                 assert!(attempted.contains(&id));
-                assert_eq!(live.state.acp_event_store.highest_seq(&id).unwrap(), frontier);
+                assert_eq!(
+                    live.state.acp_event_store.highest_seq(&id).unwrap(),
+                    frontier
+                );
                 enable_auto_resume(false);
                 live.state
                     .acp_supervisor
@@ -911,7 +915,10 @@ mod tests {
                 .await
                 .unwrap();
                 assert!(attempted.contains(&id));
-                assert_eq!(live.state.acp_event_store.highest_seq(&id).unwrap(), frontier);
+                assert_eq!(
+                    live.state.acp_event_store.highest_seq(&id).unwrap(),
+                    frontier
+                );
                 drop(held);
                 reap_rate_limit_resumes(&live.state, &mut attempted, &HashSet::new()).await;
                 settle_delivery(&live.state, &id).await;
@@ -935,7 +942,10 @@ mod tests {
                 let cap_frontier = live.state.acp_event_store.highest_seq(&id).unwrap();
                 reap_rate_limit_resumes(&live.state, &mut attempted, &HashSet::new()).await;
                 settle_delivery(&live.state, &id).await;
-                assert_eq!(live.state.acp_event_store.highest_seq(&id).unwrap(), cap_frontier);
+                assert_eq!(
+                    live.state.acp_event_store.highest_seq(&id).unwrap(),
+                    cap_frontier
+                );
                 live.state
                     .session_service
                     .enqueue_prompt(
@@ -1354,7 +1364,8 @@ mod tests {
     async fn retained_unknown_history_allows_only_read_only_attach_then_distinct_explicit_input() {
         with_managed(|scope| {
             Box::pin(async move {
-                let mut live = managed_control_session(scope, "quota-unknown-retained", "claude", None).await;
+                let mut live =
+                    managed_control_session(scope, "quota-unknown-retained", "claude", None).await;
                 let id = live.id().to_owned();
                 live.park("old work must not replay").await;
                 let original = live
@@ -1391,16 +1402,28 @@ mod tests {
                 tokio::time::timeout(Duration::from_secs(10), async {
                     let (mut assigned, mut capabilities) = (false, false);
                     while !assigned || !capabilities {
-                        match live.client.next_event().await.expect("actual retained handshake publication") {
+                        match live
+                            .client
+                            .next_event()
+                            .await
+                            .expect("actual retained handshake publication")
+                        {
                             Event::AcpSessionAssigned { acp_session_id, .. }
-                                if acp_session_id == live.sid => assigned = true,
+                                if acp_session_id == live.sid =>
+                            {
+                                assigned = true
+                            }
                             Event::PromptCapabilities { .. } => capabilities = true,
                             Event::AgentStartupError { message, .. } => panic!("{message}"),
-                            Event::AcpConnectionUnavailable { .. } => panic!("the original retained channel stays live"),
+                            Event::AcpConnectionUnavailable { .. } => {
+                                panic!("the original retained channel stays live")
+                            }
                             _ => {}
                         }
                     }
-                }).await.expect("the retained handshake publications precede its negative frontier");
+                })
+                .await
+                .expect("the retained handshake publications precede its negative frontier");
                 let attached = live
                     .state
                     .acp_supervisor
@@ -1426,7 +1449,10 @@ mod tests {
                 let frontier = live.state.acp_event_store.highest_seq(&id).unwrap();
                 let mut attempted = HashSet::from([id.clone()]);
                 reap_rate_limit_resumes(&live.state, &mut attempted, &HashSet::new()).await;
-                assert_eq!(live.state.acp_event_store.highest_seq(&id).unwrap(), frontier);
+                assert_eq!(
+                    live.state.acp_event_store.highest_seq(&id).unwrap(),
+                    frontier
+                );
                 assert_eq!(auto_resumed_breadcrumbs(&live.state, &id), 0);
                 let request = live
                     .start_prompt("a distinct explicit input after readiness")
@@ -1478,7 +1504,8 @@ mod tests {
     async fn qualified_native_loss_preserves_quota_pending_queue_and_budget_before_delivery() {
         with_managed(|scope| {
             Box::pin(async move {
-                let mut live = managed_control_session(scope, "quota-native-loss", "claude", None).await;
+                let mut live =
+                    managed_control_session(scope, "quota-native-loss", "claude", None).await;
                 let id = live.id().to_owned();
                 live.park("original work").await;
                 live.state
@@ -1531,7 +1558,8 @@ mod tests {
             Box::pin(async move {
                 for automatic in [false, true] {
                     let mut live =
-                        managed_control_session(scope, "quota-loss-during-prepare", "claude", None).await;
+                        managed_control_session(scope, "quota-loss-during-prepare", "claude", None)
+                            .await;
                     let id = live.id().to_owned();
                     enable_auto_resume(true);
                     live.park("preserve original work").await;
@@ -1613,7 +1641,10 @@ mod tests {
                         .find(|row| row.id == id)
                         .unwrap()
                         .clone();
-                    assert_eq!(live.state.acp_event_store.highest_seq(&id).unwrap(), frontier);
+                    assert_eq!(
+                        live.state.acp_event_store.highest_seq(&id).unwrap(),
+                        frontier
+                    );
                     assert_eq!(
                         live.state
                             .acp_event_store
@@ -1645,7 +1676,8 @@ mod tests {
     async fn an_aged_quota_hold_prevents_idle_reaping_without_spending_retry_budget() {
         with_managed(|scope| {
             Box::pin(async move {
-                let mut live = managed_control_session(scope, "quota-idle-hold", "claude", None).await;
+                let mut live =
+                    managed_control_session(scope, "quota-idle-hold", "claude", None).await;
                 let id = live.id().to_owned();
                 live.park("original work").await;
                 std::fs::write(
@@ -1660,7 +1692,10 @@ mod tests {
                 let frontier = live.state.acp_event_store.highest_seq(&id).unwrap();
                 let requests = live.native.requests();
                 super::super::idle::reap_idle_workers(&live.state).await;
-                assert_eq!(live.state.acp_event_store.highest_seq(&id).unwrap(), frontier);
+                assert_eq!(
+                    live.state.acp_event_store.highest_seq(&id).unwrap(),
+                    frontier
+                );
                 assert_eq!(live.native.requests(), requests);
                 assert_eq!(
                     live.state.acp_supervisor.current_lease(&id),
@@ -1781,11 +1816,16 @@ mod tests {
         with_managed(|scope| {
             Box::pin(async move {
                 for automatic in [false, true] {
-                    let mut live = managed_control_session(scope, if automatic {
-                        "quota-background-auto"
-                    } else {
-                        "quota-background-manual"
-                    }, "claude", None)
+                    let mut live = managed_control_session(
+                        scope,
+                        if automatic {
+                            "quota-background-auto"
+                        } else {
+                            "quota-background-manual"
+                        },
+                        "claude",
+                        None,
+                    )
                     .await;
                     let id = live.id().to_owned();
                     enable_auto_resume(automatic);
@@ -1888,7 +1928,10 @@ mod tests {
                         .session_service
                         .drain_queued_prompts_once(&id)
                         .await;
-                    assert_eq!(live.state.acp_event_store.highest_seq(&id).unwrap(), frontier);
+                    assert_eq!(
+                        live.state.acp_event_store.highest_seq(&id).unwrap(),
+                        frontier
+                    );
                     let submission = live.state.session_service.prompt_submission(&id).await;
                     let kind = if automatic {
                         QuotaResume::Automatic { park_seq: park.seq }

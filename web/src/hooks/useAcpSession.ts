@@ -550,8 +550,7 @@ export function useAcpSession(
   );
 
   // The server publishes the resulting Stopped event; no client-side Stopped is fabricated.
-  const hostOnlyForceRefused = hostPromptIntent != null &&
-    !(state.turnActive && nativeInputAvailable(state));
+  const hostOnlyForceRefused = hostPromptIntent != null && !(state.turnActive && nativeInputAvailable(state));
   const forceEndTurn = useCallback(async () => {
     if (!sessionId || !ownsLiveAcpActions(sessionId, actionOwner) || hostOnlyForceRefused) return;
     if (inputStateRef.current.hostPromptIntent !== hostPromptIntent) return;

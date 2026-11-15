@@ -160,8 +160,11 @@ impl OperationEffects {
         active: bool,
     ) {
         self.autonomous = Some(AutonomousControl {
-            origin: identity.origin, run_id: identity.run_id, ordinal: identity.ordinal,
-            source: identity.source, active,
+            origin: identity.origin,
+            run_id: identity.run_id,
+            ordinal: identity.ordinal,
+            source: identity.source,
+            active,
         });
     }
 
@@ -176,7 +179,10 @@ impl OperationEffects {
                 return ControlEffect::Historical;
             }
             let identity = &autonomous.identity;
-            if let Some(previous) = self.autonomous.filter(|previous| previous.origin == identity.origin) {
+            if let Some(previous) = self
+                .autonomous
+                .filter(|previous| previous.origin == identity.origin)
+            {
                 if identity.ordinal < previous.ordinal {
                     return ControlEffect::Historical;
                 }
@@ -204,10 +210,12 @@ impl OperationEffects {
             return ControlEffect::AutonomousStarted;
         }
         if (kind.changes_conversation()
-            && (metadata.host_action || matches!(metadata.scope,
-                EventScope::SessionCurrent | EventScope::OperationCurrent)))
-            || (metadata.host_action
-                && matches!(kind, ControlKind::Stopped("orphaned_at_restart")))
+            && (metadata.host_action
+                || matches!(
+                    metadata.scope,
+                    EventScope::SessionCurrent | EventScope::OperationCurrent
+                )))
+            || (metadata.host_action && matches!(kind, ControlKind::Stopped("orphaned_at_restart")))
         {
             if let Some(autonomous) = self.autonomous.as_mut() {
                 autonomous.active = false;

@@ -1338,8 +1338,11 @@ export function applyEvent(state: AcpState, frame: AcpFrame): AcpState {
   if (!acknowledgesOwnPrompt && !callbackResolution) next.interactionError = state.interactionError;
   // Live input or a fenced pending constructor heals old lifecycle chrome only.
   // Neither the comparison revision nor governed wake is Native input authority.
-  if (nativeInputAvailable(state) || state.connectionUnavailable ||
-    (state.promptWakeEligible && state.establishmentRevision !== null)) {
+  if (
+    nativeInputAvailable(state) ||
+    state.connectionUnavailable ||
+    (state.promptWakeEligible && state.establishmentRevision !== null)
+  ) {
     next.workerStopped = state.workerStopped;
     next.workerRestarting = state.workerRestarting;
     next.workerIdleStopped = state.workerIdleStopped;

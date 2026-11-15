@@ -348,7 +348,8 @@ mod tests {
                 use crate::acp::state::Event;
                 use std::time::Duration;
 
-                let mut managed = support::managed_control_session(scope, "queued-stop", "claude", None).await;
+                let mut managed =
+                    support::managed_control_session(scope, "queued-stop", "claude", None).await;
                 let not_a_repo = scope.tempdir();
                 let id = managed.id().to_owned();
                 let state = Arc::clone(&managed.state);
@@ -357,14 +358,22 @@ mod tests {
                     state.acp_event_store.has_in_flight_turn(&id).unwrap(),
                     crate::acp::event_store::ControlKnowledge::Known(true)
                 );
-                let admission = state.acp_event_store.replay_from(&id, 0).unwrap()
+                let admission = state
+                    .acp_event_store
+                    .replay_from(&id, 0)
+                    .unwrap()
                     .into_iter()
                     .rev()
-                    .find(|frame| matches!(frame.event.as_ref(), Event::ThinkingStarted)
-                        && frame.metadata.operation.is_some())
+                    .find(|frame| {
+                        matches!(frame.event.as_ref(), Event::ThinkingStarted)
+                            && frame.metadata.operation.is_some()
+                    })
                     .expect("the actual Native request has a durable admission");
                 let correlation = admission.metadata.operation.unwrap().correlation;
-                let origin = admission.metadata.native_origin.expect("actual Native source");
+                let origin = admission
+                    .metadata
+                    .native_origin
+                    .expect("actual Native source");
                 let (entered, ready) = tokio::sync::oneshot::channel();
                 let (release, wait) = std::sync::mpsc::sync_channel(1);
                 state.acp_supervisor.test_run_on_writer(move || {
@@ -372,14 +381,21 @@ mod tests {
                     wait.recv_timeout(Duration::from_secs(5)).unwrap();
                 });
                 ready.await.unwrap();
-                let submitted = state.acp_supervisor.test_observe_stopped_submission(
-                    &id, correlation, origin,
-                );
-                managed.native.send(serde_json::json!({
-                    "jsonrpc": "2.0", "id": request["id"],
-                    "result": { "stopReason": "end_turn" }
-                })).await;
-                tokio::time::timeout(Duration::from_secs(5), submitted).await.unwrap().unwrap();
+                let submitted =
+                    state
+                        .acp_supervisor
+                        .test_observe_stopped_submission(&id, correlation, origin);
+                managed
+                    .native
+                    .send(serde_json::json!({
+                        "jsonrpc": "2.0", "id": request["id"],
+                        "result": { "stopReason": "end_turn" }
+                    }))
+                    .await;
+                tokio::time::timeout(Duration::from_secs(5), submitted)
+                    .await
+                    .unwrap()
+                    .unwrap();
                 let flushes = state.acp_supervisor.test_flushes();
                 let attach = tokio::spawn({
                     let state = Arc::clone(&state);
@@ -424,7 +440,8 @@ mod tests {
                 );
                 managed.client.shutdown().await.unwrap();
             })
-        }).await;
+        })
+        .await;
     }
 
     /// #4116: an archive committed while the restarted worker's `before_session` hook runs

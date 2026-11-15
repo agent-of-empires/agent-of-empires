@@ -135,7 +135,9 @@ impl AcpBroadcastFrame {
             availability_denial: self.availability_denial,
             host_action: self.host_action,
             native_autonomous: self.native_autonomous.clone(),
-            reported_session_id: self.native_autonomous.as_ref()
+            reported_session_id: self
+                .native_autonomous
+                .as_ref()
                 .map(|autonomous| autonomous.identity.root_session_id.clone()),
             ..EventMetadata::history()
         }

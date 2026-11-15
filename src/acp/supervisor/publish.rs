@@ -108,14 +108,17 @@ impl<S: BroadcastSink> Supervisor<S> {
                     drop(lifecycle);
                     drop(workers);
                     let persisted = match epoch {
-                        Some(epoch) => sink.publish_replay_from_worker(
-                            &session_id,
-                            seq,
-                            &data,
-                            epoch,
-                            Some(subject),
-                            None,
-                        ).1,
+                        Some(epoch) => {
+                            sink.publish_replay_from_worker(
+                                &session_id,
+                                seq,
+                                &data,
+                                epoch,
+                                Some(subject),
+                                None,
+                            )
+                            .1
+                        }
                         None => sink.publish_persisted(&session_id, seq, &data),
                     };
                     Some(persisted)
@@ -162,11 +165,15 @@ impl<S: BroadcastSink> Supervisor<S> {
                     let Some(handle) = workers.get(&session_id) else {
                         return Some(Err(super::SupervisorError::Superseded(session_id.clone())));
                     };
-                    let Some(client) = original.upgrade().filter(|client| Arc::ptr_eq(client, &handle.client)) else {
+                    let Some(client) = original
+                        .upgrade()
+                        .filter(|client| Arc::ptr_eq(client, &handle.client))
+                    else {
                         return Some(Err(super::SupervisorError::Superseded(session_id.clone())));
                     };
                     let lifecycle = super::lock_recover(&lifecycle);
-                    if lifecycle.phase(&session_id) != crate::acp::runner_lifecycle::WorkerPhase::Running
+                    if lifecycle.phase(&session_id)
+                        != crate::acp::runner_lifecycle::WorkerPhase::Running
                         || lifecycle.current_lease(&session_id).as_ref() != Some(&handle.lease)
                         || handle.lease.epoch() != epoch
                         || handle.lease.cancellation().is_cancelled()
@@ -182,7 +189,10 @@ impl<S: BroadcastSink> Supervisor<S> {
                             && row.archived_at.is_none()
                             && row.trashed_at.is_none()
                             && row.terminal_handoff.is_none()
-                            && scope.choice.as_ref().is_some_and(|choice| choice.matches(row))
+                            && scope
+                                .choice
+                                .as_ref()
+                                .is_some_and(|choice| choice.matches(row))
                     }) {
                         Ok(Some(guard)) => guard,
                         Ok(None) => {
@@ -194,7 +204,9 @@ impl<S: BroadcastSink> Supervisor<S> {
                     if !client.take_cancelled_initial_prompt(intent, prompt_seq) {
                         return Some(Err(super::SupervisorError::Superseded(session_id.clone())));
                     }
-                    let data = AcpEventData::from_host(Event::Stopped { reason: "user_stopped".into() });
+                    let data = AcpEventData::from_host(Event::Stopped {
+                        reason: "user_stopped".into(),
+                    });
                     let seq = with_publication_seq(&next_seqs, &session_id, |seq| seq);
                     drop(lifecycle);
                     drop(workers);
@@ -203,7 +215,8 @@ impl<S: BroadcastSink> Supervisor<S> {
                     } else {
                         Err(super::SupervisorError::NativeStoreUnavailable)
                     })
-                }.await;
+                }
+                .await;
                 if let Some(result) = result {
                     break result;
                 }
@@ -220,7 +233,9 @@ impl<S: BroadcastSink> Supervisor<S> {
         if let Some(publication) = self.sink.publish_from_worker(publication) {
             publication.complete().await;
         }
-        completed.await.unwrap_or(Err(super::SupervisorError::ControlStateUnavailable))
+        completed
+            .await
+            .unwrap_or(Err(super::SupervisorError::ControlStateUnavailable))
     }
 
     /// Publish `Stopped { reason }` only if `expected_seq` is still the
@@ -1028,7 +1043,9 @@ mod tests {
     impl BroadcastSink for LockProbeSink {
         fn publish(&self, session_id: &str, seq: u64, _event: &AcpEventData) {
             let counter = super::super::sequence_slot(self.seqs.get().unwrap(), session_id);
-            let Ok(current) = counter.try_lock() else { panic!("persistence must not retain sequence exclusion"); };
+            let Ok(current) = counter.try_lock() else {
+                panic!("persistence must not retain sequence exclusion");
+            };
             let allocated = current.seq == seq;
             drop(current);
             self.seen.lock().unwrap().push((seq, allocated));

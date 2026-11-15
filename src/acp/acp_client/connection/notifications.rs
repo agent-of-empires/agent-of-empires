@@ -345,9 +345,9 @@ impl Shared {
         match entry {
             PendingIngress::Autonomous { first, second } => {
                 for notification in [Some(first), second].into_iter().flatten() {
-                    let sender = self.event_tx.with_autonomous(
-                        notification.metadata, notification.constructor_scope,
-                    );
+                    let sender = self
+                        .event_tx
+                        .with_autonomous(notification.metadata, notification.constructor_scope);
                     let _ = sender.send(notification.event).await;
                 }
             }
@@ -492,12 +492,21 @@ impl Shared {
         self.ingest_notification(update, local_prompt_signals).await;
     }
 
-    async fn prepare_native_notification(&self, mut update: IngressUpdate) -> Option<IngressUpdate> {
+    async fn prepare_native_notification(
+        &self,
+        mut update: IngressUpdate,
+    ) -> Option<IngressUpdate> {
         // Child traffic is never interpreted by the root contract or ordering gate.
         update.child_route = update.child_route.take().filter(|(_, route)| {
             route.source == update.original_source
-                && route.source == update.evidence.physical_source.map(|physical| physical.witness)
-                && route.provenance.as_ref()
+                && route.source
+                    == update
+                        .evidence
+                        .physical_source
+                        .map(|physical| physical.witness)
+                && route
+                    .provenance
+                    .as_ref()
                     .is_some_and(|proof| Some(proof.origin) == update.original_source)
         });
         if let Some(route) = &update.child_route {
@@ -509,22 +518,41 @@ impl Shared {
             let sender = match update.current_scope.as_ref() {
                 Some(context) => {
                     metadata.scope = EventScope::SessionCurrent;
-                    self.event_tx.with_scoped_metadata(metadata, Some(Arc::clone(context)))
+                    self.event_tx
+                        .with_scoped_metadata(metadata, Some(Arc::clone(context)))
                 }
                 None => self.event_tx.with_metadata(metadata),
             };
             match update.notification.update {
                 SessionUpdate::SubagentUpdate(child) => {
-                    self.handle_subagent_update(&sender, route, update.notification.session_id, child).await;
+                    self.handle_subagent_update(
+                        &sender,
+                        route,
+                        update.notification.session_id,
+                        child,
+                    )
+                    .await;
                     return None;
                 }
                 SessionUpdate::SessionMessage(message) => {
-                    self.handle_session_message(&sender, route, update.notification.session_id, message).await;
+                    self.handle_session_message(
+                        &sender,
+                        route,
+                        update.notification.session_id,
+                        message,
+                    )
+                    .await;
                     return None;
                 }
                 SessionUpdate::SessionMessageChunk(_) => return None,
                 child if route.0 == update.notification.session_id => {
-                    self.handle_child_notification(&sender, route, update.notification.session_id, child).await;
+                    self.handle_child_notification(
+                        &sender,
+                        route,
+                        update.notification.session_id,
+                        child,
+                    )
+                    .await;
                     return None;
                 }
                 other => update.notification.update = other,
@@ -843,11 +871,7 @@ impl Shared {
     /// `local_prompt_signals` is false for a replayed update committed with
     /// the session: it belongs to no local prompt, so it must not reach the
     /// per-prompt watchdog.
-    async fn ingest_notification(
-        &self,
-        notification: IngressUpdate,
-        local_prompt_signals: bool,
-    ) {
+    async fn ingest_notification(&self, notification: IngressUpdate, local_prompt_signals: bool) {
         // A frame the contract consumes without delivering (a lease renewal)
         // still proves the agent is alive.
         self.last_event_at.store(now_ms(), Ordering::Relaxed);
@@ -884,7 +908,8 @@ impl Shared {
                     frame.notification.notification,
                     frame.local_prompt_signals,
                     frame.epoch,
-                ).await;
+                )
+                .await;
             }
         }
         if let Some(reason) = lost {

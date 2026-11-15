@@ -68,7 +68,9 @@ impl Drop for LocalPromptScope {
             .with_current_epoch(self.terminal_epoch, || {
                 self.shared.prompt_in_flight.store(false, Ordering::Release);
                 self.shared.local_prompt_settled.notify_waiters();
-                self.shared.connection_state.finish_initial_prompt_operation(self.correlation);
+                self.shared
+                    .connection_state
+                    .finish_initial_prompt_operation(self.correlation);
             });
     }
 }
@@ -184,18 +186,24 @@ impl Session {
         correlation: Option<NativeOperationCorrelation>,
         admitted: bool,
     ) {
-        let event = Event::Stopped { reason: "user_stopped".into() };
+        let event = Event::Stopped {
+            reason: "user_stopped".into(),
+        };
         if admitted {
             let native = self.control.is_some();
             let sender = scoped_sender(&self.shared, native, scope);
             publish_scoped(&self.shared, native, scope, &sender, event, true).await;
         } else {
-            let _ = self.shared.event_tx
+            let _ = self
+                .shared
+                .event_tx
                 .with_metadata(crate::acp::event_sender::EventMetadata::host(&event))
                 .send(event)
                 .await;
         }
-        self.shared.connection_state.finish_initial_prompt_operation(correlation);
+        self.shared
+            .connection_state
+            .finish_initial_prompt_operation(correlation);
     }
 
     async fn reject_prompt_not_issued(
@@ -231,7 +239,9 @@ impl Session {
         } = prompt;
         let shared = self.shared.clone();
         let native = self.control.is_some();
-        let cancellation = shared.connection_state.initial_prompt_cancellation(correlation);
+        let cancellation = shared
+            .connection_state
+            .initial_prompt_cancellation(correlation);
 
         if let Err(error) = require_operation(&scope, correlation, native) {
             self.reject_prompt_not_issued(error.to_string(), &scope)
@@ -351,7 +361,10 @@ impl Session {
         let (epoch, terminal_epoch) = match admission {
             Ok(Some(admitted)) => admitted,
             Ok(None) => {
-                if cancellation.as_ref().is_some_and(|cancellation| cancellation.is_cancelled()) {
+                if cancellation
+                    .as_ref()
+                    .is_some_and(|cancellation| cancellation.is_cancelled())
+                {
                     self.settle_initial_prompt(&scope, correlation, false).await;
                 }
                 return Ok(false);
@@ -423,7 +436,10 @@ impl Session {
                 return Ok(self.finish_turn(turn, prompt_started_at_ms).await);
             }
         }
-        if cancellation.as_ref().is_some_and(|cancellation| cancellation.is_cancelled()) {
+        if cancellation
+            .as_ref()
+            .is_some_and(|cancellation| cancellation.is_cancelled())
+        {
             self.settle_initial_prompt(&scope, correlation, true).await;
             return Ok(false);
         }
@@ -434,10 +450,13 @@ impl Session {
                 correlation,
             })
             .await;
-        if cancellation.as_ref().is_some_and(|cancellation| cancellation.is_cancelled())
+        if cancellation
+            .as_ref()
+            .is_some_and(|cancellation| cancellation.is_cancelled())
             && !shared.connection_state.initial_prompt_issued(correlation)
         {
-            self.settle_initial_prompt(&turn.scope, correlation, true).await;
+            self.settle_initial_prompt(&turn.scope, correlation, true)
+                .await;
             return Ok(false);
         }
         let simulate_orphan = !native && simulate_orphan(&shared.session_label);
@@ -843,7 +862,9 @@ impl Session {
             command.as_ref().map(|queued| &queued.command),
             Some(ClientCmd::InitialPromptIntent(_))
         ) {
-            command = self.resolve_initial_command(command.take().expect("initial host intent")).await;
+            command = self
+                .resolve_initial_command(command.take().expect("initial host intent"))
+                .await;
             if command.is_none() {
                 return Ok(Flow::Continue);
             }
@@ -864,7 +885,10 @@ impl Session {
 
         if let ClientCmd::CancelInitialPrompt { id, expected } = &command {
             if turn.correlation != Some(*expected)
-                || !self.shared.connection_state.initial_prompt_matches(*id, *expected)
+                || !self
+                    .shared
+                    .connection_state
+                    .initial_prompt_matches(*id, *expected)
                 || current_effect(&turn.scope, native, || ()).is_err()
             {
                 return Ok(Flow::Continue);
@@ -918,11 +942,21 @@ impl Session {
             ClientCmd::ForceStop => {
                 if require_operation(&scope, correlation, native).is_err()
                     || current_effect_wait(
-                        scope.as_ref(), native, &self.shared.connection_state, || (),
-                    ).await.is_err()
+                        scope.as_ref(),
+                        native,
+                        &self.shared.connection_state,
+                        || (),
+                    )
+                    .await
+                    .is_err()
                     || current_effect_wait(
-                        turn.scope.as_ref(), native, &self.shared.connection_state, || (),
-                    ).await.is_err()
+                        turn.scope.as_ref(),
+                        native,
+                        &self.shared.connection_state,
+                        || (),
+                    )
+                    .await
+                    .is_err()
                 {
                     return Ok(Flow::Continue);
                 }

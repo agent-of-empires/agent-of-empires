@@ -660,7 +660,11 @@ pub async fn acp_cancel(
              progress for that long"
         );
     }
-    match state.acp_supervisor.cancel_prompt(&id, request.host_prompt_intent).await {
+    match state
+        .acp_supervisor
+        .cancel_prompt(&id, request.host_prompt_intent)
+        .await
+    {
         Ok(()) => {
             tracing::info!(
                 target: "acp.supervisor",

@@ -165,9 +165,12 @@ export function AcpRuntime({
     acp.cancelPrompt,
     acp.forceEndTurn,
   );
-  const hostOnly = acp.state.hostPromptIntent != null &&
-    !(acp.state.turnActive && nativeInputAvailable(acp.state));
-  const onCancel = hostOnly ? async () => { await acp.cancelPrompt(); } : cancelNativeTurn;
+  const hostOnly = acp.state.hostPromptIntent != null && !(acp.state.turnActive && nativeInputAvailable(acp.state));
+  const onCancel = hostOnly
+    ? async () => {
+        await acp.cancelPrompt();
+      }
+    : cancelNativeTurn;
   const canForceEndTurn = !hostOnly && canForceNativeTurn;
   // Only the recent slice renders, so a long session does not block first paint.
   const { windowedActivity, canLoadEarlier, loadEarlier } = useHistoryWindow(

@@ -93,7 +93,10 @@ pub(super) enum SessionIngressNotification {
     /// Daemon-minted barrier committing a local or adopted prompt outcome.
     PromptCompleted(PromptCompletedMarker),
     NativeLost(NativeChannelLostMarker),
-    Autonomous(crate::acp::control_protocol::NativeAutonomousPhase, serde_json::Value),
+    Autonomous(
+        crate::acp::control_protocol::NativeAutonomousPhase,
+        serde_json::Value,
+    ),
     AutonomousSnapshot(serde_json::Value),
     /// Raw params retain trusted frame metadata until transport-aware decode.
     AuthStatus(serde_json::Value),
@@ -126,7 +129,9 @@ impl JsonRpcMessage for SessionIngressNotification {
             Self::NativeLost(marker) => marker.method(),
             Self::AuthStatus(_) => AUTH_STATUS_UPDATE_METHOD,
             Self::Autonomous(phase, _) => phase.method(),
-            Self::AutonomousSnapshot(_) => crate::acp::control_protocol::NATIVE_AUTONOMOUS_SNAPSHOT_METHOD,
+            Self::AutonomousSnapshot(_) => {
+                crate::acp::control_protocol::NATIVE_AUTONOMOUS_SNAPSHOT_METHOD
+            }
         }
     }
 
@@ -167,7 +172,9 @@ impl JsonRpcMessage for SessionIngressNotification {
         if method == crate::acp::control_protocol::NATIVE_AUTONOMOUS_SNAPSHOT_METHOD {
             return Ok(Self::AutonomousSnapshot(params.clone()));
         }
-        if let Some(phase) = crate::acp::control_protocol::NativeAutonomousPhase::from_method(method) {
+        if let Some(phase) =
+            crate::acp::control_protocol::NativeAutonomousPhase::from_method(method)
+        {
             return Ok(Self::Autonomous(phase, params.clone()));
         }
         if !SessionNotification::matches_method(method) {
@@ -191,10 +198,19 @@ impl SessionIngressNotification {
     )> {
         let metadata = take_control_metadata(&mut params, control_transport)?;
         let notification: crate::acp::control_protocol::NativeAutonomousNotification =
-            serde_json::from_value(params).map_err(|_| agent_client_protocol::Error::invalid_params())?;
-        notification.validate(phase).map_err(|_| agent_client_protocol::Error::invalid_params())?;
-        Ok((notification, metadata.as_ref().map(|value| value.evidence).unwrap_or_default(),
-            metadata.map(|value| value.wire_bytes)))
+            serde_json::from_value(params)
+                .map_err(|_| agent_client_protocol::Error::invalid_params())?;
+        notification
+            .validate(phase)
+            .map_err(|_| agent_client_protocol::Error::invalid_params())?;
+        Ok((
+            notification,
+            metadata
+                .as_ref()
+                .map(|value| value.evidence)
+                .unwrap_or_default(),
+            metadata.map(|value| value.wire_bytes),
+        ))
     }
 
     /// Decode a `session/update` payload, splitting off the daemon reader's
@@ -567,7 +583,10 @@ pub(super) struct IngressAutonomous {
 pub(super) enum PendingIngress {
     Update(Box<IngressUpdate>),
     Auth(Box<IngressAuth>),
-    Autonomous { first: Box<IngressAutonomous>, second: Option<Box<IngressAutonomous>> },
+    Autonomous {
+        first: Box<IngressAutonomous>,
+        second: Option<Box<IngressAutonomous>>,
+    },
     PromptCompleted(Box<AdoptedPromptCompletion>),
     NativeLost,
     Replayed(SessionReplayed),
@@ -606,7 +625,10 @@ enum RequestAdmission {
 
 impl SessionIngress {
     pub(super) fn set_autonomous_negotiated(&self, enabled: bool) {
-        self.state.lock().expect("ingress identity").native_autonomous = enabled;
+        self.state
+            .lock()
+            .expect("ingress identity")
+            .native_autonomous = enabled;
     }
 
     pub(super) fn capture_autonomous(
@@ -620,8 +642,11 @@ impl SessionIngress {
             EventMetadata, NativeAutonomousIdentity, NativeAutonomousMetadata,
         };
         let stamp = evidence.autonomous?;
-        if stamp.phase != phase || stamp.run_id != notification.run_id
-            || stamp.source != notification.source || stamp.ordinal == 0 {
+        if stamp.phase != phase
+            || stamp.run_id != notification.run_id
+            || stamp.source != notification.source
+            || stamp.ordinal == 0
+        {
             return None;
         }
         let physical = evidence.physical_source?;
@@ -632,49 +657,70 @@ impl SessionIngress {
             }
             let original = state.original.as_ref()?;
             if crate::acp::state::NativeEventOrigin::owned_attempt(
-                &original.attempt, Some(original.owner),
-            ) != Some(physical.witness) {
+                &original.attempt,
+                Some(original.owner),
+            ) != Some(physical.witness)
+            {
                 return None;
             }
             let observed = evidence.session_stamp.or_else(|| {
                 let pending = evidence.original_request_stamp?;
                 (pending.attempt_id == original.attempt.id).then_some(
                     crate::acp::establishment::NativeSessionStamp {
-                        context: pending.context, generation: pending.generation,
+                        context: pending.context,
+                        generation: pending.generation,
                         profile_identity: pending.profile_identity,
                     },
                 )
             })?;
             let root = SessionId::from(notification.session_id.clone());
-            (state.history.as_ref()?.constructor.get()?.clone(), observed, root)
+            (
+                state.history.as_ref()?.constructor.get()?.clone(),
+                observed,
+                root,
+            )
         };
         let (constructor, observed, root) = constructor;
         let projection = self.projection.lock().expect("ingress projection").clone();
-        let constructor = constructor.for_autonomous(observed, root.clone(), projection).ok()?;
+        let constructor = constructor
+            .for_autonomous(observed, root.clone(), projection)
+            .ok()?;
         let mut metadata = EventMetadata::history();
         metadata.native_origin = Some(physical.witness);
         metadata.reported_session_id = Some(root.clone());
         metadata.prompt_observation = evidence.prompt_observation;
         metadata.native_autonomous = Some(Arc::new(NativeAutonomousMetadata {
             identity: Arc::new(NativeAutonomousIdentity {
-                origin: physical.witness, root_session_id: root,
-                run_id: stamp.run_id, ordinal: stamp.ordinal, source: stamp.source,
+                origin: physical.witness,
+                root_session_id: root,
+                run_id: stamp.run_id,
+                ordinal: stamp.ordinal,
+                source: stamp.source,
             }),
-            phase, stop_reason: notification.stop_reason.clone(), qualified: true,
+            phase,
+            stop_reason: notification.stop_reason.clone(),
+            qualified: true,
         }));
         let event = match phase {
-            crate::acp::control_protocol::NativeAutonomousPhase::Started =>
-                crate::acp::state::Event::ThinkingStarted,
-            crate::acp::control_protocol::NativeAutonomousPhase::Ended =>
+            crate::acp::control_protocol::NativeAutonomousPhase::Started => {
+                crate::acp::state::Event::ThinkingStarted
+            }
+            crate::acp::control_protocol::NativeAutonomousPhase::Ended => {
                 crate::acp::state::Event::Stopped {
                     reason: match notification.stop_reason.as_deref() {
                         Some("end_turn") => "agent_idle".into(),
                         Some(reason) => reason.into(),
                         None => "native_autonomous_ended".into(),
                     },
-                },
+                }
+            }
         };
-        Some(IngressAutonomous { event, metadata, constructor_scope: Some(constructor), wire_bytes })
+        Some(IngressAutonomous {
+            event,
+            metadata,
+            constructor_scope: Some(constructor),
+            wire_bytes,
+        })
     }
 
     pub(super) fn observed_native_origin(&self) -> Option<crate::acp::state::NativeEventOrigin> {
@@ -1121,9 +1167,12 @@ impl SessionIngress {
             limit: marker_limit.min(MAX_PENDING_BYTES - pending.encoded_bytes),
         };
         let encoded = match &marker {
-            PendingIngress::Autonomous { first, .. } if first.wire_bytes.is_some() =>
-                first.wire_bytes.filter(|bytes| *bytes <= count.limit),
-            _ => serde_json::to_writer(&mut count, &marker).ok().map(|()| count.written),
+            PendingIngress::Autonomous { first, .. } if first.wire_bytes.is_some() => {
+                first.wire_bytes.filter(|bytes| *bytes <= count.limit)
+            }
+            _ => serde_json::to_writer(&mut count, &marker)
+                .ok()
+                .map(|()| count.written),
         };
         if pending.updates.len() >= MAX_PENDING_UPDATES || encoded.is_none() {
             pending.updates.clear();

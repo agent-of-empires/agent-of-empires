@@ -286,11 +286,8 @@ done
                             .is_none());
                         (captured, release)
                     });
-                    let before_compaction = scope
-                        .state
-                        .acp_event_store
-                            .highest_seq(&client.id)
-                        .unwrap();
+                    let before_compaction =
+                        scope.state.acp_event_store.highest_seq(&client.id).unwrap();
                     client
                         .send_prompt("/compact", &[])
                         .await

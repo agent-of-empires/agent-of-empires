@@ -313,8 +313,9 @@ pub fn current_schema_version() -> u32 {
 /// Check whether there are any pending migrations to run.
 pub fn has_pending_migrations() -> bool {
     let current = get_current_version();
-    current < CURRENT_VERSION || (current == CURRENT_VERSION
-        && v059_reconcile_acp_lineages::autonomous_pending().unwrap_or(true))
+    current < CURRENT_VERSION
+        || (current == CURRENT_VERSION
+            && v059_reconcile_acp_lineages::autonomous_pending().unwrap_or(true))
 }
 
 /// Check compatibility before changing or stopping a managed daemon.
@@ -430,7 +431,8 @@ fn run_migrations_inner(
     let _installed = progress::install(reporter);
     let _announced = progress::install_announced(announce);
     let current = ensure_schema_supported()?;
-    let requires_exclusion = current < CURRENT_VERSION || announce
+    let requires_exclusion = current < CURRENT_VERSION
+        || announce
         || (current == CURRENT_VERSION && v059_reconcile_acp_lineages::autonomous_pending()?);
     // Older daemons know serve.lock but not the lifecycle transaction. Hold
     // both before the first schema write; standalone callers include the TUI.

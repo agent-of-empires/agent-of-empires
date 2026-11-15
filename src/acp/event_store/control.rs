@@ -594,11 +594,14 @@ impl ControlCursor {
             effects: OperationEffects::default(),
             empty_without_budget: highest.is_none() && durable.is_none(),
         };
-        let (retained_frontier, autonomous) = super::EventStore::retained_publication_state(conn, session_id)?;
+        let (retained_frontier, autonomous) =
+            super::EventStore::retained_publication_state(conn, session_id)?;
         if let Some(fact) = autonomous.as_ref().filter(|fact| fact.started < from) {
             cursor.projection.autonomous_open = fact.activity_before(from);
-            cursor.effects.restore_autonomous(&fact.identity,
-                cursor.projection.autonomous_open != Known(false));
+            cursor.effects.restore_autonomous(
+                &fact.identity,
+                cursor.projection.autonomous_open != Known(false),
+            );
         }
         let projection = &mut cursor.projection;
         scan_controls(
@@ -610,7 +613,9 @@ impl ControlCursor {
         )?;
         if let Some(fact) = autonomous {
             cursor.projection.autonomous_open = fact.activity();
-            cursor.effects.restore_autonomous(&fact.identity, fact.activity() != Known(false));
+            cursor
+                .effects
+                .restore_autonomous(&fact.identity, fact.activity() != Known(false));
             cursor.seq = cursor.seq.max(fact.frontier());
         }
         cursor.seq = cursor.seq.max(retained_frontier);

@@ -1790,7 +1790,8 @@ mod tests {
         use crate::server::test_support::managed_control_session;
         with_managed(|scope| {
             Box::pin(async move {
-                let mut live = managed_control_session(scope, "plugin-message", "claude", None).await;
+                let mut live =
+                    managed_control_session(scope, "plugin-message", "claude", None).await;
                 let id = live.id().to_owned();
                 let dir = scope.tempdir();
                 let deps = Arc::new(SessionRpcDeps {
@@ -2175,9 +2176,13 @@ mod tests {
         use crate::acp::supervisor::test_support::managed::with_managed;
         with_managed(|scope| {
             Box::pin(async move {
-                let mut live =
-                    crate::server::test_support::managed_control_session(scope, "plugin-turn-race", "claude", None)
-                        .await;
+                let mut live = crate::server::test_support::managed_control_session(
+                    scope,
+                    "plugin-turn-race",
+                    "claude",
+                    None,
+                )
+                .await;
                 let id = live.id().to_owned();
                 let state = live.state.clone();
                 state

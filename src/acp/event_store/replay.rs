@@ -127,7 +127,8 @@ impl EventStore {
                 )?;
                 found.collect::<rusqlite::Result<Vec<_>>>()?
             };
-            let (retained_frontier, autonomous) = Self::retained_publication_state(&tx, session_id)?;
+            let (retained_frontier, autonomous) =
+                Self::retained_publication_state(&tx, session_id)?;
             let highest_seq = highest_seq.max(retained_frontier);
             tx.commit()?;
             (rows, highest_seq, lowest_seq, identity, autonomous)
@@ -696,7 +697,11 @@ mod tests {
             (vec![1, 2, 3], 3),
             "a row committed after the bounds must stay out of this page"
         );
-        assert_eq!(store.highest_seq("s-1").unwrap(), 4, "the concurrent commit landed");
+        assert_eq!(
+            store.highest_seq("s-1").unwrap(),
+            4,
+            "the concurrent commit landed"
+        );
     }
 
     #[test]

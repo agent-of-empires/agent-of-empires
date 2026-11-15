@@ -1361,11 +1361,18 @@ impl AcpClient {
         self.ensure_available()?;
         if !(self.initial_prompt_intent_available() || self.connection_ready())
             || expected.session_id != self.session_id.0
-            || !matches!(expected.origin, EstablishmentOrigin::Creation { stage: CreationStage::Admitted })
+            || !matches!(
+                expected.origin,
+                EstablishmentOrigin::Creation {
+                    stage: CreationStage::Admitted
+                }
+            )
         {
             return Err(EstablishmentRefusal::Unresolved.into());
         }
-        let owner = self.connected_runner.ok_or(EstablishmentRefusal::Unconfirmed)?;
+        let owner = self
+            .connected_runner
+            .ok_or(EstablishmentRefusal::Unconfirmed)?;
         let sender = self.cmd_tx.as_ref().ok_or(AcpError::NotRunning)?.clone();
         let permit = tokio::select! {
             biased;
@@ -1445,7 +1452,13 @@ impl AcpClient {
     }
 
     fn cancel_pending_initial_prompt(&self) {
-        if let Some(pending) = self.connection_state.initial_prompt.lock().unwrap().as_ref() {
+        if let Some(pending) = self
+            .connection_state
+            .initial_prompt
+            .lock()
+            .unwrap()
+            .as_ref()
+        {
             pending.cancellation.cancel();
         }
     }
@@ -1474,9 +1487,12 @@ impl AcpClient {
                     None => InitialPromptCancellation::BeforePublication,
                 });
             }
-            pending.correlation.ok_or(crate::acp::establishment::EstablishmentRefusal::Unconfirmed)?
+            pending
+                .correlation
+                .ok_or(crate::acp::establishment::EstablishmentRefusal::Unconfirmed)?
         };
-        self.send_cmd(ClientCmd::CancelInitialPrompt { id, expected }, None).await?;
+        self.send_cmd(ClientCmd::CancelInitialPrompt { id, expected }, None)
+            .await?;
         Ok(InitialPromptCancellation::Issued)
     }
 

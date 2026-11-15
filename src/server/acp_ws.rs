@@ -389,8 +389,8 @@ async fn drain_replay_into_socket(
     let store = Arc::clone(&state.acp_event_store);
     let session_id_owned = session_id.to_string();
     // Read from seq 0, not from `since`.
-    let page =
-        tokio::task::spawn_blocking(move || store.replay_page(&session_id_owned, 0, None)).await??;
+    let page = tokio::task::spawn_blocking(move || store.replay_page(&session_id_owned, 0, None))
+        .await??;
     let mut sent = 0usize;
     let to_forward = fold_connect_history(page.events, since, folds, forward_frames)?;
     if let Some(fact) = page.autonomous {
@@ -1095,56 +1095,110 @@ mod tests {
         let storage = crate::session::Storage::open_reference("default").unwrap();
         let expected = EstablishmentExpected::capture(&row, &storage).unwrap();
         let revision = expected.revision().unwrap();
-        let recovery = EstablishmentRecoveryRequest { revision, action: EstablishmentRecoveryAction::Fresh };
-        assert!(recovery.resolve(&row, &storage).unwrap().expected.matches(&row, &storage).unwrap());
+        let recovery = EstablishmentRecoveryRequest {
+            revision,
+            action: EstablishmentRecoveryAction::Fresh,
+        };
+        assert!(recovery
+            .resolve(&row, &storage)
+            .unwrap()
+            .expected
+            .matches(&row, &storage)
+            .unwrap());
         let wire = serde_json::to_value(recovery).unwrap();
         assert!(!wire.to_string().contains("SENSITIVE_REVISION_"));
         assert!(wire.get("expected").is_none());
         assert!(serde_json::from_value::<EstablishmentRecoveryRequest>(
-            serde_json::json!({"expected":expected,"action":"fresh"})).is_err());
+            serde_json::json!({"expected":expected,"action":"fresh"})
+        )
+        .is_err());
         assert!(serde_json::from_value::<EstablishmentRecoveryRequest>(
-            serde_json::json!({"revision":revision,"expected":expected,"action":"fresh"})).is_err());
+            serde_json::json!({"revision":revision,"expected":expected,"action":"fresh"})
+        )
+        .is_err());
         for target in 0..3 {
             let mut changed = expected.clone();
             let execution = match target {
-                0 => changed.choice.choice.binding.as_mut().unwrap().execution.as_mut().unwrap(),
-                1 => changed.choice.choice.resume_binding.as_mut().unwrap().execution.as_mut().unwrap(),
+                0 => changed
+                    .choice
+                    .choice
+                    .binding
+                    .as_mut()
+                    .unwrap()
+                    .execution
+                    .as_mut()
+                    .unwrap(),
+                1 => changed
+                    .choice
+                    .choice
+                    .resume_binding
+                    .as_mut()
+                    .unwrap()
+                    .execution
+                    .as_mut()
+                    .unwrap(),
                 _ => &mut changed.choice.choice.active.as_mut().unwrap().binding,
             };
             execution.exported_default_store = None;
-            assert_ne!(changed.revision().unwrap(), revision, "checkpoint namespace marker {target}");
+            assert_ne!(
+                changed.revision().unwrap(),
+                revision,
+                "checkpoint namespace marker {target}"
+            );
             let stale = EstablishmentRecoveryRequest {
-                revision: changed.revision().unwrap(), action: EstablishmentRecoveryAction::Fresh,
+                revision: changed.revision().unwrap(),
+                action: EstablishmentRecoveryAction::Fresh,
             };
             assert!(stale.resolve(&row, &storage).is_err());
         }
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
-        let router = axum::Router::new().route("/", axum::routing::get(
-            move |ws: WebSocketUpgrade| async move {
+        let router = axum::Router::new().route(
+            "/",
+            axum::routing::get(move |ws: WebSocketUpgrade| async move {
                 ws.on_upgrade(move |mut socket| async move {
                     let mut cold = ColdFieldCache {
-                        projection: SnapshotProjection::Web, ..Default::default()
+                        projection: SnapshotProjection::Web,
+                        ..Default::default()
                     };
                     let original = crate::acp::control_cache::OriginalDecisions::default();
                     let reduced = AcpState::new(
-                        AcpSessionId("recovery-privacy".into()), AgentName("claude".into()), None);
-                    assert!(send_projected_reduced_state(
-                        &mut socket, "recovery-privacy", 0, &reduced, &mut cold,
-                        LiveControlProjection {
-                            native: Default::default(), establishment_revision: Some(revision),
-                            rate_limit_park: None, original: &original,
-                        },
-                    ).await);
+                        AcpSessionId("recovery-privacy".into()),
+                        AgentName("claude".into()),
+                        None,
+                    );
+                    assert!(
+                        send_projected_reduced_state(
+                            &mut socket,
+                            "recovery-privacy",
+                            0,
+                            &reduced,
+                            &mut cold,
+                            LiveControlProjection {
+                                native: Default::default(),
+                                establishment_revision: Some(revision),
+                                rate_limit_park: None,
+                                original: &original,
+                            },
+                        )
+                        .await
+                    );
                 })
-            },
-        ));
-        let server = tokio::spawn(async move { axum::serve(listener, router).await.unwrap(); });
-        let (mut socket, _) = tokio_tungstenite::connect_async(format!("ws://{addr}/")).await.unwrap();
+            }),
+        );
+        let server = tokio::spawn(async move {
+            axum::serve(listener, router).await.unwrap();
+        });
+        let (mut socket, _) = tokio_tungstenite::connect_async(format!("ws://{addr}/"))
+            .await
+            .unwrap();
         let public = receive_kind(&mut socket, "reduced_state").await;
         drop(socket);
         server.abort();
-        assert_eq!(public["state"]["establishment_revision"], serde_json::json!(revision));
+        assert_eq!(
+            public["state"]["establishment_revision"],
+            serde_json::json!(revision)
+        );
         assert!(public["state"].get("establishment_expected").is_none());
         assert!(!public.to_string().contains("SENSITIVE_REVISION_"));
         assert_eq!(public["state"]["connection_ready"], false);
@@ -2011,7 +2065,12 @@ mod tests {
         ] {
             with_managed(|managed| {
                 Box::pin(async move {
-                    let live = crate::server::test_support::managed_control_session(managed, "contended-ws", "claude", None)
+                    let live = crate::server::test_support::managed_control_session(
+                        managed,
+                        "contended-ws",
+                        "claude",
+                        None,
+                    )
                     .await;
                     let state = live.state.clone();
                     let id = live.id().to_owned();
@@ -2346,9 +2405,13 @@ mod tests {
         use crate::process::worker_registry;
         with_managed(|managed| {
             Box::pin(async move {
-                let mut live =
-                    crate::server::test_support::managed_control_session(managed, "physical-ws", "claude", None)
-                        .await;
+                let mut live = crate::server::test_support::managed_control_session(
+                    managed,
+                    "physical-ws",
+                    "claude",
+                    None,
+                )
+                .await;
                 let state = live.state.clone();
                 let id = live.id().to_owned();
                 crate::session::set_unread_enabled(true);
@@ -2500,8 +2563,10 @@ mod tests {
         use crate::acp::supervisor::test_support::managed::with_managed;
         with_managed(|scope| {
             Box::pin(async move {
-                let mut live =
-                    crate::server::test_support::managed_control_session(scope, "ws-loss", "claude", None).await;
+                let mut live = crate::server::test_support::managed_control_session(
+                    scope, "ws-loss", "claude", None,
+                )
+                .await;
                 let state = live.state.clone();
                 let id = live.id().to_owned();
                 let request = live.start_prompt("original").await;
@@ -2575,11 +2640,16 @@ mod tests {
         with_managed(|managed| {
             Box::pin(async move {
                 for uncertain_selection in [false, true] {
-                    let live = crate::server::test_support::managed_control_session(managed, if uncertain_selection {
-                        "websocket-uncertain-selection"
-                    } else {
-                        "websocket-final-ready"
-                    }, "claude", None)
+                    let live = crate::server::test_support::managed_control_session(
+                        managed,
+                        if uncertain_selection {
+                            "websocket-uncertain-selection"
+                        } else {
+                            "websocket-final-ready"
+                        },
+                        "claude",
+                        None,
+                    )
                     .await;
                     let id = live.id().to_owned();
                     let state = live.state.clone();
@@ -2756,7 +2826,12 @@ mod tests {
         use crate::acp::supervisor::test_support::managed::with_managed;
         with_managed(|scope| {
             Box::pin(async move {
-                let mut live = crate::server::test_support::managed_control_session(scope, "websocket-native-loss", "claude", None)
+                let mut live = crate::server::test_support::managed_control_session(
+                    scope,
+                    "websocket-native-loss",
+                    "claude",
+                    None,
+                )
                 .await;
                 let id = live.id().to_owned();
                 let _request = live.start_prompt("original retained work").await;
@@ -2820,8 +2895,13 @@ mod tests {
         use crate::acp::supervisor::test_support::managed::with_managed;
         with_managed(|scope| {
             Box::pin(async move {
-                let mut live =
-                    crate::server::test_support::managed_control_session(scope, "ws-overlap", "claude", None).await;
+                let mut live = crate::server::test_support::managed_control_session(
+                    scope,
+                    "ws-overlap",
+                    "claude",
+                    None,
+                )
+                .await;
                 let state = live.state.clone();
                 let id = live.id().to_owned();
                 let mut publications = live.client.subscribe_publications();

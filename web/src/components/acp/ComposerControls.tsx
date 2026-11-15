@@ -403,7 +403,11 @@ export function SendButton({
   );
 }
 
-export function StopButton({ disabled, onCancel, title = "Stop the agent" }: {
+export function StopButton({
+  disabled,
+  onCancel,
+  title = "Stop the agent",
+}: {
   disabled: boolean;
   onCancel: () => void;
   title?: string;

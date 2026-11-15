@@ -107,7 +107,6 @@ pub(crate) struct NativeAutonomousMetadata {
     pub(crate) qualified: bool,
 }
 
-
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct EventMetadata {
@@ -294,10 +293,14 @@ impl EventMetadata {
             anyhow::ensure!(
                 self.scope == EventScope::HistoryOnly
                     && self.native_origin == Some(autonomous.identity.origin)
-                    && self.reported_session_id.as_ref() == Some(&autonomous.identity.root_session_id)
+                    && self.reported_session_id.as_ref()
+                        == Some(&autonomous.identity.root_session_id)
                     && autonomous.identity.ordinal > 0
                     && !autonomous.identity.run_id.is_nil()
-                    && autonomous.identity.origin.owner
+                    && autonomous
+                        .identity
+                        .origin
+                        .owner
                         .is_some_and(|owner| owner.birth_fingerprint.is_some())
                     && self.operation.is_none()
                     && self.native_prompt_id.is_none()
@@ -310,13 +313,14 @@ impl EventMetadata {
                     && !self.availability_denial
                     && match autonomous.phase {
                         NativeAutonomousPhase::Started =>
-                            matches!(kind, ControlKind::Admission) && autonomous.stop_reason.is_none(),
+                            matches!(kind, ControlKind::Admission)
+                                && autonomous.stop_reason.is_none(),
                         NativeAutonomousPhase::Ended => matches!(kind, ControlKind::Stopped(reason)
-                            if reason == match autonomous.stop_reason.as_deref() {
-                                Some("end_turn") => "agent_idle",
-                                Some(reason) => reason,
-                                None => "native_autonomous_ended",
-                            }),
+                        if reason == match autonomous.stop_reason.as_deref() {
+                            Some("end_turn") => "agent_idle",
+                            Some(reason) => reason,
+                            None => "native_autonomous_ended",
+                        }),
                     },
                 "Native autonomous lifecycle has conflicting or incomplete private provenance"
             );
@@ -861,8 +865,9 @@ impl ProjectionState {
             && receipt.replay.closed
             && !receipt.replay.lost
             && receipt.session_id() == Some(root_session_id)
-            && NativeEventOrigin::owned_attempt(&receipt.attempt, Some(receipt.owner)) == Some(origin))
-            .then(|| Arc::clone(receipt))
+            && NativeEventOrigin::owned_attempt(&receipt.attempt, Some(receipt.owner))
+                == Some(origin))
+        .then(|| Arc::clone(receipt))
     }
 
     pub(crate) fn applied_clear_after_seq(

@@ -994,9 +994,10 @@ impl SessionService {
                 if needs_resume {
                     return PromptTouch::Establishment(refusal);
                 }
-                match current_native.as_mut().map(|current| {
-                    current.initial_prompt_attempt(&expected, native.storage())
-                }) {
+                match current_native
+                    .as_mut()
+                    .map(|current| current.initial_prompt_attempt(&expected, native.storage()))
+                {
                     Some(Ok(Some(attempt))) => Some(attempt),
                     Some(Err(refusal)) => return PromptTouch::Establishment(refusal),
                     _ => return PromptTouch::Establishment(refusal),
@@ -1175,27 +1176,32 @@ impl SessionService {
                 let original = resume_reservation
                     .as_ref()
                     .and_then(|reservation| reservation.establishment.as_ref());
-                initial_candidate = resume_reservation.is_none() && matches!(
-                    &inst.acp_establishment,
-                    Some(crate::acp::establishment::AcpEstablishment::Pending { attempt })
-                        if matches!(attempt.origin,
-                            crate::acp::establishment::EstablishmentOrigin::Creation {
-                                stage: crate::acp::establishment::CreationStage::Admitted
-                            })
-                );
-                if !initial_candidate && !original.is_some_and(|original| {
-                    matches!(&inst.acp_establishment,
+                initial_candidate = resume_reservation.is_none()
+                    && matches!(
+                        &inst.acp_establishment,
+                        Some(crate::acp::establishment::AcpEstablishment::Pending { attempt })
+                            if matches!(attempt.origin,
+                                crate::acp::establishment::EstablishmentOrigin::Creation {
+                                    stage: crate::acp::establishment::CreationStage::Admitted
+                                })
+                    );
+                if !initial_candidate
+                    && !original.is_some_and(|original| {
+                        matches!(&inst.acp_establishment,
                         Some(crate::acp::establishment::AcpEstablishment::Pending { attempt })
                             if attempt.same_source(original))
-                }) {
+                    })
+                {
                     return Err(SendTurnError::ResumeFailed(refusal.into()));
                 }
             }
             (inst.acp_mode_id.clone(), inst.yolo_mode, initial_candidate)
         };
         let initial = if initial_candidate {
-            self.acp_supervisor.prepare_initial_prompt(id, text, attachments)
-                .await.map_err(SendTurnError::ResumeFailed)?
+            self.acp_supervisor
+                .prepare_initial_prompt(id, text, attachments)
+                .await
+                .map_err(SendTurnError::ResumeFailed)?
         } else {
             None
         };
@@ -1237,30 +1243,32 @@ impl SessionService {
         }
         // Gate the publish below on the worker actually being there.
         if initial.is_none() {
-        if let Err(e) = self.acp_supervisor.wait_until_ready(id).await {
-            if let Some(unavailable) = self
-                .prompt_native_unavailability(id)
-                .await
-                .map_err(|_| SendTurnError::ControlStateUnavailable)?
-            {
-                return Err(SendTurnError::Unavailable(unavailable));
-            }
-            return match e {
-                crate::acp::supervisor::SupervisorError::UnknownSession(_) => {
-                    Err(SendTurnError::WorkerNotReady)
+            if let Err(e) = self.acp_supervisor.wait_until_ready(id).await {
+                if let Some(unavailable) = self
+                    .prompt_native_unavailability(id)
+                    .await
+                    .map_err(|_| SendTurnError::ControlStateUnavailable)?
+                {
+                    return Err(SendTurnError::Unavailable(unavailable));
                 }
-                crate::acp::supervisor::SupervisorError::Acp(
-                    crate::acp::acp_client::AcpError::ConnectionUnavailable(unavailable),
-                ) => Err(SendTurnError::Unavailable(unavailable)),
-                other => Err(SendTurnError::ResumeFailed(other)),
-            };
-        }
+                return match e {
+                    crate::acp::supervisor::SupervisorError::UnknownSession(_) => {
+                        Err(SendTurnError::WorkerNotReady)
+                    }
+                    crate::acp::supervisor::SupervisorError::Acp(
+                        crate::acp::acp_client::AcpError::ConnectionUnavailable(unavailable),
+                    ) => Err(SendTurnError::Unavailable(unavailable)),
+                    other => Err(SendTurnError::ResumeFailed(other)),
+                };
+            }
         }
         // A plugin-delivered turn must run under the session's persisted explicit mode.
-        if initial.is_none() && matches!(
-            caller,
-            SessionCaller::Plugin { .. } | SessionCaller::PluginMessage { .. }
-        ) {
+        if initial.is_none()
+            && matches!(
+                caller,
+                SessionCaller::Plugin { .. } | SessionCaller::PluginMessage { .. }
+            )
+        {
             if let Some(mode_id) = &acp_mode_id {
                 if let Err(e) = self.acp_supervisor.set_mode(id, mode_id, None).await {
                     return Err(match e {
@@ -1317,7 +1325,9 @@ impl SessionService {
         }
         if let Some(initial) = initial {
             let seq = published.seq.ok_or(SendTurnError::WorkerLostAfterPublish)?;
-            initial.commit(seq).map_err(|error| SendTurnError::Send(error.into()))?;
+            initial
+                .commit(seq)
+                .map_err(|error| SendTurnError::Send(error.into()))?;
             return Ok(Some(seq));
         }
         let outcome = match published.disposition {
@@ -2247,7 +2257,8 @@ impl SessionService {
             .native_control_observation(id, historical, control_seq)
             .await;
         self.settle_native_control_observation(id, observation)
-            .await.0
+            .await
+            .0
     }
 
     pub(crate) async fn native_control_observation(
@@ -2291,7 +2302,11 @@ impl SessionService {
         let (projection, establishment_revision, wait) = match result {
             Ok(Ok((projection, expected))) => {
                 let eligible = projection.prompt_wake_eligible || prompt_wake_eligible;
-                (projection.with_prompt_wake_eligibility(eligible), expected, None)
+                (
+                    projection.with_prompt_wake_eligibility(eligible),
+                    expected,
+                    None,
+                )
             }
             Ok(Err(wait)) => (Default::default(), None, Some(wait)),
             Err(_) => (Default::default(), None, None),
@@ -2311,7 +2326,10 @@ impl SessionService {
         &self,
         id: &str,
         mut observation: NativeControlObservation,
-    ) -> (crate::acp::state::NativeAvailabilityProjection, Option<crate::acp::establishment::EstablishmentRevision>) {
+    ) -> (
+        crate::acp::state::NativeAvailabilityProjection,
+        Option<crate::acp::establishment::EstablishmentRevision>,
+    ) {
         let mut context = observation.wait.as_ref().map(|wait| wait.context);
         while let Some(wait) = observation.wait.take() {
             if !wait.settle().await {
@@ -3869,7 +3887,12 @@ mod tests {
         use crate::acp::supervisor::test_support::managed::with_managed;
         with_managed(|scope| {
             Box::pin(async move {
-                let mut live = crate::server::test_support::managed_control_session(scope, "queue-lagging-mirror", "claude", None)
+                let mut live = crate::server::test_support::managed_control_session(
+                    scope,
+                    "queue-lagging-mirror",
+                    "claude",
+                    None,
+                )
                 .await;
                 let id = live.id().to_owned();
                 let request = live.start_prompt("go").await;

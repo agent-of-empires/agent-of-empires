@@ -299,15 +299,29 @@ pub(super) async fn acp_event_listener(state: Arc<AppState>) {
         } else {
             false
         };
-        if frame.native_autonomous.as_ref().is_some_and(|autonomous| autonomous.qualified) {
+        if frame
+            .native_autonomous
+            .as_ref()
+            .is_some_and(|autonomous| autonomous.qualified)
+        {
             let projected = match frame.sidebar_status {
                 Some(projected) => Some(projected),
-                None => state.session_service.sidebar_status_at(&frame.session_id, frame.seq).await,
+                None => {
+                    state
+                        .session_service
+                        .sidebar_status_at(&frame.session_id, frame.seq)
+                        .await
+                }
             };
             if let Some(projected) = projected {
                 persist_native_runtime_observation(
-                    &state, &frame, None, Some((StatusPolicy::Background, projected)), None,
-                ).await;
+                    &state,
+                    &frame,
+                    None,
+                    Some((StatusPolicy::Background, projected)),
+                    None,
+                )
+                .await;
             }
             continue;
         }
@@ -900,12 +914,19 @@ async fn persist_native_runtime_observation(
         && status_policy(frame.event.as_ref()) == Some(StatusPolicy::Background))
     .then_some(frame.native_origin)
     .flatten();
-    let autonomous = frame.native_autonomous.as_ref().filter(|autonomous| autonomous.qualified);
+    let autonomous = frame
+        .native_autonomous
+        .as_ref()
+        .filter(|autonomous| autonomous.qualified);
     let autonomous_origin = autonomous.map(|autonomous| autonomous.identity.origin);
     let autonomous_root = autonomous.map(|autonomous| autonomous.identity.root_session_id.clone());
     let scoped_origin = resource_origin.or(autonomous_origin);
-    let Some(context) = subject.map(|subject| subject.context)
-        .or_else(|| scoped_origin.map(|origin| origin.context)) else { return; };
+    let Some(context) = subject
+        .map(|subject| subject.context)
+        .or_else(|| scoped_origin.map(|origin| origin.context))
+    else {
+        return;
+    };
     let denial = frame.availability_denial;
     let saved = tokio::task::spawn_blocking(move || -> anyhow::Result<()> {
         let storage = crate::session::Storage::open_reference(&profile)?;
@@ -927,23 +948,27 @@ async fn persist_native_runtime_observation(
         let applicable = |row: &Instance, resource_owner_guarded: bool| -> anyhow::Result<bool> {
             let identity_matches = match historical_origin {
                 Some(origin) => origin.same_physical_row(row, &storage)?,
-                None => {
-                    crate::acp::state::NativeEventContext::capture(row, &storage)?
-                        == context
-                }
+                None => crate::acp::state::NativeEventContext::capture(row, &storage)? == context,
             };
             let owner_matches = if scoped_origin.is_some() {
                 resource_owner_guarded
             } else if let Some(subject) = subject {
-                if denial { subject.unavailability_still_applies(&id) }
-                else if historical_origin.is_some() { subject.owner_not_replaced(&id) }
-                else { subject.owner_is_current(&id) }
-            } else { false };
+                if denial {
+                    subject.unavailability_still_applies(&id)
+                } else if historical_origin.is_some() {
+                    subject.owner_not_replaced(&id)
+                } else {
+                    subject.owner_is_current(&id)
+                }
+            } else {
+                false
+            };
             let attempt_matches = scoped_origin.is_none_or(|origin| {
                 origin.context == context
                     && subject.is_none_or(|subject| origin.owner == subject.owner)
-                    && autonomous_root.as_ref().is_none_or(|root|
-                        row.acp_session_id.as_deref() == Some(root.0.as_ref()))
+                    && autonomous_root
+                        .as_ref()
+                        .is_none_or(|root| row.acp_session_id.as_deref() == Some(root.0.as_ref()))
                     && row.acp_establishment
                         == Some(crate::acp::establishment::AcpEstablishment::Applied {
                             attempt_id: origin.attempt_id,
@@ -2459,12 +2484,15 @@ mod tests {
         with_managed(|scope| {
             Box::pin(async move {
                 crate::session::set_unread_enabled(true);
-                let mut missed = test_support::managed_control_session(scope, "lag-missed", "claude", None).await;
+                let mut missed =
+                    test_support::managed_control_session(scope, "lag-missed", "claude", None)
+                        .await;
                 let missed_id = missed.id().to_owned();
                 let request = missed.start_prompt("actual missed terminal").await;
                 missed.finish_prompt(&request, None).await;
                 let mut already =
-                    test_support::managed_control_session(scope, "lag-observed", "claude", None).await;
+                    test_support::managed_control_session(scope, "lag-observed", "claude", None)
+                        .await;
                 let already_id = already.id().to_owned();
                 let request = already.start_prompt("already observed terminal").await;
                 already.finish_prompt(&request, None).await;
@@ -2532,8 +2560,13 @@ mod tests {
         with_managed(|scope| {
             Box::pin(async move {
                 crate::session::set_unread_enabled(true);
-                let live =
-                    test_support::managed_control_session(scope, "ready-is-not-terminal", "claude", None).await;
+                let live = test_support::managed_control_session(
+                    scope,
+                    "ready-is-not-terminal",
+                    "claude",
+                    None,
+                )
+                .await;
                 let state = live.state.clone();
                 let id = live.id().to_owned();
                 let fold = state.session_service.fold_control_state(&id).await.unwrap();
@@ -2584,8 +2617,13 @@ mod tests {
         with_managed(|scope| {
             Box::pin(async move {
                 crate::session::set_unread_enabled(true);
-                let mut live =
-                    test_support::managed_control_session(scope, "background-only-status", "claude", None).await;
+                let mut live = test_support::managed_control_session(
+                    scope,
+                    "background-only-status",
+                    "claude",
+                    None,
+                )
+                .await;
                 let state = live.state.clone();
                 let id = live.id().to_owned();
                 let path = start_projection_resource(&mut live, false).await;
@@ -2729,17 +2767,30 @@ mod tests {
         live: &mut crate::server::test_support::ManagedControlSession,
         agent: bool,
     ) -> std::path::PathBuf {
-        let workdir = live.state.instances.read().await.iter()
-            .find(|row| row.id == live.id()).unwrap().project_path.clone();
+        let workdir = live
+            .state
+            .instances
+            .read()
+            .await
+            .iter()
+            .find(|row| row.id == live.id())
+            .unwrap()
+            .project_path
+            .clone();
         let project = if agent {
             std::path::PathBuf::from(&workdir)
         } else {
             let actual = live.client.actual();
-            let home = actual.native_store.as_ref()
+            let home = actual
+                .native_store
+                .as_ref()
                 .filter(|store| store.agent == "claude" && store.filesystem == "host")
                 .and_then(|store| store.stores.first())
                 .expect("the actual Claude Bash original declares its native store");
-            home.join("projects").join(crate::session::capture::encode_claude_project_path(&workdir))
+            home.join("projects")
+                .join(crate::session::capture::encode_claude_project_path(
+                    &workdir,
+                ))
         };
         std::fs::create_dir_all(&project).unwrap();
         let transcript = if agent {
@@ -2832,8 +2883,13 @@ mod tests {
             with_managed(|scope| {
                 Box::pin(async move {
                     crate::session::set_unread_enabled(true);
-                    let mut live =
-                        test_support::managed_control_session(scope, "lag-live-work", if background { "codex" } else { "claude" }, None).await;
+                    let mut live = test_support::managed_control_session(
+                        scope,
+                        "lag-live-work",
+                        if background { "codex" } else { "claude" },
+                        None,
+                    )
+                    .await;
                     let id = live.id().to_owned();
                     let request = live.start_prompt("go").await;
                     if background {
@@ -2878,7 +2934,12 @@ mod tests {
             Box::pin(async move {
                 let state = scope.state.clone();
                 let listener = start_managed_listener(scope, &state).await;
-                let live = crate::server::test_support::managed_control_session(scope, "listener-capability", "claude", None)
+                let live = crate::server::test_support::managed_control_session(
+                    scope,
+                    "listener-capability",
+                    "claude",
+                    None,
+                )
                 .await;
                 let id = live.id().to_owned();
                 let row = await_row(
@@ -2945,8 +3006,13 @@ mod tests {
         with_managed(|scope| {
             Box::pin(async move {
                 let mut publications = scope.state.acp_events_tx.subscribe();
-                let live =
-                    test_support::managed_control_session(scope, "listener-retired-identity", "claude", None).await;
+                let live = test_support::managed_control_session(
+                    scope,
+                    "listener-retired-identity",
+                    "claude",
+                    None,
+                )
+                .await;
                 let state = live.state.clone();
                 let id = live.id().to_owned();
                 await_row(
@@ -3032,8 +3098,13 @@ mod tests {
         with_managed(|scope| {
             Box::pin(async move {
                 crate::session::set_unread_enabled(true);
-                let mut live =
-                    test_support::managed_control_session(scope, "listener-approved-burst", "claude", None).await;
+                let mut live = test_support::managed_control_session(
+                    scope,
+                    "listener-approved-burst",
+                    "claude",
+                    None,
+                )
+                .await;
                 let state = live.state.clone();
                 let id = live.id().to_owned();
                 let listener = start_managed_listener(scope, &state).await;
@@ -3115,8 +3186,13 @@ mod tests {
         with_managed(|scope| {
             Box::pin(async move {
                 crate::session::set_unread_enabled(true);
-                let mut live =
-                    test_support::managed_control_session(scope, "listener-turn-end", "claude", None).await;
+                let mut live = test_support::managed_control_session(
+                    scope,
+                    "listener-turn-end",
+                    "claude",
+                    None,
+                )
+                .await;
                 let state = live.state.clone();
                 let id = live.id().to_owned();
                 let listener = start_managed_listener(scope, &state).await;
@@ -3243,8 +3319,13 @@ mod tests {
             with_managed(|scope| {
                 Box::pin(async move {
                     crate::session::set_unread_enabled(true);
-                    let mut live =
-                        test_support::managed_control_session(scope, "listener-cold", "codex", None).await;
+                    let mut live = test_support::managed_control_session(
+                        scope,
+                        "listener-cold",
+                        "codex",
+                        None,
+                    )
+                    .await;
                     let state = live.state.clone();
                     let id = live.id().to_owned();
                     let mut publications = state.acp_events_tx.subscribe();
@@ -3750,7 +3831,8 @@ mod tests {
             with_managed(|scope| {
                 Box::pin(async move {
                     let mut live =
-                        test_support::managed_control_session(scope, "seed-status", "claude", None).await;
+                        test_support::managed_control_session(scope, "seed-status", "claude", None)
+                            .await;
                     let id = live.id().to_owned();
                     let request = live.start_prompt("go").await;
                     if !running {
@@ -3799,7 +3881,9 @@ mod tests {
         for main_running in [false, true] {
             with_managed(|scope| {
                 Box::pin(async move {
-                    let mut live = test_support::managed_control_session(scope, "seed-task", "claude", None).await;
+                    let mut live =
+                        test_support::managed_control_session(scope, "seed-task", "claude", None)
+                            .await;
                     let id = live.id().to_owned();
                     let request = live.start_prompt("go").await;
                     let path = start_projection_resource(&mut live, false).await;
@@ -3858,7 +3942,9 @@ mod tests {
         use crate::acp::supervisor::test_support::managed::with_managed;
         with_managed(|scope| {
             Box::pin(async move {
-                let live = test_support::managed_control_session(scope, "attested-reuse", "claude", None).await;
+                let live =
+                    test_support::managed_control_session(scope, "attested-reuse", "claude", None)
+                        .await;
                 let observed_store = live
                     .client
                     .establishment_projection()
@@ -3951,8 +4037,13 @@ mod tests {
             with_managed(|scope| {
                 Box::pin(async move {
                     let mut publications = scope.state.acp_events_tx.subscribe();
-                    let live =
-                        test_support::managed_control_session(scope, "delayed-assignment", "claude", None).await;
+                    let live = test_support::managed_control_session(
+                        scope,
+                        "delayed-assignment",
+                        "claude",
+                        None,
+                    )
+                    .await;
                     let state = live.state.clone();
                     let id = live.id().to_owned();
                     await_row(
@@ -4261,7 +4352,9 @@ mod tests {
             Box::pin(async move {
                 let state = scope.state.clone();
                 let listener = start_managed_listener(scope, &state).await;
-                let mut live = test_support::managed_control_session(scope, "stale-sidebar", "claude", None).await;
+                let mut live =
+                    test_support::managed_control_session(scope, "stale-sidebar", "claude", None)
+                        .await;
                 let id = live.id().to_owned();
                 let first = live.start_prompt("the original completed input").await;
                 live.finish_prompt(&first, None).await;
@@ -4340,8 +4433,13 @@ mod tests {
                     let inspection = scope.inspect_next_runner(TEST_NAME);
                     let initial_state = scope.state.clone();
                     let initial_listener = start_managed_listener(scope, &initial_state).await;
-                    let mut live =
-                        test_support::managed_control_session(scope, "ready-repair", "claude", None).await;
+                    let mut live = test_support::managed_control_session(
+                        scope,
+                        "ready-repair",
+                        "claude",
+                        None,
+                    )
+                    .await;
                     let (attached_state, reconciled_state) = tokio::sync::oneshot::channel();
                     let id = live.id().to_owned();
                     let original = load_profile_row("test", &id).unwrap();
@@ -4516,7 +4614,8 @@ mod tests {
                     // Finish that real frontier before pausing and taking a fenced seed.
                     let capabilities = observed_frame(&mut attached_publications, &id, |event| {
                         matches!(event, Event::PromptCapabilities { .. })
-                    }).await;
+                    })
+                    .await;
                     assert_eq!(capabilities.worker_generation, Some(attached.lease.epoch()));
                     assert!(attached.connection_ready());
                     assert!(attached.connection_unavailable().is_none());

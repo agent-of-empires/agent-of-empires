@@ -481,8 +481,13 @@ async fn restart_acp_inner(state: Arc<AppState>, id: String, req: SpawnAcpReques
     // The stop request shares the installation gate, so a launch either gets
     // cancelled here or is observed as running and stopped after the barrier.
     if was_resuming {
-        match retire_restart_worker(&state, &preflight_instance, &restart, checked_recovery.take())
-            .await
+        match retire_restart_worker(
+            &state,
+            &preflight_instance,
+            &restart,
+            checked_recovery.take(),
+        )
+        .await
         {
             Ok(attempt) => establishment = Some(attempt),
             Err(response) => return response,
@@ -728,7 +733,13 @@ async fn current_is_noop(
     state: &Arc<AppState>,
     expected: &crate::session::Instance,
     recovery: Option<&crate::acp::establishment::EstablishmentRecoveryRequest>,
-) -> Result<(bool, Option<crate::acp::establishment::EstablishmentRecovery>), Response> {
+) -> Result<
+    (
+        bool,
+        Option<crate::acp::establishment::EstablishmentRecovery>,
+    ),
+    Response,
+> {
     use crate::acp::establishment::{
         AcpEstablishment, EstablishmentRecoveryAction, EstablishmentRefusal,
     };
@@ -757,52 +768,58 @@ async fn current_is_noop(
             false,
             Some(native.storage().bound_profile_identity()?),
         )?;
-        let (_, result) = fence.lock_observation_project(|row, storage| {
-            anyhow::ensure!(
-                crate::acp::state::NativeEventContext::capture(&expected, storage)?
-                    == crate::acp::state::NativeEventContext::capture(row, storage)?
-                    && crate::acp::state::NativeBindingState::capture(&expected).matches(row)
-                    && expected.acp_establishment == row.acp_establishment,
-                EstablishmentRefusal::Superseded
-            );
-            let checked = recovery.map(|recovery| recovery.resolve(row, storage)).transpose()?;
-            if checked
-                .as_ref()
-                .is_some_and(|recovery| recovery.action != EstablishmentRecoveryAction::Same)
-                || !matches!(
-                    row.acp_establishment,
-                    Some(AcpEstablishment::Applied { .. })
-                )
-                || worker == crate::daemon::AcpWorkerState::Absent
-            {
-                return Ok((false, checked));
-            }
-            let current = current.as_mut().ok_or(EstablishmentRefusal::Unconfirmed)?;
-            let selected = current
-                .scope
-                .choice
-                .as_ref()
-                .is_some_and(|choice| choice.matches(row));
-            anyhow::ensure!(
-                current.scope.context
-                    == crate::acp::state::NativeEventContext::capture(row, storage)?
-                    && current.refresh(&id, selected).unwrap_or(false),
-                EstablishmentRefusal::Unconfirmed
-            );
-            if current.unavailable.is_some() {
-                return Ok((false, checked));
-            }
-            let applied = current
-                .client
-                .establishment_projection()
-                .and_then(|projection| projection.applied())
-                .ok_or(EstablishmentRefusal::Unconfirmed)?;
-            anyhow::ensure!(
-                current.ready && applied.matches(row, storage)?,
-                EstablishmentRefusal::Unconfirmed
-            );
-            Ok((true, checked))
-        }, false)?.ok_or(EstablishmentRefusal::Superseded)?;
+        let (_, result) = fence
+            .lock_observation_project(
+                |row, storage| {
+                    anyhow::ensure!(
+                        crate::acp::state::NativeEventContext::capture(&expected, storage)?
+                            == crate::acp::state::NativeEventContext::capture(row, storage)?
+                            && crate::acp::state::NativeBindingState::capture(&expected)
+                                .matches(row)
+                            && expected.acp_establishment == row.acp_establishment,
+                        EstablishmentRefusal::Superseded
+                    );
+                    let checked = recovery
+                        .map(|recovery| recovery.resolve(row, storage))
+                        .transpose()?;
+                    if checked.as_ref().is_some_and(|recovery| {
+                        recovery.action != EstablishmentRecoveryAction::Same
+                    }) || !matches!(
+                        row.acp_establishment,
+                        Some(AcpEstablishment::Applied { .. })
+                    ) || worker == crate::daemon::AcpWorkerState::Absent
+                    {
+                        return Ok((false, checked));
+                    }
+                    let current = current.as_mut().ok_or(EstablishmentRefusal::Unconfirmed)?;
+                    let selected = current
+                        .scope
+                        .choice
+                        .as_ref()
+                        .is_some_and(|choice| choice.matches(row));
+                    anyhow::ensure!(
+                        current.scope.context
+                            == crate::acp::state::NativeEventContext::capture(row, storage)?
+                            && current.refresh(&id, selected).unwrap_or(false),
+                        EstablishmentRefusal::Unconfirmed
+                    );
+                    if current.unavailable.is_some() {
+                        return Ok((false, checked));
+                    }
+                    let applied = current
+                        .client
+                        .establishment_projection()
+                        .and_then(|projection| projection.applied())
+                        .ok_or(EstablishmentRefusal::Unconfirmed)?;
+                    anyhow::ensure!(
+                        current.ready && applied.matches(row, storage)?,
+                        EstablishmentRefusal::Unconfirmed
+                    );
+                    Ok((true, checked))
+                },
+                false,
+            )?
+            .ok_or(EstablishmentRefusal::Superseded)?;
         Ok(result)
     })
     .await
@@ -3201,7 +3218,9 @@ mod tests {
                 &pending,
                 &crate::session::Storage::open_reference("default").unwrap(),
             )
-            .unwrap().revision().unwrap(),
+            .unwrap()
+            .revision()
+            .unwrap(),
             action: crate::acp::establishment::EstablishmentRecoveryAction::Same,
         };
 
@@ -3657,7 +3676,8 @@ mod tests {
         use crate::server::test_support::managed_control_session;
         with_managed(|scope| {
             Box::pin(async move {
-                let session = managed_control_session(scope, "restart-disconnect", "claude", None).await;
+                let session =
+                    managed_control_session(scope, "restart-disconnect", "claude", None).await;
                 let state = session.state.clone();
                 let id = session.id().to_owned();
                 let original = session.client.lease.spawned_runner().unwrap();
@@ -3761,7 +3781,8 @@ mod tests {
             use crate::server::test_support::managed_control_session;
             with_managed(|scope| {
                 Box::pin(async move {
-                    let session = managed_control_session(scope, "restart-exclusion", "claude", None).await;
+                    let session =
+                        managed_control_session(scope, "restart-exclusion", "claude", None).await;
                     let state = session.state.clone();
                     let id = session.id().to_owned();
                     let lock = state.instance_lock(&id).await;
@@ -4392,7 +4413,8 @@ mod tests {
         use crate::server::test_support as support;
         with_managed(|scope| {
             Box::pin(async move {
-                let mut session = support::managed_control_session(scope, "provider-busy", "claude", None).await;
+                let mut session =
+                    support::managed_control_session(scope, "provider-busy", "claude", None).await;
                 let prompt = session.start_prompt("still working").await;
                 let state = session.state.clone();
                 let id = session.id().to_owned();
@@ -4641,8 +4663,10 @@ mod tests {
         use crate::server::test_support::managed_control_session;
         with_managed(|scope| {
             Box::pin(async move {
-                let mut live = managed_control_session(scope, "manual-quota-running", "claude", None).await;
-                let ordinary = managed_control_session(scope, "ordinary-running", "claude", None).await;
+                let mut live =
+                    managed_control_session(scope, "manual-quota-running", "claude", None).await;
+                let ordinary =
+                    managed_control_session(scope, "ordinary-running", "claude", None).await;
                 let id = live.id().to_owned();
                 let state = live.state.clone();
                 let original = state
@@ -4712,7 +4736,11 @@ mod tests {
                         .unwrap(),
                     Known(0)
                 );
-                let ordinary_before = ordinary.state.acp_event_store.highest_seq(ordinary.id()).unwrap();
+                let ordinary_before = ordinary
+                    .state
+                    .acp_event_store
+                    .highest_seq(ordinary.id())
+                    .unwrap();
                 let ordinary_requests = ordinary.native.requests();
                 let ordinary_response = spawn_acp(
                     State(ordinary.state.clone()),
@@ -4723,7 +4751,11 @@ mod tests {
                 .into_response();
                 assert_eq!(ordinary_response.status(), StatusCode::OK);
                 assert_eq!(
-                    ordinary.state.acp_event_store.highest_seq(ordinary.id()).unwrap(),
+                    ordinary
+                        .state
+                        .acp_event_store
+                        .highest_seq(ordinary.id())
+                        .unwrap(),
                     ordinary_before
                 );
                 assert_eq!(ordinary.native.requests(), ordinary_requests);

@@ -202,7 +202,10 @@ pub(super) struct TestSdkSubmission {
 
 #[cfg(test)]
 impl TestSdkSubmission {
-    pub(super) fn from_incoming(session_id: &str, incoming: &crate::acp::event_sender::SdkEvent) -> Option<Self> {
+    pub(super) fn from_incoming(
+        session_id: &str,
+        incoming: &crate::acp::event_sender::SdkEvent,
+    ) -> Option<Self> {
         let crate::acp::event_sender::SdkEvent::Data(data) = incoming else {
             return None;
         };
@@ -317,7 +320,10 @@ impl ChannelSink {
         };
         let notify = {
             let mut probe = self.submission_probe.lock().unwrap();
-            if probe.as_ref().is_some_and(|probe| probe.expected == submission) {
+            if probe
+                .as_ref()
+                .is_some_and(|probe| probe.expected == submission)
+            {
                 probe.take().map(|probe| probe.submitted)
             } else {
                 None
@@ -408,7 +414,11 @@ impl super::Supervisor<ChannelSink> {
         let mut probe = self.sink.submission_probe.lock().unwrap();
         assert!(probe.is_none(), "one submission probe per sink");
         *probe = Some(TestSubmissionProbe {
-            expected: TestSdkSubmission { session_id: session_id.to_owned(), correlation, origin },
+            expected: TestSdkSubmission {
+                session_id: session_id.to_owned(),
+                correlation,
+                origin,
+            },
             submitted,
         });
         received
@@ -464,14 +474,16 @@ impl BroadcastSink for ChannelSink {
                 return None;
             }
             Err(TrySendError::Disconnected(job)) => job,
-            Err(TrySendError::Full(job)) => match blocking_io(|| jobs.send(job).err().map(|error| error.0)) {
-                None => {
-                    #[cfg(test)]
-                    self.notify_submission(submission);
-                    return None;
+            Err(TrySendError::Full(job)) => {
+                match blocking_io(|| jobs.send(job).err().map(|error| error.0)) {
+                    None => {
+                        #[cfg(test)]
+                        self.notify_submission(submission);
+                        return None;
+                    }
+                    Some(job) => job,
                 }
-                Some(job) => job,
-            },
+            }
         };
         let Job::Worker(publication) = job else {
             unreachable!("worker submission changed kind");
@@ -529,7 +541,8 @@ impl BroadcastSink for ChannelSink {
 
     fn publish_persisted(&self, session_id: &str, seq: u64, data: &AcpEventData) -> bool {
         self.persister
-            .publish_tagged(session_id, seq, data, None, None, None).1
+            .publish_tagged(session_id, seq, data, None, None, None)
+            .1
     }
 
     fn queue_persisted(
@@ -658,16 +671,19 @@ impl Persister {
                     attachments,
                     persisted,
                 } = *publication;
-                let candidate = super::with_session_sequence(&next_seqs, &session_id, |slot, current| {
-                    if expected_seq.is_some_and(|expected| expected != *current) {
-                        return None;
-                    }
-                    *current = current.saturating_add(1);
-                    Some((Arc::clone(slot), *current))
-                });
+                let candidate =
+                    super::with_session_sequence(&next_seqs, &session_id, |slot, current| {
+                        if expected_seq.is_some_and(|expected| expected != *current) {
+                            return None;
+                        }
+                        *current = current.saturating_add(1);
+                        Some((Arc::clone(slot), *current))
+                    });
                 let outcome = candidate.map(|(slot, seq)| {
-                    let outcome = if attachments.iter()
-                        .all(|blob| self.event_store.record_attachment(&session_id, seq, blob)) {
+                    let outcome = if attachments
+                        .iter()
+                        .all(|blob| self.event_store.record_attachment(&session_id, seq, blob))
+                    {
                         self.publish_tagged(&session_id, seq, &data, None, None, None)
                     } else {
                         (seq, false)
@@ -865,14 +881,18 @@ mod tests {
             let publication = {
                 let _entered = runtime.enter();
                 WorkerPublication::new(async move {
-                    assert!(persister.publish_tagged(
-                        "writer-panic",
-                        seq,
-                        &AcpEventData::from_history(Event::ThinkingStarted),
-                        Some(7),
-                        None,
-                        None
-                    ).1);
+                    assert!(
+                        persister
+                            .publish_tagged(
+                                "writer-panic",
+                                seq,
+                                &AcpEventData::from_history(Event::ThinkingStarted),
+                                Some(7),
+                                None,
+                                None
+                            )
+                            .1
+                    );
                 })
             };
             assert!(sink.publish_from_worker(publication).is_none());
@@ -980,14 +1000,18 @@ mod tests {
                 let _entered = runtime.enter();
                 WorkerPublication::new(async move {
                     let seq = super::super::with_publication_seq(&seqs, "stalled", |seq| seq);
-                    assert!(persister.publish_tagged(
-                        "stalled",
-                        seq,
-                        &AcpEventData::from_history(Event::ThinkingEnded),
-                        Some(1),
-                        None,
-                        None
-                    ).1);
+                    assert!(
+                        persister
+                            .publish_tagged(
+                                "stalled",
+                                seq,
+                                &AcpEventData::from_history(Event::ThinkingEnded),
+                                Some(1),
+                                None,
+                                None
+                            )
+                            .1
+                    );
                 })
             };
             assert!(
@@ -1046,8 +1070,11 @@ mod tests {
         }
         // Drop may only return once the writer has run what was queued.
         if done.recv_timeout(Duration::from_millis(200)).is_ok() {
-            assert_eq!(store.highest_seq("shutdown").unwrap(), 1,
-            "drop returned before the queued save");
+            assert_eq!(
+                store.highest_seq("shutdown").unwrap(),
+                1,
+                "drop returned before the queued save"
+            );
         }
         release.send(()).unwrap();
         dropper.join().unwrap();

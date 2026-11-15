@@ -544,9 +544,11 @@ impl ManagedRetirement {
         .await
         .into_response();
         let status = stopped.status();
-        // Temporary failure-only capture: retain through full validation.
+        // Include the public refusal body so guarded Stop failures remain actionable.
         let refusal = if status != axum::http::StatusCode::OK {
-            axum::body::to_bytes(stopped.into_body(), 4096).await.expect("actual Stop refusal body")
+            axum::body::to_bytes(stopped.into_body(), 4096)
+                .await
+                .expect("actual Stop refusal body")
         } else {
             axum::body::Bytes::new()
         };
@@ -1736,9 +1738,15 @@ socket.on('error', error => { console.error(error); process.exit(1); });
         let verify_owner = || async {
             let record = {
                 let registry = crate::process::worker_registry::registry_lock_until(
-                    &row.id, tokio::time::Instant::now() + Duration::from_secs(10),
-                ).await.expect("the actual producer releases registry admission");
-                registry.record().unwrap().expect("original registry custody still exists")
+                    &row.id,
+                    tokio::time::Instant::now() + Duration::from_secs(10),
+                )
+                .await
+                .expect("the actual producer releases registry admission");
+                registry
+                    .record()
+                    .unwrap()
+                    .expect("original registry custody still exists")
             };
             assert_eq!(
                 crate::acp::runner_lifecycle::RunnerIdentity::from_record(&record),

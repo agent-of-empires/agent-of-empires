@@ -395,14 +395,14 @@ export function Composer(props: Props) {
                   />
                 )}
                 {turnActive ? (
-                    <QueueSendButton
-                      connected={connected}
-                      waitingFor={props.waitingFor}
-                      connecting={props.connecting}
-                      steering={!!promptCapabilities?.steering}
-                      disabled={!canSend}
-                      onSend={submitComposer}
-                    />
+                  <QueueSendButton
+                    connected={connected}
+                    waitingFor={props.waitingFor}
+                    connecting={props.connecting}
+                    steering={!!promptCapabilities?.steering}
+                    disabled={!canSend}
+                    onSend={submitComposer}
+                  />
                 ) : (
                   <SendButton
                     connected={connected}

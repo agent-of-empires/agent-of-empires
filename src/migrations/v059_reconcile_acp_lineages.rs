@@ -21,11 +21,15 @@ pub(super) fn autonomous_pending() -> Result<bool> {
         Err(error) => return Err(error.into()),
         Ok(metadata) => anyhow::ensure!(metadata.is_file(), "ACP database is not a regular file"),
     }
-    let conn = rusqlite::Connection::open_with_flags(path,
-        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_NOFOLLOW)?;
+    let conn = rusqlite::Connection::open_with_flags(
+        path,
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_NOFOLLOW,
+    )?;
     Ok(!conn.query_row(
         "SELECT EXISTS(SELECT 1 FROM pragma_table_info('acp_establishment_commit')
-         WHERE name='autonomous_commit_json')", [], |row| row.get::<_, bool>(0),
+         WHERE name='autonomous_commit_json')",
+        [],
+        |row| row.get::<_, bool>(0),
     )?)
 }
 
@@ -37,21 +41,31 @@ pub(super) fn reconcile_autonomous_metadata() -> Result<()> {
         Err(error) => return Err(error.into()),
         Ok(metadata) => anyhow::ensure!(metadata.is_file(), "ACP database is not a regular file"),
     }
-    let mut conn = rusqlite::Connection::open_with_flags(&path,
-        rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE | rusqlite::OpenFlags::SQLITE_OPEN_NOFOLLOW)?;
-    anyhow::ensure!(EventStore::event_table_shape(&conn)? == EventTableShape::Scoped,
-        "Native lifecycle reconciliation requires scoped ACP history");
+    let mut conn = rusqlite::Connection::open_with_flags(
+        &path,
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE | rusqlite::OpenFlags::SQLITE_OPEN_NOFOLLOW,
+    )?;
+    anyhow::ensure!(
+        EventStore::event_table_shape(&conn)? == EventTableShape::Scoped,
+        "Native lifecycle reconciliation requires scoped ACP history"
+    );
     EventStore::validate_auxiliary_tables(&conn)?;
     EventStore::validate_prompt_commit_schema(&conn)?;
     EventStore::validate_budget_knowledge(&conn)?;
     let present: bool = conn.query_row(
         "SELECT EXISTS(SELECT 1 FROM pragma_table_info('acp_establishment_commit')
-         WHERE name='autonomous_commit_json')", [], |row| row.get(0),
+         WHERE name='autonomous_commit_json')",
+        [],
+        |row| row.get(0),
     )?;
-    if present { return EventStore::validate_autonomous_commit_schema(&conn); }
+    if present {
+        return EventStore::validate_autonomous_commit_schema(&conn);
+    }
     super::v055_acp_event_scope::snapshot(&conn, &path)?;
     let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
-    tx.execute_batch("ALTER TABLE acp_establishment_commit ADD COLUMN autonomous_commit_json TEXT;")?;
+    tx.execute_batch(
+        "ALTER TABLE acp_establishment_commit ADD COLUMN autonomous_commit_json TEXT;",
+    )?;
     EventStore::validate_autonomous_commit_schema(&tx)?;
     tx.commit()?;
     Ok(())

@@ -537,7 +537,9 @@ mod tests {
         use crate::server::test_support as support;
         with_managed(|scope| {
             Box::pin(async move {
-                let session = support::managed_control_session(scope, "failed-config-write", "claude", None).await;
+                let session =
+                    support::managed_control_session(scope, "failed-config-write", "claude", None)
+                        .await;
                 let id = session.id().to_owned();
                 let state = session.state.clone();
                 persist_selector(&state, &id, PersistedSelector::Model, "old-model")

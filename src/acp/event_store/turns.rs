@@ -617,12 +617,17 @@ impl EventStore {
     /// turn started by the agent without a host prompt.
     pub(crate) fn has_open_agent_turn(&self, session_id: &str) -> Result<ControlKnowledge<bool>> {
         self.with_control_snapshot(session_id, |_, cursor| {
-            use ControlKnowledge::{Known, Indeterminate};
-            Ok(match (cursor.projection.agent_open, cursor.projection.autonomous_open) {
-                (Known(true), _) | (_, Known(true)) => Known(true),
-                (Known(false), Known(false)) => Known(false),
-                _ => Indeterminate,
-            })
+            use ControlKnowledge::{Indeterminate, Known};
+            Ok(
+                match (
+                    cursor.projection.agent_open,
+                    cursor.projection.autonomous_open,
+                ) {
+                    (Known(true), _) | (_, Known(true)) => Known(true),
+                    (Known(false), Known(false)) => Known(false),
+                    _ => Indeterminate,
+                },
+            )
         })
     }
 
@@ -1255,11 +1260,26 @@ mod tests {
             })).await;
         }
         let (_tmp, store) = open_store(1000);
-        record_projection(&store, "unmatched-operation", 1, [
-            user_prompt("go"), stopped("prompt_complete"), agent_chunk("unadmitted operation"),
-        ]);
-        assert_eq!(store.has_in_flight_main_turn("unmatched-operation").unwrap(), ControlKnowledge::Known(false));
-        assert_eq!(store.holds_live_work("unmatched-operation").unwrap(), ControlKnowledge::Known(false));
+        record_projection(
+            &store,
+            "unmatched-operation",
+            1,
+            [
+                user_prompt("go"),
+                stopped("prompt_complete"),
+                agent_chunk("unadmitted operation"),
+            ],
+        );
+        assert_eq!(
+            store
+                .has_in_flight_main_turn("unmatched-operation")
+                .unwrap(),
+            ControlKnowledge::Known(false)
+        );
+        assert_eq!(
+            store.holds_live_work("unmatched-operation").unwrap(),
+            ControlKnowledge::Known(false)
+        );
     }
 
     /// A failed query is an error, never "no live work"; every aggregate

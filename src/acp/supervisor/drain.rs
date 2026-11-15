@@ -485,7 +485,12 @@ impl<S: BroadcastSink> Drain<S> {
             && (matches!(
                 data.metadata.scope,
                 EventScope::SessionCurrent | EventScope::OperationCurrent
-            ) || data.metadata.native_autonomous.as_ref().is_some_and(|autonomous| autonomous.qualified)) {
+            ) || data
+                .metadata
+                .native_autonomous
+                .as_ref()
+                .is_some_and(|autonomous| autonomous.qualified))
+        {
             match (request.as_ref(), constructor.as_ref()) {
                 (Some(request), None) => match request.try_effect_guard() {
                     Ok(guard) => Some(guard),
@@ -559,10 +564,11 @@ impl<S: BroadcastSink> Drain<S> {
             }
         }
         let native_subject = data.event.native_subject();
-        let (slot, seq) = super::with_session_sequence(&self.next_seqs, &self.session_id, |slot, current| {
-            *current = current.saturating_add(1);
-            (Arc::clone(slot), *current)
-        });
+        let (slot, seq) =
+            super::with_session_sequence(&self.next_seqs, &self.session_id, |slot, current| {
+                *current = current.saturating_add(1);
+                (Arc::clone(slot), *current)
+            });
         drop(lifecycle);
         drop(workers);
         // The original native/request/history exclusions survive the append.
@@ -970,7 +976,8 @@ impl<S: BroadcastSink> Drain<S> {
             incoming
         } {
             #[cfg(test)]
-            let submission = super::sink::TestSdkSubmission::from_incoming(&submission_session, &incoming);
+            let submission =
+                super::sink::TestSdkSubmission::from_incoming(&submission_session, &incoming);
             let completion = Arc::clone(&completion);
             let lease = lease.clone();
             let publication = super::WorkerPublication::new(async move {
@@ -2262,7 +2269,7 @@ mod tests {
             }
         }
         for open_task in [None, Some("pending-task")] {
-        super::super::test_support::managed::with_managed(|scope| Box::pin(async move {
+            super::super::test_support::managed::with_managed(|scope| Box::pin(async move {
                 let directory = scope.tempdir();
                 let transcript = directory.path().join("agent.jsonl");
                 std::fs::write(&transcript, "").unwrap();
@@ -3893,7 +3900,12 @@ mod tests {
         for stopping in [false, true] {
             with_managed(|scope| {
                 Box::pin(async move {
-                    let live = crate::server::test_support::managed_control_session(scope, "absent-publication-owner", "claude", None)
+                    let live = crate::server::test_support::managed_control_session(
+                        scope,
+                        "absent-publication-owner",
+                        "claude",
+                        None,
+                    )
                     .await;
                     let id = live.id().to_owned();
                     let supervisor = live.state.acp_supervisor.clone();
@@ -3905,13 +3917,23 @@ mod tests {
                     if stopping {
                         live.client.stop_session().await;
                     } else {
-                        live.client.shutdown().await.expect("complete the actual captured retirement");
+                        live.client
+                            .shutdown()
+                            .await
+                            .expect("complete the actual captured retirement");
                     }
                     supervisor.sink.flush();
                     assert!(!supervisor.workers.lock().await.contains_key(&id));
-                    assert!(lock_recover(&supervisor.lifecycle).current_lease(&id).is_none());
+                    assert!(lock_recover(&supervisor.lifecycle)
+                        .current_lease(&id)
+                        .is_none());
                     assert!(!lease.retirement().retains_original_client(owner));
-                    let before = live.state.session_service.fold_control_state(&id).await.unwrap();
+                    let before = live
+                        .state
+                        .session_service
+                        .fold_control_state(&id)
+                        .await
+                        .unwrap();
                     let prefix = store.highest_seq(&id).unwrap();
                     let mut frames = live.state.acp_events_tx.subscribe();
                     let drain = Drain {

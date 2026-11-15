@@ -2617,26 +2617,47 @@ async fn proxy_hello_and_primitives_shape_the_event_stream() {
             let directory = scope.tempdir();
             let initialize: serde_json::Value = serde_json::from_str(&format!(
                 r#"{{"protocolVersion":1,"agentCapabilities":{{}}{BAD_HELLO}}}"#
-            )).unwrap();
+            ))
+            .unwrap();
             let (config, native) = scope.native_peer(
-                directory.path().into(), "gemini", "gemini", move |request| {
-                    assert_eq!(request["method"], "initialize", "a rejected hello cannot issue Native New");
-                    Some(serde_json::json!({"jsonrpc":"2.0","id":request["id"],"result":initialize}))
+                directory.path().into(),
+                "gemini",
+                "gemini",
+                move |request| {
+                    assert_eq!(
+                        request["method"], "initialize",
+                        "a rejected hello cannot issue Native New"
+                    );
+                    Some(
+                        serde_json::json!({"jsonrpc":"2.0","id":request["id"],"result":initialize}),
+                    )
                 },
             );
             let (id, mut publications) = scope.create_observed(config, "incompatible-proxy").await;
             let detail = tokio::time::timeout(Duration::from_secs(10), async {
                 loop {
-                    let frame = publications.recv().await.expect("actual failed constructor publication");
-                    if frame.session_id != id { continue; }
+                    let frame = publications
+                        .recv()
+                        .await
+                        .expect("actual failed constructor publication");
+                    if frame.session_id != id {
+                        continue;
+                    }
                     match frame.event.as_ref() {
                         Event::IncompatibleAgent { detail } => break detail.clone(),
-                        Event::AcpSessionAssigned { .. } => panic!("an incompatible proxy cannot establish a Native session"),
+                        Event::AcpSessionAssigned { .. } => {
+                            panic!("an incompatible proxy cannot establish a Native session")
+                        }
                         _ => {}
                     }
                 }
-            }).await.expect("the actual failed constructor reports its typed incompatibility");
-            assert!(matches!(detail, StartupErrorDetail::InvalidProxyHello { .. }));
+            })
+            .await
+            .expect("the actual failed constructor reports its typed incompatibility");
+            assert!(matches!(
+                detail,
+                StartupErrorDetail::InvalidProxyHello { .. }
+            ));
             assert_eq!(native.requests(), ["initialize"]);
             // Keep the row until this scope's captured retirement proves its cleanup.
 

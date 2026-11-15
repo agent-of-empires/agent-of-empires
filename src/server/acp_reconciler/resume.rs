@@ -1391,7 +1391,12 @@ mod tests {
         }
         with_managed(|scope| {
             Box::pin(async move {
-                let mut live = crate::server::test_support::managed_control_session(scope, "reconciler-attach-timeout", "claude", None)
+                let mut live = crate::server::test_support::managed_control_session(
+                    scope,
+                    "reconciler-attach-timeout",
+                    "claude",
+                    None,
+                )
                 .await;
                 let id = live.id().to_owned();
                 let pending = live.start_prompt("original turn remains busy").await;

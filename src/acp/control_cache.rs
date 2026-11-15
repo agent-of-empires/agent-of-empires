@@ -436,7 +436,10 @@ impl ControlStateCache {
         identity: Option<(String, chrono::DateTime<chrono::Utc>, u64)>,
         current: Option<crate::acp::state::CurrentNativeAvailability>,
     ) -> Result<
-        (crate::acp::state::NativeAvailabilityProjection, Option<crate::acp::establishment::EstablishmentRevision>),
+        (
+            crate::acp::state::NativeAvailabilityProjection,
+            Option<crate::acp::establishment::EstablishmentRevision>,
+        ),
         crate::acp::state::NativeObservationWait,
     > {
         let slot = self.slot(session_id);
@@ -477,22 +480,32 @@ impl ControlStateCache {
             .as_ref()
             .filter(|current| current.scope.context == scope.context)
             .map_or(scope, |current| current.scope.clone());
-        let (_native_guard, (selected, establishment_revision)) = match scope.fence.lock_observation_project(
-            |row, storage| {
-                let selected = scope.choice.as_ref().is_some_and(|choice| choice.matches(row));
-                let expected = if current.is_some() && row.require_resolved_acp_selection().is_err() {
-                    Some(crate::acp::establishment::EstablishmentExpected::capture(row, storage)?.revision()?)
-                } else {
-                    None
-                };
-                Ok((selected, expected))
-            },
-            true,
-        ) {
-            Ok(Some(observation)) => observation,
-            Ok(None) => return Err(crate::acp::state::NativeObservationWait::native(&scope)),
-            Err(_) => return Ok(Default::default()),
-        };
+        let (_native_guard, (selected, establishment_revision)) =
+            match scope.fence.lock_observation_project(
+                |row, storage| {
+                    let selected = scope
+                        .choice
+                        .as_ref()
+                        .is_some_and(|choice| choice.matches(row));
+                    let expected =
+                        if current.is_some() && row.require_resolved_acp_selection().is_err() {
+                            Some(
+                                crate::acp::establishment::EstablishmentExpected::capture(
+                                    row, storage,
+                                )?
+                                .revision()?,
+                            )
+                        } else {
+                            None
+                        };
+                    Ok((selected, expected))
+                },
+                true,
+            ) {
+                Ok(Some(observation)) => observation,
+                Ok(None) => return Err(crate::acp::state::NativeObservationWait::native(&scope)),
+                Err(_) => return Ok(Default::default()),
+            };
         let context = Some(scope.context);
         let current = match current {
             Some(mut current) if Some(current.scope.context) == context => {
@@ -566,7 +579,14 @@ impl ControlStateCache {
                 NativeSubjectEvent::StartupDiagnostic => Some((seq, NativeControlFailure::Startup)),
                 _ => None,
             });
-        Ok((projection, if current.is_some() { establishment_revision } else { None }))
+        Ok((
+            projection,
+            if current.is_some() {
+                establishment_revision
+            } else {
+                None
+            },
+        ))
     }
 
     /// Whether the session has a hydrated fold, with no locking beyond the

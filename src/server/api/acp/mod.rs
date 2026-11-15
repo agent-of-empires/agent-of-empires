@@ -324,8 +324,13 @@ mod tests {
 
         with_managed(|scope| {
             Box::pin(async move {
-                let session =
-                    support::managed_control_session(scope, "late-selector-failure", "claude", None).await;
+                let session = support::managed_control_session(
+                    scope,
+                    "late-selector-failure",
+                    "claude",
+                    None,
+                )
+                .await;
                 let id = session.id().to_owned();
                 let state = session.state.clone();
                 let (_, original_lease) = state

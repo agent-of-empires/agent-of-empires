@@ -468,7 +468,8 @@ impl Session {
         let QueuedClientCmd {
             command: ClientCmd::InitialPromptIntent(intent),
             ..
-        } = queued else {
+        } = queued
+        else {
             return Some(queued);
         };
         match intent.into_native().await {
@@ -491,7 +492,9 @@ impl Session {
                             reason: error.to_string(),
                             text: text.text,
                         };
-                        let _ = self.shared.event_tx
+                        let _ = self
+                            .shared
+                            .event_tx
                             .with_metadata(crate::acp::event_sender::EventMetadata::host(&event))
                             .send(event)
                             .await;
@@ -582,7 +585,9 @@ impl Session {
                 queued.as_ref().map(|queued| &queued.command),
                 Some(ClientCmd::InitialPromptIntent(_))
             ) {
-                queued = self.resolve_initial_command(queued.take().expect("initial host intent")).await;
+                queued = self
+                    .resolve_initial_command(queued.take().expect("initial host intent"))
+                    .await;
                 if queued.is_none() {
                     continue;
                 }
@@ -659,8 +664,13 @@ impl Session {
                 ClientCmd::ForceStop => {
                     if require_operation(&scope, correlation, self.control.is_some()).is_err()
                         || current_effect_wait(
-                            scope.as_ref(), self.control.is_some(), &self.shared.connection_state, || (),
-                        ).await.is_err()
+                            scope.as_ref(),
+                            self.control.is_some(),
+                            &self.shared.connection_state,
+                            || (),
+                        )
+                        .await
+                        .is_err()
                     {
                         continue;
                     }

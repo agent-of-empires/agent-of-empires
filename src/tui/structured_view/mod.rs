@@ -640,8 +640,9 @@ async fn handle_terminal_event(
                 has_notices: state.visible_notices().next().is_some(),
                 // Native work and an exact pending host identity have distinct authority.
                 // Neither background display nor a pending host message grants Native input.
-                agent_busy: state.host_prompt_intent().is_some() || (state.native_input_available()
-                    && (state.transcript.turn_active || state.in_flight)),
+                agent_busy: state.host_prompt_intent().is_some()
+                    || (state.native_input_available()
+                        && (state.transcript.turn_active || state.in_flight)),
             };
             let intent = input::dispatch(state.focus, &key, ctx);
             // Plugin keybinds are a fallback: consulted only for a key the view
@@ -717,7 +718,9 @@ async fn apply_intent(
             .pending_elicitations
             .first()
             .is_some_and(|pending| state.can_decide(&pending.nonce)),
-        Intent::CancelInFlight => state.host_prompt_intent().is_some() || state.native_input_available(),
+        Intent::CancelInFlight => {
+            state.host_prompt_intent().is_some() || state.native_input_available()
+        }
         Intent::ChoicePick(_) | Intent::ChoiceAccept => state.can_accept_choice(),
         _ => true,
     };
@@ -979,7 +982,11 @@ async fn apply_intent(
             Ok(false)
         }
         Intent::CancelInFlight => {
-            match state.http.cancel(&state.session_id, state.host_prompt_intent()).await {
+            match state
+                .http
+                .cancel(&state.session_id, state.host_prompt_intent())
+                .await
+            {
                 Ok(()) => set_toast(state, toast_deadline, "cancel sent".into(), ToastKind::Info),
                 Err(e) => set_toast(
                     state,
@@ -2196,16 +2203,28 @@ mod tests {
         let replacement = uuid::Uuid::parse_str("a48a9426-dc57-4b54-bca3-8d415e9188bb").unwrap();
         let mut cached = native_snapshot(false, None);
         cached.host_prompt_intent = Some(original);
-        assert!(serde_json::to_value(&cached).unwrap().get("host_prompt_intent").is_none());
+        assert!(serde_json::to_value(&cached)
+            .unwrap()
+            .get("host_prompt_intent")
+            .is_none());
         fixture.snapshot(0, cached, None).await;
         fixture.act(Intent::CancelInFlight).await;
         assert!(fixture.native_requests().is_empty());
         *fixture.prompt_disposition.lock().unwrap() = "sent";
-        fixture.snapshot(1, native_snapshot(false, None), Some(serde_json::json!(true))).await;
+        fixture
+            .snapshot(
+                1,
+                native_snapshot(false, None),
+                Some(serde_json::json!(true)),
+            )
+            .await;
         send_prompt_now(&mut fixture.view, &mut None, "retain this pending message").await;
         assert!(fixture.view.in_flight);
         assert_eq!(fixture.native_requests().len(), 1);
-        assert_eq!(fixture.native_requests()[0].0, "POST /api/sessions/s-1/acp/prompt");
+        assert_eq!(
+            fixture.native_requests()[0].0,
+            "POST /api/sessions/s-1/acp/prompt"
+        );
 
         let live = |seq, intent: Option<uuid::Uuid>| {
             let mut state = serde_json::to_value(native_snapshot(false, None)).unwrap();
@@ -2227,17 +2246,22 @@ mod tests {
         assert_eq!(fixture.native_requests().len(), 1);
         fixture.view.choice = None;
         fixture.act(Intent::CancelInFlight).await;
-        assert_eq!(fixture.native_requests()[1..], [(
-            "POST /api/sessions/s-1/acp/cancel".to_owned(),
-            serde_json::json!({"host_prompt_intent": original}),
-        )]);
+        assert_eq!(
+            fixture.native_requests()[1..],
+            [(
+                "POST /api/sessions/s-1/acp/cancel".to_owned(),
+                serde_json::json!({"host_prompt_intent": original}),
+            )]
+        );
 
         fixture.ingest(live(3, Some(replacement))).await;
         fixture.ingest(live(2, Some(original))).await;
         assert_eq!(fixture.view.host_prompt_intent(), Some(replacement));
         fixture.act(Intent::CancelInFlight).await;
-        assert_eq!(fixture.native_requests().last().unwrap().1,
-            serde_json::json!({"host_prompt_intent": replacement}));
+        assert_eq!(
+            fixture.native_requests().last().unwrap().1,
+            serde_json::json!({"host_prompt_intent": replacement})
+        );
         fixture.ingest(live(4, None)).await;
         fixture.ingest(live(3, Some(replacement))).await;
         assert_eq!(fixture.view.host_prompt_intent(), None);

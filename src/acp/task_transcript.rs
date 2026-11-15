@@ -513,7 +513,9 @@ impl TaskTailer {
                 // Losing the reader ends host tracking, not the Native task.
                 let mut metadata = crate::acp::event_sender::EventMetadata::host(&event);
                 metadata.resource_ref = owner.authority.witness().map(|witness| witness.allocation);
-                let _ = access.publish_with(events.with_metadata(metadata), event).await;
+                let _ = access
+                    .publish_with(events.with_metadata(metadata), event)
+                    .await;
             }
         }))
     }
@@ -1411,7 +1413,12 @@ mod tests {
                     .fold_control_state(&f._managed.id)
                     .await
                     .unwrap();
-                let seq = scope.state.acp_event_store.highest_seq(&f._managed.id).unwrap() + 1;
+                let seq = scope
+                    .state
+                    .acp_event_store
+                    .highest_seq(&f._managed.id)
+                    .unwrap()
+                    + 1;
                 assert_eq!(state.sidebar_status(), Status::Running);
                 f.active.stop("t-1");
                 f.spawn(TailerStart::Resumed).await;
@@ -1449,7 +1456,12 @@ mod tests {
                     .fold_control_state(&f._managed.id)
                     .await
                     .unwrap();
-                let seq = scope.state.acp_event_store.highest_seq(&f._managed.id).unwrap() + 1;
+                let seq = scope
+                    .state
+                    .acp_event_store
+                    .highest_seq(&f._managed.id)
+                    .unwrap()
+                    + 1;
                 assert_eq!(state.sidebar_status(), Status::Running);
                 let watch = FileWatchService::new().unwrap();
                 f.spawn_with(watch.clone(), TailerStart::Live).await;
@@ -2002,7 +2014,10 @@ pub(crate) mod resource_test_support {
                 .unwrap();
             let session_id = receipt.session_id().unwrap().to_owned();
             let home = if agent_key == "claude" {
-                managed.actual().native_store.as_ref()
+                managed
+                    .actual()
+                    .native_store
+                    .as_ref()
                     .filter(|binding| binding.agent == agent_key && binding.filesystem == "host")
                     .and_then(|binding| binding.stores.first())
                     .expect("the actual original declares its host Claude store")
@@ -2016,7 +2031,9 @@ pub(crate) mod resource_test_support {
                 )));
             }
             let project = if agent_key == "claude" {
-                let encoded = crate::session::capture::encode_claude_project_path(&workdir.path().to_string_lossy());
+                let encoded = crate::session::capture::encode_claude_project_path(
+                    &workdir.path().to_string_lossy(),
+                );
                 home.join("projects").join(encoded)
             } else {
                 home.clone()

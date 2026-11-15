@@ -178,7 +178,8 @@ pub(crate) fn closes_tool_lifecycle(
         Event::AgentStartupError { .. }
             | Event::IncompatibleAgent { .. }
             | Event::AgentSwitched { .. }
-    ) || (matches!(event, Event::Stopped { .. }) && metadata.operation.is_none()
+    ) || (matches!(event, Event::Stopped { .. })
+        && metadata.operation.is_none()
         && metadata.native_autonomous.is_none())
 }
 

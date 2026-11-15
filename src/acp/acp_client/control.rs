@@ -517,8 +517,16 @@ impl DaemonControlClient {
     pub(super) fn install_original_ingress(&self) -> agent_client_protocol::Result<()> {
         // A read-only canonical attempt may have been generation-rebased.
         // Only the actual Original invocation or receipt identifies its physical source.
-        let Some(attempt) = self.projection.original_window().map(|(attempt, _)| attempt)
-            .or_else(|| self.projection.receipt_snapshot().map(|receipt| Arc::clone(&receipt.attempt))) else {
+        let Some(attempt) = self
+            .projection
+            .original_window()
+            .map(|(attempt, _)| attempt)
+            .or_else(|| {
+                self.projection
+                    .receipt_snapshot()
+                    .map(|receipt| Arc::clone(&receipt.attempt))
+            })
+        else {
             return Ok(());
         };
         let (store, constructor) = {
@@ -1216,7 +1224,9 @@ pub(super) async fn connect_runner_control(
             })?
             .ok_or_else(unconfirmed)?;
         let (mut read_half, mut write_half) = stream.into_split();
-        let (prompt_head, native_autonomous) = match control_protocol::read_frame(&mut read_half).await {
+        let (prompt_head, native_autonomous) = match control_protocol::read_frame(&mut read_half)
+            .await
+        {
             Ok(Some(ControlBody::Hello {
                 control_protocol_version,
                 session_id,
@@ -1227,14 +1237,23 @@ pub(super) async fn connect_runner_control(
             {
                 if let Some(snapshot) = &native_autonomous {
                     snapshot.validate().map_err(|_| unconfirmed())?;
-                    if snapshot.started.evidence.physical_source
-                        .and_then(|source| source.witness.owner) != Some(expected_owner) {
+                    if snapshot
+                        .started
+                        .evidence
+                        .physical_source
+                        .and_then(|source| source.witness.owner)
+                        != Some(expected_owner)
+                    {
                         return Err(unconfirmed());
                     }
                 }
-                (prompt_head.filter(|head| {
-                    head.scope.owner() == Some(expected_owner) && head.scope.correlation().is_some()
-                }), native_autonomous)
+                (
+                    prompt_head.filter(|head| {
+                        head.scope.owner() == Some(expected_owner)
+                            && head.scope.correlation().is_some()
+                    }),
+                    native_autonomous,
+                )
             }
             Ok(Some(ControlBody::Hello {
                 control_protocol_version,
@@ -1270,11 +1289,18 @@ pub(super) async fn connect_runner_control(
             warn!(target: "acp.protocol", ?error, "runner Attach write failed");
             unconfirmed()
         })?;
-        Ok((read_half, write_half, peer_process, prompt_head, native_autonomous))
+        Ok((
+            read_half,
+            write_half,
+            peer_process,
+            prompt_head,
+            native_autonomous,
+        ))
     };
-    let (mut read_half, write_half, peer_process, prompt_head, mut native_autonomous) = tokio::time::timeout(bound, dial)
-        .await
-        .map_err(|_| unconfirmed())??;
+    let (mut read_half, write_half, peer_process, prompt_head, mut native_autonomous) =
+        tokio::time::timeout(bound, dial)
+            .await
+            .map_err(|_| unconfirmed())??;
 
     info!(
         target: "acp.protocol",

@@ -575,9 +575,9 @@ impl EventStore {
             .with_context(|| format!("serialise event for {session_id}@{seq}"))?;
         let now_ms = chrono::Utc::now().timestamp_millis();
         let recorded = self.append_controlled(session_id, seq, event, metadata, now_ms, |tx| {
-            if let Some(recorded) = Self::record_autonomous_result(
-                tx, session_id, seq, &json, now_ms, metadata,
-            )? {
+            if let Some(recorded) =
+                Self::record_autonomous_result(tx, session_id, seq, &json, now_ms, metadata)?
+            {
                 return Ok(recorded);
             }
             match Self::record_prompt_result(tx, session_id, seq, event, &json, now_ms, metadata)? {
@@ -707,7 +707,8 @@ impl EventStore {
     ) -> Result<u64> {
         let seq: i64 = conn.query_row(
             "SELECT COALESCE(MAX(seq),0) FROM acp_events WHERE session_id=?1",
-            rusqlite::params![session_id], |row| row.get(0),
+            rusqlite::params![session_id],
+            |row| row.get(0),
         )?;
         let (retained, _) = Self::retained_publication_state(conn, session_id)?;
         Ok(u64::try_from(seq)?.max(retained))
@@ -1155,7 +1156,11 @@ mod tests {
         store.delete_session("s-1");
         assert_eq!(store.highest_seq("s-1").unwrap(), 0);
         assert_eq!(store.lowest_seq("s-1"), None);
-        assert_eq!(store.highest_seq("s-2").unwrap(), 1, "siblings are untouched");
+        assert_eq!(
+            store.highest_seq("s-2").unwrap(),
+            1,
+            "siblings are untouched"
+        );
 
         // Persisted prompt shapes, legacy and current, stay readable.
         use crate::acp::state::DiffComment;

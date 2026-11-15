@@ -747,7 +747,9 @@ describe("StartupWaitLine", () => {
       />,
     );
     act(() => vi.advanceTimersByTime(30_000));
-    const describedBy = screen.getByRole("button", { name: "Start fresh Claude Code" }).getAttribute("aria-describedby");
+    const describedBy = screen
+      .getByRole("button", { name: "Start fresh Claude Code" })
+      .getAttribute("aria-describedby");
     expect(describedBy ? document.getElementById(describedBy)?.textContent : "").toBe(description);
     expect(screen.queryByTestId("startup-wait-restart-cost")?.textContent ?? "").toBe(description);
   });
@@ -1002,8 +1004,13 @@ describe("host-only Stop while the same Native constructor is pending", () => {
       expect(state.establishmentRevision).toEqual(revision);
       expect(nativeInputAvailable(state)).toBe(false);
       expect(state.turnActive).toBe(false);
-      render(<SessionBanners {...props} state={state}
-        startingAgent={isNewSessionStarting(state, connection, "running", false) ? "Claude Code" : null} />);
+      render(
+        <SessionBanners
+          {...props}
+          state={state}
+          startingAgent={isNewSessionStarting(state, connection, "running", false) ? "Claude Code" : null}
+        />,
+      );
       expect(screen.getByTestId("startup-wait-line")).toBeTruthy();
       expect(screen.queryByText("Structured view worker stopped")).toBeNull();
     },
@@ -1022,8 +1029,14 @@ describe("host-only Stop while the same Native constructor is pending", () => {
     retired.state.host_prompt_intent = null;
     retired.state.establishment_revision = null;
     state = reducer(state, retired);
-    render(<SessionBanners {...props} state={state} acpWorkerState="absent"
-      startingAgent={isNewSessionStarting(state, connection, "absent", false) ? "Claude Code" : null} />);
+    render(
+      <SessionBanners
+        {...props}
+        state={state}
+        acpWorkerState="absent"
+        startingAgent={isNewSessionStarting(state, connection, "absent", false) ? "Claude Code" : null}
+      />,
+    );
     expect(nativeInputAvailable(state)).toBe(false);
     expect(state.hostPromptIntent).toBeNull();
     expect(state.establishmentRevision).toBeNull();

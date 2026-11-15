@@ -37,9 +37,14 @@ pub(super) fn build_initialize_request(profile: &AgentProfile) -> InitializeRequ
         )
         // Each subagent then arrives as a child session on this connection.
         .subagents(profile.supports_subagents.then(SubagentCapabilities::new));
-    capabilities.meta = Some([(
-        "ompAutonomousTurns".to_owned(), serde_json::json!({"version": 1}),
-    )].into_iter().collect());
+    capabilities.meta = Some(
+        [(
+            "ompAutonomousTurns".to_owned(),
+            serde_json::json!({"version": 1}),
+        )]
+        .into_iter()
+        .collect(),
+    );
     InitializeRequest::new(ProtocolVersion::V1)
         .client_capabilities(capabilities)
         .client_info(

@@ -3,7 +3,12 @@ import { useEffect, useId, useLayoutEffect, useRef, useState } from "react";
 import { useRespawnSession } from "../../hooks/useRespawnSession";
 import { BRAND_BUTTON, CancelButton, ConfirmButton, Dialog } from "../Dialog";
 import { useBusyAction, useConfirmKeys, useDialogFocus } from "../dialogHooks";
-import { nativeInputAvailable, type AcpConnectionUnavailability, type AcpState, type EstablishmentRevision } from "../../lib/acpTypes";
+import {
+  nativeInputAvailable,
+  type AcpConnectionUnavailability,
+  type AcpState,
+  type EstablishmentRevision,
+} from "../../lib/acpTypes";
 import { RATTLES } from "../../lib/rattles";
 import { SECONDARY_BUTTON } from "./RecoveryActionRow";
 import { StartupErrorBanner } from "./StartupErrorBanner";
@@ -362,14 +367,21 @@ function StartupFreshDialog({
       footer={
         <>
           <CancelButton onClick={onCancel} disabled={starting} />
-          <ConfirmButton buttonRef={confirmRef} onClick={confirm} busy={starting} className={BRAND_BUTTON} testId="startup-fresh-confirm">
+          <ConfirmButton
+            buttonRef={confirmRef}
+            onClick={confirm}
+            busy={starting}
+            className={BRAND_BUTTON}
+            testId="startup-fresh-confirm"
+          >
             {starting ? "Starting fresh…" : "Start fresh"}
           </ConfirmButton>
         </>
       }
     >
       <p className="text-[13px] text-text-secondary">
-        Start a fresh {agent} conversation? This stops the current start. Your message will not be resent; send it once the agent is ready.
+        Start a fresh {agent} conversation? This stops the current start. Your message will not be resent; send it once
+        the agent is ready.
       </p>
     </Dialog>
   );
@@ -565,7 +577,12 @@ function WorkerStoppedBanner({
     <StoppedPanel
       title="Structured view worker stopped"
       action={
-        <button type="button" onClick={() => void handleReconnect()} disabled={retryState === "retrying"} className={WARNING_BUTTON}>
+        <button
+          type="button"
+          onClick={() => void handleReconnect()}
+          disabled={retryState === "retrying"}
+          className={WARNING_BUTTON}
+        >
           {retryState === "retrying" ? "Reconnecting…" : "Reconnect"}
         </button>
       }

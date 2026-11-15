@@ -4857,7 +4857,11 @@ time.sleep(60)
             .to_owned();
         let inspection = scope.inspect_next_runner(&test_name);
         let mut fail_next_prompt = failed_main;
-        let agent_key = if open_task.is_some() { "claude" } else { "codex" };
+        let agent_key = if open_task.is_some() {
+            "claude"
+        } else {
+            "codex"
+        };
         let (config, peer) = scope.native_peer(
             workdir.path().to_path_buf(),
             agent_key,
@@ -4906,8 +4910,11 @@ time.sleep(60)
                 .and_then(|binding| binding.stores.first())
                 .expect("the actual Claude task's original host store")
                 .clone();
-            let project = home.join("projects").join(
-                crate::session::capture::encode_claude_project_path(&workdir.path().to_string_lossy()));
+            let project =
+                home.join("projects")
+                    .join(crate::session::capture::encode_claude_project_path(
+                        &workdir.path().to_string_lossy(),
+                    ));
             std::fs::create_dir_all(&project).unwrap();
             let transcript = project.join(format!("{native_session}.jsonl"));
             std::fs::write(&transcript, "").unwrap();
@@ -4935,7 +4942,7 @@ time.sleep(60)
         }
         let store = scope.state.acp_event_store.clone();
         if open_task.is_none() {
-        publish_native_background_start(&mut client, &peer, &store,
+            publish_native_background_start(&mut client, &peer, &store,
             serde_json::json!({"jsonrpc":"2.0","method":"session/update","params":{
                 "sessionId":native_session,"update":{
                     "sessionUpdate":"tool_call_update","toolCallId":"tc-1",
@@ -4948,34 +4955,34 @@ time.sleep(60)
             !output_file.is_empty(),
             |event| matches!(event, Event::BackgroundAgentLaunched { agent_id, .. } if agent_id == "sub-1"),
         ).await;
-        let launches = store
-            .unresolved_background_agent_launches(&client.id)
-            .unwrap();
-        let launch = launches
-            .iter()
-            .find(|launch| launch.agent_id == "sub-1")
-            .unwrap();
-        if output_file.is_empty() {
-            // An untrackable launch grants no transcript access.
-            assert!(launch.witness.is_none());
-        } else {
-            assert!(
-                launch.witness.is_some(),
-                "the actual first resource I/O must mint its durable witness"
-            );
-            let stored = store.replay_from(&client.id, 0).unwrap().into_iter().find(|stored|
+            let launches = store
+                .unresolved_background_agent_launches(&client.id)
+                .unwrap();
+            let launch = launches
+                .iter()
+                .find(|launch| launch.agent_id == "sub-1")
+                .unwrap();
+            if output_file.is_empty() {
+                // An untrackable launch grants no transcript access.
+                assert!(launch.witness.is_none());
+            } else {
+                assert!(
+                    launch.witness.is_some(),
+                    "the actual first resource I/O must mint its durable witness"
+                );
+                let stored = store.replay_from(&client.id, 0).unwrap().into_iter().find(|stored|
                     matches!(stored.event.as_ref(), Event::BackgroundAgentLaunched { agent_id, .. } if agent_id == "sub-1")
                         && stored.metadata.resource_witness.is_some()).unwrap();
-            assert_eq!(stored.metadata.scope, EventScope::HistoryOnly);
-            assert_eq!(
-                stored.metadata.resource_ref,
-                stored
-                    .metadata
-                    .resource_witness
-                    .as_ref()
-                    .map(|witness| witness.allocation)
-            );
-        }
+                assert_eq!(stored.metadata.scope, EventScope::HistoryOnly);
+                assert_eq!(
+                    stored.metadata.resource_ref,
+                    stored
+                        .metadata
+                        .resource_witness
+                        .as_ref()
+                        .map(|witness| witness.allocation)
+                );
+            }
         }
         if let Some(task_id) = open_task {
             publish_native_background_start(&mut client, &peer, &store,
@@ -5180,7 +5187,7 @@ time.sleep(60)
     async fn reattached_failed_main_keeps_its_terminal_through_ambient_accounting_and_background_work(
     ) {
         for open_task in [None, Some("surviving-task")] {
-        super::super::test_support::managed::with_managed(|scope| Box::pin(async move {
+            super::super::test_support::managed::with_managed(|scope| Box::pin(async move {
                 let dir = scope.tempdir();
                 let transcript = dir.path().join("agent.jsonl");
                 std::fs::write(&transcript, "").unwrap();

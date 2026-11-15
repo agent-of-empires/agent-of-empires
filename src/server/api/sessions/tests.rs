@@ -14231,8 +14231,10 @@ async fn the_selected_work_verdict_survives_a_concurrent_pending_turn_drain() {
     use crate::acp::supervisor::test_support::managed::with_managed;
     with_managed(|scope| {
         Box::pin(async move {
-            let mut live =
-                crate::server::test_support::managed_control_session(scope, "drained", "claude", None).await;
+            let mut live = crate::server::test_support::managed_control_session(
+                scope, "drained", "claude", None,
+            )
+            .await;
             live.park("finish the migration").await;
             let id = live.id().to_owned();
             let state = live.state.clone();
@@ -14298,7 +14300,12 @@ async fn prepared_restart_uses_current_queue_after_original_detaches() {
     with_managed(|scope| {
         Box::pin(async move {
             for remove_during_hooks in [false, true] {
-                let mut live = crate::server::test_support::managed_control_session(scope, "restart-current-queue", "claude", None)
+                let mut live = crate::server::test_support::managed_control_session(
+                    scope,
+                    "restart-current-queue",
+                    "claude",
+                    None,
+                )
                 .await;
                 live.park("original interrupted work").await;
                 live.make_quota_due();
@@ -14335,9 +14342,15 @@ async fn prepared_restart_uses_current_queue_after_original_detaches() {
                 let requests = live.native.requests();
                 let original = {
                     let registry = crate::process::worker_registry::registry_lock_until(
-                        &id, tokio::time::Instant::now() + std::time::Duration::from_secs(10),
-                    ).await.expect("the actual runner releases registry admission");
-                    registry.record().unwrap().expect("the original runner remains registered")
+                        &id,
+                        tokio::time::Instant::now() + std::time::Duration::from_secs(10),
+                    )
+                    .await
+                    .expect("the actual runner releases registry admission");
+                    registry
+                        .record()
+                        .unwrap()
+                        .expect("the original runner remains registered")
                 };
                 let original_identity =
                     crate::acp::runner_lifecycle::RunnerIdentity::from_record(&original);
@@ -14374,9 +14387,15 @@ async fn prepared_restart_uses_current_queue_after_original_detaches() {
                         assert!(original_actual.ensure_available().is_err());
                         let retained = {
                             let registry = crate::process::worker_registry::registry_lock_until(
-                                &id, tokio::time::Instant::now() + std::time::Duration::from_secs(10),
-                            ).await.expect("the actual runner releases registry admission");
-                            registry.record().unwrap().expect("the original runner remains registered")
+                                &id,
+                                tokio::time::Instant::now() + std::time::Duration::from_secs(10),
+                            )
+                            .await
+                            .expect("the actual runner releases registry admission");
+                            registry
+                                .record()
+                                .unwrap()
+                                .expect("the original runner remains registered")
                         };
                         assert_eq!(
                             crate::acp::runner_lifecycle::RunnerIdentity::from_record(&retained),
@@ -14465,9 +14484,15 @@ async fn prepared_restart_uses_current_queue_after_original_detaches() {
                         assert!(original_actual.ensure_available().is_err());
                         let retained = {
                             let registry = crate::process::worker_registry::registry_lock_until(
-                                &id, tokio::time::Instant::now() + std::time::Duration::from_secs(10),
-                            ).await.expect("the actual runner releases registry admission");
-                            registry.record().unwrap().expect("the original runner remains registered")
+                                &id,
+                                tokio::time::Instant::now() + std::time::Duration::from_secs(10),
+                            )
+                            .await
+                            .expect("the actual runner releases registry admission");
+                            registry
+                                .record()
+                                .unwrap()
+                                .expect("the original runner remains registered")
                         };
                         assert_eq!(
                             crate::acp::runner_lifecycle::RunnerIdentity::from_record(&retained),
@@ -14494,9 +14519,13 @@ async fn quota_breadcrumb_write_failure_does_not_install_pending_input() {
     use crate::acp::supervisor::test_support::managed::with_managed;
     with_managed(|scope| {
         Box::pin(async move {
-            let mut live =
-                crate::server::test_support::managed_control_session(scope, "quota-write-refused", "claude", None)
-                    .await;
+            let mut live = crate::server::test_support::managed_control_session(
+                scope,
+                "quota-write-refused",
+                "claude",
+                None,
+            )
+            .await;
             live.park("finish the migration").await;
             let id = live.id().to_owned();
             let state = live.state.clone();

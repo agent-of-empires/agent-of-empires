@@ -180,9 +180,10 @@ impl ConnectionState {
         correlation: Option<crate::acp::establishment::NativeOperationCorrelation>,
     ) -> bool {
         let mut slot = self.initial_prompt.lock().unwrap();
-        if let Some(pending) = slot.as_mut().filter(|pending| {
-            correlation.is_some() && pending.correlation == correlation
-        }) {
+        if let Some(pending) = slot
+            .as_mut()
+            .filter(|pending| correlation.is_some() && pending.correlation == correlation)
+        {
             if pending.cancellation.is_cancelled() {
                 return false;
             }
@@ -195,8 +196,13 @@ impl ConnectionState {
         &self,
         correlation: Option<crate::acp::establishment::NativeOperationCorrelation>,
     ) -> bool {
-        correlation.is_some() && self.initial_prompt.lock().unwrap().as_ref()
-            .is_some_and(|pending| pending.correlation == correlation && pending.issued)
+        correlation.is_some()
+            && self
+                .initial_prompt
+                .lock()
+                .unwrap()
+                .as_ref()
+                .is_some_and(|pending| pending.correlation == correlation && pending.issued)
     }
 
     pub(super) fn initial_prompt_matches(
@@ -204,12 +210,16 @@ impl ConnectionState {
         id: uuid::Uuid,
         correlation: crate::acp::establishment::NativeOperationCorrelation,
     ) -> bool {
-        self.initial_prompt.lock().unwrap().as_ref().is_some_and(|pending| {
-            pending.id == id
-                && pending.correlation == Some(correlation)
-                && pending.issued
-                && !pending.cancellation.is_cancelled()
-        })
+        self.initial_prompt
+            .lock()
+            .unwrap()
+            .as_ref()
+            .is_some_and(|pending| {
+                pending.id == id
+                    && pending.correlation == Some(correlation)
+                    && pending.issued
+                    && !pending.cancellation.is_cancelled()
+            })
     }
 
     pub(super) fn finish_initial_prompt_operation(
@@ -218,7 +228,9 @@ impl ConnectionState {
     ) {
         let mut slot = self.initial_prompt.lock().unwrap();
         if correlation.is_some()
-            && slot.as_ref().is_some_and(|pending| pending.correlation == correlation)
+            && slot
+                .as_ref()
+                .is_some_and(|pending| pending.correlation == correlation)
         {
             slot.take();
         }

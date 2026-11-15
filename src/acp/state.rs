@@ -844,7 +844,10 @@ impl CurrentNativeAvailability {
         &mut self,
         row: &crate::session::Instance,
         storage: &crate::session::Storage,
-    ) -> Result<Option<Arc<crate::acp::establishment::EstablishmentAttempt>>, crate::acp::establishment::EstablishmentRefusal> {
+    ) -> Result<
+        Option<Arc<crate::acp::establishment::EstablishmentAttempt>>,
+        crate::acp::establishment::EstablishmentRefusal,
+    > {
         use crate::acp::establishment::{
             AcpEstablishment, CreationStage, EstablishmentAttempt, EstablishmentOrigin,
             EstablishmentRefusal,
@@ -866,8 +869,12 @@ impl CurrentNativeAvailability {
         let Some(expected) = admission.establishment else {
             return Ok(None);
         };
-        if !matches!(expected.origin, EstablishmentOrigin::Creation { stage: CreationStage::Admitted })
-            || expected.producer != Some(self.lease.producer_id())
+        if !matches!(
+            expected.origin,
+            EstablishmentOrigin::Creation {
+                stage: CreationStage::Admitted
+            }
+        ) || expected.producer != Some(self.lease.producer_id())
             || admission.generation != expected.generation
         {
             return Ok(None);
@@ -880,7 +887,9 @@ impl CurrentNativeAvailability {
             Some(AcpEstablishment::Pending { .. }) => {
                 self.scope.context == expected.context
                     && self.scope.choice.as_deref() == Some(&expected.destination)
-                    && expected.matches_pending(row, storage).map_err(|_| EstablishmentRefusal::Unconfirmed)?
+                    && expected
+                        .matches_pending(row, storage)
+                        .map_err(|_| EstablishmentRefusal::Unconfirmed)?
             }
             Some(AcpEstablishment::Applied { attempt_id }) if *attempt_id == expected.id => {
                 expected.profile == row.source_profile
@@ -888,28 +897,41 @@ impl CurrentNativeAvailability {
                     && expected.session_id == row.id
                     && expected.created_at == row.created_at
                     && expected.generation == row.lifecycle_generation
-                    && self.scope.choice.as_ref().is_some_and(|choice| choice.matches(row))
-                    && NativeEventContext::capture(row, storage).map_err(|_| EstablishmentRefusal::Unconfirmed)?
+                    && self
+                        .scope
+                        .choice
+                        .as_ref()
+                        .is_some_and(|choice| choice.matches(row))
+                    && NativeEventContext::capture(row, storage)
+                        .map_err(|_| EstablishmentRefusal::Unconfirmed)?
                         == self.scope.context
-                    && self.client.establishment_projection().is_some_and(|projection| {
-                        projection.applied().is_some_and(|applied| applied.attempt_id == expected.id)
-                            && projection.receipt_snapshot().is_some_and(|receipt| {
-                                EstablishmentAttempt::eq(&receipt.attempt, &expected)
-                            })
-                    })
+                    && self
+                        .client
+                        .establishment_projection()
+                        .is_some_and(|projection| {
+                            projection
+                                .applied()
+                                .is_some_and(|applied| applied.attempt_id == expected.id)
+                                && projection.receipt_snapshot().is_some_and(|receipt| {
+                                    EstablishmentAttempt::eq(&receipt.attempt, &expected)
+                                })
+                        })
             }
             _ => false,
         };
         if !matches
-            || !self.refresh(&row.id, matches).map_err(|_| EstablishmentRefusal::Unconfirmed)?
+            || !self
+                .refresh(&row.id, matches)
+                .map_err(|_| EstablishmentRefusal::Unconfirmed)?
             || self.unavailable.is_some()
-            || !self.qualify_owner(&row.id).map_err(|_| EstablishmentRefusal::Unconfirmed)?
+            || !self
+                .qualify_owner(&row.id)
+                .map_err(|_| EstablishmentRefusal::Unconfirmed)?
         {
             return Ok(None);
         }
         Ok(Some(expected))
     }
-
 }
 
 pub(crate) struct NativeObservationWait {
@@ -1870,7 +1892,11 @@ impl AcpState {
             SidebarPhase::Error | SidebarPhase::PromptFailed => Status::Error,
             SidebarPhase::Waiting => Status::Waiting,
             SidebarPhase::Active => Status::Running,
-            SidebarPhase::Idle if self.has_qualified_background_work() || self.native_autonomous_active => Status::Running,
+            SidebarPhase::Idle
+                if self.has_qualified_background_work() || self.native_autonomous_active =>
+            {
+                Status::Running
+            }
             SidebarPhase::Idle => Status::Idle,
         }
     }
@@ -4299,7 +4325,12 @@ mod tests {
             NativeResourceSelector, NativeResourceStartContext, NativeSessionPermission,
         };
         use crate::acp::event_sender::EventMetadata;
-        let mut session = crate::server::test_support::managed_control_session(scope, "child-resource-provenance", "claude", None)
+        let mut session = crate::server::test_support::managed_control_session(
+            scope,
+            "child-resource-provenance",
+            "claude",
+            None,
+        )
         .await;
         for update in [
             serde_json::json!({

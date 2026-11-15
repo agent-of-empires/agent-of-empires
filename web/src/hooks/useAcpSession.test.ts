@@ -1107,17 +1107,27 @@ describe("current native admission", () => {
     async (consumer) => {
       const id = "sess-pending-host";
       const intent = "5fdcc941-9be3-4f26-ab31-21b612084392";
-      const hook = renderHook(() => {
-        const acp = useAcpSession(id);
-        const escalation = useCancelEscalation(id, acp.state.promptSeq, acp.state.cancelling,
-          acp.cancelPrompt, acp.forceEndTurn);
-        return { acp, escalation };
-      }, { wrapper: profileWrapper });
+      const hook = renderHook(
+        () => {
+          const acp = useAcpSession(id);
+          const escalation = useCancelEscalation(
+            id,
+            acp.state.promptSeq,
+            acp.state.cancelling,
+            acp.cancelPrompt,
+            acp.forceEndTurn,
+          );
+          return { acp, escalation };
+        },
+        { wrapper: profileWrapper },
+      );
       await flushAsync();
       lastSocket().open();
       await flushAsync();
       lastSocket().message({
-        session_id: id, seq: 1, event: { UserPromptSent: { text: "accepted host intent" } },
+        session_id: id,
+        seq: 1,
+        event: { UserPromptSent: { text: "accepted host intent" } },
       });
       const snapshot = currentControlSnapshot(hook.result.current.acp.state, { ready: false }, 1);
       snapshot.state.host_prompt_intent = intent;
@@ -1126,9 +1136,10 @@ describe("current native admission", () => {
       expect(nativeInputAvailable(hook.result.current.acp.state)).toBe(false);
       expect(hook.result.current.acp.state.turnActive).toBe(true);
       expect(hook.result.current.acp.state.hostPromptIntent).toBe(intent);
-      const panel = consumer === "panel"
-        ? renderView(createElement(StopSession, { sessionId: id, running: 1 }), { wrapper: profileWrapper })
-        : null;
+      const panel =
+        consumer === "panel"
+          ? renderView(createElement(StopSession, { sessionId: id, running: 1 }), { wrapper: profileWrapper })
+          : null;
       if (panel) {
         fireEvent.click(panel.getByRole("button", { name: "Stop", exact: true }));
         expect(posts("/acp/cancel")).toEqual([]);
@@ -1140,7 +1151,8 @@ describe("current native admission", () => {
       const cancels = posts("/acp/cancel");
       expect(cancels).toHaveLength(1);
       expect(cancels[0]).toMatchObject({
-        method: "POST", url: `/api/sessions/${id}/acp/cancel`,
+        method: "POST",
+        url: `/api/sessions/${id}/acp/cancel`,
       });
       expect(JSON.parse(cancels[0]!.body as string)).toEqual({ host_prompt_intent: intent });
       await act(async () => {

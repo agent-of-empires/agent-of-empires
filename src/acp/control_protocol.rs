@@ -265,14 +265,22 @@ pub struct NativeAutonomousSnapshot {
 impl NativeAutonomousFrame {
     fn validate(&self, phase: NativeAutonomousPhase) -> Result<()> {
         self.notification.validate(phase)?;
-        let stamp = self.evidence.autonomous
+        let stamp = self
+            .evidence
+            .autonomous
             .ok_or_else(|| anyhow::anyhow!("Native lifecycle has no original actor stamp"))?;
         anyhow::ensure!(
-            stamp.phase == phase && stamp.ordinal > 0
+            stamp.phase == phase
+                && stamp.ordinal > 0
                 && stamp.run_id == self.notification.run_id
                 && stamp.source == self.notification.source
-                && self.evidence.physical_source.is_some_and(|physical|
-                    physical.witness.owner.is_some_and(|owner| owner.birth_fingerprint.is_some()))
+                && self
+                    .evidence
+                    .physical_source
+                    .is_some_and(|physical| physical
+                        .witness
+                        .owner
+                        .is_some_and(|owner| owner.birth_fingerprint.is_some()))
                 && (self.evidence.session_stamp.is_some()
                     || self.evidence.original_request_stamp.is_some()),
             "incomplete original Native lifecycle stamp"
@@ -285,7 +293,10 @@ impl NativeAutonomousFrame {
             && self.notification.run_id == other.notification.run_id
             && self.notification.source == other.notification.source
             && self.evidence.physical_source == other.evidence.physical_source
-            && self.evidence.autonomous.zip(other.evidence.autonomous)
+            && self
+                .evidence
+                .autonomous
+                .zip(other.evidence.autonomous)
                 .is_some_and(|(left, right)| left.ordinal == right.ordinal)
     }
 }
@@ -295,7 +306,10 @@ impl NativeAutonomousSnapshot {
         self.started.validate(NativeAutonomousPhase::Started)?;
         if let Some(ended) = &self.ended {
             ended.validate(NativeAutonomousPhase::Ended)?;
-            anyhow::ensure!(self.started.same_run(ended), "Native lifecycle terminal changed its original run");
+            anyhow::ensure!(
+                self.started.same_run(ended),
+                "Native lifecycle terminal changed its original run"
+            );
         }
         Ok(())
     }
@@ -304,26 +318,45 @@ impl NativeAutonomousSnapshot {
         previous: Option<&Self>,
         frame: std::sync::Arc<NativeAutonomousFrame>,
     ) -> Result<Self> {
-        let phase = frame.evidence.autonomous
-            .ok_or_else(|| anyhow::anyhow!("Native lifecycle has no actor stamp"))?.phase;
+        let phase = frame
+            .evidence
+            .autonomous
+            .ok_or_else(|| anyhow::anyhow!("Native lifecycle has no actor stamp"))?
+            .phase;
         frame.validate(phase)?;
         let next = match phase {
             NativeAutonomousPhase::Started => {
                 if let Some(previous) = previous {
                     if previous.started.same_run(&frame) {
-                        anyhow::ensure!(previous.ended.is_none(), "Native producer reused a retired run");
+                        anyhow::ensure!(
+                            previous.ended.is_none(),
+                            "Native producer reused a retired run"
+                        );
                         return Ok(previous.clone());
                     }
-                    anyhow::ensure!(previous.ended.is_some()
-                        || previous.started.evidence.physical_source != frame.evidence.physical_source,
-                        "Native producer overlapped independent root runs");
+                    anyhow::ensure!(
+                        previous.ended.is_some()
+                            || previous.started.evidence.physical_source
+                                != frame.evidence.physical_source,
+                        "Native producer overlapped independent root runs"
+                    );
                 }
-                Self { started: frame, ended: None }
+                Self {
+                    started: frame,
+                    ended: None,
+                }
             }
             NativeAutonomousPhase::Ended => {
-                let previous = previous.ok_or_else(|| anyhow::anyhow!("Native terminal lost its original start"))?;
-                anyhow::ensure!(previous.started.same_run(&frame), "Native terminal differs from the retained start");
-                Self { started: std::sync::Arc::clone(&previous.started), ended: Some(frame) }
+                let previous = previous
+                    .ok_or_else(|| anyhow::anyhow!("Native terminal lost its original start"))?;
+                anyhow::ensure!(
+                    previous.started.same_run(&frame),
+                    "Native terminal differs from the retained start"
+                );
+                Self {
+                    started: std::sync::Arc::clone(&previous.started),
+                    ended: Some(frame),
+                }
             }
         };
         next.validate()?;
@@ -334,15 +367,21 @@ impl NativeAutonomousSnapshot {
         struct Count(usize);
         impl std::io::Write for Count {
             fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
-                self.0 = self.0.checked_add(bytes.len())
+                self.0 = self
+                    .0
+                    .checked_add(bytes.len())
                     .ok_or(std::io::ErrorKind::WriteZero)?;
                 Ok(bytes.len())
             }
-            fn flush(&mut self) -> std::io::Result<()> { Ok(()) }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
         }
         let mut count = Count(0);
         serde_json::to_writer(&mut count, self)?;
-        count.0.checked_add("\"native_autonomous\":,".len())
+        count
+            .0
+            .checked_add("\"native_autonomous\":,".len())
             .ok_or_else(|| anyhow::anyhow!("Native snapshot byte count overflow"))
     }
 }

@@ -372,7 +372,8 @@ impl AcpTranscript {
         self.connection_ready = state.connection_ready && self.connection_unavailable.is_none();
         self.prompt_wake_eligible =
             state.prompt_wake_eligible == Some(true) && self.connection_unavailable.is_none();
-        self.host_prompt_intent = state.host_prompt_intent
+        self.host_prompt_intent = state
+            .host_prompt_intent
             .filter(|_| self.connection_unavailable.is_none());
 
         let holds = |field: &str| unchanged.iter().any(|f| f == field);

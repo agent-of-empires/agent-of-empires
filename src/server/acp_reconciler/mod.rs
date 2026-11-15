@@ -1691,8 +1691,10 @@ mod tests {
         with_managed(|scope| {
             Box::pin(async move {
                 for shape in ["missing", "null", "v3"] {
-                    let mut live =
-                        crate::server::test_support::managed_control_session(scope, shape, "claude", None).await;
+                    let mut live = crate::server::test_support::managed_control_session(
+                        scope, shape, "claude", None,
+                    )
+                    .await;
                     let id = live.id().to_owned();
                     live.park("interrupted explicit intent").await;
                     let park = match live.state.acp_event_store.rate_limit_park(&id).unwrap() {
@@ -2045,8 +2047,13 @@ mod tests {
                 })
                 .unwrap();
                 test_support::refresh_canonical_metadata_for_test(&scope.state).await;
-                let mut original =
-                    test_support::managed_control_session(scope, "queue-drain-wake", "claude", None).await;
+                let mut original = test_support::managed_control_session(
+                    scope,
+                    "queue-drain-wake",
+                    "claude",
+                    None,
+                )
+                .await;
                 let id = original.id().to_owned();
                 let state = original.state.clone();
                 let sid = original.sid.clone();

@@ -564,8 +564,12 @@ function ComposerDock({
           }}
           availableCommands={state.availableCommands}
           connected={status === "open" && nativeInputAvailable(state)}
-          canCancelHostIntent={status === "open" && state.nativeSnapshotSeq != null &&
-            state.connectionUnavailable === null && state.hostPromptIntent != null}
+          canCancelHostIntent={
+            status === "open" &&
+            state.nativeSnapshotSeq != null &&
+            state.connectionUnavailable === null &&
+            state.hostPromptIntent != null
+          }
           canForceEndTurn={ctx.canForceEndTurn}
           stopTurn={ctx.stopTurn}
           canSubmit={status === "open" && canSubmitPromptIntent(state)}

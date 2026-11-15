@@ -301,22 +301,33 @@ impl NativeChannelState {
         use control_protocol::NativeAutonomousPhase;
         let stamp = match (phase, self.autonomous_latest) {
             (NativeAutonomousPhase::Started, Some(previous))
-                if previous.run_id == notification.run_id && previous.source == notification.source
-                    && previous.phase == NativeAutonomousPhase::Started => previous,
+                if previous.run_id == notification.run_id
+                    && previous.source == notification.source
+                    && previous.phase == NativeAutonomousPhase::Started =>
+            {
+                previous
+            }
             (NativeAutonomousPhase::Started, previous) => {
-                if previous.is_some_and(|previous| previous.phase == NativeAutonomousPhase::Started
-                    || previous.run_id == notification.run_id) {
+                if previous.is_some_and(|previous| {
+                    previous.phase == NativeAutonomousPhase::Started
+                        || previous.run_id == notification.run_id
+                }) {
                     return None;
                 }
                 self.autonomous_ordinal = self.autonomous_ordinal.checked_add(1)?;
                 control_protocol::NativeAutonomousStamp {
-                    run_id: notification.run_id, ordinal: self.autonomous_ordinal,
-                    source: notification.source, phase,
+                    run_id: notification.run_id,
+                    ordinal: self.autonomous_ordinal,
+                    source: notification.source,
+                    phase,
                 }
             }
             (NativeAutonomousPhase::Ended, Some(previous))
-                if previous.run_id == notification.run_id && previous.source == notification.source =>
-                    control_protocol::NativeAutonomousStamp { phase, ..previous },
+                if previous.run_id == notification.run_id
+                    && previous.source == notification.source =>
+            {
+                control_protocol::NativeAutonomousStamp { phase, ..previous }
+            }
             _ => return None,
         };
         self.autonomous_latest = Some(stamp);
@@ -901,15 +912,16 @@ impl RunnerShared {
                     | "plan"
             )
         );
-        let session_metadata = autonomous.is_some() || matches!(
-            update_kind,
-            Some(
-                "usage_update"
-                    | "config_option_update"
-                    | "current_mode_update"
-                    | "available_commands_update"
-            )
-        );
+        let session_metadata = autonomous.is_some()
+            || matches!(
+                update_kind,
+                Some(
+                    "usage_update"
+                        | "config_option_update"
+                        | "current_mode_update"
+                        | "available_commands_update"
+                )
+            );
         let needs_session = matches!(
             update_kind,
             Some(
@@ -1152,12 +1164,15 @@ impl RunnerShared {
             },
             _ => crate::acp::protocol::AcpPromptObservation::Ambiguous,
         });
-        let autonomous_expected = native.autonomous_negotiated && source_current
+        let autonomous_expected = native.autonomous_negotiated
+            && source_current
             && (session_stamp.is_some() || original_request_stamp.is_some());
-        let autonomous_stamp = autonomous.as_ref()
+        let autonomous_stamp = autonomous
+            .as_ref()
             .filter(|_| autonomous_expected)
             .and_then(|(phase, notification)| native.autonomous_stamp(*phase, notification));
-        let autonomous_conflict = autonomous.is_some() && autonomous_expected && autonomous_stamp.is_none();
+        let autonomous_conflict =
+            autonomous.is_some() && autonomous_expected && autonomous_stamp.is_none();
         let response = response_value
             .and_then(|(id, value)| native.calls.remove(&id).map(|call| (id, call, value)));
         let premature = response
@@ -1734,10 +1749,18 @@ impl RunnerShared {
             }
         };
         let lifecycle = match &body {
-            ControlBody::Notify { params, evidence, .. } if kind == QueuedKind::AutonomousLifecycle => {
-                match serde_json::from_value::<control_protocol::NativeAutonomousNotification>(params.clone()) {
-                    Ok(notification) if evidence.autonomous.is_some() =>
-                        Some(Arc::new(control_protocol::NativeAutonomousFrame { notification, evidence: *evidence })),
+            ControlBody::Notify {
+                params, evidence, ..
+            } if kind == QueuedKind::AutonomousLifecycle => {
+                match serde_json::from_value::<control_protocol::NativeAutonomousNotification>(
+                    params.clone(),
+                ) {
+                    Ok(notification) if evidence.autonomous.is_some() => {
+                        Some(Arc::new(control_protocol::NativeAutonomousFrame {
+                            notification,
+                            evidence: *evidence,
+                        }))
+                    }
                     _ => None,
                 }
             }
@@ -1745,11 +1768,18 @@ impl RunnerShared {
         };
         let retained = if let Some(frame) = &lifecycle {
             let previous = self.control.lock().await.autonomous.clone();
-            match control_protocol::NativeAutonomousSnapshot::next(previous.as_deref(), Arc::clone(frame)) {
+            match control_protocol::NativeAutonomousSnapshot::next(
+                previous.as_deref(),
+                Arc::clone(frame),
+            ) {
                 Ok(snapshot) => {
-                    let Ok(bytes) = snapshot.encoded_bytes() else { return false; };
-                    if bytes.saturating_add(wire.len()) > control_protocol::MAX_CONTROL_QUEUE_BYTES
-                        - control_protocol::MAX_NATIVE_LOSS_FRAME_BYTES {
+                    let Ok(bytes) = snapshot.encoded_bytes() else {
+                        return false;
+                    };
+                    if bytes.saturating_add(wire.len())
+                        > control_protocol::MAX_CONTROL_QUEUE_BYTES
+                            - control_protocol::MAX_NATIVE_LOSS_FRAME_BYTES
+                    {
                         self.observe_native_loss(NativeChannelLossCause::ProtocolEnded);
                         return false;
                     }
@@ -1760,7 +1790,9 @@ impl RunnerShared {
                     return false;
                 }
             }
-        } else { None };
+        } else {
+            None
+        };
         loop {
             let space = self.control_space.notified();
             tokio::pin!(space);
@@ -1794,12 +1826,18 @@ impl RunnerShared {
                         }
                     }
                 }
-                let retain = lifecycle.as_ref().is_some_and(|frame| native.loss.is_none()
-                    && native.receipt.as_ref().and_then(|receipt|
-                        crate::acp::state::NativePhysicalSource::from_receipt(receipt))
-                        == frame.evidence.physical_source);
-                let retained_delta = retained.as_ref().filter(|_| retain)
-                    .map_or(0, |(_, bytes)| bytes.saturating_sub(channel.autonomous_bytes));
+                let retain = lifecycle.as_ref().is_some_and(|frame| {
+                    native.loss.is_none()
+                        && native.receipt.as_ref().and_then(|receipt| {
+                            crate::acp::state::NativePhysicalSource::from_receipt(receipt)
+                        }) == frame.evidence.physical_source
+                });
+                let retained_delta = retained
+                    .as_ref()
+                    .filter(|_| retain)
+                    .map_or(0, |(_, bytes)| {
+                        bytes.saturating_sub(channel.autonomous_bytes)
+                    });
                 if channel.make_room(kind, wire.len().saturating_add(retained_delta)) {
                     channel.push_projected(scope, kind, Arc::clone(&wire), replay);
                     if let Some((snapshot, bytes)) = retained.as_ref().filter(|_| retain) {
@@ -2633,8 +2671,10 @@ impl RunnerShared {
                 transport_error("native channel unavailable"),
             ));
         }
-        let autonomous_requested = request.pointer("/clientCapabilities/_meta/ompAutonomousTurns/version")
-            .and_then(serde_json::Value::as_u64) == Some(1);
+        let autonomous_requested = request
+            .pointer("/clientCapabilities/_meta/ompAutonomousTurns/version")
+            .and_then(serde_json::Value::as_u64)
+            == Some(1);
         let response = self
             .agent_request(agent_stdin, "initialize", request, dispatch_release, None)
             .await
@@ -2645,9 +2685,14 @@ impl RunnerShared {
                 )
             })?;
         let result = handshake_result(response)?;
-        self.native_channel.lock().expect("native channel lock").autonomous_negotiated =
-            autonomous_requested && result.pointer("/_meta/ompAutonomousTurns/version")
-                .and_then(serde_json::Value::as_u64) == Some(1);
+        self.native_channel
+            .lock()
+            .expect("native channel lock")
+            .autonomous_negotiated = autonomous_requested
+            && result
+                .pointer("/_meta/ompAutonomousTurns/version")
+                .and_then(serde_json::Value::as_u64)
+                == Some(1);
         self.handshake.lock().await.initialized = Some(result.clone());
         Ok(result)
     }

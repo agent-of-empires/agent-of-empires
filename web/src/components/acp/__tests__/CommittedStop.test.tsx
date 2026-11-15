@@ -93,8 +93,12 @@ it("the committed Composer Stop cancels its current turn before SDK passive publ
               authStatus={ctx.state.authStatus}
               availableCommands={ctx.state.availableCommands}
               connected={ctx.status === "open" && nativeInputAvailable(ctx.state)}
-              canCancelHostIntent={ctx.status === "open" && ctx.state.nativeSnapshotSeq != null &&
-                ctx.state.connectionUnavailable === null && ctx.state.hostPromptIntent != null}
+              canCancelHostIntent={
+                ctx.status === "open" &&
+                ctx.state.nativeSnapshotSeq != null &&
+                ctx.state.connectionUnavailable === null &&
+                ctx.state.hostPromptIntent != null
+              }
               canForceEndTurn={ctx.canForceEndTurn}
               stopTurn={ctx.stopTurn}
               canSubmit={ctx.canSendQueuedNow}
@@ -169,8 +173,12 @@ it("the committed Composer stops only its exact pending host message without Nat
             authStatus={ctx.state.authStatus}
             availableCommands={ctx.state.availableCommands}
             connected={ctx.status === "open" && nativeInputAvailable(ctx.state)}
-            canCancelHostIntent={ctx.status === "open" && ctx.state.nativeSnapshotSeq != null &&
-              ctx.state.connectionUnavailable === null && ctx.state.hostPromptIntent != null}
+            canCancelHostIntent={
+              ctx.status === "open" &&
+              ctx.state.nativeSnapshotSeq != null &&
+              ctx.state.connectionUnavailable === null &&
+              ctx.state.hostPromptIntent != null
+            }
             canForceEndTurn={ctx.canForceEndTurn}
             stopTurn={ctx.stopTurn}
             canSubmit={ctx.canSendQueuedNow}
@@ -218,13 +226,17 @@ it("the committed Composer stops only its exact pending host message without Nat
   const stop = view.getByRole("button", { name: "Stop", exact: true }) as HTMLButtonElement;
   expect(stop.disabled).toBe(false);
   expect(stop.title).toBe("Stop the pending message");
-  await act(async () => { stop.click(); });
+  await act(async () => {
+    stop.click();
+  });
   await flushAsync();
   expect(posts("/acp/cancel")).toHaveLength(1);
   expect(posts("/acp/cancel")[0]?.url).toBe(`/api/sessions/${id}/acp/cancel`);
   expect(JSON.parse(posts("/acp/cancel")[0]!.body!)).toEqual({ host_prompt_intent: originalIntent });
   expect(current.canForceEndTurn).toBe(false);
-  await act(async () => { stop.click(); });
+  await act(async () => {
+    stop.click();
+  });
   await flushAsync();
   expect(posts("/acp/cancel")).toHaveLength(2);
   expect(JSON.parse(posts("/acp/cancel")[1]!.body!)).toEqual({ host_prompt_intent: originalIntent });
@@ -233,11 +245,15 @@ it("the committed Composer stops only its exact pending host message without Nat
 
   lastSocket().message(snapshot(3, replacementIntent));
   await flushAsync();
-  await act(async () => { originalStop(); });
+  await act(async () => {
+    originalStop();
+  });
   await flushAsync();
   expect(posts("/acp/cancel")).toHaveLength(2);
   const replacementStop = current.stopTurn;
-  await act(async () => { view.getByRole("button", { name: "Stop", exact: true }).click(); });
+  await act(async () => {
+    view.getByRole("button", { name: "Stop", exact: true }).click();
+  });
   await flushAsync();
   expect(posts("/acp/cancel")).toHaveLength(3);
   expect(JSON.parse(posts("/acp/cancel")[2]!.body!)).toEqual({ host_prompt_intent: replacementIntent });
@@ -250,12 +266,16 @@ it("the committed Composer stops only its exact pending host message without Nat
   expect(current.state.turnActive).toBe(false);
   expect(nativeInputAvailable(current.state)).toBe(false);
   expect(view.queryByRole("button", { name: "Stop", exact: true })).toBeNull();
-  await act(async () => { replacementStop(); });
+  await act(async () => {
+    replacementStop();
+  });
   await flushAsync();
   expect(posts("/acp/cancel")).toHaveLength(3);
   expect(posts("/acp/force_end_turn")).toEqual([]);
   view.unmount();
-  await act(async () => { replacementStop(); });
+  await act(async () => {
+    replacementStop();
+  });
   await flushAsync();
   expect(posts("/acp/cancel")).toHaveLength(3);
 });
