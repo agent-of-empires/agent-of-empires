@@ -2,6 +2,7 @@
 
 use anyhow::{bail, Context, Result};
 use clap::{Args, ValueEnum};
+use std::future::Future;
 use std::path::PathBuf;
 use std::sync::Mutex;
 
@@ -41,8 +42,10 @@ pub struct ServeArgs {
     #[arg(long, conflicts_with_all = ["remote", "behind_proxy", "port", "host", "auth", "no_auth", "open", "passphrase", "allowed_host", "allowed_origin"])]
     pub core_only: bool,
 
-    /// Port to listen on (default: 8080; debug builds default to 8081 so a
-    /// `cargo run` instance does not collide with an installed release `aoe`).
+    /// Port to listen on. Falls back to the `AOE_SERVE_PORT` environment
+    /// variable, then `[serve] port` in config.toml, then 8080 (debug builds
+    /// default to 8081 so a `cargo run` instance does not collide with an
+    /// installed release `aoe`).
     #[arg(long)]
     pub port: Option<u16>,
 
@@ -130,6 +133,17 @@ pub struct ServeArgs {
     #[arg(long, requires = "tunnel_name")]
     pub tunnel_url: Option<String>,
 
+    /// Public HTTPS port for Tailscale Funnel: 443, 8443 or 10000, so a second
+    /// daemon on this machine can have its own Funnel. Falls back to
+    /// `[serve] funnel_port`, then 443.
+    #[arg(
+        long,
+        value_name = "PORT",
+        requires = "remote",
+        conflicts_with_all = ["no_tailscale", "tunnel_name"],
+    )]
+    pub funnel_port: Option<crate::session::config::FunnelPort>,
+
     /// Run as a background daemon (detach from terminal)
     #[arg(long)]
     pub daemon: bool,
@@ -148,7 +162,7 @@ pub struct ServeArgs {
     /// would change daemon state (`--stop`, `--daemon`, `--remote`) or
     /// the bind config of a fresh daemon (`--no-auth`, `--auth`,
     /// `--behind-proxy`, `--read-only`, `--passphrase`, `--port`,
-    /// `--tunnel-name`, `--no-tailscale`, `--tunnel-url`, `--open`,
+    /// `--tunnel-name`, `--no-tailscale`, `--tunnel-url`, `--funnel-port`, `--open`,
     /// `--allowed-host`, `--allowed-origin`).
     /// Clap reports the misuse instead of silently ignoring the extras.
     #[arg(
@@ -157,7 +171,7 @@ pub struct ServeArgs {
             "stop", "daemon", "remote", "restart",
             "no_auth", "auth", "behind_proxy", "dangerously_allow_plaintext_remote",
             "read_only", "cityhall", "passphrase", "port",
-            "tunnel_name", "no_tailscale", "tunnel_url", "open",
+            "tunnel_name", "no_tailscale", "tunnel_url", "funnel_port", "open",
             "allowed_host", "allowed_origin",
         ],
     )]
@@ -193,7 +207,7 @@ pub struct ServeArgs {
             "stop", "status", "daemon", "daemon_child", "core_only", "remote", "rollback",
             "no_auth", "auth", "behind_proxy", "dangerously_allow_plaintext_remote",
             "read_only", "cityhall", "passphrase", "port", "host",
-            "tunnel_name", "no_tailscale", "tunnel_url", "open",
+            "tunnel_name", "no_tailscale", "tunnel_url", "funnel_port", "open",
             "allowed_host", "allowed_origin",
         ],
     )]
@@ -204,7 +218,7 @@ pub struct ServeArgs {
         "stop", "status", "restart", "daemon", "daemon_child", "core_only",
         "remote", "no_auth", "auth", "behind_proxy", "read_only", "cityhall",
         "passphrase", "port", "host", "tunnel_name", "no_tailscale",
-        "tunnel_url", "open", "allowed_host", "allowed_origin",
+        "tunnel_url", "funnel_port", "open", "allowed_host", "allowed_origin",
     ])]
     pub rollback: bool,
 }
@@ -234,19 +248,75 @@ impl ServeArgs {
             self.passphrase = resolve_launch_passphrase(self.passphrase.take(), None, || {
                 std::env::var("AOE_SERVE_PASSPHRASE").ok()
             });
+            self.resolve_port()?;
+            self.resolve_funnel_port()?;
         }
         self.cityhall = self.cityhall || std::env::var_os("AOE_CITYHALL_MODE").is_some();
         Ok(())
     }
 
-    /// Resolve the port: explicit `--port` wins; otherwise 8081 in debug
-    /// builds, 8080 in release. The `-dev` suffix on the app dir keeps
-    /// state isolated, but two daemons cannot share a port, so the default
-    /// shifts as well.
+    /// Resolve the port: explicit `--port` wins; otherwise the build default
+    /// (8081 in debug builds, 8080 in release). Fresh launches fill `port` from
+    /// `AOE_SERVE_PORT` and `[serve] port` first, in `resolve_launch`.
     pub fn resolved_port(&self) -> u16 {
         self.port
-            .unwrap_or(if cfg!(debug_assertions) { 8081 } else { 8080 })
+            .unwrap_or(crate::session::config::DEFAULT_SERVE_PORT)
     }
+
+    /// Fill a missing TCP port from `AOE_SERVE_PORT`, then `[serve] port`.
+    fn resolve_port(&mut self) -> Result<()> {
+        self.fill_port(std::env::var_os("AOE_SERVE_PORT"), || {
+            Ok(crate::session::config::ServeConfig::load()?.port)
+        })
+    }
+
+    /// Fill a missing Funnel port from `[serve] funnel_port`, and drop it when this launch
+    /// can't use Funnel.
+    fn resolve_funnel_port(&mut self) -> Result<()> {
+        self.fill_funnel_port(|| Ok(crate::session::config::ServeConfig::load()?.funnel_port))
+    }
+
+    fn fill_funnel_port(
+        &mut self,
+        configured: impl FnOnce() -> Result<crate::session::config::FunnelPort>,
+    ) -> Result<()> {
+        let may_use_funnel = self.remote && !self.no_tailscale && self.tunnel_name.is_none();
+        if !may_use_funnel {
+            self.funnel_port = None;
+        } else if self.funnel_port.is_none() {
+            self.funnel_port = Some(configured()?);
+        }
+        Ok(())
+    }
+
+    fn fill_port(
+        &mut self,
+        env: Option<std::ffi::OsString>,
+        configured: impl FnOnce() -> Result<u16>,
+    ) -> Result<()> {
+        if !self.core_only && self.port.is_none() {
+            self.port = Some(resolve_serve_port(env, configured)?);
+        }
+        Ok(())
+    }
+}
+
+/// `AOE_SERVE_PORT` wins over the configured port; an empty value counts as unset.
+fn resolve_serve_port(
+    env: Option<std::ffi::OsString>,
+    configured: impl FnOnce() -> Result<u16>,
+) -> Result<u16> {
+    let Some(raw) = env.filter(|raw| !raw.is_empty()) else {
+        // config.toml bypasses the settings validator, and port 0 binds an ephemeral port.
+        let port = configured()?;
+        return (port != 0)
+            .then_some(port)
+            .context("Invalid [serve] port 0: expected 1-65535");
+    };
+    raw.to_str()
+        .and_then(|value| value.trim().parse::<u16>().ok())
+        .filter(|port| *port != 0)
+        .with_context(|| format!("Invalid AOE_SERVE_PORT {raw:?}: expected 1-65535"))
 }
 
 /// Pure check used by both the CLI validator and its unit tests.
@@ -557,15 +627,19 @@ pub async fn lock_for_startup(profile: &str, args: &mut ServeArgs) -> Result<Opt
         LaunchMode::Tcp
     };
     args.resolve_launch(Some(requested))?;
-    match daemon_status() {
+    match tokio::task::spawn_blocking(daemon_status).await? {
         DaemonStatus::Verified(pid) if pid != std::process::id() => {
             transaction = migrate_managed_launch(transaction, false).await?;
-            let launch = managed_launch(pid)?;
+            let launch = tokio::task::spawn_blocking(move || managed_launch(pid)).await??;
             if !launch.core_only || args.core_only || args.daemon_child {
                 return Err(daemon_running_error(pid));
             }
             validate_launch_args(profile, args).await?;
-            let passphrase = recall_serve_passphrase(&launch)?;
+            let (launch, passphrase) = tokio::task::spawn_blocking(move || {
+                let passphrase = recall_serve_passphrase(&launch)?;
+                Ok::<_, anyhow::Error>((launch, passphrase))
+            })
+            .await??;
             retain_rollback_launch(&transaction, &launch, passphrase.as_deref())?;
             tracing::info!(
                 target: "serve.lifecycle",
@@ -637,6 +711,10 @@ pub struct ServeLaunch {
     pub tunnel_name: Option<String>,
     pub tunnel_url: Option<String>,
     pub no_tailscale: bool,
+    /// Absent in records written before `--funnel-port`: a restart fills it from the setting, a
+    /// rollback with the 443 those builds ran on.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub funnel_port: Option<crate::session::config::FunnelPort>,
     #[serde(default)]
     pub allowed_host: Vec<String>,
     #[serde(default)]
@@ -670,6 +748,7 @@ impl ServeLaunch {
             tunnel_name: self.tunnel_name.clone(),
             no_tailscale: self.no_tailscale,
             tunnel_url: self.tunnel_url.clone(),
+            funnel_port: self.funnel_port,
             daemon: true,
             stop: false,
             status: false,
@@ -695,7 +774,7 @@ impl ServeLaunch {
             args.auth = requested.auth;
         }
         args.core_only = requested.core_only;
-        args.port = requested.port;
+        args.port = requested.port.or(args.port);
         args.host = requested.host;
         args.remote = requested.remote;
         if !args.remote {
@@ -703,6 +782,7 @@ impl ServeLaunch {
             args.tunnel_url = None;
         }
         args.no_tailscale = requested.no_tailscale;
+        args.funnel_port = requested.funnel_port.or(args.funnel_port);
         args.passphrase = requested.passphrase;
         args
     }
@@ -819,7 +899,7 @@ async fn rollback_daemon() -> Result<()> {
             && credential.passphrase.is_some() == launch.has_passphrase,
         "Retained credentials do not match the retained launch",
     );
-    let args = launch.to_serve_args(credential.passphrase);
+    let args = rollback_args(&launch, credential.passphrase)?;
     validate_launch_args(&launch.profile, &args).await?;
     match daemon_status() {
         DaemonStatus::Verified(pid) => {
@@ -926,12 +1006,16 @@ fn live_daemon_instance_matches(pid: u32, instance_id: &str) -> bool {
             .is_some_and(|environment| environment_has_daemon_instance(&environment, instance_id));
     }
 
-    std::process::Command::new("ps")
-        .args(["-ww", "-E", "-o", "command=", "-p", &pid.to_string()])
-        .output()
-        .ok()
-        .filter(|output| output.status.success())
-        .is_some_and(|output| environment_has_daemon_instance(&output.stdout, instance_id))
+    crate::process::run_with_timeout_process_group(
+        std::process::Command::new("ps")
+            .args(["-ww", "-E", "-o", "command=", "-p", &pid.to_string()])
+            .stdin(std::process::Stdio::null()),
+        std::time::Duration::from_secs(3),
+    )
+    .ok()
+    .flatten()
+    .filter(|output| output.status.success())
+    .is_some_and(|output| environment_has_daemon_instance(&output.stdout, instance_id))
 }
 
 fn recall_serve_passphrase(launch: &ServeLaunch) -> Result<Option<String>> {
@@ -967,7 +1051,7 @@ fn resolve_launch_passphrase(
 /// plus a loopback alternate for same-host clients. Local mode may have
 /// multiple entries (Tailscale + LAN + localhost), and the user can Tab-cycle
 /// between them.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ServeUrl {
     /// Optional human-readable label ("tailscale", "lan", "localhost").
     /// None for the primary URL, which does not need one.
@@ -979,10 +1063,10 @@ pub struct ServeUrl {
 /// empty. The primary URL gets `label: None` for rendering; alternates
 /// carry their label.
 pub fn read_serve_urls() -> Vec<ServeUrl> {
-    let Ok(dir) = crate::session::get_app_dir() else {
-        return Vec::new();
-    };
-    let Ok(raw) = std::fs::read_to_string(dir.join("serve.url")) else {
+    let Some(raw) = launch_file("serve.url")
+        .ok()
+        .and_then(|file| file.read().ok().flatten())
+    else {
         return Vec::new();
     };
     let mut out: Vec<ServeUrl> = Vec::new();
@@ -1011,6 +1095,30 @@ pub fn read_serve_urls() -> Vec<ServeUrl> {
         }
     }
     out
+}
+
+/// Whether the Tailscale daemon's Funnel still routes here, from `$APP_DIR/serve.funnel`.
+/// Only a missing file means ours; one that can't be read is Unknown.
+pub fn read_serve_funnel() -> crate::server::tunnel::FunnelReach {
+    use crate::server::tunnel::FunnelReach;
+    match launch_file("serve.funnel").and_then(|file| file.read()) {
+        Ok(raw) => FunnelReach::from_marker(raw.as_deref()),
+        Err(_) => FunnelReach::Unknown,
+    }
+}
+
+/// The sentence Remote Access and `aoe serve --status` show while the Funnel URL is withdrawn.
+pub fn funnel_notice(reach: crate::server::tunnel::FunnelReach) -> Option<&'static str> {
+    use crate::server::tunnel::FunnelReach;
+    match reach {
+        FunnelReach::Ours => None,
+        FunnelReach::Lost => Some(
+            "Tailscale Funnel now routes to another server. This dashboard is reachable from this machine only. Restart Remote Access once the other server stops.",
+        ),
+        FunnelReach::Unknown => Some(
+            "Tailscale isn't answering, so the Funnel link is hidden until it does. This dashboard is reachable from this machine only for now.",
+        ),
+    }
 }
 
 fn read_serve_mode_label() -> Option<&'static str> {
@@ -1098,17 +1206,21 @@ fn inspect_daemon_process(pid: i32) -> DaemonProcessIdentity {
     // macOS / other: shell out to `ps`. `-o command=` prints the full
     // command (path + args) with no header, and `-ww` stops it being clipped
     // at the terminal width before `serve` shows up.
-    match std::process::Command::new("ps")
-        .args(["-ww", "-o", "command=", "-p", &pid.to_string()])
-        .output()
-    {
-        Ok(out) if !out.status.success() => DaemonProcessIdentity::Indeterminate,
-        Ok(out) if command_is_aoe_serve(&out.stdout) => DaemonProcessIdentity::Verified,
-        Ok(out) if command_mentions_aoe_executable(&out.stdout) => {
+    match crate::process::run_with_timeout_process_group(
+        std::process::Command::new("ps")
+            .args(["-ww", "-o", "command=", "-p", &pid.to_string()])
+            .stdin(std::process::Stdio::null()),
+        std::time::Duration::from_secs(3),
+    ) {
+        Ok(Some(out)) if !out.status.success() || out.stdout.trim_ascii().is_empty() => {
             DaemonProcessIdentity::Indeterminate
         }
-        Ok(_) => DaemonProcessIdentity::Foreign,
-        Err(_) => DaemonProcessIdentity::Indeterminate,
+        Ok(Some(out)) if command_is_aoe_serve(&out.stdout) => DaemonProcessIdentity::Verified,
+        Ok(Some(out)) if command_mentions_aoe_executable(&out.stdout) => {
+            DaemonProcessIdentity::Indeterminate
+        }
+        Ok(Some(_)) => DaemonProcessIdentity::Foreign,
+        Ok(None) | Err(_) => DaemonProcessIdentity::Indeterminate,
     }
 }
 
@@ -1149,11 +1261,12 @@ fn classify_daemon_probe(
     }
 }
 
-const SERVE_STATE_FILES: [&str; 4] = [
+const SERVE_STATE_FILES: [&str; 5] = [
     "serve.url",
     "serve.mode",
     "serve.passphrase",
     "serve.launch",
+    "serve.funnel",
 ];
 
 /// Separate from the lifetime lock a running server holds, which this state is
@@ -1179,8 +1292,10 @@ fn clear_serve_state(expected_pid: i32) -> bool {
     ) else {
         return false;
     };
-    let recorded = std::fs::read_to_string(&pid_path)
+    let recorded = crate::session::ResolvedDataFile::open(&pid_path)
+        .and_then(|file| file.read())
         .ok()
+        .flatten()
         .and_then(|raw| parse_positive_pid(&raw));
     if recorded != Some(expected_pid) {
         return false;
@@ -1215,12 +1330,9 @@ fn daemon_status_with(
     probe: impl FnOnce(i32) -> DaemonProbeDisposition,
     inspect: impl FnOnce(i32) -> DaemonProcessIdentity,
 ) -> DaemonStatus {
-    let Ok(path) = pid_file_path() else {
-        return DaemonStatus::Unverified;
-    };
-    let pid_str = match std::fs::read_to_string(&path) {
-        Ok(pid) => pid,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return DaemonStatus::Absent,
+    let pid_str = match launch_file("serve.pid").and_then(|file| file.read()) {
+        Ok(Some(pid)) => pid,
+        Ok(None) => return DaemonStatus::Absent,
         Err(_) => return DaemonStatus::Unverified,
     };
     let Some(pid) = parse_positive_pid(&pid_str) else {
@@ -1234,7 +1346,14 @@ fn daemon_status_with(
             DaemonProcessIdentity::Indeterminate => DaemonStatus::Unverified,
         },
         DaemonProbeDisposition::Stale => DaemonStatus::Absent,
-        DaemonProbeDisposition::Indeterminate => DaemonStatus::Unverified,
+        // A pid we cannot signal (EPERM) is often a root process that reused it.
+        // Only a positively foreign command clears it; anything else fails closed.
+        DaemonProbeDisposition::Indeterminate => match inspect(pid) {
+            DaemonProcessIdentity::Foreign => DaemonStatus::Absent,
+            DaemonProcessIdentity::Verified | DaemonProcessIdentity::Indeterminate => {
+                DaemonStatus::Unverified
+            }
+        },
     }
 }
 
@@ -1373,7 +1492,12 @@ async fn validate_launch_args(profile: &str, args: &ServeArgs) -> Result<AuthMod
             tailscale_probe().await.use_funnel()?
         };
         if cloudflared_required(args.no_tailscale, args.tunnel_name.is_some(), tailscale_ok) {
-            tokio::task::spawn_blocking(crate::server::tunnel::check_cloudflared).await??;
+            tokio::task::spawn_blocking(|| {
+                crate::server::tunnel::check_cloudflared(
+                    &tokio_util::sync::CancellationToken::new(),
+                )
+            })
+            .await??;
         }
     }
     Ok(auth_mode)
@@ -1529,6 +1653,7 @@ pub async fn run(profile: &str, mut args: ServeArgs, startup: Option<ServeStartu
             tunnel_name: args.tunnel_name.as_deref(),
             tunnel_url: args.tunnel_url.as_deref(),
             no_tailscale: args.no_tailscale,
+            funnel_port: args.funnel_port.unwrap_or_default().number(),
             is_daemon: args.daemon_child,
             passphrase: args.passphrase.as_deref(),
             behind_proxy: args.behind_proxy,
@@ -1546,19 +1671,20 @@ pub async fn run(profile: &str, mut args: ServeArgs, startup: Option<ServeStartu
     result
 }
 
-/// Path the daemon's stdout/stderr are redirected to. Resolved from the
-/// configured `[logging].file_path` so panic backtraces interleave with
-/// the structured tracing stream. Used by `start_daemon()` for the stdio
-/// redirect, by the TUI serve dialog for the tail pane, and by `aoe logs`
-/// for the viewer target.
+/// Configured log shared by tracing and the Daemon's redirected stdout/stderr.
 pub fn stdio_redirect_path() -> Result<PathBuf> {
+    stdio_redirect_logging().map(|(path, _)| path)
+}
+
+pub(crate) fn stdio_redirect_logging() -> Result<(PathBuf, crate::session::config::LoggingConfig)> {
     let dir = crate::session::get_app_dir()?;
     let log_cfg = crate::session::load_config()
         .ok()
         .flatten()
         .map(|c| c.logging)
         .unwrap_or_default();
-    Ok(crate::logging::resolve_log_path(&log_cfg, &dir))
+    let path = crate::logging::resolve_log_path(&log_cfg, &dir);
+    Ok((path, log_cfg))
 }
 
 /// URL a CityHall-hosted workspace fetches its config bundle from. Unset means
@@ -1741,54 +1867,193 @@ pub(crate) async fn ensure_local_daemon(
     }
     Ok((endpoint, started))
 }
+pub(crate) struct TuiDashboardLaunch {
+    pub(crate) runtime: (
+        crate::daemon::RuntimeConnection,
+        crate::daemon::DaemonClient,
+    ),
+    pub(crate) target: TuiControlTarget,
+}
+
+#[derive(Debug)]
+pub(crate) struct TuiDashboardLaunchFailure {
+    pub(crate) error: anyhow::Error,
+    pub(crate) target: Option<TuiControlTarget>,
+}
+
 pub(crate) async fn start_dashboard_for_tui(
     profile: &str,
     mut args: ServeArgs,
     predecessor_epoch: Option<&str>,
-    restart: bool,
-) -> Result<(
-    crate::daemon::RuntimeConnection,
-    crate::daemon::DaemonClient,
-)> {
-    let launch = if restart {
-        restart_daemon_with_receipt(Some(args), false).await?
+    restart: Option<TuiControlLease>,
+) -> std::result::Result<TuiDashboardLaunch, TuiDashboardLaunchFailure> {
+    let launch = async {
+        let launch = if let Some(lease) = restart {
+            lease.restart(args).await?
+        } else {
+            let startup = lock_for_startup(profile, &mut args)
+                .await?
+                .context("Dashboard startup guard is unavailable")?;
+            let startup = tokio::task::spawn_blocking(move || {
+                startup.run_migrations(None)?;
+                Ok::<_, anyhow::Error>(startup)
+            })
+            .await??;
+            let ServeStartup { lock, transaction } = startup;
+            validate_launch_args(profile, &args).await?;
+            drop(lock);
+            start_daemon(profile, &args, &transaction, false).await?;
+            tokio::task::spawn_blocking(|| {
+                managed_launch(daemon_pid().context("Dashboard successor is unavailable")?)
+            })
+            .await??
+        };
+        Ok::<_, anyhow::Error>(launch)
+    }
+    .await
+    .map_err(|error| TuiDashboardLaunchFailure {
+        error,
+        target: None,
+    })?;
+    connect_owned_dashboard(profile, predecessor_epoch, launch).await
+}
+
+async fn connect_owned_dashboard(
+    profile: &str,
+    predecessor_epoch: Option<&str>,
+    launch: ServeLaunch,
+) -> std::result::Result<TuiDashboardLaunch, TuiDashboardLaunchFailure> {
+    let target = async {
+        anyhow::ensure!(!launch.core_only, "Successor did not enable the dashboard");
+        let instance = launch
+            .instance_id
+            .as_deref()
+            .context("Successor instance proof is missing")?;
+        let target = tokio::task::spawn_blocking(tui_control_target).await??;
+        anyhow::ensure!(
+            target.process.as_ref().is_some_and(|(pid, _, owner)| {
+                *pid == launch.pid && owner.as_deref() == Some(instance)
+            }),
+            "Dashboard successor identity changed before reconnect"
+        );
+        Ok::<_, anyhow::Error>(target)
+    }
+    .await
+    .map_err(|error| TuiDashboardLaunchFailure {
+        error,
+        target: None,
+    })?;
+    drop(launch);
+    let runtime = async {
+        let instance = target
+            .process
+            .as_ref()
+            .and_then(|(_, _, owner)| owner.as_deref())
+            .context("Successor instance proof is missing")?;
+        let endpoint = crate::acp::client::discovery::local_unix_endpoint(
+            crate::daemon::transport::local_socket_path()?,
+        );
+        let connection = crate::daemon::RuntimeConnection::connect(
+            &endpoint,
+            (!profile.is_empty()).then_some(profile),
+        )
+        .await?;
+        anyhow::ensure!(
+            connection.info().owner_instance_id.as_deref() == Some(instance),
+            "Dashboard successor identity changed before reconnect"
+        );
+        anyhow::ensure!(
+            predecessor_epoch.is_none_or(|epoch| epoch != connection.info().epoch),
+            "Dashboard successor reused the predecessor epoch"
+        );
+        let client = endpoint.daemon_client()?;
+        anyhow::ensure!(
+            tokio::task::spawn_blocking(tui_control_target).await?? == target,
+            "Dashboard successor identity changed before observation"
+        );
+        Ok::<_, anyhow::Error>((connection, client))
+    }
+    .await;
+    match runtime {
+        Ok(runtime) => Ok(TuiDashboardLaunch { runtime, target }),
+        Err(error) => Err(TuiDashboardLaunchFailure {
+            error,
+            target: Some(target),
+        }),
+    }
+}
+
+/// The `aoe serve --daemon-child` argv that replays `args`; the passphrase travels in the
+/// environment instead.
+fn daemon_child_args(args: &ServeArgs, profile: &str) -> Vec<String> {
+    let mut argv: Vec<String> = Vec::new();
+    let mut push = |items: &[&str]| argv.extend(items.iter().map(|item| item.to_string()));
+    push(&["serve", "--daemon-child"]);
+    if args.read_acquisition {
+        push(&["--read-acquisition"]);
+    }
+    if args.core_only {
+        push(&["--core-only"]);
     } else {
-        let startup = lock_for_startup(profile, &mut args)
-            .await?
-            .context("Dashboard startup guard is unavailable")?;
-        let startup = tokio::task::spawn_blocking(move || {
-            startup.run_migrations(None)?;
-            Ok::<_, anyhow::Error>(startup)
-        })
-        .await??;
-        let ServeStartup { lock, transaction } = startup;
-        validate_launch_args(profile, &args).await?;
-        drop(lock);
-        start_daemon(profile, &args, &transaction, false).await?;
-        managed_launch(daemon_pid().context("Dashboard successor is unavailable")?)?
-    };
-    anyhow::ensure!(!launch.core_only, "Successor did not enable the dashboard");
-    let instance = launch
-        .instance_id
-        .context("Successor instance proof is missing")?;
-    let endpoint = crate::acp::client::discovery::local_unix_endpoint(
-        crate::daemon::transport::local_socket_path()?,
-    );
-    let connection = crate::daemon::RuntimeConnection::connect(
-        &endpoint,
-        (!profile.is_empty()).then_some(profile),
-    )
-    .await?;
-    anyhow::ensure!(
-        connection.info().owner_instance_id.as_deref() == Some(instance.as_str()),
-        "Dashboard successor identity changed before reconnect"
-    );
-    anyhow::ensure!(
-        predecessor_epoch.is_none_or(|epoch| epoch != connection.info().epoch),
-        "Dashboard successor reused the predecessor epoch"
-    );
-    let client = endpoint.daemon_client()?;
-    Ok((connection, client))
+        push(&[
+            "--port",
+            &args.resolved_port().to_string(),
+            "--host",
+            &args.host,
+        ]);
+    }
+    if args.no_auth {
+        push(&["--no-auth"]);
+    }
+    if let Some(mode) = args.auth {
+        push(&["--auth", mode.as_cli_str()]);
+    }
+    if args.behind_proxy {
+        push(&["--behind-proxy"]);
+    }
+    if args.dangerously_allow_plaintext_remote {
+        push(&["--dangerously-allow-plaintext-remote"]);
+    }
+    if args.read_only {
+        push(&["--read-only"]);
+    }
+    if args.cityhall {
+        push(&["--cityhall"]);
+    }
+    if args.remote {
+        push(&["--remote"]);
+    }
+    if let Some(ref name) = args.tunnel_name {
+        push(&["--tunnel-name", name]);
+    }
+    if let Some(ref url) = args.tunnel_url {
+        push(&["--tunnel-url", url]);
+    }
+    if args.no_tailscale {
+        push(&["--no-tailscale"]);
+    }
+    if let Some(port) = args.funnel_port {
+        push(&["--funnel-port", &port.number().to_string()]);
+    }
+    for h in &args.allowed_host {
+        push(&["--allowed-host", h]);
+    }
+    for o in &args.allowed_origin {
+        push(&["--allowed-origin", o]);
+    }
+    if !profile.is_empty() {
+        push(&["--profile", profile]);
+    }
+    argv
+}
+
+/// The retained launch to roll back to. A record from before `funnel_port` ran its Funnel on
+/// 443, the only port those builds used, so it gets 443 here rather than the setting, and the
+/// new `serve.launch` records it.
+fn rollback_args(launch: &ServeLaunch, passphrase: Option<String>) -> Result<ServeArgs> {
+    let mut args = launch.to_serve_args(passphrase);
+    args.fill_funnel_port(|| Ok(crate::session::config::FunnelPort::Port443))?;
+    Ok(args)
 }
 
 async fn start_daemon(
@@ -1805,7 +2070,7 @@ async fn start_daemon(
     let profile = resolved_profile.as_deref().unwrap_or(profile);
 
     let _state_lock = lock_serve_state()?;
-    if let Some(existing) = daemon_pid() {
+    if let Some(existing) = tokio::task::spawn_blocking(daemon_pid).await? {
         bail!("aoe serve daemon already running (PID {existing}); not starting another");
     }
     let exe = std::env::current_exe()?;
@@ -1814,63 +2079,10 @@ async fn start_daemon(
     cmd.env(SERVE_INSTANCE_ENV, &instance_id);
     cmd.env_remove("AOE_CITYHALL_MODE")
         .env_remove("AOE_SERVE_PASSPHRASE");
-    cmd.args(["serve", "--daemon-child"]);
-    if args.read_acquisition {
-        cmd.arg("--read-acquisition");
-    }
-    if args.core_only {
-        cmd.arg("--core-only");
-    } else {
-        cmd.args([
-            "--port",
-            &args.resolved_port().to_string(),
-            "--host",
-            &args.host,
-        ]);
-    }
-
-    if args.no_auth {
-        cmd.arg("--no-auth");
-    }
-    if let Some(mode) = args.auth {
-        cmd.args(["--auth", mode.as_cli_str()]);
-    }
-    if args.behind_proxy {
-        cmd.arg("--behind-proxy");
-    }
-    if args.dangerously_allow_plaintext_remote {
-        cmd.arg("--dangerously-allow-plaintext-remote");
-    }
-    if args.read_only {
-        cmd.arg("--read-only");
-    }
-    if args.cityhall {
-        cmd.arg("--cityhall");
-    }
-    if args.remote {
-        cmd.arg("--remote");
-    }
-    if let Some(ref name) = args.tunnel_name {
-        cmd.args(["--tunnel-name", name]);
-    }
-    if let Some(ref url) = args.tunnel_url {
-        cmd.args(["--tunnel-url", url]);
-    }
-    if args.no_tailscale {
-        cmd.arg("--no-tailscale");
-    }
-    for h in &args.allowed_host {
-        cmd.args(["--allowed-host", h]);
-    }
-    for o in &args.allowed_origin {
-        cmd.args(["--allowed-origin", o]);
-    }
+    cmd.args(daemon_child_args(args, profile));
     if let Some(ref passphrase) = args.passphrase {
         // Pass via env var to avoid exposing the passphrase in the process list
         cmd.env("AOE_SERVE_PASSPHRASE", passphrase);
-    }
-    if !profile.is_empty() {
-        cmd.args(["--profile", profile]);
     }
 
     cmd.stdin(transaction.handoff()?);
@@ -1959,6 +2171,7 @@ async fn start_daemon(
         tunnel_name: args.tunnel_name.clone(),
         tunnel_url: args.tunnel_url.clone(),
         no_tailscale: args.no_tailscale,
+        funnel_port: args.funnel_port,
         allowed_host: args.allowed_host.clone(),
         allowed_origin: args.allowed_origin.clone(),
         additional_fields: serde_json::Map::new(),
@@ -1983,21 +2196,30 @@ async fn start_daemon(
     let log = stdio_redirect_path()
         .map(|p| format!(" See {}.", p.display()))
         .unwrap_or_default();
+    let owner = std::sync::Arc::new((launch.instance_id, birth));
     let ready = await_daemon_ready(
         pid,
         &log,
         tokio::time::Instant::now() + readiness,
         || Ok(child.try_wait()?),
         || {
-            Box::pin(async {
-                client.local_daemon_ready(pid).await.unwrap_or(false)
-                    && daemon_pid() == Some(pid)
-                    && launch
-                        .instance_id
-                        .as_deref()
-                        .is_some_and(|instance| live_daemon_instance_matches(pid, instance))
-                    && crate::process::process_birth_identity(pid)
-                        .is_ok_and(|current| current.as_ref() == Some(&birth))
+            let owner = std::sync::Arc::clone(&owner);
+            let client = &client;
+            Box::pin(async move {
+                if !client.local_daemon_ready(pid).await.unwrap_or(false) {
+                    return Ok(false);
+                }
+                tokio::task::spawn_blocking(move || {
+                    let (instance_id, birth) = owner.as_ref();
+                    daemon_pid() == Some(pid)
+                        && instance_id
+                            .as_deref()
+                            .is_some_and(|instance| live_daemon_instance_matches(pid, instance))
+                        && crate::process::process_birth_identity(pid)
+                            .is_ok_and(|current| current.as_ref() == Some(birth))
+                })
+                .await
+                .map_err(Into::into)
             })
         },
     )
@@ -2014,14 +2236,13 @@ async fn start_daemon(
     Ok(())
 }
 
-/// Polls until `ready`, the child exits, or `deadline`. The deadline error is
-/// "unconfirmed" because the daemon may still have been starting.
+/// Propagates probe failures; deadline expiry alone leaves startup unconfirmed.
 async fn await_daemon_ready<'a>(
     pid: u32,
     log: &str,
     deadline: tokio::time::Instant,
     mut exited: impl FnMut() -> Result<Option<std::process::ExitStatus>>,
-    mut ready: impl FnMut() -> std::pin::Pin<Box<dyn std::future::Future<Output = bool> + Send + 'a>>,
+    mut ready: impl FnMut() -> std::pin::Pin<Box<dyn Future<Output = Result<bool>> + Send + 'a>>,
 ) -> Result<()> {
     let started = tokio::time::Instant::now();
     let wait = tokio::time::timeout_at(deadline, async {
@@ -2029,7 +2250,10 @@ async fn await_daemon_ready<'a>(
             if let Some(status) = exited()? {
                 anyhow::bail!("Daemon exited before readiness ({status}).{log}");
             }
-            if ready().await {
+            if ready()
+                .await
+                .with_context(|| format!("Failed to check Daemon readiness (PID {pid}).{log}"))?
+            {
                 return Ok(());
             }
             tokio::time::sleep(std::time::Duration::from_millis(50)).await;
@@ -2150,6 +2374,25 @@ async fn restart_daemon_if_current(
     Ok(TuiRestart::Restarted)
 }
 
+fn replay_args(
+    launch: &ServeLaunch,
+    override_args: Option<ServeArgs>,
+    predecessor_passphrase: Option<&str>,
+    resolve_port: impl FnOnce(&mut ServeArgs) -> Result<()>,
+) -> Result<ServeArgs> {
+    let mut args = match override_args {
+        Some(requested) => launch.overlay_tui_args(requested),
+        None => launch.to_serve_args(None),
+    };
+    args.passphrase =
+        resolve_launch_passphrase(args.passphrase.take(), Some(predecessor_passphrase), || {
+            None
+        });
+    // A core-only record has no port to replay when the request enables the dashboard.
+    resolve_port(&mut args)?;
+    Ok(args)
+}
+
 async fn replay_managed_launch(
     transaction: crate::daemon::lifecycle::Transaction,
     override_args: Option<ServeArgs>,
@@ -2161,7 +2404,7 @@ async fn replay_managed_launch(
             progress(crate::migrations::progress::Event::Step(message.to_owned()));
         }
     };
-    let Some(pid) = daemon_pid() else {
+    let Some(pid) = tokio::task::spawn_blocking(daemon_pid).await? else {
         bail!(
             "No running aoe serve daemon to restart.\n\
              Start one with: aoe serve --daemon"
@@ -2169,17 +2412,21 @@ async fn replay_managed_launch(
     };
     let transaction = migrate_managed_launch(transaction, false).await?;
 
-    let launch = managed_launch(pid)?;
-    let predecessor_passphrase = recall_serve_passphrase(&launch)?;
-    let mut args = match override_args {
-        Some(requested) => launch.overlay_tui_args(requested),
-        None => launch.to_serve_args(None),
-    };
-    args.passphrase = resolve_launch_passphrase(
-        args.passphrase.take(),
-        Some(predecessor_passphrase.as_deref()),
-        || None,
-    );
+    let (launch, predecessor_passphrase) = tokio::task::spawn_blocking(move || {
+        let launch = managed_launch(pid)?;
+        let passphrase = recall_serve_passphrase(&launch)?;
+        Ok::<_, anyhow::Error>((launch, passphrase))
+    })
+    .await??;
+    let args = replay_args(
+        &launch,
+        override_args,
+        predecessor_passphrase.as_deref(),
+        |args| {
+            args.resolve_port()?;
+            args.resolve_funnel_port()
+        },
+    )?;
     validate_launch_args(&launch.profile, &args).await?;
     retain_rollback_launch(&transaction, &launch, predecessor_passphrase.as_deref())?;
 
@@ -2196,9 +2443,12 @@ async fn replay_managed_launch(
     let transaction = migrate_managed_launch_reporting(transaction, true, reporter).await?;
     stage("Starting the new Daemon");
     complete_rollback_after(start_daemon(&launch.profile, &args, &transaction, announce).await)?;
-    let new_pid = daemon_pid().context("Restart successor is unavailable")?;
-    tracing::info!(target: "serve.lifecycle", old_pid = pid, new_pid, "daemon restarted");
-    managed_launch(new_pid)
+    let successor = tokio::task::spawn_blocking(|| {
+        managed_launch(daemon_pid().context("Restart successor is unavailable")?)
+    })
+    .await??;
+    tracing::info!(target: "serve.lifecycle", old_pid = pid, new_pid = successor.pid, "daemon restarted");
+    Ok(successor)
 }
 
 fn stale_cleanup_notice(pid: i32, announce: bool) -> Option<&'static str> {
@@ -2208,6 +2458,282 @@ fn stale_cleanup_notice(pid: i32, announce: bool) -> Option<&'static str> {
     } else {
         "Daemon was not running; serve state changed meanwhile and was preserved"
     })
+}
+/// Opaque Daemon incarnation observed before a TUI control request is queued.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct TuiControlTarget {
+    process: Option<(u32, crate::process::ProcessBirthIdentity, Option<String>)>,
+}
+
+impl TuiControlTarget {
+    pub(crate) fn is_running(&self) -> bool {
+        self.process.is_some()
+    }
+}
+
+struct TuiObservedDaemon {
+    target: TuiControlTarget,
+    dashboard: bool,
+    passphrase: bool,
+}
+
+pub(crate) fn tui_control_target() -> Result<TuiControlTarget> {
+    Ok(tui_observed_daemon()?.target)
+}
+
+fn tui_observed_daemon() -> Result<TuiObservedDaemon> {
+    let mut dashboard = false;
+    let mut passphrase = false;
+    let process = match daemon_status() {
+        DaemonStatus::Absent => None,
+        DaemonStatus::Unverified => bail!("Cannot verify the Daemon; inspect `aoe serve --status`"),
+        DaemonStatus::Verified(pid) => {
+            let birth = crate::process::process_birth_identity(pid)?
+                .context("Daemon exited while its identity was being observed")?;
+            let launch = launch_file("serve.launch")?
+                .read()?
+                .map(|raw| serde_json::from_str::<ServeLaunch>(&raw))
+                .transpose()?;
+            let instance = match launch {
+                Some(launch) if launch.pid == pid => {
+                    anyhow::ensure!(
+                        !launch_contradicts(&launch, pid, instance_is_live(&launch, pid)),
+                        "Daemon launch identity contradicts its process; preserving serve state"
+                    );
+                    dashboard = !launch.core_only;
+                    passphrase = launch.has_passphrase;
+                    launch.instance_id
+                }
+                _ => {
+                    dashboard = true;
+                    passphrase = true;
+                    None
+                }
+            };
+            Some((pid, birth, instance))
+        }
+    };
+    Ok(TuiObservedDaemon {
+        target: TuiControlTarget { process },
+        dashboard,
+        passphrase,
+    })
+}
+
+#[cfg(test)]
+pub(crate) fn wait_for_test_daemon(child: &mut std::process::Child) -> TuiControlTarget {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    loop {
+        let status = child.try_wait().expect("fixture process status");
+        assert!(status.is_none(), "Daemon fixture exited: {status:?}");
+        match tui_control_target() {
+            Ok(target)
+                if target
+                    .process
+                    .as_ref()
+                    .is_some_and(|(pid, ..)| *pid == child.id()) =>
+            {
+                return target;
+            }
+            observed => assert!(
+                std::time::Instant::now() < deadline,
+                "Daemon fixture identity did not become observable: {observed:?}"
+            ),
+        }
+        std::thread::yield_now();
+    }
+}
+
+/// Holds lifecycle exclusion through a strictly incarnation-bound mutation.
+pub(crate) struct TuiControlLease {
+    transaction: crate::daemon::lifecycle::Transaction,
+    target: TuiControlTarget,
+}
+
+impl TuiControlLease {
+    pub(crate) async fn prepare(
+        target: TuiControlTarget,
+        cancel: &tokio_util::sync::CancellationToken,
+    ) -> Result<Self> {
+        let transaction = tui_lifecycle_transaction(cancel).await?;
+        anyhow::ensure!(
+            !cancel.is_cancelled()
+                && tokio::task::spawn_blocking(tui_control_target).await?? == target
+                && !cancel.is_cancelled(),
+            "Daemon identity changed before control admission; preserving its successor"
+        );
+        Ok(Self {
+            transaction,
+            target,
+        })
+    }
+
+    /// The Funnel port of the observed Daemon's launch record, so a `--funnel-port` launch is
+    /// respected. A record from before `funnel_port` names 443. With no Daemon the `[serve]`
+    /// setting names the port. A live Daemon whose port can't be established, or that doesn't
+    /// run Funnel, is refused rather than guessed, so no unrelated port is touched.
+    pub(crate) fn funnel_port(&self) -> Result<crate::session::config::FunnelPort> {
+        let Some((pid, _, _)) = self.target.process.as_ref() else {
+            return Ok(crate::session::config::ServeConfig::load_strict()?.funnel_port);
+        };
+        let launch = running_launch(*pid)
+            .context("The Daemon has no launch record of its own; its Funnel port is unknown")?;
+        let port = rollback_args(&launch, None)?
+            .funnel_port
+            .context("The Daemon's launch does not run Funnel")?;
+        anyhow::ensure!(
+            tui_control_target()? == self.target,
+            "Daemon identity changed while resolving its Funnel port; preserving its successor"
+        );
+        Ok(port)
+    }
+
+    pub(crate) async fn stop(&self) -> Result<()> {
+        if self.target.process.is_none() {
+            return Ok(());
+        }
+        stop_daemon_locked(&self.transaction, false).await
+    }
+
+    async fn restart(self, args: ServeArgs) -> Result<ServeLaunch> {
+        replay_managed_launch(self.transaction, Some(args), false, None).await
+    }
+}
+
+async fn tui_lifecycle_transaction(
+    cancel: &tokio_util::sync::CancellationToken,
+) -> Result<crate::daemon::lifecycle::Transaction> {
+    tokio::select! {
+        biased;
+        _ = cancel.cancelled() => bail!("Serve operation cancelled before admission"),
+        result = tokio::time::timeout(
+            std::time::Duration::from_secs(3),
+            crate::daemon::lifecycle::Transaction::acquire(),
+        ) => result.context("Daemon lifecycle is busy; inspect status before retrying")?,
+    }
+}
+
+/// Read-only observation can diagnose an exited owner, never adopt its replacement.
+pub(crate) struct TuiObservationLease {
+    _transaction: crate::daemon::lifecycle::Transaction,
+    observed: TuiObservedDaemon,
+    exited_process: Option<(u32, crate::process::ProcessBirthIdentity)>,
+}
+
+impl TuiObservationLease {
+    pub(crate) async fn prepare(
+        expected: Option<TuiControlTarget>,
+        cancel: &tokio_util::sync::CancellationToken,
+    ) -> Result<Self> {
+        let transaction = tui_lifecycle_transaction(cancel).await?;
+        anyhow::ensure!(!cancel.is_cancelled(), "Serve observation cancelled");
+        let observed = tui_observed_daemon()?;
+        let exited_process = match expected {
+            Some(expected) if tui_observed_exit(&expected, &observed.target)?.is_some() => {
+                expected.process.map(|(pid, birth, _)| (pid, birth))
+            }
+            _ => None,
+        };
+        Ok(Self {
+            _transaction: transaction,
+            observed,
+            exited_process,
+        })
+    }
+
+    pub(crate) fn is_running(&self) -> bool {
+        self.observed.target.is_running()
+    }
+
+    pub(crate) fn has_dashboard(&self) -> bool {
+        self.observed.dashboard
+    }
+
+    pub(crate) fn has_passphrase(&self) -> bool {
+        self.observed.passphrase
+    }
+
+    pub(crate) fn recheck(&mut self) -> Result<()> {
+        let current = tui_control_target()?;
+        if tui_observed_exit(&self.observed.target, &current)?.is_some() {
+            self.exited_process = self
+                .observed
+                .target
+                .process
+                .take()
+                .map(|(pid, birth, _)| (pid, birth));
+            self.observed.dashboard = false;
+            self.observed.passphrase = false;
+        }
+        self.observed.target = current;
+        Ok(())
+    }
+
+    pub(crate) fn into_target_and_tail(
+        self,
+        cancel: &tokio_util::sync::CancellationToken,
+    ) -> (TuiControlTarget, crate::acp::client::autostart::LogContext) {
+        let Self {
+            _transaction,
+            observed,
+            exited_process,
+        } = self;
+        // Diagnostic scans must not retain lifecycle exclusion after the identity recheck.
+        drop(_transaction);
+        let tail = exited_process
+            .as_ref()
+            .map(|(pid, birth)| {
+                crate::acp::client::autostart::startup_log_tail(*pid, birth, cancel)
+            })
+            .unwrap_or_default();
+        (observed.target, tail)
+    }
+
+    pub(crate) fn into_target(self) -> TuiControlTarget {
+        self.observed.target
+    }
+}
+
+fn tui_observed_exit(
+    expected: &TuiControlTarget,
+    current: &TuiControlTarget,
+) -> Result<Option<u32>> {
+    if expected == current {
+        return Ok(None);
+    }
+    let changed = "Daemon identity changed during observation; preserving its successor";
+    anyhow::ensure!(!current.is_running(), "{changed}");
+    let Some((pid, birth, instance)) = &expected.process else {
+        bail!("{changed}");
+    };
+    anyhow::ensure!(
+        !crate::process::process_birth_is_live(*pid, birth)?,
+        "{changed}"
+    );
+    anyhow::ensure!(
+        crate::process::process_birth_identity(*pid)?
+            .as_ref()
+            .is_none_or(|now| now == birth),
+        "{changed}"
+    );
+    if let Some(raw) = launch_file("serve.pid")?.read()? {
+        anyhow::ensure!(parse_positive_pid(&raw) == Some(*pid as i32), "{changed}");
+    }
+    if let Some(raw) = launch_file("serve.launch")?.read()? {
+        let launch: ServeLaunch = serde_json::from_str(&raw)?;
+        anyhow::ensure!(
+            launch.pid == *pid && launch.instance_id == *instance,
+            "{changed}"
+        );
+    }
+    Ok(Some(*pid))
+}
+
+fn bail_foreign_pid(pid: i32) -> Result<()> {
+    if clear_serve_state(pid) {
+        bail!("PID {pid} belongs to a different process (stale PID file). Cleaned up.");
+    }
+    bail!("PID {pid} belongs to a different process; serve state changed meanwhile and was preserved.");
 }
 
 #[tracing::instrument(target = "serve.shutdown", skip_all)]
@@ -2230,20 +2756,27 @@ async fn stop_daemon_locked(
         );
     }
 
-    let pid_str = tokio::fs::read_to_string(&path).await?;
+    let pid_str = crate::session::ResolvedDataFile::open(&path)?
+        .read()?
+        .with_context(|| format!("PID file disappeared at {}", path.display()))?;
     let pid = parse_positive_pid(&pid_str)
         .ok_or_else(|| anyhow::anyhow!("Invalid PID in {}: {}", path.display(), pid_str.trim()))?;
-    if matches!(
-        classify_daemon_probe(nix::sys::signal::kill(
-            nix::unistd::Pid::from_raw(pid),
-            None
-        )),
-        DaemonProbeDisposition::Stale
-    ) {
+    let probe = classify_daemon_probe(nix::sys::signal::kill(
+        nix::unistd::Pid::from_raw(pid),
+        None,
+    ));
+    if probe == DaemonProbeDisposition::Stale {
         if let Some(notice) = stale_cleanup_notice(pid, announce) {
             println!("{notice}");
         }
         return Ok(());
+    }
+    // A pid we cannot signal has no capturable handle below, so settle a foreign
+    // owner here without signalling.
+    if probe == DaemonProbeDisposition::Indeterminate
+        && inspect_daemon_process(pid) == DaemonProcessIdentity::Foreign
+    {
+        return bail_foreign_pid(pid);
     }
 
     // Capture before inspecting custody, so process exit or PID reuse during
@@ -2252,9 +2785,16 @@ async fn stop_daemon_locked(
         .context("Daemon exited before its physical identity could be captured; retry stop")?;
     let process = crate::process::CapturedProcess::capture(pid as u32, &birth)?
         .context("Daemon incarnation changed before shutdown; preserving serve state")?;
-    match inspect_daemon_process(pid) {
+    let (identity, contradicts) = tokio::task::spawn_blocking(move || {
+        let identity = inspect_daemon_process(pid);
+        let contradicts = matches!(identity, DaemonProcessIdentity::Verified)
+            && serve_launch_contradicts(pid as u32);
+        (identity, contradicts)
+    })
+    .await?;
+    match identity {
         DaemonProcessIdentity::Verified => {
-            if serve_launch_contradicts(pid as u32) {
+            if contradicts {
                 bail!(
                     "PID {} is an aoe serve process, but not the daemon recorded in \
                      serve.launch (recycled PID); preserving serve state.",
@@ -2262,14 +2802,7 @@ async fn stop_daemon_locked(
                 );
             }
         }
-        DaemonProcessIdentity::Foreign => {
-            if clear_serve_state(pid) {
-                bail!("PID {pid} belongs to a different process (stale PID file). Cleaned up.");
-            }
-            bail!(
-                "PID {pid} belongs to a different process; serve state changed meanwhile and was preserved."
-            );
-        }
+        DaemonProcessIdentity::Foreign => return bail_foreign_pid(pid),
         DaemonProcessIdentity::Indeterminate => {
             bail!(
                 "Could not verify whether PID {} is an aoe serve daemon; \
@@ -2370,6 +2903,11 @@ fn print_local_status() -> Result<()> {
     } else {
         println!("URL:    (serve.url missing)");
     }
+    if mode == "tailscale" {
+        if let Some(notice) = funnel_notice(read_serve_funnel()) {
+            println!("Funnel: {notice}");
+        }
+    }
     if let Some(p) = log_path {
         println!("Log:    {}", p.display());
     }
@@ -2400,51 +2938,86 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn daemon_readiness_outcomes() {
         use std::os::unix::process::ExitStatusExt;
+        let pid = 42_424_242;
+        let log_path = "/private/readiness-fixture-e7f9.log";
+        let log = format!("\nLog: {log_path}");
         let far = tokio::time::Instant::now() + std::time::Duration::from_secs(105);
         let mut polls = 0;
+        let mut observed_ready = false;
         await_daemon_ready(
-            7,
-            "",
+            pid,
+            &log,
             far,
             || Ok(None),
             || {
                 polls += 1;
-                Box::pin(std::future::ready(polls == 3))
+                observed_ready = polls >= 3;
+                Box::pin(std::future::ready(Ok(observed_ready)))
             },
         )
         .await
         .unwrap();
+        assert!(observed_ready);
+        assert!(tokio::time::Instant::now() < far);
 
+        let started = tokio::time::Instant::now();
         let err = await_daemon_ready(
-            7,
-            " See /log.",
+            pid,
+            &log,
             far,
             || Ok(Some(std::process::ExitStatus::from_raw(1 << 8))),
-            || Box::pin(async { false }),
+            || panic!("readiness must not be probed after child exit"),
         )
         .await
-        .unwrap_err()
-        .to_string();
-        assert!(
-            err.contains("exited before readiness") && err.ends_with("See /log."),
-            "{err}"
-        );
+        .unwrap_err();
+        assert!(err.to_string().contains(log_path), "{err:#}");
+        assert_eq!(tokio::time::Instant::now(), started);
 
         let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(105);
         let err = await_daemon_ready(
-            7,
-            " See /log.",
+            pid,
+            &log,
             deadline,
             || Ok(None),
-            || Box::pin(async { false }),
+            || Box::pin(async { Ok(false) }),
         )
         .await
-        .unwrap_err()
-        .to_string();
-        assert_eq!(
-            err,
-            "Daemon startup remains unconfirmed after 105s (PID 7); stopping it. See /log."
+        .unwrap_err();
+        assert!(err.to_string().contains(log_path), "{err:#}");
+        assert!(err.to_string().contains(&pid.to_string()), "{err:#}");
+        assert_eq!(tokio::time::Instant::now(), deadline);
+
+        const PROBE_FAILURE: &str = "readiness fixture failure";
+        let mut probe = Some(tokio::task::spawn_blocking(|| -> bool {
+            panic!("{PROBE_FAILURE}");
+        }));
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(105);
+        let err = await_daemon_ready(
+            pid,
+            &log,
+            deadline,
+            || Ok(None),
+            || {
+                let probe = probe.take();
+                Box::pin(async move {
+                    match probe {
+                        Some(probe) => Ok(probe.await?),
+                        None => Ok(false),
+                    }
+                })
+            },
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            err.downcast_ref::<tokio::task::JoinError>()
+                .is_some_and(|error| error.is_panic()),
+            "{err:#}"
         );
+        assert!(err.to_string().contains(log_path), "{err:#}");
+        assert!(err.to_string().contains(&pid.to_string()), "{err:#}");
+        assert!(format!("{err:#}").contains(PROBE_FAILURE), "{err:#}");
+        assert!(tokio::time::Instant::now() < deadline);
     }
 
     use super::*;
@@ -2532,6 +3105,29 @@ mod tests {
     #[test]
     fn cloudflared_required_when_no_tailscale_flag_set() {
         assert!(cloudflared_required(true, false, true));
+    }
+
+    #[test]
+    fn serve_port_prefers_environment_over_config() {
+        let os = |value: &str| Some(std::ffi::OsString::from(value));
+        let cases: [(Option<std::ffi::OsString>, Option<u16>); 7] = [
+            (None, Some(9000)),
+            (os(""), Some(9000)),
+            (os("8090"), Some(8090)),
+            (os(" 65535 "), Some(65535)),
+            (os("0"), None),
+            (os("65536"), None),
+            (os("abc"), None),
+        ];
+        for (env, expected) in cases {
+            assert_eq!(
+                resolve_serve_port(env.clone(), || Ok(9000)).ok(),
+                expected,
+                "{env:?}"
+            );
+        }
+        assert!(resolve_serve_port(None, || Ok(0)).is_err());
+        assert!(resolve_serve_port(None, || anyhow::bail!("bad config")).is_err());
     }
 
     #[test]
@@ -2850,12 +3446,507 @@ mod tests {
             tunnel_name: Some("named".to_string()),
             tunnel_url: Some("aoe.example.com".to_string()),
             no_tailscale: true,
+            funnel_port: None,
             allowed_host: vec!["aoe.example.com".to_string()],
             allowed_origin: vec!["https://aoe.example.com:8443".to_string()],
             additional_fields: serde_json::Map::new(),
         }
     }
 
+    /// Like the TCP port, a Funnel port is read from `[serve]` alone, so a bad unrelated
+    /// section doesn't block `aoe serve`.
+    #[test]
+    #[serial_test::serial]
+    fn a_funnel_port_resolves_from_serve_alone() {
+        use clap::Parser;
+        let _home = crate::session::test_support::isolate_app_dir();
+        let path = crate::session::config::config_path().unwrap();
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(
+            &path,
+            "[updates]\nupdate_check_mode = 5\n\n[serve]\nfunnel_port = \"8443\"\n",
+        )
+        .unwrap();
+        assert!(crate::session::config::Config::load().is_err());
+        let Some(crate::cli::Commands::Serve(mut args)) =
+            crate::cli::Cli::try_parse_from(["aoe", "serve", "--remote"])
+                .unwrap()
+                .command
+        else {
+            unreachable!()
+        };
+        args.resolve_funnel_port().unwrap();
+        assert_eq!(
+            args.funnel_port,
+            Some(crate::session::config::FunnelPort::Port8443)
+        );
+    }
+
+    #[test]
+    fn funnel_port_comes_from_the_flag_then_the_setting_and_only_where_funnel_runs() {
+        use crate::session::config::FunnelPort::{self, Port10000, Port8443};
+        use clap::Parser;
+        let parse = |argv: &[&str]| {
+            crate::cli::Cli::try_parse_from(argv).map(|cli| match cli.command {
+                Some(crate::cli::Commands::Serve(args)) => args,
+                _ => unreachable!(),
+            })
+        };
+        for argv in [
+            &["aoe", "serve", "--funnel-port", "8443"][..],
+            &[
+                "aoe",
+                "serve",
+                "--remote",
+                "--no-tailscale",
+                "--funnel-port",
+                "8443",
+            ],
+            &[
+                "aoe",
+                "serve",
+                "--remote",
+                "--tunnel-name",
+                "t",
+                "--tunnel-url",
+                "a.example.com",
+                "--funnel-port",
+                "8443",
+            ],
+            &["aoe", "serve", "--remote", "--funnel-port", "8080"],
+            &["aoe", "serve", "--status", "--funnel-port", "8443"],
+            &["aoe", "serve", "--restart", "--funnel-port", "8443"],
+        ] {
+            assert!(parse(argv).is_err(), "{argv:?}");
+        }
+        let setting = || -> Result<FunnelPort> { Ok(Port10000) };
+        let unread = || -> Result<FunnelPort> { bail!("the setting isn't read") };
+        // (argv, resolved Funnel port)
+        for (argv, want) in [
+            (&["aoe", "serve", "--remote"][..], Some(Port10000)),
+            (
+                &["aoe", "serve", "--remote", "--funnel-port", "8443"],
+                Some(Port8443),
+            ),
+            (&["aoe", "serve", "--remote", "--no-tailscale"], None),
+            (&["aoe", "serve"], None),
+        ] {
+            let mut args = parse(argv).unwrap();
+            args.fill_funnel_port(setting).unwrap();
+            assert_eq!(args.funnel_port, want, "{argv:?}");
+        }
+        let mut explicit = parse(&["aoe", "serve", "--remote", "--funnel-port", "8443"]).unwrap();
+        explicit.fill_funnel_port(unread).unwrap();
+
+        // A TUI restart keeps the recorded port while it stays on Funnel.
+        let mut recorded = sample_launch();
+        (recorded.remote, recorded.no_tailscale) = (true, false);
+        (recorded.tunnel_name, recorded.tunnel_url) = (None, None);
+        recorded.funnel_port = Some(Port8443);
+        for (tui, want) in [
+            (
+                &[
+                    "aoe",
+                    "serve",
+                    "--daemon",
+                    "--remote",
+                    "--host",
+                    "127.0.0.1",
+                ][..],
+                Some(Port8443),
+            ),
+            (
+                &[
+                    "aoe",
+                    "serve",
+                    "--daemon",
+                    "--remote",
+                    "--host",
+                    "127.0.0.1",
+                    "--no-tailscale",
+                ],
+                None,
+            ),
+            (&["aoe", "serve", "--daemon", "--host", "0.0.0.0"], None),
+        ] {
+            let mut args = recorded.overlay_tui_args(parse(tui).unwrap());
+            args.fill_funnel_port(unread).unwrap();
+            assert_eq!(args.funnel_port, want, "{tui:?}");
+        }
+        assert_eq!(recorded.to_serve_args(None).funnel_port, Some(Port8443));
+
+        // `serve.launch` records it as a string; a record from before the flag reads as None.
+        let written = serde_json::to_value(&recorded).unwrap();
+        assert_eq!(written["funnel_port"], "8443");
+        let old = serde_json::to_value(sample_launch()).unwrap();
+        assert!(old.get("funnel_port").is_none(), "{old}");
+        let read: ServeLaunch = serde_json::from_value(old).unwrap();
+        assert_eq!(read.funnel_port, None);
+    }
+
+    #[test]
+    fn the_daemon_child_and_a_restart_carry_the_funnel_port() {
+        use crate::session::config::{FunnelPort::*, ServeConfig};
+        use clap::Parser;
+        let parse = |argv: &[&str]| match crate::cli::Cli::try_parse_from(argv).unwrap().command {
+            Some(crate::cli::Commands::Serve(args)) => args,
+            _ => unreachable!(),
+        };
+        // The child's argv parses back to the same Funnel port, and names none without one.
+        for (argv, want) in [
+            (
+                &["aoe", "serve", "--remote", "--funnel-port", "8443"][..],
+                Some(Port8443),
+            ),
+            (&["aoe", "serve", "--remote", "--no-tailscale"], None),
+        ] {
+            let child = daemon_child_args(&parse(argv), "");
+            let replayed = parse(
+                &[
+                    &["aoe"][..],
+                    &child.iter().map(String::as_str).collect::<Vec<_>>(),
+                ]
+                .concat(),
+            );
+            assert_eq!(replayed.funnel_port, want, "{child:?}");
+            assert_eq!(
+                child.iter().any(|a| a == "--funnel-port"),
+                want.is_some(),
+                "{child:?}"
+            );
+        }
+
+        // A restart keeps a recorded port over a changed setting, as `[serve] port` does, and
+        // fills one only when the record has none.
+        let setting = || -> Result<ServeConfig> {
+            Ok(ServeConfig {
+                port: 9000,
+                funnel_port: Port10000,
+            })
+        };
+        let mut funnel = sample_launch();
+        (funnel.remote, funnel.no_tailscale) = (true, false);
+        (funnel.tunnel_name, funnel.tunnel_url) = (None, None);
+        funnel.funnel_port = Some(Port8443);
+        let cloudflare = ServeLaunch {
+            no_tailscale: true,
+            funnel_port: None,
+            ..funnel.clone()
+        };
+        let tui_funnel = &[
+            "aoe",
+            "serve",
+            "--daemon",
+            "--remote",
+            "--host",
+            "127.0.0.1",
+        ][..];
+        let tui_cloudflare = &[tui_funnel, &["--no-tailscale"]].concat();
+        // (record, TUI request, Funnel port, TCP port)
+        for (record, request, want, port) in [
+            (&funnel, Some(tui_funnel), Some(Port8443), 9090),
+            (&funnel, None, Some(Port8443), 9090),
+            (&cloudflare, Some(tui_funnel), Some(Port10000), 9090),
+            (&funnel, Some(&tui_cloudflare[..]), None, 9090),
+        ] {
+            let args = replay_args(record, request.map(parse), Some("pw"), |args| {
+                args.fill_port(None, || Ok(setting()?.port))?;
+                args.fill_funnel_port(|| Ok(setting()?.funnel_port))
+            })
+            .unwrap();
+            assert_eq!(args.funnel_port, want, "{request:?}");
+            assert_eq!(args.port, Some(port), "{request:?}");
+        }
+
+        // A record from before `funnel_port` ran on 443. A restart takes the changed setting, but
+        // a rollback of the same record restores 443; explicit ports and Cloudflare are kept.
+        let mut written = serde_json::to_value(&funnel).unwrap();
+        written.as_object_mut().unwrap().remove("funnel_port");
+        let legacy: ServeLaunch = serde_json::from_value(written).unwrap();
+        let successor = replay_args(&legacy, None, Some("pw"), |args| {
+            args.fill_port(None, || Ok(setting()?.port))?;
+            args.fill_funnel_port(|| Ok(setting()?.funnel_port))
+        })
+        .unwrap();
+        assert_eq!(successor.funnel_port, Some(Port10000));
+        // (record, rollback's Funnel port)
+        for (record, want) in [
+            (&legacy, Some(Port443)),
+            (&funnel, Some(Port8443)),
+            (&cloudflare, None),
+        ] {
+            let args = rollback_args(record, None).unwrap();
+            assert_eq!(args.funnel_port, want, "{record:?}");
+            let child = daemon_child_args(&args, "");
+            let want = want.map(|port| port.number().to_string());
+            let recorded = child
+                .iter()
+                .position(|arg| arg == "--funnel-port")
+                .map(|at| child[at + 1].clone());
+            assert_eq!(recorded, want, "{child:?}");
+        }
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn failed_dashboard_reconnect_retains_only_the_receipt_owner() {
+        use std::os::unix::process::CommandExt;
+
+        struct ChildGuard(std::process::Child);
+        impl Drop for ChildGuard {
+            fn drop(&mut self) {
+                if matches!(self.0.try_wait(), Ok(None)) {
+                    let _ = self.0.kill();
+                }
+                let _ = self.0.wait();
+            }
+        }
+
+        let _home = crate::session::test_support::isolate_app_dir();
+        crate::session::get_profile_dir("work").unwrap();
+        let fixture = tempfile::tempdir().unwrap();
+        nix::unistd::mkfifo(
+            &fixture.path().join("serve"),
+            nix::sys::stat::Mode::S_IRUSR | nix::sys::stat::Mode::S_IWUSR,
+        )
+        .unwrap();
+        let spawn = |instance: &str| {
+            ChildGuard(
+                std::process::Command::new("cat")
+                    .arg0("aoe")
+                    .arg("serve")
+                    .env(SERVE_INSTANCE_ENV, instance)
+                    .current_dir(fixture.path())
+                    .stdin(std::process::Stdio::null())
+                    .stdout(std::process::Stdio::null())
+                    .stderr(std::process::Stdio::null())
+                    .spawn()
+                    .unwrap(),
+            )
+        };
+        let publish = |child: &mut ChildGuard, instance: &str| {
+            let mut launch = sample_launch();
+            launch.pid = child.0.id();
+            launch.instance_id = Some(instance.to_owned());
+            write_serve_launch(&launch).unwrap();
+            std::fs::write(
+                crate::session::get_app_dir().unwrap().join("serve.pid"),
+                child.0.id().to_string(),
+            )
+            .unwrap();
+            let target = wait_for_test_daemon(&mut child.0);
+            (launch, target)
+        };
+        let mut original = spawn("receipt-owner");
+        let (receipt, original_target) = publish(&mut original, "receipt-owner");
+        let socket = crate::daemon::transport::local_socket_path().unwrap();
+        assert!(socket.starts_with(
+            crate::session::get_app_dir()
+                .unwrap()
+                .canonicalize()
+                .unwrap()
+        ));
+        assert!(
+            !socket.exists(),
+            "Reconnect must hit the isolated missing socket"
+        );
+        let failure = match connect_owned_dashboard("work", None, receipt).await {
+            Err(failure) => failure,
+            Ok(_) => panic!("A missing runtime socket cannot establish a Client"),
+        };
+        let owned_target = failure
+            .target
+            .expect("Client reconnect failure must retain the verified launch owner");
+        assert_eq!(owned_target, original_target);
+
+        original.0.kill().unwrap();
+        original.0.wait().unwrap();
+        let mut successor = spawn("unrelated-successor");
+        let (_, successor_target) = publish(&mut successor, "unrelated-successor");
+        assert_ne!(owned_target, successor_target);
+        let cancel = tokio_util::sync::CancellationToken::new();
+        assert!(TuiControlLease::prepare(owned_target, &cancel)
+            .await
+            .is_err());
+        let mut stale_receipt = sample_launch();
+        stale_receipt.pid = original.0.id();
+        stale_receipt.instance_id = Some("receipt-owner".to_owned());
+        let rejected = match connect_owned_dashboard("work", None, stale_receipt).await {
+            Err(failure) => failure,
+            Ok(_) => panic!("An unrelated Daemon cannot satisfy the launch receipt"),
+        };
+        assert!(
+            rejected.target.is_none(),
+            "A receipt mismatch cannot grant authority over the successor"
+        );
+        assert!(successor.0.try_wait().unwrap().is_none());
+        assert_eq!(tui_control_target().unwrap(), successor_target);
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn lease_funnel_port_never_falls_back_to_an_unrelated_port() {
+        use std::os::unix::process::CommandExt;
+
+        struct ChildGuard(std::process::Child);
+        impl Drop for ChildGuard {
+            fn drop(&mut self) {
+                let _ = self.0.kill();
+                let _ = self.0.wait();
+            }
+        }
+
+        let _home = crate::session::test_support::isolate_app_dir();
+        crate::session::get_profile_dir("work").unwrap();
+        let config = crate::session::config::config_path().unwrap();
+        std::fs::create_dir_all(config.parent().unwrap()).unwrap();
+        std::fs::write(&config, "[serve]\nfunnel_port = \"8443\"\n").unwrap();
+        let fixture = tempfile::tempdir().unwrap();
+        nix::unistd::mkfifo(
+            &fixture.path().join("serve"),
+            nix::sys::stat::Mode::S_IRUSR | nix::sys::stat::Mode::S_IWUSR,
+        )
+        .unwrap();
+        let cancel = tokio_util::sync::CancellationToken::new();
+        let cases: [(
+            &str,
+            bool,
+            Option<crate::session::config::FunnelPort>,
+            Option<&str>,
+        ); 4] = [
+            // (case, remote funnel launch, recorded port, expected port or refusal)
+            (
+                "recorded",
+                true,
+                Some(crate::session::config::FunnelPort::Port10000),
+                Some("10000"),
+            ),
+            ("legacy", true, None, Some("443")),
+            ("no funnel", false, None, None),
+            (
+                "recorded no funnel",
+                false,
+                Some(crate::session::config::FunnelPort::Port10000),
+                None,
+            ),
+        ];
+        for (case, remote, recorded, want) in cases {
+            let mut child = ChildGuard(
+                std::process::Command::new("cat")
+                    .arg0("aoe")
+                    .arg("serve")
+                    .env(SERVE_INSTANCE_ENV, "lease-owner")
+                    .current_dir(fixture.path())
+                    .stdin(std::process::Stdio::null())
+                    .stdout(std::process::Stdio::null())
+                    .stderr(std::process::Stdio::null())
+                    .spawn()
+                    .unwrap(),
+            );
+            let mut launch = sample_launch();
+            launch.pid = child.0.id();
+            launch.instance_id = Some("lease-owner".to_owned());
+            launch.remote = remote;
+            launch.tunnel_name = None;
+            launch.tunnel_url = None;
+            launch.no_tailscale = false;
+            launch.funnel_port = recorded;
+            write_serve_launch(&launch).unwrap();
+            std::fs::write(
+                crate::session::get_app_dir().unwrap().join("serve.pid"),
+                child.0.id().to_string(),
+            )
+            .unwrap();
+            let target = wait_for_test_daemon(&mut child.0);
+            let lease = TuiControlLease::prepare(target, &cancel).await.unwrap();
+            let port = lease.funnel_port().map(|port| port.number().to_string());
+            match want {
+                Some(want) => assert_eq!(port.unwrap(), want, "{case}"),
+                None => assert!(port.is_err(), "{case}: {port:?}"),
+            }
+            // The Daemon exiting after the record was read must fail, not retarget.
+            drop(lease);
+        }
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn lease_funnel_port_without_daemon_refuses_a_broken_config() {
+        let _home = crate::session::test_support::isolate_app_dir();
+        let config = crate::session::config::config_path().unwrap();
+        std::fs::create_dir_all(config.parent().unwrap()).unwrap();
+        let cancel = tokio_util::sync::CancellationToken::new();
+        // (config.toml content, wanted port or None for an error); None content = absent file
+        for (content, want) in [
+            (None, Some("443")),
+            (Some("[serve]\nfunnel_port = \"8443\"\n"), Some("8443")),
+            (Some("[serve\nfunnel_port = "), None),
+        ] {
+            match content {
+                Some(content) => std::fs::write(&config, content).unwrap(),
+                None => drop(std::fs::remove_file(&config)),
+            }
+            let lease = TuiControlLease::prepare(tui_control_target().unwrap(), &cancel)
+                .await
+                .unwrap();
+            let port = lease.funnel_port().map(|port| port.number().to_string());
+            match want {
+                Some(want) => assert_eq!(port.unwrap(), want, "{content:?}"),
+                None => assert!(port.is_err(), "{content:?}: {port:?}"),
+            }
+        }
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn lease_funnel_port_fails_when_the_daemon_exits_before_resolution() {
+        use std::os::unix::process::CommandExt;
+
+        let _home = crate::session::test_support::isolate_app_dir();
+        crate::session::get_profile_dir("work").unwrap();
+        let config = crate::session::config::config_path().unwrap();
+        std::fs::create_dir_all(config.parent().unwrap()).unwrap();
+        std::fs::write(&config, "[serve]\nfunnel_port = \"8443\"\n").unwrap();
+        let fixture = tempfile::tempdir().unwrap();
+        nix::unistd::mkfifo(
+            &fixture.path().join("serve"),
+            nix::sys::stat::Mode::S_IRUSR | nix::sys::stat::Mode::S_IWUSR,
+        )
+        .unwrap();
+        let mut child = std::process::Command::new("cat")
+            .arg0("aoe")
+            .arg("serve")
+            .env(SERVE_INSTANCE_ENV, "lease-owner")
+            .current_dir(fixture.path())
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .unwrap();
+        let mut launch = sample_launch();
+        launch.pid = child.id();
+        launch.instance_id = Some("lease-owner".to_owned());
+        launch.remote = true;
+        launch.tunnel_name = None;
+        launch.no_tailscale = false;
+        launch.funnel_port = Some(crate::session::config::FunnelPort::Port10000);
+        write_serve_launch(&launch).unwrap();
+        std::fs::write(
+            crate::session::get_app_dir().unwrap().join("serve.pid"),
+            child.id().to_string(),
+        )
+        .unwrap();
+        let target = wait_for_test_daemon(&mut child);
+        let cancel = tokio_util::sync::CancellationToken::new();
+        let lease = TuiControlLease::prepare(target, &cancel).await.unwrap();
+        child.kill().unwrap();
+        child.wait().unwrap();
+        let port = lease.funnel_port();
+        assert!(
+            port.is_err(),
+            "an exited Daemon must not retarget: {port:?}"
+        );
+    }
     #[test]
     fn tui_restart_overlay_keeps_recorded_policy() {
         use clap::Parser;
@@ -2892,6 +3983,8 @@ mod tests {
         }
         assert!(!local.remote && local.host == "0.0.0.0");
         assert!(tunnel.remote && tunnel.host == "127.0.0.1");
+        let portless = recorded.overlay_tui_args(tui_args(&["aoe", "serve", "--daemon"]));
+        assert_eq!(portless.port, Some(recorded.port));
         // clap requires `--remote` for the tunnel flags, so a Local restart must not replay them.
         assert_eq!((&local.tunnel_name, &local.tunnel_url), (&None, &None));
         assert_eq!(tunnel.tunnel_name, recorded.tunnel_name);
@@ -2904,6 +3997,47 @@ mod tests {
         ]));
         assert!(!dashboard.core_only);
         assert_eq!((dashboard.port, dashboard.auth), (Some(8080), None));
+    }
+
+    #[test]
+    fn replay_into_dashboard_resolves_a_missing_port() {
+        use clap::Parser;
+        let parse = |argv: &[&str]| {
+            let parsed = crate::cli::Cli::try_parse_from(argv).unwrap();
+            let Some(crate::cli::Commands::Serve(args)) = parsed.command else {
+                unreachable!();
+            };
+            args
+        };
+        let mut core = sample_launch();
+        core.core_only = true;
+        let env = |value: &str| Some(std::ffi::OsString::from(value));
+        let replay = |argv: &[&str], env: Option<std::ffi::OsString>, configured: u16| {
+            replay_args(&core, Some(parse(argv)), None, |args| {
+                args.fill_port(env, || Ok(configured))
+            })
+            .unwrap()
+        };
+
+        let cases: [(&[&str], _, u16, Option<u16>); 4] = [
+            (&["aoe", "serve", "--daemon"], env("9100"), 9000, Some(9100)),
+            (&["aoe", "serve", "--daemon"], None, 9000, Some(9000)),
+            (
+                &["aoe", "serve", "--daemon", "--port", "8095"],
+                env("9100"),
+                9000,
+                Some(8095),
+            ),
+            (
+                &["aoe", "serve", "--daemon", "--core-only"],
+                env("9100"),
+                9000,
+                None,
+            ),
+        ];
+        for (argv, env, configured, expected) in cases {
+            assert_eq!(replay(argv, env, configured).port, expected, "{argv:?}");
+        }
     }
 
     #[test]
@@ -3217,6 +4351,27 @@ mod tests {
 
         #[test]
         #[serial]
+        fn unsignalable_pid_is_absent_only_when_its_command_is_foreign() {
+            let _guard = crate::session::test_support::isolate_app_dir();
+            let dir = crate::session::get_app_dir().unwrap();
+            publish(&dir, 4242);
+
+            for (identity, expected) in [
+                (DaemonProcessIdentity::Foreign, DaemonStatus::Absent),
+                (DaemonProcessIdentity::Verified, DaemonStatus::Unverified),
+                (
+                    DaemonProcessIdentity::Indeterminate,
+                    DaemonStatus::Unverified,
+                ),
+            ] {
+                let status =
+                    daemon_status_with(|_| DaemonProbeDisposition::Indeterminate, |_| identity);
+                assert_eq!(status, expected, "{identity:?}");
+            }
+        }
+
+        #[test]
+        #[serial]
         fn replacement_survives_a_probe_held_across_its_publication() {
             let _guard = crate::session::test_support::isolate_app_dir();
             let dir = crate::session::get_app_dir().unwrap();
@@ -3493,6 +4648,7 @@ mod tests {
             tunnel_name: None,
             tunnel_url: None,
             no_tailscale: false,
+            funnel_port: None,
             allowed_host: Vec::new(),
             allowed_origin: Vec::new(),
             additional_fields: serde_json::Map::new(),
@@ -3659,6 +4815,360 @@ mod tests {
         assert_eq!(
             std::fs::read_to_string(app.join(".schema_version"))?,
             version
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn tui_control_refuses_a_successor_before_stop_or_reset_admission() -> Result<()> {
+        use std::future::Future;
+        use std::os::unix::process::CommandExt;
+        use std::task::Poll;
+
+        struct ChildGuard(std::process::Child);
+        impl Drop for ChildGuard {
+            fn drop(&mut self) {
+                if matches!(self.0.try_wait(), Ok(None)) {
+                    let _ = self.0.kill();
+                }
+                let _ = self.0.wait();
+            }
+        }
+
+        let _home = crate::session::test_support::isolate_app_dir();
+        let fixture = tempfile::tempdir()?;
+        nix::unistd::mkfifo(
+            &fixture.path().join("serve"),
+            nix::sys::stat::Mode::S_IRUSR | nix::sys::stat::Mode::S_IWUSR,
+        )?;
+        let spawn = || -> Result<ChildGuard> {
+            Ok(ChildGuard(
+                std::process::Command::new("cat")
+                    .arg0("aoe")
+                    .arg("serve")
+                    .current_dir(fixture.path())
+                    .stdin(std::process::Stdio::null())
+                    .stdout(std::process::Stdio::null())
+                    .stderr(std::process::Stdio::null())
+                    .spawn()?,
+            ))
+        };
+        let pid_path = pid_file_path()?;
+        for had_predecessor in [false, true] {
+            let mut predecessor = if had_predecessor {
+                Some(spawn()?)
+            } else {
+                None
+            };
+            if let Some(child) = &predecessor {
+                std::fs::write(&pid_path, child.0.id().to_string())?;
+            }
+            let target = tui_control_target()?;
+            let transaction = crate::daemon::lifecycle::Transaction::acquire().await?;
+            let cancel = tokio_util::sync::CancellationToken::new();
+            let mut waiting = Box::pin(TuiControlLease::prepare(target, &cancel));
+            std::future::poll_fn(|cx| {
+                assert!(matches!(waiting.as_mut().poll(cx), Poll::Pending));
+                Poll::Ready(())
+            })
+            .await;
+            if let Some(child) = &mut predecessor {
+                child.0.kill()?;
+                child.0.wait()?;
+            }
+            let mut successor = spawn()?;
+            std::fs::write(&pid_path, successor.0.id().to_string())?;
+            drop(transaction);
+            assert!(waiting.await.is_err());
+            assert!(
+                successor.0.try_wait()?.is_none(),
+                "stale admission affected the successor"
+            );
+            assert_eq!(
+                std::fs::read_to_string(&pid_path)?,
+                successor.0.id().to_string(),
+            );
+            let lease = TuiControlLease::prepare(tui_control_target()?, &cancel).await?;
+            lease.stop().await?;
+            successor.0.wait()?;
+            assert!(
+                !pid_path.exists(),
+                "the freshly authorized stop must finish cleanup"
+            );
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn tui_control_cancellation_releases_a_queued_lifecycle_request() -> Result<()> {
+        use std::future::Future;
+        use std::task::Poll;
+        let _home = crate::session::test_support::isolate_app_dir();
+        let target = tui_control_target()?;
+        let transaction = crate::daemon::lifecycle::Transaction::acquire().await?;
+        let cancel = tokio_util::sync::CancellationToken::new();
+        let mut waiting = Box::pin(TuiControlLease::prepare(target, &cancel));
+        std::future::poll_fn(|cx| {
+            assert!(matches!(waiting.as_mut().poll(cx), Poll::Pending));
+            Poll::Ready(())
+        })
+        .await;
+        cancel.cancel();
+        assert!(waiting.await.is_err());
+        drop(transaction);
+        let lease = TuiControlLease::prepare(
+            tui_control_target()?,
+            &tokio_util::sync::CancellationToken::new(),
+        )
+        .await?;
+        lease.stop().await?;
+        Ok(())
+    }
+
+    #[test]
+    #[cfg_attr(
+        target_os = "linux",
+        ignore = "requires private user, mount and PID namespaces; run with --ignored"
+    )]
+    #[serial_test::serial]
+    fn tui_control_inspection_keeps_the_async_executor_reactive() -> Result<()> {
+        use std::io::Write;
+        use std::os::unix::fs::PermissionsExt;
+        use std::os::unix::net::UnixDatagram;
+        use std::os::unix::process::CommandExt;
+
+        let python = std::process::Command::new("python3")
+            .args([
+                "-c",
+                "import os,sys; print(os.path.realpath(sys.executable))",
+            ])
+            .output()
+            .context("process-inspection fixture requires python3")?;
+        anyhow::ensure!(
+            python.status.success(),
+            "python3 fixture interpreter failed"
+        );
+        let python = String::from_utf8(python.stdout)?.trim().to_owned();
+        #[cfg(target_os = "linux")]
+        if std::env::var_os("AOE_TUI_PS_TEST_CHILD").is_none() {
+            let name = format!(
+                "{}::tui_control_inspection_keeps_the_async_executor_reactive",
+                module_path!().split_once("::").unwrap().1
+            );
+            let output = std::process::Command::new("unshare")
+                .args([
+                    "--user",
+                    "--map-root-user",
+                    "--mount",
+                    "--pid",
+                    "--fork",
+                    "--mount-proc",
+                ])
+                .arg(std::env::current_exe()?)
+                .args(["--exact", &name, "--ignored", "--nocapture"])
+                .env("AOE_TUI_PS_TEST_CHILD", "1")
+                .env("TMPDIR", "/tmp")
+                .output()?;
+            anyhow::ensure!(
+                output.status.success(),
+                "private process-inspection fixture failed:\n{}{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            std::io::stdout().write_all(&output.stdout)?;
+            std::io::stderr().write_all(&output.stderr)?;
+            return Ok(());
+        }
+        #[cfg(target_os = "linux")]
+        {
+            let map = std::fs::read_to_string("/proc/self/uid_map")?;
+            anyhow::ensure!(
+                std::process::id() == 1
+                    && map
+                        .lines()
+                        .all(|line| line.split_whitespace().last() == Some("1")),
+                "process-inspection fixture requires its private namespaces"
+            );
+            anyhow::ensure!(
+                std::process::Command::new("mount")
+                    .args(["-t", "tmpfs", "-o", "mode=0700", "tmpfs", "/tmp"])
+                    .status()?
+                    .success(),
+                "could not create a trusted private runtime directory"
+            );
+            let jail = std::path::Path::new("/tmp/process-inspection-root");
+            std::fs::create_dir(jail)?;
+            let interpreter_root = std::path::Path::new(&python)
+                .components()
+                .nth(1)
+                .context("fixture interpreter has no absolute root")?
+                .as_os_str();
+            for name in ["usr", "bin", "lib", "lib64", "etc", "dev", "proc", "home"]
+                .into_iter()
+                .map(std::ffi::OsStr::new)
+                .chain(std::iter::once(interpreter_root))
+            {
+                let destination = jail.join(name);
+                if destination.exists() {
+                    continue;
+                }
+                std::fs::create_dir(&destination)?;
+                anyhow::ensure!(
+                    std::process::Command::new("mount")
+                        .arg("--rbind")
+                        .arg(std::path::Path::new("/").join(name))
+                        .arg(&destination)
+                        .status()?
+                        .success(),
+                    "could not bind private fixture dependency {name:?}"
+                );
+            }
+            std::fs::create_dir(jail.join("tmp"))?;
+            std::fs::create_dir(jail.join("run"))?;
+            nix::unistd::chroot(jail)?;
+            std::env::set_current_dir("/")?;
+        }
+
+        struct ChildGuard(std::process::Child);
+        impl Drop for ChildGuard {
+            fn drop(&mut self) {
+                let _ = self.0.kill();
+                let _ = self.0.wait();
+            }
+        }
+        #[cfg(target_os = "linux")]
+        struct ProcMask(std::path::PathBuf);
+        #[cfg(target_os = "linux")]
+        impl Drop for ProcMask {
+            fn drop(&mut self) {
+                let _ = std::process::Command::new("umount").arg(&self.0).status();
+            }
+        }
+
+        let _home = crate::session::test_support::isolate_app_dir();
+        let fixture = tempfile::TempDir::new_in("/tmp")?;
+        let fifo = fixture.path().join("serve");
+        nix::unistd::mkfifo(
+            &fifo,
+            nix::sys::stat::Mode::S_IRUSR | nix::sys::stat::Mode::S_IWUSR,
+        )?;
+        let child = ChildGuard(
+            std::process::Command::new("cat")
+                .arg0("aoe")
+                .arg("serve")
+                .current_dir(fixture.path())
+                .stdin(std::process::Stdio::null())
+                .stdout(std::process::Stdio::null())
+                .spawn()?,
+        );
+        let birth = crate::process::process_birth_identity(child.0.id())?
+            .context("fixture has no kernel birth identity")?;
+        let target = TuiControlTarget {
+            process: Some((child.0.id(), birth, None)),
+        };
+        std::fs::write(pid_file_path()?, child.0.id().to_string())?;
+        #[cfg(target_os = "linux")]
+        let _mask = {
+            let proc = std::path::PathBuf::from(format!("/proc/{}", child.0.id()));
+            let shadow = fixture.path().join("proc");
+            std::fs::create_dir(&shadow)?;
+            std::fs::copy(proc.join("stat"), shadow.join("stat"))?;
+            anyhow::ensure!(
+                std::process::Command::new("mount")
+                    .args(["--bind"])
+                    .arg(&shadow)
+                    .arg(&proc)
+                    .status()?
+                    .success(),
+                "could not isolate the fixture's process-inspection fallback"
+            );
+            ProcMask(proc)
+        };
+        let started_path = fixture.path().join("started.sock");
+        let started = UnixDatagram::bind(&started_path)?;
+        started.set_read_timeout(Some(std::time::Duration::from_secs(10)))?;
+        let release_path = fixture.path().join("release");
+        nix::unistd::mkfifo(
+            &release_path,
+            nix::sys::stat::Mode::S_IRUSR | nix::sys::stat::Mode::S_IWUSR,
+        )?;
+        let release = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&release_path)?;
+        let program = fixture.path().join("ps");
+        std::fs::write(&program, format!(
+            "#!{python}\nimport os,socket\ns=socket.socket(socket.AF_UNIX,socket.SOCK_DGRAM)\ns.sendto(str(os.getpid()).encode(),{started_path:?})\nwith open({release_path:?}) as gate: gate.readline()\nprint('aoe serve')\n",
+        ))?;
+        std::fs::set_permissions(&program, std::fs::Permissions::from_mode(0o700))?;
+        let mut path = vec![fixture.path().to_path_buf()];
+        path.extend(std::env::split_paths(
+            &std::env::var_os("PATH").unwrap_or_default(),
+        ));
+        let _path =
+            crate::session::test_support::EnvGuard::set(&[("PATH", std::env::join_paths(path)?)]);
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()?;
+        for cancel_during_inspection in [false, true] {
+            let started = started.try_clone()?;
+            let mut release = release.try_clone()?;
+            let cancel = tokio_util::sync::CancellationToken::new();
+            let cancel_worker = cancel.clone();
+            let (wake, entered) = tokio::sync::oneshot::channel();
+            let (ticked, tick) = std::sync::mpsc::channel();
+            let observer = std::thread::spawn(move || -> Result<(bool, bool)> {
+                let mut bytes = [0; 32];
+                let observed = started.recv(&mut bytes).ok().and_then(|length| {
+                    std::str::from_utf8(&bytes[..length])
+                        .ok()?
+                        .parse::<i32>()
+                        .ok()
+                });
+                let _ = wake.send(());
+                let progressed = tick
+                    .recv_timeout(std::time::Duration::from_secs(10))
+                    .is_ok();
+                let alive = observed.is_some_and(|pid| {
+                    nix::sys::signal::kill(nix::unistd::Pid::from_raw(pid), None).is_ok()
+                });
+                if cancel_during_inspection {
+                    cancel_worker.cancel();
+                }
+                release.write_all(b"continue\n")?;
+                Ok((observed.is_some(), progressed && alive))
+            });
+            let result = runtime.block_on(async {
+                let ticker = tokio::spawn(async move {
+                    let _ = entered.await;
+                    let _ = ticked.send(());
+                });
+                let result = TuiControlLease::prepare(target.clone(), &cancel).await;
+                ticker.await.unwrap();
+                result
+            });
+            let (entered, responsive) = observer.join().unwrap()?;
+            assert!(
+                entered,
+                "retained ps fixture was not entered: {:?}",
+                result.as_ref().err().map(|error| format!("{error:#}"))
+            );
+            assert!(
+                responsive,
+                "executor progressed only after the retained ps exited"
+            );
+            match result {
+                Ok(lease) => {
+                    assert!(!cancel_during_inspection);
+                    assert_eq!(lease.target, target);
+                }
+                Err(error) => assert!(cancel_during_inspection, "{error:#}"),
+            }
+        }
+        assert!(
+            nix::sys::signal::kill(nix::unistd::Pid::from_raw(child.0.id() as i32), None).is_ok()
         );
         Ok(())
     }

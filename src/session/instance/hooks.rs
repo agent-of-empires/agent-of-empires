@@ -124,7 +124,7 @@ pub(crate) fn host_hook_agent(
     tool_name: &str,
     command: &str,
     session: &crate::session::config::SessionConfig,
-) -> Option<&'static crate::agents::AgentDef> {
+) -> Option<&'static crate::agents::AgentDef<'static>> {
     Instance::execution_agent_for(tool_name, command, session)
         .ok()
         .or_else(|| crate::agents::get_agent(tool_name))
@@ -522,7 +522,7 @@ impl Instance {
 
     fn ensure_disclosed_host_hook_path(
         &self,
-        agent: Option<&'static crate::agents::AgentDef>,
+        agent: Option<&'static crate::agents::AgentDef<'static>>,
     ) -> Result<()> {
         let Some(agent) = agent else {
             return Ok(());
@@ -606,7 +606,7 @@ impl Instance {
     /// Install optional status hooks and mandatory authoritative identity hooks.
     pub(super) fn install_agent_status_hooks(
         &mut self,
-        agent: Option<&'static crate::agents::AgentDef>,
+        agent: Option<&'static crate::agents::AgentDef<'static>>,
     ) {
         self.identity_publisher_launched = false;
         let config = crate::session::config::profile_config::resolve_config_or_warn(
@@ -719,7 +719,7 @@ impl Instance {
     /// `session.pre_trust_agent_folders`. The path is canonicalized because
     /// agents key trust on the resolved directory, not the symlink used to
     /// reach it.
-    fn ensure_host_folder_trust(&self, agent: Option<&'static crate::agents::AgentDef>) {
+    fn ensure_host_folder_trust(&self, agent: Option<&'static crate::agents::AgentDef<'static>>) {
         if self.is_sandboxed() {
             return;
         }

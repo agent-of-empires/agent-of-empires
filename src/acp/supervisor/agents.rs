@@ -189,7 +189,9 @@ pub(crate) fn apply_agent_command_override(
     if !spec_from_registry || selected_agent != ovr.logical_tool {
         return Ok(());
     }
-    let Some(agent_def) = crate::agents::get_agent(&ovr.logical_tool) else {
+    // The tool's own contract names the adapter, so a takeover that hides it
+    // from listings must not drop a persisted command.
+    let Some(agent_def) = crate::agents::native_definition(&ovr.logical_tool) else {
         return Ok(());
     };
     if !command_matches_binary(&spec.command, agent_def.binary) {
@@ -348,6 +350,58 @@ mod tests {
                 "{agent} {ovr:?}"
             );
         }
+    }
+
+    /// A takeover hides the fallback from listings, but a structured session
+    /// keeps the command it persisted over the host adapter that command names.
+    #[test]
+    #[serial_test::serial]
+    fn a_takeover_keeps_a_structured_omp_command_over_the_host_adapter() {
+        let temporary = tempfile::TempDir::new().unwrap();
+        let _reload = crate::plugin::ReloadRegistryOnDrop;
+        let _app = crate::session::test_support::isolate_app_dir_at(temporary.path());
+        let overlay = || {
+            let mut s = spec("omp", &["acp"]);
+            let ovr = AgentCommandOverride {
+                logical_tool: "omp".into(),
+                command: "/opt/omp/bin/omp --verbose".into(),
+            };
+            apply_agent_command_override("omp", true, &ovr, &mut s).unwrap();
+            (s.command, s.args)
+        };
+        let persisted = (
+            "/opt/omp/bin/omp".to_string(),
+            vec!["--verbose".to_string(), "acp".to_string()],
+        );
+        assert_eq!(overlay(), persisted, "the host adapter takes the command");
+
+        crate::session::test_support::install_omp_takeover("omp-next");
+        assert!(crate::agents::get_agent("omp").is_none());
+        assert_eq!(
+            overlay(),
+            persisted,
+            "a takeover must not drop a persisted command"
+        );
+
+        revoke_omp_takeover();
+        assert!(crate::agents::get_agent("omp").is_some());
+        assert_eq!(
+            overlay(),
+            persisted,
+            "a revocation must keep the same overlay"
+        );
+    }
+
+    fn revoke_omp_takeover() {
+        let plugin = crate::plugin::plugins_dir()
+            .unwrap()
+            .join("acme.omp-cutover");
+        std::fs::remove_dir_all(&plugin).unwrap();
+        crate::session::update_config(|config| {
+            config.plugins.remove("acme.omp-cutover");
+        })
+        .unwrap();
+        crate::plugin::reload_registry();
     }
 
     #[tokio::test]

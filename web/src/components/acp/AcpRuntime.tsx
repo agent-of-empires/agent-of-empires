@@ -66,7 +66,7 @@ export interface AcpContext {
   dismissError: () => void;
   dismissPrimer: () => void;
   /** After this dashboard's restart of a start in progress succeeds. */
-  markRestartStarted: (epoch: number, stoppedSent: boolean) => void;
+  markRestartStarted: (epoch: number, stoppedSent: boolean, retriedError?: string) => void;
   /** After this dashboard's restart fails once it has stopped the Worker. */
   markRestartFailed: (epoch: number, message: string, stoppedSent: boolean) => void;
   dismissCompactionReminder: () => void;

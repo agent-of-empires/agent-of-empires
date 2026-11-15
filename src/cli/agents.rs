@@ -21,7 +21,10 @@ pub fn run() -> Result<()> {
 
     println!("Supported AI coding agents:\n");
 
-    for agent in crate::agents::AGENTS {
+    for agent in crate::agents::AGENTS
+        .iter()
+        .chain(crate::plugin::bundled_agents::available())
+    {
         let installed = available_list.iter().any(|s| s == agent.name);
         if installed {
             println!("  {installed_mark} {:<12} installed", agent.name);
@@ -74,9 +77,12 @@ pub fn run() -> Result<()> {
     let installed_count = plugin_installed
         + crate::agents::AGENTS
             .iter()
+            .chain(crate::plugin::bundled_agents::available())
             .filter(|a| available_list.iter().any(|s| s == a.name))
             .count();
-    let total_count = crate::agents::AGENTS.len() + plugin_agents.len();
+    let total_count = crate::agents::AGENTS.len()
+        + crate::plugin::bundled_agents::available().count()
+        + plugin_agents.len();
 
     println!("\n{}/{} agents installed.", installed_count, total_count);
 

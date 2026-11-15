@@ -810,6 +810,72 @@ command = "bash -lc true"
     }
 }
 
+/// An implicitly selected plugin tool owns its launch, so `--cmd-override`
+/// cannot replace it.
+#[test]
+#[parallel]
+fn cli_add_rejects_cmd_override_for_implicit_plugin_tool() {
+    let h = TuiTestHarness::new("cli_add_plugin_implicit");
+    h.append_config("[session]\ndefault_tool = \"plugin-helper\"");
+    let source = tempfile::tempdir().unwrap();
+    std::fs::write(
+        source.path().join("aoe-plugin.toml"),
+        r#"id = "acme.agent"
+name = "Agent"
+version = "1.0.0"
+api_version = 19
+
+[[agent_integrations]]
+tool = "plugin-helper"
+command = "bash -lc true"
+"#,
+    )
+    .unwrap();
+    h.run_cli_ok(&[
+        "plugin",
+        "install",
+        source.path().to_str().unwrap(),
+        "--yes",
+    ]);
+    let project = h.project_path();
+    let rejected = h.run_cli(&[
+        "add",
+        project.to_str().unwrap(),
+        "-t",
+        "ImplicitCase",
+        "--cmd-override",
+        "false",
+    ]);
+    assert!(
+        !rejected.status.success(),
+        "implicit plugin selection must reject --cmd-override"
+    );
+    assert!(
+        String::from_utf8_lossy(&rejected.stderr).contains("--cmd-override cannot be used"),
+        "{}",
+        String::from_utf8_lossy(&rejected.stderr)
+    );
+    let explicit = h.run_cli(&[
+        "add",
+        project.to_str().unwrap(),
+        "-t",
+        "ExplicitCase",
+        "--tool",
+        "plugin-helper",
+        "--cmd-override",
+        "false",
+    ]);
+    assert!(
+        !explicit.status.success(),
+        "an explicitly selected plugin tool must reject --cmd-override"
+    );
+    assert!(
+        String::from_utf8_lossy(&explicit.stderr).contains("--cmd-override cannot be used"),
+        "{}",
+        String::from_utf8_lossy(&explicit.stderr)
+    );
+}
+
 /// `aoe add` rejects bad requests before writing anything, without leaking
 /// configured command strings.
 #[test]
@@ -1461,6 +1527,49 @@ fn cli_add_workspace_runs_effective_on_create_hooks() {
             "repo_hooks={repo_hooks}: hooks did not run"
         );
     }
+}
+
+/// #4060: a failing on_create names `--skip-on-create`, which keeps the session without running it.
+#[test]
+#[parallel]
+fn cli_add_skip_on_create_keeps_a_session_whose_setup_fails() {
+    let h = TuiTestHarness::new("cli_skip_on_create");
+    let project = h.home_path().join("skip-project");
+    init_git_repo(&project);
+    let marker = h.home_path().join("on-create-ran");
+    let command = format!(
+        "touch {}; exit 3",
+        shell_words::quote(marker.to_str().unwrap())
+    );
+    h.append_config(&format!(
+        "[hooks]\non_create = [{}]",
+        serde_json::to_string(&command).unwrap()
+    ));
+    let project = project.to_str().unwrap();
+
+    let stderr = h.run_cli_err(&["add", project, "-t", "Failed"]);
+    assert!(
+        stderr.contains("Rerun with --skip-on-create"),
+        "the failure names the flag: {stderr}"
+    );
+    assert!(marker.exists(), "the control run's hook did not run");
+    std::fs::remove_file(&marker).unwrap();
+    let sessions = h.try_read_sessions();
+    assert!(
+        !sessions
+            .as_array()
+            .is_some_and(|rows| rows.iter().any(|row| row["title"] == "Failed")),
+        "the failed create was rolled back: {sessions}"
+    );
+
+    let stdout = h.run_cli_ok(&["add", project, "-t", "Kept", "--skip-on-create"]);
+    assert!(!marker.exists(), "--skip-on-create still ran on_create");
+    assert!(stdout.contains("Setup:   skipped"), "{stdout}");
+    let sessions = h.read_sessions();
+    assert_eq!(
+        crate::harness::session_by_title(&sessions, "Kept")["created_without_setup"],
+        true
+    );
 }
 
 /// #969: `aoe add -w <branch>` without `-b` attaches to an existing worktree

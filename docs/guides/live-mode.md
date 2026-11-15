@@ -10,6 +10,8 @@ Control chords reach the agent: `Ctrl+C` interrupts it rather than quitting AoE,
 
 Live send works for the Terminal and Tool views too, not just the agent pane: whichever pane is on screen is what your keystrokes reach. Turning on **Live-send when switching view** (Interaction settings, off by default) starts the relay as soon as you switch views.
 
+If another window takes live control of the session, from the Web dashboard or another TUI, AoE leaves live mode and the shortcut bar names who took it, followed by the key that takes it back (`Tab`, or `Enter` when live mode is your default). A structured session's agent pane has no live mode, so there the line names no key. With the shortcut bar hidden, a one-time status flash says the same.
+
 A foreground pane preparation may wait behind that session's accepted access
 stamp or unread clearing. It is submitted once after the write is acknowledged
 and current canonical state is applied. Changing context or authority cancels

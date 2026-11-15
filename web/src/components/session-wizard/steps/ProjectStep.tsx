@@ -1,6 +1,7 @@
-import { useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import type { AgentInfo, ImportableSession, ProjectOverrides } from "../../../lib/types";
 import { DirectoryBrowser } from "../../DirectoryBrowser";
+import { hasFinePointer } from "../../../lib/platform";
 import { ImportSessionPicker } from "./ImportSessionPicker";
 import { CloneRepoForm } from "./CloneRepoForm";
 import { ProjectSearchList } from "./ProjectSearchList";
@@ -39,6 +40,23 @@ export function ProjectStep({
     useProjectPicker(profile);
   const activeTab: Tab = manualTab ?? (!loading && !hasPicks ? "browse" : "recent");
 
+  const searchRef = useRef<HTMLInputElement>(null);
+  const filterRef = useRef<HTMLInputElement>(null);
+  const cloneRef = useRef<HTMLInputElement>(null);
+  const importRef = useRef<HTMLSelectElement>(null);
+  const opener = useRef(document.activeElement);
+  const tabFocusRequested = useRef(false);
+  // The fields mount only once projects load: focus them then, unless the user moved focus since the panel opened.
+  // A tab click is explicit intent, so it focuses once regardless.
+  useEffect(() => {
+    const requested = tabFocusRequested.current;
+    tabFocusRequested.current = false;
+    if (loading || !hasFinePointer()) return;
+    const active = document.activeElement;
+    if (!requested && active && active !== document.body && active !== opener.current) return;
+    (searchRef.current ?? filterRef.current ?? cloneRef.current ?? importRef.current)?.focus();
+  }, [loading, activeTab]);
+
   const normalizePath = (p: string) => p.replace(/\/+$/, "") || "/";
 
   const selectPath = (path: string) => {
@@ -49,9 +67,11 @@ export function ProjectStep({
     onPicked?.();
   };
 
-  // Import resumes through the built-in ACP adapter, so it needs both the CLI and the adapter.
+  // Import resumes through the ACP adapter the server reports for the row, so it needs the CLI,
+  // that adapter, and the policy. A plugin-provided tool qualifies only where the host still
+  // owns the adapter; a configured custom adapter never grants import.
   const importAgents = agents
-    .filter((a) => a.kind === "builtin" && a.acp_capable && a.installed && a.acp_installed && a.acp_allowed !== false)
+    .filter((a) => a.kind !== "custom" && a.acp_capable && a.installed && a.acp_installed && a.acp_allowed !== false)
     .map((a) => a.name);
 
   const tabs: { id: Tab; label: string }[] = [
@@ -99,7 +119,11 @@ export function ProjectStep({
             <button
               key={tab.id}
               type="button"
-              onClick={() => setManualTab(tab.id)}
+              onClick={() => {
+                if (tab.id === activeTab) return;
+                setManualTab(tab.id);
+                tabFocusRequested.current = true;
+              }}
               className={`px-3 py-2 text-sm whitespace-nowrap cursor-pointer transition-colors border-b-2 -mb-px ${
                 activeTab === tab.id
                   ? "border-brand-600 text-text-primary"
@@ -129,10 +153,11 @@ export function ProjectStep({
           isSelected={(path) => !data.scratch && data.path === path}
           onSelect={(path) => selectPath(path)}
           emptyMessage="No projects match that search. Try the Browse tab."
+          inputRef={searchRef}
         />
       )}
 
-      {!loading && activeTab === "browse" && <DirectoryBrowser onSelect={selectPath} />}
+      {!loading && activeTab === "browse" && <DirectoryBrowser onSelect={selectPath} inputRef={filterRef} />}
 
       {!loading &&
         activeTab === "import" &&
@@ -143,12 +168,13 @@ export function ProjectStep({
             profile={profile}
             onSelect={handleImportSelect}
             selectedSessionId={data.importAcpSessionId}
+            selectRef={importRef}
           />
         ) : (
           <p className="text-sm text-text-muted">Resolve the server profile or select a profile to import a session.</p>
         ))}
 
-      {!loading && activeTab === "clone" && <CloneRepoForm onCloned={selectPath} />}
+      {!loading && activeTab === "clone" && <CloneRepoForm onCloned={selectPath} inputRef={cloneRef} />}
 
       {!loading && activeTab === "scratch" && (
         <div className="space-y-3">

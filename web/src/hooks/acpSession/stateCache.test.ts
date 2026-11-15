@@ -200,6 +200,7 @@ describe("persistState (#1833)", () => {
       restartInFlight: true,
       restartStoppedSent: true,
       restartFailure: "Server returned 500.",
+      retriedError: "boom",
     });
     const { state } = JSON.parse(localStorage.getItem(key("overlay"))!) as { state: AcpState };
     expect([
@@ -208,7 +209,14 @@ describe("persistState (#1833)", () => {
       state.restartInFlight,
       state.restartStoppedSent,
       state.restartFailure,
-    ]).toEqual([[], [], false, false, null]);
+      state.retriedError,
+    ]).toEqual([[], [], false, false, null, null]);
+  });
+
+  it("drops what a failed Retry retried, so a reload reads as a first failure", () => {
+    persistState("retried", { ...emptyAcpState(), startupError: "worse", retriedError: "boom" });
+    const { state } = JSON.parse(localStorage.getItem(key("retried"))!) as { state: AcpState };
+    expect([state.startupError, state.retriedError]).toEqual(["worse", null]);
   });
 });
 

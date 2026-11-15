@@ -107,20 +107,51 @@ pub(super) fn rename_exclusive(
     destination_dir: &std::os::fd::OwnedFd,
     destination: &std::ffi::OsStr,
 ) -> std::io::Result<()> {
+    rename_with_flags(
+        source_dir,
+        source,
+        destination_dir,
+        destination,
+        libc::RENAME_EXCL,
+    )
+}
+
+pub(super) fn rename_exchange(
+    source_dir: &std::os::fd::OwnedFd,
+    source: &std::ffi::OsStr,
+    destination_dir: &std::os::fd::OwnedFd,
+    destination: &std::ffi::OsStr,
+) -> std::io::Result<()> {
+    rename_with_flags(
+        source_dir,
+        source,
+        destination_dir,
+        destination,
+        libc::RENAME_SWAP,
+    )
+}
+
+fn rename_with_flags(
+    source_dir: &std::os::fd::OwnedFd,
+    source: &std::ffi::OsStr,
+    destination_dir: &std::os::fd::OwnedFd,
+    destination: &std::ffi::OsStr,
+    flags: libc::c_uint,
+) -> std::io::Result<()> {
     use nix::NixPath;
     use std::os::fd::AsRawFd;
 
     let result = source.with_nix_path(|source| {
         destination.with_nix_path(|destination| {
             // SAFETY: both descriptors remain owned for the call and NixPath
-            // supplies live NUL-terminated names. RENAME_EXCL never replaces.
+            // supplies live NUL-terminated names. Flags select the atomic rename policy.
             nix::errno::Errno::result(unsafe {
                 libc::renameatx_np(
                     source_dir.as_raw_fd(),
                     source.as_ptr(),
                     destination_dir.as_raw_fd(),
                     destination.as_ptr(),
-                    libc::RENAME_EXCL,
+                    flags,
                 )
             })
             .map(|_| ())
@@ -358,6 +389,11 @@ fn audit_start_id(token: &AuditToken) -> String {
 
 pub(super) fn process_start_id(pid: u32) -> anyhow::Result<Option<String>> {
     Ok(audit_token(pid)?.as_ref().map(audit_start_id))
+}
+
+/// False once `pid` is gone, or exited and not yet reaped (SZOMB).
+pub(super) fn process_executing(pid: u32) -> anyhow::Result<bool> {
+    Ok(process_membership(pid)?.is_some_and(|info| info.pbi_status != libc::SZOMB))
 }
 
 pub(super) struct ProcessHandle(AuditToken);
@@ -993,19 +1029,26 @@ Pages wired down:                        300000.
 
 /// `kern.boottime` shifts on clock steps; the session UUID does not.
 pub(super) fn boot_id() -> Option<String> {
-    let out = Command::new("sysctl")
-        .args(["-n", "kern.bootsessionuuid"])
-        .output()
-        .ok()?;
-    if !out.status.success() {
+    let mut uuid = [0u8; 37];
+    let mut length = uuid.len();
+    // SAFETY: the name is NUL-terminated; buffer and length match its capacity.
+    if unsafe {
+        libc::sysctlbyname(
+            c"kern.bootsessionuuid".as_ptr(),
+            uuid.as_mut_ptr().cast(),
+            &mut length,
+            std::ptr::null_mut(),
+            0,
+        )
+    } != 0
+    {
         return None;
     }
-    let s = String::from_utf8_lossy(&out.stdout).trim().to_string();
-    if s.is_empty() {
-        None
-    } else {
-        Some(s)
-    }
+    let value = std::ffi::CStr::from_bytes_with_nul(uuid.get(..length)?)
+        .ok()?
+        .to_str()
+        .ok()?;
+    (!value.is_empty()).then(|| value.to_owned())
 }
 
 pub(super) fn foreground_arguments(shell_pid: u32) -> Vec<super::ProcessArguments> {
@@ -1418,5 +1461,48 @@ mod tests {
             guard.refresh(&mut guard.members.lock()).unwrap();
             assert_eq!(roots(&guard), 1, "root duplicated by refresh");
         }
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn captured_process_custody_survives_an_unavailable_sysctl_command() {
+        use std::io::{BufRead as _, Write as _};
+        use std::os::unix::fs::PermissionsExt as _;
+
+        struct OwnedChild(std::process::Child);
+        impl Drop for OwnedChild {
+            fn drop(&mut self) {
+                let _ = self.0.kill();
+                let _ = self.0.wait();
+            }
+        }
+        let mut child = OwnedChild(
+            Command::new("sh")
+                .args(["-c", "printf 'ready\\n'; IFS= read -r line"])
+                .stdin(std::process::Stdio::piped())
+                .stdout(std::process::Stdio::piped())
+                .spawn()
+                .unwrap(),
+        );
+        let mut ready = String::new();
+        std::io::BufReader::new(child.0.stdout.take().unwrap())
+            .read_line(&mut ready)
+            .unwrap();
+        assert_eq!(ready, "ready\n");
+        let birth = super::super::process_birth_identity(child.0.id())
+            .unwrap()
+            .unwrap();
+        let tools = tempfile::tempdir().unwrap();
+        let sysctl = tools.path().join("sysctl");
+        std::fs::write(&sysctl, "#!/bin/sh\nexit 1\n").unwrap();
+        std::fs::set_permissions(&sysctl, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let _path = crate::session::test_support::path_prepended(tools.path());
+        let captured = super::super::CapturedProcess::capture(child.0.id(), &birth)
+            .unwrap()
+            .expect("an unavailable utility must not discard custody of a live process");
+        assert!(!captured.exited().unwrap());
+        child.0.stdin.as_mut().unwrap().write_all(b"\n").unwrap();
+        assert!(child.0.wait().unwrap().success());
+        assert!(captured.exited().unwrap());
     }
 }

@@ -995,6 +995,50 @@ fn a_custom_agent_locks_yolo_only_in_the_views_that_run_an_always_yolo_base() {
 
 #[test]
 #[serial_test::serial]
+fn declared_always_yolo_does_not_overwrite_the_submitted_preference() {
+    let home = tempfile::tempdir().unwrap();
+    // Declared first so it drops last: the registry reloads after HOME is
+    // restored, never while it still points at the temporary fixture.
+    let _reload = crate::plugin::ReloadRegistryOnDrop;
+    let _home = crate::session::test_support::isolate_home(home.path());
+    let manifest = r#"
+id = "acme.yolo"
+name = "Yolo"
+version = "1.0.0"
+api_version = 21
+[[agent_integrations]]
+tool = "yolo-helper"
+command = "yolo-helper"
+[agent_integrations.launch.yolo]
+kind = "always"
+"#;
+    let dir = crate::plugin::plugins_dir().unwrap().join("acme.yolo");
+    fs::create_dir_all(&dir).unwrap();
+    fs::write(dir.join("aoe-plugin.toml"), manifest).unwrap();
+    crate::session::update_config(|config| {
+        config.plugins.insert(
+            "acme.yolo".into(),
+            crate::session::PluginConfig {
+                grant: Some(crate::session::CapabilityGrant {
+                    manifest_hash: aoe_plugin_api::PluginManifest::hash_bytes(manifest.as_bytes()),
+                    capabilities: Vec::new(),
+                    granted_at: chrono::Utc::now(),
+                }),
+                ..Default::default()
+            },
+        );
+    })
+    .unwrap();
+    crate::plugin::reload_registry();
+    let mut dialog = NewSessionDialog::new_with_tools(vec!["yolo-helper"], TEST_PATH.to_string());
+    dialog.yolo_mode_default = false;
+    dialog.reset_yolo();
+    assert_eq!(dialog.field_indices().yolo, FieldIndices::ABSENT);
+    assert!(!submitted(dialog.build_submit_result()).yolo_mode);
+}
+
+#[test]
+#[serial_test::serial]
 fn moving_between_repos_that_map_the_agent_differently_refreshes_its_lock_and_view() {
     let temp_home = tempfile::tempdir().expect("temp home");
     let _home = crate::session::test_support::isolate_home(temp_home.path());

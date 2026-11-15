@@ -21,14 +21,21 @@ const shape = (nodes: ActivityNode[]) =>
   nodes.map((n) => (n.type === "row" ? n.tool.id : `fold(${n.tools.map((t) => t.id).join(",")})`));
 
 describe("foldActivity", () => {
+  const kinds = (spec: string) => [...spec].map((k, i) => tool(i, k === "r" ? "read" : "execute"));
+
   it("folds adjacent same-kind calls but not short runs", () => {
-    const tools = [tool(0, "read"), tool(1, "read"), tool(2, "read"), tool(3, "execute"), tool(4, "execute")];
-    expect(shape(foldActivity(tools))).toEqual(["fold(t0,t1,t2)", "t3", "t4"]);
+    const nodes = foldActivity(kinds("rrrrrrree"));
+    expect(shape(nodes)).toEqual(["fold(t0,t1,t2,t3,t4,t5,t6)", "t7", "t8"]);
+  });
+
+  it("shows a short list, or one that would fold whole, as rows", () => {
+    expect(shape(foldActivity(kinds("rrrree")))).toEqual(["t0", "t1", "t2", "t3", "t4", "t5"]);
+    expect(foldActivity(kinds("rrrrrrrrrr")).every((n) => n.type === "row")).toBe(true);
   });
 
   it("never folds across an error", () => {
-    const tools = [tool(0), tool(1), tool(2, "read", "err"), tool(3), tool(4), tool(5)];
-    expect(shape(foldActivity(tools))).toEqual(["t0", "t1", "t2", "fold(t3,t4,t5)"]);
+    const tools = [tool(0), tool(1), tool(2, "read", "err"), ...Array.from({ length: 6 }, (_, i) => tool(i + 3))];
+    expect(shape(foldActivity(tools))).toEqual(["t0", "t1", "t2", "fold(t3,t4,t5,t6,t7,t8)"]);
   });
 
   it("shows head and tail of a long run and keeps every error as a row", () => {
@@ -48,7 +55,7 @@ describe("foldActivity", () => {
   });
 
   it("labels runs and spans by count and kind", () => {
-    const run = foldAt(foldActivity(Array.from({ length: 6 }, (_, i) => tool(i))), 0);
+    const run = foldAt(foldActivity(kinds("rrrrrreee")), 0);
     expect(foldLabel(run)).toBe("6 reads");
     const span = foldAt(foldActivity(Array.from({ length: 30 }, (_, i) => tool(i, i < 15 ? "read" : "execute"))), 3);
     expect(foldLabel(span)).toBe("23 calls: 12 reads, 11 commands");

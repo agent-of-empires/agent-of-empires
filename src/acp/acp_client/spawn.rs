@@ -1104,7 +1104,7 @@ mod tests {
                 Event::SessionContextReset { reason } => kinds.push(format!("reset:{reason}")),
                 Event::RateLimit { info } => kinds.push(format!("rate_limit:{}", info.kind)),
                 Event::Stopped { reason } => kinds.push(format!("stopped:{reason}")),
-                Event::AgentStartupError { message } => {
+                Event::AgentStartupError { message, .. } => {
                     panic!("recoverable failure surfaced a startup error: {message}")
                 }
                 _ => {}

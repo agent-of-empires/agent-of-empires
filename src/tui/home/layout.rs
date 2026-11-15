@@ -15,6 +15,21 @@ impl HomeView {
         self.save_list_width();
     }
 
+    /// Whether the preview pane owns the keyboard right now: live-send is relaying keys, a
+    /// System Health takeover is showing, a Session's retained transcript is being read, or
+    /// the embedded structured view is interactive. `one_pane` gives this pane the whole
+    /// narrow screen; the list keeps it otherwise. A Structured view Session has no
+    /// live-send, so its transcript counts here only while it is interactive: the stack
+    /// would hide the list, and hiding the pane instead would leave no way into it.
+    pub(super) fn preview_pane_active(&self) -> bool {
+        self.live_send.is_some()
+            || self.system_health_open
+            || self.retained_reader_focused()
+            || self.structured_preview.as_ref().is_some_and(|view| {
+                view.is_active() && Some(view.session_id()) == self.selected_session.as_deref()
+            })
+    }
+
     pub fn toggle_sidebar_collapsed(&mut self) {
         self.sidebar_collapsed = !self.sidebar_collapsed;
         let collapsed = self.sidebar_collapsed;
