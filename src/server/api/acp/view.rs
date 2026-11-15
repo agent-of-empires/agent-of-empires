@@ -693,12 +693,14 @@ fn handoff_outcome(
     }
 }
 
-/// Whether driving a persisted handoff gives the caller what it asked for. No choice drives any.
+/// Whether driving a persisted handoff gives the caller what it asked for. No choice drives any;
+/// a command that selects its own conversation honours no choice, as before reservation.
 fn pending_handoff_honours(
     outcome: TerminalConversation,
+    command_decides: bool,
     conversation: Option<TerminalConversation>,
 ) -> bool {
-    conversation.is_none_or(|asked| asked == outcome)
+    conversation.is_none_or(|asked| !command_decides && asked == outcome)
 }
 
 async fn terminal_plan(
@@ -1369,8 +1371,10 @@ async fn terminal_handoff_request(
     let (key, owner) = if let Some(pending) = durable.terminal_handoff.as_ref() {
         // The pending switch's retirement may already be durable, so a different choice is refused, not adopted.
         let outcome = handoff_outcome(&pending.context, pending.terminal.as_ref());
-        if !pending_handoff_honours(outcome, conversation) {
+        let command_decides = durable.command_session_selector().is_some();
+        if !pending_handoff_honours(outcome, command_decides, conversation) {
             let in_flight = match outcome {
+                _ if command_decides => "follows this Session's command",
                 TerminalConversation::Continue => "keeps the conversation",
                 TerminalConversation::Fresh => "starts a new conversation",
             };
@@ -4488,9 +4492,15 @@ mod tests {
                 .zip(honoured)
             {
                 assert_eq!(
-                    pending_handoff_honours(outcome, conversation),
+                    pending_handoff_honours(outcome, false, conversation),
                     honoured,
                     "{name} {conversation:?}"
+                );
+                // The Session's own command decides: only no choice drives it.
+                assert_eq!(
+                    pending_handoff_honours(outcome, true, conversation),
+                    conversation.is_none(),
+                    "{name}, command decides, {conversation:?}"
                 );
             }
         }
@@ -4593,7 +4603,13 @@ mod tests {
         let unborn = selecting("own selector, unborn", None);
         let mut held = selecting("own selector, AoE id", None);
         held.agent_session_id = Some("sid-held".into());
-        let rows = vec![unbound.clone(), unborn.clone(), held.clone()];
+        let reserved = selecting("own selector, reserved", None);
+        let rows = vec![
+            unbound.clone(),
+            unborn.clone(),
+            held.clone(),
+            reserved.clone(),
+        ];
         let _panes: Vec<_> = rows
             .iter()
             .map(|row| {
@@ -4617,7 +4633,7 @@ mod tests {
             )
         };
 
-        for row in &rows {
+        for row in &rows[..3] {
             let checked = acp_terminal_check(State(state.clone()), Path(row.id.clone())).await;
             let checked = response_json(checked).await?.1;
             assert_eq!(
@@ -4659,6 +4675,56 @@ mod tests {
             assert!(stored.terminal_handoff.is_none());
         }
         assert!(!argv.exists(), "a refused switch launched the agent");
+
+        // A no-choice switch whose reservation lands but whose adoption fails stays pending. A
+        // retry with a choice is refused as before reservation, not driven into the command.
+        {
+            let (native, durable) = load_handoff_row(&state, "default", &reserved.id).await?;
+            let cached = find_instance(&state, &reserved.id).await.unwrap();
+            let instance = adopt_persisted_structured_instance(cached, durable, "default");
+            let driver = Arc::new(
+                crate::session::try_acquire_terminal_handoff_driver(&reserved.id)?.unwrap(),
+            );
+            let seq = state.acp_event_store.highest_seq_checked(&reserved.id)?;
+            let (reserve_state, failing) = (state.clone(), state.clone());
+            let error = tokio::task::spawn_blocking(move || {
+                crate::server::session_store::before_next_adoption_for_test(move || {
+                    failing
+                        .canonical_metadata
+                        .blocking_write()
+                        .profiles
+                        .retain(|profile| profile.name != "default");
+                });
+                reserve_handoff_in(
+                    native,
+                    &instance,
+                    HandoffContext::Discard,
+                    None,
+                    seq,
+                    reserve_state,
+                    driver,
+                )
+                .map(|_| ())
+            })
+            .await?
+            .unwrap_err();
+            assert!(error.is::<HandoffReserved>(), "{error:#}");
+            crate::server::test_support::refresh_canonical_metadata_for_test(&state).await;
+            crate::server::test_support::accept_runtime_read_cache_for_test(&state).await;
+        }
+        let checked = acp_terminal_check(State(state.clone()), Path(reserved.id.clone())).await;
+        assert_eq!(response_json(checked).await?.1["reason"], "handoff_pending");
+        for body in [
+            &br#"{"conversation":"fresh"}"#[..],
+            br#"{"conversation":"continue"}"#,
+        ] {
+            let (status, json) =
+                response_json(switch(&reserved, body).await.into_response()).await?;
+            assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{json}");
+            assert_eq!(json["error"], "handoff_pending");
+            assert!(stored(&reserved)?.terminal_handoff.is_some());
+        }
+        assert!(!argv.exists(), "a refused retry launched the agent");
 
         // With nothing to carry, no choice runs the command as written: its own selector, no AoE id.
         assert_eq!(
