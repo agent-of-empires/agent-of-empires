@@ -37,6 +37,8 @@ async function openGoneSession(page: Page, { readOnly = false } = {}) {
   return { banner, recreates };
 }
 
+const composer = (page: Page) => page.locator("[data-session-composer] textarea");
+
 const noHorizontalScroll = (page: Page) =>
   page.evaluate(() => document.documentElement.scrollWidth - document.documentElement.clientWidth);
 
@@ -52,6 +54,9 @@ test.describe("at 375px", () => {
     ]);
     await expect(page.getByTestId("startup-error-banner")).toHaveCount(0);
     await expect(page.getByText("Claude Code isn't running.")).toBeVisible();
+    // A send would start the Session, rebuilding the container without the dialog's warning.
+    await expect(composer(page)).toBeDisabled();
+    await expect(composer(page)).toHaveAttribute("placeholder", "Recreate the container to send messages.");
 
     const recreate = banner.getByRole("button", { name: "Recreate container" });
     const bannerBox = (await banner.boundingBox())!;
@@ -70,6 +75,7 @@ test.describe("at 375px", () => {
     expect(recreates).toEqual(["POST"]);
     await expect(page.getByTestId("startup-wait-line")).toBeVisible();
     await expect(banner).toBeHidden();
+    await expect(composer(page)).toBeEnabled();
   });
 
   test("New Session opens the wizard for this Project, Agent and Group in Structured view", async ({ page }) => {
@@ -91,7 +97,29 @@ test.describe("at 1280px", () => {
     const { banner } = await openGoneSession(page, { readOnly: true });
     await expect(banner.getByTestId("container-gone-owner")).toHaveText("Ask the owner to recreate the container.");
     await expect(banner.getByRole("button")).toHaveText(["Details"]);
+    await expect(composer(page)).toHaveAttribute("placeholder", "Ask the owner to recreate the container.");
     await banner.getByRole("button", { name: "Details" }).click();
     await expect(banner.locator("pre")).toHaveText(MESSAGE);
   });
+});
+
+test("New Session names the Project as its sidebar header does", async ({ page }) => {
+  await page.addInitScript((path) => {
+    window.localStorage.setItem("aoe-repo-appearance-v1", JSON.stringify({ [path]: { alias: "Infra stack" } }));
+  }, `/tmp/${TITLE}`);
+  const { banner } = await openGoneSession(page);
+  await expect(banner.getByRole("button", { name: "New Session in Infra stack" })).toBeVisible();
+});
+
+test("an untyped startup error keeps the composer, as on main", async ({ page }) => {
+  const mock = await mockAcpSession(page, {
+    title: TITLE,
+    workerState: "absent",
+    acpSessionId: "acp-1",
+    sessionFields: { is_sandboxed: true, acp_agent: "claude" },
+    initialEvents: [{ AgentStartupError: { message: MESSAGE } }],
+  });
+  await openStructuredSession(page, mock);
+  await expect(page.getByTestId("startup-error-banner")).toBeVisible();
+  await expect(composer(page)).toBeEnabled();
 });

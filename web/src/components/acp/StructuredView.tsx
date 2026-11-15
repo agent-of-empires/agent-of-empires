@@ -546,6 +546,14 @@ function ComposerDock({
           currentAgent={state.agent ?? acpAgent}
           currentProvider={acpProvider}
           waitingFor={startingAgent}
+          // A send would start the Session, which rebuilds the container without Recreate's warning.
+          blockedReason={
+            state.startupError && state.startupCause?.kind === "container_missing"
+              ? view.canRestartAgent
+                ? "Recreate the container to send messages."
+                : "Ask the owner to recreate the container."
+              : null
+          }
           connecting={connecting}
           availableModes={state.availableModes}
           currentModeId={state.currentModeId}

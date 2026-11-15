@@ -1537,8 +1537,10 @@ function AppContent({
     (session: SessionResponse): NewSessionLike | undefined => {
       if (caps.readOnly) return undefined;
       const repoPath = session.main_repo_path || session.project_path;
+      // Named as its sidebar header is: the alias, else the folder name.
+      const groupId = (session.main_repo_path ?? session.project_path).replace(/\/+$/, "");
       return {
-        project: repoPath.replace(/\/+$/, "").split("/").pop() || repoPath,
+        project: repoGroups.find((group) => group.id === groupId)?.displayName ?? (groupId.split("/").pop() || groupId),
         open: () => {
           const profile = session.profile || requireProjectProfile();
           if (!profile) return;
@@ -1556,7 +1558,7 @@ function AppContent({
         },
       };
     },
-    [caps.readOnly, projects, requireProjectProfile],
+    [caps.readOnly, projects, repoGroups, requireProjectProfile],
   );
 
   const handlePinProject = useCallback(

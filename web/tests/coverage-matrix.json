@@ -4232,17 +4232,20 @@
         "src/components/acp/__tests__/ContainerGoneBanner.test.tsx",
         "src/hooks/acpSession/reducer.test.ts",
         "src/hooks/acpSession/stateCache.test.ts",
-        "src/components/session-wizard/__tests__/SessionWizard.test.tsx"
+        "src/components/session-wizard/__tests__/SessionWizard.test.tsx",
+        "src/components/acp/Composer.test.tsx"
       ],
       "components": [
         "web/src/components/acp/ContainerGoneBanner.tsx",
+        "web/src/components/acp/Composer.tsx",
+        "web/src/components/acp/StructuredView.tsx",
         "web/src/components/acp/SessionBanners.tsx",
         "web/src/components/sidebar/RecreateContainerDialog.tsx",
         "web/src/components/session-wizard/SessionWizard.tsx",
         "web/src/components/MobileMainPane.tsx",
         "web/src/App.tsx"
       ],
-      "notes": "An AgentStartupError with cause container_missing shows this banner instead of the generic one: no Retry or Use Terminal view, Recreate container (primary, full width at 375px) and New Session in the Project. Recreate confirms through the Session menu's dialog and, once the Daemon accepts it, hands over to the startup line as a Retry does. New Session opens the wizard with the Project, Agent, Group and Structured view (kept over a Terminal view profile default, not over off), title empty, sandbox and yolo from the defaults. The cause is set and cleared wherever the startup error is, a later untyped error replaces it, and it persists with the cached state."
+      "notes": "An AgentStartupError with cause container_missing shows this banner instead of the generic one: no Retry or Use Terminal view, Recreate container (primary, full width at 375px) and New Session in the Project, named as its sidebar header (alias, else folder name). The composer is disabled with \"Recreate the container to send messages.\" as its placeholder, since a send would start the Session and rebuild the container without the warning; an untyped startup error leaves it as on main. Recreate confirms through the Session menu's dialog and, once the Daemon accepts it, hands over to the startup line as a Retry does. New Session opens the wizard with the Project, Agent, Group and Structured view (kept over a Terminal view profile default, not over off), title empty, sandbox and yolo from the defaults. The cause is set and cleared wherever the startup error is, a later untyped error replaces it, and it persists with the cached state."
     },
     {
       "id": "acp.container-gone-read-only",
@@ -4250,7 +4253,7 @@
       "risk": "medium",
       "specs": ["tests/container-gone.spec.ts", "src/components/acp/__tests__/ContainerGoneBanner.test.tsx"],
       "components": ["web/src/components/acp/ContainerGoneBanner.tsx"],
-      "notes": "Where the server refuses a restart (read-only and CityHall), the banner keeps the heading and sentence, adds \"Ask the owner to recreate the container.\" and offers no actions; Details still shows the server's message."
+      "notes": "Where the server refuses a restart (read-only and CityHall), the banner keeps the heading and sentence, adds \"Ask the owner to recreate the container.\" and offers no actions, and the composer's placeholder says the same; Details still shows the server's message."
     },
     {
       "id": "acp.startup-error-banner-actions",
