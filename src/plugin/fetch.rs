@@ -90,11 +90,19 @@ pub(super) async fn fetch(
         )
     {
         // Keep staging and the lease until asynchronous file operations finish.
-        tokio::spawn(download_release_binary(fetched, operation))
-            .await
-            .context("plugin asset download task failed")?
+        await_asset_download(tokio::spawn(download_release_binary(fetched, operation))).await
     } else {
         Ok(fetched)
+    }
+}
+
+async fn await_asset_download(
+    task: tokio::task::JoinHandle<Result<FetchedPlugin>>,
+) -> Result<FetchedPlugin> {
+    match task.await {
+        Ok(result) => result,
+        Err(error) if error.is_panic() => std::panic::resume_unwind(error.into_panic()),
+        Err(error) => Err(error).context("plugin asset download task failed"),
     }
 }
 
@@ -810,6 +818,18 @@ fn ensure_executable(tree: &Path, rel: &Path) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn asset_task_panics_reach_the_job_panic_boundary() {
+        use futures_util::FutureExt;
+
+        let task: tokio::task::JoinHandle<Result<FetchedPlugin>> =
+            tokio::spawn(async { panic!("private-panic-payload") });
+        let panic = std::panic::AssertUnwindSafe(await_asset_download(task))
+            .catch_unwind()
+            .await;
+        assert!(panic.is_err());
+    }
 
     #[test]
     fn parse_ls_remote_prefers_the_peeled_tag_and_a_pinned_sha_skips_the_remote() {
