@@ -1309,9 +1309,9 @@ pub(super) fn runner_group_executing(group: u32) -> anyhow::Result<bool> {
     let mut bytes = [0u8; 1024];
     for entry in fs::read_dir("/proc")? {
         let entry = entry?;
-        if entry.file_name().to_string_lossy().parse::<u32>().is_err() {
+        let Ok(pid) = entry.file_name().to_string_lossy().parse::<u32>() else {
             continue;
-        }
+        };
         let size = match fs::File::open(entry.path().join("stat"))
             .and_then(|mut file| file.read(&mut bytes))
         {
@@ -1321,6 +1321,11 @@ pub(super) fn runner_group_executing(group: u32) -> anyhow::Result<bool> {
                 use std::os::unix::fs::MetadataExt as _;
                 let owner = entry.metadata().ok().map(|metadata| metadata.uid());
                 if foreign_process_permission_error(&error, owner, unsafe { libc::geteuid() }) {
+                    // Unreadable stat (hidepid): getpgid needs no /proc access. State is
+                    // unknown, so a member counts as executing.
+                    if u32::try_from(unsafe { libc::getpgid(pid as i32) }).ok() == Some(group) {
+                        return Ok(true);
+                    }
                     continue;
                 }
                 return Err(error).context("runner group census unavailable");
