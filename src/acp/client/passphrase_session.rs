@@ -799,6 +799,7 @@ pub(crate) mod test_daemon {
                 owner_diagnostics: Vec::new(),
                 owner_instance_id: None,
                 protocol_version: crate::daemon::RUNTIME_PROTOCOL_VERSION,
+                app_version: None,
                 cli_creation: true,
                 epoch: "epoch".into(),
                 namespace: "ns".into(),

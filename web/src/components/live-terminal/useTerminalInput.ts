@@ -28,6 +28,7 @@ export function useTerminalInput({
   sendPaste,
   uploadPastedImage,
   captureWriteAdmission,
+  onTabEscape,
 }: {
   active: boolean;
   inputRef: RefObject<HTMLTextAreaElement | null>;
@@ -38,12 +39,16 @@ export function useTerminalInput({
   sendPaste: (text: string, submit: boolean) => boolean;
   uploadPastedImage: (file: File, canWrite: () => boolean) => Promise<string | null>;
   captureWriteAdmission: () => () => boolean;
+  /** Takes a plain Tab instead of the pane when it returns true. */
+  onTabEscape?: () => boolean;
 }) {
   const composingRef = useRef(false);
   const activeRef = useRef(active);
+  const onTabEscapeRef = useRef(onTabEscape);
   useLayoutEffect(() => {
     activeRef.current = active;
-  }, [active]);
+    onTabEscapeRef.current = onTabEscape;
+  }, [active, onTabEscape]);
 
   const keyboardLayoutRef = useRef<KeyboardLayoutReader | null>(null);
   useEffect(() => {
@@ -104,6 +109,11 @@ export function useTerminalInput({
       if (composingRef.current || e.isComposing) return;
       // A plain Backspace edits the textarea natively, so autorepeat and word deletes reach the pane as a diff.
       if (e.key === "Backspace" && !e.altKey && !e.ctrlKey && !e.metaKey) return;
+      const plain = !e.shiftKey && !e.altKey && !e.ctrlKey && !e.metaKey;
+      if (e.key === "Tab" && plain && onTabEscapeRef.current?.()) {
+        e.preventDefault();
+        return;
+      }
       const seq = specialKeySequence(e);
       if (seq) {
         e.preventDefault();

@@ -518,7 +518,7 @@ async fn runner_owns_handshake_and_caches_across_attaches() {
         original.ready().await;
         let before_receipt = original.actual().establishment_projection().unwrap().receipt_snapshot().unwrap();
         let store = original.app_state().acp_event_store.clone();
-        let before = store.highest_seq(&original.id);
+        let before = store.highest_seq(&original.id).unwrap();
         inspection.query("observe-producer").await;
         original.send_prompt("complete before replacement attaches", &[]).await.unwrap();
         let prompt_id = control_deadline(prompt_received).await.unwrap();

@@ -29,8 +29,9 @@
 
 use crate::acp::elicitations::ElicitationQuestion;
 use crate::acp::state::{
-    AcpState, AuthStatus, AvailableCommand, DiffPreview, ModeInfo, PlanStepStatus, SessionNotice,
-    SessionUsage,
+    AcpState, AuthStatus, AvailableCommand, ConfigOptionDescriptor, ConfigOptionSwitchFailure,
+    DiffPreview, ModeInfo, PlanStepStatus, SessionNotice, SessionUsage, SubagentRecord,
+    SubagentState,
 };
 use crate::acp::transcript::{
     patch_transcript_row, upsert_transcript_row, TranscriptDelta, TranscriptRow, TranscriptRowKind,
@@ -67,6 +68,12 @@ pub struct AcpTranscript {
     /// Permission modes the agent advertised (`ModesAvailable`). Drives
     /// the `m` mode picker; empty when the agent never announced any.
     pub available_modes: Vec<ModeInfo>,
+    /// Agent-advertised config options; the `model_config` on/off ones (Fast
+    /// mode, Ultracode) drive the `t` toggle picker and the status line.
+    pub config_options: Vec<ConfigOptionDescriptor>,
+    /// The adapter's latest rejection of a config-option pick, until a
+    /// snapshot confirms the value.
+    pub config_option_switch_failed: Option<ConfigOptionSwitchFailure>,
     /// Auth identity the agent reported for itself. `None` when it never
     /// reported, which renders as nothing rather than as logged out.
     pub auth_status: Option<AuthStatus>,
@@ -84,6 +91,8 @@ pub struct AcpTranscript {
     /// with `turn_active` for the busy spinner, never for send-vs-park or Esc.
     pub background_agent_active: bool,
     background_subagent_active: bool,
+    /// ACP subagents roster; titles and badges the parent tool cards.
+    pub subagents: Vec<SubagentRecord>,
     /// Whether the agent accepts `_session/steering`. When true the composer
     /// sends a mid-turn prompt straight through instead of parking it: the
     /// daemon injects it into the running turn. Re-derived as `false` on a
@@ -118,6 +127,8 @@ pub struct AcpTranscript {
     /// Authority belongs only to an accepted live snapshot, never transcript
     /// replay or management transport presence. Revoked across reconnect.
     pub native_snapshot_seq: Option<u64>,
+    /// Live host-only cancellation identity, revoked with the snapshot.
+    pub host_prompt_intent: Option<uuid::Uuid>,
     /// Exact Original requests certified by the latest canonical live snapshot.
     /// These allow only a reply to that nonce, never general native input.
     pub original_decision_nonces: Vec<crate::acp::approvals::Nonce>,
@@ -213,6 +224,13 @@ pub enum NoteKind {
 }
 
 impl AcpTranscript {
+    /// The advertised Fast mode / Ultracode style on/off options.
+    pub fn toggles(&self) -> impl Iterator<Item = &ConfigOptionDescriptor> {
+        self.config_options
+            .iter()
+            .filter(|o| o.is_model_config_toggle())
+    }
+
     pub fn new(session_id: impl Into<String>) -> Self {
         Self {
             session_id: session_id.into(),
@@ -225,6 +243,8 @@ impl AcpTranscript {
             session_notices: Vec::new(),
             current_mode: None,
             available_modes: Vec::new(),
+            config_options: Vec::new(),
+            config_option_switch_failed: None,
             auth_status: None,
             available_commands: Vec::new(),
             locally_resolved: Vec::new(),
@@ -234,11 +254,13 @@ impl AcpTranscript {
             turn_active: false,
             background_agent_active: false,
             background_subagent_active: false,
+            subagents: Vec::new(),
             usage: None,
             current_plan: Vec::new(),
             lagged: false,
             last_seq: 0,
             native_snapshot_seq: None,
+            host_prompt_intent: None,
             original_decision_nonces: Vec::new(),
             connection_ready: false,
             connection_unavailable: None,
@@ -250,6 +272,7 @@ impl AcpTranscript {
 
     pub fn revoke_native_authority(&mut self) {
         self.native_snapshot_seq = None;
+        self.host_prompt_intent = None;
         self.original_decision_nonces.clear();
         self.connection_ready = false;
         self.connection_unavailable = None;
@@ -314,6 +337,17 @@ impl AcpTranscript {
         self.lagged = true;
     }
 
+    /// The newest running subagent that accepts `session/cancel`.
+    pub fn stoppable_subagent(&self) -> Option<&SubagentRecord> {
+        self.subagents.iter().rev().find(|record| {
+            record.cancel_capable
+                && matches!(
+                    record.state,
+                    SubagentState::Running | SubagentState::RequiresAction
+                )
+        })
+    }
+
     /// Adopt the daemon's folded control state, carried by a WS
     /// `reduced_state` frame on connect and after every event. This is the
     /// whole control reduction now: nothing here folds raw events, so the
@@ -353,6 +387,9 @@ impl AcpTranscript {
         if recovery_present {
             self.recovery = state.recovery;
         }
+        self.host_prompt_intent = state
+            .host_prompt_intent
+            .filter(|_| self.connection_unavailable.is_none());
 
         let holds = |field: &str| unchanged.iter().any(|f| f == field);
         if !holds("background_agents") {
@@ -363,6 +400,7 @@ impl AcpTranscript {
         }
         self.background_agent_active =
             self.background_subagent_active || !state.background_tasks.is_empty();
+        self.subagents = state.subagents;
         self.agent_name = Some(state.agent.0);
         self.turn_active = state.turn_active;
         self.steering = state.steering;
@@ -375,6 +413,10 @@ impl AcpTranscript {
         if !holds("available_modes") {
             self.available_modes = state.available_modes;
         }
+        if !holds("config_options") {
+            self.config_options = state.config_options;
+        }
+        self.config_option_switch_failed = state.config_option_switch_failed;
         self.session_notices = state.session_notices;
         self.current_mode = state.current_mode_id;
         self.auth_status = state.auth_status;
@@ -489,6 +531,7 @@ mod tests {
 
     fn tool(id: &str, name: &str) -> ToolCall {
         ToolCall {
+            prompt: None,
             id: id.into(),
             name: name.into(),
             kind: "execute".into(),
@@ -599,6 +642,7 @@ mod tests {
             name: "review".into(),
             description: "Review".into(),
             accepts_input: false,
+            input_hint: None,
         }];
         full.current_mode_id = Some("plan".into());
         full.available_modes = vec![ModeInfo {
@@ -609,6 +653,14 @@ mod tests {
         transcript.apply_reduced_state(1, full, &[], true);
         assert_eq!(transcript.available_commands.len(), 1);
         assert_eq!(transcript.available_modes.len(), 1);
+        transcript.config_options = vec![crate::acp::state::ConfigOptionDescriptor {
+            id: "fast".into(),
+            name: "Fast mode".into(),
+            description: None,
+            category: crate::acp::state::ConfigOptionCategory::Other("model_config".into()),
+            current_value: "on".into(),
+            options: vec![],
+        }];
 
         transcript.apply_reduced_state(
             2,
@@ -616,8 +668,14 @@ mod tests {
             &[
                 "available_commands".to_string(),
                 "available_modes".to_string(),
+                "config_options".to_string(),
             ],
             true,
+        );
+        assert_eq!(
+            transcript.config_options.len(),
+            1,
+            "config options survived"
         );
         assert_eq!(transcript.available_commands.len(), 1, "commands survived");
         assert_eq!(transcript.available_modes.len(), 1, "modes survived");
@@ -689,6 +747,7 @@ mod tests {
             tool_call_id: None,
             description: "background task".into(),
             workflow: None,
+            started_at: None,
         }]);
         transcript.apply_reduced_state(2, busy.clone(), &["background_agents".into()], true);
         assert!(transcript.background_agent_active);
@@ -698,6 +757,51 @@ mod tests {
         transcript.apply_reduced_state(4, busy, &[], true);
         transcript.apply_reduced_state(5, reduced(&[]), &["background_agents".into()], true);
         assert!(!transcript.background_agent_active);
+    }
+
+    #[test]
+    fn stoppable_subagent_is_the_newest_running_cancel_capable() {
+        use crate::acp::state::{SubagentRecord, SubagentState::*};
+        let record = |id: &str, state, cancel_capable| SubagentRecord {
+            session_id: id.into(),
+            parent_session_id: "s-1".into(),
+            provenance: None,
+            parent_tool_call_id: None,
+            title: None,
+            description: None,
+            state,
+            stop_reason: None,
+            cancel_capable,
+            model: None,
+        };
+        let cases = [
+            (vec![], None),
+            (
+                vec![record("a", Idle, true), record("b", Unknown, true)],
+                None,
+            ),
+            (vec![record("a", Running, false)], None),
+            (
+                vec![record("a", Running, true), record("b", Idle, true)],
+                Some("a"),
+            ),
+            (
+                vec![
+                    record("a", Running, true),
+                    record("b", RequiresAction, true),
+                ],
+                Some("b"),
+            ),
+            (
+                vec![record("a", Running, true), record("b", Running, false)],
+                Some("a"),
+            ),
+        ];
+        for (roster, want) in cases {
+            let mut t = AcpTranscript::new("s-1");
+            t.subagents = roster;
+            assert_eq!(t.stoppable_subagent().map(|r| r.session_id.as_str()), want);
+        }
     }
 
     /// A snapshot that races live deltas must not rewind the view.
@@ -755,6 +859,7 @@ mod tests {
     #[test]
     fn context_primer_pending_tracks_the_newest_reset_or_prompt() {
         let prompt = || Event::UserPromptSent {
+            merged_prompt_ids: Vec::new(),
             prompt_id: None,
             text: "go".into(),
             attachments: vec![],
@@ -858,6 +963,7 @@ mod tests {
         let mut t = AcpTranscript::new("s-1");
         let rows = server_rows(&[
             Event::UserPromptSent {
+                merged_prompt_ids: Vec::new(),
                 prompt_id: None,
                 text: "hi".into(),
                 attachments: Vec::new(),

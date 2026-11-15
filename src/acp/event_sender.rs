@@ -47,6 +47,66 @@ impl EventScope {
     }
 }
 
+/// Checked physical routing provenance; it never grants root Current authority.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct NativeChildProvenance {
+    pub(crate) origin: NativeEventOrigin,
+    /// The observed root through the parent to the unchanged child target.
+    pub(crate) ancestry: Arc<[agent_client_protocol::v1::schema::SessionId]>,
+}
+
+impl NativeChildProvenance {
+    pub(crate) fn validate(&self) -> anyhow::Result<()> {
+        anyhow::ensure!(
+            self.origin
+                .owner
+                .is_some_and(|owner| owner.birth_fingerprint.is_some())
+                && (2..=257).contains(&self.ancestry.len())
+                && self
+                    .ancestry
+                    .iter()
+                    .enumerate()
+                    .all(|(index, id)| { !self.ancestry[..index].contains(id) }),
+            "invalid persisted Native child ancestry"
+        );
+        Ok(())
+    }
+
+    pub(crate) fn root(&self) -> &agent_client_protocol::v1::schema::SessionId {
+        &self.ancestry[0]
+    }
+
+    pub(crate) fn parent(&self) -> &agent_client_protocol::v1::schema::SessionId {
+        &self.ancestry[self.ancestry.len() - 2]
+    }
+
+    pub(crate) fn child(&self) -> &agent_client_protocol::v1::schema::SessionId {
+        &self.ancestry[self.ancestry.len() - 1]
+    }
+}
+/// Private retained root-lifecycle identity, not an operation or request grant.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct NativeAutonomousIdentity {
+    pub(crate) origin: NativeEventOrigin,
+    pub(crate) root_session_id: agent_client_protocol::v1::schema::SessionId,
+    pub(crate) run_id: uuid::Uuid,
+    pub(crate) ordinal: u64,
+    pub(crate) source: super::control_protocol::NativeAutonomousSource,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct NativeAutonomousMetadata {
+    pub(crate) identity: Arc<NativeAutonomousIdentity>,
+    pub(crate) phase: super::control_protocol::NativeAutonomousPhase,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) stop_reason: Option<String>,
+    #[serde(default)]
+    pub(crate) qualified: bool,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct EventMetadata {
@@ -71,10 +131,14 @@ pub(crate) struct EventMetadata {
     pub(crate) resource_ref: Option<uuid::Uuid>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) resource_witness: Option<Arc<crate::acp::establishment::NativeResourceWitness>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) child_provenance: Option<Arc<NativeChildProvenance>>,
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub(crate) availability_denial: bool,
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub(crate) host_action: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) native_autonomous: Option<Arc<NativeAutonomousMetadata>>,
 }
 
 impl EventMetadata {
@@ -90,8 +154,10 @@ impl EventMetadata {
             clear_after_seq: None,
             resource_ref: None,
             resource_witness: None,
+            child_provenance: None,
             availability_denial: false,
             host_action: false,
+            native_autonomous: None,
         }
     }
 
@@ -115,6 +181,9 @@ impl EventMetadata {
         if self.scope != EventScope::LegacyUnqualified {
             self.scope = EventScope::HistoryOnly;
         }
+        if let Some(autonomous) = self.native_autonomous.as_mut() {
+            Arc::make_mut(autonomous).qualified = false;
+        }
         self.availability_denial = false;
     }
 
@@ -128,11 +197,32 @@ impl EventMetadata {
             && self.clear_after_seq.is_none()
             && self.resource_ref.is_none()
             && self.resource_witness.is_none()
+            && self.child_provenance.is_none()
+            && self.native_autonomous.is_none()
             && !self.availability_denial
             && !self.host_action
     }
 
     pub(crate) fn validate_for_event(&self, event: &Event) -> anyhow::Result<()> {
+        if let Some(child) = self.child_provenance.as_deref() {
+            child.validate()?;
+            anyhow::ensure!(
+                self.native_origin == Some(child.origin)
+                    && self.reported_session_id.as_ref().is_some_and(|reported| {
+                        reported == child.parent() || reported == child.child()
+                    })
+                    && (self.scope == EventScope::HistoryOnly
+                        || self.reported_session_id.as_ref() == Some(child.root())),
+                "Native child provenance differs from its original frame"
+            );
+            if let Event::SubagentUpdated { subagent, .. } = event {
+                anyhow::ensure!(
+                    subagent.session_id == child.child().0.as_ref()
+                        && subagent.parent_session_id == child.parent().0.as_ref(),
+                    "Native child snapshot differs from its routing provenance"
+                );
+            }
+        }
         let resource_matches =
             self.resource_witness
                 .as_deref()
@@ -198,6 +288,43 @@ impl EventMetadata {
         unavailable: Option<(AcpConnectionUnavailability, Option<NativeEventSubject>)>,
         resource_matches: bool,
     ) -> anyhow::Result<()> {
+        if let Some(autonomous) = self.native_autonomous.as_deref() {
+            use super::control_protocol::NativeAutonomousPhase;
+            anyhow::ensure!(
+                self.scope == EventScope::HistoryOnly
+                    && self.native_origin == Some(autonomous.identity.origin)
+                    && self.reported_session_id.as_ref()
+                        == Some(&autonomous.identity.root_session_id)
+                    && autonomous.identity.ordinal > 0
+                    && !autonomous.identity.run_id.is_nil()
+                    && autonomous
+                        .identity
+                        .origin
+                        .owner
+                        .is_some_and(|owner| owner.birth_fingerprint.is_some())
+                    && self.operation.is_none()
+                    && self.native_prompt_id.is_none()
+                    && self.clear_after_seq.is_none()
+                    && self.output_uncertainty.is_none()
+                    && self.resource_ref.is_none()
+                    && self.resource_witness.is_none()
+                    && self.child_provenance.is_none()
+                    && !self.host_action
+                    && !self.availability_denial
+                    && match autonomous.phase {
+                        NativeAutonomousPhase::Started =>
+                            matches!(kind, ControlKind::Admission)
+                                && autonomous.stop_reason.is_none(),
+                        NativeAutonomousPhase::Ended => matches!(kind, ControlKind::Stopped(reason)
+                        if reason == match autonomous.stop_reason.as_deref() {
+                            Some("end_turn") => "agent_idle",
+                            Some(reason) => reason,
+                            None => "native_autonomous_ended",
+                        }),
+                    },
+                "Native autonomous lifecycle has conflicting or incomplete private provenance"
+            );
+        }
         anyhow::ensure!(
             self.clear_after_seq.is_none()
                 || (matches!(kind, ControlKind::Cleared)
@@ -367,6 +494,21 @@ impl EventMetadata {
                 metadata.resource_ref == Some(witness.allocation)
                     && metadata.native_origin == Some(witness.origin),
                 "ACP resource witness differs from its event source"
+            );
+        }
+        if let Some(child) = metadata.child_provenance.as_deref() {
+            child.validate()?;
+            anyhow::ensure!(
+                metadata.native_origin == Some(child.origin)
+                    && metadata
+                        .reported_session_id
+                        .as_ref()
+                        .is_some_and(|reported| {
+                            reported == child.parent() || reported == child.child()
+                        })
+                    && (scope == EventScope::HistoryOnly
+                        || metadata.reported_session_id.as_ref() == Some(child.root())),
+                "Native child provenance differs from its original frame"
             );
         }
         Ok(metadata)
@@ -707,6 +849,25 @@ impl ProjectionState {
             .window
             .as_ref()
             .and_then(|window| window.receipt.clone())
+    }
+
+    pub(crate) fn autonomous_receipt(
+        &self,
+        origin: NativeEventOrigin,
+        root_session_id: &str,
+    ) -> Option<Arc<NativeEstablishmentReceipt>> {
+        let emissions = self.emissions.lock().expect("SDK projection lock");
+        let window = emissions.window.as_ref()?;
+        let receipt = window.receipt.as_ref()?;
+        (!window.lost
+            && window.wire_closed
+            && window.wire_forwarded
+            && receipt.replay.closed
+            && !receipt.replay.lost
+            && receipt.session_id() == Some(root_session_id)
+            && NativeEventOrigin::owned_attempt(&receipt.attempt, Some(receipt.owner))
+                == Some(origin))
+        .then(|| Arc::clone(receipt))
     }
 
     pub(crate) fn applied_clear_after_seq(
@@ -1520,8 +1681,10 @@ impl EventSender {
             clear_after_seq: None,
             resource_ref: None,
             resource_witness: None,
+            child_provenance: None,
             availability_denial: false,
             host_action: false,
+            native_autonomous: None,
         };
         sender.current_scope = Some(context);
         sender.constructor_scope = None;
@@ -1561,6 +1724,16 @@ impl EventSender {
         sender.metadata.scope = EventScope::SessionCurrent;
         sender.metadata.native_origin = Some(context.origin());
         sender.constructor_scope = Some(context);
+        sender
+    }
+
+    pub(crate) fn with_autonomous(
+        &self,
+        metadata: EventMetadata,
+        constructor: Option<Arc<crate::acp::establishment::NativeConstructorObservation>>,
+    ) -> Self {
+        let mut sender = self.with_metadata(metadata);
+        sender.constructor_scope = constructor;
         sender
     }
 
@@ -1900,6 +2073,7 @@ mod metadata_tests {
     fn host_resource_reference_cannot_claim_native_success_or_prompt_authority() {
         let allocation = uuid::Uuid::new_v4();
         let prompt = Event::UserPromptSent {
+            merged_prompt_ids: Vec::new(),
             text: "input".into(),
             attachments: Vec::new(),
             prompt_id: None,

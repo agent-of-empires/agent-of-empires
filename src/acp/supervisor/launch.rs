@@ -994,8 +994,9 @@ impl<S: BroadcastSink> Supervisor<S> {
         if config.seed_history_replay {
             let sink = Arc::clone(&self.sink);
             let id = req.session_id.clone();
+            let next_seqs = Arc::clone(&self.next_seqs);
             with_durable_launch(req.launch_admission.clone(), id.clone(), move || {
-                sink.clear_session_events(&id).map_err(|error| {
+                sink.clear_session_events(&id, next_seqs).map_err(|error| {
                     AcpError::Spawn(format!("import replay clear failed: {error}"))
                 })
             })
@@ -1144,10 +1145,10 @@ impl<S: BroadcastSink> Supervisor<S> {
         generation: u64,
     ) -> Result<(SpawnConfig, Option<PendingContextReset>), SupervisorError> {
         let profile = req.source_profile.clone().unwrap_or_default();
-        let cwd = req.cwd.clone();
+        let config_path = req.config_path.clone();
         let (resolved_cfg, policy) = tokio::task::spawn_blocking(move || {
             (
-                resolve_config_with_repo_or_warn(&profile, &cwd),
+                resolve_config_with_repo_or_warn(&profile, &config_path),
                 AgentPolicy::load(),
             )
         })
@@ -1234,7 +1235,10 @@ impl<S: BroadcastSink> Supervisor<S> {
             discovery_key(req.sandbox_info.is_some(), &req.agent, native),
             &req.session_id,
             req.source_profile.clone(),
-            req.cwd.clone(),
+            McpPaths {
+                cwd: req.cwd.clone(),
+                config_path: req.config_path.clone(),
+            },
             host_environment.clone(),
             claude_config_dir,
             "MCP resolution task failed",
@@ -1305,12 +1309,14 @@ impl<S: BroadcastSink> Supervisor<S> {
                 tool: req.tool.clone(),
                 spec,
                 cwd: req.cwd.clone(),
+                config_path: req.config_path.clone(),
                 additional_dirs: req.additional_dirs.clone(),
                 provider_env,
                 host_environment,
                 base_host_environment,
                 default_effort: effort,
                 default_effort_explicit: req.effort_explicit,
+                default_model_config: req.model_config.clone(),
                 default_mode: acp_defaults.and_then(|defaults| defaults.mode()),
                 default_model: model,
                 socket_path: Some(socket_path),
@@ -1379,6 +1385,7 @@ impl<S: BroadcastSink> Supervisor<S> {
             Pending::Installation(installation) => installation.identity,
             _ => unreachable!("connection phase completed before installation"),
         };
+        let mut recovery = None;
         let mut workers = loop {
             let workers = tokio::time::timeout_at(deadline, self.workers.lock())
                 .await
@@ -1386,41 +1393,89 @@ impl<S: BroadcastSink> Supervisor<S> {
             if tokio::time::Instant::now() >= deadline {
                 return Err(SupervisorError::RegistryBusy);
             }
-            let outcome = {
-                let mut lifecycle = lock_recover(&self.lifecycle);
-                if lifecycle.current_lease(session_id).as_ref() != Some(&lease) {
-                    Some(Err(InstallError::Stale))
-                } else {
-                    match worker_registry::try_registry_lock(session_id) {
-                        Ok(Some(registry)) => {
-                            match claimed_stop_for_lease(&registry, &lease, identity) {
-                                Ok(Some(_)) => {
-                                    lifecycle.begin_stop(session_id, "user_stopped", false);
+            let outcome =
+                {
+                    let mut lifecycle = lock_recover(&self.lifecycle);
+                    if lifecycle.current_lease(session_id).as_ref() != Some(&lease) {
+                        Some(Err(InstallError::Stale))
+                    } else {
+                        match worker_registry::try_registry_lock(session_id) {
+                            Ok(Some(registry)) => {
+                                match claimed_stop_for_lease(&registry, &lease, identity) {
+                                    Ok(Some(_)) => {
+                                        lifecycle.begin_stop(session_id, "user_stopped", false);
+                                    }
+                                    Ok(None) => {}
+                                    Err(_) => {
+                                        return Err(AcpError::RetainedRuntimeUnavailable(Box::new(
+                                            worker_registry::ControlAdmissionRefusal::unconfirmed(
+                                                identity,
+                                            ),
+                                        ))
+                                        .into())
+                                    }
                                 }
-                                Ok(None) => {}
-                                Err(_) => {
-                                    return Err(AcpError::RetainedRuntimeUnavailable(Box::new(
-                                        worker_registry::ControlAdmissionRefusal::unconfirmed(
-                                            identity,
-                                        ),
-                                    ))
-                                    .into())
-                                }
+                                Some(
+                                    if lifecycle.running(session_id).is_some_and(
+                                        |(current, owner)| current == lease && owner == identity,
+                                    ) {
+                                        Ok(())
+                                    } else {
+                                        lifecycle.install(&lease, identity)
+                                    },
+                                )
                             }
-                            Some(lifecycle.install(&lease, identity))
-                        }
-                        Ok(None) => None,
-                        Err(_) => {
-                            return Err(AcpError::RetainedRuntimeUnavailable(Box::new(
-                                worker_registry::ControlAdmissionRefusal::unconfirmed(identity),
-                            ))
-                            .into())
+                            Ok(None) => None,
+                            Err(_) => {
+                                return Err(AcpError::RetainedRuntimeUnavailable(Box::new(
+                                    worker_registry::ControlAdmissionRefusal::unconfirmed(identity),
+                                ))
+                                .into())
+                            }
                         }
                     }
-                }
-            };
+                };
             match outcome {
-                Some(Ok(())) => break workers,
+                Some(Ok(())) if recovery.is_some() => break workers,
+                Some(Ok(())) => {
+                    // Read fences need the writer, whose earlier SDK items may need workers.
+                    // Keep installation custody, then recheck the exact lease and registry.
+                    drop(workers);
+                    #[cfg(test)]
+                    {
+                        let observe = lock_recover(&self.installation_recovery).take();
+                        if let Some(observe) = observe {
+                            let Some(Pending::Installation(installation)) =
+                                reservation.deferred.as_ref()
+                            else {
+                                unreachable!("original installation remains owned");
+                            };
+                            observe(&lease, &installation.client, deadline);
+                        }
+                    }
+                    self.cancel_orphaned_requests(session_id);
+                    let Some(Pending::Installation(installation)) = reservation.deferred.as_ref()
+                    else {
+                        unreachable!("installation stays owned through recovery");
+                    };
+                    recovery = Some(
+                        if matches!(installation.finish.kind, WorkerKind::Attached) {
+                            (|| {
+                                Ok((
+                                    collect_resumable_background_agent_launches(
+                                        &*self.sink,
+                                        &self.next_seqs,
+                                        session_id,
+                                    )?,
+                                    self.sink.unresolved_background_task_launches(session_id)?,
+                                ))
+                            })()
+                        } else {
+                            self.detach_orphaned_background_agents(session_id);
+                            Ok((Vec::new(), Vec::new()))
+                        },
+                    );
+                }
                 Some(Err(refusal)) => {
                     drop(workers);
                     reservation.yield_to_retirement();
@@ -1464,22 +1519,6 @@ impl<S: BroadcastSink> Supervisor<S> {
             .and_then(|_| client.establishment_projection());
         let mode_waits_for_native = mode_projection.is_some();
         let mode_attempt = mode_projection.and_then(|projection| projection.attempt());
-        self.cancel_orphaned_requests(session_id);
-        let recovery: anyhow::Result<_> = if matches!(kind, WorkerKind::Attached) {
-            (|| {
-                Ok((
-                    collect_resumable_background_agent_launches(
-                        &*self.sink,
-                        &self.next_seqs,
-                        session_id,
-                    )?,
-                    self.sink.unresolved_background_task_launches(session_id)?,
-                ))
-            })()
-        } else {
-            self.detach_orphaned_background_agents(session_id);
-            Ok((Vec::new(), Vec::new()))
-        };
         if context_reset.is_some() {
             lock_recover(&self.pending_context_resets).insert(session_id.to_string());
         }
@@ -1514,6 +1553,7 @@ impl<S: BroadcastSink> Supervisor<S> {
             },
         );
         drop(workers);
+        let recovery: anyhow::Result<_> = recovery.expect("installation recovery completed");
         if respawn {
             lock_recover(&self.respawned_in_place).insert(session_id.to_owned());
         }
@@ -1839,13 +1879,14 @@ impl<S: BroadcastSink> Supervisor<S> {
     }
 
     /// Reattach to a runner left by a previous daemon by dialing its socket.
+    /// `sandbox` pairs the session's sandbox with its repo config path (`SpawnRequest::config_path`).
     pub async fn attach(
         &self,
         session_id: String,
         cwd: PathBuf,
         additional_dirs: Vec<PathBuf>,
         in_flight_turn: bool,
-        sandbox: Option<SandboxInfo>,
+        sandbox: Option<(SandboxInfo, PathBuf)>,
     ) -> Result<(), SupervisorError> {
         match self
             .begin_resume(
@@ -1870,7 +1911,7 @@ impl<S: BroadcastSink> Supervisor<S> {
         cwd: PathBuf,
         additional_dirs: Vec<PathBuf>,
         in_flight_turn: bool,
-        sandbox: Option<SandboxInfo>,
+        sandbox: Option<(SandboxInfo, PathBuf)>,
         mut reservation: ResumeReservation,
     ) -> Result<(), SupervisorError> {
         let _original_constructor = reservation.constructor.as_ref().map(|work| work.fork());
@@ -1938,8 +1979,8 @@ impl<S: BroadcastSink> Supervisor<S> {
             None => record.stored_acp_session_id.clone().unwrap_or_default(),
         };
         let sandbox_resources = match sandbox.as_ref() {
-            Some(info) => {
-                let info = info.clone();
+            Some((info, config_path)) => {
+                let (info, config_path) = (info.clone(), config_path.clone());
                 let cwd = cwd.clone();
                 let profile = record.source_profile.clone();
                 Some(
@@ -1947,6 +1988,7 @@ impl<S: BroadcastSink> Supervisor<S> {
                         crate::acp::acp_client::SessionSandbox::from_info(
                             &info,
                             cwd.as_path(),
+                            &config_path,
                             profile,
                         )
                     })
@@ -1958,7 +2000,7 @@ impl<S: BroadcastSink> Supervisor<S> {
             }
             None => None,
         };
-        let context_reset = if sandbox.as_ref().is_some_and(|info| info.enabled) {
+        let context_reset = if sandbox.as_ref().is_some_and(|(info, _)| info.enabled) {
             let profile = record.source_profile.clone().unwrap_or_default();
             let id = session_id.clone();
             let native_agent = if record.prime_runtime.is_some() {
@@ -2315,6 +2357,10 @@ async fn prepare_establishment(
                 row.lifecycle_generation == generation,
                 crate::session::LifecycleReservationError::Superseded
             );
+            anyhow::ensure!(
+                row.status != crate::session::Status::Stopped && !row.is_idle_dormant(),
+                crate::session::LifecycleReservationError::Superseded
+            );
             if let Some(scope) = &original_scope {
                 anyhow::ensure!(
                     scope.context
@@ -2574,14 +2620,34 @@ pub(super) fn apply_declared_config_dir(
     let native_of = |name: &str| crate::acp::agent_profiles::resolve(name).native_config_agent;
     // After an agent switch `tool` is unchanged but may name another backend: the tool's entry
     // applies only to a target it launches itself (same key, a built-in alias, or its base).
+    // An explicit execution mapping to another backend keeps the target's own route.
     let tool_runs_target = target == tool
         || native_of(target).is_some_and(|built_in| {
-            native_of(tool) == Some(built_in)
-                || [&session.agent_execution_as, &session.agent_detect_as]
-                    .iter()
-                    .any(|map| map.get(tool).map(String::as_str) == Some(native))
+            session
+                .agent_execution_as
+                .get(tool)
+                .is_none_or(|base| native_of(base) == Some(built_in))
+                && (native_of(tool) == Some(built_in)
+                    || [&session.agent_execution_as, &session.agent_detect_as]
+                        .iter()
+                        .any(|map| {
+                            map.get(tool).is_some_and(|base| {
+                                base == native || native_of(base) == Some(built_in)
+                            })
+                        }))
         });
-    let key = if tool_runs_target { tool } else { target };
+    let declared = |name: &str| {
+        session
+            .agent_config_dir
+            .get(name)
+            .is_some_and(|d| crate::session::config::is_resolvable_agent_config_dir(d))
+    };
+    // A compatible wrapper without a usable entry falls back to the target's.
+    let key = if tool_runs_target && (declared(tool) || !declared(target)) {
+        tool
+    } else {
+        target
+    };
     let native = session
         .agent_execution_as
         .get(key)
@@ -2671,11 +2737,17 @@ pub(super) fn discovery_key<'a>(sandboxed: bool, agent: &'a str, native: &'a str
     }
 }
 
+/// `cwd` keys the native per-project lookup; project-local servers load from `config_path`.
+pub(super) struct McpPaths {
+    pub(super) cwd: PathBuf,
+    pub(super) config_path: PathBuf,
+}
+
 pub(super) async fn resolve_mcp_servers(
     agent_key: &str,
     session_id: &str,
     profile: Option<String>,
-    cwd: PathBuf,
+    paths: McpPaths,
     session_env: Vec<(String, String)>,
     native_config_override: Option<PathBuf>,
     failure: &'static str,
@@ -2687,7 +2759,8 @@ pub(super) async fn resolve_mcp_servers(
             &agent_key,
             &session,
             profile.as_deref(),
-            &cwd,
+            &paths.cwd,
+            &paths.config_path,
             &session_env,
             native_config_override.as_deref(),
         )
@@ -2709,12 +2782,20 @@ fn resolve_mcp_layers(
     session_id: &str,
     profile: Option<&str>,
     cwd: &std::path::Path,
+    config_path: &std::path::Path,
     session_env: &[(String, String)],
     native_config_override: Option<&std::path::Path>,
 ) -> Vec<agent_client_protocol::v1::schema::McpServer> {
     use crate::session::mcp::mcp_model::{resolve_effective, summarize};
 
-    let merged = resolve_effective(agent_key, profile, cwd, session_env, native_config_override);
+    let merged = resolve_effective(
+        agent_key,
+        profile,
+        cwd,
+        config_path,
+        session_env,
+        native_config_override,
+    );
     if !merged.is_empty() {
         info!(
             target: "acp.mcp",
@@ -2769,6 +2850,292 @@ pub(super) mod tests {
     use crate::acp::runner_lifecycle::test_support::FakeProcessControl;
     use crate::daemon::AcpWorkerState;
     use std::time::Duration;
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[serial_test::serial]
+    async fn deferred_installation_reuses_the_exact_running_original_after_its_deadline() {
+        for mode in ["resume", "stop", "replacement"] {
+            super::super::test_support::managed::with_managed(|scope| Box::pin(async move {
+                let directory = scope.tempdir();
+                let (config, peer) = scope.native_peer(directory.path().into(), "gemini", "gemini", |request| {
+                    let result = match request["method"].as_str()? {
+                        "initialize" => serde_json::json!({"protocolVersion":1,"agentCapabilities":{"loadSession":true}}),
+                        "session/new" => serde_json::json!({"sessionId":"deadline-original-native"}),
+                        _ => return None,
+                    };
+                    Some(serde_json::json!({"jsonrpc":"2.0","id":request["id"],"result":result}))
+                });
+                let supervisor = scope.state.acp_supervisor.clone();
+                let store = scope.state.acp_event_store.clone();
+                let sink = supervisor.sink.clone();
+                let (observed, recovery) = tokio::sync::oneshot::channel();
+                *lock_recover(&supervisor.installation_recovery) = Some(Box::new(move |lease, client, deadline| {
+                    let (entered, ready) = std::sync::mpsc::sync_channel(1);
+                    let (release, released) = tokio::sync::oneshot::channel();
+                    assert!(sink.publish_from_worker(super::super::WorkerPublication::new(async move {
+                        entered.send(()).unwrap();
+                        tokio::time::timeout(Duration::from_secs(20), released).await
+                            .expect("the controlled real writer is released").unwrap();
+                    })).is_none());
+                    ready.recv_timeout(Duration::from_secs(10)).expect("the actual writer is held");
+                    assert!(observed.send((lease.clone(), client.clone(), deadline, release)).is_ok());
+                }));
+                let (id, mut frames) = scope.create_observed(config, "recovery-crosses-deadline").await;
+                let (lease, original, deadline, release) =
+                    tokio::time::timeout(Duration::from_secs(30), recovery).await.unwrap().unwrap();
+                let owner = lease.spawned_runner().expect("actual launched original");
+                assert_eq!(original.connected_runner(), Some(owner));
+                assert_eq!(lease.session_id(), id);
+                assert_eq!(supervisor.running_lease(&id), Some(lease.clone()));
+                let birth = crate::process::process_birth_identity(owner.pid).unwrap()
+                    .expect("the actual original is live");
+                assert_eq!(Some(birth.fingerprint()), owner.birth_fingerprint);
+                tokio::time::sleep_until(deadline + Duration::from_millis(10)).await;
+                assert!(tokio::time::Instant::now() > deadline);
+                release.send(()).unwrap();
+                tokio::time::timeout(Duration::from_secs(10), async {
+                    while !lease.retirement().has_deferred() {
+                        tokio::time::sleep(Duration::from_millis(10)).await;
+                    }
+                }).await.expect("actual deadline failure retains its original installation");
+                assert_eq!(supervisor.running_lease(&id), Some(lease.clone()));
+                assert_eq!(crate::process::process_birth_identity(owner.pid).unwrap().unwrap().fingerprint(), birth.fingerprint());
+                let record = worker_registry::load_strict(&id).unwrap().unwrap();
+                assert!(owner.owns_record(&record));
+                if mode != "resume" {
+                    scope.stop_observed_original(&lease).await;
+                    assert!(!supervisor.resume_deferred(&id).await.unwrap());
+                    assert!(supervisor.running_lease(&id).is_none());
+                    assert!(!supervisor.process_control.is_alive(owner));
+                    if mode == "replacement" {
+                        let (config, replacement_peer) = scope.native_peer(directory.path().into(), "gemini", "gemini", |request| {
+                            let result = match request["method"].as_str()? {
+                                "initialize" => serde_json::json!({"protocolVersion":1,"agentCapabilities":{"loadSession":true}}),
+                                "session/load" => {
+                                    assert_eq!(request["params"]["sessionId"], "deadline-original-native");
+                                    serde_json::json!({})
+                                }
+                                "session/new" => panic!("the retained replacement must Load the original"),
+                                _ => return None,
+                            };
+                            Some(serde_json::json!({"jsonrpc":"2.0","id":request["id"],"result":result}))
+                        });
+                        let replacement = scope.resume_stopped(&id, config).await;
+                        replacement.ready().await;
+                        let replacement_client = replacement.actual();
+                        let replacement_owner = replacement_client.connected_runner().unwrap();
+                        assert_ne!(replacement_owner, owner);
+                        let replacement_lease = supervisor.running_lease(&id).unwrap();
+                        assert_ne!(replacement_lease, lease);
+                        // Native usability precedes these final SDK publications.
+                        tokio::time::timeout(Duration::from_secs(10), async {
+                            let mut assigned = false;
+                            let mut capabilities = false;
+                            while !assigned || !capabilities {
+                                let frame = frames.recv().await.expect("actual replacement publication");
+                                if frame.session_id != id
+                                    || frame.worker_generation != Some(replacement_lease.epoch())
+                                {
+                                    continue;
+                                }
+                                match frame.event.as_ref() {
+                                    Event::AcpSessionAssigned { acp_session_id, .. }
+                                        if acp_session_id == "deadline-original-native" => assigned = true,
+                                    Event::PromptCapabilities { .. } => capabilities = true,
+                                    _ => {}
+                                }
+                            }
+                        }).await.expect("the exact replacement's assignment and capabilities are durable");
+                        let flush = supervisor.sink.clone();
+                        tokio::task::spawn_blocking(move || flush.flush()).await.unwrap();
+                        let prefix = store.highest_seq(&id).unwrap();
+                        let bytes = std::fs::read(worker_registry::record_path(&id).unwrap()).unwrap();
+                        assert!(!supervisor.resume_deferred(&id).await.unwrap());
+                        supervisor.test_assert_installed_client(&id, &replacement_client).await;
+                        assert_eq!(supervisor.running_lease(&id), Some(replacement_lease));
+                        assert!(supervisor.process_control.is_alive(replacement_owner));
+                        assert_eq!(store.highest_seq(&id).unwrap(), prefix);
+                        assert_eq!(std::fs::read(worker_registry::record_path(&id).unwrap()).unwrap(), bytes);
+                        assert_eq!(replacement_peer.requests().iter().filter(|method| method.as_str() == "session/load").count(), 1);
+                    }
+                    eprintln!("deferred installation {mode} assertions completed before cleanup: {id}");
+                    return;
+                }
+                let resumed = tokio::time::timeout(Duration::from_secs(10), supervisor.resume_deferred(&id))
+                    .await.expect("bounded retry of retained installation");
+                assert!(matches!(resumed, Ok(true)), "the exact Running original must resume, not retire: {resumed:?}");
+                let managed = scope.observe_external_resume(id.clone(), frames.resubscribe()).await;
+                supervisor.test_assert_installed_client(&id, &original).await;
+                tokio::time::timeout(Duration::from_secs(10), supervisor.wait_until_ready(&id)).await.unwrap().unwrap();
+                assert_eq!(supervisor.running_lease(&id), Some(lease.clone()));
+                assert_eq!(original.connected_runner(), Some(owner));
+                assert_eq!(crate::process::process_birth_identity(owner.pid).unwrap().unwrap().fingerprint(), birth.fingerprint());
+                assert!(owner.owns_record(&worker_registry::load_strict(&id).unwrap().unwrap()));
+                let flush = supervisor.sink.clone();
+                tokio::task::spawn_blocking(move || flush.flush()).await.unwrap();
+                let rows = store.replay_from(&id, 0).unwrap();
+                let assigned = |event: &Event| matches!(event, Event::AcpSessionAssigned { acp_session_id, .. } if acp_session_id.as_str() == "deadline-original-native");
+                assert_eq!(rows.iter().filter(|row| assigned(&row.event)).count(), 1, "the original SDK assignment must commit exactly once");
+                let mut actual = Vec::new();
+                while let Ok(frame) = frames.try_recv() {
+                    if frame.session_id == id { actual.push(frame); }
+                }
+                assert_eq!(actual.iter().filter(|frame| assigned(&frame.event)).count(), 1, "the original SDK assignment must broadcast exactly once");
+                assert!(actual.windows(2).all(|pair| pair[0].seq < pair[1].seq));
+                assert_eq!(peer.requests().iter().filter(|method| method.as_str() == "session/new").count(), 1);
+                assert_eq!(peer.requests().iter().filter(|method| method.as_str() == "initialize").count(), 1);
+                assert!(!lease.retirement().has_deferred());
+                managed.stop_session().await;
+                eprintln!("deferred installation {mode} assertions completed before cleanup: {id}");
+            })).await;
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[serial_test::serial]
+    async fn installation_flush_does_not_exclude_another_queued_sdk_completion() {
+        let (_home, _tmp) = isolate_home();
+        let sink = VecSink::new();
+        let supervisor = Arc::new(Supervisor::new(Arc::clone(&sink)));
+        let original = supervisor.test_install_stdio("queued-original").await;
+        let mut publications = sink.completed.lock().unwrap().resubscribe();
+        let reservation = supervisor
+            .reserve_spawn(
+                "installing-other",
+                ResumeKind::Spawn,
+                worker_registry::ResumeAuthority::Explicit,
+            )
+            .await
+            .unwrap();
+        let installing = reservation.lease().clone();
+        let (entered, entered_rx) = tokio::sync::oneshot::channel();
+        let (release, released) = tokio::sync::oneshot::channel();
+        let (completed, completion) = tokio::sync::oneshot::channel();
+        *sink.wrap_worker.lock().unwrap() = Some(Box::new(move |publication| {
+            super::super::WorkerPublication::new(async move {
+                let _ = entered.send(());
+                released
+                    .await
+                    .expect("installation releases the original SDK item");
+                let result =
+                    tokio::time::timeout(Duration::from_secs(5), publication.complete()).await;
+                let _ = completed.send(result.is_ok());
+            })
+        }));
+        let (query, querying) = tokio::sync::oneshot::channel();
+        *sink.before_orphan_query.lock().unwrap() = Some(Box::new(move || {
+            let _ = query.send(());
+            release.send(()).expect("the queued SDK item remains owned");
+        }));
+        let (events, inbound) = mpsc::channel(4);
+        let events = crate::acp::event_sender::EventSender::from(events);
+        let drain =
+            supervisor.start_drain_task("queued-original".into(), original.clone(), inbound, None);
+        events.send(Event::ThinkingStarted).await.unwrap();
+        tokio::time::timeout(Duration::from_secs(10), entered_rx)
+            .await
+            .unwrap()
+            .unwrap();
+        let (client, _commands) = AcpClient::fake_for_test(AcpSessionId("installing-other".into()));
+        let (keep_open, inbound) = mpsc::channel(4);
+        let installer = {
+            let supervisor = Arc::clone(&supervisor);
+            tokio::spawn(async move {
+                supervisor
+                    .install_worker(
+                        "installing-other",
+                        reservation,
+                        Arc::new(client),
+                        inbound,
+                        None,
+                        super::super::ConstructionFinish::new(WorkerKind::Stdio, None, None, false),
+                    )
+                    .await
+            })
+        };
+        tokio::time::timeout(Duration::from_secs(10), querying)
+            .await
+            .unwrap()
+            .unwrap();
+        let installed = tokio::time::timeout(Duration::from_secs(10), installer)
+            .await
+            .expect("installation must finish")
+            .expect("installation task")
+            .is_ok();
+        let completed = tokio::time::timeout(Duration::from_secs(10), completion)
+            .await
+            .unwrap()
+            .unwrap();
+        supervisor.publish_next(
+            "installing-other",
+            Event::SessionNotice {
+                key: None,
+                severity: "info".into(),
+                title: "installed actor remains publishable".into(),
+                description: None,
+            },
+        );
+        let flush_sink = Arc::clone(&sink);
+        tokio::time::timeout(
+            Duration::from_secs(10),
+            tokio::task::spawn_blocking(move || {
+                flush_sink.durable.flush();
+            }),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        let store = sink.establishment_store().unwrap();
+        let queued = store.replay_from("queued-original", 0).unwrap();
+        let other = store.replay_from("installing-other", 0).unwrap();
+        let leases = (
+            supervisor.running_lease("queued-original"),
+            supervisor.running_lease("installing-other"),
+        );
+        let mut broadcast = Vec::new();
+        while let Ok(frame) = publications.try_recv() {
+            broadcast.push((frame.session_id, frame.seq));
+        }
+        supervisor
+            .workers
+            .lock()
+            .await
+            .get("installing-other")
+            .unwrap()
+            .drain_task
+            .abort();
+        supervisor.test_remove_worker("queued-original").await;
+        supervisor.test_remove_worker("installing-other").await;
+        drain.abort();
+        let _ = drain.await;
+        drop(events);
+        drop(keep_open);
+        assert!(
+            installed,
+            "the installing actor must preserve its original reservation"
+        );
+        assert!(
+            completed,
+            "an installation read fence must not hold workers against real queued SDK completion"
+        );
+        assert_eq!(leases, (Some(original), Some(installing)));
+        assert_eq!(queued.len(), 1, "the actual SDK publication must commit");
+        assert_eq!(queued[0].seq, 1);
+        assert!(matches!(queued[0].event.as_ref(), Event::ThinkingStarted));
+        assert_eq!(
+            other.len(),
+            1,
+            "the independently installed actor must still publish"
+        );
+        assert_eq!(other[0].seq, 1);
+        assert_eq!(
+            broadcast.len(),
+            2,
+            "both actors must reach real live delivery"
+        );
+        assert!(broadcast.contains(&("queued-original".to_owned(), 1)));
+        assert!(broadcast.contains(&("installing-other".to_owned(), 1)));
+    }
 
     async fn managed_attach_original(
         scope: &mut super::super::test_support::managed::ManagedScope,
@@ -3183,6 +3550,79 @@ time.sleep(60)
                 vec![pair("CLAUDE_CONFIG_DIR", "/acct")],
                 Some(PathBuf::from("/acct")),
             ),
+            // A session pinned to the `claude-code` agent still runs its wrapper's account.
+            (
+                {
+                    let mut cfg = cfg(&[("claude-c", "/acct")]);
+                    cfg.session
+                        .agent_detect_as
+                        .insert("claude-c".into(), "claude".into());
+                    cfg
+                },
+                "claude-c",
+                "claude-code",
+                vec![pair("CLAUDE_CONFIG_DIR", "/acct")],
+                Some(PathBuf::from("/acct")),
+            ),
+            // A wrapper without an entry keeps the pinned target's directory.
+            (
+                {
+                    let mut cfg = cfg(&[("claude-code", "/target")]);
+                    cfg.session
+                        .agent_detect_as
+                        .insert("claude-c".into(), "claude".into());
+                    cfg
+                },
+                "claude-c",
+                "claude-code",
+                vec![pair("CLAUDE_CONFIG_DIR", "/target")],
+                Some(PathBuf::from("/target")),
+            ),
+            // An unresolvable wrapper entry does not shadow the target's.
+            (
+                {
+                    let mut cfg = cfg(&[("claude-c", "relative/dir"), ("claude-code", "/target")]);
+                    cfg.session
+                        .agent_detect_as
+                        .insert("claude-c".into(), "claude".into());
+                    cfg
+                },
+                "claude-c",
+                "claude-code",
+                vec![pair("CLAUDE_CONFIG_DIR", "/target")],
+                Some(PathBuf::from("/target")),
+            ),
+            // With both entries the wrapper's wins.
+            (
+                {
+                    let mut cfg = cfg(&[("claude-c", "/acct"), ("claude-code", "/target")]);
+                    cfg.session
+                        .agent_detect_as
+                        .insert("claude-c".into(), "claude".into());
+                    cfg
+                },
+                "claude-c",
+                "claude-code",
+                vec![pair("CLAUDE_CONFIG_DIR", "/acct")],
+                Some(PathBuf::from("/acct")),
+            ),
+            // A wrapper that executes as another backend does not leak into the pinned target.
+            (
+                {
+                    let mut cfg = cfg(&[("claude-c", "/codex"), ("claude-code", "/target")]);
+                    cfg.session
+                        .agent_detect_as
+                        .insert("claude-c".into(), "claude".into());
+                    cfg.session
+                        .agent_execution_as
+                        .insert("claude-c".into(), "codex".into());
+                    cfg
+                },
+                "claude-c",
+                "claude-code",
+                vec![pair("CLAUDE_CONFIG_DIR", "/target")],
+                Some(PathBuf::from("/target")),
+            ),
             (
                 cfg(&[("codex", "/acct")]),
                 "codex",
@@ -3420,6 +3860,34 @@ time.sleep(60)
         });
         let (config, _) = supervisor.spawn_config(&request, 1).await.unwrap();
         assert_eq!(exported(&config), Some(recorded));
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn first_launch_forwards_a_workspace_launch_repo_project_mcp_servers() {
+        let (_home, temp) = isolate_home();
+        let _env = crate::session::test_support::EnvGuard::unset(&["CLAUDE_CONFIG_DIR"]);
+        let repo = temp.path().join("repo");
+        let workspace = temp.path().join("workspace");
+        std::fs::create_dir_all(&repo).unwrap();
+        std::fs::create_dir_all(&workspace).unwrap();
+        std::fs::write(
+            repo.join(".mcp.json"),
+            r#"{ "mcpServers": { "project-only": { "command": "pl" } } }"#,
+        )
+        .unwrap();
+        let servers = crate::session::mcp::project_mcp::load_project_mcp_servers(&repo).unwrap();
+        let hash = crate::session::mcp::project_mcp::fingerprint(&servers);
+        crate::session::config::repo_config::trust_repo(&repo, None, Some(&hash)).unwrap();
+
+        let supervisor = Supervisor::new(VecSink::new());
+        let mut request = spawn_request("workspace-mcp");
+        request.cwd = workspace;
+        request.config_path = repo;
+
+        let (config, _) = supervisor.spawn_config(&request, 1).await.unwrap();
+
+        assert!(mcp_names(&config.mcp_servers).contains(&"project-only"));
     }
 
     #[tokio::test]
@@ -4057,9 +4525,19 @@ time.sleep(60)
             r#""project-only": { "command": "pl" }, "shared": { "command": "from-project" }"#,
         );
 
-        let resolve = |profile: Option<&'static str>, cwd: std::path::PathBuf| async move {
+        let resolve = |profile: Option<&'static str>,
+                       cwd: std::path::PathBuf,
+                       config_path: std::path::PathBuf| async move {
             let merged = tokio::task::spawn_blocking(move || {
-                resolve_mcp_layers("claude", "resolve-test", profile, &cwd, &[], None)
+                resolve_mcp_layers(
+                    "claude",
+                    "resolve-test",
+                    profile,
+                    &cwd,
+                    &config_path,
+                    &[],
+                    None,
+                )
             })
             .await
             .unwrap();
@@ -4080,7 +4558,12 @@ time.sleep(60)
             (names, shared)
         };
 
-        let (names, shared) = resolve(Some("work"), tmp.path().to_path_buf()).await;
+        let (names, shared) = resolve(
+            Some("work"),
+            tmp.path().to_path_buf(),
+            tmp.path().to_path_buf(),
+        )
+        .await;
         assert_eq!(
             names,
             ["global-only", "native-only", "profile-only", "shared"],
@@ -4092,7 +4575,7 @@ time.sleep(60)
         // against the global layer: with no profile argument at all,
         // `resolve_default_profile` would pick "work" (the only profile on
         // disk) and its `shared` would win.
-        let (names, shared) = resolve(Some("empty"), repo.clone()).await;
+        let (names, shared) = resolve(Some("empty"), repo.clone(), repo.clone()).await;
         assert!(
             !names.contains(&"project-only".to_string()),
             "untrusted project is skipped"
@@ -4102,7 +4585,7 @@ time.sleep(60)
         let servers = crate::session::mcp::project_mcp::load_project_mcp_servers(&repo).unwrap();
         let hash = crate::session::mcp::project_mcp::fingerprint(&servers);
         crate::session::config::repo_config::trust_repo(&repo, None, Some(&hash)).unwrap();
-        let (names, shared) = resolve(Some("empty"), repo).await;
+        let (names, shared) = resolve(Some("empty"), repo.clone(), repo.clone()).await;
         assert!(
             names.contains(&"project-only".to_string()),
             "trusted project is forwarded"
@@ -4111,6 +4594,19 @@ time.sleep(60)
             shared.as_deref(),
             Some("from-project"),
             "trusted project wins"
+        );
+
+        let workspace = tmp.path().join("workspace");
+        std::fs::create_dir_all(&workspace).unwrap();
+        let (names, _) = resolve(Some("empty"), workspace.clone(), repo.clone()).await;
+        assert!(
+            names.contains(&"project-only".to_string()),
+            "a workspace forwards its launch repo's servers"
+        );
+        let (names, _) = resolve(Some("empty"), repo, workspace).await;
+        assert!(
+            !names.contains(&"project-only".to_string()),
+            "project servers come from config_path, not cwd"
         );
     }
 
@@ -4125,6 +4621,7 @@ time.sleep(60)
         let approval = |nonce: &str| Approval {
             nonce: Nonce(nonce.into()),
             tool_call: ToolCall {
+                prompt: None,
                 id: nonce.into(),
                 name: "Bash".into(),
                 kind: "execute".into(),
@@ -4360,10 +4857,15 @@ time.sleep(60)
             .to_owned();
         let inspection = scope.inspect_next_runner(&test_name);
         let mut fail_next_prompt = failed_main;
+        let agent_key = if open_task.is_some() {
+            "claude"
+        } else {
+            "codex"
+        };
         let (config, peer) = scope.native_peer(
             workdir.path().to_path_buf(),
-            "claude",
-            "claude",
+            agent_key,
+            agent_key,
             move |request| {
                 let id = request.get("id")?;
                 let result = match request["method"].as_str()? {
@@ -4399,18 +4901,27 @@ time.sleep(60)
             .receipt_snapshot()
             .expect("actual Applied receipt");
         let native_session = receipt.session_id().expect("actual Native SID").to_owned();
-        let home = client
-            .actual()
-            .native_store
-            .as_ref()
-            .filter(|binding| binding.agent == "claude" && binding.filesystem == "host")
-            .and_then(|binding| binding.stores.first())
-            .expect("actual original host Claude store")
-            .clone();
-        let project = home.join("projects/-enc");
-        std::fs::create_dir_all(&project).unwrap();
-        let task_transcript = project.join(format!("{native_session}.jsonl"));
-        std::fs::write(&task_transcript, "").unwrap();
+        let task_transcript = if open_task.is_some() {
+            let home = client
+                .actual()
+                .native_store
+                .as_ref()
+                .filter(|binding| binding.agent == agent_key && binding.filesystem == "host")
+                .and_then(|binding| binding.stores.first())
+                .expect("the actual Claude task's original host store")
+                .clone();
+            let project =
+                home.join("projects")
+                    .join(crate::session::capture::encode_claude_project_path(
+                        &workdir.path().to_string_lossy(),
+                    ));
+            std::fs::create_dir_all(&project).unwrap();
+            let transcript = project.join(format!("{native_session}.jsonl"));
+            std::fs::write(&transcript, "").unwrap();
+            transcript
+        } else {
+            std::path::PathBuf::from(output_file)
+        };
         if failed_main {
             scope
                 .state
@@ -4430,7 +4941,8 @@ time.sleep(60)
             .expect("original correlated Native failure is durable");
         }
         let store = scope.state.acp_event_store.clone();
-        publish_native_background_start(&mut client, &peer, &store,
+        if open_task.is_none() {
+            publish_native_background_start(&mut client, &peer, &store,
             serde_json::json!({"jsonrpc":"2.0","method":"session/update","params":{
                 "sessionId":native_session,"update":{
                     "sessionUpdate":"tool_call_update","toolCallId":"tc-1",
@@ -4443,33 +4955,34 @@ time.sleep(60)
             !output_file.is_empty(),
             |event| matches!(event, Event::BackgroundAgentLaunched { agent_id, .. } if agent_id == "sub-1"),
         ).await;
-        let launches = store
-            .unresolved_background_agent_launches(&client.id)
-            .unwrap();
-        let launch = launches
-            .iter()
-            .find(|launch| launch.agent_id == "sub-1")
-            .unwrap();
-        if output_file.is_empty() {
-            // An untrackable launch grants no transcript access.
-            assert!(launch.witness.is_none());
-        } else {
-            assert!(
-                launch.witness.is_some(),
-                "the actual first resource I/O must mint its durable witness"
-            );
-            let stored = store.replay_from(&client.id, 0).unwrap().into_iter().find(|stored|
+            let launches = store
+                .unresolved_background_agent_launches(&client.id)
+                .unwrap();
+            let launch = launches
+                .iter()
+                .find(|launch| launch.agent_id == "sub-1")
+                .unwrap();
+            if output_file.is_empty() {
+                // An untrackable launch grants no transcript access.
+                assert!(launch.witness.is_none());
+            } else {
+                assert!(
+                    launch.witness.is_some(),
+                    "the actual first resource I/O must mint its durable witness"
+                );
+                let stored = store.replay_from(&client.id, 0).unwrap().into_iter().find(|stored|
                     matches!(stored.event.as_ref(), Event::BackgroundAgentLaunched { agent_id, .. } if agent_id == "sub-1")
                         && stored.metadata.resource_witness.is_some()).unwrap();
-            assert_eq!(stored.metadata.scope, EventScope::HistoryOnly);
-            assert_eq!(
-                stored.metadata.resource_ref,
-                stored
-                    .metadata
-                    .resource_witness
-                    .as_ref()
-                    .map(|witness| witness.allocation)
-            );
+                assert_eq!(stored.metadata.scope, EventScope::HistoryOnly);
+                assert_eq!(
+                    stored.metadata.resource_ref,
+                    stored
+                        .metadata
+                        .resource_witness
+                        .as_ref()
+                        .map(|witness| witness.allocation)
+                );
+            }
         }
         if let Some(task_id) = open_task {
             publish_native_background_start(&mut client, &peer, &store,
@@ -4665,6 +5178,7 @@ time.sleep(60)
             methods,
             "read-only attachment must not create, load, or resubmit Native work"
         );
+
         fixture
     }
 
@@ -4672,11 +5186,12 @@ time.sleep(60)
     #[serial_test::serial]
     async fn reattached_failed_main_keeps_its_terminal_through_ambient_accounting_and_background_work(
     ) {
-        super::super::test_support::managed::with_managed(|scope| Box::pin(async move {
+        for open_task in [None, Some("surviving-task")] {
+            super::super::test_support::managed::with_managed(|scope| Box::pin(async move {
                 let dir = scope.tempdir();
                 let transcript = dir.path().join("agent.jsonl");
                 std::fs::write(&transcript, "").unwrap();
-                let mut fixture = managed_background_original(scope, "retained-failed-background", transcript.to_str().unwrap(), Some("surviving-task"), true).await;
+                let mut fixture = managed_background_original(scope, "retained-failed-background", transcript.to_str().unwrap(), open_task, true).await;
                 let failed = fold_background_journal(&fixture.store, &fixture.client.id);
                 assert!(!failed.turn_active);
                 assert_eq!(failed.sidebar_status(), crate::session::Status::Error);
@@ -4710,6 +5225,7 @@ time.sleep(60)
                 assert!(!fixture.peer.requests().iter().any(|method| method == "session/load"));
                 fixture.client.shutdown().await.expect("checked original retirement and checkpoint cleanup");
             })).await;
+        }
     }
 
     async fn await_background_agent_resolved(
@@ -5221,7 +5737,7 @@ time.sleep(60)
                     replacement.send_prompt("replacement continuation", &[]).await.unwrap();
                     let replacement_request = tokio::time::timeout(Duration::from_secs(10), replacement_rx)
                         .await.unwrap().unwrap();
-                    let prefix = store.highest_seq(&id);
+                    let prefix = store.highest_seq(&id).unwrap();
                     let replacement_pending = store.has_in_flight_turn(&id).unwrap();
                     assert_eq!(replacement_pending, crate::acp::event_store::ControlKnowledge::Known(true));
                     let record_path = worker_registry::record_path(&id).unwrap();

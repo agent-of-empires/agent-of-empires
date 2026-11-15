@@ -8,9 +8,9 @@ import { useDashboardUpdate } from "../../hooks/useDashboardUpdate";
 import * as api from "../../lib/api";
 import type { ServerAbout } from "../../lib/api";
 
-function aboutWith(webBuildId: string | null): ServerAbout {
+function aboutWith(webBuildId: string | null, version = "1.0.0"): ServerAbout {
   return {
-    version: "1.0.0",
+    version,
     auth_required: false,
     passphrase_enabled: false,
     auth_mode: "none",
@@ -47,14 +47,17 @@ afterEach(() => {
 });
 
 function Banner() {
-  return useDashboardUpdate() ? <DashboardUpdateBanner /> : null;
+  const version = useDashboardUpdate();
+  return version !== null ? <DashboardUpdateBanner version={version} /> : null;
 }
 
 describe("DashboardUpdateBanner", () => {
   it("shows the reload prompt when the server's bundle differs", async () => {
-    vi.spyOn(api, "fetchAbout").mockResolvedValue(aboutWith("index-NewerBuild.js"));
+    vi.spyOn(api, "fetchAbout").mockResolvedValue(aboutWith("index-NewerBuild.js", "1.22.1"));
     render(<Banner />);
-    expect(await screen.findByRole("status", { name: "Dashboard update available" })).toBeDefined();
+    const banner = await screen.findByRole("status", { name: "Dashboard update available" });
+    // #5514: the banner names the version the Daemon now serves.
+    expect(banner.textContent).toContain("Dashboard updated to v1.22.1.");
     expect(screen.getByRole("button", { name: "Reload now" })).toBeDefined();
   });
 

@@ -245,6 +245,32 @@ describe("ApprovalCard decisions", () => {
       expect(onResolve).toHaveBeenCalledExactlyOnceWith("Allow", undefined);
     });
 
+    it("requires a new full hold after permission is withdrawn and regranted", () => {
+      const approval = makeApproval({ destructive: true });
+      const onResolve = vi.fn().mockResolvedValue(undefined);
+      const { rerender } = render(<ApprovalCard approval={approval} canDecide onResolve={onResolve} />);
+      const button = screen.getByRole("button", { name: "Hold to allow" }) as HTMLButtonElement;
+      hold(button, 400);
+      rerender(<ApprovalCard approval={approval} canDecide={false} onResolve={onResolve} />);
+      expect(button.disabled).toBe(true);
+      act(() => {
+        vi.advanceTimersByTime(50);
+      });
+      rerender(<ApprovalCard approval={approval} canDecide onResolve={onResolve} />);
+      expect(button.disabled).toBe(false);
+      act(() => {
+        vi.advanceTimersByTime(500);
+      });
+      expect(onResolve).not.toHaveBeenCalled();
+
+      hold(button, 799);
+      expect(onResolve).not.toHaveBeenCalled();
+      act(() => {
+        vi.advanceTimersByTime(1);
+      });
+      expect(onResolve).toHaveBeenCalledExactlyOnceWith("Allow", undefined);
+    });
+
     it.each([" ", "Enter"])("allows from the keyboard after an 800ms %j hold, ignoring key repeat", (key) => {
       const onResolve = mount(makeApproval({ destructive: true }));
       const button = screen.getByRole("button", { name: /Hold to allow/ });

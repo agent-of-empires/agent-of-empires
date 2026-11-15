@@ -38,7 +38,7 @@ pub(crate) use teardown::{NativeBindingCheckpoint, RetirementResources, Retireme
 
 pub(crate) use agents::{apply_agent_command_override, command_override_for_spawn};
 pub(crate) use launch::{host_spawn_environment, with_durable_launch};
-pub use sink::{BroadcastSink, ChannelSink};
+pub use sink::{BroadcastSink, ChannelSink, Persisted, WorkerPublication};
 
 #[cfg(test)]
 thread_local! {
@@ -72,10 +72,10 @@ pub(crate) type Launcher = Arc<
 type Workers = Arc<Mutex<HashMap<String, WorkerHandle>>>;
 pub(crate) use launch::LiveFreshProposal;
 /// Per-session publication order, retained across worker replacement.
-type SeqMap = std::sync::Mutex<HashMap<String, Arc<std::sync::Mutex<SessionSequence>>>>;
+pub type SeqMap = std::sync::Mutex<HashMap<String, Arc<std::sync::Mutex<SessionSequence>>>>;
 
 #[derive(Default)]
-struct SessionSequence {
+pub struct SessionSequence {
     seq: u64,
     retired: bool,
 }
@@ -136,6 +136,9 @@ pub enum SupervisorError {
     Establishment(#[from] crate::acp::establishment::EstablishmentRefusal),
     #[error("worker registry admission busy")]
     RegistryBusy,
+    /// The event log could not say whether a turn is open; the caller retries.
+    #[error("session {0:?} event log is unavailable")]
+    EventStoreUnavailable(String),
 }
 
 impl SupervisorError {
@@ -217,6 +220,9 @@ impl From<WorkerPhase> for AcpWorkerState {
 #[derive(Debug, Error)]
 #[error("native observation epoch is busy")]
 pub(crate) struct NativeObservationBusy;
+#[cfg(test)]
+type InstallationRecoveryObserver =
+    Box<dyn FnOnce(&Lease, &Arc<AcpClient>, tokio::time::Instant) + Send>;
 
 pub struct Supervisor<S: BroadcastSink> {
     sink: Arc<S>,
@@ -242,6 +248,8 @@ pub struct Supervisor<S: BroadcastSink> {
     worker_notify: Arc<tokio::sync::Notify>,
     #[cfg(test)]
     worker_waits: tokio::sync::broadcast::Sender<String>,
+    #[cfg(test)]
+    installation_recovery: std::sync::Mutex<Option<InstallationRecoveryObserver>>,
     /// Build-stale sessions draining a turn before the reconciler respawns them.
     respawn_pending: SharedSet,
     /// Sessions parked on a compatibility rejection, keyed to the failing binary.
@@ -580,6 +588,8 @@ pub struct SpawnRequest {
     /// The session's logical tool (`Instance.tool`); host hooks see this as `AOE_TOOL`.
     pub tool: String,
     pub cwd: PathBuf,
+    /// Where repo config is read; a workspace's `cwd` holds none (`Instance::repo_config_path`).
+    pub config_path: PathBuf,
     pub additional_dirs: Vec<PathBuf>,
     pub provider_env: Vec<(String, String)>,
     /// LLM backend pinned on the session row, one of
@@ -589,6 +599,8 @@ pub struct SpawnRequest {
     pub effort: Option<String>,
     /// True for persisted user effort, not a resolved default.
     pub effort_explicit: bool,
+    /// Persisted `model_config` picks, re-applied after the model and effort.
+    pub model_config: std::collections::BTreeMap<String, String>,
     /// Prior ACP session id; loaded instead of a new session when the agent supports it.
     pub stored_acp_session_id: Option<String>,
     /// Parent ACP session id to `session/fork` from.
@@ -655,6 +667,8 @@ impl<S: BroadcastSink> Supervisor<S> {
             worker_notify: Arc::default(),
             #[cfg(test)]
             worker_waits: tokio::sync::broadcast::channel(64).0,
+            #[cfg(test)]
+            installation_recovery: Default::default(),
             respawn_pending: Arc::default(),
             incompatible_binaries: Arc::default(),
             force_respawn: Arc::default(),
@@ -767,29 +781,13 @@ impl<S: BroadcastSink> Supervisor<S> {
             return Err(SupervisorError::TeardownPending(session_id.into()));
         }
         drop(lifecycle);
-        loop {
-            let sequence = sequence_slot(&self.next_seqs, session_id);
-            let mut current = lock_recover(&sequence);
-            if current.retired {
-                continue;
-            }
-            self.sink
-                .clear_session_events(session_id)
-                .map_err(|error| {
-                    warn!(target: "acp.supervisor", session = %session_id, %error,
-                    "could not clear the retired session journal");
-                    SupervisorError::NativeStoreUnavailable
-                })?;
-            current.retired = true;
-            let mut sequences = lock_recover(&self.next_seqs);
-            if sequences
-                .get(session_id)
-                .is_some_and(|slot| Arc::ptr_eq(slot, &sequence))
-            {
-                sequences.remove(session_id);
-            }
-            break;
-        }
+        self.sink
+            .clear_session_events(session_id, Arc::clone(&self.next_seqs))
+            .map_err(|error| {
+                warn!(target: "acp.supervisor", session = %session_id, %error,
+                "could not clear the retired session journal");
+                SupervisorError::NativeStoreUnavailable
+            })?;
         lock_recover(&self.startup_requeues).remove(session_id);
         lock_recover(&self.respawned_in_place).remove(session_id);
         Ok(())
@@ -1114,7 +1112,7 @@ fn sequence_slot(next_seqs: &SeqMap, session_id: &str) -> Arc<std::sync::Mutex<S
 fn with_session_sequence<T>(
     next_seqs: &SeqMap,
     session_id: &str,
-    publish: impl FnOnce(&mut u64) -> T,
+    publish: impl FnOnce(&Arc<std::sync::Mutex<SessionSequence>>, &mut u64) -> T,
 ) -> T {
     // Both store I/O and waiters leave the async worker while publication is serialized.
     sink::blocking_io(|| loop {
@@ -1123,7 +1121,7 @@ fn with_session_sequence<T>(
         if sequence.retired {
             continue;
         }
-        return publish(&mut sequence.seq);
+        return publish(&slot, &mut sequence.seq);
     })
 }
 
@@ -1132,10 +1130,23 @@ fn with_publication_seq<T>(
     session_id: &str,
     publish: impl FnOnce(u64) -> T,
 ) -> T {
-    with_session_sequence(next_seqs, session_id, |current| {
+    with_session_sequence(next_seqs, session_id, |_slot, current| {
         *current = current.saturating_add(1);
         publish(*current)
     })
+}
+
+/// Queue owned host DATA on the same writer order as SDK completion.
+/// Return only the actual allocated seq and store outcome, outside all seq locks.
+fn publish_next_persisted<S: BroadcastSink + ?Sized>(
+    sink: &S,
+    next_seqs: &Arc<SeqMap>,
+    session_id: &str,
+    data: crate::acp::event_sender::AcpEventData,
+) -> (u64, bool) {
+    sink.queue_persisted(session_id, Arc::clone(next_seqs), data, None)
+        .wait()
+        .expect("event writer ended before completing host publication")
 }
 
 fn lock_recover<T>(m: &std::sync::Mutex<T>) -> std::sync::MutexGuard<'_, T> {

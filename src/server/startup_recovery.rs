@@ -861,6 +861,8 @@ mod tests {
                                 let original = test_support::managed_control_session(
                                     scope,
                                     "shelved-recovery",
+                                    "claude",
+                                    None,
                                 )
                                 .await;
                                 original.client.stop_session().await;
@@ -959,7 +961,8 @@ mod tests {
                             .unwrap();
                             let native_before =
                                 original.as_ref().map(|session| session.native.requests());
-                            let seq_before = state.acp_event_store.highest_seq(&candidate.id);
+                            let seq_before =
+                                state.acp_event_store.highest_seq(&candidate.id).unwrap();
                             let mut rx = state.status_tx.subscribe();
                             let response = crate::server::api::sessions::recovery_restart(
                                 state.clone(),
@@ -997,7 +1000,7 @@ mod tests {
                                 "recovery must not mutate shelved metadata"
                             );
                             assert_eq!(
-                                state.acp_event_store.highest_seq(&candidate.id),
+                                state.acp_event_store.highest_seq(&candidate.id).unwrap(),
                                 seq_before,
                                 "refused recovery publishes no ACP effects"
                             );

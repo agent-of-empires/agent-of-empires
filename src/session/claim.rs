@@ -92,12 +92,6 @@ pub(crate) fn finalize_restore_commit(
     RestoreCommit::Committed
 }
 
-pub(crate) fn release_trash_reservation(all: &mut [Instance], id: &str, generation: u64) {
-    if let Some(row) = all.iter_mut().find(|instance| instance.id == id) {
-        row.release_lifecycle_reservation_if_owned(LifecycleOperation::Trash, generation);
-    }
-}
-
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub(crate) enum RelocationCommit {
     Persisted,

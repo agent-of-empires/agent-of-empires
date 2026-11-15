@@ -47,6 +47,7 @@ export function currentControlSnapshot(
       })),
       operation_error: state.lastErrorEvidence,
       recovery: receipt.recovery,
+      integration_lost: state.integrationLost ?? null,
       connection_unavailable: unavailable,
       connection_ready: receipt.ready && unavailable === null,
       prompt_wake_eligible: receipt.wakeEligible === true && unavailable === null,

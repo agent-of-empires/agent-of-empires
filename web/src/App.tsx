@@ -33,6 +33,7 @@ import { useWorkspaces } from "./hooks/useWorkspaces";
 import { useLastSessionRestore } from "./hooks/useLastSessionRestore";
 import { SCRATCH_GROUP_ID, useRepoGroups } from "./hooks/useRepoGroups";
 import { useSessionGroups } from "./hooks/useSessionGroups";
+import { useStatusGroups } from "./hooks/useStatusGroups";
 import { useAttentionJump } from "./hooks/useAttentionJump";
 import { useNestedSidebarGroups } from "./hooks/useNestedSidebarGroups";
 import { useOrgGroups } from "./hooks/useOrgGroups";
@@ -156,7 +157,7 @@ import { DockGroups, type DockGroupView } from "./components/DockGroups";
 import { BottomDock } from "./components/BottomDock";
 import { PaneDndController } from "./components/PaneDndController";
 import { visibleToFullIndex, type DropTarget } from "./components/paneDnd";
-import { BackgroundAgentsPanel } from "./components/acp/BackgroundAgentsPanel";
+import { BackgroundAgentsPanel, type AgentFocus } from "./components/acp/BackgroundAgentsPanel";
 import { hasStartedBefore } from "./components/acp/startupWait";
 import { DiffPane } from "./components/DiffPane";
 import { FilesPane } from "./components/FilesPane";
@@ -560,6 +561,14 @@ function AppContent({
     pluginSort,
     pluginAttention,
   );
+  // The status axis groups by execution status instead of by where a session
+  // lives, so it owns its own grouping and collapse state.
+  const { groups: statusGroups, toggleGroupCollapsed: toggleStatusGroupCollapsed } = useStatusGroups(
+    workspaces,
+    sidebarSortMode,
+    pluginSort,
+    pluginAttention,
+  );
   // The nested `repo+group` axis reuses the already-built repo groups for
   // its top level (so repo collapse, appearance, and ordering are shared
   // with the repo axis) and splits each repo by `group_path` underneath.
@@ -580,15 +589,18 @@ function AppContent({
     toggleRepoCollapsed: toggleOrgRepoCollapsed,
   } = useOrgGroups(repoGroups);
 
-  // The sidebar render path consumes one honest model (SidebarGroup): the
-  // repo axis maps in via an adapter, the user-group axis is already in
-  // that shape. Collapse routing follows the active axis so the two
-  // axes keep independent collapse state. See #1234.
-  const sidebarGroups = useMemo(
-    () => (sidebarAxis === "group" ? sessionGroups : repoGroups.map(repoGroupToSidebarGroup)),
-    [sidebarAxis, sessionGroups, repoGroups],
-  );
-  const toggleSidebarGroup = sidebarAxis === "group" ? toggleGroupCollapsed : toggleRepoCollapsed;
+  // Collapse state is independent for each grouping axis.
+  const sidebarGroups = useMemo(() => {
+    if (sidebarAxis === "status") return statusGroups;
+    if (sidebarAxis === "group") return sessionGroups;
+    return repoGroups.map(repoGroupToSidebarGroup);
+  }, [sidebarAxis, statusGroups, sessionGroups, repoGroups]);
+  const toggleSidebarGroup =
+    sidebarAxis === "status"
+      ? toggleStatusGroupCollapsed
+      : sidebarAxis === "group"
+        ? toggleGroupCollapsed
+        : toggleRepoCollapsed;
 
   // Drag-end handler for the sidebar. Optimistically applies the new
   // order locally so the row snaps into place, then persists to the
@@ -768,11 +780,19 @@ function AppContent({
   );
   // Open (or focus) the Sub agents pane. Used by an inline async
   // sub-agent card to jump to its panel entry.
-  const openAgentsPane = useCallback(() => {
-    const dock = dockOf(paneLayout, "agents");
-    if (dock) activateTab(dock, "agents");
-    else toggleKind("agents", "right");
-  }, [paneLayout, activateTab, toggleKind]);
+  const [agentFocus, setAgentFocus] = useState<AgentFocus | null>(null);
+  const focusAgent = useCallback((agentId?: string) => {
+    if (agentId) setAgentFocus((f) => ({ agentId, nonce: (f?.nonce ?? 0) + 1 }));
+  }, []);
+  const openAgentsPane = useCallback(
+    (agentId?: string) => {
+      focusAgent(agentId);
+      const dock = dockOf(paneLayout, "agents");
+      if (dock) activateTab(dock, "agents");
+      else toggleKind("agents", "right");
+    },
+    [paneLayout, activateTab, toggleKind, focusAgent],
+  );
   const closePaneAny = useCallback(
     (id: string) => {
       // Closing an extra terminal tab kills its tmux shell so it does not leak;
@@ -2012,7 +2032,13 @@ function AppContent({
       const plugin = pluginPaneById.get(id);
       if (plugin) return <PluginPaneBody entry={plugin.entry} />;
       if (id === "agents") {
-        return <BackgroundAgentsPanel sessionId={activeSessionId} />;
+        return (
+          <BackgroundAgentsPanel
+            sessionId={activeSessionId}
+            readOnly={caps.readOnly || !!activeSession?.trashed_at || !!activeSession?.archived_at}
+            focus={agentFocus}
+          />
+        );
       }
       if (id === "files") {
         // Remount on session switch so the selected file (and any in-flight
@@ -2098,6 +2124,7 @@ function AppContent({
                             onOpenFileRef={handleOpenFileRef}
                             fileRefSession={session}
                             onOpenAgentsPane={openAgentsPane}
+                            serverReadOnly={caps.readOnly}
                             isSandboxed={session.is_sandboxed}
                             onSwitchToTerminal={
                               canSwitchToTerminal ? () => handleSwitchView(session.id, false) : undefined
@@ -2338,7 +2365,11 @@ function AppContent({
           view={rightPanelView}
           pluginPanes={pluginPanes}
           onBackToAgent={() => handlePickView("agent")}
-          onOpenAgentsPane={() => handlePickView("agents")}
+          agentFocus={agentFocus}
+          onOpenAgentsPane={(agentId) => {
+            focusAgent(agentId);
+            handlePickView("agents");
+          }}
           onSwitchToTerminal={canSwitchToTerminal ? (id) => handleSwitchView(id, false) : undefined}
           onOpenTerminal={canSwitchToTerminal ? handleOpenPairedTerminal : undefined}
           canRestartAgent={canRestartAgent}

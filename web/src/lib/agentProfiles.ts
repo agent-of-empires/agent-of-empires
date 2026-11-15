@@ -53,7 +53,7 @@ const CLAUDE: AgentProfile = {
   specialTitles: {
     skillNames: ["skill", "claude-skill"],
     scheduleNames: ["ScheduleWakeup", "CronCreate", "CronList", "CronDelete"],
-    harnessNames: ["ToolSearch", "Monitor", "TaskStop"],
+    harnessNames: ["ToolSearch", "Monitor", "TaskStop", "SendMessage"],
     workflowNames: ["Workflow"],
   },
 };

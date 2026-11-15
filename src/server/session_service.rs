@@ -15,7 +15,7 @@ use tokio::sync::RwLock;
 
 use crate::daemon::{CreationPhase, CreationProgress};
 use crate::server::session_spawn::{spawn_structured_session, SpawnOutcome, StructuredSessionSpec};
-use crate::session::{Instance, PluginCreateIdempotency};
+use crate::session::{Instance, PluginCreateIdempotency, SessionStore};
 
 pub(crate) struct RecoverySnapshot {
     row: Instance,
@@ -269,6 +269,7 @@ fn queue_drain_batch<'a>(
 
 pub(crate) struct NativeControlObservation {
     pub projection: crate::acp::state::NativeAvailabilityProjection,
+    pub establishment_revision: Option<crate::acp::establishment::EstablishmentRevision>,
     wait: Option<crate::acp::state::NativeObservationWait>,
     identity: Option<(String, chrono::DateTime<chrono::Utc>, u64)>,
     current: Option<crate::acp::state::CurrentNativeAvailability>,
@@ -479,7 +480,8 @@ pub(crate) struct SendTurnRequest<'a> {
     /// Forces the resume trigger even when the worker looks alive, mirroring
     /// the handler's idle-dormant wake (#1689).
     pub woke_idle_dormant: bool,
-    pub prompt_id: Option<String>,
+    /// Transcript row id first, then the ids of queued rows folded into the same turn.
+    pub prompt_ids: Vec<String>,
     /// True when the daemon queued this turn itself (a rate-limit resume
     /// continuation) rather than the user typing it just now, so the
     /// transcript model can skip rendering a duplicate row for it.
@@ -958,6 +960,7 @@ impl SessionService {
             namespace,
             guard,
             resume_reservation,
+            initial_prompt,
         ) = {
             let probe_state = state.clone();
             let prepared = tokio::task::spawn_blocking(move || -> anyhow::Result<_> {
@@ -1009,9 +1012,21 @@ impl SessionService {
                 Ok(None) => {}
                 Err(_) => return PromptTouch::ControlStateUnavailable,
             }
-            if let Err(refusal) = expected.require_resolved_acp_selection() {
-                return PromptTouch::Establishment(refusal);
-            }
+            let initial_prompt = if let Err(refusal) = expected.require_resolved_acp_selection() {
+                if needs_resume {
+                    return PromptTouch::Establishment(refusal);
+                }
+                match current_native
+                    .as_mut()
+                    .map(|current| current.initial_prompt_attempt(&expected, native.storage()))
+                {
+                    Some(Ok(Some(attempt))) => Some(attempt),
+                    Some(Err(refusal)) => return PromptTouch::Establishment(refusal),
+                    _ => return PromptTouch::Establishment(refusal),
+                }
+            } else {
+                None
+            };
             // No lifecycle/title flock crosses late-construction retirement.
             let (expected, reservation) = if needs_resume {
                 match crate::server::api::sessions::resume_structured_stop(&state, expected, None)
@@ -1036,6 +1051,7 @@ impl SessionService {
                 namespace,
                 guard,
                 reservation,
+                initial_prompt,
             )
         };
         let result = tokio::task::spawn_blocking(move || -> anyhow::Result<PromptTouch> {
@@ -1056,7 +1072,19 @@ impl SessionService {
                     refused = Some(outcome);
                     anyhow::bail!(crate::session::LifecycleReservationError::Superseded);
                 }
-                if resume_reservation.is_none() {
+                if let Some(original) = initial_prompt.as_ref() {
+                    let admitted = current_native.as_mut()
+                        .ok_or(crate::acp::establishment::EstablishmentRefusal::Superseded)?
+                        .initial_prompt_attempt(row, native.storage())?;
+                    if !admitted.as_ref().is_some_and(|admitted| {
+                        crate::acp::establishment::EstablishmentAttempt::eq(admitted, original)
+                    }) {
+                        refused = Some(PromptTouch::Establishment(
+                            crate::acp::establishment::EstablishmentRefusal::Superseded,
+                        ));
+                        anyhow::bail!(crate::acp::establishment::EstablishmentRefusal::Superseded);
+                    }
+                } else if resume_reservation.is_none() {
                     if let Err(refusal) = row.require_resolved_acp_selection() {
                         refused = Some(PromptTouch::Establishment(refusal));
                         return Err(refusal.into());
@@ -1145,14 +1173,14 @@ impl SessionService {
             text,
             attachments,
             woke_idle_dormant,
-            prompt_id,
+            prompt_ids,
             synthesized,
             no_revive,
         } = turn;
         use crate::server::acp_reconciler::ResumeTrigger;
         // Ownership gate, before ANY side effect (no wake, resume, publish, or forward for
         // a denied caller).
-        let (acp_mode_id, yolo_mode) = {
+        let (acp_mode_id, yolo_mode, initial_candidate) = {
             let instances = self.instances.read().await;
             let Some(inst) = instances.iter().find(|i| i.id == id) else {
                 return Err(SendTurnError::SessionNotFound);
@@ -1165,19 +1193,39 @@ impl SessionService {
             if inst.terminal_handoff.is_some() || !inst.launch_is_finalized() {
                 return Err(SendTurnError::WorkerNotReady);
             }
+            let mut initial_candidate = false;
             if let Err(refusal) = inst.require_resolved_acp_selection() {
                 let original = resume_reservation
                     .as_ref()
                     .and_then(|reservation| reservation.establishment.as_ref());
-                if !original.is_some_and(|original| {
-                    matches!(&inst.acp_establishment,
+                initial_candidate = resume_reservation.is_none()
+                    && matches!(
+                        &inst.acp_establishment,
+                        Some(crate::acp::establishment::AcpEstablishment::Pending { attempt })
+                            if matches!(attempt.origin,
+                                crate::acp::establishment::EstablishmentOrigin::Creation {
+                                    stage: crate::acp::establishment::CreationStage::Admitted
+                                })
+                    );
+                if !initial_candidate
+                    && !original.is_some_and(|original| {
+                        matches!(&inst.acp_establishment,
                         Some(crate::acp::establishment::AcpEstablishment::Pending { attempt })
                             if attempt.same_source(original))
-                }) {
+                    })
+                {
                     return Err(SendTurnError::ResumeFailed(refusal.into()));
                 }
             }
-            (inst.acp_mode_id.clone(), inst.yolo_mode)
+            (inst.acp_mode_id.clone(), inst.yolo_mode, initial_candidate)
+        };
+        let initial = if initial_candidate {
+            self.acp_supervisor
+                .prepare_initial_prompt(id, text, attachments)
+                .await
+                .map_err(SendTurnError::ResumeFailed)?
+        } else {
+            None
         };
         if let Some(unavailable) = self
             .prompt_native_unavailability(id)
@@ -1216,29 +1264,33 @@ impl SessionService {
             }
         }
         // Gate the publish below on the worker actually being there.
-        if let Err(e) = self.acp_supervisor.wait_until_ready(id).await {
-            if let Some(unavailable) = self
-                .prompt_native_unavailability(id)
-                .await
-                .map_err(|_| SendTurnError::ControlStateUnavailable)?
-            {
-                return Err(SendTurnError::Unavailable(unavailable));
-            }
-            return match e {
-                crate::acp::supervisor::SupervisorError::UnknownSession(_) => {
-                    Err(SendTurnError::WorkerNotReady)
+        if initial.is_none() {
+            if let Err(e) = self.acp_supervisor.wait_until_ready(id).await {
+                if let Some(unavailable) = self
+                    .prompt_native_unavailability(id)
+                    .await
+                    .map_err(|_| SendTurnError::ControlStateUnavailable)?
+                {
+                    return Err(SendTurnError::Unavailable(unavailable));
                 }
-                crate::acp::supervisor::SupervisorError::Acp(
-                    crate::acp::acp_client::AcpError::ConnectionUnavailable(unavailable),
-                ) => Err(SendTurnError::Unavailable(unavailable)),
-                other => Err(SendTurnError::ResumeFailed(other)),
-            };
+                return match e {
+                    crate::acp::supervisor::SupervisorError::UnknownSession(_) => {
+                        Err(SendTurnError::WorkerNotReady)
+                    }
+                    crate::acp::supervisor::SupervisorError::Acp(
+                        crate::acp::acp_client::AcpError::ConnectionUnavailable(unavailable),
+                    ) => Err(SendTurnError::Unavailable(unavailable)),
+                    other => Err(SendTurnError::ResumeFailed(other)),
+                };
+            }
         }
         // A plugin-delivered turn must run under the session's persisted explicit mode.
-        if matches!(
-            caller,
-            SessionCaller::Plugin { .. } | SessionCaller::PluginMessage { .. }
-        ) {
+        if initial.is_none()
+            && matches!(
+                caller,
+                SessionCaller::Plugin { .. } | SessionCaller::PluginMessage { .. }
+            )
+        {
             if let Some(mode_id) = &acp_mode_id {
                 if let Err(e) = self.acp_supervisor.set_mode(id, mode_id, None).await {
                     return Err(match e {
@@ -1262,6 +1314,13 @@ impl SessionService {
         {
             return Err(SendTurnError::Unavailable(unavailable));
         }
+        if let Some(unavailable) = self
+            .prompt_native_unavailability(id)
+            .await
+            .map_err(|_| SendTurnError::ControlStateUnavailable)?
+        {
+            return Err(SendTurnError::Unavailable(unavailable));
+        }
         // Persist the admitted turn before forwarding it to the agent.
         let published = self
             .acp_supervisor
@@ -1269,7 +1328,7 @@ impl SessionService {
                 id,
                 text.to_string(),
                 attachments,
-                prompt_id,
+                prompt_ids,
                 synthesized,
                 caller.message_origin().map(str::to_string),
             )
@@ -1285,6 +1344,13 @@ impl SessionService {
                 let _ = arrived.send(());
                 let _ = released.await;
             }
+        }
+        if let Some(initial) = initial {
+            let seq = published.seq.ok_or(SendTurnError::WorkerLostAfterPublish)?;
+            initial
+                .commit(seq)
+                .map_err(|error| SendTurnError::Send(error.into()))?;
+            return Ok(Some(seq));
         }
         let outcome = match published.disposition {
             crate::acp::supervisor::PromptDisposition::Forward => {
@@ -1423,7 +1489,7 @@ impl SessionService {
                     text: &text,
                     attachments: &attachments,
                     woke_idle_dormant: false,
-                    prompt_id: None,
+                    prompt_ids: Vec::new(),
                     synthesized,
                     no_revive: false,
                 },
@@ -2169,10 +2235,15 @@ impl SessionService {
             cache.get_or_hydrate(&sid, || {
                 let mut reduced = AcpState::new(AcpSessionId(sid.clone()), agent, model);
                 let mut last_seq = 0;
-                for stored in store.replay_from(&sid, 0)? {
+                let page = store.replay_page(&sid, 0, None)?;
+                for stored in page.events {
                     reduced.apply_scoped_event(stored.seq, &stored.event, &stored.metadata)?;
                     last_seq = stored.seq;
                 }
+                if let Some(fact) = page.autonomous {
+                    fact.restore_state(&mut reduced);
+                }
+                last_seq = last_seq.max(page.highest_seq);
                 Ok((reduced, last_seq))
             })
         })
@@ -2311,6 +2382,7 @@ impl SessionService {
             .await;
         self.settle_native_control_observation(id, observation)
             .await
+            .0
     }
 
     pub(crate) async fn native_control_observation(
@@ -2351,16 +2423,21 @@ impl SessionService {
             )
         })
         .await;
-        let (projection, wait) = match result {
-            Ok(Ok(projection)) => {
+        let (projection, establishment_revision, wait) = match result {
+            Ok(Ok((projection, expected))) => {
                 let eligible = projection.prompt_wake_eligible || prompt_wake_eligible;
-                (projection.with_prompt_wake_eligibility(eligible), None)
+                (
+                    projection.with_prompt_wake_eligibility(eligible),
+                    expected,
+                    None,
+                )
             }
-            Ok(Err(wait)) => (Default::default(), Some(wait)),
-            Err(_) => (Default::default(), None),
+            Ok(Err(wait)) => (Default::default(), None, Some(wait)),
+            Err(_) => (Default::default(), None, None),
         };
         NativeControlObservation {
             projection,
+            establishment_revision,
             wait,
             identity,
             current,
@@ -2373,7 +2450,10 @@ impl SessionService {
         &self,
         id: &str,
         mut observation: NativeControlObservation,
-    ) -> crate::acp::state::NativeAvailabilityProjection {
+    ) -> (
+        crate::acp::state::NativeAvailabilityProjection,
+        Option<crate::acp::establishment::EstablishmentRevision>,
+    ) {
         let mut context = observation.wait.as_ref().map(|wait| wait.context);
         while let Some(wait) = observation.wait.take() {
             if !wait.settle().await {
@@ -2396,10 +2476,11 @@ impl SessionService {
                 return Default::default();
             }
             observation.projection = next.projection;
+            observation.establishment_revision = next.establishment_revision;
             observation.wait = next.wait;
             context = next_context;
         }
-        observation.projection
+        (observation.projection, observation.establishment_revision)
     }
 
     /// Existing WorkerDown/startup prompt-intent admission, not native health.
@@ -2622,7 +2703,7 @@ impl SessionService {
                     text: &combined,
                     attachments: &attachments,
                     woke_idle_dormant: false,
-                    prompt_id: None,
+                    prompt_ids: sent_ids.clone(),
                     synthesized: false,
                     no_revive: false,
                 },
@@ -3454,6 +3535,7 @@ mod tests {
             extra_args: String::new(),
             command_override: String::new(),
             extra_repo_paths: Vec::new(),
+            workspace: false,
             repo_base_branches: Vec::new(),
             scratch: false,
             trust_hooks: None,
@@ -3739,7 +3821,7 @@ mod tests {
                         text: "hi",
                         attachments: &[],
                         woke_idle_dormant: false,
-                        prompt_id: None,
+                        prompt_ids: Vec::new(),
                         synthesized: false,
                         no_revive: false,
                     },
@@ -3759,7 +3841,7 @@ mod tests {
                         text: "hi",
                         attachments: &[],
                         woke_idle_dormant: false,
-                        prompt_id: None,
+                        prompt_ids: Vec::new(),
                         synthesized: false,
                         no_revive: false,
                     },
@@ -3779,7 +3861,7 @@ mod tests {
                         text: "hi",
                         attachments: &[],
                         woke_idle_dormant: false,
-                        prompt_id: None,
+                        prompt_ids: Vec::new(),
                         synthesized: false,
                         no_revive: false,
                     },
@@ -3803,7 +3885,7 @@ mod tests {
                         text: "hi",
                         attachments: &[],
                         woke_idle_dormant: false,
-                        prompt_id: None,
+                        prompt_ids: Vec::new(),
                         synthesized: false,
                         no_revive: false,
                     },
@@ -3823,7 +3905,7 @@ mod tests {
                         text: "hi",
                         attachments: &[],
                         woke_idle_dormant: false,
-                        prompt_id: None,
+                        prompt_ids: Vec::new(),
                         synthesized: false,
                         no_revive: false,
                     },
@@ -3932,6 +4014,8 @@ mod tests {
                 let mut live = crate::server::test_support::managed_control_session(
                     scope,
                     "queue-lagging-mirror",
+                    "claude",
+                    None,
                 )
                 .await;
                 let id = live.id().to_owned();
@@ -5036,7 +5120,7 @@ mod tests {
                     text: "one explicit wake",
                     attachments: &[],
                     woke_idle_dormant: false,
-                    prompt_id: None,
+                    prompt_ids: Vec::new(),
                     synthesized: false,
                     no_revive: false,
                 },

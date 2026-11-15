@@ -130,12 +130,23 @@ impl HomeView {
                         .collect()
                 })
                 .unwrap_or_default(),
+            status_group_collapsed: user_config
+                .as_ref()
+                .map(|c| {
+                    c.app_state
+                        .status_group_collapsed
+                        .iter()
+                        .map(|path| (path.clone(), true))
+                        .collect()
+                })
+                .unwrap_or_default(),
             remote_owner_cache: std::cell::RefCell::new(HashMap::new()),
             registered_projects: Vec::new(),
             show_help: false,
             help_scroll: 0,
             new_dialog: None,
             confirm_dialog: None,
+            pending_archive_group_ids: None,
             unified_delete_dialog: None,
             group_delete_options_dialog: None,
             rename_dialog: None,
@@ -263,6 +274,7 @@ impl HomeView {
             runtime_outcome_messages: Vec::new(),
             sidebar_source: crate::tui::session_feed::SidebarSource::Disconnected,
             runtime_failure_reason: None,
+            offline_attention: crate::tui::dialogs::DaemonAttention::Offline,
             restart_in_flight: std::collections::HashSet::new(),
             pending_creation: None,
             structured_transcript_painted: false,

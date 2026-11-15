@@ -21,13 +21,172 @@ pub(super) struct QueuedPrompt {
     pub(super) correlation: Option<crate::acp::establishment::NativeOperationCorrelation>,
 }
 
+pub(super) struct InitialPromptState {
+    pub(super) id: uuid::Uuid,
+    pub(super) cancellation: tokio_util::sync::CancellationToken,
+    pub(super) seq: Option<u64>,
+    pub(super) correlation: Option<crate::acp::establishment::NativeOperationCorrelation>,
+    pub(super) issued: bool,
+}
+
+/// Host intent only. No Native command or permission exists before completion.
+pub(super) struct InitialPromptIntent {
+    pub(super) id: uuid::Uuid,
+    pub(super) client: std::sync::Weak<super::AcpClient>,
+    pub(super) expected: std::sync::Arc<crate::acp::establishment::EstablishmentAttempt>,
+    pub(super) owner: crate::acp::runner_lifecycle::RunnerIdentity,
+    pub(super) cancellation: tokio_util::sync::CancellationToken,
+    pub(super) blocks: Vec<ContentBlock>,
+}
+
+pub(crate) enum InitialPromptCancellation {
+    Missing,
+    BeforePublication,
+    Pending { seq: u64 },
+    ConsumerWillSettle,
+    Issued,
+}
+
+/// Reserves the existing bounded actor lane before the host row is published.
+pub(crate) struct PreparedInitialPrompt {
+    pub(super) client: std::sync::Arc<super::AcpClient>,
+    pub(super) id: uuid::Uuid,
+    pub(super) permit: Option<tokio::sync::mpsc::OwnedPermit<QueuedClientCmd>>,
+    pub(super) queued: Option<QueuedClientCmd>,
+}
+
+impl PreparedInitialPrompt {
+    pub(crate) fn commit(mut self, seq: u64) -> Result<(), super::errors::AcpError> {
+        let queued = self.queued.take().expect("reserved initial intent");
+        let permit = self.permit.take().expect("reserved actor capacity");
+        let result = self.client.connection_state.admit(|| {
+            let mut slot = self.client.connection_state.initial_prompt.lock().unwrap();
+            let pending = slot
+                .as_mut()
+                .filter(|pending| pending.id == self.id)
+                .ok_or(super::errors::AcpError::NotRunning)?;
+            if pending.cancellation.is_cancelled() {
+                return Err(super::errors::AcpError::NotRunning);
+            }
+            pending.seq = Some(seq);
+            drop(permit.send(queued));
+            Ok(())
+        });
+        match result {
+            Ok(Ok(())) => Ok(()),
+            Ok(Err(error)) | Err(error) => {
+                self.client.clear_initial_prompt(self.id);
+                Err(error)
+            }
+        }
+    }
+}
+
+impl Drop for PreparedInitialPrompt {
+    fn drop(&mut self) {
+        if self.queued.is_some() {
+            let mut slot = self.client.connection_state.initial_prompt.lock().unwrap();
+            if slot.as_ref().is_some_and(|pending| pending.id == self.id) {
+                if let Some(pending) = slot.take() {
+                    pending.cancellation.cancel();
+                }
+            }
+        }
+    }
+}
+
+impl InitialPromptIntent {
+    pub(super) async fn into_native(
+        self,
+    ) -> Result<QueuedClientCmd, (super::errors::AcpError, Self)> {
+        use crate::acp::establishment::{
+            EstablishmentAttempt, EstablishmentRefusal, NativeOperationCorrelation,
+        };
+        let Some(client) = self.client.upgrade() else {
+            return Err((super::errors::AcpError::NotRunning, self));
+        };
+        let result = async {
+            tokio::select! {
+                biased;
+                _ = self.cancellation.cancelled() => return Err(super::errors::AcpError::NotRunning),
+                ready = client.connection_state.wait_until_usable() => ready?,
+            }
+            client.ensure_established()?;
+            let projection = client
+                .establishment_projection()
+                .ok_or(EstablishmentRefusal::Unconfirmed)?;
+            let receipt = projection
+                .receipt_snapshot()
+                .ok_or(EstablishmentRefusal::Unconfirmed)?;
+            if client.connected_runner != Some(self.owner)
+                || !EstablishmentAttempt::eq(&receipt.attempt, &self.expected)
+            {
+                return Err(EstablishmentRefusal::Superseded.into());
+            }
+            let correlation = NativeOperationCorrelation::new(Some(self.id));
+            let scope = tokio::select! {
+                biased;
+                _ = self.cancellation.cancelled() => return Err(super::errors::AcpError::NotRunning),
+                scope = client.capture_operation_context(
+                    correlation,
+                    tokio::time::Instant::now() + crate::acp::supervisor::WORKER_READY_TIMEOUT,
+                    Some(&self.expected),
+                ) => scope?,
+            }
+            .ok_or(EstablishmentRefusal::Unconfirmed)?;
+            if self.cancellation.is_cancelled()
+                || !projection.receipt_snapshot().as_ref().is_some_and(|current| {
+                    std::sync::Arc::ptr_eq(current, &receipt)
+                })
+            {
+                return Err(EstablishmentRefusal::Superseded.into());
+            }
+            let mut slot = client.connection_state.initial_prompt.lock().unwrap();
+            let pending = slot
+                .as_mut()
+                .filter(|pending| pending.id == self.id)
+                .ok_or(super::errors::AcpError::NotRunning)?;
+            if pending.cancellation.is_cancelled() {
+                return Err(super::errors::AcpError::NotRunning);
+            }
+            pending.correlation = Some(correlation);
+            Ok((scope, correlation))
+        }
+        .await;
+        match result {
+            Ok((scope, correlation)) => Ok(QueuedClientCmd {
+                command: ClientCmd::Prompt(self.blocks),
+                scope: Some(scope),
+                correlation: Some(correlation),
+            }),
+            Err(error) => {
+                if !self.cancellation.is_cancelled() {
+                    client.clear_initial_prompt(self.id);
+                }
+                Err((error, self))
+            }
+        }
+    }
+}
+
 /// Commands sent from `AcpClient` methods to the background connection task.
 pub(super) enum ClientCmd {
     /// The fully-built prompt content blocks (text first, then any
     /// attachments). Built in `send_prompt` so the connection task just
     /// forwards them to `session/prompt`. See #1000.
     Prompt(Vec<ContentBlock>),
+    InitialPromptIntent(InitialPromptIntent),
     Cancel,
+    CancelInitialPrompt {
+        id: uuid::Uuid,
+        expected: crate::acp::establishment::NativeOperationCorrelation,
+    },
+    /// `session/cancel` for one subagent session. Answers whether it was sent:
+    /// false when the child is unknown or did not advertise `cancel`.
+    CancelChild {
+        session_id: String,
+        respond_to: oneshot::Sender<bool>,
+    },
     /// Force-stop now: end the in-flight turn with `user_forced` and let
     /// the drain task kill the worker process group + respawn. See #1727.
     ForceStop,
@@ -39,6 +198,8 @@ pub(super) enum ClientCmd {
     SetConfigOption {
         config_id: String,
         value: String,
+        /// A `model_config` pick that a conversation reset must re-send.
+        remember: bool,
     },
     /// Send the experimental `session/delete` RPC for the given ACP
     /// session id and report the outcome via `respond_to`. Issued by
@@ -81,7 +242,10 @@ pub(super) enum ClientCmd {
 impl ClientCmd {
     pub(super) fn requires_operation(&self) -> bool {
         match self {
-            Self::Shutdown | Self::ResumeBackgroundTailing(_) | Self::ResumeTaskTailing(_) => false,
+            Self::Shutdown
+            | Self::InitialPromptIntent(_)
+            | Self::ResumeBackgroundTailing(_)
+            | Self::ResumeTaskTailing(_) => false,
             #[cfg(test)]
             Self::FlushForTest(_) => false,
             _ => true,

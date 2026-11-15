@@ -144,27 +144,6 @@ pub(crate) fn background_resource_from_parts<'a>(
     }
 }
 
-/// A successful `TaskStop`. Claude writes no `<task-notification>` for a task
-/// it killed, so the tool result is the only end signal.
-pub(super) fn background_task_stopped_from_value(v: &serde_json::Value) -> Option<Event> {
-    let cc = v.get("_meta")?.get("claudeCode")?;
-    if cc.get("toolName").and_then(|t| t.as_str()) != Some("TaskStop") {
-        return None;
-    }
-    let tr = cc.get("toolResponse")?;
-    if !tr
-        .get("message")?
-        .as_str()?
-        .starts_with("Successfully stopped task")
-    {
-        return None;
-    }
-    Some(Event::BackgroundTaskFinished {
-        task_id: tr.get("task_id")?.as_str()?.to_string(),
-        ended_at: Some(chrono::Utc::now()),
-    })
-}
-
 pub(crate) fn background_resource_from_value(
     value: &serde_json::Value,
 ) -> Option<BackgroundResourceCue<'_>> {
@@ -239,8 +218,30 @@ impl BackgroundResourceCue<'_> {
             tool_call_id,
             description,
             workflow,
+            started_at: Some(chrono::Utc::now()),
         })
     }
+}
+
+/// A successful `TaskStop`. Claude writes no `<task-notification>` for a task
+/// it killed, so the tool result is the only end signal.
+pub(super) fn background_task_stopped_from_value(v: &serde_json::Value) -> Option<Event> {
+    let cc = v.get("_meta")?.get("claudeCode")?;
+    if cc.get("toolName").and_then(|t| t.as_str()) != Some("TaskStop") {
+        return None;
+    }
+    let tr = cc.get("toolResponse")?;
+    if !tr
+        .get("message")?
+        .as_str()?
+        .starts_with("Successfully stopped task")
+    {
+        return None;
+    }
+    Some(Event::BackgroundTaskFinished {
+        task_id: tr.get("task_id")?.as_str()?.to_string(),
+        ended_at: Some(chrono::Utc::now()),
+    })
 }
 
 #[cfg(test)]
@@ -360,6 +361,7 @@ mod tests {
                 tool_call_id,
                 description,
                 workflow,
+                ..
             }) => {
                 assert_eq!(task_id, "wfgxmundi");
                 assert_eq!(tool_call_id.as_deref(), Some("toolu_1"));

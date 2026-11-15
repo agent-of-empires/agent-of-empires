@@ -403,131 +403,10 @@ fn prepare_trashed_worktree_with(
     relocate_worktree_to_trash(inst)
 }
 
-pub struct TrashRequest {
-    pub session_id: String,
-    pub instance: Instance,
-    pub generation: u64,
-}
-
 #[derive(Debug, Clone)]
 pub struct TrashRelocation {
     pub new_project_path: String,
     pub pre_trash_project_path: Option<String>,
-}
-
-#[derive(Debug)]
-pub struct TrashResult {
-    pub session_id: String,
-    pub relocation: Option<TrashRelocation>,
-    pub relocate_warning: Option<String>,
-}
-
-/// Execute and commit trash under identity and lifecycle exclusion.
-pub fn perform_trash(request: &TrashRequest) -> TrashResult {
-    let failed = |reason: String| TrashResult {
-        session_id: request.session_id.clone(),
-        relocation: None,
-        relocate_warning: Some(reason),
-    };
-    let storage = match crate::session::Storage::open_unwatched(&request.instance.source_profile) {
-        Ok(storage) => storage,
-        Err(error) => return failed(format!("could not open lifecycle storage: {error}")),
-    };
-    let _identity = match crate::session::acquire_session_identity_lock() {
-        Ok(lock) => lock,
-        Err(error) => return failed(format!("could not acquire identity lock: {error}")),
-    };
-    let _lifecycle_lock = match storage.acquire_instance_lifecycle_lock(&request.session_id) {
-        Ok(lock) => lock,
-        Err(error) => {
-            return failed(format!("could not acquire lifecycle lock: {error}"));
-        }
-    };
-    let mut inst = match storage.update_complete(|instances, _groups| {
-        Ok(instances
-            .iter()
-            .find(|instance| instance.id == request.session_id)
-            .filter(|instance| {
-                instance.lifecycle_reservation_is_owned(
-                    crate::session::LifecycleOperation::Trash,
-                    request.generation,
-                )
-            })
-            .cloned())
-    }) {
-        Ok(Some(instance)) => instance,
-        Ok(None) => {
-            return failed("trash lifecycle reservation was superseded before teardown".to_string())
-        }
-        Err(error) => return failed(format!("could not verify trash reservation: {error}")),
-    };
-    inst.source_profile = storage.profile().to_owned();
-    let stopped = inst.kill_all_tmux_sessions_locked();
-    let outcome = match &stopped {
-        Ok(()) => prepare_trashed_worktree(&mut inst),
-        Err(error) => RelocateOutcome::Failed {
-            reason: format!("Tmux teardown failed; worktree retained: {error}"),
-        },
-    };
-    let relocation = match &outcome {
-        RelocateOutcome::Relocated { .. } => Some(TrashRelocation {
-            new_project_path: inst.project_path.clone(),
-            pre_trash_project_path: inst.pre_trash_project_path.clone(),
-        }),
-        RelocateOutcome::Skipped | RelocateOutcome::Failed { .. } => None,
-    };
-    let commit = storage.update(|instances, _groups| {
-        if let Some(relocation) = &relocation {
-            use crate::session::claim::RelocationCommit;
-            match crate::session::claim::commit_trash_relocation(
-                instances,
-                &request.session_id,
-                request.generation,
-                relocation,
-            ) {
-                RelocationCommit::Persisted => {}
-                outcome @ RelocationCommit::Superseded => {
-                    tracing::warn!(target: "session.trash", session = %request.session_id, ?outcome, "trash relocation not committed");
-                }
-                outcome => {
-                    tracing::debug!(target: "session.trash", session = %request.session_id, ?outcome, "trash relocation not committed");
-                }
-            }
-        } else if let Err(error) = &stopped {
-            if let Some(row) = instances
-                .iter_mut()
-                .find(|row| row.id == request.session_id)
-            {
-                if row.finish_lifecycle_status(
-                    crate::session::LifecycleOperation::Trash,
-                    request.generation,
-                    crate::session::Status::Error,
-                ) {
-                    row.last_error = Some(error.to_string());
-                }
-            }
-        } else {
-            crate::session::claim::release_trash_reservation(
-                instances,
-                &request.session_id,
-                request.generation,
-            );
-        }
-        Ok(())
-    });
-    if let Err(error) = commit {
-        return failed(format!("could not commit trash transition: {error}"));
-    }
-
-    TrashResult {
-        session_id: request.session_id.clone(),
-        relocation,
-        relocate_warning: match outcome {
-            RelocateOutcome::Failed { reason } => Some(reason),
-            RelocateOutcome::Relocated { warning, .. } => warning,
-            RelocateOutcome::Skipped => None,
-        },
-    }
 }
 
 /// Undo a trash relocation that landed after the row had already been
@@ -2087,6 +1966,49 @@ mod tests {
             matches!(outcome, RelocateOutcome::Skipped),
             "a plain session has no managed worktree to relocate: {outcome:?}"
         );
+    }
+
+    /// The daemon's lost-race path: a commit against a restored row is
+    /// `Superseded` and leaves it untouched, then the undo moves the worktree
+    /// back to the path the live row already points at.
+    #[test]
+    #[serial_test::serial]
+    fn superseded_relocation_commit_is_followed_by_worktree_undo() {
+        let _app = crate::session::test_support::isolate_app_dir();
+        if !git_available() {
+            return;
+        }
+        let (_tmp, mut inst) = real_worktree_instance();
+        let original = inst.project_path.clone();
+        inst.trash();
+        assert!(matches!(
+            relocate_worktree_to_trash(&mut inst),
+            RelocateOutcome::Relocated { .. }
+        ));
+        let reloc = TrashRelocation {
+            new_project_path: inst.project_path.clone(),
+            pre_trash_project_path: inst.pre_trash_project_path.clone(),
+        };
+
+        let mut live = inst.clone();
+        live.untrash();
+        live.project_path = original.clone();
+        live.pre_trash_project_path = None;
+        let mut rows = vec![live];
+        let generation = rows[0].lifecycle_generation;
+
+        assert_eq!(
+            crate::session::claim::commit_trash_relocation(&mut rows, &inst.id, generation, &reloc),
+            crate::session::claim::RelocationCommit::Superseded
+        );
+        assert_eq!(rows[0].project_path, original, "row must stay untouched");
+
+        assert!(matches!(
+            undo_raced_relocation(&rows[0], &reloc),
+            RestoreOutcome::Restored { .. }
+        ));
+        assert!(PathBuf::from(&original).exists());
+        assert!(!PathBuf::from(&reloc.new_project_path).exists());
     }
 
     /// A relocation that lands after the row was restored (the not-atomic

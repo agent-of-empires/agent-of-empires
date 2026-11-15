@@ -70,6 +70,7 @@ export interface AcpContext {
   pendingAttachments: PromptAttachmentInput[];
   setPendingAttachments: React.Dispatch<React.SetStateAction<PromptAttachmentInput[]>>;
   forceEndTurn: () => Promise<void>;
+  cancelSubagent: (childId: string) => Promise<void>;
   lastActivityRef: Session["lastActivityRef"];
   dismissError: () => void;
   dismissPrimer: () => void;
@@ -230,13 +231,20 @@ export function AcpRuntime({
     },
     [acpRef, sessionId],
   );
-  const { onCancel, canForceEndTurn } = useCancelEscalation(
+  const { onCancel: cancelNativeTurn, canForceEndTurn: canForceNativeTurn } = useCancelEscalation(
     sessionId,
     acp.state.promptSeq,
     acp.state.cancelling,
     acp.cancelPrompt,
     acp.forceEndTurn,
   );
+  const hostOnly = acp.state.hostPromptIntent != null && !(acp.state.turnActive && nativeInputAvailable(acp.state));
+  const onCancel = hostOnly
+    ? async () => {
+        await acp.cancelPrompt();
+      }
+    : cancelNativeTurn;
+  const canForceEndTurn = !hostOnly && canForceNativeTurn;
   // Only the recent slice renders, so a long session does not block first paint.
   const { windowedActivity, canLoadEarlier, loadEarlier } = useHistoryWindow(
     sessionId,
@@ -343,6 +351,7 @@ export function AcpRuntime({
         pendingAttachments,
         setPendingAttachments,
         forceEndTurn: acp.forceEndTurn,
+        cancelSubagent: acp.cancelSubagent,
         lastActivityRef: acp.lastActivityRef,
         dismissError: acp.dismissError,
         dismissPrimer: acp.dismissPrimer,

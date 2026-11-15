@@ -16,7 +16,7 @@ export interface SettingsKeys {
   tmux: "clipboard" | "mouse" | "socket_name" | "status_bar" | "vt_live";
   updates: "auto_update_plugins" | "update_check_mode";
   web: "mcp_enabled" | "notifications_enabled" | "notify_on_error" | "notify_on_idle" | "notify_on_waiting" | "notify_on_wake_fire";
-  worktree: "auto_cleanup" | "bare_repo_path_template" | "default_base_branch" | "delete_branch_on_cleanup" | "enabled" | "init_submodules" | "path_template" | "workspace_path_template";
+  worktree: "auto_cleanup" | "bare_repo_path_template" | "default_base_branch" | "delete_branch_on_cleanup" | "enabled" | "init_submodules" | "path_template" | "workspace_by_default" | "workspace_path_template";
 }
 
 export type SettingsSection = keyof SettingsKeys;

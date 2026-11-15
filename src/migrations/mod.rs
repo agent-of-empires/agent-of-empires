@@ -63,9 +63,12 @@ mod v051_structured_view;
 mod v052_runtime_filter_acp_target;
 mod v053_runtime_filter_reset;
 mod v054_acp_establishment;
+mod v054_retained_history_identity;
 mod v055_acp_event_scope;
+mod v055_global_max_concurrent_workers;
 mod v056_native_prompt_publication;
 mod v057_acp_budget_knowledge;
+mod v059_reconcile_acp_lineages;
 
 /// Fixtures shared by migrations that rewrite agent hook files.
 #[cfg(test)]
@@ -106,7 +109,7 @@ use anyhow::{Context, Result};
 use std::fs;
 use tracing::{debug, info};
 
-const CURRENT_VERSION: u32 = 57;
+const CURRENT_VERSION: u32 = 59;
 const VERSION_FILE: &str = ".schema_version";
 
 /// Version, log name, and the one-time transformation to run.
@@ -282,14 +285,21 @@ const MIGRATIONS: &[Migration] = &[
         v052_runtime_filter_acp_target::run,
     ),
     (53, "runtime_filter_reset", v053_runtime_filter_reset::run),
-    (54, "acp_establishment", v054_acp_establishment::run),
-    (55, "acp_event_scope", v055_acp_event_scope::run),
     (
-        56,
-        "native_prompt_publication",
-        v056_native_prompt_publication::run,
+        54,
+        "retained_history_identity",
+        v054_retained_history_identity::run,
     ),
-    (57, "acp_budget_knowledge", v057_acp_budget_knowledge::run),
+    (
+        55,
+        "global_max_concurrent_workers",
+        v055_global_max_concurrent_workers::run,
+    ),
+    (
+        59,
+        "reconcile_acp_lineages",
+        v059_reconcile_acp_lineages::run,
+    ),
 ];
 
 /// The data-schema version this build targets, i.e. the version every install
@@ -302,7 +312,10 @@ pub fn current_schema_version() -> u32 {
 
 /// Check whether there are any pending migrations to run.
 pub fn has_pending_migrations() -> bool {
-    get_current_version() < CURRENT_VERSION
+    let current = get_current_version();
+    current < CURRENT_VERSION
+        || (current == CURRENT_VERSION
+            && v059_reconcile_acp_lineages::autonomous_pending().unwrap_or(true))
 }
 
 /// Check compatibility before changing or stopping a managed daemon.
@@ -320,7 +333,7 @@ pub(crate) fn ensure_schema_supported() -> Result<u32> {
 pub fn assert_schema_current() -> Result<()> {
     let current = ensure_schema_supported()?;
     anyhow::ensure!(
-        current == CURRENT_VERSION,
+        current == CURRENT_VERSION && !v059_reconcile_acp_lineages::autonomous_pending()?,
         "data schema version {current} is behind this build ({CURRENT_VERSION}); \
          the parent `aoe serve` must migrate before launching the daemon child"
     );
@@ -393,6 +406,13 @@ pub(crate) fn reconcile_serve_launch_under_transaction(
     v044_reconcile_serve_passphrase_policy::run_with_transaction(transaction)
 }
 
+/// Whether reconciliation accepts this `serve.launch` schema and shape.
+pub(crate) fn validate_serve_launch_schema(
+    record: &serde_json::Map<String, serde_json::Value>,
+) -> Result<()> {
+    v044_reconcile_serve_passphrase_policy::validate_record_schema(record)
+}
+
 pub(crate) fn run_migrations_under_exclusion(
     reporter: Option<progress::Reporter>,
     announce: bool,
@@ -411,10 +431,13 @@ fn run_migrations_inner(
     let _installed = progress::install(reporter);
     let _announced = progress::install_announced(announce);
     let current = ensure_schema_supported()?;
+    let requires_exclusion = current < CURRENT_VERSION
+        || announce
+        || (current == CURRENT_VERSION && v059_reconcile_acp_lineages::autonomous_pending()?);
     // Older daemons know serve.lock but not the lifecycle transaction. Hold
     // both before the first schema write; standalone callers include the TUI.
     let owned_transaction;
-    let transaction = if (current < CURRENT_VERSION || announce) && transaction.is_none() {
+    let transaction = if requires_exclusion && transaction.is_none() {
         // A concurrent migrator holds this through its migration and the daemon
         // start it hands off to; match the async acquire bound.
         owned_transaction = crate::daemon::lifecycle::Transaction::acquire_blocking_for(
@@ -427,7 +450,7 @@ fn run_migrations_inner(
     // Another migrator may have completed while we acquired its transaction.
     let current = ensure_schema_supported()?;
     let owned_serve;
-    let serve = if (current < CURRENT_VERSION || announce) && serve.is_none() {
+    let serve = if requires_exclusion && serve.is_none() {
         owned_serve = crate::cli::serve::try_lock_serve()?.ok_or(DaemonBlocksMigration(
             "A daemon or migration is starting or running",
         ))?;
@@ -435,7 +458,7 @@ fn run_migrations_inner(
     } else {
         serve
     };
-    if current < CURRENT_VERSION || announce {
+    if requires_exclusion {
         let transaction = transaction.context("Missing migration lifecycle transaction")?;
         // Drop this probe before v044 and explicit recovery take nested lifetime
         // and state exclusions. The held transaction and serve lock exclude starts.
@@ -450,6 +473,7 @@ fn run_migrations_inner(
     }
     debug!("Current schema version: {}", current);
     if current == CURRENT_VERSION {
+        v059_reconcile_acp_lineages::reconcile_autonomous_metadata()?;
         v027_isolate_sandbox_stores::reconcile_pending(announce)?;
         v033_isolate_sandbox_content::reconcile_pending(announce)?;
     } else {

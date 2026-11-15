@@ -50,26 +50,55 @@ export function filterOrg(groups: OrgNestedGroup[], keep: RowFilter): OrgNestedG
     .filter((og) => og.repos.length > 0);
 }
 
-export const sunkViews = (groups: SidebarGroup[]) =>
-  groups.flatMap((g) => g.workspaces.filter((v) => workspaceIsSunk(v.workspace) && !workspaceIsTrashed(v.workspace)));
-
-/** Workspace ids in render order, so Shift+click ranges only span visible rows; first occurrence wins. */
-export function renderedOrder(groups: SidebarGroup[], expandAll: boolean, sunkExpanded: boolean): string[] {
-  const ids = new Set<string>();
-  for (const g of groups) {
-    if (!sidebarGroupHasLiveWorkspace(g) || !(expandAll || !g.collapsed)) continue;
-    for (const v of g.workspaces) if (!workspaceIsSunk(v.workspace)) ids.add(v.workspace.id);
-  }
-  if (sunkExpanded) {
-    for (const g of groups) for (const v of g.workspaces) if (workspaceIsSunk(v.workspace)) ids.add(v.workspace.id);
-  }
-  return [...ids];
+/** The subgroups a nested axis renders: a collapsed repo hides every subgroup under it. */
+export function visibleSubgroups(groups: NestedSidebarGroup[], expandAll: boolean): SidebarGroup[] {
+  return groups.flatMap((ng) => (expandAll || !ng.repo.collapsed ? ng.subgroups : []));
 }
 
-/** Every workspace once, in group order; a workspace can appear under several groups. */
-export function uniqueWorkspaces(groups: SidebarGroup[]): Workspace[] {
-  const byId = new Map<string, Workspace>();
-  for (const g of groups)
-    for (const v of g.workspaces) if (!byId.has(v.workspace.id)) byId.set(v.workspace.id, v.workspace);
+/** The repos an org axis renders: a collapsed org hides every repo under it. */
+export function visibleOrgRepos(groups: OrgNestedGroup[], expandAll: boolean): SidebarGroup[] {
+  return groups.flatMap((og) => (expandAll || !og.org.collapsed ? og.repos : []));
+}
+
+// Deduped by workspace: the status axis slices one workspace into a bucket per status, so the
+// footer lists it once with every archived session from those buckets. First bucket wins for
+// the row identity, matching the group order.
+export const sunkViews = (groups: SidebarGroup[]) => {
+  const byId = new Map<string, SidebarWorkspaceView>();
+  for (const g of groups) {
+    for (const v of g.workspaces) {
+      if (!workspaceIsSunk(v.workspace) || workspaceIsTrashed(v.workspace)) continue;
+      const kept = byId.get(v.workspace.id);
+      if (!kept) {
+        byId.set(v.workspace.id, v);
+        continue;
+      }
+      const alreadyShown = new Set(kept.workspace.sessions.map((s) => s.id));
+      const extra = v.workspace.sessions.filter((s) => !alreadyShown.has(s.id));
+      if (extra.length > 0) {
+        byId.set(v.workspace.id, {
+          ...kept,
+          workspace: { ...kept.workspace, sessions: [...kept.workspace.sessions, ...extra] },
+        });
+      }
+    }
+  }
   return [...byId.values()];
+};
+
+/** Rendered row keys in render order, so Shift+click ranges only span visible rows. `allGroups`
+ *  supplies the footer, which ignores group collapse and lists each workspace once. */
+export function renderedOrder(
+  groups: SidebarGroup[],
+  expandAll: boolean,
+  sunkExpanded: boolean,
+  allGroups: SidebarGroup[] = groups,
+): string[] {
+  const keys = new Set<string>();
+  for (const g of groups) {
+    if (!sidebarGroupHasLiveWorkspace(g) || !(expandAll || !g.collapsed)) continue;
+    for (const v of g.workspaces) if (!workspaceIsSunk(v.workspace)) keys.add(v.key);
+  }
+  if (sunkExpanded) for (const v of sunkViews(allGroups)) keys.add(v.key);
+  return [...keys];
 }

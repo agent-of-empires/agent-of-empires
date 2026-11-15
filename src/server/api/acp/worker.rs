@@ -18,7 +18,7 @@ pub struct SpawnAcpRequest {
     pub agent: Option<String>,
     pub model: Option<String>,
     #[serde(default)]
-    pub recovery: Option<crate::acp::establishment::EstablishmentRecovery>,
+    pub recovery: Option<crate::acp::establishment::EstablishmentRecoveryRequest>,
     /// Extra dirs the agent may use through fs/*; the worktree is always allowed.
     #[serde(default)]
     pub additional_dirs: Vec<PathBuf>,
@@ -237,7 +237,7 @@ pub async fn spawn_acp(
         && state.acp_supervisor.is_running(&id).await
     {
         match current_is_noop(&state, &instance, None).await {
-            Ok(true) => {
+            Ok((true, _)) => {
                 return Json(SpawnAcpResponse {
                     session_id: id,
                     agent: pick_agent(&state, &instance, instance.agent_name.as_deref()).await,
@@ -245,7 +245,7 @@ pub async fn spawn_acp(
                 })
                 .into_response();
             }
-            Ok(false) => {}
+            Ok((false, _)) => {}
             Err(response) => return response,
         }
     }
@@ -498,9 +498,9 @@ async fn restart_acp_inner(
     {
         return response;
     }
-    if let Some(recovery) = req.recovery.as_ref() {
+    let mut checked_recovery = if let Some(recovery) = req.recovery.as_ref() {
         match current_is_noop(&state, &preflight_instance, Some(recovery)).await {
-            Ok(true) => {
+            Ok((true, _)) => {
                 return Json(SpawnAcpResponse {
                     session_id: id,
                     agent: preflight_agent,
@@ -508,14 +508,17 @@ async fn restart_acp_inner(
                 })
                 .into_response()
             }
-            Ok(false) => {}
+            Ok((false, recovery)) => recovery,
             Err(response) => return response,
         }
-    } else if session_recovery.is_none() {
-        if let Err(refusal) = preflight_instance.require_resolved_acp_selection() {
-            return supervisor_error_response("restart refused", &refusal.into());
+    } else {
+        if session_recovery.is_none() {
+            if let Err(refusal) = preflight_instance.require_resolved_acp_selection() {
+                return supervisor_error_response("restart refused", &refusal.into());
+            }
         }
-    }
+        None
+    };
 
     let was_resuming =
         state.acp_supervisor.worker_state(&id).await == crate::daemon::AcpWorkerState::Resuming;
@@ -561,7 +564,7 @@ async fn restart_acp_inner(
             &state,
             &preflight_instance,
             &restart,
-            req.recovery.clone(),
+            checked_recovery.take(),
             session_recovery.clone(),
         )
         .await
@@ -627,7 +630,7 @@ async fn restart_acp_inner(
             &state,
             &instance,
             &restart,
-            req.recovery.clone(),
+            checked_recovery.take(),
             session_recovery.clone(),
         )
         .await
@@ -817,8 +820,14 @@ async fn restart_acp_inner(
 async fn current_is_noop(
     state: &Arc<AppState>,
     expected: &crate::session::Instance,
-    recovery: Option<&crate::acp::establishment::EstablishmentRecovery>,
-) -> Result<bool, Response> {
+    recovery: Option<&crate::acp::establishment::EstablishmentRecoveryRequest>,
+) -> Result<
+    (
+        bool,
+        Option<crate::acp::establishment::EstablishmentRecovery>,
+    ),
+    Response,
+> {
     use crate::acp::establishment::{
         AcpEstablishment, EstablishmentRecoveryAction, EstablishmentRefusal,
     };
@@ -831,69 +840,75 @@ async fn current_is_noop(
     let profile = expected.source_profile.clone();
     let id = expected.id.clone();
     let expected = expected.clone();
-    let recovery = recovery.cloned();
-    tokio::task::spawn_blocking(move || -> anyhow::Result<bool> {
+    let recovery = recovery.copied();
+    tokio::task::spawn_blocking(move || -> anyhow::Result<_> {
         use crate::session::SessionStore as _;
         let native = crate::server::session_store::NativeSessionStore::open(
             owner,
             &profile,
             Some(id.clone()),
         )?;
-        let _lifecycle = native.storage().acquire_instance_lifecycle_lock(&id)?;
-        let row = native
-            .load()?
-            .into_iter()
-            .find(|row| row.id == id)
-            .ok_or(crate::session::SessionGone)?;
-        anyhow::ensure!(
-            crate::acp::state::NativeEventContext::capture(&expected, native.storage())?
-                == crate::acp::state::NativeEventContext::capture(&row, native.storage())?
-                && crate::acp::state::NativeBindingState::capture(&expected).matches(&row)
-                && expected.acp_establishment == row.acp_establishment,
-            EstablishmentRefusal::Superseded
-        );
-        if let Some(recovery) = &recovery {
-            anyhow::ensure!(
-                recovery.expected.matches(&row, native.storage())?,
-                EstablishmentRefusal::Superseded
-            );
-        }
-        if recovery
-            .as_ref()
-            .is_some_and(|recovery| recovery.action != EstablishmentRecoveryAction::Same)
-            || !matches!(
-                row.acp_establishment,
-                Some(AcpEstablishment::Applied { .. })
-            )
-            || worker == crate::daemon::AcpWorkerState::Absent
-        {
-            return Ok(false);
-        }
-        let current = current.as_mut().ok_or(EstablishmentRefusal::Unconfirmed)?;
-        let selected = current
-            .scope
-            .choice
-            .as_ref()
-            .is_some_and(|choice| choice.matches(&row));
-        anyhow::ensure!(
-            current.scope.context
-                == crate::acp::state::NativeEventContext::capture(&row, native.storage())?
-                && current.refresh(&id, selected).unwrap_or(false),
-            EstablishmentRefusal::Unconfirmed
-        );
-        if current.unavailable.is_some() {
-            return Ok(false);
-        }
-        let applied = current
-            .client
-            .establishment_projection()
-            .and_then(|projection| projection.applied())
-            .ok_or(EstablishmentRefusal::Unconfirmed)?;
-        anyhow::ensure!(
-            current.ready && applied.matches(&row, native.storage())?,
-            EstablishmentRefusal::Unconfirmed
-        );
-        Ok(true)
+        let fence = crate::session::NativeInputFence::capture_route(
+            &profile,
+            &id,
+            expected.created_at,
+            expected.lifecycle_generation,
+            false,
+            Some(native.storage().bound_profile_identity()?),
+        )?;
+        let (_, result) = fence
+            .lock_observation_project(
+                |row, storage| {
+                    anyhow::ensure!(
+                        crate::acp::state::NativeEventContext::capture(&expected, storage)?
+                            == crate::acp::state::NativeEventContext::capture(row, storage)?
+                            && crate::acp::state::NativeBindingState::capture(&expected)
+                                .matches(row)
+                            && expected.acp_establishment == row.acp_establishment,
+                        EstablishmentRefusal::Superseded
+                    );
+                    let checked = recovery
+                        .map(|recovery| recovery.resolve(row, storage))
+                        .transpose()?;
+                    if checked.as_ref().is_some_and(|recovery| {
+                        recovery.action != EstablishmentRecoveryAction::Same
+                    }) || !matches!(
+                        row.acp_establishment,
+                        Some(AcpEstablishment::Applied { .. })
+                    ) || worker == crate::daemon::AcpWorkerState::Absent
+                    {
+                        return Ok((false, checked));
+                    }
+                    let current = current.as_mut().ok_or(EstablishmentRefusal::Unconfirmed)?;
+                    let selected = current
+                        .scope
+                        .choice
+                        .as_ref()
+                        .is_some_and(|choice| choice.matches(row));
+                    anyhow::ensure!(
+                        current.scope.context
+                            == crate::acp::state::NativeEventContext::capture(row, storage)?
+                            && current.refresh(&id, selected).unwrap_or(false),
+                        EstablishmentRefusal::Unconfirmed
+                    );
+                    if current.unavailable.is_some() {
+                        return Ok((false, checked));
+                    }
+                    let applied = current
+                        .client
+                        .establishment_projection()
+                        .and_then(|projection| projection.applied())
+                        .ok_or(EstablishmentRefusal::Unconfirmed)?;
+                    anyhow::ensure!(
+                        current.ready && applied.matches(row, storage)?,
+                        EstablishmentRefusal::Unconfirmed
+                    );
+                    Ok((true, checked))
+                },
+                false,
+            )?
+            .ok_or(EstablishmentRefusal::Superseded)?;
+        Ok(result)
     })
     .await
     .map_err(anyhow::Error::from)
@@ -1186,11 +1201,7 @@ async fn validate_restart_agent(
 ) -> Result<(), Response> {
     if !state
         .acp_supervisor
-        .agent_is_valid_switch_target(
-            agent,
-            &instance.source_profile,
-            std::path::Path::new(&instance.project_path),
-        )
+        .agent_is_valid_switch_target(agent, &instance.source_profile, instance.repo_config_path())
         .await
     {
         return Err((
@@ -1358,7 +1369,7 @@ async fn check_switch_target(
         .agent_is_valid_switch_target(
             target,
             &instance.source_profile,
-            std::path::Path::new(&instance.project_path),
+            instance.repo_config_path(),
         )
         .await
     {
@@ -1428,6 +1439,7 @@ async fn persist_agent_switch(
             }
             instance.agent_name = Some(target.clone());
             instance.acp_effort = None;
+            instance.acp_model_config.clear();
             instance.agent_model = model.clone();
             instance.terminal_rebind_pending = true;
             Ok(())
@@ -1553,7 +1565,10 @@ pub async fn switch_acp_agent(
         Ok(store) => store,
         Err(response) => return response,
     };
-    let before_seq = state.acp_event_store.highest_seq(&id);
+    let before_seq = match state.acp_event_store.highest_seq(&id) {
+        Ok(seq) => seq,
+        Err(_) => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
+    };
 
     if resume_reservation.is_none() {
         if let Err(e) = async {
@@ -1645,6 +1660,15 @@ pub async fn switch_acp_agent(
     let request = SpawnRequest {
         launch_admission: Some(admission),
         sandbox_continuation: crate::acp::supervisor::SandboxContinuation::Fresh,
+        model: model.clone(),
+        effort: None,
+        effort_explicit: false,
+        model_config: Default::default(),
+        stored_acp_session_id: None,
+        fork_from: None,
+        seed_history_replay: false,
+        prior_conversation: false,
+        claude_store_pin: None,
         ..spawn_request_for(&instance, target.clone(), sandbox_info)
     };
     if let Some(response) = refuse_if_stored_row_shelved(&state, &instance).await {
@@ -2014,6 +2038,49 @@ mod tests {
     use crate::acp::agent_policy::AgentPolicy;
     use crate::acp::state::RateLimitInfo;
     use crate::session::SessionStore as _;
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn restart_and_switch_accept_a_workspace_launch_repo_agent() {
+        let _home = crate::session::test_support::isolate_app_dir();
+        crate::session::config::update_config(|config| {
+            config
+                .session
+                .custom_agents
+                .insert("my-pi".into(), "pi".into());
+        })
+        .unwrap();
+        let workspace = tempfile::tempdir().unwrap();
+        let checkout = workspace.path().join("repo");
+        std::fs::create_dir_all(checkout.join(".agent-of-empires")).unwrap();
+        std::fs::write(
+            checkout.join(".agent-of-empires/config.toml"),
+            "[session.agent_detect_as]\nmy-pi = \"pi\"\n",
+        )
+        .unwrap();
+        let mut row = crate::session::Instance::new("ws", workspace.path().to_str().unwrap());
+        row.source_profile = "default".into();
+        row.workspace_info = Some(crate::session::WorkspaceInfo {
+            branch: "feat".into(),
+            workspace_dir: row.project_path.clone(),
+            repos: vec![crate::session::WorkspaceRepo {
+                name: "repo".into(),
+                source_path: checkout.to_string_lossy().into_owned(),
+                branch: "feat".into(),
+                worktree_path: checkout.to_string_lossy().into_owned(),
+                main_repo_path: checkout.to_string_lossy().into_owned(),
+                managed_by_aoe: true,
+                branch_preexisting: false,
+                base_branch: None,
+                base_branch_override: None,
+            }],
+            created_at: chrono::Utc::now(),
+            cleanup_on_delete: true,
+        });
+        let state = crate::server::test_support::build_test_app_state(vec![row.clone()]);
+
+        assert!(validate_restart_agent(&state, &row, "my-pi").await.is_ok());
+        assert!(check_switch_target(&state, &row, "my-pi").await.is_ok());
+    }
 
     async fn durable_stop_state(row: crate::session::Instance) -> Arc<AppState> {
         crate::server::test_support::seed_instances_on_disk_for_test("default", vec![row.clone()]);
@@ -2293,7 +2360,7 @@ mod tests {
         for retire in [true, false] {
             with_managed(|scope| Box::pin(async move {
                 let mut publications = scope.state.acp_events_tx.subscribe();
-                let session = support::managed_control_session(scope, "late-assignment-stop").await;
+                let session = support::managed_control_session(scope, "late-assignment-stop", "claude", None).await;
                 let state = session.state.clone();
                 let id = session.id().to_owned();
                 let original = session.client.lease.spawned_runner().unwrap();
@@ -3338,11 +3405,13 @@ mod tests {
             Some(0)
         );
         let pending = find_instance(&state, &id).await.unwrap();
-        let recovery = crate::acp::establishment::EstablishmentRecovery {
-            expected: crate::acp::establishment::EstablishmentExpected::capture(
+        let recovery = crate::acp::establishment::EstablishmentRecoveryRequest {
+            revision: crate::acp::establishment::EstablishmentExpected::capture(
                 &pending,
                 &crate::session::Storage::open_reference("default").unwrap(),
             )
+            .unwrap()
+            .revision()
             .unwrap(),
             action: crate::acp::establishment::EstablishmentRecoveryAction::Same,
         };
@@ -3799,7 +3868,8 @@ mod tests {
         use crate::server::test_support::managed_control_session;
         with_managed(|scope| {
             Box::pin(async move {
-                let session = managed_control_session(scope, "restart-disconnect").await;
+                let session =
+                    managed_control_session(scope, "restart-disconnect", "claude", None).await;
                 let state = session.state.clone();
                 let id = session.id().to_owned();
                 let original = session.client.lease.spawned_runner().unwrap();
@@ -3903,7 +3973,8 @@ mod tests {
             use crate::server::test_support::managed_control_session;
             with_managed(|scope| {
                 Box::pin(async move {
-                    let session = managed_control_session(scope, "restart-exclusion").await;
+                    let session =
+                        managed_control_session(scope, "restart-exclusion", "claude", None).await;
                     let state = session.state.clone();
                     let id = session.id().to_owned();
                     let lock = state.instance_lock(&id).await;
@@ -3983,7 +4054,7 @@ mod tests {
             use crate::acp::supervisor::test_support::managed::with_managed;
             use crate::server::test_support::managed_control_session;
             with_managed(|scope| Box::pin(async move {
-            let session = managed_control_session(scope, "selector-provider-order").await;
+            let session = managed_control_session(scope, "selector-provider-order", "claude", None).await;
             let state = session.state.clone();
             let id = session.id().to_owned();
             let current = find_instance(&state, &id).await.unwrap();
@@ -4352,7 +4423,7 @@ mod tests {
         use crate::acp::supervisor::test_support::managed::with_managed;
         use crate::server::test_support as support;
         with_managed(|scope| Box::pin(async move {
-            let session = support::managed_control_session(scope, "failed-backend-write").await;
+            let session = support::managed_control_session(scope, "failed-backend-write", "claude", None).await;
             let state = session.state.clone();
             let id = session.id().to_owned();
             let original = session.client.lease.spawned_runner().unwrap();
@@ -4534,7 +4605,8 @@ mod tests {
         use crate::server::test_support as support;
         with_managed(|scope| {
             Box::pin(async move {
-                let mut session = support::managed_control_session(scope, "provider-busy").await;
+                let mut session =
+                    support::managed_control_session(scope, "provider-busy", "claude", None).await;
                 let prompt = session.start_prompt("still working").await;
                 let state = session.state.clone();
                 let id = session.id().to_owned();
@@ -4783,8 +4855,10 @@ mod tests {
         use crate::server::test_support::managed_control_session;
         with_managed(|scope| {
             Box::pin(async move {
-                let mut live = managed_control_session(scope, "manual-quota-running").await;
-                let ordinary = managed_control_session(scope, "ordinary-running").await;
+                let mut live =
+                    managed_control_session(scope, "manual-quota-running", "claude", None).await;
+                let ordinary =
+                    managed_control_session(scope, "ordinary-running", "claude", None).await;
                 let id = live.id().to_owned();
                 let state = live.state.clone();
                 let original = state
@@ -4793,7 +4867,7 @@ mod tests {
                     .await
                     .unwrap();
                 live.park("continue the interrupted work").await;
-                let frontier = state.acp_event_store.highest_seq(&id);
+                let frontier = state.acp_event_store.highest_seq(&id).unwrap();
                 let request = || {
                     Ok(Json(SpawnAcpRequest {
                         recovery: None,
@@ -4854,7 +4928,11 @@ mod tests {
                         .unwrap(),
                     Known(0)
                 );
-                let ordinary_before = ordinary.state.acp_event_store.highest_seq(ordinary.id());
+                let ordinary_before = ordinary
+                    .state
+                    .acp_event_store
+                    .highest_seq(ordinary.id())
+                    .unwrap();
                 let ordinary_requests = ordinary.native.requests();
                 let ordinary_response = spawn_acp(
                     State(ordinary.state.clone()),
@@ -4865,7 +4943,11 @@ mod tests {
                 .into_response();
                 assert_eq!(ordinary_response.status(), StatusCode::OK);
                 assert_eq!(
-                    ordinary.state.acp_event_store.highest_seq(ordinary.id()),
+                    ordinary
+                        .state
+                        .acp_event_store
+                        .highest_seq(ordinary.id())
+                        .unwrap(),
                     ordinary_before
                 );
                 assert_eq!(ordinary.native.requests(), ordinary_requests);
@@ -4887,7 +4969,7 @@ mod tests {
                     state.acp_event_store.rate_limit_park(&id).unwrap(),
                     Indeterminate
                 ));
-                let before = state.acp_event_store.highest_seq(&id);
+                let before = state.acp_event_store.highest_seq(&id).unwrap();
                 let methods = live.native.requests();
                 let reattached = spawn_acp(State(state.clone()), Path(id.clone()), request())
                     .await
@@ -4911,7 +4993,7 @@ mod tests {
                 .await
                 .into_response();
                 assert_eq!(refused.status(), StatusCode::SERVICE_UNAVAILABLE);
-                assert_eq!(state.acp_event_store.highest_seq(&id), before);
+                assert_eq!(state.acp_event_store.highest_seq(&id).unwrap(), before);
                 assert_eq!(live.native.requests(), methods);
                 assert_eq!(
                     state.acp_supervisor.current_lease(&id),

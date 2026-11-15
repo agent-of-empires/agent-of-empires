@@ -1646,16 +1646,20 @@ impl HomeView {
         let Some(group_path) = self.selected_group.clone() else {
             return;
         };
-        let count = self.active_sessions_in_selected_group().len();
+        let ids = self.active_sessions_in_selected_group();
+        let count = ids.len();
         if count == 0 {
             return;
         }
-        // Project/Org mode groups by repo or owner and Manual mode by assigned path, so
-        // name the scope accordingly and show the full path, or nested groups sharing a
-        // leaf segment would be ambiguous.
+        // Pin the set the count describes: status buckets reshuffle while the dialog is open.
+        self.pending_archive_group_ids = Some(ids);
+        // Project/Org group by repo or owner and Manual by assigned path, so name the
+        // scope and show the full path, or nested groups sharing a leaf segment
+        // would be ambiguous.
         let (title, scope) = match self.group_by {
             crate::session::config::GroupByMode::Project => ("Archive project", "project"),
             crate::session::config::GroupByMode::Org => ("Archive org", "org"),
+            crate::session::config::GroupByMode::Status => ("Archive status", "status"),
             crate::session::config::GroupByMode::Manual => ("Archive group", "group"),
         };
         let noun = if count == 1 { "session" } else { "sessions" };
@@ -1876,6 +1880,7 @@ impl HomeView {
                         self.pending_force_remove_session = None;
                         self.pending_trash_session = None;
                         self.pending_image_pull = None;
+                        self.pending_archive_group_ids = None;
                         // Mirrors the keyboard route: Cancel means "don't discard", so
                         // settings stays open and `settings_close_confirm` resets.
                         self.settings_close_confirm = false;
@@ -2679,6 +2684,7 @@ impl HomeView {
                     self.pending_force_remove_session = None;
                     self.pending_trash_session = None;
                     self.pending_image_pull = None;
+                    self.pending_archive_group_ids = None;
                 }
                 DialogResult::Submit(_) => {
                     let action = dialog.action().to_string();
@@ -3706,6 +3712,11 @@ impl HomeView {
                 }
             })
             .or_else(|| {
+                // Status headers name a state, not a group, so prefilling the field
+                // would create a manual group called "Waiting".
+                if self.group_by == GroupByMode::Status {
+                    return None;
+                }
                 // The scratch bucket's group_path is an internal sentinel; show
                 // its display label in the Group field, not the raw sentinel (#3237).
                 self.selected_group
@@ -3713,7 +3724,7 @@ impl HomeView {
                     .map(|g| crate::session::project_group_display_name(g).to_string())
             });
 
-        if prefill_path.is_some() || prefill_group.is_some() {
+        if prefill_path.is_some() || prefill_group.is_some() || self.selected_group.is_some() {
             let existing_groups: Vec<String> = self.all_group_paths();
             let current_profile = self
                 .profile_for_cursor(self.cursor)
@@ -3803,7 +3814,7 @@ impl HomeView {
         }
         let config = crate::session::config::repo_config::resolve_config_with_repo_or_warn(
             &inst.source_profile,
-            std::path::Path::new(&inst.project_path),
+            inst.repo_config_path(),
         );
         // The reverse direction stays available regardless, so a session can always get out.
         (config.acp.structured_view.is_offered()
@@ -4034,7 +4045,7 @@ impl HomeView {
             .values()
             .find(|inst| match self.group_by {
                 GroupByMode::Project => super::project_group_key(inst) == group_path,
-                GroupByMode::Org => false,
+                GroupByMode::Org | GroupByMode::Status => false,
                 GroupByMode::Manual => {
                     inst.group_path == group_path
                         || inst.group_path.starts_with(&format!("{group_path}/"))
@@ -4260,14 +4271,24 @@ impl HomeView {
             return;
         };
 
-        let repo_path = std::path::PathBuf::from(&inst.project_path);
         let session_id_owned = inst.id.clone();
         let profile = inst.source_profile.clone();
-        let base_override = inst.base_branch_override.clone();
-        let worktree_base = inst
-            .worktree_info
-            .as_ref()
-            .and_then(|w| w.base_branch.clone());
+        // A single-repo workspace's cwd is the workspace dir, not a checkout, so
+        // diff its one repo; the daemon routes an unnamed base write there too.
+        let (repo_path, base_override, worktree_base) = match inst.all_repos() {
+            [only] => (
+                std::path::PathBuf::from(&only.worktree_path),
+                only.base_branch_override.clone(),
+                only.base_branch.clone(),
+            ),
+            _ => (
+                std::path::PathBuf::from(&inst.project_path),
+                inst.base_branch_override.clone(),
+                inst.worktree_info
+                    .as_ref()
+                    .and_then(|w| w.base_branch.clone()),
+            ),
+        };
 
         // A session on a non-git project runs in place, so there is no repo to diff
         // against; say so rather than surfacing the git layer's raw error.
@@ -4364,7 +4385,15 @@ impl HomeView {
             .selected_session
             .as_ref()
             .and_then(|id| self.get_instance(id))
-            .map(|inst| inst.project_path.clone());
+            .map(|inst| {
+                if inst.workspace_info.is_some() {
+                    repo_config::repo_config_source_path(inst.repo_config_path())
+                        .to_string_lossy()
+                        .into_owned()
+                } else {
+                    inst.project_path.clone()
+                }
+            });
         match SettingsView::new(&self.config_profile(), project_path) {
             Ok(view) => self.settings_view = Some(view),
             Err(e) => {
@@ -4390,7 +4419,7 @@ impl HomeView {
                 use crate::update::install::InstallMethod;
                 if !matches!(
                     &method,
-                    InstallMethod::Homebrew | InstallMethod::Tarball { .. }
+                    InstallMethod::Homebrew { .. } | InstallMethod::Tarball { .. }
                 ) {
                     let msg = match &method {
                         InstallMethod::Nix => {
@@ -5033,13 +5062,14 @@ impl HomeView {
     }
 
     /// Info-dialog copy for a rename/delete attempted on a header derived automatically
-    /// (Project/Org), where there is no user-owned group to act on. `None` for `Manual`,
+    /// (Project/Org/Status), where there is no user-owned group to act on. `None` for `Manual`,
     /// where the caller proceeds with its normal flow.
     fn automatic_group_hint(&self) -> Option<(String, String)> {
         let mode_label = match self.group_by {
             GroupByMode::Manual => return None,
             GroupByMode::Project => "Project",
             GroupByMode::Org => "Org",
+            GroupByMode::Status => "Status",
         };
         let toggle = if self.strict_hotkeys { "Ctrl+G" } else { "'g'" };
         Some((
@@ -5079,6 +5109,18 @@ impl HomeView {
                 .insert(path.to_string(), !collapsed);
             self.rebuild_flat_items();
             self.save_org_group_collapsed();
+            return;
+        }
+        if self.group_by == GroupByMode::Status {
+            let collapsed = self
+                .status_group_collapsed
+                .get(path)
+                .copied()
+                .unwrap_or(false);
+            self.status_group_collapsed
+                .insert(path.to_string(), !collapsed);
+            self.rebuild_flat_items();
+            self.save_status_group_collapsed();
             return;
         }
         let result = (|| -> anyhow::Result<()> {
@@ -6326,7 +6368,7 @@ impl HomeView {
                         .map(|wt| wt.branch.clone())
                         .or_else(|| inst.workspace_info.as_ref().map(|w| w.branch.clone())),
                     has_sandbox: inst.sandbox_info.as_ref().is_some_and(|s| s.enabled),
-                    project_path: Some(inst.project_path.clone()),
+                    config_path: Some(inst.repo_config_path().to_string_lossy().into_owned()),
                     is_scratch: inst.scratch,
                 };
 
@@ -7015,7 +7057,7 @@ impl HomeView {
     }
 
     /// Auto-start live-send after an explicit view switch (`ToggleView`,
-    /// opening a tool session) when the `Auto Live-Send On View Switch`
+    /// opening a tool session) when the `Live-send when switching view`
     /// setting is on for the selected session's resolved config. `None`
     /// when there's no selected session or the setting is off; the
     /// caller then leaves the plain view switch alone. Deliberately not
@@ -8286,6 +8328,7 @@ mod tests {
             create_new_branch: false,
             base_branch: None,
             extra_repo_paths: Vec::new(),
+            workspace: false,
             sandbox: true,
             sandbox_image: "ubuntu:latest".to_string(),
             yolo_mode: false,

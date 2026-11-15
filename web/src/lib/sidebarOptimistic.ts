@@ -1,4 +1,4 @@
-import type { Workspace } from "./types";
+import type { SessionResponse, Workspace } from "./types";
 import { resolveEffectiveSnoozedUntil, snoozeTimestampCloseEnough } from "./sidebarSort";
 
 /** Wall-clock target for an optimistic snooze: `Date.now() + minutes *
@@ -15,8 +15,8 @@ export function makeOptimisticSnoozedUntil(minutes: number): string {
 export interface OptimisticTriage {
   pinned: boolean | null;
   archived: boolean | null;
-  /** The session an `archived` override was issued for; it reconciles against and gates actions on that session only. */
-  archivedSessionId: string | null;
+  /** The session every override here was issued for; only the rows that show it render the entry. */
+  sessionId: string | null;
   snoozedUntil: string | null | undefined;
   unread: boolean | null;
 }
@@ -25,7 +25,7 @@ export interface OptimisticTriage {
 export const EMPTY_OPTIMISTIC: OptimisticTriage = Object.freeze({
   pinned: null,
   archived: null,
-  archivedSessionId: null,
+  sessionId: null,
   snoozedUntil: undefined,
   unread: null,
 });
@@ -64,6 +64,50 @@ export function effectiveUnreadOf(optimistic: OptimisticTriage, serverUnread: bo
   return optimistic.unread ?? serverUnread;
 }
 
+/** Overlay keys pair a workspace with the session its pending action targets; ids contain no separator. */
+const KEY_SEP = "\u0000";
+
+export function optimisticKey(workspaceId: string, sessionId: string | null): string {
+  return `${workspaceId}${KEY_SEP}${sessionId ?? ""}`;
+}
+
+/** A row's pending overrides: the aggregate it renders, plus each target session's own entry when several apply. */
+export interface RowOptimistic extends OptimisticTriage {
+  /** Keyed by target session id; absent while only one session of the row has a pending action. */
+  bySession?: ReadonlyMap<string, OptimisticTriage>;
+}
+
+/** The overrides a row may render: a pending action belongs only to the session it was issued for. */
+export function optimisticForRow(map: ReadonlyMap<string, OptimisticTriage>, workspace: Workspace): RowOptimistic {
+  const untargeted = map.get(optimisticKey(workspace.id, null));
+  if (untargeted) return untargeted;
+  const bySession = new Map<string, OptimisticTriage>();
+  for (const session of workspace.sessions) {
+    const override = map.get(optimisticKey(workspace.id, session.id));
+    if (override) bySession.set(session.id, override);
+  }
+  if (bySession.size === 0) return EMPTY_OPTIMISTIC;
+  // Keep the stored entry as the row's identity while it is the only one pending.
+  if (bySession.size === 1) return bySession.values().next().value!;
+  return { ...mergeTriage([...bySession.values()]), bySession };
+}
+
+/** A row renders as one aggregate: a pending archive, pin or unread on any target shows on the combined row. */
+function mergeTriage(entries: readonly OptimisticTriage[]): OptimisticTriage {
+  const tri = (of: (e: OptimisticTriage) => boolean | null) =>
+    entries.some((e) => of(e) === true) ? true : entries.some((e) => of(e) === false) ? false : null;
+  return {
+    pinned: tri((e) => e.pinned),
+    archived: tri((e) => e.archived),
+    sessionId: null,
+    snoozedUntil:
+      entries.find((e) => e.snoozedUntil != null)?.snoozedUntil ??
+      entries.find((e) => e.snoozedUntil !== undefined)?.snoozedUntil ??
+      undefined,
+    unread: tri((e) => e.unread),
+  };
+}
+
 /** A boolean clears once it matches the server; a snooze clears when both are unsnoozed or the deadlines are close enough. */
 function fieldCaughtUp<T>(override: T | null, server: T): boolean {
   return override !== null && override === server;
@@ -81,36 +125,44 @@ export function reconcileOptimistic(
   workspaces: readonly Workspace[],
 ): Map<string, OptimisticTriage> {
   if (map.size === 0) return map as Map<string, OptimisticTriage>;
-  const workspaceById = new Map<string, Workspace>();
+  // A workspace can arrive as several slices (one per group or status bucket); the override
+  // reconciles against its target session wherever that slice appears.
+  const sessionsById = new Map<string, Map<string, SessionResponse>>();
   for (const ws of workspaces) {
-    if (!workspaceById.has(ws.id)) workspaceById.set(ws.id, ws);
+    let sessions = sessionsById.get(ws.id);
+    if (!sessions) sessionsById.set(ws.id, (sessions = new Map()));
+    for (const s of ws.sessions) sessions.set(s.id, s);
   }
   let changed = false;
   const next = new Map<string, OptimisticTriage>();
-  for (const [id, override] of map) {
-    const workspace = workspaceById.get(id);
+  for (const [key, override] of map) {
+    const [workspaceId] = key.split(KEY_SEP);
+    const sessions = sessionsById.get(workspaceId!);
     // Keep a vanished workspace's override so a mid-refresh row doesn't flicker back to stale state.
-    if (!workspace) {
-      next.set(id, override);
+    if (!sessions) {
+      next.set(key, override);
       continue;
     }
-    const server = serverTriageOf(workspace);
-    // An archive touches one session, so it is caught up when that session matches, not the row aggregate.
-    const archivedTarget = workspace.sessions.find((s) => s.id === override.archivedSessionId);
-    const pinned = fieldCaughtUp(override.pinned, server.isPinned) ? null : override.pinned;
-    const archived = fieldCaughtUp(
-      override.archived,
-      archivedTarget ? archivedTarget.archived_at != null : server.isArchived,
-    )
-      ? null
-      : override.archived;
-    const archivedSessionId = archived === null ? null : override.archivedSessionId;
-    const snoozedUntil = snoozeCaughtUp(override.snoozedUntil, server.snoozedUntil) ? undefined : override.snoozedUntil;
-    const unread = fieldCaughtUp(override.unread, server.unread) ? null : override.unread;
+    const target = override.sessionId == null ? undefined : sessions.get(override.sessionId);
+    // Nothing renders an override whose target session left the workspace.
+    if (override.sessionId != null && !target) {
+      changed = true;
+      continue;
+    }
+    const all = [...sessions.values()];
+    const serverPinned = target ? target.pinned_at != null : all.some((s) => s.pinned_at != null);
+    const serverArchived = target ? target.archived_at != null : all.some((s) => s.archived_at != null);
+    const serverSnoozedUntil = target
+      ? (target.snoozed_until ?? null)
+      : (all.find((s) => s.snoozed_until)?.snoozed_until ?? null);
+    const serverUnread = target ? target.unread === true : all.some((s) => s.unread === true);
+    const pinned = fieldCaughtUp(override.pinned, serverPinned) ? null : override.pinned;
+    const archived = fieldCaughtUp(override.archived, serverArchived) ? null : override.archived;
+    const snoozedUntil = snoozeCaughtUp(override.snoozedUntil, serverSnoozedUntil) ? undefined : override.snoozedUntil;
+    const unread = fieldCaughtUp(override.unread, serverUnread) ? null : override.unread;
     if (
       pinned !== override.pinned ||
       archived !== override.archived ||
-      archivedSessionId !== override.archivedSessionId ||
       snoozedUntil !== override.snoozedUntil ||
       unread !== override.unread
     ) {
@@ -120,7 +172,7 @@ export function reconcileOptimistic(
       changed = true;
       continue;
     }
-    next.set(id, { pinned, archived, archivedSessionId, snoozedUntil, unread });
+    next.set(key, { pinned, archived, sessionId: override.sessionId, snoozedUntil, unread });
   }
   return changed ? next : (map as Map<string, OptimisticTriage>);
 }
@@ -129,8 +181,7 @@ export function withOverride(prev: OptimisticTriage | undefined, patch: Partial<
   return {
     pinned: patch.pinned !== undefined ? patch.pinned : (prev?.pinned ?? null),
     archived: patch.archived !== undefined ? patch.archived : (prev?.archived ?? null),
-    archivedSessionId:
-      patch.archivedSessionId !== undefined ? patch.archivedSessionId : (prev?.archivedSessionId ?? null),
+    sessionId: patch.sessionId !== undefined ? patch.sessionId : (prev?.sessionId ?? null),
     snoozedUntil: "snoozedUntil" in patch ? patch.snoozedUntil : (prev?.snoozedUntil ?? undefined),
     unread: patch.unread !== undefined ? patch.unread : (prev?.unread ?? null),
   };

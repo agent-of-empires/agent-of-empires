@@ -1006,16 +1006,21 @@ pub async fn trash_session(
         } else {
             outcome
         };
-        store.update(|rows, _| {
-            if matches!(outcome, crate::session::trash::RelocateOutcome::Relocated { .. }) {
-                let relocation = crate::session::trash::TrashRelocation {
-                    new_project_path: instance.project_path,
-                    pre_trash_project_path: instance.pre_trash_project_path,
-                };
-                match crate::session::claim::commit_trash_relocation(rows, &worker_id, generation, &relocation) {
+        let relocation = matches!(outcome, crate::session::trash::RelocateOutcome::Relocated { .. })
+            .then(|| crate::session::trash::TrashRelocation {
+                new_project_path: instance.project_path.clone(),
+                pre_trash_project_path: instance.pre_trash_project_path.clone(),
+            });
+        let mut superseded = false;
+        let committed = store.update(|rows, _| {
+            if let Some(relocation) = &relocation {
+                match crate::session::claim::commit_trash_relocation(rows, &worker_id, generation, relocation) {
                     crate::session::claim::RelocationCommit::Persisted => {}
                     crate::session::claim::RelocationCommit::AlreadyGone => return Err(LifecycleTargetError::Missing.into()),
-                    crate::session::claim::RelocationCommit::Superseded => return Err(LifecycleTargetError::Busy.into()),
+                    crate::session::claim::RelocationCommit::Superseded => {
+                        superseded = true;
+                        return Ok(());
+                    }
                 }
             } else {
                 let row = rows.iter_mut().find(|row| row.id == worker_id)
@@ -1036,7 +1041,17 @@ pub async fn trash_session(
                 row.last_error = Some(error.to_string());
             }
             Ok(())
-        })?;
+        });
+        if let Some(relocation) = relocation.filter(|_| superseded) {
+            if let crate::session::trash::RestoreOutcome::Failed { reason } =
+                crate::session::trash::undo_raced_relocation(&instance, &relocation)
+            {
+                tracing::warn!(target: "session.trash", session = %worker_id, %reason, "could not move superseded trash relocation back");
+            }
+            committed?;
+            return Err(LifecycleTargetError::Busy.into());
+        }
+        committed?;
         retirement.generation = None;
         drop(_lifecycle);
         if physical_retired {
@@ -1269,14 +1284,14 @@ pub async fn force_smart_rename(
         return resp;
     }
 
-    let Some((profile, tool, command, project_path, sandboxed, title, structured)) = ({
+    let Some((profile, tool, command, config_path, sandboxed, title, structured)) = ({
         let instances = state.instances.read().await;
         instances.iter().find(|i| i.id == id).map(|i| {
             (
                 i.source_profile.clone(),
                 i.tool.clone(),
                 i.command.clone(),
-                i.project_path.clone(),
+                i.repo_config_path().to_path_buf(),
                 i.is_sandboxed(),
                 i.title.clone(),
                 i.is_structured(),
@@ -1289,7 +1304,7 @@ pub async fn force_smart_rename(
     // Manual requests bypass the setting and current-title gates; the worker revalidates all others.
     let resolved = crate::session::config::repo_config::resolve_config_with_repo_or_warn(
         &profile,
-        std::path::Path::new(&project_path),
+        &config_path,
     );
     let config = &resolved.session;
     if let Err(reason) = crate::session::smart_rename::check_eligible_resolved(
@@ -1723,7 +1738,7 @@ fn commit_structured_user_stop(
     // The original producer can have persisted its binding before the async
     // listener obtains instance exclusion. Preserve that qualified observation
     // while we still own its native incarnation, before Stop supersedes it.
-    let through = state.acp_event_store.highest_seq_checked(id)?;
+    let through = state.acp_event_store.highest_seq(id)?;
     let observed = state
         .acp_event_store
         .handoff_context_event(id, 0, through)?;
@@ -2907,8 +2922,7 @@ fn reserve_structured_restart(
             target,
             Some(instance.id.clone()),
         )?;
-        (&target_native as &dyn SessionStore)
-            .launch_configuration(std::path::Path::new(&instance.project_path))?;
+        (&target_native as &dyn SessionStore).launch_configuration(instance.repo_config_path())?;
         let rows = target_native.load()?;
         if rows.iter().any(|row| row.id == instance.id)
             || is_duplicate_session(rows.iter(), &probe.title, &probe.project_path, None)
@@ -2916,8 +2930,7 @@ fn reserve_structured_restart(
             return Err(duplicate_session_error(&probe.title));
         }
     } else {
-        (&native as &dyn SessionStore)
-            .launch_configuration(std::path::Path::new(&instance.project_path))?;
+        (&native as &dyn SessionStore).launch_configuration(instance.repo_config_path())?;
     }
     let mut binding = None;
     let reserved = (&native as &dyn SessionStore).update(|rows, _| {
@@ -3208,7 +3221,7 @@ async fn finish_structured_restart(
                 &started.tool,
                 started.agent_name.as_deref(),
                 &started.source_profile,
-                std::path::Path::new(&started.project_path),
+                started.repo_config_path(),
             )
             .await;
         let mut request = crate::server::api::acp::spawn_request_for(
@@ -3278,7 +3291,7 @@ async fn finish_structured_restart(
                                 text: &wake,
                                 attachments: &[],
                                 woke_idle_dormant: false,
-                                prompt_id: None,
+                                prompt_ids: Vec::new(),
                                 synthesized: true,
                                 no_revive: true, },
                             )
@@ -3476,8 +3489,8 @@ async fn prepare_agent_session_inner(
         physical: mut captured_physical,
     } = input;
     if preparation == AgentPreparation::Ensure && state.cityhall_mode {
-    return crate::server::api::cityhall_response();
-}
+        return crate::server::api::cityhall_response();
+    }
     if state.read_only && preparation == AgentPreparation::Ensure {
         return super::ensure::agent_target_response(&state, &id, None).await;
     }
@@ -4410,7 +4423,7 @@ async fn prepare_agent_session_inner(
     drop(guard);
     drop(submission);
     drop(namespace);
-    if let Some(reservation) = resume_reservation.take() {
+    let resume_triggered = if let Some(reservation) = resume_reservation.take() {
         match crate::server::acp_reconciler::trigger_resume_background(
             &state.session_service,
             &id,
@@ -4419,13 +4432,15 @@ async fn prepare_agent_session_inner(
         )
         .await
         {
-            Ok(crate::server::acp_reconciler::ResumeTrigger::Started) => {}
+            Ok(crate::server::acp_reconciler::ResumeTrigger::Started) => true,
             Ok(_) => return StatusCode::CONFLICT.into_response(),
             Err(error) => {
                 return crate::server::api::acp::supervisor_error_response("start failed", &error);
             }
         }
-    }
+    } else {
+        false
+    };
     if preparation == AgentPreparation::Restart {
         let Some((generation, profile)) = restart_identity else {
             return StatusCode::CONFLICT.into_response();
@@ -4500,7 +4515,7 @@ async fn prepare_agent_session_inner(
             response
         }
     } else {
-        if structured {
+        if structured && !resume_triggered {
             state.acp_supervisor.request_respawn(&id);
         }
         if outcome.is_some() || structured {
@@ -4759,6 +4774,7 @@ mod durable_stop_tests {
             if target == "restart" {
                 row.view = crate::session::View::Structured;
                 row.status = Status::Running;
+                crate::server::test_support::select_retained_for_test(&mut row);
             }
             crate::server::test_support::seed_instances_on_disk_for_test(
                 "default",
@@ -4986,7 +5002,7 @@ mod durable_stop_tests {
                 assert!(SystemProcessControl::default().is_alive(filler_owner));
                 let original_methods = original_native.requests();
                 let filler_methods = filler_native.requests();
-                let frontier = state.acp_event_store.highest_seq(&id);
+                let frontier = state.acp_event_store.highest_seq(&id).unwrap();
                 let (load_config, load_native) = scope.native_peer(
                     project.path().into(),
                     "codex",
@@ -5025,7 +5041,7 @@ mod durable_stop_tests {
                 assert_eq!(after.lifecycle_reservation, lifecycle_reservation);
                 assert_eq!(after.status, Status::Stopped);
                 assert_eq!(worker_registry::stop_intent(&id).unwrap(), stop);
-                assert_eq!(state.acp_event_store.highest_seq(&id), frontier);
+                assert_eq!(state.acp_event_store.highest_seq(&id).unwrap(), frontier);
                 assert!(state.acp_supervisor.current_lease(&id).is_none());
                 assert!(load_native.requests().is_empty());
                 assert_eq!(original_native.requests(), original_methods);
@@ -5057,11 +5073,14 @@ mod durable_stop_tests {
                 assert_eq!(original_native.requests(), ["initialize", "session/new"]);
                 assert_eq!(load_native.requests(), ["initialize", "session/load"]);
                 assert_ne!(resumed.lease.spawned_runner(), Some(owner));
+                let record = {
+                    let registry = worker_registry::registry_lock_until(
+                        &id, tokio::time::Instant::now() + std::time::Duration::from_secs(10),
+                    ).await.expect("the actual runner releases registry publication");
+                    registry.record().unwrap().expect("the actual resumed runner remains registered")
+                };
                 assert_eq!(
-                    worker_registry::load_strict(&id)
-                        .unwrap()
-                        .unwrap()
-                        .stored_acp_session_id
+                    record.stored_acp_session_id
                         .as_deref(),
                     Some(sid)
                 );
@@ -5968,6 +5987,8 @@ mod restart_wake_tests {
                 let mut live = crate::server::test_support::managed_control_session(
                     scope,
                     "restart-quota-publication-io",
+                    "claude",
+                    None,
                 )
                 .await;
                 live.park("original interrupted work").await;
@@ -5988,7 +6009,7 @@ mod restart_wake_tests {
                 // alone correctly refuses Spawn while that retained physical owner stays alive.
                 live.client.shutdown().await.unwrap();
                 let requests = live.native.requests();
-                let frontier = state.acp_event_store.highest_seq(&id);
+                let frontier = state.acp_event_store.highest_seq(&id).unwrap();
                 let budget = state
                     .acp_event_store
                     .rate_limit_redelivery_streak(&id)
@@ -6079,7 +6100,7 @@ mod restart_wake_tests {
                     serde_json::to_value(current.pending_initial_turn).unwrap()
                 );
                 assert!(!state.acp_supervisor.is_running(&id).await);
-                assert_eq!(state.acp_event_store.highest_seq(&id), frontier);
+                assert_eq!(state.acp_event_store.highest_seq(&id).unwrap(), frontier);
                 assert_eq!(
                     state
                         .acp_event_store

@@ -4,6 +4,7 @@ const IS_MAC = typeof navigator !== "undefined" && /Mac|iPhone|iPad|iPod/.test(n
 import type { SessionResponse } from "../lib/types";
 import type { ConversationSearchHit } from "../lib/api";
 import type { CommandAction } from "../components/command-palette/types";
+import { useLivePanes } from "../lib/liveControl";
 
 export type ConversationActionData = Omit<CommandAction, "perform"> & { sessionId: string };
 
@@ -102,8 +103,22 @@ export function useCommandActions({
   onOpenFocusWindow,
   onExitFocusMode,
 }: Args): CommandAction[] {
+  // The agent pane first, so Take control claims the terminal the Session is about.
+  const viewOnlyPane = useLivePanes(activeSessionId).find((p) => p.viewOnly);
+  const takeControl = viewOnlyPane?.claim;
   return useMemo(() => {
     const actions: CommandAction[] = [];
+
+    if (takeControl) {
+      actions.push({
+        id: "action:take-control",
+        title: "Take control",
+        subtitle: "live terminal",
+        group: "Actions",
+        keywords: ["take over", "control", "live", "terminal", "view only", "type"],
+        perform: takeControl,
+      });
+    }
 
     if (focusMode) {
       actions.push({
@@ -304,5 +319,6 @@ export function useCommandActions({
     onEnterFocusMode,
     onOpenFocusWindow,
     onExitFocusMode,
+    takeControl,
   ]);
 }

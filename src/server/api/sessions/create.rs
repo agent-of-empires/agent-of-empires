@@ -658,7 +658,7 @@ pub(crate) fn run_create_hooks(
     let hook_env = repo_config::lifecycle_env_vars(instance);
     if instance.sandbox_info.is_some() {
         instance.ensure_container_in(store, None)?;
-        let workdir = instance.container_workdir();
+        let workdir = instance.hook_container_workdir(plan.on_create_from_repo);
         if let Some(sandbox) = instance.sandbox_info.as_ref() {
             repo_config::execute_hooks_in_container_streamed(
                 plan.on_create(),
@@ -671,7 +671,7 @@ pub(crate) fn run_create_hooks(
     } else {
         repo_config::execute_hooks_streamed(
             plan.on_create(),
-            std::path::Path::new(&instance.project_path),
+            instance.hook_workdir(plan.on_create_from_repo),
             progress,
             &hook_env,
         )?;
@@ -961,6 +961,7 @@ pub(crate) async fn create_session_with(
         let mut paths = projects.into_iter().map(|p| p.path);
         body.path = paths.next().unwrap();
         body.extra_repo_paths = paths.collect();
+        body.workspace = false;
         body.view = crate::session::View::Structured;
         // Fork and import resume an existing agent session and would bypass the
         // server-derived path and ACP gate, so they are not honored here.
@@ -1003,6 +1004,13 @@ pub(crate) async fn create_session_with(
             StatusCode::BAD_REQUEST,
             "validation_failed",
             "Cannot combine scratch with extra_repo_paths",
+        );
+    }
+    if body.workspace && !create_body_uses_worktree(&body) {
+        return api_error(
+            StatusCode::BAD_REQUEST,
+            "validation_failed",
+            "Workspace mode requires worktree mode",
         );
     }
     // The builder ignores `path` in scratch mode, but accepting both silently
@@ -1406,6 +1414,7 @@ pub(crate) async fn create_session_with(
         extra_args: body.extra_args,
         command_override: body.command_override,
         extra_repo_paths: body.extra_repo_paths,
+        workspace: body.workspace,
         repo_base_branches: body
             .repo_bases
             .into_iter()

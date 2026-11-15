@@ -1660,6 +1660,7 @@ fn terminal_status_follows_canonical_snapshots_across_stop_and_disconnect() {
     env.view.apply_session_feed();
     assert_eq!(env.view.get_instance(&id).unwrap().status, Status::Stopped);
 }
+
 #[test]
 #[serial]
 fn terminal_rows_take_status_and_observations_from_the_daemon_only() {
@@ -4483,6 +4484,40 @@ fn observed_legacy_tool(
             },
         }),
     }
+}
+
+#[test]
+#[serial]
+fn indeterminate_launch_refuses_attachment_without_resubmitting() {
+    use crate::tui::home::panes::{NativePane, PaneIntent};
+    let mut env = create_test_env_with_sessions(1);
+    let id = env.view.instance_at(0).id.clone();
+    env.view.select_session_by_id(&id);
+    let mut respond = env.view.session_feed.request_driver_for_test();
+    env.view
+        .session_feed
+        .publish_for_test(daemon_snapshot(&env.view, &id, "Stopped"));
+    env.view.apply_session_feed();
+    env.view
+        .prepare_native_attachment(&id, NativePane::Agent, None, PaneIntent::Attach)
+        .unwrap();
+    let error = crate::daemon::DaemonClientError::Committed {
+        cursor: crate::daemon::RuntimeCursor {
+            epoch: "test".into(),
+            revision: 2,
+        },
+        code: crate::daemon::ApiErrorCode::LaunchIndeterminate,
+    };
+    assert_eq!(respond(Err(error.to_string())).unwrap().0, id);
+    env.view.apply_session_feed();
+    env.view.apply_restart_results();
+    assert!(env.view.take_native_attachment().is_none());
+    assert!(env.view.pending_native_attachment.is_none());
+    assert!(env.view.live_send.is_none());
+    assert!(env.view.session_feed.can_submit(&id));
+    assert!(env.view.pending_indeterminate_resolution.is_none());
+    assert!(env.view.info_dialog.is_some());
+    assert!(respond(Err("no automatic retry".into())).is_none());
 }
 
 #[test]

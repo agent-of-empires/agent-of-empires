@@ -164,8 +164,8 @@ pub async fn ensure_tool(
             }
             if error.is::<crate::tmux::LegacyToolUnavailable>() {
                 return (StatusCode::CONFLICT,
-                    Json(serde_json::json!({"error":"legacy_tool_ownership_unavailable", "message":error.to_string()})))
-                    .into_response();
+                Json(serde_json::json!({"error":"legacy_tool_ownership_unavailable", "message":error.to_string()})))
+                .into_response();
             }
             if error.is::<crate::session::ToolLaunchUnavailable>() {
                 return (

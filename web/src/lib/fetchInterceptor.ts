@@ -65,8 +65,10 @@ export function installFetchErrorToasts(): void {
     const isApi = path.startsWith("/api/");
     const sameOrigin = isSameOrigin(rawUrl);
 
+    // A 401 or a rotation answers the token the request carried, not one saved while it was in flight.
+    const sentToken = sameOrigin ? getToken() : null;
     // X-Request-Id correlates a devtools entry with the backend `http.request` span.
-    let patchedInit = attachAuthHeader(sameOrigin, init);
+    let patchedInit = attachAuthHeader(sameOrigin, sentToken, init);
     if (sameOrigin && isApi) {
       try {
         const requestId = crypto.randomUUID();
@@ -83,14 +85,16 @@ export function installFetchErrorToasts(): void {
     try {
       const res = await original(input, patchedInit);
       if (sameOrigin) {
+        // The header names the token current when the response was built, so a slow
+        // response must not overwrite one saved since.
         const rotated = res.headers.get("x-aoe-token");
-        if (rotated) saveToken(rotated);
+        if (rotated && getToken() === sentToken) saveToken(rotated);
       }
       if (res.status === 401 && isApi) {
         const authError = await classifyAuthError(res);
         if (authError === "login_required") {
           handleLoginRequired();
-        } else if (authError === "unauthorized" && !isLoginAttemptPath(path)) {
+        } else if (authError === "unauthorized" && !isLoginAttemptPath(path) && getToken() === sentToken) {
           // A generic 401 outside login attempts means the token is dead.
           handleTokenAuthFailure();
         }
@@ -171,9 +175,12 @@ export function resetTokenExpired(): void {
 }
 
 // Skips cross-origin URLs so credentials never leak off-site.
-function attachAuthHeader(sameOrigin: boolean, init: RequestInit | undefined): RequestInit | undefined {
+function attachAuthHeader(
+  sameOrigin: boolean,
+  token: string | null,
+  init: RequestInit | undefined,
+): RequestInit | undefined {
   if (!sameOrigin) return init;
-  const token = getToken();
   let bindingSecret: string | null = null;
   try {
     bindingSecret = getOrCreateDeviceBindingSecret();

@@ -237,7 +237,7 @@ test("per-profile setting override leaves global state untouched", async ({ serv
 
   // The TextField saves on blur.
   const defaultTool = page
-    .locator("label", { hasText: /^Default Tool$/ })
+    .locator("label", { hasText: /^Default Agent$/ })
     .locator("..")
     .locator("input[type=text]");
   await defaultTool.fill(sentinel);

@@ -10,6 +10,7 @@ mod command_loop;
 mod establish;
 mod notifications;
 mod prompt;
+mod subagents;
 #[cfg(test)]
 mod tests;
 #[cfg(test)]
@@ -47,7 +48,8 @@ use super::pending::PendingResponders;
 use super::permission_handlers::{handle_elicitation_request, handle_permission_request};
 use super::rate_limit::captured_rate_limit_resets_at;
 use super::session_identity::{
-    spawn_native_callback, PendingIngress, SessionIngress, SessionIngressNotification,
+    spawn_native_callback, PendingIngress, RequestPolicy, SessionIngress,
+    SessionIngressNotification,
 };
 use super::terminal_handlers::{
     handle_create_terminal, handle_kill_terminal, handle_release_terminal, handle_terminal_output,
@@ -76,6 +78,7 @@ pub(crate) struct ConnectionState {
     foreground_finished: AtomicBool,
     establishment_declined: AtomicBool,
     pub(super) admission: std::sync::Mutex<()>,
+    pub(super) initial_prompt: std::sync::Mutex<Option<super::commands::InitialPromptState>>,
     sdk_closing: AtomicBool,
     unavailable_wake: tokio::sync::Notify,
     ordered_loss_wake: tokio::sync::Notify,
@@ -161,6 +164,78 @@ pub(super) enum CallbackDuration {
 }
 
 impl ConnectionState {
+    pub(super) fn initial_prompt_cancellation(
+        &self,
+        correlation: Option<crate::acp::establishment::NativeOperationCorrelation>,
+    ) -> Option<tokio_util::sync::CancellationToken> {
+        let correlation = correlation?;
+        let slot = self.initial_prompt.lock().unwrap();
+        slot.as_ref()
+            .filter(|pending| pending.correlation == Some(correlation))
+            .map(|pending| pending.cancellation.clone())
+    }
+
+    pub(super) fn begin_initial_prompt_write(
+        &self,
+        correlation: Option<crate::acp::establishment::NativeOperationCorrelation>,
+    ) -> bool {
+        let mut slot = self.initial_prompt.lock().unwrap();
+        if let Some(pending) = slot
+            .as_mut()
+            .filter(|pending| correlation.is_some() && pending.correlation == correlation)
+        {
+            if pending.cancellation.is_cancelled() {
+                return false;
+            }
+            pending.issued = true;
+        }
+        true
+    }
+
+    pub(super) fn initial_prompt_issued(
+        &self,
+        correlation: Option<crate::acp::establishment::NativeOperationCorrelation>,
+    ) -> bool {
+        correlation.is_some()
+            && self
+                .initial_prompt
+                .lock()
+                .unwrap()
+                .as_ref()
+                .is_some_and(|pending| pending.correlation == correlation && pending.issued)
+    }
+
+    pub(super) fn initial_prompt_matches(
+        &self,
+        id: uuid::Uuid,
+        correlation: crate::acp::establishment::NativeOperationCorrelation,
+    ) -> bool {
+        self.initial_prompt
+            .lock()
+            .unwrap()
+            .as_ref()
+            .is_some_and(|pending| {
+                pending.id == id
+                    && pending.correlation == Some(correlation)
+                    && pending.issued
+                    && !pending.cancellation.is_cancelled()
+            })
+    }
+
+    pub(super) fn finish_initial_prompt_operation(
+        &self,
+        correlation: Option<crate::acp::establishment::NativeOperationCorrelation>,
+    ) {
+        let mut slot = self.initial_prompt.lock().unwrap();
+        if correlation.is_some()
+            && slot
+                .as_ref()
+                .is_some_and(|pending| pending.correlation == correlation)
+        {
+            slot.take();
+        }
+    }
+
     pub(super) fn reserve_native_duration(
         self: &Arc<Self>,
     ) -> Result<NativeOperationDuration, AcpError> {
@@ -417,7 +492,6 @@ impl ConnectionState {
         Some(observation)
     }
 }
-
 pub(super) struct RunnerLink {
     pub(super) control: Arc<DaemonControlClient>,
     /// Shared with the control reader, which claims an adopted turn's
@@ -441,6 +515,7 @@ pub(super) struct ConnectionParams {
     pub(super) expected_agent: ExpectedAgent,
     pub(super) source_profile: Option<String>,
     pub(super) default_effort: Option<String>,
+    pub(super) default_model_config: std::collections::BTreeMap<String, String>,
     pub(super) default_mode: Option<String>,
     pub(super) default_model: Option<String>,
     pub(super) mcp_servers: Vec<McpServer>,
@@ -502,7 +577,7 @@ macro_rules! resource_requests {
                                 let Some(scope) = scope else {
                                     return reply(responder, Err(super::session_identity::SessionIngress::request_refused()));
                                 };
-                                let outcome = ingress.run_request(scope, &id, work).await;
+                                let outcome = ingress.run_request(scope, &id, RequestPolicy::ParentOnly, work).await;
                                 reply(responder, outcome)
                             })
                         }
@@ -535,6 +610,7 @@ pub(super) async fn run_connection_task<W, R>(
         expected_agent,
         source_profile,
         default_effort,
+        default_model_config,
         default_mode,
         default_model,
         mcp_servers,
@@ -574,9 +650,9 @@ pub(super) async fn run_connection_task<W, R>(
         ingress.observe_projection(projection);
     }
     ingress.begin();
-    let original_ingress = match (control.as_ref(), &mode) {
-        (Some(control), ConnectMode::Fresh) => control.install_original_ingress(),
-        _ => Ok(()),
+    let original_ingress = match control.as_ref() {
+        Some(control) => control.install_original_ingress(),
+        None => Ok(()),
     };
     let shared = Arc::new(Shared::new(
         event_tx.clone(),
@@ -684,6 +760,45 @@ pub(super) async fn run_connection_task<W, R>(
                                     .await?;
                                 return Ok(());
                             }
+                            SessionIngressNotification::AutonomousSnapshot(params) => {
+                                if !control_notifications { return Ok(()); }
+                                let envelope: crate::acp::control_protocol::NativeAutonomousSnapshotEnvelope =
+                                    serde_json::from_value(params)
+                                        .map_err(|_| agent_client_protocol::Error::invalid_params())?;
+                                envelope.snapshot.validate()
+                                    .map_err(|_| agent_client_protocol::Error::invalid_params())?;
+                                let snapshot = envelope.snapshot;
+                                let Some(first) = shared.ingress.capture_autonomous(
+                                    crate::acp::control_protocol::NativeAutonomousPhase::Started,
+                                    snapshot.started.notification.clone(), snapshot.started.evidence,
+                                    Some(envelope.wire_bytes),
+                                ) else { return Ok(()); };
+                                let second = if let Some(ended) = &snapshot.ended {
+                                    let Some(second) = shared.ingress.capture_autonomous(
+                                        crate::acp::control_protocol::NativeAutonomousPhase::Ended,
+                                        ended.notification.clone(), ended.evidence, Some(0),
+                                    ) else { return Ok(()); };
+                                    Some(Box::new(second))
+                                } else { None };
+                                shared.handle_ingress_marker(PendingIngress::Autonomous {
+                                    first: Box::new(first), second,
+                                }).await?;
+                                return Ok(());
+                            }
+                            SessionIngressNotification::Autonomous(phase, params) => {
+                                let (notification, evidence, bytes) =
+                                    SessionIngressNotification::decode_autonomous(
+                                        phase, params, control_notifications,
+                                    )?;
+                                if let Some(notification) = shared.ingress.capture_autonomous(
+                                    phase, notification, evidence, bytes,
+                                ) {
+                                    shared.handle_ingress_marker(
+                                        PendingIngress::Autonomous { first: Box::new(notification), second: None },
+                                    ).await?;
+                                }
+                                return Ok(());
+                            }
                             SessionIngressNotification::Update(params) => params,
                         };
                         let (notification, wire_bytes) = SessionIngressNotification::decode_update(
@@ -718,8 +833,11 @@ pub(super) async fn run_connection_task<W, R>(
                             .ingress
                             .notification(notification, wire_bytes)
                             .await?;
-                        if let Some((notification, _guard)) = admitted {
-                            shared.handle_notification(notification, true).await;
+                        match admitted {
+                            Some((notification, _guard)) => {
+                                shared.handle_notification(notification, true).await;
+                            }
+                            None => shared.settle_discarded().await,
                         }
                         Ok(())
                     }
@@ -734,15 +852,16 @@ pub(super) async fn run_connection_task<W, R>(
                 let control = control.clone();
                 move |request: RequestPermissionRequest,
                       responder: Responder<RequestPermissionResponse>,
-                      connection: ConnectionTo<Agent>| {
+                      conn: ConnectionTo<Agent>| {
                     let (shared, pending) = (shared.clone(), pending.clone());
                     let control = control.clone();
                     let request_id = responder.id().clone();
                     let scope = shared.ingress.capture_request();
                     async move {
                         let state = shared.connection_state.clone();
+
                         spawn_native_callback(
-                            &connection,
+                            &conn,
                             &state,
                             control.as_ref(),
                             &request_id,
@@ -751,6 +870,14 @@ pub(super) async fn run_connection_task<W, R>(
                                     Ok(captured) => captured,
                                     Err(error) => return reply(responder, Err(error)),
                                 };
+                                let id = request.session_id.clone();
+                                if let Some(callback) = &captured {
+                                    if let Err(error) = shared.ingress.request(
+                                        &callback.ingress, &id, RequestPolicy::ParentOrChild,
+                                    ).await {
+                                        return reply(responder, Err(error));
+                                    }
+                                }
                                 let cache = match &captured {
                                     Some(callback) => callback.history.as_ref()
                                         .map(|history| Arc::clone(&history.tool_context)),
@@ -760,7 +887,6 @@ pub(super) async fn run_connection_task<W, R>(
                                     Some(callback) => shared.event_tx.with_context(callback.context.clone()),
                                     None => shared.event_tx.clone(),
                                 };
-                                let id = request.session_id.clone();
                                 let native = captured.is_some();
                                 let handled = handle_permission_request(
                                     request, sender, pending, profile, cache, captured,
@@ -768,11 +894,12 @@ pub(super) async fn run_connection_task<W, R>(
                                 let outcome = if native {
                                     handled.await
                                 } else {
-                                    shared.ingress.run_request(scope, &id, handled).await
+                                    shared.ingress.run_request(scope, &id, RequestPolicy::ParentOrChild, handled).await
                                 };
                                 reply(responder, outcome)
                             },
-                        )
+                        )?;
+                        Ok(())
                     }
                 }
             },
@@ -785,15 +912,16 @@ pub(super) async fn run_connection_task<W, R>(
                 let control = control.clone();
                 move |request: CreateElicitationRequest,
                       responder: Responder<CreateElicitationResponse>,
-                      connection: ConnectionTo<Agent>| {
+                      conn: ConnectionTo<Agent>| {
                     let (shared, pending) = (shared.clone(), pending.clone());
                     let control = control.clone();
                     let request_id = responder.id().clone();
                     let scope = shared.ingress.capture_request();
                     async move {
                         let state = shared.connection_state.clone();
+
                         spawn_native_callback(
-                            &connection,
+                            &conn,
                             &state,
                             control.as_ref(),
                             &request_id,
@@ -807,25 +935,29 @@ pub(super) async fn run_connection_task<W, R>(
                                     None => shared.event_tx.clone(),
                                 };
                                 let id = match request.scope() {
-                                    ElicitationScope::Session(scope) => {
-                                        Some(scope.session_id.clone())
-                                    }
+                                    ElicitationScope::Session(scope) => Some(scope.session_id.clone()),
                                     _ => None,
                                 };
+                                if let (Some(callback), Some(id)) = (&captured, &id) {
+                                    if let Err(error) = shared.ingress.request(
+                                        &callback.ingress, id, RequestPolicy::ParentOrChild,
+                                    ).await {
+                                        return reply(responder, Err(error));
+                                    }
+                                }
                                 let native = captured.is_some();
-                                let work = handle_elicitation_request(
-                                    request, sender, pending, captured,
-                                );
+                                let work = handle_elicitation_request(request, sender, pending, captured);
                                 let outcome = if native {
                                     work.await
                                 } else if let Some(id) = id {
-                                    shared.ingress.run_request(scope, &id, work).await
+                                    shared.ingress.run_request(scope, &id, RequestPolicy::ParentOrChild, work).await
                                 } else {
                                     work.await
                                 };
                                 reply(responder, outcome)
                             },
-                        )
+                        )?;
+                        Ok(())
                     }
                 }
             },
@@ -882,6 +1014,7 @@ pub(super) async fn run_connection_task<W, R>(
         expected_agent,
         mcp_servers,
         default_effort,
+        default_model_config,
         default_mode,
         default_model,
         source_profile,

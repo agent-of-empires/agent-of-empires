@@ -2,20 +2,18 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { act, cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
 
-import { useReducer } from "react";
-
-import { applyEvent, emptyAcpState, type AcpEvent, nativeInputAvailable } from "../../../lib/acpTypes";
-
-import { reducer, type Action } from "../../../hooks/acpSession/reducer";
-
-import { isNewSessionStarting } from "../startupWait";
-
-import type { AcpState, Approval, Elicitation, ReducedState } from "../../../lib/acpTypes";
-
+import { applyEvent, applyReducedState, emptyAcpState, nativeInputAvailable } from "../../../lib/acpTypes";
+import type {
+  AcpEvent,
+  AcpState,
+  Approval,
+  Elicitation,
+  EstablishmentRevision,
+  IntegrationLostReason,
+  ReducedState,
+} from "../../../lib/acpTypes";
 import { setServerDown } from "../../../lib/connectionState";
-
 import { clearAcpCache, useAcpSession } from "../../../hooks/useAcpSession";
-
 import {
   currentControlSnapshot,
   flushAsync,
@@ -24,10 +22,11 @@ import {
   lastSocket,
   profileWrapper,
 } from "../../../hooks/__tests__/acpHarness";
-
 import { ApprovalCard } from "../ApprovalCard";
-
 import { AskUserQuestionCard } from "../AskUserQuestionCard";
+import { reducer, type Action } from "../../../hooks/acpSession/reducer";
+import { useReducer } from "react";
+import { isNewSessionStarting } from "../startupWait";
 
 import {
   SessionBanners,
@@ -385,6 +384,85 @@ describe("StartupWaitLine", () => {
       vi.fn((query: string) => ({ matches: reduce && query.includes("reduce"), media: query })),
     );
   afterEach(() => vi.unstubAllGlobals());
+  const startupRevision = (version = 1): EstablishmentRevision => Array<number>(32).fill(version);
+
+  const recoveringLine = (revision: EstablishmentRevision | null, sessionId = "s1") => (
+    <StartupWaitLine
+      sessionId={sessionId}
+      agent="Claude Code"
+      sentPending
+      queuedPending={false}
+      canRestart
+      restartEpoch={0}
+      sentStopped={false}
+      establishmentRevision={revision}
+    />
+  );
+
+  it("refuses Start fresh without a current recovery comparison", () => {
+    vi.useFakeTimers();
+    reducedMotion(true);
+    const post = vi.fn();
+    vi.stubGlobal("fetch", post);
+    render(recoveringLine(null));
+    act(() => vi.advanceTimersByTime(30_000));
+    const fresh = screen.getByRole("button", { name: "Start fresh Claude Code" });
+    expect((fresh as HTMLButtonElement).disabled).toBe(true);
+    fireEvent.click(fresh);
+    expect(screen.queryByRole("dialog")).toBeNull();
+    expect(post).not.toHaveBeenCalled();
+  });
+
+  it("requires renewed human consent when the recovery attempt changes before confirmation", async () => {
+    vi.useFakeTimers();
+    reducedMotion(true);
+    const post = vi.fn().mockResolvedValue({ ok: true, status: 200, text: async () => "" });
+    vi.stubGlobal("fetch", post);
+    const before = startupRevision(1);
+    const after = startupRevision(2);
+    const { rerender } = render(recoveringLine(before));
+    act(() => vi.advanceTimersByTime(30_000));
+    fireEvent.click(screen.getByRole("button", { name: "Start fresh Claude Code" }));
+    expect(post).not.toHaveBeenCalled();
+    rerender(recoveringLine(after));
+    await act(async () => fireEvent.click(screen.getByTestId("startup-fresh-confirm")));
+    expect(post).not.toHaveBeenCalled();
+    expect(screen.queryByRole("dialog")).toBeNull();
+    expect(screen.getByTestId("startup-wait-restart-error").textContent).toContain(
+      "The conversation changed. Review Start fresh again.",
+    );
+    fireEvent.click(screen.getByRole("button", { name: "Start fresh Claude Code" }));
+    await act(async () => fireEvent.click(screen.getByTestId("startup-fresh-confirm")));
+    expect(post).toHaveBeenCalledTimes(1);
+    expect(post.mock.calls[0]![0]).toBe("/api/sessions/s1/acp/restart");
+    expect(JSON.parse(post.mock.calls[0]![1].body)).toEqual({
+      recovery: { revision: after, action: "fresh" },
+    });
+  });
+
+  it("invalidates a pending Start fresh confirmation when the selected session changes", async () => {
+    vi.useFakeTimers();
+    reducedMotion(true);
+    const post = vi.fn().mockResolvedValue({ ok: true, status: 200, text: async () => "" });
+    vi.stubGlobal("fetch", post);
+    const { rerender } = render(recoveringLine(startupRevision(1)));
+    act(() => vi.advanceTimersByTime(30_000));
+    fireEvent.click(screen.getByRole("button", { name: "Start fresh Claude Code" }));
+    expect(screen.getByRole("dialog")).toBeTruthy();
+    const next = startupRevision(2);
+    rerender(recoveringLine(next, "s2"));
+    expect(screen.queryByRole("dialog")).toBeNull();
+    expect(screen.queryByRole("button", { name: "Start fresh Claude Code" })).toBeNull();
+    expect(post).not.toHaveBeenCalled();
+    act(() => vi.advanceTimersByTime(30_000));
+    fireEvent.click(screen.getByRole("button", { name: "Start fresh Claude Code" }));
+    await act(async () => fireEvent.click(screen.getByTestId("startup-fresh-confirm")));
+    expect(post).toHaveBeenCalledTimes(1);
+    expect(post.mock.calls[0]![0]).toBe("/api/sessions/s2/acp/restart");
+    expect(JSON.parse(post.mock.calls[0]![1].body)).toEqual({
+      recovery: { revision: next, action: "fresh" },
+    });
+  });
 
   it("names the Agent and counts up, then says it's still starting, with no duration", () => {
     vi.useFakeTimers();
@@ -460,18 +538,24 @@ describe("StartupWaitLine", () => {
         canRestart
         restartEpoch={3}
         sentStopped={false}
+        establishmentRevision={startupRevision()}
         onRestarted={onRestarted}
       />,
     );
-    const restart = () => screen.queryByRole("button", { name: "Restart Claude Code" });
+    const restart = () => screen.queryByRole("button", { name: "Start fresh Claude Code" });
     act(() => vi.advanceTimersByTime(29_000));
     expect(restart()).toBeNull();
     act(() => vi.advanceTimersByTime(1_000));
+    fireEvent.click(restart()!);
+    expect(spawn).not.toHaveBeenCalled();
     await act(async () => {
-      fireEvent.click(restart()!);
+      fireEvent.click(screen.getByTestId("startup-fresh-confirm"));
     });
     expect(spawn).toHaveBeenCalledTimes(1);
     expect(spawn.mock.calls[0]![0]).toBe("/api/sessions/s1/acp/restart");
+    expect(JSON.parse(spawn.mock.calls[0]![1].body)).toEqual({
+      recovery: { revision: startupRevision(), action: "fresh" },
+    });
     act(() => vi.advanceTimersByTime(1_000));
     expect(screen.getByTestId("startup-wait-elapsed").textContent).toBe(elapsedAfter);
     expect(restart() === null).toBe(failure === null);
@@ -497,12 +581,14 @@ describe("StartupWaitLine", () => {
         canRestart
         restartEpoch={restartEpoch}
         sentStopped={false}
+        establishmentRevision={startupRevision()}
         onRestarted={onRestarted}
       />
     );
     const { rerender } = render(line(0));
     act(() => vi.advanceTimersByTime(30_000));
-    fireEvent.click(screen.getByRole("button", { name: "Restart Claude Code" }));
+    fireEvent.click(screen.getByRole("button", { name: "Start fresh Claude Code" }));
+    fireEvent.click(screen.getByTestId("startup-fresh-confirm"));
     // The replacement is assigned before the restart request answers.
     rerender(line(1));
     await act(async () => respond({ ok: true, status: 200, text: () => Promise.resolve("") }));
@@ -529,8 +615,12 @@ describe("StartupWaitLine", () => {
       ),
     );
     let dispatch!: (action: Action) => void;
+    const sent = reducer(emptyAcpState(), frame(1, { UserPromptSent: { text: "hi" } }));
+    const snapshot = currentControlSnapshot(sent, { ready: false, wakeEligible: true }, 1);
+    snapshot.state.establishment_revision = startupRevision();
+    const initialState = reducer(sent, snapshot);
     function Owner() {
-      const [state, send] = useReducer(reducer, reducer(emptyAcpState(), frame(1, { UserPromptSent: { text: "hi" } })));
+      const [state, send] = useReducer(reducer, initialState);
       dispatch = send;
       const connection = {
         status: "open",
@@ -559,7 +649,8 @@ describe("StartupWaitLine", () => {
     }
     render(<Owner />);
     act(() => vi.advanceTimersByTime(30_000));
-    fireEvent.click(screen.getByRole("button", { name: "Restart Claude Code" }));
+    fireEvent.click(screen.getByRole("button", { name: "Start fresh Claude Code" }));
+    fireEvent.click(screen.getByTestId("startup-fresh-confirm"));
     return {
       dispatch: (action: Action) => act(() => dispatch(action)),
       respond: (status: number, body: string) =>
@@ -656,7 +747,9 @@ describe("StartupWaitLine", () => {
       />,
     );
     act(() => vi.advanceTimersByTime(30_000));
-    const describedBy = screen.getByRole("button", { name: "Restart Claude Code" }).getAttribute("aria-describedby");
+    const describedBy = screen
+      .getByRole("button", { name: "Start fresh Claude Code" })
+      .getAttribute("aria-describedby");
     expect(describedBy ? document.getElementById(describedBy)?.textContent : "").toBe(description);
     expect(screen.queryByTestId("startup-wait-restart-cost")?.textContent ?? "").toBe(description);
   });
@@ -726,5 +819,269 @@ describe("SessionBanners startup line", () => {
     act(() => vi.advanceTimersByTime(31_000));
     expect(screen.queryByTestId("startup-wait-restart")).toBeNull();
     expect((screen.getByTestId("session-recovery-restart-same") as HTMLButtonElement).disabled).toBe(true);
+  });
+});
+
+describe("accepted integration-loss snapshot diagnostics", () => {
+  const message = "Agent integration lost: hold overflow";
+  const banners = (state: AcpState) => (
+    <SessionBanners
+      sessionId="snapshot-diagnostic"
+      state={state}
+      startingAgent={null}
+      canRestart={false}
+      acpWorkerState="running"
+      trashedAt={null}
+      archivedAt={null}
+      snoozedUntil={null}
+      dismissError={vi.fn()}
+    />
+  );
+  const snapshot = (
+    state: AcpState,
+    reason: IntegrationLostReason | null,
+    seq: number,
+    receipt: Parameters<typeof currentControlSnapshot>[1] = { ready: false },
+  ) => {
+    const header = currentControlSnapshot(state, receipt, seq);
+    const wire = { ...header.state, integration_lost: reason };
+    return applyReducedState(state, wire, header.unchanged, header.seq);
+  };
+
+  beforeEach(() => setServerDown(false));
+
+  it.each<[IntegrationLostReason, string]>([
+    [{ kind: "contract_violation", detail: "invalid primitive epoch" }, "invalid primitive epoch"],
+    [{ kind: "hold_overflow" }, "hold overflow"],
+    [{ kind: "lease_overflow" }, "lease overflow"],
+  ])("renders snapshot-only reason %j without a raw frame or native authority (%s)", (reason, detail) => {
+    const state = snapshot(emptyAcpState(), reason, 20);
+    render(banners(state));
+    expect(screen.getByText(`Agent integration lost: ${detail}`)).toBeTruthy();
+    expect(screen.queryByTestId("startup-error-banner")).toBeNull();
+    expect(screen.queryByRole("button", { name: /retry/i })).toBeNull();
+    expect(state).toMatchObject({
+      connectionReady: false,
+      connectionUnavailable: null,
+      promptWakeEligible: false,
+      nativeSnapshotSeq: 20,
+    });
+    expect(nativeInputAvailable(state)).toBe(false);
+  });
+
+  it.each<[string, Parameters<typeof currentControlSnapshot>[1]]>([
+    ["Available", { ready: true }],
+    ["governed wake", { ready: false, wakeEligible: true }],
+    [
+      "qualified native loss",
+      {
+        ready: false,
+        unavailable: { source: "native", cause: "stdout_eof", phase: "established" },
+      },
+    ],
+  ])("keeps integration diagnostics separate from the %s native receipt", (_label, receipt) => {
+    const header = currentControlSnapshot(emptyAcpState(), receipt, 20);
+    const baseline = applyReducedState(emptyAcpState(), header.state, [], header.seq);
+    const state = snapshot(baseline, { kind: "hold_overflow" }, 20, receipt);
+    render(banners(state));
+    expect(screen.getByText(message)).toBeTruthy();
+    expect({
+      ready: state.connectionReady,
+      unavailable: state.connectionUnavailable,
+      wake: state.promptWakeEligible,
+    }).toEqual({
+      ready: baseline.connectionReady,
+      unavailable: baseline.connectionUnavailable,
+      wake: baseline.promptWakeEligible,
+    });
+    expect(nativeInputAvailable(state)).toBe(nativeInputAvailable(baseline));
+  });
+
+  it.each<["current reason" | "current clear", IntegrationLostReason | null]>([
+    ["current reason", { kind: "hold_overflow" }],
+    ["current clear", null],
+  ])("protects the %s from covered raw loss/reset history and an older snapshot", (_label, reason) => {
+    let state = snapshot(emptyAcpState(), reason, 20);
+    const view = render(banners(state));
+    const expectDiagnostic = () => {
+      if (reason) expect(screen.getByText(message)).toBeTruthy();
+      else expect(screen.queryByText(/Agent integration lost:/)).toBeNull();
+      expect(nativeInputAvailable(state)).toBe(false);
+    };
+    expectDiagnostic();
+    state = applyEvent(state, {
+      session_id: "snapshot-diagnostic",
+      seq: 5,
+      event: { IntegrationLost: { reason: { kind: "contract_violation", detail: "older raw loss" } } },
+    });
+    view.rerender(banners(state));
+    expectDiagnostic();
+    state = applyEvent(state, {
+      session_id: "snapshot-diagnostic",
+      seq: 6,
+      event: { UserPromptSent: { text: "older raw prompt" } },
+    });
+    view.rerender(banners(state));
+    expectDiagnostic();
+    expect(snapshot(state, { kind: "lease_overflow" }, 19)).toEqual(state);
+    for (const [index, connectionReady] of [undefined, false, true].entries()) {
+      state = applyEvent(state, {
+        session_id: "snapshot-diagnostic",
+        seq: 21 + index,
+        event: {
+          AcpSessionAssigned: {
+            acp_session_id: "new-current-native",
+            ...(connectionReady === undefined ? {} : { connection_ready: connectionReady }),
+            native_subject: null,
+          },
+        },
+      });
+      view.rerender(banners(state));
+      expectDiagnostic();
+      expect(state.integrationLost).toEqual(reason);
+    }
+    state = snapshot(state, null, 24);
+    view.rerender(banners(state));
+    expect(screen.queryByText(/Agent integration lost:/)).toBeNull();
+    expect(state.integrationLost).toBeNull();
+    expect(nativeInputAvailable(state)).toBe(false);
+  });
+
+  it("keeps raw integration diagnostics when a legacy snapshot omits the optional field", () => {
+    const initial = applyEvent(emptyAcpState(), {
+      session_id: "snapshot-diagnostic",
+      seq: 1,
+      event: { IntegrationLost: { reason: { kind: "hold_overflow" } } },
+    });
+    const header = currentControlSnapshot(initial, { ready: false }, 20);
+    delete header.state.integration_lost;
+    const state = applyReducedState(initial, header.state, [], header.seq);
+    render(banners(state));
+    expect(screen.getByText(message)).toBeTruthy();
+    expect(nativeInputAvailable(state)).toBe(false);
+  });
+
+  it("clears only the current integration diagnostic while preserving unrelated errors", () => {
+    let initial = applyEvent(emptyAcpState(), {
+      session_id: "snapshot-diagnostic",
+      seq: 1,
+      event: { AgentStartupError: { message: "Unrelated startup diagnostic" } },
+    });
+    initial = applyEvent(initial, {
+      session_id: "snapshot-diagnostic",
+      seq: 2,
+      event: { PromptRuntimeError: { message: "Retained operation diagnostic" } },
+    });
+    initial = reducer(initial, { kind: "error", message: "Retained callback failure" });
+    const lost = snapshot(initial, { kind: "hold_overflow" }, 20);
+    const view = render(banners(lost));
+    expect(screen.getByText(message)).toBeTruthy();
+    fireEvent.click(screen.getByTestId("startup-error-banner-details"));
+    expect(screen.getByText("Unrelated startup diagnostic")).toBeTruthy();
+    expect(screen.getByText("Retained callback failure")).toBeTruthy();
+    expect(screen.getByText(message)).toBeTruthy();
+    const cleared = snapshot(lost, null, 21);
+    view.rerender(banners(cleared));
+    expect(screen.queryByText(/Agent integration lost:/)).toBeNull();
+    expect(cleared.startupError).toBe("Unrelated startup diagnostic");
+    expect(cleared.lastError).toBe("Retained operation diagnostic");
+    expect(cleared.interactionError).toEqual(initial.interactionError);
+    expect(screen.getByText("Unrelated startup diagnostic")).toBeTruthy();
+    expect(screen.getByText("Retained callback failure")).toBeTruthy();
+    expect(nativeInputAvailable(cleared)).toBe(false);
+  });
+});
+
+describe("host-only Stop while the same Native constructor is pending", () => {
+  const connection = {
+    status: "open" as const,
+    hasEverOpened: true,
+    reconnecting: false,
+    retryCount: 0,
+    maxRetries: 5,
+  };
+  const intent = "5fdcc941-9be3-4f26-ab31-21b612084392";
+  const revision = Array.from({ length: 32 }, (_, i) => i) as EstablishmentRevision;
+  const props = {
+    sessionId: "pending-host-worker",
+    acpWorkerState: "running" as const,
+    canRestart: true,
+    trashedAt: null,
+    archivedAt: null,
+    snoozedUntil: null,
+    dismissError: vi.fn(),
+  };
+
+  it.each(["before", "after"] as const)(
+    "does not report physical retirement when the host stop arrives %s its live snapshot",
+    (order) => {
+      const initial = currentControlSnapshot(emptyAcpState(), { ready: false, wakeEligible: true }, 2);
+      initial.state.host_prompt_intent = intent;
+      initial.state.establishment_revision = revision;
+      let state = reducer(emptyAcpState(), initial);
+      const stopped = {
+        kind: "frame" as const,
+        frame: {
+          session_id: props.sessionId,
+          seq: 3,
+          scope: "history_only",
+          event: { Stopped: { reason: "user_stopped" } },
+        },
+      };
+      const settled = currentControlSnapshot(state, { ready: false, wakeEligible: true }, 3);
+      settled.state.host_prompt_intent = null;
+      settled.unchanged.push("establishment_revision");
+      delete settled.state.establishment_revision;
+      if (order === "before") {
+        state = reducer(state, stopped);
+        expect(state.hostPromptIntent).toBe(intent);
+        expect(state.establishmentRevision).toEqual(revision);
+        state = reducer(state, settled);
+      } else {
+        state = reducer(state, settled);
+        state = reducer(state, stopped);
+      }
+      expect(state.hostPromptIntent).toBeNull();
+      expect(state.establishmentRevision).toEqual(revision);
+      expect(nativeInputAvailable(state)).toBe(false);
+      expect(state.turnActive).toBe(false);
+      render(
+        <SessionBanners
+          {...props}
+          state={state}
+          startingAgent={isNewSessionStarting(state, connection, "running", false) ? "Claude Code" : null}
+        />,
+      );
+      expect(screen.getByTestId("startup-wait-line")).toBeTruthy();
+      expect(screen.queryByText("Structured view worker stopped")).toBeNull();
+    },
+  );
+
+  it("retains the real worker-stop explanation when the live constructor is gone", () => {
+    const initial = currentControlSnapshot(emptyAcpState(), { ready: false, wakeEligible: true }, 2);
+    initial.state.host_prompt_intent = intent;
+    initial.state.establishment_revision = revision;
+    let state = reducer(emptyAcpState(), initial);
+    state = reducer(state, {
+      kind: "frame",
+      frame: { session_id: props.sessionId, seq: 3, event: { Stopped: { reason: "user_stopped" } } },
+    });
+    const retired = currentControlSnapshot(state, { ready: false, wakeEligible: false }, 3);
+    retired.state.host_prompt_intent = null;
+    retired.state.establishment_revision = null;
+    state = reducer(state, retired);
+    render(
+      <SessionBanners
+        {...props}
+        state={state}
+        acpWorkerState="absent"
+        startingAgent={isNewSessionStarting(state, connection, "absent", false) ? "Claude Code" : null}
+      />,
+    );
+    expect(nativeInputAvailable(state)).toBe(false);
+    expect(state.hostPromptIntent).toBeNull();
+    expect(state.establishmentRevision).toBeNull();
+    expect(screen.queryByTestId("startup-wait-line")).toBeNull();
+    expect(screen.getByText("Structured view worker stopped")).toBeTruthy();
   });
 });

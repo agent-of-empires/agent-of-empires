@@ -173,6 +173,7 @@ pub fn resolve_effective(
     agent_key: &str,
     profile: Option<&str>,
     cwd: &Path,
+    repo_config_path: &Path,
     session_env: &[(String, String)],
     native_config_override: Option<&Path>,
 ) -> Vec<ResolvedMcpServer> {
@@ -207,14 +208,14 @@ pub fn resolve_effective(
         },
         McpLayer {
             provenance: McpProvenance::ProjectLocal,
-            servers: or_warn(trusted_project_servers(cwd), "project-local"),
+            servers: or_warn(trusted_project_servers(repo_config_path), "project-local"),
         },
     ])
 }
 
-fn trusted_project_servers(cwd: &Path) -> Result<Vec<ProjectMcpServer>> {
+fn trusted_project_servers(repo_config_path: &Path) -> Result<Vec<ProjectMcpServer>> {
     use crate::session::config::repo_config::{is_repo_trusted, repo_config_source_path};
-    let source = repo_config_source_path(cwd);
+    let source = repo_config_source_path(repo_config_path);
     let servers = super::project_mcp::load_project_mcp_servers(&source)?;
     if servers.is_empty() {
         return Ok(servers);
@@ -246,7 +247,7 @@ pub struct McpSurfaceView {
 /// against (and recorded in) the drift store.
 pub fn resolve_surface(agent: &str, profile: Option<&str>, cwd: &Path) -> McpSurfaceView {
     let session_env = session_env_for_discovery(profile);
-    let effective = resolve_effective(agent, profile, cwd, &session_env, None);
+    let effective = resolve_effective(agent, profile, cwd, cwd, &session_env, None);
     let reconcile = load_native_mcp_servers_checked_from_home(
         agent,
         profile,

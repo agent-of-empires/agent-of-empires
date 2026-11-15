@@ -15,7 +15,7 @@ fn settings_shortcut_bar_hides_the_row_and_survives_restart() {
     h.send_keys("s");
     h.wait_for("Settings");
     h.send_keys("/");
-    h.type_text("Show shortcut bar");
+    h.type_text("Shortcut bar");
     h.send_keys("Enter");
     h.send_keys("Enter");
     h.send_keys("C-s");
@@ -47,7 +47,7 @@ fn settings_shortcut_bar_hides_the_row_and_survives_restart() {
     h.send_keys("s");
     h.wait_for("Settings");
     h.send_keys("/");
-    h.type_text("Show shortcut bar");
+    h.type_text("Shortcut bar");
     h.send_keys("Enter");
     h.send_keys("Enter");
     h.send_keys("C-s");
@@ -188,7 +188,7 @@ fn shortcut_bar_tip_after_cli_creation_waits_for_home_and_is_seen_once() {
     assert_eq!(read_state()["sessions_created"].as_integer(), Some(31));
     h.send_keys("Escape");
     h.wait_for_timeout("More room for your sessions", Duration::from_secs(15));
-    h.assert_screen_contains("Show shortcut bar");
+    h.assert_screen_contains("Shortcut bar");
     let state = read_state();
     assert!(state["tips_seen"]
         .as_array()
@@ -224,8 +224,8 @@ fn settings_changes_sidebar_position_and_persists_it() {
         h.send_keys("s");
         h.wait_for("Settings");
         h.send_keys("/");
-        h.type_text("Sidebar Position");
-        h.wait_for("Sidebar Position");
+        h.type_text("Sidebar position");
+        h.wait_for("Sidebar position");
         h.send_keys("Enter");
         h.send_keys("Enter");
         h.send_keys("C-s");

@@ -7,7 +7,7 @@ use serde::{Deserialize, Serialize};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
 /// Current wire generation.
-pub const CONTROL_PROTOCOL_VERSION: u32 = 6;
+pub const CONTROL_PROTOCOL_VERSION: u32 = 8;
 
 /// Maximum NDJSON frame accepted from the ACP agent.
 pub const MAX_AGENT_FRAME_BYTES: usize = 64 * 1024 * 1024;
@@ -153,6 +153,75 @@ pub struct NativeReplayFrame {
 }
 
 /// Native ingress evidence, captured before any control or SDK queue wait.
+/// Opt-in Native root lifecycle, independent from a host request or Written window.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum NativeAutonomousSource {
+    Irc,
+    BackgroundDelivery,
+    CustomMessage,
+    QueuedMessage,
+    ScheduledContinuation,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum NativeAutonomousPhase {
+    Started,
+    Ended,
+}
+
+impl NativeAutonomousPhase {
+    pub(crate) fn method(self) -> &'static str {
+        match self {
+            Self::Started => "_omp/autonomous_turn/start",
+            Self::Ended => "_omp/autonomous_turn/end",
+        }
+    }
+
+    pub(crate) fn from_method(method: &str) -> Option<Self> {
+        match method {
+            "_omp/autonomous_turn/start" => Some(Self::Started),
+            "_omp/autonomous_turn/end" => Some(Self::Ended),
+            _ => None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub(crate) struct NativeAutonomousNotification {
+    pub(crate) version: u8,
+    pub(crate) session_id: String,
+    pub(crate) run_id: uuid::Uuid,
+    pub(crate) source: NativeAutonomousSource,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) stop_reason: Option<String>,
+}
+
+impl NativeAutonomousNotification {
+    pub(crate) fn validate(&self, phase: NativeAutonomousPhase) -> Result<()> {
+        anyhow::ensure!(
+            self.version == 1
+                && !self.session_id.is_empty()
+                && !self.run_id.is_nil()
+                && (phase == NativeAutonomousPhase::Ended || self.stop_reason.is_none()),
+            "invalid negotiated Native autonomous lifecycle"
+        );
+        Ok(())
+    }
+}
+
+/// Allocated by the original physical actor, never by an attachment or SDK.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct NativeAutonomousStamp {
+    pub(crate) run_id: uuid::Uuid,
+    pub(crate) ordinal: u64,
+    pub(crate) source: NativeAutonomousSource,
+    pub(crate) phase: NativeAutonomousPhase,
+}
+
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct NativeNotifyEvidence {
@@ -165,6 +234,156 @@ pub struct NativeNotifyEvidence {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) resource_start_stamp: Option<crate::acp::establishment::NativeSessionStamp>,
     pub(crate) prompt_observation: Option<crate::acp::protocol::AcpPromptObservation>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) autonomous: Option<NativeAutonomousStamp>,
+}
+
+/// Private daemon-to-SDK relay marker; never accepted from the Native peer.
+pub(crate) const NATIVE_AUTONOMOUS_SNAPSHOT_METHOD: &str = "_aoe/native_autonomous_snapshot";
+
+#[derive(Debug, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct NativeAutonomousSnapshotEnvelope {
+    pub(crate) snapshot: std::sync::Arc<NativeAutonomousSnapshot>,
+    pub(crate) wire_bytes: usize,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct NativeAutonomousFrame {
+    pub(crate) notification: NativeAutonomousNotification,
+    pub(crate) evidence: NativeNotifyEvidence,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct NativeAutonomousSnapshot {
+    pub(crate) started: std::sync::Arc<NativeAutonomousFrame>,
+    pub(crate) ended: Option<std::sync::Arc<NativeAutonomousFrame>>,
+}
+
+impl NativeAutonomousFrame {
+    fn validate(&self, phase: NativeAutonomousPhase) -> Result<()> {
+        self.notification.validate(phase)?;
+        let stamp = self
+            .evidence
+            .autonomous
+            .ok_or_else(|| anyhow::anyhow!("Native lifecycle has no original actor stamp"))?;
+        anyhow::ensure!(
+            stamp.phase == phase
+                && stamp.ordinal > 0
+                && stamp.run_id == self.notification.run_id
+                && stamp.source == self.notification.source
+                && self
+                    .evidence
+                    .physical_source
+                    .is_some_and(|physical| physical
+                        .witness
+                        .owner
+                        .is_some_and(|owner| owner.birth_fingerprint.is_some()))
+                && (self.evidence.session_stamp.is_some()
+                    || self.evidence.original_request_stamp.is_some()),
+            "incomplete original Native lifecycle stamp"
+        );
+        Ok(())
+    }
+
+    fn same_run(&self, other: &Self) -> bool {
+        self.notification.session_id == other.notification.session_id
+            && self.notification.run_id == other.notification.run_id
+            && self.notification.source == other.notification.source
+            && self.evidence.physical_source == other.evidence.physical_source
+            && self
+                .evidence
+                .autonomous
+                .zip(other.evidence.autonomous)
+                .is_some_and(|(left, right)| left.ordinal == right.ordinal)
+    }
+}
+
+impl NativeAutonomousSnapshot {
+    pub(crate) fn validate(&self) -> Result<()> {
+        self.started.validate(NativeAutonomousPhase::Started)?;
+        if let Some(ended) = &self.ended {
+            ended.validate(NativeAutonomousPhase::Ended)?;
+            anyhow::ensure!(
+                self.started.same_run(ended),
+                "Native lifecycle terminal changed its original run"
+            );
+        }
+        Ok(())
+    }
+
+    pub(crate) fn next(
+        previous: Option<&Self>,
+        frame: std::sync::Arc<NativeAutonomousFrame>,
+    ) -> Result<Self> {
+        let phase = frame
+            .evidence
+            .autonomous
+            .ok_or_else(|| anyhow::anyhow!("Native lifecycle has no actor stamp"))?
+            .phase;
+        frame.validate(phase)?;
+        let next = match phase {
+            NativeAutonomousPhase::Started => {
+                if let Some(previous) = previous {
+                    if previous.started.same_run(&frame) {
+                        anyhow::ensure!(
+                            previous.ended.is_none(),
+                            "Native producer reused a retired run"
+                        );
+                        return Ok(previous.clone());
+                    }
+                    anyhow::ensure!(
+                        previous.ended.is_some()
+                            || previous.started.evidence.physical_source
+                                != frame.evidence.physical_source,
+                        "Native producer overlapped independent root runs"
+                    );
+                }
+                Self {
+                    started: frame,
+                    ended: None,
+                }
+            }
+            NativeAutonomousPhase::Ended => {
+                let previous = previous
+                    .ok_or_else(|| anyhow::anyhow!("Native terminal lost its original start"))?;
+                anyhow::ensure!(
+                    previous.started.same_run(&frame),
+                    "Native terminal differs from the retained start"
+                );
+                Self {
+                    started: std::sync::Arc::clone(&previous.started),
+                    ended: Some(frame),
+                }
+            }
+        };
+        next.validate()?;
+        Ok(next)
+    }
+
+    pub(crate) fn encoded_bytes(&self) -> Result<usize> {
+        struct Count(usize);
+        impl std::io::Write for Count {
+            fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+                self.0 = self
+                    .0
+                    .checked_add(bytes.len())
+                    .ok_or(std::io::ErrorKind::WriteZero)?;
+                Ok(bytes.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        let mut count = Count(0);
+        serde_json::to_writer(&mut count, self)?;
+        count
+            .0
+            .checked_add("\"native_autonomous\":,".len())
+            .ok_or_else(|| anyhow::anyhow!("Native snapshot byte count overflow"))
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -269,6 +488,8 @@ pub enum ControlBody {
         control_protocol_version: u32,
         session_id: String,
         prompt_head: Option<NativePromptHead>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        native_autonomous: Option<std::sync::Arc<NativeAutonomousSnapshot>>,
     },
     /// Runner's answer to [`ControlBody::Initialize`]: the raw ACP
     /// `initialize` result (an `InitializeResponse` serialized to JSON).
@@ -378,6 +599,13 @@ pub enum ControlBody {
     },
     /// Cancel the in-flight turn (maps to a `session/cancel` notification).
     Cancel {
+        scope: crate::acp::establishment::NativeRequestScope,
+    },
+    /// Cancel one subagent session's work (`session/cancel` addressed to the
+    /// child id). The turn of the root session keeps running.
+    CancelSession {
+        parent_session_id: String,
+        session_id: String,
         scope: crate::acp::establishment::NativeRequestScope,
     },
     /// A non-establishing client-to-agent request. `session/new`, load and fork
@@ -616,6 +844,7 @@ mod tests {
             control_protocol_version: CONTROL_PROTOCOL_VERSION,
             session_id: "s".into(),
             prompt_head: None,
+            native_autonomous: None,
         };
         let b = ControlBody::PromptCompleted {
             prompt_req_id: 1,

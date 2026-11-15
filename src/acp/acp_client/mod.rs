@@ -4,6 +4,7 @@
 //! connection task (see `connection`) that owns the session; this module holds
 //! the public surface, and each concern lives in a submodule.
 
+mod aoe_ingress;
 mod batch;
 mod between_prompt;
 mod close;
@@ -46,6 +47,7 @@ pub(crate) use update_events::native_compaction_cue;
 mod watchdog;
 
 pub use close::CloseSessionOutcome;
+pub(crate) use commands::{InitialPromptCancellation, PreparedInitialPrompt};
 pub(crate) use connection::CANCEL_ESCALATION_GRACE;
 pub use delete::DeleteSessionOutcome;
 pub(crate) use errors::public_diagnostic;
@@ -217,6 +219,7 @@ struct Launch {
     install_binary: String,
     source_profile: Option<String>,
     default_effort: Option<String>,
+    default_model_config: std::collections::BTreeMap<String, String>,
     default_mode: Option<String>,
     default_model: Option<String>,
     mcp_servers: Vec<McpServer>,
@@ -281,6 +284,8 @@ impl Launch {
                 .unwrap() = test_options.fresh_response_application.take();
             *connection_state.test_establishment_usable.lock().unwrap() =
                 test_options.establishment_usable.take();
+            *connection_state.test_prompt_admission.lock().unwrap() =
+                test_options.prompt_admission.take();
             *connection_state.test_fresh_write_pending.lock().unwrap() =
                 test_options.fresh_write_pending.take();
             *connection_state.test_prompt_completed.lock().unwrap() =
@@ -309,6 +314,7 @@ impl Launch {
             expected_agent: ExpectedAgent::from_command(&self.install_binary),
             source_profile: self.source_profile,
             default_effort: self.default_effort,
+            default_model_config: self.default_model_config,
             default_mode: self.default_mode,
             default_model: self.default_model,
             mcp_servers: self.mcp_servers,
@@ -727,7 +733,10 @@ impl AcpClient {
         let (client, event_tx) = Self::fake_with_consumer(session_id, move |cmd| {
             let name = match cmd {
                 ClientCmd::Prompt(_) => "prompt",
+                ClientCmd::InitialPromptIntent(_) => "initial_prompt_intent",
                 ClientCmd::Cancel => "cancel",
+                ClientCmd::CancelInitialPrompt { .. } => "cancel_initial_prompt",
+                ClientCmd::CancelChild { .. } => "cancel_child",
                 ClientCmd::ForceStop => "force_stop",
                 ClientCmd::SetMode(_) => "set_mode",
                 ClientCmd::SetConfigOption { .. } => "set_config_option",
@@ -834,10 +843,11 @@ impl AcpClient {
         let sandbox = match &config.sandbox_info {
             // Resolving the workdir touches git2 and may shell out to docker.
             Some(info) => {
-                let (info, cwd) = (info.clone(), config.cwd.clone());
+                let (info, cwd, config_path) =
+                    (info.clone(), config.cwd.clone(), config.config_path.clone());
                 let profile = config.source_profile.clone();
                 let resolved = tokio::task::spawn_blocking(move || {
-                    SessionSandbox::from_info(&info, cwd.as_path(), profile)
+                    SessionSandbox::from_info(&info, cwd.as_path(), &config_path, profile)
                 })
                 .await
                 .map_err(|e| AcpError::Spawn(format!("sandbox resolve task panicked: {e}")))??;
@@ -869,6 +879,7 @@ impl AcpClient {
             install_binary: config.spec.command.clone(),
             source_profile: config.source_profile.clone(),
             default_effort: config.default_effort.clone(),
+            default_model_config: config.default_model_config.clone(),
             default_mode: config.default_mode.clone(),
             default_model: config.default_model.clone(),
             mcp_servers: config.mcp_servers.clone(),
@@ -1079,6 +1090,7 @@ impl AcpClient {
             // Resume sends no session/new or load, so defaults and MCP servers
             // were applied on first connect.
             default_effort: None,
+            default_model_config: Default::default(),
             default_mode: None,
             default_model: None,
             mcp_servers: Vec::new(),
@@ -1147,10 +1159,6 @@ impl AcpClient {
 
     pub(crate) async fn wait_until_usable(&self) -> Result<(), AcpError> {
         self.connection_state.wait_until_usable().await
-    }
-
-    pub(crate) fn initial_prompt_intent_available(&self) -> bool {
-        self.connection_state.initial_prompt_intent_available()
     }
 
     pub(crate) fn connected_runner(&self) -> Option<crate::acp::runner_lifecycle::RunnerIdentity> {
@@ -1298,6 +1306,10 @@ impl AcpClient {
         Ok(correlation)
     }
 
+    pub(crate) fn initial_prompt_intent_available(&self) -> bool {
+        self.connection_state.initial_prompt_intent_available()
+    }
+
     async fn send_queued(&self, queued: QueuedClientCmd) -> Result<(), AcpError> {
         self.ensure_established()?;
         let cmd_tx = self.cmd_tx.as_ref().ok_or(AcpError::NotRunning)?;
@@ -1317,18 +1329,8 @@ impl AcpClient {
         Ok(())
     }
 
-    /// Attachments follow the text block. Callers gate kinds on the agent's
-    /// prompt capabilities (#1000).
-    pub async fn send_prompt(
-        &self,
-        text: &str,
-        attachments: &[AttachmentBlob],
-    ) -> Result<(), AcpError> {
-        self.ensure_established()?;
+    fn prompt_blocks(text: &str, attachments: &[AttachmentBlob]) -> Vec<ContentBlock> {
         use base64::Engine as _;
-        if self.cmd_tx.is_none() {
-            return Err(AcpError::NotRunning);
-        }
         let mut blocks = Vec::with_capacity(1 + attachments.len());
         blocks.push(ContentBlock::Text(TextContent::new(text)));
         for att in attachments {
@@ -1338,7 +1340,6 @@ impl AcpClient {
                 PromptAttachmentKind::Image => ContentBlock::Image(ImageContent::new(data, mime)),
                 PromptAttachmentKind::Audio => ContentBlock::Audio(AudioContent::new(data, mime)),
                 PromptAttachmentKind::Resource => {
-                    // The bytes never leave the daemon; the uri only names them.
                     let uri = format!("attachment:///{}", att.id);
                     let blob = BlobResourceContents::new(data, uri).mime_type(mime);
                     ContentBlock::Resource(EmbeddedResource::new(
@@ -1347,6 +1348,167 @@ impl AcpClient {
                 }
             });
         }
+        blocks
+    }
+
+    pub(crate) async fn prepare_initial_prompt(
+        self: &Arc<Self>,
+        expected: Arc<crate::acp::establishment::EstablishmentAttempt>,
+        cancellation: tokio_util::sync::CancellationToken,
+        text: &str,
+        attachments: &[AttachmentBlob],
+    ) -> Result<commands::PreparedInitialPrompt, AcpError> {
+        use crate::acp::establishment::{CreationStage, EstablishmentOrigin, EstablishmentRefusal};
+        self.ensure_available()?;
+        if !(self.initial_prompt_intent_available() || self.connection_ready())
+            || expected.session_id != self.session_id.0
+            || !matches!(
+                expected.origin,
+                EstablishmentOrigin::Creation {
+                    stage: CreationStage::Admitted
+                }
+            )
+        {
+            return Err(EstablishmentRefusal::Unresolved.into());
+        }
+        let owner = self
+            .connected_runner
+            .ok_or(EstablishmentRefusal::Unconfirmed)?;
+        let sender = self.cmd_tx.as_ref().ok_or(AcpError::NotRunning)?.clone();
+        let permit = tokio::select! {
+            biased;
+            _ = cancellation.cancelled() => return Err(AcpError::NotRunning),
+            _ = self.connection_state.wait_callback_end() => return Err(AcpError::NotRunning),
+            reserved = sender.reserve_owned() => reserved.map_err(|_| AcpError::NotRunning)?,
+        };
+        self.ensure_available()?;
+        let id = uuid::Uuid::new_v4();
+        {
+            let mut slot = self.connection_state.initial_prompt.lock().unwrap();
+            if slot.is_some() || cancellation.is_cancelled() {
+                return Err(EstablishmentRefusal::Unresolved.into());
+            }
+            *slot = Some(commands::InitialPromptState {
+                id,
+                cancellation: cancellation.clone(),
+                seq: None,
+                correlation: None,
+                issued: false,
+            });
+        }
+        let queued = QueuedClientCmd {
+            command: ClientCmd::InitialPromptIntent(commands::InitialPromptIntent {
+                id,
+                client: Arc::downgrade(self),
+                expected,
+                owner,
+                cancellation,
+                blocks: Self::prompt_blocks(text, attachments),
+            }),
+            scope: None,
+            correlation: None,
+        };
+        Ok(commands::PreparedInitialPrompt {
+            client: Arc::clone(self),
+            id,
+            permit: Some(permit),
+            queued: Some(queued),
+        })
+    }
+
+    pub(crate) fn initial_prompt_identity(&self) -> Option<uuid::Uuid> {
+        if self.ensure_available().is_err() {
+            return None;
+        }
+        self.connection_state
+            .initial_prompt
+            .lock()
+            .unwrap()
+            .as_ref()
+            .filter(|pending| !pending.cancellation.is_cancelled())
+            .map(|pending| pending.id)
+    }
+
+    pub(crate) fn take_cancelled_initial_prompt(&self, id: uuid::Uuid, seq: u64) -> bool {
+        let mut slot = self.connection_state.initial_prompt.lock().unwrap();
+        if slot.as_ref().is_some_and(|pending| {
+            pending.id == id
+                && pending.seq == Some(seq)
+                && pending.correlation.is_none()
+                && !pending.issued
+                && pending.cancellation.is_cancelled()
+        }) {
+            slot.take();
+            true
+        } else {
+            false
+        }
+    }
+
+    fn clear_initial_prompt(&self, id: uuid::Uuid) {
+        let mut slot = self.connection_state.initial_prompt.lock().unwrap();
+        if slot.as_ref().is_some_and(|pending| pending.id == id) {
+            slot.take();
+        }
+    }
+
+    fn cancel_pending_initial_prompt(&self) {
+        if let Some(pending) = self
+            .connection_state
+            .initial_prompt
+            .lock()
+            .unwrap()
+            .as_ref()
+        {
+            pending.cancellation.cancel();
+        }
+    }
+
+    pub(crate) async fn cancel_initial_prompt(
+        &self,
+        id: uuid::Uuid,
+    ) -> Result<commands::InitialPromptCancellation, AcpError> {
+        use commands::InitialPromptCancellation;
+        self.ensure_available()?;
+        let expected = {
+            let mut slot = self.connection_state.initial_prompt.lock().unwrap();
+            let Some(pending) = slot.as_mut().filter(|pending| pending.id == id) else {
+                return Ok(InitialPromptCancellation::Missing);
+            };
+            if pending.cancellation.is_cancelled() {
+                return Ok(InitialPromptCancellation::Missing);
+            }
+            if !pending.issued {
+                pending.cancellation.cancel();
+                if pending.correlation.is_some() {
+                    return Ok(InitialPromptCancellation::ConsumerWillSettle);
+                }
+                return Ok(match pending.seq {
+                    Some(seq) => InitialPromptCancellation::Pending { seq },
+                    None => InitialPromptCancellation::BeforePublication,
+                });
+            }
+            pending
+                .correlation
+                .ok_or(crate::acp::establishment::EstablishmentRefusal::Unconfirmed)?
+        };
+        self.send_cmd(ClientCmd::CancelInitialPrompt { id, expected }, None)
+            .await?;
+        Ok(InitialPromptCancellation::Issued)
+    }
+
+    /// Attachments follow the text block. Callers gate kinds on the agent's
+    /// prompt capabilities (#1000).
+    pub async fn send_prompt(
+        &self,
+        text: &str,
+        attachments: &[AttachmentBlob],
+    ) -> Result<(), AcpError> {
+        self.ensure_established()?;
+        if self.cmd_tx.is_none() {
+            return Err(AcpError::NotRunning);
+        }
+        let blocks = Self::prompt_blocks(text, attachments);
         self.send_cmd(ClientCmd::Prompt(blocks), None)
             .await
             .map(|_| ())
@@ -1355,6 +1517,21 @@ impl AcpClient {
     /// Best-effort `session/cancel`; Ok even with no turn in flight.
     pub async fn cancel_prompt(&self) -> Result<(), AcpError> {
         self.send_cmd(ClientCmd::Cancel, None).await.map(|_| ())
+    }
+
+    /// Cancel one subagent's work without ending the root turn. False when the
+    /// child is unknown or cannot be cancelled.
+    pub async fn cancel_child(&self, session_id: &str) -> Result<bool, AcpError> {
+        let (respond_to, sent) = oneshot::channel();
+        self.send_cmd(
+            ClientCmd::CancelChild {
+                session_id: session_id.to_string(),
+                respond_to,
+            },
+            None,
+        )
+        .await?;
+        sent.await.map_err(|_| AcpError::AgentExited)
     }
 
     /// Skip the cancel-escalation grace: an in-flight turn ends as
@@ -1401,12 +1578,14 @@ impl AcpClient {
         &self,
         config_id: &str,
         value: &str,
+        remember: bool,
         request_nonce: Option<uuid::Uuid>,
     ) -> Result<crate::acp::establishment::NativeOperationCorrelation, AcpError> {
         self.send_cmd(
             ClientCmd::SetConfigOption {
                 config_id: config_id.to_string(),
                 value: value.to_string(),
+                remember,
             },
             request_nonce,
         )
@@ -1577,6 +1756,7 @@ impl AcpClient {
 
     pub async fn shutdown(&self) -> Result<(), AcpError> {
         let _shutdown = self.shutdown_gate.lock().await;
+        self.cancel_pending_initial_prompt();
         let native = self
             ._prime_runtime
             .as_ref()

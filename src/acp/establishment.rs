@@ -208,6 +208,59 @@ impl EstablishmentExpected {
             && self.choice.matches(row)
             && self.authority == row.acp_establishment)
     }
+
+    pub(crate) fn revision(&self) -> anyhow::Result<EstablishmentRevision> {
+        use sha2::Digest as _;
+        struct Writer<'a>(&'a mut sha2::Sha256);
+        impl std::io::Write for Writer<'_> {
+            fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+                self.0.update(bytes);
+                Ok(bytes.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        // This complete comparison graph contains ordered structs/vectors, not maps.
+        // Its derived serialization includes all checkpoint-route markers (including
+        // None versus Some(false)). PrimeRuntime's skipped observation is also
+        // excluded from its equality; its compared proof_path remains serialized.
+        // An unrepresentable path fails closed instead of producing a partial digest.
+        let mut digest = sha2::Sha256::new();
+        digest.update(b"agent-of-empires/establishment-recovery-revision/v1\0");
+        serde_json::to_writer(Writer(&mut digest), self)?;
+        Ok(EstablishmentRevision(digest.finalize().into()))
+    }
+}
+
+/// Public comparison data, never Native/callback/resource authority.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct EstablishmentRevision([u8; 32]);
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct EstablishmentRecoveryRequest {
+    pub(crate) revision: EstablishmentRevision,
+    pub(crate) action: EstablishmentRecoveryAction,
+}
+
+impl EstablishmentRecoveryRequest {
+    pub(crate) fn resolve(
+        self,
+        row: &Instance,
+        storage: &Storage,
+    ) -> anyhow::Result<EstablishmentRecovery> {
+        let expected = EstablishmentExpected::capture(row, storage)?;
+        anyhow::ensure!(
+            self.revision == expected.revision()?,
+            EstablishmentRefusal::Superseded
+        );
+        Ok(EstablishmentRecovery {
+            expected,
+            action: self.action,
+        })
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -722,6 +775,7 @@ pub(crate) struct NativeConstructorObservation {
     original: std::sync::Arc<NativeCallbackOriginal>,
     fence: std::sync::Arc<crate::session::NativeInputFence>,
     origin: crate::acp::state::NativeEventOrigin,
+    autonomous: Option<NativeAutonomousConstructor>,
 }
 
 impl NativeConstructorObservation {
@@ -743,6 +797,30 @@ impl NativeConstructorObservation {
             original,
             fence,
             origin,
+            autonomous: None,
+        }))
+    }
+
+    pub(crate) fn for_autonomous(
+        &self,
+        stamp: NativeSessionStamp,
+        root_session_id: agent_client_protocol::v1::schema::SessionId,
+        projection: std::sync::Weak<crate::acp::event_sender::ProjectionState>,
+    ) -> anyhow::Result<std::sync::Arc<Self>> {
+        anyhow::ensure!(
+            stamp.context == self.original.attempt.context
+                && stamp.generation == self.original.attempt.generation,
+            EstablishmentRefusal::Superseded
+        );
+        Ok(std::sync::Arc::new(Self {
+            original: std::sync::Arc::clone(&self.original),
+            fence: std::sync::Arc::clone(&self.fence),
+            origin: self.origin,
+            autonomous: Some(NativeAutonomousConstructor {
+                stamp,
+                root_session_id,
+                projection,
+            }),
         }))
     }
 
@@ -791,6 +869,26 @@ impl NativeConstructorObservation {
                             && self.original.matches_original(row, storage)?,
                         EstablishmentRefusal::Superseded
                     );
+                    if let Some(autonomous) = &self.autonomous {
+                        let projection = autonomous
+                            .projection
+                            .upgrade()
+                            .ok_or(EstablishmentRefusal::Unconfirmed)?;
+                        let receipt = projection
+                            .autonomous_receipt(self.origin, autonomous.root_session_id.0.as_ref())
+                            .ok_or(EstablishmentRefusal::Unconfirmed)?;
+                        let postimage = self
+                            .original
+                            .postimage
+                            .get()
+                            .ok_or(EstablishmentRefusal::Unconfirmed)?;
+                        anyhow::ensure!(
+                            NativeSessionPermission::capture_stamp(
+                                &receipt, postimage, row, storage,
+                            )? == autonomous.stamp,
+                            EstablishmentRefusal::Superseded
+                        );
+                    }
                     Ok(())
                 },
                 nonblocking,
@@ -804,12 +902,20 @@ impl NativeConstructorObservation {
     }
 }
 
+#[derive(Debug)]
+struct NativeAutonomousConstructor {
+    stamp: NativeSessionStamp,
+    root_session_id: agent_client_protocol::v1::schema::SessionId,
+    projection: std::sync::Weak<crate::acp::event_sender::ProjectionState>,
+}
+
 #[derive(Debug, Clone)]
 struct NativeCallbackContext {
     original: std::sync::Arc<NativeCallbackOriginal>,
     stamp: Option<NativeSessionStamp>,
     original_stamp: Option<OriginalRequestStamp>,
-    session_id: Option<std::sync::Arc<str>>,
+    parent_session_id: Option<std::sync::Arc<str>>,
+    target_session_id: Option<std::sync::Arc<str>>,
     fence: std::sync::Arc<crate::session::NativeInputFence>,
 }
 
@@ -853,26 +959,37 @@ impl NativeCallbackContext {
                         ),
                     EstablishmentRefusal::Superseded
                 );
-                // A New callback does not select an id. Load must match its
-                // already-known id; global forms remain bound to this peer.
-                if let (EstablishmentTarget::Load { session_id, .. }, Some(reported)) =
-                    (&self.original.attempt.target, self.session_id.as_deref())
-                {
+                // A New callback does not select an id. A Load decision remains
+                // bound to its observed parent, including a registered child target.
+                if let (EstablishmentTarget::Load { session_id, .. }, Some(reported)) = (
+                    &self.original.attempt.target,
+                    self.parent_session_id.as_deref(),
+                ) {
                     anyhow::ensure!(session_id == reported, EstablishmentRefusal::Superseded);
                 }
             }
             if new_io {
                 anyhow::ensure!(
-                    self.session_id
+                    self.target_session_id
                         .as_deref()
                         .is_some_and(|sid| !sid.is_empty()),
                     EstablishmentRefusal::Unconfirmed
+                );
+                anyhow::ensure!(
+                    self.parent_session_id
+                        .as_ref()
+                        .is_none_or(|parent| self.target_session_id.as_ref() == Some(parent)),
+                    EstablishmentRefusal::Superseded
                 );
             }
             if let (true, Some(postimage), Some(session_id)) = (
                 current || new_io,
                 self.original.postimage.get(),
-                self.session_id.as_deref(),
+                if new_io {
+                    self.target_session_id.as_deref()
+                } else {
+                    self.parent_session_id.as_deref()
+                },
             ) {
                 anyhow::ensure!(
                     postimage.choice.acp_session_id.as_deref() == Some(session_id),
@@ -1013,7 +1130,8 @@ impl NativeRequestContext {
         original: std::sync::Arc<NativeCallbackOriginal>,
         stamp: Option<NativeSessionStamp>,
         original_stamp: Option<OriginalRequestStamp>,
-        session_id: Option<std::sync::Arc<str>>,
+        parent_session_id: Option<std::sync::Arc<str>>,
+        target_session_id: Option<std::sync::Arc<str>>,
     ) -> anyhow::Result<Self> {
         let fence = crate::session::NativeInputFence::capture_route(
             &original.attempt.profile,
@@ -1041,7 +1159,8 @@ impl NativeRequestContext {
                 original,
                 stamp,
                 original_stamp,
-                session_id,
+                parent_session_id,
+                target_session_id,
                 fence,
             }),
         })
@@ -1133,7 +1252,8 @@ impl NativeRequestContext {
                             .store
                             .as_ref()
                             .and_then(|binding| binding.exported_default_store.as_ref())
-                    && left.session_id == right.session_id
+                    && left.parent_session_id == right.parent_session_id
+                    && left.target_session_id == right.target_session_id
             }
             _ => false,
         }
@@ -2861,7 +2981,8 @@ mod tests {
     #[serial_test::serial]
     fn deferred_creation_admits_its_first_original_once_without_replacing_consent() {
         use super::{
-            AcpEstablishment, CreationStage, EstablishmentBlockReason, EstablishmentOrigin,
+            insert_created_instance, AcpEstablishment, CreationStage, EstablishmentBlockReason,
+            EstablishmentOrigin,
         };
         use crate::session::{Instance, ResumeIntent, Status, Storage, View};
 
@@ -2869,9 +2990,20 @@ mod tests {
         let storage = Storage::new_unwatched("default").unwrap();
         let mut row = Instance::new("deferred-creation", home.path().to_str().unwrap());
         row.view = View::Structured;
+        let mut rows = Vec::new();
         row.status = Status::Idle;
-        let prepared = row.arm_establishment(&storage, true, None).unwrap();
-        row.finish_acp_creation(&storage, &prepared).unwrap();
+        insert_created_instance(&mut rows, &mut row, &storage).unwrap();
+        let Some(AcpEstablishment::Pending { attempt }) = row.acp_establishment.as_mut() else {
+            unreachable!("absent-row creation owns its initial permission");
+        };
+        attempt.origin = EstablishmentOrigin::Creation {
+            stage: CreationStage::Ready,
+        };
+        let mut unfinished = row.clone();
+        unfinished.status = Status::Creating;
+        let before = unfinished.acp_establishment.clone();
+        assert!(unfinished.arm_acp_establishment(&storage, None).is_err());
+        assert_eq!(unfinished.acp_establishment, before);
         let original = row
             .acp_establishment
             .as_ref()

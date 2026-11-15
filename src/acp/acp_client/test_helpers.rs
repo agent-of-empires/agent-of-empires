@@ -54,6 +54,7 @@ pub(crate) struct SdkTestOptions {
     pub(crate) initialize_response_application: Option<SdkTestGate>,
     pub(crate) fresh_response_application: Option<SdkTestGate>,
     pub(crate) establishment_usable: Option<SdkTestGate>,
+    pub(crate) prompt_admission: Option<SdkTestGate>,
     pub(crate) prompt_completed: Option<SdkTestGate>,
     pub(crate) control_output:
         Option<tokio::sync::mpsc::UnboundedSender<crate::acp::control_protocol::ControlBody>>,
@@ -240,12 +241,14 @@ pub(super) fn env_test_spawn_config(cwd: std::path::PathBuf) -> SpawnConfig {
             description: "test".into(),
             env_allowlist: None,
         },
+        config_path: cwd.clone(),
         cwd,
         additional_dirs: vec![],
         provider_env: vec![],
         host_environment: vec![],
         default_effort: None,
         default_effort_explicit: false,
+        default_model_config: Default::default(),
         default_mode: None,
         default_model: None,
         socket_path: None,
@@ -290,11 +293,13 @@ pub(super) fn reset_fake_spawn_config(
             env_allowlist: None,
         },
         cwd: cwd.to_path_buf(),
+        config_path: cwd.to_path_buf(),
         additional_dirs: vec![],
         provider_env: vec![],
         host_environment: vec![],
         default_effort: None,
         default_effort_explicit: false,
+        default_model_config: Default::default(),
         default_mode: None,
         default_model: None,
         socket_path: None,
@@ -584,7 +589,7 @@ async fn original_human_decisions_cross_pending_and_applied_without_current_auth
                             assert!(matches!(status, axum::http::StatusCode::NOT_FOUND | axum::http::StatusCode::CONFLICT),
                                 "Stop must revoke the still-unanswered Original nonce: {status}: {}",
                                 String::from_utf8_lossy(&body));
-                            let frontier = scope.state.acp_event_store.highest_seq(&client.id);
+                            let frontier = scope.state.acp_event_store.highest_seq(&client.id).unwrap();
                             assert!(cache.original_decisions(&client.id, frontier).await.unwrap().nonces.is_empty());
                             assert!(!peer.requests().iter().any(|method| method == "session/prompt"));
                             assert_eq!(peer.requests().iter().filter(|method| method.as_str() == expected_method).count(), 1);

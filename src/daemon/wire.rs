@@ -66,6 +66,9 @@ pub struct CliCreationOptions {
     pub generated_name: bool,
     #[serde(default)]
     pub no_submodules: bool,
+    /// `None` follows `worktree.workspace_by_default` on the Daemon host.
+    #[serde(default)]
+    pub workspace: Option<bool>,
     pub worktree_path_id: Option<String>,
 }
 
@@ -103,6 +106,9 @@ pub struct CreateSessionBody {
     pub hook_env: Vec<String>,
     #[serde(default)]
     pub extra_repo_paths: Vec<String>,
+    /// Create the worktree inside a workspace directory even with no extra repos.
+    #[serde(default)]
+    pub workspace: bool,
     /// Repository names or paths override the shared base_branch.
     #[serde(default)]
     pub repo_bases: Vec<RepoBaseInput>,

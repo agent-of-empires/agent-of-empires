@@ -35,6 +35,7 @@ use crate::acp::client::{
 };
 use crate::acp::elicitations::ElicitationResolution;
 use crate::acp::protocol::ApprovalDecisionWire;
+use crate::acp::state::ConfigOptionSwitchFailure;
 use crate::daemon::{DaemonEndpoint, QueuedPromptEntry, WsError};
 use crate::plugin::ui_state::{Tone, UiSnapshot};
 use crate::session::config::{resolve_theme_name, resolve_theme_palette_mode};
@@ -470,9 +471,12 @@ async fn apply_ws_message(
             recovery_present,
         }) => {
             let was_active = state.transcript.turn_active;
+            let prior_host_intent = state.transcript.host_prompt_intent;
+            let prior_failure = state.transcript.config_option_switch_failed.clone();
             state
                 .transcript
                 .apply_reduced_state(seq, *reduced, &unchanged, recovery_present);
+            toast_new_switch_failure(state, toast_deadline, prior_failure);
             state.reconcile_selection();
             state.prune_dismissed_notices();
             auto_present_elicitation(state, toast_deadline);
@@ -481,9 +485,11 @@ async fn apply_ws_message(
             if !was_active && now_active {
                 // Turn started; the optimistic lock has served its purpose.
                 state.in_flight = false;
-            } else if was_active && !now_active {
-                // Turn ended: release the lock and pull the post-drain queue
-                // snapshot, since the daemon drains server-side at this edge.
+            } else if (was_active && !now_active)
+                || (prior_host_intent.is_some() && state.transcript.host_prompt_intent.is_none())
+            {
+                // A Native turn ended or a host-only intent settled without opening one.
+                // Release the submit lock and pull the authoritative queue snapshot.
                 state.in_flight = false;
                 refresh_queue(state).await;
             }
@@ -631,14 +637,13 @@ async fn handle_terminal_event(
                     Some(ChoicePurpose::OpenLink)
                 ),
                 has_modes: !state.transcript.available_modes.is_empty(),
+                has_toggles: state.transcript.toggles().next().is_some(),
                 has_notices: state.visible_notices().next().is_some(),
-                // Esc-to-cancel and other action gates read this: it must
-                // track only the main turn, not a display-only background
-                // sub-agent signal (see `AcpTranscript.background_agent_active`),
-                // or Esc stops being inert while the main turn is genuinely
-                // idle (#4001).
-                agent_busy: state.native_input_available()
-                    && (state.transcript.turn_active || state.in_flight),
+                // Native work and an exact pending host identity have distinct authority.
+                // Neither background display nor a pending host message grants Native input.
+                agent_busy: state.host_prompt_intent().is_some()
+                    || (state.native_input_available()
+                        && (state.transcript.turn_active || state.in_flight)),
             };
             let intent = input::dispatch(state.focus, &key, ctx);
             // Plugin keybinds are a fallback: consulted only for a key the view
@@ -714,7 +719,9 @@ async fn apply_intent(
             .pending_elicitations
             .first()
             .is_some_and(|pending| state.can_decide(&pending.nonce)),
-        Intent::CancelInFlight => state.native_input_available(),
+        Intent::CancelInFlight => {
+            state.host_prompt_intent().is_some() || state.native_input_available()
+        }
         Intent::ChoicePick(_) | Intent::ChoiceAccept => state.can_accept_choice(),
         _ => true,
     };
@@ -976,7 +983,11 @@ async fn apply_intent(
             Ok(false)
         }
         Intent::CancelInFlight => {
-            match state.http.cancel(&state.session_id).await {
+            match state
+                .http
+                .cancel(&state.session_id, state.host_prompt_intent())
+                .await
+            {
                 Ok(()) => set_toast(state, toast_deadline, "cancel sent".into(), ToastKind::Info),
                 Err(e) => set_toast(
                     state,
@@ -987,8 +998,48 @@ async fn apply_intent(
             }
             Ok(false)
         }
+        Intent::StopSubagent => {
+            let Some(target) = state.transcript.stoppable_subagent() else {
+                set_toast(
+                    state,
+                    toast_deadline,
+                    "no stoppable subagent".into(),
+                    ToastKind::Info,
+                );
+                return Ok(false);
+            };
+            let child_id = target.session_id.clone();
+            let label = target
+                .title
+                .clone()
+                .filter(|title| !title.is_empty())
+                .unwrap_or_else(|| child_id.chars().take(8).collect());
+            match state
+                .http
+                .cancel_subagent(&state.session_id, &child_id)
+                .await
+            {
+                Ok(()) => set_toast(
+                    state,
+                    toast_deadline,
+                    format!("stop sent to subagent: {label}"),
+                    ToastKind::Info,
+                ),
+                Err(e) => set_toast(
+                    state,
+                    toast_deadline,
+                    format!("stop subagent failed: {e}"),
+                    ToastKind::Error,
+                ),
+            }
+            Ok(false)
+        }
         Intent::OpenModePicker => {
             open_mode_picker(state);
+            Ok(false)
+        }
+        Intent::OpenToggles => {
+            open_toggle_picker(state);
             Ok(false)
         }
         Intent::AnswerElicitation => {
@@ -1142,6 +1193,35 @@ fn open_mode_picker(state: &mut StructuredViewState) {
         options,
         selected,
         purpose: ChoicePurpose::Mode,
+    });
+}
+
+/// One row per Fast mode / Ultracode toggle; accepting flips it. A row's value
+/// is `<config_id>=<new value>`.
+fn open_toggle_picker(state: &mut StructuredViewState) {
+    let options: Vec<(String, String)> = state
+        .transcript
+        .toggles()
+        .map(|t| {
+            let (now, next) = if t.current_value == "on" {
+                ("on", "off")
+            } else {
+                ("off", "on")
+            };
+            (
+                format!("{}={next}", t.id),
+                format!("{}: {now} (Enter turns {next})", t.name),
+            )
+        })
+        .collect();
+    if options.is_empty() {
+        return;
+    }
+    state.choice = Some(ChoicePicker {
+        title: " Toggles (Enter=flip · Esc=close) ".to_string(),
+        options,
+        selected: 0,
+        purpose: ChoicePurpose::Toggle,
     });
 }
 
@@ -1329,6 +1409,24 @@ async fn accept_choice(state: &mut StructuredViewState, toast_deadline: &mut Opt
                 );
             }
         },
+        ChoicePurpose::Toggle => {
+            let Some((config_id, next)) = value.split_once('=') else {
+                return;
+            };
+            // Pessimistic: the status line follows the adapter's reported value.
+            if let Err(e) = state
+                .http
+                .set_config_option(&state.session_id, config_id, next)
+                .await
+            {
+                set_toast(
+                    state,
+                    toast_deadline,
+                    format!("toggle failed: {e}"),
+                    ToastKind::Error,
+                );
+            }
+        }
         // `value` is the option_id the agent offered; the server checks
         // it still belongs to the pending request.
         ChoicePurpose::Approval { nonce } => {
@@ -1700,6 +1798,34 @@ fn apply_pane_scroll(state: &mut StructuredViewState, delta: i32) {
     }
 }
 
+/// Surface an adapter rejection of a pick once; the 202 the daemon answers
+/// with hides it from the request that caused it.
+fn toast_new_switch_failure(
+    state: &mut StructuredViewState,
+    deadline: &mut Option<Instant>,
+    prior: Option<ConfigOptionSwitchFailure>,
+) {
+    let Some(failure) = state
+        .transcript
+        .config_option_switch_failed
+        .clone()
+        .filter(|f| prior.as_ref() != Some(f))
+    else {
+        return;
+    };
+    let option = state
+        .transcript
+        .config_options
+        .iter()
+        .find(|o| o.id == failure.config_id);
+    let name = option.map_or(failure.config_id.as_str(), |o| o.name.as_str());
+    let value = option
+        .and_then(|o| o.options.iter().find(|c| c.value == failure.value))
+        .map_or(failure.value.as_str(), |c| c.name.as_str());
+    let text = format!("{name} could not switch to {value}: {}", failure.reason);
+    set_toast(state, deadline, text, ToastKind::Error);
+}
+
 fn set_toast(
     state: &mut StructuredViewState,
     deadline: &mut Option<Instant>,
@@ -1937,12 +2063,14 @@ async fn wait_for_dismiss(event_stream: &mut EventStream) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::acp::state::{ConfigOptionCategory, ConfigOptionChoice, ConfigOptionDescriptor};
     use crate::daemon::Source;
 
     struct NativeInputFixture {
         view: StructuredViewState,
         wire: tokio::sync::broadcast::Sender<String>,
         requests: std::sync::Arc<std::sync::Mutex<Vec<(String, serde_json::Value)>>>,
+        prompt_disposition: std::sync::Arc<std::sync::Mutex<&'static str>>,
         server: tokio::task::JoinHandle<()>,
     }
 
@@ -1966,6 +2094,8 @@ mod tests {
             let messages = wire.clone();
             let requests = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
             let received = requests.clone();
+            let prompt_disposition = std::sync::Arc::new(std::sync::Mutex::new("queued"));
+            let dispatch = prompt_disposition.clone();
             let app = axum::Router::new()
                 .route("/sessions/{id}/acp/ws", axum::routing::get(move |upgrade: WebSocketUpgrade| {
                     let mut messages = messages.subscribe();
@@ -1987,6 +2117,7 @@ mod tests {
                 }))
                 .fallback(move |method: axum::http::Method, uri: axum::http::Uri, body: axum::body::Bytes| {
                     let received = received.clone();
+                    let dispatch = dispatch.clone();
                     async move {
                         if method != axum::http::Method::GET {
                             received.lock().unwrap().push((
@@ -1997,7 +2128,11 @@ mod tests {
                         if uri.path().ends_with("/queue") && method == axum::http::Method::GET {
                             axum::Json(serde_json::json!([])).into_response()
                         } else if uri.path().ends_with("/acp/prompt") {
-                            axum::Json(serde_json::json!({"disposition":"queued","queued_id":"accepted"})).into_response()
+                            if *dispatch.lock().unwrap() == "sent" {
+                                axum::Json(serde_json::json!({"disposition":"sent"})).into_response()
+                            } else {
+                                axum::Json(serde_json::json!({"disposition":"queued","queued_id":"accepted"})).into_response()
+                            }
                         } else {
                             axum::http::StatusCode::NO_CONTENT.into_response()
                         }
@@ -2014,6 +2149,7 @@ mod tests {
                 view: StructuredViewState::new("s-1".into(), endpoint, http, Some(ws)),
                 wire,
                 requests,
+                prompt_disposition,
                 server,
             }
         }
@@ -2061,6 +2197,88 @@ mod tests {
         }
     }
 
+    #[tokio::test]
+    async fn live_host_intent_stop_is_exact_without_native_authority_or_cached_revival() {
+        let mut fixture = NativeInputFixture::new().await;
+        let original = uuid::Uuid::parse_str("5fdcc941-9be3-4f26-ab31-21b612084392").unwrap();
+        let replacement = uuid::Uuid::parse_str("a48a9426-dc57-4b54-bca3-8d415e9188bb").unwrap();
+        let mut cached = native_snapshot(false, None);
+        cached.host_prompt_intent = Some(original);
+        assert!(serde_json::to_value(&cached)
+            .unwrap()
+            .get("host_prompt_intent")
+            .is_none());
+        fixture.snapshot(0, cached, None).await;
+        fixture.act(Intent::CancelInFlight).await;
+        assert!(fixture.native_requests().is_empty());
+        *fixture.prompt_disposition.lock().unwrap() = "sent";
+        fixture
+            .snapshot(
+                1,
+                native_snapshot(false, None),
+                Some(serde_json::json!(true)),
+            )
+            .await;
+        send_prompt_now(&mut fixture.view, &mut None, "retain this pending message").await;
+        assert!(fixture.view.in_flight);
+        assert_eq!(fixture.native_requests().len(), 1);
+        assert_eq!(
+            fixture.native_requests()[0].0,
+            "POST /api/sessions/s-1/acp/prompt"
+        );
+
+        let live = |seq, intent: Option<uuid::Uuid>| {
+            let mut state = serde_json::to_value(native_snapshot(false, None)).unwrap();
+            state["host_prompt_intent"] = serde_json::json!(intent);
+            serde_json::json!({
+                "kind": "reduced_state", "session_id": "s-1", "seq": seq, "state": state,
+            })
+        };
+        fixture.ingest(live(2, Some(original))).await;
+        assert_eq!(fixture.view.host_prompt_intent(), Some(original));
+        assert!(!fixture.view.native_input_available());
+        assert!(!fixture.view.transcript.turn_active);
+        assert!(fixture.view.in_flight);
+        let footer = native_footer(&fixture.view);
+        assert!(footer.contains("Host message pending"));
+        assert!(!footer.contains("● Ready"));
+        fixture.view.choice = Some(native_mode_choice());
+        fixture.act(Intent::ChoiceAccept).await;
+        assert_eq!(fixture.native_requests().len(), 1);
+        fixture.view.choice = None;
+        fixture.act(Intent::CancelInFlight).await;
+        assert_eq!(
+            fixture.native_requests()[1..],
+            [(
+                "POST /api/sessions/s-1/acp/cancel".to_owned(),
+                serde_json::json!({"host_prompt_intent": original}),
+            )]
+        );
+
+        fixture.ingest(live(3, Some(replacement))).await;
+        fixture.ingest(live(2, Some(original))).await;
+        assert_eq!(fixture.view.host_prompt_intent(), Some(replacement));
+        fixture.act(Intent::CancelInFlight).await;
+        assert_eq!(
+            fixture.native_requests().last().unwrap().1,
+            serde_json::json!({"host_prompt_intent": replacement})
+        );
+        fixture.ingest(live(4, None)).await;
+        fixture.ingest(live(3, Some(replacement))).await;
+        assert_eq!(fixture.view.host_prompt_intent(), None);
+        assert!(!fixture.view.native_input_available());
+        assert!(!fixture.view.in_flight);
+        fixture.act(Intent::CancelInFlight).await;
+        assert_eq!(fixture.native_requests().len(), 3);
+
+        fixture.ingest(live(5, Some(replacement))).await;
+        fixture.view.disconnect_management();
+        assert_eq!(fixture.view.host_prompt_intent(), None);
+        assert_eq!(fixture.view.transcript.host_prompt_intent, None);
+        fixture.act(Intent::CancelInFlight).await;
+        assert_eq!(fixture.native_requests().len(), 3);
+    }
+
     fn native_snapshot(
         ready: bool,
         unavailable: Option<crate::acp::state::AcpConnectionUnavailability>,
@@ -2096,6 +2314,7 @@ mod tests {
                 name: "Pick a plan".into(),
                 kind: "other".into(),
                 args_preview: "{}".into(),
+                prompt: None,
                 started_at: chrono::Utc::now(),
                 parent_tool_call_id: None,
                 memory_recall: None,
@@ -2411,6 +2630,7 @@ mod tests {
                 .pending_approvals
                 .push(crate::acp::permissions::build_approval(
                     ToolCall {
+                        prompt: None,
                         id: "pending".into(),
                         name: "read".into(),
                         kind: "read".into(),
@@ -2745,6 +2965,124 @@ mod tests {
         }
     }
 
+    fn config_option(
+        id: &str,
+        name: &str,
+        category: ConfigOptionCategory,
+        current: &str,
+        values: &[&str],
+    ) -> ConfigOptionDescriptor {
+        ConfigOptionDescriptor {
+            id: id.into(),
+            name: name.into(),
+            description: None,
+            category,
+            current_value: current.into(),
+            options: values
+                .iter()
+                .map(|v| ConfigOptionChoice {
+                    value: (*v).into(),
+                    name: (*v).into(),
+                    description: None,
+                })
+                .collect(),
+        }
+    }
+
+    #[test]
+    fn toggle_picker_rows_carry_the_flipped_value_for_on_off_model_config_options() {
+        let mut state = test_state();
+        open_toggle_picker(&mut state);
+        assert!(state.choice.is_none(), "no advertised toggles: no-op");
+
+        let model_config = || ConfigOptionCategory::Other("model_config".into());
+        state.transcript.config_options = vec![
+            config_option(
+                "model",
+                "Model",
+                ConfigOptionCategory::Model,
+                "a",
+                &["a", "b"],
+            ),
+            config_option("fast", "Fast mode", model_config(), "off", &["on", "off"]),
+            config_option(
+                "ultracode",
+                "Ultracode",
+                model_config(),
+                "on",
+                &["off", "on"],
+            ),
+            config_option("tier", "Tier", model_config(), "std", &["std", "pro"]),
+            config_option(
+                "beta",
+                "Beta",
+                ConfigOptionCategory::Other("misc".into()),
+                "off",
+                &["on", "off"],
+            ),
+        ];
+        open_toggle_picker(&mut state);
+        let picker = state.choice.as_ref().expect("picker open");
+        assert!(matches!(picker.purpose, ChoicePurpose::Toggle));
+        assert_eq!(
+            picker.options,
+            vec![
+                (
+                    "fast=on".to_string(),
+                    "Fast mode: off (Enter turns on)".to_string()
+                ),
+                (
+                    "ultracode=off".to_string(),
+                    "Ultracode: on (Enter turns off)".to_string()
+                ),
+            ]
+        );
+    }
+
+    /// The daemon answers a pick with 202, so the adapter's rejection only
+    /// arrives on a later frame: one error toast, value display untouched.
+    #[tokio::test]
+    async fn a_rejected_toggle_pick_toasts_once_and_keeps_the_confirmed_value() {
+        use crate::acp::state::{AcpSessionId, AcpState, AgentName};
+        let model_config = ConfigOptionCategory::Other("model_config".into());
+        let mut acp = AcpState::new(AcpSessionId("s-1".into()), AgentName("claude".into()), None);
+        acp.config_options = vec![config_option(
+            "ultracode",
+            "Ultracode",
+            model_config,
+            "off",
+            &["on", "off"],
+        )];
+        let frame = |acp: &AcpState, seq| {
+            Ok(WsMessage::ReducedState {
+                seq,
+                state: Box::new(acp.clone()),
+                unchanged: Vec::new(),
+            })
+        };
+        let mut state = test_state();
+        let mut deadline = None;
+        apply_ws_message(&mut state, &mut deadline, frame(&acp, 1)).await;
+        assert!(state.toast.is_none());
+
+        acp.config_option_switch_failed = Some(crate::acp::state::ConfigOptionSwitchFailure {
+            config_id: "ultracode".into(),
+            value: "on".into(),
+            reason: "not on this model".into(),
+        });
+        apply_ws_message(&mut state, &mut deadline, frame(&acp, 2)).await;
+        let toast = state.toast.take().expect("rejection toasted");
+        assert!(matches!(toast.kind, ToastKind::Error));
+        assert_eq!(
+            toast.text,
+            "Ultracode could not switch to on: not on this model"
+        );
+        assert_eq!(state.transcript.config_options[0].current_value, "off");
+
+        apply_ws_message(&mut state, &mut deadline, frame(&acp, 3)).await;
+        assert!(state.toast.is_none(), "the same failure is not re-toasted");
+    }
+
     #[test]
     fn mode_picker_opens_preselecting_current_mode() {
         let mut state = test_state();
@@ -2855,7 +3193,10 @@ mod tests {
                 assert_eq!(remaining[0].field_key, "question_1");
                 assert!(answers.is_empty());
             }
-            ChoicePurpose::Mode | ChoicePurpose::OpenLink | ChoicePurpose::Approval { .. } => {
+            ChoicePurpose::Mode
+            | ChoicePurpose::Toggle
+            | ChoicePurpose::OpenLink
+            | ChoicePurpose::Approval { .. } => {
                 panic!("expected elicitation purpose")
             }
         }
@@ -2933,6 +3274,7 @@ mod tests {
                     name: (*name).into(),
                     description: String::new(),
                     accepts_input: false,
+                    input_hint: None,
                 })
                 .collect();
             state.composer.insert_str("/c");
@@ -3007,6 +3349,7 @@ mod tests {
             .pending_approvals
             .push(crate::acp::permissions::build_approval(
                 crate::acp::state::ToolCall {
+                    prompt: None,
                     id: "hover-pending".into(),
                     name: "read".into(),
                     kind: "read".into(),

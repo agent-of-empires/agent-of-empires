@@ -233,20 +233,7 @@ impl ManagedClient {
     }
 
     pub(crate) async fn stop_session(&self) {
-        let stopped = crate::server::api::sessions::stop_session(
-            State(self.state.clone()),
-            axum::extract::Path(self.id.clone()),
-        )
-        .await
-        .into_response();
-        assert_eq!(
-            stopped.status(),
-            axum::http::StatusCode::OK,
-            "real Stop must settle the original projection before retained Load/Fork"
-        );
-        self.retirement
-            .completed
-            .store(true, std::sync::atomic::Ordering::Release);
+        self.retirement.stop_session().await;
     }
 
     /// Release the stopped case's real SID ownership before reusing it.
@@ -541,6 +528,38 @@ impl ManagedRetirement {
         .await??;
         let _ = self.prepared.set(prepared.clone());
         Ok(Some(prepared))
+    }
+
+    async fn stop_session(&self) {
+        let id = self
+            .target
+            .lease
+            .as_ref()
+            .expect("captured original lease")
+            .session_id();
+        let stopped = crate::server::api::sessions::stop_session(
+            State(self.state.clone()),
+            axum::extract::Path(id.to_owned()),
+        )
+        .await
+        .into_response();
+        let status = stopped.status();
+        // Include the public refusal body so guarded Stop failures remain actionable.
+        let refusal = if status != axum::http::StatusCode::OK {
+            axum::body::to_bytes(stopped.into_body(), 4096)
+                .await
+                .expect("actual Stop refusal body")
+        } else {
+            axum::body::Bytes::new()
+        };
+        assert_eq!(
+            status,
+            axum::http::StatusCode::OK,
+            "real Stop must settle the original projection before retained Load/Fork: {}",
+            String::from_utf8_lossy(&refusal)
+        );
+        self.completed
+            .store(true, std::sync::atomic::Ordering::Release);
     }
 
     async fn retire(&self) -> anyhow::Result<()> {
@@ -849,6 +868,9 @@ pub(crate) async fn with_managed_capacity<F>(
                 actual.default_effort_explicit = template.default_effort_explicit;
                 actual.default_mode = template.default_mode;
                 actual.default_model = template.default_model;
+                for (id, value) in template.default_model_config {
+                    actual.default_model_config.entry(id).or_insert(value);
+                }
                 actual.mcp_servers = template.mcp_servers;
                 actual.socket_path =
                     Some(crate::process::worker_registry::socket_path_for(&session_id.0).unwrap());
@@ -870,7 +892,12 @@ pub(crate) async fn with_managed_capacity<F>(
         })
     };
     let store = Arc::new(
-        EventStore::open(&home.path().join("managed-events.db"), retained_events).unwrap(),
+        EventStore::open(
+            &home.path().join("managed-events.db"),
+            retained_events,
+            Default::default(),
+        )
+        .unwrap(),
     );
     let state = crate::server::test_support::build_test_app_state_with_event_capacity(
         Vec::new(),
@@ -1708,10 +1735,19 @@ socket.on('error', error => { console.error(error); process.exit(1); });
         if attempt.as_ref() == expected.as_ref() && *actual == owner
             && issued.receipt.same_store(store.as_deref()))
         );
-        let verify_owner = || {
-            let record = crate::process::worker_registry::load_strict(&row.id)
-                .unwrap()
-                .expect("original registry custody still exists");
+        let verify_owner = || async {
+            let record = {
+                let registry = crate::process::worker_registry::registry_lock_until(
+                    &row.id,
+                    tokio::time::Instant::now() + Duration::from_secs(10),
+                )
+                .await
+                .expect("the actual producer releases registry admission");
+                registry
+                    .record()
+                    .unwrap()
+                    .expect("original registry custody still exists")
+            };
             assert_eq!(
                 crate::acp::runner_lifecycle::RunnerIdentity::from_record(&record),
                 owner
@@ -1721,14 +1757,14 @@ socket.on('error', error => { console.error(error); process.exit(1); });
                 .expect("original physical runner is still live");
             assert_eq!(Some(birth.fingerprint()), owner.birth_fingerprint);
         };
-        verify_owner();
+        verify_owner().await;
         let before: IssuedOriginal =
             serde_json::from_value(inspection.query("pending-original").await).unwrap();
         assert_eq!(before.request_id, issued.request_id);
         assert_eq!(before.scope, issued.scope);
         assert_eq!(before.receipt.as_ref(), issued.receipt.as_ref());
         original.supervisor.detach_all().await;
-        verify_owner();
+        verify_owner().await;
         let after: IssuedOriginal =
             serde_json::from_value(inspection.query("pending-original").await).unwrap();
         assert_eq!(after.request_id, issued.request_id);
@@ -2385,6 +2421,41 @@ socket.on('error', error => { console.error(error); process.exit(1); });
         events: broadcast::Receiver<AcpBroadcastFrame>,
     ) -> ManagedClient {
         self.installed(id, events).await
+    }
+
+    pub(crate) async fn stop_observed_original(&mut self, lease: &Lease) {
+        assert!(
+            self.leases.lock().unwrap().contains(lease),
+            "the original must belong to this actual launcher"
+        );
+        assert_eq!(
+            self.state
+                .acp_supervisor
+                .lifecycle
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .current_lease(lease.session_id())
+                .as_ref(),
+            Some(lease),
+            "capture the exact current original before public Stop"
+        );
+        let retirement = self
+            .retirements
+            .iter()
+            .find(|retirement| {
+                retirement.target.lease.as_ref() == Some(lease)
+                    && Arc::ptr_eq(&retirement.state, &self.state)
+            })
+            .cloned()
+            .unwrap_or_else(|| {
+                let retirement = Arc::new(ManagedRetirement::capture(
+                    self.state.clone(),
+                    lease.clone(),
+                ));
+                self.retirements.push(retirement.clone());
+                retirement
+            });
+        retirement.stop_session().await;
     }
 
     pub(crate) async fn reconcile_after<F: Future<Output = ()>>(

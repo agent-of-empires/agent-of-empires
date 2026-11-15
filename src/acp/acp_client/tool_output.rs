@@ -1,7 +1,7 @@
 //! Reading a tool call's content: text, media and resource blocks, memory
 //! recalls, and diffs, each under a size cap.
 
-use crate::acp::state::{DiffPreview, Event, MemoryRecall, ToolOutputBlock};
+use crate::acp::state::{DiffPreview, Event, MemoryRecall, ToolOutputBlock, ARGS_CUT_MARKER};
 use agent_client_protocol::v1::schema::ContentBlock;
 
 pub(super) fn raw_event<T: serde::Serialize>(value: &T) -> Event {
@@ -34,7 +34,7 @@ pub(super) fn preview_args(raw: &serde_json::Value) -> String {
     let mut out = String::with_capacity(serialised.len().min(16 * 1024));
     for c in serialised.chars() {
         if out.len() >= 16 * 1024 {
-            out.push_str("\u{2026}[truncated]");
+            out.push_str(ARGS_CUT_MARKER);
             break;
         }
         if c.is_control() && c != '\n' && c != '\t' {
@@ -43,6 +43,22 @@ pub(super) fn preview_args(raw: &serde_json::Value) -> String {
         out.push(c);
     }
     out
+}
+
+/// Cap on the retained prompt so a runaway one cannot bloat the event log.
+const PROMPT_MAX_CHARS: usize = 256 * 1024;
+
+/// The `prompt` argument when the serialised args exceed the 16 KiB `preview_args` cap, clipped at
+/// `PROMPT_MAX_CHARS`. Control-character stripping can keep a borderline call under its own cap.
+pub(super) fn full_prompt(raw: &serde_json::Value) -> Option<String> {
+    let prompt = raw.get("prompt")?.as_str()?;
+    if serde_json::to_string(raw).ok()?.len() <= 16 * 1024 {
+        return None;
+    }
+    Some(match prompt.char_indices().nth(PROMPT_MAX_CHARS) {
+        Some((end, _)) => format!("{}\u{2026}[truncated]", &prompt[..end]),
+        None => prompt.to_string(),
+    })
 }
 
 /// A missing field and an explicit JSON `null` both mean "no args", so the UI
@@ -281,6 +297,26 @@ mod tests {
         EmbeddedResourceResource, ImageContent, ResourceLink, TextResourceContents,
         ToolCallContent,
     };
+
+    #[test]
+    fn full_prompt_is_kept_only_when_the_preview_was_cut() {
+        let short = serde_json::json!({ "prompt": "do it" });
+        assert_eq!(full_prompt(&short), None);
+        let long = "p".repeat(20_000);
+        let big = serde_json::json!({ "description": "d", "prompt": long });
+        assert_eq!(full_prompt(&big).as_deref(), Some(long.as_str()));
+        assert_eq!(
+            full_prompt(&serde_json::json!({ "command": "x".repeat(20_000) })),
+            None
+        );
+        let runaway = serde_json::json!({ "prompt": "p".repeat(PROMPT_MAX_CHARS + 10) });
+        let clipped = full_prompt(&runaway).unwrap();
+        assert!(clipped.ends_with("\u{2026}[truncated]"));
+        assert_eq!(
+            clipped.chars().count(),
+            PROMPT_MAX_CHARS + "\u{2026}[truncated]".chars().count()
+        );
+    }
 
     /// #1713: a missing or null raw_input previews as empty, not "null".
     #[test]

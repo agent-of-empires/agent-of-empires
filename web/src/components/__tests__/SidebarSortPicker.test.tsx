@@ -7,8 +7,8 @@ import { createRef } from "react";
 import { ContextMenu } from "../ContextMenu";
 import { SidebarSortPicker } from "../SidebarSortPicker";
 import type { SidebarSortMode } from "../../lib/sidebarSort";
-import type { Workspace } from "../../lib/types";
 import { useSidebarSelection } from "../sidebar/useSidebarSelection";
+import { makeSession, makeWorkspace } from "./fixtures";
 import { useKeyboardShortcuts, type ShortcutActions } from "../../hooks/useKeyboardShortcuts";
 
 function setup(sortMode: SidebarSortMode = "manual") {
@@ -111,13 +111,17 @@ describe("SidebarSortPicker", () => {
       ],
     ];
     for (const [popup, open, closed] of cases) {
-      const workspaces = [{ id: "a" }, { id: "b" }, { id: "c" }] as Workspace[];
+      const rows = ["a", "b", "c"].map((id) => ({
+        key: id,
+        workspace: makeWorkspace(id, [makeSession({ id: `s-${id}` })]),
+      }));
       const { result } = renderHook(() =>
         useSidebarSelection({
-          allWorkspaces: workspaces,
+          rows,
           orderedIds: ["a", "b", "c"],
           triage: {} as Parameters<typeof useSidebarSelection>[0]["triage"],
           activeId: null,
+          activeSessionId: null,
           onSelect: vi.fn(),
         }),
       );

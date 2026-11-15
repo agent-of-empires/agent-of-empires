@@ -392,7 +392,7 @@ const INITIALIZE_RESULT = {
   agentInfo: {
     name: "@agentclientprotocol/claude-agent-acp",
     // Must stay at or above CLAUDE_AGENT_ACP_MIN_VERSION in src/acp/agent_compat.rs.
-    version: "0.99.1",
+    version: "0.103.0",
   },
   // Omitted rather than empty: some clients read an empty list as auth required.
 };
@@ -401,7 +401,7 @@ const INITIALIZE_RESULT = {
 // name and a version at its floor. FAKE_ACP_STEERING advertises `_session/steering` at the
 // separate steering floor.
 const STEERING_ENABLED = process.env.FAKE_ACP_STEERING === "1";
-const STEERING_MIN_VERSION = "0.99.1";
+const STEERING_MIN_VERSION = "0.103.0";
 
 // Running prompts decide `injected` versus `promptRequired`, as the real adapter's turnQueue does.
 const activeTurns = new Set();
@@ -568,6 +568,13 @@ async function handleRequest(msg) {
       const replayBeforeResponse = process.env.FAKE_ACP_LOAD_REPLAY_BEFORE_RESPONSE === "1";
       if (method === "session/load" && loadReplay && replayBeforeResponse) {
         replayLoadHistory();
+      }
+      if (method === "session/load" && script.holdLoad === true) {
+        fakeDebug(`session/load held sessionId=${sessionId} pid=${process.pid}`);
+        while (!existsSync(`${process.env.FAKE_ACP_SCRIPT}.load-release`)) {
+          await new Promise((resolve) => setTimeout(resolve, 20));
+        }
+        fakeDebug(`session/load released sessionId=${sessionId} pid=${process.pid}`);
       }
       if (method === "session/load" && script.holdLoad === true) {
         fakeDebug(`session/load held sessionId=${sessionId} pid=${process.pid}`);

@@ -403,12 +403,20 @@ export function SendButton({
   );
 }
 
-export function StopButton({ disabled, onCancel }: { disabled: boolean; onCancel: () => void }) {
+export function StopButton({
+  disabled,
+  onCancel,
+  title = "Stop the agent",
+}: {
+  disabled: boolean;
+  onCancel: () => void;
+  title?: string;
+}) {
   return (
     <button
       type="button"
       aria-label="Stop"
-      title="Stop the agent"
+      title={title}
       disabled={disabled}
       onClick={onCancel}
       className={[

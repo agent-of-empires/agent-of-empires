@@ -526,6 +526,7 @@ mod tests {
             ("sandbox", "memory_limit", true),
             ("worktree", "auto_cleanup", true),
             ("worktree", "path_template", false),
+            ("worktree", "workspace_by_default", false),
             ("session", "custom_agents", false),
             ("sandbox", "default_image", false),
             ("sandbox", "container_runtime", false),

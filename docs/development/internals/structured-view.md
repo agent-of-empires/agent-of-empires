@@ -13,14 +13,20 @@ Each runner registers at `<app_dir>/acp-workers/<session_id>.json` (pid, socket 
 Invariants worth knowing before touching this code:
 
 - **One owner per generation.** Every spawn, attach and respawn has a local lease epoch tied to its captured runner generation. Shutdown, the reaper, the drain task and the reconciler refuse stale authority. A spawn completing after a stop tears its own runner down instead of installing it. Stop remains pending until its captured runner and scopes retire and any directly owned child is reaped, holding prompts and refusing resumes while the reconciler retries.
-- **Compatibility is not liveness.** `runner_version` is 7 and the control wire is v6. The optional registry `control_protocol_version` is a prerequisite, not proof of native usability; missing/null stays Unknown without rewriting old records. Unknown, incompatible or unconfirmed live ownership is refused before adoption, replacement, budget or queue effects. The actual connected Unix peer must match the captured PID and kernel birth before Attach. Compatible v6 workers retain the existing build-staleness replacement policy.
+- **Compatibility is not liveness.** `runner_version` is 7 and the control wire is v8. The optional registry `control_protocol_version` is a prerequisite, not proof of native usability; missing/null stays Unknown without rewriting old records. Unknown, incompatible or unconfirmed live ownership is refused before adoption, replacement, budget or queue effects. The actual connected Unix peer must match the captured PID and kernel birth before Attach. Compatible v8 workers retain the existing build-staleness replacement policy.
 - **Prompt admission responses.** HTTP refusals preserve the admission decision's status, headers and body.
 - **Process-group termination.** Runners are group leaders via `setsid`, and every termination path signals the group, so the node wrapper and SDK child die with the runner rather than reparenting to PID 1. Prefer the verbs over `kill -9`, which leaves the runner no chance to clean up.
 - **Self-termination watchdog.** A runner polls its own registry record and exits when abandoned: record gone, superseded, or detached from any daemon past a 48h retention window (reset on reattach). This is the backstop for a daemon that dies without killing its runners.
 - **Detach buffer.** Ordinary outbound frames have a 4096-frame budget. Two bounded bootstrap slots and retained completion/loss items preserve management progress without reducing it; all share the 128 MiB byte bound. Admission charges actual retained completion bytes, prefix included, and reserves loss bytes separately. After identity announcement, continuing notifications wait for real writes rather than evicting the backlog. Detached overflow remains best effort. Reverse calls outstanding at detach are cancelled toward the agent and queued replies are dropped; `terminal/release` remains idempotent cleanup.
 - **Native-session admission.** Only lifecycle results select native identity; notification and callback metadata never do. Native content remains historical, including content reporting an unknown SID; it grants neither current-state effects nor callback, filesystem or terminal permissions. Pending replay covers the producer's full bounded ordinary, bootstrap and retained-item budget and charges original control-wire bytes. Authenticated incomplete replay is accounted and closed without forwarding its tagged partial content. Stored history is not rewritten.
 - **Qualified publication.** Current events retain their captured constructor or request scope through queueing. Contention waits outside publication locks, then revalidates that same scope; stale events become historical. Native forwarding waits for confirmed journal publication of its exact qualified `ThinkingStarted`. Failure, historical publication or a closed confirmation refuses submission, without replay or Native outcome. This confirms local admission, not Native execution or output. Matching terminal correlation settles only that original operation.
-- **Publication order.** Each session holds one guard from sequence allocation through attachment writes, journal commit, control fold and broadcast. The sequence map is released before waiting for that guard. Worker lookup and async work stay outside it. Proven retirement precedes journal, budget, seal and cached-projection cleanup under the same guard; the counter is retired only after cleanup succeeds.
+- **Publication order.** One bounded writer FIFO owns host DATA and full SDK completion items, including metadata, captured context, journal confirmation and pending responder ownership. It allocates sequence numbers before attachment writes, journal commit, control fold and broadcast, without retaining sequence or global worker/lifecycle locks across store I/O. Borrowed processing and replay are created only inside sequential completion; acknowledgment follows the actual durable result. Flush observes all earlier jobs. Proven retirement queues cleanup in that same order; the exact counter slot is retired and removed only after its journal, budget, seal and cached-projection cleanup succeeds.
+  Queue admission alone does not prove journal or live-delivery completion.
+  Post-EOF restart-budget notices use this lane and recheck the original owner
+  before allocating their sequence.
+  An already committed Native phase returns its original durable sequence.
+  Its unused candidate is released only on the same still-current, nonretired
+  counter slot; real missing rows remain Unknown rather than implying main idle.
 - **Clear display boundary.** Successful Fresh publishes `SessionCleared` with the establishment journal's certified `clear_after_seq`. Transcript rows retain their actual creation sequence through patches. Web and TUI place the new conversation's pre-result messages and plan after that boundary without rewriting or duplicating raw history. The cut is display metadata, never Native identity, readiness or operation authority.
 - **Command preparation.** Before enqueue, the client freezes its original receipt, Applied projection, owner and operation correlation. The first lifecycle-locked capture fixes the permission; subsequent waits cannot rebase it onto a newer generation. Identified lifecycle or registry contention waits outside physical guards within one deadline, with cancellation on client termination. The same anchored profile, candidate and live owner are revalidated before the command is queued once. No Native RPC or user intent is replayed.
 - **Launch authority.** Preparation pins the native profile, title, lifecycle generation and provider under owned namespace, submission and instance exclusion. Startup is reserved before those preparation guards are released; hooks and readiness never run while holding them. Blocking admission owns its namespace guard through native checkpoints, including caller cancellation.
@@ -39,6 +45,14 @@ Invariants worth knowing before touching this code:
 - **Startup requeue.** Failed startup and an ended attached connection can clear the reconciler's attempted-session pin. This preserves the existing retry budget and still passes canonical admission; a requeue ID grants neither a new native invocation for Pending/Blocked authority nor permission to reset conversation selection.
 - **Managed consumer fixture custody (`cfg(test)`).** The private host re-enters its current libtest executable as the real production runner, with separate argv, socket and birth-observation files for each launch. The actual native parent records the original child's birth before waiting/reaping; cleanup may only compare that birth, never adopt the current occupant of an old PID. A helper panic remains a permanent fixture failure even if the body ignores its join result. The host completes owned cleanup and restores its environment before reporting that failure; unconfirmed cleanup still aborts before restoration. These fixtures require the original Node shim dependencies, not a separately built normal `aoe` executable.
 - **Background recovery.** Retained allocation witnesses bind only to the actual established Control receipt; adoption revalidates the original identity before transcript I/O. Retained selectors, never current configuration or paths alone, choose the source. Child progress and END retain the child's allocation without a prompt outcome or Written window. Captured teardown can publish Detached only for the exact durable allocation, including unfinished children of a finished workflow; it does not prove Native completion or success. Failed allocation reads retain cleanup debt. SDK teardown cancels local readers before joining their event drain; Native work and durable witnesses remain. Private witnesses and transcript paths never reach clients.
+- **Subagent sessions.** A profile with `supports_subagents` declares the ACP subagents capability, so each subagent is a child session on the same connection. `SessionIngress` admits a child only after a `subagent_update` on an admitted session names it, and answers its permission and elicitation requests but refuses its fs and terminal requests, which assume the root session's workspace. Child traffic takes `handle_child_notification`, never the root's dedup, compaction or watchdog path. The adapter hides the Agent/Task call, so aoe synthesizes the card from the parent-to-child delegation `session_message` (its message id is the card id and the child's `parent_tool_call_id`); the child's reply or hand-back `session_message` completes it, while a background child has none and its card follows the roster state. Only child tool calls and its model reach the transcript, and the tool calls nest under that card via `parent_tool_call_id`. `SubagentUpdated` carries a full merged snapshot, so replay is last-write-wins, and its state replaces the transcript tailer's heuristics for that agent. Stop sends `session/cancel` with the child id over `POST /api/sessions/{id}/acp/subagents/{child_id}/cancel`, or `ControlBody::CancelSession` through a runner (control protocol 8), and only for a child that announced `capabilities.cancel`. The client freezes the observed current parent and checks the child route and cancel capability. The required wire frame carries that parent, the child target and the original `NativeRequestScope`; the runner retains its attachment, owner and exact selected-parent checks through the scoped Native write. The emitted notification names only the child, not the root turn. Old protocol5/6/7 declarations remain incompatible rather than being restamped. A child's own delegations (grandchildren) are not rendered: their `session_message`s are dropped. A conversation reset is refused while a child runs, since it would drop the child routes. Restoring children after `session/load` is not implemented, so an async agent left open by a restart is still resolved by the resumed tailer below.
+  Native ingress freezes the physical source, observed parent SID and admitted
+  ancestry before queueing or pending replay. Private persisted metadata, not
+  payload IDs, carries that proof. Historical child snapshots may update display
+  records without root effects. Both child/resource arrival orders require
+  matching checked source, parent, allocation and delegation-card provenance
+  before joining a child to a current background resource; missing legacy proof
+  stays unqualified.
 
 Owned-runner unit fixtures require a freshly built normal `aoe` binary from the
 same candidate and feature set. CI builds `--no-default-features --features vendored
@@ -46,6 +60,42 @@ same candidate and feature set. CI builds `--no-default-features --features vend
 macOS unit tests. Targeted runs may set `AOE_TEST_ACP_RUNNER_EXE` to that matching
 binary; fixtures never build it or borrow a stale executable. The separate
 Node-free default-build proof remains independent.
+
+## Native autonomous lifecycle
+
+The optional Native ACP extension negotiates
+`_meta.ompAutonomousTurns.version = 1` in both initialize directions. Only
+positively observed `_omp/autonomous_turn/start` and its matching
+`_omp/autonomous_turn/end` establish and settle independently initiated root
+work. Ordinary content, accounting, compaction and silence remain historical;
+they cannot manufacture either boundary.
+
+The original physical actor allocates a source-local lifecycle ordinal. Its
+root SID, run identity, physical birth and original context are frozen before
+queueing. This readonly qualification stays private and `history_only`; it
+creates no Original/Written request, Native input permission, callback grant
+or child/resource authority. Main request completion and failed-main budgets
+remain independent. An autonomous terminal cannot manufacture main-idle
+knowledge when retained main history is unknown.
+
+Same-original reattachment restores the captured readonly constructor and
+revalidates its original fence. The authenticated greeting retains the latest
+actual start/end alongside the independent cached prompt result. These facts
+share the existing bootstrap slots and byte bound, not another frame allowance.
+An old main completion cannot release autonomous work, and late old-source
+boundaries cannot take ownership of replacement work.
+
+One bounded nullable `autonomous_commit_json` fact on the existing establishment
+row commits with its real event. It survives ordinary row retention and
+deduplicates already committed phases without new sequence, fold or broadcast.
+Cold replay reads events, this fact and high-water in the same read transaction.
+Missing legacy proof stays unqualified; malformed present proof is an error,
+not an empty history or zero frontier. Migration59 reconciles the nullable
+column idempotently without rewriting `seal_json` or `prompt_commit_json`,
+inventing legacy authority or renumbering Frontier60. A fenced host orphan
+boundary retires only its captured old custody; it is not a Native terminal.
+Public HTTP/WebSocket serialization omits the private lifecycle proof and run
+identity. Reduced activity does not imply current Native controls.
 
 ## Owned retirement and idle decisions
 
@@ -100,6 +150,12 @@ Pending values and futures contain no strong lifecycle lease. Stop cancels an
 active claim before waiting for the existing retirement gate; cancellation
 returns the original continuation, and retirement drains its queued final
 identity without restoring control authority.
+Installation recovery waits on writer-backed orphan and resource reads without
+holding the global worker lock. The same owned payload survives a recovery
+deadline; bounded reacquisition rechecks the registry, exact lease and physical
+identity before installing its handle. A retry recognizes only that original's
+matching Running lease and identity, without calling lifecycle installation
+again or admitting arbitrary Running work.
 Large pre-install values use one owned payload allocation which moves unchanged
 between a reservation and its existing custody slot across retries. Registration
 completion is boxed only when registration was deferred; the post-install future
@@ -255,6 +311,8 @@ successful intentional conversation reset, or new runtime ownership releases
 the local outcome fence. This is producer ownership, not permission to retry,
 replace a provider, or create a conversation. Rate-limit parking for owned
 outcomes is unchanged. Error and Idle alone never authorize effects.
+A completed adapter-initiated idle turn consumes its terminal claim, so a stale
+Cancel cannot terminate it again.
 
 Optional `PromptRuntimeError.evidence` carries source, operation, independently
 observed runtime facts, blocking scope, reported code, ingestion time and the
@@ -341,6 +399,18 @@ retryable worker-not-ready permission. Before publication, refusal preserves
 pending and named queued intent. After publication, the admitted request
 supersedes the pending initial turn even when its forward is refused; the named
 queue row remains parked, and no native input is replayed.
+
+Web background Stop actions for the root or a child use the live session's
+cancellation path and recheck the current connection and native-input admission
+at the gesture. A cached card, Unknown receipt or callback from a replaced
+session cannot authorize a POST.
+
+Current Web snapshots carry integration loss separately from startup and
+operation errors. Its reason stays visible without native-input readiness,
+does not grant that readiness and does not replace unrelated diagnostics or
+offer startup repair by itself. An accepted current snapshot's explicit
+`integration_lost: null` clears the diagnostic; older snapshots, legacy omission
+and raw session assignment do not.
 
 Publication samples supervisor worker state before taking publication or instance
 exclusion. Producers and native-control admission try the native flock/cache
@@ -534,10 +604,14 @@ ingress; an old queued frame cannot taint a later prompt. Exact response IDs
 close only their original windows. Temporal observation is not prompt causality,
 successful RPC completion, or permission to perform a new Native effect.
 
+An output-attribution diagnostic requires an original result and a `Written`
+observation whose exact window is marked uncertain. Silence, thinking, compaction,
+notices and steering do not by themselves diagnose missing output; historical
+results retain their content without gaining temporal authorship.
+
 A positive main-prompt cancel does not prove an individual tool's outcome.
 Partial output and its recorded uncertainty survive reload without a fabricated
 tool result or terminal state.
-
 The daemon folds the event stream once per WebSocket connection into two projections, so clients do not re-derive them:
 
 - **Control state**: turn flags, pending approvals and elicitations, usage, plan, modes, slash commands, shipped as `reduced_state` on connect and after every event. `unchanged` names the cold fields the socket already holds, which the daemon omits rather than re-serializing. The connect frame is folded over the whole session even with a `since` cursor, because clients adopt it verbatim.
@@ -566,6 +640,33 @@ Raw event frames still stream for what the daemon does not model (worker lifecyc
 
 The daemon also owns prompt dispatch: `POST /acp/prompt` runs `acp::dispatch::decide` and returns `sent`, `steered`, or `queued`, and the server-owned queue persists follow-ups until its turn-end drain. Cancelling and compacting turns always queue; a dormant worker is sent the prompt so the request wakes it.
 
+## Retained history consistency
+
+Retained page identity combines the event-store incarnation with the session
+revision. Every append or replacement invalidates the complete snapshot.
+Bounds and identity are read in one SQLite transaction; independent indexed
+first/last lookups avoid scanning payloads for metadata. A stale identity reaches
+the HTTP client as a conflict, while coherent successful pages carrying different
+identities are rejected as inconsistent metadata. Neither may publish mixed rows.
+Unchanged incomplete histories retain their identity for cheap refresh probes.
+Identity installation reserves SQLite's writer before checking its schema, so
+concurrent first openers cannot race a read-to-write upgrade. Reentry preserves
+the existing incarnation and session revisions; lock waiting remains bounded by
+the connection's busy policy.
+
+File-backed retained reads reuse the independent query-only search reader, not
+the event writer. Identity, bounds and raw rows share one read transaction; commit
+and release the reader before JSON decoding. Private memory and temporary
+databases use their original connection and still release it before decoding.
+Raw retained pages preserve scanned rows and cursors without turn alignment.
+Forward retained replay keeps reducer state across pages.
+
+Migration 54 installs identity only when `acp_events` exists. An existing empty
+database defers to the normal EventStore opener, which creates schema before
+identity. Corruption and access failures are not empty-database cases. Backward
+cursors remain strict within SQLite's signed sequence range; a larger unsigned
+cursor includes the maximum stored signed sequence rather than dropping it.
+
 ## Persistence and the context primer
 
 Transcripts persist in a SQLite event log. The web client mirrors each session's reduced state into `localStorage` (7-day expiry, full replay past the origin quota) so a reload hydrates instantly and fetches only the seq delta.
@@ -578,7 +679,12 @@ SQLite engine, not a copy of the main database file alone.
 
 Native ACP HTTP history decodes each existing JSON replay page incrementally, with a fixed-size read buffer and no copy of the entire encoded body. Replay pages and individual events or rows may exceed 16 MiB; the generic daemon response decoder remains size-bounded. The native history decoder retains the 15-second body-read deadline, requires a complete valid document through EOF, and cancels a pending body read if its caller is dropped. Count-based paging and raw/rows cursor metadata are unchanged. This does not change the pre-existing WebSocket message limits.
 
-A cold open loads recent-first rather than folding from seq 0 before first paint. `GET /api/sessions/{id}/acp/replay?before=<seq>&limit=N` returns the events closest below `before`, aligned to a user-turn boundary so a page never seams a split turn. The client renders the tail immediately and, on a long session, also pulls a small `since=0` prefix for the pinned handshake snapshot (capabilities, slash palette, agent and model) the composer needs. Scrolling to the top pages older history, prepending with the scroll position frozen; each page is fetched twice, once for frames and once for `view=rows`, and a failure on either leg abandons the page rather than advancing the cursor.
+An interactive cold open loads recent-first rather than folding from seq 0.
+Ordinary backward replay, including `view=rows`, trims a leading partial turn
+when older rows remain. The client paints the tail and pulls a small `since=0`
+prefix for the composer's handshake state. Scrolling to the top prepends older
+history with the scroll position frozen. Each page fetches both frames and rows;
+failure on either leg abandons the page without advancing its cursor.
 
 Failed context restoration preserves the selected conversation and history; it never authorizes an implicit New. An explicit reset can render the "Conversation context reset" callout and offer `GET /api/sessions/{id}/acp/context-primer?before_seq=<reset-seq>`: a compact recap of the last ~20 turns, capped at ~24k characters with bulky tool I/O omitted, pre-filled into the composer and never auto-sent.
 
@@ -688,6 +794,39 @@ separate `409 worker_not_stopped` response is used when the worker is still
 present after a successful shutdown wait. The restart request is runtime-owned,
 so disconnecting the HTTP client does not leave the session half-restarted.
 
+### Governed initial intent and explicit Fresh
+
+While establishment is unresolved, a prompt may be accepted as a host-only
+intent in the existing bounded actor queue. Its `202` response with disposition
+`sent` and no `queued_id` proves host admission, not a Native prompt write.
+Only the same captured Original attempt, generation, profile, choice, producer
+and client may issue it after genuine Applied confirmation and ordinary Native
+operation capture. Stop before that write settles this intent once without a
+Native prompt or cancel RPC; a replacement cannot inherit its payload.
+
+The authoritative live snapshot can expose `host_prompt_intent` independently
+of Native readiness and `turn_active`. Web Stop and TUI Ctrl+C submit that exact
+UUID to the existing cancel endpoint. A supplied stale, missing or replaced
+identity refuses without falling back to whichever Native turn is current.
+After actual issue, cancellation still needs the matching original request and
+unchanged Native authority. Bodyless Native cancellation retains its own checks.
+Host-only Stop does not retire the physical worker or display worker-stopped
+chrome. Completion, Stop, Fresh, failure and supersession invalidate the host
+identity; cached/replayed state cannot restore it, and reconnect must reobserve
+the live source. Other Native and child controls inherit no host-only permission.
+
+Fresh requires explicit confirmation against the `recovery.revision` captured
+when the recovery gesture opens. The public revision is an opaque 32-byte array,
+a stateless comparison digest, not authority. It covers the complete private
+comparison state, including checkpoint namespace distinctions, without exposing
+endpoints, userinfo, routing/config/socket paths, container or Prime snapshots.
+The server compares it with the same freshly fenced canonical state before
+Stop or New, then retains the full internal Expected/CAS checks. A changed or
+missing revision requires reobservation and renewed consent, never silent
+retargeting. Successful recovery does not resend a stopped prompt; a later
+explicit send waits for actual current Native readiness.
+
+
 ## Agent switching
 
 `POST /api/sessions/{id}/acp/switch-agent` stops the current worker, spawns the target, persists `agent_name`, clears `acp_session_id` (the old id belongs to a different vendor), resolves the model from the request alone so the old backend's pick does not follow the session across vendors (as `Instance::swap_tool` does), and emits `AgentSwitched { from, to, reason }` so reducers drop backend-specific transient state and the transcript shows a divider. The composer is pre-filled with a context-primer recap, never auto-sent. CLI: `aoe acp switch-agent <session> <target> [--model <name>]`. `reason` is `manual` or `rate_limited`. Completion commits through the scoped native store under canonical exclusion. An automatic respawn retains the originating launch intent; an independent launch supersedes it and refuses the old completion.
@@ -701,7 +840,7 @@ Each agent has two profile sources, kept aligned by registry key:
 - **Server**, `src/acp/agent_profiles.rs`: `parent_meta_namespaces`, `clear_aliases`, and the `supports_exit_plan_mode` / `supports_wakeup_tools` gates.
 - **Frontend**, `web/src/lib/agentProfiles.ts`: the card-classifier alias map, claude-specialized capabilities (`todos`, `skills`, `wakeup`), the MCP prefix list, and special-title patterns matched only when the capability is on.
 
-Profiles are conservative: an unverified tool surface is omitted rather than guessed, so the generic tool card is the fallback. Mode-picker sources resolve in order: a `category:"mode"` config option, then the ACP `SessionModeState` channel, then, for claude-family agents only, the built-in taxonomy. Subagent indentation needs the adapter to emit `_meta.<namespace>.parentToolUseId`. An off-protocol subagent that streams no children (opencode's `task`) is classified by `ToolCall.raw_name` through the profile's `subagentToolNames`, not by the mutable title an update overwrites. To diagnose a tool rendering as a generic card, compare the tool-start frame's `tool.kind` / `tool.name` against the profile; the alias map only fires when `kind` is `"other"`.
+Profiles are conservative: an unverified tool surface is omitted rather than guessed, so the generic tool card is the fallback. Mode-picker sources resolve in order: a `category:"mode"` config option, then the ACP `SessionModeState` channel, then, for claude-family agents only, the built-in taxonomy. Subagent indentation needs the adapter to emit `_meta.<namespace>.parentToolUseId` on child tool calls; for a profile that supports subagents the link comes from the delegation `session_message` instead (see Subagent sessions). An off-protocol subagent that streams no children (opencode's `task`) is classified by `ToolCall.raw_name` through the profile's `subagentToolNames`, not by the mutable title an update overwrites. To diagnose a tool rendering as a generic card, compare the tool-start frame's `tool.kind` / `tool.name` against the profile; the alias map only fires when `kind` is `"other"`.
 
 ## Security model
 

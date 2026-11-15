@@ -114,7 +114,7 @@ async fn cached_native_stop_reason_survives_retained_attachment_and_next_input()
                 bounded(original.send_prompt("original pending native request", &[])).await.unwrap();
                 let first = bounded(prompts.recv()).await.expect("actual first prompt reached native stdin");
                 let store = original.app_state().acp_event_store.clone();
-                let before = store.highest_seq(&original.id);
+                let before = store.highest_seq(&original.id).unwrap();
                 let mut client = bounded(scope.adopt_with(original, in_flight, || async {
                     // Joining the old SDK does not mean the runner has consumed its socket EOF.
                     bounded(async {
@@ -149,7 +149,7 @@ async fn cached_native_stop_reason_survives_retained_attachment_and_next_input()
                 stopped(&mut client, reason).await;
                 assert_native_stop(&client, before, &first, reason);
 
-                let before_next = store.highest_seq(&client.id);
+                let before_next = store.highest_seq(&client.id).unwrap();
                 bounded(client.send_prompt("distinct next explicit native request", &[])).await.unwrap();
                 let next = bounded(prompts.recv()).await.expect("actual next prompt reached native stdin");
                 assert_ne!(next["id"], first["id"]);

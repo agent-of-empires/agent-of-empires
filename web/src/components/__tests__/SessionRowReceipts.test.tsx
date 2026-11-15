@@ -41,6 +41,7 @@ function Harness({
         workspaces.map((workspace) => (
           <SessionRow
             key={workspace.id}
+            rowKey={workspace.id}
             workspace={workspace}
             observedById={current.observedById}
             runtimeEpoch={current.runtimeEpoch}
