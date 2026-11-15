@@ -5208,10 +5208,25 @@ exec sleep 60
                 "0"
             );
             assert_eq!(releases.get(), 0);
-            assert!(matches!(
-                revived,
-                Ok(super::super::EnsureReadyOutcome::Indeterminate { .. })
-            ));
+            if after_marker {
+                let error = match revived {
+                    Err(super::super::EnsureReadyError::Tmux(error)) => error,
+                    other => panic!("the failed probe must refuse revival: {other:?}"),
+                };
+                assert_eq!(
+                    error.downcast_ref::<ManagedResumeRefused>().map(|refusal| refusal.0),
+                    Some(ManagedResumeCause::PreviousProbeFailed)
+                );
+                let unchanged = storage.load().unwrap().remove(0);
+                assert_eq!(unchanged.conversation_state(), row.conversation_state());
+                assert_eq!(unchanged.lifecycle_generation, row.lifecycle_generation);
+                assert!(unchanged.lifecycle_reservation.is_none());
+            } else {
+                assert!(matches!(
+                    revived,
+                    Ok(super::super::EnsureReadyOutcome::Indeterminate { .. })
+                ));
+            }
         }
     }
 
