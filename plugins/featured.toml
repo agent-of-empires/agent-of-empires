@@ -74,10 +74,11 @@ versions = {"0.1.1" = "sha256:b4174e233f643d6d565e75b6d88968d3e5f28f5c14e15008e2
 # tag instead of a moving default branch.
 #
 # 0.5.0 is the first release whose manifest declares `api_version = 21` with the
-# launch, detection, resume, capture and reply declarations, so it needs a host
-# that both accepts API 21 and consumes those declarations. On an older host the
-# load-time host_compat check skips it and the bundled `aoe.omp-fallback` contract
-# keeps working. Pinning it here is what lets its reserved-namespace id install.
+# launch, detection, resume, capture and reply declarations. A host older than
+# 1.24.0 rejects that manifest in `PluginManifest::from_toml_str` with
+# `UnsupportedApiVersion` and records a load error, so the plugin stays inactive
+# there while the bundled `aoe.omp-fallback` contract keeps working. Pinning it
+# here is what lets its reserved-namespace id install.
 #
 # plugin-omp v0.5.0 @ 2863be6a5425870c24316f7e9faa716c4019546f
 [plugins."agent-of-empires.omp"]
