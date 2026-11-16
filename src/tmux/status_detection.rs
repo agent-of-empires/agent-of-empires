@@ -2222,6 +2222,12 @@ Tips for getting started:
 \u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}
  >   Type your message or @path/to/file
 ";
+        let gemini_quoting_wrapped = gemini_quoting.replace(
+            "offers 1. Trust folder (proj),",
+            "offers 1. Trust folder\n  (proj),",
+        );
+        let gemini_trust_unnumbered =
+            GEMINI_FOLDER_TRUST_PROMPT.replace("1. Trust folder (", "Trust folder (");
         // (agent, screen, deciding rule, status)
         let cases = [
             (
@@ -2269,6 +2275,18 @@ Tips for getting started:
             ),
             ("gemini", GEMINI_AFTER_TRUST, "no_rule", Status::Idle),
             ("gemini", gemini_quoting, "no_rule", Status::Idle),
+            (
+                "gemini",
+                gemini_quoting_wrapped.as_str(),
+                "no_rule",
+                Status::Idle,
+            ),
+            (
+                "gemini",
+                gemini_trust_unnumbered.as_str(),
+                "folder_trust_prompt",
+                Status::Waiting,
+            ),
         ];
         for (agent, screen, rule, status) in cases {
             assert_eq!(detected(agent, screen), (rule, status), "{agent}: {screen}");

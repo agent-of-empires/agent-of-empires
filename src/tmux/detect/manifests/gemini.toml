@@ -2,6 +2,7 @@ id = "gemini"
 
 [markers.trust_choice]
 contains = ["1. trust folder ("]
+wrap = 2
 
 [[rules]]
 extends = "interrupt_hint"
