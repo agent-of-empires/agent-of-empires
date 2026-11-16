@@ -1627,6 +1627,7 @@ async fn sandbox_login_queue_keeps_http_prompt() {
         text: "run the nightly task".to_string(),
         attachments: Vec::new(),
         synthesized: false,
+        error: None,
     });
     crate::session::test_support::sandbox_needing_login(app_dir.path(), &mut inst);
     let state = crate::server::test_support::build_native_test_app_state(vec![inst]).await;
