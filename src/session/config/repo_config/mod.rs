@@ -87,10 +87,12 @@ pub(crate) fn repo_config_inputs(source: &Path) -> Vec<PathBuf> {
     if source.as_os_str().is_empty() {
         return Vec::new();
     }
-    vec![
-        source.join(REPO_CONFIG_PATH),
-        source.join(LEGACY_REPO_CONFIG_PATH),
-    ]
+    // Like the loader, consult the legacy path only when the primary is absent.
+    let primary = source.join(REPO_CONFIG_PATH);
+    if fs::symlink_metadata(&primary).is_ok() {
+        return vec![primary];
+    }
+    vec![primary, source.join(LEGACY_REPO_CONFIG_PATH)]
 }
 
 /// Loads `.agent-of-empires/config.toml`, falling back to the legacy
