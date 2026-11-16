@@ -1530,7 +1530,6 @@ fn drive_terminal_handoff(
             crate::session::LifecycleReservationError::Superseded
         );
         let mut claimed = owner.is_some();
-        let mut ended = false;
         loop {
             if exclusion.is_none() {
                 exclusion = Some(HandoffExclusion::acquire(&state, &id).await?);
@@ -1652,7 +1651,7 @@ fn drive_terminal_handoff(
                     let launch_state = state.clone();
                     let launch_id = id.clone();
                     let launch_driver = driver.clone();
-                    ended = tokio::task::spawn_blocking(move || -> anyhow::Result<bool> {
+                    tokio::task::spawn_blocking(move || -> anyhow::Result<()> {
                         let mut held =
                             TerminalHandoff::new(native, launch_id.clone(), launch_driver);
                         // The launch refuses the command's selector beside AoE's own conversation
@@ -1709,7 +1708,7 @@ fn drive_terminal_handoff(
                             }
                             Ok(())
                         })?;
-                        Ok(ended)
+                        Ok(())
                     })
                     .await??;
                 }
@@ -1718,7 +1717,7 @@ fn drive_terminal_handoff(
                     let cleanup_state = state.clone();
                     let cleanup_id = id.clone();
                     let cleanup_driver = driver.clone();
-                    tokio::task::spawn_blocking(move || -> anyhow::Result<()> {
+                    let ended = tokio::task::spawn_blocking(move || -> anyhow::Result<bool> {
                         let _driver = cleanup_driver;
                         let _title = crate::session::acquire_session_title_lock(&cleanup_id)?;
                         let _lifecycle = native
@@ -1740,6 +1739,9 @@ fn drive_terminal_handoff(
                             recorded.stage == HandoffStage::ProjectionCleanupOwed,
                             crate::session::LifecycleReservationError::Superseded
                         );
+                        // Read from disk, so a cleanup resumed after a failure or a restart still
+                        // reports a launch that was owed but never started.
+                        let ended = recorded.launch_required && !recorded.launch_started;
                         recorded.ensure_original_stopped(&cleanup_id)?;
                         let mut target = cleanup_state
                             .acp_supervisor
@@ -1762,7 +1764,7 @@ fn drive_terminal_handoff(
                             current.last_error = Some(command_selector_ended(&cleanup_id));
                             native.adopt_runtime_fields(&current)?;
                         }
-                        Ok(())
+                        Ok(ended)
                     })
                     .await??;
                     return if ended {
@@ -5077,8 +5079,20 @@ mod tests {
             })
             .collect();
         crate::server::test_support::seed_instances_on_disk_for_test("default", rows.clone());
-        let state = crate::server::test_support::build_test_app_state(rows.clone());
+        let db_path = project.path().join("events.db");
+        let state = crate::server::test_support::build_test_app_state_impl_with_event_store(
+            rows.clone(),
+            Vec::new(),
+            Vec::new(),
+            None,
+            Some(Arc::new(crate::acp::event_store::EventStore::open(
+                &db_path, 100,
+            )?)),
+            |_| {},
+            |supervisor| supervisor,
+        );
         crate::server::test_support::refresh_canonical_metadata_for_test(&state).await;
+        let db = rusqlite::Connection::open(&db_path)?;
         let stored = |id: &str| -> anyhow::Result<Instance> {
             let rows = crate::session::Storage::open_unwatched("default")?.load()?;
             Ok(rows.into_iter().find(|r| r.id == id).unwrap())
@@ -5110,28 +5124,52 @@ mod tests {
                 .await??;
             }
             assert!(stored(&held.id)?.terminal_handoff.is_some());
-            let response = acp_disable(
-                State(state.clone()),
-                Path(held.id.clone()),
-                axum::body::Bytes::from_static(b""),
-            )
-            .await
-            .into_response();
-            let status = response.status();
-            let code = response
-                .headers()
-                .get(crate::daemon::ERROR_CODE_HEADER)
-                .cloned();
-            let body = axum::body::to_bytes(response.into_body(), 8192).await?;
-            assert_eq!(status, StatusCode::CONFLICT, "{body:?}");
-            assert_eq!(
-                code.as_ref().and_then(|v| v.to_str().ok()),
-                Some("command_selector_conflict")
-            );
-            assert_eq!(
-                std::str::from_utf8(&body)?,
-                command_selector_ended(&held.id)
-            );
+            // The first cleanup fails after the skipped launch is saved, so the outcome must
+            // survive into a resumed cleanup.
+            db.execute(
+                "INSERT OR REPLACE INTO acp_rate_limit_budgets (session_id, spent, armed) VALUES (?1,2,1)",
+                [&held.id],
+            )?;
+            db.execute_batch(&format!("CREATE TRIGGER refuse_handoff_delete BEFORE DELETE ON acp_rate_limit_budgets WHEN OLD.session_id = '{}' BEGIN SELECT RAISE(ABORT, 'durable handoff cleanup blocked'); END;", held.id))?;
+            let switch = || {
+                acp_disable(
+                    State(state.clone()),
+                    Path(held.id.clone()),
+                    axum::body::Bytes::from_static(b""),
+                )
+            };
+            let interrupted = switch().await.into_response();
+            assert_eq!(interrupted.status(), StatusCode::SERVICE_UNAVAILABLE);
+            let pending = stored(&held.id)?;
+            let intent = pending
+                .terminal_handoff
+                .as_ref()
+                .expect("cleanup still owed");
+            assert_eq!(intent.stage, HandoffStage::ProjectionCleanupOwed);
+            assert_eq!(pending.view, View::Terminal);
+            db.execute_batch("DROP TRIGGER refuse_handoff_delete")?;
+            if held.id == flag_removed.id {
+                // A retried switch drives the cleanup and still answers with the coded refusal.
+                let response = switch().await.into_response();
+                let status = response.status();
+                let code = response
+                    .headers()
+                    .get(crate::daemon::ERROR_CODE_HEADER)
+                    .cloned();
+                let body = axum::body::to_bytes(response.into_body(), 8192).await?;
+                assert_eq!(status, StatusCode::CONFLICT, "{body:?}");
+                assert_eq!(
+                    code.as_ref().and_then(|v| v.to_str().ok()),
+                    Some("command_selector_conflict")
+                );
+                assert_eq!(
+                    std::str::from_utf8(&body)?,
+                    command_selector_ended(&held.id)
+                );
+            } else {
+                // So does the daemon's own recovery, which has no request to answer.
+                recover_pending_terminal_handoffs(&state, HandoffRecovery::Maintenance).await;
+            }
             let ended = stored(&held.id)?;
             assert!(ended.terminal_handoff.is_none(), "the handoff ended");
             assert!(ended.lifecycle_reservation.is_none());
