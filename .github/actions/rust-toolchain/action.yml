@@ -44,8 +44,8 @@ runs:
         PY
         )"
         echo "channel=$channel" >> "$GITHUB_OUTPUT"
-    # A version key never changes content, so a hit never goes stale. Only the
-    # toolchain dir is cached; rustup and its proxies come from the runner image.
+    # Only the toolchain dir is cached; rustup and its proxies come from the runner
+    # image. A two-part MSRV like 1.95 keeps the first patch it cached, fine for a check.
     - id: cache
       uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
       with:
