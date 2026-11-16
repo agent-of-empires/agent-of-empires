@@ -34,7 +34,7 @@ pub(super) fn plan_from_markdown(plan_text: &str) -> Option<Plan> {
 }
 
 /// Every line starting with a Markdown list marker (`-`, `*`, `+`, `1.`, `1)`)
-/// becomes a step.
+/// outside a fenced code block becomes a step.
 /// Sub-bullets flatten in, since `PlanEntry` has no nesting field.
 pub(super) fn parse_plan_steps(text: &str) -> Vec<PlanStep> {
     use std::sync::OnceLock;
@@ -45,7 +45,19 @@ pub(super) fn parse_plan_steps(text: &str) -> Vec<PlanStep> {
     });
 
     let mut steps = Vec::new();
+    let mut fence: Option<&str> = None;
     for line in text.lines() {
+        let trimmed = line.trim_start();
+        if let Some(open) = fence {
+            if trimmed.starts_with(open) {
+                fence = None;
+            }
+            continue;
+        }
+        if let Some(open) = ["```", "~~~"].into_iter().find(|f| trimmed.starts_with(f)) {
+            fence = Some(open);
+            continue;
+        }
         if let Some(caps) = bullet.captures(line) {
             let raw_title = caps.get(1).map(|m| m.as_str()).unwrap_or("");
             let title = strip_markdown_emphasis(raw_title);
@@ -149,8 +161,8 @@ mod tests {
         assert_eq!(plan.steps.len(), 3);
         assert_eq!(plan.steps[0].title, "Step one");
 
-        // Every list marker counts; headings and surrounding prose do not.
-        let md = "# Plan\n\nHere's the plan:\n\n- First, **read** the file\n+ Then patch it\n1. Run tests\n2) Commit\n\nOther prose.";
+        // Every list marker counts; headings, prose and fenced code do not.
+        let md = "# Plan\n\nHere's the plan:\n\n- First, **read** the file\n```diff\n+    let x = 1;\n- old\n~~~\n```\n+ Then patch it\n~~~\n1. not a step\n~~~\n1. Run tests\n2) Commit\n\nOther prose.";
         let steps = parse_plan_steps(md);
         let titles: Vec<&str> = steps.iter().map(|s| s.title.as_str()).collect();
         assert_eq!(
