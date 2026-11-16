@@ -155,6 +155,7 @@ impl<S: BroadcastSink> Supervisor<S> {
         let unrecorded = PublishedPrompt {
             disposition,
             seq: None,
+            last_seq: None,
         };
         // The first id names the transcript row; the rest were folded into it by a queue drain or send-now.
         let mut prompt_ids = prompt_ids.into_iter();
@@ -186,9 +187,11 @@ impl<S: BroadcastSink> Supervisor<S> {
             self.sink.delete_attachments_for_seq(session_id, seq);
             return unrecorded;
         }
-        if is_clear && disposition == PromptDisposition::Forward {
-            self.publish_next(session_id, &Event::SessionCleared);
-        }
+        let last_seq = if is_clear && disposition == PromptDisposition::Forward {
+            self.publish_next(session_id, &Event::SessionCleared)
+        } else {
+            seq
+        };
         #[cfg(test)]
         let gate = self.prompt_publish_gate.lock().unwrap().take();
         #[cfg(test)]
@@ -199,6 +202,7 @@ impl<S: BroadcastSink> Supervisor<S> {
         PublishedPrompt {
             disposition,
             seq: Some(seq),
+            last_seq: Some(last_seq),
         }
     }
 
@@ -527,13 +531,18 @@ pub(super) fn cancel_orphaned_requests_on<S: BroadcastSink>(
     }
 }
 
-/// The session's registry record, if it names an agent and its runner is alive.
+/// The session's registry record while its runner is alive. A record that predates
+/// `agent_key` ran `claude`.
 fn live_record_agent(session_id: &str) -> Option<crate::process::worker_registry::WorkerRecord> {
     crate::process::worker_registry::load(session_id)
         .ok()
         .flatten()
-        .filter(|record| {
-            !record.agent_key.is_empty() && crate::process::worker_registry::is_record_live(record)
+        .filter(crate::process::worker_registry::is_record_live)
+        .map(|mut record| {
+            if record.agent_key.is_empty() {
+                record.agent_key = "claude".into();
+            }
+            record
         })
 }
 
@@ -951,6 +960,7 @@ inherits-claude = "claude"
             PublishedPrompt {
                 disposition: PromptDisposition::Forward,
                 seq: Some(recorded),
+                last_seq: Some(recorded),
             }
         );
 
@@ -971,6 +981,7 @@ inherits-claude = "claude"
             PublishedPrompt {
                 disposition: PromptDisposition::Forward,
                 seq: None,
+                last_seq: None,
             }
         );
     }

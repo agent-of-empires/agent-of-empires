@@ -1280,7 +1280,7 @@ impl SessionService {
             }
         };
         if receiver.is_some() && outcome.is_err() {
-            if let Some(seq) = published.seq {
+            if let Some(seq) = published.last_seq {
                 self.acp_supervisor
                     .publish_stopped_if_seq(id, "delivery_failed", seq);
             }
@@ -3832,6 +3832,102 @@ mod tests {
             assert_eq!(rows[0].text, "after");
             crate::process::worker_registry::delete(id).unwrap();
         }
+    }
+
+    /// A forwarded clear publishes `SessionCleared` after its prompt, so a delivery failure
+    /// after publication must still close the turn it opened.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn a_forwarded_clear_that_fails_after_publication_closes_its_turn() {
+        use std::time::Duration;
+        let _home = crate::session::test_support::isolate_app_dir();
+        let id = "forwarded-clear";
+        let service = crate::server::test_support::build_test_app_state(vec![structured_idle_row(
+            id, "opencode",
+        )])
+        .session_service
+        .clone();
+        let recorded = service
+            .acp_supervisor
+            .test_insert_worker_cmd_recording(id)
+            .await;
+        let _live = save_agent_record(id, "opencode", true);
+        let published = Arc::new(tokio::sync::Barrier::new(2));
+        service
+            .acp_supervisor
+            .test_gate_prompt_publish(Arc::clone(&published));
+        let send = tokio::spawn({
+            let service = Arc::clone(&service);
+            async move {
+                service
+                    .send_classified_turn(
+                        &SessionCaller::User,
+                        id,
+                        SendTurnRequest {
+                            resume_authority:
+                                crate::process::worker_registry::ResumeAuthority::Automatic,
+                            text: "/new",
+                            attachments: &[],
+                            woke_idle_dormant: false,
+                            prompt_ids: Vec::new(),
+                            synthesized: false,
+                            no_revive: false,
+                        },
+                        Some(crate::acp::supervisor::Classified {
+                            agent: "opencode".into(),
+                            profile: &crate::acp::agent_profiles::OPENCODE,
+                        }),
+                    )
+                    .await
+            }
+        });
+        tokio::time::timeout(Duration::from_secs(10), published.wait())
+            .await
+            .unwrap();
+        // The receiver goes away after `UserPromptSent` and `SessionCleared` are stored.
+        service.acp_supervisor.test_remove_worker(id).await;
+        tokio::time::timeout(Duration::from_secs(10), published.wait())
+            .await
+            .unwrap();
+        let outcome = tokio::time::timeout(Duration::from_secs(10), send)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(matches!(outcome, Err(ref e) if e.published()));
+        assert!(recorded.lock().unwrap().is_empty());
+        assert!(!service.fold_control_state(id).await.turn_active);
+        crate::process::worker_registry::delete(id).ok();
+    }
+
+    /// A live runner whose record predates `agent_key` runs `claude`: it classifies the session's
+    /// prompts and receives the queue.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn a_live_worker_recorded_without_an_agent_key_runs_claude() {
+        let _home = crate::session::test_support::isolate_app_dir();
+        declare_custom_reset("/new");
+        let id = "unkeyed-runner";
+        let service = crate::server::test_support::build_test_app_state(vec![structured_idle_row(
+            id, "bridge",
+        )])
+        .session_service
+        .clone();
+        let recorded = service
+            .acp_supervisor
+            .test_insert_worker_cmd_recording(id)
+            .await;
+        let _live = save_agent_record(id, "", true);
+        let classified = service.agent_profile(id, Some("/new")).await.unwrap();
+        assert_eq!(classified.agent, "claude");
+        service
+            .enqueue_prompt(id, "q0".into(), "hello".into(), Vec::new(), None, None)
+            .await
+            .unwrap();
+        service.drain_queued_prompts_once(id).await;
+        service.acp_supervisor.test_flush_worker_commands(id).await;
+        assert_eq!(*recorded.lock().unwrap(), ["prompt"]);
+        assert!(service.queued_prompts_snapshot(id).await.is_empty());
+        crate::process::worker_registry::delete(id).ok();
     }
 
     /// A batch cut for one agent is withheld from a worker a resume started as another, so the

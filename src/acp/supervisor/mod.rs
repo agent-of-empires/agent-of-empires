@@ -132,10 +132,13 @@ pub enum PromptDisposition {
 
 /// A published user prompt: how to route its text, and the seq of its
 /// `UserPromptSent` event, which is `None` when that event was not persisted.
+/// `last_seq` is the last seq the publication authored, past `seq` when a
+/// forwarded clear also published `SessionCleared`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct PublishedPrompt {
     pub disposition: PromptDisposition,
     pub seq: Option<u64>,
+    pub last_seq: Option<u64>,
 }
 
 /// How this supervisor acquired the worker.
