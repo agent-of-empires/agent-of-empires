@@ -1818,26 +1818,9 @@ impl HomeView {
             if let Some(result) = dialog.handle_click(col, row) {
                 match result {
                     DialogResult::Continue => {}
-                    DialogResult::Cancel => {
-                        self.repo_trust_dialog = None;
-                        self.pending_repo_trust_data = None;
-                        self.pending_repo_trust_fingerprint = None;
-                        self.pending_repo_trust_skip_on_create = false;
-                    }
+                    DialogResult::Cancel => self.cancel_repo_trust(),
                     DialogResult::Submit(action) => {
-                        self.repo_trust_dialog = None;
-                        let fingerprint = self.pending_repo_trust_fingerprint.take();
-                        let skip = std::mem::take(&mut self.pending_repo_trust_skip_on_create);
-                        if let Some(data) = self.pending_repo_trust_data.take() {
-                            let decision = match action {
-                                RepoTrustAction::Trust { .. } => {
-                                    RepoTrustDecision::Approve(fingerprint)
-                                }
-                                RepoTrustAction::Skip { .. } => RepoTrustDecision::Refuse,
-                            };
-                            let emit = self.create_session_with_hooks(data, decision, skip);
-                            self.pending_dialog_click_action = emit;
-                        }
+                        self.pending_dialog_click_action = self.submit_repo_trust(action);
                     }
                 }
             }
@@ -2655,26 +2638,8 @@ impl HomeView {
         if let Some(dialog) = &mut self.repo_trust_dialog {
             match dialog.handle_key(key) {
                 DialogResult::Continue => {}
-                DialogResult::Cancel => {
-                    self.repo_trust_dialog = None;
-                    self.pending_repo_trust_data = None;
-                    self.pending_repo_trust_fingerprint = None;
-                    self.pending_repo_trust_skip_on_create = false;
-                }
-                DialogResult::Submit(action) => {
-                    self.repo_trust_dialog = None;
-                    let fingerprint = self.pending_repo_trust_fingerprint.take();
-                    let skip = std::mem::take(&mut self.pending_repo_trust_skip_on_create);
-                    if let Some(data) = self.pending_repo_trust_data.take() {
-                        let decision = match action {
-                            RepoTrustAction::Trust { .. } => {
-                                RepoTrustDecision::Approve(fingerprint)
-                            }
-                            RepoTrustAction::Skip { .. } => RepoTrustDecision::Refuse,
-                        };
-                        return self.create_session_with_hooks(data, decision, skip);
-                    }
-                }
+                DialogResult::Cancel => self.cancel_repo_trust(),
+                DialogResult::Submit(action) => return self.submit_repo_trust(action),
             }
             return None;
         }
@@ -7840,6 +7805,7 @@ impl HomeView {
         skip_on_create: bool,
     ) -> Option<Action> {
         use crate::session::TrustSurface;
+        self.pending_repo_trust_recovery = None;
         // A fingerprint we cannot build can only refuse.
         let (trust, fingerprint) = match creation_trust_review(&data) {
             Ok(review) => review,
@@ -7909,6 +7875,42 @@ impl HomeView {
         self.pending_repo_trust_data = Some(data);
         self.pending_repo_trust_fingerprint = Some(fingerprint);
         self.pending_repo_trust_skip_on_create = skip_on_create;
+        None
+    }
+
+    pub(super) fn cancel_repo_trust(&mut self) {
+        self.repo_trust_dialog = None;
+        self.pending_repo_trust_data = None;
+        self.pending_repo_trust_fingerprint = None;
+        self.pending_repo_trust_skip_on_create = false;
+        self.pending_repo_trust_recovery = None;
+    }
+
+    /// Applies the answer to the open trust prompt. A prompt a setup-failed resubmit reopened
+    /// returns to that dialog when the send is refused.
+    pub(super) fn submit_repo_trust(&mut self, action: RepoTrustAction) -> Option<Action> {
+        self.repo_trust_dialog = None;
+        let fingerprint = self.pending_repo_trust_fingerprint.take();
+        let skip_on_create = std::mem::take(&mut self.pending_repo_trust_skip_on_create);
+        let recovery = self.pending_repo_trust_recovery.take();
+        let data = self.pending_repo_trust_data.take()?;
+        let decision = match action {
+            RepoTrustAction::Trust { .. } => RepoTrustDecision::Approve(fingerprint),
+            RepoTrustAction::Skip { .. } => RepoTrustDecision::Refuse,
+        };
+        let Some(dialog) = recovery else {
+            return self.create_session_with_hooks(data, decision, skip_on_create);
+        };
+        let (trust_hooks, trust_review) = decision.into_request();
+        let request = super::CreationRequest {
+            data,
+            trust_hooks,
+            trust_review,
+            skip_on_create,
+        };
+        if let Err(request) = self.submit_creation(request) {
+            self.create_hook_failed = Some((dialog, *request));
+        }
         None
     }
 
