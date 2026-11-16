@@ -232,11 +232,11 @@ describe("installed plugins", () => {
 
 describe("detail modal", () => {
   it("opens from an installed row with fallback fields, header icon, and closes", async () => {
-    renderWith([{ ...EXAMPLE, icon: "github", icon_asset_url: "/api/plugins/x/icon" }]);
+    renderWith([{ ...EXAMPLE, icon: "github", icon_asset_url: "/plugin-icons/x" }]);
     await click("plugin-open-example.plugin");
     const modal = await screen.findByTestId("plugin-detail-modal");
     expect(modal.textContent).toContain("v0.1.0");
-    expect((await screen.findByTestId("plugin-detail-icon")).getAttribute("src")).toBe("/api/plugins/x/icon");
+    expect((await screen.findByTestId("plugin-detail-icon")).getAttribute("src")).toBe("/plugin-icons/x");
     await click("plugin-detail-close");
     await waitFor(() => expect(screen.queryByTestId("plugin-detail-modal")).toBeNull());
     await click("plugin-open-example.plugin");

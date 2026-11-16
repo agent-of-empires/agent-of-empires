@@ -133,6 +133,8 @@ fn normalize_path(path: &str) -> &str {
 fn is_machine_endpoint(path: &str) -> bool {
     let path = path.trim_end_matches('/');
     path.starts_with("/api/")
+        // Not under `/api/`, but refused with a 401 like it, never passed through.
+        || path.starts_with("/plugin-icons/")
         || path.contains("/ws")
         || (path.starts_with("/sessions/") && path.ends_with("/live-ws"))
         || is_mcp_path(path)
@@ -373,11 +375,25 @@ struct PageTicketClaim {
     tickets: Vec<String>,
 }
 
-/// Set only for a GET of exactly `/api/plugins/{id}/pages/{page_id}`.
-fn page_ticket_claim(request: &Request) -> Option<PageTicketClaim> {
+/// A GET that cannot send the device binding header and what stands in for it.
+enum UnboundClaim {
+    PageTicket(PageTicketClaim),
+    /// A plugin icon `<img>` load: the live session alone suffices.
+    PluginIcon,
+}
+
+fn unbound_claim(request: &Request) -> Option<UnboundClaim> {
     if request.method() != axum::http::Method::GET {
         return None;
     }
+    if let Some(id) = request.uri().path().strip_prefix("/plugin-icons/") {
+        return (!id.is_empty() && !id.contains('/')).then_some(UnboundClaim::PluginIcon);
+    }
+    page_ticket_claim(request).map(UnboundClaim::PageTicket)
+}
+
+/// Set only for exactly `/api/plugins/{id}/pages/{page_id}`.
+fn page_ticket_claim(request: &Request) -> Option<PageTicketClaim> {
     let rest = request.uri().path().strip_prefix("/api/plugins/")?;
     let (plugin_id, rest) = rest.split_once('/')?;
     let page_id = rest.strip_prefix("pages/")?;
@@ -392,12 +408,13 @@ fn page_ticket_claim(request: &Request) -> Option<PageTicketClaim> {
 }
 
 /// A bound session presents its binding. A frame load cannot, so on a plugin page route
-/// a ticket that session minted for that exact page stands in for it.
+/// a ticket that session minted for that exact page stands in for it; a plugin icon needs
+/// only the live session.
 async fn session_valid(
     state: &AppState,
     session_id: &str,
     binding: Option<&[u8]>,
-    claim: Option<PageTicketClaim>,
+    claim: Option<UnboundClaim>,
 ) -> bool {
     if let Some(binding) = binding {
         return state
@@ -405,8 +422,12 @@ async fn session_valid(
             .validate_session(session_id, binding)
             .await;
     }
-    let Some(claim) = claim else {
-        return false;
+    let claim = match claim {
+        Some(UnboundClaim::PageTicket(claim)) => claim,
+        Some(UnboundClaim::PluginIcon) => {
+            return state.login_manager.session_live(session_id).await
+        }
+        None => return false,
     };
     for ticket in &claim.tickets {
         if state
@@ -439,7 +460,7 @@ async fn run_passphrase_wall(
 
     let has_valid_session = match &session_id {
         Some(id) => {
-            let claim = page_ticket_claim(&request);
+            let claim = unbound_claim(&request);
             session_valid(state, id, presented_binding.as_deref(), claim).await
         }
         None => false,
@@ -641,7 +662,7 @@ pub async fn auth_middleware(
     };
     let session_valid = match &presented_session_id {
         Some(id) => {
-            let claim = page_ticket_claim(&request);
+            let claim = unbound_claim(&request);
             session_valid(&state, id, presented_binding.as_deref(), claim).await
         }
         None => false,
@@ -1217,6 +1238,7 @@ mod tests {
             "/api/plugins",
             "/api/plugins/github/pages/prs",
             "/pluginsx",
+            "/plugin-icons/github",
             "/api/sessions/abc/acp/ws",
             "/api/settings",
             "/api/login/elevate",
@@ -1336,10 +1358,11 @@ mod tests {
         }
     }
 
-    /// Plugin page deep links are document navigations that cannot carry a device binding
-    /// header, so the shell must load on a bare session cookie while APIs stay gated.
+    /// Plugin page deep links and plugin icon `<img>` loads cannot carry a device binding
+    /// header: the shell loads on a bare session cookie, an icon on a live session, and
+    /// APIs stay gated.
     #[tokio::test]
-    async fn plugin_page_shell_loads_remote_without_binding_header() {
+    async fn plugin_shell_and_icon_load_remote_without_binding_header() {
         use crate::server::login::LoginManager;
         use tower::ServiceExt;
 
@@ -1360,13 +1383,12 @@ mod tests {
                 None => format!("aoe_session={session_id}"),
             };
 
-            let get = |uri: &str| {
-                let mut req = Request::builder()
-                    .uri(uri)
-                    .header("host", "localhost")
-                    .header("cookie", &cookie)
-                    .body(axum::body::Body::empty())
-                    .unwrap();
+            let get = |uri: &str, cookie: Option<&str>| {
+                let mut req = Request::builder().uri(uri).header("host", "localhost");
+                if let Some(cookie) = cookie {
+                    req = req.header("cookie", cookie);
+                }
+                let mut req = req.body(axum::body::Body::empty()).unwrap();
                 req.extensions_mut().insert(ConnectInfo(
                     "203.0.113.7:5555".parse::<SocketAddr>().unwrap(),
                 ));
@@ -1375,13 +1397,41 @@ mod tests {
             };
 
             // 404 when the build embeds no dashboard; either way auth let it through.
-            let shell = get("/plugins/github/prs").await;
+            let shell = get("/plugins/github/prs", Some(&cookie)).await;
             assert!(
                 matches!(shell, StatusCode::OK | StatusCode::NOT_FOUND),
                 "{token:?}: {shell}"
             );
-            for api in ["/api/sessions", "/api/plugins/github/pages/prs"] {
-                assert_eq!(get(api).await, StatusCode::UNAUTHORIZED, "{token:?} {api}");
+            // The handler's own 404 for an unknown plugin, not the wall's 401: the session
+            // alone suffices, with or without the token.
+            let session_only = format!("aoe_session={session_id}");
+            for with_session in [&cookie, &session_only] {
+                assert_eq!(
+                    get("/plugin-icons/absent.plugin", Some(with_session)).await,
+                    StatusCode::NOT_FOUND,
+                    "{token:?} {with_session}"
+                );
+            }
+            let token_only = token.map(|t| format!("aoe_token={t}"));
+            let mut anonymous = vec![None];
+            anonymous.extend(token_only.as_deref().map(Some));
+            for anonymous in anonymous {
+                assert_eq!(
+                    get("/plugin-icons/absent.plugin", anonymous).await,
+                    StatusCode::UNAUTHORIZED,
+                    "{token:?} {anonymous:?}"
+                );
+            }
+            for api in [
+                "/api/sessions",
+                "/api/plugins/github/pages/prs",
+                "/plugin-icons/absent.plugin/extra",
+            ] {
+                assert_eq!(
+                    get(api, Some(&cookie)).await,
+                    StatusCode::UNAUTHORIZED,
+                    "{token:?} {api}"
+                );
             }
         }
     }
