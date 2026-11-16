@@ -3,6 +3,7 @@ import { useEffect, useId, useRef, useState } from "react";
 import { useRespawnSession } from "../../hooks/useRespawnSession";
 import type { AcpState } from "../../lib/acpTypes";
 import { RATTLES } from "../../lib/rattles";
+import type { RecreateContainerBlock } from "../sidebar/sessionActionTargets";
 import { ContainerGoneBanner, type NewSessionLike } from "./ContainerGoneBanner";
 import { SECONDARY_BUTTON } from "./RecoveryActionRow";
 import { StartupErrorBanner } from "./StartupErrorBanner";
@@ -24,6 +25,7 @@ export function SessionBanners({
   onRestarted,
   onRestartFailed,
   recreateContainerTitle,
+  recreateContainerBlock,
   newSession,
 }: {
   sessionId: string;
@@ -36,6 +38,8 @@ export function SessionBanners({
   onRestartFailed?: (epoch: number, message: string, stoppedSent: boolean) => void;
   /** The Session's title when the dashboard may recreate its container. */
   recreateContainerTitle?: string;
+  /** Why Recreate container isn't offered, or null when it is. */
+  recreateContainerBlock: RecreateContainerBlock | null;
   /** Opens the wizard for a Session like this one; omitted on a read-only server. */
   newSession?: NewSessionLike;
   acpWorkerState: "absent" | "resuming" | "running" | "stopping";
@@ -64,7 +68,9 @@ export function SessionBanners({
           message={state.startupError}
           canRestart={canRestart}
           recreateContainerTitle={recreateContainerTitle}
+          recreateBlock={recreateContainerBlock}
           newSession={newSession}
+          onRestore={onRestore}
           // As a Retry does, so the startup line replaces the banner until the Agent starts or fails again.
           onRecreated={() => onRestarted?.(state.restartEpoch, false, state.startupError ?? "")}
         />

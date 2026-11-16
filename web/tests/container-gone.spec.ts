@@ -13,14 +13,25 @@ const REMINDER_ABOUT = { acp_compaction_reminder: true, acp_compaction_reminder_
 const WITH_COMPACT = { available_commands: [{ name: "compact", description: "compact", accepts_input: false }] };
 const NEAR_FULL = [{ UsageUpdated: { usage: { used: 180_000, size: 200_000, cost: null } } }];
 
-async function openGoneSession(page: Page, { readOnly = false, queued = false, nearFull = false } = {}) {
+const RECREATE_LINE = "This Session's sandbox container is gone. Recreate it to use this Session again.";
+
+async function openGoneSession(
+  page: Page,
+  {
+    readOnly = false,
+    queued = false,
+    nearFull = false,
+    fields = {} as Record<string, unknown>,
+    line = RECREATE_LINE,
+  } = {},
+) {
   const mock = await mockAcpSession(page, {
     title: TITLE,
     about: { ...(readOnly ? { read_only: true } : {}), ...(nearFull ? REMINDER_ABOUT : {}) },
     reducedState: nearFull ? WITH_COMPACT : undefined,
     workerState: "absent",
     acpSessionId: "acp-1",
-    sessionFields: { is_sandboxed: true, group_path: "infra", acp_agent: "claude" },
+    sessionFields: { is_sandboxed: true, group_path: "infra", acp_agent: "claude", ...fields },
     initialEvents: [
       ...(nearFull ? NEAR_FULL : []),
       { AgentStartupError: { message: MESSAGE, cause: { kind: "container_missing" } } },
@@ -45,9 +56,7 @@ async function openGoneSession(page: Page, { readOnly = false, queued = false, n
   await openStructuredSession(page, mock);
   const banner = page.getByTestId("container-gone-banner");
   await expect(banner.getByRole("heading", { name: "Claude couldn't start in Structured view" })).toBeVisible();
-  await expect(banner).toContainText(
-    "This Session's sandbox container is gone. Recreate it to use this Session again.",
-  );
+  await expect(banner.getByTestId("container-gone-line")).toHaveText(line);
   return { banner, recreates };
 }
 
@@ -108,12 +117,92 @@ test.describe("at 1280px", () => {
   test.use({ viewport: { width: 1280, height: 800 } });
 
   test("a read-only dashboard asks the owner and offers no actions", async ({ page }) => {
-    const { banner } = await openGoneSession(page, { readOnly: true });
-    await expect(banner.getByTestId("container-gone-owner")).toHaveText("Ask the owner to recreate the container.");
+    const { banner } = await openGoneSession(page, {
+      readOnly: true,
+      line: "This Session's sandbox container is gone. Ask the owner to recreate the container.",
+    });
     await expect(banner.getByRole("button")).toHaveText(["Details"]);
     await expect(composer(page)).toHaveAttribute("placeholder", "Ask the owner to recreate the container.");
     await banner.getByRole("button", { name: "Details" }).click();
     await expect(banner.locator("pre")).toHaveText(MESSAGE);
+  });
+});
+
+const AT = "2026-11-01T00:00:00Z";
+const NEW = `New Session in ${TITLE}`;
+// Recreate isn't offered for these, so the screen names what is: Unarchive, Restore, or waiting.
+const UNOFFERED = [
+  {
+    state: "archived",
+    fields: { archived_at: AT },
+    line: "Unarchive this Session from the sidebar, then recreate its container.",
+    buttons: [NEW, "Details"],
+    composer: null,
+  },
+  {
+    state: "trashed",
+    fields: { trashed_at: AT },
+    line: "Restore this Session from Trash, then recreate its container.",
+    buttons: ["Restore", NEW, "Details"],
+    composer: null,
+  },
+  {
+    state: "being created",
+    fields: { status: "Creating" },
+    line: "Wait for this Session to finish being created.",
+    buttons: [NEW, "Details"],
+    composer: "Wait for this Session to finish being created.",
+  },
+  {
+    state: "being deleted",
+    fields: { status: "Deleting" },
+    line: "Wait for this Session to finish being deleted.",
+    buttons: [NEW, "Details"],
+    composer: "Wait for this Session to finish being deleted.",
+  },
+];
+
+test.describe("at 1280px, where Recreate isn't offered", () => {
+  test.use({ viewport: { width: 1280, height: 800 } });
+  for (const c of UNOFFERED) {
+    test(`a Session ${c.state} names the control that exists`, async ({ page }) => {
+      const { banner } = await openGoneSession(page, {
+        fields: c.fields,
+        line: `This Session's sandbox container is gone. ${c.line}`,
+      });
+      await expect(banner.getByRole("button")).toHaveText(c.buttons);
+      if (c.composer === null) await expect(composer(page)).toHaveCount(0);
+      else await expect(composer(page)).toHaveAttribute("placeholder", c.composer);
+    });
+  }
+
+  test("Restore restores the trashed Session", async ({ page }) => {
+    const restores: string[] = [];
+    await page.route("**/api/sessions/*/restore", (r) => {
+      restores.push(r.request().method());
+      return r.fulfill({ status: 500, json: {} });
+    });
+    const { banner } = await openGoneSession(page, {
+      fields: { trashed_at: AT },
+      line: "This Session's sandbox container is gone. Restore this Session from Trash, then recreate its container.",
+    });
+    await banner.getByRole("button", { name: "Restore" }).click();
+    await expect.poll(() => restores).toEqual(["POST"]);
+    // A failed restore brings the button back.
+    await expect(banner.getByRole("button", { name: "Restore" })).toBeEnabled();
+  });
+});
+
+test.describe("at 375px, where Recreate isn't offered", () => {
+  test.use({ viewport: { width: 375, height: 812 } });
+
+  test("the mobile pane names the control that exists too", async ({ page }) => {
+    const { banner } = await openGoneSession(page, {
+      fields: { status: "Deleting" },
+      line: "This Session's sandbox container is gone. Wait for this Session to finish being deleted.",
+    });
+    await expect(banner.getByRole("button")).toHaveText([NEW, "Details"]);
+    await expect(composer(page)).toHaveAttribute("placeholder", "Wait for this Session to finish being deleted.");
   });
 });
 

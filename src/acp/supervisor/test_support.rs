@@ -180,6 +180,22 @@ impl<S: BroadcastSink> Supervisor<S> {
         handle.lease = respawn;
     }
 
+    /// Parks an approval on the session's installed worker; see
+    /// [`AcpClient::test_park_approval`].
+    pub(crate) async fn test_park_approval(
+        &self,
+        session_id: &str,
+        nonce: &str,
+    ) -> tokio::sync::oneshot::Receiver<
+        Option<(crate::acp::approvals::ApprovalDecision, Option<String>)>,
+    > {
+        let client = self
+            .client_for_session(session_id)
+            .await
+            .expect("test worker");
+        client.test_park_approval(Nonce(nonce.to_string())).await
+    }
+
     /// A fake worker whose command loop records every command it receives.
     pub(crate) async fn test_insert_worker_cmd_recording(
         &self,

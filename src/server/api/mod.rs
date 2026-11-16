@@ -28,10 +28,10 @@ pub(crate) use acp::structured_spawn_error_message;
 pub use acp::{
     acp_attachment, acp_cancel, acp_cancel_subagent, acp_context_primer, acp_disable, acp_enable,
     acp_files, acp_force_end_turn, acp_prompt, acp_prompt_diff_comments, acp_replay,
-    acp_set_config_option, acp_set_mode, acp_task_output, acp_worker_log, agent_install_info,
-    get_option_catalog, install_agent, list_acp_agents, list_importable_sessions, resolve_approval,
-    resolve_elicitation, restart_acp, shutdown_acp, spawn_acp, switch_acp_agent,
-    switch_acp_provider,
+    acp_set_config_option, acp_set_mode, acp_task_output, acp_terminal_check, acp_worker_log,
+    agent_install_info, get_option_catalog, install_agent, list_acp_agents,
+    list_importable_sessions, resolve_approval, resolve_elicitation, restart_acp, shutdown_acp,
+    spawn_acp, switch_acp_agent, switch_acp_provider,
 };
 pub(crate) use acp::{
     publish_startup_error_if_current, recover_pending_terminal_handoffs, HandoffRecovery,
@@ -257,11 +257,27 @@ pub(crate) fn api_error_with_code_header(
     message: impl Into<String>,
 ) -> axum::response::Response {
     let mut response = api_error(code.status(), code.as_str(), message);
+    insert_code_header(&mut response, code);
+    response
+}
+
+/// The code header with a plain-text body, for an endpoint whose existing
+/// clients show the body as it is.
+pub(crate) fn text_error_with_code_header(
+    code: crate::daemon::ApiErrorCode,
+    message: impl Into<String>,
+) -> axum::response::Response {
+    use axum::response::IntoResponse as _;
+    let mut response = (code.status(), message.into()).into_response();
+    insert_code_header(&mut response, code);
+    response
+}
+
+fn insert_code_header(response: &mut axum::response::Response, code: crate::daemon::ApiErrorCode) {
     let (name, value) = code.header()[0];
     if let Ok(value) = axum::http::HeaderValue::from_str(value) {
         response.headers_mut().insert(name, value);
     }
-    response
 }
 
 pub(crate) fn read_only_block(state: &AppState) -> Option<axum::response::Response> {

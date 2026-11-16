@@ -164,27 +164,32 @@ impl SessionAgent {
     pub(crate) fn profile_with(
         &self,
         registry: &AgentRegistry,
-        config: &crate::session::config::Config,
+        session_config: &crate::session::config::SessionConfig,
+        default_agent: &str,
     ) -> &'static crate::acp::agent_profiles::AgentProfile {
-        self.classify_with(registry, config).profile
+        self.classify_with(registry, session_config, default_agent)
+            .profile
     }
 
     fn classify_with(
         &self,
         registry: &AgentRegistry,
-        config: &crate::session::config::Config,
+        session_config: &crate::session::config::SessionConfig,
+        default_agent: &str,
     ) -> Classified {
         let agent = match self {
             Self::Worker(key) => key.clone(),
-            Self::Next { tool, explicit } => crate::acp::pick_acp_agent_name(
-                registry,
-                &config.session,
-                &config.acp,
-                tool,
-                explicit.as_deref(),
-            ),
+            Self::Next { tool, explicit } => {
+                crate::acp::agent_registry::pick_acp_agent_name_with_default(
+                    registry,
+                    session_config,
+                    default_agent,
+                    tool,
+                    explicit.as_deref(),
+                )
+            }
         };
-        let profile = crate::acp::agent_profiles::resolve_with_config(&agent, &config.session);
+        let profile = crate::acp::agent_profiles::resolve_with_config(&agent, session_config);
         Classified { agent, profile }
     }
 
@@ -205,11 +210,16 @@ impl SessionAgent {
             },
             Self::Next { .. } => self.classify_with(
                 &AgentRegistry::with_defaults(),
-                &crate::session::config::Config::default(),
+                &crate::session::config::SessionConfig::default(),
+                crate::session::config::AcpConfig::default().resolved_default_agent(),
             ),
         };
         with_resolved_config(profile, project_path, move |cfg| {
-            self.classify_with(&AgentRegistry::with_defaults(), &cfg)
+            self.classify_with(
+                &AgentRegistry::with_defaults(),
+                &cfg.session,
+                cfg.acp.resolved_default_agent(),
+            )
         })
         .await
         .unwrap_or(fallback)

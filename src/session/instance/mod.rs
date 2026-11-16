@@ -82,7 +82,7 @@ pub(crate) mod test_helpers;
 mod tmux_session;
 mod types;
 
-pub(crate) use accessors::resolved_agent_for;
+pub(crate) use accessors::{resolved_agent_for, UNBOUND_STORE_HINT};
 pub use flags::{
     is_valid_session_color, SandboxLoginRequired, SandboxLoginUnsupported, SessionBucket,
     StartBlocked, SESSION_COLORS,

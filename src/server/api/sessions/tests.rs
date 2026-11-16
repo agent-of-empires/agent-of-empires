@@ -4406,7 +4406,8 @@ fn session_cfg_cache_discovers_a_repeated_main_checkout_once() {
     let path = repo.path().to_str().unwrap();
 
     let misses = AtomicUsize::new(0);
-    let mut cache = super::model::SessionCfgCache::new(&misses);
+    let mut store = super::SessionCfgStore::default();
+    let mut cache = super::model::SessionCfgCache::new(&mut store, &misses);
     for _ in 0..3 {
         cache.resolve("default", path);
         cache.structured_view("default", path);
@@ -4414,6 +4415,199 @@ fn session_cfg_cache_discovers_a_repeated_main_checkout_once() {
 
     assert_eq!(cache.discoveries, 1);
     assert_eq!(misses.load(Ordering::Relaxed), 1);
+}
+
+// Regression witness for #5665: the store outlives a request, so an unchanged
+// config is neither rediscovered nor re-resolved, while any input edit, even one
+// that keeps the file's size, resolves again on the next request.
+#[test]
+#[serial_test::serial]
+fn session_cfg_store_reresolves_only_after_an_input_edit() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    let tmp_home = tempfile::tempdir().expect("tempdir HOME");
+    let _home = crate::session::test_support::isolate_app_dir_at(tmp_home.path());
+    let global = crate::session::get_app_dir()
+        .expect("app dir")
+        .join("config.toml");
+    let repo = tempfile::tempdir().expect("tempdir repo");
+    run_git(repo.path(), &["init", "-q"]);
+    let repo_config = repo.path().join(".agent-of-empires/config.toml");
+    std::fs::create_dir_all(repo_config.parent().unwrap()).unwrap();
+    let legacy_config = repo.path().join(".aoe/config.toml");
+    std::fs::create_dir_all(legacy_config.parent().unwrap()).unwrap();
+    let path = repo.path().to_str().unwrap();
+
+    let mut store = super::SessionCfgStore::default();
+    use crate::session::config::StructuredView::{Auto, Off};
+    let detect = |name: &str| format!("[session.agent_detect_as]\n{name} = \"claude\"\n");
+    // Misses, discoveries, then the resolved values, so a stale entry fails too.
+    let mut request_at = |at: &str, edit: &dyn Fn()| {
+        edit();
+        let misses = AtomicUsize::new(0);
+        let mut cache = super::model::SessionCfgCache::new(&mut store, &misses);
+        let mut aliases: Vec<String> = cache
+            .resolve("default", at)
+            .agent_detect_as
+            .keys()
+            .cloned()
+            .collect();
+        aliases.sort();
+        let view = cache.structured_view("default", at);
+        (
+            misses.load(Ordering::Relaxed),
+            cache.discoveries,
+            aliases.join(","),
+            view,
+        )
+    };
+
+    assert_eq!(
+        request_at(path, &|| {}),
+        (1, 1, String::new(), Auto),
+        "first request"
+    );
+    assert_eq!(
+        request_at(path, &|| {}),
+        (0, 0, String::new(), Auto),
+        "unchanged inputs"
+    );
+    let repo_dir = repo_config.parent().unwrap();
+    let app_dir = global.parent().unwrap();
+    let copy_dir = tempfile::tempdir().expect("tempdir config copy");
+    let cases: [(&str, &dyn Fn(), &str, _); 8] = [
+        (
+            "legacy repo config created",
+            &|| std::fs::write(&legacy_config, detect("ll")).unwrap(),
+            "ll",
+            Auto,
+        ),
+        // The loader picks a dangling primary over the legacy file, and the legacy file again once it goes.
+        (
+            "dangling primary link created",
+            &|| std::os::unix::fs::symlink("/nonexistent", &repo_config).unwrap(),
+            "",
+            Auto,
+        ),
+        (
+            "dangling primary link removed",
+            &|| std::fs::remove_file(&repo_config).unwrap(),
+            "ll",
+            Auto,
+        ),
+        (
+            "repo config created",
+            &|| std::fs::write(&repo_config, detect("aa")).unwrap(),
+            "aa",
+            Auto,
+        ),
+        (
+            "same-size repo config edit",
+            &|| std::fs::write(&repo_config, detect("bb")).unwrap(),
+            "bb",
+            Auto,
+        ),
+        (
+            "global config edit",
+            &|| std::fs::write(&global, "[acp]\nstructured_view = \"off\"\n").unwrap(),
+            "bb",
+            Off,
+        ),
+        // A repo config directory linked to the app dir is the global config, so it is skipped.
+        (
+            "repo config dir linked to the app dir",
+            &|| {
+                std::fs::remove_dir_all(repo_dir).unwrap();
+                std::os::unix::fs::symlink(app_dir, repo_dir).unwrap();
+            },
+            "",
+            Off,
+        ),
+        (
+            "link retargeted to an identical copy",
+            &|| {
+                std::fs::copy(&global, copy_dir.path().join("config.toml")).unwrap();
+                std::fs::remove_file(repo_dir).unwrap();
+                std::os::unix::fs::symlink(copy_dir.path(), repo_dir).unwrap();
+            },
+            "",
+            Off,
+        ),
+    ];
+    for (case, edit, aliases, view) in cases {
+        assert_eq!(
+            request_at(path, edit),
+            (1, 0, aliases.to_string(), view),
+            "{case}"
+        );
+    }
+    run_git(
+        repo.path(),
+        &["config", "core.worktree", copy_dir.path().to_str().unwrap()],
+    );
+    assert_eq!(
+        request_at(path, &|| {}),
+        (1, 1, String::new(), Off),
+        "core.worktree edit"
+    );
+
+    // A linked worktree's main repo follows a retargeted link in its gitdir path.
+    let layout = tempfile::tempdir().expect("tempdir worktree layout");
+    for (repo, alias) in [("a", "aa"), ("b", "bb")] {
+        let root = layout.path().join(repo);
+        std::fs::create_dir_all(root.join(".git/worktrees/w")).unwrap();
+        std::fs::create_dir_all(root.join(".agent-of-empires")).unwrap();
+        std::fs::write(root.join(".agent-of-empires/config.toml"), detect(alias)).unwrap();
+    }
+    let current = layout.path().join("current");
+    let worktree = layout.path().join("w");
+    std::fs::create_dir(&worktree).unwrap();
+    std::fs::write(
+        worktree.join(".git"),
+        format!("gitdir: {}/.git/worktrees/w\n", current.display()),
+    )
+    .unwrap();
+    let worktree = worktree.to_str().unwrap();
+    let link = |repo: &str| {
+        let _ = std::fs::remove_file(&current);
+        std::os::unix::fs::symlink(layout.path().join(repo), &current).unwrap();
+    };
+    for (repo, alias) in [("a", "aa"), ("b", "bb")] {
+        let (misses, _, aliases, _) = request_at(worktree, &|| link(repo));
+        assert_eq!((misses, aliases.as_str()), (1, alias), "worktree of {repo}");
+    }
+
+    // An empty profile shares the entry of the default profile it names.
+    let misses = AtomicUsize::new(0);
+    let mut cache = super::model::SessionCfgCache::new(&mut store, &misses);
+    cache.resolve("", path);
+    cache.resolve(&crate::session::config::effective_profile(""), path);
+    assert_eq!(misses.load(Ordering::Relaxed), 1, "empty profile");
+
+    // A `.git` file pointing nowhere skips discovery; a failed discovery is retried, not cached.
+    let broken_cases: [(&str, fn(&std::path::Path), usize); 2] = [
+        (
+            "gitfile pointing nowhere",
+            |dir| std::fs::write(dir.join(".git"), "gitdir: /nonexistent\n").unwrap(),
+            0,
+        ),
+        (
+            "unopenable .git dir",
+            |dir| std::fs::create_dir(dir.join(".git")).unwrap(),
+            1,
+        ),
+    ];
+    for (case, setup, discoveries) in broken_cases {
+        let broken = tempfile::tempdir().expect("tempdir broken repo");
+        setup(broken.path());
+        let broken = broken.path().to_str().unwrap();
+        for _ in 0..2 {
+            let misses = AtomicUsize::new(0);
+            let mut cache = super::model::SessionCfgCache::new(&mut store, &misses);
+            cache.resolve("default", broken);
+            assert_eq!(cache.discoveries, discoveries, "{case}");
+        }
+    }
 }
 
 // Repo roots that differ only in non-UTF-8 bytes must not share a config. APFS rejects such names.
@@ -4452,7 +4646,8 @@ fn session_cfg_cache_keeps_non_utf8_repo_roots_apart() {
         .collect();
 
     let misses = AtomicUsize::new(0);
-    let mut cache = super::model::SessionCfgCache::new(&misses);
+    let mut store = super::SessionCfgStore::default();
+    let mut cache = super::model::SessionCfgCache::new(&mut store, &misses);
     for path in &paths {
         cache.resolve("default", path);
     }
