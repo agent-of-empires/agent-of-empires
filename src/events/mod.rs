@@ -79,6 +79,17 @@ fn not_like_clauses(prefixes: &[&str]) -> (String, Vec<String>) {
     (fragment, patterns)
 }
 
+fn create_owner_only(path: &Path) -> std::io::Result<()> {
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create(true).truncate(false);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    options.open(path).map(drop)
+}
+
 pub fn open(db_path: &Path, schema: &Schema) -> Result<Connection> {
     if let Some(parent) = db_path.parent() {
         if !parent.exists() {
@@ -87,6 +98,9 @@ pub fn open(db_path: &Path, schema: &Schema) -> Result<Connection> {
             })?;
         }
     }
+    // SQLite gives the -wal and -shm files the main file's mode, so create it owner-only first.
+    create_owner_only(db_path)
+        .with_context(|| format!("create event log at {}", db_path.display()))?;
     let conn = Connection::open(db_path)
         .with_context(|| format!("open event log at {}", db_path.display()))?;
     conn.pragma_update(None, "journal_mode", "WAL")
@@ -773,6 +787,22 @@ mod tests {
         ))
         .unwrap();
         conn
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn open_creates_owner_only_db_and_sidecars() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("e.db");
+        let schema = Schema::new("demo").unwrap();
+        let conn = open(&db, &schema).unwrap();
+        insert_event(&conn, &schema, "a", 1, "\"x\"", 1).unwrap();
+        for suffix in ["", "-wal", "-shm"] {
+            let path = dir.path().join(format!("e.db{suffix}"));
+            let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+            assert_eq!(mode, 0o600, "{}", path.display());
+        }
     }
 
     #[test]
