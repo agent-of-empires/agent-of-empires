@@ -49,8 +49,7 @@ pub(super) fn is_compact_failure(text: &str) -> bool {
     text.contains("Compacting failed")
 }
 
-/// Clears the plan strip: after a compaction the model forgot its plan, and
-/// after a `plan_removed` the adapter dropped it.
+/// The model forgot its plan, so a finished compaction clears the plan strip.
 fn cleared_plan() -> Event {
     Event::PlanUpdated {
         plan: Plan {
@@ -309,11 +308,11 @@ fn notice_severity_str(severity: &NoticeSeverity) -> &str {
 }
 
 /// TodoWrite arrives as a checklist plan; a synthetic TodoWrite card pair
-/// records each update in the transcript.
-fn checklist_events(entries: Vec<PlanEntry>) -> Vec<Event> {
+/// records each update in the transcript. A legacy plan has no id, so one is minted.
+fn checklist_events(entries: Vec<PlanEntry>, plan_id: Option<String>) -> Vec<Event> {
     let ts_ms = chrono::Utc::now().timestamp_millis();
     let seq = SYNTHETIC_TOOL_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    let plan_id = format!("plan-{ts_ms}-{seq}");
+    let plan_id = plan_id.unwrap_or_else(|| format!("plan-{ts_ms}-{seq}"));
     let tool_id = format!("todo-{ts_ms}-{seq}");
     let todos_json: Vec<serde_json::Value> = entries
         .iter()
@@ -601,14 +600,20 @@ pub(super) fn map_update_to_events(
             }
             events
         }
-        SessionUpdate::Plan(p) => checklist_events(p.entries),
-        // AoE has one plan strip, so ids only pick the renderer: claude-agent-acp
-        // sends the TodoWrite checklist as items under `plan` and the approved
-        // ExitPlanMode plan as markdown under `plan-mode`.
+        SessionUpdate::Plan(p) => checklist_events(p.entries, None),
+        // One plan strip shows the latest plan; the ACP id becomes its
+        // `plan_id`, so a removal clears only the plan it names.
         SessionUpdate::PlanUpdate(update) => match update.plan {
-            PlanUpdateContent::Items(items) => checklist_events(items.entries),
+            PlanUpdateContent::Items(items) => {
+                checklist_events(items.entries, Some(items.plan_id.to_string()))
+            }
             PlanUpdateContent::Markdown(md) => plan_from_markdown(&md.content)
-                .map(|plan| Event::PlanUpdated { plan })
+                .map(|plan| Event::PlanUpdated {
+                    plan: Plan {
+                        plan_id: md.plan_id.to_string(),
+                        ..plan
+                    },
+                })
                 .into_iter()
                 .collect(),
             other => {
@@ -616,7 +621,9 @@ pub(super) fn map_update_to_events(
                 Vec::new()
             }
         },
-        SessionUpdate::PlanRemoved(_) => vec![cleared_plan()],
+        SessionUpdate::PlanRemoved(removed) => vec![Event::PlanRemoved {
+            plan_id: removed.plan_id.to_string(),
+        }],
         SessionUpdate::CurrentModeUpdate(mode_update) => {
             let id = mode_update.current_mode_id.0.to_string();
             // The legacy enum also folds gemini ApprovalMode ids (#1819).
@@ -848,18 +855,17 @@ mod tests {
         }
     }
 
-    /// #5532: every plan shape feeds the one plan strip and `plan_removed`
-    /// clears it. ExitPlanMode adds no plan of its own, since the adapter
-    /// sends the approved plan as `plan-mode`.
+    /// #5532: every plan shape feeds the one plan strip, keyed by its ACP id.
+    /// ExitPlanMode adds no plan of its own, since the adapter sends the
+    /// approved plan as `plan-mode`.
     #[test]
-    fn plan_updates_feed_and_clear_the_plan_strip() {
+    fn plan_updates_feed_the_plan_strip() {
         use agent_client_protocol::v1::schema::{
             Plan as AcpPlan, PlanEntryPriority, PlanEntryStatus, PlanRemoved, PlanUpdate, ToolKind,
         };
         use serde_json::json;
         let entry = |s| PlanEntry::new(s, PlanEntryPriority::Medium, PlanEntryStatus::InProgress);
         let update = |content| SessionUpdate::PlanUpdate(PlanUpdate::new(content));
-        let removed = |id| SessionUpdate::PlanRemoved(PlanRemoved::new(id));
         let exit_plan_mode = AcpToolCall::new("tc-plan", "ExitPlanMode")
             .kind(ToolKind::SwitchMode)
             .raw_input(json!({ "plan": "- a\n- b" }));
@@ -869,18 +875,19 @@ mod tests {
                 .as_object()
                 .cloned();
         let checklist = ["tool_call_started", "plan_updated", "tool_call_completed"];
-        for (name, update, want_kinds, want_steps) in [
+        // (name, update, event kinds, (ACP plan id, step titles) of any PlanUpdated)
+        for (name, update, want_kinds, want_plan) in [
             (
                 "legacy checklist",
                 SessionUpdate::Plan(AcpPlan::new(vec![entry("a")])),
                 &checklist[..],
-                Some(vec!["a"]),
+                Some((None, vec!["a"])),
             ),
             (
                 "checklist",
                 update(PlanUpdateContent::items("plan", vec![entry("a")])),
                 &checklist[..],
-                Some(vec!["a"]),
+                Some((Some("plan"), vec!["a"])),
             ),
             (
                 "approved plan",
@@ -889,7 +896,7 @@ mod tests {
                     "# Plan\n\n- a\n- b",
                 )),
                 &["plan_updated"][..],
-                Some(vec!["a", "b"]),
+                Some((Some("plan-mode"), vec!["a", "b"])),
             ),
             (
                 "bullet-less approved plan",
@@ -904,16 +911,10 @@ mod tests {
                 None,
             ),
             (
-                "checklist removed",
-                removed("plan"),
-                &["plan_updated"][..],
-                Some(vec![]),
-            ),
-            (
-                "approved plan removed",
-                removed("plan-mode"),
-                &["plan_updated"][..],
-                Some(vec![]),
+                "removal",
+                SessionUpdate::PlanRemoved(PlanRemoved::new("plan")),
+                &["plan_removed"][..],
+                None,
             ),
             (
                 "ExitPlanMode",
@@ -925,30 +926,37 @@ mod tests {
                 "plan_proposal",
                 SessionUpdate::ToolCall(proposal),
                 &["tool_call_started", "plan_updated"][..],
-                Some(vec!["a", "b"]),
+                Some((None, vec!["a", "b"])),
             ),
         ] {
             let events = claude(update);
             assert_eq!(kinds(&events), want_kinds, "{name}");
-            let steps = events.iter().find_map(|e| match e {
-                Event::PlanUpdated { plan } => Some(
-                    plan.steps
-                        .iter()
-                        .map(|s| s.title.as_str())
-                        .collect::<Vec<_>>(),
-                ),
+            let plan = events.iter().find_map(|e| match e {
+                Event::PlanUpdated { plan } => Some(plan),
                 _ => None,
             });
-            assert_eq!(steps, want_steps, "{name}");
+            // A `None` id is minted per update, so only its presence is checked.
+            let got = plan.map(|p| {
+                let titles: Vec<&str> = p.steps.iter().map(|s| s.title.as_str()).collect();
+                (p.plan_id.as_str(), titles)
+            });
+            match (got, want_plan) {
+                (Some((id, titles)), Some((want_id, want_titles))) => {
+                    assert_eq!(titles, want_titles, "{name}");
+                    assert!(want_id.is_none_or(|w| w == id), "{name}: {id}");
+                }
+                (got, want) => assert_eq!(got.is_some(), want.is_some(), "{name}"),
+            }
         }
     }
 
-    /// A daemon restart rebuilds the strip and sidebar from the event log:
-    /// the checklist keeps its last state and a removed plan stays removed.
+    /// The strip and the sidebar, rebuilt from the event log after a daemon
+    /// restart, agree: a removal clears only the plan it names, and a driven
+    /// `/clear` (which never reaches the adapter) clears whatever is shown.
     #[test]
     fn plan_state_survives_event_log_replay() {
         use crate::acp::event_store::EventStore;
-        use crate::acp::state::{AcpSessionId, AcpState, AgentName, PlanStepStatus};
+        use crate::acp::state::{AcpSessionId, AcpState, AgentName};
         use agent_client_protocol::v1::schema::{
             PlanEntryPriority, PlanEntryStatus, PlanRemoved, PlanUpdate,
         };
@@ -958,42 +966,60 @@ mod tests {
                 vec![PlanEntry::new("a", PlanEntryPriority::Medium, status)],
             )))
         };
+        let approved = SessionUpdate::PlanUpdate(PlanUpdate::new(PlanUpdateContent::markdown(
+            "plan-mode",
+            "- b",
+        )));
+        let removed = |id| SessionUpdate::PlanRemoved(PlanRemoved::new(id));
         let tmp = tempfile::TempDir::new().unwrap();
         let store = EventStore::open(&tmp.path().join("acp.db"), 1000).unwrap();
         let mut seq = 0;
-        let mut record = |updates: Vec<SessionUpdate>| {
-            for event in updates.into_iter().flat_map(claude) {
+        let mut record = |events: Vec<Event>| {
+            for event in events {
                 seq += 1;
                 store.record("s", seq, &event).unwrap();
             }
         };
-        let replayed = |store: &EventStore| {
+        let mapped = |updates: Vec<SessionUpdate>| updates.into_iter().flat_map(claude).collect();
+        // (step id, title) of the plan shown, from the replayed state and the sidebar query.
+        let shown = |store: &EventStore| {
             let mut state =
                 AcpState::new(AcpSessionId("s".into()), AgentName("claude".into()), None);
             for (seq, event) in store.replay_from("s", 0) {
                 state.apply_event(seq, event).unwrap();
             }
-            let statuses = |plan: crate::acp::state::Plan| -> Vec<PlanStepStatus> {
-                plan.steps.into_iter().map(|s| s.status).collect()
+            let steps = |plan: crate::acp::state::Plan| -> Vec<(String, String)> {
+                plan.steps
+                    .into_iter()
+                    .map(|s| (s.title, format!("{:?}", s.status)))
+                    .collect()
             };
-            (
-                state.current_plan.map(statuses),
-                store.latest_plan("s").map(statuses),
-            )
+            let replayed = state.current_plan.map(steps);
+            assert_eq!(
+                replayed,
+                store.latest_plan("s").map(steps),
+                "strip and sidebar"
+            );
+            replayed
         };
+        let step = |title: &str, status: &str| Some(vec![(title.to_string(), status.to_string())]);
 
-        record(vec![
+        record(mapped(vec![
             checklist(PlanEntryStatus::Pending),
             checklist(PlanEntryStatus::Completed),
-        ]);
-        let done = Some(vec![PlanStepStatus::Done]);
-        assert_eq!(replayed(&store), (done.clone(), done));
-
-        record(vec![
-            SessionUpdate::PlanRemoved(PlanRemoved::new("plan")),
-            SessionUpdate::PlanRemoved(PlanRemoved::new("plan-mode")),
-        ]);
-        assert_eq!(replayed(&store), (Some(vec![]), Some(vec![])));
+        ]));
+        assert_eq!(shown(&store), step("a", "Done"));
+        record(mapped(vec![approved, removed("plan")]));
+        assert_eq!(
+            shown(&store),
+            step("b", "Pending"),
+            "stale id leaves the approved plan"
+        );
+        record(mapped(vec![removed("plan-mode")]));
+        assert_eq!(shown(&store), None);
+        record(mapped(vec![checklist(PlanEntryStatus::Pending)]));
+        record(vec![Event::SessionCleared]);
+        assert_eq!(shown(&store), None, "driven /clear");
     }
 
     #[test]
