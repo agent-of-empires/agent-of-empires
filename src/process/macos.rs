@@ -50,6 +50,9 @@ const STAGING_SANDBOX: &str = r#"
 (allow file-read*)
 (allow sysctl-read)
 (allow file-write* (subpath (param "AOE_STAGING_ROOT")))
+; Git opens this character device O_RDWR. Reads and metadata are covered above;
+; only data writes are needed, not host metadata writes or arbitrary device I/O.
+(allow file-write-data (literal "/dev/null"))
 (allow network-outbound (remote tcp))
 (allow network-outbound (remote udp "*:53"))
 (allow network-outbound (literal "/private/var/run/mDNSResponder"))
@@ -833,6 +836,59 @@ mod staging_volume_tests {
     }
 
     #[test]
+    fn null_device_rdwr_preserves_host_write_boundary() {
+        use std::io::{Read as _, Write as _};
+        use std::os::fd::AsRawFd as _;
+        use std::os::unix::fs::FileTypeExt as _;
+        const FIXTURE: &str = "_AOE_INTERNAL_MACOS_STAGING_NULL_FIXTURE";
+        if let Some(outside) = std::env::var_os(FIXTURE) {
+            let mut null = std::fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .open("/dev/null")
+                .unwrap();
+            // SAFETY: F_GETFL only examines the live descriptor.
+            assert_eq!(
+                unsafe { libc::fcntl(null.as_raw_fd(), libc::F_GETFL) } & libc::O_ACCMODE,
+                libc::O_RDWR
+            );
+            assert!(null.metadata().unwrap().file_type().is_char_device());
+            null.write_all(b"discarded").unwrap();
+            assert_eq!(null.read(&mut [0u8; 1]).unwrap(), 0);
+            for path in [
+                std::path::Path::new(&outside),
+                std::path::Path::new("/dev/zero"),
+            ] {
+                let error = std::fs::OpenOptions::new()
+                    .read(true)
+                    .write(true)
+                    .open(path)
+                    .unwrap_err();
+                assert_eq!(error.raw_os_error(), Some(libc::EPERM), "{path:?}");
+            }
+            println!("null O_RDWR probe completed");
+            return;
+        }
+        let (parent, mut volume) = volume();
+        let outside = parent.path().join("host-canary");
+        std::fs::write(&outside, b"unchanged").unwrap();
+        let executable = std::env::current_exe().unwrap();
+        let mut child = volume.command(executable.to_str().unwrap());
+        let module = module_path!().split_once("::").unwrap().1;
+        child
+            .args([
+                "--exact",
+                &format!("{module}::null_device_rdwr_preserves_host_write_boundary"),
+                "--nocapture",
+            ])
+            .env(FIXTURE, &outside);
+        let output = staging_tool(&mut child).unwrap();
+        assert!(String::from_utf8_lossy(&output).contains("null O_RDWR probe completed"));
+        assert_eq!(std::fs::read(&outside).unwrap(), b"unchanged");
+        volume.close().unwrap();
+    }
+
+    #[test]
     fn readonly_host_fcntls_are_denied() {
         use std::os::fd::AsRawFd as _;
         use std::os::macos::fs::MetadataExt as _;
@@ -1073,12 +1129,47 @@ mod staging_volume_tests {
 
     #[test]
     fn sandbox_https_dns_tls() {
+        use std::io::Read as _;
+        use std::os::fd::AsRawFd as _;
         use std::time::{Duration, Instant};
-        struct Server(std::process::Child);
+        struct Server {
+            child: std::process::Child,
+            stderr: std::process::ChildStderr,
+            diagnostic: Vec<u8>,
+            truncated: bool,
+        }
+        impl Server {
+            fn drain_stderr(&mut self) {
+                let mut buffer = [0u8; 1024];
+                for _ in 0..16 {
+                    match self.stderr.read(&mut buffer) {
+                        Ok(0) => break,
+                        Ok(count) => {
+                            let retained = count.min(8192 - self.diagnostic.len());
+                            self.diagnostic.extend_from_slice(&buffer[..retained]);
+                            self.truncated |= retained < count;
+                        }
+                        Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => break,
+                        Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+                        Err(error) => panic!("reading local TLS server stderr: {error}"),
+                    }
+                }
+            }
+
+            fn diagnostic(&mut self) -> String {
+                let status = self.child.try_wait().unwrap();
+                self.drain_stderr();
+                format!(
+                    "status={status:?}, stderr={}{}",
+                    String::from_utf8_lossy(&self.diagnostic),
+                    if self.truncated { " [truncated]" } else { "" }
+                )
+            }
+        }
         impl Drop for Server {
             fn drop(&mut self) {
-                let _ = self.0.kill();
-                let _ = self.0.wait();
+                let _ = self.child.kill();
+                let _ = self.child.wait();
             }
         }
         let (parent, mut volume) = volume();
@@ -1115,28 +1206,78 @@ mod staging_volume_tests {
         let listener = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
         let address = listener.local_addr().unwrap();
         drop(listener);
-        let mut server = Server(
-            Command::new("/usr/bin/openssl")
-                .args(["s_server", "-www", "-quiet", "-accept"])
-                .arg(address.to_string())
-                .arg("-cert")
-                .arg(&certificate)
-                .arg("-key")
-                .arg(&key)
-                .stdin(std::process::Stdio::null())
-                .stdout(std::process::Stdio::null())
-                .stderr(std::process::Stdio::null())
-                .spawn()
-                .unwrap(),
+        // LibreSSL's s_server accepts a numeric port, not OpenSSL's host:port.
+        // It binds INADDR_ANY; the fixture sandbox accepts only loopback peers.
+        // See OpenBSD usr.bin/openssl/{s_server,s_socket}.c.
+        let profile = format!(
+            "{STAGING_SANDBOX}\n\
+            (allow network-bind (local tcp \"*:{}\"))\n\
+            (allow network-inbound (remote tcp \"127.0.0.1:*\"))",
+            address.port()
+        );
+        let mut child = Command::new("/usr/bin/sandbox-exec")
+            .arg("-p")
+            .arg(profile)
+            .arg("-D")
+            .arg(format!("AOE_STAGING_ROOT={}", volume.root().display()))
+            .arg("/usr/bin/openssl")
+            // -www serves HTTP without reading stdin, unlike interactive mode.
+            .args(["s_server", "-www", "-quiet", "-accept"])
+            .arg(address.port().to_string())
+            .arg("-cert")
+            .arg(&certificate)
+            .arg("-key")
+            .arg(&key)
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .unwrap();
+        let stderr = child.stderr.take().unwrap();
+        let mut server = Server {
+            child,
+            stderr,
+            diagnostic: Vec::new(),
+            truncated: false,
+        };
+        // Drain diagnostics without allowing the child to block on a full pipe.
+        let fd = server.stderr.as_raw_fd();
+        // SAFETY: the live stderr pipe belongs to server.
+        let flags = unsafe { libc::fcntl(fd, libc::F_GETFL) };
+        assert!(
+            flags >= 0 && unsafe { libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK) } == 0,
+            "{}",
+            std::io::Error::last_os_error()
         );
         let deadline = Instant::now() + Duration::from_secs(10);
-        while std::net::TcpStream::connect(address).is_err() {
+        loop {
+            server.drain_stderr();
             assert!(
-                server.0.try_wait().unwrap().is_none(),
-                "local TLS server exited"
+                server.child.try_wait().unwrap().is_none(),
+                "local TLS server exited: {}",
+                server.diagnostic()
             );
-            assert!(Instant::now() < deadline, "local TLS server did not start");
-            std::thread::sleep(Duration::from_millis(10));
+            if std::net::TcpStream::connect(address).is_ok() {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "local TLS server did not start: {}",
+                server.diagnostic()
+            );
+            // Wait for diagnostics/exit or the next readiness probe, not a
+            // presumed startup duration. The actual request runs only once.
+            let mut event = libc::pollfd {
+                fd,
+                events: libc::POLLIN,
+                revents: 0,
+            };
+            // SAFETY: event points to one initialized, live poll descriptor.
+            let result = unsafe { libc::poll(&mut event, 1, 10) };
+            if result < 0 {
+                let error = std::io::Error::last_os_error();
+                assert_eq!(error.kind(), std::io::ErrorKind::Interrupted, "{error}");
+            }
         }
         let mut request = volume.command("/usr/bin/curl");
         request
@@ -1154,7 +1295,19 @@ mod staging_volume_tests {
             .arg(format!("https://localhost:{}/", address.port()));
         // localhost exercises getaddrinfo without depending on public DNS.
         // Certificate verification stays enabled against the private fixture.
-        assert!(!success(&mut request).is_empty());
+        let output = request.output().unwrap();
+        assert!(
+            output.status.success(),
+            "curl failed ({}): {}\nlocal TLS server: {}",
+            output.status,
+            String::from_utf8_lossy(&output.stderr),
+            server.diagnostic()
+        );
+        assert!(
+            !output.stdout.is_empty(),
+            "empty TLS response: {}",
+            server.diagnostic()
+        );
         volume.close().unwrap();
     }
 }

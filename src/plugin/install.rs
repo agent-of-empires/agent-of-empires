@@ -2203,7 +2203,17 @@ mod tests {
                     assert!(config.plugins[&id].grant.is_some());
                     assert!(Lockfile::load().unwrap().get(&id).is_some());
                 } else {
-                    assert!(result.is_err(), "{dev}/{target}");
+                    assert!(
+                        !super::super::execution::needs_recovery(&result),
+                        "{dev}/{target}: {:#}",
+                        result.as_ref().unwrap_err()
+                    );
+                    let error = result.unwrap_err();
+                    assert!(
+                        format!("{error:#}")
+                            .contains("release-binary worker is not runnable after install"),
+                        "{dev}/{target}: {error:#}"
+                    );
                     assert_eq!(
                         serde_json::to_value(&Config::load().unwrap().plugins[&id]).unwrap(),
                         before
@@ -2215,6 +2225,9 @@ mod tests {
                     source.path().join("aoe-plugin.toml").is_file(),
                     "dev source remains user-owned"
                 );
+                let operation =
+                    begin_operation().unwrap_or_else(|error| panic!("{dev}/{target}: {error:#}"));
+                drop(operation);
             }
         }
     }
@@ -2273,6 +2286,10 @@ mod tests {
                     };
                     let mut commit = fetch::test_gate::install(&final_dir, "metadata-commit");
                     let mut rollback = fetch::test_gate::install(&final_dir, "rollback");
+                    let mut preparation = fetch::test_gate::install(
+                        &super::super::plugins_dir().unwrap(),
+                        "source-prepared",
+                    );
                     let task = tokio::spawn(async move {
                         if operation == "install" {
                             apply_install(&input, &fingerprint, dev, OperationLog::Inherit).await
@@ -2280,6 +2297,7 @@ mod tests {
                             apply_update(id, Some(fingerprint), true, OperationLog::Inherit).await
                         }
                     });
+                    preparation.wait_for_preparation().await;
                     tokio::time::timeout(std::time::Duration::from_secs(5), &mut commit.entered)
                         .await
                         .unwrap()
@@ -2960,9 +2978,12 @@ mod tests {
                 .unwrap(),
             "copy",
         );
+        let mut preparation =
+            fetch::test_gate::install(&super::super::plugins_dir().unwrap(), "staging-ready");
         let operation = tokio::spawn(async move {
             apply_install(&input, &consent.fingerprint, false, OperationLog::Inherit).await
         });
+        preparation.wait_for_preparation().await;
         tokio::time::timeout(std::time::Duration::from_secs(5), &mut gate.entered)
             .await
             .unwrap()

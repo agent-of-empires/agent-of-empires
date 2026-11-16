@@ -1265,6 +1265,14 @@ mod tests {
             let final_dir = plugins.join("acme.blocking");
             let before = serde_json::to_value(Config::load().unwrap().plugins).unwrap();
             let before_lock = std::fs::read(root.join("plugins.lock")).ok();
+            let mut preparation = plugin::fetch::test_gate::install(
+                &plugins,
+                if boundary == "stage" {
+                    "staging-ready"
+                } else {
+                    "source-prepared"
+                },
+            );
             let mut gate = if boundary == "stage" {
                 plugin::fetch::test_gate::install(&manifest.canonicalize().unwrap(), "copy")
             } else {
@@ -1292,6 +1300,7 @@ mod tests {
             .await;
             assert_eq!(response.status(), StatusCode::ACCEPTED);
             let accepted: PluginJobAccepted = decode(response).await;
+            preparation.wait_for_preparation().await;
             tokio::time::timeout(std::time::Duration::from_secs(5), &mut gate.entered)
                 .await
                 .unwrap()
@@ -1483,6 +1492,7 @@ while not (p/'finish').exists():
         );
         let consent: plugin::install::InstallConsent = decode(response).await;
         let plugins = plugin::plugins_dir().unwrap();
+        let mut preparation = plugin::fetch::test_gate::install(&plugins, "source-prepared");
         let mut capture = plugin::fetch::test_gate::install(&plugins, "command-capture");
         let mut observe = plugin::fetch::test_gate::install(&plugins, "command-observe");
         let mut census = plugin::fetch::test_gate::install(&plugins, "command-census");
@@ -1521,6 +1531,7 @@ while not (p/'finish').exists():
         )
         .await;
         assert_eq!(response.status(), StatusCode::ACCEPTED);
+        preparation.wait_for_preparation().await;
         tokio::time::timeout(Duration::from_secs(5), &mut capture.entered)
             .await
             .unwrap()

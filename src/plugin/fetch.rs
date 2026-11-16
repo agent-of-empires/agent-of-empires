@@ -273,6 +273,8 @@ fn stage_with_limit(
     let tree = staging.volume().root().join("tree");
 
     let result = super::execution::catch_panic(|| {
+        #[cfg(test)]
+        test_gate::reach_observed(&staging.directory, &tree, "staging-ready");
         let (requested_ref, resolved_commit) = match &source {
             PluginSource::Github { reference, .. } => {
                 let sha = git_clone_checkout(
@@ -303,6 +305,8 @@ fn stage_with_limit(
         }
         let tree_hash = super::integrity::tree_hash(&tree)?;
         let publication_hash = complete_tree_hash(&tree)?;
+        #[cfg(test)]
+        test_gate::reach_observed(&staging.directory, &tree, "source-prepared");
         Ok(FetchedPlugin {
             staging: None,
             operation: None,
@@ -2024,9 +2028,11 @@ mod tests {
         let (entered, waiting) = tokio::sync::oneshot::channel();
         let (release, released) = tokio::sync::oneshot::channel();
         *pause.lock().unwrap() = Some((entered, released));
+        let mut preparation = test_gate::install(&plugins, "source-prepared");
         let operation = crate::plugin::install::begin_operation().unwrap();
         let staged_source = source.clone();
         let task = tokio::spawn(async move { fetch(&staged_source, Some(operation)).await });
+        preparation.wait_for_preparation().await;
         tokio::time::timeout(Duration::from_secs(5), waiting)
             .await
             .unwrap()
@@ -2054,9 +2060,11 @@ mod tests {
         }));
         drop(operation);
         let mut gate = test_gate::install(&plugins, "asset");
+        let mut preparation = test_gate::install(&plugins, "source-prepared");
         let operation = crate::plugin::install::begin_operation().unwrap();
         let staged_source = source.clone();
         let task = tokio::spawn(async move { fetch(&staged_source, Some(operation)).await });
+        preparation.wait_for_preparation().await;
         let tree = tokio::time::timeout(Duration::from_secs(5), &mut gate.entered)
             .await
             .unwrap()
@@ -2815,6 +2823,16 @@ pub(crate) mod test_gate {
         phase: &'static str,
     }
     impl Gate {
+        pub(crate) async fn wait_for_preparation(&mut self) {
+            // Disk-image acquisition has its own bounded backend deadline. Do
+            // not charge it to the five-second behavior assertion that follows.
+            tokio::time::timeout(std::time::Duration::from_secs(90), &mut self.entered)
+                .await
+                .expect("plugin staging preparation must reach its checkpoint")
+                .expect("plugin staging preparation checkpoint must remain live");
+            self.release();
+        }
+
         pub(crate) fn release(&mut self) {
             if let Some(release) = self.release.take() {
                 let _ = release.send(false);
@@ -2838,10 +2856,11 @@ pub(crate) mod test_gate {
         }
     }
     pub(crate) fn install(path: &Path, phase: &'static str) -> Gate {
+        let path = scope_path(path);
         let (entered, receiver) = tokio::sync::oneshot::channel();
         let (release, waiting) = mpsc::channel();
         HOOKS.lock().unwrap().push(Hook {
-            path: path.to_owned(),
+            path: path.clone(),
             phase,
             entered,
             release: waiting,
@@ -2849,7 +2868,7 @@ pub(crate) mod test_gate {
         Gate {
             entered: receiver,
             release: Some(release),
-            path: path.to_owned(),
+            path,
             phase,
         }
     }
@@ -2858,6 +2877,7 @@ pub(crate) mod test_gate {
     }
 
     pub(crate) fn reach_observed(scope: &Path, path: &Path, phase: &'static str) {
+        let scope = scope_path(scope);
         let hook = {
             let mut hooks = HOOKS.lock().unwrap();
             hooks
@@ -2875,5 +2895,44 @@ pub(crate) mod test_gate {
                 panic!("private-panic-payload");
             }
         }
+    }
+
+    fn scope_path(path: &Path) -> PathBuf {
+        #[cfg(target_os = "macos")]
+        {
+            // /var and /private/var name the same directory on macOS. A gate
+            // may precede publication, so resolve the existing ancestor only.
+            for ancestor in path.ancestors() {
+                if let Ok(root) = ancestor.canonicalize() {
+                    return root.join(path.strip_prefix(ancestor).expect("path ancestor"));
+                }
+            }
+        }
+        // Linux staging roots can be /proc/PID/root paths into another mount
+        // namespace. Never resolve those in the observing process.
+        path.to_owned()
+    }
+
+    #[tokio::test]
+    async fn gate_matches_existing_ancestor_and_preserves_observed_path() {
+        let root = tempfile::tempdir().unwrap();
+        let scope = root.path().join("not-published");
+        let mut gate = install(&scope, "scope-alias");
+        #[cfg(target_os = "macos")]
+        let reached_scope = root.path().canonicalize().unwrap().join("not-published");
+        #[cfg(not(target_os = "macos"))]
+        let reached_scope = scope;
+        let observed = PathBuf::from("/proc/123/root/tree");
+        let worker_observation = observed.clone();
+        let task = tokio::task::spawn_blocking(move || {
+            reach_observed(&reached_scope, &worker_observation, "scope-alias");
+        });
+        let entered = tokio::time::timeout(std::time::Duration::from_secs(5), &mut gate.entered)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(entered, observed);
+        gate.release();
+        task.await.unwrap();
     }
 }
