@@ -401,20 +401,24 @@ pub(super) fn custom_agent_acp_capable(
 }
 
 /// A config input's bytes, or why it could not be read (absent, or a directory).
-type Fingerprint = Result<Vec<u8>, std::io::ErrorKind>;
+type Fingerprint = Result<std::sync::Arc<[u8]>, std::io::ErrorKind>;
 
 /// Read `path` once per request, so an input many entries share costs one read.
 fn fingerprint<'a>(
     seen: &'a mut HashMap<std::path::PathBuf, Fingerprint>,
     path: &std::path::Path,
 ) -> &'a Fingerprint {
-    seen.entry(path.to_path_buf())
-        .or_insert_with(|| std::fs::read(path).map_err(|error| error.kind()))
+    seen.entry(path.to_path_buf()).or_insert_with(|| {
+        std::fs::read(path)
+            .map(std::sync::Arc::from)
+            .map_err(|error| error.kind())
+    })
 }
 
 /// `(profile, repo config source)` config resolutions kept across requests. Each
 /// request revalidates them against the bytes of their input files, so an edit
 /// shows on the next publish. See #5665.
+/// Never evicts: entries of purged sessions stay until restart, a few KB each.
 #[derive(Default)]
 pub(crate) struct SessionCfgStore {
     /// `project_path` to its repo config source, with the `.git` it was discovered from.

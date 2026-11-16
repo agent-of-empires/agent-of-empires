@@ -82,8 +82,6 @@ fn resolved_repo_config_path(project_path: &Path) -> Option<PathBuf> {
         .find(|path| path.exists())
 }
 
-/// Loads `.agent-of-empires/config.toml`, falling back to the legacy
-/// `.aoe/config.toml`. `None` when absent, empty, or for the empty (scratch) path.
 /// Files [`load_repo_config`] may read for `source`.
 pub(crate) fn repo_config_inputs(source: &Path) -> Vec<PathBuf> {
     if source.as_os_str().is_empty() {
@@ -95,6 +93,8 @@ pub(crate) fn repo_config_inputs(source: &Path) -> Vec<PathBuf> {
     ]
 }
 
+/// Loads `.agent-of-empires/config.toml`, falling back to the legacy
+/// `.aoe/config.toml`. `None` when absent, empty, or for the empty (scratch) path.
 pub fn load_repo_config(project_path: &Path) -> Result<Option<RepoConfig>> {
     // An empty path would resolve relative to the launch directory.
     if project_path.as_os_str().is_empty() {
@@ -323,15 +323,15 @@ pub fn resolve_config_with_repo_or_warn(profile: &str, project_path: &Path) -> C
 }
 
 /// [`resolve_config_with_repo_or_warn`] for an already discovered repo config source.
-pub fn resolve_config_with_repo_source_or_warn(profile: &str, config_path: &Path) -> Config {
+pub fn resolve_config_with_repo_source_or_warn(profile: &str, source: &Path) -> Config {
     let base = profile_config::resolve_config_or_warn(profile);
-    let mut merged = match load_repo_config(config_path) {
+    let mut merged = match load_repo_config(source) {
         Ok(Some(repo_config)) => merge_repo_config(base, &repo_config),
         Ok(None) => base,
         Err(e) => {
             tracing::warn!(target: "session.store",
                 "Failed to load repo config at '{}', falling back to profile config: {e}",
-                config_path.display()
+                source.display()
             );
             base
         }
