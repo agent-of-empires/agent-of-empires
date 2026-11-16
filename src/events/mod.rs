@@ -441,25 +441,26 @@ pub fn all_topic_seqs(conn: &Connection, schema: &Schema) -> Vec<(String, u64)> 
     rows.filter_map(|r| r.ok()).collect()
 }
 
+/// Latest `created_at` per topic, ignoring the `excluded` discriminants. One indexed
+/// lookup per topic, so a long history is never scanned.
 pub fn last_event_at_for_topics(
     conn: &Connection,
     schema: &Schema,
     topics: &[String],
-    excluded_prefixes: &[&str],
+    excluded: &[&str],
 ) -> HashMap<String, i64> {
     let mut out = HashMap::new();
     if topics.is_empty() {
         return out;
     }
-    let placeholders = std::iter::repeat_n("?", topics.len())
+    let placeholders = std::iter::repeat_n("?", excluded.len())
         .collect::<Vec<_>>()
         .join(",");
-    let (clauses, patterns) = not_like_clauses(excluded_prefixes);
     let sql = format!(
-        "SELECT session_id, MAX(created_at) FROM {events}
-         WHERE session_id IN ({placeholders})
-           {clauses}
-         GROUP BY session_id",
+        "SELECT created_at FROM {events}
+         WHERE session_id = ? AND discriminant NOT IN ({placeholders})
+         ORDER BY created_at DESC
+         LIMIT 1",
         events = schema.events_table(),
     );
     let mut stmt = match conn.prepare(&sql) {
@@ -469,23 +470,18 @@ pub fn last_event_at_for_topics(
             return out;
         }
     };
-    let mut bind: Vec<Value> = topics.iter().map(|t| Value::Text(t.clone())).collect();
-    bind.extend(patterns.into_iter().map(Value::Text));
-    let rows = stmt.query_map(params_from_iter(bind), |row| {
-        Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
-    });
-    match rows {
-        Ok(iter) => {
-            for r in iter {
-                match r {
-                    Ok((topic, created_at)) => {
-                        out.insert(topic, created_at);
-                    }
-                    Err(e) => warn!(target: "events", "last_event_at_for_topics row: {e}"),
-                }
+    for topic in topics {
+        let bind = std::iter::once(topic.as_str()).chain(excluded.iter().copied());
+        match stmt
+            .query_row(params_from_iter(bind), |row| row.get::<_, i64>(0))
+            .optional()
+        {
+            Ok(Some(created_at)) => {
+                out.insert(topic.clone(), created_at);
             }
+            Ok(None) => {}
+            Err(e) => warn!(target: "events", "last_event_at_for_topics query: {e}"),
         }
-        Err(e) => warn!(target: "events", "last_event_at_for_topics query: {e}"),
     }
     out
 }

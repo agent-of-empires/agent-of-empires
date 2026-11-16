@@ -3,6 +3,7 @@
 import { renderHook } from "@testing-library/react";
 import { afterEach, describe, expect, it, vi } from "vitest";
 
+import { fileDraftKey, registerFileEditor, setFileDraft } from "../../lib/fileEditGuard";
 import type { DockLayout, PaneGroup } from "../../lib/paneLayout";
 import type { DockLocation } from "../../lib/panes";
 import { useOpenPairedTerminal, usePairedTerminalReveal } from "../usePairedTerminalReveal";
@@ -126,6 +127,34 @@ describe("usePairedTerminalReveal", () => {
     expect(activateTab.mock.calls).toEqual(activated ? [activated] : []);
     expect(openTab.mock.calls).toEqual(opened ? [opened] : []);
     raf.mockRestore();
+  });
+
+  it("one pane: keeping an unsaved main-view edit leaves the view and mode untouched", () => {
+    const key = fileDraftKey("s1", "notes.txt");
+    const original = { content: "", version: "v1", is_binary: false, truncated: false };
+    setFileDraft(key, { original, text: "draft", pendingSave: null });
+    const release = registerFileEditor(key, null, vi.fn());
+    const confirm = vi.spyOn(window, "confirm").mockReturnValue(false);
+    const setRightPanelView = vi.fn();
+    const prepare = vi.fn(() => false);
+    const { result } = renderHook(() =>
+      usePairedTerminalReveal({
+        singlePane: true,
+        layout: layout([group(["terminal:0"])]),
+        openTab: vi.fn(),
+        activateTab: vi.fn(),
+        setRightPanelView,
+      }),
+    );
+
+    expect(result.current(prepare)).toBeNull();
+    expect(confirm).toHaveBeenCalledOnce();
+    expect(prepare).not.toHaveBeenCalled();
+    expect(setRightPanelView).not.toHaveBeenCalled();
+    expect(focus.setPendingTerminalFocus).not.toHaveBeenCalled();
+    release();
+    setFileDraft(key, null);
+    confirm.mockRestore();
   });
 });
 

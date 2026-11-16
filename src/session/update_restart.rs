@@ -10,11 +10,7 @@ use crate::acp::agent_registry::AgentRegistry;
 use crate::process::worker_registry::WorkerRecord;
 use crate::session::{Instance, Status};
 
-const MTIME_TTL: Duration = Duration::from_secs(30);
-
-/// Bounded by the number of distinct agent binaries.
-static MTIME_CACHE: Mutex<Option<HashMap<String, (Instant, Option<SystemTime>)>>> =
-    Mutex::new(None);
+const OBSERVED_TTL: Duration = Duration::from_secs(30);
 
 /// What a structured worker actually runs: the registered ACP command, which for adapter-backed
 /// agents is the adapter (it bundles its own CLI), not the CLI on `PATH`.
@@ -27,66 +23,79 @@ fn adapter_command(inst: &Instance, record: &WorkerRecord) -> Option<String> {
         .map(|spec| spec.command.clone())
 }
 
-fn newest_mtime(path: &std::path::Path) -> Option<SystemTime> {
-    // A package manager may keep a fixed mtime on the target but recreate the bin symlink.
-    let target = std::fs::metadata(path).and_then(|m| m.modified()).ok();
-    let link = std::fs::symlink_metadata(path)
-        .and_then(|m| m.modified())
-        .ok();
-    target.max(link)
+/// Where an executable path resolves now. Symlink metadata is ignored: re-creating a link with
+/// the same target is not an update.
+#[derive(Clone)]
+struct Observed {
+    resolved: std::path::PathBuf,
+    mtime: Option<SystemTime>,
 }
 
+fn observe(path: &std::path::Path) -> Option<Observed> {
+    let resolved = std::fs::canonicalize(path).ok()?;
+    let mtime = std::fs::metadata(&resolved).and_then(|m| m.modified()).ok();
+    Some(Observed { resolved, mtime })
+}
+
+/// Bounded by the number of distinct agent binaries.
+static OBSERVED_CACHE: Mutex<Option<HashMap<String, (Instant, Option<Observed>)>>> =
+    Mutex::new(None);
+
 /// Cached by `key`; `path` runs only on a miss, outside the cache lock.
-fn cached_mtime(
+fn cached_observation(
     key: String,
     path: impl FnOnce() -> Option<std::path::PathBuf>,
-) -> Option<SystemTime> {
+) -> Option<Observed> {
     {
-        let mut guard = MTIME_CACHE.lock().ok()?;
+        let mut guard = OBSERVED_CACHE.lock().ok()?;
         let cache = guard.get_or_insert_with(HashMap::new);
-        if let Some((at, mtime)) = cache.get(&key) {
-            if at.elapsed() < MTIME_TTL {
-                return *mtime;
+        if let Some((at, observed)) = cache.get(&key) {
+            if at.elapsed() < OBSERVED_TTL {
+                return observed.clone();
             }
         }
     }
-    let mtime = path().and_then(|path| newest_mtime(&path));
-    MTIME_CACHE
+    let observed = path().and_then(|path| observe(&path));
+    OBSERVED_CACHE
         .lock()
         .ok()?
         .get_or_insert_with(HashMap::new)
-        .insert(key, (Instant::now(), mtime));
-    mtime
+        .insert(key, (Instant::now(), observed.clone()));
+    observed
 }
 
-/// Which adapter copy a spawn runs. With both a PATH copy and a bundled one, spawn runs a version
-/// probe to choose, which a list poll must not do, so the offer is withheld instead.
-fn pick_adapter(
-    path_copy: Option<std::path::PathBuf>,
-    bundled: Option<std::path::PathBuf>,
-) -> Option<std::path::PathBuf> {
-    match (path_copy, bundled) {
-        (Some(path), None) | (None, Some(path)) => Some(path),
-        _ => None,
-    }
-}
-
-fn adapter_mtime(command: &str) -> Option<SystemTime> {
-    cached_mtime(format!("acp:{command}"), || {
-        let app_dir = crate::session::get_app_dir().ok();
-        pick_adapter(
-            which::which(command).ok(),
-            app_dir
-                .as_deref()
-                .and_then(|dir| crate::acp::adapters::bundled_adapter_bin(dir, command)),
-        )
-    })
+/// `launched` is the resolved path recorded at launch, when known: a different one means the link
+/// was switched to another version, which a fixed target mtime would hide.
+fn executable_updated(
+    observed: &Observed,
+    launched: Option<&std::path::Path>,
+    started_at: DateTime<Utc>,
+) -> bool {
+    launched.is_some_and(|launched| launched != observed.resolved)
+        || observed
+            .mtime
+            .is_some_and(|mtime| modified_after(mtime, started_at))
 }
 
 /// Whole seconds, so a binary written in the launch second is not flagged.
 fn modified_after(mtime: SystemTime, started_at: DateTime<Utc>) -> bool {
     let modified = mtime.duration_since(UNIX_EPOCH).map_or(0, |d| d.as_secs());
     modified as i64 > started_at.timestamp()
+}
+
+fn is_stale(
+    path: &std::path::Path,
+    launched: Option<&std::path::Path>,
+    started_at: DateTime<Utc>,
+) -> bool {
+    let Some(observed) =
+        cached_observation(path.display().to_string(), || Some(path.to_path_buf()))
+    else {
+        return false;
+    };
+    // A cached view may predate the launch; confirm a flag against the live path.
+    executable_updated(&observed, launched, started_at)
+        && observe(path).is_some_and(|live| executable_updated(&live, launched, started_at))
 }
 
 /// An idle row whose agent binary was replaced after launch. Reads only the row and the
@@ -104,17 +113,21 @@ pub fn binary_updated(inst: &Instance) -> bool {
             .and_then(|record| {
                 let started_at =
                     DateTime::from_timestamp(i64::try_from(record.started_at).ok()?, 0)?;
-                let command = adapter_command(inst, &record)?;
-                Some(modified_after(adapter_mtime(&command)?, started_at))
+                adapter_command(inst, &record)?;
+                let path = record.launch_executable.as_ref()?;
+                Some(is_stale(
+                    path,
+                    record.launch_resolved_executable.as_deref(),
+                    started_at,
+                ))
             })
     } else {
         // The executable the launch itself ran, so the observer's PATH never decides.
         inst.launch_executable
             .as_ref()
             .zip(inst.started_at)
-            .and_then(|(path, started_at)| {
-                let mtime = cached_mtime(path.display().to_string(), || Some(path.clone()))?;
-                Some(modified_after(mtime, started_at))
+            .map(|(path, started_at)| {
+                is_stale(path, inst.launch_resolved_executable.as_deref(), started_at)
             })
     };
     stale.unwrap_or(false)
@@ -195,6 +208,137 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
+    fn a_relinked_executable_is_flagged_only_when_its_target_changed() {
+        use std::os::unix::fs::symlink;
+        let dir = tempfile::tempdir().unwrap();
+        let v1 = dir.path().join("v1");
+        let v2 = dir.path().join("v2");
+        let link = dir.path().join("agent");
+        for version in [&v1, &v2] {
+            std::fs::write(version, "#!/bin/sh\n").unwrap();
+            std::fs::File::options()
+                .write(true)
+                .open(version)
+                .unwrap()
+                .set_modified(UNIX_EPOCH + Duration::from_secs(500))
+                .unwrap();
+        }
+        symlink(&v1, &link).unwrap();
+
+        let mut inst = Instance::new("t", "/tmp");
+        inst.status = Status::Idle;
+        inst.started_at = DateTime::from_timestamp(1_000, 0);
+        inst.launch_executable = Some(link.clone());
+        inst.launch_resolved_executable = std::fs::canonicalize(&link).ok();
+        assert!(!binary_updated(&inst));
+
+        // Same target, new link mtime: the Claude Code installer case.
+        std::fs::remove_file(&link).unwrap();
+        symlink(&v1, &link).unwrap();
+        let started = inst.started_at.unwrap();
+        assert!(!executable_updated(
+            &observe(&link).unwrap(),
+            inst.launch_resolved_executable.as_deref(),
+            started
+        ));
+
+        // Another version with the same old mtime: only the resolved path shows it.
+        std::fs::remove_file(&link).unwrap();
+        symlink(&v2, &link).unwrap();
+        let switched = observe(&link).unwrap();
+        assert!(executable_updated(
+            &switched,
+            inst.launch_resolved_executable.as_deref(),
+            started
+        ));
+        // A row with no recorded path cannot tell, and does not guess.
+        assert!(!executable_updated(&switched, None, started));
+
+        // Rewritten in place after launch.
+        std::fs::File::options()
+            .write(true)
+            .open(&v2)
+            .unwrap()
+            .set_modified(UNIX_EPOCH + Duration::from_secs(2_000))
+            .unwrap();
+        assert!(executable_updated(&observe(&link).unwrap(), None, started));
+
+        // A dangling link is not an update.
+        std::fs::remove_file(&v2).unwrap();
+        assert!(observe(&link).is_none());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_restart_right_after_a_link_switch_is_not_flagged_by_a_cached_view() {
+        use std::os::unix::fs::symlink;
+        let dir = tempfile::tempdir().unwrap();
+        let (v1, v2, link) = (
+            dir.path().join("v1"),
+            dir.path().join("v2"),
+            dir.path().join("agent"),
+        );
+        for version in [&v1, &v2] {
+            std::fs::write(version, "#!/bin/sh\n").unwrap();
+            std::fs::File::options()
+                .write(true)
+                .open(version)
+                .unwrap()
+                .set_modified(UNIX_EPOCH + Duration::from_secs(500))
+                .unwrap();
+        }
+        symlink(&v1, &link).unwrap();
+        let mut inst = Instance::new("t", "/tmp");
+        inst.status = Status::Idle;
+        inst.started_at = DateTime::from_timestamp(1_000, 0);
+        inst.launch_executable = Some(link.clone());
+        inst.launch_resolved_executable = std::fs::canonicalize(&link).ok();
+        assert!(!binary_updated(&inst));
+
+        // The link moves to v2 and the session restarts on it inside the cache TTL.
+        std::fs::remove_file(&link).unwrap();
+        symlink(&v2, &link).unwrap();
+        inst.launch_resolved_executable = std::fs::canonicalize(&link).ok();
+        assert!(!binary_updated(&inst));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_worker_adapter_link_switch_is_flagged_and_a_relink_is_not() {
+        use std::os::unix::fs::symlink;
+        let dir = tempfile::tempdir().unwrap();
+        let (v1, v2, link) = (
+            dir.path().join("v1"),
+            dir.path().join("v2"),
+            dir.path().join("adapter"),
+        );
+        for version in [&v1, &v2] {
+            std::fs::write(version, "#!/bin/sh\n").unwrap();
+            std::fs::File::options()
+                .write(true)
+                .open(version)
+                .unwrap()
+                .set_modified(UNIX_EPOCH + Duration::from_secs(500))
+                .unwrap();
+        }
+        symlink(&v1, &link).unwrap();
+        let started = DateTime::from_timestamp(1_000, 0).unwrap();
+        let launched = std::fs::canonicalize(&link).unwrap();
+        assert!(!is_stale(&link, Some(&launched), started));
+
+        std::fs::remove_file(&link).unwrap();
+        symlink(&v1, &link).unwrap();
+        assert!(!is_stale(&link, Some(&launched), started));
+
+        // Past the cache TTL the switch is seen; a live re-check confirms it.
+        std::fs::remove_file(&link).unwrap();
+        symlink(&v2, &link).unwrap();
+        let switched = observe(&link).unwrap();
+        assert!(executable_updated(&switched, Some(&launched), started));
+    }
+
+    #[cfg(unix)]
+    #[test]
     fn a_sandboxed_row_is_never_flagged_by_host_binaries() {
         use std::os::unix::fs::PermissionsExt;
         let dir = tempfile::tempdir().unwrap();
@@ -221,16 +365,6 @@ mod tests {
             container_workdir: None,
         });
         assert!(!binary_updated(&inst));
-    }
-
-    #[test]
-    fn an_adapter_on_both_path_and_bundle_is_not_guessed() {
-        let path = || Some(std::path::PathBuf::from("/usr/bin/adapter"));
-        let bundled = || Some(std::path::PathBuf::from("/data/adapters/adapter"));
-        assert_eq!(pick_adapter(path(), None), path());
-        assert_eq!(pick_adapter(None, bundled()), bundled());
-        assert_eq!(pick_adapter(path(), bundled()), None);
-        assert_eq!(pick_adapter(None, None), None);
     }
 
     #[test]

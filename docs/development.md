@@ -23,6 +23,17 @@ The core-rest CI leg requires the scoped cancellation case to run with
 may skip the scoped case when no usable user manager exists; unscoped
 cancellation still runs.
 
+The process-inspection executor test is ignored by default on Linux because it
+requires Python 3 and private user, mount and PID namespaces. Run it explicitly
+on a host that supports `unshare`:
+
+```sh
+cargo test --lib cli::serve::tests::tui_control_inspection_keeps_the_async_executor_reactive -- --exact --ignored --nocapture
+```
+
+Missing prerequisites fail explicit Linux runs. On macOS this test runs by
+default and requires Python 3, so a missing `python3` also fails normal test runs.
+
 Creation-progress events are advisory and publish independently of session
 snapshots. Tests that need a published session must wait for its ID in the
 canonical snapshot. Hold in-flight fixture gates until explicit release, with

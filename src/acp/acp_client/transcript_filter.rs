@@ -34,8 +34,10 @@ pub(super) fn is_transcript_event(event: &Event) -> bool {
             // create a running record with nothing to ever complete it.
             | Event::BackgroundAgentLaunched { .. }
             | Event::PromptRuntimeError { .. }
-            // A replayed arm would read as a live watch after every respawn.
+            // A replayed arm would read as a live watch or wakeup after every
+            // respawn, a wakeup dated from the replay.
             | Event::MonitorArmed { .. }
+            | Event::WakeupScheduled { .. }
             // A replayed completion would re-run its side effects on every
             // reattach (a duplicate divider and summary, a re-based web
             // `usageBaseline`), and a replayed start would latch

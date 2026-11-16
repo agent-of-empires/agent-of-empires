@@ -65,6 +65,13 @@ pub(super) struct Session {
 
 impl Session {
     pub(super) async fn send_cancel(&self) -> Result<(), agent_client_protocol::Error> {
+        #[cfg(test)]
+        let _gate = tokio::select! {
+            gate = self.shared.cancel_send_gate.read() => gate,
+            _ = self.shared.connection_state.wait_unavailable() => {
+                return Err(acp_internal_error("ACP connection unavailable".into()));
+            }
+        };
         match self.control.as_ref() {
             Some(control) => {
                 control.cancel().await;
@@ -197,11 +204,13 @@ impl Session {
         // is serialized with every command.
         let mut idle_tick = tokio::time::interval(BETWEEN_PROMPT_IDLE_CHECK_INTERVAL);
         idle_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        let shared = self.shared.clone();
         loop {
             self.acp_session_id =
                 self.shared.ingress.current().ok_or_else(|| {
                     acp_internal_error("native session is not established".into())
                 })?;
+            let cancel_deadline = *shared.cancel_deadline.lock().unwrap();
             // Fallback prompts go first so later messages cannot overtake them.
             let mut cmd = match self
                 .shared
@@ -214,12 +223,48 @@ impl Session {
                 Some(blocks) => Some(ClientCmd::Prompt(blocks)),
                 None => tokio::select! {
                     _ = self.shared.connection_state.wait_ordered_unavailable() => {
-                        // EOF must wake an idle established session too. The
-                        // ordered boundary preserves earlier replay/outcomes;
-                        // outer cleanup owns the one qualified loss event.
                         return Err(acp_internal_error("agent connection unavailable".into()));
                     }
                     cmd = self.cmd_rx.recv() => cmd,
+                    _ = async {
+                        match cancel_deadline {
+                            Some(deadline) => tokio::time::sleep_until(deadline).await,
+                            None => std::future::pending().await,
+                        }
+                    } => {
+                        if !shared.prompt_in_flight.load(Ordering::Acquire)
+                            || shared.terminal_claim.claimed()
+                        {
+                            *shared.cancel_deadline.lock().unwrap() = None;
+                            continue;
+                        }
+                        let turn = shared.terminal_claim.current_turn();
+                        let publication = shared.state.publication.lock().await;
+                        let permit = shared.event_tx.reserve().await
+                            .map_err(|_| acp_internal_error("agent connection unavailable".into()))?;
+                        let published = shared.connection_state.admit(|| {
+                            shared.terminal_claim.claim_and_publish(
+                                turn,
+                                || shared.prompt_in_flight.load(Ordering::Acquire),
+                                || {
+                                    shared.adopted_turn_active.store(false, Ordering::Release);
+                                    shared.between_prompt.deactivate();
+                                    permit.send(Event::Stopped {
+                                        reason: "agent_unresponsive".into(),
+                                    });
+                                    shared.prompt_in_flight.store(false, Ordering::Release);
+                                    *shared.cancel_deadline.lock().unwrap() = None;
+                                    shared.local_prompt_settled.notify_waiters();
+                                },
+                            )
+                        }).map_err(|_| acp_internal_error("agent connection unavailable".into()))?;
+                        drop(publication);
+                        if published {
+                            break;
+                        }
+                        *shared.cancel_deadline.lock().unwrap() = None;
+                        continue;
+                    }
                     _ = idle_tick.tick() => {
                         self.between_prompt_idle_tick().await;
                         continue;
@@ -242,6 +287,15 @@ impl Session {
                     let _ = respond_to.send(self.cancel_child(session_id).await);
                 }
                 Some(ClientCmd::Cancel) => {
+                    if shared.adopted_turn_active.load(Ordering::Relaxed)
+                        && shared.prompt_in_flight.load(Ordering::Relaxed)
+                        && !shared.terminal_claim.claimed()
+                    {
+                        // Arm first: a control loss during the send keeps the deadline.
+                        self.request_cancel().await;
+                        self.send_cancel().await?;
+                        continue;
+                    }
                     info!(target: "acp.protocol", "sending session/cancel (no prompt in flight)");
                     // Not `?`: a dead connection is when the UI most needs
                     // the synthetic Stopped below.
@@ -338,10 +392,12 @@ impl Session {
         if shared.connection_state.loss().is_some() {
             return;
         }
-        let Some(cost_seen) = shared
-            .between_prompt
-            .take_idle_fire(now_ms(), shared.aoe.leases.working(now_ms()))
-        else {
+        shared.expire_silent_subagents(now_ms()).await;
+        let Some(cost_seen) = shared.between_prompt.take_idle_fire(
+            now_ms(),
+            shared.aoe.leases.working(now_ms()),
+            shared.subagent_working(now_ms()),
+        ) else {
             return;
         };
         let adopted = shared.adopted_turn_active.swap(false, Ordering::Relaxed);
@@ -353,7 +409,6 @@ impl Session {
             if !shared.terminal_claim.claim_failed() {
                 return;
             }
-            shared.between_prompt.deactivate();
             shared
                 .emit_while_available([
                     Event::RateLimit { info },
@@ -711,7 +766,6 @@ impl Session {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::acp::acp_client::lifecycle::TerminalClaim;
     use crate::acp::acp_client::session_identity::{RequestPolicy, SessionIngress};
     use agent_client_protocol::{ByteStreams, Client};
     use futures_util::FutureExt as _;
@@ -764,7 +818,7 @@ mod tests {
                         "reset-fence-test".into(),
                         &crate::acp::agent_profiles::GEMINI,
                         lifecycle_tx,
-                        Arc::new(TerminalClaim::new()),
+                        Arc::new(crate::acp::acp_client::SessionState::default()),
                         Arc::new(AtomicBool::new(false)),
                         None,
                         ingress.clone(),

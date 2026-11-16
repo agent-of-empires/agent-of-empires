@@ -223,6 +223,7 @@ async fn auth_status_is_cleared_per_adapter_process() {
         acp_session_id: "s-auth".into(),
         in_flight_turn: false,
         unsuccessful_main: false,
+        live_recovery: None,
     };
     let cases = [
         ("silent replacement", fresh(), false, vec![false]),
@@ -256,6 +257,7 @@ async fn auth_bootstrap_exceeding_public_and_shim_capacity_reaches_ready_before_
             acp_session_id: "s-auth".into(),
             in_flight_turn: false,
             unsuccessful_main: false,
+            live_recovery: None,
         },
     ] {
         let fresh = matches!(&mode, ConnectMode::Fresh { .. });
@@ -682,6 +684,12 @@ async fn rate_limit_on_an_agent_initiated_turn_preserves_the_connection() {
     assert!(
         limit.is_some() && limit < stopped,
         "RateLimit then Stopped(rate_limited) expected: {seen:?}"
+    );
+    // The rejected window travels on the event, so a later report for another window of the
+    // same account cannot replace this deadline in the account table.
+    assert!(
+        matches!(&seen[limit.unwrap()], Event::RateLimit { info } if info.kind == "five_hour"),
+        "the event names its window: {seen:?}"
     );
     fake.agent.abort();
     let _ = fake.agent.await;
@@ -1139,6 +1147,7 @@ async fn transport_and_protocol_failure_remain_fatal_across_turn_ownership() {
             acp_session_id: "s-eof".into(),
             in_flight_turn: true,
             unsuccessful_main: false,
+            live_recovery: None,
         });
         let mut fake = spawn_fake_connection("s-eof", resume, mode == "after_error", move |id| {
             entered.send(()).unwrap();
@@ -1234,6 +1243,7 @@ async fn unsupported_session_prompt_prose_preserves_identity_and_the_next_explic
             acp_session_id: "s-rejected".into(),
             in_flight_turn: false,
             unsuccessful_main: false,
+            live_recovery: None,
         }),
         false,
         move |id| {

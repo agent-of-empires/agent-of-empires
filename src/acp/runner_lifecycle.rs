@@ -159,6 +159,8 @@ struct Construction {
     admissions: std::sync::atomic::AtomicU64,
     #[cfg(test)]
     child_wait_completed: tokio::sync::watch::Sender<Option<bool>>,
+    /// A rate limit rejecting this launch belongs to its caller, which reads it from the error.
+    defers_rate_limit_rejection: std::sync::atomic::AtomicBool,
 }
 
 impl Default for Construction {
@@ -187,6 +189,7 @@ impl Default for Construction {
             owned_child_wait_pending: std::sync::atomic::AtomicBool::new(false),
             #[cfg(test)]
             child_wait_completed: tokio::sync::watch::channel(None).0,
+            defers_rate_limit_rejection: std::sync::atomic::AtomicBool::new(false),
         }
     }
 }
@@ -542,6 +545,20 @@ impl Lease {
             None => Ok(None),
             Some(admission) => admission.native_scope.clone().map(Some).ok_or(()),
         }
+    }
+
+    /// A rate limit rejecting this launch publishes no park and wakes nothing: the caller owns
+    /// the outcome. Only this lease's launch is affected, never a newer one of the session.
+    pub(crate) fn defer_rate_limit_rejection(&self) {
+        self.construction
+            .defers_rate_limit_rejection
+            .store(true, std::sync::atomic::Ordering::Release);
+    }
+
+    pub(crate) fn defers_rate_limit_rejection(&self) -> bool {
+        self.construction
+            .defers_rate_limit_rejection
+            .load(std::sync::atomic::Ordering::Acquire)
     }
 
     pub(crate) fn record_scope(&self, scope: crate::process::worker_registry::ScopeOwnership) {

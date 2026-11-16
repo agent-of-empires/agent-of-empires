@@ -16,3 +16,20 @@ describe("buildCreateRequest workspace", () => {
     }
   });
 });
+
+describe("buildCreateRequest pull_latest_image", () => {
+  it("asks for the pull only for a Structured view Sandbox with the box checked", () => {
+    const sandbox = { sandboxEnabled: true, useStructuredView: true };
+    const cases: [Partial<WizardData>, boolean, boolean, true | undefined][] = [
+      [sandbox, true, true, true],
+      [sandbox, true, false, undefined],
+      [{ ...sandbox, sandboxEnabled: false }, true, true, undefined],
+      [{ ...sandbox, useStructuredView: false }, true, true, undefined],
+      [sandbox, false, true, undefined],
+    ];
+    for (const [over, acpCapable, pull, want] of cases) {
+      const body = buildCreateRequest({ ...initialData, ...over }, acpCapable, { pullLatest: pull });
+      expect(body.pull_latest_image, JSON.stringify({ over, acpCapable, pull })).toBe(want);
+    }
+  });
+});

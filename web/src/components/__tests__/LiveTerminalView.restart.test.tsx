@@ -8,6 +8,7 @@ import { PairedShellPane } from "../PairedTerminal";
 import { installResizeObserver } from "./liveTerminalHarness";
 import { clearMobileKeyboardProxyInput, deliverMobileKeyboardProxyInput } from "../../lib/mobileKeyboardProxy";
 import { makeSession } from "./fixtures";
+import type { SessionResponse } from "../../lib/types";
 
 const { ensureSession, ensureTerminal, pasteImage, reportTelemetrySeen } = vi.hoisted(() => ({
   ensureSession: vi.fn<(...args: unknown[]) => Promise<{ ok: boolean; message?: string | null }>>(async () => ({
@@ -329,6 +330,64 @@ describe("read-only live consumers with the real socket and terminal", () => {
       expect(fetchSpy).toHaveBeenCalledTimes(1);
     },
   );
+
+  // A status change isn't a revocation. Read-only, a Session held in Error, and another Session or surface (callers
+  // key the view by both, so it unmounts) are.
+  type Change = (view: ReturnType<typeof render>, session: SessionResponse) => void;
+  const to =
+    (over: Partial<SessionResponse>, readOnly = false): Change =>
+    (view, session) =>
+      view.rerender(<TerminalView session={{ ...session, ...over }} readOnly={readOnly} />);
+  it.each<[string, Change, boolean]>([
+    ["Running to Waiting", to({ status: "Waiting" }), true],
+    ["Running to Idle", to({ status: "Idle" }), true],
+    ["read-only", to({}, true), false],
+    ["held in Error", to({ status: "Error" }), false],
+    ["unmount", (view) => view.unmount(), false],
+  ])("an image read in progress across %s", async (_name, change, uploads) => {
+    let finishDecode!: () => void;
+    let decoded!: () => void;
+    const decodingStarted = new Promise<void>((resolve) => {
+      decoded = resolve;
+    });
+    vi.stubGlobal(
+      "FileReader",
+      class {
+        result = "data:image/png;base64,aGk=";
+        onload: (() => void) | null = null;
+        readAsDataURL() {
+          finishDecode = () => this.onload?.();
+          decoded();
+        }
+      },
+    );
+    const fetchSpy = vi
+      .fn<typeof fetch>()
+      .mockResolvedValue(new Response(JSON.stringify({ path: "/wt/kept.png" }), { status: 200 }));
+    vi.stubGlobal("fetch", fetchSpy);
+    const session = makeSession({ id: "status-image", status: "Running" });
+    const view = render(<TerminalView session={session} readOnly={false} />);
+    await waitFor(() => expect(FakeWS.sockets).toHaveLength(1));
+    const socket = FakeWS.sockets[0]!;
+    socket.open();
+    socket.deliver({ type: "size_owner", is_owner: true });
+    const file = new File(["hi"], "img.png", { type: "image/png" });
+    fireEvent.paste(screen.getByLabelText("Live terminal input"), {
+      clipboardData: { getData: () => "caption", items: [{ kind: "file", type: file.type, getAsFile: () => file }] },
+    });
+    await decodingStarted;
+    const pendingUpload = pasteImage.mock.results.at(-1)!.value as Promise<string | null>;
+    change(view, session);
+    await act(async () => {
+      finishDecode();
+      await pendingUpload;
+    });
+    expect(await pendingUpload).toBe(uploads ? "/wt/kept.png" : null);
+    expect(fetchSpy).toHaveBeenCalledTimes(uploads ? 1 : 0);
+    expect(socket.controls().filter(({ type }) => type === "paste")).toEqual(
+      uploads ? [{ type: "paste", text: " caption /wt/kept.png ", submit: false }] : [],
+    );
+  });
 
   it.each(["revoked clipboard", ""])(
     "drops delayed clipboard result %j across a read-only round trip",

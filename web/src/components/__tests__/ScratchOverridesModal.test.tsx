@@ -176,9 +176,10 @@ describe("ScratchOverridesModal", () => {
     mockUpdateGlobal.mockImplementation(() => new Promise(() => {}));
     const onClose = vi.fn();
     renderModal(onClose);
-    await waitFor(() => expect(smartRenameSelect().value).toBe("inherit"));
+    await waitFor(() => expect(saveButton().disabled).toBe(false));
 
     fireEvent.click(screen.getByRole("button", { name: "Save" }));
+    expect(mockUpdateGlobal).toHaveBeenCalledWith({ session: { scratch_smart_rename: "inherit" } });
     fireEvent.keyDown(document, { key: "Escape" });
     expect(onClose).not.toHaveBeenCalled();
   });

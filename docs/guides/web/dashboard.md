@@ -17,6 +17,23 @@ Each sidebar row carries an animated braille glyph encoding the session's state:
 
 The **?** in the sidebar header opens a legend of every glyph and mark: the status glyphs, Unread, Pinned Session, Favorite, Project, Pinned project and the Group dot. It's a popover on desktop and a sheet on a phone. Hovering a glyph or mark with a mouse shows what it means, and a row that needs attention for another reason adds that on a second line. With a row focused from the keyboard, its glyph's meaning shows too, along with **Press Enter to open**. Animated glyphs in the legend hold still when your system asks for reduced motion.
 
+An Error row's tooltip shows the first line of the error AoE recorded for the session, or says that none was recorded. Opening a Terminal view session in Error doesn't restart it. It shows that error in full, with **Copy error** and **Restart**, so on a phone you tap the row to read it.
+
+## Editing project files
+
+Editing is off by default. Enable **Settings > Panels > Edit project text files** in the browser, then open an existing file in **Files** and select **Edit**.
+
+- Save or Cancel in the viewer. Ctrl/Cmd+S and Esc apply only while the text area has focus. Confirm before leaving the edited view with unsaved changes; changing another pane does not ask. Unsaved text survives resizing or rotating across the phone layout. Resizing does not duplicate or cancel a pending save.
+- Existing UTF-8 text files up to 5 MB only. Read-only dashboards, out-of-project transcript files, and Sandbox folders backed by separate volumes and individual file bind mounts stay read-only with a reason. Files are unavailable in CityHall mode.
+- Saves retain consistent LF, CRLF or CR endings and the edited text's trailing newline. Mixed endings follow line position and can shift after lines are inserted or removed.
+- Saves retain ordinary file permissions and clear special permission bits.
+- Saves use a [verified atomic exchange](../../api.md#get-and-put-apisessionsidfile). A conflict keeps your draft; copy your edits or reload. If another writer prevents restoration, check the reported `<filename>.aoe-conflict[.N]` recovery file beside the original. The editor polls for external changes while open.
+- Filesystems without atomic exchange support disable editing with a reason. An uncertain-save error means the write may already be on disk; check the file before retrying.
+- Temporary Sandbox verification failures pause saving and show a reason. Saving resumes when verification succeeds, keeping the draft.
+- Turning editing off hides the editor and parks unsaved text. Turn it back on to resume the same draft and opened version.
+- Trash and permanent deletion ask before discarding unsaved drafts, including parked drafts.
+- After saving, optionally draft a note in Structured view without submitting it. Terminal view shows a reminder to tell the agent.
+
 ## Creating a session
 
 The **New session** wizard is one screen of one-line rows, like the TUI dialog; a row with a chevron opens its details in a panel:
@@ -47,9 +64,9 @@ Individual settings appear under `Settings`: a writable toggle flips inline with
 
 ## First-run onboarding
 
-The first time you open the dashboard in a browser, a **Choose your theme** card appears before anything else. Picking a theme applies it live and saves it to your default profile; you can switch freely, then click **Continue**. Change it later in Settings > Appearance. The card is skipped in read-only mode and for anyone who already finished the tutorial.
+Opening `/` on a writable dashboard sends you to the setup wizard at `/setup` until you finish it or click **Go to dashboard**. Its steps edit the regular settings, so a step shows as done once one of its settings differs from the default, wherever it was changed (the TUI, Settings or a hand-edited `config.toml`), or once you keep its defaults with **Next**. Only the Agents step is required. Skips, finishing, leaving early and dismissing the dashboard's **Finish setting up** banner are stored as the `setup_*` keys in `state.toml` (see [Configuration Reference](../configuration.md#statetoml)). Open `/setup` again at any time. Read-only and CityHall dashboards never show it.
 
-After the theme card, an interactive walkthrough highlights the major regions (command bar, sidebar, starting a session, settings, and inside a session the diff panel and composer). Two of its steps open Settings for you: the Worktree tab, explaining the per-session path templates, and the Plugins tab, explaining how to find, install, and trust plugins. Each step lists its keyboard shortcuts and has a **Skip** button.
+Once setup is out of the way, an interactive walkthrough highlights the major regions (command bar, sidebar, starting a session, settings, and inside a session the diff panel and composer). Two of its steps open Settings for you: the Worktree tab, explaining the per-session path templates, and the Plugins tab, explaining how to find, install, and trust plugins. Each step lists its keyboard shortcuts and has a **Skip** button.
 
 Completing or skipping the tour records `app_state.has_seen_web_tour` on the server, so it does not relaunch on reload or on another device pointed at the same server. That flag persists in the server's `state.toml` (a sibling of `config.toml`, see [Configuration Reference](../configuration.md#statetoml)); the `GET /api/settings` JSON key is unchanged, still `app_state.has_seen_web_tour`. To replay it, open the overflow menu and choose **Show tutorial**; re-triggering adapts to where you are (dashboard regions, or composer / mode picker / send controls inside a session). It does not auto-launch on touch devices, where it is menu-only.
 
@@ -150,6 +167,6 @@ Lifecycle hooks are shown **read-only** here, each labeled with its source (prof
 
 ## On mobile
 
-Below the `md` breakpoint the dashboard shows a single full-viewport pane instead of the desktop split. The right-panel button opens a picker for **Agent terminal**, **Paired terminal**, and whichever panes the session allows: **Sub agents** in structured-view sessions, **Diff** and **Files** outside CityHall mode, and plugin panes. A back chip returns to the agent terminal. The agent terminal and paired shell stay alive in the background when you switch away, preserving scrollback and focus.
+Below the `md` breakpoint the dashboard shows a single full-viewport pane instead of the desktop split. The right-panel button opens a picker for **Agent terminal**, **Paired terminal**, and whichever panes the session allows: **Background** in structured-view sessions, **Diff** and **Files** outside CityHall mode, and plugin panes. A back chip returns to the agent terminal. The agent terminal and paired shell stay alive in the background when you switch away, preserving scrollback and focus.
 
 In a structured-view conversation, the top bar and the message composer can each be folded away to give the transcript their height back. A small tab sits at the top right, below the bar and any banners under it, and another at the bottom right, just above the composer; tap one to collapse that region and tap it again to bring it back. The two are independent, so you can hide either or both, and both tabs stay on screen while collapsed so you are never stranded. Leaving the conversation for the dashboard, settings, or the diff pane shows the top bar again, since it is the only navigation those views have.

@@ -44,6 +44,34 @@ impl EventStore {
         }
     }
 
+    /// The newest startup error and its recorded time (epoch ms), unless a session
+    /// assignment followed it: an assigned worker got past login.
+    pub fn unassigned_startup_error(&self, session_id: &str) -> Option<(String, i64)> {
+        let (json, created_at, assigned): (String, i64, bool) = self
+            .conn()
+            .query_row(
+                "SELECT event_json, created_at, EXISTS(
+                     SELECT 1 FROM acp_events a
+                     WHERE a.session_id = ?1 AND a.seq > e.seq
+                       AND a.discriminant = 'AcpSessionAssigned')
+                 FROM acp_events e
+                 WHERE e.session_id = ?1 AND e.discriminant = 'AgentStartupError'
+                 ORDER BY e.seq DESC LIMIT 1",
+                params![session_id],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .optional()
+            .ok()
+            .flatten()?;
+        if assigned {
+            return None;
+        }
+        match decode_logged(&json, session_id, "unassigned_startup_error")? {
+            Event::AgentStartupError { message, .. } => Some((message, created_at)),
+            _ => None,
+        }
+    }
+
     /// The session's current rate-limit park, unless a real continuation
     /// (a prompt, an agent switch, an explicit clear, or an organic stop) superseded it.
     pub fn rate_limit_park(&self, session_id: &str) -> Option<RateLimitPark> {
@@ -171,8 +199,7 @@ impl EventStore {
                     "SELECT event_json FROM acp_events
                  WHERE session_id = ?1
                    AND seq > ?2
-                   AND (json_extract(event_json, '$.Stopped') IS NOT NULL
-                     OR json_extract(event_json, '$.AgentStartupError') IS NOT NULL
+                   AND (discriminant IN ('Stopped', 'AgentStartupError')
                      OR ",
                     native_channel_loss_sql!("event_json"),
                     ")
@@ -206,6 +233,7 @@ impl EventStore {
             conn.query_row(
                 "SELECT MAX(seq) FROM acp_events
                  WHERE session_id = ?1
+                   AND discriminant = 'Stopped'
                    AND json_extract(event_json, '$.Stopped.reason') = 'rate_limited'",
                 params![session_id],
                 |row| row.get::<_, Option<i64>>(0),
@@ -454,13 +482,7 @@ mod tests {
             ("bare park", vec![], true, false),
             (
                 "failed resume",
-                vec![
-                    auto_resume(),
-                    Event::AgentStartupError {
-                        message: "spawn failed".into(),
-                        native_subject: None,
-                    },
-                ],
+                vec![auto_resume(), Event::startup_error("spawn failed")],
                 true,
                 false,
             ),
@@ -683,10 +705,7 @@ mod tests {
                 rate_limit_event(0),
                 stopped("rate_limited"),
                 auto_resume(),
-                Event::AgentStartupError {
-                    message: "boom".into(),
-                    native_subject: None,
-                },
+                Event::startup_error("boom"),
             ],
         );
         assert_eq!(streak(), 1, "a resume whose spawn failed spends nothing");

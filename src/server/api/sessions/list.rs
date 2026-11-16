@@ -23,7 +23,26 @@ pub async fn get_recent_projects() -> Json<RecentProjectsResponse> {
     Json(RecentProjectsResponse { projects })
 }
 
-/// Worker presence is sampled before publication/instance exclusion, never under it.
+pub(crate) async fn queue_control_states(
+    state: &Arc<AppState>,
+) -> HashMap<String, crate::acp::state::AcpState> {
+    let ids: Vec<String> = state
+        .instances
+        .read()
+        .await
+        .iter()
+        .filter(|row| row.is_structured() && !row.queued_prompts.is_empty())
+        .map(|row| row.id.clone())
+        .collect();
+    let mut controls = HashMap::with_capacity(ids.len());
+    for id in ids {
+        let control = state.session_service.fold_control_state(&id).await;
+        controls.insert(id, control);
+    }
+    controls
+}
+
+/// Sample worker presence and qualified queue state before publication/instance exclusion.
 pub(crate) async fn project_sessions(
     state: &Arc<AppState>,
     worker_states: &HashMap<
@@ -33,6 +52,7 @@ pub(crate) async fn project_sessions(
             Option<crate::daemon::AcpWorkerStart>,
         ),
     >,
+    queue_controls: &HashMap<String, crate::acp::state::AcpState>,
 ) -> Vec<SessionResponse> {
     let instances = state.instances.read().await;
     let claude_fullscreen = crate::claude_settings::read_tui_fullscreen();
@@ -42,6 +62,8 @@ pub(crate) async fn project_sessions(
         // CityHall cannot expose terminal sessions.
         .filter(|inst| !state.cityhall_mode || inst.is_structured())
         .collect();
+    let mut resume_configs: std::collections::HashMap<String, crate::session::ResumeProfileConfig> =
+        std::collections::HashMap::new();
     let mut sessions: Vec<SessionResponse> = scoped_instances
         .iter()
         .copied()
@@ -86,6 +108,16 @@ pub(crate) async fn project_sessions(
                 active_monitor,
             );
             session.acp_worker_start = acp_worker_start;
+            // Archived and trashed rows render stopped; skip the resume check.
+            if !inst.is_archived() && !inst.is_trashed() {
+                session.context_resume = Some(context_resume_with(inst, || {
+                    resume_configs
+                        .entry(inst.source_profile.clone())
+                        .or_insert_with(|| {
+                            crate::session::resume_profile_config(&inst.source_profile)
+                        })
+                }));
+            }
             if structured_live && acp_worker_state == crate::daemon::AcpWorkerState::Running {
                 // Gate on a live worker: a pending nonce only exists on a
                 // running worker, and spawn/attach sweep orphaned nonces out of
@@ -212,12 +244,20 @@ pub(crate) async fn project_sessions(
     }
 
     // Snapshot canonical quota probes before releasing the registry read lock.
-    let park_probes: Vec<(usize, String, String)> = sessions
+    let park_probes: Vec<(usize, String, String, Option<crate::session::Instance>)> = sessions
         .iter()
         .zip(scoped_instances.iter().copied())
         .enumerate()
         .filter(|(_, (_, inst))| inst.is_structured() && !inst.is_archived() && !inst.is_trashed())
-        .map(|(i, (_, inst))| (i, inst.id.clone(), inst.source_profile.clone()))
+        .map(|(i, (resp, inst))| {
+            (
+                i,
+                inst.id.clone(),
+                inst.source_profile.clone(),
+                (resp.acp_worker_state != crate::daemon::AcpWorkerState::Running)
+                    .then(|| inst.clone()),
+            )
+        })
         .collect();
 
     // Overlay the smart-rename indicator. `Running` comes from the live
@@ -225,7 +265,7 @@ pub(crate) async fn project_sessions(
     // indicator cannot drift from the runtime gate.
     {
         use crate::session::smart_rename::{
-            check_eligible_resolved, resolve_smart_rename_config, SmartRenameState,
+            check_eligible_with_declarations, resolve_smart_rename_config, SmartRenameState,
         };
         use std::collections::HashSet;
         let inflight: HashSet<String> = state
@@ -260,7 +300,7 @@ pub(crate) async fn project_sessions(
                 session_cfg,
             );
             let cfg = resolve_smart_rename_config(session_cfg, smart_rename_override);
-            let eligible = check_eligible_resolved(
+            let eligible = check_eligible_with_declarations(
                 inst.is_structured(),
                 cfg.setting_on,
                 false,
@@ -269,7 +309,7 @@ pub(crate) async fn project_sessions(
                 cfg.rename_agent,
                 inst.is_sandboxed(),
                 &inst.command,
-                cfg.overrides,
+                session_cfg,
             )
             .is_ok();
             if eligible {
@@ -290,6 +330,24 @@ pub(crate) async fn project_sessions(
         "list_sessions resolved session config once per unique profile/project pair"
     );
 
+    // Sessions whose daemon queue holds messages, with what decides why it waits.
+    let queue_probes: Vec<(usize, String, String, String, bool)> = scoped_instances
+        .iter()
+        .enumerate()
+        .filter(|(_, inst)| inst.is_structured() && !inst.is_archived() && !inst.is_trashed())
+        .filter_map(|(i, inst)| {
+            let first = inst.queued_prompts.first()?;
+            let agent_key = inst.agent_name.clone().unwrap_or_else(|| inst.tool.clone());
+            Some((
+                i,
+                inst.id.clone(),
+                first.text.clone(),
+                agent_key,
+                inst.is_idle_dormant(),
+            ))
+        })
+        .collect();
+
     // The park probe touches config files and SQLite, so it runs with the
     // session registry unlocked rather than holding writers behind it.
     drop(scoped_instances);
@@ -298,30 +356,70 @@ pub(crate) async fn project_sessions(
         let store = Arc::clone(&state.acp_event_store);
         let overlays = tokio::task::spawn_blocking(move || {
             use std::collections::HashMap;
-            let mut auto_resume_cache: HashMap<String, bool> = HashMap::new();
+            let mut config_cache: HashMap<
+                String,
+                (bool, crate::server::acp_reconciler::FailoverSettings),
+            > = HashMap::new();
             park_probes
                 .into_iter()
-                .map(|(i, id, profile)| {
-                    let auto_resume =
-                        *auto_resume_cache.entry(profile.clone()).or_insert_with(|| {
-                            crate::session::config::profile_config::resolve_config_or_warn(&profile)
-                                .acp
-                                .rate_limit_auto_resume
-                        });
-                    let park = store.rate_limit_park(&id).map(|park| {
+                .map(|(i, id, profile, workerless)| {
+                    let (auto_resume, failover) = config_cache
+                        .entry(profile.clone())
+                        .or_insert_with(|| {
+                            let config =
+                                crate::session::config::profile_config::resolve_config_or_warn(
+                                    &profile,
+                                );
+                            (
+                                config.acp.rate_limit_auto_resume,
+                                crate::server::acp_reconciler::FailoverSettings::of(&config),
+                            )
+                        })
+                        .clone();
+                    let park = store.rate_limit_park(&id);
+                    let failover_to =
+                        workerless
+                            .as_ref()
+                            .zip(park.as_ref())
+                            .and_then(|(row, park)| {
+                                crate::server::acp_reconciler::failover_target(
+                                    row,
+                                    &failover,
+                                    park,
+                                    store.rate_limit_redelivery_streak(&id),
+                                    &store,
+                                )
+                            });
+                    let park = park.map(|park| {
                         park.info
                             .unwrap_or_else(crate::acp::state::RateLimitInfo::undated)
                     });
-                    (i, auto_resume, park)
+                    (i, auto_resume, park, failover_to)
                 })
                 .collect::<Vec<_>>()
         })
         .await
         .unwrap_or_default();
-        for (i, auto_resume, park) in overlays {
+        for (i, auto_resume, park, failover_to) in overlays {
             sessions[i].rate_limit_auto_resume = Some(auto_resume);
             sessions[i].rate_limit = park;
+            sessions[i].rate_limit_failover_to = failover_to;
         }
+    }
+
+    // The park overlay completes the pre-publication queue-state snapshot.
+    for (i, id, first, agent_key, idle_dormant) in queue_probes {
+        use crate::daemon::AcpWorkerState::{Resuming, Running};
+        let worker = crate::acp::dispatch::WorkerLiveness {
+            running: matches!(sessions[i].acp_worker_state, Resuming | Running),
+            idle_dormant,
+            rate_limit_parked: sessions[i].rate_limit.is_some(),
+        };
+        let Some(control) = queue_controls.get(&id) else {
+            continue;
+        };
+        let solo = crate::acp::agent_profiles::resolve(&agent_key).is_solo_command(&first);
+        sessions[i].queue_reason = crate::acp::dispatch::queue_hold(control, worker, solo);
     }
 
     // Resolve remote owners with a permanent cache on AppState
@@ -738,6 +836,7 @@ mod workspace_ordering_tests {
             sandbox_container_name: None,
             outside_repository: false,
             scratch: false,
+            created_without_setup: false,
             has_managed_worktree: false,
             has_cleanable_worktree: false,
             tie_workdir_to_name: false,
@@ -769,6 +868,9 @@ mod workspace_ordering_tests {
             }),
             rate_limit: None,
             rate_limit_auto_resume: None,
+            rate_limit_failover_to: None,
+            queued_count: 0,
+            queue_reason: None,
             acp_capable: false,
             acp_session_id: None,
             import_pending: false,
@@ -907,7 +1009,8 @@ mod workspace_ordering_tests {
             }
             assert!(!state.acp_event_store.has_in_flight_main_turn(&row.id));
             let workers = state.acp_supervisor.worker_states_snapshot().await;
-            let projected = project_sessions(&state, &workers).await;
+            let projected =
+                project_sessions(&state, &workers, &queue_control_states(&state).await).await;
             let projected = &projected[0];
             let eligible = matches!(scope, Scope::Live);
             assert_eq!(projected.rate_limit.is_some(), eligible);
@@ -927,7 +1030,8 @@ mod workspace_ordering_tests {
                     .acp_event_store
                     .record(&row.id, next, &prompt("new explicit main intent"))
                     .unwrap();
-                let after = project_sessions(&state, &workers).await;
+                let after =
+                    project_sessions(&state, &workers, &queue_control_states(&state).await).await;
                 assert!(
                     after[0].rate_limit.is_none(),
                     "only the newer genuine main input supersedes the hold"

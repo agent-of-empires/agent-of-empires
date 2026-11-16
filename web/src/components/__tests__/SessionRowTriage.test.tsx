@@ -5,6 +5,7 @@ import { act, cleanup, fireEvent, screen } from "@testing-library/react";
 
 import type { SessionResponse } from "../../lib/types";
 import { OPEN_SESSION_EVENT } from "../../lib/sessionRoute";
+import { clearPendingSwitchAccount, getPendingSwitchAccount } from "../../lib/switchAccountTrigger";
 import { OPEN_SWITCH_AGENT_EVENT, consumePendingSwitchAgent } from "../../lib/switchAgentTrigger";
 import { firstRequest, makeSession, makeWorkspace, openRowMenu, renderRow, stubFetch } from "./fixtures";
 
@@ -45,6 +46,19 @@ describe("SessionRow chips", () => {
       for (const l of absent) expect(label(l)).toBeNull();
     },
   );
+
+  it("names the created-without-setup chip in the row's accessible name, and shows only its icon", () => {
+    renderRow(ws({ created_without_setup: true }));
+    expect(screen.getByRole("link", { name: /Created without setup/ })).toBeTruthy();
+    const chip = screen.getByTitle("Created without setup");
+    const visible = Array.from(chip.childNodes).filter(
+      (n) => !(n instanceof SVGElement) && !(n instanceof Element && n.classList.contains("sr-only")),
+    );
+    expect(visible).toEqual([]);
+    cleanup();
+    renderRow(ws());
+    expect(screen.queryByRole("link", { name: /Created without setup/ })).toBeNull();
+  });
 
   it("keeps favorite identity distinct from pin in normal and compact rows", () => {
     for (const compact of [false, true]) {
@@ -386,6 +400,27 @@ describe("SessionRow triage actions", () => {
     }
   });
 
+  it("Switch account is offered on live structured sessions only and latches the dialog request", () => {
+    // Terminal, archived and trashed rows never mount the dialog, so a latch would strand.
+    for (const overrides of [
+      { view: "terminal" as const },
+      { view: "structured" as const, archived_at: PAST },
+      { view: "structured" as const, trashed_at: PAST },
+      // A failover already swapping the account would race a manual restart.
+      { view: "structured" as const, rate_limit_failover_to: "claude-b" },
+    ]) {
+      openRowMenu(ws({ id: "sess-acct", ...overrides }));
+      expect(testId("sidebar-context-menu-switch-account")).toBeNull();
+      cleanup();
+    }
+
+    openRowMenu(ws({ id: "sess-acct", view: "structured" }));
+    click("sidebar-context-menu-switch-account");
+    expect(getPendingSwitchAccount()).toBe("sess-acct");
+    expect(fetchSpy).not.toHaveBeenCalled();
+    clearPendingSwitchAccount();
+  });
+
   it("New Session opens the wizard with main_repo_path over project_path (#2023)", () => {
     const onCreateSession = vi.fn();
     openRowMenu(ws({ project_path: "/p", main_repo_path: "/repos/work" }), { onCreateSession });
@@ -478,5 +513,44 @@ describe("SessionRow mark tooltips", () => {
       fireEvent.pointerEnter(testId("sidebar-status-glyph")!, { pointerType: "mouse" });
       expect(screen.getByRole("tooltip").textContent, JSON.stringify(over)).toContain(tip);
     }
+  });
+
+  // An Error Session second in its row: the row reads the Session whose status it shows.
+  const pair = (over: Partial<SessionResponse>) =>
+    over.status === "Error"
+      ? makeWorkspace("w", [
+          makeSession({ id: "a", status: "Stopped", last_error: "stale" }),
+          makeSession({ id: "b", ...over }),
+        ])
+      : ws(over);
+  it.each<[string, Partial<SessionResponse>, string, string | null]>([
+    [
+      "a recorded error",
+      { status: "Error", last_error: "\nresume failed\nsecond" },
+      "Errorresume failed",
+      "resume failed",
+    ],
+    ["no recorded error", { status: "Error", last_error: null }, "Error · no details recorded", null],
+    [
+      "a Structured view error",
+      { status: "Error", last_error: "resume failed", view: "structured" },
+      "Error: the Session failed; also shown while deleting",
+      null,
+    ],
+    ["Deleting", { status: "Deleting", last_error: "resume failed" }, "Deleting…", null],
+  ])("glyph tooltip and description: %s", (_name, over, tip, described) => {
+    renderRow(pair(over));
+    const glyph = testId("sidebar-status-glyph")!;
+    fireEvent.pointerEnter(glyph, { pointerType: "mouse" });
+    expect(screen.getByRole("tooltip").textContent).toBe(tip);
+    // Only a recorded error's line wraps, at a space or else mid-word.
+    const bubble = screen.getByRole("tooltip").classList;
+    expect([bubble.contains("whitespace-normal"), bubble.contains("break-words")]).toEqual([
+      described !== null,
+      described !== null,
+    ]);
+    const describedBy = glyph.getAttribute("aria-describedby");
+    expect(describedBy ? document.getElementById(describedBy)?.textContent : null).toBe(described);
+    if (over.status === "Error") expect(glyph.getAttribute("aria-label")).toBe("Error · needs attention (error)");
   });
 });

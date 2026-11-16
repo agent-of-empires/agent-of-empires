@@ -1,6 +1,7 @@
 //! Turn state shared between the notification handler and the command loop,
 //! and the `session/update` handler itself.
 
+use super::subagents::BackgroundReport;
 use crate::acp::agent_profiles::AgentProfile;
 use crate::acp::background_agent::{spawn_tailer, TailerStart, TranscriptSource};
 use crate::acp::state::{BackgroundTaskLaunch, Event, SubagentRecord};
@@ -18,9 +19,11 @@ use crate::acp::acp_client::aoe_ingress::{AoeIngress, Ingested};
 use crate::acp::acp_client::between_prompt::BetweenPromptTracker;
 use crate::acp::acp_client::control::{publish_adopted_completion, DaemonControlClient};
 use crate::acp::acp_client::lifecycle::{
-    forward_lifecycle_signals, LifecycleEnvelope, TerminalClaim,
+    forward_lifecycle_signals, LifecycleEnvelope, LifecycleSignal, TerminalClaim,
 };
-use crate::acp::acp_client::rate_limit::record_rate_limit_report;
+use crate::acp::acp_client::rate_limit::{
+    record_rate_limit_report, take_rate_limit_from_captured_rejection,
+};
 use crate::acp::acp_client::session_identity::{PendingIngress, SessionIngress};
 use crate::acp::acp_client::session_sandbox::SessionSandbox;
 use crate::acp::acp_client::tool_context::{
@@ -33,6 +36,7 @@ use crate::acp::acp_client::update_events::{
     CompactionFold, CompactionTracker,
 };
 use crate::acp::acp_client::watchdog::classify_watchdog_notification_signals;
+use crate::acp::acp_client::SessionState;
 
 pub(super) fn now_ms() -> i64 {
     chrono::Utc::now().timestamp_millis()
@@ -40,6 +44,7 @@ pub(super) fn now_ms() -> i64 {
 
 pub(super) struct Shared {
     pub(super) event_tx: mpsc::Sender<Event>,
+    pub(super) state: Arc<SessionState>,
     pub(super) connection_state: Arc<super::ConnectionState>,
     control: Option<Arc<DaemonControlClient>>,
     pending_responders: crate::acp::acp_client::pending::PendingResponders,
@@ -80,13 +85,23 @@ pub(super) struct Shared {
     /// Reset epochs (unix seconds) per rejected quota window. Cleared at each
     /// prompt and drained when a turn parks; a window that later reports a
     /// non-rejected status is removed (#3028, #3152).
-    pub(super) rate_limit_rejections: std::sync::Mutex<HashMap<String, i64>>,
+    pub(super) rate_limit_rejections: Arc<std::sync::Mutex<HashMap<String, i64>>>,
+    pub(super) cancel_deadline: Arc<std::sync::Mutex<Option<tokio::time::Instant>>>,
+    #[cfg(test)]
+    pub(super) cancel_send_gate: Arc<tokio::sync::RwLock<()>>,
     /// Scoped to one turn; see `AgentMessageDedup` (#2281).
     pub(super) agent_msg_dedup: std::sync::Mutex<AgentMessageDedup>,
     compaction: std::sync::Mutex<CompactionTracker>,
     pub(super) tool_context_cache: ToolContextCache,
     /// Merged snapshot per subagent session; see `subagents.rs`.
     pub(super) subagents: std::sync::Mutex<HashMap<String, SubagentRecord>>,
+    /// Background children whose card waits for their final answer; see
+    /// `subagents.rs`.
+    pub(super) background_reports: std::sync::Mutex<HashMap<String, BackgroundReport>>,
+    /// Epoch-ms of the last validated child traffic.
+    pub(super) subagent_activity_at: AtomicI64,
+    /// Epoch-ms of each child's own last validated traffic.
+    pub(super) subagent_seen: std::sync::Mutex<HashMap<String, i64>>,
     bg_transcript_source: TranscriptSource,
     pub(super) bg_tasks: Arc<ActiveTasks>,
     pub(super) aoe: AoeIngress,
@@ -100,7 +115,7 @@ impl Shared {
         session_label: String,
         profile: &'static AgentProfile,
         lifecycle_tx: mpsc::Sender<LifecycleEnvelope>,
-        terminal_claim: Arc<TerminalClaim>,
+        state: Arc<SessionState>,
         prompt_in_flight: Arc<AtomicBool>,
         sandbox: Option<&SessionSandbox>,
         ingress: Arc<SessionIngress>,
@@ -131,22 +146,29 @@ impl Shared {
             last_event_at: AtomicI64::new(now_ms()),
             first_event_after_attach: AtomicBool::new(false),
             prompt_sent_since_attach: AtomicBool::new(false),
-            terminal_claim,
+            terminal_claim: state.terminal_claim.clone(),
             adopted_turn_active: AtomicBool::new(false),
             prompt_in_flight,
             local_prompt_settled: tokio::sync::Notify::new(),
             prompt_epoch: AtomicU64::new(0),
             lifecycle_tx,
             between_prompt: BetweenPromptTracker::default(),
-            rate_limit_rejections: Default::default(),
+            rate_limit_rejections: state.rate_limit_rejections.clone(),
+            cancel_deadline: state.cancel_deadline.clone(),
+            #[cfg(test)]
+            cancel_send_gate: state.cancel_send_gate.clone(),
             agent_msg_dedup: Default::default(),
             compaction: Default::default(),
             tool_context_cache: Arc::new(std::sync::Mutex::new(ToolCallContextCache::default())),
             subagents: Default::default(),
+            background_reports: Default::default(),
+            subagent_activity_at: AtomicI64::new(0),
+            subagent_seen: Default::default(),
             bg_transcript_source,
             bg_tasks: Arc::default(),
             aoe: AoeIngress::default(),
             claude_home,
+            state,
         }
     }
 
@@ -176,17 +198,31 @@ impl Shared {
 
     /// Inferred idle/watchdog terminals recheck native admission after channel
     /// backpressure. Genuine correlated outcomes use `emit` instead.
-    pub(super) async fn emit_while_available<const N: usize>(&self, events: [Event; N]) -> bool {
-        let Ok(mut permits) = self.event_tx.reserve_many(N).await else {
-            return false;
-        };
-        self.connection_state
-            .admit(|| {
-                for event in events {
-                    permits.next().expect("reserved event permit").send(event);
-                }
-            })
-            .is_ok()
+    pub(super) async fn emit_while_available(
+        &self,
+        events: impl IntoIterator<Item = Event>,
+    ) -> bool {
+        let turn = self.terminal_claim.current_turn();
+        let failed = self.terminal_claim.failed();
+        let _publication = self.state.publication.lock().await;
+        for event in events {
+            let Ok(permit) = self.event_tx.reserve().await else {
+                return false;
+            };
+            if self
+                .connection_state
+                .admit(|| {
+                    self.terminal_claim.publish_claimed(turn, failed, || {
+                        permit.send(event);
+                    })
+                })
+                .ok()
+                != Some(true)
+            {
+                return false;
+            }
+        }
+        true
     }
 
     pub(super) async fn wait_local_prompt_settled(&self) {
@@ -250,6 +286,73 @@ impl Shared {
         }
     }
 
+    /// Validated child traffic keeps whichever watchdog owns the turn from
+    /// reading a parent that waits on its subagents as silent. Call it before
+    /// publishing events so a full event channel cannot delay the signal.
+    pub(super) async fn note_child_activity(
+        &self,
+        child: &SessionId,
+        local_prompt_signals: bool,
+        epoch: u64,
+    ) {
+        let now = now_ms();
+        self.subagent_seen
+            .lock()
+            .expect("subagent seen mutex poisoned")
+            .insert(child.0.to_string(), now);
+        self.subagent_activity_at.store(now, Ordering::Relaxed);
+        if self.prompt_in_flight.load(Ordering::Relaxed) {
+            forward_lifecycle_signals(
+                local_prompt_signals && epoch != 0,
+                &self.lifecycle_tx,
+                epoch,
+                Some(LifecycleSignal::SubagentActivity),
+                None,
+                &self.session_label,
+            )
+            .await;
+        } else {
+            self.arm_for_subagent_activity().await;
+        }
+    }
+
+    pub(super) async fn arm_for_subagent_activity(&self) {
+        let _publication = self.state.publication.lock().await;
+        self.between_prompt.observe(
+            Some(&LifecycleSignal::SubagentActivity),
+            None,
+            now_ms(),
+            self.adopted_turn_active.load(Ordering::Relaxed),
+            &self.terminal_claim,
+        );
+    }
+
+    /// A claimed terminal must reach the drain even if SDK teardown cancels its caller.
+    pub(super) async fn publish_terminal(&self, reason: String, preceding: Vec<Event>) {
+        let turn = self.terminal_claim.current_turn();
+        let event_tx = self.event_tx.clone();
+        let state = self.state.clone();
+        let publication = state.publication.clone().lock_owned().await;
+        let publication = tokio::spawn(async move {
+            let _publication = publication;
+            if state.terminal_claim.claimed_turn() != Some(turn) {
+                return;
+            }
+            *state.cancel_deadline.lock().unwrap() = None;
+            for event in preceding {
+                if event_tx.send(event).await.is_err() {
+                    return;
+                }
+            }
+            let _ = event_tx.send(Event::Stopped { reason }).await;
+        });
+        #[cfg(test)]
+        let _settle = self.state.terminal_settle_gate.read().await;
+        self.prompt_in_flight.store(false, Ordering::Release);
+        self.local_prompt_settled.notify_waiters();
+        let _ = publication.await;
+    }
+
     pub(super) async fn handle_ingress_marker(
         &self,
         marker: PendingIngress,
@@ -285,19 +388,80 @@ impl Shared {
             }
             PendingIngress::PromptCompleted(adopted) => {
                 if let Some(control) = self.control.as_ref() {
-                    let turn = adopted.turn;
-                    if publish_adopted_completion(
-                        *adopted,
-                        &self.event_tx,
-                        &control.completion,
-                        &self.prompt_in_flight,
-                        &self.terminal_claim,
-                    )
-                    .await
-                    {
+                    let mut adopted = *adopted;
+                    let accepted = {
+                        let completion = control
+                            .completion
+                            .lock()
+                            .expect("completion mutex poisoned");
+                        if !matches!(
+                            *completion,
+                            crate::acp::acp_client::control::PromptCompletion::Adopted
+                        ) || self.terminal_claim.claimed_turn() != Some(adopted.turn)
+                        {
+                            false
+                        } else {
+                            let diagnostic =
+                                adopted.diagnostic.take().map(|value| value.into_event());
+                            let diagnostic = match diagnostic {
+                                Some(Event::RateLimit { mut info }) => {
+                                    if let Some(captured) = take_rate_limit_from_captured_rejection(
+                                        &self.rate_limit_rejections,
+                                        chrono::Utc::now(),
+                                    ) {
+                                        info.kind = captured.kind;
+                                        info.resets_at = captured.resets_at;
+                                    }
+                                    Some(Event::RateLimit { info })
+                                }
+                                None if !matches!(
+                                    adopted.reason.as_str(),
+                                    "cancelled" | "prompt_failed"
+                                ) =>
+                                {
+                                    take_rate_limit_from_captured_rejection(
+                                        &self.rate_limit_rejections,
+                                        chrono::Utc::now(),
+                                    )
+                                    .map(|info| {
+                                        adopted.reason = "rate_limited".into();
+                                        Event::RateLimit { info }
+                                    })
+                                }
+                                other => other,
+                            };
+                            adopted.diagnostic = diagnostic.and_then(
+                                crate::acp::control_protocol::AdoptedPromptDiagnostic::new,
+                            );
+                            self.terminal_claim.publish_claimed(
+                                adopted.turn,
+                                matches!(adopted.reason.as_str(), "prompt_failed" | "rate_limited"),
+                                || {},
+                            )
+                        }
+                    };
+                    if accepted {
                         self.adopted_turn_active.store(false, Ordering::Release);
                         self.between_prompt
-                            .deactivate_unsuccessful_turn(&self.terminal_claim, turn);
+                            .deactivate_unsuccessful_turn(&self.terminal_claim, adopted.turn);
+                        let events = self.event_tx.clone();
+                        let completion = control.completion.clone();
+                        let in_flight = self.prompt_in_flight.clone();
+                        let state = self.state.clone();
+                        let publication = state.publication.clone().lock_owned().await;
+                        tokio::spawn(async move {
+                            publish_adopted_completion(
+                                adopted,
+                                &events,
+                                &completion,
+                                &in_flight,
+                                &state,
+                                publication,
+                            )
+                            .await;
+                        })
+                        .await
+                        .expect("terminal publisher completes");
                     }
                 }
             }
@@ -408,30 +572,62 @@ impl Shared {
         local_prompt_signals: bool,
         epoch: u64,
     ) {
-        // Subagent traffic never feeds the root session's dedup, compaction
-        // or watchdog state: a busy child would hold its parent's turn open.
+        // Subagent traffic never feeds the root session's dedup or compaction
+        // state; it only proves the parent's turn is still live.
         let from_child = self.ingress.child_route(&notification.session_id).is_some();
+        let suppressing = self.suppress_history_replay.load(Ordering::Relaxed);
+        // Replayed children died with the old adapter; ingress already routed them.
+        if suppressing
+            && (from_child
+                || matches!(
+                    notification.update,
+                    SessionUpdate::SubagentUpdate(_)
+                        | SessionUpdate::SessionMessage(_)
+                        | SessionUpdate::SessionMessageChunk(_)
+                ))
+        {
+            tracing::trace!(
+                target: "acp.protocol",
+                session = %self.session_label,
+                "dropping post-load subagent replay frame"
+            );
+            return;
+        }
         match notification.update {
             SessionUpdate::SubagentUpdate(update) => {
                 return self
-                    .handle_subagent_update(notification.session_id, update)
+                    .handle_subagent_update(
+                        notification.session_id,
+                        update,
+                        local_prompt_signals,
+                        epoch,
+                    )
                     .await;
             }
             SessionUpdate::SessionMessage(message) => {
                 return self
-                    .handle_session_message(notification.session_id, message)
+                    .handle_session_message(
+                        notification.session_id,
+                        message,
+                        local_prompt_signals,
+                        epoch,
+                    )
                     .await;
             }
-            SessionUpdate::SessionMessageChunk(_) => return,
+            SessionUpdate::SessionMessageChunk(_) if !from_child => return,
             update if from_child => {
                 return self
-                    .handle_child_notification(notification.session_id, update)
+                    .handle_child_notification(
+                        notification.session_id,
+                        update,
+                        local_prompt_signals,
+                        epoch,
+                    )
                     .await;
             }
             update => notification.update = update,
         }
         self.last_event_at.store(now_ms(), Ordering::Relaxed);
-        let suppressing = self.suppress_history_replay.load(Ordering::Relaxed);
         // Drop the adapter's leaked restatement before anything sees it
         // (#2281). Replayed history resets rather than feeds the deduper.
         {
@@ -480,6 +676,7 @@ impl Shared {
         if lifecycle.is_some() || wakeup.is_some() {
             self.first_event_after_attach.store(true, Ordering::Relaxed);
         }
+        let publication = self.state.publication.lock().await;
         let prompt_active = self.prompt_in_flight.load(Ordering::Acquire);
         let failed_main_turn = !prompt_active && self.terminal_claim.failed();
         if !prompt_active
@@ -498,6 +695,7 @@ impl Shared {
                 "between-prompt watchdog armed for an agent-initiated turn"
             );
         }
+        drop(publication);
         self.capture_rate_limit(&notification.update);
         let session_id = notification.session_id.0.to_string();
         let update_for_tool_context = notification.update.clone();
@@ -678,7 +876,7 @@ mod tests {
             "s-echo".to_string(),
             &crate::acp::agent_profiles::CLAUDE,
             lifecycle_tx,
-            Arc::new(TerminalClaim::new()),
+            Arc::new(SessionState::default()),
             Arc::new(AtomicBool::new(prompt_in_flight)),
             None,
             Arc::new(SessionIngress::new(Some(SessionId::from("native")))),
