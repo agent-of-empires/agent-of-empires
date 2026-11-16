@@ -345,7 +345,16 @@ fn run_plugin_row_status_scenario(scenario: &str, include_github: bool, include_
     h.stop_daemon_on_drop();
     let port = pick_free_port();
     let port_s = port.to_string();
-    let start = h.run_cli(&["serve", "--daemon", "--port", &port_s, "--no-auth"]);
+    let start = h.run_cli(&[
+        "serve",
+        "--daemon",
+        "--port",
+        &port_s,
+        "--no-auth",
+        "--behind-proxy",
+        "--allowed-host",
+        "127.0.0.1",
+    ]);
     assert!(
         start.status.success(),
         "daemon start failed: {}",

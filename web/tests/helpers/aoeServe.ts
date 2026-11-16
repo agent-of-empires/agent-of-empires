@@ -618,7 +618,7 @@ export async function spawnAoeServe(opts: SpawnOptions): Promise<ServeHandle> {
 
   function buildArgs(boundPort: number): string[] {
     const args = ["serve", "--host", "127.0.0.1", "--port", String(boundPort)];
-    if (authMode === "none") args.push("--no-auth");
+    if (authMode === "none") args.push("--no-auth", "--behind-proxy", "--allowed-host", "127.0.0.1");
     if (authMode === "token") args.push("--auth", "token");
     if (authMode === "passphrase") {
       // `--passphrase` alone keeps token auth with a passphrase second factor, which renders TokenEntryPage.

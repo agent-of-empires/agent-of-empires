@@ -62,7 +62,7 @@ Before printing, the command asks the running daemon whether it serves `/mcp`, b
 | Token authentication, no passphrase (the default) | URL plus the `Authorization: Bearer` header |
 | `--auth passphrase`, with or without `--behind-proxy` | None: the login wall covers every TCP caller, including loopback, and `/mcp` accepts only a browser login session. The command exits non-zero. Restart with `--auth token` and without `--passphrase` |
 | Token authentication plus a passphrase, including `--remote` | None: `/mcp` still requires the login session cookie, so a bearer token is not enough. The command exits non-zero. `--remote` cannot drop its passphrase |
-| `--auth none` | URL only |
+| `--auth none` with `--behind-proxy` | URL only |
 | `aoe serve --core-only` | None: a core-only daemon does not listen on TCP |
 
 If the daemon refuses the printed credential, for example because the token rotated at that moment, the command exits non-zero instead of printing an entry that cannot connect.

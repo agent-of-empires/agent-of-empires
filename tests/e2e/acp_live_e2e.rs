@@ -391,6 +391,9 @@ fn start_daemon(h: &TuiTestHarness) -> u16 {
         "--port",
         &port.to_string(),
         "--no-auth",
+        "--behind-proxy",
+        "--allowed-host",
+        "127.0.0.1",
     ]);
     assert!(
         start.status.success(),

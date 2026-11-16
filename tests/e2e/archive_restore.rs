@@ -1510,6 +1510,9 @@ fn trash_retry_menu_rejects_old_epoch_and_accepts_fresh_consent() {
             "--port",
             &port.to_string(),
             "--no-auth",
+            "--behind-proxy",
+            "--allowed-host",
+            "127.0.0.1",
         ]);
         assert!(crate::harness::wait_for_port(port, Duration::from_secs(10)));
         h.wait_for("Reconnect");
