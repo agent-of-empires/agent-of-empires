@@ -834,7 +834,7 @@ mod staging_volume_tests {
     fn readonly_host_fcntls_are_denied() {
         use std::os::fd::AsRawFd as _;
         use std::os::macos::fs::MetadataExt as _;
-        const FIXTURE: &str = "AOE_MACOS_STAGING_FCNTL_FIXTURE";
+        const FIXTURE: &str = "_AOE_INTERNAL_MACOS_STAGING_FCNTL_FIXTURE";
         const FILES: [&str; 3] = ["canary", "donor", "receiver"];
         if let Some(fixture) = std::env::var_os(FIXTURE) {
             let files = FILES.map(|name| {
