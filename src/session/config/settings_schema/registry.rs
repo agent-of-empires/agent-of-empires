@@ -302,6 +302,7 @@ mod tests {
             "systemd.survive_daemon_restart",
             "systemd.tasks_max",
             "tmux.socket_name",
+            "web.mcp_enabled",
             "web.notifications_enabled",
             "web.notify_on_error",
             "web.notify_on_idle",
