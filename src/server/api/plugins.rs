@@ -2538,6 +2538,52 @@ id = "voice"
         );
     }
 
+    /// Under passphrase-only auth an `<img>` load of an installed icon passes the wall
+    /// without a session or device binding.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn an_installed_icon_loads_without_a_session_under_passphrase_auth() {
+        use tower::ServiceExt;
+        let _app_dir = AppDirEnvGuard::new();
+        let dir = crate::plugin::plugins_dir().unwrap().join("acme.logo");
+        std::fs::create_dir_all(dir.join("assets")).unwrap();
+        std::fs::write(
+            dir.join("aoe-plugin.toml"),
+            "id = \"acme.logo\"\nname = \"Logo\"\nversion = \"1.0.0\"\napi_version = 16\nicon_asset = \"assets/icon.png\"\n",
+        )
+        .unwrap();
+        std::fs::write(dir.join("assets/icon.png"), b"png-bytes").unwrap();
+        crate::plugin::reload_registry();
+
+        let state = crate::server::test_support::build_test_app_state_with_policy_configured(
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            None,
+            |state| {
+                state.login_manager =
+                    std::sync::Arc::new(crate::server::login::LoginManager::new(Some("pw")))
+            },
+        );
+        let app = crate::server::test_support::build_router_for_test(state);
+        let mut req = axum::http::Request::get("/plugin-icons/acme.logo")
+            .header("host", "127.0.0.1")
+            .header("sec-fetch-dest", "image")
+            .body(axum::body::Body::empty())
+            .unwrap();
+        req.extensions_mut()
+            .insert(axum::extract::ConnectInfo(std::net::SocketAddr::from((
+                [203, 0, 113, 7],
+                5555,
+            ))));
+        let resp = app.oneshot(req).await.unwrap();
+
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(resp.headers()["content-type"], "image/png");
+        let body = axum::body::to_bytes(resp.into_body(), 1024).await.unwrap();
+        assert_eq!(&body[..], b"png-bytes");
+    }
+
     #[test]
     #[serial_test::serial]
     fn composer_snapshot_forwarding_requires_active_composer_read_capability() {

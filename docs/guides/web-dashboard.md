@@ -234,6 +234,7 @@ native clients on the owner-verified Unix API retain the local-owner exemption.
 
 - **Token auth** (`--auth=token`, default): a random 256-bit token, generated on startup and stored at `~/.config/agent-of-empires/serve.token` (Linux) or `~/.agent-of-empires/serve.token` (macOS). Passed via URL on first visit, then kept as an `HttpOnly; SameSite=Strict` cookie.
 - **Passphrase wall** (`--auth=passphrase`, or combined with token via `--passphrase`): an argon2-hashed passphrase gates `/login`. Sessions bind to a per-device secret in `localStorage`, so a leaked cookie alone is insufficient.
+- **Plugin icons**: an `<img>` load cannot send the device-binding header, so under passphrase-only auth `/plugin-icons/{id}` skips the wall, and an anonymous caller can tell whether a plugin with an icon is installed (200 vs 404). With token auth on, the token is still required.
 - **Plaintext refusal**: plain HTTP from a non-loopback peer gets `426` before authentication, so tokens and passphrases never cross a network in the clear. A TLS proxy or tunnel in front of a loopback bind is unaffected. A direct bind to a LAN or tailnet IP needs `--dangerously-allow-plaintext-remote` (per bind, logged at every start). Native clients likewise refuse to send a token or passphrase to a plaintext non-loopback endpoint.
 - **Rate limiting**: 5 failed logins from an IP trigger a 15-minute lockout.
 - **Token rotation**: in `--remote` mode the token rotates every 4 hours with a 5-minute grace period for active sessions.
