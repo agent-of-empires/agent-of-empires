@@ -590,7 +590,7 @@ fn apply_prepared_install(
         {
             return Err(e);
         }
-        std::fs::remove_dir_all(&final_dir).map_err(|error| {
+        remove_owned_tree(&final_dir).map_err(|error| {
             super::execution::RecoveryRequired(format!(
                 "removing failed install {}: {error}; original failure: {e:#}",
                 final_dir.display()
@@ -620,7 +620,7 @@ fn apply_prepared_install(
         #[cfg(test)]
         fetch::test_gate::reach(&final_dir, "rollback");
         let metadata = prior.restore(&p.id);
-        let tree = std::fs::remove_dir_all(&final_dir);
+        let tree = remove_owned_tree(&final_dir);
         if metadata.is_err() || tree.is_err() {
             return Err(super::execution::RecoveryRequired(format!(
                 "install {} failed: {e:#}; metadata restoration: {metadata:?}; tree restoration: {tree:?}", p.id
@@ -1512,9 +1512,7 @@ fn is_installed_external(id: &str) -> Result<bool> {
 /// Drop the plugin's directory, config entry and lock entry.
 fn remove_external(id: &str) -> Result<()> {
     let dir = super::plugins_dir()?.join(id);
-    if dir.exists() {
-        std::fs::remove_dir_all(&dir).with_context(|| format!("removing {}", dir.display()))?;
-    }
+    remove_owned_tree(&dir).with_context(|| format!("removing {}", dir.display()))?;
     update_config(|config| config.plugins.remove(id))?;
     let mut lock = Lockfile::load()?;
     if lock.remove(id) {
@@ -1735,25 +1733,169 @@ fn confirm_capabilities(
     ))
 }
 
-fn publication_tree(fetched: &FetchedPlugin, final_dir: &Path) -> Result<tempfile::TempDir> {
+/// Remove only an AoE-owned tree. Never follow links or chmod a pathname:
+/// legacy dev-install links are unlinked without touching their user-owned target.
+pub(super) fn remove_owned_tree(path: &Path) -> Result<()> {
+    use nix::dir::Dir;
+    use nix::errno::Errno;
+    use nix::fcntl::{open, openat, AtFlags, OFlag};
+    use nix::sys::stat::{fchmod, fstat, fstatat, FileStat, Mode};
+    use nix::unistd::{geteuid, unlinkat, UnlinkatFlags};
+    use std::ffi::CStr;
+    use std::os::fd::OwnedFd;
+
+    fn same_entry(left: &FileStat, right: &FileStat) -> bool {
+        left.st_dev == right.st_dev
+            && left.st_ino == right.st_ino
+            && left.st_mode & libc::S_IFMT == right.st_mode & libc::S_IFMT
+    }
+
+    fn remove(parent: &OwnedFd, name: &CStr, device: libc::dev_t, root: bool) -> Result<()> {
+        let observed = match fstatat(parent, name, AtFlags::AT_SYMLINK_NOFOLLOW) {
+            Ok(stat) => stat,
+            Err(Errno::ENOENT) => return Ok(()),
+            Err(error) => return Err(error).context("inspecting owned cleanup entry"),
+        };
+        let kind = observed.st_mode & libc::S_IFMT;
+        match kind {
+            libc::S_IFDIR => {
+                if observed.st_uid != geteuid().as_raw() || device != observed.st_dev {
+                    bail!("owned cleanup refuses a foreign directory or mount");
+                }
+                let fd = openat(
+                    parent,
+                    name,
+                    OFlag::O_RDONLY | OFlag::O_DIRECTORY | OFlag::O_NOFOLLOW | OFlag::O_CLOEXEC,
+                    Mode::empty(),
+                )
+                .context("opening owned cleanup directory without following links")?;
+                let opened = fstat(&fd)?;
+                if !same_entry(&observed, &opened) || opened.st_uid != geteuid().as_raw() {
+                    bail!("owned cleanup directory changed before opening");
+                }
+                if opened.st_mode & 0o700 != 0o700 {
+                    fchmod(&fd, Mode::from_bits_truncate(opened.st_mode | 0o700))
+                        .context("restoring owner access to owned cleanup directory")?;
+                }
+                let mut entries = Dir::from_fd(fd.try_clone()?)?;
+                for entry in entries.iter() {
+                    let entry = entry.context("reading owned cleanup directory")?;
+                    let name = entry.file_name();
+                    if name.to_bytes() != b"." && name.to_bytes() != b".." {
+                        remove(&fd, name, opened.st_dev, false)?;
+                    }
+                }
+                let current = fstatat(parent, name, AtFlags::AT_SYMLINK_NOFOLLOW)?;
+                if !same_entry(&opened, &current) {
+                    bail!("owned cleanup directory changed before removal");
+                }
+                unlinkat(parent, name, UnlinkatFlags::RemoveDir)?;
+            }
+            libc::S_IFLNK | libc::S_IFREG if !root || kind == libc::S_IFLNK => {
+                let current = fstatat(parent, name, AtFlags::AT_SYMLINK_NOFOLLOW)?;
+                if !same_entry(&observed, &current) {
+                    bail!("owned cleanup leaf changed before removal");
+                }
+                unlinkat(parent, name, UnlinkatFlags::NoRemoveDir)?;
+            }
+            _ => bail!("owned cleanup refuses an unexpected file or special entry"),
+        }
+        Ok(())
+    }
+
+    let leaf = path
+        .file_name()
+        .context("owned cleanup needs a tree leaf")?;
+    let parent = path.parent().context("owned cleanup needs a tree parent")?;
+    let parent = if parent.as_os_str().is_empty() {
+        Path::new(".")
+    } else {
+        parent
+    };
+    let parent = match open(
+        parent,
+        OFlag::O_RDONLY | OFlag::O_DIRECTORY | OFlag::O_NOFOLLOW | OFlag::O_CLOEXEC,
+        Mode::empty(),
+    ) {
+        Ok(fd) => fd,
+        Err(Errno::ENOENT) => return Ok(()),
+        Err(error) => return Err(error).context("opening owned cleanup parent"),
+    };
+    use std::os::unix::ffi::OsStrExt;
+    let leaf = std::ffi::CString::new(leaf.as_bytes())?;
+    remove(&parent, &leaf, fstat(&parent)?.st_dev, true)
+        .with_context(|| format!("removing owned tree {}", path.display()))
+}
+
+fn with_publication<T>(
+    fetched: &FetchedPlugin,
+    final_dir: &Path,
+    publish: impl FnOnce(&Path) -> Result<T>,
+) -> Result<T> {
     let parent = final_dir
         .parent()
         .context("plugin destination has no parent")?;
+    // Keep the path before copying: TempDir::drop silently discards cleanup
+    // errors, including partial copies whose directory modes are read-only.
     let directory = tempfile::Builder::new()
         .prefix(".publish-")
         .tempdir_in(parent)
-        .context("creating destination-local plugin publication directory")?;
-    fetched.copy_for_publication(&directory.path().join("tree"))?;
-    Ok(directory)
+        .context("creating destination-local plugin publication directory")?
+        .keep();
+    let result = super::execution::catch_panic(|| {
+        let tree = directory.join("tree");
+        fetched.copy_for_publication(&tree)?;
+        publish(&tree)
+    });
+    #[cfg(test)]
+    fetch::test_gate::reach(final_dir, "publication-cleanup");
+    if let Err(cleanup) = remove_owned_tree(&directory) {
+        return Err(super::execution::RecoveryRequired(format!(
+            "plugin publication cleanup unproven at {}: {cleanup:#}; publication outcome: {}",
+            directory.display(),
+            match &result {
+                Ok(_) => "succeeded".to_owned(),
+                Err(error) => format!("{error:#}"),
+            }
+        ))
+        .into());
+    }
+    result
+}
+
+fn rename_publication_tree(tree: &Path, destination: &Path) -> Result<()> {
+    use nix::fcntl::{open, OFlag};
+    use nix::sys::stat::{fchmod, fstat, Mode};
+
+    let directory = open(
+        tree,
+        OFlag::O_RDONLY | OFlag::O_DIRECTORY | OFlag::O_NOFOLLOW | OFlag::O_CLOEXEC,
+        Mode::empty(),
+    )
+    .context("opening publication root")?;
+    let mode = Mode::from_bits_truncate(fstat(&directory)?.st_mode);
+    // Moving a directory across parents can require updating its read-only `..`.
+    fchmod(&directory, mode | Mode::S_IWUSR)?;
+    let result = std::fs::rename(tree, destination)
+        .with_context(|| format!("publishing plugin into {}", destination.display()));
+    if let Err(error) = fchmod(&directory, mode) {
+        return Err(super::execution::RecoveryRequired(format!(
+            "restoring publication root permissions for {} -> {}: {error}; rename outcome: {result:?}",
+            tree.display(),
+            destination.display()
+        ))
+        .into());
+    }
+    result
 }
 
 fn move_into_place(fetched: &FetchedPlugin, final_dir: &Path) -> Result<()> {
-    let publication = publication_tree(fetched, final_dir)?;
-    if final_dir.exists() {
-        bail!("plugin destination {} already exists", final_dir.display());
-    }
-    std::fs::rename(publication.path().join("tree"), final_dir)
-        .with_context(|| format!("publishing plugin into {}", final_dir.display()))
+    with_publication(fetched, final_dir, |tree| {
+        if final_dir.exists() {
+            bail!("plugin destination {} already exists", final_dir.display());
+        }
+        rename_publication_tree(tree, final_dir)
+    })
 }
 
 fn build_steps(manifest: &PluginManifest) -> &[BuildStep] {
@@ -1875,79 +2017,78 @@ fn replace_and_build(
 
     // Copy and verify before displacing the prior installation. Rename stays on
     // the destination filesystem even when acquisition used a private mount.
-    let publication = publication_tree(fetched, final_dir)?;
+    with_publication(fetched, final_dir, |tree| {
+        let had_prior = final_dir.exists();
+        if had_prior {
+            #[cfg(test)]
+            fetch::test_gate::reach(final_dir, "publication-backup");
+            std::fs::rename(final_dir, &backup_dir)
+                .with_context(|| format!("backing up current {plugin_id} before update"))?;
+        }
 
-    let had_prior = final_dir.exists();
-    if had_prior {
-        std::fs::rename(final_dir, &backup_dir)
-            .with_context(|| format!("backing up current {plugin_id} before update"))?;
-    }
+        let place_and_build = (|| -> Result<()> {
+            rename_publication_tree(tree, final_dir)?;
+            build_in_place(
+                plugin_id,
+                final_dir,
+                &fetched.manifest,
+                node_env,
+                log,
+                fetched.budget,
+            )?;
+            #[cfg(test)]
+            fetch::test_gate::reach(final_dir, "metadata-commit");
+            commit_metadata()
+        })();
 
-    let place_and_build = (|| -> Result<()> {
-        std::fs::rename(publication.path().join("tree"), final_dir)
-            .with_context(|| format!("publishing plugin into {}", final_dir.display()))?;
-        build_in_place(
-            plugin_id,
-            final_dir,
-            &fetched.manifest,
-            node_env,
-            log,
-            fetched.budget,
-        )?;
-        #[cfg(test)]
-        fetch::test_gate::reach(final_dir, "metadata-commit");
-        commit_metadata()
-    })();
-
-    match place_and_build {
-        Ok(()) => {
-            if had_prior {
-                #[cfg(test)]
-                fetch::test_gate::reach(final_dir, "backup-cleanup");
-                if let Err(error) = std::fs::remove_dir_all(&backup_dir) {
-                    return Err(super::execution::RecoveryRequired(format!(
+        match place_and_build {
+            Ok(()) => {
+                if had_prior {
+                    #[cfg(test)]
+                    fetch::test_gate::reach(final_dir, "backup-cleanup");
+                    if let Err(error) = remove_owned_tree(&backup_dir) {
+                        return Err(super::execution::RecoveryRequired(format!(
                         "update {plugin_id} committed, but backup cleanup at {} failed: {error}; do not restore this backup over the committed installation",
                         backup_dir.display()
                     )).into());
+                    }
                 }
+                Ok(())
             }
-            Ok(())
-        }
-        Err(e) => {
-            if e.downcast_ref::<super::execution::RecoveryRequired>()
-                .is_some()
-            {
-                return Err(e);
-            }
-            #[cfg(test)]
-            fetch::test_gate::reach(final_dir, "rollback");
-            let metadata = prior.restore(plugin_id);
-            if final_dir.exists() {
-                std::fs::remove_dir_all(final_dir).map_err(|error| {
-                    super::execution::RecoveryRequired(format!(
-                        "removing failed update {}: {error}; original failure: {e:#}; metadata restoration: {metadata:?}",
-                        final_dir.display()
-                    ))
-                })?;
-            }
-            if had_prior {
-                std::fs::rename(&backup_dir, final_dir).map_err(|error| {
+            Err(e) => {
+                if e.downcast_ref::<super::execution::RecoveryRequired>()
+                    .is_some()
+                {
+                    return Err(e);
+                }
+                #[cfg(test)]
+                fetch::test_gate::reach(final_dir, "rollback");
+                let metadata = prior.restore(plugin_id);
+                remove_owned_tree(final_dir).map_err(|error| {
+                super::execution::RecoveryRequired(format!(
+                    "removing failed update {}: {error}; original failure: {e:#}; metadata restoration: {metadata:?}",
+                    final_dir.display()
+                ))
+            })?;
+                if had_prior {
+                    std::fs::rename(&backup_dir, final_dir).map_err(|error| {
                     super::execution::RecoveryRequired(format!(
                         "restoring {} from {}: {error}; original failure: {e:#}; metadata restoration: {metadata:?}",
                         final_dir.display(),
                         backup_dir.display()
                     ))
                 })?;
+                }
+                if let Err(error) = metadata {
+                    return Err(super::execution::RecoveryRequired(format!(
+                        "update {plugin_id} failed: {e:#}; metadata restoration failed: {error:#}"
+                    ))
+                    .into());
+                }
+                Err(e)
             }
-            if let Err(error) = metadata {
-                return Err(super::execution::RecoveryRequired(format!(
-                    "update {plugin_id} failed: {e:#}; metadata restoration failed: {error:#}"
-                ))
-                .into());
-            }
-            Err(e)
         }
-    }
+    })
 }
 
 fn persisted_source(source: &PluginSource, input: &str) -> String {
@@ -2021,6 +2162,200 @@ mod tests {
     use serial_test::serial;
 
     #[test]
+    fn owned_cleanup_unlinks_legacy_and_internal_links_without_changing_targets() {
+        use std::os::unix::fs::{symlink, MetadataExt, PermissionsExt};
+        let fixture = tempfile::tempdir().unwrap();
+        let outside = fixture.path().join("user-source");
+        std::fs::create_dir(&outside).unwrap();
+        std::fs::write(outside.join("retained"), b"user bytes").unwrap();
+        std::fs::set_permissions(&outside, std::fs::Permissions::from_mode(0o555)).unwrap();
+        let before = std::fs::metadata(&outside).unwrap();
+        let legacy = fixture.path().join("legacy-dev");
+        symlink(&outside, &legacy).unwrap();
+        remove_owned_tree(&legacy).unwrap();
+        assert!(std::fs::symlink_metadata(&legacy).is_err());
+        let owned = fixture.path().join("owned");
+        std::fs::create_dir(&owned).unwrap();
+        std::fs::create_dir(owned.join("nested")).unwrap();
+        std::fs::write(owned.join("nested/payload"), b"owned bytes").unwrap();
+        std::fs::set_permissions(owned.join("nested"), std::fs::Permissions::from_mode(0o555))
+            .unwrap();
+        symlink(&outside, owned.join("outside")).unwrap();
+        symlink(fixture.path().join("missing"), owned.join("dangling")).unwrap();
+        std::fs::set_permissions(&owned, std::fs::Permissions::from_mode(0o555)).unwrap();
+        remove_owned_tree(&owned).unwrap();
+        assert!(!owned.exists());
+        let after = std::fs::metadata(&outside).unwrap();
+        assert_eq!((after.dev(), after.ino()), (before.dev(), before.ino()));
+        assert_eq!(after.permissions().mode(), before.permissions().mode());
+        assert_eq!(
+            std::fs::read(outside.join("retained")).unwrap(),
+            b"user bytes"
+        );
+        std::fs::set_permissions(&outside, std::fs::Permissions::from_mode(0o700)).unwrap();
+    }
+
+    async fn readonly_installation_cleanup(case: &str) {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+        let _reload = super::super::ReloadRegistryOnDrop;
+        let _home = isolate_app_dir();
+        let source = tempfile::tempdir().unwrap();
+        let effects = tempfile::tempdir().unwrap();
+        let node = super::super::write_fake_node(effects.path(), "node");
+        let _node = crate::session::test_support::EnvGuard::set(&[("AOE_ACP_NODE", &node)]);
+        let id = "acme.readonly";
+        let base = format!(
+            "id = \"{id}\"\nname = \"Readonly\"\nversion = \"1.0.0\"\napi_version = 2\ncapabilities = [\"runtime.worker\"]\n[runtime]\nkind = \"command\"\ncommand = [\"sh\"]\nsystem = true\n"
+        );
+        let manifest = source.path().join("aoe-plugin.toml");
+        std::fs::write(&manifest, &base).unwrap();
+        std::fs::create_dir_all(source.path().join("assets/nested")).unwrap();
+        std::fs::write(source.path().join("assets/nested/payload"), b"retained").unwrap();
+        let directories = [
+            source.path().to_path_buf(),
+            source.path().join("assets"),
+            source.path().join("assets/nested"),
+        ];
+        for directory in &directories {
+            std::fs::set_permissions(directory, std::fs::Permissions::from_mode(0o555)).unwrap();
+        }
+        let source_identity = std::fs::metadata(source.path()).unwrap();
+        let input = source.path().to_str().unwrap();
+        let final_dir = super::super::plugins_dir().unwrap().join(id);
+        if case == "failed-install" {
+            std::fs::write(
+                &manifest,
+                format!("{base}\n[[runtime.build]]\ncommand = [\"sh\", \"-c\", \"exit 1\"]\n"),
+            )
+            .unwrap();
+            let result = install(input, true, false).await;
+            assert!(!super::super::execution::needs_recovery(&result));
+            assert!(format!("{:#}", result.unwrap_err()).contains("build step"));
+            assert!(!final_dir.exists());
+            assert!(!Config::load().unwrap().plugins.contains_key(id));
+            assert!(Lockfile::load().unwrap().get(id).is_none());
+            assert!(begin_operation().is_ok());
+            for directory in &directories {
+                assert_eq!(
+                    std::fs::metadata(directory).unwrap().permissions().mode() & 0o777,
+                    0o555
+                );
+                std::fs::set_permissions(directory, std::fs::Permissions::from_mode(0o700))
+                    .unwrap();
+            }
+            return;
+        }
+        install(input, true, false).await.unwrap();
+        assert_eq!(
+            std::fs::metadata(final_dir.join("assets/nested"))
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777,
+            0o555
+        );
+        if case != "uninstall" {
+            let before_hash = super::super::integrity::tree_hash(&final_dir).unwrap();
+            let before_config = serde_json::to_value(&Config::load().unwrap().plugins[id]).unwrap();
+            let before_lock = Lockfile::load().unwrap().get(id).cloned();
+            let mut next = base.replace("1.0.0", "2.0.0");
+            if case == "failed-build" {
+                next.push_str("\n[[runtime.build]]\ncommand = [\"sh\", \"-c\", \"exit 1\"]\n");
+            }
+            std::fs::write(&manifest, &next).unwrap();
+            let fingerprint = match preview_update(id, true).await.unwrap() {
+                UpdatePreview::SafeUpdate { fingerprint, .. } => fingerprint,
+                UpdatePreview::ConsentRequired { consent, .. } => consent.fingerprint,
+                other => panic!("expected update: {other:?}"),
+            };
+            let result = apply_update(id, Some(fingerprint), true, OperationLog::Inherit).await;
+            if case == "failed-build" {
+                assert!(!super::super::execution::needs_recovery(&result));
+                assert!(format!("{:#}", result.unwrap_err()).contains("build step"));
+                assert_eq!(
+                    super::super::integrity::tree_hash(&final_dir).unwrap(),
+                    before_hash
+                );
+                assert_eq!(
+                    serde_json::to_value(&Config::load().unwrap().plugins[id]).unwrap(),
+                    before_config
+                );
+                assert_eq!(Lockfile::load().unwrap().get(id), before_lock.as_ref());
+            } else {
+                assert_eq!(result.unwrap().version, "2.0.0");
+            }
+            assert!(!final_dir.with_file_name(format!("{id}.bak")).exists());
+        }
+        assert_eq!(
+            std::fs::metadata(&final_dir).unwrap().permissions().mode() & 0o777,
+            0o555
+        );
+        uninstall(id).unwrap();
+        assert!(!final_dir.exists());
+        assert!(!Config::load().unwrap().plugins.contains_key(id));
+        assert!(Lockfile::load().unwrap().get(id).is_none());
+        let after = std::fs::metadata(source.path()).unwrap();
+        assert_eq!(
+            (after.dev(), after.ino()),
+            (source_identity.dev(), source_identity.ino())
+        );
+        for directory in &directories {
+            assert_eq!(
+                std::fs::metadata(directory).unwrap().permissions().mode() & 0o777,
+                0o555
+            );
+        }
+        assert_eq!(
+            std::fs::read(source.path().join("assets/nested/payload")).unwrap(),
+            b"retained"
+        );
+        assert!(begin_operation().is_ok());
+        for directory in &directories {
+            std::fs::set_permissions(directory, std::fs::Permissions::from_mode(0o700)).unwrap();
+        }
+    }
+
+    #[tokio::test]
+    #[serial]
+    #[cfg_attr(
+        target_os = "linux",
+        ignore = "requires private user/mount namespaces and bubblewrap"
+    )]
+    async fn readonly_nonempty_installation_uninstalls() {
+        readonly_installation_cleanup("uninstall").await;
+    }
+
+    #[tokio::test]
+    #[serial]
+    #[cfg_attr(
+        target_os = "linux",
+        ignore = "requires private user/mount namespaces and bubblewrap"
+    )]
+    async fn readonly_nonempty_failed_install_removes_uncommitted_tree() {
+        readonly_installation_cleanup("failed-install").await;
+    }
+
+    #[tokio::test]
+    #[serial]
+    #[cfg_attr(
+        target_os = "linux",
+        ignore = "requires private user/mount namespaces and bubblewrap"
+    )]
+    async fn readonly_nonempty_failed_build_restores_prior_installation() {
+        readonly_installation_cleanup("failed-build").await;
+    }
+
+    #[tokio::test]
+    #[serial]
+    #[cfg_attr(
+        target_os = "linux",
+        ignore = "requires private user/mount namespaces and bubblewrap"
+    )]
+    async fn readonly_nonempty_update_removes_old_backup() {
+        readonly_installation_cleanup("update").await;
+    }
+
+    #[test]
     #[serial]
     fn staging_marker_blocks_admission_after_process_ownership_is_lost() {
         let _home = isolate_app_dir();
@@ -2090,8 +2425,186 @@ mod tests {
         assert_eq!(std::fs::read(final_dir.join("old")).unwrap(), b"old");
         assert!(!final_dir.with_file_name("acme.copy.bak").exists());
         assert_eq!(std::fs::read_dir(final_dir).unwrap().count(), 1);
+        assert!(std::fs::read_dir(super::super::plugins_dir().unwrap())
+            .unwrap()
+            .all(|entry| !entry
+                .unwrap()
+                .file_name()
+                .to_string_lossy()
+                .starts_with(".publish-")));
         drop(operation);
         assert!(begin_operation().is_ok());
+    }
+
+    #[tokio::test]
+    #[serial]
+    #[cfg_attr(
+        target_os = "linux",
+        ignore = "requires private user/mount namespaces and bubblewrap"
+    )]
+    async fn staging_volume_readonly_publication_exits_clean_without_displacing_prior_tree() {
+        use std::os::unix::fs::PermissionsExt;
+        let _home = isolate_app_dir();
+        let source = tempfile::tempdir().unwrap();
+        std::fs::write(
+            source.path().join("aoe-plugin.toml"),
+            "id = \"acme.copy\"\nname = \"Copy\"\nversion = \"1.0.0\"\napi_version = 2\n",
+        )
+        .unwrap();
+        let readonly = source.path().join("readonly");
+        std::fs::create_dir(&readonly).unwrap();
+        std::fs::write(readonly.join("payload"), b"approved").unwrap();
+        std::fs::set_permissions(&readonly, std::fs::Permissions::from_mode(0o555)).unwrap();
+        let operation = begin_operation().unwrap();
+        let prepared = prepare_install(
+            source.path().to_str().unwrap(),
+            false,
+            Some(operation.clone()),
+        )
+        .await
+        .unwrap();
+        let final_dir = super::super::plugins_dir().unwrap().join("acme.copy");
+        std::fs::create_dir(&final_dir).unwrap();
+        std::fs::write(final_dir.join("old"), b"old").unwrap();
+        let before = super::super::integrity::tree_hash(&final_dir).unwrap();
+        let prior = PriorMetadata::capture("acme.copy").unwrap();
+        let backup = final_dir.with_file_name("acme.copy.bak");
+        let mut backup_gate = fetch::test_gate::install(&final_dir, "publication-backup");
+        let backup_destination = final_dir.clone();
+        let backup_prior = PriorMetadata::capture("acme.copy").unwrap();
+        let backup_task = tokio::task::spawn_blocking(move || {
+            let error = replace_and_build(
+                "acme.copy",
+                &prepared.fetched,
+                &backup_destination,
+                &NodeEnv::new(),
+                &OperationLog::Inherit,
+                || panic!("failed backup must not commit"),
+                &backup_prior,
+            )
+            .unwrap_err();
+            assert!(format!("{error:#}").contains("backing up current"));
+            prepared
+        });
+        tokio::time::timeout(std::time::Duration::from_secs(5), &mut backup_gate.entered)
+            .await
+            .unwrap()
+            .unwrap();
+        std::fs::create_dir(&backup).unwrap();
+        std::fs::write(backup.join("obstruction"), b"retained").unwrap();
+        backup_gate.release();
+        let prepared = backup_task.await.unwrap();
+        remove_owned_tree(&backup).unwrap();
+        let destination = final_dir.clone();
+        tokio::task::spawn_blocking(move || {
+            let fetched = &prepared.fetched;
+            // All these exits leave a complete, nonempty read-only copy.
+            let exists = move_into_place(fetched, &destination).unwrap_err();
+            assert!(format!("{exists:#}").contains("already exists"));
+            let rename: Result<()> = with_publication(fetched, &destination, |tree| {
+                std::fs::rename(tree, destination.join("missing/child"))?;
+                Ok(())
+            });
+            assert!(rename.is_err());
+            let panic: Result<()> = with_publication(fetched, &destination, |_| {
+                panic!("controlled publication panic")
+            });
+            assert!(super::super::execution::needs_recovery(&panic));
+            std::fs::write(fetched.tree.join("readonly/payload"), b"changed").unwrap();
+            let mismatch = replace_and_build(
+                "acme.copy",
+                fetched,
+                &destination,
+                &NodeEnv::new(),
+                &OperationLog::Inherit,
+                || panic!("unverified copy must not commit"),
+                &prior,
+            )
+            .unwrap_err();
+            assert!(format!("{mismatch:#}").contains("differs from the approved staging tree"));
+            prepared.fetched.close().unwrap();
+        })
+        .await
+        .unwrap();
+        assert_eq!(
+            super::super::integrity::tree_hash(&final_dir).unwrap(),
+            before
+        );
+        assert!(!final_dir.with_file_name("acme.copy.bak").exists());
+        assert!(std::fs::read_dir(super::super::plugins_dir().unwrap())
+            .unwrap()
+            .all(|entry| !entry
+                .unwrap()
+                .file_name()
+                .to_string_lossy()
+                .starts_with(".publish-")));
+        assert_eq!(
+            std::fs::metadata(&readonly).unwrap().permissions().mode() & 0o777,
+            0o555
+        );
+        assert_eq!(
+            std::fs::read(readonly.join("payload")).unwrap(),
+            b"approved"
+        );
+        std::fs::set_permissions(&readonly, std::fs::Permissions::from_mode(0o700)).unwrap();
+        drop(operation);
+        assert!(begin_operation().is_ok());
+    }
+
+    #[tokio::test]
+    #[serial]
+    #[cfg_attr(
+        target_os = "linux",
+        ignore = "requires private user/mount namespaces and bubblewrap"
+    )]
+    async fn staging_volume_publication_cleanup_failure_retains_path_and_exclusion() {
+        use nix::sys::stat::Mode;
+        let _reload = super::super::ReloadRegistryOnDrop;
+        let _home = isolate_app_dir();
+        let source = tempfile::tempdir().unwrap();
+        std::fs::write(
+            source.path().join("aoe-plugin.toml"),
+            "id = \"acme.publish\"\nname = \"Publish\"\nversion = \"1.0.0\"\napi_version = 2\n",
+        )
+        .unwrap();
+        let plugins = super::super::plugins_dir().unwrap();
+        let final_dir = plugins.join("acme.publish");
+        let mut cleanup = fetch::test_gate::install(&final_dir, "publication-cleanup");
+        let mut preparation = fetch::test_gate::install(&plugins, "source-prepared");
+        let input = source.path().to_str().unwrap().to_owned();
+        let task = tokio::spawn(async move { install(&input, true, false).await });
+        preparation.wait_for_preparation().await;
+        tokio::time::timeout(std::time::Duration::from_secs(5), &mut cleanup.entered)
+            .await
+            .unwrap()
+            .unwrap();
+        let publication = std::fs::read_dir(&plugins)
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .find(|path| {
+                path.file_name()
+                    .unwrap()
+                    .to_string_lossy()
+                    .starts_with(".publish-")
+            })
+            .unwrap();
+        let obstruction = publication.join("unsafe-fifo");
+        nix::unistd::mkfifo(&obstruction, Mode::S_IRUSR | Mode::S_IWUSR).unwrap();
+        cleanup.release();
+        let error = task.await.unwrap().unwrap_err();
+        assert!(error
+            .downcast_ref::<super::super::execution::RecoveryRequired>()
+            .is_some());
+        assert!(format!("{error:#}").contains(publication.to_str().unwrap()));
+        assert!(publication.is_dir());
+        assert!(final_dir.join("aoe-plugin.toml").is_file());
+        assert!(crate::session::get_app_dir()
+            .unwrap()
+            .join(".plugin-recovery-required")
+            .is_file());
+        assert!(begin_operation().is_err());
+        std::fs::remove_file(obstruction).unwrap();
+        remove_owned_tree(&publication).unwrap();
     }
 
     #[tokio::test]

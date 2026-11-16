@@ -116,7 +116,7 @@ impl Staging {
                 .context("proving plugin staging volume cleanup")?;
         }
         self.volume.take();
-        std::fs::remove_dir_all(&self.directory)
+        super::install::remove_owned_tree(&self.directory)
             .context("removing detached plugin staging directory")?;
         std::fs::remove_file(&self.marker).context("removing plugin staging marker")?;
         std::fs::File::open(self.marker.parent().expect("staging marker parent"))?.sync_all()?;
@@ -610,7 +610,7 @@ fn git_clone_checkout(
     let native_tree = staging.mount.join("tree");
     // A full clone supports tags and commit IDs without retrying a quota failure.
     let mut clone = git_command(
-        &["clone", "--no-checkout", "--", url],
+        &["clone", "--origin", "origin", "--no-checkout", "--", url],
         &staging.mount,
         staging,
     );
@@ -671,7 +671,8 @@ fn git_clone_checkout(
         budget,
     )?;
     let sha = run_git(&["rev-parse", "HEAD"], &native_tree, staging, budget)?;
-    std::fs::remove_dir_all(dest.join(".git")).context("removing staged Git metadata")?;
+    super::install::remove_owned_tree(&dest.join(".git"))
+        .context("removing staged Git metadata")?;
     Ok(sha)
 }
 
@@ -1655,6 +1656,35 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
+    fn detached_staging_close_removes_read_only_subtrees() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let fixture = tempfile::tempdir().unwrap();
+        let directory = fixture.path().join("staging");
+        let mount = directory.join("volume");
+        let nested = mount.join("tree/read-only");
+        std::fs::create_dir_all(&nested).unwrap();
+        std::fs::write(nested.join("file"), b"owned staging content").unwrap();
+        for path in [&nested, &mount.join("tree"), &mount, &directory] {
+            std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o555)).unwrap();
+        }
+        let marker = fixture.path().join(super::super::install::STAGING_MARKER);
+        super::super::install::create_staging_marker(&marker, &mount).unwrap();
+        let mut staging = Staging {
+            directory: directory.clone(),
+            mount,
+            marker: marker.clone(),
+            volume: None,
+        };
+
+        staging.close().unwrap();
+
+        assert!(!directory.exists());
+        assert!(!marker.exists());
+    }
+
+    #[test]
     #[serial_test::serial]
     #[cfg_attr(
         target_os = "linux",
@@ -1710,6 +1740,16 @@ mod tests {
                 "!printf trusted-helper",
             ],
         );
+        run_git(
+            &repo,
+            &[
+                "config",
+                "--file",
+                global.to_str().unwrap(),
+                "clone.defaultRemoteName",
+                "upstream",
+            ],
+        );
         let _configuration = EnvGuard::set(&[
             ("GIT_CONFIG_GLOBAL", global.to_str().unwrap()),
             ("GIT_CONFIG_NOSYSTEM", "1"),
@@ -1742,6 +1782,16 @@ mod tests {
             )
             .unwrap(),
             "!printf trusted-helper"
+        );
+        assert_eq!(
+            super::run_git(
+                &["config", "--get", "clone.defaultRemoteName"],
+                &staging.mount,
+                &staging,
+                budget
+            )
+            .unwrap(),
+            "upstream"
         );
         let tree = staging.volume().root().join("tree");
         for reference in [
