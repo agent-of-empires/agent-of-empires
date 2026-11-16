@@ -115,7 +115,7 @@ Two kinds of non-fatal failure surface through the same channel instead of abort
 
 ### Post-checkout hooks
 
-Some repos install pre-commit hooks at the `post-checkout` stage (`uv-sync`, `npm install`, LFS smudge) that fire when `git worktree add` checks out the branch. If one fails, the worktree and its `.git` pointer already exist and are usable. Usually the hook needs network access or credentials the new worktree does not have yet: re-run it by hand once the environment is set up, or set `core.hooksPath` per checkout. Sandboxed sessions mount the repo's `.git/hooks` read-only, so only hooks installed on the host run (see [Git config and hooks](sandbox.md#git-config-and-hooks)).
+Some repos install pre-commit hooks at the `post-checkout` stage (`uv-sync`, `npm install`, LFS smudge) that fire when `git worktree add` checks out the branch. If one fails, the worktree and its `.git` pointer already exist and are usable. Usually the hook needs network access or credentials the new worktree does not have yet: re-run it by hand once the environment is set up, or set `core.hooksPath` per checkout. Sandboxed sessions mount the repo's `.git/hooks` read-only, so only hooks installed on the host run, as long as hooks live in the default `.git/hooks`. A `core.hooksPath` pointing into the checkout (such as `.githooks`) stays writable from the sandbox (see [Git config and hooks](sandbox.md#git-config-and-hooks)).
 
 ### Fetch failures
 

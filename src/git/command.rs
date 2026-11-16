@@ -27,7 +27,7 @@ fn hardening_args() -> &'static [String] {
                 .iter()
                 .filter_map(|scope| {
                     Command::new("git")
-                        .args(["config", scope, "--get-all", key])
+                        .args(["config", scope, "--includes", "--get-all", key])
                         .output()
                         .ok()
                 })
@@ -339,7 +339,7 @@ mod tests {
             let path = tmp.path().join(name);
             std::fs::write(
                 &path,
-                format!("#!/bin/sh\n{body}\ntouch {}/{name}\n", marks.display()),
+                format!("#!/bin/sh\ntouch {}/{name}\n{body}\n", marks.display()),
             )
             .unwrap();
             std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
@@ -381,6 +381,11 @@ mod tests {
                 .status()
                 .unwrap();
         }
+
+        // Control: running the fixture does leave its marker.
+        assert!(std::process::Command::new(&ssh).status().is_ok());
+        assert!(marks.join("ssh").exists(), "fixture must record execution");
+        std::fs::remove_file(marks.join("ssh")).unwrap();
 
         git(&["status"]);
         git(&["checkout", "-q", "-b", "a"]);
