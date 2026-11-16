@@ -4439,40 +4439,80 @@ fn session_cfg_store_reresolves_only_after_an_input_edit() {
     let path = repo.path().to_str().unwrap();
 
     let mut store = super::SessionCfgStore::default();
+    use crate::session::config::StructuredView::{Auto, Off};
+    let detect = |name: &str| format!("[session.agent_detect_as]\n{name} = \"claude\"\n");
+    // Misses, discoveries, then the resolved values, so a stale entry fails too.
     let mut request = |edit: &dyn Fn()| {
         edit();
         let misses = AtomicUsize::new(0);
         let mut cache = super::model::SessionCfgCache::new(&mut store, &misses);
-        cache.resolve("default", path);
-        cache.structured_view("default", path);
-        (misses.load(Ordering::Relaxed), cache.discoveries)
+        let mut aliases: Vec<String> = cache
+            .resolve("default", path)
+            .agent_detect_as
+            .keys()
+            .cloned()
+            .collect();
+        aliases.sort();
+        let view = cache.structured_view("default", path);
+        (
+            misses.load(Ordering::Relaxed),
+            cache.discoveries,
+            aliases.join(","),
+            view,
+        )
     };
 
-    assert_eq!(request(&|| {}), (1, 1), "first request");
-    assert_eq!(request(&|| {}), (0, 0), "unchanged inputs");
-    let cases: [(&str, &dyn Fn()); 6] = [
-        ("legacy repo config created", &|| {
-            std::fs::write(&legacy_config, "# l\n").unwrap()
-        }),
+    assert_eq!(
+        request(&|| {}),
+        (1, 1, String::new(), Auto),
+        "first request"
+    );
+    assert_eq!(
+        request(&|| {}),
+        (0, 0, String::new(), Auto),
+        "unchanged inputs"
+    );
+    let cases: [(&str, &dyn Fn(), &str, _); 6] = [
+        (
+            "legacy repo config created",
+            &|| std::fs::write(&legacy_config, detect("ll")).unwrap(),
+            "ll",
+            Auto,
+        ),
         // The loader picks a dangling primary over the legacy file, and the legacy file again once it goes.
-        ("dangling primary link created", &|| {
-            std::os::unix::fs::symlink("/nonexistent", &repo_config).unwrap()
-        }),
-        ("dangling primary link removed", &|| {
-            std::fs::remove_file(&repo_config).unwrap()
-        }),
-        ("repo config created", &|| {
-            std::fs::write(&repo_config, "# a\n").unwrap()
-        }),
-        ("same-size repo config edit", &|| {
-            std::fs::write(&repo_config, "# b\n").unwrap()
-        }),
-        ("global config edit", &|| {
-            std::fs::write(&global, "# c\n").unwrap()
-        }),
+        (
+            "dangling primary link created",
+            &|| std::os::unix::fs::symlink("/nonexistent", &repo_config).unwrap(),
+            "",
+            Auto,
+        ),
+        (
+            "dangling primary link removed",
+            &|| std::fs::remove_file(&repo_config).unwrap(),
+            "ll",
+            Auto,
+        ),
+        (
+            "repo config created",
+            &|| std::fs::write(&repo_config, detect("aa")).unwrap(),
+            "aa",
+            Auto,
+        ),
+        (
+            "same-size repo config edit",
+            &|| std::fs::write(&repo_config, detect("bb")).unwrap(),
+            "bb",
+            Auto,
+        ),
+        (
+            "global config edit",
+            &|| std::fs::write(&global, "[acp]\nstructured_view = \"off\"\n").unwrap(),
+            "bb",
+            Off,
+        ),
     ];
-    for (case, edit) in cases {
-        assert_eq!(request(edit), (1, 0), "{case}");
+    for (case, edit, aliases, view) in cases {
+        assert_eq!(request(edit), (1, 0, aliases.to_string(), view), "{case}");
     }
 
     // An empty profile shares the entry of the default profile it names.
