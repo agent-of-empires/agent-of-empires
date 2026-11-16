@@ -33,13 +33,14 @@ pub(super) fn plan_from_markdown(plan_text: &str) -> Option<Plan> {
     })
 }
 
-/// Every line starting with `-`, `*`, or `<digit>.` becomes a step.
+/// Every line starting with a Markdown list marker (`-`, `*`, `+`, `1.`, `1)`)
+/// becomes a step.
 /// Sub-bullets flatten in, since `PlanEntry` has no nesting field.
 pub(super) fn parse_plan_steps(text: &str) -> Vec<PlanStep> {
     use std::sync::OnceLock;
     static BULLET: OnceLock<regex::Regex> = OnceLock::new();
     let bullet = BULLET.get_or_init(|| {
-        regex::Regex::new(r"^\s*(?:[-*]|\d+\.)\s+(.+?)\s*$")
+        regex::Regex::new(r"^\s*(?:[-*+]|\d+[.)])\s+(.+?)\s*$")
             .expect("static plan-step regex must compile")
     });
 
@@ -148,8 +149,8 @@ mod tests {
         assert_eq!(plan.steps.len(), 3);
         assert_eq!(plan.steps[0].title, "Step one");
 
-        // Dash and numbered bullets both count; surrounding prose does not.
-        let md = "Here's the plan:\n\n- First, **read** the file\n- Then patch it\n1. Run tests\n2. Commit\n\nOther prose.";
+        // Every list marker counts; headings and surrounding prose do not.
+        let md = "# Plan\n\nHere's the plan:\n\n- First, **read** the file\n+ Then patch it\n1. Run tests\n2) Commit\n\nOther prose.";
         let steps = parse_plan_steps(md);
         let titles: Vec<&str> = steps.iter().map(|s| s.title.as_str()).collect();
         assert_eq!(
