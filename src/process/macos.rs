@@ -355,23 +355,15 @@ impl StagingVolume {
         let mut command = Command::new("/usr/bin/hdiutil");
         command.args(["info", "-plist"]);
         let inventory = staging_plist(&staging_tool(&mut command)?)?;
-        let images = staging_plist_array(&inventory, "images")?;
-        let mut found = 0;
-        for entry in images.iter() {
-            let record = staging_plist_dictionary(*entry)?;
-            let path = staging_plist_string(&record, "image-path")?;
-            if std::path::Path::new(&path) == self.image {
-                found += 1;
-                anyhow::ensure!(
-                    attached && staging_attached_device(&record, &self.root)? == self.device,
-                    "plugin staging image remains attached or changed device"
-                );
-            }
-        }
-        anyhow::ensure!(
-            found == usize::from(attached),
-            "plugin staging image attachment is ambiguous"
-        );
+        staging_verify_inventory(
+            &inventory,
+            &self.image,
+            self.image_identity,
+            &self.root,
+            self.mount_identity,
+            &self.device,
+            attached,
+        )?;
         Ok(())
     }
 
@@ -426,9 +418,11 @@ fn staging_remove_unattached_image(image: &std::path::Path) -> anyhow::Result<()
     let inventory = staging_plist(&staging_tool(&mut command)?)?;
     for entry in staging_plist_array(&inventory, "images")?.iter() {
         let record = staging_plist_dictionary(*entry)?;
+        let path = staging_plist_string(&record, "image-path")?;
         anyhow::ensure!(
-            std::path::Path::new(&staging_plist_string(&record, "image-path")?) != image,
-            "rejected staging image remains attached"
+            staging_image_identity(std::path::Path::new(&path))?
+                != Some(metadata_identity(&metadata)),
+            "rejected staging image remains attached: {path}"
         );
     }
     anyhow::ensure!(
@@ -436,6 +430,73 @@ fn staging_remove_unattached_image(image: &std::path::Path) -> anyhow::Result<()
         "rejected staging image changed identity"
     );
     std::fs::remove_file(image)?;
+    Ok(())
+}
+
+// Resolve directory aliases through the filesystem, but never follow a replaced
+// final image symlink. Compare against the identity held by the open image file.
+fn staging_image_identity(path: &std::path::Path) -> anyhow::Result<Option<(u64, u64)>> {
+    use std::os::unix::fs::OpenOptionsExt as _;
+    match std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC | libc::O_NONBLOCK)
+        .open(path)
+    {
+        Ok(file) => {
+            let metadata = file.metadata()?;
+            anyhow::ensure!(metadata.is_file(), "inventory image is not a regular file");
+            Ok(Some(metadata_identity(&metadata)))
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(error) => {
+            Err(error).with_context(|| format!("opening inventory image {}", path.display()))
+        }
+    }
+}
+
+fn staging_verify_inventory(
+    inventory: &core_foundation::dictionary::CFDictionary,
+    image: &std::path::Path,
+    image_identity: (u64, u64),
+    root: &std::path::Path,
+    mount_identity: (u64, u64),
+    device: &str,
+    attached: bool,
+) -> anyhow::Result<()> {
+    let images = staging_plist_array(inventory, "images")?;
+    let mut found = 0;
+    let mut paths = Vec::with_capacity(images.len() as usize);
+    for entry in images.iter() {
+        let record = staging_plist_dictionary(*entry)?;
+        let path = staging_plist_string(&record, "image-path")?;
+        let identity = staging_image_identity(std::path::Path::new(&path))?;
+        let matches = identity == Some(image_identity);
+        // A record for our device must name our anchored image, even if its
+        // recorded path disappeared or now names a different file.
+        for entity in staging_plist_array(&record, "system-entities")?.iter() {
+            let entity = staging_plist_dictionary(*entity)?;
+            anyhow::ensure!(
+                staging_plist_string(&entity, "dev-entry")? != device || matches,
+                "plugin staging device {device} names a different image: {path}"
+            );
+        }
+        if matches {
+            found += 1;
+            anyhow::ensure!(
+                attached
+                    && staging_attached_device(&record, root)? == device
+                    && metadata_identity(&std::fs::symlink_metadata(root)?) == mount_identity,
+                "plugin staging image remains attached or changed device/mount: {path}"
+            );
+        }
+        paths.push((path, identity));
+    }
+    anyhow::ensure!(
+        found == usize::from(attached),
+        "plugin staging image attachment is ambiguous: found={found}, expected={}, image={} identity={image_identity:?}, inventory={paths:?}",
+        usize::from(attached),
+        image.display()
+    );
     Ok(())
 }
 
@@ -539,8 +600,9 @@ fn staging_attached_device(
         "fixed staging image must expose exactly one device"
     );
     let entity = staging_plist_dictionary(*entities.get(0).context("missing image device")?)?;
+    let mounted = std::fs::metadata(staging_plist_string(&entity, "mount-point")?)?;
     anyhow::ensure!(
-        std::path::Path::new(&staging_plist_string(&entity, "mount-point")?) == root,
+        metadata_identity(&mounted) == metadata_identity(&std::fs::symlink_metadata(root)?),
         "disk image attached at an unexpected mountpoint"
     );
     let device = staging_plist_string(&entity, "dev-entry")?;
@@ -1212,7 +1274,7 @@ mod staging_volume_tests {
         let profile = format!(
             "{STAGING_SANDBOX}\n\
             (allow network-bind (local tcp \"*:{}\"))\n\
-            (allow network-inbound (remote tcp \"127.0.0.1:*\"))",
+            (allow network-inbound (remote tcp \"localhost:*\"))",
             address.port()
         );
         let mut child = Command::new("/usr/bin/sandbox-exec")
@@ -2832,6 +2894,95 @@ impl super::SleepInhibit for CaffeinateInhibitor {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn staging_inventory_uses_anchored_image_and_mount_identities() {
+        use std::os::unix::fs::symlink;
+
+        let parent = tempfile::tempdir().unwrap();
+        let image = parent.path().join("volume.dmg");
+        let root = parent.path().join("mount");
+        let alias = parent.path().join("alias");
+        std::fs::write(&image, b"image").unwrap();
+        std::fs::create_dir(&root).unwrap();
+        symlink(parent.path(), &alias).unwrap();
+        let held = std::fs::File::open(&image).unwrap();
+        let image_identity = metadata_identity(&held.metadata().unwrap());
+        let mount_identity = metadata_identity(&std::fs::metadata(&root).unwrap());
+        let snapshot = |paths: &[std::path::PathBuf], mount: &std::path::Path, device: &str| {
+            let records = paths
+                .iter()
+                .map(|path| {
+                    format!(
+                        "<dict><key>image-path</key><string>{}</string>\
+                        <key>system-entities</key><array><dict>\
+                        <key>mount-point</key><string>{}</string>\
+                        <key>dev-entry</key><string>{device}</string>\
+                        </dict></array></dict>",
+                        path.display(),
+                        mount.display()
+                    )
+                })
+                .collect::<String>();
+            staging_plist(
+                format!(
+                    "<?xml version=\"1.0\"?><plist version=\"1.0\"><dict>\
+                    <key>images</key><array>{records}</array></dict></plist>"
+                )
+                .as_bytes(),
+            )
+            .unwrap()
+        };
+        let verify = |inventory: &core_foundation::dictionary::CFDictionary, attached| {
+            staging_verify_inventory(
+                inventory,
+                &image,
+                image_identity,
+                &root,
+                mount_identity,
+                "/dev/disk42",
+                attached,
+            )
+        };
+        let aliased_image = alias.join("volume.dmg");
+        let aliased_mount = alias.join("mount");
+        let inventory = snapshot(
+            std::slice::from_ref(&aliased_image),
+            &aliased_mount,
+            "/dev/disk42",
+        );
+        assert!(verify(&inventory, true).is_ok());
+        assert!(verify(&inventory, false).is_err());
+        let images = [image.clone(), aliased_image.clone()];
+        let duplicate = snapshot(&images, &root, "/dev/disk42");
+        assert!(verify(&duplicate, true).is_err());
+        let changed_device = snapshot(std::slice::from_ref(&image), &root, "/dev/disk43");
+        assert!(verify(&changed_device, true).is_err());
+        let other_mount = parent.path().join("other-mount");
+        std::fs::create_dir(&other_mount).unwrap();
+        let changed_mount = snapshot(std::slice::from_ref(&image), &other_mount, "/dev/disk42");
+        assert!(verify(&changed_mount, true).is_err());
+        let empty = snapshot(&[], &root, "/dev/disk42");
+        assert!(verify(&empty, false).is_ok());
+        let error = verify(&empty, true).unwrap_err().to_string();
+        assert!(error.contains("found=0"));
+        assert!(error.contains(&image.display().to_string()));
+        // A mount path that resolves to another directory must not inherit the
+        // identity captured when attachment completed.
+        std::fs::rename(&root, parent.path().join("retained-mount")).unwrap();
+        std::fs::create_dir(&root).unwrap();
+        assert!(verify(&inventory, true).is_err());
+        std::fs::remove_dir(&root).unwrap();
+        std::fs::rename(parent.path().join("retained-mount"), &root).unwrap();
+
+        // The old descriptor stays live, so replacement cannot reuse its inode.
+        std::fs::rename(&image, parent.path().join("retained.dmg")).unwrap();
+        std::fs::write(&image, b"replacement").unwrap();
+        assert!(verify(&inventory, true).is_err());
+        std::fs::remove_file(&image).unwrap();
+        symlink(parent.path().join("retained.dmg"), &image).unwrap();
+        assert!(verify(&inventory, true).is_err());
+    }
+
     use super::*;
 
     #[test]

@@ -2385,6 +2385,8 @@ mod tests {
         let backup = final_dir.with_file_name("acme.cleanup.bak");
         let rescue = source.path().join("old-tree");
         let mut cleanup = fetch::test_gate::install(&final_dir, "backup-cleanup");
+        let mut preparation =
+            fetch::test_gate::install(&super::super::plugins_dir().unwrap(), "source-prepared");
         let task = tokio::spawn(async move {
             apply_update(
                 "acme.cleanup",
@@ -2394,6 +2396,7 @@ mod tests {
             )
             .await
         });
+        preparation.wait_for_preparation().await;
         tokio::time::timeout(std::time::Duration::from_secs(5), &mut cleanup.entered)
             .await
             .unwrap()
@@ -3018,20 +3021,24 @@ mod tests {
         let _reload = super::super::ReloadRegistryOnDrop;
         let _home = isolate_app_dir();
         let source = tempfile::tempdir().unwrap();
-        let input = source.path().to_str().unwrap();
+        let input = source.path().display().to_string();
         std::fs::write(
             source.path().join("aoe-plugin.toml"),
             "id = \"acme.special\"\nname = \"Special\"\nversion = \"1.0.0\"\napi_version = 2\n",
         )
         .unwrap();
-        let consent = preview_install(input, false).await.unwrap();
+        let consent = preview_install(&input, false).await.unwrap();
         nix::unistd::mkfifo(&source.path().join("fifo"), nix::sys::stat::Mode::S_IRUSR).unwrap();
-        let result = tokio::time::timeout(
-            std::time::Duration::from_secs(5),
-            apply_install(input, &consent.fingerprint, false, OperationLog::Inherit),
-        )
-        .await
-        .unwrap();
+        let mut preparation =
+            fetch::test_gate::install(&super::super::plugins_dir().unwrap(), "staging-ready");
+        let task = tokio::spawn(async move {
+            apply_install(&input, &consent.fingerprint, false, OperationLog::Inherit).await
+        });
+        preparation.wait_for_preparation().await;
+        let result = tokio::time::timeout(std::time::Duration::from_secs(5), task)
+            .await
+            .unwrap()
+            .unwrap();
         assert!(result.unwrap_err().to_string().contains("special file"));
         assert!(!Config::load().unwrap().plugins.contains_key("acme.special"));
         assert!(Lockfile::load().unwrap().get("acme.special").is_none());
