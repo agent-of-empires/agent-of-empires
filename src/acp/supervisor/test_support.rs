@@ -150,6 +150,16 @@ impl<S: BroadcastSink> Supervisor<S> {
         cmds
     }
 
+    /// The event a fresh worker publishes once attached; it clears a startup error.
+    pub(crate) fn test_publish_worker_attached(&self, session_id: &str) {
+        self.publish_next(
+            session_id,
+            &Event::AcpSessionAssigned {
+                acp_session_id: format!("acp-{session_id}"),
+            },
+        );
+    }
+
     pub(crate) async fn test_install_attached(&self, session_id: &str, identity: RunnerIdentity) {
         let (client, _tx) = AcpClient::fake_for_test(AcpSessionId(session_id.into()));
         self.test_install_handle(session_id, client, WorkerKind::Attached, Some(identity))
