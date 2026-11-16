@@ -152,6 +152,7 @@ fn is_login_session_exempt(path: &str) -> bool {
         || path == "/setup"
         || path.starts_with("/session/")
         || path.starts_with("/plugins/")
+        || path.starts_with("/plugin-icons/")
         || path == "/api/login"
         || path == "/api/login/status"
         || path == "/api/login/passkey/start"
@@ -1187,6 +1188,7 @@ mod tests {
             "/session/abc",
             "/session/2626c6af68754732",
             "/plugins/github/prs",
+            "/plugin-icons/github",
             "/api/login",
             "/api/login/status",
             "/api/login/passkey/start",
@@ -1217,6 +1219,7 @@ mod tests {
             "/api/plugins",
             "/api/plugins/github/pages/prs",
             "/pluginsx",
+            "/plugin-iconsx",
             "/api/sessions/abc/acp/ws",
             "/api/settings",
             "/api/login/elevate",
@@ -1336,10 +1339,10 @@ mod tests {
         }
     }
 
-    /// Plugin page deep links are document navigations that cannot carry a device binding
-    /// header, so the shell must load on a bare session cookie while APIs stay gated.
+    /// Plugin page deep links and plugin icon `<img>` loads cannot carry a device binding
+    /// header, so both must pass on a bare session cookie while APIs stay gated.
     #[tokio::test]
-    async fn plugin_page_shell_loads_remote_without_binding_header() {
+    async fn plugin_shell_and_icon_load_remote_without_binding_header() {
         use crate::server::login::LoginManager;
         use tower::ServiceExt;
 
@@ -1379,6 +1382,12 @@ mod tests {
             assert!(
                 matches!(shell, StatusCode::OK | StatusCode::NOT_FOUND),
                 "{token:?}: {shell}"
+            );
+            // The handler's own 404 for an unknown plugin, not the wall's 401 or redirect.
+            assert_eq!(
+                get("/plugin-icons/absent.plugin").await,
+                StatusCode::NOT_FOUND,
+                "{token:?}"
             );
             for api in ["/api/sessions", "/api/plugins/github/pages/prs"] {
                 assert_eq!(get(api).await, StatusCode::UNAUTHORIZED, "{token:?} {api}");
