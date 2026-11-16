@@ -173,6 +173,16 @@ impl<S: BroadcastSink> Supervisor<S> {
         respawn.epoch()
     }
 
+    /// Leave a running fixture part-way through a respawn, so it reports `Resuming`.
+    pub(crate) async fn test_begin_respawn(&self, session_id: &str) {
+        let mut workers = self.workers.lock().await;
+        let handle = workers.get_mut(session_id).expect("test worker");
+        let (respawn, _) = lock_recover(&self.lifecycle)
+            .begin_respawn(&handle.lease)
+            .expect("fixture is running");
+        handle.lease = respawn;
+    }
+
     /// A fake worker whose command loop records every command it receives.
     pub(crate) async fn test_insert_worker_cmd_recording(
         &self,
@@ -690,6 +700,107 @@ impl Drop for HeldChild {
             }
             Self::Constructor(None) => {}
         }
+    }
+}
+
+/// Retains the child-owned control endpoint while Rust scripts its frames.
+pub(crate) struct RetainedControlPeer {
+    pub(crate) record: WorkerRecord,
+    pub(crate) identity: RunnerIdentity,
+    child: HeldChild,
+    _socket_dir: tempfile::TempDir,
+}
+
+impl RetainedControlPeer {
+    pub(crate) async fn new(
+        session_id: &str,
+        cwd: &std::path::Path,
+        generation: u64,
+        native_id: &str,
+        scripted_control: std::path::PathBuf,
+    ) -> Self {
+        use std::os::unix::process::CommandExt as _;
+        use std::process::Stdio;
+        use tokio::io::{AsyncBufReadExt as _, BufReader};
+
+        let socket_dir = tempfile::TempDir::with_prefix_in("aoe-drain-", "/tmp").unwrap();
+        let socket = socket_dir.path().join("runner.sock");
+        let script = r#"
+import select, socket, sys, threading
+frontend, backend = sys.argv[1:]
+def forward(client):
+    with client, socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as peer:
+        try:
+            peer.connect(backend)
+            while True:
+                ready, _, _ = select.select([client, peer], [], [])
+                for source in ready:
+                    data = source.recv(65536)
+                    if not data:
+                        return
+                    (peer if source is client else client).sendall(data)
+        except OSError:
+            return
+listener = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+listener.bind(frontend)
+listener.listen(8)
+print("ready", flush=True)
+while True:
+    client, _ = listener.accept()
+    threading.Thread(target=forward, args=(client,), daemon=True).start()
+"#;
+        let mut child = std::process::Command::new("python3")
+            .args(["-u", "-c", script])
+            .arg(crate::process::worker::control_socket_sibling(&socket))
+            .arg(scripted_control)
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .process_group(0)
+            .spawn()
+            .unwrap();
+        let pid = child.id();
+        let stdout = tokio::process::ChildStdout::from_std(child.stdout.take().unwrap()).unwrap();
+        let child = HeldChild::Retained(child);
+        let mut lines = BufReader::new(stdout).lines();
+        let ready =
+            tokio::time::timeout(std::time::Duration::from_secs(10), lines.next_line()).await;
+        assert!(
+            matches!(&ready, Ok(Ok(Some(line))) if line == "ready"),
+            "fixture child did not bind its control socket: {ready:?}"
+        );
+        let mut record = WorkerRecord::new(
+            session_id.into(),
+            pid,
+            socket,
+            "test-agent-acp".into(),
+            "test-agent".into(),
+            cwd.into(),
+            None,
+            vec![],
+            vec![],
+            Some(native_id.into()),
+            None,
+        )
+        .with_generation(generation);
+        record.control_protocol_version =
+            Some(crate::acp::control_protocol::CONTROL_PROTOCOL_VERSION);
+        let identity = RunnerIdentity::from_record(&record);
+        assert!(identity.birth_fingerprint.is_some());
+        worker_registry::save(&record).unwrap();
+        Self {
+            record,
+            identity,
+            child,
+            _socket_dir: socket_dir,
+        }
+    }
+
+    pub(crate) fn exit_peer(&mut self) {
+        let HeldChild::Retained(child) = &mut self.child else {
+            unreachable!("the fixture retains its original child")
+        };
+        child.kill().unwrap();
+        child.wait().unwrap();
     }
 }
 

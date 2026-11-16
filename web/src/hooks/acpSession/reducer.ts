@@ -83,7 +83,8 @@ export type Action =
   | { kind: "hydrate_server_queue"; rows: ServerQueuedPrompt[]; queueAtRead: QueuedPrompt[] }
   | { kind: "confirm_queued_prompt"; id: string }
   | { kind: "dismiss_primer" }
-  | { kind: "restart_started"; epoch: number; stoppedSent: boolean }
+  /** `retriedError` marks a Retry from the startup error banner, which replaces the banner with the startup line. */
+  | { kind: "restart_started"; epoch: number; stoppedSent: boolean; retriedError?: string }
   | {
       kind: "restart_failed";
       epoch: number;
@@ -321,6 +322,7 @@ export function reducer(state: AcpState, action: Action): AcpState {
       return {
         ...state,
         optimisticRows: state.optimisticRows.concat(row),
+        retriedError: state.restartInFlight ? state.retriedError : null,
         restartFailure: null,
         inflightPromptIds: state.inflightPromptIds.includes(id)
           ? state.inflightPromptIds
@@ -395,11 +397,21 @@ export function reducer(state: AcpState, action: Action): AcpState {
         restartInFlight: true,
         restartStoppedSent: state.restartStoppedSent || action.stoppedSent,
         restartFailure: null,
+        ...(action.retriedError !== undefined && { startupError: null, retriedError: action.retriedError }),
       };
     case "restart_failed":
       if (action.epoch !== state.restartEpoch)
         return {
           ...state,
+          restartStoppedSent: state.restartStoppedSent || action.stoppedSent,
+        };
+      // A refused Retry fails like the start it retried.
+      if (state.retriedError !== null)
+        return {
+          ...state,
+          restartInFlight: false,
+          restartEpoch: state.restartEpoch + 1,
+          startupError: action.message,
           restartStoppedSent: state.restartStoppedSent || action.stoppedSent,
         };
       return {

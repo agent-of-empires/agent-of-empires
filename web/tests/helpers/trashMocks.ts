@@ -20,6 +20,7 @@ export interface TrashSession {
   /** A cleanup flag reaches the DELETE only when the session flag and its cleanup_defaults entry are both set. */
   cleanableWorktree?: boolean;
   sandboxed?: boolean;
+  pendingTrash?: boolean;
 }
 
 interface TrashState extends TrashSession {
@@ -73,6 +74,13 @@ function sessionPayload(s: TrashState) {
     trashed_at: s.trashedAt,
     trash_lifecycle_id: s.trashLifecycleId,
     lifecycle_generation: s.lifecycleGeneration,
+    lifecycle_reservation: s.pendingTrash
+      ? {
+          op: "trash",
+          generation: s.lifecycleGeneration,
+          at: new Date(Date.parse(s.createdAt) - 3_600_000).toISOString(),
+        }
+      : null,
     cleanup_defaults: {
       delete_to_trash: s.deleteToTrash ?? true,
       delete_worktree: cleanable,
@@ -109,6 +117,7 @@ export async function installTrashMocks(
   );
   const failDelete = new Set(opts.failDeleteIds ?? []);
   const busyDelete = new Set(opts.busyDeleteIds ?? []);
+  let revision = 1;
 
   if (opts.groupAxis) {
     await page.addInitScript(() => {
@@ -128,7 +137,7 @@ export async function installTrashMocks(
     if (r.request().method() !== "GET") return r.fulfill({ status: 400 });
     const live = sessions.filter((s) => !handle.deletedIds.includes(s.id)).map((s) => sessionPayload(state.get(s.id)!));
     return r.fulfill({
-      headers: { "aoe-runtime-epoch": "mock-runtime", "aoe-runtime-revision": "1" },
+      headers: { "aoe-runtime-epoch": "mock-runtime", "aoe-runtime-revision": String(revision) },
       json: { sessions: live, workspace_ordering: [] },
     });
   });
@@ -146,12 +155,17 @@ export async function installTrashMocks(
         const next = {
           ...previous,
           trashed,
+          pendingTrash: trashed && previous.pendingTrash,
           trashedAt: trashed ? new Date().toISOString() : null,
           trashLifecycleId: trashed ? randomUUID() : null,
           lifecycleGeneration: previous.lifecycleGeneration + 1,
         };
         state.set(s.id, next);
-        return r.fulfill({ json: sessionPayload(next) });
+        revision += 1;
+        return r.fulfill({
+          headers: { "aoe-runtime-epoch": "mock-runtime", "aoe-runtime-revision": String(revision) },
+          json: sessionPayload(next),
+        });
       });
     }
   }
@@ -196,6 +210,7 @@ export async function installTrashMocks(
         json: { error: "lifecycle_busy", message: "Sessions are busy with another operation", busy },
       });
     }
+    if (deleted.length > 0) revision += 1;
     return r.fulfill({
       json: {
         status: failed.length || busy.length ? "partial" : "deleted",

@@ -18,7 +18,7 @@ interface Props {
 /// one tip at a time with Previous / Next, a "Show tips on startup" checkbox,
 /// and Close. Auto-pops on startup (from App) and is reopenable from the top-bar
 /// menu. Each tip is marked seen as it is shown, so the seen state stays in sync
-/// with the TUI. Modeled on TelemetryConsentModal's fixed-overlay styling.
+/// with the TUI.
 export function TipsModal({ tips, startIndex, enabled, onMarkSeen, onSetEnabled, onClose }: Props) {
   const count = tips.length;
   const clampedStart = count === 0 ? 0 : Math.min(Math.max(startIndex, 0), count - 1);

@@ -2,7 +2,7 @@
 import { act, fireEvent, render, renderHook, waitFor } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
-import type { BackgroundAgent, BackgroundShell, SubagentRecord, WorkflowRun } from "../../../lib/acpTypes";
+import type { ActivityRow, BackgroundAgent, BackgroundShell, SubagentRecord, WorkflowRun } from "../../../lib/acpTypes";
 import type * as AcpSessionHooks from "../../../hooks/useAcpSession";
 import { applyEvent, applyReducedState, emptyAcpState } from "../../../lib/acpTypes";
 import { currentControlSnapshot } from "../../../../tests/helpers/acpControlSnapshot";
@@ -18,12 +18,14 @@ const tasksMock = vi.fn<() => string[]>(() => []);
 const runsMock = vi.fn<() => Record<string, WorkflowRun>>(() => ({}));
 const subagentsMock = vi.fn<() => SubagentRecord[]>(() => []);
 const shellsMock = vi.fn<() => BackgroundShell[]>(() => []);
+const activityMock = vi.fn<() => ActivityRow[]>(() => []);
 const taskOutputMock = vi.fn();
 vi.mock("../../../lib/api", async (importActual) => ({
   ...(await importActual<typeof import("../../../lib/api")>()),
   fetchTaskOutput: (...args: unknown[]) => taskOutputMock(...args),
 }));
 vi.mock("../../../hooks/useAcpSession", () => ({
+  useActivity: () => activityMock(),
   useBackgroundAgents: () => agentsMock(),
   useBackgroundShells: () => shellsMock(),
   useBackgroundTasks: () => tasksMock(),
@@ -71,9 +73,42 @@ describe("BackgroundAgentsPanel shells", () => {
     const { container } = render(<BackgroundAgentsPanel sessionId="s-1" />);
     const text = container.textContent ?? "";
     expect(text).not.toContain("No background work yet");
-    expect(text).toContain("Running shells · 1");
-    expect(text).toContain("Recent shells · 1");
+    expect(text).toContain("Running · 1");
+    expect(text).toContain("Recent · 1");
     expect(text.indexOf("npm run dev")).toBeLessThan(text.indexOf("make build"));
+    expect(text).not.toContain("Shells");
+  });
+
+  it("groups shells and agents by Running and Recent, and filters them by kind", () => {
+    agentsMock.mockReturnValue([
+      agent(),
+      agent({ agentId: "a2", toolCallId: "t2", description: "Old agent", status: "completed", endedAt: "2020-01-01" }),
+    ]);
+    shellsMock.mockReturnValue([
+      shell(),
+      shell({ taskId: "bx0", command: "make build", finished: true, endedAt: new Date().toISOString() }),
+    ]);
+    const { container, getByRole, rerender } = render(<BackgroundAgentsPanel sessionId="s-1" />);
+    const text = () => container.textContent ?? "";
+    expect(text()).toContain("Background · 4");
+    const [running, recent] = [text().indexOf("Running · 2"), text().indexOf("Recent · 2")];
+    expect(running).toBeGreaterThanOrEqual(0);
+    for (const live of ["npm run dev", "Map backend lifecycle"]) expect(text().indexOf(live)).toBeLessThan(recent);
+    for (const old of ["make build", "Old agent"]) expect(text().indexOf(old)).toBeGreaterThan(recent);
+    fireEvent.click(getByRole("button", { name: "Shells 2" }));
+    expect(text()).toContain("npm run dev");
+    expect(text()).not.toContain("Map backend lifecycle");
+    fireEvent.click(getByRole("button", { name: "Agents 2" }));
+    expect(text()).not.toContain("npm run dev");
+    expect(text()).toContain("Old agent");
+    // With one kind left the chips go, and so does their filter.
+    fireEvent.click(getByRole("button", { name: "Shells 2" }));
+    agentsMock.mockReturnValue([]);
+    rerender(<BackgroundAgentsPanel sessionId="s-1" />);
+    shellsMock.mockReturnValue([]);
+    agentsMock.mockReturnValue([agent()]);
+    rerender(<BackgroundAgentsPanel sessionId="s-1" />);
+    expect(text()).toContain("Map backend lifecycle");
   });
 
   it("shows the empty state with no agents and no shells", () => {
@@ -103,7 +138,7 @@ describe("BackgroundAgentsPanel shells", () => {
 
     agentsMock.mockReturnValue([agent()]);
     view.rerender(<BackgroundAgentsPanel sessionId="s-1" />);
-    expect(view.getByText("Background agents · 1")).toBeTruthy();
+    expect(view.getByText("Background · 2")).toBeTruthy();
     expect(view.getByRole("dialog")).toBeTruthy();
   });
 
@@ -290,7 +325,7 @@ describe("BackgroundAgentsPanel", () => {
     ]);
     const { container } = render(<BackgroundAgentsPanel sessionId="s-1" />);
     const text = container.textContent ?? "";
-    expect(text).toContain("Background agents · 4");
+    expect(text).toContain("Background · 4");
     expect(text).toContain("issue-drafts");
     expect(text).toContain("2 of 3 done");
     expect(text).toContain("Draft · 2/2");
@@ -416,8 +451,7 @@ describe("BackgroundAgentsPanel", () => {
   it("lists a running agent with description, tool count, and last activity", () => {
     agentsMock.mockReturnValue([agent()]);
     const { container } = render(<BackgroundAgentsPanel sessionId="s-1" />);
-    expect(container.textContent).toContain("Background agents · 1");
-    expect(container.textContent).toContain("Inline sub-agents also appear in the transcript");
+    expect(container.textContent).toContain("Background · 1");
     expect(container.textContent).toContain("Map backend lifecycle");
     expect(container.textContent).toContain("running");
     expect(container.textContent).toContain("3 tools");
@@ -456,6 +490,23 @@ describe("BackgroundAgentsPanel", () => {
       expect(container.textContent).toContain(text);
     }
     expect(container.textContent).not.toContain("a1");
+  });
+
+  it("shows a row duration only while active or once ended", () => {
+    const startedAt = new Date(Date.now() - 65_000).toISOString();
+    const ended = new Date(Date.parse(startedAt) + 30_000).toISOString();
+    for (const [over, shown] of [
+      [{ status: "running" }, /1m \d+s/],
+      [{ status: "completed", endedAt: ended }, /30s/],
+      [{ status: "stopped" }, null],
+    ] as const) {
+      agentsMock.mockReturnValue([agent({ startedAt, lastText: null, ...over })]);
+      const { container, unmount } = render(<BackgroundAgentsPanel sessionId="s-1" readOnly />);
+      const row = [...container.querySelectorAll("button")].find((b) => b.textContent?.includes("Map backend"))!;
+      if (shown) expect(row.textContent, over.status).toMatch(shown);
+      else expect(row.textContent, over.status).not.toMatch(/\d+s/);
+      unmount();
+    }
   });
 
   it("orders running agents before finished ones", () => {
@@ -526,7 +577,7 @@ describe("BackgroundAgentsPanel", () => {
       ...over,
     });
 
-    it("POSTs the child cancel route and surfaces a failure", async () => {
+    it("asks before POSTing the child cancel route, and surfaces a failure", async () => {
       const { useAcpSession } = await vi.importActual<typeof AcpSessionHooks>("../../../hooks/useAcpSession");
       installAcpFakes();
       const runtime = renderHook(() => useAcpSession("s-1"), { wrapper: profileWrapper });
@@ -540,7 +591,9 @@ describe("BackgroundAgentsPanel", () => {
       vi.stubGlobal("fetch", fetchMock);
       agentsMock.mockReturnValue([agent()]);
       subagentsMock.mockReturnValue([record()]);
-      const { getByRole, findByText } = render(<BackgroundAgentsPanel sessionId="s-1" />);
+      const { getByRole, getByTitle, findByText } = render(<BackgroundAgentsPanel sessionId="s-1" />);
+      fireEvent.click(getByTitle("Stop this sub-agent"));
+      expect(fetchMock).not.toHaveBeenCalled();
       fireEvent.click(getByRole("button", { name: "Stop sub-agent" }));
       expect(fetchMock).toHaveBeenCalledWith("/api/sessions/s-1/acp/subagents/child-1/cancel", { method: "POST" });
       expect(await findByText(/Could not stop subagent \(409\)/)).toBeTruthy();
@@ -570,17 +623,87 @@ describe("BackgroundAgentsPanel", () => {
           stop_reason: "end_turn",
         }),
       ]);
-      const { container, getAllByRole } = render(<BackgroundAgentsPanel sessionId="s-1" />);
-      expect(container.textContent).toContain("Background agents · 2");
+      const { container, getAllByTitle, getByRole } = render(<BackgroundAgentsPanel sessionId="s-1" />);
+      expect(container.textContent).toContain("Background · 2");
       expect(container.textContent).toContain("Explore repo");
       expect(container.textContent).toContain("Unlinked");
       expect(container.textContent).toContain("done");
-      const stops = getAllByRole("button", { name: "Stop sub-agent" });
+      const stops = getAllByTitle("Stop this sub-agent");
       expect(stops).toHaveLength(1);
       fireEvent.click(stops[0]!);
+      fireEvent.click(getByRole("button", { name: "Stop sub-agent" }));
       expect(fetchMock).toHaveBeenCalledWith("/api/sessions/s-1/acp/subagents/child-1/cancel", { method: "POST" });
       runtime.unmount();
       vi.unstubAllGlobals();
+      subagentsMock.mockReturnValue([]);
+    });
+
+    it("opens a child with the prompt and calls its thread card shows", () => {
+      const at = "2026-01-01T00:00:00Z";
+      const launch: ActivityRow = {
+        id: "r1",
+        kind: "tool_start",
+        text: "",
+        at,
+        tool: {
+          id: "msg-1",
+          name: "Explore repo",
+          kind: "think",
+          args_preview: JSON.stringify({ prompt: "find the flaky test" }),
+          started_at: at,
+        },
+      };
+      const call: ActivityRow = {
+        id: "r2",
+        kind: "tool_start",
+        text: "",
+        at,
+        tool: {
+          id: "c1",
+          name: "cargo test",
+          kind: "execute",
+          args_preview: JSON.stringify({ command: "cargo test" }),
+          started_at: at,
+          parent_tool_call_id: "msg-1",
+        },
+      };
+      agentsMock.mockReturnValue([]);
+      subagentsMock.mockReturnValue([record({ parent_tool_call_id: "msg-1", title: "Explore repo" })]);
+      activityMock.mockReturnValue([launch, call]);
+      const { container, getByRole, unmount } = render(<BackgroundAgentsPanel sessionId="s-1" />);
+      fireEvent.click(getByRole("button", { name: /Explore repo/ }));
+      expect(container.textContent).toContain("find the flaky test");
+      expect(container.textContent).toContain("1 call");
+      expect(container.textContent).toContain("cargo test");
+      expect(container.textContent).not.toContain("no prompt recorded");
+
+      unmount();
+
+      // A reload can page in the child's calls without its launch row.
+      activityMock.mockReturnValue([call]);
+      const paged = render(<BackgroundAgentsPanel sessionId="s-1" />);
+      fireEvent.click(paged.getByRole("button", { name: /Explore repo/ }));
+      expect(paged.container.textContent).toContain("1 call");
+      expect(paged.container.textContent).toContain("cargo test");
+      paged.unmount();
+
+      // Before its card's row loads, the child shows its roster title and state only.
+      activityMock.mockReturnValue([]);
+      const bare = render(<BackgroundAgentsPanel sessionId="s-1" />);
+      expect(bare.container.textContent).toContain("Explore repo");
+      expect(bare.container.textContent).toContain("running");
+      subagentsMock.mockReturnValue([]);
+    });
+
+    it("opens the detail Stop confirmation on the header's wrapping row, not in its action group", () => {
+      agentsMock.mockReturnValue([agent()]);
+      subagentsMock.mockReturnValue([record()]);
+      const { getByRole, getByTitle } = render(<BackgroundAgentsPanel sessionId="s-1" />);
+      fireEvent.click(getByRole("button", { name: /Map backend lifecycle/ }));
+      fireEvent.click(getByTitle("Stop this sub-agent"));
+      const row = getByRole("alertdialog").parentElement!;
+      expect(row.className).toContain("flex-wrap");
+      expect(row.querySelector("[aria-expanded]")?.textContent).toContain("Map backend lifecycle");
       subagentsMock.mockReturnValue([]);
     });
 
@@ -588,7 +711,7 @@ describe("BackgroundAgentsPanel", () => {
       agentsMock.mockReturnValue([agent()]);
       subagentsMock.mockReturnValue([record()]);
       const { container } = render(<BackgroundAgentsPanel sessionId="s-1" />);
-      expect(container.textContent).toContain("Background agents · 1");
+      expect(container.textContent).toContain("Background · 1");
       subagentsMock.mockReturnValue([]);
     });
 
@@ -601,8 +724,8 @@ describe("BackgroundAgentsPanel", () => {
       for (const [a, roster] of cases) {
         agentsMock.mockReturnValue([a]);
         subagentsMock.mockReturnValue(roster);
-        const { queryByRole, unmount } = render(<BackgroundAgentsPanel sessionId="s-1" />);
-        expect(queryByRole("button", { name: "Stop sub-agent" })).toBeNull();
+        const { queryByTitle, unmount } = render(<BackgroundAgentsPanel sessionId="s-1" />);
+        expect(queryByTitle("Stop this sub-agent")).toBeNull();
         unmount();
       }
       subagentsMock.mockReturnValue([]);
@@ -614,10 +737,10 @@ describe("BackgroundAgentsPanel", () => {
         agent({ agentId: "u", toolCallId: "t-u", status: "unknown" }),
       ]);
       subagentsMock.mockReturnValue([record({ parent_tool_call_id: "t-w" })]);
-      const { container, getAllByRole } = render(<BackgroundAgentsPanel sessionId="s-1" />);
+      const { container, getAllByTitle } = render(<BackgroundAgentsPanel sessionId="s-1" />);
       expect(container.textContent).toContain("Waiting on you");
       expect(container.textContent).toContain("Unknown");
-      expect(getAllByRole("button", { name: "Stop sub-agent" })).toHaveLength(1);
+      expect(getAllByTitle("Stop this sub-agent")).toHaveLength(1);
       subagentsMock.mockReturnValue([]);
     });
 
@@ -673,7 +796,7 @@ describe("BackgroundAgentsPanel", () => {
           runsMock.mockReturnValue({});
           const view = render(<BackgroundAgentsPanel sessionId="s-1" />);
           expect(view.getByText(label)).toBeTruthy();
-          expect(view.queryAllByRole("button", { name: "Stop sub-agent" })).toHaveLength(state === "idle" ? 0 : 1);
+          expect(view.queryAllByTitle("Stop this sub-agent")).toHaveLength(state === "idle" ? 0 : 1);
           expect(view.getByText("Local-only card")).toBeTruthy();
           expect(view.getByText("Local-only child")).toBeTruthy();
 
@@ -692,7 +815,7 @@ describe("BackgroundAgentsPanel", () => {
           subagentsMock.mockReturnValue(older.subagents);
           view.rerender(<BackgroundAgentsPanel sessionId="s-1" />);
           expect(view.getByText(label)).toBeTruthy();
-          expect(view.queryAllByRole("button", { name: "Stop sub-agent" })).toHaveLength(state === "idle" ? 0 : 1);
+          expect(view.queryAllByTitle("Stop this sub-agent")).toHaveLength(state === "idle" ? 0 : 1);
           view.unmount();
         },
       );
@@ -730,8 +853,8 @@ describe("BackgroundAgentsPanel", () => {
     expect(text).toContain("Subagent 1 of 2");
     fireEvent.click(getByRole("button", { name: "Next subagent" }));
     expect(container.textContent).toContain("Subagent 2 of 2");
-    fireEvent.click(getByRole("button", { name: /All agents/ }));
-    expect(container.textContent).toContain("Background agents · 2");
+    fireEvent.click(getByRole("button", { name: /All background work/ }));
+    expect(container.textContent).toContain("Background · 2");
   });
 });
 

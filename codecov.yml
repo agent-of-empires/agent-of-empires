@@ -247,5 +247,8 @@ coverage:
         base: auto
         if_ci_failed: error
 
-github_checks:
-  annotations: true
+# Commit statuses, not check runs. Codecov creates a check run as in_progress and
+# completes it in a second call that fails about 8% of the time with no retry,
+# which leaves codecov/patch or codecov/project pending forever. Statuses are one
+# call. Cost: no inline annotations on uncovered lines.
+github_checks: false

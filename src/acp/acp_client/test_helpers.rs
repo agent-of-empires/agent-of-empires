@@ -156,6 +156,7 @@ impl super::AcpClient {
             mcp_servers: Vec::new(),
             claude_home: None,
             cancellation: tokio_util::sync::CancellationToken::new(),
+            state: std::sync::Arc::default(),
         };
         Self::connect_via_socket(
             record.socket_path.clone(),

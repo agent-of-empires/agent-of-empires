@@ -64,6 +64,8 @@ mod v052_runtime_filter_acp_target;
 mod v053_runtime_filter_reset;
 mod v054_retained_history_identity;
 mod v055_global_max_concurrent_workers;
+mod v056_launch_resolved_executable;
+mod v057_worker_launch_executable;
 
 /// Fixtures shared by migrations that rewrite agent hook files.
 #[cfg(test)]
@@ -104,7 +106,7 @@ use anyhow::{Context, Result};
 use std::fs;
 use tracing::{debug, info};
 
-const CURRENT_VERSION: u32 = 55;
+const CURRENT_VERSION: u32 = 57;
 const VERSION_FILE: &str = ".schema_version";
 
 /// Version, log name, and the one-time transformation to run.
@@ -289,6 +291,16 @@ const MIGRATIONS: &[Migration] = &[
         55,
         "global_max_concurrent_workers",
         v055_global_max_concurrent_workers::run,
+    ),
+    (
+        56,
+        "launch_resolved_executable",
+        v056_launch_resolved_executable::run,
+    ),
+    (
+        57,
+        "worker_launch_executable",
+        v057_worker_launch_executable::run,
     ),
 ];
 

@@ -42,10 +42,9 @@ use super::commands::{ClientCmd, ConnectMode};
 use super::control::DaemonControlClient;
 use super::errors::{acp_internal_error, AcpError};
 use super::fs_handlers::{handle_read_text_file, handle_write_text_file};
-use super::lifecycle::TerminalClaim;
 use super::pending::PendingResponders;
 use super::permission_handlers::{handle_elicitation_request, handle_permission_request};
-use super::rate_limit::captured_rate_limit_resets_at;
+use super::rate_limit::captured_rate_limit_reset;
 use super::session_identity::{
     spawn_native_callback, PendingIngress, RequestPolicy, SessionIngress,
     SessionIngressNotification,
@@ -54,7 +53,7 @@ use super::terminal_handlers::{
     handle_create_terminal, handle_kill_terminal, handle_release_terminal, handle_terminal_output,
     handle_wait_for_terminal_exit,
 };
-use super::SessionResources;
+use super::{SessionResources, SessionState};
 use notifications::Shared;
 
 /// After a cancel, declare the adapter unresponsive if no prompt response
@@ -253,9 +252,7 @@ impl ConnectionState {
 
 pub(super) struct RunnerLink {
     pub(super) control: Arc<DaemonControlClient>,
-    /// Shared with the control reader, which claims an adopted turn's
-    /// completion so the fallback watchdogs stand down.
-    pub(super) terminal_claim: Arc<TerminalClaim>,
+    pub(super) state: Arc<SessionState>,
     pub(super) prompt_in_flight: Arc<AtomicBool>,
 }
 
@@ -282,6 +279,145 @@ pub(super) struct ConnectionParams {
     pub(super) runner: Option<RunnerLink>,
     pub(super) cancellation: tokio_util::sync::CancellationToken,
     pub(super) shutdown: tokio_util::sync::CancellationToken,
+}
+
+#[cfg(test)]
+pub(super) struct PromptTestSession {
+    session: Option<command_loop::Session>,
+    commands: mpsc::Sender<ClientCmd>,
+    shutdown: tokio_util::sync::CancellationToken,
+    sdk: tokio::task::JoinHandle<()>,
+    _agent: tokio::io::DuplexStream,
+    _cwd: tempfile::TempDir,
+}
+
+#[cfg(test)]
+impl PromptTestSession {
+    pub(super) async fn new(
+        control: Arc<DaemonControlClient>,
+        state: Arc<SessionState>,
+        in_flight: Arc<AtomicBool>,
+        event_tx: mpsc::Sender<Event>,
+    ) -> Self {
+        use tokio_util::compat::{TokioAsyncReadCompatExt, TokioAsyncWriteCompatExt};
+
+        let (daemon, agent) = tokio::io::duplex(64 * 1024);
+        let (read, write) = tokio::io::split(daemon);
+        let (connection_tx, connection_rx) = oneshot::channel();
+        let shutdown = tokio_util::sync::CancellationToken::new();
+        let sdk_shutdown = shutdown.clone();
+        let sdk = tokio::spawn(async move {
+            Client
+                .v1()
+                .name("prompt-consumer-test")
+                .connect_with(
+                    ByteStreams::new(write.compat_write(), read.compat()),
+                    move |connection: ConnectionTo<Agent>| async move {
+                        assert!(connection_tx.send(connection).is_ok());
+                        sdk_shutdown.cancelled().await;
+                        Ok(())
+                    },
+                )
+                .await
+                .expect("test SDK connection completes");
+        });
+        let connection = connection_rx.await.expect("SDK supplies connection");
+        let cwd = tempfile::tempdir().unwrap();
+        let id = SessionId::from("sid-adopted");
+        let ingress = control.ingress.clone();
+        {
+            let _fence = ingress.fence.write().await;
+            assert!(ingress.finish(Some(id.clone())).unwrap().is_empty());
+        }
+        let (lifecycle_tx, lifecycle_rx) = mpsc::channel(128);
+        let (commands, cmd_rx) = mpsc::channel(8);
+        let shared = Arc::new(Shared::new(
+            event_tx,
+            "prompt".into(),
+            &crate::acp::agent_profiles::GEMINI,
+            lifecycle_tx,
+            state,
+            in_flight,
+            None,
+            ingress,
+            None,
+            control.connection_state.clone(),
+            Some(control.clone()),
+            Arc::default(),
+        ));
+        shared.adopted_turn_active.store(true, Ordering::Relaxed);
+        Self {
+            session: Some(command_loop::Session {
+                connection,
+                shared,
+                control: Some(control),
+                acp_session_id: id,
+                channels: super::config_options::SessionChannels::default(),
+                steering_capable: false,
+                close_capable: false,
+                source_profile: None,
+                default_effort: None,
+                default_model_config: Default::default(),
+                default_mode: None,
+                default_model: None,
+                agent_cwd: cwd.path().to_path_buf(),
+                mcp_servers: Vec::new(),
+                cmd_rx,
+                lifecycle_rx,
+                pending_prompts: std::collections::VecDeque::new(),
+            }),
+            commands,
+            shutdown,
+            sdk,
+            _agent: agent,
+            _cwd: cwd,
+        }
+    }
+
+    pub(super) fn commands(&self) -> mpsc::Sender<ClientCmd> {
+        self.commands.clone()
+    }
+
+    pub(super) fn queue(&self, adopted: crate::acp::control_protocol::AdoptedPromptCompletion) {
+        let shared = self.session.as_ref().unwrap().shared.clone();
+        tokio::spawn(async move {
+            shared
+                .apply_replay(vec![
+                    crate::acp::acp_client::session_identity::PendingIngress::PromptCompleted(
+                        Box::new(adopted),
+                    ),
+                ])
+                .await;
+        });
+    }
+
+    pub(super) async fn finish(
+        &self,
+        adopted: crate::acp::control_protocol::AdoptedPromptCompletion,
+    ) {
+        self.session
+            .as_ref()
+            .unwrap()
+            .shared
+            .apply_replay(vec![
+                crate::acp::acp_client::session_identity::PendingIngress::PromptCompleted(
+                    Box::new(adopted),
+                ),
+            ])
+            .await;
+    }
+
+    pub(super) async fn run(mut self) -> agent_client_protocol::Result<()> {
+        self.session.take().unwrap().run().await
+    }
+}
+
+#[cfg(test)]
+impl Drop for PromptTestSession {
+    fn drop(&mut self) {
+        self.shutdown.cancel();
+        self.sdk.abort();
+    }
 }
 
 /// Handlers compute an answer without knowing whether the request arrived over
@@ -358,13 +494,9 @@ pub(super) async fn run_connection_task<W, R>(
     } = params;
     let label = resources.label.clone();
     let (lifecycle_tx, lifecycle_rx) = mpsc::channel(128);
-    let (control, terminal_claim, prompt_in_flight) = match runner {
-        Some(r) => (Some(r.control), r.terminal_claim, r.prompt_in_flight),
-        None => (
-            None,
-            Arc::new(TerminalClaim::new()),
-            Arc::new(AtomicBool::new(false)),
-        ),
+    let (control, state, prompt_in_flight) = match runner {
+        Some(r) => (Some(r.control), r.state, r.prompt_in_flight),
+        None => (None, Arc::default(), Arc::new(AtomicBool::new(false))),
     };
     let _control_shutdown = super::control::ShutdownControlOnDrop(control.clone());
     // A runner owns identity across daemons, so its ingress is the one that
@@ -387,7 +519,7 @@ pub(super) async fn run_connection_task<W, R>(
         label.clone(),
         profile,
         lifecycle_tx,
-        terminal_claim,
+        state,
         prompt_in_flight,
         resources.sandbox.as_ref(),
         ingress.clone(),
@@ -649,6 +781,7 @@ pub(super) async fn run_connection_task<W, R>(
         ),
     );
 
+    let control_for_report = control.clone();
     let establish_ctx = establish::EstablishCtx {
         shared: shared.clone(),
         control: control.clone(),
@@ -757,14 +890,24 @@ pub(super) async fn run_connection_task<W, R>(
     };
 
     pending_responders.lock().await.clear();
+    let control_lost = control_for_report
+        .as_ref()
+        .is_some_and(|control| control.lost())
+        && connection_state
+            .loss()
+            .is_some_and(|loss| loss.source == AcpConnectionSource::Control);
+
     if let Err(e) = &result {
         if !shutdown.is_cancelled() && !cancellation.is_cancelled() {
-            report_connection_error(e, &shared, &ready_tx).await;
+            report_connection_error(e, &shared, &ready_tx, control_lost).await;
         }
     } else {
         info!(target: "acp.protocol", session = %label, "ACP connection task ended cleanly");
     }
     if connection_state.loss().is_some()
+        && !connection_state
+            .loss()
+            .is_some_and(|loss| loss.source == AcpConnectionSource::Control)
         && !connection_state.is_stopping()
         && !shutdown.is_cancelled()
         && !cancellation.is_cancelled()
@@ -810,6 +953,7 @@ async fn report_connection_error(
     e: &agent_client_protocol::Error,
     shared: &Shared,
     ready_tx: &ReadyTx,
+    control_lost: bool,
 ) {
     let label = &shared.session_label;
     let event_tx = &shared.event_tx;
@@ -818,6 +962,9 @@ async fn report_connection_error(
         session = %label,
         "ACP connection task ended with error: {:?}", e
     );
+    if control_lost {
+        return;
+    }
     if shared.connection_state.loss().is_none()
         && (!shared
             .connection_state
@@ -838,16 +985,16 @@ async fn report_connection_error(
         shared.publish_connection_unavailable().await;
         return;
     }
-    let resets_at =
-        captured_rate_limit_resets_at(&shared.rate_limit_rejections, chrono::Utc::now());
-    let rate_limit = super::rate_limit::classify_rate_limit_error(e, resets_at).or_else(|| {
-        super::rate_limit::classify_rate_limit_from_message(&e.message, resets_at).map(
-            |mut info| {
-                info.status = super::errors::public_error_message(e);
-                info
-            },
-        )
-    });
+    let resets_at = captured_rate_limit_reset(&shared.rate_limit_rejections, chrono::Utc::now());
+    let rate_limit =
+        super::rate_limit::classify_rate_limit_error(e, resets_at.as_ref()).or_else(|| {
+            super::rate_limit::classify_rate_limit_from_message(&e.message, resets_at.as_ref()).map(
+                |mut info| {
+                    info.status = super::errors::public_error_message(e);
+                    info
+                },
+            )
+        });
     if let Some(tx) = ready_tx.lock().await.take() {
         // A handshake-time limit fails the spawn as rate-limited so the
         // supervisor parks instead of burning respawn budget (#3514).
@@ -881,13 +1028,10 @@ async fn report_connection_error(
             .await;
     } else {
         let _ = event_tx
-            .send(Event::AgentStartupError {
-                message: format!(
-                    "ACP connection failed: {}",
-                    super::errors::public_error_message(e)
-                ),
-                native_subject: None,
-            })
+            .send(Event::startup_error(format!(
+                "ACP connection failed: {}",
+                super::errors::public_error_message(e)
+            )))
             .await;
     }
 }

@@ -22,7 +22,7 @@ use crate::acp::acp_client::errors::{acp_internal_error, prompt_runtime_error, A
 use crate::acp::acp_client::lifecycle::{LifecycleSignal, OffProtocolWorkKind};
 use crate::acp::acp_client::opencode::recover_opencode_prompt_error;
 use crate::acp::acp_client::rate_limit::{
-    captured_rate_limit_resets_at, classify_rate_limit_error, clear_captured_rejections,
+    captured_rate_limit_reset, classify_rate_limit_error, clear_captured_rejections,
     take_rate_limit_from_captured_rejection,
 };
 use crate::acp::acp_client::reset::ResetSessionOutcome;
@@ -39,7 +39,6 @@ type PromptFut = Pin<Box<dyn Future<Output = PromptResult> + Send>>;
 type SteerFut = Pin<
     Box<dyn Future<Output = (Vec<ContentBlock>, OrderedRequestResult<serde_json::Value>)> + Send>,
 >;
-
 type PromptResult = OrderedRequestResult<PromptResponse>;
 
 struct LocalPromptScope(std::sync::Arc<super::notifications::Shared>);
@@ -88,7 +87,7 @@ enum Flow {
 #[derive(Default)]
 struct TurnFlags {
     shutdown: bool,
-    rate_limited: bool,
+    rate_limit: Option<RateLimitInfo>,
     force_stopped: bool,
     prompt_orphaned: bool,
     agent_unresponsive: bool,
@@ -106,6 +105,7 @@ struct TurnFlags {
 struct Turn {
     epoch: u64,
     flags: TurnFlags,
+    preceding: Vec<Event>,
     watchdog: SilentOrphanWatchdog,
     cfg: SilentOrphanWatchdogConfig,
     orphan_check_enabled: bool,
@@ -124,11 +124,9 @@ impl Turn {
             .apply_signal(signal, Instant::now(), chrono::Utc::now(), self.cfg);
     }
 
-    fn start_cancel_grace(&mut self) {
+    fn start_cancel_grace(&mut self, deadline: Instant) {
         self.flags.cancelling = true;
-        self.cancel_grace
-            .as_mut()
-            .reset(Instant::now() + CANCEL_ESCALATION_GRACE);
+        self.cancel_grace.as_mut().reset(deadline);
     }
 }
 
@@ -157,6 +155,7 @@ impl Session {
     /// not manufacture a second `Stopped` or a peer prompt failure.
     pub(super) async fn run_prompt(&mut self, blocks: Vec<ContentBlock>) -> AcpResult<bool> {
         let shared = self.shared.clone();
+        let publication = shared.state.publication.lock().await;
         let epoch = {
             let _admission = shared
                 .connection_state
@@ -207,11 +206,13 @@ impl Session {
             shared.terminal_claim.begin_turn();
             shared.between_prompt.reset_for_prompt();
             clear_captured_rejections(&shared.rate_limit_rejections);
+            *shared.cancel_deadline.lock().unwrap() = None;
             info!(target: "acp.protocol", "sending prompt ({} content blocks)", blocks.len());
             // Bump the epoch before sending so envelopes from a handler parked on
             // the previous prompt are discarded.
             shared.prompt_epoch.fetch_add(1, Ordering::Relaxed) + 1
         };
+        drop(publication);
         let _scope = LocalPromptScope(shared.clone());
         while self.lifecycle_rx.try_recv().is_ok() {}
 
@@ -219,6 +220,7 @@ impl Session {
         let orphan_check_period = silent_orphan_check_interval();
         let mut turn = Turn {
             epoch,
+            preceding: Vec::new(),
             flags: TurnFlags::default(),
             watchdog: SilentOrphanWatchdog::default(),
             cfg: SilentOrphanWatchdogConfig {
@@ -377,7 +379,7 @@ impl Session {
 
     async fn on_prompt_result(&mut self, turn: &mut Turn, result: PromptResult) -> AcpResult<Flow> {
         turn.flags.result_observed = !matches!(&result, PromptResult::Unavailable(_));
-        let (res, correlated) = match result {
+        let (result, correlated) = match result {
             PromptResult::Correlated(result) => (result, true),
             PromptResult::Refused(error) => (Err(error), false),
             PromptResult::Unavailable(observation) => {
@@ -388,56 +390,37 @@ impl Session {
                 return Err(acp_internal_error("ACP connection unavailable".into()));
             }
             PromptResult::Abandoned => {
-                self.shared
-                    .emit(Event::PromptRuntimeError {
-                        message: "Prompt completion was not observed".into(),
-                        evidence: Some(crate::session::OperationErrorEvidence::new(
-                            crate::session::ErrorEvidenceSource::LocalPromptResult,
-                            crate::session::ErrorOperation::Prompt,
-                        )),
-                        native_subject: None,
-                    })
-                    .await;
+                turn.preceding.push(Event::PromptRuntimeError {
+                    message: "Prompt completion was not observed".into(),
+                    evidence: Some(crate::session::OperationErrorEvidence::new(
+                        crate::session::ErrorEvidenceSource::LocalPromptResult,
+                        crate::session::ErrorOperation::Prompt,
+                    )),
+                    native_subject: None,
+                });
                 turn.flags.prompt_failed = true;
                 return Ok(Flow::Break);
             }
         };
-        let e = match res {
-            Ok(resp) => {
-                turn.flags.prompt_cancelled = matches!(resp.stop_reason, StopReason::Cancelled);
-                turn.flags.agent_stop_reason = Some(resp.stop_reason);
-                if !turn.flags.prompt_cancelled {
-                    if let Some(info) = self.take_parking_rejection() {
-                        self.shared.emit(Event::RateLimit { info }).await;
-                        turn.flags.rate_limited = true;
-                    }
-                }
+        if let Ok(response) = &result {
+            turn.flags.prompt_cancelled = matches!(response.stop_reason, StopReason::Cancelled);
+            turn.flags.agent_stop_reason = Some(response.stop_reason);
+        }
+        if correlated {
+            turn.flags.rate_limit = self.completion_rate_limit(&result);
+            if turn.flags.rate_limit.is_some() {
                 return Ok(Flow::Break);
             }
-            Err(e) => e,
-        };
-        let label = &self.shared.session_label;
-        // A rate limit parks the session rather than burning restart budget
-        // on a worker that would hit it again (#1281).
-        let resets_at =
-            captured_rate_limit_resets_at(&self.shared.rate_limit_rejections, chrono::Utc::now());
-        if let Some(info) = correlated
-            .then(|| classify_rate_limit_error(&e, resets_at))
-            .flatten()
-        {
-            info!(
-                target: "acp.protocol",
-                session = %label,
-                resets_at = ?info.resets_at,
-                "session/prompt returned rate_limit; parking session"
-            );
-            self.shared.emit(Event::RateLimit { info }).await;
-            turn.flags.rate_limited = true;
-            return Ok(Flow::Break);
         }
-        warn!(target: "acp.protocol", session = %label, error = ?e, "prompt operation failed; preserving connection and conversation");
-        let mut diagnostic =
-            prompt_runtime_error(&e, crate::session::ErrorEvidenceSource::LocalPromptResult);
+        let error = match result {
+            Ok(_) => return Ok(Flow::Break),
+            Err(error) => error,
+        };
+        warn!(target: "acp.protocol", session = %self.shared.session_label, ?error, "prompt operation failed; preserving connection and conversation");
+        let mut diagnostic = prompt_runtime_error(
+            &error,
+            crate::session::ErrorEvidenceSource::LocalPromptResult,
+        );
         if !correlated {
             if let Event::PromptRuntimeError {
                 evidence: Some(evidence),
@@ -447,15 +430,29 @@ impl Session {
                 evidence.reported_code = None;
             }
         }
-        self.shared.emit(diagnostic).await;
+        turn.preceding.push(diagnostic);
         turn.flags.prompt_failed = true;
         Ok(Flow::Break)
     }
 
     /// The adapter can end a limited turn normally, so a still-future rejected
     /// window captured during it is the only evidence; park like the error path.
-    fn take_parking_rejection(&self) -> Option<RateLimitInfo> {
+    pub(super) fn completion_rate_limit(
+        &self,
+        result: &AcpResult<PromptResponse>,
+    ) -> Option<RateLimitInfo> {
         let shared = &self.shared;
+        match result {
+            Err(error) => {
+                return classify_rate_limit_error(
+                    error,
+                    captured_rate_limit_reset(&shared.rate_limit_rejections, chrono::Utc::now())
+                        .as_ref(),
+                )
+            }
+            Ok(response) if matches!(response.stop_reason, StopReason::Cancelled) => return None,
+            Ok(_) => {}
+        }
         let info = take_rate_limit_from_captured_rejection(
             &shared.rate_limit_rejections,
             chrono::Utc::now(),
@@ -467,6 +464,25 @@ impl Session {
             "prompted turn ended on a rejected rate-limit window; parking session"
         );
         Some(info)
+    }
+
+    /// Starts the cancel escalation grace once and returns its deadline; a
+    /// repeated cancel keeps the original deadline.
+    pub(super) async fn request_cancel(&self) -> Instant {
+        let deadline = Instant::now() + CANCEL_ESCALATION_GRACE;
+        {
+            let mut current = self.shared.cancel_deadline.lock().unwrap();
+            if let Some(deadline) = *current {
+                return deadline;
+            }
+            *current = Some(deadline);
+        }
+        let escalates_at =
+            chrono::Utc::now() + chrono::Duration::from_std(CANCEL_ESCALATION_GRACE).unwrap();
+        self.shared
+            .emit(Event::CancelRequested { escalates_at })
+            .await;
+        deadline
     }
 
     async fn reject_busy(&self, text: String) {
@@ -492,17 +508,12 @@ impl Session {
             }
             Some(ClientCmd::Cancel) => {
                 info!(target: "acp.protocol", "sending session/cancel during in-flight prompt");
-                self.send_cancel().await?;
-                // Only the first cancel arms escalation and tells the UI.
+                // Only the first cancel arms escalation and tells the UI. Arm it
+                // before the send, so a control loss during it keeps the deadline.
                 if !turn.flags.cancelling {
-                    turn.start_cancel_grace();
-                    let escalates_at = chrono::Utc::now()
-                        + chrono::Duration::from_std(CANCEL_ESCALATION_GRACE)
-                            .unwrap_or_else(|_| chrono::Duration::seconds(10));
-                    self.shared
-                        .emit(Event::CancelRequested { escalates_at })
-                        .await;
+                    turn.start_cancel_grace(self.request_cancel().await);
                 }
+                self.send_cancel().await?;
             }
             Some(ClientCmd::ForceStop) => {
                 warn!(
@@ -640,16 +651,23 @@ impl Session {
 
     async fn on_orphan_check(&mut self, turn: &mut Turn) -> Flow {
         let label = self.shared.session_label.clone();
-        let fire = turn.watchdog.should_fire(Instant::now(), turn.cfg)
+        let subagents_active = self.shared.subagent_working(now_ms());
+        let fire = turn
+            .watchdog
+            .should_fire(Instant::now(), turn.cfg, subagents_active)
             && !self.shared.aoe.leases.working(now_ms());
         let off_protocol = turn.watchdog.off_protocol_work_seen();
-        if fire && turn.watchdog.cost_seen() && off_protocol.is_none() {
+        let grace_secs = turn
+            .watchdog
+            .effective_grace(turn.cfg, subagents_active)
+            .as_secs();
+        if fire && turn.watchdog.cost_seen() && off_protocol.is_none() && !subagents_active {
             // The turn finished but the PromptResponse never came: end cleanly
             // as prompt_complete with no flag set (#2237).
             info!(
                 target: "acp.protocol",
                 session = %label,
-                grace_secs = turn.watchdog.effective_grace(turn.cfg).as_secs(),
+                grace_secs,
                 "silent-orphan watchdog: turn wrapped up (cost-populated usage) without PromptResponse; ending cleanly as prompt_complete"
             );
             // The runner may still be running the turn; without this the next
@@ -665,10 +683,17 @@ impl Session {
                 session = %label,
                 off_protocol_work = ?off_protocol,
                 in_flight_tools = turn.watchdog.tool_calls_in_flight_len(),
-                grace_secs = turn.watchdog.effective_grace(turn.cfg).as_secs(),
+                subagents_active,
+                grace_secs,
                 "silent-orphan watchdog fired: no progress past grace and no in-flight tools; sending session/cancel"
             );
             turn.flags.prompt_orphaned = true;
+            // Armed before the send, like a user cancel, without telling the UI.
+            if !turn.flags.cancelling {
+                let deadline = Instant::now() + CANCEL_ESCALATION_GRACE;
+                *self.shared.cancel_deadline.lock().unwrap() = Some(deadline);
+                turn.start_cancel_grace(deadline);
+            }
             if let Err(err) = self.send_cancel().await {
                 warn!(
                     target: "acp.protocol",
@@ -680,9 +705,6 @@ impl Session {
                 return Flow::Break;
             }
             turn.flags.orphan_cancel_sent = true;
-            if !turn.flags.cancelling {
-                turn.start_cancel_grace();
-            }
         }
         let next = Instant::now() + turn.orphan_check_period;
         turn.orphan_check.as_mut().reset(next);
@@ -756,6 +778,7 @@ impl Session {
         if !turn.flags.result_observed && shared.connection_state.loss().is_some() {
             return false;
         }
+        let mut preceding = std::mem::take(&mut turn.preceding);
         // A cost marker can land in the same tick the prompt resolves (#2370).
         while let Ok(env) = self.lifecycle_rx.try_recv() {
             if env.epoch == turn.epoch {
@@ -772,25 +795,23 @@ impl Session {
             if let Some(message) =
                 recover_opencode_prompt_error(&self.acp_session_id.0, prompt_started_at_ms)
             {
-                shared
-                    .emit(Event::PromptRuntimeError {
-                        message,
-                        evidence: Some(crate::session::OperationErrorEvidence::new(
-                            crate::session::ErrorEvidenceSource::TranscriptRecovery,
-                            crate::session::ErrorOperation::Prompt,
-                        )),
-                        native_subject: None,
-                    })
-                    .await;
+                preceding.push(Event::PromptRuntimeError {
+                    message,
+                    evidence: Some(crate::session::OperationErrorEvidence::new(
+                        crate::session::ErrorEvidenceSource::TranscriptRecovery,
+                        crate::session::ErrorOperation::Prompt,
+                    )),
+                    native_subject: None,
+                });
                 turn.flags.prompt_failed = true;
             }
         }
-        let f = &turn.flags;
-        let reason = if f.prompt_failed {
+        let f = &mut turn.flags;
+        let reason = if f.rate_limit.is_none() && f.prompt_failed {
             "prompt_failed"
         } else {
             terminal_stop_reason(
-                f.rate_limited,
+                f.rate_limit.is_some(),
                 f.force_stopped,
                 f.prompt_orphaned,
                 f.agent_unresponsive,
@@ -799,22 +820,28 @@ impl Session {
                 f.orphan_cancel_sent && finished,
             )
         };
-        let claimed = if f.prompt_failed || f.rate_limited {
+        if let Some(info) = f.rate_limit.take() {
+            preceding.push(Event::RateLimit { info });
+        }
+        let terminal_at = now_ms();
+        let claimed = if reason == "prompt_failed" || reason == "rate_limited" {
             shared.terminal_claim.claim_failed()
         } else {
             shared.terminal_claim.claim()
         };
         if claimed {
-            if f.prompt_failed || f.rate_limited {
+            if reason == "prompt_failed" || reason == "rate_limited" {
                 shared.between_prompt.deactivate();
             }
-            let event = Event::Stopped {
-                reason: reason.into(),
-            };
-            if turn.flags.result_observed {
-                shared.emit(event).await;
-            } else if !shared.emit_while_available([event]).await {
-                return false;
+            if f.result_observed {
+                shared.publish_terminal(reason.into(), preceding).await;
+            } else {
+                preceding.push(Event::Stopped {
+                    reason: reason.into(),
+                });
+                if !shared.emit_while_available(preceding).await {
+                    return false;
+                }
             }
         }
         shared.reset_message_dedup();
@@ -823,6 +850,13 @@ impl Session {
             .lock()
             .expect("last prompt mutex poisoned")
             .1 = now_ms();
+        shared.prompt_in_flight.store(false, Ordering::Relaxed);
+        *shared.cancel_deadline.lock().unwrap() = None;
+        if shared.subagent_activity_at.load(Ordering::Relaxed) >= terminal_at
+            || shared.subagent_working(now_ms())
+        {
+            shared.arm_for_subagent_activity().await;
+        }
         // Missing after a Stopped, this line signals a stranded prompt (#3190).
         info!(
             target: "acp.protocol",

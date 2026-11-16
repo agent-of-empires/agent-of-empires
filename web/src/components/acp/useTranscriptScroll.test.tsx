@@ -40,6 +40,7 @@ type HarnessProps = {
   folded: boolean;
   closed: boolean;
   streamed: boolean;
+  composerCollapsed?: boolean;
 };
 
 function box(top: number, bottom: number): DOMRect {
@@ -56,13 +57,13 @@ function box(top: number, bottom: number): DOMRect {
   };
 }
 
-function Harness({ metrics, sessionId, folded, closed, streamed }: HarnessProps) {
+function Harness({ metrics, sessionId, folded, closed, streamed, composerCollapsed = false }: HarnessProps) {
   const { viewportRef, belowViewportRef, messagesContentRef } = useTranscriptScroll({
     sessionId,
     canLoadEarlierHistory: false,
     loadEarlierHistory: () => {},
     loadingEarlierHistory: false,
-    composerCollapsed: false,
+    composerCollapsed,
     promptSeq: 0,
     hasEverOpened: true,
     localInflight: false,
@@ -282,6 +283,51 @@ describe("useTranscriptScroll fold corrections", () => {
       expect(metrics.scrollTop).toBe(gesture ? 1080 : 1140);
     },
   );
+
+  it("stays pinned when a late gesture-less scroll to the top lands during a composer transition", () => {
+    Object.defineProperty(window, "matchMedia", {
+      configurable: true,
+      value: (query: string) =>
+        ({
+          matches: query === "(pointer: coarse)",
+          addEventListener: () => {},
+          removeEventListener: () => {},
+        }) as MediaQueryList,
+    });
+    const frames: FrameRequestCallback[] = [];
+    vi.stubGlobal("requestAnimationFrame", (cb: FrameRequestCallback) => frames.push(cb));
+    vi.stubGlobal("cancelAnimationFrame", () => {});
+    const runFrame = () => act(() => frames.shift()?.(performance.now()));
+
+    const metrics: Metrics = { clientHeight: 100, scrollHeight: 1200, scrollTop: 1100, cardPageTop: 1150 };
+    const sessionId = "late-top-scroll-composer-transition";
+    saveScrollState(sessionId, { stuck: true, top: metrics.scrollTop });
+    const props = { metrics, sessionId, folded: false, closed: false, streamed: false };
+    const view = render(<Harness {...props} />);
+    const viewport = view.getByTestId("viewport") as HTMLDivElement;
+    act(() => {
+      viewport.dispatchEvent(new Event("scroll"));
+      contentObserver(viewport).fire();
+    });
+
+    view.rerender(<Harness {...props} composerCollapsed={true} />);
+    runFrame();
+    // The injected scrollTop=0 event arrives late and clears the pin refs.
+    metrics.scrollTop = 0;
+    act(() => viewport.dispatchEvent(new Event("scroll")));
+    // The chrome-transition pin returns to the bottom; its scroll event is not a reader move.
+    runFrame();
+    act(() => viewport.dispatchEvent(new Event("scroll")));
+    expect(metrics.scrollTop).toBe(1100);
+
+    act(() => {
+      metrics.clientHeight = 60;
+      metrics.scrollTop = 1080;
+      viewport.dispatchEvent(new Event("scroll"));
+      contentObserver(viewport).fire();
+    });
+    expect(metrics.scrollTop).toBe(1140);
+  });
 
   it("continues following final text after a closed run folds without cards", () => {
     const metrics: Metrics = { clientHeight: 100, scrollHeight: 1200, scrollTop: 1100, cardPageTop: 1150 };

@@ -35,6 +35,9 @@ pub(crate) enum LifecycleSignal {
     WakeupPending {
         at: chrono::DateTime<chrono::Utc>,
     },
+    /// Validated traffic from a subagent session: liveness only, so it keeps
+    /// any end-of-turn accounting already seen.
+    SubagentActivity,
     CompactionStarted,
     CompactionCompleted,
     /// The adapter emits this after the turn's own terminal on a cancel, so
@@ -225,16 +228,16 @@ impl TerminalClaim {
             .claimed
     }
 
+    pub(super) fn claimed_turn(&self) -> Option<u64> {
+        let state = self.state.lock().expect("terminal claim mutex poisoned");
+        state.claimed.then_some(state.epoch)
+    }
+
     pub(super) fn current_turn(&self) -> u64 {
         self.state
             .lock()
             .expect("terminal claim mutex poisoned")
             .epoch
-    }
-
-    pub(super) fn claimed_turn(&self) -> Option<u64> {
-        let state = self.state.lock().expect("terminal claim mutex poisoned");
-        state.claimed.then_some(state.epoch)
     }
 
     /// Closures only enqueue reserved events; neither closure may await or reenter this claim.
@@ -299,6 +302,9 @@ pub(super) async fn forward_lifecycle_signals(
     }
 }
 
+/// The SDK's acknowledgement of a background `Agent` launch.
+pub(super) const ASYNC_AGENT_LAUNCHED: &str = "Async agent launched successfully";
+
 /// Matches SDK markers only at line starts so echoed output does not extend
 /// watchdog grace.
 pub(super) fn detect_off_protocol_work_completed(
@@ -316,7 +322,7 @@ pub(super) fn detect_off_protocol_work_completed(
         .flat_map(str::lines)
         .find_map(|line| {
             let line = line.trim_start();
-            if line.starts_with("Async agent launched successfully") {
+            if line.starts_with(ASYNC_AGENT_LAUNCHED) {
                 Some(OffProtocolWorkKind::AsyncAgent)
             } else if line.starts_with("Command running in background with ID: ") {
                 Some(OffProtocolWorkKind::BackgroundCommand)
@@ -686,17 +692,17 @@ mod tests {
             }
         ));
         assert!(!terminal.claimed());
-        assert!(terminal.claim());
-        assert!(
-            !terminal.publish_claimed(adopted, true, || panic!("old completion must not publish"))
-        );
-        let current = terminal.claimed_turn().unwrap();
+        let current = terminal.current_turn();
         let permit = events.try_reserve().unwrap();
-        assert!(terminal.publish_claimed(current, true, || {
-            permit.send(Event::Stopped {
-                reason: "prompt_failed".into(),
-            });
-        }));
+        assert!(terminal.claim_and_publish(
+            current,
+            || true,
+            || {
+                permit.send(Event::Stopped {
+                    reason: "prompt_failed".into(),
+                });
+            }
+        ));
         assert!(
             matches!(received.try_recv(), Ok(Event::Stopped { reason }) if reason == "prompt_failed")
         );

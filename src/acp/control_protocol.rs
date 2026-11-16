@@ -97,7 +97,6 @@ pub(crate) struct NativeChannelLostMarker {}
 pub struct SessionReplayed {}
 
 /// Daemon-minted completion barrier, ordered behind preceding SDK notifications.
-/// Adopted payloads contain the bounded public diagnostic, never raw error envelopes.
 #[derive(
     Debug, Clone, Default, Serialize, Deserialize, agent_client_protocol::JsonRpcNotification,
 )]

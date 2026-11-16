@@ -36,6 +36,7 @@ pub use prompt::{
     acp_attachment, acp_cancel, acp_cancel_subagent, acp_force_end_turn, acp_prompt,
     acp_prompt_diff_comments, resolve_approval, resolve_elicitation,
 };
+pub(crate) use prompt::{submit_prompt, PromptSubmission, PromptSubmitError, PromptSubmitted};
 pub use view::{acp_disable, acp_enable};
 pub(crate) use view::{
     publish_startup_error_if_current, recover_pending_terminal_handoffs, HandoffRecovery,

@@ -753,8 +753,10 @@ mod tests {
             description: None,
             state,
             stop_reason: None,
+            error: None,
             cancel_capable,
             model: None,
+            background: false,
         };
         let cases = [
             (vec![], None),

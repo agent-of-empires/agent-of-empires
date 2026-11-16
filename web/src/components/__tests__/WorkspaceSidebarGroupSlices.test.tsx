@@ -27,7 +27,7 @@ const split = (secondPinned: string | null): Workspace =>
     { projectPath: "/repo-a", branch: "feature/x" },
   );
 
-const sidebar = (ws: Workspace) => (
+const sidebar = (ws: Workspace, onNew: Props["onNew"] = noop) => (
   <SessionActionProvider sessions={ws.sessions} runtimeEpoch="boot" observedById={{}} onSessionMutation={noop}>
     <WorkspaceSidebar
       {...({
@@ -53,7 +53,7 @@ const sidebar = (ws: Workspace) => (
         onSelect: vi.fn(),
         onToggleGroup: noop,
         onUpdateRepoAppearance: noop,
-        onNew: noop,
+        onNew,
         onCreateSession: noop,
         savedProjects: [],
         onAddProject: noop,
@@ -138,5 +138,44 @@ describe("expanded rows when the worktree's membership changes", () => {
     // A second session joins: 1 -> 2. The row is still expanded and must show the canonical unpinned state.
     rerender(sidebar(members(["a", "c"])));
     expect(pinMark(firstExpandedRow())).toBeNull();
+  });
+});
+
+describe("the + on a group header", () => {
+  it("opens the wizard with that group, and with nothing for Ungrouped", () => {
+    const onNew = vi.fn();
+    const ws = makeWorkspace(
+      "w",
+      [
+        makeSession({ id: "s1", title: "one", project_path: "/repo-a", group_path: "alpha" }),
+        makeSession({ id: "s2", title: "two", project_path: "/repo-a", group_path: "" }),
+      ],
+      { projectPath: "/repo-a" },
+    );
+    render(sidebar(ws, onNew));
+
+    fireEvent.click(screen.getByRole("button", { name: "New session in alpha" }));
+    expect(onNew).toHaveBeenLastCalledWith({ group: "alpha" });
+
+    fireEvent.click(screen.getByRole("button", { name: "New session in Ungrouped" }));
+    expect(onNew).toHaveBeenLastCalledWith();
+  });
+});
+
+describe("opening the wizard without a group", () => {
+  it("passes no prefill from the toolbar + and the empty-state button", () => {
+    const onNew = vi.fn();
+    const one = makeWorkspace("w", [makeSession({ id: "s1", title: "one", project_path: "/repo-a" })], {
+      projectPath: "/repo-a",
+    });
+    const { unmount } = render(sidebar(one, onNew));
+    fireEvent.click(screen.getByRole("button", { name: "New project session" }));
+    expect(onNew).toHaveBeenLastCalledWith();
+    unmount();
+
+    onNew.mockClear();
+    render(sidebar({ ...one, sessions: [] }, onNew));
+    fireEvent.click(within(screen.getByTestId("sidebar-empty-state")).getByRole("button", { name: /New session/ }));
+    expect(onNew).toHaveBeenCalledExactlyOnceWith();
   });
 });

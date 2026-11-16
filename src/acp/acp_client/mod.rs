@@ -24,6 +24,8 @@ mod permission_handlers;
 mod plan;
 mod rate_limit;
 mod raw_input;
+#[cfg(test)]
+mod recovery_tests;
 mod reset;
 mod resolve_command;
 mod runner;
@@ -42,8 +44,9 @@ mod watchdog;
 
 pub use close::CloseSessionOutcome;
 pub(crate) use connection::CANCEL_ESCALATION_GRACE;
+pub(crate) use control::ControlLoss;
 pub use delete::DeleteSessionOutcome;
-pub use errors::{AcpError, IncompatibleAgentError};
+pub use errors::{is_authentication_failure, AcpError, IncompatibleAgentError};
 pub use list::{list_native_sessions, ListSessionsError};
 pub use reset::ResetSessionOutcome;
 pub use resolve_command::{
@@ -128,6 +131,52 @@ pub struct AcpClient {
     connection_shutdown: tokio_util::sync::CancellationToken,
     connection_task: std::sync::Mutex<Option<tokio::task::JoinHandle<()>>>,
     _prime_runtime: Option<crate::process::prime::PrimeCleanupGuard>,
+    control_loss: Option<Arc<std::sync::OnceLock<control::ControlLoss>>>,
+    reattach: Option<Box<ReattachSpec>>,
+}
+
+/// What dialing the same runner again needs; resume sends no session/new or load.
+#[derive(Clone)]
+struct ReattachSpec {
+    socket_path: PathBuf,
+    expected_owner: crate::acp::runner_lifecycle::RunnerIdentity,
+    cwd: PathBuf,
+    additional_dirs: Vec<PathBuf>,
+    sandbox: Option<(SessionSandbox, SandboxPathMap)>,
+    agent_key: String,
+    source_profile: Option<String>,
+    claude_home: Option<PathBuf>,
+    state: Arc<SessionState>,
+}
+
+/// Resources and turn ownership survive replacement of the control connection.
+struct SessionState {
+    terminals: TerminalManager,
+    terminal_claim: Arc<TerminalClaim>,
+    cancel_deadline: Arc<std::sync::Mutex<Option<tokio::time::Instant>>>,
+    rate_limit_rejections: Arc<std::sync::Mutex<HashMap<String, i64>>>,
+    publication: Arc<tokio::sync::Mutex<()>>,
+    /// Holding its write lock stalls every cancel send.
+    #[cfg(test)]
+    cancel_send_gate: Arc<tokio::sync::RwLock<()>>,
+    #[cfg(test)]
+    terminal_settle_gate: Arc<tokio::sync::RwLock<()>>,
+}
+
+impl Default for SessionState {
+    fn default() -> Self {
+        Self {
+            terminals: TerminalManager::new(),
+            terminal_claim: Arc::new(TerminalClaim::new()),
+            cancel_deadline: Arc::default(),
+            rate_limit_rejections: Arc::default(),
+            publication: Arc::default(),
+            #[cfg(test)]
+            cancel_send_gate: Arc::default(),
+            #[cfg(test)]
+            terminal_settle_gate: Arc::default(),
+        }
+    }
 }
 
 impl Drop for AcpClient {
@@ -212,6 +261,7 @@ struct Launch {
     mcp_servers: Vec<McpServer>,
     claude_home: Option<PathBuf>,
     cancellation: tokio_util::sync::CancellationToken,
+    state: Arc<SessionState>,
 }
 
 impl Launch {
@@ -238,18 +288,16 @@ impl Launch {
             .unwrap_or_else(|| Arc::new(ConnectionState::default()));
         let label = self.session_id.0.clone();
         let connected_runner = runner.as_ref().map(|runner| runner.control.peer_identity());
+        let mut resources =
+            SessionResources::new(self.cwd, self.additional_dirs, label.clone(), self.sandbox);
+        resources.terminals = self.state.terminals.clone();
         let params = ConnectionParams {
             event_tx,
             connection_state: connection_state.clone(),
             cmd_rx,
             child: child.clone(),
             pending_responders: pending_responders.clone(),
-            resources: SessionResources::new(
-                self.cwd,
-                self.additional_dirs,
-                label.clone(),
-                self.sandbox,
-            ),
+            resources,
             mode: self.mode,
             ready_tx,
             profile: self.profile,
@@ -280,6 +328,8 @@ impl Launch {
             connection_shutdown: shutdown,
             connection_task: std::sync::Mutex::new(Some(task)),
             _prime_runtime: None,
+            control_loss: None,
+            reattach: None,
         };
         (client, ready_rx)
     }
@@ -296,6 +346,7 @@ pub(crate) struct PendingRunnerConnection {
     handshake:
         Option<std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), AcpError>> + Send>>>,
     control: Option<ShutdownControlOnDrop>,
+    reattach: Option<Box<ReattachSpec>>,
 }
 
 impl PendingRunnerConnection {
@@ -321,6 +372,7 @@ impl PendingRunnerConnection {
             client: None,
             handshake: None,
             control: None,
+            reattach: None,
         })
     }
 
@@ -331,7 +383,7 @@ impl PendingRunnerConnection {
         let owned = self.newborn;
         if let Some(launch) = self.launch.as_ref() {
             let label = launch.session_id.0.clone();
-            let terminal_claim = Arc::new(TerminalClaim::new());
+            let terminal_claim = launch.state.terminal_claim.clone();
             if matches!(
                 &launch.mode,
                 ConnectMode::Resume {
@@ -370,16 +422,20 @@ impl PendingRunnerConnection {
             let transport = ByteStreams::new(write_half.compat_write(), read_half.compat());
             let launch = self.launch.take().expect("one original connection");
             let install_binary = launch.install_binary.clone();
+            let control_loss = control.loss_handle();
+            let state = launch.state.clone();
             let (mut client, ready) = launch.start(
                 mpsc::channel(64),
                 transport,
                 None,
                 Some(RunnerLink {
                     control: control.clone(),
-                    terminal_claim,
+                    state,
                     prompt_in_flight,
                 }),
             );
+            client.control_loss = Some(control_loss);
+            client.reattach = self.reattach.take();
             if self.newborn {
                 client.runner_pid = Some(self.owner.pid);
                 client.native_store = self.native_store.take();
@@ -441,6 +497,9 @@ impl PendingRunnerConnection {
             )));
         }
         self.owner = owner;
+        if let Some(spec) = self.reattach.as_mut() {
+            spec.expected_owner = owner;
+        }
         Ok(())
     }
 
@@ -477,6 +536,8 @@ impl AcpClient {
             connection_shutdown: tokio_util::sync::CancellationToken::new(),
             connection_task: std::sync::Mutex::new(None),
             _prime_runtime: None,
+            control_loss: None,
+            reattach: None,
         };
         (client, event_tx)
     }
@@ -764,6 +825,7 @@ impl AcpClient {
                 .and_then(|binding| binding.stores.first())
                 .cloned(),
             cancellation: cancellation.clone(),
+            state: Arc::default(),
         };
 
         if let Some(socket_path) = config.socket_path.clone() {
@@ -796,12 +858,21 @@ impl AcpClient {
                 let _ = entered.send(runner_identity);
                 let _ = release.await;
             }
-            let mut pending = PendingRunnerConnection::new(
-                socket_path,
-                launch(sandbox, &native_store),
-                runner_identity,
-                native_store,
-            )?;
+            let launch = launch(sandbox, &native_store);
+            let reattach = ReattachSpec {
+                socket_path: socket_path.clone(),
+                expected_owner: runner_identity,
+                cwd: launch.cwd.clone(),
+                additional_dirs: launch.additional_dirs.clone(),
+                sandbox: launch.sandbox.clone(),
+                agent_key: config.agent_key.clone(),
+                source_profile: launch.source_profile.clone(),
+                claude_home: launch.claude_home.clone(),
+                state: launch.state.clone(),
+            };
+            let mut pending =
+                PendingRunnerConnection::new(socket_path, launch, runner_identity, native_store)?;
+            pending.reattach = Some(Box::new(reattach));
             if let Err(error) = pending.advance(None).await {
                 if matches!(
                     &error,
@@ -912,25 +983,48 @@ impl AcpClient {
                 crate::acp::runner_lifecycle::RunnerIdentity::from_record(&record)
             }
         };
-        // The binary name keeps the compatibility gate active on reattach; an
-        // unknown agent maps to `Other` anyway.
-        let install_binary = crate::acp::AgentRegistry::with_defaults()
-            .get(&agent_key)
-            .map(|spec| spec.command.clone())
-            .unwrap_or_default();
-        let launch = Launch {
-            session_id,
-            mode: ConnectMode::Resume {
-                acp_session_id: stored_acp_session_id,
-                in_flight_turn,
-                unsuccessful_main,
-            },
+        let spec = ReattachSpec {
+            socket_path,
+            expected_owner,
             cwd,
             additional_dirs,
             sandbox,
-            profile: agent_profiles::resolve(&agent_key),
-            install_binary,
+            agent_key,
             source_profile,
+            claude_home,
+            state: Arc::default(),
+        };
+        let mode = ConnectMode::Resume {
+            acp_session_id: stored_acp_session_id,
+            in_flight_turn,
+            unsuccessful_main,
+            live_recovery: None,
+        };
+        Self::resume(spec, session_id, mode, deadline, launch_lease).await
+    }
+
+    async fn resume(
+        spec: ReattachSpec,
+        session_id: AcpSessionId,
+        mode: ConnectMode,
+        deadline: Option<tokio::time::Instant>,
+        launch_lease: Option<crate::acp::runner_lifecycle::Lease>,
+    ) -> Result<Self, AcpError> {
+        // The binary name keeps the compatibility gate active on reattach; an
+        // unknown agent maps to `Other` anyway.
+        let install_binary = crate::acp::AgentRegistry::with_defaults()
+            .get(&spec.agent_key)
+            .map(|agent| agent.command.clone())
+            .unwrap_or_default();
+        let launch = Launch {
+            session_id,
+            mode,
+            cwd: spec.cwd.clone(),
+            additional_dirs: spec.additional_dirs.clone(),
+            sandbox: spec.sandbox.clone(),
+            profile: agent_profiles::resolve(&spec.agent_key),
+            install_binary,
+            source_profile: spec.source_profile.clone(),
             // Resume sends no session/new or load, so defaults and MCP servers
             // were applied on first connect.
             default_effort: None,
@@ -938,14 +1032,23 @@ impl AcpClient {
             default_mode: None,
             default_model: None,
             mcp_servers: Vec::new(),
-            claude_home,
+            claude_home: spec.claude_home.clone(),
             cancellation: launch_lease
                 .as_ref()
                 .map_or_else(tokio_util::sync::CancellationToken::new, |lease| {
                     lease.cancellation().child_token()
                 }),
+            state: spec.state.clone(),
         };
-        Self::connect_via_socket(socket_path, launch, deadline, expected_owner).await
+        let mut client = Self::connect_via_socket(
+            spec.socket_path.clone(),
+            launch,
+            deadline,
+            spec.expected_owner,
+        )
+        .await?;
+        client.reattach = Some(Box::new(spec));
+        Ok(client)
     }
 
     pub fn connection_unavailable(&self) -> Option<crate::acp::state::AcpConnectionUnavailability> {
@@ -976,6 +1079,64 @@ impl AcpClient {
 
     pub(crate) fn ensure_available(&self) -> Result<(), AcpError> {
         self.connection_state.admit(|| ())
+    }
+
+    /// Set once the runner side ended this client's control channel.
+    pub(crate) fn control_loss(&self) -> Option<control::ControlLoss> {
+        self.control_loss.as_ref()?.get().copied()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn test_terminal_claimed(&self) -> bool {
+        self.reattach
+            .as_ref()
+            .is_some_and(|spec| spec.state.terminal_claim.claimed())
+    }
+
+    #[cfg(test)]
+    pub(crate) fn test_terminal_settle_gate(&self) -> Arc<tokio::sync::RwLock<()>> {
+        Arc::clone(&self.reattach.as_ref().unwrap().state.terminal_settle_gate)
+    }
+
+    /// Claims the terminal of the turn `loss` left in flight. `false` when no
+    /// turn was in flight or a path that survived the loss already published it.
+    pub(crate) fn claim_lost_turn(&self, loss: control::ControlLoss) -> bool {
+        loss.turn_in_flight
+            && self
+                .reattach
+                .as_ref()
+                .is_none_or(|spec| spec.state.terminal_claim.claim())
+    }
+
+    /// Dial the same runner again after [`Self::control_loss`]. Ready before
+    /// the resume, whose replay the caller must drain; `AcpSessionAssigned`
+    /// confirms it.
+    pub(crate) async fn reattach(
+        &self,
+        stored_acp_session_id: String,
+        in_flight_turn: bool,
+        deadline: tokio::time::Instant,
+        launch_lease: crate::acp::runner_lifecycle::Lease,
+    ) -> Result<Self, AcpError> {
+        let spec = *self.reattach.clone().ok_or(AcpError::NotRunning)?;
+        let unsuccessful_main = spec.state.terminal_claim.failed();
+        let mode = ConnectMode::Resume {
+            acp_session_id: stored_acp_session_id,
+            in_flight_turn: in_flight_turn && !spec.state.terminal_claim.claimed(),
+            unsuccessful_main,
+            live_recovery: Some(deadline),
+        };
+        let mut client = Self::resume(
+            spec,
+            self.session_id.clone(),
+            mode,
+            Some(deadline),
+            Some(launch_lease),
+        )
+        .await?;
+        client.runner_pid = self.runner_pid;
+        client.native_store = self.native_store.clone();
+        Ok(client)
     }
 
     async fn send_cmd(&self, cmd: ClientCmd) -> Result<(), AcpError> {
