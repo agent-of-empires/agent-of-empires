@@ -39,6 +39,8 @@ pub struct WindowLimit {
     pub until_ms: i64,
     /// `until_ms` is a guess (no reset time was reported), not a reported deadline.
     pub estimated: bool,
+    /// When the report behind `until_ms` was observed.
+    pub observed_at_ms: i64,
 }
 
 /// What is known about one account at a point in time.
@@ -146,7 +148,7 @@ impl EventStore {
     ) -> rusqlite::Result<Option<AccountState>> {
         let conn = self.conn();
         let mut statement = conn.prepare(&format!(
-            "SELECT window_kind, limited_until_ms, unusable_until_ms, estimated
+            "SELECT window_kind, limited_until_ms, unusable_until_ms, estimated, updated_at_ms
              FROM {ACCOUNT_LIMITS_TABLE} WHERE account_key = ?1"
         ))?;
         let rows = statement.query_map(params![account_key], |row| {
@@ -155,12 +157,13 @@ impl EventStore {
                 row.get::<_, i64>(1)?,
                 row.get::<_, i64>(2)?,
                 row.get::<_, bool>(3)?,
+                row.get::<_, i64>(4)?,
             ))
         })?;
         let mut state = AccountState::default();
         let mut seen = false;
         for row in rows {
-            let (kind, until_ms, unusable_until_ms, estimated) = row?;
+            let (kind, until_ms, unusable_until_ms, estimated, observed_at_ms) = row?;
             seen = true;
             state.unusable_until_ms = state.unusable_until_ms.max(unusable_until_ms);
             if kind != LOGIN_ROW {
@@ -168,6 +171,7 @@ impl EventStore {
                     kind,
                     until_ms,
                     estimated,
+                    observed_at_ms,
                 });
             }
         }

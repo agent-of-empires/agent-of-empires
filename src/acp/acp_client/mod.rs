@@ -48,6 +48,7 @@ pub(crate) use control::ControlLoss;
 pub use delete::DeleteSessionOutcome;
 pub use errors::{is_authentication_failure, AcpError, IncompatibleAgentError};
 pub use list::{list_native_sessions, ListSessionsError};
+pub(crate) use rate_limit::{refine_from_status, FIVE_HOUR_WINDOW_SECS};
 pub use reset::ResetSessionOutcome;
 pub use resolve_command::{
     is_bare_command, on_agent_path, resolve_agent_command, ResolvedAgentCommand, Unresolved,

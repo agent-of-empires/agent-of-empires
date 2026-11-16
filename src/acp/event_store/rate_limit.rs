@@ -14,11 +14,34 @@ pub struct RateLimitPark {
     pub info: Option<RateLimitInfo>,
     /// When the latest `RateLimit` was recorded (epoch ms), 0 when unknown.
     pub recorded_at_ms: i64,
+    /// When the park's reset was last reported (epoch ms): `recorded_at_ms`, or the earlier
+    /// event an inherited reset was copied from.
+    pub observed_at_ms: i64,
     /// The redelivery cap already parked the session; only a queued prompt
     /// or a manual resume releases it.
     pub cap_reached: bool,
     /// When auto-resume last fired for this park, so a failed resume retries on a schedule.
     pub last_resume_attempt_ms: Option<i64>,
+}
+
+/// Key the sink adds to a `RateLimit` whose reset it copied from an earlier event: when that
+/// reset was originally reported (epoch ms). Decoding ignores it.
+pub(super) const INHERITED_OBSERVATION_KEY: &str = "inherited_observed_at_ms";
+
+fn latest_reset_observed_ms(conn: &rusqlite::Connection, session_id: &str) -> Option<i64> {
+    conn.query_row(
+        &format!(
+            "SELECT COALESCE(json_extract(event_json, '$.RateLimit.{INHERITED_OBSERVATION_KEY}'),
+                            created_at)
+             FROM acp_events
+             WHERE session_id = ?1 AND discriminant = 'RateLimit'
+             ORDER BY seq DESC LIMIT 1"
+        ),
+        params![session_id],
+        |row| row.get(0),
+    )
+    .optional()
+    .unwrap_or(None)
 }
 
 impl EventStore {
@@ -41,6 +64,12 @@ impl EventStore {
             Event::RateLimit { info } => Some((info, created_at)),
             _ => None,
         }
+    }
+
+    /// When the latest `RateLimit`'s reset was last reported (epoch ms): when the event was
+    /// recorded, or for a reset the sink inherited, when it was originally reported.
+    pub fn latest_rate_limit_observed_ms(&self, session_id: &str) -> Option<i64> {
+        latest_reset_observed_ms(&self.conn(), session_id)
     }
 
     /// The newest startup error and its recorded time (epoch ms), unless a session
@@ -149,9 +178,11 @@ impl EventStore {
                 |row| row.get::<_, Option<i64>>(0),
             )
             .unwrap_or(None);
+        let observed_at_ms = latest_reset_observed_ms(&conn, session_id).unwrap_or(recorded_at_ms);
         Some(RateLimitPark {
             info,
             recorded_at_ms,
+            observed_at_ms,
             cap_reached: cap_seq.is_some(),
             last_resume_attempt_ms,
         })

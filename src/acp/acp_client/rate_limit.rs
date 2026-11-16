@@ -22,40 +22,220 @@ impl CapturedReset {
     }
 }
 
-/// Reset time comes only from a captured rejected-window epoch; the localized
-/// message is displayed verbatim, never parsed.
+/// `errorKind`s the adapter reports for an account-level limit: a quota window
+/// (`rate_limit`) or a spend cap or empty credit balance (`billing_error`).
+/// `overloaded` and `server_error` are capacity trouble that another account
+/// meets just the same, so they stay plain errors.
+const ACCOUNT_LIMIT_KINDS: &[&str] = &["rate_limit", "billing_error"];
+
+/// The status prose and `errorKind` of a flattened error message, split at the JSON object that
+/// runs to its end, which is the error's own `data`; braces in the prose are not. Without a
+/// string `errorKind` there it is `None`: a nested `cause.errorKind` is never the top level.
+fn flattened_error(message: &str) -> Option<(&str, String)> {
+    let (at, data): (usize, serde_json::Value) =
+        message.match_indices('{').find_map(|(at, _)| {
+            let data = serde_json::from_str(&message[at..]).ok()?;
+            Some((at, data))
+        })?;
+    let kind = data.get("errorKind")?.as_str()?.to_string();
+    Some((
+        message[..at].trim_end_matches(|c: char| c == ':' || c.is_whitespace()),
+        kind,
+    ))
+}
+
+/// A captured rejected-window epoch is the authority on the reset; without one
+/// the reset and window come from the status text (`refine_from_status`).
 pub(crate) fn classify_rate_limit_error(
     err: &agent_client_protocol::Error,
     captured: Option<CapturedReset>,
+    now: chrono::DateTime<chrono::Utc>,
 ) -> Option<RateLimitInfo> {
     let kind = err.data.as_ref()?.get("errorKind")?.as_str()?;
-    (kind == "rate_limit").then(|| RateLimitInfo {
-        status: err.message.clone(),
-        resets_at: captured.as_ref().map(|c| c.resets_at),
-        kind: captured
-            .as_ref()
-            .map_or_else(|| kind.to_string(), |c| c.kind()),
-    })
+    let kind = *ACCOUNT_LIMIT_KINDS.iter().find(|k| **k == kind)?;
+    Some(limit_info(err.message.clone(), kind, captured, now))
 }
 
 /// Fallback for an outer error that kept only the serialized `errorKind`.
 pub(crate) fn classify_rate_limit_from_message(
     message: &str,
     captured: Option<CapturedReset>,
+    now: chrono::DateTime<chrono::Utc>,
 ) -> Option<RateLimitInfo> {
-    let matched = [
-        "\"errorKind\":\"rate_limit\"",
-        "\"errorKind\": \"rate_limit\"",
-    ]
-    .iter()
-    .any(|fingerprint| message.contains(fingerprint));
-    matched.then(|| RateLimitInfo {
-        status: message.to_string(),
-        resets_at: captured.as_ref().map(|c| c.resets_at),
-        kind: captured
-            .as_ref()
-            .map_or_else(|| "rate_limit".to_string(), |c| c.kind()),
-    })
+    let (prose, kind) = flattened_error(message)?;
+    let kind = *ACCOUNT_LIMIT_KINDS.iter().find(|k| **k == kind)?;
+    Some(limit_info(prose.to_string(), kind, captured, now))
+}
+
+fn limit_info(
+    status: String,
+    kind: &str,
+    captured: Option<CapturedReset>,
+    now: chrono::DateTime<chrono::Utc>,
+) -> RateLimitInfo {
+    // A captured window is a quota window's: a billing error keeps its own kind and takes no reset.
+    let captured = captured.filter(|_| kind == "rate_limit");
+    refine_from_status(
+        RateLimitInfo {
+            status,
+            resets_at: captured.as_ref().map(|c| c.resets_at),
+            kind: captured
+                .as_ref()
+                .map_or_else(|| kind.to_string(), |c| c.kind()),
+        },
+        now,
+    )
+}
+
+/// Fills the reset and window a report left out from its status text, e.g.
+/// "You've hit your weekly limit · resets Nov 18, 12am (Europe/Berlin)", read
+/// relative to `now`, the time the limit was seen.
+pub(crate) fn refine_from_status(
+    mut info: RateLimitInfo,
+    now: chrono::DateTime<chrono::Utc>,
+) -> RateLimitInfo {
+    let beyond_five_hours = |reset: chrono::DateTime<chrono::Utc>| {
+        reset.timestamp() - now.timestamp() > FIVE_HOUR_WINDOW_SECS
+    };
+    // A stored status may still carry the serialized error data behind its prose.
+    let prose = flattened_error(&info.status).map_or(info.status.as_str(), |(prose, _)| prose);
+    if info.kind == "rate_limit" {
+        // A captured reset a five-hour window cannot reach keeps the generic kind.
+        let incompatible = status_window(prose) == Some("five_hour")
+            && info.resets_at.is_some_and(beyond_five_hours);
+        if let Some(window) = status_window(prose).filter(|_| !incompatible) {
+            info.kind = window.to_string();
+        }
+    }
+    if info.resets_at.is_none() {
+        info.resets_at = status_reset(prose, now)
+            .filter(|reset| info.kind != "five_hour" || !beyond_five_hours(*reset));
+        if info.resets_at.is_none() && prose.contains("resets ") {
+            tracing::debug!(
+                target: "acp.protocol",
+                status = %prose,
+                "usage-limit status names a reset that could not be read; keeping the timed schedule"
+            );
+        }
+    }
+    info
+}
+
+/// A weekly window is the longest the status text can name; anything further out is misread.
+const MAX_RESET_AHEAD_SECS: i64 = 8 * 24 * 3600;
+
+/// A reset this close behind `now` is a window that just cleared (or a write that lagged the
+/// report), not one that rolls to tomorrow.
+const JUST_ELAPSED_SECS: i64 = 600;
+
+/// The two instants of a repeated local time lie at most this far apart.
+const FOLD_SPAN_SECS: i64 = 2 * 3600;
+
+/// A five-hour window cannot name a reset further out than this.
+pub(crate) const FIVE_HOUR_WINDOW_SECS: i64 = 5 * 3600;
+
+/// The quota window a status line names, as the adapter's `rateLimitType` would.
+fn status_window(status: &str) -> Option<&'static str> {
+    let status = status.to_ascii_lowercase();
+    if status.contains("weekly limit") {
+        Some("seven_day")
+    } else if status.contains("5-hour limit") || status.contains("session limit") {
+        Some("five_hour")
+    } else {
+        None
+    }
+}
+
+/// The next instant matching "resets [Mon D, ]H[:MM]am|pm (Zone)" after `now`,
+/// read in the stated IANA zone. `None` when the text is anything else, when the
+/// reset just passed, or when it lies beyond a weekly window.
+fn status_reset(
+    status: &str,
+    now: chrono::DateTime<chrono::Utc>,
+) -> Option<chrono::DateTime<chrono::Utc>> {
+    let rest = &status[status.rfind("resets ")? + "resets ".len()..];
+    let (when, zone) = rest.split_once(" (")?;
+    let tz = jiff::tz::TimeZone::get(zone.split(')').next()?).ok()?;
+    let (date, clock) = when
+        .split_once(", ")
+        .or_else(|| when.split_once(" at "))
+        .map_or((None, when), |(date, clock)| (Some(date), clock));
+    let (hour, minute) = parse_clock(clock)?;
+    let now = jiff::Timestamp::from_second(now.timestamp()).ok()?;
+    let local_today = now.to_zoned_datetime(tz.clone()).date();
+    let days: Vec<jiff::civil::Date> = match date {
+        // Yesterday only serves the just-elapsed check.
+        None => [
+            local_today.yesterday().ok(),
+            Some(local_today),
+            local_today.tomorrow().ok(),
+        ]
+        .into_iter()
+        .flatten()
+        .collect(),
+        Some(date) => {
+            let (month, day) = parse_month_day(date)?;
+            [
+                local_today.year() - 1,
+                local_today.year(),
+                local_today.year() + 1,
+            ]
+            .into_iter()
+            .filter_map(|year| jiff::civil::Date::new(year, month, day).ok())
+            .collect()
+        }
+    };
+    // A repeated local time (clocks going back) is both of its instants; one the clocks skip
+    // (going forward) never happens.
+    let instants: Vec<jiff::Timestamp> = days
+        .iter()
+        .flat_map(|day| {
+            let at = tz.to_ambiguous_timestamp(day.at(hour, minute, 0, 0));
+            let skipped = matches!(at.offset(), jiff::tz::AmbiguousOffset::Gap { .. });
+            [at.earlier(), at.later()].map(|t| t.ok().filter(|_| !skipped))
+        })
+        .flatten()
+        .collect();
+    let behind = |t: &jiff::Timestamp| now.as_second() - t.as_second();
+    let future = instants.iter().copied().filter(|t| *t > now).min();
+    if let Some(elapsed) = instants
+        .iter()
+        .filter(|t| (0..JUST_ELAPSED_SECS).contains(&behind(t)))
+        .max()
+    {
+        // Only the other instant of a repeated local time can still be ahead of one just gone.
+        let twin = |f: &jiff::Timestamp| f.as_second() - elapsed.as_second() <= FOLD_SPAN_SECS;
+        if !future.as_ref().is_some_and(twin) {
+            return None;
+        }
+    }
+    let reset = future?;
+    (reset.as_second() - now.as_second() <= MAX_RESET_AHEAD_SECS)
+        .then(|| chrono::DateTime::from_timestamp(reset.as_second(), 0))?
+}
+
+/// "6pm", "6:30pm", "12am" as 24-hour `(hour, minute)`.
+fn parse_clock(clock: &str) -> Option<(i8, i8)> {
+    let clock = clock.trim().to_ascii_lowercase();
+    let (digits, pm) = match (clock.strip_suffix("am"), clock.strip_suffix("pm")) {
+        (Some(digits), _) => (digits, false),
+        (_, Some(digits)) => (digits, true),
+        _ => return None,
+    };
+    let (hour, minute) = digits.split_once(':').unwrap_or((digits, "0"));
+    let (hour, minute): (i8, i8) = (hour.parse().ok()?, minute.parse().ok()?);
+    ((1..=12).contains(&hour) && (0..60).contains(&minute))
+        .then_some((hour % 12 + if pm { 12 } else { 0 }, minute))
+}
+
+fn parse_month_day(date: &str) -> Option<(i8, i8)> {
+    const MONTHS: [&str; 12] = [
+        "jan", "feb", "mar", "apr", "may", "jun", "jul", "aug", "sep", "oct", "nov", "dec",
+    ];
+    let (month, day) = date.trim().split_once(' ')?;
+    let month = month.get(..3)?.to_ascii_lowercase();
+    let month = MONTHS.iter().position(|m| *m == month)? as i8 + 1;
+    Some((month, day.trim().parse().ok()?))
 }
 
 /// A stored session ID the agent no longer knows, as opposed to an
@@ -218,6 +398,305 @@ mod tests {
         err
     }
 
+    /// Monday 2026-11-16 10:00 UTC, which is 11:00 in Europe/Berlin.
+    fn now() -> chrono::DateTime<chrono::Utc> {
+        "2026-11-16T10:00:00Z".parse().unwrap()
+    }
+
+    fn utc(s: &str) -> Option<chrono::DateTime<chrono::Utc>> {
+        Some(s.parse().unwrap())
+    }
+
+    /// The reset a status line names, read in the zone it states.
+    #[test]
+    fn status_reset_reads_the_stated_zone() {
+        let weekly = "Internal error: You've hit your weekly limit";
+        let cases = [
+            (format!("{weekly} · resets Nov 18, 12am (Europe/Berlin)"), utc("2026-11-17T23:00:00Z")),
+            (format!("{weekly} · resets 12am (Europe/Berlin)"), utc("2026-11-16T23:00:00Z")),
+            (format!("{weekly} · resets Nov 17, 11pm (UTC)"), utc("2026-11-17T23:00:00Z")),
+            ("You've hit your 5-hour limit · resets 6:30pm (Europe/Berlin)".into(), utc("2026-11-16T17:30:00Z")),
+            ("You've hit your session limit · resets 3pm (Europe/Berlin)".into(), utc("2026-11-16T14:00:00Z")),
+            // A time already past today means tomorrow.
+            ("You've hit your session limit · resets 9:20am (Europe/Berlin)".into(), utc("2026-11-17T08:20:00Z")),
+            // Further out than a weekly window is a misread, not a reset.
+            ("weekly limit · resets Jan 2, 12am (UTC)".into(), None),
+            // Wrapped in a flattened connection error.
+            (
+                format!("ACP connection failed: {weekly} · resets Nov 18, 12am (Europe/Berlin): {{\"errorKind\":\"rate_limit\"}}"),
+                utc("2026-11-17T23:00:00Z"),
+            ),
+            ("usage limit reached".into(), None),
+            ("You've hit your weekly limit".into(), None),
+            ("weekly limit · resets 6pm".into(), None),
+            ("weekly limit · resets 6pm (Mars/Olympus)".into(), None),
+            ("weekly limit · resets 25pm (UTC)".into(), None),
+            ("weekly limit · resets soon (UTC)".into(), None),
+        ];
+        for (status, want) in cases {
+            assert_eq!(status_reset(&status, now()), want, "{status}");
+        }
+    }
+
+    /// Ingestion: the weekly limit arrives as an `errorKind: rate_limit` error with
+    /// no captured epoch, and its reset and window come from the status text.
+    #[test]
+    fn classify_reads_reset_and_window_from_the_status_text() {
+        let limit = json!({ "errorKind": "rate_limit" });
+        let weekly =
+            "Internal error: You've hit your weekly limit · resets Nov 18, 12am (Europe/Berlin)";
+        let info =
+            classify_rate_limit_error(&err(weekly, Some(limit.clone())), None, now()).unwrap();
+        assert_eq!(info.resets_at, utc("2026-11-17T23:00:00Z"));
+        assert_eq!(info.kind, "seven_day");
+
+        for (status, kind) in [
+            (
+                "You've hit your 5-hour limit · resets 6pm (UTC)",
+                "five_hour",
+            ),
+            (
+                "You've hit your session limit · resets 6pm (UTC)",
+                "five_hour",
+            ),
+            ("You've hit your limit", "rate_limit"),
+        ] {
+            let info =
+                classify_rate_limit_error(&err(status, Some(limit.clone())), None, now()).unwrap();
+            assert_eq!(info.kind, kind, "{status}");
+        }
+
+        // A five-hour window cannot reach tomorrow: a stale 9:20am read at 11:00 Berlin is
+        // dropped, while a midnight rollover an hour ahead stands.
+        let five = |status: &str, now: &str| {
+            let now = now.parse().unwrap();
+            classify_rate_limit_error(&err(status, Some(limit.clone())), None, now)
+                .unwrap()
+                .resets_at
+        };
+        assert_eq!(
+            five(
+                "You've hit your session limit · resets 9:20am (Europe/Berlin)",
+                "2026-11-16T10:00:00Z"
+            ),
+            None
+        );
+        assert_eq!(
+            five(
+                "You've hit your 5-hour limit · resets 12:30am (UTC)",
+                "2026-11-16T23:30:00Z"
+            ),
+            utc("2026-11-17T00:30:00Z")
+        );
+
+        // The captured epoch outranks the text, and names the window.
+        let captured = CapturedReset {
+            window: "seven_day_opus".into(),
+            resets_at: utc("2026-11-20T00:00:00Z").unwrap(),
+        };
+        let info =
+            classify_rate_limit_error(&err(weekly, Some(limit)), Some(captured), now()).unwrap();
+        assert_eq!(info.resets_at, utc("2026-11-20T00:00:00Z"));
+        assert_eq!(info.kind, "seven_day_opus");
+
+        // The flattened fallback reads the same text.
+        let flat = format!("ACP connection failed: {weekly}: {{\"errorKind\":\"rate_limit\"}}");
+        let info = classify_rate_limit_from_message(&flat, None, now()).unwrap();
+        assert_eq!(
+            (info.resets_at, info.kind.as_str()),
+            (utc("2026-11-17T23:00:00Z"), "seven_day")
+        );
+    }
+
+    /// Boundaries of the text reader: a year rollover, a just-cleared reset, a repeated
+    /// local hour, and serialized error data trailing the status.
+    #[test]
+    fn status_reset_edges() {
+        let at = |s: &str| -> chrono::DateTime<chrono::Utc> { s.parse().unwrap() };
+        let cases = [
+            // Year rollover within a weekly window.
+            (
+                "limit · resets Jan 2, 12am (UTC)",
+                at("2026-12-30T12:00:00Z"),
+                utc("2027-01-02T00:00:00Z"),
+            ),
+            // A write that lagged the report must not roll the reset a day or a year ahead.
+            ("limit · resets 6pm (UTC)", at("2026-11-18T18:00:30Z"), None),
+            (
+                "limit · resets Nov 18, 6pm (UTC)",
+                at("2026-11-18T18:00:30Z"),
+                None,
+            ),
+            // 1:30am occurs twice on 2024-11-03 (05:30Z, then 06:30Z); the later one is still ahead.
+            (
+                "limit · resets Nov 3, 1:30am (America/New_York)",
+                at("2024-11-03T06:00:00Z"),
+                utc("2024-11-03T06:30:00Z"),
+            ),
+            (
+                "limit · resets Nov 3, 1:30am (America/New_York)",
+                at("2024-11-03T04:00:00Z"),
+                utc("2024-11-03T05:30:00Z"),
+            ),
+            // A clock-only reset that passed on the previous local date is just elapsed too.
+            (
+                "limit · resets 11:59pm (UTC)",
+                at("2026-11-17T00:01:00Z"),
+                None,
+            ),
+            // The earlier 1:30am just passed, the repeated one is still ahead: that one stands.
+            (
+                "limit · resets Nov 3, 1:30am (America/New_York)",
+                at("2024-11-03T05:35:00Z"),
+                utc("2024-11-03T06:30:00Z"),
+            ),
+            // 2:30am does not exist on 2024-03-10 in New York; no instant stands in for it.
+            (
+                "limit · resets Mar 10, 2:30am (America/New_York)",
+                at("2024-03-10T06:00:00Z"),
+                None,
+            ),
+            // Claude Code's `at` form of a dated reset.
+            (
+                "weekly limit · resets Nov 18 at 4pm (America/Toronto)",
+                at("2026-11-16T10:00:00Z"),
+                utc("2026-11-18T21:00:00Z"),
+            ),
+            // Braces in a structured message are part of the status.
+            (
+                "Weekly limit for {account} · resets Nov 18, 12am (UTC)",
+                at("2026-11-16T10:00:00Z"),
+                utc("2026-11-18T00:00:00Z"),
+            ),
+        ];
+        for (status, now, want) in cases {
+            assert_eq!(status_reset(status, now), want, "{status} at {now}");
+        }
+    }
+
+    /// Only the error's own `errorKind` decides; a nested cause cannot turn capacity trouble
+    /// into an account limit.
+    #[test]
+    fn flattened_kind_is_the_top_level_one() {
+        let nested = "ACP connection failed: Internal error: busy: {\"errorKind\":\"overloaded\",\"cause\":{\"errorKind\":\"billing_error\"}}";
+        assert!(classify_rate_limit_from_message(nested, None, now()).is_none());
+        let top = "ACP connection failed: Internal error: low: {\"cause\":{\"errorKind\":\"overloaded\"},\"errorKind\":\"billing_error\"}";
+        assert_eq!(
+            classify_rate_limit_from_message(top, None, now())
+                .unwrap()
+                .kind,
+            "billing_error"
+        );
+        assert!(
+            classify_rate_limit_from_message("{ not json errorKind rate_limit", None, now())
+                .is_none()
+        );
+        // A JSON object in the prose is not the error data behind it.
+        let braced = "ACP connection failed: weekly limit for {\"scope\":\"account\"} · resets Nov 18, 12am (UTC): {\"errorKind\":\"rate_limit\"}";
+        let info = classify_rate_limit_from_message(braced, None, now()).unwrap();
+        assert_eq!(info.kind, "seven_day");
+        assert_eq!(info.resets_at, utc("2026-11-18T00:00:00Z"));
+        assert!(info.status.contains("{\"scope\":\"account\"}"));
+        // ...nor does an `errorKind` in the prose stand in for the data's.
+        let spoofed = "ACP connection failed: odd {\"errorKind\":\"rate_limit\"} text: {\"errorKind\":\"overloaded\"}";
+        assert!(classify_rate_limit_from_message(spoofed, None, now()).is_none());
+        // Serialized data after the status is not status: its fields never read as the reset.
+        let with_detail = "ACP connection failed: weekly limit · resets Nov 18, 12am (UTC): {\"errorKind\":\"rate_limit\",\"detail\":\"quota resets after billing\"}";
+        let info = classify_rate_limit_from_message(with_detail, None, now()).unwrap();
+        assert_eq!(info.resets_at, utc("2026-11-18T00:00:00Z"));
+        assert_eq!(info.kind, "seven_day");
+        // A stored status that still carries its serialized data reads only its prose.
+        let stored = RateLimitInfo {
+            status: "ACP connection failed: weekly limit · resets Nov 18, 12am (UTC): {\"errorKind\":\"rate_limit\",\"detail\":\"Previous window resets Nov 20, 12am (UTC)\"}".into(),
+            resets_at: None,
+            kind: "rate_limit".into(),
+        };
+        assert_eq!(
+            refine_from_status(stored, now()).resets_at,
+            utc("2026-11-18T00:00:00Z")
+        );
+        // A captured reset a five-hour window cannot reach keeps the generic kind.
+        let far = CapturedReset {
+            window: String::new(),
+            resets_at: utc("2026-11-20T10:00:00Z").unwrap(),
+        };
+        let info = classify_rate_limit_error(
+            &err(
+                "You've hit your 5-hour limit · resets 6pm (UTC)",
+                Some(json!({ "errorKind": "rate_limit" })),
+            ),
+            Some(far),
+            now(),
+        )
+        .unwrap();
+        assert_eq!(
+            (info.kind.as_str(), info.resets_at),
+            ("rate_limit", utc("2026-11-20T10:00:00Z"))
+        );
+        // JSON inside the message is not the error's data: the structured error decides.
+        let structured = err(
+            "Limit reached for {\"scope\":\"account\"}",
+            Some(json!({ "errorKind": "rate_limit" })),
+        );
+        assert!(classify_rate_limit_error(&structured, None, now()).is_some());
+        // Data without its own errorKind ends the search; a nested one is never promoted.
+        let cause_only =
+            "ACP connection failed: low: {\"cause\":{\"errorKind\":\"billing_error\"}}";
+        assert!(classify_rate_limit_from_message(cause_only, None, now()).is_none());
+        // A billing error keeps its own kind and takes no captured quota window.
+        let quota = CapturedReset {
+            window: "five_hour".into(),
+            resets_at: utc("2026-11-16T15:00:00Z").unwrap(),
+        };
+        let billing = classify_rate_limit_error(
+            &err("low", Some(json!({ "errorKind": "billing_error" }))),
+            Some(quota),
+            now(),
+        )
+        .unwrap();
+        assert_eq!(
+            (billing.kind.as_str(), billing.resets_at),
+            ("billing_error", None)
+        );
+    }
+
+    /// Account-level limits park; capacity trouble another account would meet too does not.
+    #[test]
+    fn only_account_level_error_kinds_park() {
+        for (kind, parks) in [
+            ("rate_limit", true),
+            ("billing_error", true),
+            ("overloaded", false),
+            ("server_error", false),
+            ("authentication_failed", false),
+            ("invalid_request", false),
+            ("max_output_tokens", false),
+            ("unknown", false),
+        ] {
+            let data = Some(json!({ "errorKind": kind }));
+            let message = format!("boom: {{\"errorKind\":\"{kind}\"}}");
+            let direct =
+                classify_rate_limit_error(&err("Credit balance is too low", data), None, now());
+            let flat = classify_rate_limit_from_message(&message, None, now());
+            assert_eq!((direct.is_some(), flat.is_some()), (parks, parks), "{kind}");
+            if parks {
+                assert_eq!(
+                    direct.unwrap().resets_at,
+                    None,
+                    "{kind}: no reset is invented"
+                );
+            }
+        }
+        let billing = json!({ "errorKind": "billing_error" });
+        let info = classify_rate_limit_error(
+            &err("Credit balance is too low", Some(billing)),
+            None,
+            now(),
+        )
+        .unwrap();
+        assert_eq!(info.kind, "billing_error");
+    }
+
     #[test]
     fn classify_rate_limit_error_cases() {
         let limit = json!({ "errorKind": "rate_limit" });
@@ -228,25 +707,29 @@ mod tests {
         };
 
         // #3152: no captured epoch means an unknown reset, never a guess.
-        let info =
-            classify_rate_limit_error(&err("You've hit your limit", Some(limit.clone())), None)
-                .unwrap();
+        let info = classify_rate_limit_error(
+            &err("You've hit your limit", Some(limit.clone())),
+            None,
+            now(),
+        )
+        .unwrap();
         assert_eq!(info.kind, "rate_limit");
         assert!(info.status.contains("hit your limit"));
         assert_eq!(info.resets_at, None);
 
-        let info = classify_rate_limit_error(&err("limit", Some(limit)), Some(captured)).unwrap();
+        let info =
+            classify_rate_limit_error(&err("limit", Some(limit)), Some(captured), now()).unwrap();
         assert_eq!(info.resets_at, Some(resets_at));
         assert_eq!(info.kind, "seven_day", "the window names the limit");
 
         let with_reset = json!({ "errorKind": "rate_limit", "resets_at": "2099-01-01T00:00:00Z" });
-        let info = classify_rate_limit_error(&err("x", Some(with_reset)), None).unwrap();
+        let info = classify_rate_limit_error(&err("x", Some(with_reset)), None, now()).unwrap();
         assert_eq!(info.resets_at, None);
 
         let internal = json!({ "errorKind": "internal" });
-        assert!(classify_rate_limit_error(&err("closed", Some(internal)), None).is_none());
+        assert!(classify_rate_limit_error(&err("closed", Some(internal)), None, now()).is_none());
         let invalid = agent_client_protocol::Error::invalid_params();
-        assert!(classify_rate_limit_error(&invalid, None).is_none());
+        assert!(classify_rate_limit_error(&invalid, None, now()).is_none());
 
         // The same fingerprint inside a flattened error message.
         let resets_at = chrono::Utc::now() + chrono::Duration::minutes(20);
@@ -259,12 +742,12 @@ mod tests {
                     window: window.into(),
                     resets_at,
                 };
-                let info = classify_rate_limit_from_message(msg, Some(captured)).unwrap();
+                let info = classify_rate_limit_from_message(msg, Some(captured), now()).unwrap();
                 assert_eq!(info.kind, kind);
                 assert_eq!(info.resets_at, Some(resets_at));
             }
         }
-        assert!(classify_rate_limit_from_message("connection refused", None).is_none());
+        assert!(classify_rate_limit_from_message("connection refused", None, now()).is_none());
     }
 
     #[test]

@@ -3494,6 +3494,7 @@ mod tests {
         let park = |info, cap_reached| RateLimitPark {
             info,
             recorded_at_ms: 0,
+            observed_at_ms: 0,
             cap_reached,
             last_resume_attempt_ms: None,
         };

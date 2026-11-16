@@ -294,10 +294,15 @@ pub(crate) async fn reap_rate_limit_resumes(
             continue;
         }
         // A pruned `RateLimit` row has no reset time and follows the unknown-reset schedule.
+        // A stored status that names its reset supplies it, read from when it was recorded.
         let info = park
             .info
             .clone()
             .unwrap_or_else(crate::acp::state::RateLimitInfo::undated);
+        let info = match DateTime::from_timestamp_millis(park.recorded_at_ms) {
+            Some(recorded_at) => crate::acp::acp_client::refine_from_status(info, recorded_at),
+            None => info,
+        };
         let Some(streak) = query_store(
             &state.acp_event_store,
             &id,
@@ -309,17 +314,48 @@ pub(crate) async fn reap_rate_limit_resumes(
             continue;
         };
         // The account table serves the failover alone; with it off the schedule is unchanged.
+        // Whichever of the park's reset and the account's report was observed last stands, so a
+        // correction moves the schedule down as well as up.
         let reported = if failover_settings.enabled {
-            failover::reported_deadline(state, &row, &info).await
+            failover::reported_deadline(state, &row, &info, park.observed_at_ms).await
         } else {
             None
         };
-        let scheduled_at =
-            reported.unwrap_or_else(|| scheduled_resume_at(&info, park.recorded_at_ms, streak));
+        let own = info.resets_at.map(|reset| {
+            rate_limit_resume_at(
+                reset,
+                park.recorded_at_ms,
+                RATE_LIMIT_AUTO_RESUME_GRACE_SECS,
+            )
+        });
+        let reported_at = reported.as_ref().map(|r| r.at);
+        let scheduled_at = match (&reported, own) {
+            (Some(reported), Some(own)) => {
+                // A report of another window may lengthen the park's reset, never shorten it.
+                if reported.observed_at_ms > park.observed_at_ms
+                    && (reported.same_window || reported.at > own)
+                {
+                    reported.at
+                } else {
+                    own
+                }
+            }
+            (Some(reported), None) => reported.at,
+            (None, Some(own)) => own,
+            (None, None) => scheduled_resume_at(&info, park.recorded_at_ms, streak),
+        };
         // A park a swap or resume already touched belongs to the account it ran on then.
         let first_sight = park.last_resume_attempt_ms.is_none();
-        if failover_settings.enabled && first_sight && reported.is_none() {
-            failover::record_limit(state, &row, &info, scheduled_at, park.recorded_at_ms).await;
+        // A newer observation of the deadline the table already holds is still recorded, so a
+        // sibling's older report cannot overwrite it later.
+        let confirms = reported
+            .as_ref()
+            .is_some_and(|r| r.observed_at_ms < park.observed_at_ms);
+        if failover_settings.enabled
+            && first_sight
+            && (reported_at != Some(scheduled_at) || confirms)
+        {
+            failover::record_limit(state, &row, &info, scheduled_at, park.observed_at_ms).await;
         }
         let Some(latest_seq) = query_store(
             &state.acp_event_store,
@@ -1128,7 +1164,8 @@ mod tests {
             &crate::acp::state::RateLimitInfo {
                 resets_at: None,
                 ..weekly
-            }
+            },
+            0
         )
         .await
         .is_none());
@@ -1165,7 +1202,7 @@ mod tests {
             kind: "usage".into(),
         };
         assert_eq!(
-            failover::reported_deadline(&state, &row, &undated).await,
+            failover::reported_deadline(&state, &row, &undated, 0).await,
             None,
             "the non-Claude park inherits no Claude deadline"
         );
@@ -1224,7 +1261,8 @@ mod tests {
     }
 
     /// With every pool account limited there is no target: the park runs the timed
-    /// resume under its budget, and at the cap it still ends in the terminal park.
+    /// resume under its budget, and at the cap it still ends in the terminal park. The pool is
+    /// limited in another window than the park's own, whose reset has passed.
     #[tokio::test]
     #[serial_test::serial]
     async fn an_entirely_limited_pool_keeps_the_redelivery_budget() {
@@ -1239,7 +1277,7 @@ mod tests {
                 state.acp_event_store.record_account_limit(
                     &account_key_of(tool),
                     Utc::now().timestamp_millis() + 3_600_000,
-                    "usage",
+                    "other_window",
                     Utc::now().timestamp_millis(),
                     false,
                 );
@@ -1379,6 +1417,533 @@ mod tests {
     /// park has none. The account's reported deadline, still in force for the same window,
     /// stands in for it: the timed resume waits for it instead of the 1h estimate, and the
     /// estimate never overwrites it.
+    /// A weekly park stored with no `resets_at` still names its reset in the status: the
+    /// resume waits for it, not the 1h estimate, and the account records that window as reported.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn an_undated_weekly_park_waits_for_the_reset_its_status_names() {
+        let id = "sess-failover-weekly-text";
+        let (_home, state, _project, _registry) = failover_session(id, 0).await;
+        let two_hours_ago = (Utc::now() - chrono::Duration::hours(2)).timestamp_millis();
+        let reset = (Utc::now() + chrono::Duration::days(2))
+            .date_naive()
+            .and_hms_opt(0, 0, 0)
+            .unwrap()
+            .and_utc();
+        let status = format!(
+            "Internal error: You've hit your weekly limit · resets {}, 12am (UTC)",
+            reset.format("%b %-d")
+        );
+        let next = state.acp_event_store.highest_seq(id);
+        for (offset, event) in [
+            Event::RateLimit {
+                info: crate::acp::state::RateLimitInfo {
+                    status,
+                    resets_at: None,
+                    kind: "rate_limit".into(),
+                },
+            },
+            Event::Stopped {
+                reason: "rate_limited".into(),
+            },
+        ]
+        .iter()
+        .enumerate()
+        {
+            state
+                .acp_event_store
+                .record_at(id, next + 1 + offset as u64, event, two_hours_ago)
+                .unwrap();
+        }
+        state
+            .acp_supervisor
+            .hydrate_seqs([(id.to_string(), state.acp_event_store.highest_seq(id))]);
+        let now_ms = Utc::now().timestamp_millis();
+        state.acp_event_store.record_account_limit(
+            &account_key_of("claude-b"),
+            now_ms + 3_600_000,
+            "usage",
+            now_ms,
+            false,
+        );
+        let mut attempted: HashSet<String> = [id.to_string()].into();
+
+        let released = reap_rate_limit_resumes(&state, &mut attempted, &HashSet::new()).await;
+
+        assert!(
+            released.is_empty() && attempted.contains(id),
+            "the 1h estimate elapsed an hour ago; the weekly reset is two days out"
+        );
+        let stored = state
+            .acp_event_store
+            .account_state(&account_key_of("claude-a"))
+            .unwrap();
+        let window = stored.window("seven_day").unwrap();
+        assert_eq!(
+            (window.until_ms, window.estimated),
+            (
+                (reset + chrono::Duration::seconds(i64::from(RATE_LIMIT_AUTO_RESUME_GRACE_SECS)))
+                    .timestamp_millis(),
+                false
+            )
+        );
+    }
+
+    /// A later report for the account's window extended the deadline past the one an old
+    /// park's status names: the old text must not release the session early.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn a_status_reset_never_outranks_a_newer_reported_deadline() {
+        let id = "sess-failover-text-vs-report";
+        let (_home, state, _project, _registry) = failover_session(id, 0).await;
+        let recorded = Utc::now() - chrono::Duration::days(3);
+        let named = (recorded + chrono::Duration::days(1))
+            .date_naive()
+            .and_hms_opt(0, 0, 0)
+            .unwrap()
+            .and_utc();
+        let status = format!(
+            "Internal error: You've hit your weekly limit · resets {}, 12am (UTC)",
+            named.format("%b %-d")
+        );
+        let next = state.acp_event_store.highest_seq(id);
+        for (offset, event) in [
+            Event::RateLimit {
+                info: crate::acp::state::RateLimitInfo {
+                    status,
+                    resets_at: None,
+                    kind: "rate_limit".into(),
+                },
+            },
+            Event::Stopped {
+                reason: "rate_limited".into(),
+            },
+        ]
+        .iter()
+        .enumerate()
+        {
+            state
+                .acp_event_store
+                .record_at(
+                    id,
+                    next + 1 + offset as u64,
+                    event,
+                    recorded.timestamp_millis(),
+                )
+                .unwrap();
+        }
+        state
+            .acp_supervisor
+            .hydrate_seqs([(id.to_string(), state.acp_event_store.highest_seq(id))]);
+        let now_ms = Utc::now().timestamp_millis();
+        for tool in ["claude-a", "claude-b"] {
+            state.acp_event_store.record_account_limit(
+                &account_key_of(tool),
+                now_ms + 24 * 3_600_000,
+                "seven_day",
+                now_ms - 1_000,
+                false,
+            );
+        }
+        let mut attempted: HashSet<String> = [id.to_string()].into();
+
+        let released = reap_rate_limit_resumes(&state, &mut attempted, &HashSet::new()).await;
+
+        assert!(
+            released.is_empty() && attempted.contains(id),
+            "the text named a reset two days ago; the account reported one a day from now"
+        );
+    }
+
+    /// A park that already carries a reset (parsed or captured) still yields to a later report
+    /// of the same window on the account, and an unnamed report counts for a named park.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn a_dated_park_yields_to_a_later_reported_deadline() {
+        for (reported_kind, id) in [
+            ("seven_day", "sess-dated-named"),
+            ("rate_limit", "sess-dated-unnamed"),
+        ] {
+            let (_home, state, _project, _registry) = failover_session(id, 0).await;
+            let recorded = Utc::now() - chrono::Duration::hours(2);
+            let next = state.acp_event_store.highest_seq(id);
+            for (offset, event) in [
+                Event::RateLimit {
+                    info: crate::acp::state::RateLimitInfo {
+                        status: "You've hit your weekly limit".into(),
+                        resets_at: Some(Utc::now() - chrono::Duration::hours(1)),
+                        kind: "seven_day".into(),
+                    },
+                },
+                Event::Stopped {
+                    reason: "rate_limited".into(),
+                },
+            ]
+            .iter()
+            .enumerate()
+            {
+                state
+                    .acp_event_store
+                    .record_at(
+                        id,
+                        next + 1 + offset as u64,
+                        event,
+                        recorded.timestamp_millis(),
+                    )
+                    .unwrap();
+            }
+            state
+                .acp_supervisor
+                .hydrate_seqs([(id.to_string(), state.acp_event_store.highest_seq(id))]);
+            let now_ms = Utc::now().timestamp_millis();
+            for tool in ["claude-a", "claude-b"] {
+                state.acp_event_store.record_account_limit(
+                    &account_key_of(tool),
+                    now_ms + 24 * 3_600_000,
+                    reported_kind,
+                    now_ms - 1_000,
+                    false,
+                );
+            }
+            let mut attempted: HashSet<String> = [id.to_string()].into();
+
+            let released = reap_rate_limit_resumes(&state, &mut attempted, &HashSet::new()).await;
+
+            assert!(
+                released.is_empty() && attempted.contains(id),
+                "{reported_kind}: the park's own reset passed an hour ago, the account's runs a day more"
+            );
+        }
+    }
+
+    /// Of a dated park and the account's report for its window, the one observed last stands,
+    /// whichever way it moves the deadline.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn the_later_observation_of_a_window_wins_in_both_directions() {
+        const HOUR_MS: i64 = 3_600_000;
+        // (id, park reset, report deadline, report observed, session is released)
+        // All offsets are in hours from now; the park was recorded two hours ago.
+        for (id, park_reset, report_until, report_observed, released) in [
+            ("sess-obs-report-extends", 10, 24, -1, false),
+            ("sess-obs-report-corrects-down", 10, -1, -1, true),
+            ("sess-obs-park-corrects-down", -1, 24, -3, true),
+            ("sess-obs-park-corrects-up", 10, 1, -3, false),
+        ] {
+            let (_home, state, _project, _registry) = failover_session(id, 0).await;
+            let recorded = Utc::now() - chrono::Duration::hours(2);
+            let next = state.acp_event_store.highest_seq(id);
+            for (offset, event) in [
+                Event::RateLimit {
+                    info: crate::acp::state::RateLimitInfo {
+                        status: "You've hit your weekly limit".into(),
+                        resets_at: Some(Utc::now() + chrono::Duration::hours(park_reset)),
+                        kind: "seven_day".into(),
+                    },
+                },
+                Event::Stopped {
+                    reason: "rate_limited".into(),
+                },
+            ]
+            .iter()
+            .enumerate()
+            {
+                state
+                    .acp_event_store
+                    .record_at(
+                        id,
+                        next + 1 + offset as u64,
+                        event,
+                        recorded.timestamp_millis(),
+                    )
+                    .unwrap();
+            }
+            state
+                .acp_supervisor
+                .hydrate_seqs([(id.to_string(), state.acp_event_store.highest_seq(id))]);
+            let now_ms = Utc::now().timestamp_millis();
+            state.acp_event_store.record_account_limit(
+                &account_key_of("claude-a"),
+                now_ms + report_until * HOUR_MS,
+                "seven_day",
+                now_ms + report_observed * HOUR_MS,
+                false,
+            );
+            // The other account stays limited in another window, so no failover takes the park.
+            state.acp_event_store.record_account_limit(
+                &account_key_of("claude-b"),
+                now_ms + 24 * HOUR_MS,
+                "other_window",
+                now_ms,
+                false,
+            );
+            let mut attempted: HashSet<String> = [id.to_string()].into();
+
+            let got = reap_rate_limit_resumes(&state, &mut attempted, &HashSet::new()).await;
+
+            assert_eq!(got.contains(id), released, "{id}");
+        }
+    }
+
+    /// A newer window-less report may only lengthen a named park's explicit reset: it can
+    /// describe another window of the account, so it never ends the park sooner.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn an_unnamed_report_never_shortens_a_named_explicit_reset() {
+        const HOUR_MS: i64 = 3_600_000;
+        // (id, report deadline in hours from now, session is released)
+        for (id, report_until, released) in [
+            ("sess-unnamed-shorter", -1, false),
+            ("sess-unnamed-longer", 24, false),
+        ] {
+            let (_home, state, _project, _registry) = failover_session(id, 0).await;
+            let recorded = Utc::now() - chrono::Duration::hours(2);
+            let next = state.acp_event_store.highest_seq(id);
+            for (offset, event) in [
+                Event::RateLimit {
+                    info: crate::acp::state::RateLimitInfo {
+                        status: "You've hit your weekly limit".into(),
+                        resets_at: Some(Utc::now() + chrono::Duration::hours(10)),
+                        kind: "seven_day".into(),
+                    },
+                },
+                Event::Stopped {
+                    reason: "rate_limited".into(),
+                },
+            ]
+            .iter()
+            .enumerate()
+            {
+                state
+                    .acp_event_store
+                    .record_at(
+                        id,
+                        next + 1 + offset as u64,
+                        event,
+                        recorded.timestamp_millis(),
+                    )
+                    .unwrap();
+            }
+            state
+                .acp_supervisor
+                .hydrate_seqs([(id.to_string(), state.acp_event_store.highest_seq(id))]);
+            let now_ms = Utc::now().timestamp_millis();
+            state.acp_event_store.record_account_limit(
+                &account_key_of("claude-a"),
+                now_ms + report_until * HOUR_MS,
+                "rate_limit",
+                now_ms - 1_000,
+                false,
+            );
+            state.acp_event_store.record_account_limit(
+                &account_key_of("claude-b"),
+                now_ms + 24 * HOUR_MS,
+                "other_window",
+                now_ms,
+                false,
+            );
+            let mut attempted: HashSet<String> = [id.to_string()].into();
+
+            let got = reap_rate_limit_resumes(&state, &mut attempted, &HashSet::new()).await;
+
+            assert_eq!(got.contains(id), released, "{id}");
+        }
+    }
+
+    /// A rejection that inherited its reset repeats it in a newer event; the reset was still
+    /// observed when it first appeared, so a correction another session recorded in between
+    /// stands, and the later event never overwrites it.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn an_inherited_reset_keeps_its_original_observation_time() {
+        const HOUR_MS: i64 = 3_600_000;
+        let id = "sess-obs-inherited";
+        let (_home, state, _project, _registry) = failover_session(id, 0).await;
+        let now_ms = Utc::now().timestamp_millis();
+        let reset = Utc::now() + chrono::Duration::hours(10);
+        let next = state.acp_event_store.highest_seq(id);
+        let limit = Event::RateLimit {
+            info: crate::acp::state::RateLimitInfo {
+                status: "You've hit your weekly limit".into(),
+                resets_at: Some(reset),
+                kind: "seven_day".into(),
+            },
+        };
+        let stopped = Event::Stopped {
+            reason: "rate_limited".into(),
+        };
+        // Report four hours ago; a later rejection inherited it, carrying that time.
+        let store = &state.acp_event_store;
+        store
+            .record_at(id, next + 1, &limit, now_ms - 4 * HOUR_MS)
+            .unwrap();
+        store
+            .record_inherited_rate_limit(id, next + 2, &limit, now_ms - 4 * HOUR_MS)
+            .unwrap();
+        store
+            .record_at(id, next + 3, &stopped, now_ms - HOUR_MS)
+            .unwrap();
+        state
+            .acp_supervisor
+            .hydrate_seqs([(id.to_string(), state.acp_event_store.highest_seq(id))]);
+        // Another session corrected the window two hours ago: it has already cleared.
+        state.acp_event_store.record_account_limit(
+            &account_key_of("claude-a"),
+            now_ms - HOUR_MS,
+            "seven_day",
+            now_ms - 2 * HOUR_MS,
+            false,
+        );
+        state.acp_event_store.record_account_limit(
+            &account_key_of("claude-b"),
+            now_ms + 24 * HOUR_MS,
+            "other_window",
+            now_ms,
+            false,
+        );
+        let mut attempted: HashSet<String> = [id.to_string()].into();
+
+        let released = reap_rate_limit_resumes(&state, &mut attempted, &HashSet::new()).await;
+
+        assert!(
+            released.contains(id),
+            "the correction is newer than the reset's first observation"
+        );
+        let stored = state
+            .acp_event_store
+            .account_state(&account_key_of("claude-a"))
+            .unwrap();
+        assert_eq!(
+            stored.window("seven_day").unwrap().until_ms,
+            now_ms - HOUR_MS,
+            "the inherited copy must not overwrite the correction"
+        );
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn a_direct_report_repeating_a_reset_is_observed_when_it_is_repeated() {
+        const HOUR_MS: i64 = 3_600_000;
+        let id = "sess-obs-reported-again";
+        let (_home, state, _project, _registry) = failover_session(id, 0).await;
+        let now_ms = Utc::now().timestamp_millis();
+        let reset = Utc::now() + chrono::Duration::hours(10);
+        let limit = Event::RateLimit {
+            info: crate::acp::state::RateLimitInfo {
+                status: "You've hit your weekly limit".into(),
+                resets_at: Some(reset),
+                kind: "seven_day".into(),
+            },
+        };
+        let stopped = Event::Stopped {
+            reason: "rate_limited".into(),
+        };
+        // This session reports the reset, a sibling on the account corrects it, then this
+        // session reports the same reset again: its history reads A, A, but the second is a
+        // fresh observation, newer than the correction.
+        let store = &state.acp_event_store;
+        let next = store.highest_seq(id);
+        store
+            .record_at(id, next + 1, &limit, now_ms - 4 * HOUR_MS)
+            .unwrap();
+        store
+            .record_at(id, next + 2, &limit, now_ms - HOUR_MS)
+            .unwrap();
+        store
+            .record_at(id, next + 3, &stopped, now_ms - HOUR_MS)
+            .unwrap();
+        state
+            .acp_supervisor
+            .hydrate_seqs([(id.to_string(), store.highest_seq(id))]);
+        store.record_account_limit(
+            &account_key_of("claude-a"),
+            now_ms - HOUR_MS,
+            "seven_day",
+            now_ms - 2 * HOUR_MS,
+            false,
+        );
+        store.record_account_limit(
+            &account_key_of("claude-b"),
+            now_ms + 24 * HOUR_MS,
+            "other_window",
+            now_ms,
+            false,
+        );
+        let mut attempted: HashSet<String> = [id.to_string()].into();
+
+        let released = reap_rate_limit_resumes(&state, &mut attempted, &HashSet::new()).await;
+
+        assert!(
+            !released.contains(id),
+            "the fresh report outranks the older correction"
+        );
+        let stored = store.account_state(&account_key_of("claude-a")).unwrap();
+        assert!(
+            stored.window("seven_day").unwrap().until_ms > now_ms + 9 * HOUR_MS,
+            "the correction must not wake the session early"
+        );
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn a_newer_confirmation_of_the_same_deadline_is_recorded() {
+        const HOUR_MS: i64 = 3_600_000;
+        let id = "sess-obs-confirmed";
+        let (_home, state, _project, _registry) = failover_session(id, 0).await;
+        let now_ms = Utc::now().timestamp_millis();
+        let reset = DateTime::from_timestamp_millis(now_ms + 10 * HOUR_MS).unwrap();
+        let deadline_ms =
+            now_ms + 10 * HOUR_MS + i64::from(RATE_LIMIT_AUTO_RESUME_GRACE_SECS) * 1000;
+        let store = &state.acp_event_store;
+        let next = store.highest_seq(id);
+        let limit = Event::RateLimit {
+            info: crate::acp::state::RateLimitInfo {
+                status: "You've hit your weekly limit".into(),
+                resets_at: Some(reset),
+                kind: "seven_day".into(),
+            },
+        };
+        let stopped = Event::Stopped {
+            reason: "rate_limited".into(),
+        };
+        // The session confirms, an hour ago, the deadline the table already holds from a
+        // report four hours old.
+        store
+            .record_at(id, next + 1, &limit, now_ms - HOUR_MS)
+            .unwrap();
+        store
+            .record_at(id, next + 2, &stopped, now_ms - HOUR_MS)
+            .unwrap();
+        state
+            .acp_supervisor
+            .hydrate_seqs([(id.to_string(), store.highest_seq(id))]);
+        let key = account_key_of("claude-a");
+        store.record_account_limit(&key, deadline_ms, "seven_day", now_ms - 4 * HOUR_MS, false);
+        store.record_account_limit(
+            &account_key_of("claude-b"),
+            now_ms + 24 * HOUR_MS,
+            "other_window",
+            now_ms,
+            false,
+        );
+        let mut attempted: HashSet<String> = [id.to_string()].into();
+
+        reap_rate_limit_resumes(&state, &mut attempted, &HashSet::new()).await;
+
+        // A sibling's delayed report, observed between the two, must not override it.
+        store.record_account_limit(
+            &key,
+            now_ms - HOUR_MS,
+            "seven_day",
+            now_ms - 2 * HOUR_MS,
+            false,
+        );
+        let stored = store.account_state(&key).unwrap();
+        let window = stored.window("seven_day").unwrap();
+        assert_eq!(window.until_ms, deadline_ms);
+        assert_eq!(window.observed_at_ms, now_ms - HOUR_MS);
+    }
+
     #[tokio::test]
     #[serial_test::serial]
     async fn an_undated_park_uses_the_accounts_reported_deadline() {

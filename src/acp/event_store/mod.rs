@@ -236,6 +236,33 @@ impl EventStore {
     pub fn record(&self, session_id: &str, seq: u64, event: &Event) -> Result<()> {
         let json = serde_json::to_string(event)
             .with_context(|| format!("serialise event for {session_id}@{seq}"))?;
+        self.record_json(session_id, seq, event, json)
+    }
+
+    /// Append a `RateLimit` whose reset was copied from an earlier event, stamped with when that
+    /// reset was originally reported. Only an inherited reset carries the stamp; any other
+    /// `RateLimit` is observed when it is recorded.
+    pub fn record_inherited_rate_limit(
+        &self,
+        session_id: &str,
+        seq: u64,
+        event: &Event,
+        observed_at_ms: i64,
+    ) -> Result<()> {
+        let mut value = serde_json::to_value(event)
+            .with_context(|| format!("serialise event for {session_id}@{seq}"))?;
+        value
+            .get_mut("RateLimit")
+            .and_then(serde_json::Value::as_object_mut)
+            .context("inherited reset on an event that is not a RateLimit")?
+            .insert(
+                rate_limit::INHERITED_OBSERVATION_KEY.into(),
+                observed_at_ms.into(),
+            );
+        self.record_json(session_id, seq, event, value.to_string())
+    }
+
+    fn record_json(&self, session_id: &str, seq: u64, event: &Event, json: String) -> Result<()> {
         let now_ms = chrono::Utc::now().timestamp_millis();
         let mut conn = self.conn();
         let tx = conn.transaction()?;

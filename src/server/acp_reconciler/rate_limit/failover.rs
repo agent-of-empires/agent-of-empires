@@ -14,6 +14,7 @@ use std::time::{Duration, Instant};
 use chrono::{DateTime, Utc};
 use tokio::sync::Semaphore;
 
+use crate::acp::acp_client::FIVE_HOUR_WINDOW_SECS;
 use crate::acp::event_store::AccountState;
 #[cfg(test)]
 use crate::acp::event_store::WindowLimit;
@@ -248,31 +249,87 @@ pub(super) async fn record_limit(
     .await;
 }
 
-/// The deadline already reported for the session's account and this park's window, when the
-/// park itself carries none: a session that started after the reset was announced never saw it.
-/// Only a reported (not estimated) deadline still in the future counts.
+/// A deadline the account table holds for a park's window, and when that report was observed.
+#[derive(Debug, PartialEq, Eq)]
+pub(super) struct ReportedDeadline {
+    pub(super) at: DateTime<Utc>,
+    pub(super) observed_at_ms: i64,
+    /// The report names the park's own window, so it may also end it sooner than the park's
+    /// explicit reset; a window-less report only extends it.
+    pub(super) same_window: bool,
+}
+
+/// The deadline already reported for the session's account and this park's window: a session that
+/// started after the reset was announced never saw it, and a report observed after the park
+/// supersedes the reset the park carries. Only a reported (not estimated) deadline counts; a
+/// park without a reset of its own needs one still in the future, or one observed since the park.
 pub(super) async fn reported_deadline(
     state: &Arc<AppState>,
     row: &Instance,
     info: &RateLimitInfo,
-) -> Option<DateTime<Utc>> {
-    if info.resets_at.is_some() {
-        return None;
-    }
+    park_observed_at_ms: i64,
+) -> Option<ReportedDeadline> {
     let key = observed_account_key(state, row).await?;
     let store = Arc::clone(&state.acp_event_store);
     let account = tokio::task::spawn_blocking(move || store.account_state(&key))
         .await
         .ok()
         .flatten()?;
-    in_force_deadline(&account, &info.kind, Utc::now().timestamp_millis())
+    reported_window_deadline(
+        &account,
+        &info.kind,
+        info.resets_at.is_none(),
+        Utc::now().timestamp_millis(),
+        park_observed_at_ms,
+    )
 }
 
-fn in_force_deadline(account: &AccountState, kind: &str, now_ms: i64) -> Option<DateTime<Utc>> {
-    let window = account.window(kind)?;
-    (!window.estimated && window.until_ms > now_ms)
-        .then(|| DateTime::from_timestamp_millis(window.until_ms))
-        .flatten()
+/// The deadline reported for window `kind`. A window-less report (`rate_limit`) is compatible with
+/// every window, so a named lookup also sees it, unless it lies beyond what a five-hour window can
+/// reach. A window-less lookup with no reset of its own takes the latest in-force deadline of all;
+/// any other lookup takes the most recently observed report, so a named window follows its newest
+/// correction. Two named windows never share a deadline. A lookup with no reset of its own also
+/// sees a deadline that has passed when it was observed since the park, so the correction that
+/// decides the wake is still chosen at its deadline.
+fn reported_window_deadline(
+    account: &AccountState,
+    kind: &str,
+    any_window: bool,
+    now_ms: i64,
+    park_observed_at_ms: i64,
+) -> Option<ReportedDeadline> {
+    let matching = account
+        .windows
+        .iter()
+        .filter(|w| {
+            !w.estimated
+                && (!any_window || w.until_ms > now_ms || w.observed_at_ms >= park_observed_at_ms)
+        })
+        .filter(|w| {
+            // A billing deadline is its own: it matches by exact kind only, both ways.
+            if kind == "billing_error" || w.kind == "billing_error" {
+                return w.kind == kind;
+            }
+            // `until_ms` is the scheduled wake, the reset plus grace: reach is the raw reset's.
+            let grace_ms = i64::from(super::RATE_LIMIT_AUTO_RESUME_GRACE_SECS) * 1000;
+            let unreachable = kind == "five_hour"
+                && w.kind == "rate_limit"
+                && w.until_ms - grace_ms - w.observed_at_ms > FIVE_HOUR_WINDOW_SECS * 1000;
+            !unreachable
+                && (w.kind == kind
+                    || w.kind == "rate_limit"
+                    || (any_window && kind == "rate_limit"))
+        });
+    let window = if any_window && kind == "rate_limit" {
+        matching.max_by_key(|w| w.until_ms)?
+    } else {
+        matching.max_by_key(|w| (w.observed_at_ms, w.until_ms))?
+    };
+    Some(ReportedDeadline {
+        at: DateTime::from_timestamp_millis(window.until_ms)?,
+        observed_at_ms: window.observed_at_ms,
+        same_window: window.kind == kind,
+    })
 }
 
 /// Marks the session's current account unusable when its newest startup error is a failed login.
@@ -600,6 +657,7 @@ mod tests {
                 kind: "usage".into(),
                 until_ms: limited_until_ms,
                 estimated: false,
+                observed_at_ms: 0,
             }],
             unusable_until_ms,
         }
@@ -836,34 +894,226 @@ mod tests {
     }
 
     #[test]
+    fn an_undated_named_window_follows_its_latest_observation() {
+        let window = |kind: &str, until_ms, observed_at_ms| WindowLimit {
+            kind: kind.into(),
+            until_ms,
+            estimated: false,
+            observed_at_ms,
+        };
+        let lookup = |windows: Vec<WindowLimit>, kind, any_window| {
+            let account = AccountState {
+                windows,
+                unusable_until_ms: 0,
+            };
+            reported_window_deadline(&account, kind, any_window, 1_000, 0)
+                .map(|d| (d.at.timestamp_millis(), d.observed_at_ms))
+        };
+        // The generic report is older but reaches further, or newer but ends sooner: a named
+        // window follows the later observation either way.
+        for (generic, weekly) in [
+            ((20_000, 100), (10_000, 200)),
+            ((5_000, 300), (10_000, 200)),
+            ((20_000, 300), (10_000, 200)),
+        ] {
+            let windows = vec![
+                window("rate_limit", generic.0, generic.1),
+                window("seven_day", weekly.0, weekly.1),
+            ];
+            let latest = if generic.1 > weekly.1 {
+                generic
+            } else {
+                weekly
+            };
+            assert_eq!(
+                lookup(windows.clone(), "seven_day", true),
+                Some(latest),
+                "undated weekly park, generic {generic:?} weekly {weekly:?}"
+            );
+            assert_eq!(
+                lookup(windows.clone(), "seven_day", false),
+                Some(latest),
+                "dated weekly park"
+            );
+            // Only a window-less undated park takes the longest deadline of all.
+            assert_eq!(
+                lookup(windows, "rate_limit", true),
+                Some((
+                    generic.0.max(weekly.0),
+                    if generic.0 >= weekly.0 {
+                        generic.1
+                    } else {
+                        weekly.1
+                    }
+                )),
+                "undated generic park"
+            );
+        }
+    }
+
+    /// A weekly correction observed since the park keeps deciding the wake at and after its own
+    /// deadline: an older generic report that reaches further never takes over. A report observed
+    /// before the park is still dropped once it has elapsed.
+    #[test]
+    fn a_correction_observed_since_the_park_decides_through_its_deadline() {
+        let window = |kind: &str, until_ms, observed_at_ms| WindowLimit {
+            kind: kind.into(),
+            until_ms,
+            estimated: false,
+            observed_at_ms,
+        };
+        let account = AccountState {
+            windows: vec![
+                window("rate_limit", 50_000, 100),
+                window("seven_day", 10_000, 300),
+            ],
+            unusable_until_ms: 0,
+        };
+        let park_observed = 200;
+        // Just before the corrected reset, at it, and after it.
+        for now_ms in [9_999, 10_000, 10_001] {
+            let got = reported_window_deadline(&account, "seven_day", true, now_ms, park_observed)
+                .map(|d| d.at.timestamp_millis());
+            assert_eq!(got, Some(10_000), "now {now_ms}");
+        }
+        let stale = AccountState {
+            windows: vec![window("seven_day", 10_000, 100)],
+            unusable_until_ms: 0,
+        };
+        assert_eq!(
+            reported_window_deadline(&stale, "seven_day", true, 10_000, park_observed),
+            None,
+            "elapsed and observed before the park"
+        );
+    }
+
+    #[test]
     fn only_a_reported_deadline_in_force_for_the_same_window_stands_in() {
         let reported = |until_ms, kind: &str, estimated| AccountState {
             windows: vec![WindowLimit {
                 kind: kind.into(),
                 until_ms,
                 estimated,
+                observed_at_ms: 0,
             }],
             unusable_until_ms: 0,
         };
-        let at = |account: AccountState, kind| in_force_deadline(&account, kind, 1_000);
+        let at = |account: AccountState, kind, any_window| {
+            reported_window_deadline(&account, kind, any_window, 1_000, i64::MAX)
+                .map(|d| d.at.timestamp_millis())
+        };
         assert_eq!(
-            at(reported(5_000, "usage", false), "usage").map(|d| d.timestamp_millis()),
+            at(reported(5_000, "usage", false), "usage", false),
             Some(5_000)
         );
         assert_eq!(
-            at(reported(5_000, "weekly", false), "usage"),
+            at(reported(5_000, "weekly", false), "usage", false),
             None,
             "another window"
         );
         assert_eq!(
-            at(reported(5_000, "usage", true), "usage"),
+            at(reported(5_000, "usage", true), "usage", false),
             None,
             "a guess is no deadline"
         );
         assert_eq!(
-            at(reported(1_000, "usage", false), "usage"),
+            at(reported(1_000, "usage", false), "usage", true),
             None,
-            "already elapsed"
+            "already elapsed, for a park with no reset of its own"
+        );
+        assert_eq!(
+            at(reported(1_000, "usage", false), "usage", false),
+            Some(1_000),
+            "a dated park still sees a correction that has elapsed"
+        );
+        let generic_multi_day = 1_000 + 6 * 3600 * 1000;
+        assert_eq!(
+            at(
+                reported(generic_multi_day, "rate_limit", false),
+                "five_hour",
+                false
+            ),
+            None,
+            "an unnamed deadline a five-hour window cannot reach is not its"
+        );
+        // The reach is fixed by when the report was observed: a later pass, within five hours
+        // of the deadline, still does not take it for a five-hour window's.
+        for now_ms in [1_000, generic_multi_day - 3_600_000] {
+            assert!(
+                reported_window_deadline(
+                    &reported(generic_multi_day, "rate_limit", false),
+                    "five_hour",
+                    false,
+                    now_ms,
+                    i64::MAX
+                )
+                .is_none(),
+                "pass at {now_ms}"
+            );
+        }
+        // The stored deadline is the raw reset plus the wake grace; the bound is on the reset.
+        let grace_ms = i64::from(super::super::RATE_LIMIT_AUTO_RESUME_GRACE_SECS) * 1000;
+        let five_hours_ms = FIVE_HOUR_WINDOW_SECS * 1000;
+        assert_eq!(
+            at(
+                reported(five_hours_ms + grace_ms, "rate_limit", false),
+                "five_hour",
+                false
+            ),
+            Some(five_hours_ms + grace_ms),
+            "a reset exactly five hours out is reachable"
+        );
+        assert_eq!(
+            at(
+                reported(five_hours_ms + grace_ms + 1_000, "rate_limit", false),
+                "five_hour",
+                false
+            ),
+            None,
+            "a reset one second past five hours is not"
+        );
+        assert_eq!(
+            at(
+                reported(generic_multi_day, "rate_limit", false),
+                "seven_day",
+                false
+            ),
+            Some(generic_multi_day)
+        );
+        assert_eq!(
+            at(reported(5_000, "seven_day", false), "rate_limit", true),
+            Some(5_000),
+            "a window-less report without a reset of its own takes the account's reported one"
+        );
+        assert_eq!(
+            at(reported(5_000, "seven_day", false), "rate_limit", false),
+            None,
+            "a window-less report with its own reset stays apart from a named window"
+        );
+        assert_eq!(
+            at(reported(5_000, "rate_limit", false), "seven_day", false),
+            Some(5_000),
+            "a window-less deadline is compatible with a later named report"
+        );
+        for (stored, lookup, any_window) in [
+            ("rate_limit", "billing_error", true),
+            ("seven_day", "billing_error", true),
+            ("billing_error", "rate_limit", true),
+            ("billing_error", "seven_day", false),
+        ] {
+            assert_eq!(
+                at(reported(5_000, stored, false), lookup, any_window),
+                None,
+                "billing and quota deadlines stay apart: {stored} vs {lookup}"
+            );
+        }
+        assert_eq!(
+            at(
+                reported(5_000, "billing_error", false),
+                "billing_error",
+                true
+            ),
+            Some(5_000)
         );
     }
 
