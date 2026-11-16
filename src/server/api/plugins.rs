@@ -2567,9 +2567,8 @@ id = "voice"
         let app = crate::server::test_support::build_router_for_test(state);
         let get =
             |cookie: Option<String>| {
-                let mut req = axum::http::Request::get("/plugin-icons/acme.logo")
-                    .header("host", "127.0.0.1")
-                    .header("sec-fetch-dest", "image");
+                let mut req =
+                    axum::http::Request::get("/plugin-icons/acme.logo").header("host", "127.0.0.1");
                 if let Some(cookie) = cookie {
                     req = req.header("cookie", cookie);
                 }

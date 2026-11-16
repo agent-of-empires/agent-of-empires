@@ -1402,14 +1402,20 @@ mod tests {
                 matches!(shell, StatusCode::OK | StatusCode::NOT_FOUND),
                 "{token:?}: {shell}"
             );
-            // The handler's own 404 for an unknown plugin, not the wall's 401.
-            assert_eq!(
-                get("/plugin-icons/absent.plugin", Some(&cookie)).await,
-                StatusCode::NOT_FOUND,
-                "{token:?}"
-            );
+            // The handler's own 404 for an unknown plugin, not the wall's 401: the session
+            // alone suffices, with or without the token.
+            let session_only = format!("aoe_session={session_id}");
+            for with_session in [&cookie, &session_only] {
+                assert_eq!(
+                    get("/plugin-icons/absent.plugin", Some(with_session)).await,
+                    StatusCode::NOT_FOUND,
+                    "{token:?} {with_session}"
+                );
+            }
             let token_only = token.map(|t| format!("aoe_token={t}"));
-            for anonymous in [None, token_only.as_deref()] {
+            let mut anonymous = vec![None];
+            anonymous.extend(token_only.as_deref().map(Some));
+            for anonymous in anonymous {
                 assert_eq!(
                     get("/plugin-icons/absent.plugin", anonymous).await,
                     StatusCode::UNAUTHORIZED,
