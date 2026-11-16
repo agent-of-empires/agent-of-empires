@@ -13,8 +13,6 @@ fn render(view: &mut HomeView, width: u16) -> Buffer {
                 Rect::new(4, 2, width, 32),
                 &load_theme("empire"),
                 None,
-                None,
-                None,
             );
         })
         .unwrap();

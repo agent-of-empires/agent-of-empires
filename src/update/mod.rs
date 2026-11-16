@@ -44,7 +44,7 @@ fn is_nightly(version: &str) -> bool {
     version.contains("-nightly.")
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct UpdateInfo {
     pub available: bool,
     pub current_version: String,

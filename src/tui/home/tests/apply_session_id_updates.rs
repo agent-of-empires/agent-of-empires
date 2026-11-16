@@ -160,7 +160,7 @@ fn settings_mouse_discard_reverts_theme_preview() {
     terminal
         .draw(|f| {
             let area = f.area();
-            view.render(f, area, &theme, None, None, None);
+            view.render(f, area, &theme, None);
         })
         .unwrap();
 

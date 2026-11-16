@@ -12,6 +12,7 @@ use std::path::PathBuf;
 use std::process::Stdio;
 use std::time::Duration;
 
+use super::home::update_bar::UpdateBar;
 use super::home::{bindings, HomeView, TerminalMode};
 use super::styles::Theme;
 use crate::containers::image_update::ImageUpdate;
@@ -1588,29 +1589,18 @@ impl App {
 
     fn render(&mut self, frame: &mut Frame) {
         let start = std::time::Instant::now();
-        if self.update_status.as_ref().is_some_and(|s| s.is_expired()) {
-            self.update_status = None;
-        }
-        let store_move_line = self.home.store_move_status_line();
-        let status_text = self
-            .update_status
-            .as_ref()
-            .map(|s| s.text.as_str())
-            .or(store_move_line.as_deref());
-        // Hidden while its own pull runs, so it can't re-render under the toast.
-        let image_update = self
-            .image_banner_active()
-            .then_some(self.image_update.as_ref());
+        self.clear_expired_status();
+        let live = self.home.store_move_status_line();
+        let bar = UpdateBar::pick(
+            self.update_status.as_ref().map(|s| s.text.as_str()),
+            live.as_deref(),
+            self.update_info.as_ref(),
+            self.image_update.as_ref(),
+            self.image_pull_rx.is_some(),
+        );
         // Reset so a frame that skips the preview path reports zero.
         self.home.preview_timings = Default::default();
-        self.home.render(
-            frame,
-            frame.area(),
-            &self.theme,
-            self.update_info.as_ref(),
-            status_text,
-            image_update.flatten(),
-        );
+        self.home.render(frame, frame.area(), &self.theme, bar);
         // Sampled: only frames over the 16ms budget and live-send frames.
         let elapsed = start.elapsed();
         let in_live = self.home.live_send.is_some();
@@ -1716,15 +1706,60 @@ impl App {
         self.home.instances().any(|i| i.is_sandboxed())
     }
 
-    /// The image banner has the lowest priority and stays hidden while its own
-    /// pull runs, so `u` can't re-arm into a no-op.
-    fn image_banner_active(&self) -> bool {
-        should_show_image_banner(
-            self.image_update.is_some(),
-            self.update_info.is_some(),
-            self.update_status.is_some(),
+    fn clear_expired_status(&mut self) {
+        if self.update_status.as_ref().is_some_and(|s| s.is_expired()) {
+            self.update_status = None;
+        }
+    }
+
+    /// Ctrl+X on the update bar: acts on the line on screen and returns whether one was.
+    /// The live sandbox line has nothing to dismiss, so the key is spent without effect.
+    fn dismiss_update_bar(&mut self) -> bool {
+        self.clear_expired_status();
+        let live = self.home.store_move_status_line();
+        match UpdateBar::pick(
+            self.update_status.as_ref().map(|s| s.text.as_str()),
+            live.as_deref(),
+            self.update_info.as_ref(),
+            self.image_update.as_ref(),
             self.image_pull_rx.is_some(),
-        )
+        ) {
+            None => return false,
+            Some(UpdateBar::Live(_)) => {}
+            // A pull keeps running and reports its outcome as a new status.
+            Some(UpdateBar::Status(_)) => self.update_status = None,
+            Some(UpdateBar::AppUpdate(info)) => {
+                let v = info.latest_version.clone();
+                self.dismissed_update_version = Some(v.clone());
+                persist_dismissed_update_version(Some(v));
+                self.update_info = None;
+            }
+            Some(UpdateBar::ImageUpdate(update)) => {
+                let digest = update.remote_digest.clone();
+                self.dismissed_image_digest = Some(digest.clone());
+                persist_dismissed_image_digest(Some(digest));
+                self.image_update = None;
+            }
+        }
+        true
+    }
+
+    /// The Update key on the sandbox image line opens the pull prompt; returns whether it did.
+    fn pull_from_update_bar(&mut self) -> bool {
+        self.clear_expired_status();
+        let live = self.home.store_move_status_line();
+        let Some(UpdateBar::ImageUpdate(update)) = UpdateBar::pick(
+            self.update_status.as_ref().map(|s| s.text.as_str()),
+            live.as_deref(),
+            self.update_info.as_ref(),
+            self.image_update.as_ref(),
+            self.image_pull_rx.is_some(),
+        ) else {
+            return false;
+        };
+        let image = update.image.clone();
+        self.home.prompt_pull_sandbox_image(image);
+        true
     }
 
     fn spawn_image_update_check(&mut self) {
@@ -2068,15 +2103,6 @@ fn plan_disk_refresh(
     }
 }
 
-fn should_show_image_banner(
-    has_image_update: bool,
-    has_app_update: bool,
-    has_status: bool,
-    pull_in_flight: bool,
-) -> bool {
-    has_image_update && !has_app_update && !has_status && !pull_in_flight
-}
-
 /// Log and record reload errors; the loop keeps the previous in-memory state.
 fn handle_tick_reload_storage(
     result: anyhow::Result<()>,
@@ -2291,37 +2317,15 @@ impl App {
                 bindings::ActionId::DismissUpdateBanner,
                 self.home.strict_hotkeys,
                 &key,
-            ) && (self.update_info.is_some()
-                || self.update_status.is_some()
-                || self.image_update.is_some())
-                && !self.home.has_dialog() =>
+            ) && !self.home.has_dialog()
+                && self.dismiss_update_bar() =>
             {
-                if self.image_banner_active() {
-                    if let Some(update) = self.image_update.as_ref() {
-                        let digest = update.remote_digest.clone();
-                        self.dismissed_image_digest = Some(digest.clone());
-                        persist_dismissed_image_digest(Some(digest));
-                    }
-                    self.image_update = None;
-                    return Ok(());
-                }
-                if let Some(info) = self.update_info.as_ref() {
-                    let v = info.latest_version.clone();
-                    self.dismissed_update_version = Some(v.clone());
-                    persist_dismissed_update_version(Some(v));
-                }
-                self.update_info = None;
-                self.update_status = None;
                 return Ok(());
             }
-            // The image banner only shows without an app update, so `u` is free.
-            (KeyCode::Char('u'), KeyModifiers::NONE)
-                if self.image_banner_active() && !self.home.has_dialog() =>
+            _ if bindings::is_bound(bindings::ActionId::Update, self.home.strict_hotkeys, &key)
+                && !self.home.has_dialog()
+                && self.pull_from_update_bar() =>
             {
-                if let Some(update) = self.image_update.as_ref() {
-                    let image = update.image.clone();
-                    self.home.prompt_pull_sandbox_image(image);
-                }
                 return Ok(());
             }
             _ => {}
@@ -3488,6 +3492,132 @@ pub enum Action {
 mod tests {
     use super::*;
 
+    fn key_app() -> (App, Terminal<TuiBackend>) {
+        let app = App::new(
+            "test",
+            AvailableTools::with_tools(&[]),
+            true,
+            false,
+            crate::file_watch::FileWatchService::noop(),
+        )
+        .unwrap();
+        let backend =
+            crate::tui::hyperlink::HyperlinkBackend::new(std::io::stdout(), Default::default());
+        let terminal = Terminal::with_options(
+            backend,
+            ratatui::TerminalOptions {
+                viewport: ratatui::Viewport::Fixed(ratatui::layout::Rect::new(0, 0, 100, 40)),
+            },
+        )
+        .unwrap();
+        (app, terminal)
+    }
+
+    fn app_update() -> UpdateInfo {
+        UpdateInfo {
+            available: true,
+            current_version: "1.0.0".into(),
+            latest_version: "1.1.0".into(),
+        }
+    }
+
+    fn image_update() -> ImageUpdate {
+        ImageUpdate {
+            image: "ghcr.io/agent-of-empires/aoe-sandbox:latest".into(),
+            remote_digest: "sha256:abc".into(),
+        }
+    }
+
+    const CTRL_X: KeyEvent = KeyEvent::new(KeyCode::Char('x'), KeyModifiers::CONTROL);
+
+    /// #5747: each Ctrl+X acts on the line on screen, never one hidden behind it.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn dismiss_during_a_pull_hides_only_the_pull_line() {
+        let _home = crate::session::test_support::isolate_app_dir();
+        crate::session::get_profile_dir("test").unwrap();
+        let (mut app, mut terminal) = key_app();
+        app.update_info = Some(app_update());
+        app.image_update = Some(image_update());
+        app.update_status = Some(UpdateStatus::persistent(
+            "pulling the sandbox image…".into(),
+        ));
+        let (pull_done, pull_rx) = tokio::sync::oneshot::channel();
+        app.image_pull_rx = Some(pull_rx);
+        let dismissed = || AppStateConfig::load().unwrap().dismissed_update_version;
+
+        app.handle_key(CTRL_X, &mut terminal).await.unwrap();
+        assert!(app.update_status.is_none());
+        assert_eq!(app.update_info, Some(app_update()));
+        assert_eq!(app.dismissed_update_version, None);
+        assert_eq!(dismissed(), None);
+
+        pull_done.send(Ok(())).unwrap();
+        assert!(app.poll_image_pull_status());
+        assert!(app
+            .update_status
+            .as_ref()
+            .is_some_and(|s| s.text.starts_with("sandbox image updated")));
+
+        app.handle_key(CTRL_X, &mut terminal).await.unwrap();
+        assert!(app.update_status.is_none());
+        assert_eq!(app.update_info, Some(app_update()));
+
+        app.handle_key(CTRL_X, &mut terminal).await.unwrap();
+        assert!(app.update_info.is_none());
+        assert_eq!(dismissed(), Some("1.1.0".into()));
+    }
+
+    /// The store-move line has nothing to dismiss: Ctrl+X and the pull key leave the image
+    /// update behind it alone.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn keys_leave_the_image_update_behind_the_store_move_line() {
+        let _home = crate::session::test_support::isolate_app_dir();
+        crate::session::get_profile_dir("test").unwrap();
+        let (mut app, mut terminal) = key_app();
+        let _lane = app
+            .home
+            .session_feed
+            .show_sandbox_progress_for_test("copying files");
+        assert!(app.home.store_move_status_line().is_some());
+        app.image_update = Some(image_update());
+
+        app.handle_key(CTRL_X, &mut terminal).await.unwrap();
+        app.handle_key(KeyEvent::from(KeyCode::Char('u')), &mut terminal)
+            .await
+            .unwrap();
+        assert_eq!(app.image_update, Some(image_update()));
+        assert_eq!(app.dismissed_image_digest, None);
+        assert_eq!(AppStateConfig::load().unwrap().dismissed_image_digest, None);
+        assert!(app.home.confirm_dialog.is_none());
+    }
+
+    /// The pull key is the registry's Update chord: bare `u`, or Ctrl+U under strict hotkeys.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn image_pull_key_follows_strict_hotkeys() {
+        let _home = crate::session::test_support::isolate_app_dir();
+        crate::session::get_profile_dir("test").unwrap();
+        let bare_u = KeyEvent::from(KeyCode::Char('u'));
+        let ctrl_u = KeyEvent::new(KeyCode::Char('u'), KeyModifiers::CONTROL);
+        for (strict, key, opens) in [
+            (false, bare_u, true),
+            (true, bare_u, false),
+            (true, ctrl_u, true),
+        ] {
+            let (mut app, mut terminal) = key_app();
+            app.home.strict_hotkeys = strict;
+            app.image_update = Some(image_update());
+            app.handle_key(key, &mut terminal).await.unwrap();
+            assert_eq!(
+                app.home.confirm_dialog.is_some(),
+                opens,
+                "strict={strict} key={key:?}"
+            );
+        }
+    }
+
     #[tokio::test]
     #[serial_test::serial]
     async fn startup_onboarding_preserves_saved_state_during_config_edits() {
@@ -4031,8 +4161,7 @@ mod tests {
                 app.reconcile_structured_preview().await;
                 terminal
                     .draw(|frame| {
-                        app.home
-                            .render(frame, frame.area(), &theme, None, None, None);
+                        app.home.render(frame, frame.area(), &theme, None);
                     })
                     .unwrap();
                 if app
@@ -4053,8 +4182,7 @@ mod tests {
         app.home.retained_scroll_offset = 7;
         terminal
             .draw(|frame| {
-                app.home
-                    .render(frame, frame.area(), &theme, None, None, None);
+                app.home.render(frame, frame.area(), &theme, None);
             })
             .unwrap();
         let pane = app.home.preview_text_view.pane;
@@ -4076,8 +4204,7 @@ mod tests {
         app.home.handle_drag_end();
         terminal
             .draw(|frame| {
-                app.home
-                    .render(frame, frame.area(), &theme, None, None, None);
+                app.home.render(frame, frame.area(), &theme, None);
             })
             .unwrap();
         assert!(app
@@ -4087,8 +4214,7 @@ mod tests {
             .is_some_and(|text| text.contains("OLD")));
         terminal
             .draw(|frame| {
-                app.home
-                    .render(frame, frame.area(), &theme, None, None, None);
+                app.home.render(frame, frame.area(), &theme, None);
             })
             .unwrap();
         assert!(
@@ -4113,8 +4239,6 @@ mod tests {
                         frame.area(),
                         if resize { &theme } else { &changed_theme },
                         None,
-                        None,
-                        None,
                     );
                 })
                 .unwrap();
@@ -4126,8 +4250,7 @@ mod tests {
             terminal = Terminal::new(ratatui::backend::TestBackend::new(200, 40)).unwrap();
             terminal
                 .draw(|frame| {
-                    app.home
-                        .render(frame, frame.area(), &theme, None, None, None);
+                    app.home.render(frame, frame.area(), &theme, None);
                 })
                 .unwrap();
             assert!(app.home.handle_drag_start(x, y));
@@ -4135,8 +4258,7 @@ mod tests {
             app.home.handle_drag_end();
             terminal
                 .draw(|frame| {
-                    app.home
-                        .render(frame, frame.area(), &theme, None, None, None);
+                    app.home.render(frame, frame.area(), &theme, None);
                 })
                 .unwrap();
             assert!(app
@@ -4162,8 +4284,7 @@ mod tests {
                 app.reconcile_structured_preview().await;
                 terminal
                     .draw(|frame| {
-                        app.home
-                            .render(frame, frame.area(), &theme, None, None, None);
+                        app.home.render(frame, frame.area(), &theme, None);
                     })
                     .unwrap();
                 if app
@@ -4376,20 +4497,6 @@ mod tests {
         reset_creates(2);
         clear_reported_session_creates(5, SendOutcome::Sent);
         assert_eq!(TUI_SESSION_CREATES.load(Ordering::Relaxed), 0);
-    }
-
-    #[test]
-    fn image_banner_shows_only_when_it_owns_the_row() {
-        assert!(should_show_image_banner(true, false, false, false));
-        assert!(!should_show_image_banner(false, false, false, false));
-        assert!(!should_show_image_banner(true, true, false, false));
-        assert!(!should_show_image_banner(true, false, true, false));
-    }
-
-    #[test]
-    fn image_banner_stays_hidden_while_its_own_pull_runs() {
-        assert!(!should_show_image_banner(true, false, false, true));
-        assert!(!should_show_image_banner(true, false, true, true));
     }
 
     #[test]
@@ -4951,8 +5058,7 @@ mod tests {
         let q = KeyEvent::from(KeyCode::Char('q'));
         let takeover = |app: &mut App| {
             test_render::text(&test_render::draw(110, 40, |frame, theme| {
-                app.home
-                    .render(frame, frame.area(), theme, None, None, None)
+                app.home.render(frame, frame.area(), theme, None)
             }))
         };
         let mismatched = |app: &mut App, attention| {
@@ -5071,8 +5177,7 @@ mod tests {
         // The whole home screen as the user sees it, including a takeover.
         let home = |app: &mut App| {
             test_render::text(&test_render::draw(110, 40, |frame, theme| {
-                app.home
-                    .render(frame, frame.area(), theme, None, None, None)
+                app.home.render(frame, frame.area(), theme, None)
             }))
         };
         let screen = |app: &App| {

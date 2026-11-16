@@ -12,8 +12,6 @@ fn render(view: &mut HomeView, width: u16, height: u16) {
                 Rect::new(4, 2, width, height),
                 &load_theme("empire"),
                 None,
-                None,
-                None,
             );
         })
         .unwrap();

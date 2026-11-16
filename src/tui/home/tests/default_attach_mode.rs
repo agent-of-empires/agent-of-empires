@@ -382,7 +382,7 @@ fn render_home(env: &mut TestEnv) -> String {
     terminal
         .draw(|f| {
             let area = f.area();
-            env.view.render(f, area, &theme, None, None, None);
+            env.view.render(f, area, &theme, None);
         })
         .unwrap();
     let buf = terminal.backend().buffer();

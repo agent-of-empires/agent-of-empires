@@ -644,7 +644,7 @@ fn full_render_pipeline_captures_copy_text_after_finalize() {
         terminal
             .draw(|f| {
                 let area = f.area();
-                env.view.render(f, area, &theme, None, None, None);
+                env.view.render(f, area, &theme, None);
             })
             .unwrap();
 
@@ -680,7 +680,7 @@ fn full_render_pipeline_captures_copy_text_after_finalize() {
         terminal
             .draw(|f| {
                 let area = f.area();
-                env.view.render(f, area, &theme, None, None, None);
+                env.view.render(f, area, &theme, None);
             })
             .unwrap();
 

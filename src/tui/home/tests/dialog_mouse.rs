@@ -12,7 +12,7 @@ fn render(env: &mut TestEnv) -> Buffer {
     terminal
         .draw(|f| {
             let area = f.area();
-            env.view.render(f, area, &theme, None, None, None);
+            env.view.render(f, area, &theme, None);
         })
         .unwrap();
     terminal.backend().buffer().clone()

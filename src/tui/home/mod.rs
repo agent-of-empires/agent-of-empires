@@ -31,6 +31,7 @@ mod status;
 mod store_move;
 #[cfg(test)]
 mod tests;
+pub(crate) mod update_bar;
 mod user_action;
 mod watchers;
 

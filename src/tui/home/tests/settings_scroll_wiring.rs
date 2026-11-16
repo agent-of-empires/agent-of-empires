@@ -16,7 +16,7 @@ fn render_short(env: &mut TestEnv) {
     terminal
         .draw(|f| {
             let area = f.area();
-            env.view.render(f, area, &theme, None, None, None);
+            env.view.render(f, area, &theme, None);
         })
         .unwrap();
 }
