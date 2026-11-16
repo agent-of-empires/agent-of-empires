@@ -83,6 +83,22 @@ pub async fn queue_enqueue(
     // Serialize replacements with a concurrent drain (#3621). The prompt
     // endpoint already holds this guard before calling buffer_and_enqueue.
     let _submission = state.session_service.prompt_submission(&id).await;
+    // A client that lost the response to an earlier POST re-posts the same id; once the
+    // drain has delivered it, queueing it again would send it twice.
+    if state.session_service.was_prompt_delivered(&id, &req.id)
+        && !state
+            .session_service
+            .queued_prompts_snapshot(&id)
+            .await
+            .iter()
+            .any(|q| q.id == req.id)
+    {
+        return (
+            StatusCode::OK,
+            Json(serde_json::json!({ "id": req.id, "delivered": true })),
+        )
+            .into_response();
+    }
     if let Some((status, msg)) = queue_refusal(
         state
             .session_service
@@ -487,6 +503,57 @@ mod tests {
             let rows = state.session_service.queued_prompts_snapshot(&id).await;
             assert_eq!(rows[0].origin, want, "{header:?}");
         }
+    }
+
+    /// A client that lost the response to its POST re-posts the id after the
+    /// drain delivered and retired the row; that must not queue it again.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn a_re_post_of_a_delivered_id_queues_nothing() {
+        let _app_dir = crate::session::test_support::isolate_app_dir();
+        let mut inst = Instance::new("queue-redeliver", "/tmp/aoe-5730-redeliver");
+        inst.id = "sess-5730".to_string();
+        inst.view = crate::session::View::Structured;
+        inst.status = crate::session::Status::Idle;
+        let id = inst.id.clone();
+        let state = crate::server::test_support::build_test_app_state(vec![inst]);
+        let service = state.session_service.clone();
+        let commands = service
+            .acp_supervisor
+            .test_insert_worker_cmd_recording(&id)
+            .await;
+        let post = || async {
+            queue_enqueue(
+                State(Arc::clone(&state)),
+                Path(id.clone()),
+                axum::http::HeaderMap::new(),
+                Ok(Json(EnqueueRequest {
+                    id: "q1".to_string(),
+                    text: "follow-up".to_string(),
+                    origin_device: None,
+                    attachments: Vec::new(),
+                })),
+            )
+            .await
+            .into_response()
+        };
+
+        assert_eq!(post().await.status(), StatusCode::OK);
+        service.drain_queued_prompts_once(&id).await;
+        assert!(service.queued_prompts_snapshot(&id).await.is_empty());
+        let delivered = commands.lock().unwrap().len();
+        assert_eq!(delivered, 1, "the drain delivered the prompt once");
+
+        let response = post().await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let body: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(body["delivered"], true);
+        assert!(service.queued_prompts_snapshot(&id).await.is_empty());
+        service.drain_queued_prompts_once(&id).await;
+        assert_eq!(commands.lock().unwrap().len(), delivered);
     }
 
     /// #4092: the resume admission orders queue rows against the rate-limit
