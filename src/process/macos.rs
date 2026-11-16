@@ -578,8 +578,8 @@ fn staging_verify_inventory(
         let path = staging_plist_string(&record, "image-path")?;
         let identity = staging_image_identity(std::path::Path::new(&path))?;
         anyhow::ensure!(
-            identity.is_some(),
-            "cannot resolve inventory image identity: {path}"
+            identity.is_some() || std::path::Path::new(&path) != image,
+            "cannot resolve staging image identity: {path}"
         );
         // Disk numbers can be reused after detach; only file identity proves ownership.
         let matches = identity == Some(image_identity);
@@ -593,11 +593,10 @@ fn staging_verify_inventory(
             );
         }
         if attached && !matches {
-            // A different image claiming our device or mount is a contradiction,
-            // not delayed publication. Unrelated entities may omit either field.
+            // Unrelated catalogue entries may outlive detach and device reuse.
+            // Only a claim on the anchored mount contradicts this attachment.
             for entity in staging_plist_array(&record, "system-entities")?.iter() {
                 let entity = staging_plist_dictionary(*entity)?;
-                let claimed_device = staging_plist_optional_string(&entity, "dev-entry")?;
                 let claimed_mount = staging_plist_optional_string(&entity, "mount-point")?;
                 let claims_mount = match claimed_mount {
                     Some(path) => {
@@ -609,8 +608,8 @@ fn staging_verify_inventory(
                     None => false,
                 };
                 anyhow::ensure!(
-                    claimed_device.as_deref() != Some(device) && !claims_mount,
-                    "another inventory image claims the staging device or mount: {path}"
+                    !claims_mount,
+                    "another inventory image claims the staging mount: {path}"
                 );
             }
         }
@@ -3141,7 +3140,9 @@ mod tests {
             "/dev/disk42",
         );
         assert!(verify(&recycled, false).is_ok());
-        assert!(verify(&recycled, true).is_err());
+        assert!(verify(&recycled, true)
+            .unwrap_err()
+            .is::<StagingInventoryMissing>());
         let incomplete = staging_plist(
             format!(
                 "<?xml version=\"1.0\"?><plist version=\"1.0\"><dict>\
@@ -3162,6 +3163,10 @@ mod tests {
         )
         .unwrap();
         assert!(verify(&incomplete, true).is_ok());
+        std::fs::remove_file(&other_image).unwrap();
+        assert!(verify(&incomplete, true).is_ok());
+        assert!(verify(&recycled, false).is_ok());
+        std::fs::write(&other_image, b"unrelated image").unwrap();
         let empty = snapshot(&[], &root, "/dev/disk42");
         assert!(verify(&empty, false).is_ok());
         let error = verify(&empty, true).unwrap_err().to_string();
@@ -3217,12 +3222,13 @@ mod tests {
             &root,
             "/dev/disk42",
         );
+        let conflicting_mount = snapshot(std::slice::from_ref(&other_image), &root, "/dev/disk43");
         for (contradiction, message) in [
             (&duplicate, "found=2"),
             (&changed_device, "changed device/mount"),
             (&changed_mount, "unexpected mountpoint"),
-            (&recycled, "another inventory image claims"),
-            (&unknown_alias, "cannot resolve inventory image identity"),
+            (&conflicting_mount, "another inventory image claims"),
+            (&unknown_alias, "another inventory image claims"),
         ] {
             let (rejected, observations, elapsed) =
                 await_snapshots(&[&empty, contradiction, &inventory], budget);
