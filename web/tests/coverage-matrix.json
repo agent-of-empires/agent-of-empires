@@ -3244,6 +3244,14 @@
       ]
     },
     {
+      "id": "settings.persistent-terminals",
+      "kind": "vitest",
+      "risk": "low",
+      "description": "Kept terminals stay attached across session switches, so each keeps its scroll position.",
+      "specs": ["src/components/__tests__/TerminalSessionStack.test.tsx"],
+      "components": ["web/src/components/TerminalSessionStack.tsx"]
+    },
+    {
       "id": "settings.persistent-structured-views",
       "kind": "vitest",
       "risk": "low",
@@ -5786,7 +5794,7 @@
       "id": "settings.plugins",
       "kind": "vitest",
       "risk": "high",
-      "description": "Plugin cards show validation, including a warning-styled dev badge.",
+      "description": "Plugin cards show validation, including a warning-styled dev badge. Failed jobs retain their bounded tail and display the actual full-log path on the Daemon host.",
       "specs": [
         "src/components/settings/__tests__/PluginsSettings.test.tsx",
         "src/components/settings/__tests__/PluginIdentityIcon.test.tsx"

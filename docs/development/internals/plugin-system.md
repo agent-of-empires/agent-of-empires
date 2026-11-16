@@ -18,11 +18,56 @@ Host architecture and security boundaries. Plugin authors want [Writing plugins]
 
 `src/plugin/mod.rs` owns a lazily loaded process-wide registry; reloading it after a config change updates the CLI, TUI, and web views from one `PluginView`. The standalone `aoe-plugin-api` crate is the source of truth for `aoe-plugin.toml`, and parsing is strict: unknown fields, unsupported API versions, invalid ids, and malformed contributions are rejected. `api_version` describes the manifest schema; `aoe_version` constrains the host application.
 
-Per-plugin settings live under `[plugins."<id>".settings]` in `config.toml` and per-session metadata in `Instance.plugin_meta[<id>]`. Both survive disable and reinstall.
+Per-plugin settings live under `[plugins."<id>".settings]` in `config.toml` and per-session metadata in `Instance.plugin_meta[<id>]`. Disabling preserves both. Uninstall removes external plugin configuration; stale staged settings must not recreate it or alter a replacement installation.
 
 ## Installation and trust
 
 Sources are local paths or GitHub references. Installation stages content in the app directory, validates the manifest and host compatibility, runs declared build steps, then atomically places the plugin under `plugins/<id>/`. Build outputs go under `.aoe-build/`, excluded from source integrity. The lockfile pins installed source identity, resolved revision, content hash, manifest hash, and grants, and an update that changes capabilities requires approval. Featured plugins additionally match the repository's pinned source hash and may claim reserved namespaces.
+
+`execution.rs` gives preparation/application one fixed two-hour wall-clock
+budget across Git and approved builds. A private spawn-only owned-child wrapper
+keeps the direct child unreaped, reserving its original PGID through settlement.
+Signal failures retain custody through bounded observation; success requires
+physical child exit and no executing original-group member.
+Its ephemeral descendant tree borrows that custody instead of requiring a
+historical root audit token across exec. Owned macOS descendants retain the
+kernel's exec-stable physical birth ID after parent-birth ancestry proof.
+Observation distinguishes that birth from the execution token; each signal
+checks a fresh audit token against the retained birth. Previously admitted
+escaped descendants remain owned across exec. Recovered trees and runners
+keep their original identity fences. Physically exited history is pruned
+through a PID index.
+Tree and target metadata roll back together; the old tree remains until config
+and lock writes commit. Unproven settlement/restoration or post-commit backup
+cleanup retains exclusion, evidence and an in-process recovery fence, including
+failed marker writes. Admission checks recovery under the operation flock;
+every external worker launch checks it too. See
+[manual recovery](../../plugins.md#installing-external-plugins).
+This is lifecycle supervision, not a malicious-code sandbox.
+
+Local staging retains directory descriptors, rejects unsupported entries before
+opening, opens regular files nonblocking without following links, and validates
+opened identities before copying handles. Iterator errors propagate. Release
+assets keep their bytes, metadata, staging owner, and operation lease through
+async download and blocking hash/extract; the tree hash remains pre-injection.
+Preview never builds, provisions Node, grants capabilities, or publishes an install.
+Preview-only transport adds ten minutes to the shared execution budget. Network
+resolution and release metadata each allow 60 seconds, asset transfer 300 seconds,
+and the two possible changelog requests 30 seconds each, within that allowance.
+
+TUI update review pins one verified local HTTP client. Approval submits the
+existing Daemon job exactly once; that job owns both apply and worker restart,
+independently of the TUI runtime. A watch snapshot coalesces accepted id, latest
+shared log and terminal outcome; closing its receiver stops observation only.
+Job responses carry the real host log path, never a job-id-derived filename.
+Other manager lifecycle actions are unchanged.
+Settings merge only user-owned plugin leaves under operation-then-config lock
+order, compare source/dev/full grant against their baseline, and adopt persisted
+values. Delayed live refresh rereads persisted intent and never replays stale
+enabled values. The lifecycle comparison is conservative, not absolute ABA proof.
+Active text/list editors capture field identity and owning lifecycle before
+resync, cancel on replacement/removal/field disappearance, and rebind unchanged
+editors by identity rather than position.
 
 Every worker needs `runtime.worker`; other capabilities gate host RPCs and are checked before dispatch. A plugin reaches only its own settings and metadata unless granted more. Capability checks are an API boundary, not an OS sandbox: workers run as ordinary child processes through `NoSandbox`, so only trusted plugin code should be installed.
 
