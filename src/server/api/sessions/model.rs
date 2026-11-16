@@ -474,7 +474,7 @@ impl<'a> SessionCfgCache<'a> {
             return std::path::PathBuf::new();
         }
         let project = std::path::Path::new(project_path);
-        let git = fingerprint(&mut self.seen, &project.join(".git"));
+        let git = fingerprint(&mut self.seen, &project.join(".git")).clone();
         // Resolve from the `.git` bytes just read, with its gitdir looked up afresh, so a
         // rewrite or a retargeted link is never missed. A linked worktree needs nothing more.
         let gitdir = git
@@ -489,7 +489,12 @@ impl<'a> SessionCfgCache<'a> {
         {
             return main_repo;
         }
-        let discovered_from = (git.clone(), gitdir);
+        // libgit2 cannot open a `.git` file pointing nowhere, so do not race it with a reread.
+        let utf8 = |bytes: &std::sync::Arc<[u8]>| std::str::from_utf8(bytes).is_ok();
+        if git.content.as_ref().is_ok_and(utf8) && gitdir.is_none() {
+            return project.to_path_buf();
+        }
+        let discovered_from = (git, gitdir);
         if let Some((cached_from, source)) = self.store.sources.get(project_path) {
             if *cached_from == discovered_from {
                 return source.clone();

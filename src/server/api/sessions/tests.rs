@@ -4575,15 +4575,29 @@ fn session_cfg_store_reresolves_only_after_an_input_edit() {
     cache.resolve(&crate::session::config::effective_profile(""), path);
     assert_eq!(misses.load(Ordering::Relaxed), 1, "empty profile");
 
-    // A `.git` whose repo cannot be opened is retried rather than cached.
-    let broken = tempfile::tempdir().expect("tempdir broken repo");
-    std::fs::write(broken.path().join(".git"), "gitdir: /nonexistent\n").unwrap();
-    let broken = broken.path().to_str().unwrap();
-    for _ in 0..2 {
-        let misses = AtomicUsize::new(0);
-        let mut cache = super::model::SessionCfgCache::new(&mut store, &misses);
-        cache.resolve("default", broken);
-        assert_eq!(cache.discoveries, 1, "failed discovery must not be cached");
+    // A `.git` file pointing nowhere skips discovery; a failed discovery is retried, not cached.
+    let broken_cases: [(&str, fn(&std::path::Path), usize); 2] = [
+        (
+            "gitfile pointing nowhere",
+            |dir| std::fs::write(dir.join(".git"), "gitdir: /nonexistent\n").unwrap(),
+            0,
+        ),
+        (
+            "unopenable .git dir",
+            |dir| std::fs::create_dir(dir.join(".git")).unwrap(),
+            1,
+        ),
+    ];
+    for (case, setup, discoveries) in broken_cases {
+        let broken = tempfile::tempdir().expect("tempdir broken repo");
+        setup(broken.path());
+        let broken = broken.path().to_str().unwrap();
+        for _ in 0..2 {
+            let misses = AtomicUsize::new(0);
+            let mut cache = super::model::SessionCfgCache::new(&mut store, &misses);
+            cache.resolve("default", broken);
+            assert_eq!(cache.discoveries, discoveries, "{case}");
+        }
     }
 }
 
