@@ -6,6 +6,7 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
 
+import { stubMatchMedia } from "../../hooks/__tests__/fixtures";
 import { FOCUS_TERMINAL_EVENT } from "../../lib/terminalFocus";
 import { SwitchAccountModal } from "./SwitchAccountModal";
 
@@ -125,9 +126,12 @@ describe("SwitchAccountModal", () => {
   });
 
   it.each([
-    ["is still there", true],
-    ["was removed by the switch", false],
-  ])("on close, focus goes back to the opener if it %s, else to the composer", async (_l, openerStays) => {
+    ["the opener is still there", true, false, []],
+    ["the switch removed the opener", false, false, ["composer"]],
+    ["the switch removed the opener on touch, where the composer would open the keyboard", false, true, []],
+  ])("on close, restores focus when %s", async (_l, openerStays, coarse, expected) => {
+    const originalMatchMedia = window.matchMedia;
+    stubMatchMedia(coarse, "(pointer: coarse)");
     const opener = document.createElement("button");
     document.body.append(opener);
     opener.focus();
@@ -148,12 +152,11 @@ describe("SwitchAccountModal", () => {
     if (!openerStays) opener.remove();
     unmount();
     window.removeEventListener(FOCUS_TERMINAL_EVENT, onEvent);
+    window.matchMedia = originalMatchMedia;
     if (openerStays) {
       expect(document.activeElement).toBe(opener);
-      expect(focusEvents).toEqual([]);
       opener.remove();
-    } else {
-      expect(focusEvents).toEqual(["composer"]);
     }
+    expect(focusEvents).toEqual(expected);
   });
 });

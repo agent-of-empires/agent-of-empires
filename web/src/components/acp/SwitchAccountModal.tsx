@@ -1,4 +1,5 @@
-import { useEffect, useRef, useState, type KeyboardEvent as ReactKeyboardEvent } from "react";
+import { useEffect, useEffectEvent, useRef, useState, type KeyboardEvent as ReactKeyboardEvent } from "react";
+import { useIsCoarsePointer } from "../../hooks/useIsCoarsePointer";
 import { fetchAccountTargets } from "../../lib/api";
 import type { AuthStatus } from "../../lib/acpTypes";
 import { dispatchFocusTerminal } from "../../lib/terminalFocus";
@@ -62,10 +63,15 @@ function SwitchAccountDialog({
     return () => document.removeEventListener("keydown", onKey);
   }, [onClose]);
 
+  const isCoarse = useIsCoarsePointer();
+  // Confirming hides the banner button that opened this, so focus falls back to the composer; not on touch, where it opens the keyboard.
+  const restoreFocus = useEffectEvent((previous: HTMLElement | null) => {
+    if (previous?.isConnected) previous.focus();
+    else if (!isCoarse) dispatchFocusTerminal("composer");
+  });
   useEffect(() => {
     const previous = document.activeElement as HTMLElement | null;
-    // Confirming hides the banner button that opened this, so focus falls back to the composer.
-    return () => (previous?.isConnected ? previous.focus() : dispatchFocusTerminal("composer"));
+    return () => restoreFocus(previous);
   }, []);
 
   // Confirm is disabled until the names load, so focus Cancel meanwhile and move on once it can take it.

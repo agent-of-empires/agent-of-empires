@@ -125,7 +125,7 @@ export function UsageLimitBanner({
             </p>
           ) : null}
           {failoverTo && (
-            <p className="mt-1 text-xs text-text-secondary" data-testid="usage-limit-failover">
+            <p role="status" className="mt-1 text-xs text-text-secondary" data-testid="usage-limit-failover">
               Switching to {failoverTo}…
             </p>
           )}
