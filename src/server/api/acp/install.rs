@@ -86,7 +86,7 @@ async fn install_on_host(package: &str) -> Result<std::process::Output, Response
 }
 
 /// Whether the session's sandbox container is running.
-async fn container_running(session_id: &str) -> bool {
+pub(super) async fn container_running(session_id: &str) -> bool {
     let sid = session_id.to_string();
     tokio::task::spawn_blocking(move || {
         crate::containers::DockerContainer::from_session_id(&sid)
