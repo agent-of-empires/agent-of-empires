@@ -34,20 +34,19 @@ pub fn drop_daemon_servers(
                 | ProjectMcpTransport::Sse { url, headers } => (url, headers),
                 ProjectMcpTransport::Stdio { .. } => return true,
             };
-            let Ok(url) = reqwest::Url::parse(url) else {
-                return true;
-            };
-            let host_is_daemon = url.host_str().is_some_and(|host| {
-                let loopback = host.eq_ignore_ascii_case("localhost")
-                    || host
-                        .trim_matches(['[', ']'])
-                        .parse::<std::net::IpAddr>()
-                        .is_ok_and(|ip| ip.is_loopback());
-                loopback || daemon.iter().any(|d| d.host_str() == Some(host))
-            });
             let has_token = headers
                 .values()
                 .any(|value| tokens.iter().any(|token| value.contains(token)));
+            let host_is_daemon = reqwest::Url::parse(url).is_ok_and(|url| {
+                url.host_str().is_some_and(|host| {
+                    let loopback = host.eq_ignore_ascii_case("localhost")
+                        || host
+                            .trim_matches(['[', ']'])
+                            .parse::<std::net::IpAddr>()
+                            .is_ok_and(|ip| ip.is_loopback());
+                    loopback || daemon.iter().any(|d| d.host_str() == Some(host))
+                })
+            });
             let drop = host_is_daemon || has_token;
             if drop {
                 warn!(
@@ -275,6 +274,8 @@ mod tests {
             "local": { "type": "sse", "url": "http://localhost:9000/sse" },
             "v6": { "type": "http", "url": "http://[::1]:9000/mcp" },
             "lan": { "type": "http", "url": "http://192.168.1.5:8080/mcp" },
+            "unparseable": { "type": "http", "url": "u",
+                             "headers": { "Authorization": "Bearer sekrit" } },
             "renamed": { "type": "http", "url": "https://proxy.example.test/mcp",
                          "headers": { "X-Key": "Bearer sekrit" } },
             "github": { "type": "http", "url": "https://api.github.test/mcp",
