@@ -652,6 +652,37 @@ impl AnchoredDir {
         }
     }
 
+    /// Open the regular file `relative` with `O_NOFOLLOW` on every component.
+    /// A write creates missing parents and the file, then truncates it after
+    /// the type check, so a special file is never truncated.
+    pub(crate) fn open_file(&self, relative: &Path, write: bool) -> Result<File> {
+        let (parent, leaf) = if write {
+            self.open_parent_creating(relative)?
+        } else {
+            self.open_parent(relative)?
+        };
+        let access = if write {
+            OFlag::O_WRONLY | OFlag::O_CREAT
+        } else {
+            OFlag::O_RDONLY
+        };
+        let fd = openat(
+            &parent,
+            leaf.as_os_str(),
+            access | OFlag::O_NOFOLLOW | OFlag::O_CLOEXEC | OFlag::O_NONBLOCK,
+            Mode::from_bits_truncate(0o666),
+        )
+        .context("opening anchored file")?;
+        if fstat(&fd)?.st_mode & nix::libc::S_IFMT != nix::libc::S_IFREG {
+            bail!("anchored path is not a regular file");
+        }
+        let file = File::from(fd);
+        if write {
+            file.set_len(0).context("truncating anchored file")?;
+        }
+        Ok(file)
+    }
+
     pub(crate) fn read_dir(&self, relative: &Path, max_entries: usize) -> Result<Vec<OsString>> {
         self.list_dir(relative, max_entries, false)
     }
@@ -1228,6 +1259,24 @@ impl AnchoredDir {
             .context("opening anchored directory component")?;
         }
         Ok(current)
+    }
+
+    fn open_parent_creating(&self, relative: &Path) -> Result<(OwnedFd, std::ffi::OsString)> {
+        let mut components = normal_components(relative)?;
+        let Some(leaf) = components.pop() else {
+            bail!("anchored file path has no leaf");
+        };
+        let flags = OFlag::O_DIRECTORY | OFlag::O_NOFOLLOW | OFlag::O_CLOEXEC | OFlag::O_RDONLY;
+        let mut current = openat(&self.fd, ".", flags, Mode::empty())?;
+        for component in components {
+            match mkdirat(&current, component.as_os_str(), Mode::S_IRWXU) {
+                Ok(()) | Err(Errno::EEXIST) => {}
+                Err(error) => return Err(error).context("creating anchored directory"),
+            }
+            current = openat(&current, component.as_os_str(), flags, Mode::empty())
+                .context("opening anchored parent component")?;
+        }
+        Ok((current, leaf))
     }
 
     fn open_parent(&self, relative: &Path) -> Result<(OwnedFd, std::ffi::OsString)> {
