@@ -7,14 +7,15 @@ use rmcp::handler::server::wrapper::{Json, Parameters};
 use rmcp::model::CallToolResult;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
-use tokio::sync::broadcast::error::RecvError;
+use tokio::sync::broadcast::{self, error::RecvError};
 
 use super::control::{not_found, transcript_page};
 use super::{read_only_refusal, tool_error, McpServer};
 use crate::acp::acp_client::AcpError;
 use crate::acp::approvals::{ApprovalDecision, ApprovalOption, Nonce};
 use crate::acp::supervisor::SupervisorError;
-use crate::daemon::AcpWorkerState;
+use crate::server::api::sessions::settleable_approvals;
+use crate::server::push::StatusChange;
 use crate::session::{Status, View};
 
 const DEFAULT_WAIT_SECS: u64 = 60;
@@ -139,6 +140,14 @@ pub(super) struct Approved {
     approved: bool,
 }
 
+enum Woke {
+    Changed(Status),
+    /// Changes were dropped, so the store is read again.
+    Lagged,
+    Deadline,
+    Shutdown,
+}
+
 /// Characters of raw arguments a summary falls back to when no target can be named.
 const SUMMARY_CHARS: usize = 200;
 
@@ -155,44 +164,39 @@ impl McpServer {
         Parameters(params): Parameters<WaitForParams>,
     ) -> Result<Json<WaitResult>, CallToolResult> {
         let id = params.session_id;
-        let timeout = wait_timeout(params.timeout_s);
-        let deadline = tokio::time::Instant::now() + timeout;
+        let deadline = tokio::time::Instant::now() + wait_timeout(params.timeout_s);
         // Subscribe before the first read so no change between the two is missed.
         let mut changes = self.state.status_tx.subscribe();
-        let mut current = self.status_of(&id).await.ok_or_else(|| not_found(&id))?;
+        let (mut current, view) = self.session_of(&id).await.ok_or_else(|| not_found(&id))?;
+        // A terminal session has no event seqs, so there is no turn to wait for.
+        let after_seq = params.after_seq.filter(|_| view == View::Structured);
         let timed_out = loop {
-            if self.settled(&id, current, &params.states, params.after_seq) {
+            if self.settled(&id, current, &params.states, after_seq) {
                 break false;
             }
-            tokio::select! {
-                biased;
-                change = changes.recv() => match change {
-                    Ok(change) if change.instance_id == id => current = change.new,
-                    Ok(_) => continue,
-                    Err(RecvError::Lagged(_)) => {
-                        current = self.status_of(&id).await.ok_or_else(|| not_found(&id))?;
-                    }
-                    Err(RecvError::Closed) => break true,
-                },
-                _ = self.state.shutdown.cancelled() => break true,
-                _ = tokio::time::sleep_until(deadline) => break true,
+            if current == Status::Deleting {
+                return Err(not_found(&id));
             }
+            current = match self.next_change(&id, &mut changes, deadline).await {
+                Woke::Changed(status) => status,
+                Woke::Lagged => self.status_of(&id).await.ok_or_else(|| not_found(&id))?,
+                Woke::Deadline => break true,
+                Woke::Shutdown => {
+                    return Err(tool_error("busy", "The daemon is shutting down"));
+                }
+            };
         };
         if timed_out {
             current = self.status_of(&id).await.ok_or_else(|| not_found(&id))?;
         }
-        let structured = self.view_of(&id).await == Some(View::Structured);
-        let page = params
-            .after_seq
-            .filter(|_| structured)
-            .map(|since| transcript_page(&self.state, &id, since));
+        let page = after_seq.map(|since| transcript_page(&self.state, &id, since));
         Ok(Json(WaitResult {
             status: current.into(),
             timed_out,
             next_since: page.as_ref().map(|(_, next, _)| *next),
             has_more: page.as_ref().map(|(_, _, more)| *more),
             messages: page.map(|(text, _, _)| text),
-            pending_approvals: self.pending_approvals(&id).await,
+            pending_approvals: self.pending_approvals(&id, view).await,
         }))
     }
 
@@ -205,11 +209,9 @@ impl McpServer {
         Parameters(params): Parameters<SessionParams>,
     ) -> Result<Json<Approvals>, CallToolResult> {
         let id = params.session_id;
-        if self.view_of(&id).await.is_none() {
-            return Err(not_found(&id));
-        }
+        let view = self.view_of(&id).await.ok_or_else(|| not_found(&id))?;
         Ok(Json(Approvals {
-            approvals: self.pending_approvals(&id).await,
+            approvals: self.pending_approvals(&id, view).await,
         }))
     }
 
@@ -293,6 +295,39 @@ impl McpServer {
 }
 
 impl McpServer {
+    async fn session_of(&self, id: &str) -> Option<(Status, View)> {
+        self.state
+            .instances
+            .read()
+            .await
+            .iter()
+            .find(|i| i.id == id)
+            .map(|i| (i.status, i.view))
+    }
+
+    /// The next status change for `id`. Other sessions' changes are skipped here, so they cost
+    /// no re-check; the deadline and shutdown win over a backlog of them.
+    async fn next_change(
+        &self,
+        id: &str,
+        changes: &mut broadcast::Receiver<StatusChange>,
+        deadline: tokio::time::Instant,
+    ) -> Woke {
+        loop {
+            tokio::select! {
+                biased;
+                _ = self.state.shutdown.cancelled() => return Woke::Shutdown,
+                _ = tokio::time::sleep_until(deadline) => return Woke::Deadline,
+                change = changes.recv() => match change {
+                    Ok(change) if change.instance_id == id => return Woke::Changed(change.new),
+                    Ok(_) => {}
+                    Err(RecvError::Lagged(_)) => return Woke::Lagged,
+                    Err(RecvError::Closed) => return Woke::Shutdown,
+                },
+            }
+        }
+    }
+
     async fn status_of(&self, id: &str) -> Option<Status> {
         self.state
             .instances
@@ -325,17 +360,12 @@ impl McpServer {
         }
     }
 
-    /// Pending approvals live on a running worker, which sweeps orphans from the log when it
-    /// starts, so a session without one has none to settle.
-    async fn pending_approvals(&self, id: &str) -> Vec<PendingApproval> {
-        if self.view_of(id).await != Some(View::Structured)
-            || self.state.acp_supervisor.worker_state(id).await != AcpWorkerState::Running
-        {
+    async fn pending_approvals(&self, id: &str, view: View) -> Vec<PendingApproval> {
+        if view != View::Structured {
             return Vec::new();
         }
-        self.state
-            .acp_event_store
-            .pending_approval_requests(id)
+        let worker = self.state.acp_supervisor.worker_state(id).await;
+        settleable_approvals(&self.state, id, worker)
             .into_iter()
             .map(|approval| {
                 let call = approval.tool_call;

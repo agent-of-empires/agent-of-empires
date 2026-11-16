@@ -2,6 +2,20 @@
 
 use super::*;
 
+/// A structured session's pending approvals that can still be settled. A pending nonce only
+/// exists on a running worker, and spawn/attach sweep orphaned nonces out of the durable log,
+/// so for any other worker the log's leftovers are phantoms the resolver can only 404 on.
+pub(crate) fn settleable_approvals(
+    state: &AppState,
+    id: &str,
+    worker: crate::daemon::AcpWorkerState,
+) -> Vec<crate::acp::approvals::Approval> {
+    if worker != crate::daemon::AcpWorkerState::Running {
+        return Vec::new();
+    }
+    state.acp_event_store.pending_approval_requests(id)
+}
+
 #[derive(serde::Serialize)]
 pub struct RecentProjectsResponse {
     pub projects: Vec<crate::session::RecentProjectEntry>,
@@ -89,14 +103,8 @@ pub(crate) async fn project_sessions(state: &Arc<AppState>) -> Vec<SessionRespon
                         })
                 }));
             }
-            if structured_live && acp_worker_state == crate::daemon::AcpWorkerState::Running {
-                // Gate on a live worker: a pending nonce only exists on a
-                // running worker, and spawn/attach sweep orphaned nonces out of
-                // the durable log, so projecting a non-running row would surface
-                // a phantom approval the resolver can only 404 on.
-                session.pending_approvals = state
-                    .acp_event_store
-                    .pending_approval_requests(&inst.id)
+            if structured_live {
+                session.pending_approvals = settleable_approvals(state, &inst.id, acp_worker_state)
                     .into_iter()
                     .map(|approval| PendingApproval {
                         nonce: approval.nonce.0,

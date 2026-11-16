@@ -1358,6 +1358,18 @@ fn approval_requested(
     }
 }
 
+/// Waits until a `wait_for` has subscribed to the status broadcast.
+async fn await_subscriber(state: &crate::server::AppState, before: usize) {
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
+    while state.status_tx.receiver_count() == before {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "wait_for never subscribed"
+        );
+        tokio::task::yield_now().await;
+    }
+}
+
 /// Moves a session's status as the daemon does: in the store, then on the broadcast.
 async fn move_status(state: &crate::server::AppState, id: &str, to: crate::session::Status) {
     let mut instances = state.instances.write().await;
@@ -1396,14 +1408,7 @@ async fn wait_for_returns_on_a_status_broadcast_or_times_out() {
             .await
         }
     });
-    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
-    while state.status_tx.receiver_count() == subscribers {
-        assert!(
-            tokio::time::Instant::now() < deadline,
-            "wait_for never subscribed"
-        );
-        tokio::task::yield_now().await;
-    }
+    await_subscriber(&state, subscribers).await;
     // A status outside `states` does not end the wait.
     move_status(&state, id, Status::Starting).await;
     move_status(&state, id, Status::Idle).await;
@@ -1435,10 +1440,23 @@ async fn wait_for_after_seq_waits_for_that_turn_and_returns_its_messages() {
     seed_events(&state, id, std::slice::from_ref(&prompt));
     let args = json!({"session_id": id, "after_seq": 1, "timeout_s": 0});
 
-    let pending = call(&app, "wait_for", args.clone()).await;
+    let pending = call(&app, "wait_for", args).await;
     assert_eq!(pending["status"], "Idle", "{pending}");
     assert_eq!(pending["timed_out"], true, "{pending}");
 
+    let subscribers = state.status_tx.receiver_count();
+    let waiter = tokio::spawn({
+        let app = app.clone();
+        async move {
+            call(
+                &app,
+                "wait_for",
+                json!({"session_id": id, "after_seq": 1, "timeout_s": 300}),
+            )
+            .await
+        }
+    });
+    await_subscriber(&state, subscribers).await;
     let rest = [
         crate::acp::Event::AgentMessageChunk {
             text: "four".into(),
@@ -1451,7 +1469,13 @@ async fn wait_for_after_seq_waits_for_that_turn_and_returns_its_messages() {
     for (seq, event) in (2..).zip(&rest) {
         state.acp_event_store.record(id, seq, event).expect("seed");
     }
-    let done = call(&app, "wait_for", args).await;
+    move_status(&state, id, crate::session::Status::Running).await;
+    move_status(&state, id, crate::session::Status::Idle).await;
+    let done = tokio::time::timeout(std::time::Duration::from_secs(10), waiter)
+        .await
+        .expect("wait_for returned once the turn ended")
+        .unwrap();
+    assert_eq!(done["status"], "Idle", "{done}");
     assert_eq!(done["timed_out"], false, "{done}");
     let messages = done["messages"].as_str().unwrap();
     assert!(messages.contains("four"), "{messages}");
@@ -1500,6 +1524,13 @@ async fn approvals_are_listed_and_settled_by_nonce() {
     seed_events(&state, id, &events);
     let listed = call(&app, "list_approvals", json!({"session_id": id})).await;
     assert_eq!(listed["approvals"], json!([]), "{listed}");
+    let no_worker = call_result(
+        &app,
+        "approve",
+        json!({"session_id": id, "nonce": "n-allow", "decision": "allow"}),
+    )
+    .await;
+    assert_eq!(error_code(&no_worker), Some("not_running"), "{no_worker}");
 
     let _cmds = state
         .acp_supervisor
@@ -1599,7 +1630,8 @@ async fn approvals_are_listed_and_settled_by_nonce() {
     assert_eq!(error_code(&again), Some("not_found"), "{again}");
 }
 
-/// A terminal session has no approvals: none are listed and `approve` is refused.
+/// A terminal session has no approvals or turns: none are listed, `approve` is refused, and
+/// `after_seq` is ignored.
 #[tokio::test]
 #[serial_test::serial]
 async fn terminal_sessions_have_no_approvals() {
@@ -1611,6 +1643,16 @@ async fn terminal_sessions_have_no_approvals() {
 
     let listed = call(&app, "list_approvals", json!({"session_id": id})).await;
     assert_eq!(listed["approvals"], json!([]));
+    // It has no event seqs, so `after_seq` does not hold an `Idle` wait open.
+    let waited = call(
+        &app,
+        "wait_for",
+        json!({"session_id": id, "after_seq": 5, "timeout_s": 0}),
+    )
+    .await;
+    assert_eq!(waited["status"], "Idle", "{waited}");
+    assert_eq!(waited["timed_out"], false, "{waited}");
+    assert!(waited.get("messages").is_none(), "{waited}");
     let refused = call_result(
         &app,
         "approve",
