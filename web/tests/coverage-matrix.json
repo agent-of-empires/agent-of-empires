@@ -6081,6 +6081,14 @@
         "web/src/components/profiles/ProfilesSection.tsx",
         "web/src/components/sidebar/SessionRowMenu.tsx"
       ]
+    },
+    {
+      "id": "terminal-switch-refusal-text",
+      "kind": "deferred",
+      "issue": "https://github.com/agent-of-empires/agent-of-empires/issues/5651",
+      "risk": "low",
+      "reason": "Copy-only: a refused switch to Terminal view still toasts the server's plain-text message, now reworded; the server pins the text in acp::view tests. The web dialog in the next #5651 PR brings the tested flow.",
+      "components": ["web/src/lib/api.ts", "web/src/App.tsx"]
     }
   ]
 }
