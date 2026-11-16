@@ -1433,6 +1433,7 @@ mod tests {
             .acp_supervisor
             .test_insert_worker_cmd_recording(id)
             .await;
+        let _live = crate::acp::supervisor::test_support::save_agent_record(id, "claude", true);
         state.acp_supervisor.test_publish_worker_attached(id);
         state.instances.write().await[0].status = crate::session::Status::Idle;
         service.drain_queued_prompts_once(id).await;
@@ -1552,6 +1553,7 @@ mod tests {
             .acp_supervisor
             .test_insert_worker_cmd_recording(id)
             .await;
+        let _live = crate::acp::supervisor::test_support::save_agent_record(id, "claude", true);
         state.acp_supervisor.test_publish_worker_attached(id);
         state.instances.write().await[0].status = crate::session::Status::Idle;
         service.drain_queued_prompts_once(id).await;
