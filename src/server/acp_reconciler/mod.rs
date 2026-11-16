@@ -359,13 +359,9 @@ pub async fn reconcile_acp_workers(
         }
         // A stop fences automatic resumes, but is not a crash-loop park.
         if crate::process::worker_registry::stop_requested(&id) {
-            if with_queued_prompts.contains(&id) && !stop_notified.contains(&id) {
-                tracing::info!(
-                    target: "acp.supervisor",
-                    session = %id,
-                    "holding queued prompts: the worker was stopped and waits for an explicit start"
-                );
-                if crate::server::api::publish_startup_error_if_current(
+            if with_queued_prompts.contains(&id)
+                && !stop_notified.contains(&id)
+                && crate::server::api::publish_startup_error_if_current(
                     state,
                     &id,
                     &target.source_profile,
@@ -373,9 +369,14 @@ pub async fn reconcile_acp_workers(
                     STOP_FENCE_MESSAGE.to_string(),
                 )
                 .await
-                {
-                    stop_notified.insert(id.clone());
-                }
+            {
+                // Logged once per notice; a refused publication retries next tick.
+                tracing::info!(
+                    target: "acp.supervisor",
+                    session = %id,
+                    "holding queued prompts: the worker was stopped and waits for an explicit start"
+                );
+                stop_notified.insert(id.clone());
             }
             attempted.insert(id);
             continue;
