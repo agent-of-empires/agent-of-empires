@@ -6132,10 +6132,17 @@
     },
     {
       "id": "terminal-switch-command-selector-conflict",
+      "kind": "live-playwright",
+      "risk": "medium",
+      "specs": ["tests/live/acp-session-history.spec.ts"],
+      "components": ["web/src/lib/api.ts", "web/src/App.tsx", "web/src/components/SwitchViewDialog.tsx"]
+    },
+    {
+      "id": "terminal-switch-command-selector-owed-ending",
       "kind": "deferred",
       "issue": "https://github.com/agent-of-empires/agent-of-empires/issues/5651",
       "risk": "low",
-      "reason": "Behaviour change without a client flow yet: a switch whose command's own session flag conflicts with AoE's conversation is now refused before retirement, so the Session stays in Structured view, and a handoff already owed from before ends in Terminal view with Error instead of retrying. The dashboard only toasts the server's plain-text refusal; no client reads the new reason code yet. Handler tests in acp::view cover both paths, and the tested web flow comes with the #5651 switch dialog.",
+      "reason": "A handoff owed from before the up-front refusal now ends in Terminal view with Error and the remedy instead of retrying, including when its cleanup resumes after a failure or restart. A live run can't produce that state: it needs a reservation made by a daemon without the refusal. Handler tests in acp::view cover the ending, the resumed cleanup and both remedies; the web flow that shows it comes with the #5651 switch dialog.",
       "components": ["web/src/lib/api.ts", "web/src/App.tsx"]
     }
   ]
