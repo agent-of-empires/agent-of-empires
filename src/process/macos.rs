@@ -29,6 +29,8 @@ pub(super) struct StagingVolume {
 // Leave room for both instead of advertising the whole budget as usable space.
 const STAGING_IMAGE_OVERHEAD: u64 = 8 * 1024 * 1024;
 const STAGING_TOOL_OUTPUT: usize = 1024 * 1024;
+// This bounds read-only catalogue convergence, not attachment or quota enforcement.
+const STAGING_INVENTORY_WAIT: std::time::Duration = std::time::Duration::from_secs(5);
 
 #[cfg(test)]
 std::thread_local! {
@@ -38,6 +40,10 @@ std::thread_local! {
 #[derive(Debug, thiserror::Error)]
 #[error("spawning bounded macOS staging tool: {0}")]
 struct StagingToolNotStarted(#[source] std::io::Error);
+
+#[derive(Debug, thiserror::Error)]
+#[error("{0}")]
+struct StagingInventoryMissing(String);
 
 const STAGING_SANDBOX: &str = r#"
 (version 1)
@@ -148,7 +154,7 @@ impl StagingVolume {
             .arg((capacity / 512).to_string())
             .arg(&image);
         let mut created = false;
-        let mut attach_started = false;
+        let mut attachment_may_exist = false;
         let result: anyhow::Result<Self> = (|| {
             staging_tool(&mut create)?;
             created = true;
@@ -195,10 +201,10 @@ impl StagingVolume {
                     attach.pre_exec(|| Err(std::io::Error::from_raw_os_error(libc::EAGAIN)));
                 }
             }
-            attach_started = true;
+            attachment_may_exist = true;
             let output = staging_tool(&mut attach).inspect_err(|error| {
                 if error.downcast_ref::<StagingToolNotStarted>().is_some() {
-                    attach_started = false;
+                    attachment_may_exist = false;
                 }
             })?;
             let attached = staging_plist(&output)?;
@@ -216,9 +222,11 @@ impl StagingVolume {
                 limit,
                 closed: false,
             };
-            volume.verify_mounted()?;
-            // A successful attach alone does not prove which image owns the mount.
-            volume.verify_inventory(true)?;
+            // The attach reply and statfs do not prove that a separate catalogue
+            // snapshot already includes this image. Absence is never ownership
+            // proof: wait only while both anchored identities remain valid, and
+            // require one exact inventory record before admitting any writer.
+            volume.wait_for_inventory()?;
             // Prove that the installed policy compiles and can launch a child now,
             // not only when the first untrusted checkout eventually happens.
             let mut probe = volume.command("/usr/bin/true");
@@ -230,7 +238,12 @@ impl StagingVolume {
                     return Err(error);
                 }
                 return match volume.close() {
-                    Ok(()) => Err(error),
+                    Ok(()) => {
+                        // close proved detach, underlying mountpoint restoration
+                        // and image removal; no asynchronous attachment remains.
+                        attachment_may_exist = false;
+                        Err(error)
+                    }
                     Err(cleanup) => Err(error.context(super::StagingAcquisitionUncertain(
                         format!("cannot clean up rejected macOS staging sandbox: {cleanup:#}"),
                     ))),
@@ -250,16 +263,19 @@ impl StagingVolume {
                 let unchanged_mountpoint = std::fs::symlink_metadata(&root).is_ok_and(|current| {
                     metadata_identity(&current) == metadata_identity(&metadata)
                 });
-                if unchanged_mountpoint
+                if !attachment_may_exist
+                    && unchanged_mountpoint
                     && std::fs::symlink_metadata(&image)
                         .is_err_and(|e| e.kind() == std::io::ErrorKind::NotFound)
                 {
                     return Err(error);
                 }
                 // Before attach, a completed create can be rolled back only
-                // after inventory proves no device still owns its image.
+                // after inventory proves no device still owns its image. Once
+                // attach starts, absence cannot prove safe custody: retain the
+                // image and recovery marker rather than detach an unproven device.
                 if created
-                    && !attach_started
+                    && !attachment_may_exist
                     && unchanged_mountpoint
                     && staging_remove_unattached_image(&image).is_ok()
                 {
@@ -313,7 +329,7 @@ impl StagingVolume {
         command
     }
 
-    fn verify_mounted(&mut self) -> anyhow::Result<()> {
+    fn verify_mounted(&self) -> anyhow::Result<()> {
         use std::os::unix::fs::MetadataExt as _;
         let image = self
             .image_file
@@ -321,7 +337,11 @@ impl StagingVolume {
             .context("plugin staging image is closed")?
             .metadata()?;
         anyhow::ensure!(
-            metadata_identity(&std::fs::symlink_metadata(&self.image)?) == self.image_identity
+            image.is_file()
+                && image.nlink() == 1
+                && image.uid() == unsafe { libc::geteuid() }
+                && metadata_identity(&std::fs::symlink_metadata(&self.image)?)
+                    == self.image_identity
                 && metadata_identity(&image) == self.image_identity
                 && image.len() == self.image_length
                 && image
@@ -352,9 +372,20 @@ impl StagingVolume {
     }
 
     fn verify_inventory(&self, attached: bool) -> anyhow::Result<()> {
+        self.verify_inventory_before(
+            attached,
+            std::time::Instant::now() + std::time::Duration::from_secs(90),
+        )
+    }
+
+    fn verify_inventory_before(
+        &self,
+        attached: bool,
+        deadline: std::time::Instant,
+    ) -> anyhow::Result<()> {
         let mut command = Command::new("/usr/bin/hdiutil");
         command.args(["info", "-plist"]);
-        let inventory = staging_plist(&staging_tool(&mut command)?)?;
+        let inventory = staging_plist(&staging_tool_before(&mut command, deadline)?)?;
         staging_verify_inventory(
             &inventory,
             &self.image,
@@ -365,6 +396,24 @@ impl StagingVolume {
             attached,
         )?;
         Ok(())
+    }
+
+    fn wait_for_inventory(&self) -> anyhow::Result<()> {
+        let started = std::time::Instant::now();
+        let deadline = started + STAGING_INVENTORY_WAIT;
+        staging_wait_for_inventory(
+            || {
+                self.verify_mounted()?;
+                let inventory = self.verify_inventory_before(true, deadline);
+                // Check even an absent snapshot: loss of the original image,
+                // mount, statfs device or ownership ends the wait immediately.
+                self.verify_mounted()?;
+                inventory
+            },
+            || started.elapsed(),
+            std::thread::sleep,
+            STAGING_INVENTORY_WAIT,
+        )
     }
 
     /// The caller must prove all writers stopped before requesting detach.
@@ -406,6 +455,63 @@ impl StagingVolume {
     }
 }
 
+// Only a complete, noncontradictory snapshot lacking the anchored image may
+// converge. Parse errors, unknown image aliases, duplicate records, changed
+// ownership and device/mount mismatches are final errors, never retry signals.
+fn staging_wait_for_inventory(
+    mut observe: impl FnMut() -> anyhow::Result<()>,
+    mut elapsed: impl FnMut() -> std::time::Duration,
+    mut pause: impl FnMut(std::time::Duration),
+    timeout: std::time::Duration,
+) -> anyhow::Result<()> {
+    let mut observations = 0;
+    let mut first_inventory = None;
+    let mut last_inventory = None;
+    loop {
+        observations += 1;
+        match observe() {
+            Ok(()) => return Ok(()),
+            Err(error) => match error.downcast::<StagingInventoryMissing>() {
+                Ok(missing) => {
+                    if first_inventory.is_none() {
+                        first_inventory = Some(missing);
+                    } else {
+                        last_inventory = Some(missing);
+                    }
+                }
+                Err(error) => {
+                    let duration = elapsed();
+                    return match first_inventory.as_ref() {
+                        Some(first) => Err(error.context(format!(
+                            "macOS staging inventory readiness failed: elapsed={:?}, observations={observations}, first_inventory={first}, last_inventory={}",
+                            duration,
+                            last_inventory.as_ref().unwrap_or(first),
+                        ))),
+                        None if duration >= timeout => Err(error.context(format!(
+                            "macOS staging inventory readiness failed: elapsed={duration:?}, observations={observations}, first_inventory=<unavailable>, last_inventory=<unavailable>",
+                        ))),
+                        None => Err(error),
+                    };
+                }
+            },
+        }
+        let remaining = timeout.saturating_sub(elapsed());
+        if !remaining.is_zero() {
+            pause(remaining.min(std::time::Duration::from_millis(25)));
+        }
+        let duration = elapsed();
+        if duration >= timeout {
+            let first = first_inventory
+                .as_ref()
+                .expect("observed missing inventory");
+            anyhow::bail!(
+                "macOS staging inventory did not publish the anchored image before deadline: elapsed={duration:?}, observations={observations}, first_inventory={first}, last_inventory={}",
+                last_inventory.as_ref().unwrap_or(first),
+            );
+        }
+    }
+}
+
 fn staging_remove_unattached_image(image: &std::path::Path) -> anyhow::Result<()> {
     use std::os::unix::fs::MetadataExt as _;
     let metadata = std::fs::symlink_metadata(image)?;
@@ -421,7 +527,8 @@ fn staging_remove_unattached_image(image: &std::path::Path) -> anyhow::Result<()
         let path = staging_plist_string(&record, "image-path")?;
         anyhow::ensure!(
             staging_image_identity(std::path::Path::new(&path))?
-                != Some(metadata_identity(&metadata)),
+                .with_context(|| format!("cannot resolve inventory image identity: {path}"))?
+                != metadata_identity(&metadata),
             "rejected staging image remains attached: {path}"
         );
     }
@@ -470,6 +577,10 @@ fn staging_verify_inventory(
         let record = staging_plist_dictionary(*entry)?;
         let path = staging_plist_string(&record, "image-path")?;
         let identity = staging_image_identity(std::path::Path::new(&path))?;
+        anyhow::ensure!(
+            identity.is_some(),
+            "cannot resolve inventory image identity: {path}"
+        );
         // Disk numbers can be reused after detach; only file identity proves ownership.
         let matches = identity == Some(image_identity);
         if matches {
@@ -481,14 +592,41 @@ fn staging_verify_inventory(
                 "plugin staging image remains attached or changed device/mount: {path}"
             );
         }
+        if attached && !matches {
+            // A different image claiming our device or mount is a contradiction,
+            // not delayed publication. Unrelated entities may omit either field.
+            for entity in staging_plist_array(&record, "system-entities")?.iter() {
+                let entity = staging_plist_dictionary(*entity)?;
+                let claimed_device = staging_plist_optional_string(&entity, "dev-entry")?;
+                let claimed_mount = staging_plist_optional_string(&entity, "mount-point")?;
+                let claims_mount = match claimed_mount {
+                    Some(path) => {
+                        std::path::Path::new(&path) == root
+                            || std::fs::metadata(&path).is_ok_and(|metadata| {
+                                metadata_identity(&metadata) == mount_identity
+                            })
+                    }
+                    None => false,
+                };
+                anyhow::ensure!(
+                    claimed_device.as_deref() != Some(device) && !claims_mount,
+                    "another inventory image claims the staging device or mount: {path}"
+                );
+            }
+        }
         paths.push((path, identity));
     }
-    anyhow::ensure!(
-        found == usize::from(attached),
-        "plugin staging image attachment is ambiguous: found={found}, expected={}, image={} identity={image_identity:?}, inventory={paths:?}",
-        usize::from(attached),
-        image.display()
-    );
+    let diagnostic = || {
+        format!(
+            "plugin staging image attachment is ambiguous: found={found}, expected={}, image={} identity={image_identity:?}, inventory={paths:?}",
+            usize::from(attached),
+            image.display()
+        )
+    };
+    if attached && found == 0 {
+        return Err(StagingInventoryMissing(diagnostic()).into());
+    }
+    anyhow::ensure!(found == usize::from(attached), "{}", diagnostic());
     Ok(())
 }
 
@@ -581,6 +719,27 @@ fn staging_plist_string(
         .downcast::<core_foundation::string::CFString>()
         .context("disk image field is not a string")?
         .to_string())
+}
+
+fn staging_plist_optional_string(
+    dictionary: &core_foundation::dictionary::CFDictionary,
+    key: &str,
+) -> anyhow::Result<Option<String>> {
+    use core_foundation::{
+        base::{CFType, TCFType as _},
+        string::CFString,
+    };
+    let key = CFString::new(key);
+    dictionary
+        .find(key.as_concrete_TypeRef().cast::<std::ffi::c_void>())
+        .map(|value| {
+            // SAFETY: find returns a live retained dictionary's CF object.
+            unsafe { CFType::wrap_under_get_rule(*value) }
+                .downcast::<CFString>()
+                .context("disk image field is not a string")
+                .map(|value| value.to_string())
+        })
+        .transpose()
 }
 
 fn staging_attached_device(
@@ -684,8 +843,22 @@ fn staging_cloexec_descriptors(ceiling: i32) -> std::io::Result<()> {
 /// System disk-image tools are trusted, but their completion still has a
 /// deadline. Any failure leaves the backing image and caller's recovery marker.
 fn staging_tool(command: &mut Command) -> anyhow::Result<Vec<u8>> {
+    staging_tool_before(
+        command,
+        std::time::Instant::now() + std::time::Duration::from_secs(90),
+    )
+}
+
+fn staging_tool_before(
+    command: &mut Command,
+    deadline: std::time::Instant,
+) -> anyhow::Result<Vec<u8>> {
     use std::os::fd::AsRawFd as _;
     use std::time::{Duration, Instant};
+    anyhow::ensure!(
+        Instant::now() < deadline,
+        "macOS staging tool deadline expired before spawn"
+    );
     command
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::piped())
@@ -693,7 +866,6 @@ fn staging_tool(command: &mut Command) -> anyhow::Result<Vec<u8>> {
     let mut child = command.spawn().map_err(StagingToolNotStarted)?;
     let mut stdout = child.stdout.take().context("staging tool stdout missing")?;
     let mut stderr = child.stderr.take().context("staging tool stderr missing")?;
-    let deadline = Instant::now() + Duration::from_secs(90);
     let result = (|| {
         for fd in [stdout.as_raw_fd(), stderr.as_raw_fd()] {
             // SAFETY: both descriptors belong to the live child's pipes.
@@ -2995,6 +3167,71 @@ mod tests {
         let error = verify(&empty, true).unwrap_err().to_string();
         assert!(error.contains("found=0"));
         assert!(error.contains(&image.display().to_string()));
+
+        // Drive the real inventory validator with a virtual monotonic clock.
+        // Publication, deadline and contradictions need no mounted image or sleep.
+        let await_snapshots = |snapshots: &[&core_foundation::dictionary::CFDictionary],
+                               timeout| {
+            use std::cell::Cell;
+            use std::time::Duration;
+            let observations = Cell::new(0usize);
+            let elapsed = Cell::new(Duration::ZERO);
+            let result = staging_wait_for_inventory(
+                || {
+                    let index = observations.get();
+                    observations.set(index + 1);
+                    verify(snapshots[index.min(snapshots.len() - 1)], true)
+                },
+                || elapsed.get(),
+                |duration| elapsed.set(elapsed.get() + duration),
+                timeout,
+            );
+            (result, observations.get(), elapsed.get())
+        };
+        let budget = std::time::Duration::from_millis(50);
+        let tick = std::time::Duration::from_millis(25);
+        let (published, observations, elapsed) = await_snapshots(&[&empty, &inventory], budget);
+        assert!(published.is_ok());
+        assert_eq!(observations, 2);
+        assert_eq!(elapsed, tick);
+
+        let unrelated = snapshot(
+            std::slice::from_ref(&other_image),
+            &other_mount,
+            "/dev/disk43",
+        );
+        let (missing, observations, elapsed) = await_snapshots(&[&empty, &unrelated], budget);
+        let error = missing.unwrap_err().to_string();
+        assert!(error.contains("before deadline"));
+        assert!(error.contains("elapsed=50ms"));
+        assert!(error.contains("observations=2"));
+        assert!(error.contains("first_inventory="));
+        assert!(error.contains("inventory=[]"));
+        assert!(error.contains("last_inventory="));
+        assert!(error.contains(&other_image.display().to_string()));
+        assert_eq!(observations, 2);
+        assert_eq!(elapsed, budget);
+
+        let unknown_alias = snapshot(
+            &[image.clone(), parent.path().join("unknown-image-alias.dmg")],
+            &root,
+            "/dev/disk42",
+        );
+        for (contradiction, message) in [
+            (&duplicate, "found=2"),
+            (&changed_device, "changed device/mount"),
+            (&changed_mount, "unexpected mountpoint"),
+            (&recycled, "another inventory image claims"),
+            (&unknown_alias, "cannot resolve inventory image identity"),
+        ] {
+            let (rejected, observations, elapsed) =
+                await_snapshots(&[&empty, contradiction, &inventory], budget);
+            let error = rejected.unwrap_err();
+            assert!(format!("{error:#}").contains(message), "{error:#}");
+            assert!(error.downcast_ref::<StagingInventoryMissing>().is_none());
+            assert_eq!(observations, 2);
+            assert_eq!(elapsed, tick, "contradictions must not wait or recover");
+        }
         // A mount path that resolves to another directory must not inherit the
         // identity captured when attachment completed.
         std::fs::rename(&root, parent.path().join("retained-mount")).unwrap();
