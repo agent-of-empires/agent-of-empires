@@ -99,8 +99,11 @@ pub fn open(db_path: &Path, schema: &Schema) -> Result<Connection> {
         }
     }
     // SQLite gives the -wal and -shm files the main file's mode, so create it owner-only first.
-    create_owner_only(db_path)
-        .with_context(|| format!("create event log at {}", db_path.display()))?;
+    // Private memory and temporary databases have no file to create.
+    if !matches!(db_path.to_str(), Some("" | ":memory:")) {
+        create_owner_only(db_path)
+            .with_context(|| format!("create event log at {}", db_path.display()))?;
+    }
     let conn = Connection::open(db_path)
         .with_context(|| format!("open event log at {}", db_path.display()))?;
     conn.pragma_update(None, "journal_mode", "WAL")
