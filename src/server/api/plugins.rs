@@ -2538,11 +2538,11 @@ id = "voice"
         );
     }
 
-    /// Under passphrase-only auth an `<img>` load of an installed icon passes the wall
-    /// without a session or device binding.
+    /// Under passphrase-only auth an `<img>` load of an installed icon needs a live session
+    /// but not its device binding.
     #[tokio::test]
     #[serial_test::serial]
-    async fn an_installed_icon_loads_without_a_session_under_passphrase_auth() {
+    async fn an_installed_icon_loads_on_an_unbound_session_under_passphrase_auth() {
         use tower::ServiceExt;
         let _app_dir = AppDirEnvGuard::new();
         let dir = crate::plugin::plugins_dir().unwrap().join("acme.logo");
@@ -2555,33 +2555,44 @@ id = "voice"
         std::fs::write(dir.join("assets/icon.png"), b"png-bytes").unwrap();
         crate::plugin::reload_registry();
 
+        let login = std::sync::Arc::new(crate::server::login::LoginManager::new(Some("pw")));
+        let session = login.create_session(&[7u8; 32], "203.0.113.7", "t").await;
         let state = crate::server::test_support::build_test_app_state_with_policy_configured(
             Vec::new(),
             Vec::new(),
             Vec::new(),
             None,
-            |state| {
-                state.login_manager =
-                    std::sync::Arc::new(crate::server::login::LoginManager::new(Some("pw")))
-            },
+            |state| state.login_manager = std::sync::Arc::clone(&login),
         );
         let app = crate::server::test_support::build_router_for_test(state);
-        let mut req = axum::http::Request::get("/plugin-icons/acme.logo")
-            .header("host", "127.0.0.1")
-            .header("sec-fetch-dest", "image")
-            .body(axum::body::Body::empty())
-            .unwrap();
-        req.extensions_mut()
-            .insert(axum::extract::ConnectInfo(std::net::SocketAddr::from((
-                [203, 0, 113, 7],
-                5555,
-            ))));
-        let resp = app.oneshot(req).await.unwrap();
+        let get =
+            |cookie: Option<String>| {
+                let mut req = axum::http::Request::get("/plugin-icons/acme.logo")
+                    .header("host", "127.0.0.1")
+                    .header("sec-fetch-dest", "image");
+                if let Some(cookie) = cookie {
+                    req = req.header("cookie", cookie);
+                }
+                let mut req = req.body(axum::body::Body::empty()).unwrap();
+                req.extensions_mut().insert(axum::extract::ConnectInfo(
+                    std::net::SocketAddr::from(([203, 0, 113, 7], 5555)),
+                ));
+                app.clone().oneshot(req)
+            };
+        let cookie = format!("aoe_session={session}");
 
+        let resp = get(None).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED, "no session");
+
+        let resp = get(Some(cookie.clone())).await.unwrap();
         assert_eq!(resp.status(), StatusCode::OK);
         assert_eq!(resp.headers()["content-type"], "image/png");
         let body = axum::body::to_bytes(resp.into_body(), 1024).await.unwrap();
         assert_eq!(&body[..], b"png-bytes");
+
+        login.invalidate_session(&session).await;
+        let resp = get(Some(cookie)).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED, "after logout");
     }
 
     #[test]
