@@ -69,3 +69,17 @@ versions = {"0.1.0" = "sha256:d83d52337a66bded91103cb88778cbbbee0f639e68b15d68d7
 [plugins."agent-of-empires.aoe-freebuf"]
 source = "gh:agent-of-empires/plugin-freebuf"
 versions = {"0.1.1" = "sha256:b4174e233f643d6d565e75b6d88968d3e5f28f5c14e15008e25f47475d94b743"}
+
+# Released and pinned at `v0.5.0`, so an install with no `@ref` resolves that
+# tag instead of a moving default branch.
+#
+# 0.5.0 is the first release whose manifest declares `api_version = 21` with the
+# launch, detection, resume, capture and reply declarations, so it needs a host
+# that both accepts API 21 and consumes those declarations. On an older host the
+# load-time host_compat check skips it and the bundled `aoe.omp-fallback` contract
+# keeps working. Pinning it here is what lets its reserved-namespace id install.
+#
+# plugin-omp v0.5.0 @ 2863be6a5425870c24316f7e9faa716c4019546f
+[plugins."agent-of-empires.omp"]
+source = "gh:agent-of-empires/plugin-omp"
+versions = {"0.5.0" = "sha256:a2d718a00808b815ae6f3dcd7b05f6a81fdb6fedf642cb8883c42ef53889a962"}
