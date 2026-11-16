@@ -45,17 +45,17 @@ pub(super) fn parse_plan_steps(text: &str) -> Vec<PlanStep> {
     });
 
     let mut steps = Vec::new();
-    let mut fence: Option<&str> = None;
+    let mut fence: Option<(char, usize)> = None;
     for line in text.lines() {
-        let trimmed = line.trim_start();
-        if let Some(open) = fence {
-            if trimmed.starts_with(open) {
+        let run = fence_run(line);
+        if let Some((ch, len)) = fence {
+            if run.is_some_and(|(c, n, rest)| c == ch && n >= len && rest.trim().is_empty()) {
                 fence = None;
             }
             continue;
         }
-        if let Some(open) = ["```", "~~~"].into_iter().find(|f| trimmed.starts_with(f)) {
-            fence = Some(open);
+        if let Some((ch, len, _)) = run {
+            fence = Some((ch, len));
             continue;
         }
         if let Some(caps) = bullet.captures(line) {
@@ -73,6 +73,16 @@ pub(super) fn parse_plan_steps(text: &str) -> Vec<PlanStep> {
         }
     }
     steps
+}
+
+/// The fence char, run length and remainder of a CommonMark fence line.
+fn fence_run(line: &str) -> Option<(char, usize, &str)> {
+    let trimmed = line.trim_start();
+    let ch = trimmed.chars().next().filter(|c| matches!(c, '`' | '~'))?;
+    let len = trimmed.len() - trimmed.trim_start_matches(ch).len();
+    let rest = &trimmed[len..];
+    // A backtick fence's info string cannot contain a backtick.
+    (len >= 3 && !(ch == '`' && rest.contains('`'))).then_some((ch, len, rest))
 }
 
 /// Unwraps `**bold**`, `__bold__`, `*italic*` and `_italic_` so the PlanStrip
@@ -176,6 +186,21 @@ mod tests {
         );
         for s in &steps {
             assert!(matches!(s.status, PlanStepStatus::Pending));
+        }
+
+        // CommonMark closing fences: same char, at least the opener's length,
+        // nothing but whitespace after.
+        for (fenced, closed) in [
+            ("~~~\n~~~literal\n- hidden\n~~~  ", true),
+            ("````\n```\n- hidden\n````", true),
+            ("```rust\n- hidden\n~~~\n`````", true),
+            ("~~~\n- hidden\n```", false),
+            ("````\n- hidden\n```", false),
+        ] {
+            let md = format!("{fenced}\n- after");
+            let titles: Vec<String> = parse_plan_steps(&md).into_iter().map(|s| s.title).collect();
+            let want: &[&str] = if closed { &["after"] } else { &[] };
+            assert_eq!(titles, want, "{fenced:?}");
         }
 
         {
