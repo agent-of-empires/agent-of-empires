@@ -13,11 +13,15 @@ fn restrict(dir: &std::path::Path) -> Result<usize> {
         let entry = entry?;
         let name = entry.file_name();
         let Some(name) = name.to_str() else { continue };
-        if !PREFIXES.iter().any(|p| name.starts_with(p)) || !entry.file_type()?.is_file() {
+        let path = entry.path();
+        // metadata follows symlinks, so a linked log restricts its target.
+        let Ok(meta) = std::fs::metadata(&path) else {
+            continue;
+        };
+        if !PREFIXES.iter().any(|p| name.starts_with(p)) || !meta.is_file() {
             continue;
         }
-        let path = entry.path();
-        let mode = std::fs::metadata(&path)?.permissions().mode();
+        let mode = meta.permissions().mode();
         if mode & 0o077 != 0 {
             std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))?;
             changed += 1;
@@ -58,8 +62,16 @@ mod tests {
             std::fs::write(&path, b"x").unwrap();
             std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
         }
-        assert_eq!(super::restrict(dir.path()).unwrap(), 6);
+        let target = dir.path().join("history.sqlite");
+        std::fs::write(&target, b"x").unwrap();
+        std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o644)).unwrap();
+        std::os::unix::fs::symlink(&target, dir.path().join("cockpit_events.db")).unwrap();
+        assert_eq!(super::restrict(dir.path()).unwrap(), 7);
         assert_eq!(super::restrict(dir.path()).unwrap(), 0);
+        assert_eq!(
+            std::fs::metadata(&target).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
         for name in names {
             let mode = std::fs::metadata(dir.path().join(name))
                 .unwrap()

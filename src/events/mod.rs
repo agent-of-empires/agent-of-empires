@@ -81,13 +81,18 @@ fn not_like_clauses(prefixes: &[&str]) -> (String, Vec<String>) {
 
 fn create_owner_only(path: &Path) -> std::io::Result<()> {
     let mut options = std::fs::OpenOptions::new();
-    options.write(true).create(true).truncate(false);
+    options.write(true).create_new(true);
     #[cfg(unix)]
     {
         use std::os::unix::fs::OpenOptionsExt;
         options.mode(0o600);
     }
-    options.open(path).map(drop)
+    match options.open(path) {
+        Ok(_) => Ok(()),
+        // Reopening a database already open in this process would drop its SQLite locks.
+        Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => Ok(()),
+        Err(err) => Err(err),
+    }
 }
 
 pub fn open(db_path: &Path, schema: &Schema) -> Result<Connection> {
