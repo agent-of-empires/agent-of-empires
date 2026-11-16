@@ -28,6 +28,7 @@ import { Composer } from "./Composer";
 import { ContextPrimerBanner } from "./ContextPrimerBanner";
 import { PlanStrip } from "./PlanStrip";
 import { ModeSwitchFailedNotice, QueuedPromptsStrip, RejectedPromptsStrip, SessionNoticesStrip } from "./PromptStrips";
+import type { NewSessionLike } from "./ContainerGoneBanner";
 import { SessionBanners } from "./SessionBanners";
 import { ConfigOptionSwitchFailedNotice } from "./SessionConfigControls";
 import { StartupErrorScreen } from "./StartupErrorScreen";
@@ -88,6 +89,8 @@ interface Props {
   onOpenTerminal?: (mode: ShellMode) => void;
   /** Whether the server lets the dashboard restart the Agent. */
   canRestartAgent?: boolean;
+  /** Opens the wizard for a Session like this one; omitted on a read-only server. */
+  newSessionLike?: NewSessionLike;
 }
 
 const STARTER_PROMPTS = [
@@ -290,6 +293,8 @@ function AcpChrome({
         canRestart={!!view.canRestartAgent}
         onRestarted={ctx.markRestartStarted}
         onRestartFailed={ctx.markRestartFailed}
+        recreateContainerTitle={view.recreateContainerTitle}
+        newSession={view.newSessionLike}
       />
 
       <ThreadPrimitive.Root className="flex flex-1 flex-col min-h-0">
@@ -443,6 +448,13 @@ function ComposerDock({
   const compactAliases = useCompactAliases();
   // The Daemon's solo commands: they run as their own turn, never steered into one.
   const soloAliases = useMemo(() => [...clearAliases, ...compactAliases], [clearAliases, compactAliases]);
+  // A send would start the Session, which rebuilds the container without Recreate's warning.
+  const blockedReason =
+    state.startupError && state.startupCause?.kind === "container_missing"
+      ? view.canRestartAgent
+        ? "Recreate the container to send messages."
+        : "Ask the owner to recreate the container."
+      : null;
   return (
     <>
       <UsageLimitSection
@@ -486,6 +498,7 @@ function ComposerDock({
         })}
         onStartAndSend={view.onStartSession}
         onStopTurn={ctx.stopTurn}
+        blockedReason={blockedReason}
         soloAliases={soloAliases}
         agent={agent}
       />
@@ -516,11 +529,13 @@ function ComposerDock({
         onDismiss={ctx.dismissPrimer}
       />
 
-      <CompactionReminderBanner
-        state={state}
-        onCompact={() => ctx.sendPrompt("/compact")}
-        onDismiss={ctx.dismissCompactionReminder}
-      />
+      {!blockedReason && (
+        <CompactionReminderBanner
+          state={state}
+          onCompact={() => ctx.sendPrompt("/compact")}
+          onDismiss={ctx.dismissCompactionReminder}
+        />
+      )}
 
       {collapsible && (
         <ChromeCollapseHandle
@@ -541,6 +556,7 @@ function ComposerDock({
           currentAgent={state.agent ?? acpAgent}
           currentProvider={acpProvider}
           waitingFor={startingAgent}
+          blockedReason={blockedReason}
           connecting={connecting}
           availableModes={state.availableModes}
           currentModeId={state.currentModeId}

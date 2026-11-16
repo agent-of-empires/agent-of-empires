@@ -42,7 +42,8 @@ async function createSession(serve: ServeHandle, body: Record<string, unknown>) 
 test.describe("clone URL tab", () => {
   async function openCloneTab(page: Page, serve: ServeHandle) {
     await page.goto(serve.baseUrl);
-    await page.locator("body").click();
+    await expect(page.locator("html[data-shortcuts-ready]")).toBeAttached();
+    await page.evaluate(() => (document.activeElement as HTMLElement | null)?.blur());
     await page.keyboard.press("n");
     await expect(page.getByRole("heading", { name: "New session" })).toBeVisible({ timeout: 10_000 });
     await page.getByRole("button", { name: "Clone URL", exact: true }).click();

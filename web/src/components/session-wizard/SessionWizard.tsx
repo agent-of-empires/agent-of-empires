@@ -91,6 +91,8 @@ export interface WizardPrefill {
   scratch?: boolean;
   /** The registered project's worktree override for `path`; `undefined` means none. */
   worktreeEnabled?: boolean;
+  /** Kept over the profile's view default, as a direct edit would be. */
+  useStructuredView?: boolean;
 }
 
 function initialWizardData(prefill: WizardPrefill | undefined, nameOnly: boolean): WizardData {
@@ -117,6 +119,10 @@ function initialWizardData(prefill: WizardPrefill | undefined, nameOnly: boolean
     // Seeded here rather than dispatched so APPLY_PROFILE_DEFAULTS cannot clobber it.
     projectWorktreeOverride: prefill.scratch ? undefined : prefill.worktreeEnabled,
     extraRepoPaths: prefill.scratch ? [] : base.extraRepoPaths,
+    ...(prefill.useStructuredView !== undefined && {
+      useStructuredView: prefill.useStructuredView,
+      structuredViewDirty: true,
+    }),
   };
 }
 

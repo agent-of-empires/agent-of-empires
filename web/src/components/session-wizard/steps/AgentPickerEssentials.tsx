@@ -1,6 +1,7 @@
 import type { AgentInfo } from "../../../lib/types";
 import { effectiveLifecycle, type AgentLifecycleInfo } from "../../../lib/agentProfiles";
 import type { WizardData } from "../wizardReducer";
+import { hasFinePointer } from "../../../lib/platform";
 
 interface Props {
   data: WizardData;
@@ -52,6 +53,7 @@ export function AgentPickerEssentials({ data, onChange, agents }: Props) {
           <button
             type="button"
             key={agent.name}
+            autoFocus={data.tool === agent.name && hasFinePointer()}
             onClick={() => onChange("tool", agent.name)}
             className={`min-h-[44px] text-left p-3 rounded-lg border transition-colors cursor-pointer focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-brand-600 ${
               data.tool === agent.name

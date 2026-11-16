@@ -826,6 +826,13 @@
       "components": ["web/src/hooks/useAcpSession.ts", "web/src/lib/api.ts"]
     },
     {
+      "id": "acp.login-required-queued-prompt",
+      "kind": "vitest",
+      "risk": "medium",
+      "specs": ["src/hooks/useAcpSession.test.ts"],
+      "components": ["web/src/hooks/useAcpSession.ts", "web/src/hooks/acpSession/reducer.ts"]
+    },
+    {
       "id": "acp.server-queue",
       "kind": "vitest",
       "risk": "medium",
@@ -996,6 +1003,13 @@
         "src/hooks/__tests__/useSettingsCommands.test.tsx"
       ],
       "components": ["web/src/components/SettingsView.tsx", "web/src/hooks/useSettingsCommands.ts"]
+    },
+    {
+      "id": "settings.shared-credential",
+      "kind": "vitest",
+      "risk": "medium",
+      "specs": ["src/components/settings/__tests__/SharedCredentialSetting.test.tsx"],
+      "components": ["web/src/components/SettingsView.tsx", "web/src/components/settings/FormFields.tsx"]
     },
     {
       "id": "settings.session-auto-stop-idle",
@@ -1745,6 +1759,41 @@
         "web/src/components/session-wizard/steps/LaunchFields.tsx",
         "web/src/components/session-wizard/steps/ProfilePresetPicker.tsx"
       ]
+    },
+    {
+      "id": "wizard.first-field-autofocus",
+      "kind": "mocked-playwright",
+      "risk": "low",
+      "specs": ["tests/wizard-project.spec.ts", "tests/wizard.spec.ts"],
+      "components": [
+        "web/src/components/DirectoryBrowser.tsx",
+        "web/src/components/session-wizard/steps/AgentPickerEssentials.tsx",
+        "web/src/components/session-wizard/steps/CloneRepoForm.tsx",
+        "web/src/components/session-wizard/steps/ExtraReposPicker.tsx",
+        "web/src/components/session-wizard/steps/ImportSessionPicker.tsx",
+        "web/src/components/session-wizard/steps/LaunchFields.tsx",
+        "web/src/components/session-wizard/steps/ProjectSearchList.tsx",
+        "web/src/components/session-wizard/steps/ProjectStep.tsx",
+        "web/src/components/session-wizard/steps/SandboxPanel.tsx",
+        "web/src/components/session-wizard/steps/WorktreePanel.tsx"
+      ],
+      "notes": "On a fine-pointer device each wizard sub-panel focuses its first editable control on open: the Project and Extra repos search, the Browse filter, the Clone URL, the Import agent select, the Worktree branch name, the Sandbox image, and the selected agent. Fields that appear when projects finish loading keep any focus the user chose meanwhile. A touch device focuses nothing."
+    },
+    {
+      "id": "modals.first-field-autofocus",
+      "kind": "mocked-playwright",
+      "risk": "low",
+      "specs": [
+        "tests/modal-autofocus.spec.ts",
+        "tests/diff-comments.spec.ts",
+        "tests/sidebar-project-settings.spec.ts"
+      ],
+      "components": [
+        "web/src/components/McpServerForm.tsx",
+        "web/src/components/ProjectFormModal.tsx",
+        "web/src/components/diff/comments/SendCommentsDialog.tsx"
+      ],
+      "notes": "On a fine-pointer device the MCP server form focuses Name when adding and Transport when editing, the project form focuses Path when adding and the base branch when editing, and Send diff comments focuses the intro. A touch device focuses nothing."
     },
     {
       "id": "wizard.scratch-toggle-visible",
@@ -3209,6 +3258,14 @@
       ]
     },
     {
+      "id": "settings.persistent-terminals",
+      "kind": "vitest",
+      "risk": "low",
+      "description": "Kept terminals stay attached across session switches, so each keeps its scroll position.",
+      "specs": ["src/components/__tests__/TerminalSessionStack.test.tsx"],
+      "components": ["web/src/components/TerminalSessionStack.tsx"]
+    },
+    {
       "id": "settings.persistent-structured-views",
       "kind": "vitest",
       "risk": "low",
@@ -4271,6 +4328,40 @@
         "web/src/components/acp/signInSteps.ts"
       ],
       "notes": "Auth-required startup errors name the agent's own sign-in step from signInSteps.ts: Claude gets claude auth login and ANTHROPIC_API_KEY, Codex gets codex login (codex login --device-auth in a Container) and OPENAI_API_KEY, other agents get generic sign-in copy with no Claude or Codex commands. A sandboxed Session with install off runs the command inside the container and points new Sessions at the dashboard's \"Sandbox image update available\" banner, which offers Update now to pull it or shows the command to run, never at the TUI."
+    },
+    {
+      "id": "acp.container-gone-banner",
+      "kind": "mocked-playwright",
+      "risk": "high",
+      "specs": [
+        "tests/container-gone.spec.ts",
+        "src/components/acp/__tests__/ContainerGoneBanner.test.tsx",
+        "src/hooks/acpSession/reducer.test.ts",
+        "src/hooks/acpSession/stateCache.test.ts",
+        "src/components/session-wizard/__tests__/SessionWizard.test.tsx",
+        "src/components/acp/Composer.test.tsx",
+        "src/components/acp/QueuedPromptsStrip.test.tsx"
+      ],
+      "components": [
+        "web/src/components/acp/ContainerGoneBanner.tsx",
+        "web/src/components/acp/Composer.tsx",
+        "web/src/components/acp/PromptStrips.tsx",
+        "web/src/components/acp/StructuredView.tsx",
+        "web/src/components/acp/SessionBanners.tsx",
+        "web/src/components/sidebar/RecreateContainerDialog.tsx",
+        "web/src/components/session-wizard/SessionWizard.tsx",
+        "web/src/components/MobileMainPane.tsx",
+        "web/src/App.tsx"
+      ],
+      "notes": "An AgentStartupError with cause container_missing shows this banner instead of the generic one: no Retry or Use Terminal view, Recreate container (primary, full width at 375px) and New Session in the Project, named as its sidebar header (alias, else folder name). The composer is disabled with \"Recreate the container to send messages.\" as its placeholder, since a send would start the Session and rebuild the container without the warning; a queued row's Start and send is disabled with the same reason, and the compaction reminder's Compact now isn't offered; an untyped startup error leaves all three as on main. Recreate confirms through the Session menu's dialog and, once the Daemon accepts it, hands over to the startup line as a Retry does. New Session opens the wizard with the Project, Agent, Group and Structured view (kept over a Terminal view profile default, not over off), title empty, sandbox and yolo from the defaults. The cause is set and cleared wherever the startup error is, a later untyped error replaces it, and it persists with the cached state."
+    },
+    {
+      "id": "acp.container-gone-read-only",
+      "kind": "mocked-playwright",
+      "risk": "medium",
+      "specs": ["tests/container-gone.spec.ts", "src/components/acp/__tests__/ContainerGoneBanner.test.tsx"],
+      "components": ["web/src/components/acp/ContainerGoneBanner.tsx"],
+      "notes": "Where the server refuses a restart (read-only and CityHall), the banner keeps the heading and sentence, adds \"Ask the owner to recreate the container.\" and offers no actions, and the composer's placeholder says the same; Details still shows the server's message."
     },
     {
       "id": "acp.startup-error-banner-actions",
@@ -5751,7 +5842,7 @@
       "id": "settings.plugins",
       "kind": "vitest",
       "risk": "high",
-      "description": "Plugin cards show validation, including a warning-styled dev badge.",
+      "description": "Plugin cards show validation, including a warning-styled dev badge. Failed jobs retain their bounded tail and display the actual full-log path on the Daemon host.",
       "specs": [
         "src/components/settings/__tests__/PluginsSettings.test.tsx",
         "src/components/settings/__tests__/PluginIdentityIcon.test.tsx"

@@ -827,7 +827,7 @@ impl PendingJob {
             Self::Picker { .. } => Some("Checking access options"),
             Self::Providers { .. } => Some("Checking tunnel providers"),
             Self::Retry { .. } => Some("Stopping the observed daemon before provider retry"),
-            Self::Reset => Some("Resetting Funnel; closing does not undo an admitted reset"),
+            Self::Reset => Some("Turning Funnel off; closing does not undo an admitted request"),
             _ => None,
         }
     }
@@ -889,6 +889,16 @@ impl ServeView {
     }
 
     pub(crate) fn for_launch(launch: DashboardLaunch, jobs: &mut ServeJobs) -> Self {
+        Self::for_launch_with(launch, jobs.submitter())
+    }
+
+    /// A launch view whose worker is already gone, so every job disconnects on the first tick.
+    #[cfg(test)]
+    pub(crate) fn for_launch_with_closed_worker(launch: DashboardLaunch) -> Self {
+        Self::for_launch_with(launch, Submitter::closed_for_test())
+    }
+
+    fn for_launch_with(launch: DashboardLaunch, submitter: Submitter) -> Self {
         let (state, running, observed_target) = match launch {
             DashboardLaunch::Running { target, started_at } => (
                 ServeViewState::Starting {
@@ -912,7 +922,7 @@ impl ServeView {
                 failure.target.or(target.observed_target),
             ),
         };
-        let mut view = Self::with_state(state, jobs.submitter());
+        let mut view = Self::with_state(state, submitter);
         view.launch_in_flight = running;
         view.target = observed_target;
         if running {
@@ -1852,10 +1862,14 @@ impl ServeView {
                 self.state = ServeViewState::provider_retry(failed, tailscale, cloudflare);
                 self.providers_checked_at = Some(Instant::now());
             }
-            (PendingJob::Reset, JobResult::Reset(result)) => {
+            (PendingJob::Reset, JobResult::Reset { port, result }) => {
+                let command = port.map_or_else(
+                    || "tailscale funnel off".to_owned(),
+                    crate::server::tunnel::funnel_off_command,
+                );
                 let message = match result {
-                    Ok(()) => "Ran `tailscale funnel reset`. The existing funnel config (if any) has been cleared.\n\nPress P to pick a provider and start again.".to_owned(),
-                    Err(error) => format!("`tailscale funnel reset` did not complete: {error}\n\nInspect Funnel state before retrying, then press P to pick a provider."),
+                    Ok(()) => format!("Ran `{command}`. Funnel on that port is off; other ports are untouched.\n\nPress P to pick a provider and start again."),
+                    Err(error) => format!("`{command}` did not complete: {error}\n\nInspect Funnel state before retrying, then press P to pick a provider."),
                 };
                 self.state = ServeViewState::Error {
                     message,
