@@ -722,7 +722,7 @@ pub fn snapshot(instance: &Instance) -> Option<AgentIntegrationSnapshot> {
     if !eligible(instance) {
         return None;
     }
-    let registry = crate::plugin::registry();
+    let registry = super::registry();
     let plugin = provider(&registry, &instance.tool).ok()??;
     read_report(&instance.id, &instance.tool, plugin)
         .ok()
@@ -765,7 +765,7 @@ pub(crate) fn owned_status(
     if !eligible(instance) {
         return None;
     }
-    let registry = crate::plugin::registry();
+    let registry = super::registry();
     let own_claim = provider(&registry, &instance.tool);
     let alias = crate::tmux::status_rules::detection_tool(
         &instance.source_profile,
@@ -1052,7 +1052,7 @@ pub fn respond(
         eligible(instance),
         "session does not support provider integration replies"
     );
-    let registry = crate::plugin::registry();
+    let registry = super::registry();
     let plugin = provider(&registry, &instance.tool)?
         .context("provider integration is not enabled and approved")?;
     // The dialog may have opened while the plugin still owned this name. Only a
