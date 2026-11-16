@@ -401,7 +401,8 @@ pub(super) fn custom_agent_acp_capable(
 }
 
 /// A config input's bytes, or why it could not be read (absent, or a directory).
-type Fingerprint = Result<std::sync::Arc<[u8]>, std::io::ErrorKind>;
+/// On a read error, whether the path itself exists: a dangling link is not an absent file.
+type Fingerprint = Result<std::sync::Arc<[u8]>, (std::io::ErrorKind, bool)>;
 
 /// Read `path` once per request, so an input many entries share costs one read.
 fn fingerprint<'a>(
@@ -411,7 +412,7 @@ fn fingerprint<'a>(
     seen.entry(path.to_path_buf()).or_insert_with(|| {
         std::fs::read(path)
             .map(std::sync::Arc::from)
-            .map_err(|error| error.kind())
+            .map_err(|error| (error.kind(), std::fs::symlink_metadata(path).is_ok()))
     })
 }
 

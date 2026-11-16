@@ -4434,6 +4434,8 @@ fn session_cfg_store_reresolves_only_after_an_input_edit() {
     run_git(repo.path(), &["init", "-q"]);
     let repo_config = repo.path().join(".agent-of-empires/config.toml");
     std::fs::create_dir_all(repo_config.parent().unwrap()).unwrap();
+    let legacy_config = repo.path().join(".aoe/config.toml");
+    std::fs::create_dir_all(legacy_config.parent().unwrap()).unwrap();
     let path = repo.path().to_str().unwrap();
 
     let mut store = super::SessionCfgStore::default();
@@ -4448,7 +4450,17 @@ fn session_cfg_store_reresolves_only_after_an_input_edit() {
 
     assert_eq!(request(&|| {}), (1, 1), "first request");
     assert_eq!(request(&|| {}), (0, 0), "unchanged inputs");
-    let cases: [(&str, &dyn Fn()); 3] = [
+    let cases: [(&str, &dyn Fn()); 6] = [
+        ("legacy repo config created", &|| {
+            std::fs::write(&legacy_config, "# l\n").unwrap()
+        }),
+        // The loader picks a dangling primary over the legacy file, and the legacy file again once it goes.
+        ("dangling primary link created", &|| {
+            std::os::unix::fs::symlink("/nonexistent", &repo_config).unwrap()
+        }),
+        ("dangling primary link removed", &|| {
+            std::fs::remove_file(&repo_config).unwrap()
+        }),
         ("repo config created", &|| {
             std::fs::write(&repo_config, "# a\n").unwrap()
         }),
