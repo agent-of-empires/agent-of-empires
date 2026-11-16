@@ -133,6 +133,8 @@ fn normalize_path(path: &str) -> &str {
 fn is_machine_endpoint(path: &str) -> bool {
     let path = path.trim_end_matches('/');
     path.starts_with("/api/")
+        // Login-exempt, but still behind the token gate.
+        || path.starts_with("/plugin-icons/")
         || path.contains("/ws")
         || (path.starts_with("/sessions/") && path.ends_with("/live-ws"))
         || is_mcp_path(path)
@@ -1363,13 +1365,12 @@ mod tests {
                 None => format!("aoe_session={session_id}"),
             };
 
-            let get = |uri: &str| {
-                let mut req = Request::builder()
-                    .uri(uri)
-                    .header("host", "localhost")
-                    .header("cookie", &cookie)
-                    .body(axum::body::Body::empty())
-                    .unwrap();
+            let get = |uri: &str, with_cookie: bool| {
+                let mut req = Request::builder().uri(uri).header("host", "localhost");
+                if with_cookie {
+                    req = req.header("cookie", &cookie);
+                }
+                let mut req = req.body(axum::body::Body::empty()).unwrap();
                 req.extensions_mut().insert(ConnectInfo(
                     "203.0.113.7:5555".parse::<SocketAddr>().unwrap(),
                 ));
@@ -1378,19 +1379,34 @@ mod tests {
             };
 
             // 404 when the build embeds no dashboard; either way auth let it through.
-            let shell = get("/plugins/github/prs").await;
+            let shell = get("/plugins/github/prs", true).await;
             assert!(
                 matches!(shell, StatusCode::OK | StatusCode::NOT_FOUND),
                 "{token:?}: {shell}"
             );
             // The handler's own 404 for an unknown plugin, not the wall's 401 or redirect.
             assert_eq!(
-                get("/plugin-icons/absent.plugin").await,
+                get("/plugin-icons/absent.plugin", true).await,
                 StatusCode::NOT_FOUND,
                 "{token:?}"
             );
+            // With no credentials, only the token gate still guards the icon.
+            let anonymous = if token.is_some() {
+                StatusCode::UNAUTHORIZED
+            } else {
+                StatusCode::NOT_FOUND
+            };
+            assert_eq!(
+                get("/plugin-icons/absent.plugin", false).await,
+                anonymous,
+                "{token:?}"
+            );
             for api in ["/api/sessions", "/api/plugins/github/pages/prs"] {
-                assert_eq!(get(api).await, StatusCode::UNAUTHORIZED, "{token:?} {api}");
+                assert_eq!(
+                    get(api, true).await,
+                    StatusCode::UNAUTHORIZED,
+                    "{token:?} {api}"
+                );
             }
         }
     }

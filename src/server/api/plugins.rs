@@ -143,7 +143,7 @@ fn content_type_for_icon(path: &std::path::Path) -> Option<&'static str> {
     }
 }
 
-/// `GET /api/plugins/{id}/icon`: stream an installed plugin's `icon_asset`
+/// `GET /plugin-icons/{id}`: stream an installed plugin's `icon_asset`
 /// from its install directory. Mirrors `serve_sound_file`'s allowlist-then-read
 /// shape: the manifest path is re-validated and re-joined against the
 /// plugin's own directory rather than trusted from a cached URL. A builtin
