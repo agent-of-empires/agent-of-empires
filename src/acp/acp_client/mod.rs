@@ -981,6 +981,34 @@ impl AcpClient {
             .map_err(|_| AcpError::AgentExited)
     }
 
+    /// Parks an approval as a permission request does, and yields what it was answered with:
+    /// the decision and named option, or `None` for a cancel.
+    #[cfg(test)]
+    pub(crate) async fn test_park_approval(
+        &self,
+        nonce: Nonce,
+    ) -> oneshot::Receiver<Option<(ApprovalDecision, Option<String>)>> {
+        let (resolve_tx, resolve_rx) = oneshot::channel();
+        self.pending_responders.lock().await.insert(
+            nonce,
+            pending::PendingResponder {
+                resolver: PendingResolver::Approval(resolve_tx),
+            },
+        );
+        let (answer_tx, answer_rx) = oneshot::channel();
+        tokio::spawn(async move {
+            let answer = match resolve_rx.await {
+                Ok(ApprovalResolutionMessage::Decision {
+                    decision,
+                    option_id,
+                }) => Some((decision, option_id)),
+                _ => None,
+            };
+            let _ = answer_tx.send(answer);
+        });
+        answer_rx
+    }
+
     pub async fn cancel_permission(&self, nonce: Nonce) -> Result<(), AcpError> {
         self.take_approval(&nonce)
             .await?

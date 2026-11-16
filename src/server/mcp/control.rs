@@ -387,18 +387,13 @@ impl McpServer {
                     has_more: page.has_more,
                 }));
             }
-            let text_page = text_page(&page.events, since);
-            // A page cut short leaves events for the next call, whatever the store says.
-            let next_since = match text_page.last_seq {
-                Some(seq) if text_page.cut => seq,
-                _ => page.last_scanned_seq.unwrap_or(since),
-            };
+            let (text, next_since, has_more) = rendered_page(page, since);
             return Ok(Json(Output {
                 view: View::Structured,
-                text: Some(text_page.text),
+                text: Some(text),
                 events: None,
                 next_since: Some(next_since),
-                has_more: page.has_more || text_page.cut,
+                has_more,
             }));
         }
         let lines = params.lines.unwrap_or(DEFAULT_LINES).clamp(1, 2000) as usize;
@@ -526,7 +521,7 @@ impl McpServer {
             .map(|i| i.id.clone())
     }
 
-    async fn view_of(&self, id: &str) -> Option<View> {
+    pub(super) async fn view_of(&self, id: &str) -> Option<View> {
         self.state
             .instances
             .read()
@@ -696,6 +691,31 @@ fn readiness_of(detected: Option<(Option<Status>, &str)>) -> PaneReadiness {
 /// The audit line HTTP `POST /send` writes for keystrokes typed into a pane.
 fn log_terminal_message_sent(id: &str, message: &str) {
     tracing::info!(target: "session.lifecycle", session = %id, len = message.len(), via = "mcp", "terminal message sent");
+}
+
+/// A structured session's transcript after `since` as one text page: the text, the cursor to
+/// read on from, and whether more follows it.
+pub(super) fn transcript_page(
+    state: &crate::server::AppState,
+    id: &str,
+    since: u64,
+) -> (String, u64, bool) {
+    rendered_page(
+        state
+            .acp_event_store
+            .replay_page(id, since, Some(READ_PAGE)),
+        since,
+    )
+}
+
+fn rendered_page(page: crate::acp::event_store::ReplayPage, since: u64) -> (String, u64, bool) {
+    let text_page = text_page(&page.events, since);
+    // A page cut short leaves events for the next call, whatever the store says.
+    let next_since = match text_page.last_seq {
+        Some(seq) if text_page.cut => seq,
+        _ => page.last_scanned_seq.unwrap_or(since),
+    };
+    (text_page.text, next_since, page.has_more || text_page.cut)
 }
 
 /// One `read_output` text page: the longest run of whole events, from `since`, whose rendering
@@ -899,7 +919,7 @@ async fn terminal_refusal(id: &str, error: SendKeysError) -> CallToolResult {
     }
 }
 
-fn not_found(id: &str) -> CallToolResult {
+pub(super) fn not_found(id: &str) -> CallToolResult {
     tool_error("not_found", format!("No session {id}"))
 }
 

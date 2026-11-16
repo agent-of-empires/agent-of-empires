@@ -32,6 +32,7 @@ use crate::daemon::SessionResponse;
 use crate::session::SessionScope;
 
 mod control;
+mod wait;
 
 #[derive(Debug, Default, Clone, Copy, Deserialize, JsonSchema)]
 #[serde(rename_all = "lowercase")]
@@ -65,7 +66,7 @@ impl McpServer {
     fn new(state: Arc<AppState>) -> Self {
         Self {
             state,
-            tool_router: Self::tool_router() + Self::control_router(),
+            tool_router: Self::tool_router() + Self::control_router() + Self::wait_router(),
         }
     }
 
