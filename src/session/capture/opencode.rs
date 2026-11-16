@@ -504,11 +504,13 @@ mod tests {
         std::fs::write(
             &script,
             r#"import os, signal, socket, sys
+os.dup2(os.open(os.environ['SHUTDOWN_STDERR'], os.O_WRONLY | os.O_CREAT | os.O_APPEND), 2)
 if os.fork():
     os.wait()
     sys.exit(0)
-control = socket.create_connection(('127.0.0.1', int(os.environ['SHUTDOWN_CONTROL_PORT'])), timeout=3)
+control = socket.create_connection(('127.0.0.1', int(os.environ['SHUTDOWN_CONTROL_PORT'])), timeout=30)
 def stopped(signum, frame):
+    open(os.environ['SHUTDOWN_SIGNALLED'], 'w').close()
     control.sendall(b'T')
     if control.recv(1) != b'R': sys.exit(2)
     with open(os.environ['SHUTDOWN_COMPLETE'], 'w') as marker: marker.write('finished')
@@ -526,14 +528,20 @@ while True:
 "#,
         )
         .unwrap();
+        // Longer than every wait below, so only an early return can pass.
+        let grace = Duration::from_secs(30);
+        let stderr = directory.path().join("stderr");
         for outcome in ["success", "error", "panic"] {
             let finished = directory.path().join(outcome);
+            let signalled = directory.path().join(format!("{outcome}-signalled"));
             let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
             listener.set_nonblocking(true).unwrap();
             let mut command = std::process::Command::new(&python);
             command
                 .arg(&script)
                 .env("SHUTDOWN_COMPLETE", &finished)
+                .env("SHUTDOWN_SIGNALLED", &signalled)
+                .env("SHUTDOWN_STDERR", &stderr)
                 .env(
                     "SHUTDOWN_CONTROL_PORT",
                     listener.local_addr().unwrap().port().to_string(),
@@ -542,16 +550,15 @@ while True:
             let project_path = directory.path().to_str().unwrap();
             let result = std::thread::scope(|scope| {
                 let worker = scope.spawn(move || {
-                    let result =
-                        with_serve(project_path, command, Duration::from_secs(5), move |_| {
-                            Box::pin(async move {
-                                match outcome {
-                                    "success" => Ok("completed"),
-                                    "error" => anyhow::bail!("call failed"),
-                                    _ => panic!("worker failed"),
-                                }
-                            })
-                        });
+                    let result = with_serve(project_path, command, grace, move |_| {
+                        Box::pin(async move {
+                            match outcome {
+                                "success" => Ok("completed"),
+                                "error" => anyhow::bail!("call failed"),
+                                _ => panic!("worker failed"),
+                            }
+                        })
+                    });
                     let _ = sender.send(result);
                 });
                 let deadline = Instant::now() + Duration::from_secs(8);
@@ -569,13 +576,19 @@ while True:
                 };
                 control.set_nonblocking(false).unwrap();
                 control
-                    .set_read_timeout(Some(Duration::from_secs(8)))
+                    .set_read_timeout(Some(Duration::from_secs(10)))
                     .unwrap();
                 control
                     .set_write_timeout(Some(Duration::from_secs(3)))
                     .unwrap();
                 let mut entered = [0];
-                control.read_exact(&mut entered).unwrap();
+                if let Err(error) = control.read_exact(&mut entered) {
+                    panic!(
+                        "{outcome}: no SIGTERM acknowledgement ({error}); handler entered: {}; stderr: {:?}",
+                        signalled.exists(),
+                        std::fs::read_to_string(&stderr).unwrap_or_default()
+                    );
+                }
                 assert_eq!(entered, *b"T");
                 assert!(!finished.exists());
                 assert!(
@@ -586,7 +599,9 @@ while True:
                     "helper returned while descendant shutdown was blocked"
                 );
                 control.write_all(b"R").unwrap();
-                let result = receiver.recv_timeout(Duration::from_secs(8)).unwrap();
+                let result = receiver
+                    .recv_timeout(Duration::from_secs(10))
+                    .expect("helper must return once the group settles, not after the grace");
                 worker.join().unwrap();
                 result
             });
