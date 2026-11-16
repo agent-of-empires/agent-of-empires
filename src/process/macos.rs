@@ -470,16 +470,8 @@ fn staging_verify_inventory(
         let record = staging_plist_dictionary(*entry)?;
         let path = staging_plist_string(&record, "image-path")?;
         let identity = staging_image_identity(std::path::Path::new(&path))?;
+        // Disk numbers can be reused after detach; only file identity proves ownership.
         let matches = identity == Some(image_identity);
-        // A record for our device must name our anchored image, even if its
-        // recorded path disappeared or now names a different file.
-        for entity in staging_plist_array(&record, "system-entities")?.iter() {
-            let entity = staging_plist_dictionary(*entity)?;
-            anyhow::ensure!(
-                staging_plist_string(&entity, "dev-entry")? != device || matches,
-                "plugin staging device {device} names a different image: {path}"
-            );
-        }
         if matches {
             found += 1;
             anyhow::ensure!(
@@ -563,10 +555,11 @@ fn staging_plist_value(
         base::{CFType, TCFType as _},
         string::CFString,
     };
+    let field = key;
     let key = CFString::new(key);
     let value = dictionary
         .find(key.as_concrete_TypeRef().cast::<std::ffi::c_void>())
-        .context("missing disk image property-list field")?;
+        .with_context(|| format!("missing disk image property-list field {field:?}"))?;
     // SAFETY: find returns a live retained dictionary's CF object.
     Ok(unsafe { CFType::wrap_under_get_rule(*value) })
 }
@@ -2961,6 +2954,35 @@ mod tests {
         std::fs::create_dir(&other_mount).unwrap();
         let changed_mount = snapshot(std::slice::from_ref(&image), &other_mount, "/dev/disk42");
         assert!(verify(&changed_mount, true).is_err());
+        let other_image = parent.path().join("other.dmg");
+        std::fs::write(&other_image, b"unrelated image").unwrap();
+        let recycled = snapshot(
+            std::slice::from_ref(&other_image),
+            &other_mount,
+            "/dev/disk42",
+        );
+        assert!(verify(&recycled, false).is_ok());
+        assert!(verify(&recycled, true).is_err());
+        let incomplete = staging_plist(
+            format!(
+                "<?xml version=\"1.0\"?><plist version=\"1.0\"><dict>\
+                <key>images</key><array>\
+                <dict><key>image-path</key><string>{}</string>\
+                <key>system-entities</key><array><dict>\
+                <key>mount-point</key><string>{}</string>\
+                <key>dev-entry</key><string>/dev/disk42</string>\
+                </dict></array></dict>\
+                <dict><key>image-path</key><string>{}</string>\
+                <key>system-entities</key><array><dict/></array></dict>\
+                </array></dict></plist>",
+                image.display(),
+                root.display(),
+                other_image.display(),
+            )
+            .as_bytes(),
+        )
+        .unwrap();
+        assert!(verify(&incomplete, true).is_ok());
         let empty = snapshot(&[], &root, "/dev/disk42");
         assert!(verify(&empty, false).is_ok());
         let error = verify(&empty, true).unwrap_err().to_string();
