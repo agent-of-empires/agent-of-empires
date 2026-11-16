@@ -351,10 +351,13 @@ async fn tools_list_advertises_each_tool_with_an_output_schema() {
     assert_eq!(
         names,
         [
+            "approve",
             "create_session",
+            "list_approvals",
             "list_sessions",
             "read_output",
             "send",
+            "wait_for",
             "whoami"
         ]
     );
@@ -960,6 +963,10 @@ async fn mutating_tools_refuse_while_read_only() {
             "create_session",
             json!({"path": "/tmp", "tool": "claude", "view": "structured"}),
         ),
+        (
+            "approve",
+            json!({"session_id": id, "nonce": "n", "decision": "allow"}),
+        ),
     ];
     for (tool, arguments) in refused {
         let result = call_result(&app, tool, arguments).await;
@@ -1320,4 +1327,295 @@ async fn create_session_refuses_an_empty_prompt() {
         );
     }
     assert!(state.instances.read().await.is_empty());
+}
+
+fn approval_requested(
+    nonce: &str,
+    options: Vec<crate::acp::approvals::ApprovalOption>,
+) -> crate::acp::Event {
+    use crate::acp::approvals::{is_choice_list, Approval, Nonce};
+    crate::acp::Event::ApprovalRequested {
+        approval: Approval {
+            nonce: Nonce(nonce.into()),
+            tool_call: crate::acp::state::ToolCall {
+                id: format!("call-{nonce}"),
+                name: "Bash".into(),
+                kind: "execute".into(),
+                args_preview: json!({"command": "cargo test\nmore"}).to_string(),
+                prompt: None,
+                started_at: chrono::Utc::now(),
+                parent_tool_call_id: None,
+                memory_recall: None,
+                diffs: Vec::new(),
+            },
+            destructive: false,
+            choice: is_choice_list(&options),
+            options,
+            plan: None,
+            requested_at: chrono::Utc::now(),
+            resolved: None,
+        },
+    }
+}
+
+/// Moves a session's status as the daemon does: in the store, then on the broadcast.
+async fn move_status(state: &crate::server::AppState, id: &str, to: crate::session::Status) {
+    let mut instances = state.instances.write().await;
+    let inst = instances.iter_mut().find(|i| i.id == id).unwrap();
+    let old = inst.status;
+    inst.status = to;
+    crate::server::push::publish_status_change(&state.status_tx, inst, old);
+}
+
+/// `wait_for` answers a broadcast status change at once, and the current status with
+/// `timed_out` when the deadline passes first.
+#[tokio::test]
+#[serial_test::serial]
+async fn wait_for_returns_on_a_status_broadcast_or_times_out() {
+    use crate::session::Status;
+    let _guard = crate::session::test_support::isolate_app_dir();
+    let id = "mcp-wait";
+    let mut session = structured_session(id);
+    session.status = Status::Running;
+    let (app, state) = seeded_app(vec![session], false).await;
+
+    let timed_out = call(&app, "wait_for", json!({"session_id": id, "timeout_s": 0})).await;
+    assert_eq!(timed_out["status"], "Running", "{timed_out}");
+    assert_eq!(timed_out["timed_out"], true);
+    assert_eq!(timed_out["pending_approvals"], json!([]));
+
+    let subscribers = state.status_tx.receiver_count();
+    let waiter = tokio::spawn({
+        let app = app.clone();
+        async move {
+            call(
+                &app,
+                "wait_for",
+                json!({"session_id": id, "timeout_s": 300}),
+            )
+            .await
+        }
+    });
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
+    while state.status_tx.receiver_count() == subscribers {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "wait_for never subscribed"
+        );
+        tokio::task::yield_now().await;
+    }
+    // A status outside `states` does not end the wait.
+    move_status(&state, id, Status::Starting).await;
+    move_status(&state, id, Status::Idle).await;
+    let woke = tokio::time::timeout(std::time::Duration::from_secs(10), waiter)
+        .await
+        .expect("wait_for returned on the broadcast")
+        .unwrap();
+    assert_eq!(woke["status"], "Idle", "{woke}");
+    assert_eq!(woke["timed_out"], false);
+
+    let unknown = call_result(
+        &app,
+        "wait_for",
+        json!({"session_id": "nope", "timeout_s": 0}),
+    )
+    .await;
+    assert_eq!(error_code(&unknown), Some("not_found"));
+}
+
+/// With `after_seq`, an `Idle` read before that turn ended is the previous turn's, so the
+/// wait goes on; once the turn ends the result carries the transcript after the prompt.
+#[tokio::test]
+#[serial_test::serial]
+async fn wait_for_after_seq_waits_for_that_turn_and_returns_its_messages() {
+    let _guard = crate::session::test_support::isolate_app_dir();
+    let id = "mcp-wait-seq";
+    let (app, state) = seeded_app(vec![structured_session(id)], false).await;
+    let prompt = user_prompt("what is two plus two");
+    seed_events(&state, id, std::slice::from_ref(&prompt));
+    let args = json!({"session_id": id, "after_seq": 1, "timeout_s": 0});
+
+    let pending = call(&app, "wait_for", args.clone()).await;
+    assert_eq!(pending["status"], "Idle", "{pending}");
+    assert_eq!(pending["timed_out"], true, "{pending}");
+
+    let rest = [
+        crate::acp::Event::AgentMessageChunk {
+            text: "four".into(),
+            message_id: None,
+        },
+        crate::acp::Event::Stopped {
+            reason: "end_turn".into(),
+        },
+    ];
+    for (seq, event) in (2..).zip(&rest) {
+        state.acp_event_store.record(id, seq, event).expect("seed");
+    }
+    let done = call(&app, "wait_for", args).await;
+    assert_eq!(done["timed_out"], false, "{done}");
+    let messages = done["messages"].as_str().unwrap();
+    assert!(messages.contains("four"), "{messages}");
+    assert!(!messages.contains("two plus two"), "{messages}");
+    assert_eq!(done["next_since"], 3);
+    assert_eq!(done["has_more"], false);
+}
+
+/// Approvals seeded through the event log are listed, by `wait_for` too, and each decision
+/// kind reaches the agent; a choice list takes only a named option, and an unknown nonce errors.
+#[tokio::test]
+#[serial_test::serial]
+async fn approvals_are_listed_and_settled_by_nonce() {
+    use crate::acp::approvals::{ApprovalDecision, ApprovalOption, ApprovalOptionKind};
+    let _guard = crate::session::test_support::isolate_app_dir();
+    let id = "mcp-approve";
+    let mut session = structured_session(id);
+    session.status = crate::session::Status::Waiting;
+    let (app, state) = seeded_app(vec![session], false).await;
+
+    // Without a running worker nothing can settle them, so none are listed.
+    let answers = vec![
+        ApprovalOption {
+            option_id: "red".into(),
+            name: "Red".into(),
+            kind: ApprovalOptionKind::AllowOnce,
+        },
+        ApprovalOption {
+            option_id: "blue".into(),
+            name: "Blue".into(),
+            kind: ApprovalOptionKind::AllowOnce,
+        },
+    ];
+    let nonces = ["n-allow", "n-always", "n-deny", "n-choice"];
+    let events: Vec<_> = nonces
+        .iter()
+        .map(|nonce| {
+            let options = if *nonce == "n-choice" {
+                answers.clone()
+            } else {
+                Vec::new()
+            };
+            approval_requested(nonce, options)
+        })
+        .collect();
+    seed_events(&state, id, &events);
+    let listed = call(&app, "list_approvals", json!({"session_id": id})).await;
+    assert_eq!(listed["approvals"], json!([]), "{listed}");
+
+    let _cmds = state
+        .acp_supervisor
+        .test_insert_worker_cmd_recording(id)
+        .await;
+    let mut parked = std::collections::HashMap::new();
+    for nonce in nonces {
+        parked.insert(
+            nonce,
+            state.acp_supervisor.test_park_approval(id, nonce).await,
+        );
+    }
+
+    let listed = call(&app, "list_approvals", json!({"session_id": id})).await;
+    let approvals = listed["approvals"].as_array().unwrap();
+    let listed_nonces: Vec<&str> = approvals
+        .iter()
+        .map(|a| a["nonce"].as_str().unwrap())
+        .collect();
+    assert_eq!(listed_nonces, nonces);
+    assert_eq!(approvals[0]["tool_name"], "Bash");
+    assert_eq!(approvals[0]["summary"], "cargo test");
+    assert_eq!(approvals[3]["choice"], true);
+    assert_eq!(approvals[3]["options"][1]["option_id"], "blue");
+    assert_eq!(approvals[3]["options"][1]["kind"], "allow_once");
+
+    let waited = call(&app, "wait_for", json!({"session_id": id, "timeout_s": 0})).await;
+    assert_eq!(waited["status"], "Waiting", "{waited}");
+    assert_eq!(waited["timed_out"], false);
+    assert_eq!(waited["pending_approvals"].as_array().unwrap().len(), 4);
+
+    // (arguments, error code) for refusals that leave the approval pending.
+    let refused = [
+        (
+            json!({"nonce": "n-choice", "decision": "allow"}),
+            "invalid_request",
+        ),
+        (
+            json!({"nonce": "n-choice", "decision": "option"}),
+            "invalid_request",
+        ),
+        (
+            json!({"nonce": "n-choice", "decision": "option", "option_id": "green"}),
+            "invalid_request",
+        ),
+        (
+            json!({"nonce": "n-unknown", "decision": "allow"}),
+            "not_found",
+        ),
+    ];
+    for (mut arguments, code) in refused {
+        arguments["session_id"] = id.into();
+        let result = call_result(&app, "approve", arguments.clone()).await;
+        assert_eq!(error_code(&result), Some(code), "{arguments}: {result}");
+    }
+
+    // (nonce, arguments, what the agent receives)
+    let settled = [
+        (
+            "n-allow",
+            json!({"decision": "allow"}),
+            (ApprovalDecision::Allow, None),
+        ),
+        (
+            "n-always",
+            json!({"decision": "always"}),
+            (ApprovalDecision::AllowAlways, None),
+        ),
+        (
+            "n-deny",
+            json!({"decision": "deny"}),
+            (ApprovalDecision::Deny, None),
+        ),
+        (
+            "n-choice",
+            json!({"decision": "option", "option_id": "blue"}),
+            (ApprovalDecision::Allow, Some("blue".to_string())),
+        ),
+    ];
+    for (nonce, mut arguments, want) in settled {
+        arguments["session_id"] = id.into();
+        arguments["nonce"] = nonce.into();
+        let approved = call(&app, "approve", arguments).await;
+        assert_eq!(approved["approved"], true, "{nonce}");
+        let answer = parked.remove(nonce).unwrap().await.unwrap();
+        assert_eq!(answer, Some(want), "{nonce}");
+    }
+
+    // The log still lists it until the agent records the resolution, but the agent no longer
+    // holds the nonce.
+    let again = call_result(
+        &app,
+        "approve",
+        json!({"session_id": id, "nonce": "n-allow", "decision": "allow"}),
+    )
+    .await;
+    assert_eq!(error_code(&again), Some("not_found"), "{again}");
+}
+
+/// A terminal session has no approvals: none are listed and `approve` is refused.
+#[tokio::test]
+#[serial_test::serial]
+async fn terminal_sessions_have_no_approvals() {
+    let _guard = crate::session::test_support::isolate_app_dir();
+    let mut session = Instance::new("term", "/tmp/aoe-term");
+    session.source_profile = "default".into();
+    let id = session.id.clone();
+    let (app, _state) = seeded_app(vec![session], false).await;
+
+    let listed = call(&app, "list_approvals", json!({"session_id": id})).await;
+    assert_eq!(listed["approvals"], json!([]));
+    let refused = call_result(
+        &app,
+        "approve",
+        json!({"session_id": id, "nonce": "n", "decision": "allow"}),
+    )
+    .await;
+    assert_eq!(error_code(&refused), Some("invalid_request"), "{refused}");
 }
