@@ -4962,8 +4962,25 @@ mod tests {
             .await?
             .unwrap_err();
             assert!(error.is::<HandoffReserved>(), "{error:#}");
+            // The failed adoption left the runtime degraded. The dropped owner's release writes
+            // in the background, and a write between a reload's read and its commit drops that
+            // reload, so restore health only once the release has landed.
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+            while stored(&reserved)?.lifecycle_reservation.is_some() {
+                anyhow::ensure!(
+                    std::time::Instant::now() < deadline,
+                    "the reservation was never released"
+                );
+                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            }
             crate::server::test_support::refresh_canonical_metadata_for_test(&state).await;
-            crate::server::test_support::accept_runtime_read_cache_for_test(&state).await;
+            while *state.canonical_health.read().await != crate::daemon::RuntimeHealth::Healthy {
+                anyhow::ensure!(
+                    std::time::Instant::now() < deadline,
+                    "the runtime never recovered"
+                );
+                crate::server::test_support::accept_runtime_read_cache_for_test(&state).await;
+            }
         }
         let checked = acp_terminal_check(State(state.clone()), Path(reserved.id.clone())).await;
         assert_eq!(response_json(checked).await?.1["reason"], "handoff_pending");
