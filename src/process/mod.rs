@@ -2214,7 +2214,12 @@ mod tests {
             started.elapsed() >= grace,
             "a descendant that ignores SIGTERM keeps the group alive for the whole grace"
         );
-        assert!(!runner_group_executing(group).unwrap());
+        // SIGKILL is only queued; the descendant exits asynchronously.
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while runner_group_executing(group).unwrap() {
+            assert!(Instant::now() < deadline, "SIGKILL must end the group");
+            std::thread::sleep(WAIT_POLL_INTERVAL);
+        }
     }
 
     #[cfg(any(target_os = "linux", target_os = "macos"))]
