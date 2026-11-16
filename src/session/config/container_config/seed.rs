@@ -559,8 +559,11 @@ pub(super) fn sync_agent_config(
                 .context("configuration file has no leaf")?,
         );
         let preserve = preserve_files.contains(&name);
-        let existing = parent.regular_lookup(leaf)?;
-        if preserve && existing == Some(true) {
+        let kind = parent
+            .entry_stat(leaf)?
+            .map(|stat| stat.st_mode & nix::libc::S_IFMT);
+        // A directory cannot be renamed over; skip it rather than abort the sync.
+        if preserve && matches!(kind, Some(nix::libc::S_IFREG | nix::libc::S_IFDIR)) {
             continue;
         }
         publish_source_file(
@@ -568,7 +571,7 @@ pub(super) fn sync_agent_config(
             &parent,
             leaf,
             boundary,
-            !preserve || existing.is_some(),
+            !preserve || kind.is_some(),
             ReadAccess::default(),
         )?;
     }
@@ -2341,6 +2344,23 @@ mod tests {
             .file_type()
             .is_symlink());
         assert_eq!(fs::read(&host_file).unwrap(), b"HOST_BYTES");
+
+        // A directory at the path is skipped; later entries still sync.
+        fs::remove_file(active.join("settings.json")).unwrap();
+        fs::create_dir(active.join("settings.json")).unwrap();
+        fs::write(source.join("other.json"), b"{}").unwrap();
+        sync_agent_config(
+            &source,
+            &active,
+            &["settings.json", "other.json"],
+            &[],
+            &[],
+            &["settings.json"],
+            &boundary,
+        )
+        .unwrap();
+        assert!(active.join("settings.json").is_dir());
+        assert!(active.join("other.json").is_file());
     }
 
     #[test]
