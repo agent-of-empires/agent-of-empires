@@ -60,13 +60,20 @@ const LEGACY_REPO_CONFIG_PATH: &str = ".aoe/config.toml";
 /// macOS/Windows, where the app dir is `~/.agent-of-empires`). Directories are
 /// compared canonicalized because the save target need not exist yet.
 fn resolves_to_global_config(candidate: &Path) -> bool {
+    resolves_to_global_config_in(candidate, None)
+}
+
+/// [`resolves_to_global_config`] with the candidate's canonical directory, when already read.
+fn resolves_to_global_config_in(candidate: &Path, canonical_dir: Option<&Path>) -> bool {
     let Ok(app_dir) = crate::session::get_app_dir_path() else {
         return false;
     };
-    candidate.file_name() == Some("config.toml".as_ref())
-        && candidate
-            .parent()
-            .is_some_and(|dir| normalize_path(dir) == normalize_path(&app_dir))
+    let dir = match (canonical_dir, candidate.parent()) {
+        (Some(dir), _) => dir.to_string_lossy().to_string(),
+        (None, Some(dir)) => normalize_path(dir),
+        (None, None) => return false,
+    };
+    candidate.file_name() == Some("config.toml".as_ref()) && dir == normalize_path(&app_dir)
 }
 
 /// The file [`load_repo_config`] reads: `.agent-of-empires/config.toml`, else
@@ -94,18 +101,20 @@ fn load_repo_config_via(project_path: &Path, read: super::ReadFile) -> Result<Op
         return Ok(None);
     }
     let config_path = project_path.join(REPO_CONFIG_PATH);
-    let (config_path, is_legacy, content) = match read(&config_path) {
-        Err((std::io::ErrorKind::NotFound, false)) => {
+    let absent =
+        |file: &super::FileRead| file.content == Err((std::io::ErrorKind::NotFound, false));
+    let (config_path, is_legacy, file) = match read(&config_path) {
+        primary if absent(&primary) => {
             let legacy_path = project_path.join(LEGACY_REPO_CONFIG_PATH);
             match read(&legacy_path) {
-                Err((std::io::ErrorKind::NotFound, false)) => return Ok(None),
-                content => (legacy_path, true, content),
+                legacy if absent(&legacy) => return Ok(None),
+                legacy => (legacy_path, true, legacy),
             }
         }
-        content => (config_path, false, content),
+        primary => (config_path, false, primary),
     };
 
-    if resolves_to_global_config(&config_path) {
+    if resolves_to_global_config_in(&config_path, file.dir.as_deref()) {
         tracing::debug!(target: "session.store",
             path = %config_path.display(),
             "Skipping repo config: this project path resolves to the global config.toml"
@@ -118,7 +127,8 @@ fn load_repo_config_via(project_path: &Path, read: super::ReadFile) -> Result<Op
         );
     }
 
-    let content = content
+    let content = file
+        .content
         .map_err(|(kind, _)| anyhow::Error::from(std::io::Error::from(kind)))
         .and_then(|bytes| Ok(String::from_utf8(bytes.to_vec())?))
         .with_context(|| format!("Failed to read {}", config_path.display()))?;
@@ -434,14 +444,15 @@ mod tests {
         let repo = tempfile::tempdir().unwrap();
         let global = crate::session::config::config_path().unwrap();
         let repo_config = repo.path().join(REPO_CONFIG_PATH);
-        let read = |path: &Path| -> super::super::FileRead {
-            if path == global {
+        let read = |path: &Path| super::super::FileRead {
+            dir: None,
+            content: if path == global {
                 Ok(b"[acp]\nstructured_view = \"off\"\n".as_slice().into())
             } else if path == repo_config {
                 Ok(b"[worktree]\nauto_cleanup = false\n".as_slice().into())
             } else {
                 Err((std::io::ErrorKind::NotFound, false))
-            }
+            },
         };
 
         let config = resolve_config_with_repo_source_or_warn("default", repo.path(), &read);
@@ -451,6 +462,27 @@ mod tests {
             super::super::StructuredView::Off
         );
         assert!(!config.worktree.auto_cleanup);
+    }
+
+    /// The global-config exclusion follows the directory the read recorded, so a cache that
+    /// fingerprints it notices a retargeted directory link.
+    #[test]
+    #[serial_test::serial]
+    fn repo_config_is_skipped_only_when_its_read_dir_is_the_app_dir() {
+        let home = tempfile::tempdir().unwrap();
+        let _home = crate::session::test_support::isolate_app_dir_at(home.path());
+        let app_dir = std::fs::canonicalize(crate::session::get_app_dir().unwrap()).unwrap();
+        let repo = tempfile::tempdir().unwrap();
+        for (dir, skipped) in [(app_dir.clone(), true), (repo.path().to_path_buf(), false)] {
+            let read = |_: &Path| super::super::FileRead {
+                dir: Some(dir.clone()),
+                content: Ok(b"[session.agent_detect_as]\nx = \"claude\"\n"
+                    .as_slice()
+                    .into()),
+            };
+            let loaded = load_repo_config_via(repo.path(), &read).unwrap();
+            assert_eq!(loaded.is_none(), skipped, "{}", dir.display());
+        }
     }
 
     /// A repo pointing `default_tool` at the user's own custom agent would launch its command (#3154).

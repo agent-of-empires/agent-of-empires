@@ -4221,21 +4221,29 @@ fn config_save_lock() -> &'static Mutex<()> {
     LOCK.get_or_init(|| Mutex::new(()))
 }
 
-/// One read of a config file. On error, whether the path itself exists: a
-/// dangling link is not an absent file.
-pub(crate) type FileRead = std::result::Result<std::sync::Arc<[u8]>, (std::io::ErrorKind, bool)>;
+/// One read of a config file.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct FileRead {
+    /// The file's canonical directory, so a retargeted directory link reads as a change.
+    pub(crate) dir: Option<PathBuf>,
+    /// On error, whether the path itself exists: a dangling link is not an absent file.
+    pub(crate) content: std::result::Result<std::sync::Arc<[u8]>, (std::io::ErrorKind, bool)>,
+}
 
 /// How config resolution reads its files, so a caller can resolve from bytes it already holds.
 pub(crate) type ReadFile<'a> = &'a dyn Fn(&Path) -> FileRead;
 
 pub(crate) fn read_file(path: &Path) -> FileRead {
-    fs::read(path)
-        .map(std::sync::Arc::from)
-        .map_err(|error| (error.kind(), fs::symlink_metadata(path).is_ok()))
+    FileRead {
+        dir: path.parent().and_then(|dir| fs::canonicalize(dir).ok()),
+        content: fs::read(path)
+            .map(std::sync::Arc::from)
+            .map_err(|error| (error.kind(), fs::symlink_metadata(path).is_ok())),
+    }
 }
 
 pub(super) fn read_optional_config(path: &Path, read: ReadFile) -> Result<Option<String>> {
-    match read(path) {
+    match read(path).content {
         Ok(bytes) => Ok(Some(String::from_utf8(bytes.to_vec())?)),
         // A missing file is optional; a broken link or an unreadable path is not.
         Err((std::io::ErrorKind::NotFound, false)) => Ok(None),

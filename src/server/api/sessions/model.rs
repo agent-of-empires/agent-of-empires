@@ -416,8 +416,14 @@ fn fingerprint<'a>(
 /// Never evicts: entries of purged sessions stay until restart, a few KB each.
 #[derive(Default)]
 pub(crate) struct SessionCfgStore {
-    /// `project_path` to its repo config source, with the `.git` it was discovered from.
-    sources: HashMap<String, (Fingerprint, std::path::PathBuf)>,
+    /// `project_path` to its repo config source, with the `.git` and gitdir it was discovered from.
+    sources: HashMap<
+        String,
+        (
+            (Fingerprint, Option<std::path::PathBuf>),
+            std::path::PathBuf,
+        ),
+    >,
     entries: HashMap<(String, std::path::PathBuf), StoredSessionCfg>,
 }
 
@@ -463,21 +469,36 @@ impl<'a> SessionCfgCache<'a> {
 
     /// Discovery can open the repo through libgit2, so it reruns only when `.git` changes.
     fn source(&mut self, project_path: &str) -> std::path::PathBuf {
-        let git = fingerprint(
-            &mut self.seen,
-            &std::path::Path::new(project_path).join(".git"),
-        );
-        if let Some((discovered_from, source)) = self.store.sources.get(project_path) {
-            if discovered_from == git {
+        // The empty (scratch) path would probe the launch directory.
+        if project_path.is_empty() {
+            return std::path::PathBuf::new();
+        }
+        let project = std::path::Path::new(project_path);
+        let git = fingerprint(&mut self.seen, &project.join(".git"));
+        // Resolve from the `.git` bytes just read, with its gitdir looked up afresh, so a
+        // rewrite or a retargeted link is never missed. A linked worktree needs nothing more.
+        let gitdir = git
+            .content
+            .as_ref()
+            .ok()
+            .and_then(|bytes| std::str::from_utf8(bytes).ok())
+            .and_then(|content| crate::git::GitWorktree::gitfile_target(project, content));
+        if let Some(main_repo) = gitdir
+            .as_deref()
+            .and_then(crate::git::GitWorktree::find_main_repo_from_worktree_gitdir)
+        {
+            return main_repo;
+        }
+        let discovered_from = (git.clone(), gitdir);
+        if let Some((cached_from, source)) = self.store.sources.get(project_path) {
+            if *cached_from == discovered_from {
                 return source.clone();
             }
         }
-        let git = git.clone();
         #[cfg(test)]
         {
             self.discoveries += 1;
         }
-        let project = std::path::Path::new(project_path);
         // A failed discovery falls back uncached, so the next request retries it.
         let Some(source) =
             crate::session::config::repo_config::discover_repo_config_source(project)
@@ -486,7 +507,7 @@ impl<'a> SessionCfgCache<'a> {
         };
         self.store
             .sources
-            .insert(project_path.to_string(), (git, source.clone()));
+            .insert(project_path.to_string(), (discovered_from, source.clone()));
         source
     }
 

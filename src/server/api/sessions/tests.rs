@@ -4442,18 +4442,18 @@ fn session_cfg_store_reresolves_only_after_an_input_edit() {
     use crate::session::config::StructuredView::{Auto, Off};
     let detect = |name: &str| format!("[session.agent_detect_as]\n{name} = \"claude\"\n");
     // Misses, discoveries, then the resolved values, so a stale entry fails too.
-    let mut request = |edit: &dyn Fn()| {
+    let mut request_at = |at: &str, edit: &dyn Fn()| {
         edit();
         let misses = AtomicUsize::new(0);
         let mut cache = super::model::SessionCfgCache::new(&mut store, &misses);
         let mut aliases: Vec<String> = cache
-            .resolve("default", path)
+            .resolve("default", at)
             .agent_detect_as
             .keys()
             .cloned()
             .collect();
         aliases.sort();
-        let view = cache.structured_view("default", path);
+        let view = cache.structured_view("default", at);
         (
             misses.load(Ordering::Relaxed),
             cache.discoveries,
@@ -4463,16 +4463,19 @@ fn session_cfg_store_reresolves_only_after_an_input_edit() {
     };
 
     assert_eq!(
-        request(&|| {}),
+        request_at(path, &|| {}),
         (1, 1, String::new(), Auto),
         "first request"
     );
     assert_eq!(
-        request(&|| {}),
+        request_at(path, &|| {}),
         (0, 0, String::new(), Auto),
         "unchanged inputs"
     );
-    let cases: [(&str, &dyn Fn(), &str, _); 6] = [
+    let repo_dir = repo_config.parent().unwrap();
+    let app_dir = global.parent().unwrap();
+    let copy_dir = tempfile::tempdir().expect("tempdir config copy");
+    let cases: [(&str, &dyn Fn(), &str, _); 8] = [
         (
             "legacy repo config created",
             &|| std::fs::write(&legacy_config, detect("ll")).unwrap(),
@@ -4510,9 +4513,59 @@ fn session_cfg_store_reresolves_only_after_an_input_edit() {
             "bb",
             Off,
         ),
+        // A repo config directory linked to the app dir is the global config, so it is skipped.
+        (
+            "repo config dir linked to the app dir",
+            &|| {
+                std::fs::remove_dir_all(repo_dir).unwrap();
+                std::os::unix::fs::symlink(app_dir, repo_dir).unwrap();
+            },
+            "",
+            Off,
+        ),
+        (
+            "link retargeted to an identical copy",
+            &|| {
+                std::fs::copy(&global, copy_dir.path().join("config.toml")).unwrap();
+                std::fs::remove_file(repo_dir).unwrap();
+                std::os::unix::fs::symlink(copy_dir.path(), repo_dir).unwrap();
+            },
+            "",
+            Off,
+        ),
     ];
     for (case, edit, aliases, view) in cases {
-        assert_eq!(request(edit), (1, 0, aliases.to_string(), view), "{case}");
+        assert_eq!(
+            request_at(path, edit),
+            (1, 0, aliases.to_string(), view),
+            "{case}"
+        );
+    }
+
+    // A linked worktree's main repo follows a retargeted link in its gitdir path.
+    let layout = tempfile::tempdir().expect("tempdir worktree layout");
+    for (repo, alias) in [("a", "aa"), ("b", "bb")] {
+        let root = layout.path().join(repo);
+        std::fs::create_dir_all(root.join(".git/worktrees/w")).unwrap();
+        std::fs::create_dir_all(root.join(".agent-of-empires")).unwrap();
+        std::fs::write(root.join(".agent-of-empires/config.toml"), detect(alias)).unwrap();
+    }
+    let current = layout.path().join("current");
+    let worktree = layout.path().join("w");
+    std::fs::create_dir(&worktree).unwrap();
+    std::fs::write(
+        worktree.join(".git"),
+        format!("gitdir: {}/.git/worktrees/w\n", current.display()),
+    )
+    .unwrap();
+    let worktree = worktree.to_str().unwrap();
+    let link = |repo: &str| {
+        let _ = std::fs::remove_file(&current);
+        std::os::unix::fs::symlink(layout.path().join(repo), &current).unwrap();
+    };
+    for (repo, alias) in [("a", "aa"), ("b", "bb")] {
+        let (misses, _, aliases, _) = request_at(worktree, &|| link(repo));
+        assert_eq!((misses, aliases.as_str()), (1, alias), "worktree of {repo}");
     }
 
     // An empty profile shares the entry of the default profile it names.
