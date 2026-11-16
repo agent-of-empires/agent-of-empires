@@ -198,14 +198,9 @@ fn pane_has_agent_content(raw_content: &str, tool: &str) -> bool {
         }
     }
     let lower = clean.to_lowercase();
-    if lower
+    lower
         .split(|c: char| !c.is_alphanumeric() && c != '-' && c != '_')
         .any(|word| tool_names.iter().any(|name| word == name))
-    {
-        return true;
-    }
-
-    false
 }
 
 #[cfg(test)]

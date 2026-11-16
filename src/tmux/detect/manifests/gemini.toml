@@ -10,11 +10,27 @@ extends = "spinner"
 id = "spinner"
 priority = 960
 
+# The first-run folder-trust dialog. Its text stays on screen after Gemini
+# restarts into the composer, which then decides instead.
+[[rules]]
+id = "folder_trust_prompt"
+state = "waiting"
+priority = 955
+region = "collapsed_recent"
+visible = true
+contains = ["do you trust the files in this folder?", "trust folder (", "don't trust"]
+not = [{ region = "whole_recent", line_regex = ['^\s*>(?:\s|$)'] }]
+
 [[rules]]
 extends = "approval_prompt"
 id = "approval_prompt"
 priority = 950
 contains_any = ["execute?", "enter to select", "esc to cancel"]
+# The trust dialog's "allows", left on screen after the restart, unless a tool
+# confirmation is up too.
+not = [
+  { contains = ["trusting a folder allows gemini cli"], not = [{ contains_any = ["allow once", "execute?", "enter to select", "esc to cancel", "(y/n)", "[y/n]", "approve"] }] },
+]
 
 # Only a bare `>`: Gemini renders ordinary prose behind the same glyph, so the
 # `> something` form the other agents accept would fire on transcript text.

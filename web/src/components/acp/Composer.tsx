@@ -9,6 +9,7 @@ import { AtSign, Paperclip, Pencil, Slash } from "lucide-react";
 import { useFocusTerminalTarget } from "../../hooks/useFocusTerminalTarget";
 import { useMobileKeyboard } from "../../hooks/useMobileKeyboard";
 import { useSkillIndex } from "../../hooks/useSkillIndex";
+import { consumeComposerPrefill, subscribeComposerPrefill } from "../../lib/composerPrefill";
 import { clearDraft } from "../../lib/acpDrafts";
 import type { AcpState, PromptAttachmentInput, PromptCapabilities, QueuedPrompt } from "../../lib/acpTypes";
 import { isIOS, isStandalone } from "../../lib/platform";
@@ -85,6 +86,8 @@ interface Props {
   connected: boolean;
   /** For a Session that has never started: the Agent it waits for. */
   waitingFor?: string | null;
+  /** Why nothing may be sent; shown as the placeholder while typing and sending are off. */
+  blockedReason?: string | null;
   /** The Worker is running; only the connection is down. */
   connecting?: boolean;
   /** Mid-turn the textarea stays editable and sends go through the queue. */
@@ -119,7 +122,7 @@ export function Composer(props: Props) {
   // Regular iOS Safari already lifts the composer by keyboardHeight; only the PWA needs this.
   const iosPwa = useMemo(() => isIOS() && isStandalone(), []);
   const recall = useQueueRecall(queuedPrompts, client, loadText);
-  const canSend = composerText.trim().length > 0 || attachments.supported.length > 0;
+  const canSend = !props.blockedReason && (composerText.trim().length > 0 || attachments.supported.length > 0);
   const provider = useProviderSwitch(sessionId, props.currentAgent, props.currentProvider);
 
   const submitComposer = useCallback(() => {
@@ -143,6 +146,17 @@ export function Composer(props: Props) {
   usePluginDraftOperations(sessionId, client, taRef);
   usePrimerPrefill(props.primerPrefill, loadText);
   useDraftPersistence(sessionId, client, composerText, draftTextRef, taRef);
+  useEffect(() => {
+    const consume = () => {
+      const text = consumeComposerPrefill(sessionId);
+      if (text === null) return;
+      const current = draftTextRef.current;
+      loadText(current ? `${current}\n\n${text}` : text);
+    };
+    const unsubscribe = subscribeComposerPrefill(consume);
+    consume();
+    return unsubscribe;
+  }, [sessionId, draftTextRef, loadText]);
   useInitialFocus(isMobile, taRef);
   // Sidebar session selection focuses the composer even when already mounted.
   useFocusTerminalTarget("composer", taRef, props.active);
@@ -245,12 +259,14 @@ export function Composer(props: Props) {
               unstable_insertNewlineOnTouchEnter
               // Cancel stays behind the Stop button; a stray Escape must not abort a turn.
               cancelOnEscape={false}
+              disabled={!!props.blockedReason}
               placeholder={
-                turnActive
+                props.blockedReason ??
+                (turnActive
                   ? connected && promptCapabilities?.steering
                     ? "Add to the current turn… (the agent picks it up mid-work)"
                     : "Queue a follow-up… (sent when current turn ends)"
-                  : "Send a message…  Type @ for files, / for commands"
+                  : "Send a message…  Type @ for files, / for commands")
               }
               onInput={(e) => fitTextarea(e.currentTarget)}
               onFocus={() => {

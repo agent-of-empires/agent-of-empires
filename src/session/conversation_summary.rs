@@ -1,11 +1,7 @@
 //! Agent-agnostic "summary of the conversation so far" for structured-view (ACP) sessions.
 
 use crate::acp::state::Event;
-use crate::agents;
-use crate::session::smart_rename::{
-    resolve_rename_tool, strip_ansi, truncate_bytes, OneshotModel, SkipReason,
-};
-use std::collections::HashMap;
+use crate::session::smart_rename::{strip_ansi, truncate_bytes, OneshotAgent, SkipReason};
 
 /// Only one summary one-shot runs at a time process-wide.
 pub const MAX_CONCURRENT: usize = 1;
@@ -13,7 +9,7 @@ pub const MAX_CONCURRENT: usize = 1;
 /// Hard cap on the transcript text handed to the one-shot.
 // ponytail: argv transport with a 48 KiB cap; switch to piping the prompt via
 // stdin only if a future change needs a materially larger single call.
-const MAX_INPUT_BYTES: usize = 48_000;
+pub(crate) const MAX_INPUT_BYTES: usize = 48_000;
 
 /// Per-tool-call cap so a single noisy `args_preview` (a pasted file, a long
 /// shell line) cannot dominate the summary input.
@@ -39,40 +35,31 @@ const MIN_DELTA_TURNS: usize = 8;
 
 /// Resolve the agent for the summary one-shot and gate it, mirroring
 /// `smart_rename::check_eligible_resolved` but without the title / enabled gates.
-pub fn resolve_summary_agent(
+pub(crate) fn resolve_summary_agent(
     structured: bool,
     session_tool: &str,
     summary_setting: &str,
     sandboxed: bool,
     session_command: &str,
-    overrides: &HashMap<String, String>,
-) -> Result<&'static agents::AgentDef, SkipReason> {
+    config: &crate::session::config::SessionConfig,
+) -> Result<OneshotAgent, SkipReason> {
     if !structured {
         return Err(SkipReason::NotStructured);
     }
     if sandboxed {
         return Err(SkipReason::Sandboxed);
     }
-    let summary_tool = resolve_rename_tool(session_tool, summary_setting);
-    let Some(agent) = agents::get_agent(summary_tool) else {
-        return Err(SkipReason::NoOneshot);
-    };
-    if agent.oneshot_flag.is_none() {
-        return Err(SkipReason::NoOneshot);
-    }
-    // Only a command override of the resolved summary agent's own binary disqualifies it: when the
-    // summary agent is the session's own agent, the session's launch command counts; when it is a
-    // different agent, the one-shot launches that binary fresh, so the session command is
-    // irrelevant (same semantics as smart-rename).
-    let (command, override_in_cfg) = if summary_tool == session_tool {
-        (session_command, overrides.contains_key(session_tool))
-    } else {
-        ("", overrides.contains_key(summary_tool))
-    };
-    if override_in_cfg || (!command.is_empty() && command != agent.binary) {
-        return Err(SkipReason::CommandOverridden);
-    }
-    Ok(agent)
+    crate::session::smart_rename::check_eligible_with_declarations(
+        true,
+        true,
+        true,
+        "",
+        session_tool,
+        summary_setting,
+        false,
+        session_command,
+        config,
+    )
 }
 
 /// The last `ConversationSummary` in an event list: its text and the seq it
@@ -92,8 +79,29 @@ pub fn last_summary(events: &[(u64, Event)]) -> (Option<String>, u64) {
 }
 
 /// Reconstruct the transcript for events with seq greater than `since_seq` into a compact,
-/// agent-readable form.
+/// agent-readable form, keeping the last `MAX_INPUT_BYTES`.
 pub fn extract_transcript_delta(events: &[(u64, Event)], since_seq: u64) -> (String, u64, usize) {
+    let (mut out, snapshot_seq, new_turns) = render_transcript_delta(events, since_seq);
+    if out.len() > MAX_INPUT_BYTES {
+        // Keep the tail on a char boundary and flag the drop honestly.
+        let start = out.len() - MAX_INPUT_BYTES;
+        let mut boundary = start;
+        while boundary < out.len() && !out.is_char_boundary(boundary) {
+            boundary += 1;
+        }
+        out = format!(
+            "[... earlier turns in this segment truncated ...]\n{}",
+            &out[boundary..]
+        );
+    }
+    (out, snapshot_seq, new_turns)
+}
+
+/// [`extract_transcript_delta`] without the size cap.
+pub(crate) fn render_transcript_delta(
+    events: &[(u64, Event)],
+    since_seq: u64,
+) -> (String, u64, usize) {
     let mut out = String::new();
     let mut snapshot_seq = since_seq;
     let mut new_turns = 0usize;
@@ -144,19 +152,6 @@ pub fn extract_transcript_delta(events: &[(u64, Event)], since_seq: u64) -> (Str
             // prior summaries) is intentionally excluded from the summary input.
             _ => {}
         }
-    }
-
-    if out.len() > MAX_INPUT_BYTES {
-        // Keep the tail on a char boundary and flag the drop honestly.
-        let start = out.len() - MAX_INPUT_BYTES;
-        let mut boundary = start;
-        while boundary < out.len() && !out.is_char_boundary(boundary) {
-            boundary += 1;
-        }
-        out = format!(
-            "[... earlier turns in this segment truncated ...]\n{}",
-            &out[boundary..]
-        );
     }
 
     (out, snapshot_seq, new_turns)
@@ -278,7 +273,7 @@ mod serve {
         session_id: String,
         trigger: SummaryTrigger,
     ) {
-        let Some((profile, tool, command, project_path, sandboxed, structured)) = ({
+        let Some((profile, tool, command, project_path, config_path, sandboxed, structured)) = ({
             let instances = state.instances.read().await;
             instances.iter().find(|i| i.id == session_id).map(|i| {
                 (
@@ -286,6 +281,7 @@ mod serve {
                     i.tool.clone(),
                     i.command.clone(),
                     i.project_path.clone(),
+                    i.repo_config_path().to_path_buf(),
                     i.is_sandboxed(),
                     i.is_structured(),
                 )
@@ -296,7 +292,7 @@ mod serve {
 
         let resolved = crate::session::config::repo_config::resolve_config_with_repo_or_warn(
             &profile,
-            std::path::Path::new(&project_path),
+            &config_path,
         );
         if trigger == SummaryTrigger::Auto && !resolved.session.conversation_summary {
             return;
@@ -307,7 +303,7 @@ mod serve {
             &resolved.session.smart_rename_agent,
             sandboxed,
             &command,
-            &resolved.session.agent_command_override,
+            &resolved.session,
         ) {
             Ok(agent) => agent,
             Err(reason) => {
@@ -336,11 +332,7 @@ mod serve {
         // A summary reads the whole transcript and can run a bigger model turn (see
         // SUMMARY_TIMEOUT), so it uses the CLI default model rather than the cheap alias
         // smart-rename titles pin.
-        let Some(argv) = crate::session::smart_rename::build_oneshot_argv(
-            agent,
-            &prompt,
-            OneshotModel::CliDefault,
-        ) else {
+        let Some(argv) = agent.argv(&prompt, None) else {
             return;
         };
 
@@ -380,6 +372,7 @@ mod tests {
 
     fn user(text: &str) -> Event {
         Event::UserPromptSent {
+            merged_prompt_ids: Vec::new(),
             prompt_id: None,
             text: text.into(),
             attachments: vec![],
@@ -389,6 +382,7 @@ mod tests {
     }
     fn synthesized_user(text: &str) -> Event {
         Event::UserPromptSent {
+            merged_prompt_ids: Vec::new(),
             prompt_id: None,
             text: text.into(),
             attachments: vec![],
@@ -405,6 +399,7 @@ mod tests {
     fn tool(name: &str, args: &str) -> Event {
         Event::ToolCallStarted {
             tool_call: ToolCall {
+                prompt: None,
                 id: "t1".into(),
                 name: name.into(),
                 kind: "execute".into(),
@@ -439,6 +434,7 @@ mod tests {
     #[test]
     fn extract_labels_a_plugin_message_with_its_sender_not_as_the_user() {
         let plugin = Event::UserPromptSent {
+            merged_prompt_ids: Vec::new(),
             prompt_id: None,
             text: "PR #7 was merged".into(),
             attachments: vec![],
@@ -519,20 +515,20 @@ mod tests {
 
     #[test]
     fn resolve_summary_agent_gates() {
-        let overrides = HashMap::new();
-        assert!(resolve_summary_agent(true, "claude", "", false, "", &overrides).is_ok());
+        let config = crate::session::config::SessionConfig::default();
+        assert!(resolve_summary_agent(true, "claude", "", false, "", &config).is_ok());
         assert!(matches!(
-            resolve_summary_agent(false, "claude", "", false, "", &overrides),
+            resolve_summary_agent(false, "claude", "", false, "", &config),
             Err(SkipReason::NotStructured)
         ));
         assert!(matches!(
-            resolve_summary_agent(true, "claude", "", true, "", &overrides),
+            resolve_summary_agent(true, "claude", "", true, "", &config),
             Err(SkipReason::Sandboxed)
         ));
         assert!(matches!(
-            resolve_summary_agent(true, "cursor", "", false, "", &overrides),
+            resolve_summary_agent(true, "cursor", "", false, "", &config),
             Err(SkipReason::NoOneshot)
         ));
-        assert!(resolve_summary_agent(true, "claude", "codex", false, "", &overrides).is_ok());
+        assert!(resolve_summary_agent(true, "claude", "codex", false, "", &config).is_ok());
     }
 }

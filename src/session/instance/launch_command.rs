@@ -39,7 +39,7 @@ type LaunchRouting = (
 );
 
 fn prepared_fork_mints_child(
-    agent: Option<&'static crate::agents::AgentDef>,
+    agent: Option<&crate::agents::AgentDef>,
     intent: &ResumeIntent,
     context: &super::execution::AgentLaunchContext<'_>,
 ) -> bool {
@@ -52,10 +52,10 @@ fn prepared_fork_mints_child(
         })
 }
 
-fn resolved_yolo(
-    agent: &'static crate::agents::AgentDef,
+fn resolved_yolo<'a>(
+    agent: &'a crate::agents::AgentDef<'a>,
     launch_context: &super::execution::AgentLaunchContext<'_>,
-) -> Option<&'static crate::agents::YoloMode> {
+) -> Option<&'a crate::agents::YoloMode<'a>> {
     let yolo = agent.yolo.as_ref()?;
     let generation = launch_context.generation();
     match yolo.resolve(generation) {
@@ -69,6 +69,94 @@ fn resolved_yolo(
             None
         }
     }
+}
+
+/// The shell construct in `command` that would take an argument AoE appends, so
+/// the agent never receives it as argv.
+///
+/// Unlike `direct_launch_words`, which describes the output of executable
+/// discovery, anything the shell resolves before running the agent is fine here:
+/// a quoted path, `~`, `$HOME` or an escaped space all still name the agent. Only
+/// an operator, comment or substitution moves the appended argument elsewhere.
+fn shell_consumed_by(command: &str) -> Option<&'static str> {
+    #[derive(PartialEq)]
+    enum Quote {
+        None,
+        Single,
+        Double,
+    }
+    let mut quote = Quote::None;
+    // The shell only reads `#` as a comment where a word begins.
+    let mut at_word_start = true;
+    let mut chars = command.chars();
+    while let Some(c) = chars.next() {
+        match quote {
+            Quote::Single => {
+                if c == '\'' {
+                    quote = Quote::None;
+                }
+            }
+            Quote::Double => match c {
+                '"' => quote = Quote::None,
+                '\\' => drop(chars.next()),
+                _ => {}
+            },
+            Quote::None => match c {
+                '\'' => {
+                    quote = Quote::Single;
+                    at_word_start = false;
+                }
+                '"' => {
+                    quote = Quote::Double;
+                    at_word_start = false;
+                }
+                // A backslash-newline is removed before tokenization, so it
+                // neither starts nor ends a word: `helper \<LF># x` is still a
+                // comment, while `\#` is a literal `#` inside a word.
+                '\\' => match chars.next() {
+                    Some('\n') => {}
+                    _ => at_word_start = false,
+                },
+                '|' => return Some("a pipe (`|`)"),
+                '&' => return Some("a chained command (`&`)"),
+                ';' => return Some("a second command (`;`)"),
+                '<' | '>' => return Some("a redirection"),
+                '#' if at_word_start => return Some("a comment (`#`)"),
+                '(' | ')' => return Some("a subshell"),
+                '`' => return Some("a command substitution"),
+                '\n' | '\r' => return Some("a line break"),
+                _ => at_word_start = c.is_whitespace(),
+            },
+        }
+    }
+    None
+}
+
+/// The text AoE appends a mode or instruction flag to, as the user or
+/// declaration wrote it: the supplied command plus the session's extra args.
+///
+/// The flag lands after both, so both are scanned. AoE's own rendering (a quoted
+/// program path, a quoted model value) is not part of it.
+fn appended_flag_invocation(supplied: &str, extra_args: &str) -> String {
+    if extra_args.is_empty() {
+        supplied.to_owned()
+    } else {
+        format!("{supplied} {extra_args}")
+    }
+}
+
+/// Refuse an argument AoE appends for the agent when the shell would consume it,
+/// naming the construct so a declaration can be corrected.
+fn refuse_shell_consumed_argument(command: &str, argument: &str) -> Result<()> {
+    if let Some(construct) = shell_consumed_by(command) {
+        anyhow::bail!(
+            "`{}` contains {}, so the agent's {} would reach the shell instead of the agent; declare the bare agent invocation",
+            command,
+            construct,
+            argument
+        );
+    }
+    Ok(())
 }
 
 fn prime_runtime_for_capture(
@@ -117,9 +205,19 @@ fn wrap_prime_launch(
 }
 
 /// Append yolo-mode flags or environment variables to a launch command.
-fn apply_yolo_mode(cmd: &mut String, yolo: &crate::agents::YoloMode, is_sandboxed: bool) {
+///
+/// `invocation` is the command as the user or declaration wrote it plus the
+/// session's extra args, before AoE renders and pins it: the refusal is about
+/// that text, never about the quoting AoE's own rendering adds for a path.
+fn apply_yolo_mode(
+    cmd: &mut String,
+    yolo: &crate::agents::YoloMode,
+    is_sandboxed: bool,
+    invocation: &str,
+) -> Result<()> {
     match yolo {
         crate::agents::YoloMode::CliFlag(flag) => {
+            refuse_shell_consumed_argument(invocation, "mode flag")?;
             *cmd = format!("{} {}", cmd, flag);
         }
         crate::agents::YoloMode::EnvVar(key, value) if !is_sandboxed => {
@@ -129,6 +227,7 @@ fn apply_yolo_mode(cmd: &mut String, yolo: &crate::agents::YoloMode, is_sandboxe
         | crate::agents::YoloMode::AlwaysYolo
         | crate::agents::YoloMode::EitherGeneration { .. } => {}
     }
+    Ok(())
 }
 
 /// Format an environment variable assignment as a shell-safe command prefix.
@@ -187,7 +286,7 @@ fn apply_no_daemon_flag(
     };
     let (program, probe) = match (execution, unpinned) {
         (Some(execution), _)
-            if execution.inputs.container.is_none() && execution.agent.name == agent.name =>
+            if execution.inputs.container.is_none() && execution.binding.agent == agent.name =>
         {
             (&execution.program, execution.host_command())
         }
@@ -196,29 +295,39 @@ fn apply_no_daemon_flag(
         }
         _ => return,
     };
-    let Some(invocation) = parse_launch_command(inst.get_tool_command()) else {
+    let Some(invocation) = parse_launch_command(&inst.get_tool_command()) else {
         return;
     };
     if invocation.words.first().map(String::as_str) != Some(agent.binary) {
         return;
     }
-    let Ok(mut words) = shell_words::split(cmd) else {
+    insert_no_daemon_flag(cmd, agent, program, &probe);
+}
+
+fn insert_no_daemon_flag(
+    cmd: &mut String,
+    agent: &crate::agents::AgentDef,
+    program: &std::path::Path,
+    probe: &std::process::Command,
+) {
+    let Some(mut parsed) = parse_launch_command(cmd) else {
         return;
     };
+    let words = &mut parsed.words;
     if words.first().map(String::as_str) != program.to_str() {
         return;
     }
     // Past `--` every word is a positional, so only the options before it count.
     let options_end = words.iter().position(|w| w == "--").unwrap_or(words.len());
     let options = &words[1..options_end];
-    let Some(flag) = agent.supported_no_daemon_flag(&probe, options) else {
+    let Some(flag) = agent.supported_no_daemon_flag(probe, options) else {
         return;
     };
     if options.iter().any(|w| w == flag) {
         return;
     }
     words.insert(options_end, flag.to_owned());
-    *cmd = shell_words::join(words);
+    *cmd = render_launch_command(parsed);
 }
 
 /// Write the Pi session-id extension into the app dir and return its path.
@@ -247,11 +356,11 @@ pub(super) fn environment_defines_path(environment: &[String]) -> bool {
 }
 
 pub(super) fn build_resume_flags(
-    tool: &str,
+    agent: Option<&crate::agents::AgentDef>,
     session_id: &str,
     is_existing_session: bool,
 ) -> String {
-    use crate::agents::{get_agent, ResumeStrategy};
+    use crate::agents::ResumeStrategy;
 
     if !is_valid_session_id(session_id) {
         tracing::warn!(target: "session.store",
@@ -260,12 +369,12 @@ pub(super) fn build_resume_flags(
         );
         return String::new();
     }
-    let Some(agent) = get_agent(tool) else {
+    let Some(agent) = agent else {
         return String::new();
     };
     let Some(support) = agent.session_support.as_ref() else {
         tracing::info!(target: "session.store",
-            tool = %tool,
+            tool = %agent.name,
             sid = %session_id,
             "session resume is disabled for this agent; stored ID left unused"
         );
@@ -341,56 +450,84 @@ pub(super) fn build_fork_flags(
 
 pub(super) struct ParsedLaunchCommand {
     pub(super) words: Vec<String>,
+    pub(super) assignments: Vec<(String, String)>,
     pub(super) executable_end: usize,
 }
 
 pub(super) fn parse_launch_command(command: &str) -> Option<ParsedLaunchCommand> {
-    let words = shell_words::split(command).ok()?;
-    words.first()?;
-
-    let mut started = false;
+    let mut spans = Vec::new();
+    let mut start = None;
     let mut quote = None;
     let mut escaped = false;
     for (offset, ch) in command.char_indices() {
-        let separator = matches!(ch, ' ' | '\t' | '\n' | '\r');
-        if !started {
-            if separator {
+        if start.is_none() {
+            if ch.is_ascii_whitespace() {
                 continue;
             }
-            started = true;
+            start = Some(offset);
         }
         if escaped {
             escaped = false;
             continue;
         }
         match quote {
-            Some('\'') => {
-                if ch == '\'' {
-                    quote = None;
-                }
-            }
-            Some('"') => match ch {
-                '"' => quote = None,
-                '\\' => escaped = true,
-                _ => {}
-            },
-            _ => match ch {
+            Some('\'') if ch == '\'' => quote = None,
+            Some('"') if ch == '"' => quote = None,
+            Some('"') if ch == '\\' => escaped = true,
+            Some(_) => {}
+            None => match ch {
                 '\'' | '"' => quote = Some(ch),
                 '\\' => escaped = true,
-                _ if separator => {
-                    return Some(ParsedLaunchCommand {
-                        words,
-                        executable_end: offset,
-                    });
+                _ if ch.is_ascii_whitespace() => {
+                    spans.push((start.take()?, offset));
                 }
                 _ => {}
             },
         }
     }
+    if let Some(start) = start {
+        spans.push((start, command.len()));
+    }
+    let mut words = shell_words::split(command).ok()?;
+    if spans.len() != words.len() {
+        return None;
+    }
+    let mut assignments = Vec::new();
+    for ((start, end), word) in spans.iter().zip(&words) {
+        let raw = &command[*start..*end];
+        let Some((key, _)) = raw.split_once('=') else {
+            break;
+        };
+        let mut chars = key.chars();
+        if !matches!(chars.next(), Some(c) if c.is_ascii_alphabetic() || c == '_')
+            || !chars.all(|c| c.is_ascii_alphanumeric() || c == '_')
+        {
+            break;
+        }
+        let (_, value) = word.split_once('=')?;
+        assignments.push((key.to_owned(), value.to_owned()));
+    }
+    let executable_end = spans.get(assignments.len())?.1;
+    words.drain(..assignments.len());
     Some(ParsedLaunchCommand {
         words,
-        executable_end: command.len(),
+        assignments,
+        executable_end,
     })
+}
+
+pub(super) fn render_launch_command(parsed: ParsedLaunchCommand) -> String {
+    let command = shell_words::join(parsed.words);
+    if parsed.assignments.is_empty() {
+        return command;
+    }
+    let assignments = parsed
+        .assignments
+        .into_iter()
+        .map(|(key, value)| format!("{key}={}", shell_words::quote(&value)))
+        .collect::<Vec<_>>()
+        .join(" ");
+    format!("{assignments} {command}")
 }
 
 /// Insert a subcommand at the parsed executable boundary, or append flags.
@@ -410,22 +547,22 @@ pub(super) fn splice_subcommand_or_append(
 }
 
 pub(super) fn append_resume_flags(
-    tool: &str,
+    agent: Option<&crate::agents::AgentDef>,
     session_id: Option<&str>,
     is_existing_session: bool,
     cmd: &mut String,
     executable_end: usize,
     context: &str,
 ) -> bool {
-    use crate::agents::{get_agent, ResumeStrategy};
+    use crate::agents::ResumeStrategy;
 
     if let Some(session_id) = session_id {
-        let resume_part = build_resume_flags(tool, session_id, is_existing_session);
+        let resume_part = build_resume_flags(agent, session_id, is_existing_session);
         if resume_part.is_empty() {
             return false;
         }
         let subcommand_at = matches!(
-            get_agent(tool).and_then(|agent| agent.session_support.as_ref()),
+            agent.and_then(|agent| agent.session_support.as_ref()),
             Some(crate::agents::SessionSupport {
                 resume: ResumeStrategy::Subcommand(_),
                 ..
@@ -446,7 +583,7 @@ pub(super) fn append_resume_flags(
 /// web renderer handles ANSI fine. Unsetting `NO_COLOR` and advertising
 /// `TERM=xterm-256color` plus `COLORTERM=truecolor` at launch keeps color on
 /// without pinning tools to a specific `FORCE_COLOR` depth.
-fn apply_agent_launch_env(cmd: &mut String, agent: Option<&'static crate::agents::AgentDef>) {
+fn apply_agent_launch_env(cmd: &mut String, agent: Option<&crate::agents::AgentDef>) {
     if !matches!(agent.map(|a| a.name), Some("antigravity" | "codex")) {
         return;
     }
@@ -494,13 +631,16 @@ pub(super) fn wrap_command_ignore_suspend(
 }
 
 fn pin_host_program(cmd: &mut String, snapshot: &std::process::Command) -> Result<()> {
-    let mut words = shell_words::split(cmd)?;
-    *words.first_mut().context("host program is missing")? = snapshot
+    let mut parsed = parse_launch_command(cmd).context("host program is missing")?;
+    *parsed
+        .words
+        .first_mut()
+        .context("host program is missing")? = snapshot
         .get_program()
         .to_str()
         .context("host executable path is not UTF-8")?
         .to_owned();
-    *cmd = shell_words::join(words);
+    *cmd = render_launch_command(parsed);
     Ok(())
 }
 
@@ -697,11 +837,11 @@ impl Instance {
                     "sandbox executable identity is unprovable"
                 );
                 anyhow::ensure!(
-                    !Self::contains_active_shell_syntax(self.get_tool_command())
+                    !Self::contains_active_shell_syntax(&self.get_tool_command())
                         && !Self::contains_active_shell_syntax(&self.extra_args),
                     "sandbox command contains active shell syntax"
                 );
-                let parsed = parse_launch_command(self.get_tool_command())
+                let parsed = parse_launch_command(&self.get_tool_command())
                     .context("sandbox command is unparseable")?;
                 let program = execution
                     .map(|execution| execution.program.as_os_str())
@@ -786,17 +926,27 @@ impl Instance {
     }
 
     pub fn expects_shell(&self) -> bool {
-        crate::tmux::utils::is_shell_command(self.get_tool_command())
+        crate::tmux::utils::is_shell_command(&self.get_tool_command())
     }
 
-    pub fn get_tool_command(&self) -> &str {
-        if self.command.is_empty() {
-            crate::agents::get_agent(&self.tool)
-                .map(|a| a.binary)
-                .unwrap_or("bash")
-        } else {
-            &self.command
+    pub fn get_tool_command(&self) -> std::borrow::Cow<'_, str> {
+        if !self.command.is_empty() {
+            return std::borrow::Cow::Borrowed(&self.command);
         }
+        if let Some(declared) = self.declared_agent() {
+            if let Some(command) = &declared.contribution().command {
+                return std::borrow::Cow::Owned(command.clone());
+            }
+        }
+        std::borrow::Cow::Borrowed(
+            crate::agents::get_agent(&self.tool)
+                .or_else(|| {
+                    crate::plugin::bundled_agents::definitions()
+                        .find(|agent| agent.name == self.tool)
+                })
+                .map(|a| a.binary)
+                .unwrap_or("bash"),
+        )
     }
 
     /// The text searched for a user-selected `--agent NAME` flag: both the
@@ -819,7 +969,16 @@ impl Instance {
     /// command so subcommand-scoped flags (yolo, resume) parse correctly.
     fn get_launch_command(&self) -> String {
         if self.command.is_empty() {
+            if let Some(declared) = self.declared_agent() {
+                if let Some(command) = &declared.contribution().command {
+                    return command.clone();
+                }
+            }
             crate::agents::get_agent(&self.tool)
+                .or_else(|| {
+                    crate::plugin::bundled_agents::definitions()
+                        .find(|agent| agent.name == self.tool)
+                })
                 .map(|a| a.launch_base_command())
                 .unwrap_or_else(|| "bash".to_string())
         } else {
@@ -1048,7 +1207,7 @@ impl Instance {
         }
         let require_conversation_publication = execution
             .as_ref()
-            .is_some_and(|execution| execution.agent.name == "opencode")
+            .is_some_and(|execution| execution.binding.agent == "opencode")
             && !fork_mints_child
             && self.stored_fork_child().is_some();
         Ok(PreparedLaunch {
@@ -1142,10 +1301,74 @@ impl Instance {
                 &self.extra_args,
             ))?;
         }
+        if let Some(super::execution::NativeAgent::Declared(declared)) =
+            execution.map(|execution| &execution.agent)
+        {
+            return declared
+                .with_definition(|agent| {
+                    self.build_launch_command_for_agent_in(
+                        stores,
+                        execution,
+                        unpinned,
+                        expected,
+                        Some(agent),
+                    )
+                })
+                .context("invalid agent declaration")?;
+        }
+        if execution.is_none() && crate::agents::get_agent(&self.tool).is_none() {
+            let config = crate::session::config::repo_config::resolve_config_with_repo(
+                &self.effective_profile(),
+                std::path::Path::new(&self.project_path),
+            )?;
+            if !config
+                .session
+                .agent_command_override
+                .get(&self.tool)
+                .is_some_and(|command| !command.trim().is_empty())
+            {
+                let declared = crate::plugin::agent_integration::declared_agent(
+                    crate::plugin::registry(),
+                    &self.tool,
+                    config
+                        .session
+                        .custom_agents
+                        .iter()
+                        .filter(|(_, command)| !command.trim().is_empty())
+                        .map(|(name, _)| name.as_str()),
+                );
+                if let Some(declared) = declared.filter(|agent| {
+                    self.command.is_empty()
+                        || agent.contribution().command.as_deref() == Some(self.command.as_str())
+                }) {
+                    return declared
+                        .with_definition(|agent| {
+                            self.build_launch_command_for_agent_in(
+                                stores,
+                                execution,
+                                unpinned,
+                                expected,
+                                Some(agent),
+                            )
+                        })
+                        .context("invalid agent declaration")?;
+                }
+            }
+        }
         let agent = execution
-            .map(|execution| execution.agent)
+            .and_then(|execution| execution.agent.builtin())
             .or_else(|| self.default_selector_agent());
+        self.build_launch_command_for_agent_in(stores, execution, unpinned, expected, agent)
+    }
 
+    fn build_launch_command_for_agent_in(
+        &mut self,
+        stores: CaptureStorage<'_>,
+        execution: Option<&super::execution::NativeExecution>,
+        unpinned: Option<&UnpinnedCodexLaunch>,
+        expected: &mut ConversationState,
+        agent: Option<&crate::agents::AgentDef>,
+    ) -> Result<LaunchCommandParts> {
         let parts = if self.is_sandboxed() {
             let fallback_container_name = execution
                 .is_none()
@@ -1188,7 +1411,7 @@ impl Instance {
                     None,
                     &crate::session::config::repo_config::resolve_config_with_repo(
                         &self.effective_profile(),
-                        std::path::Path::new(&self.project_path),
+                        self.repo_config_path(),
                     )?,
                 )?)
             } else {
@@ -1227,12 +1450,13 @@ impl Instance {
                     )
                 });
 
-            let launch_cmd = self.freeze_native_invocation(
-                self.get_launch_command(),
-                execution,
-                None,
-                launch_context,
-            )?;
+            // The guard is about the text the user or declaration wrote, before
+            // AoE renders and pins it: quoting AoE adds for a model value or a
+            // program path is not a shell construct.
+            let supplied = self.get_launch_command();
+            let guarded = appended_flag_invocation(&supplied, &self.extra_args);
+            let launch_cmd =
+                self.freeze_native_invocation(supplied.clone(), execution, None, launch_context)?;
             let base_cmd = if self.extra_args.is_empty() {
                 launch_cmd
             } else if self.command.is_empty() {
@@ -1251,6 +1475,7 @@ impl Instance {
             let mut tool_cmd = if self.is_yolo_mode() {
                 match yolo {
                     Some(crate::agents::YoloMode::CliFlag(flag)) => {
+                        refuse_shell_consumed_argument(&guarded, "mode flag")?;
                         format!("{} {}", base_cmd, flag)
                     }
                     Some(crate::agents::YoloMode::EnvVar(..))
@@ -1268,6 +1493,7 @@ impl Instance {
                 .filter(|s| !s.is_empty())
             {
                 if let Some(flag_template) = agent.and_then(|a| a.instruction_flag) {
+                    refuse_shell_consumed_argument(&guarded, "instruction flag")?;
                     let escaped = shell_escape(instruction);
                     let flag = flag_template.replace("{}", &escaped);
                     tool_cmd = format!("{} {}", tool_cmd, flag);
@@ -1385,7 +1611,7 @@ impl Instance {
     #[cfg(test)]
     fn build_host_command(
         &mut self,
-        agent: Option<&'static crate::agents::AgentDef>,
+        agent: Option<&crate::agents::AgentDef>,
         execution: Option<&super::execution::NativeExecution>,
         expected: &mut ConversationState,
     ) -> Result<LaunchCommandParts> {
@@ -1402,7 +1628,7 @@ impl Instance {
     fn build_host_command_in(
         &mut self,
         stores: CaptureStorage<'_>,
-        agent: Option<&'static crate::agents::AgentDef>,
+        agent: Option<&crate::agents::AgentDef>,
         execution: Option<&super::execution::NativeExecution>,
         unpinned: Option<&UnpinnedCodexLaunch>,
         expected: &mut ConversationState,
@@ -1427,7 +1653,7 @@ impl Instance {
     #[cfg(test)]
     fn build_host_command_with_identity_extension(
         &mut self,
-        agent: Option<&'static crate::agents::AgentDef>,
+        agent: Option<&crate::agents::AgentDef>,
         identity_extension: Option<&(String, String)>,
         execution: Option<&super::execution::NativeExecution>,
         expected: &mut ConversationState,
@@ -1446,7 +1672,7 @@ impl Instance {
     fn build_host_command_with_identity_extension_in(
         &mut self,
         stores: CaptureStorage<'_>,
-        agent: Option<&'static crate::agents::AgentDef>,
+        agent: Option<&crate::agents::AgentDef>,
         identity_extension: Option<&(String, String)>,
         execution: Option<&super::execution::NativeExecution>,
         unpinned: Option<&UnpinnedCodexLaunch>,
@@ -1482,7 +1708,7 @@ impl Instance {
             fallback_profile = self.effective_profile();
             &fallback_profile
         };
-        let program = parse_launch_command(self.get_tool_command()).and_then(|parsed| {
+        let program = parse_launch_command(&self.get_tool_command()).and_then(|parsed| {
             parsed.words.first().and_then(|word| {
                 Path::new(word)
                     .file_name()
@@ -1502,9 +1728,14 @@ impl Instance {
 
         if self.command.is_empty() {
             match agent {
-                Some(a) => {
+                Some(_) => {
+                    // A blank stored command can still select an approved
+                    // declaration whose command carries an assignment and fixed
+                    // arguments; the binary alone would drop them.
+                    let supplied = self.get_launch_command();
+                    let guarded = appended_flag_invocation(&supplied, &self.extra_args);
                     let mut cmd = self.freeze_native_invocation(
-                        a.launch_base_command(),
+                        supplied.clone(),
                         execution,
                         unpinned,
                         launch_context,
@@ -1524,7 +1755,7 @@ impl Instance {
                     }
                     if host_command.is_none() {
                         if let Some(yolo) = yolo {
-                            apply_yolo_mode(&mut cmd, yolo, false);
+                            apply_yolo_mode(&mut cmd, yolo, false, &guarded)?;
                         }
                     }
                     let is_existing = self.apply_session_flags_in(
@@ -1547,7 +1778,7 @@ impl Instance {
                             if let Some(yolo) =
                                 agent.and_then(|agent| resolved_yolo(agent, launch_context))
                             {
-                                apply_yolo_mode(&mut cmd, yolo, false);
+                                apply_yolo_mode(&mut cmd, yolo, false, &guarded)?;
                             }
                         }
                     }
@@ -1609,8 +1840,10 @@ impl Instance {
                 }),
             }
         } else {
+            let supplied = self.command.clone();
+            let guarded = appended_flag_invocation(&supplied, &self.extra_args);
             let mut cmd = self.freeze_native_invocation(
-                self.command.clone(),
+                supplied.clone(),
                 execution,
                 unpinned,
                 launch_context,
@@ -1623,7 +1856,7 @@ impl Instance {
             }
             if host_command.is_none() {
                 if let Some(yolo) = yolo {
-                    apply_yolo_mode(&mut cmd, yolo, false);
+                    apply_yolo_mode(&mut cmd, yolo, false, &guarded)?;
                 }
             }
             let is_existing = self.apply_session_flags_in(
@@ -1645,7 +1878,7 @@ impl Instance {
                 if !defer_yolo && self.is_yolo_mode() {
                     if let Some(yolo) = agent.and_then(|agent| resolved_yolo(agent, launch_context))
                     {
-                        apply_yolo_mode(&mut cmd, yolo, false);
+                        apply_yolo_mode(&mut cmd, yolo, false, &guarded)?;
                     }
                 }
             }
@@ -1704,6 +1937,499 @@ mod tests {
     use super::*;
     use crate::agents::AgentGeneration;
     use crate::session::instance::test_helpers::*;
+
+    /// Installs launch-only declarations whose commands carry shell syntax, so a
+    /// declared instruction or YOLO flag would land on the shell.
+    fn install_shell_syntax_declarations() {
+        let manifest = r#"
+id = "acme.shell-syntax"
+name = "Shell syntax"
+version = "1.0.0"
+api_version = 21
+
+[[agent_integrations]]
+tool = "zzalpha"
+command = "prime-agent | tee log"
+[agent_integrations.launch]
+instruction_flag = "--prompt={}"
+
+[[agent_integrations]]
+tool = "zzbeta"
+command = "prime-agent # trailing"
+[agent_integrations.launch]
+instruction_flag = "--prompt={}"
+
+[[agent_integrations]]
+tool = "zzgamma"
+command = "prime-agent"
+[agent_integrations.launch]
+instruction_flag = "--prompt={}"
+
+[[agent_integrations]]
+tool = "zzdelta"
+command = "prime-agent | tee log"
+[agent_integrations.launch.yolo]
+kind = "flag"
+flag = "--yolo"
+[agent_integrations.launch.resume]
+kind = "flag"
+flag = "--resume"
+[agent_integrations.launch.capture]
+backend = "omp"
+host = "pane_scoped"
+sandbox = "unsupported"
+
+[[agent_integrations]]
+tool = "zzepsilon"
+command = "prime-agent"
+[agent_integrations.launch.yolo]
+kind = "flag"
+flag = "--yolo"
+[agent_integrations.launch.resume]
+kind = "flag"
+flag = "--resume"
+[agent_integrations.launch.capture]
+backend = "omp"
+host = "pane_scoped"
+sandbox = "unsupported"
+"#;
+        let dir = crate::plugin::plugins_dir()
+            .unwrap()
+            .join("acme.shell-syntax");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("aoe-plugin.toml"), manifest).unwrap();
+        crate::session::update_config(|config| {
+            config.plugins.insert(
+                "acme.shell-syntax".into(),
+                crate::session::PluginConfig {
+                    grant: Some(crate::session::CapabilityGrant {
+                        manifest_hash: aoe_plugin_api::PluginManifest::hash_bytes(
+                            manifest.as_bytes(),
+                        ),
+                        capabilities: Vec::new(),
+                        granted_at: chrono::Utc::now(),
+                    }),
+                    ..Default::default()
+                },
+            );
+        })
+        .unwrap();
+        crate::plugin::reload_registry();
+    }
+
+    /// The mode flag is argv for the agent, so a shell-consumed supplied command
+    /// must be refused. AoE's own rendering quotes a resolved program path, and
+    /// that quoting is not the user's: it must not trip the refusal.
+    #[test]
+    fn the_mode_flag_guards_the_supplied_command_not_the_rendered_one() {
+        let mut rendered = "'/tmp/bin=tag/opencode' --standalone".to_owned();
+        apply_yolo_mode(
+            &mut rendered,
+            &crate::agents::YoloMode::CliFlag("--yolo"),
+            false,
+            "opencode",
+        )
+        .expect("a rendered program path must not read as shell syntax");
+        assert_eq!(rendered, "'/tmp/bin=tag/opencode' --standalone --yolo");
+
+        let mut plain = "opencode".to_owned();
+        let error = apply_yolo_mode(
+            &mut plain,
+            &crate::agents::YoloMode::CliFlag("--yolo"),
+            false,
+            "opencode | tee log",
+        )
+        .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("mode flag would reach the shell"),
+            "{error}"
+        );
+        assert_eq!(plain, "opencode", "a refused flag must not be appended");
+    }
+
+    /// A packaged (sandboxed) launch appends the configured instruction to the
+    /// declared command. That argument is argv for the agent, so a pipeline or a
+    /// comment in the declared command must be refused instead of handing the
+    /// instruction to the shell; a bare command still receives it.
+    #[test]
+    #[serial_test::serial]
+    fn declared_instruction_requires_a_direct_sandbox_command() {
+        let temp = tempfile::tempdir().unwrap();
+        // Declared first so it reloads after the app directory is restored.
+        let _reload = crate::plugin::ReloadRegistryOnDrop;
+        let _app = crate::session::test_support::isolate_app_dir_at(temp.path());
+        let _env = crate::session::test_support::EnvGuard::set(&[
+            ("HOME", temp.path().to_path_buf()),
+            ("XDG_CONFIG_HOME", temp.path().join(".config")),
+            ("USERPROFILE", temp.path().to_path_buf()),
+        ]);
+        let _featured = crate::session::test_support::EnvGuard::unset(&["AOE_FEATURED_INDEX_PATH"]);
+        install_shell_syntax_declarations();
+        let project = temp.path().join("project");
+        std::fs::create_dir_all(&project).unwrap();
+
+        let declared = |tool: &str, command: &str| {
+            let mut inst = Instance::new(tool, project.to_str().unwrap());
+            inst.tool = tool.into();
+            inst.command = command.into();
+            inst.source_profile = "declared-shell".into();
+            let mut sandbox = test_sandbox(tool, Some("/workspace/project"));
+            sandbox.custom_instruction = Some("hello".into());
+            inst.sandbox_info = Some(sandbox);
+            inst
+        };
+
+        for tool in ["zzalpha", "zzbeta"] {
+            let command = crate::plugin::agent_integration::declared_agent(
+                crate::plugin::registry(),
+                tool,
+                std::iter::empty(),
+            )
+            .expect("the declaration is installed")
+            .contribution()
+            .command
+            .clone()
+            .expect("the declaration names its command");
+            let mut inst = declared(tool, &command);
+            // Host runtimes differ: without the fixture the runtime lookup fails
+            // on a runner that has no container runtime, before the append.
+            let config = inst.build_container_config_for_test().unwrap();
+            let _transport = install_container_transport(temp.path(), tool, &config.volumes);
+            let error = match inst.prepare_launch_command(inst.conversation_state()) {
+                Err(error) => error,
+                Ok(_) => panic!("a shell command must not receive the declared instruction"),
+            };
+            assert!(
+                error
+                    .to_string()
+                    .contains("reach the shell instead of the agent"),
+                "{tool} `{command}`: {error}"
+            );
+        }
+
+        // The session's extra args are appended before the instruction, so a
+        // construct they introduce must not receive it either.
+        for extra in ["| tee log", "# trailing", "\\\n# trailing"] {
+            let mut inst = declared("zzgamma", "prime-agent");
+            inst.extra_args = extra.into();
+            let config = inst.build_container_config_for_test().unwrap();
+            let _transport = install_container_transport(temp.path(), "zzgamma", &config.volumes);
+            let error = match inst.prepare_launch_command(inst.conversation_state()) {
+                Err(error) => error,
+                Ok(_) => panic!("extra args `{extra}` must not receive the instruction"),
+            };
+            assert!(
+                error
+                    .to_string()
+                    .contains("instruction flag would reach the shell"),
+                "{extra}: {error}"
+            );
+        }
+
+        // A continuation that joins words without introducing a construct keeps
+        // the instruction as argv.
+        let mut continued = declared("zzgamma", "prime-agent");
+        continued.extra_args = "--fast \\\n--verbose".into();
+        let config = continued.build_container_config_for_test().unwrap();
+        let _transport = install_container_transport(temp.path(), "zzgamma", &config.volumes);
+        let prepared = continued
+            .prepare_launch_command(continued.conversation_state())
+            .expect("a continued invocation must launch");
+        assert!(
+            prepared.command.unwrap().contains("--prompt="),
+            "a continued command must receive the instruction"
+        );
+
+        // YOLO off and a bare command: the instruction is appended as argv. The
+        // transport is fixtures so the launch does not depend on a host runtime.
+        let mut direct = declared("zzgamma", "prime-agent");
+        let config = direct.build_container_config_for_test().unwrap();
+        let _transport = install_container_transport(temp.path(), "zzgamma", &config.volumes);
+        let prepared = direct
+            .prepare_launch_command(direct.conversation_state())
+            .expect("a bare declared command must launch");
+        assert!(
+            prepared.command.unwrap().contains("--prompt="),
+            "the direct command must receive the instruction"
+        );
+    }
+
+    /// A packaged launch of a built-in agent appends the mode flag to a command
+    /// AoE rendered itself: `quote_model_value_in_args` quotes a value the shell
+    /// would otherwise read as a glob, and pinning may quote the program path.
+    /// That rendering is not a shell construct, so the launch must not be refused.
+    #[test]
+    #[serial_test::serial]
+    fn a_rendered_model_value_does_not_refuse_a_sandbox_mode_flag() {
+        use super::super::test_helpers::{
+            admit_sandbox_fixture, install_container_transport, test_sandbox, tool_instance,
+        };
+
+        let temp = tempfile::tempdir().unwrap();
+        let _home = crate::session::test_support::isolate_home(temp.path());
+        let _app = crate::session::test_support::isolate_app_dir_at(&temp.path().join("app"));
+        let project = temp.path().join("project");
+        std::fs::create_dir_all(&project).unwrap();
+        let mut inst = tool_instance("qwen", project.to_str().unwrap());
+        inst.sandbox_info = Some(test_sandbox("qwen-rendered", Some("/workspace/project")));
+        inst.extra_args = "--model opus[1m]".into();
+        inst.yolo_mode = true;
+        admit_sandbox_fixture(&inst);
+        let config = inst.build_container_config_for_test().unwrap();
+        let _transport = install_container_transport(temp.path(), "qwen-rendered", &config.volumes);
+        std::fs::copy(
+            temp.path().join("native-bin/prime-agent"),
+            temp.path().join("native-bin/qwen"),
+        )
+        .unwrap();
+
+        let prepared = inst
+            .prepare_launch_command(inst.conversation_state())
+            .expect("a built-in agent keeps its mode flag in a sandbox");
+        let command = prepared.command.unwrap();
+        assert!(
+            command.contains("--yolo"),
+            "the mode flag must be appended: {command}"
+        );
+    }
+
+    /// The host launch appends the same declaration-derived arguments as the
+    /// packaged one, and they are argv for the agent. A pipeline in the declared
+    /// command would hand the mode flag to the shell, so the guard holds on the
+    /// host path too while a bare command still takes it. Resume flags need no
+    /// guard here: a command that hides the agent behind a launcher already
+    /// starts fresh instead of injecting a selector.
+    #[test]
+    #[serial_test::serial]
+    fn declared_host_launch_refuses_arguments_the_shell_would_consume() {
+        let temp = tempfile::tempdir().unwrap();
+        let _reload = crate::plugin::ReloadRegistryOnDrop;
+        let _app = crate::session::test_support::isolate_app_dir_at(temp.path());
+        let _env = crate::session::test_support::EnvGuard::set(&[
+            ("HOME", temp.path().to_path_buf()),
+            ("XDG_CONFIG_HOME", temp.path().join(".config")),
+            ("USERPROFILE", temp.path().to_path_buf()),
+        ]);
+        let _featured = crate::session::test_support::EnvGuard::unset(&["AOE_FEATURED_INDEX_PATH"]);
+        install_shell_syntax_declarations();
+        let project = temp.path().join("project");
+        std::fs::create_dir_all(&project).unwrap();
+
+        let declared = |tool: &str| {
+            let command = crate::plugin::agent_integration::declared_agent(
+                crate::plugin::registry(),
+                tool,
+                std::iter::empty(),
+            )
+            .expect("the declaration is installed")
+            .contribution()
+            .command
+            .clone()
+            .expect("the declaration names its command");
+            let mut inst = Instance::new(tool, project.to_str().unwrap());
+            inst.tool = tool.into();
+            inst.command = command.clone();
+            inst.source_profile = "declared-shell".into();
+            (inst, command)
+        };
+
+        let (mut piped, command) = declared("zzdelta");
+        piped.yolo_mode = true;
+        let error = match piped.prepare_launch_command(piped.conversation_state()) {
+            Err(error) => error,
+            Ok(prepared) => panic!(
+                "a host pipeline must not receive the mode flag: {:?}",
+                prepared.command
+            ),
+        };
+        assert!(
+            error
+                .to_string()
+                .contains("mode flag would reach the shell"),
+            "{command}: {error}"
+        );
+
+        let (mut piped, command) = declared("zzdelta");
+        piped.set_agent_conversation(Some("4f6f3a52".into()), None, None);
+        let prepared = piped
+            .prepare_launch_command(piped.conversation_state())
+            .expect("a launcher-hidden command launches without a resume selector");
+        assert!(
+            !prepared.command.unwrap().contains("--resume"),
+            "{command} must not receive a resume flag the shell would consume"
+        );
+
+        // The session's extra args are appended before the flag, so a construct
+        // they introduce is the shell's problem too.
+        for extra in ["| tee log", "# trailing", "\\\n# trailing"] {
+            let (mut inst, _) = declared("zzepsilon");
+            inst.yolo_mode = true;
+            inst.extra_args = extra.into();
+            let error = match inst.prepare_launch_command(inst.conversation_state()) {
+                Err(error) => error,
+                Ok(prepared) => panic!(
+                    "extra args `{extra}` must not receive the mode flag: {:?}",
+                    prepared.command
+                ),
+            };
+            assert!(
+                error
+                    .to_string()
+                    .contains("mode flag would reach the shell"),
+                "{extra}: {error}"
+            );
+        }
+
+        // A continuation that joins words without introducing a construct keeps
+        // the flag as argv.
+        let (mut continued, _) = declared("zzepsilon");
+        continued.yolo_mode = true;
+        continued.extra_args = "--fast \\\n--verbose".into();
+        let prepared = continued
+            .prepare_launch_command(continued.conversation_state())
+            .expect("a continued invocation must launch");
+        assert!(
+            prepared.command.unwrap().contains("--yolo"),
+            "a continued command must receive the mode flag"
+        );
+
+        let (mut direct, _) = declared("zzepsilon");
+        direct.yolo_mode = true;
+        let prepared = direct
+            .prepare_launch_command(direct.conversation_state())
+            .expect("a bare declared command must launch");
+        assert!(
+            prepared.command.unwrap().contains("--yolo"),
+            "the direct command must receive the mode flag"
+        );
+    }
+
+    /// A legacy row with a blank stored command launches the declaration's
+    /// complete command: its assignment and fixed argument are part of the
+    /// invocation, not just its binary. A stored command is rendered as written.
+    #[test]
+    #[serial_test::serial]
+    fn a_blank_stored_command_renders_the_declared_command_in_full() {
+        let temp = tempfile::tempdir().unwrap();
+        // Declared first so it reloads after the app directory is restored.
+        let _reload = crate::plugin::ReloadRegistryOnDrop;
+        let _app = crate::session::test_support::isolate_app_dir_at(temp.path());
+        crate::session::test_support::install_omp_takeover("OMP_MODE=plugin omp-next --verbose");
+        assert!(crate::agents::get_agent("omp").is_none());
+
+        let project = temp.path().join("project");
+        std::fs::create_dir_all(&project).unwrap();
+        for stored in ["", "OMP_MODE=plugin omp-next --verbose"] {
+            let mut inst = Instance::new("omp", project.to_str().unwrap());
+            inst.tool = "omp".into();
+            inst.command = stored.into();
+            let prepared = inst
+                .prepare_launch_command(inst.conversation_state())
+                .unwrap_or_else(|error| panic!("stored `{stored}`: {error}"));
+            let command = prepared.command.expect("a declaration launches");
+            assert!(
+                command.contains("OMP_MODE=plugin omp-next --verbose"),
+                "stored `{stored}`: {command}"
+            );
+        }
+    }
+
+    /// An appended argument is argv for the agent unless the shell would route it
+    /// somewhere else. Quoting, `~` and `$HOME` name the agent, so they are not
+    /// refused; an operator, comment or substitution is, and the refusal names it.
+    #[test]
+    fn an_appended_argument_is_refused_only_where_the_shell_would_take_it() {
+        for command in [
+            "helper --verbose",
+            "TOKEN=local helper",
+            "~/bin/helper",
+            "$HOME/bin/helper",
+            "/opt/my tools/helper",
+            "'/opt/my tools/helper'",
+            "helper --model 'opus[1m]'",
+            "/opt/proj#1/bin/helper",
+        ] {
+            assert_eq!(shell_consumed_by(command), None, "{command}");
+        }
+        for (command, construct) in [
+            ("helper | tee /tmp/helper.log", "a pipe"),
+            ("helper; echo done", "a second command"),
+            ("helper && echo done", "a chained command"),
+            ("helper &", "a chained command"),
+            ("helper > /tmp/helper.log", "a redirection"),
+            ("helper < /tmp/input", "a redirection"),
+            ("helper # trailing", "a comment"),
+            ("$(which helper)", "a subshell"),
+            ("`which helper`", "a command substitution"),
+            ("helper\necho done", "a line break"),
+        ] {
+            let found = shell_consumed_by(command).unwrap_or_else(|| panic!("{command}"));
+            assert!(
+                found.contains(construct),
+                "{command} reports {found}, expected {construct}"
+            );
+        }
+        let error = refuse_shell_consumed_argument("helper | tee log", "mode flag").unwrap_err();
+        assert!(
+            error.to_string().contains("contains a pipe (`|`)"),
+            "{error}"
+        );
+        refuse_shell_consumed_argument("~/bin/helper", "mode flag").unwrap();
+        let supplied = "helper | tee log".to_owned();
+        let mut rendered = supplied.clone();
+        apply_yolo_mode(
+            &mut rendered,
+            &crate::agents::YoloMode::CliFlag("--yolo"),
+            false,
+            &supplied,
+        )
+        .unwrap_err();
+        assert_eq!(
+            rendered, supplied,
+            "a refused mode flag must not be appended"
+        );
+    }
+
+    #[test]
+    fn parses_assignments_and_quoted_executable_for_resume() {
+        let command = "TOKEN='a b' PATH=/bin '/opt/my tools/omp' --verbose";
+        let parsed = parse_launch_command(command).unwrap();
+        assert_eq!(
+            parsed.assignments,
+            [
+                ("TOKEN".into(), "a b".into()),
+                ("PATH".into(), "/bin".into())
+            ]
+        );
+        assert_eq!(parsed.words, ["/opt/my tools/omp", "--verbose"]);
+        let mut resumed = command.to_string();
+        splice_subcommand_or_append(&mut resumed, "resume", Some(parsed.executable_end));
+        assert_eq!(
+            resumed,
+            "TOKEN='a b' PATH=/bin '/opt/my tools/omp' resume --verbose"
+        );
+        let quoted = parse_launch_command("'TOKEN=value' omp").unwrap();
+        assert!(quoted.assignments.is_empty());
+        assert_eq!(quoted.words[0], "TOKEN=value");
+        assert!(parse_launch_command("TOKEN=value").is_none());
+    }
+
+    #[test]
+    fn pinned_host_program_preserves_assignment_environment() {
+        let mut command = "AOE_PREFIX_TEST='a b' opencode".to_owned();
+        pin_host_program(&mut command, &std::process::Command::new("/usr/bin/env")).unwrap();
+        let output = std::process::Command::new("sh")
+            .args(["-c", &command])
+            .output()
+            .unwrap();
+        assert!(output.status.success());
+        assert!(String::from_utf8(output.stdout)
+            .unwrap()
+            .lines()
+            .any(|line| line == "AOE_PREFIX_TEST=a b"));
+    }
     use crate::session::test_support::EnvGuard;
 
     fn host_command(inst: &mut Instance) -> String {
@@ -1975,13 +2701,23 @@ mod tests {
             ("mistral", false, String::new()),
         ] {
             assert_eq!(
-                build_resume_flags(tool, sid, existing),
+                build_resume_flags(crate::agents::get_agent(tool), sid, existing),
                 expected,
                 "{tool}/{existing}"
             );
         }
-        assert_eq!(build_resume_flags("claude", "$(rm -rf /)", true), "");
-        assert_eq!(build_resume_flags("opencode", "id; echo pwned", false), "");
+        assert_eq!(
+            build_resume_flags(crate::agents::get_agent("claude"), "$(rm -rf /)", true),
+            ""
+        );
+        assert_eq!(
+            build_resume_flags(
+                crate::agents::get_agent("opencode"),
+                "id; echo pwned",
+                false
+            ),
+            ""
+        );
 
         for (tool, parent, child, generation, expected) in [
             (
@@ -3355,6 +4091,138 @@ mod tests {
         );
     }
 
+    /// A literal `NAME=value` prefix must not outrank the attested store: the
+    /// frozen launch runs `env`, which would otherwise reassign the key the
+    /// snapshot already exports.
+    #[test]
+    #[serial_test::serial]
+    fn a_recorded_store_outranks_a_literal_prefix_assignment() {
+        let _app = crate::session::test_support::isolate_app_dir();
+        let stub = tempfile::tempdir().unwrap();
+        let _claude = crate::session::test_support::install_login_shell_path_command(
+            stub.path(),
+            "claude",
+            "#!/bin/sh\nexit 1\n",
+        );
+        let home = dirs::home_dir().unwrap();
+        let app = crate::session::get_app_dir().unwrap();
+        std::fs::create_dir_all(&app).unwrap();
+        let project = home.join("project-prefix-conflict");
+        std::fs::create_dir_all(&project).unwrap();
+        let profile = crate::session::config::effective_profile("");
+        let _registry = crate::tmux::status_rules::ProfileRegistryGuard::take(&profile);
+        let sid = "99999999-8888-7777-6666-555555555555";
+        for root in ["recorded", "prefix"] {
+            std::fs::create_dir_all(home.join(root)).unwrap();
+        }
+        std::fs::write(
+            app.join("config.toml"),
+            "[session.agent_config_dir]\nclaude = \"~/recorded\"\n",
+        )
+        .unwrap();
+
+        let mut inst = Instance::new("claude-prefix-conflict", project.to_str().unwrap());
+        inst.tool = "claude".into();
+        // The stored command carries a different store than the recorded binding.
+        inst.command = format!(
+            "CLAUDE_CONFIG_DIR={} claude",
+            shell_words::quote(&home.join("prefix").to_string_lossy()),
+        );
+        inst.source_profile = profile.clone();
+        inst.agent_session_id = Some(sid.into());
+        inst.agent_session_binding = Some(crate::session::ConversationBinding {
+            session_id: sid.into(),
+            provenance: crate::session::ConversationProvenance::Asserted,
+            transcript_path: None,
+            execution: Some(
+                inst.resolve_native_execution(None)
+                    .expect("the recorded entry attests a store")
+                    .binding,
+            ),
+        });
+        inst.resume_intent = crate::session::ResumeIntent::Default;
+        let transcript = home
+            .join("recorded/projects")
+            .join(crate::session::capture::encode_claude_project_path(
+                &crate::session::capture::canonicalize_or_raw(project.to_str().unwrap())
+                    .to_string_lossy(),
+            ))
+            .join(format!("{sid}.jsonl"));
+        std::fs::create_dir_all(transcript.parent().unwrap()).unwrap();
+        std::fs::write(&transcript, "conversation\n").unwrap();
+
+        let prepared = inst
+            .prepare_launch_command(inst.conversation_state())
+            .expect("a recorded store must still launch");
+        let command = prepared.command.expect("the launch has a command");
+        // The launch is a wrapped login shell, so the arguments live inside the
+        // here-document; asserting on `parsed.assignments` would never fail.
+        // This is the end-to-end wiring check: the conflicting prefix must not
+        // reach the final command at all.
+        let prefix_store = home.join("prefix");
+        assert!(
+            !command.contains(prefix_store.to_string_lossy().as_ref()),
+            "the conflicting prefix store must not reach the launch: {command}"
+        );
+        let execution = prepared.execution.expect("managed launch execution");
+        let routed = execution
+            .host_command()
+            .get_envs()
+            .find(|(key, _)| *key == std::ffi::OsStr::new("CLAUDE_CONFIG_DIR"))
+            .map(|(_, value)| {
+                value
+                    .map(std::ffi::OsStr::to_string_lossy)
+                    .map(|v| v.into_owned())
+            });
+        assert_eq!(
+            routed,
+            Some(Some(
+                home.join("recorded")
+                    .canonicalize()
+                    .unwrap()
+                    .to_string_lossy()
+                    .into_owned()
+            )),
+            "the effective launch environment must match the attested binding"
+        );
+
+        // The same conflict with no recorded conversation: the configured store
+        // is then the only authority the prefix must yield to.
+        let mut configured = Instance::new("claude-configured-conflict", project.to_str().unwrap());
+        configured.tool = "claude".into();
+        configured.command = inst.command.clone();
+        configured.source_profile = profile.clone();
+        let prepared = configured
+            .prepare_launch_command(configured.conversation_state())
+            .expect("a configured store must still launch");
+        let command = prepared.command.expect("the launch has a command");
+        assert!(
+            !command.contains(prefix_store.to_string_lossy().as_ref()),
+            "a configured store must outrank the prefix too: {command}"
+        );
+        let execution = prepared.execution.expect("configured launch execution");
+        let routed = execution
+            .host_command()
+            .get_envs()
+            .find(|(key, _)| *key == std::ffi::OsStr::new("CLAUDE_CONFIG_DIR"))
+            .map(|(_, value)| {
+                value
+                    .map(std::ffi::OsStr::to_string_lossy)
+                    .map(|v| v.into_owned())
+            });
+        assert_eq!(
+            routed,
+            Some(Some(
+                home.join("recorded")
+                    .canonicalize()
+                    .unwrap()
+                    .to_string_lossy()
+                    .into_owned()
+            )),
+            "the configured store must be the launched store"
+        );
+    }
+
     /// A typed title rides the first launch as the agent's own session name, quoted, and only
     /// once the setting is on: with it off the agent is not even probed for the flag.
     #[test]
@@ -3911,6 +4779,21 @@ mod tests {
             "#!/bin/sh\ncase \"$1\" in --help) echo '      --no-daemon  Run without the daemon';; esac\nexit 0\n",
         );
         let codex = tool_instance("codex", project.to_str().unwrap());
+        let path = temp_home.path().join("bin/codex");
+        let program = shell_escape(path.to_str().unwrap());
+        let mut command = format!("AOE_PREFIX_TEST='a b' {program} -- 'fix the build'");
+        insert_no_daemon_flag(
+            &mut command,
+            crate::agents::get_agent("codex").unwrap(),
+            &path,
+            &std::process::Command::new(&path),
+        );
+        let parsed = parse_launch_command(&command).unwrap();
+        assert_eq!(
+            parsed.assignments,
+            [("AOE_PREFIX_TEST".into(), "a b".into())]
+        );
+        assert_eq!(&parsed.words[1..], ["--no-daemon", "--", "fix the build"]);
         if crate::process::HAS_CODEX_MANAGED_PREFERENCES {
             let error = codex
                 .resolve_native_execution(None)
@@ -3930,7 +4813,7 @@ mod tests {
         let mut command = format!("{program} -- 'fix the build'");
         apply_no_daemon_flag(
             &mut command,
-            Some(execution.agent),
+            execution.agent.builtin(),
             &codex,
             Some(&execution),
             None,
@@ -3944,7 +4827,7 @@ mod tests {
         let mut command = format!("{program} -- --no-daemon");
         apply_no_daemon_flag(
             &mut command,
-            Some(execution.agent),
+            execution.agent.builtin(),
             &codex,
             Some(&execution),
             None,

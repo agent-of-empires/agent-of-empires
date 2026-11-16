@@ -294,8 +294,8 @@ mod tests {
             ("v0.37.0", true),
             // A stale global install that used to clear the floor.
             ("0.55.0", true),
-            ("0.98.0", true),
-            ("0.99.1", false),
+            ("0.102.0", true),
+            ("0.103.0", false),
             ("version=0.37.0", false),
             ("0.37.0-beta.1", true),
             ("junk", false),

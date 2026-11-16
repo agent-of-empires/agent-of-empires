@@ -2,6 +2,7 @@ import { Fragment, useId, useState } from "react";
 import {
   Archive,
   ArrowLeftRight,
+  UserRoundCog,
   ChevronRight,
   CircleDot,
   CircleStop,
@@ -94,6 +95,7 @@ export interface SingleRowActions {
   editGroup: () => void;
   switchView: (sessionId: string) => void;
   switchAgent: (sessionId: string) => void;
+  switchAccount: (sessionId: string) => void;
   fork: (sessionId: string) => void;
   autoName: (sessionId: string) => void;
   summarize: (sessionId: string) => void;
@@ -251,6 +253,12 @@ export function SingleRowMenuItems({
         label: "Switch agent",
         testId: "sidebar-context-menu-switch-agent",
         glyph: icon(ArrowLeftRight),
+        indent: true,
+      }),
+      item("switchAccount", {
+        label: "Switch account",
+        testId: "sidebar-context-menu-switch-account",
+        glyph: icon(UserRoundCog),
         indent: true,
       }),
     ],

@@ -117,6 +117,22 @@ pub struct AddArgs {
     #[arg(long = "no-submodules")]
     no_submodules: bool,
 
+    /// Create the worktree inside a workspace directory (from
+    /// `worktree.workspace_path_template`) even with no `--repo`/`--project`,
+    /// so more projects can be attached later without moving the session
+    /// (use with --worktree). Overrides `worktree.workspace_by_default`.
+    #[arg(
+        long = "workspace",
+        requires = "worktree_branch",
+        conflicts_with_all = ["no_workspace", "generated_name"]
+    )]
+    workspace: bool,
+
+    /// Create a plain worktree even when `worktree.workspace_by_default` is
+    /// on. Ignored when `--repo`/`--project` make a multi-repo workspace.
+    #[arg(long = "no-workspace")]
+    no_workspace: bool,
+
     /// Run session in a container sandbox
     #[arg(short = 's', long)]
     sandbox: bool,
@@ -138,6 +154,11 @@ pub struct AddArgs {
     /// servers without prompting
     #[arg(long = "trust-hooks")]
     trust_hooks: bool,
+
+    /// Create the session without running its on_create hooks, so a failing
+    /// setup script does not roll the session back. on_launch hooks still run
+    #[arg(long = "skip-on-create")]
+    skip_on_create: bool,
 
     /// Extra arguments to append after the agent binary
     #[arg(long, allow_hyphen_values = true)]
@@ -185,6 +206,7 @@ pub struct AddArgs {
             "extra_repos",
             "projects",
             "no_submodules",
+            "workspace",
         ]
     )]
     scratch: bool,
@@ -225,6 +247,9 @@ pub async fn run(profile: &str, args: AddArgs) -> Result<()> {
     }
     if args.generated_name && (!args.extra_repos.is_empty() || !args.projects.is_empty()) {
         bail!("--generated-name does not apply to multi-repo workspaces");
+    }
+    if args.workspace && branch.is_none() {
+        bail!("--workspace requires --worktree with a non-empty branch name");
     }
     let endpoint = require_daemon().await?;
     let local = endpoint.unix_path().is_some();
@@ -321,10 +346,12 @@ pub async fn run(profile: &str, args: AddArgs) -> Result<()> {
         yolo_mode: args.yolo,
         worktree_enabled: branch.is_some(),
         worktree_branch: branch.map(str::to_owned),
+        workspace: false,
         create_new_branch: args.create_branch,
         base_branch: args.base_branch,
         sandbox,
         sandbox_image: args.sandbox_image,
+        pull_latest_image: false,
         extra_args: args.extra_args.unwrap_or_default(),
         extra_env: Vec::new(),
         hook_env: explicit_hook_env(&args.hook_env),
@@ -362,6 +389,7 @@ pub async fn run(profile: &str, args: AddArgs) -> Result<()> {
         scratch: args.scratch,
         trust_hooks: Some(trust),
         trust_review: Some(review.fingerprint),
+        skip_on_create: args.skip_on_create,
         import_acp_session_id: None,
         fork_from: None,
         fork_session_id: None,
@@ -377,12 +405,19 @@ pub async fn run(profile: &str, args: AddArgs) -> Result<()> {
             fork_source: args.fork_from,
             generated_name: args.generated_name,
             no_submodules: args.no_submodules,
+            workspace: match (args.workspace, args.no_workspace) {
+                (true, _) => Some(true),
+                (_, true) => Some(false),
+                _ => None,
+            },
             worktree_path_id: review.worktree_path_id,
         }),
     };
     let signal = tokio::signal::ctrl_c();
     tokio::pin!(signal);
-    let row = create_and_observe(&client, &body, &epoch, &key, signal.as_mut()).await?;
+    let row = create_and_observe(&client, &body, &epoch, &key, signal.as_mut())
+        .await
+        .map_err(with_skip_hint)?;
     for warning in &row.warnings {
         eprintln!("Warning: {warning}");
     }
@@ -409,6 +444,9 @@ pub async fn run(profile: &str, args: AddArgs) -> Result<()> {
     }
     if row.yolo_mode {
         println!("  YOLO:    enabled");
+    }
+    if row.created_without_setup {
+        println!("  Setup:   skipped (on_create hooks did not run)");
     }
     if !row.workspace_repos.is_empty() {
         println!("  Workspace: {} repos", row.workspace_repos.len());
@@ -697,6 +735,19 @@ fn creation_is_final(row: &SessionResponse) -> bool {
         }
 }
 
+/// Names the way past a failed on_create hook, which rolled the creation back.
+fn with_skip_hint(error: anyhow::Error) -> anyhow::Error {
+    match error.downcast_ref::<DaemonClientError>() {
+        Some(DaemonClientError::Status {
+            code: Some(crate::daemon::ApiErrorCode::CreateHookFailed),
+            ..
+        }) => anyhow::anyhow!(
+            "{error:#}\nRerun with --skip-on-create to keep the session without running on_create."
+        ),
+        _ => error,
+    }
+}
+
 fn definitive(error: &DaemonClientError) -> bool {
     matches!(error, DaemonClientError::Status { status, code, .. }
         if status.is_client_error() && *status != reqwest::StatusCode::REQUEST_TIMEOUT
@@ -869,6 +920,38 @@ mod tests {
         .await;
         assert!(result.is_err());
         assert!(!submitted.get());
+    }
+
+    #[test]
+    fn workspace_flags_parse_only_with_a_worktree() {
+        use clap::Parser;
+        for argv in [
+            &["aoe", "add", ".", "--workspace"][..],
+            &[
+                "aoe",
+                "add",
+                ".",
+                "-w",
+                "b",
+                "--workspace",
+                "--no-workspace",
+            ][..],
+            &[
+                "aoe",
+                "add",
+                ".",
+                "-w",
+                "b",
+                "--workspace",
+                "--generated-name",
+            ][..],
+            &["aoe", "add", "--scratch", "--workspace"][..],
+        ] {
+            assert!(crate::cli::Cli::try_parse_from(argv).is_err(), "{argv:?}");
+        }
+        assert!(
+            crate::cli::Cli::try_parse_from(["aoe", "add", ".", "-w", "b", "--workspace"]).is_ok()
+        );
     }
 
     #[test]

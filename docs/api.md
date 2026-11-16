@@ -56,14 +56,35 @@ without a token. To connect an agent, see
 | Tool | Arguments | Returns |
 | --- | --- | --- |
 | `list_sessions` | `state` (`live`, default, or `all`), `group` (exact path and descendants), `children_of` (direct parent id) | The `{sessions, workspace_ordering}` envelope from the published canonical snapshot. |
-| `whoami` | none | `null`; no session credential is currently available. |
+| `whoami` | none | The calling session (same row shape as `GET /api/sessions`) when the request carries its own session credential, `null` otherwise. |
+| `create_session` | `path`, `tool`, and optionally `title`, `view` (`terminal`, default, or `structured`), `agent_name`, `agent_model`, `agent_effort`, `group`, `worktree_enabled`, `worktree_branch`, `create_new_branch`, `base_branch`, `sandbox`, `sandbox_image`, `yolo_mode`, `profile`, `prompt`, `parent_session_id`, `idempotency_key` | `{session, fresh, prompt_sent, prompt_delivery, prompt_error?}`. `fresh` is false when `idempotency_key` matched an earlier create, whose session it returns. `prompt_delivery` is one of: `none` (no `prompt`); `pending_initial_turn` (a structured session stored it as its first turn); `sent` (typed into a terminal session once its agent's status rules show an empty or live input box); `blocked_waiting` (the terminal agent is waiting on a dialog, such as Claude's folder-trust question, so nothing was typed: a person answers it in the terminal, then `send` the prompt); `not_ready` (the terminal agent did not reach its input prompt within 30 s, so nothing was typed; an agent without a status manifest has no input-prompt rule to read, so it gets `not_ready` at once. `send` can deliver the prompt, but it has no dialog check for such an agent either, so check the pane first (`read_output`)); `not_running` (the terminal session did not start); `replayed` (a retry of an earlier create with the same key; the prompt is not delivered again, and the first create's outcome is not reported, so read it with `read_output`); `failed` (typing it failed). `prompt_error` explains `failed`, `blocked_waiting` and `not_ready`. A `prompt` that strips to nothing is refused with `invalid_request`. |
+| `send` | `session_id`, `message` | `{disposition, reason?, queued_id?, seq?}`. A structured session reports `sent`, `steered` or `queued` and the prompt's event `seq`; a terminal session reports `sent` with no seq. A message that strips to nothing is refused with `invalid_request` in either view. A terminal session is refused with `waiting`, and nothing is typed, when its agent's status rules detect a dialog or question waiting on a person (such as Claude's folder-trust question), or, for an agent with a status manifest, when its pane can't be captured. This check is only as good as those rules: a dialog they don't recognise, or any pane of an agent without a status manifest, is typed into, so `send` is not a way to keep an agent's questions or approvals for a person; explicit approval tools are #4635. HTTP `POST /send` still types into such a pane. A stopped terminal session is refused with `not_running`; `send` doesn't start it. A structured prompt that was recorded before its agent stopped is refused with `send_failed`; `read_output` shows it, so don't resend it. A structured prompt held for the sandbox login, or because the session's `before_start` hook failed, stays in the queue and is refused with `send_failed` naming its `queued_id`; it goes out after the login, so don't resend it. |
+| `read_output` | `session_id`, `since` and `raw` (structured), `lines` (terminal, 1 to 2000, default 200) | A structured session's transcript after `since` as text, or its raw events, with `next_since` and `has_more`; a terminal session's pane capture. A text page holds whole events up to 48 KB, so following `next_since` reads every event once; one event that alone renders past 48 KB comes back whole as the only event on its page. |
 
-Both tools declare an `outputSchema` and return `structuredContent`.
+A session can authenticate to `/mcp` as itself: a bearer equal to
+`hex(HMAC-SHA256(secret, session_id))` sent with an `X-AoE-Session` header naming
+that `session_id`. The secret is generated once per app directory and never
+rotates. The pair is accepted only on `/mcp`, and only while the session exists
+and is neither archived nor trashed; any other case reports the same `401` as a
+missing token. It never bypasses the passphrase wall for a remote caller. The
+daemon-wide bearer keeps working unchanged. A session credential has the same
+authority as the daemon-wide bearer on `/mcp`: `list_sessions` is not scoped to the
+caller, so one session can list every session.
+
+Every tool declares an `outputSchema` and returns `structuredContent`. A refusal is a
+tool error (`isError`) whose `structuredContent` carries a `code`, such as
+`read_only`, `not_found`, `not_running`, `busy` (retryable), `invalid_request`,
+`waiting` (a terminal pane shows a dialog), `send_failed`, `internal`, `parent_not_found`, `parent_is_sub_session` or
+`hooks_need_trust`, and a `message`.
+`create_session` takes no hook-trust, callback, command-override, environment or
+fork fields, so repository hooks that need approval are refused with
+`hooks_need_trust` until someone trusts them in the dashboard.
 Listing does not persist workspace ordering or rebuild rows from mutable state.
-Read-only mode permits these reads. CityHall rejects `POST /mcp` with `403`,
+Read-only mode permits `list_sessions`, `whoami` and `read_output`, and refuses
+`create_session` and `send` with `read_only`. CityHall rejects `POST /mcp` with `403`,
 as it does other non-allowlisted POST routes, including over the owner socket.
 MCP POST requests remain tracked runtime work: shutdown interrupts them, and a
-long-running request can delay draining. No mutation or automatic replay is added.
+long-running request can delay draining. No request is replayed automatically.
 
 ## Skills
 
@@ -212,6 +233,46 @@ rejects symlinks, special files, packages over 64 MiB, individual files over
 32 MiB, more than 1,024 files, and directory nesting deeper than 16 levels.
 
 Native clients classify errors from the status and one `AoE-Error-Code` response header, never from the body. A missing, repeated, unknown or status-inconsistent value means "generic status". Plain HTTP from a non-loopback peer gets `426 tls_required` before authentication unless the bind sets `--dangerously-allow-plaintext-remote`.
+
+## Plugin lifecycle
+
+Install uses `POST /api/plugins/install/preview` with `source` and optional
+`dev` (default `false`), then `POST /api/plugins/install` with those fields
+and `expected_fingerprint` set to the preview's `fingerprint`. Update uses
+`GET /api/plugins/{id}/update/preview` and
+`POST /api/plugins/{id}/update/apply` with `expected_fingerprint`.
+Update previews include a source `notice` and a fingerprint, including
+`no_update`. Explicit CLI updates reapply that pinned source to repair missing
+files; other consumers can keep treating `no_update` as no available version.
+The CLI and both TUI review branches show the notice before applying.
+Uninstall uses `POST /api/plugins/{id}/uninstall`.
+Apply returns `202` with `job_id`; observe it through
+`GET /api/plugins/jobs/{job_id}`. A second active lifecycle job returns `409`.
+The response's existing `log` object contains `path` (the actual Daemon-host
+filename), `exists`, `tail`, `lines_returned` and `truncated`. A bounded tail may
+omit the original diagnostic; recover the full file on that host using `path`.
+Older Daemons may omit the diagnostic `path`; native clients still observe
+the job's status and tail without displaying an empty locator. Consent
+disclosures and fingerprints remain required, including update source notices.
+Generic preview failures return `502` with `AoE-Error-Code: preview_failed`.
+An already-installed install preview returns `409` with
+`AoE-Error-Code: plugin_already_installed`; conflicting Daemon jobs return `409`
+with `AoE-Error-Code: plugin_job_active`. Native clients show fixed recovery
+guidance from these codes without reflecting response bodies.
+The Daemon warns with the redacted chained preview cause under `plugin.install`;
+an expected already-installed refusal is logged at debug instead.
+Native install/update preview transport deadlines are two hours plus ten minutes;
+mutation submission, job polling and general send deadlines are unchanged.
+
+Lifecycle changes share cross-process exclusion with local TUI operations and
+startup sweeps. If another process owns that exclusion, an accepted job fails
+before fetching or applying its candidate; it is not queued or retried.
+
+Only a verified local Unix peer may use absolute local directories or `dev`,
+including updates whose recorded source is local. Other principals receive
+`403` with `AoE-Error-Code: local_plugin_source_required`, even over loopback TCP.
+Preview and apply retain read-only and CityHall restrictions; apply also requires
+elevation. See [plugin consent and job recovery](plugins.md#installing-external-plugins).
 
 ## Runtime CLI reads
 
@@ -483,6 +544,20 @@ running engine, when no effective `on_create` hooks need a container. Container
 creation hooks and later launch still require the engine. Non-CLI creation
 retains its existing readiness checks.
 
+`pull_latest_image: true` force-pulls the session's Sandbox image before its
+container starts and its `on_create` hooks run, so it requires a running engine.
+It applies the dashboard's pull gate. An unsandboxed request is refused with
+`400 validation_failed`. A request that can't pull (`sandbox.allow_image_pull`
+off) gets `403 pull_disabled`, and one in read-only or CityHall mode gets that
+mode's refusal. Only a configured image may be pulled: the global or a
+profile's `sandbox.default_image`. Any other `sandbox_image` is refused with
+`400 unknown_image`, and an omitted one pulls the profile's default.
+These refusals come before anything is provisioned. While the pull runs, the
+create-progress `stage` is `pulling_image`. A failed pull ends the creation with
+`400 sandbox_image_update_failed`, and the session and its resources are rolled
+back. Only the local owner sees the runtime's output in its message; a replay
+of the cached failure does not include it. CityHall creations ignore the field.
+
 With CLI intent, `extra_args` uses shell-style word grouping and each decoded
 argument is quoted for literal delivery. Only the authenticated owner on the
 Daemon's Unix socket may use shell metacharacters in decoded arguments or
@@ -505,6 +580,13 @@ skips untrusted hooks and MCP. Skipping retains global/profile hooks and any
 already-trusted repository surfaces without granting or revoking approval.
 Plugin creation always refuses unapproved repository hooks.
 
+`skip_on_create: true` creates the session without running any `on_create`
+hook, and the response row carries `created_without_setup: true` when there was
+one to skip. The `trust_hooks` decision and the other hook types still apply.
+A failed creation is cached under its key, so resend with a new
+`idempotency_key` to retry or to skip. Plugin and CityHall creations ignore
+`skip_on_create`.
+
 `POST /api/sessions/creation-trust` reviews `{path, profile?, scratch?}` without
 granting trust or provisioning a session. It returns merged and repository-only
 hooks, MCP summaries with environment/header names but not their values,
@@ -525,11 +607,12 @@ resources are provisioned. Review again rather than approving unseen changes.
 Discarding a review requires no cancellation or cleanup.
 
 `POST /api/sessions/{id}/creation/cancel` requests deferred cancellation while
-provisioning or creation/launch hooks are pending. `202 Accepted` carries the
-runtime epoch and revision headers like every other mutation, so a native caller
-can fence the acknowledgement against the snapshot it was applied at. It is not
-a canonical commit receipt: the current phase finishes before the daemon rolls
-back its owned resources. The original creation request then returns `409`
+provisioning, a `pull_latest_image` pull or creation/launch hooks are pending.
+`202 Accepted` carries the runtime epoch and revision headers like every other
+mutation, so a native caller can fence the acknowledgement against the snapshot
+it was applied at. It is not a canonical commit receipt: the current phase
+finishes before the daemon rolls back its owned resources, except that an image
+pull is stopped. The original creation request then returns `409`
 with `aoe-error-code: creation_cancelled`. Cleanup failures retain resources.
 Repeated requests remain accepted until finalization; after the hook boundary
 or completion, the route returns `409` with `creation_not_pending`. Cancelling
@@ -574,6 +657,12 @@ and `import_acp_session_id`. A missing row returns `404`, an active lifecycle
 reservation returns `409`, and a missing conversation or incompatible provider
 returns `400`. CityHall mode refuses canonical forks with `403`. An idempotent
 replay still succeeds when the parent row has since been removed.
+
+At creation admission, an `import_acp_session_id` found already owned is refused
+with `400 create_failed` and the safe message “Import source is already owned by
+an AoE session”. Frozen cleanup ownership covers all tools' current and parked
+ACP IDs, even after an ordinary purge removes the visible row. Unrelated failures
+remain sanitized rather than exposing their internal causes.
 
 **Worktree fields**
 
@@ -643,6 +732,20 @@ epoch, with matching lifecycle generation, profile, and live terminal identity.
 A successful terminal restart can still have canonical status `Starting`.
 Clients must not wait for `Idle` as an additional attachment grant.
 
+## GET and PUT /api/sessions/{id}/file
+
+GET accepts `?path=<relative-or-absolute-path>` and returns `content`, `is_binary`, `truncated`, `version`, and `edit_disabled_reason`. Add `editing=true` to request a version and edit-eligibility checks. `version_only=true` requests those checks without the content payload or an atomic-exchange probe. Reads may include out-of-project files proven by the Session's transcript; that provenance never grants writes.
+
+PUT accepts `{ "path", "version", "content" }` for an existing project UTF-8 text file up to 5 MB. Send the opened GET version. A successful verified atomic exchange returns 204.
+
+- The server rechecks the opened version before exchanging the complete stage with the target, then verifies the displaced file's full version against the original canonical path. Conflicts return 409 and retain the browser draft.
+- If the displaced version changed, the server checks that the target is still its staged inode before undoing the exchange. If another writer intervenes, displaced versions that cannot be safely removed are retained beside the file as `<filename>.aoe-conflict[.N]`, without replacing an existing recovery file. Unverified `.aoe-copy-*` staging entries can also remain; inspect recovery files before deleting them.
+- Filesystems without atomic exchange support are read-only in the editor, with an `edit_disabled_reason`; PUT returns 403. Support is probed with scratch files when opening the editor, never the real target. Successful probes are cached per filesystem for the process lifetime; polls and save checks do not probe. After a successful probe on the same filesystem, a writable file in a read-only directory opens as editable; its save fails with 500 and keeps the draft. There is no optimistic-rename fallback.
+- A writer holding an old open file handle can still write after final verification. Path-level exchange does not cover that case.
+- A failure after publication, such as a directory-sync error, returns 500 with an uncertain-save message. The write may already be applied; check the disk file before retrying.
+
+Read-only and CityHall modes return 403. Escaping paths, binary files, and unverified or separate Sandbox volumes cannot be edited. The browser's opt-in setting and workflow are described in [Editing project files](guides/web/dashboard.md#editing-project-files).
+
 ## POST /api/sessions/{id}/send
 
 Type a message into the agent and press Enter, the same way the TUI's
@@ -671,9 +774,16 @@ Before delivery, the HTTP endpoint removes bracketed-paste delimiters and remain
 | `409` | `{"error": "resume_failed", "message": "...", "resume_session_id": "..."}` | Auto-revive tried to resume a stored conversation, but the pane exited during the probe. The ID and failure marker are preserved in this call; the next default revival can start fresh. |
 | `409` | `{"error": "session_transient", "status": "..."}` | Session is mid-lifecycle and cannot accept input yet |
 | `409` | `{"error": "session_archived" \| "session_trashed", "message": "..."}` | Session is archived or trashed, even with a live pane or `revive: false`; unarchive or restore it first. `/start`, `/ensure`, `/container-terminal` and structured-view prompts refuse the same way. |
+| `409` | `{"error": "sandbox_login_required", "message", "tool", "profile"?, "command"?}` | Reviving a sandbox needs the sandbox login of its agent (`sandbox.shared_credential = "separate_login"`); `tool` is the one to log in. `profile` is present only when the session runs under a profile other than the default one (pass it as `-p <profile>`); `command` only when the session runs its own command for the tool and `aoe sandbox login --tool <tool>` alone would log in another file than the launch waits for (pass it as `--command <command>`). Terminal sessions have no queue, so the message is not kept; send it again after `aoe sandbox login --tool <tool>` |
 | `500` | `{"error": "tmux_error"}` or `{"error": "internal"}` | Unexpected failure (logged server-side) |
 
 After a prior failed resume probe, a default restart or send-driven revival can start a new conversation and deliver input there. The old native transcript is not deleted, but its AoE association is abandoned. `/ensure` reports this as `resume_outcome: "fresh_after_failed_resume"` with `prior_session_id` and a message, rather than claiming a successful resume. See [session recovery policy](guides/session-resume.md#pinning-or-resetting-a-conversation) for explicit retry and direct CLI start behavior.
+
+A structured-view prompt (`POST /api/sessions/{id}/acp/prompt`) that would revive a sandbox needing the login answers `409` with `{"error": "sandbox_login_required", "message", "tool", "profile"?, "command"?, "queued_id"}` instead (`profile` and `command` as in the `409` above): the prompt is kept in the session's queue under `queued_id` and delivered after the login, so do not send it again. The session also shows the instruction as its startup error until the login exists.
+
+If the session's `host_hooks.before_start` hook fails while that launch is admitted, the prompt is kept the same way and the answer is `502` with `{"error": "before_start_hook_failed", "message", "queued_id"}`. Nothing is held: the next launch that works delivers the queue. `message` is fixed text and never carries the hook's command or output.
+
+`/start`, `/ensure`, `/restart`, `/recreate-container` and `/acp/spawn` refuse a launch that needs the login the same way (`409` `sandbox_login_required`, or `502` `before_start_hook_failed`), without `queued_id`. A restart or recreate is refused before the running agent is stopped or its container is discarded. With Apple Container, which cannot run the login helper, they answer `409` `{"error": "sandbox_login_unsupported", "message"}` instead, and nothing is held.
 
 Concurrent POSTs to the same `id` are serialized server-side, so two
 orchestrators racing on the same session won't interleave keystrokes
@@ -861,6 +971,7 @@ Move a session to Trash. Optional JSON fields:
 | --- | --- | --- |
 | `kill_pane` | `true` | Stop the session's terminal panes during the transition. |
 | `expected_generation` | omitted | Require the selected session's `lifecycle_generation`; a mismatch returns `409 lifecycle_superseded` without mutation. |
+| `expected_profile` | omitted | Require the selected profile as well as the generation; a mismatch returns `409 lifecycle_superseded` without mutation. |
 
 Repeating a completed request for an already-trashed session succeeds without
 repeating teardown or relocation. A fresh lifecycle reservation returns
@@ -876,6 +987,13 @@ preventing explicit Restore or Purge. A retry also settles the transition when
 all known worktree paths are proven absent. Unverified existing paths, unknown
 original locations, and filesystem lookup errors keep the transition protected.
 
+Unfinished Trash exposes Retry and read-only inspection, not record-only removal.
+Retry retains existing lifecycle, native ownership, and filesystem checks. An
+unverified checkout stays visible in Trash until those checks can settle it.
+UI requests capture their original profile, generation, and runtime epoch;
+replacement state requires fresh consent.
+
+
 ## Explicit structured worker stop
 
 `DELETE /api/sessions/:id/acp` is a durable user stop, not a daemon detach. It commits the native stopped/dormant generation before retiring the captured original worker and returns `204` only after retirement is proven. Generic `POST /api/sessions/:id/stop` uses the same structured-worker stop boundary.
@@ -883,6 +1001,10 @@ original locations, and filesystem lookup errors keep the transition protected.
 Admitted stop work survives HTTP cancellation; its committed native fence survives daemon reconstruction. Automatic reconciliation does not resume a committed stop. A later explicit spawn, start, restart, backend/provider switch or accepted prompt proves original retirement before consuming only its observed stop generation and token; a newer stop wins. A `no_revive` prompt cannot clear the stop.
 
 If a write commits but canonical publication fails, the stop remains durable and the response reports an unconfirmed outcome. Unproven retirement remains pending rather than reporting success. Daemon detach, idle shutdown and internal provider teardown do not independently create user-stop intent. Reversible stop preserves native transcript history.
+
+## POST /api/sessions/{id}/acp/subagents/{child_id}/cancel
+
+Stops one Claude subagent session without ending the root turn. `202` when `session/cancel` was sent to the child, `409` when the child is unknown or did not announce the `cancel` capability (`SubagentRecord.cancel_capable`). `POST /api/sessions/{id}/acp/cancel` still cancels the whole turn.
 
 ## DELETE /api/workspaces
 

@@ -2,9 +2,9 @@
 
 use super::FieldDescriptor;
 use crate::session::config::{
-    AcpConfig, AuthConfig, DiffConfig, LoggingConfig, SandboxConfig, SessionConfig, SkillsConfig,
-    SystemdSettings, TelemetryConfig, ThemeConfig, TmuxConfig, UpdatesConfig, WebConfig,
-    WorktreeConfig,
+    AcpConfig, AuthConfig, DiffConfig, LoggingConfig, SandboxConfig, ServeConfig, SessionConfig,
+    SkillsConfig, SystemdSettings, TelemetryConfig, ThemeConfig, TmuxConfig, UpdatesConfig,
+    WebConfig, WorktreeConfig,
 };
 use crate::sound::SoundConfig;
 use crate::status_hooks::StatusHookConfig;
@@ -34,6 +34,7 @@ fn build_schema() -> Vec<FieldDescriptor> {
     out.extend(StatusHookConfig::settings_descriptors());
     out.extend(WebConfig::settings_descriptors());
     out.extend(AuthConfig::settings_descriptors());
+    out.extend(ServeConfig::settings_descriptors());
     out.extend(AcpConfig::settings_descriptors());
     out.extend(DiffConfig::settings_descriptors());
     out.extend(SkillsConfig::settings_descriptors());
@@ -298,6 +299,7 @@ mod tests {
         for (section, field, expected) in [
             ("sandbox", "extra_volumes", RepoPolicy::Deny),
             ("sandbox", "selinux_relabel", RepoPolicy::Deny),
+            ("sandbox", "shared_credential", RepoPolicy::Deny),
             ("worktree", "path_template", RepoPolicy::Deny),
             ("session", "default_tool", RepoPolicy::Deny),
             ("session", "agent_detect_as", RepoPolicy::Allow),

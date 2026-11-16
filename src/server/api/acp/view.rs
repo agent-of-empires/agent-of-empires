@@ -134,7 +134,7 @@ pub async fn acp_enable(
     // default fallback, which would accept every tool.
     let resolvable = {
         let profile = instance.source_profile.clone();
-        let project_path = PathBuf::from(&instance.project_path);
+        let project_path = instance.repo_config_path().to_path_buf();
         let tool = instance.tool.clone();
         let agent_name = instance.agent_name.clone();
         tokio::task::spawn_blocking(move || {
@@ -393,6 +393,15 @@ async fn deferred_enable_request(
         Ok(info) => info,
         Err(e) => {
             tracing::warn!(target: "acp.switch", session = %session_id, "container ensure failed: {e}");
+            if let Some(login) = e.downcast_ref::<crate::session::SandboxLoginRequired>() {
+                // The user switched the view, so no push.
+                state.session_service.sandbox_login.hold(
+                    session_id,
+                    crate::server::sandbox_login::LaunchOrigin::Interactive,
+                    login,
+                );
+                return Some(Err(login.to_string()));
+            }
             return Some(Err(format!("container start failed: {e}")));
         }
     };
@@ -866,7 +875,7 @@ fn record_retired_handoff_in(
                     let config =
                         crate::session::config::repo_config::resolve_config_with_repo_or_warn(
                             &row.source_profile,
-                            std::path::Path::new(&row.project_path),
+                            row.repo_config_path(),
                         );
                     let yolo = row.yolo_mode;
                     crate::session::builder::apply_agent_launch_config(
@@ -3445,6 +3454,70 @@ mod tests {
             assert!(retained.is_idle_dormant());
             assert_eq!(births.load(Ordering::SeqCst), 1);
         }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn sandbox_login_gate_enable_publishes_the_plain_message() {
+        let app_dir = crate::session::test_support::isolate_app_dir();
+        let _auth = crate::session::test_support::unset_claude_auth_routes();
+        let (_runtime, _calls) =
+            crate::session::test_support::failing_container_runtime(app_dir.path());
+        crate::session::config::update_config(|c| {
+            c.sandbox.shared_credential =
+                crate::session::config::SharedCredentialMode::SeparateLogin;
+        })
+        .unwrap();
+        let mut inst = Instance::new("claude", "/tmp/aoe-login-gate-enable");
+        inst.view = crate::session::View::Structured;
+        inst.source_profile = "default".into();
+        inst.sandbox_info = Some(crate::session::SandboxInfo {
+            provider: None,
+            enabled: true,
+            container_id: None,
+            image: "test:latest".to_string(),
+            container_name: "aoe-login-gate-enable".to_string(),
+            extra_env: None,
+            custom_instruction: None,
+            before_start_env: Vec::new(),
+            before_start_hook_env: Vec::new(),
+            container_workdir: None,
+        });
+        crate::server::test_support::seed_instances_on_disk_for_test("default", vec![inst.clone()]);
+        let state = crate::server::test_support::build_test_app_state(vec![inst.clone()]);
+        crate::server::test_support::refresh_canonical_metadata_for_test(&state).await;
+        let id = inst.id.clone();
+        let login = &state.session_service.sandbox_login;
+        let mut notices = login.subscribe();
+        let exclusion =
+            crate::acp::sandbox::LaunchExclusion::acquire(state.clone(), &inst.id, true)
+                .await
+                .unwrap();
+
+        let message =
+            match deferred_enable_request(&state, &inst, "claude".to_string(), None, exclusion)
+                .await
+            {
+                Some(Err(message)) => message,
+                other => panic!(
+                    "expected a startup error, got {:?}",
+                    other.map(|r| r.is_ok())
+                ),
+            };
+        assert_eq!(
+            message,
+            crate::session::test_support::login_required("claude").to_string()
+        );
+        assert_eq!(
+            login.held_origin(&id),
+            Some(crate::server::sandbox_login::LaunchOrigin::Interactive),
+            "a view switch is the user's own launch"
+        );
+        assert!(
+            notices.try_recv().is_err(),
+            "no push for an interactive hold"
+        );
     }
 
     /// An enable queued behind the transition lock must spawn on a provider

@@ -403,131 +403,10 @@ fn prepare_trashed_worktree_with(
     relocate_worktree_to_trash(inst)
 }
 
-pub struct TrashRequest {
-    pub session_id: String,
-    pub instance: Instance,
-    pub generation: u64,
-}
-
 #[derive(Debug, Clone)]
 pub struct TrashRelocation {
     pub new_project_path: String,
     pub pre_trash_project_path: Option<String>,
-}
-
-#[derive(Debug)]
-pub struct TrashResult {
-    pub session_id: String,
-    pub relocation: Option<TrashRelocation>,
-    pub relocate_warning: Option<String>,
-}
-
-/// Execute and commit trash under identity and lifecycle exclusion.
-pub fn perform_trash(request: &TrashRequest) -> TrashResult {
-    let failed = |reason: String| TrashResult {
-        session_id: request.session_id.clone(),
-        relocation: None,
-        relocate_warning: Some(reason),
-    };
-    let storage = match crate::session::Storage::open_unwatched(&request.instance.source_profile) {
-        Ok(storage) => storage,
-        Err(error) => return failed(format!("could not open lifecycle storage: {error}")),
-    };
-    let _identity = match crate::session::acquire_session_identity_lock() {
-        Ok(lock) => lock,
-        Err(error) => return failed(format!("could not acquire identity lock: {error}")),
-    };
-    let _lifecycle_lock = match storage.acquire_instance_lifecycle_lock(&request.session_id) {
-        Ok(lock) => lock,
-        Err(error) => {
-            return failed(format!("could not acquire lifecycle lock: {error}"));
-        }
-    };
-    let mut inst = match storage.update_complete(|instances, _groups| {
-        Ok(instances
-            .iter()
-            .find(|instance| instance.id == request.session_id)
-            .filter(|instance| {
-                instance.lifecycle_reservation_is_owned(
-                    crate::session::LifecycleOperation::Trash,
-                    request.generation,
-                )
-            })
-            .cloned())
-    }) {
-        Ok(Some(instance)) => instance,
-        Ok(None) => {
-            return failed("trash lifecycle reservation was superseded before teardown".to_string())
-        }
-        Err(error) => return failed(format!("could not verify trash reservation: {error}")),
-    };
-    inst.source_profile = storage.profile().to_owned();
-    let stopped = inst.kill_all_tmux_sessions_locked();
-    let outcome = match &stopped {
-        Ok(()) => prepare_trashed_worktree(&mut inst),
-        Err(error) => RelocateOutcome::Failed {
-            reason: format!("Tmux teardown failed; worktree retained: {error}"),
-        },
-    };
-    let relocation = match &outcome {
-        RelocateOutcome::Relocated { .. } => Some(TrashRelocation {
-            new_project_path: inst.project_path.clone(),
-            pre_trash_project_path: inst.pre_trash_project_path.clone(),
-        }),
-        RelocateOutcome::Skipped | RelocateOutcome::Failed { .. } => None,
-    };
-    let commit = storage.update(|instances, _groups| {
-        if let Some(relocation) = &relocation {
-            use crate::session::claim::RelocationCommit;
-            match crate::session::claim::commit_trash_relocation(
-                instances,
-                &request.session_id,
-                request.generation,
-                relocation,
-            ) {
-                RelocationCommit::Persisted => {}
-                outcome @ RelocationCommit::Superseded => {
-                    tracing::warn!(target: "session.trash", session = %request.session_id, ?outcome, "trash relocation not committed");
-                }
-                outcome => {
-                    tracing::debug!(target: "session.trash", session = %request.session_id, ?outcome, "trash relocation not committed");
-                }
-            }
-        } else if let Err(error) = &stopped {
-            if let Some(row) = instances
-                .iter_mut()
-                .find(|row| row.id == request.session_id)
-            {
-                if row.finish_lifecycle_status(
-                    crate::session::LifecycleOperation::Trash,
-                    request.generation,
-                    crate::session::Status::Error,
-                ) {
-                    row.last_error = Some(error.to_string());
-                }
-            }
-        } else {
-            crate::session::claim::release_trash_reservation(
-                instances,
-                &request.session_id,
-                request.generation,
-            );
-        }
-        Ok(())
-    });
-    if let Err(error) = commit {
-        return failed(format!("could not commit trash transition: {error}"));
-    }
-
-    TrashResult {
-        session_id: request.session_id.clone(),
-        relocation,
-        relocate_warning: match outcome {
-            RelocateOutcome::Failed { reason } => Some(reason),
-            RelocateOutcome::Relocated { warning, .. } => warning,
-            RelocateOutcome::Skipped => None,
-        },
-    }
 }
 
 /// Undo a trash relocation that landed after the row had already been
@@ -642,6 +521,20 @@ enum ReconcilePlan {
     PointAtOriginal(PathBuf),
 }
 
+/// Any pane Trash stops (agent, terminals, tools) still alive. A failed scan reads as alive:
+/// only a confirmed absence lets the checkout move.
+fn has_live_owned_pane(inst: &Instance) -> bool {
+    match crate::tmux::scan_live_sessions() {
+        crate::tmux::LiveScan::NoServer => false,
+        crate::tmux::LiveScan::Unknown => true,
+        crate::tmux::LiveScan::Sessions(live) => {
+            crate::tmux::any_owned_live_pane(live.keys().map(String::as_str), &inst.id, |name| {
+                !crate::tmux::utils::session_has_live_pane(name)
+            })
+        }
+    }
+}
+
 fn plan_trashed_reconcile(inst: &Instance) -> ReconcilePlan {
     plan_trashed_reconcile_cached(inst, &mut ProtectedBranchCache::default())
 }
@@ -700,6 +593,11 @@ fn plan_trashed_reconcile_cached(
         // row, take its flock, and write twice on every sweep for a relocation that always answers
         // Skipped.
         if is_protected_default_branch_cached(inst, cache) {
+            return ReconcilePlan::Nothing;
+        }
+        // A pane that survived a failed Trash teardown must not lose its checkout. A pending
+        // transition is left to the lifecycle guard in `reconcile_trashed_transition`.
+        if !inst.has_pending_trash() && has_live_owned_pane(inst) {
             return ReconcilePlan::Nothing;
         }
         return ReconcilePlan::Relocate;
@@ -900,7 +798,7 @@ fn reconcile_trashed_batch(
         .into_iter()
         .map(|(generation, mut durable)| {
             let changed = match storage.acquire_instance_lifecycle_lock(&durable.id) {
-                Ok(_lifecycle_lock) => reconcile_trashed_location(&mut durable),
+                Ok(_lifecycle_lock) => reconcile_unless_pane_live(&mut durable),
                 Err(error) => {
                     tracing::warn!(
                         target: "session.trash",
@@ -954,6 +852,15 @@ fn reconcile_trashed_batch(
     })
 }
 
+/// Reconcile a row whose Trash reservation is already held. The reservation hides the
+/// pending-Trash guard from the plan, so re-probe: a pane live since the scan keeps its checkout.
+fn reconcile_unless_pane_live(durable: &mut Instance) -> bool {
+    if plan_trashed_reconcile(durable) == ReconcilePlan::Relocate && has_live_owned_pane(durable) {
+        return false;
+    }
+    reconcile_trashed_location(durable)
+}
+
 /// Reconcile one trashed worktree as a serialized lifecycle transition.
 ///
 /// Pending Trash teardown must be resumed through the lifecycle handler.
@@ -994,7 +901,7 @@ pub(crate) fn reconcile_trashed_transition(
         Ok((generation, stored.clone()))
     })?;
 
-    let changed = reconcile_trashed_location(&mut durable);
+    let changed = reconcile_unless_pane_live(&mut durable);
     let relocation = TrashRelocation {
         new_project_path: durable.project_path.clone(),
         pre_trash_project_path: durable.pre_trash_project_path.clone(),
@@ -1414,6 +1321,22 @@ mod tests {
             .is_ok()
     }
 
+    /// A `tmux` that reports no server, first on `PATH`: relocation needs a scan that confirms
+    /// no live pane, and the host's own tmux (or its absence) must not decide that.
+    fn no_tmux_server() -> (tempfile::TempDir, crate::session::test_support::EnvGuard) {
+        use std::os::unix::fs::PermissionsExt;
+        let bin = tempfile::tempdir().unwrap();
+        let tmux = bin.path().join("tmux");
+        std::fs::write(
+            &tmux,
+            "#!/bin/sh\necho 'no server running on /tmp/fixture' >&2\nexit 1\n",
+        )
+        .unwrap();
+        std::fs::set_permissions(&tmux, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let guard = crate::session::test_support::path_prepended(bin.path());
+        (bin, guard)
+    }
+
     #[test]
     #[serial_test::serial]
     fn relocate_then_restore_round_trip() {
@@ -1474,6 +1397,7 @@ mod tests {
         if !git_available() {
             return;
         }
+        let _tmux = no_tmux_server();
         let (_tmp, mut inst) = real_worktree_instance();
         let original = inst.project_path.clone();
         // Legacy trashed row: trashed, worktree still in the active dir, no marker.
@@ -1634,6 +1558,7 @@ mod tests {
         if !git_available() {
             return;
         }
+        let _tmux = no_tmux_server();
         let (_tmp, mut inst) = real_worktree_instance();
         // Point the row at an unrelated repo so `git worktree move` refuses the
         // checkout while its registration is still intact.
@@ -1651,6 +1576,117 @@ mod tests {
         assert!(!reconcile_trashed_location(&mut inst));
     }
 
+    /// A tmux scan that fails for any reason but "no server" must not read as
+    /// "no live pane": the checkout stays put until a scan can answer.
+    #[test]
+    #[cfg(unix)]
+    #[serial_test::serial]
+    fn a_failed_tmux_scan_keeps_the_checkout_in_place() {
+        use std::os::unix::fs::PermissionsExt;
+        let _app = crate::session::test_support::isolate_app_dir();
+        if !git_available() {
+            return;
+        }
+        let (_tmp, mut inst) = real_worktree_instance();
+        inst.trash();
+        let bin = tempfile::tempdir().unwrap();
+        let path = std::env::join_paths(
+            std::iter::once(bin.path().to_path_buf())
+                .chain(std::env::split_paths(&std::env::var_os("PATH").unwrap())),
+        )
+        .unwrap();
+        let _env = crate::session::test_support::EnvGuard::set(&[("PATH", path)]);
+        let tmux = bin.path().join("tmux");
+        for (stderr, expected) in [
+            (
+                "error connecting to /tmp/fixture (Permission denied)",
+                ReconcilePlan::Nothing,
+            ),
+            ("no server running on /tmp/fixture", ReconcilePlan::Relocate),
+        ] {
+            std::fs::write(&tmux, format!("#!/bin/sh\necho '{stderr}' >&2\nexit 1\n")).unwrap();
+            std::fs::set_permissions(&tmux, std::fs::Permissions::from_mode(0o755)).unwrap();
+            assert_eq!(plan_trashed_reconcile(&inst), expected, "{stderr}");
+        }
+    }
+
+    /// Trash stops tools and indexed terminals too: one of them left alive
+    /// after the agent pane is gone still holds the checkout.
+    #[test]
+    #[serial_test::serial]
+    fn a_surviving_tool_or_indexed_terminal_keeps_the_checkout_in_place() {
+        let _app = crate::session::test_support::isolate_app_dir();
+        if !git_available() || !crate::tmux::is_tmux_available() {
+            return;
+        }
+        let (_tmp, mut inst) = real_worktree_instance();
+        inst.trash();
+        let suffix = format!("_{}", crate::cli::truncate_id(&inst.id, 8));
+        assert_eq!(plan_trashed_reconcile(&inst), ReconcilePlan::Relocate);
+        for name in [
+            format!("{}lazygit{suffix}", crate::tmux::TOOL_PREFIX),
+            format!("{}title{suffix}_t2", crate::tmux::TERMINAL_PREFIX),
+        ] {
+            let pane = crate::tmux::test_helpers::TmuxTestSession::from_name(name);
+            assert!(crate::tmux::tmux_command()
+                .args(["new-session", "-d", "-s", pane.name(), "sleep", "600"])
+                .output()
+                .unwrap()
+                .status
+                .success());
+            assert_eq!(
+                plan_trashed_reconcile(&inst),
+                ReconcilePlan::Nothing,
+                "{}",
+                pane.name()
+            );
+        }
+    }
+
+    /// A pane that goes live after the scan but before the batch reserves the row must keep its
+    /// checkout: the reservation hides the pending-Trash guard from the plan.
+    #[test]
+    #[serial_test::serial]
+    fn a_pane_live_after_the_scan_keeps_the_batch_checkout_in_place() {
+        let _guard = crate::session::test_support::isolate_app_dir();
+        if !git_available() || !crate::tmux::is_tmux_available() {
+            return;
+        }
+        let storage = crate::session::Storage::new_unwatched("default").unwrap();
+        let (_tmp, mut inst) = real_worktree_instance();
+        inst.trash();
+        let snapshot = inst.clone();
+        let original = inst.project_path.clone();
+        storage
+            .update(|instances, _groups| {
+                instances.push(inst.clone());
+                Ok(())
+            })
+            .unwrap();
+        assert_eq!(plan_trashed_reconcile(&snapshot), ReconcilePlan::Relocate);
+
+        let suffix = format!("_{}", crate::cli::truncate_id(&inst.id, 8));
+        let pane = crate::tmux::test_helpers::TmuxTestSession::from_name(format!(
+            "{}lazygit{suffix}",
+            crate::tmux::TOOL_PREFIX
+        ));
+        assert!(crate::tmux::tmux_command()
+            .args(["new-session", "-d", "-s", pane.name(), "sleep", "600"])
+            .output()
+            .unwrap()
+            .status
+            .success());
+
+        assert!(
+            reconcile_trashed_batch(&storage, std::slice::from_ref(&snapshot))
+                .unwrap()
+                .is_empty()
+        );
+        let stored = storage.load().unwrap().into_iter().next().unwrap();
+        assert_eq!(stored.project_path, original);
+        assert!(stored.lifecycle_reservation.is_none());
+    }
+
     /// #3611 review: the plan is decided from an unlocked snapshot, so a peer
     /// can restore the row before the batch reserves it. Reserving anyway would
     /// pin a Trash reservation on a live session for the rest of the batch and
@@ -1662,6 +1698,7 @@ mod tests {
             return;
         }
         let _guard = crate::session::test_support::isolate_app_dir();
+        let _tmux = no_tmux_server();
         let storage = crate::session::Storage::new_unwatched("default").unwrap();
         let (_tmp, mut inst) = real_worktree_instance();
         inst.trash();
@@ -1720,6 +1757,7 @@ mod tests {
             return;
         }
         let _guard = crate::session::test_support::isolate_app_dir();
+        let _tmux = no_tmux_server();
         let storage = crate::session::Storage::new_unwatched("default").unwrap();
         let mut plain = Instance::new("plain", "/tmp/plain");
         plain.trash();
@@ -2087,6 +2125,49 @@ mod tests {
             matches!(outcome, RelocateOutcome::Skipped),
             "a plain session has no managed worktree to relocate: {outcome:?}"
         );
+    }
+
+    /// The daemon's lost-race path: a commit against a restored row is
+    /// `Superseded` and leaves it untouched, then the undo moves the worktree
+    /// back to the path the live row already points at.
+    #[test]
+    #[serial_test::serial]
+    fn superseded_relocation_commit_is_followed_by_worktree_undo() {
+        let _app = crate::session::test_support::isolate_app_dir();
+        if !git_available() {
+            return;
+        }
+        let (_tmp, mut inst) = real_worktree_instance();
+        let original = inst.project_path.clone();
+        inst.trash();
+        assert!(matches!(
+            relocate_worktree_to_trash(&mut inst),
+            RelocateOutcome::Relocated { .. }
+        ));
+        let reloc = TrashRelocation {
+            new_project_path: inst.project_path.clone(),
+            pre_trash_project_path: inst.pre_trash_project_path.clone(),
+        };
+
+        let mut live = inst.clone();
+        live.untrash();
+        live.project_path = original.clone();
+        live.pre_trash_project_path = None;
+        let mut rows = vec![live];
+        let generation = rows[0].lifecycle_generation;
+
+        assert_eq!(
+            crate::session::claim::commit_trash_relocation(&mut rows, &inst.id, generation, &reloc),
+            crate::session::claim::RelocationCommit::Superseded
+        );
+        assert_eq!(rows[0].project_path, original, "row must stay untouched");
+
+        assert!(matches!(
+            undo_raced_relocation(&rows[0], &reloc),
+            RestoreOutcome::Restored { .. }
+        ));
+        assert!(PathBuf::from(&original).exists());
+        assert!(!PathBuf::from(&reloc.new_project_path).exists());
     }
 
     /// A relocation that lands after the row was restored (the not-atomic

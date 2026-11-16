@@ -159,6 +159,22 @@ impl<S: BroadcastSink> Supervisor<S> {
         }
     }
 
+    /// Cancel one subagent of the session; the root turn keeps running. False
+    /// when the child is unknown or did not advertise `cancel`.
+    pub async fn cancel_subagent(
+        &self,
+        session_id: &str,
+        child_id: &str,
+    ) -> Result<bool, SupervisorError> {
+        debug!(target: "acp.supervisor", session = %session_id, child = %child_id, "subagent cancel requested");
+        let client = self.ready_client(session_id).await?;
+        match client.cancel_child(child_id).await {
+            Ok(sent) => Ok(sent),
+            Err(AcpError::AgentExited) => Ok(false),
+            Err(e) => Err(SupervisorError::Acp(e)),
+        }
+    }
+
     /// User-initiated "Force stop".
     pub async fn force_end_turn(&self, session_id: &str) {
         debug!(target: "acp.supervisor", session = %session_id, "force stop requested");
@@ -188,9 +204,10 @@ impl<S: BroadcastSink> Supervisor<S> {
         session_id: &str,
         config_id: &str,
         value: &str,
+        remember: bool,
     ) -> Result<(), SupervisorError> {
         let client = self.ready_client(session_id).await?;
-        client.set_config_option(config_id, value).await?;
+        client.set_config_option(config_id, value, remember).await?;
         Ok(())
     }
 
@@ -205,6 +222,27 @@ impl<S: BroadcastSink> Supervisor<S> {
             .map(|h| &mut h.kind)
         {
             set_spawn_model(spawn_config, Some(model.to_string()));
+        }
+    }
+
+    /// A watchdog respawn clones the cached spawn config, which a live
+    /// `model_config` pick never reaches.
+    pub async fn refresh_cached_model_config(
+        &self,
+        session_id: &str,
+        config_id: &str,
+        value: &str,
+    ) {
+        if let Some(WorkerKind::Runner { spawn_config }) = self
+            .workers
+            .lock()
+            .await
+            .get_mut(session_id)
+            .map(|h| &mut h.kind)
+        {
+            spawn_config
+                .default_model_config
+                .insert(config_id.to_string(), value.to_string());
         }
     }
 

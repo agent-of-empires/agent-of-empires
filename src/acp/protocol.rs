@@ -359,6 +359,7 @@ mod tests {
                 summary: None,
                 transcript_dir: "/home/user/.claude/transcripts/wf_1".into(),
             }),
+            started_at: None,
         });
         for frame in [agent, workflow] {
             let json = serde_json::to_string(&frame).unwrap();

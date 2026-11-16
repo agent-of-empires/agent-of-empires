@@ -2088,7 +2088,8 @@ mod tests {
     #[serial_test::serial]
     fn legacy_dead_pane_consent_never_adopts_recycled_ids_from_a_replacement_server(
     ) -> anyhow::Result<()> {
-        if !tmux_available() {
+        #[cfg(unix)]
+        if crate::tmux::tests::run_probe_test_in_subprocess() {
             return Ok(());
         }
         let home = crate::session::test_support::isolate_app_dir();
@@ -2097,6 +2098,9 @@ mod tests {
             crate::tmux::TMUX_SOCKET_ENV,
             socket.as_os_str(),
         )]);
+        if !tmux_available() {
+            return Ok(());
+        }
         struct PrivateServer<'a>(&'a std::path::Path);
         impl Drop for PrivateServer<'_> {
             fn drop(&mut self) {
@@ -2156,6 +2160,11 @@ mod tests {
         let original_server =
             crate::tmux::configured_tmux_server_identity(&crate::tmux::TmuxCommandDeadline::new())?
                 .expect("original private server");
+        let original_birth = crate::process::process_birth_identity(original_server.1)?
+            .expect("original private server is alive");
+        let original_process =
+            crate::process::CapturedProcess::capture(original_server.1, &original_birth)?
+                .expect("original private server remains alive");
         let adoption = crate::session::LegacyToolAdoption {
             tmux_session: name.clone(),
             identity: ToolSession::legacy_identity(original.get(&name).unwrap())?,
@@ -2172,6 +2181,14 @@ mod tests {
             .arg("kill-server")
             .status()?
             .success());
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while !original_process.exited()? {
+            anyhow::ensure!(
+                std::time::Instant::now() < deadline,
+                "original private server did not exit"
+            );
+            std::thread::yield_now();
+        }
         let replacement = create_dead()?;
         let replacement_server =
             crate::tmux::configured_tmux_server_identity(&crate::tmux::TmuxCommandDeadline::new())?

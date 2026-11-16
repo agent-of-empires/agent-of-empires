@@ -23,10 +23,11 @@ use crate::acp::acp_client::between_prompt::{
 use crate::acp::acp_client::commands::ClientCmd;
 use crate::acp::acp_client::config_options::{
     config_option_failure_event, config_options_event, dispatch_set_config_option,
-    dispatch_set_mode, mode_config_id, model_option, modes_available_event,
+    dispatch_set_mode, mode_config_id, model_config_values, model_option, modes_available_event,
     thought_level_config_id, ConfigOptionDispatchPurpose, SessionChannels,
 };
 use crate::acp::acp_client::control::DaemonControlClient;
+use crate::acp::acp_client::control::{control_outcome_reason, prompt_outcome_to_response};
 use crate::acp::acp_client::delete::handle_delete_session_cmd;
 use crate::acp::acp_client::errors::acp_internal_error;
 use crate::acp::acp_client::lifecycle::LifecycleEnvelope;
@@ -51,6 +52,7 @@ pub(super) struct Session {
     pub(super) close_capable: bool,
     pub(super) source_profile: Option<String>,
     pub(super) default_effort: Option<String>,
+    pub(super) default_model_config: std::collections::BTreeMap<String, String>,
     pub(super) default_mode: Option<String>,
     pub(super) default_model: Option<String>,
     pub(super) agent_cwd: PathBuf,
@@ -65,6 +67,8 @@ pub(super) struct Session {
 
 impl Session {
     pub(super) async fn send_cancel(&self) -> Result<(), agent_client_protocol::Error> {
+        #[cfg(test)]
+        let _gate = self.shared.cancel_send_gate.read().await;
         match self.control.as_ref() {
             Some(control) => {
                 control.cancel().await;
@@ -76,7 +80,33 @@ impl Session {
         }
     }
 
-    pub(super) fn dispatch_config_option(&mut self, config_id: String, value: String) {
+    /// A subagent session only honours `session/cancel` when it announced the
+    /// capability; the root turn is unaffected either way.
+    pub(super) async fn cancel_child(&self, session_id: String) -> bool {
+        let child = SessionId::from(session_id.clone());
+        if !self
+            .shared
+            .ingress
+            .child_route(&child)
+            .is_some_and(|route| route.cancel_capable)
+        {
+            return false;
+        }
+        match self.control.as_ref() {
+            Some(control) => control.cancel_session(session_id).await,
+            None => self
+                .connection
+                .send_notification(CancelNotification::new(child))
+                .is_ok(),
+        }
+    }
+
+    pub(super) fn dispatch_config_option(
+        &mut self,
+        config_id: String,
+        value: String,
+        remember: bool,
+    ) {
         // A reset re-applies `default_model`, so it follows the live pick.
         if self
             .channels
@@ -85,6 +115,10 @@ impl Session {
             .is_some_and(|option| option.id == config_id)
         {
             self.default_model = Some(value.clone());
+        }
+        if remember {
+            self.default_model_config
+                .insert(config_id.clone(), value.clone());
         }
         dispatch_set_config_option(
             &self.connection,
@@ -113,16 +147,46 @@ impl Session {
         // is serialized with every command.
         let mut idle_tick = tokio::time::interval(BETWEEN_PROMPT_IDLE_CHECK_INTERVAL);
         idle_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        let shared = self.shared.clone();
+        let mut completion = shared.adopted_completion_tx.subscribe();
         loop {
             self.acp_session_id =
                 self.shared.ingress.current().ok_or_else(|| {
                     acp_internal_error("native session is not established".into())
                 })?;
+            let cancel_deadline = *shared.cancel_deadline.lock().unwrap();
             // Fallback prompts go first so later messages cannot overtake them.
             let cmd = match self.pending_prompts.pop_front() {
                 Some(blocks) => Some(ClientCmd::Prompt(blocks)),
                 None => tokio::select! {
+                    biased;
+                    outcome = async {
+                        completion.wait_for(Option::is_some).await.expect("shared owns the completion sender").clone().unwrap()
+                    } => {
+                        shared.adopted_completion_tx.send_replace(None);
+                        if self.finish_adopted_turn(outcome).await {
+                            break;
+                        }
+                        continue;
+                    }
                     cmd = self.cmd_rx.recv() => cmd,
+                    _ = async {
+                        match cancel_deadline {
+                            Some(deadline) => tokio::time::sleep_until(deadline).await,
+                            None => std::future::pending().await,
+                        }
+                    } => {
+                        if shared.prompt_in_flight.swap(false, Ordering::Relaxed)
+                            && shared.terminal_claim.claim()
+                        {
+                            self.stand_down_idle_completion();
+                            *shared.cancel_deadline.lock().unwrap() = None;
+                            shared.publish_terminal("agent_unresponsive".into(), vec![]).await;
+                            break;
+                        }
+                        *shared.cancel_deadline.lock().unwrap() = None;
+                        continue;
+                    }
                     _ = idle_tick.tick() => {
                         if self.between_prompt_idle_tick().await {
                             break;
@@ -137,7 +201,22 @@ impl Session {
                         break;
                     }
                 }
+                Some(ClientCmd::CancelChild {
+                    session_id,
+                    respond_to,
+                }) => {
+                    let _ = respond_to.send(self.cancel_child(session_id).await);
+                }
                 Some(ClientCmd::Cancel) => {
+                    if shared.adopted_turn_active.load(Ordering::Relaxed)
+                        && shared.prompt_in_flight.load(Ordering::Relaxed)
+                        && !shared.terminal_claim.claimed()
+                    {
+                        // Arm first: a control loss during the send keeps the deadline.
+                        self.request_cancel().await;
+                        self.send_cancel().await?;
+                        continue;
+                    }
                     info!(target: "acp.protocol", "sending session/cancel (no prompt in flight)");
                     // Not `?`: a dead connection is when the UI most needs
                     // the synthetic Stopped below.
@@ -152,9 +231,7 @@ impl Session {
                     // a spurious Stopped while idle is a reducer no-op (#2237).
                     self.stand_down_idle_completion();
                     self.shared
-                        .emit(Event::Stopped {
-                            reason: "cancelled".into(),
-                        })
+                        .publish_terminal("cancelled".into(), vec![])
                         .await;
                 }
                 Some(ClientCmd::ForceStop) => {
@@ -170,9 +247,11 @@ impl Session {
                     acp_session_id,
                     respond_to,
                 }) => handle_delete_session_cmd(&self.connection, acp_session_id, respond_to),
-                Some(ClientCmd::SetConfigOption { config_id, value }) => {
-                    self.dispatch_config_option(config_id, value)
-                }
+                Some(ClientCmd::SetConfigOption {
+                    config_id,
+                    value,
+                    remember,
+                }) => self.dispatch_config_option(config_id, value, remember),
                 Some(ClientCmd::ResumeBackgroundTailing(launches)) => {
                     self.shared.resume_background_tailing(launches)
                 }
@@ -207,6 +286,38 @@ impl Session {
         Ok(())
     }
 
+    /// Ends an adopted turn with the runner's reported outcome. Returns `false`
+    /// when the turn was already superseded, ended or claimed elsewhere.
+    async fn finish_adopted_turn(
+        &self,
+        outcome: crate::acp::control_protocol::PromptOutcome,
+    ) -> bool {
+        let shared = &self.shared;
+        if !shared.adopted_turn_active.swap(false, Ordering::Relaxed)
+            || !shared.prompt_in_flight.swap(false, Ordering::Relaxed)
+            || !shared.terminal_claim.claim()
+        {
+            return false;
+        }
+        shared.between_prompt.deactivate();
+        *shared.cancel_deadline.lock().unwrap() = None;
+        let result = prompt_outcome_to_response(outcome.clone());
+        let rate_limit = self.completion_rate_limit(&result);
+        let parked = rate_limit.is_some();
+        let reason = if parked {
+            "rate_limited".into()
+        } else {
+            control_outcome_reason(&outcome)
+        };
+        let preceding = rate_limit
+            .into_iter()
+            .map(|info| Event::RateLimit { info })
+            .collect();
+        shared.publish_terminal(reason, preceding).await;
+        shared.reset_message_dedup();
+        parked
+    }
+
     /// This path owns the turn's terminal, so the other idle-completion
     /// paths must not add a duplicate (#2899).
     fn stand_down_idle_completion(&self) {
@@ -221,7 +332,12 @@ impl Session {
     /// then end so the drain loop drops the worker and the reaper can resume it.
     async fn between_prompt_idle_tick(&self) -> bool {
         let shared = &self.shared;
-        let Some(cost_seen) = shared.between_prompt.take_idle_fire(now_ms()) else {
+        shared.expire_silent_subagents(now_ms()).await;
+        let Some(cost_seen) = shared.between_prompt.take_idle_fire(
+            now_ms(),
+            shared.aoe.leases.working(now_ms()),
+            shared.subagent_working(now_ms()),
+        ) else {
             return false;
         };
         // An adopted turn races the detached resume-idle task for its
@@ -243,11 +359,8 @@ impl Session {
                 resets_at = ?info.resets_at,
                 "agent-initiated turn ended on a rejected rate-limit window; emitting RateLimit + Stopped"
             );
-            shared.emit(Event::RateLimit { info }).await;
             shared
-                .emit(Event::Stopped {
-                    reason: "rate_limited".into(),
-                })
+                .publish_terminal("rate_limited".into(), vec![Event::RateLimit { info }])
                 .await;
             return true;
         }
@@ -258,11 +371,7 @@ impl Session {
             reason,
             "between-prompt idle watchdog: synthesizing Stopped for completed turn"
         );
-        shared
-            .emit(Event::Stopped {
-                reason: reason.into(),
-            })
-            .await;
+        shared.publish_terminal(reason.into(), vec![]).await;
         false
     }
 
@@ -285,8 +394,29 @@ impl Session {
             });
             return Ok(());
         };
+        if ingress.has_parked() {
+            let _ = respond_to.send(ResetSessionOutcome::Failed {
+                message: "an approval is waiting for an answer; resolve it before clearing the conversation".into(),
+            });
+            return Ok(());
+        }
+        if self.shared.has_active_subagent() {
+            self.shared
+                .emit(Event::PromptRejected {
+                    reason: "agent_busy".into(),
+                    text,
+                })
+                .await;
+            let _ = respond_to.send(ResetSessionOutcome::Failed {
+                message: "a subagent is still running; wait for it to finish before clearing the conversation".into(),
+            });
+            return Ok(());
+        }
         let work = self.shared.between_prompt.work_state();
-        if work.is_busy() || !self.shared.bg_tasks.is_empty() {
+        if work.is_busy()
+            || !self.shared.bg_tasks.is_empty()
+            || self.shared.aoe.leases.any_live(now_ms())
+        {
             // Old-session events would be attributed to the new conversation.
             warn!(
                 target: "acp.protocol",
@@ -343,6 +473,8 @@ impl Session {
                 // session/new is the irreversible commit; the loop picks the
                 // id back up from the ingress on its next iteration.
                 self.session_from_storage = false;
+                self.shared.aoe.session_reset();
+                self.shared.settle_discarded().await;
                 self.channels = SessionChannels::new(
                     new_session.modes.as_ref(),
                     new_session.config_options.as_deref(),
@@ -410,9 +542,9 @@ impl Session {
     }
 
     /// The fresh session starts on adapter defaults, so the model, effort and
-    /// mode are re-sent, best-effort, within the reset deadline. The model
-    /// goes first because a switch rebuilds the option set the effort is
-    /// resolved from.
+    /// mode and model_config picks are re-sent, best-effort, within the reset
+    /// deadline. The model goes first because a switch rebuilds the option
+    /// set the effort and the toggles are resolved from.
     async fn reapply_defaults(
         &self,
         new_id: &SessionId,
@@ -420,6 +552,7 @@ impl Session {
         deadline: tokio::time::Instant,
     ) {
         let mut effort_id = options.and_then(thought_level_config_id);
+        let mut toggles = options.map(model_config_values).unwrap_or_default();
         if let (Some(model), Some(option)) = (
             self.default_model.as_deref(),
             options.and_then(model_option),
@@ -430,7 +563,10 @@ impl Session {
                     .reset_set_option(new_id, config_id, model, deadline)
                     .await
                 {
-                    Some(Ok(options)) => effort_id = thought_level_config_id(&options),
+                    Some(Ok(options)) => {
+                        effort_id = thought_level_config_id(&options);
+                        toggles = model_config_values(&options);
+                    }
                     Some(Err(reason)) => {
                         let event = config_option_failure_event(
                             option.id,
@@ -463,6 +599,21 @@ impl Session {
                 .is_none()
             {
                 return;
+            }
+        }
+        for (id, value) in &self.default_model_config {
+            if toggles.get(id).is_none_or(|current| current == value) {
+                continue;
+            }
+            match self
+                .reset_set_option(new_id, SessionConfigId::new(id.clone()), value, deadline)
+                .await
+            {
+                Some(Ok(options)) => toggles = model_config_values(&options),
+                Some(Err(reason)) => {
+                    debug!(target: "acp.protocol", "post-reset {id} rejected: {reason}")
+                }
+                None => return,
             }
         }
     }

@@ -10,6 +10,7 @@ import {
   type AcpState,
   type ActivityRow,
   type BackgroundAgent,
+  type BackgroundShell,
 } from "../../lib/acpTypes";
 import { STORAGE_KEY_PREFIX } from "../../lib/acpStateStorage";
 import {
@@ -20,6 +21,7 @@ import {
   loadPersistedState,
   persistState,
   useBackgroundAgents,
+  useBackgroundShells,
 } from "./stateCache";
 
 const key = (id: string) => STORAGE_KEY_PREFIX + id;
@@ -36,7 +38,7 @@ beforeEach(() => localStorage.clear());
 afterEach(() => vi.restoreAllMocks());
 
 describe("loadPersistedState", () => {
-  it.each(["pendingElicitations", "oldestSeq"])("backfills %s missing from an older entry", (field) => {
+  it.each(["pendingElicitations", "oldestSeq", "startupCause"])("backfills %s missing from an older entry", (field) => {
     const legacy: Record<string, unknown> = { ...emptyAcpState() };
     delete legacy[field];
     writeEntry("legacy", legacy);
@@ -198,6 +200,7 @@ describe("persistState (#1833)", () => {
       restartInFlight: true,
       restartStoppedSent: true,
       restartFailure: "Server returned 500.",
+      retriedError: "boom",
     });
     const { state } = JSON.parse(localStorage.getItem(key("overlay"))!) as { state: AcpState };
     expect([
@@ -206,7 +209,20 @@ describe("persistState (#1833)", () => {
       state.restartInFlight,
       state.restartStoppedSent,
       state.restartFailure,
-    ]).toEqual([[], [], false, false, null]);
+      state.retriedError,
+    ]).toEqual([[], [], false, false, null, null]);
+  });
+
+  it("drops what a failed Retry retried, so a reload reads as a first failure", () => {
+    persistState("retried", { ...emptyAcpState(), startupError: "worse", retriedError: "boom" });
+    const { state } = JSON.parse(localStorage.getItem(key("retried"))!) as { state: AcpState };
+    expect([state.startupError, state.retriedError]).toEqual(["worse", null]);
+  });
+
+  it("keeps a startup error's cause, so a reload shows the same banner", () => {
+    const cause = { kind: "container_missing" } as const;
+    persistState("gone", { ...emptyAcpState(), startupError: "removed", startupCause: cause });
+    expect(loadPersistedState("gone")?.startupCause).toEqual(cause);
   });
 });
 
@@ -238,5 +254,19 @@ describe("useBackgroundAgents", () => {
     expect(result.current).toBe(agents);
     unmount();
     clearAcpCache("sess-bg");
+  });
+});
+
+describe("useBackgroundShells", () => {
+  it("follows cache writes for its session without a socket", () => {
+    const { result, unmount } = renderHook(() => useBackgroundShells("sess-sh"));
+    expect(result.current).toEqual([]);
+    const shells: BackgroundShell[] = [
+      { taskId: "t1", command: "sleep 9", startedAt: null, endedAt: null, finished: false },
+    ];
+    act(() => cacheSet("sess-sh", { ...emptyAcpState(), backgroundShells: shells }));
+    expect(result.current).toBe(shells);
+    unmount();
+    clearAcpCache("sess-sh");
   });
 });

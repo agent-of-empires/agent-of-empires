@@ -3,6 +3,7 @@
 
 use crate::acp::state::{
     ConfigOptionCategory, ConfigOptionChoice, ConfigOptionDescriptor, Event, ModeInfo,
+    MODEL_CONFIG_CATEGORY,
 };
 use agent_client_protocol::v1::schema::{
     SessionConfigId, SessionConfigKind, SessionConfigOption, SessionConfigOptionCategory,
@@ -11,6 +12,7 @@ use agent_client_protocol::v1::schema::{
 };
 use agent_client_protocol::v1::ConnectionTo;
 use agent_client_protocol::Agent;
+use std::collections::BTreeMap;
 use tokio::sync::mpsc;
 use tracing::{debug, info, warn};
 
@@ -44,6 +46,8 @@ pub(super) struct SessionChannels {
     pub(super) mode_config_option_id: Option<String>,
     pub(super) thought_level_config_option_id: Option<String>,
     pub(super) model_option: Option<ModelOption>,
+    /// Advertised `model_config` options, id to current value.
+    pub(super) model_config: BTreeMap<String, String>,
 }
 
 impl SessionChannels {
@@ -63,6 +67,7 @@ impl SessionChannels {
                 .and_then(thought_level_config_id)
                 .map(|id| id.0.to_string()),
             model_option: options.and_then(model_option),
+            model_config: options.map(model_config_values).unwrap_or_default(),
         }
     }
 }
@@ -184,6 +189,20 @@ pub(super) async fn apply_config_default(
     }
 }
 
+/// The `category:"model_config"` selects, id to current value.
+pub(super) fn model_config_values(options: &[SessionConfigOption]) -> BTreeMap<String, String> {
+    options
+        .iter()
+        .filter(|o| o.category == Some(SessionConfigOptionCategory::ModelConfig))
+        .filter_map(|o| match &o.kind {
+            SessionConfigKind::Select(select) => {
+                Some((o.id.0.to_string(), select.current_value.0.to_string()))
+            }
+            _ => None,
+        })
+        .collect()
+}
+
 /// First `Select` option in `category`; other kinds have no settable value.
 fn select_config_id(
     options: &[SessionConfigOption],
@@ -263,7 +282,7 @@ pub(super) fn map_acp_config_option(option: SessionConfigOption) -> Option<Confi
         SessionConfigOptionCategory::ThoughtLevel => ConfigOptionCategory::ThoughtLevel,
         // A sibling of `Model`, not another model picker (#3403).
         SessionConfigOptionCategory::ModelConfig => {
-            ConfigOptionCategory::Other("model_config".to_string())
+            ConfigOptionCategory::Other(MODEL_CONFIG_CATEGORY.to_string())
         }
         SessionConfigOptionCategory::Other(s) => ConfigOptionCategory::Other(s),
         // Only a genuinely new named upstream variant reaches this arm.

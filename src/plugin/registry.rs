@@ -81,7 +81,11 @@ impl LoadedPlugin {
     }
 }
 
-fn grant_covers(grant: &CapabilityGrant, manifest: &PluginManifest, manifest_hash: &str) -> bool {
+pub(super) fn grant_covers(
+    grant: &CapabilityGrant,
+    manifest: &PluginManifest,
+    manifest_hash: &str,
+) -> bool {
     grant.manifest_hash == manifest_hash
         && manifest
             .capabilities
@@ -95,6 +99,14 @@ pub struct PluginRegistry {
 }
 
 impl PluginRegistry {
+    #[cfg(test)]
+    pub(crate) fn from_test_plugins(plugins: Vec<LoadedPlugin>) -> Self {
+        Self {
+            plugins,
+            load_errors: Vec::new(),
+        }
+    }
+
     pub fn load(config: &Config) -> Self {
         let mut plugins = Vec::new();
         let mut load_errors = Vec::new();

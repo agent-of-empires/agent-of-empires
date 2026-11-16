@@ -2,9 +2,10 @@
 
 use std::io::Write;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::{Arc, LazyLock, Mutex, OnceLock};
 
 use fs2::FileExt;
+use regex::Regex;
 use tracing_subscriber::filter::EnvFilter;
 use tracing_subscriber::layer::SubscriberExt;
 use tracing_subscriber::reload;
@@ -12,6 +13,34 @@ use tracing_subscriber::util::SubscriberInitExt;
 use tracing_subscriber::Registry;
 
 use crate::session::config::{LoggingConfig, RotationKind};
+
+/// Each pattern keeps capture group 1 (the key) and replaces the value. Quoted values run
+/// through backslash escapes to their closing quote.
+static REDACTORS: LazyLock<[Regex; 6]> = LazyLock::new(|| {
+    [
+        r#"(?i)((?:set-)?cookie["']?\s*[:=]\s*)(?:"(?:\\.|[^"\\])*"|'(?:\\.|[^'\\])*'|[^\r\n]+)"#,
+        r#"(?i)(authorization["']?\s*[:=]\s*")(?:\\.|[^"\\\r\n])+"#,
+        r#"(?i)(authorization["']?\s*[:=]\s*')(?:\\.|[^'\\\r\n])+"#,
+        r#"(?i)(authorization["']?\s*[:=]\s*)[^\s"'][^\r\n]*"#,
+        r#"(?i)((?:\w*token|passphrase|api[_-]?key|\w*password|\w*secret)["']?\s*[:=]\s*)(?:"(?:\\.|[^"\\])*"|'(?:\\.|[^'\\])*'|[^\s&"',;]+)"#,
+        r#"()(?i:gh[pousr]_[A-Za-z0-9_]+|github_pat_[A-Za-z0-9_]+)"#,
+    ]
+    .map(|p| Regex::new(p).expect("static redaction pattern"))
+});
+
+static USERINFO: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"(?i)([a-z][a-z0-9+.-]*://)[^/?#\s@]+@").expect("static redaction pattern")
+});
+
+pub fn redact(text: &str) -> String {
+    let mut redacted = USERINFO.replace_all(text, "${1}[REDACTED]@");
+    for re in REDACTORS.iter() {
+        if let std::borrow::Cow::Owned(next) = re.replace_all(&redacted, "${1}[REDACTED]") {
+            redacted = std::borrow::Cow::Owned(next);
+        }
+    }
+    redacted.into_owned()
+}
 
 /// Contexts whose stdout is the UI or discarded force the file sink.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -636,12 +665,17 @@ fn write_raw_startup_marker(writer: &mut dyn Write) {
     let exe = std::env::current_exe()
         .map(|p| p.display().to_string())
         .unwrap_or_default();
+    let pid = std::process::id();
+    let birth = crate::process::process_birth_identity(pid).ok().flatten();
+    let (boot_id, start_id) = birth
+        .as_ref()
+        .map_or(("unavailable", "unavailable"), |birth| {
+            (birth.boot_id.as_str(), birth.start_id.as_str())
+        });
     let line = format!(
-        "{} INFO log.runtime [AOE_START_MARKER] version={} pid={} exe={}\n",
+        "{} INFO log.runtime [AOE_START_MARKER] version={} pid={pid} boot_id={boot_id} start_id={start_id} exe={exe}\n",
         chrono::Utc::now().to_rfc3339(),
         env!("CARGO_PKG_VERSION"),
-        std::process::id(),
-        exe,
     );
     let _ = writer.write_all(line.as_bytes());
     let _ = writer.flush();
@@ -825,7 +859,7 @@ impl Drop for SizeRotatingWriter {
     }
 }
 
-fn path_with_suffix(path: &Path, suffix: &str) -> PathBuf {
+pub(crate) fn path_with_suffix(path: &Path, suffix: &str) -> PathBuf {
     let mut s = path.as_os_str().to_os_string();
     s.push(suffix);
     PathBuf::from(s)
@@ -1500,5 +1534,97 @@ mod tests {
         cfg.keep_count = 0;
         let policy = RotationPolicy::from(&cfg);
         assert_eq!(policy.keep_count, 1, "keep_count=0 must clamp to 1");
+    }
+
+    #[test]
+    fn redact_strips_secret_values_and_keeps_keys() {
+        let cases = [
+            (
+                "url https://h/?token=abc123&x=1",
+                "url https://h/?token=[REDACTED]&x=1",
+            ),
+            ("TOKEN=abc", "TOKEN=[REDACTED]"),
+            (
+                "clone https://user:hunter2@example.com/acme failed",
+                "clone https://[REDACTED]@example.com/acme failed",
+            ),
+            (
+                "clone HTTPS://user:hunter2@example.com/acme failed",
+                "clone HTTPS://[REDACTED]@example.com/acme failed",
+            ),
+            (
+                "GET https://example.com?next=a@b#x@y",
+                "GET https://example.com?next=a@b#x@y",
+            ),
+            ("passphrase=hunter2 next", "passphrase=[REDACTED] next"),
+            (
+                "passphrase = \"two words\" next",
+                "passphrase = [REDACTED] next",
+            ),
+            (
+                "Authorization: Bearer eyJ.abc.def",
+                "Authorization: [REDACTED]",
+            ),
+            (
+                "authorization: basic dXNlcjpwdw==",
+                "authorization: [REDACTED]",
+            ),
+            ("Authorization: Token abc", "Authorization: [REDACTED]"),
+            (
+                "Authorization: Digest a=1, b=2",
+                "Authorization: [REDACTED]",
+            ),
+            ("Authorization: abc123 next", "Authorization: [REDACTED]"),
+            (
+                r#"{"authorization": "Digest username=\"alice\", response=\"xyz\""}"#,
+                r#"{"authorization": "[REDACTED]"}"#,
+            ),
+            (
+                r"authorization='Digest a=\'b\' c' ok",
+                r"authorization='[REDACTED]' ok",
+            ),
+            (
+                r#"{"cookie": "a=\"b\"; c=d", "x": 1}"#,
+                r#"{"cookie": [REDACTED], "x": 1}"#,
+            ),
+            (
+                r#"{"token": "a\"b", "x": 1}"#,
+                r#"{"token": [REDACTED], "x": 1}"#,
+            ),
+            (r"client_secret='it\'s' ok", r"client_secret=[REDACTED] ok"),
+            (
+                r#"Authorization: Digest username="alice", response="xyz""#,
+                "Authorization: [REDACTED]",
+            ),
+            (
+                r#"{"access_token":"s3cret","a":1}"#,
+                r#"{"access_token":[REDACTED],"a":1}"#,
+            ),
+            ("api_key='k 1'", "api_key=[REDACTED]"),
+            (
+                "password=hunter2 client_secret=abc",
+                "password=[REDACTED] client_secret=[REDACTED]",
+            ),
+            ("Cookie: sid=1; t=2", "Cookie: [REDACTED]"),
+            (
+                r#"{"authorization": "Bearer x", "cookie": "sid=1"}"#,
+                r#"{"authorization": "[REDACTED]", "cookie": [REDACTED]}"#,
+            ),
+            (
+                r#"authorization="Bearer x" ok"#,
+                r#"authorization="[REDACTED]" ok"#,
+            ),
+            (
+                "a token=1 and passphrase=2",
+                "a token=[REDACTED] and passphrase=[REDACTED]",
+            ),
+            (
+                "tokens=5 token_count=3 secrets=5 password_hash=x token=",
+                "tokens=5 token_count=3 secrets=5 password_hash=x token=",
+            ),
+        ];
+        for (input, expected) in cases {
+            assert_eq!(redact(input), expected, "input: {input}");
+        }
     }
 }

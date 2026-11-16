@@ -106,7 +106,12 @@ pub(super) fn build_router(state: Arc<AppState>) -> Router {
             "/api/sessions/{id}/diff/file/raw",
             get(api::session_diff_file_raw),
         )
-        .route("/api/sessions/{id}/file", get(api::session_file))
+        .route(
+            "/api/sessions/{id}/file",
+            get(api::session_file)
+                .put(api::save_session_file)
+                .layer(axum::extract::DefaultBodyLimit::max(32 * 1024 * 1024)),
+        )
         .route("/api/sessions/{id}/file/raw", get(api::session_file_raw))
         // Read-only runtime read: one Hello, one Snapshot, one clean close.
         .route("/api/runtime/read/ws", get(runtime_ws::runtime_ws))
@@ -179,6 +184,10 @@ pub(super) fn build_router(state: Arc<AppState>) -> Router {
             post(api::force_smart_rename),
         )
         .route("/api/sessions/{id}/summarize", post(api::summarize_session))
+        .route(
+            "/api/sessions/{id}/account-targets",
+            get(api::session_account_targets),
+        )
         .route("/api/sessions/{id}/start", post(api::start_session))
         .route(
             "/api/sessions/{id}/restart",
@@ -337,6 +346,8 @@ pub(super) fn build_router(state: Arc<AppState>) -> Router {
             "/api/app-state/web-tour-seen",
             post(api::mark_web_tour_seen),
         )
+        .route("/api/setup", get(api::get_setup).patch(api::patch_setup))
+        .route("/api/setup/runtimes", get(api::get_setup_runtimes))
         .route("/api/app-state/dismiss-update", post(api::dismiss_update))
         .route(
             "/api/app-state/web-ui-state",
@@ -466,6 +477,14 @@ pub(super) fn build_router(state: Arc<AppState>) -> Router {
             post(api::acp_prompt_diff_comments),
         )
         .route("/api/sessions/{id}/acp/cancel", post(api::acp_cancel))
+        .route(
+            "/api/sessions/{id}/acp/tasks/{task_id}/output",
+            get(api::acp_task_output),
+        )
+        .route(
+            "/api/sessions/{id}/acp/subagents/{child_id}/cancel",
+            post(api::acp_cancel_subagent),
+        )
         .route(
             "/api/sessions/{id}/acp/force_end_turn",
             post(api::acp_force_end_turn),

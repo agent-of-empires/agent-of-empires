@@ -129,16 +129,16 @@ pub(super) fn push_origin(list: &mut Vec<String>, raw: String) {
     push_unique(list, norm_origin(&raw));
 }
 
-/// Extract the bare host from a tunnel URL like `https://x.trycloudflare.com`.
-pub(super) fn host_from_url(url: &str) -> Option<String> {
+/// The `host[:port]` of a tunnel URL like `https://x.trycloudflare.com` or
+/// `https://node.ts.net:8443`, lowercased.
+pub(super) fn authority_from_url(url: &str) -> Option<String> {
     let after_scheme = url.split_once("://").map_or(url, |(_, rest)| rest);
     let authority = after_scheme
         .split(['/', '?', '#'])
         .next()
         .unwrap_or(after_scheme);
     let authority = authority.rsplit_once('@').map_or(authority, |(_, h)| h);
-    let host = norm_host(authority);
-    (!host.is_empty()).then_some(host)
+    (!norm_host(authority).is_empty()).then(|| authority.to_ascii_lowercase())
 }
 
 /// Resolve the `(allowed_hosts, allowed_origins)` pair the DNS-rebinding gate
@@ -151,8 +151,8 @@ pub(super) fn host_from_url(url: &str) -> Option<String> {
 /// - Each local host gets `http`/`https` origins on the actual bind `port`.
 /// - Operator `--allowed-host` entries are trusted for direct access on the
 ///   bind port and for standard-port (proxy) access.
-/// - A `tunnel_host` (Cloudflare/Tailscale public name) is auto-injected with
-///   its portless `https` origin, so tunnels work with no operator flag.
+/// - A `tunnel_host` (Cloudflare/Tailscale public `host[:port]`) is auto-injected
+///   with its `https` origin, so tunnels work with no operator flag.
 /// - Operator `--allowed-origin` entries are normalized to the browser's
 ///   `Origin` form (lowercased, no trailing slash, default port elided) for
 ///   reverse proxies on nonstandard ports.
@@ -198,7 +198,14 @@ pub(super) fn resolve_access_policy(
         let nh = norm_host(th);
         if !nh.is_empty() {
             push_unique(&mut hosts, nh.clone());
-            push_origin(&mut origins, format!("https://{}", bracket_if_ipv6(&nh)));
+            let hb = bracket_if_ipv6(&nh);
+            push_origin(
+                &mut origins,
+                match host_port(th).and_then(|(_, port)| port) {
+                    Some(port) => format!("https://{hb}:{port}"),
+                    None => format!("https://{hb}"),
+                },
+            );
         }
     }
 
@@ -407,6 +414,7 @@ pub(super) const CITYHALL_MUTATION_ALLOW: &[(&str, &str)] = &[
     ("POST", "/api/sessions/{id}/acp/prompt"),
     ("POST", "/api/sessions/{id}/acp/prompt/diff-comments"),
     ("POST", "/api/sessions/{id}/acp/cancel"),
+    ("POST", "/api/sessions/{id}/acp/subagents/{child_id}/cancel"),
     ("POST", "/api/sessions/{id}/acp/force_end_turn"),
     ("POST", "/api/sessions/{id}/acp/approvals/{nonce}"),
     ("POST", "/api/sessions/{id}/acp/elicitations/{nonce}"),
@@ -455,6 +463,8 @@ pub(super) const CITYHALL_MUTATION_ALLOW: &[(&str, &str)] = &[
 /// Mutating routes deliberately unavailable in CityHall.
 #[cfg(test)]
 pub(super) const CITYHALL_MUTATION_DENY: &[(&str, &str)] = &[
+    // The setup wizard never shows in CityHall mode.
+    ("PATCH", "/api/setup"),
     ("POST", "/api/sandbox/image-pull"),
     ("POST", "/api/sandbox/image-dismiss"),
     ("POST", "/api/sessions/creation-trust"),
@@ -469,6 +479,8 @@ pub(super) const CITYHALL_MUTATION_DENY: &[(&str, &str)] = &[
     ("POST", "/api/sessions/{id}/terminal"),
     ("DELETE", "/api/sessions/{id}/terminal"),
     ("POST", "/api/sessions/{id}/container-terminal"),
+    // Files pane editor.
+    ("PUT", "/api/sessions/{id}/file"),
     // Git / project / profile management.
     ("POST", "/api/git/clone"),
     ("POST", "/api/cityhall/apply"),
@@ -874,6 +886,8 @@ pub(super) async fn cityhall_gate(
 ///   redirect, so both hosts must be allowed. `data:` covers inline icons.
 ///   `raw.githubusercontent.com` serves plugin screenshots resolved by the
 ///   plugin detail endpoint (#2484).
+/// - `media-src 'self' blob:`: browser sounds are fetched with auth and
+///   played from a blob URL, since `<audio src>` bypasses the fetch interceptor.
 /// - `font-src 'self'`: Geist fonts are bundled under /fonts/.
 /// - `connect-src 'self' ws: wss:`: REST + PTY WebSocket to same origin.
 /// - `frame-ancestors 'none'`: CSP-native equivalent of X-Frame-Options.
@@ -883,6 +897,7 @@ pub(super) const CSP: &str = "default-src 'self'; \
     script-src 'self' 'wasm-unsafe-eval'; \
     style-src 'self' 'unsafe-inline'; \
     img-src 'self' data: blob: https://github.com https://avatars.githubusercontent.com https://raw.githubusercontent.com; \
+    media-src 'self' blob:; \
     font-src 'self'; \
     connect-src 'self' ws: wss:; \
     frame-ancestors 'none'; \
@@ -1216,20 +1231,19 @@ mod tests {
     }
 
     #[test]
-    fn host_from_url_extracts_bare_host() {
-        assert_eq!(
-            host_from_url("https://x.trycloudflare.com").as_deref(),
-            Some("x.trycloudflare.com")
-        );
-        assert_eq!(
-            host_from_url("https://foo.ts.net/path?x=1").as_deref(),
-            Some("foo.ts.net")
-        );
-        assert_eq!(
-            host_from_url("https://Foo.TS.net").as_deref(),
-            Some("foo.ts.net")
-        );
-        assert_eq!(host_from_url(""), None);
+    fn authority_from_url_keeps_the_port() {
+        for (url, want) in [
+            ("https://x.trycloudflare.com", Some("x.trycloudflare.com")),
+            ("https://foo.ts.net/path?x=1", Some("foo.ts.net")),
+            ("https://Foo.TS.net", Some("foo.ts.net")),
+            (
+                "https://node.ts.net:8443/?token=t",
+                Some("node.ts.net:8443"),
+            ),
+            ("", None),
+        ] {
+            assert_eq!(authority_from_url(url).as_deref(), want, "{url}");
+        }
     }
 
     #[test]
@@ -1541,6 +1555,23 @@ mod tests {
             evaluate_access(Some("x.trycloudflare.com"), None, &h, &[]),
             AccessDecision::Allow
         );
+    }
+
+    #[test]
+    fn a_tunnel_on_another_port_allows_only_that_origin() {
+        let (h, o) = resolve_access_policy("127.0.0.1", 8081, &[], &[], Some("node.ts.net:8443"));
+        // (Origin, decision)
+        for (origin, want) in [
+            ("https://node.ts.net:8443", AccessDecision::Allow),
+            ("https://node.ts.net", AccessDecision::DenyOrigin),
+            ("https://node.ts.net:443", AccessDecision::DenyOrigin),
+        ] {
+            assert_eq!(
+                evaluate_access(Some("node.ts.net:8443"), Some(origin), &h, &o),
+                want,
+                "{origin}"
+            );
+        }
     }
 
     #[test]
@@ -1946,6 +1977,7 @@ mod tests {
             "default-src 'self'",
             "script-src 'self' 'wasm-unsafe-eval'",
             "img-src 'self' data: blob: https://github.com https://avatars.githubusercontent.com https://raw.githubusercontent.com",
+            "media-src 'self' blob:",
             "connect-src 'self' ws: wss:",
             "frame-ancestors 'none'",
         ] {

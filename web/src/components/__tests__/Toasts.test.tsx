@@ -53,6 +53,17 @@ describe("ToastProvider", () => {
     expect(screen.queryByRole("alert")).toBeNull();
   });
 
+  it("keeps an action toast usable when its action returns false", () => {
+    renderProvider();
+    const reopen = vi.fn().mockReturnValueOnce(false).mockReturnValueOnce(true);
+    act(() => toastBus.handler?.action("Session was not created", "Reopen", reopen));
+    fireEvent.click(screen.getByRole("button", { name: "Reopen" }));
+    expect(screen.getByRole("alert").textContent).toContain("Session was not created");
+    fireEvent.click(screen.getByRole("button", { name: "Reopen" }));
+    expect(reopen).toHaveBeenCalledTimes(2);
+    expect(screen.queryByRole("alert")).toBeNull();
+  });
+
   it("keeps an action toast past a plain toast's lifetime until it is dismissed", () => {
     renderProvider();
     act(() => {
@@ -181,6 +192,238 @@ describe("click-to-open (ui.open_url) toast", () => {
     const toast = screen.getByText("Approve?").closest("div");
     expect(toast?.getAttribute("role")).toBe("alert");
     expect(toast?.className).toContain("cursor-pointer");
+  });
+});
+
+// #5344: a linked toast opened only through the outer div's pointer handler.
+describe("linked toasts from the keyboard", () => {
+  it("open through a focusable button once, before Dismiss in tab order; Dismiss never navigates", () => {
+    const open = vi.spyOn(window, "open").mockReturnValue(null);
+    const onOpen = vi.fn();
+    window.addEventListener(OPEN_SESSION_EVENT, onOpen);
+    renderProvider();
+    // (how the toast arrives, its message, what opening it must do)
+    const cases: [() => void, string, () => void][] = [
+      [
+        () => dispatchPush({ type: "aoe-push", payload: { title: "Done", session_id: "sess-1" } }),
+        "Done",
+        () => expect((onOpen.mock.calls.at(-1)![0] as CustomEvent).detail).toEqual({ sessionId: "sess-1" }),
+      ],
+      [
+        () => act(() => toastBus.handler?.openLink("Review PR", "https://example.com/pr/1")),
+        "Review PR",
+        () => expect(open).toHaveBeenLastCalledWith("https://example.com/pr/1", "_blank", "noopener,noreferrer"),
+      ],
+    ];
+    for (const [arrive, message, opened] of cases) {
+      const before = onOpen.mock.calls.length + open.mock.calls.length;
+      arrive();
+      const toast = screen.getByText(message).closest("[role]") as HTMLElement;
+      const buttons = within(toast).getAllByRole("button");
+      const opener = within(toast).getByRole("button", { name: message });
+      expect(buttons.indexOf(opener), message).toBe(0);
+      expect(buttons.at(-1)?.getAttribute("aria-label"), message).toBe("Dismiss");
+      opener.focus();
+      expect(document.activeElement, message).toBe(opener);
+      // Enter or Space on a native button is a click.
+      act(() => fireEvent.click(opener));
+      expect(onOpen.mock.calls.length + open.mock.calls.length - before, message).toBe(1);
+      opened();
+      expect(screen.queryByText(message), message).toBeNull();
+
+      arrive();
+      const again = screen.getByText(message).closest("[role]") as HTMLElement;
+      act(() => fireEvent.click(within(again).getByRole("button", { name: "Dismiss" })));
+      expect(onOpen.mock.calls.length + open.mock.calls.length - before, `${message}: Dismiss`).toBe(1);
+      expect(screen.queryByText(message), message).toBeNull();
+    }
+    window.removeEventListener(OPEN_SESSION_EVENT, onOpen);
+    open.mockRestore();
+  });
+
+  it("names a blank message's opener after its target and opens it once", () => {
+    const open = vi.spyOn(window, "open").mockReturnValue(null);
+    const onOpen = vi.fn();
+    window.addEventListener(OPEN_SESSION_EVENT, onOpen);
+    renderProvider();
+    // (how the blank toast arrives, the opener's name, what opening it must do)
+    const cases: [() => void, string, () => void][] = [
+      [
+        () => act(() => toastBus.handler?.openLink("   ", "https://example.com/pr/1")),
+        "Open link",
+        () => expect(open).toHaveBeenLastCalledWith("https://example.com/pr/1", "_blank", "noopener,noreferrer"),
+      ],
+      [
+        () => dispatchPush({ type: "aoe-push", payload: { title: "  ", session_id: "sess-1" } }),
+        "Open session",
+        () => expect((onOpen.mock.calls.at(-1)![0] as CustomEvent).detail).toEqual({ sessionId: "sess-1" }),
+      ],
+    ];
+    for (const [arrive, name, opened] of cases) {
+      const before = onOpen.mock.calls.length + open.mock.calls.length;
+      arrive();
+      const opener = screen.getByRole("button", { name });
+      const toast = opener.closest("[role]") as HTMLElement;
+      expect(within(toast).getAllByRole("button").indexOf(opener), name).toBe(0);
+      act(() => fireEvent.click(opener));
+      expect(onOpen.mock.calls.length + open.mock.calls.length - before, name).toBe(1);
+      opened();
+      expect(screen.queryByRole("button", { name }), name).toBeNull();
+    }
+    window.removeEventListener(OPEN_SESSION_EVENT, onOpen);
+    open.mockRestore();
+  });
+});
+
+describe("timed toast lifetime", () => {
+  const LIFETIME = 6000;
+  const GRACE = 2000;
+
+  const toastFor = (message: string) => screen.getByText(message).closest("[role]") as HTMLElement;
+  const dismissOf = (message: string) => within(toastFor(message)).getByRole("button", { name: "Dismiss" });
+  const advance = (ms: number) => act(() => void vi.advanceTimersByTime(ms));
+  const present = (message: string) => screen.queryByText(message) !== null;
+
+  it.each([
+    ["plain", () => act(() => toastBus.handler?.info("m"))],
+    ["session", () => dispatchPush({ type: "aoe-push", payload: { title: "m", session_id: "s1" } })],
+    ["link", () => act(() => toastBus.handler?.openLink("m", "https://example.com"))],
+  ])("expires a %s toast after its lifetime", (_name, push) => {
+    renderProvider();
+    push();
+    advance(LIFETIME - 1);
+    expect(present("m")).toBe(true);
+    advance(1);
+    expect(present("m")).toBe(false);
+  });
+
+  it("pauses while hovered and resumes with a grace period", () => {
+    renderProvider();
+    act(() => toastBus.handler?.info("hover"));
+    advance(5000);
+    fireEvent.pointerEnter(toastFor("hover"));
+    advance(60_000);
+    expect(present("hover")).toBe(true);
+    fireEvent.pointerLeave(toastFor("hover"));
+    advance(GRACE - 1);
+    expect(present("hover")).toBe(true);
+    advance(1);
+    expect(present("hover")).toBe(false);
+  });
+
+  it("resumes with the remaining time when it exceeds the grace", () => {
+    renderProvider();
+    act(() => toastBus.handler?.info("early"));
+    advance(1000);
+    fireEvent.pointerEnter(toastFor("early"));
+    advance(30_000);
+    fireEvent.pointerLeave(toastFor("early"));
+    advance(4999);
+    expect(present("early")).toBe(true);
+    advance(1);
+    expect(present("early")).toBe(false);
+  });
+
+  it("pauses while focused", () => {
+    renderProvider();
+    act(() => toastBus.handler?.openLink("focus", "https://example.com"));
+    advance(5000);
+    fireEvent.focusIn(dismissOf("focus"));
+    advance(60_000);
+    expect(present("focus")).toBe(true);
+    fireEvent.focusOut(dismissOf("focus"), { relatedTarget: document.body });
+    advance(GRACE - 1);
+    expect(present("focus")).toBe(true);
+    advance(1);
+    expect(present("focus")).toBe(false);
+  });
+
+  it("keeps the pause when focus moves within the toast", () => {
+    renderProvider();
+    act(() => toastBus.handler?.openLink("focus", "https://example.com"));
+    advance(5000);
+    const dismiss = dismissOf("focus");
+    fireEvent.focusIn(dismiss);
+    fireEvent.focusOut(dismiss, { relatedTarget: within(toastFor("focus")).getByRole("button", { name: "focus" }) });
+    advance(60_000);
+    expect(present("focus")).toBe(true);
+    fireEvent.focusOut(dismiss, { relatedTarget: document.body });
+    advance(GRACE - 1);
+    expect(present("focus")).toBe(true);
+    advance(1);
+    expect(present("focus")).toBe(false);
+  });
+
+  it("needs both hover and focus released", () => {
+    renderProvider();
+    act(() => toastBus.handler?.info("both"));
+    advance(5000);
+    fireEvent.pointerEnter(toastFor("both"));
+    fireEvent.focusIn(dismissOf("both"));
+    fireEvent.pointerLeave(toastFor("both"));
+    advance(60_000);
+    expect(present("both")).toBe(true);
+    fireEvent.focusOut(dismissOf("both"), { relatedTarget: document.body });
+    advance(GRACE - 1);
+    expect(present("both")).toBe(true);
+    advance(1);
+    expect(present("both")).toBe(false);
+  });
+
+  it("does not subtract elapsed time twice on repeated pauses", () => {
+    renderProvider();
+    act(() => toastBus.handler?.info("twice"));
+    advance(5000);
+    fireEvent.pointerEnter(toastFor("twice"));
+    fireEvent.focusIn(dismissOf("twice"));
+    advance(3000);
+    fireEvent.pointerLeave(toastFor("twice"));
+    fireEvent.focusOut(dismissOf("twice"), { relatedTarget: document.body });
+    advance(GRACE - 1);
+    expect(present("twice")).toBe(true);
+    advance(1);
+    expect(present("twice")).toBe(false);
+  });
+
+  it("keeps a separate timer for each toast", () => {
+    renderProvider();
+    act(() => toastBus.handler?.info("A"));
+    advance(1000);
+    act(() => toastBus.handler?.info("B"));
+    fireEvent.pointerEnter(toastFor("A"));
+    advance(LIFETIME - 1);
+    expect(present("B")).toBe(true);
+    advance(1);
+    expect(present("B")).toBe(false);
+    expect(present("A")).toBe(true);
+    advance(60_000);
+    expect(present("A")).toBe(true);
+    fireEvent.pointerLeave(toastFor("A"));
+    advance(4999);
+    expect(present("A")).toBe(true);
+    advance(1);
+    expect(present("A")).toBe(false);
+  });
+
+  it("clears the timer when a toast is dismissed", () => {
+    renderProvider();
+    act(() => toastBus.handler?.info("x"));
+    fireEvent.pointerEnter(toastFor("x"));
+    fireEvent.click(dismissOf("x"));
+    expect(present("x")).toBe(false);
+    expect(vi.getTimerCount()).toBe(0);
+
+    act(() => toastBus.handler?.info("z"));
+    fireEvent.click(dismissOf("z"));
+    expect(present("z")).toBe(false);
+    expect(vi.getTimerCount()).toBe(0);
+  });
+
+  it("clears timers on unmount", () => {
+    const { unmount } = renderProvider();
+    act(() => toastBus.handler?.info("y"));
+    unmount();
+    expect(vi.getTimerCount()).toBe(0);
   });
 });
 

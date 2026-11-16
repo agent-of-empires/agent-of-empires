@@ -4,6 +4,7 @@ pub(super) use super::AppState;
 
 use axum::{http::StatusCode, response::Response};
 mod acp;
+pub(crate) use acp::{submit_prompt, PromptSubmission, PromptSubmitError, PromptSubmitted};
 mod client_log;
 mod file_provenance;
 mod git;
@@ -18,17 +19,19 @@ mod projects;
 mod queue;
 mod sandbox_image;
 pub(crate) mod sessions;
+mod setup;
 mod skills;
 pub(crate) mod system;
 mod telemetry;
 
 pub(crate) use acp::structured_spawn_error_message;
 pub use acp::{
-    acp_attachment, acp_cancel, acp_context_primer, acp_disable, acp_enable, acp_files,
-    acp_force_end_turn, acp_prompt, acp_prompt_diff_comments, acp_replay, acp_set_config_option,
-    acp_set_mode, acp_worker_log, agent_install_info, get_option_catalog, install_agent,
-    list_acp_agents, list_importable_sessions, resolve_approval, resolve_elicitation, restart_acp,
-    shutdown_acp, spawn_acp, switch_acp_agent, switch_acp_provider,
+    acp_attachment, acp_cancel, acp_cancel_subagent, acp_context_primer, acp_disable, acp_enable,
+    acp_files, acp_force_end_turn, acp_prompt, acp_prompt_diff_comments, acp_replay,
+    acp_set_config_option, acp_set_mode, acp_task_output, acp_worker_log, agent_install_info,
+    get_option_catalog, install_agent, list_acp_agents, list_importable_sessions, resolve_approval,
+    resolve_elicitation, restart_acp, shutdown_acp, spawn_acp, switch_acp_agent,
+    switch_acp_provider,
 };
 pub(crate) use acp::{
     publish_startup_error_if_current, recover_pending_terminal_handoffs, HandoffRecovery,
@@ -54,6 +57,11 @@ pub use plugins::{
     set_plugin_enabled, start_plugin_install, start_plugin_uninstall,
 };
 pub use projects::{create_project, delete_project, list_projects, update_project};
+#[cfg(test)]
+pub(crate) use sandbox_image::status_generation_for_test as sandbox_image_status_generation_for_test;
+pub(crate) use sandbox_image::{
+    create_pull_refusal, invalidate_status as invalidate_sandbox_image_status,
+};
 pub use sandbox_image::{sandbox_image_dismiss, sandbox_image_pull, sandbox_image_status};
 pub use sessions::{
     abandon_purge, attach_session_project, cancel_creation, create_session,
@@ -61,18 +69,20 @@ pub use sessions::{
     ensure_container_terminal, ensure_session, ensure_terminal, ensure_tool, force_smart_rename,
     get_recent_projects, kill_terminal, list_sessions, paste_image, preview_volume_ignores_globs,
     read_output, recreate_container, rename_session, restart_for_update, restart_session,
-    restore_session, review_creation_trust, search_sessions, send_message, serve_session_artifact,
-    session_diff_file, session_diff_file_raw, session_diff_files, session_file, session_file_raw,
-    set_worktree_name, start_session, stop_auxiliary, stop_session, summarize_session,
-    touch_session_access, trash_session, update_session_archive, update_session_color,
-    update_session_diff_base, update_session_favorite, update_session_group,
-    update_session_notifications, update_session_pin, update_session_snooze, update_session_unread,
-    update_workspace_ordering, OutputQuery, SendMessageRequest,
+    restore_session, review_creation_trust, save_session_file, search_sessions, send_message,
+    serve_session_artifact, session_account_targets, session_diff_file, session_diff_file_raw,
+    session_diff_files, session_file, session_file_raw, set_worktree_name, start_session,
+    stop_auxiliary, stop_session, summarize_session, touch_session_access, trash_session,
+    update_session_archive, update_session_color, update_session_diff_base,
+    update_session_favorite, update_session_group, update_session_notifications,
+    update_session_pin, update_session_snooze, update_session_unread, update_workspace_ordering,
+    OutputQuery, SendMessageRequest,
 };
 pub(crate) use sessions::{
     lifecycle_rejection, persist_session_update, purge_expired_trash, reconcile_trashed_worktrees,
     reconcile_worktree_paths, trash_sweep_interval,
 };
+pub use setup::{get_setup, get_setup_runtimes, patch_setup};
 pub use skills::{
     adopt_skill, create_skill, delete_skill, edit_skill, list_skills, read_skill, sync_skills,
 };
@@ -171,6 +181,61 @@ pub(crate) fn start_blocked_response(
     api_error_with_code_header(code, blocked.to_string())
 }
 
+/// The 409 body for a sandbox launch that needs the sandbox login first: the code, the
+/// instruction, the tool the login is for, and the `profile` and `command` its recovery needs.
+pub(crate) fn sandbox_login_required_body(
+    err: &crate::session::SandboxLoginRequired,
+) -> serde_json::Value {
+    let mut body = serde_json::json!({
+        "error": crate::session::SandboxLoginRequired::CODE,
+        "message": err.to_string(),
+        "tool": err.tool,
+    });
+    if let Some(command) = &err.command {
+        body["command"] = serde_json::Value::String(command.clone());
+    }
+    if let Some(profile) = &err.profile {
+        body["profile"] = serde_json::Value::String(profile.clone());
+    }
+    body
+}
+
+/// 409 for a sandbox launch that needs the sandbox login first.
+pub(crate) fn sandbox_login_required_response(
+    err: &crate::session::SandboxLoginRequired,
+) -> Response {
+    use axum::response::IntoResponse as _;
+    (
+        StatusCode::CONFLICT,
+        axum::Json(sandbox_login_required_body(err)),
+    )
+        .into_response()
+}
+
+/// 409 for a sandbox launch refused because it needs a sandbox login the active container
+/// runtime cannot perform; nothing is held, the setting or the runtime has to change.
+pub(crate) fn sandbox_login_unsupported_response(
+    err: &crate::session::SandboxLoginUnsupported,
+) -> Response {
+    api_error(
+        StatusCode::CONFLICT,
+        crate::session::SandboxLoginUnsupported::CODE,
+        err.to_string(),
+    )
+}
+
+/// 502 for a launch whose `host_hooks.before_start` hook produced no environment. The
+/// message is the error's fixed words, never the command or its output.
+pub(crate) fn before_start_hook_failed_response(
+    err: &crate::session::BeforeStartHookError,
+) -> Response {
+    api_error(
+        StatusCode::BAD_GATEWAY,
+        "before_start_hook_failed",
+        err.to_string(),
+    )
+}
+
 pub(crate) fn api_error(
     status: axum::http::StatusCode,
     code: &str,
@@ -228,6 +293,9 @@ pub(super) fn session_not_found() -> axum::response::Response {
     )
 }
 
+/// Why `aoe serve --read-only` refused a change.
+pub(crate) const READ_ONLY_MESSAGE: &str = "Server is in read-only mode";
+
 /// Canonical 403 body for `aoe serve --read-only`.
 pub(super) fn read_only_response() -> axum::response::Response {
     use axum::response::IntoResponse as _;
@@ -236,7 +304,7 @@ pub(super) fn read_only_response() -> axum::response::Response {
         crate::daemon::ApiErrorCode::ReadOnly.header(),
         axum::Json(serde_json::json!({
             "error": "read_only",
-            "message": "Server is in read-only mode"
+            "message": READ_ONLY_MESSAGE
         })),
     )
         .into_response()
@@ -397,6 +465,28 @@ pub(super) fn validate_profile_name(name: &str) -> Result<(), String> {
 mod tests {
     use super::*;
 
+    /// The 409 body of the queue endpoint names `profile` and `command` only when set.
+    #[tokio::test]
+    async fn sandbox_login_required_response_names_profile_and_command_only_when_set() {
+        let body = |response: Response| async move {
+            let bytes = axum::body::to_bytes(response.into_body(), 4096)
+                .await
+                .unwrap();
+            serde_json::from_slice::<serde_json::Value>(&bytes).unwrap()
+        };
+        let mut blocked = crate::session::test_support::login_required("claude");
+        let plain = body(sandbox_login_required_response(&blocked)).await;
+        assert_eq!(plain.get("profile"), None);
+        assert_eq!(plain.get("command"), None);
+
+        blocked.profile = Some("work".to_string());
+        blocked.command = Some("claude".to_string());
+        let named = body(sandbox_login_required_response(&blocked)).await;
+        assert_eq!(named["profile"], "work");
+        assert_eq!(named["command"], "claude");
+        assert_eq!(named["tool"], "claude");
+    }
+
     // Write handlers and their existing rejection/extractor boundaries.
     const MUTATING_HANDLERS: &[(&str, &str, &[&str])] = &[
         (
@@ -472,6 +562,11 @@ mod tests {
             ],
         ),
         (
+            "sessions/file_edit.rs",
+            include_str!("sessions/file_edit.rs"),
+            &["save_session_file"],
+        ),
+        (
             "sessions/list.rs",
             include_str!("sessions/list.rs"),
             &["update_workspace_ordering"],
@@ -504,6 +599,7 @@ mod tests {
             include_str!("sandbox_image.rs"),
             &["sandbox_image_pull", "sandbox_image_dismiss"],
         ),
+        ("setup.rs", include_str!("setup.rs"), &["patch_setup"]),
         (
             "system.rs",
             include_str!("system.rs"),
@@ -540,6 +636,7 @@ mod tests {
             include_str!("acp/prompt.rs"),
             &[
                 "acp_cancel",
+                "acp_cancel_subagent",
                 "acp_force_end_turn",
                 "acp_prompt",
                 "acp_prompt_diff_comments",
@@ -1750,6 +1847,7 @@ mod tests {
             (Method::PATCH, "/api/theme"),
             (Method::POST, "/api/sandbox/image-pull"),
             (Method::POST, "/api/sandbox/image-dismiss"),
+            (Method::PUT, "/api/sessions/missing/file"),
         ] {
             let mut request = Request::builder()
                 .method(method.clone())

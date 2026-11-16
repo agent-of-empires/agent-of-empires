@@ -42,6 +42,11 @@ pub mod worktree;
 
 pub use definition::{command_name, Cli, Commands, DaemonCommands, CLI_COMMAND_NAMES};
 
+/// Ends the process with this status; the command already printed its output.
+#[derive(Debug, thiserror::Error)]
+#[error("exit status {0}")]
+pub struct Exit(pub i32);
+
 pub(crate) fn color_enabled() -> bool {
     use std::io::IsTerminal;
     std::io::stdout().is_terminal() && std::env::var_os("NO_COLOR").is_none_or(|v| v.is_empty())

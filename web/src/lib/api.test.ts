@@ -3,13 +3,20 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import * as api from "./api";
 import type { ServerAbout } from "./api";
+import { reportError } from "./logger";
 import { onSettingsChanged } from "./settingsEvents";
 import type { CreateSessionRequest, SettingsFieldDescriptor } from "./types";
+
+vi.mock("./logger", async (importOriginal) => ({
+  ...(await importOriginal<typeof import("./logger")>()),
+  reportError: vi.fn(),
+}));
 
 const fetchSpy = vi.fn<typeof fetch>();
 
 beforeEach(() => {
   fetchSpy.mockReset();
+  vi.mocked(reportError).mockClear();
   vi.stubGlobal("fetch", fetchSpy);
 });
 
@@ -103,6 +110,19 @@ const requestCases: RequestCase[] = [
   ["GET /api/sessions/s1/diff/file?path=src%2Fa+b.ts", () => api.getSessionFileContents("s1", "src/a b.ts")],
   ["GET /api/sessions/s1/diff/file?path=a.ts&repo=myrepo", () => api.getSessionFileContents("s1", "a.ts", "myrepo")],
   ["GET /api/sessions/s1/file?path=a+b.ts", () => api.getSessionFile("s1", "a b.ts")],
+  [
+    "GET /api/sessions/s1/file?path=a+b.ts&version_only=true",
+    () => api.getSessionFile("s1", "a b.ts", { versionOnly: true }),
+  ],
+  [
+    "PUT /api/sessions/s1/file",
+    () => api.saveSessionFile("s1", "a.ts", "v1", "updated"),
+    {
+      body: { path: "a.ts", version: "v1", content: "updated" },
+      respond: new Response(null, { status: 204 }),
+      result: { ok: true, status: 204, error: undefined },
+    },
+  ],
   ["GET /api/settings", () => api.fetchSettings()],
   ["GET /api/settings?profile=my%20profile", () => api.fetchSettings("my profile")],
   ["GET /api/settings?layer=machine", () => api.fetchMachineSettings()],
@@ -457,7 +477,11 @@ const requestCases: RequestCase[] = [
     () => api.trashSession("../plugins/x/uninstall#"),
     { body: { kill_pane: true } },
   ],
-  ["POST /api/sessions/s1/restore", () => api.restoreSession("s1"), { respond: json(session), result: session }],
+  [
+    "POST /api/sessions/s1/restore",
+    () => api.restoreSession("s1"),
+    { respond: runtimeJson(session), result: { session, cursor } },
+  ],
   ["POST /api/sessions/s1/stop", () => api.stopSession("s1"), { respond: json(session), result: session }],
   [
     "POST /api/sessions/s1/start",
@@ -842,6 +866,102 @@ describe("ensureTerminal", () => {
     offline();
     expect(await api.ensureTerminal("s1")).toEqual({ ok: false, message: "offline" });
   });
+
+  describe("lifecycle_busy", () => {
+    const busy = (operation = "launch") => json({ error: "lifecycle_busy", operation, message: "busy" }, 409);
+    beforeEach(() => vi.useFakeTimers());
+    afterEach(() => vi.useRealTimers());
+
+    it("retries until the launch releases the reservation", async () => {
+      fetchSpy.mockResolvedValueOnce(busy()).mockResolvedValueOnce(busy()).mockResolvedValueOnce(empty());
+      const result = api.ensureTerminal("s1");
+      await vi.advanceTimersByTimeAsync(10_000);
+      expect(await result).toEqual({ ok: true });
+      expect(fetchSpy).toHaveBeenCalledTimes(3);
+    });
+
+    it("does not wait out a busy operation other than a launch", async () => {
+      fetchSpy.mockResolvedValue(busy("stop"));
+      const result = api.ensureTerminal("s1");
+      await vi.advanceTimersByTimeAsync(60_000);
+      expect(await result).toEqual({ ok: false, error: "lifecycle_busy", message: "busy" });
+      expect(fetchSpy).toHaveBeenCalledTimes(1);
+    });
+
+    it("gives the busy error back once the budget is spent", async () => {
+      fetchSpy.mockImplementation(async () => busy());
+      const result = api.ensureTerminal("s1");
+      await vi.advanceTimersByTimeAsync(60_000);
+      expect(await result).toEqual({ ok: false, error: "lifecycle_busy", message: "busy" });
+      const calls = fetchSpy.mock.calls.length;
+      await vi.advanceTimersByTimeAsync(60_000);
+      expect(fetchSpy).toHaveBeenCalledTimes(calls);
+    });
+
+    // The budget bounds when retries start; a request already in flight is not aborted.
+    it("starts no retry once slow busy responses have spent the budget", async () => {
+      fetchSpy.mockImplementation(() => new Promise((resolve) => setTimeout(() => resolve(busy()), 20_000)));
+      const result = api.ensureTerminal("s1");
+      await vi.advanceTimersByTimeAsync(60_000);
+      expect(await result).toEqual({ ok: false, error: "lifecycle_busy", message: "busy" });
+      expect(fetchSpy).toHaveBeenCalledTimes(2);
+    });
+
+    it("sends no request at or after the deadline", async () => {
+      fetchSpy.mockImplementation(() => new Promise((resolve) => setTimeout(() => resolve(busy()), 29_900)));
+      const result = api.ensureTerminal("s1");
+      await vi.advanceTimersByTimeAsync(60_000);
+      expect(await result).toEqual({ ok: false, error: "lifecycle_busy", message: "busy" });
+      expect(fetchSpy).toHaveBeenCalledTimes(1);
+    });
+
+    it("reports an abort that lands during the final wait", async () => {
+      fetchSpy.mockImplementation(() => new Promise((resolve) => setTimeout(() => resolve(busy()), 29_900)));
+      const controller = new AbortController();
+      const result = api.ensureTerminal("s1", 0, false, controller.signal);
+      await vi.advanceTimersByTimeAsync(29_950);
+      controller.abort();
+      await vi.advanceTimersByTimeAsync(5_000);
+      expect(await result).toEqual({ ok: false, error: "aborted" });
+      expect(fetchSpy).toHaveBeenCalledTimes(1);
+    });
+
+    it("reports an abort that lands during the body read", async () => {
+      const controller = new AbortController();
+      fetchSpy.mockResolvedValueOnce({
+        ok: false,
+        status: 409,
+        json: () =>
+          new Promise((_, reject) =>
+            controller.signal.addEventListener("abort", () => reject(new DOMException("aborted", "AbortError"))),
+          ),
+      } as Response);
+      const result = api.ensureTerminal("s1", 0, false, controller.signal);
+      await vi.advanceTimersByTimeAsync(0);
+      controller.abort();
+      expect(await result).toEqual({ ok: false, error: "aborted" });
+      expect(fetchSpy).toHaveBeenCalledTimes(1);
+    });
+
+    it("stops retrying once its signal aborts", async () => {
+      fetchSpy.mockImplementation(async () => busy());
+      const controller = new AbortController();
+      const result = api.ensureTerminal("s1", 0, false, controller.signal);
+      await vi.advanceTimersByTimeAsync(300);
+      const calls = fetchSpy.mock.calls.length;
+      expect(calls).toBeGreaterThan(0);
+      controller.abort();
+      await vi.advanceTimersByTimeAsync(5_000);
+      expect(await result).toEqual({ ok: false, error: "aborted" });
+      expect(fetchSpy).toHaveBeenCalledTimes(calls);
+    });
+
+    it("does not retry other refusals", async () => {
+      fetchSpy.mockResolvedValueOnce(empty(500));
+      expect(await api.ensureTerminal("s1")).toEqual({ ok: false, message: "Server error (500)" });
+      expect(fetchSpy).toHaveBeenCalledTimes(1);
+    });
+  });
 });
 describe("startSession", () => {
   it.each([
@@ -1064,9 +1184,41 @@ describe("fetchProfileAgents", () => {
     expect(lastCall().url).toBe("/api/agents?profile=work");
   });
 
+  it.each([
+    ["a project", "work", { path: "/r/a b", scratch: false }, "/api/agents?profile=work&path=%2Fr%2Fa+b"],
+    ["scratch, which drops the path", "work", { path: "/r/a", scratch: true }, "/api/agents?profile=work&scratch=true"],
+    ["no project", "work", { path: "", scratch: false }, "/api/agents?profile=work"],
+    ["neither", undefined, undefined, "/api/agents"],
+  ] as const)("sends %s", async (_name, profile, project, url) => {
+    fetchSpy.mockResolvedValueOnce(json([]));
+    await api.fetchProfileAgents(profile, project);
+    expect(lastCall().url).toBe(url);
+  });
+
   it("is null for fetchAgents when the profile is unknown", async () => {
     fetchSpy.mockResolvedValueOnce(json({ error: "profile_not_found" }, 404));
     expect(await api.fetchAgents("work")).toBeNull();
+  });
+});
+
+describe("fetchSandboxImageStatus", () => {
+  it.each([
+    ["the default image, cached", undefined, {}, "/api/sandbox/image-status"],
+    [
+      "an image, fresh",
+      "ghcr.io/x/sb:1",
+      { fresh: true },
+      "/api/sandbox/image-status?image=ghcr.io%2Fx%2Fsb%3A1&fresh=true",
+    ],
+  ] as const)("asks for %s", async (_name, image, opts, url) => {
+    fetchSpy.mockResolvedValueOnce(json({ state: "current" }));
+    await api.fetchSandboxImageStatus(image, opts);
+    expect(lastCall().url).toBe(url);
+  });
+
+  it("names a refusal such as an image that isn't configured", async () => {
+    fetchSpy.mockResolvedValueOnce(json({ error: "unknown_image", message: "no" }, 400));
+    expect(await api.fetchSandboxImageStatus("mine:latest")).toEqual({ error: "unknown_image" });
   });
 });
 
@@ -1354,11 +1506,11 @@ describe("login", () => {
 describe("session mutation messages", () => {
   it.each([
     ["trashSession", () => api.trashSession("s1"), { relocation: { status: "relocated", warning: "w" } }],
-    ["restoreSession", () => api.restoreSession("s1"), { status: "restored", warning: "w" }],
+    ["restoreSession", async () => (await api.restoreSession("s1"))?.session, { status: "restored", warning: "w" }],
   ])("%s folds a degraded move warning into warnings", async (_name, call, outcome) => {
-    fetchSpy.mockResolvedValueOnce(json({ ...session, outcome }));
+    fetchSpy.mockResolvedValueOnce(runtimeJson({ ...session, outcome }));
     expect((await call())?.warnings).toEqual(["w"]);
-    fetchSpy.mockResolvedValueOnce(json({ ...session, outcome: { status: "restored" } }));
+    fetchSpy.mockResolvedValueOnce(runtimeJson({ ...session, outcome: { status: "restored" } }));
     expect((await call())?.warnings).toBeUndefined();
   });
 
@@ -1542,6 +1694,33 @@ describe("profile settings write guard", () => {
     expect([...writable].sort()).toEqual(["description", "session", "theme"]);
   });
 
+  it("a stalled setup read or save times out as a failure", { timeout: 1000 }, async () => {
+    const stalls = new AbortController();
+    const timeout = vi.spyOn(AbortSignal, "timeout").mockReturnValue(stalls.signal);
+    try {
+      const stall = (_: unknown, init?: RequestInit) =>
+        new Promise<Response>((_, reject) =>
+          init?.signal?.addEventListener("abort", () => reject(new Error("timeout"))),
+        );
+      fetchSpy.mockImplementation(stall);
+      const schemaRead = api.getSettingsSchema();
+      const machineRead = api.fetchMachineSettings();
+      const telemetryRead = api.fetchTelemetryStatus();
+      const save = api.updateMachineSettingsInline({ worktree: { enabled: true } });
+      const setupRead = api.fetchSetup();
+      const setupSave = api.updateSetup({ deferred: true });
+      stalls.abort();
+      expect(await schemaRead).toBeNull();
+      expect(await machineRead).toBeNull();
+      expect(await telemetryRead).toBeNull();
+      expect(await save).toBe("uncertain");
+      expect(await setupRead).toBeNull();
+      expect(await setupSave).toEqual({ ok: false });
+    } finally {
+      timeout.mockRestore();
+    }
+  });
+
   it("caches a successful schema fetch and retries a failed one", async () => {
     fetchSpy.mockResolvedValueOnce(empty(503));
     expect(await api.getSettingsSchema()).toBeNull();
@@ -1710,6 +1889,41 @@ describe("restartSession", () => {
   });
 });
 
+describe("account switching", () => {
+  it("lists target names and null when they can't be read", async () => {
+    fetchSpy.mockResolvedValueOnce(json({ targets: ["claude-b"] }));
+    expect(await api.fetchAccountTargets("s 1")).toEqual(["claude-b"]);
+    expect(lastCall().url).toBe("/api/sessions/s%201/account-targets");
+
+    expect(reportError).not.toHaveBeenCalled();
+
+    fetchSpy.mockResolvedValueOnce(json({ error: "read_only" }, 403));
+    expect(await api.fetchAccountTargets("s1")).toBeNull();
+    expect(reportError).toHaveBeenCalledWith(expect.any(String), {
+      level: "warn",
+      target: "web.client.api",
+      sessionId: "s1",
+    });
+  });
+
+  it("restarts with the tool and demands the conversation carry, surfacing a 409 reason", async () => {
+    fetchSpy.mockResolvedValueOnce(empty());
+    expect(await api.switchSessionAccount("s1", "claude-b")).toEqual({ ok: true });
+    const { url, init } = lastCall();
+    expect(url).toBe("/api/sessions/s1/restart");
+    expect(init?.method).toBe("POST");
+    expect(bodyOf(init)).toEqual({ tool: "claude-b", require_account_carry: true });
+
+    fetchSpy.mockResolvedValueOnce(
+      json({ error: "account_swap_unavailable", message: "Cannot switch. Nothing changed." }, 409),
+    );
+    expect(await api.switchSessionAccount("s1", "claude-b")).toEqual({
+      ok: false,
+      message: "Cannot switch. Nothing changed.",
+    });
+  });
+});
+
 describe("restartSessionForUpdate", () => {
   it("POSTs and reports success, the server message on a 409, and nothing when offline", async () => {
     fetchSpy.mockResolvedValueOnce(empty());
@@ -1721,5 +1935,18 @@ describe("restartSessionForUpdate", () => {
 
     offline();
     expect(await api.restartSessionForUpdate("s1")).toEqual({ ok: false });
+  });
+});
+
+describe("fetchTaskOutput", () => {
+  it("requests the task output of a session with both ids encoded", async () => {
+    fetchSpy.mockResolvedValueOnce(json({ exists: true, output: "hi", truncated: false }));
+    expect(await api.fetchTaskOutput("s 1", "t/2")).toEqual({ exists: true, output: "hi", truncated: false });
+    expect(lastCall().url).toBe("/api/sessions/s%201/acp/tasks/t%2F2/output");
+  });
+
+  it("is null on a non-2xx answer", async () => {
+    fetchSpy.mockResolvedValueOnce(json({}, 404));
+    expect(await api.fetchTaskOutput("s", "t")).toBeNull();
   });
 });

@@ -37,6 +37,11 @@ use crate::session::capture::{
 mod accessors;
 mod capture_slot;
 mod container;
+#[cfg(test)]
+pub(crate) use container::before_start_slot_waiters;
+pub(crate) use container::{
+    forget_before_start_resolution, BeforeStartHook, BeforeStartHookError, Releasing,
+};
 mod execution;
 pub(crate) use capture_slot::{Handoff, Held, Unserved};
 pub(crate) use execution::{ActiveExecution, CaptureContext, ConversationKey, ConversationState};
@@ -46,6 +51,7 @@ pub use execution::{
 mod flags;
 mod hooks;
 pub(crate) use hooks::HostHookApprovalRequired;
+pub(crate) use status_update::CAPTURE_FAILED_RULE;
 mod identity_sidecar;
 mod kill;
 mod launch_command;
@@ -77,7 +83,10 @@ mod tmux_session;
 mod types;
 
 pub(crate) use accessors::resolved_agent_for;
-pub use flags::{is_valid_session_color, SessionBucket, StartBlocked, SESSION_COLORS};
+pub use flags::{
+    is_valid_session_color, SandboxLoginRequired, SandboxLoginUnsupported, SessionBucket,
+    StartBlocked, SESSION_COLORS,
+};
 pub use lifecycle::{LifecycleOperation, LifecycleReservation, LifecycleReservationError};
 
 #[cfg(test)]
@@ -89,7 +98,8 @@ pub(crate) use resume::{
     LaunchReservation, ManagedResumeRefused, ResumeAttemptPolicy, ResumeLaunchOptions,
 };
 pub(crate) use sid_persist::{
-    persist_session_to_storage, CaptureCommit, SidPersistOutcome, SidWrite,
+    persist_session_to_storage, persist_session_with_storage, CaptureCommit, SidPersistOutcome,
+    SidWrite,
 };
 pub use start::{LaunchSidOutcome, StartOutcome};
 pub(crate) use status::PassiveStatusPatch;
@@ -108,6 +118,28 @@ enum ResumeStaticUnavailable {
     Agent,
     Sandbox,
     Command,
+}
+
+/// A profile's config as the resume check reads it. When resolution failed,
+/// `config` is the warn fallback, which answers legacy selectors but no native agent.
+pub(crate) struct ResumeProfileConfig {
+    config: crate::session::Config,
+    resolved: bool,
+}
+
+/// Resolve `source_profile` for [`Instance::terminal_context_resume_cached_with`].
+pub(crate) fn resume_profile_config(source_profile: &str) -> ResumeProfileConfig {
+    let profile = crate::session::config::effective_profile(source_profile);
+    match crate::session::config::profile_config::resolve_config(&profile) {
+        Ok(config) => ResumeProfileConfig {
+            config,
+            resolved: true,
+        },
+        Err(_) => ResumeProfileConfig {
+            config: crate::session::config::profile_config::resolve_config_or_warn(&profile),
+            resolved: false,
+        },
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -462,6 +494,10 @@ pub struct Instance {
     /// a path only; hook output is never recorded here.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub launch_executable: Option<std::path::PathBuf>,
+    /// `launch_executable` with symlinks resolved at launch, to tell a switched link from a
+    /// re-created one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub launch_resolved_executable: Option<std::path::PathBuf>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub archived_at: Option<DateTime<Utc>>,
 
@@ -649,6 +685,9 @@ pub struct Instance {
     /// See `src/session/scratch.rs`.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub scratch: bool,
+    /// Created with its `on_create` hooks skipped (`skip_on_create`), so their setup never ran.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub created_without_setup: bool,
 
     // Git worktree integration
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -830,6 +869,13 @@ pub struct Instance {
     /// new one. Additive: absent in older rows, no migration.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub acp_effort: Option<String>,
+    /// Picks on `category:"model_config"` on/off options (Fast mode,
+    /// Ultracode), keyed by option id and re-applied after the model and
+    /// effort on every worker (re)spawn. An option the current model does not
+    /// advertise is skipped, not dropped. Cleared on an agent switch. Additive:
+    /// absent in older rows, no migration.
+    #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub acp_model_config: std::collections::BTreeMap<String, String>,
     /// Agent-assigned ACP session id captured from `session/new`. When
     /// the agent advertises `agent_capabilities.load_session = true`
     /// (claude-agent-acp does), the next spawn calls `session/load`
@@ -929,6 +975,15 @@ pub struct Instance {
     /// from scratch.
     #[serde(skip)]
     pending_host_env: Vec<(String, String)>,
+    /// What the sandbox login admission of the launch in progress ran with (the target agent
+    /// and the request's environment), so the come-up gates on the same launch. May hold a
+    /// secret; never persisted, never printed.
+    #[serde(skip)]
+    launch_admission: Option<container::LaunchAdmission>,
+    /// The come-up's `before_start` environment was already resolved, ahead of the
+    /// destructive steps of this launch: the come-up itself does not mint again.
+    #[serde(skip)]
+    before_start_minted_for_launch: bool,
 
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) capture_started_at: Option<std::time::SystemTime>,

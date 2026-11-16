@@ -153,6 +153,15 @@ fn resolve_host_creation(
                 .map(|project| project.path),
         );
     }
+    body.workspace = wants_workspace(
+        options.workspace,
+        options.generated_name,
+        body.worktree_branch
+            .as_deref()
+            .is_some_and(|b| !b.trim().is_empty()),
+        body.create_new_branch,
+        config.worktree.workspace_by_default,
+    );
     if !original_repos.is_empty() {
         original_repos.extend(body.extra_repo_paths.iter().map(std::path::PathBuf::from));
         let mut pairs: Vec<_> = std::mem::take(&mut body.repo_bases)
@@ -181,7 +190,10 @@ fn resolve_host_creation(
             crate::session::builder::resolve_repo_base_selectors(&original_repos, &pairs)?
                 .into_iter()
                 .map(|(path, base_branch)| {
-                    let path = if mono_repo {
+                    // A workspace plans from the launch path, which may be a linked worktree.
+                    let path = if mono_repo && body.workspace {
+                        std::path::PathBuf::from(&body.path)
+                    } else if mono_repo {
                         path
                     } else {
                         path.canonicalize().context(
@@ -214,6 +226,10 @@ fn resolve_host_creation(
         !options.generated_name || body.extra_repo_paths.is_empty(),
         "--generated-name does not apply to multi-repo workspaces"
     );
+    anyhow::ensure!(
+        !options.generated_name || options.workspace != Some(true),
+        "--generated-name does not apply to a workspace"
+    );
     let unknown_tool = |description: &str| {
         let mut names = crate::agents::agent_names();
         names.extend(config.session.custom_agents.keys().map(String::as_str));
@@ -224,11 +240,43 @@ fn resolve_host_creation(
             names.join(", ")
         )
     };
+    let configured_custom_agents: Vec<&str> = config
+        .session
+        .custom_agents
+        .iter()
+        .filter(|(_, command)| !command.trim().is_empty())
+        .map(|(name, _)| name.as_str())
+        .collect();
+    let plugin_registry = crate::plugin::registry();
+    let plugin_tool = |command: &str| {
+        crate::plugin::agent_integration::resolve_declared_tool(
+            &plugin_registry,
+            command,
+            configured_custom_agents.iter().copied(),
+        )
+    };
+    let plugin_owned = |name: &str| {
+        if config
+            .session
+            .agent_command_override
+            .get(name)
+            .is_some_and(|command| !command.trim().is_empty())
+        {
+            return false;
+        }
+        crate::plugin::agent_integration::declared_agent(
+            plugin_registry.clone(),
+            name,
+            configured_custom_agents.iter().copied(),
+        )
+        .is_some()
+    };
     let explicit_tool = !body.tool.trim().is_empty() || options.command.is_some();
     if let Some(command) = options.command.as_deref() {
         body.tool = crate::agents::resolve_tool_name(command)
-            .with_context(|| unknown_tool(&format!("Unknown tool in command: {command}")))?
-            .to_owned();
+            .map(str::to_owned)
+            .or_else(|| plugin_tool(command))
+            .with_context(|| unknown_tool(&format!("Unknown tool in command: {command}")))?;
         if command.trim().contains(' ')
             && body.command_override.is_empty()
             && config.session.resolve_tool_command(&body.tool).is_empty()
@@ -254,29 +302,15 @@ fn resolve_host_creation(
                 .filter(|name| !name.trim().is_empty())
             {
                 anyhow::ensure!(
-                    crate::agents::get_agent(detect_as).is_some(),
+                    crate::agents::native_definition(detect_as).is_some(),
                     "Unknown agent_detect_as for custom agent '{name}'"
                 );
             }
             body.tool = name.to_owned();
         } else if let Some(tool) = crate::agents::resolve_tool_name(name) {
             body.tool = tool.to_owned();
-        } else if crate::plugin::agent_integration::agent_command(
-            name,
-            config
-                .session
-                .custom_agents
-                .iter()
-                .filter(|(_, command)| !command.trim().is_empty())
-                .map(|(name, _)| name.as_str()),
-        )
-        .is_some()
-        {
-            anyhow::ensure!(
-                body.command_override.is_empty(),
-                "--cmd-override cannot be used with configured custom agent --tool selections"
-            );
-            body.tool = name.to_owned();
+        } else if let Some(tool) = plugin_tool(name) {
+            body.tool = tool;
         } else {
             anyhow::ensure!(
                 !config.session.custom_agents.contains_key(name),
@@ -298,7 +332,9 @@ fn resolve_host_creation(
                     {
                         Some(name.to_owned())
                     } else {
-                        crate::agents::resolve_tool_name(name).map(str::to_owned)
+                        crate::agents::resolve_tool_name(name)
+                            .map(str::to_owned)
+                            .or_else(|| plugin_tool(name))
                     }
                 })
             })
@@ -310,12 +346,17 @@ fn resolve_host_creation(
             }
         }
     }
+    // Every selection path lands here with its canonical tool, so this one check
+    // rejects the override for explicit and implicit plugin selections alike.
+    if !body.command_override.is_empty() && plugin_owned(&body.tool) {
+        anyhow::bail!("--cmd-override cannot be used with a plugin-provided agent");
+    }
     if explicit_tool {
         let configured = config.session.resolve_tool_command(&body.tool);
         if options.command.is_some() && !configured.is_empty() {
-            let binary = shell_words::split(&configured)?
-                .into_iter()
-                .next()
+            let binary = aoe_plugin_api::agent_integration::launch_prefix(&configured)
+                .and_then(|(prefix, _)| prefix.last().map(|word| (*word).to_owned()))
+                .or_else(|| shell_words::split(&configured).ok()?.into_iter().next())
                 .context("Configured agent command is empty")?;
             anyhow::ensure!(
                 crate::tmux::is_binary_on_path(&binary),
@@ -386,6 +427,7 @@ fn resolve_host_creation(
                     std::path::Path::new(&body.path),
                     body.scratch,
                     body.trust_hooks,
+                    body.skip_on_create,
                 )
             },
         };
@@ -431,4 +473,176 @@ fn resolve_host_creation(
     }
     body.cli = Some(options);
     Ok((body, warnings))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    #[serial_test::serial]
+    fn plugin_owned_override_follows_the_configured_command() {
+        let home = tempfile::tempdir().unwrap();
+        let _reload = crate::plugin::ReloadRegistryOnDrop;
+        let _env = crate::session::test_support::EnvGuard::set(&[
+            ("HOME", home.path()),
+            ("XDG_CONFIG_HOME", home.path()),
+            ("USERPROFILE", home.path()),
+        ]);
+        let _featured = crate::session::test_support::EnvGuard::unset(&["AOE_FEATURED_INDEX_PATH"]);
+        let manifest = r#"id = "acme.cli-override"
+name = "CLI override"
+version = "1.0.0"
+api_version = 19
+capabilities = ["session.integration"]
+[[agent_integrations]]
+tool = "plugin-helper"
+command = "true"
+provider_versions = ["^18"]
+"#;
+        let dir = crate::plugin::plugins_dir()
+            .unwrap()
+            .join("acme.cli-override");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("aoe-plugin.toml"), manifest).unwrap();
+        crate::session::update_config(|config| {
+            config.plugins.insert(
+                "acme.cli-override".into(),
+                crate::session::PluginConfig {
+                    grant: Some(crate::session::CapabilityGrant {
+                        manifest_hash: aoe_plugin_api::PluginManifest::hash_bytes(
+                            manifest.as_bytes(),
+                        ),
+                        capabilities: vec!["session.integration".into()],
+                        granted_at: chrono::Utc::now(),
+                    }),
+                    ..Default::default()
+                },
+            );
+            config.session.default_tool = Some("plugin-helper".into());
+        })
+        .unwrap();
+        crate::plugin::reload_registry();
+
+        for configured in ["", "   ", "true"] {
+            crate::session::update_config(|config| {
+                config
+                    .session
+                    .agent_command_override
+                    .insert("plugin-helper".into(), configured.into());
+            })
+            .unwrap();
+            for tool in ["plugin-helper", ""] {
+                let body: CreateSessionBody = serde_json::from_value(serde_json::json!({
+                    "path": home.path(), "tool": tool, "command_override": "false"
+                }))
+                .unwrap();
+                let result = resolve_host_creation(body, Default::default(), None, "default");
+                if configured.trim().is_empty() {
+                    assert!(result
+                        .err()
+                        .expect("plugin-owned override must be rejected")
+                        .to_string()
+                        .contains("--cmd-override cannot be used"));
+                } else {
+                    let (body, _) = result.unwrap();
+                    assert_eq!(body.tool, "plugin-helper");
+                    assert_eq!(body.command_override, "false");
+                }
+            }
+        }
+    }
+
+    /// A takeover hides `omp` from listings, but a configured wrapper detected
+    /// as `omp` still names a real identity, so `--tool` must accept it.
+    #[test]
+    #[serial_test::serial]
+    fn a_takeover_keeps_a_configured_wrapper_detectable_as_omp() {
+        let home = tempfile::tempdir().unwrap();
+        let _reload = crate::plugin::ReloadRegistryOnDrop;
+        let _app = crate::session::test_support::isolate_app_dir_at(home.path());
+        crate::session::update_config(|config| {
+            config
+                .session
+                .custom_agents
+                .insert("work-omp".into(), "omp --verbose".into());
+            config
+                .session
+                .agent_detect_as
+                .insert("work-omp".into(), "omp".into());
+        })
+        .unwrap();
+        let resolve = || {
+            let body: CreateSessionBody = serde_json::from_value(serde_json::json!({
+                "path": home.path(), "scratch": true, "tool": "work-omp"
+            }))
+            .unwrap();
+            resolve_host_creation(body, Default::default(), None, "default")
+        };
+        let accepted = || {
+            resolve()
+                .expect("a wrapper detected as omp is a known agent")
+                .0
+                .tool
+        };
+
+        assert_eq!(accepted(), "work-omp");
+
+        crate::session::test_support::install_omp_takeover("omp-next");
+        assert!(crate::agents::get_agent("omp").is_none());
+        assert_eq!(accepted(), "work-omp");
+
+        crate::session::update_config(|config| {
+            config
+                .session
+                .agent_detect_as
+                .insert("work-omp".into(), "no-such-agent".into());
+        })
+        .unwrap();
+        let refused = match resolve() {
+            Ok(_) => panic!("an unknown alias stays unknown"),
+            Err(error) => format!("{error:#}"),
+        };
+        assert!(refused.contains("Unknown agent_detect_as"), "{refused}");
+    }
+}
+
+/// An explicit flag wins over the setting. The setting only applies to a
+/// worktree session creating its branch: attaching reuses the branch's existing
+/// checkout, which a workspace cannot. `--generated-name` opts out because a
+/// workspace directory ignores the title.
+fn wants_workspace(
+    flag: Option<bool>,
+    generated_name: bool,
+    has_worktree: bool,
+    create_new_branch: bool,
+    workspace_by_default: bool,
+) -> bool {
+    flag.unwrap_or(workspace_by_default && has_worktree && create_new_branch && !generated_name)
+}
+
+#[cfg(test)]
+mod workspace_tests {
+    use super::wants_workspace;
+
+    #[test]
+    fn workspace_flag_overrides_the_setting() {
+        let cases = [
+            (None, false, true, true, false, false),
+            (None, false, true, true, true, true),
+            (None, false, true, false, true, false),
+            (None, false, false, true, true, false),
+            (None, true, true, true, true, false),
+            (Some(true), false, true, true, false, true),
+            (Some(true), false, true, false, false, true),
+            (Some(false), false, true, true, true, false),
+        ];
+        for (flag, generated, worktree, new_branch, default, want) in cases {
+            assert_eq!(
+                wants_workspace(flag, generated, worktree, new_branch, default),
+                want,
+                "{flag:?} generated={generated} worktree={worktree} new_branch={new_branch} default={default}"
+            );
+        }
+    }
 }

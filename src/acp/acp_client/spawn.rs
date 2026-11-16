@@ -21,6 +21,8 @@ pub struct SpawnConfig {
     pub tool: String,
     pub spec: AgentSpec,
     pub cwd: PathBuf,
+    /// Where repo config is re-read on respawn; see `SpawnRequest::config_path`.
+    pub config_path: PathBuf,
     pub additional_dirs: Vec<PathBuf>,
     /// Request-sourced provider env, filtered by `provider_env_denyreason`.
     pub provider_env: Vec<(String, String)>,
@@ -33,6 +35,9 @@ pub struct SpawnConfig {
     /// The effort was set per session, not inherited from the model's profile
     /// default, so a model change must not re-resolve it.
     pub default_effort_explicit: bool,
+    /// `Instance.acp_model_config`, re-asserted through `model_config` options
+    /// after the model and effort on every establish.
+    pub default_model_config: std::collections::BTreeMap<String, String>,
     /// Applied strictly through a `category:"mode"` option on fresh sessions.
     pub default_mode: Option<String>,
     /// `Instance.agent_model`, re-asserted through a `category:"model"` option
@@ -165,7 +170,12 @@ pub(super) fn is_host_only_path_env(key: &str) -> bool {
 /// The adapter's `env_allowlist` (#3238) resolved against the live env, with
 /// denied keys dropped. Shared by all three spawn paths.
 pub(super) fn allowlisted_env_pairs(config: &SpawnConfig) -> Vec<(String, String)> {
-    let Some(allowlist) = config.spec.env_allowlist.as_ref() else {
+    allowlisted_env_pairs_for(config.spec.env_allowlist.as_deref())
+}
+
+/// [`allowlisted_env_pairs`] for the allowlist of an adapter spec.
+pub(super) fn allowlisted_env_pairs_for(allowlist: Option<&[String]>) -> Vec<(String, String)> {
+    let Some(allowlist) = allowlist else {
         return Vec::new();
     };
     let mut pairs = Vec::new();
@@ -1099,7 +1109,7 @@ mod tests {
                 Event::SessionContextReset { reason } => kinds.push(format!("reset:{reason}")),
                 Event::RateLimit { info } => kinds.push(format!("rate_limit:{}", info.kind)),
                 Event::Stopped { reason } => kinds.push(format!("stopped:{reason}")),
-                Event::AgentStartupError { message } => {
+                Event::AgentStartupError { message, .. } => {
                     panic!("recoverable failure surfaced a startup error: {message}")
                 }
                 _ => {}

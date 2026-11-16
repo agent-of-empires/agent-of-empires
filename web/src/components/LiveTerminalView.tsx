@@ -11,11 +11,11 @@ import { ArrowJoystick } from "./ArrowJoystick";
 import { useWebSettings } from "../hooks/useWebSettings";
 import { invalidateRetainedImeContext } from "../lib/mobileKeyboardProxy";
 import { TerminalConnectionBanners } from "./TerminalConnectionBanners";
+import { SessionErrorPanel } from "./SessionErrorPanel";
 import { ensureSession, ensureTerminal, isStartRefusal, pasteImage } from "../lib/api";
 import { armClipboardWrite, writeClipboard } from "../lib/clipboard";
 import type { ArmedClipboardWrite } from "../lib/clipboard";
 import type { SessionResponse } from "../lib/types";
-import { reportError } from "../lib/toastBus";
 import {
   FOCUS_TERMINAL_EVENT,
   consumePendingTerminalFocus,
@@ -25,7 +25,8 @@ import {
 } from "../lib/terminalFocus";
 import { safeGetItem, safeRemoveItem, safeSetItem } from "../lib/safeStorage";
 import { isSessionActive } from "../lib/session";
-import { StrokeIcon } from "./icons";
+import { publishLivePane } from "../lib/liveControl";
+import { LiveControlStrip } from "./LiveControlStrip";
 
 interface Props {
   readOnly: boolean;
@@ -37,6 +38,13 @@ interface Props {
    *  Ignored for the agent surface; 0 is the primary paired shell. */
   terminalIndex?: number;
 }
+
+/** How long a blocked key's "Not sent" text holds; each further blocked key restarts it. */
+export const BLOCKED_HOLD_MS = 2000;
+/** Past the fit's resize debounce: a view that reports no new grid by then claims with its last one. */
+const CLAIM_FIT_DEADLINE_MS = 1000;
+/** A claim the Daemon doesn't grant by then brings the strip back. */
+const CLAIMING_TIMEOUT_MS = 5000;
 
 const SURFACES = {
   agent: { wsPath: "live-ws", focusTarget: "agent" as const, dataTerm: "agent" },
@@ -65,6 +73,15 @@ export function LiveTerminalView({ session, readOnly, active = true, surface = "
   const [ensureError, setEnsureError] = useState<string | null>(null);
   // An archived or trashed session stays refused until unarchived or restored, so Retry is pointless.
   const [ensureRetryable, setEnsureRetryable] = useState(true);
+  // A launch (a Restart's included) holds the lifecycle reservation while the row reads Starting, and refuses an
+  // ensure sent meanwhile; that ensure is sent again once the Session leaves Starting.
+  const [ensureAfterStart, setEnsureAfterStart] = useState(false);
+  // An Error Session isn't started on open, which would clear the error it reports (#5055); Restart starts it.
+  const errored = surface === "agent" && session.status === "Error";
+  // One deleted from the panel keeps it, without Restart.
+  const [wasErrored, setWasErrored] = useState(errored);
+  if (errored !== wasErrored && (errored || session.status !== "Deleting")) setWasErrored(errored);
+  const errorHeld = errored || (wasErrored && session.status === "Deleting");
   const clipboardArmRef = useRef<ArmedClipboardWrite | null>(null);
   const receiveAgentClipboard = useCallback((text: string) => {
     const armed = clipboardArmRef.current;
@@ -95,9 +112,19 @@ export function LiveTerminalView({ session, readOnly, active = true, surface = "
     if (safeGetItem(pipeNoticeKey) !== null) safeRemoveItem(pipeNoticeKey);
     if (pipeNoticeDismissed) setPipeNoticeDismissed(false);
   }, [pipeNoticeDismissed, pipeNoticeKey]);
+  const stripCollapseKey = `aoe-live-control-strip-collapsed:${session.id}:${surface}:${terminalIndex}`;
+  const [stripCollapsed, setStripCollapsed] = useState(() => safeGetItem(stripCollapseKey) !== null);
+  const collapseStrip = useCallback(() => {
+    safeSetItem(stripCollapseKey, "1");
+    setStripCollapsed(true);
+  }, [stripCollapseKey]);
+  const expandStrip = useCallback(() => {
+    safeRemoveItem(stripCollapseKey);
+    setStripCollapsed(false);
+  }, [stripCollapseKey]);
   // Read-only live routes observe existing panes; their backend fences forbid creation, claims and resizing.
   const live = useLiveTerminal(
-    readOnly || ensureState === "ready" ? session.id : null,
+    !errorHeld && (readOnly || ensureState === "ready") ? session.id : null,
     readOnly,
     wsPath,
     receiveAgentClipboard,
@@ -108,11 +135,17 @@ export function LiveTerminalView({ session, readOnly, active = true, surface = "
   const inputRef = useRef<HTMLTextAreaElement | null>(null);
   const { keyboardHeight, keyboardOpen } = useMobileKeyboard(inputRef);
   const [inputFocused, setInputFocused] = useState(false);
-  const policyRef = useRef({ readOnly, sessionId: session.id, surface, terminalIndex });
+  // A new policy object revokes write admission, so only these fences replace it.
+  const policyRef = useRef({ readOnly, errorHeld, sessionId: session.id, surface, terminalIndex });
   useLayoutEffect(() => {
-    policyRef.current = { readOnly, sessionId: session.id, surface, terminalIndex };
+    policyRef.current = { readOnly, errorHeld, sessionId: session.id, surface, terminalIndex };
     if (readOnly) inputRef.current?.blur();
-  }, [readOnly, session.id, surface, terminalIndex]);
+  }, [readOnly, errorHeld, session.id, surface, terminalIndex]);
+  const awaitingStart = ensureAfterStart && session.status === "Starting";
+  const startRef = useRef({ status: session.status, awaitingStart });
+  useLayoutEffect(() => {
+    startRef.current = { status: session.status, awaitingStart };
+  }, [session.status, awaitingStart]);
   useLayoutEffect(
     () => () => {
       policyRef.current.readOnly = true;
@@ -128,43 +161,127 @@ export function LiveTerminalView({ session, readOnly, active = true, surface = "
   const [composeOpen, setComposeOpen] = useState(false);
 
   const notOwner = live.state.ownerKnown && !live.state.isOwner;
-  const lastUndeliveredToastRef = useRef(0);
-  // Throttled, so a held repeat key does not stack toasts.
-  const reportUndelivered = useCallback(() => {
-    const now = Date.now();
-    if (now - lastUndeliveredToastRef.current < 2000) return;
-    lastUndeliveredToastRef.current = now;
-    reportError(
+  const viewOnly = !readOnly && live.state.connected && notOwner;
+  // Take control hides the strip first, so the claim resizes the pane once, to the grid without it.
+  const { claimAfterResize } = live;
+  const [claiming, setClaiming] = useState(false);
+  if (claiming && (live.state.isOwner || !live.state.connected)) setClaiming(false);
+  const claimingTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  useEffect(
+    () => () => {
+      if (claimingTimerRef.current) clearTimeout(claimingTimerRef.current);
+    },
+    [],
+  );
+  const takeControlRef = useRef<HTMLButtonElement | null>(null);
+  // Where the Tab escape took focus from: the terminal's input or App's keyboard proxy.
+  const escapeOriginRef = useRef<HTMLElement | null>(null);
+  const takeControl = useCallback(() => {
+    // The strip unmounts once claiming, so focus goes back to where it was; a touch tap restores nothing, so no
+    // soft keyboard opens.
+    if (document.activeElement === takeControlRef.current) {
+      const origin = escapeOriginRef.current?.isConnected ? escapeOriginRef.current : null;
+      (origin ?? (coarse ? null : inputRef.current))?.focus();
+    }
+    escapeOriginRef.current = null;
+    setClaiming(true);
+    claimAfterResize(CLAIM_FIT_DEADLINE_MS);
+    if (claimingTimerRef.current) clearTimeout(claimingTimerRef.current);
+    claimingTimerRef.current = setTimeout(() => setClaiming(false), CLAIMING_TIMEOUT_MS);
+  }, [claimAfterResize, coarse]);
+  const [blockedHold, setBlockedHold] = useState<string | null>(null);
+  const holdTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  useEffect(
+    () => () => {
+      if (holdTimerRef.current) clearTimeout(holdTimerRef.current);
+    },
+    [],
+  );
+  const noteBlocked = useCallback(() => {
+    setBlockedHold(
       readOnly
-        ? "Not sent: this server is read-only."
+        ? "Not sent: this Daemon is read-only."
         : notOwner
-          ? "Not sent: this session is live on another device. Take over first."
+          ? "Not sent. Take control to type."
           : "Not sent: terminal not connected.",
     );
+    if (holdTimerRef.current) clearTimeout(holdTimerRef.current);
+    holdTimerRef.current = setTimeout(() => {
+      holdTimerRef.current = null;
+      setBlockedHold(null);
+    }, BLOCKED_HOLD_MS);
   }, [notOwner, readOnly]);
-  const { sendData, sendPaste, manualReconnect } = live;
+  // Holding control drops the hold at once: no notice may resize a terminal this tab sizes.
+  const holdShown =
+    blockedHold !== null && !claiming && (readOnly || notOwner || !live.state.connected) ? blockedHold : null;
+  const { sendData, sendPaste, manualReconnect, reconnectAndClaim } = live;
   // Automatic redials keep the dismissal; only a reconnect the user asked for brings the notice back.
   const reconnect = useCallback(() => {
     clearPipeNoticeDismissal();
     manualReconnect();
   }, [clearPipeNoticeDismissal, manualReconnect]);
-  // Explicit sends (toolbar, paste, compose) report a drop; typed keys stay quiet.
+  // Explicit sends (toolbar, paste, compose) always report a drop; typed keys only when another window has
+  // control or the Daemon is read-only, not while the connection banner already says why.
   const sendDataOrReport = useCallback(
     (data: string) => {
       const ok = sendData(data);
-      if (!ok) reportUndelivered();
+      if (!ok) noteBlocked();
       return ok;
     },
-    [sendData, reportUndelivered],
+    [sendData, noteBlocked],
   );
   const sendPasteOrReport = useCallback(
     (text: string, submit: boolean) => {
       const ok = sendPaste(text, submit);
-      if (!ok) reportUndelivered();
+      if (!ok) noteBlocked();
       return ok;
     },
-    [sendPaste, reportUndelivered],
+    [sendPaste, noteBlocked],
   );
+  const sendTyped = useCallback(
+    (data: string) => {
+      const ok = sendData(data);
+      if (!ok && (notOwner || readOnly)) noteBlocked();
+      return ok;
+    },
+    [sendData, noteBlocked, notOwner, readOnly],
+  );
+  // While view only the terminal sends no keys, so during a hold Tab can reach Take control.
+  const escapeTabToTakeControl = useCallback(() => {
+    if (!viewOnly || holdShown === null || !takeControlRef.current) return false;
+    escapeOriginRef.current = document.activeElement instanceof HTMLElement ? document.activeElement : null;
+    takeControlRef.current.focus();
+    return true;
+  }, [viewOnly, holdShown]);
+  const slowWhileOwner =
+    !readOnly && live.state.connected && live.state.isOwner && live.state.transportReason === "pipe_owned";
+  const reconnectClaiming = useCallback(() => {
+    clearPipeNoticeDismissal();
+    reconnectAndClaim();
+  }, [clearPipeNoticeDismissal, reconnectAndClaim]);
+  useEffect(() => {
+    const key = `${session.id}:${surface}:${terminalIndex}`;
+    publishLivePane(key, {
+      sessionId: session.id,
+      surface,
+      terminalIndex,
+      viewOnly,
+      claim: takeControl,
+      slow:
+        slowWhileOwner && !pipeNoticeDismissed ? { reconnect: reconnectClaiming, dismiss: dismissPipeNotice } : null,
+    });
+    return () => publishLivePane(key, null);
+  }, [
+    session.id,
+    surface,
+    terminalIndex,
+    viewOnly,
+    takeControl,
+    slowWhileOwner,
+    pipeNoticeDismissed,
+    reconnectClaiming,
+    dismissPipeNotice,
+  ]);
   // Out of band like the toolbar keys, so the retained IME syllable stops shadowing the line.
   const sendArrow = useCallback(
     (sequence: string) => {
@@ -248,10 +365,12 @@ export function LiveTerminalView({ session, readOnly, active = true, surface = "
     ensureRequestRef.current = controller;
     setEnsureError(null);
     setEnsureState("pending");
+    setEnsureAfterStart(false);
+    const sentWhileStarting = startRef.current.status === "Starting";
     const ensure =
       surface === "agent"
         ? ensureSession(session.id, controller.signal)
-        : ensureTerminal(session.id, terminalIndex, surface === "paired-container");
+        : ensureTerminal(session.id, terminalIndex, surface === "paired-container", controller.signal);
     ensure
       .then((res) => {
         if (controller.signal.aborted) return;
@@ -259,6 +378,8 @@ export function LiveTerminalView({ session, readOnly, active = true, surface = "
           lastEnsuredSessionIdRef.current = session.id;
           setEnsureWarning(res.message ?? null);
           setEnsureState("ready");
+        } else if (res.error === "lifecycle_busy" && sentWhileStarting) {
+          setEnsureAfterStart(true);
         } else {
           setEnsureState("error");
           setEnsureError(res.message ?? "Could not start session.");
@@ -274,13 +395,24 @@ export function LiveTerminalView({ session, readOnly, active = true, surface = "
   const shelved = !!session.archived_at || !!session.trashed_at;
   useEffect(() => {
     const policy = policyRef.current;
-    if (policy.readOnly) return;
+    if (policy.readOnly || policy.errorHeld || startRef.current.awaitingStart) return;
     if (lastEnsuredSessionIdRef.current === policy.sessionId) {
       if (consumePendingTerminalFocus(focusTarget, focusIndex)) focusSelf();
       return;
     }
     retryEnsure();
-  }, [session.id, shelved, readOnly, focusSelf, focusTarget, focusIndex, retryEnsure]);
+  }, [
+    session.id,
+    shelved,
+    readOnly,
+    errorHeld,
+    ensureAfterStart,
+    awaitingStart,
+    focusSelf,
+    focusTarget,
+    focusIndex,
+    retryEnsure,
+  ]);
 
   // Drain a pending focus latch once the pane is mounted.
   useEffect(() => {
@@ -333,6 +465,8 @@ export function LiveTerminalView({ session, readOnly, active = true, surface = "
     if (inputFocused) ta.blur();
     else ta.focus();
   }, [inputFocused]);
+
+  if (errorHeld) return <SessionErrorPanel session={session} readOnly={readOnly} />;
 
   if (!readOnly && ensureState === "pending") {
     return (
@@ -400,49 +534,6 @@ export function LiveTerminalView({ session, readOnly, active = true, surface = "
         </div>
       )}
 
-      {!readOnly && live.state.connected && live.state.ownerKnown && !live.state.isOwner && (
-        <div className="absolute left-0 right-0 top-3 flex justify-center z-20 px-3">
-          <button
-            type="button"
-            onClick={live.claim}
-            data-live-takeover
-            className="flex items-center gap-1.5 text-xs font-semibold text-white bg-brand-600 hover:bg-brand-500 active:bg-brand-700 border border-brand-400/50 rounded-full px-4 py-2 shadow-lg cursor-pointer animate-fade-in"
-          >
-            <StrokeIcon size={13} strokeWidth="2.5" hidden>
-              <path d="M9 18l6-6-6-6" />
-            </StrokeIcon>
-            Live on another device. Take over
-          </button>
-        </div>
-      )}
-
-      {live.state.connected && live.state.transportReason === "pipe_owned" && !pipeNoticeDismissed && (
-        <div
-          data-live-pipe-notice
-          className={`absolute left-0 right-0 ${ensureWarning ? "top-24" : "top-14"} z-20 flex justify-center px-3 pointer-events-none`}
-        >
-          <div className="pointer-events-auto flex items-center gap-1 text-xs text-text-muted bg-surface-900/90 border border-surface-700/60 rounded-lg pl-3 pr-1 max-w-md">
-            <span className="py-1 break-words">Slower updates: another client is rendering this pane.</span>
-            <button
-              type="button"
-              onClick={reconnect}
-              aria-label="Retry faster updates"
-              className="h-8 shrink-0 px-2 rounded-md text-brand-500 hover:text-brand-400 cursor-pointer underline"
-            >
-              Retry
-            </button>
-            <button
-              type="button"
-              onClick={dismissPipeNotice}
-              aria-label="Dismiss slower updates notice"
-              className="h-8 w-8 shrink-0 rounded-md text-text-muted hover:text-text-primary cursor-pointer text-base leading-none"
-            >
-              &times;
-            </button>
-          </div>
-        </div>
-      )}
-
       <div
         className="flex-1 overflow-hidden bg-[var(--term-bg)] relative"
         // Click-to-type, like every terminal.
@@ -467,10 +558,11 @@ export function LiveTerminalView({ session, readOnly, active = true, surface = "
           setCadence={live.setCadence}
           enterReading={live.enterReading}
           returnToLive={live.returnToLive}
-          sendData={live.sendData}
+          sendData={sendTyped}
           sendPaste={sendPasteOrReport}
           uploadPastedImage={uploadPastedImage}
           captureWriteAdmission={captureWriteAdmission}
+          onTabEscape={escapeTabToTakeControl}
           forwardWheel={live.forwardWheel}
           forwardButton={live.forwardButton}
           ctrlActiveRef={ctrlActiveRef}
@@ -487,6 +579,18 @@ export function LiveTerminalView({ session, readOnly, active = true, surface = "
           <ArrowJoystick onArrow={sendArrow} />
         )}
       </div>
+
+      <LiveControlStrip
+        mode={readOnly ? "read-only" : viewOnly && !claiming ? "view-only" : null}
+        hold={holdShown}
+        ownerKind={live.state.ownerKind}
+        lag={live.state.transportReason === "pipe_owned"}
+        collapsed={stripCollapsed}
+        onTakeControl={takeControl}
+        onCollapse={collapseStrip}
+        onExpand={expandStrip}
+        takeControlRef={takeControlRef}
+      />
 
       {!readOnly && coarse && live.state.connected && (
         <MobileTerminalToolbar

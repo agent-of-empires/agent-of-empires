@@ -904,6 +904,7 @@ mod tests {
             tool_call_id: Some("toolu_1".into()),
             description: String::new(),
             workflow: None,
+            started_at: None,
         };
         state.apply_event(1, started).unwrap();
 
@@ -935,6 +936,7 @@ mod tests {
                 tool_call_id: Some("toolu_1".into()),
                 description: String::new(),
                 workflow: None,
+                started_at: None,
             };
             state.apply_event(seq, started).unwrap();
         }
@@ -1268,6 +1270,7 @@ mod tests {
             tool_call_id: Some(tool_call_id.into()),
             description: "sleep".into(),
             workflow: None,
+            started_at: None,
         };
         let old = old_tailer.spawn(Some(started("toolu_old"))).await.unwrap();
         assert!(matches!(

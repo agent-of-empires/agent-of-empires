@@ -143,7 +143,7 @@ function Disclosure({ label, children }: { label: string; children: ReactNode })
   );
 }
 
-function CopyCommand({ command }: { command: string }) {
+export function CopyCommand({ command }: { command: string }) {
   const [feedback, setFeedback] = useState<"copied" | "failed" | null>(null);
   const codeRef = useRef<HTMLElement>(null);
   const copy = async () => {
@@ -167,7 +167,7 @@ function CopyCommand({ command }: { command: string }) {
       <button type="button" onClick={() => void copy()} className={linkButton} aria-label={`Copy ${command}`}>
         Copy
       </button>
-      {/* Inside the banner's live region, so it is announced without a nested one. */}
+      {/* Callers put it inside a live region, so this is announced without a nested one. */}
       <span>
         {feedback === "copied" ? "Copied" : feedback === "failed" ? "Couldn't copy. Select and copy it." : ""}
       </span>

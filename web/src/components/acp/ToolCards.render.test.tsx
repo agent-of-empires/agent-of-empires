@@ -28,6 +28,7 @@ import {
   emptyAcpState,
   type ActivityRow,
   type BackgroundAgent,
+  type SubagentRecord,
   type ToolCall,
   type ToolOutputBlock,
 } from "../../lib/acpTypes";
@@ -173,14 +174,6 @@ describe("ToolCard headers", () => {
       "subagent child",
       makeToolCall({ kind: "read", args_preview: args({ path: "child.ts", _aoe_parent_tool_call_id: "p" }) }),
       undefined,
-      {},
-      ["subagent", "child.ts"],
-      [],
-    ],
-    [
-      "nested subagent child",
-      makeToolCall({ kind: "read", args_preview: args({ path: "child.ts", _aoe_parent_tool_call_id: "p" }) }),
-      undefined,
       { nested: true },
       ["child.ts"],
       ["subagent"],
@@ -258,11 +251,43 @@ describe("ToolCard headers", () => {
       [],
     ],
     ["task stop", fixtures.taskStop, undefined, { toolKey: "claude" }, ["task stop", "task-abc123"], []],
+    [
+      "send message",
+      fixtures.sendMessage,
+      undefined,
+      { toolKey: "claude" },
+      ["send message", "ace246fde7e3ac073", "Fix graph diff bug"],
+      ["Follow-up fix details"],
+    ],
     ["empty tool search", makeToolCall({ name: "ToolSearch" }), undefined, { toolKey: "claude" }, ["search tools"], []],
     ["empty monitor", makeToolCall({ name: "Monitor" }), undefined, { toolKey: "claude" }, ["background watch"], []],
     ["empty task stop", makeToolCall({ name: "TaskStop" }), undefined, { toolKey: "claude" }, ["stop task"], []],
+    [
+      "empty send message",
+      makeToolCall({ name: "SendMessage" }),
+      undefined,
+      { toolKey: "claude" },
+      ["send message", "agent"],
+      [],
+    ],
+    [
+      "send message error",
+      fixtures.sendMessage,
+      makeError({ text: "agent not found" }),
+      { toolKey: "claude" },
+      ["send message", "tool failed", "agent not found"],
+      [],
+    ],
     // Harness names are Claude-only; a coincidental Monitor elsewhere is generic.
     ["codex Monitor", fixtures.monitor, undefined, { toolKey: "codex" }, ["Monitor"], ["errors in deploy.log"]],
+    [
+      "codex SendMessage",
+      fixtures.sendMessage,
+      undefined,
+      { toolKey: "codex" },
+      ["SendMessage"],
+      ["Fix graph diff bug"],
+    ],
   ])("%s", (_label, tool, result, opts, contains, excludes) => {
     const { text } = renderCard(tool, result, opts);
     for (const s of contains) expect(text()).toContain(s);
@@ -303,6 +328,20 @@ describe("ToolCard expanded bodies", () => {
       makeCompletion({ text: "build ok" }),
       { toolKey: "claude" },
       ["1m 30s", "npm run build", "build ok"],
+      [],
+    ],
+    [
+      "send message input and result",
+      fixtures.sendMessage,
+      makeCompletion({ text: '{"success":true,"resumedAgentId":"ace246fde7e3ac073"}' }),
+      { toolKey: "claude" },
+      [
+        "send message",
+        '"to": "ace246fde7e3ac073"',
+        '"summary": "Fix graph diff bug"',
+        "Follow-up fix details",
+        "resumedAgentId",
+      ],
       [],
     ],
     [
@@ -744,9 +783,65 @@ describe("SubagentCard", () => {
     const { container, getByRole } = render(<SubagentCard tool={tool} result={makeCompletion()} children={children} />);
     expect(container.textContent).toContain("subagent");
     expect(container.textContent).toContain("investigate bug");
-    expect(container.textContent).toContain("1 tool");
-    fireEvent.click(getByRole("button"));
+    fireEvent.click(getByRole("button", { name: /investigate bug/ }));
+    // A done agent keeps Activity to its summary row until opened.
+    expect(container.textContent).toContain("1 call");
+    expect(container.textContent).not.toContain("x.ts");
+    fireEvent.click(getByRole("button", { name: "Activity" }));
     expect(container.textContent).toContain("x.ts");
+  });
+
+  it("shows the roster title and its settled status for the matching tool call", () => {
+    const tool = makeToolCall({ id: "task-1", name: "Task", args_preview: args({ description: "investigate bug" }) });
+    const subagents: SubagentRecord[] = [
+      {
+        session_id: "child-1",
+        parent_session_id: "s",
+        parent_tool_call_id: "task-1",
+        title: "Auth audit",
+        state: "idle",
+        stop_reason: "end_turn",
+        cancel_capable: false,
+      },
+    ];
+    const { container } = render(
+      <BackgroundAgentsContext.Provider value={{ agents: [], subagents }}>
+        <SubagentCard tool={tool} result={makeCompletion()} children={[]} />
+      </BackgroundAgentsContext.Provider>,
+    );
+    expect(container.textContent).toContain("Auth audit");
+    expect(container.textContent).not.toContain("investigate bug");
+    expect(container.textContent).toContain("done");
+    expect(container.textContent).not.toContain("idle");
+  });
+
+  it.each([
+    ["running", undefined, "running"],
+    ["requires_action", undefined, "Waiting on you"],
+    ["idle", "end_turn", "done"],
+    ["idle", undefined, "done"],
+    ["idle", "cancelled", "stopped"],
+    ["idle", "error", "failed"],
+    ["unknown", undefined, "running"],
+  ])("shows the %s state (stop reason %s) as %j", (state, stop_reason, word) => {
+    const tool = makeToolCall({ id: "task-1", name: "Task", args_preview: args({ description: "d" }) });
+    const subagents = [
+      {
+        session_id: "child-1",
+        parent_session_id: "s",
+        parent_tool_call_id: "task-1",
+        state,
+        stop_reason,
+        cancel_capable: false,
+      },
+    ] as SubagentRecord[];
+    const { container } = render(
+      <BackgroundAgentsContext.Provider value={{ agents: [], subagents }}>
+        <SubagentCard tool={tool} children={[]} />
+      </BackgroundAgentsContext.Provider>,
+    );
+    expect(container.textContent).toContain(`d ${word}`);
+    expect(container.textContent).not.toContain("idle");
   });
 
   it("renders an off-protocol launch with its prompt and unwrapped report", () => {
@@ -760,7 +855,7 @@ describe("SubagentCard", () => {
     const { container, getByRole } = render(<SubagentCard tool={tool} result={result} children={[]} />);
     expect(container.textContent).toContain("Trace clear session resets");
     expect(container.textContent).not.toContain("0 tools");
-    fireEvent.click(getByRole("button"));
+    fireEvent.click(getByRole("button", { name: /Trace clear session resets/ }));
     expect(container.textContent).toContain("Research only, do not edit files.");
     expect(container.textContent).toContain("No files edited. Conclusion: safe.");
     expect(container.textContent).not.toContain("task_result");
@@ -777,6 +872,119 @@ describe("SubagentCard", () => {
   });
 });
 
+describe("delegation card from the session identity", () => {
+  // The adapter hides the Agent call: the card is the delegation message id and
+  // no background-agent record exists.
+  const card = makeToolCall({
+    id: "msg-1",
+    name: "Explore repo",
+    kind: "think",
+    args_preview: args({ description: "Explore repo", prompt: "find the bug" }),
+  });
+  const child: SubagentRecord = {
+    session_id: "child-1",
+    parent_session_id: "root",
+    parent_tool_call_id: "msg-1",
+    title: "Explore repo",
+    state: "running",
+    cancel_capable: true,
+  };
+  const view = (
+    record: SubagentRecord,
+    result?: ActivityRow,
+    cancelSubagent = vi.fn().mockResolvedValue(undefined),
+  ) => (
+    <BackgroundAgentsContext.Provider value={{ agents: [], subagents: [record], cancelSubagent }}>
+      {wrap(<ToolCard tool={card} result={result} />)}
+    </BackgroundAgentsContext.Provider>
+  );
+
+  it("has one Stop, which confirms and then cancels the child by session id", () => {
+    const cancelSubagent = vi.fn().mockResolvedValue(undefined);
+    const { container, getAllByRole, getByRole } = render(
+      view({ ...child, background: true }, undefined, cancelSubagent),
+    );
+    expect(container.textContent).toContain("Explore repo");
+    expect(getAllByRole("button", { name: "Stop" })).toHaveLength(1);
+    fireEvent.click(getByRole("button", { name: "Stop" }));
+    expect(cancelSubagent).not.toHaveBeenCalled();
+    fireEvent.click(getByRole("button", { name: "Stop sub-agent" }));
+    expect(cancelSubagent).toHaveBeenCalledWith("child-1");
+  });
+
+  it("offers no Stop when the child cannot be cancelled, or the session is read-only", () => {
+    const { queryByRole } = render(view({ ...child, cancel_capable: false }));
+    expect(queryByRole("button", { name: "Stop" })).toBeNull();
+    const readOnly = render(
+      <BackgroundAgentsContext.Provider
+        value={{ agents: [], subagents: [child], cancelSubagent: vi.fn(), readOnly: true }}
+      >
+        {wrap(<ToolCard tool={card} />)}
+      </BackgroundAgentsContext.Provider>,
+    );
+    expect(readOnly.queryByRole("button", { name: "Stop" })).toBeNull();
+  });
+
+  it.each([
+    ["end_turn", "done"],
+    ["error", "failed"],
+    ["cancelled", "stopped"],
+  ])("stops looking active once the child is idle with no reply (%s)", (stop_reason, word) => {
+    const { container, queryByRole } = render(view({ ...child, state: "idle", stop_reason }));
+    expect(container.textContent).toContain(`Explore repo ${word}`);
+    expect(container.textContent).not.toMatch(/running|idle/);
+    expect(queryByRole("button", { name: "Stop" })).toBeNull();
+  });
+
+  it("shows a failed child's error text", () => {
+    const { container, getByRole } = render(
+      view({ ...child, state: "idle", stop_reason: "error", error: "Authentication required" }),
+    );
+    fireEvent.click(getByRole("button", { name: /Explore repo/ }));
+    expect(container.textContent).toContain("Authentication required");
+  });
+
+  it("ends a foreground card the turn end stopped, with its stop time", () => {
+    const stopped = makeStopped({ toolCallId: "msg-1" });
+    const { container, getByRole } = render(view(child, stopped));
+    expect(container.textContent).toContain("Explore repo stopped");
+    expect(container.querySelector(".animate-pulse")).toBeNull();
+    fireEvent.click(getByRole("button", { name: /Explore repo/ }));
+    expect(container.textContent).toContain("Stopped before it reported.");
+    expect(container.textContent).not.toContain("Finished without");
+  });
+
+  it("keeps a background card running when the turn end stopped its launch call", () => {
+    const stopped = makeStopped({ toolCallId: "msg-1" });
+    const { container } = render(view({ ...child, background: true }, stopped));
+    expect(container.textContent).toContain("running");
+    expect(container.textContent).not.toMatch(/done|stopped/);
+    expect(container.querySelector(".animate-pulse")).not.toBeNull();
+    // A child whose state the agent cannot report never resolves, so the stop ends it.
+    const unknown = render(view({ ...child, background: true, state: "unknown" }, stopped));
+    expect(unknown.container.textContent).toContain("Explore repo stopped");
+  });
+
+  it.each([
+    ["end_turn", "done"],
+    ["cancelled", "stopped"],
+  ])("settles a background card from the record, with no duration (%s)", (stop_reason, word) => {
+    const stopped = makeStopped({ toolCallId: "msg-1" });
+    const { container } = render(view({ ...child, background: true, state: "idle", stop_reason }, stopped));
+    expect(container.textContent).toContain(`Explore repo ${word}`);
+    expect(container.textContent).not.toMatch(/\d+(ms|s)\b/);
+  });
+
+  it("keeps the reply as the card's report", () => {
+    const { container, getByRole } = render(
+      view({ ...child, state: "idle" }, makeCompletion({ toolCallId: "msg-1", text: "the answer" })),
+    );
+    fireEvent.click(getByRole("button", { name: /Explore repo/ }));
+    expect(container.textContent).toContain("find the bug");
+    expect(container.textContent).toContain("the answer");
+  });
+});
+
 describe("AsyncSubagentCard", () => {
   const tool = makeToolCall({
     id: "task-async",
@@ -787,7 +995,8 @@ describe("AsyncSubagentCard", () => {
   it("is a neutral background card before any tailer event, never leaking the launch marker", () => {
     const { container } = render(<AsyncSubagentCard tool={tool} />);
     expect(container.textContent).toContain("Map backend lifecycle");
-    expect(container.textContent).toContain("runs in background");
+    expect(container.textContent).toContain("background");
+    expect(container.textContent).toContain("running");
     expect(container.textContent).not.toMatch(/agentId|Async agent launched|internal ID/);
   });
 
@@ -801,8 +1010,8 @@ describe("AsyncSubagentCard", () => {
       status: "running",
       startedAt: new Date().toISOString(),
       endedAt: null,
-      toolCount: 3,
-      tools: [],
+      toolCount: 1,
+      tools: [{ name: "Read", title: "a.ts", ok: true }],
       lastTool: "Read",
       lastText: "scanning files",
       result: null,
@@ -813,19 +1022,144 @@ describe("AsyncSubagentCard", () => {
         <AsyncSubagentCard tool={tool} />
       </BackgroundAgentsContext.Provider>,
     );
-    expect(container.textContent).toContain("3 tools · Read");
+    expect(container.textContent).toContain("Read a.ts");
     expect(container.textContent).not.toContain("agentId");
   });
 
-  it("opens the Sub agents pane on click", () => {
+  it("shows Stop only for a cancel-capable active subagent, without opening the pane", () => {
+    const openPane = vi.fn();
+    const cancelSubagent = vi.fn().mockResolvedValue(undefined);
+    const agent: BackgroundAgent = {
+      agentId: "a1",
+      toolCallId: "task-async",
+      description: "d",
+      prompt: "",
+      model: "",
+      status: "running",
+      startedAt: new Date().toISOString(),
+      endedAt: null,
+      toolCount: 0,
+      tools: [],
+      lastTool: null,
+      lastText: null,
+      result: null,
+      warning: null,
+    };
+    const record: SubagentRecord = {
+      session_id: "child-1",
+      parent_session_id: "s",
+      parent_tool_call_id: "task-async",
+      state: "running",
+      cancel_capable: true,
+    };
+    const view = (a: BackgroundAgent, r: SubagentRecord) => (
+      <BackgroundAgentsContext.Provider value={{ agents: [a], subagents: [r], cancelSubagent, openPane }}>
+        <AsyncSubagentCard tool={tool} />
+      </BackgroundAgentsContext.Provider>
+    );
+    const { getAllByRole, getByRole, queryByRole, rerender } = render(view(agent, record));
+    expect(getAllByRole("button", { name: "Stop" })).toHaveLength(1);
+    fireEvent.click(getByRole("button", { name: "Stop" }));
+    fireEvent.click(getByRole("button", { name: "Stop sub-agent" }));
+    expect(cancelSubagent).toHaveBeenCalledWith("child-1");
+    expect(openPane).not.toHaveBeenCalled();
+    rerender(view({ ...agent, status: "completed", endedAt: agent.startedAt }, record));
+    expect(queryByRole("button", { name: "Stop" })).toBeNull();
+  });
+
+  it("settles from the roster before any background-agent record", () => {
+    const record: SubagentRecord = {
+      session_id: "child-1",
+      parent_session_id: "s",
+      parent_tool_call_id: "task-async",
+      state: "idle",
+      stop_reason: "cancelled",
+      cancel_capable: true,
+    };
+    const { container } = render(
+      <BackgroundAgentsContext.Provider value={{ agents: [], subagents: [record] }}>
+        <AsyncSubagentCard tool={tool} />
+      </BackgroundAgentsContext.Provider>,
+    );
+    expect(container.textContent).toContain("Map backend lifecycle stopped");
+    expect(container.textContent).not.toContain("running");
+  });
+
+  it("labels a requires_action agent as waiting on the user", () => {
+    const agent = {
+      agentId: "a1",
+      toolCallId: "task-async",
+      status: "requires_action",
+      startedAt: new Date().toISOString(),
+      endedAt: null,
+      toolCount: 0,
+      tools: [],
+    } as unknown as BackgroundAgent;
+    const { container } = render(
+      <BackgroundAgentsContext.Provider value={{ agents: [agent] }}>
+        <AsyncSubagentCard tool={tool} />
+      </BackgroundAgentsContext.Provider>,
+    );
+    expect(container.textContent).toContain("Waiting on you");
+  });
+
+  it("opens the Background pane on click", () => {
     const openPane = vi.fn();
     const { getByRole } = render(
       <BackgroundAgentsContext.Provider value={{ agents: [], openPane }}>
         <AsyncSubagentCard tool={tool} />
       </BackgroundAgentsContext.Provider>,
     );
-    fireEvent.click(getByRole("button"));
+    fireEvent.click(getByRole("button", { name: "Open in side pane" }));
     expect(openPane).toHaveBeenCalledTimes(1);
+  });
+});
+
+describe("SubagentCard reading", () => {
+  const manyCalls = (n: number, errorAt: number[]) =>
+    Array.from({ length: n }, (_, i) => ({
+      tool: makeToolCall({
+        id: `c${i}`,
+        kind: i % 2 ? "read" : "execute",
+        args_preview: args({ path: `f${i}.ts` }),
+      }),
+      result: errorAt.includes(i) ? makeError() : makeCompletion(),
+    }));
+
+  it("shows the whole prompt and report unclipped, each with a copy button", () => {
+    const prompt = Array.from({ length: 30 }, (_, i) => `prompt line ${i}`).join("\n\n");
+    const report = Array.from({ length: 30 }, (_, i) => `report line ${i}`).join("\n\n");
+    const tool = makeToolCall({ id: "t", name: "Task", args_preview: args({ description: "long", prompt }) });
+    const { container, getByRole } = render(
+      <SubagentCard tool={tool} result={makeCompletion({ text: report })} children={[]} />,
+    );
+    fireEvent.click(getByRole("button", { name: /long/ }));
+    expect(container.textContent).toContain("Input");
+    expect(container.textContent).toContain("Output");
+    // 59 lines: the first 40 show, the rest a step away, and the cut says how much is hidden.
+    expect(container.textContent).toContain("report line 10");
+    expect(container.textContent).not.toContain("report line 29");
+    fireEvent.click(getByRole("button", { name: /Show 19 more lines, 19 remaining/ }));
+    expect(container.textContent).toContain("report line 29");
+    fireEvent.click(getByRole("button", { name: /Show full prompt/ }));
+    expect(container.textContent).toContain("prompt line 29");
+    expect(getByRole("button", { name: "Copy prompt" })).toBeTruthy();
+    expect(getByRole("button", { name: "Copy report" })).toBeTruthy();
+  });
+
+  it("folds 54 calls but keeps both errors as rows, each fold saying no errors", () => {
+    const tool = makeToolCall({ id: "t", name: "Task", args_preview: args({ description: "big" }) });
+    const { container, getByRole } = render(
+      <SubagentCard tool={tool} result={makeCompletion()} children={manyCalls(54, [20, 40])} />,
+    );
+    fireEvent.click(getByRole("button", { name: /big/ }));
+    fireEvent.click(getByRole("button", { name: "Activity" }));
+    expect(container.querySelectorAll('[data-activity-status="err"]')).toHaveLength(2);
+    expect(container.textContent).toContain("2 errors");
+    const folds = [...container.querySelectorAll("button[aria-expanded]")].filter((b) =>
+      b.textContent?.includes("no errors"),
+    );
+    expect(folds.length).toBeGreaterThanOrEqual(3);
   });
 });
 
@@ -878,7 +1212,7 @@ describe("WorkflowToolCard", () => {
     expect(text()).toContain("Draft1 done");
     expect(text()).toContain("Verify1 running · 0 done");
     expect(text()).toContain("await agent");
-    fireEvent.click(getByText("Open Sub agents"));
+    fireEvent.click(getByText("Open Background"));
     expect(openPane).toHaveBeenCalledTimes(1);
   });
 

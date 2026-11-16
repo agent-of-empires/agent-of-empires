@@ -9,7 +9,7 @@ use super::{
 use crate::acp::approvals::ApprovalDecision;
 use crate::acp::elicitations::ElicitationOutcome;
 use crate::acp::event_store::{AttachmentBlob, UnresolvedBackgroundAgentLaunch};
-use crate::acp::state::{BackgroundAgentStatus, Event};
+use crate::acp::state::{BackgroundAgentStatus, Event, SubagentState};
 
 impl<S: BroadcastSink> Supervisor<S> {
     pub(super) fn publish_next(&self, session_id: &str, event: &Event) -> u64 {
@@ -18,7 +18,7 @@ impl<S: BroadcastSink> Supervisor<S> {
 
     /// Publish an `AgentStartupError` for a session whose worker never came online.
     pub fn publish_startup_error(&self, session_id: &str, message: String) {
-        self.publish_next(session_id, &Event::AgentStartupError { message });
+        self.publish_next(session_id, &Event::startup_error(message));
     }
 
     /// Publish `Stopped { reason }` only if `expected_seq` is still the
@@ -109,7 +109,7 @@ impl<S: BroadcastSink> Supervisor<S> {
     }
 
     pub async fn publish_user_prompt(&self, session_id: &str, text: String) -> PromptDisposition {
-        self.publish_user_prompt_with_attachments(session_id, text, &[], None, false, None)
+        self.publish_user_prompt_with_attachments(session_id, text, &[], Vec::new(), false, None)
             .await
             .disposition
     }
@@ -123,7 +123,7 @@ impl<S: BroadcastSink> Supervisor<S> {
         session_id: &str,
         text: String,
         attachments: &[AttachmentBlob],
-        prompt_id: Option<String>,
+        prompt_ids: Vec<String>,
         synthesized: bool,
         origin_plugin: Option<String>,
     ) -> PublishedPrompt {
@@ -141,6 +141,8 @@ impl<S: BroadcastSink> Supervisor<S> {
             disposition,
             seq: None,
         };
+        // The first id names the transcript row; the rest were folded into it by a queue drain or send-now.
+        let mut prompt_ids = prompt_ids.into_iter();
         let event = Event::UserPromptSent {
             text,
             attachments: attachments
@@ -153,7 +155,8 @@ impl<S: BroadcastSink> Supervisor<S> {
                     size: blob.data.len() as u64,
                 })
                 .collect(),
-            prompt_id,
+            prompt_id: prompt_ids.next(),
+            merged_prompt_ids: prompt_ids.collect(),
             synthesized,
             origin_plugin,
         };
@@ -257,6 +260,9 @@ pub(super) fn detach_orphaned_background_agents_on<S: BroadcastSink>(
             },
         );
     }
+    for event in cancelled_open_subagents(sink, session_id) {
+        publish_next_persisted(sink, next_seqs, session_id, &event);
+    }
     let stale_ids = sink.unresolved_background_agent_ids(session_id);
     if stale_ids.is_empty() {
         return;
@@ -270,6 +276,22 @@ pub(super) fn detach_orphaned_background_agents_on<S: BroadcastSink>(
     for agent_id in stale_ids {
         publish_background_agent_detached(sink, next_seqs, session_id, agent_id, warning);
     }
+}
+
+/// A dead worker's working subagents will never report their idle, so each
+/// closes as cancelled.
+pub(super) fn cancelled_open_subagents<S: BroadcastSink>(sink: &S, session_id: &str) -> Vec<Event> {
+    sink.open_subagents(session_id)
+        .into_iter()
+        .map(|mut subagent| {
+            subagent.state = SubagentState::Idle;
+            subagent.stop_reason = Some("cancelled".into());
+            Event::SubagentUpdated {
+                subagent,
+                at: chrono::Utc::now(),
+            }
+        })
+        .collect()
 }
 
 fn publish_background_agent_detached<S: BroadcastSink>(
@@ -609,7 +631,7 @@ mod tests {
             "s-1",
             "resent after rate limit".into(),
             &[],
-            None,
+            Vec::new(),
             true,
             None,
         )
@@ -628,6 +650,43 @@ mod tests {
         assert_eq!(flags, [false, true]);
     }
 
+    /// A queue drain folds several rows into one turn: the first id names the
+    /// event and the rest ride in `merged_prompt_ids` so a client settles all of them (#5401).
+    #[tokio::test]
+    async fn publish_user_prompt_splits_leading_id_from_merged_ids() {
+        let sink = VecSink::new();
+        let sup = Supervisor::new(sink.clone());
+        for ids in [vec![], vec!["a"], vec!["a", "b", "c"]] {
+            let ids: Vec<String> = ids.into_iter().map(String::from).collect();
+            sup.publish_user_prompt_with_attachments("s-1", "t".into(), &[], ids, false, None)
+                .await;
+        }
+
+        let got: Vec<(Option<String>, Vec<String>)> = sink
+            .frames
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|(_, _, event)| match event {
+                Event::UserPromptSent {
+                    prompt_id,
+                    merged_prompt_ids,
+                    ..
+                } => (prompt_id.clone(), merged_prompt_ids.clone()),
+                other => panic!("unexpected {other:?}"),
+            })
+            .collect();
+        let s = |v: &[&str]| v.iter().map(|x| x.to_string()).collect::<Vec<_>>();
+        assert_eq!(
+            got,
+            [
+                (None, vec![]),
+                (Some("a".into()), vec![]),
+                (Some("a".into()), s(&["b", "c"])),
+            ]
+        );
+    }
+
     /// The published seq is the `UserPromptSent` event's, and there is none when the
     /// event did not reach the store; the text is still routed either way.
     #[tokio::test]
@@ -644,7 +703,14 @@ mod tests {
         let sup = Supervisor::new(sink.clone());
         sup.publish_user_prompt("s-1", "first".into()).await;
         let published = sup
-            .publish_user_prompt_with_attachments("s-1", "second".into(), &[], None, false, None)
+            .publish_user_prompt_with_attachments(
+                "s-1",
+                "second".into(),
+                &[],
+                Vec::new(),
+                false,
+                None,
+            )
             .await;
         let recorded = sink.frames.lock().unwrap().last().unwrap().1;
         assert_eq!(
@@ -657,7 +723,14 @@ mod tests {
 
         let sup = Supervisor::new(std::sync::Arc::new(RefusesToPersist));
         let published = sup
-            .publish_user_prompt_with_attachments("s-1", "lost".into(), &[], None, false, None)
+            .publish_user_prompt_with_attachments(
+                "s-1",
+                "lost".into(),
+                &[],
+                Vec::new(),
+                false,
+                None,
+            )
             .await;
         assert_eq!(
             published,

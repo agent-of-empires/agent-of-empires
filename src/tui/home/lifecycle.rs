@@ -104,7 +104,9 @@ impl HomeView {
             group_by,
             row_tag_mode: resolved.session.row_tag,
             show_activity_age: resolved.session.show_activity_age,
+            show_structured_badge: resolved.session.show_structured_badge,
             sidebar_position: resolved.session.sidebar_position,
+            narrow_layout: resolved.session.narrow_layout,
             agent_clipboard_forward: resolved.tmux.clipboard
                 != crate::session::config::TmuxSettingMode::Disabled,
             hyperlink_cells: crate::tui::hyperlink::SharedHyperlinks::default(),
@@ -156,8 +158,10 @@ impl HomeView {
             context_menu: None,
             group_rename_context: None,
             repo_trust_dialog: None,
+            create_hook_failed: None,
             pending_repo_trust_data: None,
             pending_repo_trust_fingerprint: None,
+            pending_repo_trust_skip_on_create: false,
             hooks_install_dialog: None,
             pending_hooks_install_data: None,
             volume_ignores_glob_dialog: None,
@@ -181,9 +185,12 @@ impl HomeView {
             skills_manager_dialog: None,
             command_palette: None,
             serve_view: None,
+            serve_jobs: super::super::dialogs::ServeJobs::default(),
             connections_view: None,
             pending_dashboard_launch: None,
+            pending_dashboard_stop: None,
             dashboard_launch: None,
+            dashboard_stop: None,
             update_confirm_dialog: None,
             telemetry_consent_dialog: None,
             tips_dialog: None,
@@ -211,6 +218,7 @@ impl HomeView {
             hover_cell: None,
             status_flash: None,
             live_send_ctrl_c_flash_until: None,
+            live_takeover: None,
             sidebar_collapsed: user_config
                 .as_ref()
                 .and_then(|c| c.app_state.home_sidebar_collapsed)

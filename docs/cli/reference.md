@@ -56,6 +56,7 @@ This document contains the help content for the `aoe` command-line program.
 * [`aoe plugin install`↴](#aoe-plugin-install)
 * [`aoe plugin update`↴](#aoe-plugin-update)
 * [`aoe plugin uninstall`↴](#aoe-plugin-uninstall)
+* [`aoe plugin job`↴](#aoe-plugin-job)
 * [`aoe plugin hash`↴](#aoe-plugin-hash)
 * [`aoe plugin discover`↴](#aoe-plugin-discover)
 * [`aoe plugin outdated`↴](#aoe-plugin-outdated)
@@ -72,6 +73,7 @@ This document contains the help content for the `aoe` command-line program.
 * [`aoe project remove`↴](#aoe-project-remove)
 * [`aoe sandbox`↴](#aoe-sandbox)
 * [`aoe sandbox reclaim`↴](#aoe-sandbox-reclaim)
+* [`aoe sandbox login`↴](#aoe-sandbox-login)
 * [`aoe worktree`↴](#aoe-worktree)
 * [`aoe worktree list`↴](#aoe-worktree-list)
 * [`aoe worktree info`↴](#aoe-worktree-info)
@@ -123,6 +125,7 @@ This document contains the help content for the `aoe` command-line program.
 * [`aoe acp`↴](#aoe-acp)
 * [`aoe acp doctor`↴](#aoe-acp-doctor)
 * [`aoe acp agents`↴](#aoe-acp-agents)
+* [`aoe acp lint-stream`↴](#aoe-acp-lint-stream)
 * [`aoe acp stop`↴](#aoe-acp-stop)
 * [`aoe acp recover`↴](#aoe-acp-recover)
 * [`aoe acp kill`↴](#aoe-acp-kill)
@@ -170,7 +173,7 @@ Run without arguments to launch the TUI dashboard.
 * `plugin` — Manage plugins (list, info, enable, disable, install, update, uninstall)
 * `profile` — Manage profiles (separate workspaces)
 * `project` — Manage the project registry used by multi-repo session pickers
-* `sandbox` — Inspect and reclaim per-session sandbox agent stores
+* `sandbox` — Reclaim per-session sandbox agent stores and log agent sandboxes in
 * `worktree` — Manage git worktrees for parallel development
 * `tmux` — tmux integration utilities
 * `sounds` — Manage sound effects for agent state transitions
@@ -230,11 +233,14 @@ Add a new session
 * `-r`, `--repo <EXTRA_REPOS>` — Additional repositories for multi-repo workspace (use with --worktree)
 * `--project <PROJECTS>` — Names of registered projects to include as extra repos (use with --worktree). Resolves against the union of global + profile project registries
 * `--no-submodules` — Skip `git submodule update --init --recursive` after creating the worktree, overriding the `worktree.init_submodules` config (default true). Useful for repos with large or deeply nested submodule trees that you don't need inside the agent session
+* `--workspace` — Create the worktree inside a workspace directory (from `worktree.workspace_path_template`) even with no `--repo`/`--project`, so more projects can be attached later without moving the session (use with --worktree). Overrides `worktree.workspace_by_default`
+* `--no-workspace` — Create a plain worktree even when `worktree.workspace_by_default` is on. Ignored when `--repo`/`--project` make a multi-repo workspace
 * `-s`, `--sandbox` — Run session in a container sandbox
 * `--sandbox-image <SANDBOX_IMAGE>` — Custom container image for sandbox (implies --sandbox)
 * `--hook-env <KEY[=VALUE]>` — Env var for the host `before_start` hook only, never the container (`KEY=VALUE` or `KEY`; repeatable; requires --sandbox)
 * `-y`, `--yolo` — Enable YOLO mode (skip permission prompts)
 * `--trust-hooks` — Automatically trust this repository's hooks and project-local MCP servers without prompting
+* `--skip-on-create` — Create the session without running its on_create hooks, so a failing setup script does not roll the session back. on_launch hooks still run
 * `--extra-args <EXTRA_ARGS>` — Extra arguments to append after the agent binary
 * `--cmd-override <CMD_OVERRIDE>` — Override the agent binary command
 * `--structured-view` — Render this session in the structured view (ACP-based native rendering) instead of the default terminal view. `aoe add` defaults to the terminal (raw tmux/PTY) so the CLI matches the TUI; pass this (or `--agent`) to opt into the structured rendering. Ignored for tools with no ACP adapter
@@ -918,6 +924,7 @@ Manage plugins (list, info, enable, disable, install, update, uninstall)
 * `install` — Install an external plugin from a `gh:owner/repo[@ref]` slug or a local directory. With no `@ref`, installs the repo's latest release; an explicit `@ref` installs unverified, un-audited code. Community plugins run at your own risk
 * `update` — Update an installed external plugin from its recorded source and restart its worker in a running daemon. Prompts to re-approve capabilities if the update changes the capability set
 * `uninstall` — Uninstall an external plugin, removing its files and capability grant
+* `job` — Observe an accepted plugin job without submitting another operation
 * `hash` — Print the deterministic source tree hash for a plugin directory, the value a maintainer pins in the featured index
 * `discover` — Search GitHub's `aoe-plugin` topic for installable plugins
 * `outdated` — List installed external plugins that have an update available
@@ -1022,6 +1029,18 @@ Uninstall an external plugin, removing its files and capability grant
 ###### **Arguments:**
 
 * `<ID>` — Plugin id
+
+
+
+## `aoe plugin job`
+
+Observe an accepted plugin job without submitting another operation
+
+**Usage:** `aoe plugin job <ID>`
+
+###### **Arguments:**
+
+* `<ID>` — Job id returned by install, update, or uninstall
 
 
 
@@ -1219,13 +1238,14 @@ Remove a project from the registry
 
 ## `aoe sandbox`
 
-Inspect and reclaim per-session sandbox agent stores
+Reclaim per-session sandbox agent stores and log agent sandboxes in
 
 **Usage:** `aoe sandbox <COMMAND>`
 
 ###### **Subcommands:**
 
 * `reclaim` — Report per-session agent stores whose session no longer exists in any profile, and how much disk they hold. Reports only unless `--delete` is given: a store can hold a copy of that agent's credentials
+* `login` — Log an agent's sandboxes in (sandbox.shared_credential = "separate_login"): prints a sign-in link, then reads the code shown after sign-in. The login belongs to one shared credential file per profile and tool: an agent with its own `session.agent_config_dir` entry (a wrapper agent) has its own file, so a session of profile X running tool T waiting for the login needs `aoe sandbox login -p X --tool T`. The file follows the command T launches (`agent_command_override`, else `custom_agents`, else the built-in). Only agents that declare a sandbox login have one; today that is Claude
 
 
 
@@ -1238,6 +1258,21 @@ Report per-session agent stores whose session no longer exists in any profile, a
 ###### **Options:**
 
 * `--delete` — Remove the reported stores instead of only naming them
+
+
+
+## `aoe sandbox login`
+
+Log an agent's sandboxes in (sandbox.shared_credential = "separate_login"): prints a sign-in link, then reads the code shown after sign-in. The login belongs to one shared credential file per profile and tool: an agent with its own `session.agent_config_dir` entry (a wrapper agent) has its own file, so a session of profile X running tool T waiting for the login needs `aoe sandbox login -p X --tool T`. The file follows the command T launches (`agent_command_override`, else `custom_agents`, else the built-in). Only agents that declare a sandbox login have one; today that is Claude
+
+**Usage:** `aoe sandbox login [OPTIONS]`
+
+###### **Options:**
+
+* `--tool <TOOL>` — The agent whose sandboxes the login is for: the tool name of the sessions waiting for it. Defaults to the profile's default tool when it has a sandbox login, else the only agent that has one
+* `--command <COMMAND>` — The command the launch runs for `--tool` when a session overrides the profile's: the login lands in the file that launch is gated on. A session that waits for the login names it in the message it stops with; without `--command` the profile's command for the tool is used
+* `--check` — Only report whether the shared credential file needs a login: exit 0 when ok, 2 when needed, 3 when not applicable (`host_seed` mode, a tool without a shared credential file, or a login that is needed on Apple Container, which cannot run the login helper)
+* `--force` — Log in again even though the shared credential is usable
 
 
 
@@ -1772,7 +1807,7 @@ Start the aoe daemon: REST/WebSocket API, plus the web dashboard in builds that 
 ###### **Options:**
 
 * `--core-only` — Serve the private local API without opening TCP or a dashboard
-* `--port <PORT>` — Port to listen on (default: 8080; debug builds default to 8081 so a `cargo run` instance does not collide with an installed release `aoe`)
+* `--port <PORT>` — Port to listen on. Falls back to the `AOE_SERVE_PORT` environment variable, then `[serve] port` in config.toml, then 8080 (debug builds default to 8081 so a `cargo run` instance does not collide with an installed release `aoe`)
 * `--host <HOST>` — Host/IP to bind to (use 0.0.0.0 for LAN/VPN access)
 
   Default value: `127.0.0.1`
@@ -1791,11 +1826,15 @@ Start the aoe daemon: REST/WebSocket API, plus the web dashboard in builds that 
 * `--tunnel-name <TUNNEL_NAME>` — Use a named Cloudflare Tunnel (requires prior `cloudflared tunnel create`). Takes precedence over Tailscale auto-detection
 * `--no-tailscale` — Skip Tailscale Funnel auto-detection and go straight to Cloudflare. Useful if you have Tailscale installed for unrelated reasons
 * `--tunnel-url <TUNNEL_URL>` — Hostname for a named tunnel (e.g., aoe.example.com)
+* `--funnel-port <PORT>` — Public HTTPS port for Tailscale Funnel: 443, 8443 or 10000, so a second daemon on this machine can have its own Funnel. Falls back to `[serve] funnel_port`, then 443
+
+  Possible values: `443`, `8443`, `10000`
+
 * `--daemon` — Run as a background daemon (detach from terminal)
 * `--stop` — Stop a running daemon
 * `--status` — Print the local daemon's PID, mode, URLs, and log path. With `AOE_DAEMON_URL` set, report the remote daemon's reachability and token state instead. Exits non-zero when no daemon is running. Useful for shell scripts that want to know whether a daemon is up without parsing `ps`.
 
-   `--status` is read-only and incompatible with every flag that would change daemon state (`--stop`, `--daemon`, `--remote`) or the bind config of a fresh daemon (`--no-auth`, `--auth`, `--behind-proxy`, `--read-only`, `--passphrase`, `--port`, `--tunnel-name`, `--no-tailscale`, `--tunnel-url`, `--open`, `--allowed-host`, `--allowed-origin`). Clap reports the misuse instead of silently ignoring the extras.
+   `--status` is read-only and incompatible with every flag that would change daemon state (`--stop`, `--daemon`, `--remote`) or the bind config of a fresh daemon (`--no-auth`, `--auth`, `--behind-proxy`, `--read-only`, `--passphrase`, `--port`, `--tunnel-name`, `--no-tailscale`, `--tunnel-url`, `--funnel-port`, `--open`, `--allowed-host`, `--allowed-origin`). Clap reports the misuse instead of silently ignoring the extras.
 * `--passphrase <PASSPHRASE>` — Require a passphrase for login (second-factor auth). Can also be set via AOE_SERVE_PASSPHRASE environment variable
 * `--open` — Open the dashboard URL in the default browser once the server is ready. Ignored in a build with no dashboard bundle, under --daemon or --remote, and whenever no browser the user could see is reachable (see `tui::open_url`): over SSH without a forwarded display, or on Linux/BSD with no display server. `BROWSER` overrides the check on platforms whose launcher reads it, which excludes macOS
 * `--restart` — Restart the running managed daemon with its recorded policy. Missing credentials are rejected before stopping it
@@ -1873,6 +1912,7 @@ Manage the ACP structured-view workers (doctor, ps, logs, prompt, approve, ...)
 
 * `doctor` — Verify the structured view can start: Node runtime, configured agents, provider auth (claude auth login)
 * `agents` — List configured agents (claude-code, aoe-agent, etc.)
+* `lint-stream` — Check a recorded agent-to-client NDJSON stream (one JSON-RPC frame per line) against the `_meta.aoe` primitive contract. Exits 1 on any finding, so a plugin can run it in CI
 * `stop` — Stop an agent worker and settle its owned native processes. Unlike `aoe serve --stop`, this ends the worker rather than detaching
 * `recover` — Retire unprovable worker ownership after external shutdown confirmation
 * `kill` — SIGKILL the runner, then settle its native workers
@@ -1915,6 +1955,23 @@ Verify the structured view can start: Node runtime, configured agents, provider 
 List configured agents (claude-code, aoe-agent, etc.)
 
 **Usage:** `aoe acp agents`
+
+
+
+## `aoe acp lint-stream`
+
+Check a recorded agent-to-client NDJSON stream (one JSON-RPC frame per line) against the `_meta.aoe` primitive contract. Exits 1 on any finding, so a plugin can run it in CI
+
+**Usage:** `aoe acp lint-stream [OPTIONS] <PATH>`
+
+###### **Arguments:**
+
+* `<PATH>` — NDJSON file, or `-` for stdin
+
+###### **Options:**
+
+* `--json` — Emit findings as JSON instead of a human report
+* `--require-hello` — Fail a stream with no `_meta.aoe.proxy` hello
 
 
 

@@ -37,77 +37,93 @@ pub(super) fn render(view: &ServeView, frame: &mut Frame, area: Rect, theme: &Th
         );
         return;
     }
-    match &view.state {
-        ServeViewState::ModePicker {
-            selected,
-            tunnel_available,
-            local_available,
-            flash,
-        } => render_mode_picker(
-            frame,
-            area,
-            theme,
-            &mut mouse,
-            *selected,
-            (*local_available, *tunnel_available),
-            flash_text(flash),
-        ),
-        ServeViewState::Confirm {
-            selected,
-            tailscale,
-            cloudflare,
-            flash,
-        } => render_confirm(
-            frame,
-            area,
-            theme,
-            &mut mouse,
-            *selected,
-            (*tailscale, *cloudflare),
-            flash_text(flash),
-        ),
-        ServeViewState::Checking { .. } => render_pending(
-            frame,
-            area,
-            theme,
-            &mut mouse,
-            " Checking... ",
-            "Looking for a running daemon",
-        ),
-        ServeViewState::Starting {
-            mode, started_at, ..
-        } => render_starting(
-            frame,
-            area,
-            theme,
-            &mut mouse,
-            *mode,
-            started_at.elapsed(),
-            false,
-        ),
-        ServeViewState::Active { mode, urls, .. } => {
-            render_active(view, frame, area, theme, &mut mouse);
-            if view.show_help {
-                // Any click closes the overlay, so nothing beneath is a target.
-                mouse.keys.clear();
-                mouse.copies.clear();
-                let effect =
-                    RestartEffect::of(*mode, urls, &view.restart_probe, view.running_persists);
-                render_help_overlay(frame, area, theme, *mode, effect);
+    if let Some(banner) = view
+        .pending
+        .as_ref()
+        .and_then(|pending| pending.kind.banner())
+    {
+        render_pending(frame, area, theme, &mut mouse, " Checking... ", banner);
+    } else {
+        match &view.state {
+            ServeViewState::ModePicker {
+                selected,
+                tunnel_available,
+                local_available,
+                flash,
+            } => render_mode_picker(
+                frame,
+                area,
+                theme,
+                &mut mouse,
+                (*selected, *local_available, *tunnel_available),
+                &view.local_primary,
+                flash_text(flash),
+            ),
+            ServeViewState::Confirm {
+                selected,
+                tailscale,
+                cloudflare,
+                flash,
+            } => render_confirm(
+                frame,
+                area,
+                theme,
+                &mut mouse,
+                *selected,
+                (*tailscale, *cloudflare),
+                flash_text(flash),
+            ),
+            ServeViewState::Checking { .. } => render_pending(
+                frame,
+                area,
+                theme,
+                &mut mouse,
+                " Checking... ",
+                "Looking for a running daemon",
+            ),
+            ServeViewState::Starting {
+                mode, started_at, ..
+            } => render_starting(
+                frame,
+                area,
+                theme,
+                &mut mouse,
+                *mode,
+                started_at.elapsed(),
+                false,
+            ),
+            ServeViewState::Active {
+                mode, urls, funnel, ..
+            } => {
+                render_active(view, frame, area, theme, &mut mouse);
+                if view.show_help {
+                    // Any click closes the overlay, so nothing beneath is a target.
+                    mouse.keys.clear();
+                    mouse.copies.clear();
+                    let effect = RestartEffect::of(
+                        *mode,
+                        urls,
+                        *funnel,
+                        &view.restart_probe,
+                        view.running_persists,
+                    );
+                    render_help_overlay(frame, area, theme, *mode, effect);
+                }
             }
+            ServeViewState::Error {
+                message,
+                mode,
+                transport,
+            } => render_error(
+                frame,
+                area,
+                theme,
+                &mut mouse,
+                message,
+                view.control_error.as_deref(),
+                &error_recovery_keys(*mode, *transport),
+            ),
         }
-        ServeViewState::Error {
-            message,
-            mode,
-            transport,
-        } => render_error(
-            frame,
-            area,
-            theme,
-            &mut mouse,
-            message,
-            &error_recovery_keys(message, *mode, *transport),
-        ),
     }
     if let Some(rect) = mouse.hover.current_in(&mouse.rects()) {
         paint_hover_bg(frame, rect, theme.selection);
@@ -223,8 +239,8 @@ fn render_mode_picker(
     area: Rect,
     theme: &Theme,
     mouse: &mut ServeMouse,
-    selected: ServeMode,
-    (local_available, tunnel_available): (bool, bool),
+    (selected, local_available, tunnel_available): (ServeMode, bool, bool),
+    local_primary: &str,
     flash: &str,
 ) {
     let title = format!(" {} ", view_title());
@@ -238,15 +254,6 @@ fn render_mode_picker(
         Style::default().fg(theme.title).bold(),
     );
 
-    let local_primary = crate::server::discover_tagged_ips()
-        .into_iter()
-        .next()
-        .map(|(kind, ip)| match kind {
-            crate::server::IpKind::Tailscale => format!("{} (Tailscale)", ip),
-            crate::server::IpKind::Lan => format!("{} (LAN)", ip),
-            crate::server::IpKind::Loopback => format!("{} (loopback)", ip),
-        })
-        .unwrap_or_else(|| "only localhost available".to_string());
     let tunnel_status = if tunnel_available {
         "reachable from your phone"
     } else {
@@ -267,7 +274,7 @@ fn render_mode_picker(
             "Internet (HTTPS)",
             ServeMode::Tunnel,
             tunnel_available,
-            tunnel_status.to_string(),
+            tunnel_status,
             [
                 "Token + passphrase (2FA).",
                 "Pick transport on next screen.",
@@ -277,8 +284,8 @@ fn render_mode_picker(
     ];
     for (card_area, title, mode, available, headline, body_lines, unavailable_note) in cards {
         let select = match mode {
-            ServeMode::Local => KeyCode::Char('h'),
-            ServeMode::Tunnel => KeyCode::Char('l'),
+            ServeMode::Local => KeyCode::Left,
+            ServeMode::Tunnel => KeyCode::Right,
         };
         mouse
             .keys
@@ -313,7 +320,7 @@ fn render_mode_picker(
     centered_line(
         frame,
         keys,
-        "[←/→] choose   [L] Local   [T] Tunnel   [Enter] confirm   [Esc] cancel",
+        "[←/→] choose  [Enter] continue  [Esc] cancel",
         Style::default().fg(theme.dimmed),
     );
     record_hints(frame, mouse, keys);
@@ -396,13 +403,14 @@ fn render_confirm(
     ];
     for (card_area, title, transport, status, body_lines, not_installed) in cards {
         let select = match transport {
-            TunnelTransport::Tailscale => KeyCode::Char('h'),
-            TunnelTransport::Cloudflare => KeyCode::Char('l'),
+            TunnelTransport::Tailscale => KeyCode::Left,
+            TunnelTransport::Cloudflare => KeyCode::Right,
         };
         mouse
             .keys
             .push((card_key(selected == transport, select), card_area));
-        let ready = status == TransportStatus::Ready;
+        // A timed-out provider is still selectable: its status line carries the warning.
+        let ready = matches!(status, TransportStatus::Ready | TransportStatus::TimedOut);
         let (card_inner, body) =
             render_card(frame, card_area, theme, title, selected == transport, ready);
         let mut lines = vec![Line::from("")];
@@ -417,6 +425,11 @@ fn render_confirm(
             TransportStatus::NotInstalled => {
                 ("\u{26A0}", not_installed, Style::default().fg(theme.dimmed))
             }
+            TransportStatus::TimedOut => (
+                "\u{26A0}",
+                "Timed out, checking again",
+                Style::default().fg(theme.waiting).bold(),
+            ),
             TransportStatus::FunnelNotEnabled => (
                 "\u{26A0}",
                 "Funnel not enabled for this node",
@@ -439,7 +452,7 @@ fn render_confirm(
     centered_line(
         frame,
         keys,
-        "[←/→] select  [T] Tailscale  [C] Cloudflare  [R] refresh  [Enter] confirm  [Esc] cancel",
+        "[←/→] choose  [T] Tailscale  [C] Cloudflare  [Enter] start  [Esc] cancel",
         Style::default().fg(theme.dimmed),
     );
     record_hints(frame, mouse, keys);
@@ -564,6 +577,7 @@ fn render_active(
         urls,
         url_index,
         passphrase,
+        funnel,
         opened_at,
         ..
     } = &view.state
@@ -577,6 +591,7 @@ fn render_active(
             theme,
             mouse,
             "Daemon started but no URL available yet.",
+            None,
             &[],
         );
         return;
@@ -590,8 +605,24 @@ fn render_active(
     let [header, content, footer] = Layout::vertical([
         Constraint::Length(3),
         Constraint::Min(10),
-        // A pending confirm can wrap to three rows on a narrow terminal.
-        Constraint::Length(if view.pending_confirm.is_some() { 4 } else { 3 }),
+        // A pending confirm can wrap to three rows on a narrow terminal, five with the Funnel
+        // sentence.
+        Constraint::Length(match view.pending_confirm {
+            None => 3,
+            Some(_)
+                if RestartEffect::of(
+                    *mode,
+                    urls,
+                    *funnel,
+                    &view.restart_probe,
+                    view.running_persists,
+                )
+                .retakes_funnel =>
+            {
+                6
+            }
+            Some(_) => 4,
+        }),
     ])
     .areas(area);
 
@@ -627,11 +658,7 @@ fn render_active(
     frame.render_widget(Paragraph::new(Line::from(header_spans)), header_inner);
 
     let url = active_url.url.as_str();
-    let qr_text = render_qr(url);
-    let qr_lines: Vec<Line> = qr_text
-        .lines()
-        .map(|l| Line::styled(l, Style::default().fg(theme.text)))
-        .collect();
+    let notice = crate::cli::serve::funnel_notice(*funnel);
     let center = |line: Line<'static>| Paragraph::new(line).alignment(Alignment::Center);
     let labeled = |label: &'static str, value: String, style: Style| {
         center(Line::from(vec![
@@ -642,11 +669,30 @@ fn render_active(
 
     // Each row may carry `(label, drawn value width, value a click copies)`.
     type Copy = Option<(&'static str, u16, String)>;
-    let mut rows: Vec<(u16, Paragraph, Copy)> = vec![(
-        qr_lines.len() as u16,
-        Paragraph::new(qr_lines).alignment(Alignment::Center),
-        None,
-    )];
+    // A withdrawn Funnel leaves only a loopback URL, which no phone can scan.
+    let first_row = match notice {
+        Some(text) => {
+            let width = content.width.saturating_sub(2).max(1) as usize;
+            (
+                text.chars().count().div_ceil(width) as u16 + 1,
+                Paragraph::new(text)
+                    .style(Style::default().fg(theme.waiting))
+                    .wrap(Wrap { trim: true })
+                    .alignment(Alignment::Center),
+            )
+        }
+        None => {
+            let qr_lines: Vec<Line> = render_qr(url)
+                .lines()
+                .map(|l| Line::styled(l.to_owned(), Style::default().fg(theme.text)))
+                .collect();
+            (
+                qr_lines.len() as u16,
+                Paragraph::new(qr_lines).alignment(Alignment::Center),
+            )
+        }
+    };
+    let mut rows: Vec<(u16, Paragraph, Copy)> = vec![(first_row.0, first_row.1, None)];
     if !cfg!(feature = "web") {
         rows.push((
             API_ONLY_ROWS,
@@ -658,7 +704,11 @@ fn render_active(
         ));
     }
     rows.push((1, Paragraph::new(""), None));
-    if let Some(label) = &active_url.label {
+    if let Some(label) = active_url
+        .label
+        .as_deref()
+        .or(notice.map(|_| "this machine only"))
+    {
         rows.push((
             1,
             center(Line::styled(format!("via {}", label), dimmed.italic())),
@@ -727,7 +777,13 @@ fn render_active(
     frame.render_widget(footer_block, footer);
     let footer_text = match view.pending_confirm.map(|(action, _)| action) {
         Some(action) => {
-            let effect = RestartEffect::of(*mode, urls, &view.restart_probe, view.running_persists);
+            let effect = RestartEffect::of(
+                *mode,
+                urls,
+                *funnel,
+                &view.restart_probe,
+                view.running_persists,
+            );
             let (first, effect_text) = match action {
                 PendingConfirm::NewPassphrase => (
                     "Press G again for a new passphrase.",
@@ -754,9 +810,13 @@ fn render_active(
                 }
                 LinkChange::Replaced | LinkChange::Moved => Some("The link changes: re-scan it."),
             };
+            let funnel_back = (action == PendingConfirm::Restart && effect.retakes_funnel).then_some(
+                "The Funnel link comes back only if no other server holds it; otherwise the Daemon stops and says why.",
+            );
             let rest = [effect_text]
                 .into_iter()
                 .chain(link)
+                .chain(funnel_back)
                 .chain(["Any other key cancels."]);
             let mut spans = vec![Span::styled(
                 first,
@@ -807,6 +867,9 @@ fn restart_help(effect: RestartEffect) -> String {
         LinkChange::Replaced if effect.passphrase => "new link, sign in again".to_string(),
         LinkChange::Replaced => "new link".to_string(),
         LinkChange::Moved => format!("new link; {logins}"),
+        LinkChange::Same if effect.retakes_funnel => {
+            format!("takes the Funnel link back if no other server holds it; {logins}")
+        }
         LinkChange::Same if effect.may_change => format!("link may change; {logins}"),
         LinkChange::Same => logins.to_string(),
     };
@@ -912,17 +975,13 @@ fn split_url_and_token(url: &str) -> (String, Option<&str>) {
 }
 
 /// The keys `error_key` handles for this failure, shown before the way out.
-fn error_recovery_keys(
-    message: &str,
-    mode: ServeMode,
-    transport: Option<TunnelTransport>,
-) -> Vec<&'static str> {
+fn error_recovery_keys(mode: ServeMode, transport: Option<TunnelTransport>) -> Vec<&'static str> {
     let mut keys = Vec::new();
     if mode == ServeMode::Tunnel {
         keys.push("[P] Pick provider");
     }
-    if funnel_reset_applies(message, mode, transport) {
-        keys.push("[R] Reset Funnel");
+    if funnel_reset_applies(mode, transport) {
+        keys.push("[R] Turn off Funnel on its port");
     }
     keys
 }
@@ -933,6 +992,7 @@ fn render_error(
     theme: &Theme,
     mouse: &mut ServeMouse,
     message: &str,
+    control_error: Option<&str>,
     recovery: &[&str],
 ) {
     let inner = render_page(frame, area, " Serve failed ", theme.error, theme.error);
@@ -956,8 +1016,17 @@ fn render_error(
         Layout::vertical([Constraint::Min(1), Constraint::Length(rows.len() as u16)])
             .margin(1)
             .areas(inner);
+    let mut content = Text::from(message);
+    if let Some(error) = control_error {
+        content.lines.push(Line::default());
+        content.lines.push(Line::styled(
+            "Recovery controls unavailable",
+            Style::default().fg(theme.error),
+        ));
+        content.lines.extend(error.lines().map(Line::raw));
+    }
     frame.render_widget(
-        Paragraph::new(message)
+        Paragraph::new(content)
             .wrap(Wrap { trim: true })
             .style(Style::default().fg(theme.text)),
         body,
@@ -1019,31 +1088,19 @@ mod tests {
     /// bundle must say the endpoint is API-only instead of drawing a code nothing answers.
     #[test]
     fn active_screen_matches_the_dashboard_feature() {
-        let view = ServeView {
-            state: ServeViewState::Active {
-                mode: ServeMode::Local,
-                transport: None,
-                urls: vec![ServeUrl {
-                    label: Some("lan".to_string()),
-                    url: "http://192.168.1.42:8080/?t=abc123def456".to_string(),
-                }],
-                url_index: 0,
-                passphrase: None,
-                opened_at: Instant::now(),
-                log_offset: 0,
-            },
-            pending_passphrase: String::new(),
-            pending_confirm: None,
-            show_help: false,
-            mouse: Default::default(),
-            copied: None,
-            running_persists: Some(true),
-            restart_probe: Default::default(),
-            pending_launch: None,
-            launch_in_flight: false,
-            stop_requested: false,
-            probes: super::super::Probes::new(|_| false),
-        };
+        let view = view(ServeViewState::Active {
+            mode: ServeMode::Local,
+            transport: None,
+            urls: vec![ServeUrl {
+                label: Some("lan".to_string()),
+                url: "http://192.168.1.42:8080/?t=abc123def456".to_string(),
+            }],
+            url_index: 0,
+            passphrase: None,
+            funnel: crate::server::tunnel::FunnelReach::Ours,
+            opened_at: Instant::now(),
+            log_offset: 0,
+        });
         let mut term = Terminal::new(TestBackend::new(72, 26)).unwrap();
         term.draw(|f| render(&view, f, f.area(), &Theme::default()))
             .unwrap();
@@ -1083,20 +1140,9 @@ mod tests {
     }
 
     fn view(state: ServeViewState) -> ServeView {
-        ServeView {
-            state,
-            pending_passphrase: String::new(),
-            pending_confirm: None,
-            show_help: false,
-            mouse: Default::default(),
-            copied: None,
-            running_persists: Some(true),
-            restart_probe: Default::default(),
-            pending_launch: None,
-            launch_in_flight: false,
-            stop_requested: false,
-            probes: super::super::Probes::new(|_| false),
-        }
+        let mut view = ServeView::for_test(state);
+        view.running_persists = Some(true);
+        view
     }
 
     fn draw(view: &ServeView) -> ratatui::buffer::Buffer {
@@ -1107,6 +1153,30 @@ mod tests {
         crate::tui::dialogs::test_render::draw(width, 40, |f, _| {
             render(view, f, f.area(), &Theme::default())
         })
+    }
+
+    #[test]
+    fn a_timed_out_provider_card_shows_selection_and_the_retry_hint() {
+        use crate::tui::dialogs::test_render::{find, text};
+        let theme = Theme::default();
+        assert_ne!(theme.accent, theme.title);
+        for (selected, title_color) in [
+            (TunnelTransport::Tailscale, theme.accent),
+            (TunnelTransport::Cloudflare, theme.title),
+        ] {
+            let buf = draw_at(
+                &view(ServeViewState::Confirm {
+                    selected,
+                    tailscale: TransportStatus::TimedOut,
+                    cloudflare: TransportStatus::Ready,
+                    flash: None,
+                }),
+                100,
+            );
+            assert!(text(&buf).contains("Timed out, checking again"));
+            let (x, y) = find(&buf, "Tailscale Funnel");
+            assert_eq!(buf[(x, y)].fg, title_color, "{selected:?}");
+        }
     }
 
     #[test]
@@ -1137,6 +1207,7 @@ mod tests {
                 }],
                 url_index: 0,
                 passphrase: Some("correct-horse".to_string()),
+                funnel: crate::server::tunnel::FunnelReach::Ours,
                 opened_at: Instant::now(),
                 log_offset: 0,
             });
@@ -1163,6 +1234,7 @@ mod tests {
             }],
             url_index: 0,
             passphrase: None,
+            funnel: crate::server::tunnel::FunnelReach::Ours,
             opened_at: Instant::now(),
             log_offset: 0,
         });
@@ -1197,6 +1269,181 @@ mod tests {
             .split_whitespace()
             .collect::<Vec<_>>()
             .join(" ")
+    }
+
+    fn draws_qr(buf: &ratatui::buffer::Buffer) -> bool {
+        buf.content()
+            .iter()
+            .any(|cell| ["\u{2588}", "\u{2580}", "\u{2584}"].contains(&cell.symbol()))
+    }
+
+    #[test]
+    fn a_withdrawn_funnel_shows_why_instead_of_a_qr_code() {
+        use crate::server::tunnel::FunnelReach;
+        let loopback = "http://127.0.0.1:8080/?token=t";
+        let funnel = "https://host.tailnet.ts.net/?token=t";
+        let qr = draws_qr;
+        // (Funnel state, the URL serve.url leads with)
+        for (reach, url) in [
+            (FunnelReach::Lost, loopback),
+            (FunnelReach::Unknown, loopback),
+            (FunnelReach::Ours, funnel),
+        ] {
+            let view = view(ServeViewState::Active {
+                mode: ServeMode::Tunnel,
+                transport: Some(TunnelTransport::Tailscale),
+                urls: vec![ServeUrl {
+                    label: None,
+                    url: url.to_string(),
+                }],
+                url_index: 0,
+                passphrase: Some("correct-horse".to_string()),
+                funnel: reach,
+                opened_at: Instant::now(),
+                log_offset: 0,
+            });
+            for width in [60, 100] {
+                let buf = draw_at(&view, width);
+                let screen = text_in(&buf, buf.area);
+                let notice = crate::cli::serve::funnel_notice(reach);
+                if let Some(notice) = notice {
+                    assert!(screen.contains(notice), "{reach:?} at {width}: {screen}");
+                }
+                assert_eq!(
+                    screen.contains("via this machine only"),
+                    notice.is_some(),
+                    "{reach:?} at {width}: {screen}"
+                );
+                assert!(screen.contains(url), "{reach:?} at {width}: {screen}");
+                assert_eq!(
+                    qr(&buf),
+                    notice.is_none() && cfg!(feature = "web"),
+                    "{reach:?} at {width}"
+                );
+            }
+        }
+    }
+
+    /// Reattach and a launch open Active through `running`. A read between the daemon's two
+    /// writes (no marker yet, the loopback-only URL) shows the Unknown notice, never a QR
+    /// code for the loopback address.
+    #[test]
+    fn a_half_published_read_opens_active_with_the_unknown_notice() {
+        use crate::server::tunnel::FunnelReach;
+        let loopback = "http://127.0.0.1:8080/?token=t";
+        let view = view(super::super::ServeViewState::running(
+            ServeMode::Tunnel,
+            Some(TunnelTransport::Tailscale),
+            Some("correct-horse".to_string()),
+            vec![ServeUrl {
+                label: None,
+                url: loopback.to_string(),
+            }],
+            FunnelReach::Ours,
+            0,
+        ));
+        let notice = crate::cli::serve::funnel_notice(FunnelReach::Unknown).unwrap();
+        for width in [60, 100] {
+            let buf = draw_at(&view, width);
+            let screen = text_in(&buf, buf.area);
+            assert!(screen.contains(notice), "at {width}: {screen}");
+            assert!(screen.contains(loopback), "at {width}: {screen}");
+            assert!(!draws_qr(&buf), "at {width}: a QR for the loopback URL");
+        }
+    }
+
+    #[test]
+    fn a_withdrawn_funnel_restart_says_it_takes_the_link_back() {
+        use super::super::{RestartProbe, TokenWindow};
+        use crate::server::tunnel::FunnelReach;
+        let back = "The Funnel link comes back only if no other server holds it; otherwise the Daemon stops and says why.";
+        let tunnel = |on_funnel| RestartProbe {
+            on_funnel,
+            persists: true,
+            local_token: TokenWindow::Reused,
+            ..RestartProbe::default()
+        };
+        // (Funnel state, URL, the restart takes the Funnel path, says the link comes back)
+        let cases = [
+            (
+                FunnelReach::Lost,
+                "http://127.0.0.1:8080/?token=t",
+                true,
+                true,
+            ),
+            (
+                FunnelReach::Unknown,
+                "http://127.0.0.1:8080/?token=t",
+                true,
+                true,
+            ),
+            // A restart onto Cloudflare opens a new link, as it does with the Funnel ours.
+            (
+                FunnelReach::Lost,
+                "http://127.0.0.1:8080/?token=t",
+                false,
+                false,
+            ),
+            (
+                FunnelReach::Ours,
+                "https://host.tailnet.ts.net/?token=t",
+                true,
+                false,
+            ),
+        ];
+        for (reach, url, on_funnel, says_back) in cases {
+            let case = format!("{reach:?} on_funnel={on_funnel}");
+            let mut view = view(ServeViewState::Active {
+                mode: ServeMode::Tunnel,
+                transport: Some(TunnelTransport::Tailscale),
+                urls: vec![ServeUrl {
+                    label: None,
+                    url: url.to_string(),
+                }],
+                url_index: 0,
+                passphrase: Some("correct-horse".to_string()),
+                funnel: reach,
+                opened_at: Instant::now(),
+                log_offset: 0,
+            });
+            view.restart_probe = tunnel(on_funnel);
+            view.pending_confirm = Some((PendingConfirm::Restart, Instant::now()));
+            for width in [60, 80, 120] {
+                let buf = crate::tui::dialogs::test_render::draw(width, 24, |f, theme| {
+                    render(&view, f, f.area(), theme)
+                });
+                let footer = text_in(&buf, Rect::new(0, 17, width, 7));
+                assert!(
+                    footer.ends_with("Any other key cancels."),
+                    "{case} at {width}: {footer}"
+                );
+                assert_eq!(
+                    footer.contains(back),
+                    says_back,
+                    "{case} at {width}: {footer}"
+                );
+                assert_eq!(
+                    footer.contains("re-scan"),
+                    !on_funnel,
+                    "{case} at {width}: {footer}"
+                );
+            }
+            let ServeViewState::Active { urls, .. } = &view.state else {
+                unreachable!()
+            };
+            let help = restart_help(RestartEffect::of(
+                ServeMode::Tunnel,
+                urls,
+                reach,
+                &view.restart_probe,
+                view.running_persists,
+            ));
+            assert_eq!(
+                help.contains("takes the Funnel link back if no other server holds it"),
+                says_back,
+                "{case}: {help}"
+            );
+        }
     }
 
     #[test]
@@ -1478,6 +1725,7 @@ mod tests {
                 }],
                 url_index: 0,
                 passphrase: (mode == Tunnel).then(|| "correct-horse".to_string()),
+                funnel: crate::server::tunnel::FunnelReach::Ours,
                 opened_at: Instant::now(),
                 log_offset: 0,
             });
@@ -1547,117 +1795,64 @@ mod tests {
     }
 
     #[test]
-    fn a_card_click_selects_it_then_confirms_it() {
-        let mut view = view(ServeViewState::ModePicker {
+    fn card_clicks_select_by_arrow_then_confirm_and_footers_match_their_keys() {
+        let picker = ServeViewState::ModePicker {
             selected: ServeMode::Local,
             tunnel_available: true,
             local_available: true,
             flash: None,
-        });
-        let buf = draw(&view);
-        let (x, y) = crate::tui::dialogs::test_render::find(&buf, "Internet (HTTPS)");
-        assert_eq!(
-            view.handle_click(x, y).map(|k| k.code),
-            Some(KeyCode::Char('l'))
-        );
-        view.handle_key(KeyEvent::from(KeyCode::Char('l')));
-        draw(&view);
-        assert_eq!(
-            view.handle_click(x, y).map(|k| k.code),
-            Some(KeyCode::Enter)
-        );
-        let buf = draw(&view);
-        let (x, y) = crate::tui::dialogs::test_render::find(&buf, "[Esc] cancel");
-        assert_eq!(view.handle_click(x, y).map(|k| k.code), Some(KeyCode::Esc));
-    }
-
-    #[test]
-    fn the_error_footer_offers_recovery_keys_first_and_only_those_error_key_handles() {
-        use ServeMode::{Local, Tunnel};
-        use TunnelTransport::{Cloudflare, Tailscale};
-        let (p, r) = ("[P] Pick provider", "[R] Reset Funnel");
-        let rest = "[S] Force stop    [Enter] Back to sessions";
-        let funnel_msg = "Tailscale Funnel setup failed";
-        // (mode, transport, message, width, footer rows)
-        let cases = [
+        };
+        let providers = ServeViewState::Confirm {
+            selected: TunnelTransport::Cloudflare,
+            tailscale: TransportStatus::Ready,
+            cloudflare: TransportStatus::Ready,
+            flash: None,
+        };
+        for (state, card, arrow, footer, hints) in [
             (
-                Tunnel,
-                Some(Tailscale),
-                "timed out",
-                120,
-                vec![format!("{p}    {r}    {rest}")],
-            ),
-            // Too wide at 80 columns: the recovery keys and the way out take a row each.
-            (
-                Tunnel,
-                Some(Tailscale),
-                "timed out",
-                80,
-                vec![format!("{p}    {r}"), rest.to_string()],
+                picker,
+                "Internet (HTTPS)",
+                KeyCode::Right,
+                "[←/→] choose  [Enter] continue  [Esc] cancel",
+                vec![("[Enter]", KeyCode::Enter), ("[Esc]", KeyCode::Esc)],
             ),
             (
-                Tunnel,
-                Some(Tailscale),
-                "timed out",
-                60,
-                vec![format!("{p}    {r}"), rest.to_string()],
+                providers,
+                "Tailscale Funnel",
+                KeyCode::Left,
+                "[←/→] choose  [T] Tailscale  [C] Cloudflare  [Enter] start  [Esc] cancel",
+                vec![
+                    ("[T]", KeyCode::Char('T')),
+                    ("[C]", KeyCode::Char('C')),
+                    ("[Enter]", KeyCode::Enter),
+                    ("[Esc]", KeyCode::Esc),
+                ],
             ),
-            // At 60 columns the three hints no longer fit on one row.
-            (
-                Tunnel,
-                Some(Cloudflare),
-                funnel_msg,
-                60,
-                vec![p.to_string(), rest.to_string()],
-            ),
-            // A known Cloudflare failure gets no Funnel reset, whatever the message says.
-            (
-                Tunnel,
-                Some(Cloudflare),
-                funnel_msg,
-                80,
-                vec![format!("{p}    {rest}")],
-            ),
-            // A reattached daemon's transport is unknown, so the message decides.
-            (
-                Tunnel,
-                None,
-                funnel_msg,
-                120,
-                vec![format!("{p}    {r}    {rest}")],
-            ),
-            (Local, None, funnel_msg, 120, vec![rest.to_string()]),
-        ];
-        for (mode, transport, message, width, want) in cases {
-            let case = format!("{mode:?} {transport:?} {message:?} at {width}");
-            let mut view = view(ServeViewState::Error {
-                message: message.to_string(),
-                mode,
-                transport,
-            });
-            let buf = draw_at(&view, width);
-            let rows: Vec<String> = (0..buf.area.height)
-                .map(|y| {
-                    let row: String = (0..buf.area.width).map(|x| buf[(x, y)].symbol()).collect();
-                    row.trim_matches(|c: char| c == '│' || c.is_whitespace())
-                        .to_string()
-                })
-                .filter(|row| row.contains("[S] ") || row.contains("[P] ") || row.contains("[R] "))
-                .collect();
-            assert_eq!(rows, want, "{case}");
-            // Every hint stays whole and clickable, on either row.
-            let mut hints = vec![("[S]", KeyCode::Char('S')), ("[Enter]", KeyCode::Enter)];
-            if mode == Tunnel {
-                hints.push(("[P]", KeyCode::Char('P')));
-            }
-            for (label, code) in hints {
-                let (x, y) = crate::tui::dialogs::test_render::find(&buf, label);
+        ] {
+            let mut view = view(state);
+            let buf = draw(&view);
+            crate::tui::dialogs::test_render::find(&buf, footer);
+            for (hint, code) in hints {
+                let (x, y) = crate::tui::dialogs::test_render::find(&buf, hint);
                 assert_eq!(
                     view.handle_click(x, y).map(|k| k.code),
                     Some(code),
-                    "{case}: {label}"
+                    "{hint}"
                 );
             }
+            let (x, y) = crate::tui::dialogs::test_render::find(&buf, card);
+            assert_eq!(
+                view.handle_click(x, y).map(|k| k.code),
+                Some(arrow),
+                "{card}"
+            );
+            view.handle_key(KeyEvent::from(arrow));
+            draw(&view);
+            assert_eq!(
+                view.handle_click(x, y).map(|k| k.code),
+                Some(KeyCode::Enter),
+                "{card}"
+            );
         }
     }
 }

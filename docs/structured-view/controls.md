@@ -11,11 +11,14 @@ A session runs in one of the modes its adapter advertises. For `claude-agent-acp
 | Mode | Meaning |
 |------|---------|
 | `default` | Every Write/Edit/Bash routes through an approval card. |
+| `auto` | Claude decides which actions need approval. The default for a new session on `claude-agent-acp` 0.101.0+ when no mode is configured. |
 | `acceptEdits` | Edit-kind tools auto-approved; Bash and unknown tools still prompt. |
 | `bypassPermissions` | All tools auto-approved (YOLO). |
 | `plan` | Read-only; the agent drafts a plan but runs no side-effectful tools. |
 
 Other adapters report their own ids (Gemini's `auto_edit` and `yolo` map onto `acceptEdits` and `bypassPermissions`).
+
+YOLO sessions are unaffected by Auto. To keep Manual, set `mode = "default"` under `[acp.acp_defaults.claude]` (or the dashboard's Default mode control), or set `permissions.defaultMode: "default"` or `disableAutoMode: "disable"` in Claude settings. A model without Auto support starts in `default`.
 
 `[session] yolo_mode_default`, or the wizard's "Yolo mode" switch, asks the adapter to start in `bypassPermissions`. This is best-effort: if the adapter refuses, an amber notice appears and the session keeps whatever mode it landed in. `claude-agent-acp` offers `bypassPermissions` only when `aoe serve` was launched with `ALLOW_BYPASS=1` in its environment; without it, use `acceptEdits` or approve as you go. An Agent that always runs in yolo mode shows the switch locked on.
 

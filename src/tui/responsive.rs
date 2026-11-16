@@ -7,6 +7,8 @@
 //! ratios suit content panes, but only above a usability floor: each constant
 //! documents the width below which it stops working.
 
+use crate::session::config::NarrowLayout;
+
 /// Below this width the home view stacks (list above preview) instead of
 /// side-by-side, and the preview drops its info header for the session title +
 /// status icon in the block title.
@@ -63,6 +65,39 @@ pub fn dialog_width(viewport_width: u16) -> u16 {
     }
 }
 
+/// Which panes a narrow home view draws, and at what list height.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NarrowArrangement {
+    /// Only the list, full width and height.
+    ListOnly,
+    /// Only the preview, full width and height.
+    PreviewOnly,
+    /// The list above the preview at this height.
+    Split(u16),
+}
+
+/// Arrange a narrow (below [`STACKED_BREAKPOINT`]) home view for `layout`.
+/// `preview_active` says the preview is the pane being worked in: live-send is
+/// relaying keys, a transcript is being read, or a System Health takeover is
+/// showing.
+pub fn narrow_arrangement(
+    layout: NarrowLayout,
+    main_height: u16,
+    requested_list_height: Option<u16>,
+    preview_active: bool,
+) -> NarrowArrangement {
+    match (layout, preview_active) {
+        (NarrowLayout::OnePane, true) => NarrowArrangement::PreviewOnly,
+        (NarrowLayout::OnePane, false) => NarrowArrangement::ListOnly,
+        (NarrowLayout::BigPreview, true) => {
+            NarrowArrangement::Split(stacked_list_height(main_height, Some(0)))
+        }
+        (NarrowLayout::BigPreview | NarrowLayout::Stacked, _) => {
+            NarrowArrangement::Split(stacked_list_height(main_height, requested_list_height))
+        }
+    }
+}
+
 pub fn stacked_list_height(main_height: u16, requested: Option<u16>) -> u16 {
     let automatic = (main_height / STACKED_LIST_HEIGHT_FRACTION)
         .clamp(STACKED_LIST_HEIGHT_MIN, STACKED_LIST_HEIGHT_MAX);
@@ -93,6 +128,29 @@ mod tests {
         }
         for (height, want) in [(10, 2), (15, 5), (30, 10), (60, STACKED_LIST_HEIGHT_MAX)] {
             assert_eq!(stacked_list_height(height, None), want, "{height}");
+        }
+    }
+
+    #[test]
+    fn narrow_arrangement_follows_the_layout() {
+        let cases = [
+            (NarrowLayout::Stacked, false, NarrowArrangement::Split(10)),
+            (NarrowLayout::Stacked, true, NarrowArrangement::Split(10)),
+            (NarrowLayout::OnePane, false, NarrowArrangement::ListOnly),
+            (NarrowLayout::OnePane, true, NarrowArrangement::PreviewOnly),
+            (
+                NarrowLayout::BigPreview,
+                false,
+                NarrowArrangement::Split(10),
+            ),
+            (NarrowLayout::BigPreview, true, NarrowArrangement::Split(5)),
+        ];
+        for (layout, preview_active, want) in cases {
+            assert_eq!(
+                narrow_arrangement(layout, 30, None, preview_active),
+                want,
+                "{layout:?}"
+            );
         }
     }
 

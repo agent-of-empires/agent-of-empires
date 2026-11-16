@@ -3,6 +3,7 @@ import { fetchWorktrees, type WorktreeInfo } from "../../../lib/api";
 import { useBranchSuggestions } from "./branchSuggestions";
 import { ToggleRow } from "./Toggle";
 import type { WizardData } from "../wizardReducer";
+import { hasFinePointer } from "../../../lib/platform";
 
 interface Props {
   data: WizardData;
@@ -20,6 +21,7 @@ export function WorktreePanel({ data, onChange }: Props) {
       <input
         id="wizard-worktree-branch"
         type="text"
+        autoFocus={hasFinePointer()}
         value={data.worktreeBranch}
         onChange={(e) => onChange("worktreeBranch", e.target.value)}
         placeholder="Uses session title if empty"
@@ -42,6 +44,22 @@ export function WorktreePanel({ data, onChange }: Props) {
       />
 
       {!data.attachExisting && <BaseBranchPicker data={data} onChange={onChange} />}
+
+      <ToggleRow
+        className="mt-4 cursor-pointer"
+        title="Workspace directory"
+        switchLabel="Workspace directory"
+        description={
+          data.attachExisting
+            ? "Not available when attaching to an existing branch."
+            : hasExtraRepos
+              ? "Always on with extra repositories."
+              : "Start in a workspace folder so projects added later don't move the session."
+        }
+        disabled={data.attachExisting || hasExtraRepos}
+        checked={!data.attachExisting && (data.useWorkspace || hasExtraRepos)}
+        onChange={(v) => onChange("useWorkspace", v)}
+      />
     </div>
   );
 }

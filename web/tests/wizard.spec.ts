@@ -127,6 +127,24 @@ test.describe("essentials", () => {
   });
 });
 
+test.describe("panels focus their first field", () => {
+  test("Worktree focuses the branch name, Sandbox the image, Agent the selected agent", async ({ page }) => {
+    await startWizard(page, {
+      docker: true,
+      settings: { worktree: { enabled: true }, sandbox: { enabled_by_default: true } },
+    });
+    const w = wizard(page);
+    await openPanel(page, "Worktree");
+    await expect(w.getByPlaceholder(BRANCH_PLACEHOLDER)).toBeFocused();
+    await closePanel(page);
+    await openPanel(page, "Sandbox");
+    await expect(w.getByLabel("Container image")).toBeFocused();
+    await closePanel(page);
+    await openPanel(page, "Agent");
+    await expect(w.getByRole("button", { name: "claude", exact: true })).toBeFocused();
+  });
+});
+
 test.describe("create progress", () => {
   test("a slow create shows the running hook and its output, and can continue in the background", async ({ page }) => {
     let release!: () => void;
@@ -677,6 +695,176 @@ test.describe("View row", () => {
   });
 });
 
+test.describe("Sandbox row", () => {
+  test.describe("at 375px", () => {
+    test.use({ viewport: { width: 375, height: 812 } });
+
+    // The two longest statuses are wider than the row's 129px summary on their own (#5626 review).
+    const states: Array<[string, Record<string, unknown>]> = [
+      ["Update available", { state: "available", remote_digest: "sha256:b" }],
+      ["Couldn't check for updates", { state: "check_failed", error: "registry unreachable" }],
+      ["Update status unknown", { state: "unknown", reason: "no_digest" }],
+    ];
+    for (const [label, reply] of states) {
+      test(`leads with "${label}", kept whole while only the image truncates`, async ({ page }) => {
+        const image = "ghcr.io/example-org/a-long-sandbox-image-name-for-narrow-screens:2026.11.12";
+        const asked: string[] = [];
+        await page.route("**/api/sandbox/image-status**", (r) => {
+          asked.push(new URL(r.request().url()).search);
+          return r.fulfill({ json: { image, ...reply } });
+        });
+        await startWizard(page, {
+          docker: true,
+          settings: { sandbox: { enabled_by_default: true, default_image: image } },
+        });
+        await page.setViewportSize({ width: 375, height: 812 });
+        const row = wizard(page).getByTestId("wizard-sandbox-row");
+        const status = row.getByTestId("sandbox-image-status");
+        await expect(status).toContainText(label);
+        // The banner polls the default image too; the wizard asks for its own, fresh.
+        expect(asked).toContain(`?${new URLSearchParams({ image, fresh: "true" })}`);
+        const fit = await status.evaluate((el) => {
+          // SwitchRow's summary truncates, so its box clips whatever overflows it.
+          let clip = el.parentElement;
+          while (clip && getComputedStyle(clip).overflowX === "visible") clip = clip.parentElement;
+          const s = el.getBoundingClientRect();
+          const c = clip!.getBoundingClientRect();
+          return {
+            own: el.scrollWidth <= el.clientWidth,
+            inside: s.left >= c.left - 0.5 && s.right <= c.right + 0.5 && s.bottom <= c.bottom + 0.5,
+          };
+        });
+        expect(fit).toEqual({ own: true, inside: true });
+        expect(await row.getByText(image).evaluate((el) => el.scrollWidth > el.clientWidth)).toBe(true);
+        const overflow = await page.evaluate(
+          () => document.documentElement.scrollWidth - document.documentElement.clientWidth,
+        );
+        expect(overflow).toBeLessThanOrEqual(0);
+      });
+    }
+  });
+
+  for (const width of [375, 1280]) {
+    test(`pulls the latest image first, and a failed pull relaunches with both in view, at ${width}px`, async ({
+      page,
+    }) => {
+      const image = "ghcr.io/example-org/sandbox:2026.11";
+      await page.route("**/api/sandbox/image-status**", (r) =>
+        r.fulfill({
+          json: {
+            image,
+            state: "available",
+            remote_digest: "sha256:b",
+            dismissed: false,
+            pull_blocked: null,
+            pull_command: `docker pull ${image}`,
+          },
+        }),
+      );
+      await page.route("**/api/sandbox/volume-ignores-preview**", (r) =>
+        r.fulfill({ json: { acknowledged: true, globs: [] } }),
+      );
+      await page.route("**/api/sessions/create-progress/**", (r) =>
+        r.fulfill({ json: { stage: "pulling_image", hook: null, output: [] } }),
+      );
+      let release!: () => void;
+      const held = new Promise<void>((resolve) => (release = resolve));
+      const created = await startWizard(page, {
+        docker: true,
+        settings: { sandbox: { enabled_by_default: true, default_image: image } },
+        onCreate: async (_body, route) => {
+          if (created.length > 1) return undefined;
+          await held;
+          await route.fulfill({
+            status: 400,
+            json: {
+              error: "sandbox_image_update_failed",
+              message: `Couldn't pull the latest Sandbox image ${image}.`,
+              stage: "pulling_image",
+              reference: "3f9c1a2b-77d0-4e0b-9b1f-0d3b5c2a11a1",
+            },
+          });
+          return true;
+        },
+      });
+      await page.setViewportSize({ width, height: width === 375 ? 812 : 800 });
+      const w = wizard(page);
+      const box = w.getByRole("checkbox", { name: "Pull latest image first" });
+      await expect(box).toBeChecked();
+      await expect(box).toBeInViewport();
+      await launch(page);
+
+      await expect(w.getByTestId("create-progress")).toContainText("Pulling latest image");
+      await expect(w.getByText("A large image can take a few minutes to download.")).toBeVisible();
+      expect(created[0]!.pull_latest_image).toBe(true);
+      release();
+
+      const failure = w.getByRole("alert").filter({ hasText: "Couldn't pull the latest image" });
+      await expect(failure).toContainText("The session wasn't created.");
+      const relaunch = failure.getByRole("button", { name: "Launch with current image" });
+      await expect(relaunch).toBeInViewport();
+      // The failure box grows the footer; the box it blames stays readable above it.
+      await expect(w.getByTestId("wizard-pull-latest")).toBeInViewport({ ratio: 1 });
+      const overflow = await page.evaluate(
+        () => document.documentElement.scrollWidth - document.documentElement.clientWidth,
+      );
+      expect(overflow).toBeLessThanOrEqual(0);
+
+      await relaunch.click();
+      await expect.poll(() => created.length).toBe(2);
+      expect(created[1]!.pull_latest_image).toBeUndefined();
+      expect(created[1]!.sandbox).toBe(true);
+      expect(created[1]!.idempotency_key).not.toBe(created[0]!.idempotency_key);
+    });
+  }
+
+  // The longest cue and status together are wider than the md+ modal's 256px summary.
+  for (const width of [1280, 375]) {
+    test(`a pull failure's cue shares the status's line, with the image still shown, at ${width}px`, async ({
+      page,
+    }) => {
+      const image = "ghcr.io/example-org/a-long-sandbox-image-name-for-narrow-screens:2026.11.12";
+      await page.route("**/api/sandbox/image-status**", (r) =>
+        r.fulfill({ json: { image, state: "check_failed", error: "registry unreachable" } }),
+      );
+      await page.route("**/api/sandbox/volume-ignores-preview**", (r) =>
+        r.fulfill({ json: { acknowledged: true, globs: [] } }),
+      );
+      await startWizard(page, {
+        docker: true,
+        settings: { sandbox: { enabled_by_default: true, default_image: image } },
+        onCreate: (_body, route) =>
+          route
+            .fulfill({
+              status: 400,
+              json: { error: "sandbox_image_pull_failed", message: "Pull refused.", stage: "pulling_image" },
+            })
+            .then(() => true),
+      });
+      await page.setViewportSize({ width, height: width < 768 ? 812 : 900 });
+      await launch(page);
+      const row = wizard(page).getByTestId("wizard-sandbox-row");
+      const cue = row.getByText("image pull failed");
+      await expect(cue).toBeVisible();
+      const status = row.getByTestId("sandbox-image-status");
+      await expect(status).toContainText("Couldn't check for updates");
+      expect((await cue.boundingBox())!.y).toBe((await status.boundingBox())!.y);
+      const fit = await status.evaluate((el) => {
+        let clip = el.parentElement;
+        while (clip && getComputedStyle(clip).overflowX === "visible") clip = clip.parentElement;
+        const c = clip!.getBoundingClientRect();
+        const inside = (r: DOMRect) =>
+          r.width > 0 && r.left >= c.left - 0.5 && r.right <= c.right + 0.5 && r.bottom <= c.bottom + 0.5;
+        return {
+          status: inside(el.getBoundingClientRect()),
+          image: inside(el.nextElementSibling!.getBoundingClientRect()),
+        };
+      });
+      expect(fit).toEqual({ status: true, image: true });
+    });
+  }
+});
+
 test.describe("create failure", () => {
   for (const width of [1280, 375]) {
     test(`a refused create shows its step, reference and a relaunch without Sandbox at ${width}px`, async ({
@@ -732,6 +920,87 @@ test.describe("create failure", () => {
       await expect(page.getByTestId("session-wizard")).toHaveCount(0);
     });
   }
+
+  test("at 375px, Launch without Sandbox with no host adapter stops on the View row, focused and in view", async ({
+    page,
+  }) => {
+    await page.route("**/api/sandbox/volume-ignores-preview**", (r) =>
+      r.fulfill({ json: { acknowledged: true, globs: [] } }),
+    );
+    // The gate reads `acp_create_ready` only once the debounced fetch for the selected project answers.
+    const projectAgents = page.waitForResponse((r) => {
+      const url = new URL(r.url());
+      return url.pathname === "/api/agents" && url.searchParams.get("path") === "/tmp/example";
+    });
+    const created = await startWizard(page, {
+      docker: true,
+      settings: { sandbox: { enabled_by_default: true } },
+      agents: [{ ...CLAUDE_AGENT, acp_create_ready: false }],
+      onCreate: (_body, route) =>
+        route
+          .fulfill({
+            status: 400,
+            json: {
+              error: "sandbox_unavailable",
+              message: "Docker isn't running, so the Sandbox can't start. Start Docker, then try again.",
+              stage: "starting_container",
+            },
+          })
+          .then(() => true),
+    });
+    await projectAgents;
+    await page.setViewportSize({ width: 375, height: 600 });
+    const w = wizard(page);
+    await launch(page);
+    await w.getByRole("button", { name: "Launch without Sandbox" }).click();
+
+    const terminal = w.getByRole("radiogroup", { name: "View" }).getByRole("radio", { name: "Terminal view" });
+    await expect(terminal).toBeFocused();
+    await expect(terminal).toBeInViewport();
+    await expect(w.getByTestId("wizard-view-row")).toContainText("ACP adapter not installed");
+    await expect(switchNamed(page, "Run in a safe container")).toHaveAttribute("aria-checked", "false");
+    expect(created).toHaveLength(1);
+    expect(created[0]!.view).toBe("structured");
+  });
+
+  test("at 375px, a failed hook offers Create without setup, which sends the skip and closes on a 201", async ({
+    page,
+  }) => {
+    let refusals = 0;
+    const created = await startWizard(page, {
+      onCreate: (_body, route) =>
+        (refusals++ === 0
+          ? route.fulfill({
+              status: 400,
+              json: {
+                error: "hook_failed",
+                message: "An on_create hook exited with code 1.",
+                stage: "running_hooks",
+              },
+            })
+          : route.fulfill({ status: 201, json: { id: "new-session", created_without_setup: true } })
+        ).then(() => true),
+    });
+    await page.setViewportSize({ width: 375, height: 812 });
+    await launch(page);
+
+    const box = wizard(page).getByRole("alert").filter({ hasText: "An on_create hook failed" });
+    await expect(box.getByRole("button", { name: "Try again" })).toBeInViewport();
+    const skip = box.getByRole("button", { name: "Create without setup" });
+    await expect(skip).toBeInViewport();
+    const overflow = await page.evaluate(
+      () => document.documentElement.scrollWidth - document.documentElement.clientWidth,
+    );
+    expect(overflow).toBeLessThanOrEqual(0);
+
+    await skip.click();
+    await expect.poll(() => created.length).toBe(2);
+    expect(created[0]!.skip_on_create).toBeUndefined();
+    expect(created[1]!.skip_on_create).toBe(true);
+    expect(created[1]!.idempotency_key).not.toBe(created[0]!.idempotency_key);
+    await expect(page.getByTestId("session-wizard")).toHaveCount(0);
+    await expect(page).toHaveURL(/\/session\/new-session$/);
+  });
 
   test("a background refusal's Reopen stays in view when the toasts overflow the column at 375px", async ({ page }) => {
     let release!: () => void;

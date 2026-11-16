@@ -128,6 +128,16 @@ impl<S: BroadcastSink> Supervisor<S> {
         respawn.epoch()
     }
 
+    /// Leave a running fixture part-way through a respawn, so it reports `Resuming`.
+    pub(crate) async fn test_begin_respawn(&self, session_id: &str) {
+        let mut workers = self.workers.lock().await;
+        let handle = workers.get_mut(session_id).expect("test worker");
+        let (respawn, _) = lock_recover(&self.lifecycle)
+            .begin_respawn(&handle.lease)
+            .expect("fixture is running");
+        handle.lease = respawn;
+    }
+
     /// A fake worker whose command loop records every command it receives.
     pub(crate) async fn test_insert_worker_cmd_recording(
         &self,
@@ -138,6 +148,16 @@ impl<S: BroadcastSink> Supervisor<S> {
         self.test_install_handle(session_id, client, WorkerKind::Stdio, None)
             .await;
         cmds
+    }
+
+    /// The event a fresh worker publishes once attached; it clears a startup error.
+    pub(crate) fn test_publish_worker_attached(&self, session_id: &str) {
+        self.publish_next(
+            session_id,
+            &Event::AcpSessionAssigned {
+                acp_session_id: format!("acp-{session_id}"),
+            },
+        );
     }
 
     pub(crate) async fn test_install_attached(&self, session_id: &str, identity: RunnerIdentity) {
@@ -348,11 +368,13 @@ pub(crate) fn spawn_request(session_id: &str) -> SpawnRequest {
         agent: "claude-code".into(),
         tool: "claude-code".into(),
         cwd: std::env::temp_dir(),
+        config_path: std::env::temp_dir(),
         additional_dirs: vec![],
         provider_env: vec![],
         model: None,
         effort: None,
         effort_explicit: false,
+        model_config: Default::default(),
         stored_acp_session_id: None,
         fork_from: None,
         sandbox_continuation: super::SandboxContinuation::Persisted,
@@ -381,11 +403,13 @@ pub(super) fn runner_config(socket_path: PathBuf) -> SpawnConfig {
             env_allowlist: None,
         },
         cwd: std::env::temp_dir(),
+        config_path: std::env::temp_dir(),
         additional_dirs: vec![],
         provider_env: vec![],
         host_environment: vec![],
         default_effort: None,
         default_effort_explicit: false,
+        default_model_config: Default::default(),
         default_mode: None,
         default_model: None,
         socket_path: Some(socket_path),

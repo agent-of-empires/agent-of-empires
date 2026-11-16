@@ -366,3 +366,37 @@ test.describe("Delete active session", () => {
     await expect(row).toHaveCount(0, { timeout: 10_000 });
   });
 });
+
+test("mixed workspace recovery targets only its unfinished Trash member", async ({ page }) => {
+  const shared = { projectPath: "/tmp/mixed-recovery", branch: "main", groupPath: "/tmp" };
+  const handle = await installTrashMocks(
+    page,
+    [
+      {
+        ...shared,
+        id: "mixed-pending",
+        title: "pending member",
+        trashed: true,
+        pendingTrash: true,
+      },
+      { ...shared, id: "mixed-live", title: "live member", trashed: false },
+    ],
+    { groupAxis: true },
+  );
+  await page.goto("/session/mixed-live");
+  const live = page.getByRole("navigation", { name: "Sessions sidebar" }).locator('a[href="/session/mixed-live"]');
+  await expect(live).toBeVisible();
+  await openTrash(page);
+  const pending = trashRows(page).filter({ hasText: "pending member" });
+  await expect(pending).toBeVisible();
+  await expect(trashRows(page).filter({ hasText: "live member" })).toHaveCount(0);
+  await pending.getByTestId("sidebar-trash-retry").click();
+  await expect.poll(() => handle.trashedIds).toEqual(["mixed-pending"]);
+  await expect(pending.getByTestId("sidebar-trash-retry")).toBeEnabled();
+  await expect(live).toBeVisible();
+  await expect(page).toHaveURL(/\/session\/mixed-live/);
+  expect(handle.restoredIds).toEqual([]);
+  expect(handle.deletedIds).toEqual([]);
+  await expect(pending.getByTestId("sidebar-trash-forget")).toHaveCount(0);
+  await expect(page).toHaveURL(/\/session\/mixed-live/);
+});

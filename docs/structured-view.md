@@ -100,7 +100,8 @@ Features depend on the ACP adapter and its profile:
 | `/clear` boundary divider | `/clear` | `/new` | `/new` | none | none |
 | TodoWrite / Skill / ExitPlanMode / ScheduleWakeup cards | ✓ | — | — | — | — |
 | Subagent indentation | ✓ | — | unverified | — | — |
-| Workflow agents in the Sub agents pane | ✓ | — | — | — | — |
+| Per-subagent state and Stop | ✓ | — | — | — | — |
+| Workflow agents in the Background pane | ✓ | — | — | — | — |
 | Session resume across `aoe serve` restart | ✓ | depends | ✓ | depends | depends |
 
 In a sandboxed session a Claude `Workflow` run is not tracked, like a backgrounded command: the session can show idle while its agents still work.
@@ -118,7 +119,7 @@ aoe add . --agent codex --model gpt-5
 aoe add . --agent codex --effort high
 ```
 
-`--agent` implies structured view and refuses an uninstalled adapter with an install hint. `--structured-view` without `--agent` can fall back to terminal view with a warning. If you decline the repository hooks needed to find the adapter, creation is refused instead. The TUI and the web dashboard refuse such a session with the same hint before anything is created. An adapter counts as installed when aoe finds it, when it is on the PATH set by [`environment`](guides/configuration.md#host-environment), or when a `before_session` hook is configured, or an `on_create` or `on_launch` hook will run first (the profile's, or the repository's unless this create skips it), since any of them may set PATH or install the adapter. A relative PATH entry is searched from the session's directory; for a new worktree or scratch session, which doesn't exist yet when the check runs, it counts. Sandboxed sessions skip the check, since the adapter runs inside the container, whose image must bundle it.
+`--agent` implies structured view and refuses an uninstalled adapter with an install hint. `--structured-view` without `--agent` can fall back to terminal view with a warning. If you decline the repository hooks needed to find the adapter, creation is refused instead. The TUI and the web dashboard refuse such a session with the same hint before anything is created. The web wizard also disables Structured view ahead of time, as "ACP adapter not installed", when the server reports that the selected Profile and project would refuse it (counting both their hooks), Sandbox is off and there is no command override. Until the server answers for a newly chosen project, Structured view stays available for an agent that is ACP-capable without the repository, and the create's own check decides; an agent that only the repository's `agent_detect_as` makes ACP-capable shows Structured view as unavailable until the answer arrives. An adapter counts as installed when aoe finds it, when it is on the PATH set by [`environment`](guides/configuration.md#host-environment), or when a `before_session` hook is configured, or an `on_create` or `on_launch` hook will run first (the profile's, or the repository's unless this create skips it), since any of them may set PATH or install the adapter. A relative PATH entry is searched from the session's directory; for a new worktree or scratch session, which doesn't exist yet when the check runs, it counts. Sandboxed sessions skip the check, since the adapter runs inside the container, whose image must bundle it.
 
 ## Requirements
 
@@ -191,8 +192,25 @@ reload. See [retained history internals](development/internals/structured-view.m
 for the storage and migration contract.
 
 Dialogs close when their target session changes or disappears. Trash context
-menus reject actions if the original session, profile, or lifecycle generation
-changes. Restore and permanent deletion never target a replacement selection.
+menus reject actions if their original session, profile, lifecycle generation,
+or runtime epoch changes. Restore and permanent deletion never target a
+replacement selection.
+
+An unfinished Trash transition offers **Retry Trash** in the TUI context menu and
+web Trash controls. A fresh owner remains busy; an unverified retained checkout
+can still prevent completion. Retry is an explicit management action, never part
+of opening the transcript.
+The TUI command palette exposes Restore and Retry Trash using
+the same lifecycle-gated actions as the context menu. Opening Trash confirmation
+captures its runtime epoch; a daemon replacement invalidates the confirmation.
+Trash remains read-only without discarding untargeted pending composer paste.
+Web recovery lists unfinished members of mixed live/Trash workspaces separately.
+It never retries or restores a live sibling. Restore receipts keep their native
+revision so a late older Retry cannot replace the restored row.
+
+If Retry cannot verify the checkout, keep the record in Trash and inspect its
+retained history read-only. There is no record-only removal action. A fresh
+runtime, profile, or lifecycle generation requires fresh recovery consent.
 
 The reader shows retained ACP history, including events
 recorded before a switch to terminal view. Missing or unreadable event ranges

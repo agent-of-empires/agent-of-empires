@@ -37,6 +37,7 @@ A conflicting built-in tool and command, such as tool `claude` with command `cod
 A bare, non-path wrapper mapped by `agent_detect_as` can still start fresh and capture its pane-scoped published ID without the execution contract. AoE does not preassign a native ID from a status alias alone, including after an explicit fresh choice or disabled `auto_resume_on_restart`. Resuming a published ID still requires the contract. A native selector supplied by the user remains user-owned only when the row has no AoE-managed conversation state; AoE does not inject another selector. A known conversation can still be tried after an external working-directory or store move on Default when native execution resolves and its target checks pass; its old binding remains authoritative until a qualified observation updates it.
 
 Shell pipelines, remote launchers, redirections, expansion, and unrecognized context-changing arguments are not supported managed invocations. The program, routing environment, and native namespace arguments are fixed from one validated launch snapshot and restored after the login shell.
+Literal leading `NAME=value` assignments and a shell-quoted executable are supported for direct commands. The assignments are included when resolving the executable and its native store.
 
 ## Supported managed contexts
 

@@ -61,11 +61,12 @@ export interface AcpContext {
   pendingAttachments: PromptAttachmentInput[];
   setPendingAttachments: React.Dispatch<React.SetStateAction<PromptAttachmentInput[]>>;
   forceEndTurn: () => Promise<void>;
+  cancelSubagent: (childId: string) => Promise<void>;
   lastActivityRef: Session["lastActivityRef"];
   dismissError: () => void;
   dismissPrimer: () => void;
   /** After this dashboard's restart of a start in progress succeeds. */
-  markRestartStarted: (epoch: number, stoppedSent: boolean) => void;
+  markRestartStarted: (epoch: number, stoppedSent: boolean, retriedError?: string) => void;
   /** After this dashboard's restart fails once it has stopped the Worker. */
   markRestartFailed: (epoch: number, message: string, stoppedSent: boolean) => void;
   dismissCompactionReminder: () => void;
@@ -247,6 +248,7 @@ export function AcpRuntime({
         pendingAttachments,
         setPendingAttachments,
         forceEndTurn: acp.forceEndTurn,
+        cancelSubagent: acp.cancelSubagent,
         lastActivityRef: acp.lastActivityRef,
         dismissError: acp.dismissError,
         dismissPrimer: acp.dismissPrimer,

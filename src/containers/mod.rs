@@ -16,6 +16,7 @@ pub use container_interface::{
 };
 use error::Result;
 pub(crate) use execution::{ContainerExecutionSnapshot, RuntimeExecutionSnapshot};
+pub(crate) use runtime::RuntimeKind;
 pub use runtime::{ContainerRuntime, ContainerState};
 
 /// Returns the CLI binary name for the configured container runtime.

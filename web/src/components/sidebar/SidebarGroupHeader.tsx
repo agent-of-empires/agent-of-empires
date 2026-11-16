@@ -10,7 +10,12 @@ import {
 } from "../../lib/repoAppearance";
 import { STATUS_DOT_CLASS } from "../../lib/session";
 import { usePluginAttention } from "../../lib/pluginUiContext";
-import { workspaceAttentionCount, workspaceIsSunk } from "../../lib/sidebarSort";
+import {
+  attentionBadgeText,
+  workspaceAttentionCount,
+  workspaceErrorCount,
+  workspaceIsSunk,
+} from "../../lib/sidebarSort";
 import { useSidebarCompact } from "../../lib/sidebarCompact";
 import { OFFLINE_TITLE } from "../../lib/connectionState";
 import { ContextMenu, MenuChoiceRow, MenuItem, MenuSeparator, MenuSwatches } from "../ContextMenu";
@@ -129,6 +134,7 @@ export const SidebarGroupHeader = memo(function SidebarGroupHeader(props: Props)
     (n, v) => n + workspaceAttentionCount(v.workspace, pluginAttention),
     0,
   );
+  const errorCount = group.workspaces.reduce((n, v) => n + workspaceErrorCount(v.workspace), 0);
 
   return (
     <>
@@ -237,9 +243,7 @@ export const SidebarGroupHeader = memo(function SidebarGroupHeader(props: Props)
             {group.displayName}
           </span>
           {attentionCount > 0 && (
-            <Tooltip
-              text={`${attentionCount} session${attentionCount === 1 ? "" : "s"} need${attentionCount === 1 ? "s" : ""} attention`}
-            >
+            <Tooltip text={attentionBadgeText(attentionCount, errorCount)}>
               <span
                 className="shrink-0 min-w-[1.25rem] rounded-full bg-status-error px-1.5 text-[11px] font-semibold leading-[1.25rem] tabular-nums text-white text-center"
                 data-testid="sidebar-group-attention-badge"

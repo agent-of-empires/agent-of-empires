@@ -27,14 +27,16 @@ mod worker;
 pub(crate) use attachments::{sniff_image_mime, validate_attachments};
 pub use config::{acp_set_config_option, acp_set_mode};
 pub use history::{
-    acp_context_primer, acp_files, acp_replay, acp_worker_log, list_importable_sessions,
+    acp_context_primer, acp_files, acp_replay, acp_task_output, acp_worker_log,
+    list_importable_sessions,
 };
 pub(crate) use history::{importable_sessions, list_error_response, read_log_tail};
 pub use install::{agent_install_info, install_agent};
 pub use prompt::{
-    acp_attachment, acp_cancel, acp_force_end_turn, acp_prompt, acp_prompt_diff_comments,
-    resolve_approval, resolve_elicitation,
+    acp_attachment, acp_cancel, acp_cancel_subagent, acp_force_end_turn, acp_prompt,
+    acp_prompt_diff_comments, resolve_approval, resolve_elicitation,
 };
+pub(crate) use prompt::{submit_prompt, PromptSubmission, PromptSubmitError, PromptSubmitted};
 pub use view::{acp_disable, acp_enable};
 pub(crate) use view::{
     publish_startup_error_if_current, recover_pending_terminal_handoffs, HandoffRecovery,
@@ -178,12 +180,14 @@ pub(crate) fn spawn_request_for(
         agent,
         tool: instance.tool.clone(),
         cwd: PathBuf::from(&instance.project_path),
+        config_path: instance.repo_config_path().to_path_buf(),
         additional_dirs: vec![],
         provider_env: vec![],
         provider: instance.agent_provider.clone(),
         model: instance.agent_model.clone(),
         effort: instance.acp_effort.clone(),
         effort_explicit: instance.acp_effort.is_some(),
+        model_config: instance.acp_model_config.clone(),
         stored_acp_session_id: instance.acp_session_id.clone(),
         fork_from: instance.fork_pending.clone(),
         sandbox_continuation: crate::acp::supervisor::SandboxContinuation::Persisted,
@@ -227,6 +231,16 @@ fn launch_error_response(context: &str, error: &anyhow::Error) -> Response {
     if let Some(blocked) = error.downcast_ref::<crate::session::StartBlocked>() {
         return crate::server::api::start_blocked_response(*blocked);
     }
+    if let Some(login) = error.downcast_ref::<crate::session::SandboxLoginRequired>() {
+        return crate::server::api::sandbox_login_required_response(login);
+    }
+    if let Some(unsupported) = error.downcast_ref::<crate::session::SandboxLoginUnsupported>() {
+        return crate::server::api::sandbox_login_unsupported_response(unsupported);
+    }
+    if let Some(hook) = error.downcast_ref::<crate::session::BeforeStartHookError>() {
+        // The hook's own failure, in fixed words; a switch queues nothing.
+        return crate::server::api::before_start_hook_failed_response(hook);
+    }
     if error.is::<crate::session::SessionGone>() {
         return session_not_found();
     }
@@ -258,7 +272,7 @@ async fn pick_agent(
             &instance.tool,
             explicit,
             &instance.source_profile,
-            std::path::Path::new(&instance.project_path),
+            instance.repo_config_path(),
         )
         .await
 }

@@ -145,6 +145,22 @@ describe("in-flight prompt settlement", () => {
     });
     expect(reducer(echoed, { kind: "settle_inflight_prompt", id: "p1" }).turnActive).toBe(true);
   });
+
+  it("a drained batch echo settles every merged id and their overlay rows (#5401)", () => {
+    const three = run(
+      sent("p1"),
+      { kind: "user_prompt", id: "p2", text: "second" },
+      { kind: "user_prompt", id: "p3", text: "third" },
+      { kind: "user_prompt", id: "other", text: "still sending" },
+    );
+    const drained = applyEvent(three, {
+      session_id: "s-1",
+      seq: 1,
+      event: { UserPromptSent: { text: "hi\n\nsecond\n\nthird", prompt_id: "p1", merged_prompt_ids: ["p2", "p3"] } },
+    });
+    expect(drained.inflightPromptIds).toEqual(["other"]);
+    expect(drained.optimisticRows.map((r) => r.id)).toEqual(["p1", "other"]);
+  });
 });
 
 describe("prompt queue", () => {
@@ -179,6 +195,34 @@ describe("prompt queue", () => {
     expect(reducer(s, { kind: "clear_queue" }).queuedPrompts).toEqual([]);
   });
 
+  it("server prompt rows settle their own and merged ids when the live frame was missed (#5401)", () => {
+    const row = (id: string, mergedPromptIds?: string[]) => ({
+      id,
+      kind: "user_prompt" as const,
+      at: "2026-01-01T00:00:00Z",
+      text: id,
+      ...(mergedPromptIds ? { mergedPromptIds } : {}),
+    });
+    const pending = (...ids: string[]) =>
+      run(empty(), ...ids.map((id): Action => ({ kind: "user_prompt", id, text: id })));
+
+    const idle = reducer(pending("p1", "p2", "p3"), {
+      kind: "transcript_snapshot",
+      rows: [row("p1", ["p2", "p3"])],
+    });
+    expect(idle.inflightPromptIds).toEqual([]);
+    expect(idle.optimisticRows).toEqual([]);
+    expect(idle.turnActive).toBe(false);
+
+    const busy = reducer(pending("p1", "p2", "direct"), { kind: "transcript_snapshot", rows: [row("p1", ["p2"])] });
+    expect(busy.inflightPromptIds).toEqual(["direct"]);
+    expect(busy.optimisticRows.map((r) => r.id)).toEqual(["direct"]);
+
+    const older = reducer(pending("p2"), { kind: "prepend", rows: [row("p1", ["p2"])], oldestSeq: 0 });
+    expect(older.inflightPromptIds).toEqual([]);
+    expect(older.optimisticRows).toEqual([]);
+  });
+
   it("hydrate replaces confirmed rows with the server snapshot but keeps in-flight ones", () => {
     const local = run(
       empty(),
@@ -191,6 +235,50 @@ describe("prompt queue", () => {
       rows: [serverRow("a", 0, "one"), serverRow("b", 1, "two")],
     });
     expect(next.queuedPrompts.map((q) => q.text)).toEqual(["one", "two", "just typed"]);
+  });
+
+  it("hydrate retires the optimistic row and spinner of a prompt the queue holds, and only those (#5401)", () => {
+    const local = run(
+      empty(),
+      { kind: "user_prompt", id: "lost-response", text: "queued during compact" },
+      { kind: "user_prompt", id: "direct", text: "dispatched, echo not here yet" },
+    );
+    const next = reducer(local, { kind: "hydrate_server_queue", rows: [serverRow("lost-response", 0, "queued")] });
+    expect(next.inflightPromptIds).toEqual(["direct"]);
+    expect(next.optimisticRows.map((r) => r.id)).toEqual(["direct"]);
+    expect(next.turnActive).toBe(true);
+
+    const idle = reducer(run(empty(), { kind: "user_prompt", id: "lost-response", text: "x" }), {
+      kind: "hydrate_server_queue",
+      rows: [serverRow("lost-response", 0, "x")],
+    });
+    expect(idle.optimisticRows).toEqual([]);
+    expect(idle.turnActive).toBe(false);
+  });
+
+  it("a late queued response does not duplicate a row hydration already added", () => {
+    const hydrated = reducer(empty(), { kind: "hydrate_server_queue", rows: [serverRow("q1", 0, "one")] });
+    const late = run(
+      hydrated,
+      { kind: "enqueue_prompt", id: "q1", text: "one" },
+      { kind: "confirm_queued_prompt", id: "q1" },
+    );
+    expect(late.queuedPrompts.map((q) => q.id)).toEqual(["q1"]);
+  });
+
+  it("a late queued response restores local attachment bytes on a hydrated row", () => {
+    const ref = { id: "att1", kind: "image" as const, mime_type: "image/png", name: "a.png", size: 9 };
+    const hydrated = reducer(empty(), { kind: "hydrate_server_queue", rows: [serverRow("q1", 0, "srv", [ref])] });
+    expect(hydrated.queuedPrompts[0]?.attachments?.[0]?.dataB64).toBe("");
+
+    const late = reducer(hydrated, { kind: "enqueue_prompt", id: "q1", text: "local", attachments: [image] });
+    expect(late.queuedPrompts).toHaveLength(1);
+    expect(late.queuedPrompts[0]).toMatchObject({ id: "q1", text: "srv" });
+    expect(late.queuedPrompts[0]?.attachments?.[0]?.dataB64).toBe("REALBYTES");
+
+    const again = reducer(late, { kind: "hydrate_server_queue", rows: [serverRow("q1", 0, "srv", [ref])] });
+    expect(again.queuedPrompts).toHaveLength(1);
+    expect(again.queuedPrompts[0]?.attachments?.[0]?.dataB64).toBe("REALBYTES");
   });
 
   it("hydrate keeps local attachment bytes, else builds a metadata-only view", () => {
@@ -410,5 +498,122 @@ describe("a restart of a start in progress", () => {
   ])("%s", (_label, actions, restartFailure, workerStopped) => {
     const state = run(empty(), ...actions);
     expect([state.restartFailure, state.workerStopped]).toEqual([restartFailure, workerStopped]);
+  });
+});
+
+describe("a Retry of a startup error", () => {
+  const frame = (seq: number, event: AcpFrame["event"]): Action => ({
+    kind: "frame",
+    frame: { session_id: "s", seq, event },
+  });
+  const failed = (seq: number, message: string) => frame(seq, { AgentStartupError: { message } });
+  const retry = (epoch = 1): Action => ({ kind: "restart_started", epoch, stoppedSent: false, retriedError: "boom" });
+  // [startupError, retriedError, restartInFlight] after a first failure, then these.
+  it.each<[string, Action[], [string | null, string | null, boolean]]>([
+    ["starting it hides the error and keeps what it retries", [retry()], [null, "boom", true]],
+    ["its own stop doesn't end it", [retry(), frame(2, { Stopped: { reason: "user_stopped" } })], [null, "boom", true]],
+    ["typing during it keeps it", [retry(), { kind: "user_prompt", text: "hi" }], [null, "boom", true]],
+    ["a stale one is ignored", [retry(0)], ["boom", null, false]],
+    [
+      "the Agent starting ends it",
+      [retry(), frame(2, { AcpSessionAssigned: { acp_session_id: "a" } })],
+      [null, null, false],
+    ],
+    ["a new error ends it and keeps what it retried", [retry(), failed(2, "worse")], ["worse", "boom", false]],
+    [
+      "a refusal fails like the start it retried",
+      [retry(), { kind: "restart_failed", epoch: 1, message: "capacity full", stoppedSent: false }],
+      ["capacity full", "boom", false],
+    ],
+    [
+      "a startup line restart's error isn't a Retry's",
+      [{ kind: "restart_started", epoch: 1, stoppedSent: false }, failed(2, "worse")],
+      ["worse", null, false],
+    ],
+    [
+      "a prompt echo during it keeps it",
+      [retry(), frame(2, { UserPromptSent: { text: "hi", prompt_id: "p1" } })],
+      [null, "boom", true],
+    ],
+    [
+      "a later error with no Retry is a first failure again",
+      [retry(), failed(2, "worse"), failed(3, "other")],
+      ["other", null, false],
+    ],
+    [
+      "sending after a failed Retry clears it",
+      [retry(), failed(2, "worse"), { kind: "user_prompt", text: "hi" }],
+      [null, null, false],
+    ],
+  ])("%s", (_label, actions, expected) => {
+    const state = run(empty(), failed(1, "boom"), ...actions);
+    expect([state.startupError, state.retriedError, state.restartInFlight]).toEqual(expected);
+  });
+});
+
+describe("a diagnosed startup cause", () => {
+  const frame = (seq: number, event: AcpFrame["event"]): Action => ({
+    kind: "frame",
+    frame: { session_id: "s", seq, event },
+  });
+  const gone = (seq: number) =>
+    frame(seq, { AgentStartupError: { message: "removed", cause: { kind: "container_missing" } } });
+  const failed = (seq: number) => frame(seq, { AgentStartupError: { message: "boom" } });
+  const retry: Action = { kind: "restart_started", epoch: 1, stoppedSent: false, retriedError: "boom" };
+  // [cause kind, startupError, retriedError, restartInFlight] after these.
+  it.each<[string, Action[], [string | null, string | null, string | null, boolean]]>([
+    ["the typed event sets it", [gone(1)], ["container_missing", "removed", null, false]],
+    [
+      "an unknown kind reads as none",
+      [frame(1, { AgentStartupError: { message: "x", cause: { kind: "later" } as never } })],
+      [null, "x", null, false],
+    ],
+    ["a later untyped error replaces it", [gone(1), failed(2)], [null, "boom", null, false]],
+    ["it replaces an earlier untyped error", [failed(1), gone(2)], ["container_missing", "removed", null, false]],
+    [
+      "it ends a Retry without comparing errors",
+      [failed(1), retry, gone(2)],
+      ["container_missing", "removed", null, false],
+    ],
+    [
+      "Recreate's hand-off to the startup line clears it",
+      [gone(1), { ...retry, retriedError: "removed" }],
+      [null, null, "removed", true],
+    ],
+    [
+      "a refused restart after it is untyped",
+      [
+        gone(1),
+        { ...retry, retriedError: "removed" },
+        { kind: "restart_failed", epoch: 1, message: "no", stoppedSent: false },
+      ],
+      [null, "no", "removed", false],
+    ],
+    ["sending clears it", [gone(1), { kind: "user_prompt", text: "hi" }], [null, null, null, false]],
+    [
+      "a new turn clears it",
+      [gone(1), frame(2, { UserPromptSent: { text: "hi", prompt_id: "p" } })],
+      [null, null, null, false],
+    ],
+    [
+      "the Agent starting clears it",
+      [gone(1), frame(2, { AcpSessionAssigned: { acp_session_id: "a" } })],
+      [null, null, null, false],
+    ],
+    [
+      "an Agent switch clears it",
+      [gone(1), frame(2, { AgentSwitched: { from: "claude", to: "codex", reason: "manual" } })],
+      [null, null, null, false],
+    ],
+    [
+      "a lost integration is untyped",
+      [gone(1), frame(2, { IntegrationLost: { reason: { kind: "hold_overflow" } } })],
+      [null, "Agent integration lost: hold overflow", null, false],
+    ],
+  ])("%s", (_label, actions, expected) => {
+    const state = run(empty(), ...actions);
+    expect([state.startupCause?.kind ?? null, state.startupError, state.retriedError, state.restartInFlight]).toEqual(
+      expected,
+    );
   });
 });

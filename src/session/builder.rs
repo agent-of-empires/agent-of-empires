@@ -82,6 +82,10 @@ pub struct InstanceParams {
     pub command_override: String,
     /// Additional repository paths for multi-repo workspace mode
     pub extra_repo_paths: Vec<String>,
+    /// Create the worktree inside a workspace directory even with no
+    /// `extra_repo_paths`, so more projects can be attached later without
+    /// moving the session's cwd. Requires worktree mode.
+    pub workspace: bool,
     /// Per-repo base branches as `(selector, base)` pairs, from
     /// `aoe add --repo-base <selector>=<ref>` or the web wizard. The
     /// selector is a repo directory name or one of the paths in `path` /
@@ -747,6 +751,12 @@ pub(crate) fn plan_instance(
         if !params.extra_repo_paths.is_empty() {
             bail!("Cannot combine --scratch with extra repository paths");
         }
+        if params.workspace {
+            bail!("Cannot combine --scratch with workspace mode");
+        }
+    }
+    if params.workspace && !params.worktree_enabled {
+        bail!("Workspace mode requires worktree mode");
     }
 
     if params.sandbox {
@@ -768,6 +778,40 @@ pub(crate) fn plan_instance(
         std::path::PathBuf::from(&params.path)
     };
     let mut config = super::config::repo_config::resolve_config_with_repo(profile, &config_path)?;
+    let overridden = config
+        .session
+        .agent_command_override
+        .get(&params.tool)
+        .is_some_and(|command| !command.trim().is_empty());
+    if !overridden && crate::agents::get_agent(&params.tool).is_none() {
+        let declared = crate::plugin::agent_integration::declared_agent(
+            crate::plugin::registry(),
+            &params.tool,
+            config
+                .session
+                .custom_agents
+                .iter()
+                .filter(|(_, command)| !command.trim().is_empty())
+                .map(|(name, _)| name.as_str()),
+        );
+        if declared.as_ref().is_some_and(|agent| {
+            agent
+                .contribution()
+                .launch
+                .as_ref()
+                .is_some_and(|launch| launch.host_only)
+        }) {
+            if params.sandbox {
+                bail!(
+                    "{} can only run on the host, not in a sandbox.",
+                    params.tool
+                );
+            }
+            if params.worktree_enabled {
+                bail!("{} does not support worktree mode.", params.tool);
+            }
+        }
+    }
     if params.no_submodules {
         config.worktree.init_submodules = false;
     }
@@ -847,7 +891,7 @@ pub(crate) fn plan_instance(
     };
 
     if let Some(branch) = &effective_worktree_branch {
-        if !params.extra_repo_paths.is_empty() {
+        if params.workspace || !params.extra_repo_paths.is_empty() {
             let primary_path = PathBuf::from(&params.path)
                 .canonicalize()
                 .unwrap_or_else(|_| PathBuf::from(&params.path));
@@ -1338,14 +1382,19 @@ pub mod structured {
     /// Whether an `on_create` or `on_launch` hook will run before a create in `project_path`
     /// launches, or is waiting on the user's trust decision. `profile_hooks` must be the
     /// profile's own, without the repository's, which count only under `trust_hooks` (the
-    /// create's decision; `Some(false)` skips them).
+    /// create's decision; `Some(false)` skips them). `on_create` doesn't count under
+    /// `skip_on_create`.
     pub fn preparation_hooks_apply(
         profile_hooks: &crate::session::HooksConfig,
         project_path: &std::path::Path,
         scratch: bool,
         trust_hooks: Option<bool>,
+        skip_on_create: bool,
     ) -> bool {
         use crate::session::config::repo_config::{check_repo_trust, TrustSurface};
+        let prepares = |hooks: &crate::session::HooksConfig| {
+            (!skip_on_create && !hooks.on_create.is_empty()) || !hooks.on_launch.is_empty()
+        };
         if prepares(profile_hooks) {
             return true;
         }
@@ -1359,10 +1408,6 @@ pub mod structured {
             }
             _ => false,
         }
-    }
-
-    fn prepares(hooks: &crate::session::HooksConfig) -> bool {
-        !hooks.on_create.is_empty() || !hooks.on_launch.is_empty()
     }
 
     /// Pre-create validation for an explicit structured-view choice, run BEFORE any worktree,
@@ -1562,7 +1607,7 @@ pub mod structured {
     pub fn apply_structured_choice(instance: &mut Instance) {
         let config = crate::session::config::repo_config::resolve_config_with_repo_or_warn(
             &instance.source_profile,
-            std::path::Path::new(&instance.project_path),
+            instance.repo_config_path(),
         );
         if !tool_acp_capable(&instance.tool, &config) {
             tracing::warn!(
@@ -2168,6 +2213,7 @@ mod tests {
             project: &'a std::path::Path,
             scratch: bool,
             trust_hooks: Option<bool>,
+            skip_on_create: bool,
             want: bool,
         }
         let cases = [
@@ -2177,6 +2223,7 @@ mod tests {
                 project: plain.path(),
                 scratch: false,
                 trust_hooks: None,
+                skip_on_create: false,
                 want: true,
             },
             Case {
@@ -2185,6 +2232,7 @@ mod tests {
                 project: plain.path(),
                 scratch: false,
                 trust_hooks: None,
+                skip_on_create: false,
                 want: true,
             },
             Case {
@@ -2193,6 +2241,7 @@ mod tests {
                 project: plain.path(),
                 scratch: false,
                 trust_hooks: None,
+                skip_on_create: false,
                 want: false,
             },
             Case {
@@ -2201,6 +2250,7 @@ mod tests {
                 project: untrusted.path(),
                 scratch: false,
                 trust_hooks: None,
+                skip_on_create: false,
                 want: true,
             },
             Case {
@@ -2209,6 +2259,7 @@ mod tests {
                 project: untrusted.path(),
                 scratch: false,
                 trust_hooks: Some(false),
+                skip_on_create: false,
                 want: false,
             },
             Case {
@@ -2217,6 +2268,7 @@ mod tests {
                 project: untrusted.path(),
                 scratch: true,
                 trust_hooks: None,
+                skip_on_create: false,
                 want: false,
             },
             Case {
@@ -2225,6 +2277,25 @@ mod tests {
                 project: trusted.path(),
                 scratch: false,
                 trust_hooks: Some(false),
+                skip_on_create: false,
+                want: true,
+            },
+            Case {
+                label: "profile on_create, skipped",
+                profile: &on_create,
+                project: plain.path(),
+                scratch: false,
+                trust_hooks: None,
+                skip_on_create: true,
+                want: false,
+            },
+            Case {
+                label: "profile on_launch, on_create skipped",
+                profile: &on_launch,
+                project: plain.path(),
+                scratch: false,
+                trust_hooks: None,
+                skip_on_create: true,
                 want: true,
             },
         ];
@@ -2235,6 +2306,7 @@ mod tests {
                     case.project,
                     case.scratch,
                     case.trust_hooks,
+                    case.skip_on_create,
                 ),
                 case.want,
                 "{}",
@@ -3089,6 +3161,7 @@ mod tests {
             extra_args: String::new(),
             command_override: String::new(),
             extra_repo_paths: Vec::new(),
+            workspace: false,
             repo_base_branches: Vec::new(),
             scratch: false,
             fork_seed: None,
@@ -3096,6 +3169,43 @@ mod tests {
             no_submodules: false,
             tie_workdir_to_name: false,
             worktree_path_id: None,
+        }
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn workspace_without_extra_repos_builds_a_single_repo_workspace() {
+        let _home = crate::session::test_support::isolate_app_dir();
+        let _registry = crate::tmux::status_rules::ProfileRegistryGuard::take("default");
+        let parent = init_repo_with_commit("solo");
+        let project = parent.path().join("solo");
+        let mut params = custom_agent_params(&project, "claude");
+        params.workspace = true;
+        params.worktree_enabled = true;
+        params.worktree_branch = Some("solo-ws".into());
+        params.create_new_branch = true;
+
+        let instance = build_instance(params.clone(), &[], &[], "default")
+            .unwrap()
+            .instance;
+        let workspace = instance.workspace_info.as_ref().expect("workspace_info");
+        assert_eq!(instance.project_path, workspace.workspace_dir);
+        assert_eq!(workspace.repos.len(), 1);
+        assert_eq!(workspace.repos[0].name, "solo");
+        assert!(std::path::Path::new(&workspace.repos[0].worktree_path).is_dir());
+        assert!(instance.worktree_info.is_none());
+
+        for (worktree_enabled, scratch, expected) in [
+            (false, false, "Workspace mode requires worktree mode"),
+            (false, true, "Cannot combine --scratch with workspace mode"),
+        ] {
+            let mut params = params.clone();
+            params.worktree_enabled = worktree_enabled;
+            params.scratch = scratch;
+            let Err(err) = build_instance(params, &[], &[], "default") else {
+                panic!("{expected}: must error");
+            };
+            assert!(err.to_string().contains(expected), "{err:#}");
         }
     }
 
@@ -3363,6 +3473,7 @@ mod tests {
             extra_args: String::new(),
             command_override: String::new(),
             extra_repo_paths: vec![],
+            workspace: false,
             repo_base_branches: Vec::new(),
             scratch: false,
             fork_seed: Some(ForkSeed::Structured {
@@ -3440,6 +3551,7 @@ mod tests {
             extra_args: String::new(),
             command_override: String::new(),
             extra_repo_paths: vec![],
+            workspace: false,
             repo_base_branches: Vec::new(),
             scratch: false,
             fork_seed: Some(ForkSeed::Terminal {

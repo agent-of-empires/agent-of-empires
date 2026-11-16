@@ -9,7 +9,8 @@ use serde_json::Value;
 use serial_test::parallel;
 
 use crate::harness::{
-    app_dir_in, require_tmux, wait_until, write_executable, TuiTestHarness, PROFILE, SYSTEMD_OFF,
+    app_dir_in, pid_alive, require_tmux, wait_until, write_executable, TuiTestHarness, PROFILE,
+    SYSTEMD_OFF,
 };
 
 /// Replaces the harness's `[systemd]` section, with a slice no real session
@@ -209,10 +210,6 @@ fn systemd_unit_in_list(h: &TuiTestHarness, id: &str) -> Value {
         .clone()
 }
 
-fn pid_alive(pid: u32) -> bool {
-    std::path::Path::new(&format!("/proc/{pid}")).exists()
-}
-
 #[test]
 #[parallel]
 fn tmux_session_runs_in_its_own_scope_until_removed() {
@@ -308,7 +305,7 @@ fn tmux_session_runs_in_its_own_scope_until_removed() {
     let owned_unit = cgroup.trim().rsplit('/').next().unwrap();
     wait_for_release(owned_unit, escapee);
     assert!(
-        pid_alive(replacement_pid),
+        pid_alive(replacement_pid as i32),
         "owned cleanup killed a same-SID unit from a different namespace"
     );
     assert_eq!(
@@ -337,12 +334,12 @@ fn tmux_session_runs_in_its_own_scope_until_removed() {
 fn wait_for_release(glob: &str, escapee: u32) {
     wait_until(Duration::from_secs(10), Duration::from_millis(100), || {
         let units = units_matching(glob);
-        if units.is_empty() && !pid_alive(escapee) {
+        if units.is_empty() && !pid_alive(escapee as i32) {
             Ok(())
         } else {
             Err(format!(
                 "units {units:?} escapee {escapee} alive={}",
-                pid_alive(escapee)
+                pid_alive(escapee as i32)
             ))
         }
     });

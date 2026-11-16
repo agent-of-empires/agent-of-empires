@@ -4,7 +4,7 @@ use std::collections::HashSet;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use chrono::Utc;
+use chrono::{DateTime, Utc};
 use tokio::io::{AsyncReadExt, AsyncSeekExt, SeekFrom};
 use tokio::sync::mpsc::{Sender, WeakSender};
 use tokio_util::sync::CancellationToken;
@@ -22,8 +22,11 @@ const ABORT_AFTER: Duration = Duration::from_secs(300);
 /// Give the transcript file this long to appear after launch.
 const WAIT_FILE_FOR: Duration = Duration::from_secs(30);
 const CONTAINER_EXEC_TIMEOUT: Duration = Duration::from_secs(10);
-/// Cap on the assistant-text preview carried in progress/result.
+/// Cap on the assistant-text preview carried in progress.
 const TEXT_PREVIEW_CHARS: usize = 240;
+/// Cap on the final report carried in the completion, so a runaway report
+/// cannot bloat the event log.
+const RESULT_MAX_CHARS: usize = 256 * 1024;
 
 /// Where a sub-agent transcript lives, and how to read it.
 #[derive(Clone)]
@@ -288,6 +291,8 @@ struct ToolEntry {
     name: String,
     title: Option<String>,
     ok: Option<bool>,
+    started_at: Option<DateTime<Utc>>,
+    ended_at: Option<DateTime<Utc>>,
 }
 
 /// Hard cap on per-agent tool entries carried in events, so a runaway
@@ -303,6 +308,9 @@ struct Snapshot {
     tools: Vec<ToolEntry>,
     last_tool: Option<String>,
     last_text: Option<String>,
+    /// The latest assistant text up to `RESULT_MAX_CHARS`, kept for a
+    /// completion inferred from final text.
+    last_report: Option<String>,
     /// Final assistant text seen alongside an `end_turn` stop reason.
     result: Option<String>,
     /// Set once a terminal `end_turn` assistant message is parsed.
@@ -462,6 +470,11 @@ fn fold_line(line: &str, snap: &mut Snapshot) {
         return;
     };
     let kind = v.get("type").and_then(|t| t.as_str());
+    let at = v
+        .get("timestamp")
+        .and_then(|t| t.as_str())
+        .and_then(|t| DateTime::parse_from_rfc3339(t).ok())
+        .map(|t| t.with_timezone(&Utc));
     let Some(msg) = v.get("message") else {
         return;
     };
@@ -474,15 +487,17 @@ fn fold_line(line: &str, snap: &mut Snapshot) {
             let end_turn = msg.get("stop_reason").and_then(|s| s.as_str()) == Some("end_turn");
             for block in blocks {
                 match block.get("type").and_then(|t| t.as_str()) {
-                    Some("tool_use") => fold_tool_use(block, snap),
+                    Some("tool_use") => fold_tool_use(block, at, snap),
                     Some("text") => {
                         if let Some(text) = block.get("text").and_then(|t| t.as_str()) {
                             let preview = preview(text);
                             if !preview.is_empty() {
-                                snap.last_text = Some(preview.clone());
+                                let report = clip(text, RESULT_MAX_CHARS);
+                                snap.last_text = Some(preview);
+                                snap.last_report = Some(report.clone());
                                 snap.last_was_text = true;
                                 if end_turn {
-                                    snap.result = Some(preview);
+                                    snap.result = Some(report);
                                 }
                             }
                         }
@@ -497,7 +512,7 @@ fn fold_line(line: &str, snap: &mut Snapshot) {
         Some("user") => {
             for block in blocks {
                 if block.get("type").and_then(|t| t.as_str()) == Some("tool_result") {
-                    fold_tool_result(block, snap);
+                    fold_tool_result(block, at, snap);
                 }
             }
         }
@@ -507,7 +522,7 @@ fn fold_line(line: &str, snap: &mut Snapshot) {
 }
 
 /// Record a tool call.
-fn fold_tool_use(block: &serde_json::Value, snap: &mut Snapshot) {
+fn fold_tool_use(block: &serde_json::Value, at: Option<DateTime<Utc>>, snap: &mut Snapshot) {
     snap.tool_count += 1;
     snap.last_was_text = false;
     let name = block
@@ -533,12 +548,14 @@ fn fold_tool_use(block: &serde_json::Value, snap: &mut Snapshot) {
         name,
         title,
         ok: None,
+        started_at: at,
+        ended_at: None,
     });
 }
 
 /// Fill in a tool's outcome from its `tool_result`, matched by id, and
 /// clear it from the unresolved set (which, unlike `tools`, is uncapped).
-fn fold_tool_result(block: &serde_json::Value, snap: &mut Snapshot) {
+fn fold_tool_result(block: &serde_json::Value, at: Option<DateTime<Utc>>, snap: &mut Snapshot) {
     let Some(id) = block.get("tool_use_id").and_then(|i| i.as_str()) else {
         return;
     };
@@ -549,6 +566,7 @@ fn fold_tool_result(block: &serde_json::Value, snap: &mut Snapshot) {
     snap.unresolved_tools.remove(id);
     if let Some(entry) = snap.tools.iter_mut().find(|t| t.id == id) {
         entry.ok = Some(!is_error);
+        entry.ended_at = at;
     }
 }
 
@@ -579,9 +597,12 @@ fn snapshot_tools(snap: &Snapshot) -> Vec<crate::acp::state::BackgroundAgentTool
     snap.tools
         .iter()
         .map(|t| crate::acp::state::BackgroundAgentTool {
+            id: Some(t.id.clone()).filter(|id| !id.is_empty()),
             name: t.name.clone(),
             title: t.title.clone(),
             ok: t.ok,
+            started_at: t.started_at,
+            ended_at: t.ended_at,
         })
         .collect()
 }
@@ -589,11 +610,16 @@ fn snapshot_tools(snap: &Snapshot) -> Vec<crate::acp::state::BackgroundAgentTool
 /// First `TEXT_PREVIEW_CHARS` characters of `text`, trimmed, with an
 /// ellipsis if truncated.
 pub(crate) fn preview(text: &str) -> String {
+    clip(text, TEXT_PREVIEW_CHARS)
+}
+
+/// `text` trimmed to at most `max` characters, with an ellipsis if cut.
+fn clip(text: &str, max: usize) -> String {
     let trimmed = text.trim();
-    if trimmed.chars().count() <= TEXT_PREVIEW_CHARS {
+    if trimmed.chars().count() <= max {
         return trimmed.to_string();
     }
-    let head: String = trimmed.chars().take(TEXT_PREVIEW_CHARS).collect();
+    let head: String = trimmed.chars().take(max).collect();
     format!("{}…", head.trim_end())
 }
 
@@ -615,7 +641,7 @@ fn infer_idle_outcome(snap: &Snapshot) -> (BackgroundAgentStatus, Option<String>
     if snap.last_was_text && snap.last_text.is_some() && !dangling_tool {
         (
             BackgroundAgentStatus::Completed,
-            snap.last_text.clone(),
+            snap.last_report.clone(),
             Some("no explicit end_turn marker; completion inferred from final text".into()),
         )
     } else {
@@ -899,5 +925,52 @@ mod tests {
 
         let long = preview(&"x".repeat(TEXT_PREVIEW_CHARS + 50));
         assert!(long.ends_with('…') && long.chars().count() <= TEXT_PREVIEW_CHARS + 1);
+    }
+
+    #[test]
+    fn tools_carry_ids_and_transcript_timestamps() {
+        let snap = folded(&[
+            r#"{"type":"assistant","timestamp":"2026-11-06T10:00:00Z","message":{"content":[{"type":"tool_use","id":"t1","name":"Bash","input":{"command":"ls"}}]}}"#,
+            r#"{"type":"assistant","message":{"content":[{"type":"tool_use","id":"t2","name":"Read"}]}}"#,
+            r#"{"type":"user","timestamp":"2026-11-06T10:00:03.500Z","message":{"content":[{"type":"tool_result","tool_use_id":"t1","is_error":false}]}}"#,
+            r#"{"type":"user","timestamp":"not a time","message":{"content":[{"type":"tool_result","tool_use_id":"t2","is_error":false}]}}"#,
+        ]);
+        let tools = snapshot_tools(&snap);
+        let at = |s: &str| Some(DateTime::parse_from_rfc3339(s).unwrap().with_timezone(&Utc));
+        assert_eq!(tools[0].id.as_deref(), Some("t1"));
+        assert_eq!(tools[0].started_at, at("2026-11-06T10:00:00Z"));
+        assert_eq!(tools[0].ended_at, at("2026-11-06T10:00:03.500Z"));
+        assert_eq!(tools[1].id.as_deref(), Some("t2"));
+        assert_eq!(
+            tools[1].started_at, None,
+            "a missing timestamp is not invented"
+        );
+        assert_eq!(
+            tools[1].ended_at, None,
+            "a malformed timestamp is not invented"
+        );
+    }
+
+    #[test]
+    fn final_report_is_kept_beyond_the_progress_preview() {
+        let report = "line\n".repeat(200);
+        let line = |stop: &str| {
+            format!(
+                r#"{{"type":"assistant","message":{{"stop_reason":{stop},"content":[{{"type":"text","text":{}}}]}}}}"#,
+                serde_json::to_string(&report).unwrap()
+            )
+        };
+        let snap = folded(&[&line("\"end_turn\"")]);
+        assert_eq!(snap.result.as_deref(), Some(report.trim()));
+        assert!(snap.last_text.as_deref().unwrap().ends_with('…'));
+
+        let inferred = folded(&[&line("null")]);
+        assert_eq!(
+            infer_idle_outcome(&inferred).1.as_deref(),
+            Some(report.trim())
+        );
+
+        let huge = "x".repeat(RESULT_MAX_CHARS + 10);
+        assert!(clip(&huge, RESULT_MAX_CHARS).ends_with('…'));
     }
 }

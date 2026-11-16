@@ -185,6 +185,24 @@ impl Drop for PersistedMutation {
 #[derive(Debug)]
 pub(crate) struct QueuePersistFailed;
 
+/// Cap on queue depth per session. The queue lives on the `Instance` and every mutation
+/// rewrites the whole profile session file, so depth costs disk I/O on each enqueue rather
+/// than just memory.
+pub(crate) const MAX_QUEUED_PROMPTS_PER_SESSION: usize = 100;
+
+/// Cap on a single queued prompt's text. Unlike `/acp/prompt`, which streams straight to the
+/// agent, this text is persisted and rewritten on every subsequent queue mutation, so
+/// 256 KiB bounds that rewrite.
+pub(crate) const MAX_QUEUED_TEXT_BYTES: usize = 256 * 1024;
+
+/// Whether a session's queue can take a prompt, see [`SessionService::check_queue_room`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum QueueRoom {
+    Available,
+    TextTooLarge,
+    Full,
+}
+
 /// Result of `SessionService::edit_queued_prompt`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum EditQueuedOutcome {
@@ -263,6 +281,8 @@ pub struct SessionService {
     /// The queue drain reads turn liveness from it so it agrees with prompt
     /// dispatch; see [`SessionService::fold_control_state`].
     pub acp_control_cache: Arc<crate::acp::control_cache::ControlStateCache>,
+    /// Sessions held until the sandbox login they need exists.
+    pub(crate) sandbox_login: Arc<crate::server::sandbox_login::SandboxLoginService>,
     /// In-flight plugin creates keyed by `(plugin_id, idempotency_key)`.
     /// Sync mutex: critical sections are tiny and never span an `await`.
     create_in_flight: std::sync::Mutex<HashMap<(String, String), CreateInFlight>>,
@@ -371,6 +391,11 @@ pub(crate) enum SendTurnError {
     RevivalRefused,
     /// Post-publish: the forward found the resumed worker gone.
     WorkerLostAfterPublish,
+    /// Pre-publish: resuming the worker needs the sandbox login first.
+    LoginRequired(crate::session::SandboxLoginRequired),
+    /// Pre-publish: the sandbox login admission ran a `host_hooks.before_start` hook and it
+    /// failed; the message is the hook's own error. The caller keeps the turn.
+    HookFailed(String),
     /// Post-publish: the forward to the agent failed.
     Send(crate::acp::supervisor::SupervisorError),
 }
@@ -408,7 +433,8 @@ pub(crate) struct SendTurnRequest<'a> {
     /// Forces the resume trigger even when the worker looks alive, mirroring
     /// the handler's idle-dormant wake (#1689).
     pub woke_idle_dormant: bool,
-    pub prompt_id: Option<String>,
+    /// Transcript row id first, then the ids of queued rows folded into the same turn.
+    pub prompt_ids: Vec<String>,
     /// True when the daemon queued this turn itself (a rate-limit resume
     /// continuation) rather than the user typing it just now, so the
     /// transcript model can skip rendering a duplicate row for it.
@@ -431,6 +457,8 @@ impl std::fmt::Display for SendTurnError {
             Self::ResumeFailed(e) => write!(f, "worker resume failed: {e}"),
             Self::WorkerNotReady | Self::WorkerLostAfterPublish => write!(f, "worker not ready"),
             Self::RevivalRefused => write!(f, "no_revive: reviving a stopped worker is required"),
+            Self::LoginRequired(blocked) => write!(f, "{blocked}"),
+            Self::HookFailed(message) => write!(f, "{message}"),
             Self::Send(e) => write!(f, "prompt forward failed: {e}"),
         }
     }
@@ -467,6 +495,7 @@ impl SessionService {
             acp_supervisor: acp.supervisor,
             acp_event_store: acp.event_store,
             acp_control_cache: acp.control_cache,
+            sandbox_login: Arc::default(),
             create_in_flight: std::sync::Mutex::new(HashMap::new()),
             pending_drains: std::sync::Mutex::new(std::collections::HashSet::new()),
             persist_locks: RwLock::new(HashMap::new()),
@@ -548,6 +577,7 @@ impl SessionService {
                 cancelled: false,
             },
             published_at: std::time::Instant::now(),
+            cancel: tokio_util::sync::CancellationToken::new(),
         }));
         {
             let mut active = self
@@ -569,7 +599,8 @@ impl SessionService {
     }
 
     /// Refuse a cancellation the creation can no longer honor. Accepted
-    /// requests only mark the in-flight phase; the rollback still owns cleanup.
+    /// requests mark the in-flight phase and stop an image pull; the rollback
+    /// still owns cleanup.
     pub(crate) fn cancel_creation(&self, id: &str) -> bool {
         let entry = {
             let active = self
@@ -588,6 +619,7 @@ impl SessionService {
                 CreationLifecycle::Running | CreationLifecycle::Cancelled => {
                     entry.lifecycle = CreationLifecycle::Cancelled;
                     entry.progress.cancelled = true;
+                    entry.cancel.cancel();
                 }
             }
         }
@@ -665,9 +697,11 @@ impl SessionService {
         };
 
         spec.created_by_plugin = Some(plugin_id.to_string());
-        // Fail-closed: install-time plugin consent is not repository trust.
+        // Fail-closed: install-time plugin consent is not repository trust, nor a choice to
+        // skip setup.
         spec.trust_hooks = None;
         spec.trust_review = None;
+        spec.skip_on_create = false;
 
         let Some(key) = idempotency_key else {
             let outcome = spawn_structured_session(self, spec).await?;
@@ -999,7 +1033,7 @@ impl SessionService {
             text,
             attachments,
             woke_idle_dormant,
-            prompt_id,
+            prompt_ids,
             synthesized,
             no_revive,
         } = turn;
@@ -1032,10 +1066,88 @@ impl SessionService {
             return Err(SendTurnError::RevivalRefused);
         }
         if needs_resume {
+            let origin = match caller {
+                SessionCaller::User => crate::server::sandbox_login::LaunchOrigin::Interactive,
+                SessionCaller::Plugin { .. } | SessionCaller::PluginMessage { .. } => {
+                    crate::server::sandbox_login::LaunchOrigin::Unattended
+                }
+            };
+            // Refused here, before the detached resume, so the caller can keep the turn.
+            // A join error falls through to the same gate in the container ensure.
+            let row = self
+                .instances
+                .read()
+                .await
+                .iter()
+                .find(|i| i.id == id && i.is_sandboxed())
+                .cloned();
+            if let Some(mut row) = row {
+                // Resolves a `before_start` hook the cheap decision cannot see: once per
+                // session, whichever copy of the row asks, so the resume reuses the result.
+                // A daemon without a native state, or a store that cannot open, falls
+                // through to the same gate in the container ensure.
+                let native_state = self.native_state().ok();
+                let checked = tokio::task::spawn_blocking(move || -> anyhow::Result<()> {
+                    let Some(state) = native_state else {
+                        return Ok(());
+                    };
+                    let profile = row.source_profile.clone();
+                    let native = crate::server::session_store::NativeSessionStore::open(
+                        state, &profile, None,
+                    )?;
+                    row.ensure_sandbox_launchable(&native)
+                })
+                .await;
+                let gate = match checked {
+                    Ok(Ok(())) => Ok(()),
+                    Ok(Err(e)) => match e.downcast::<crate::session::SandboxLoginRequired>() {
+                        Ok(blocked) => Err(blocked),
+                        Err(e) => match e.downcast::<crate::session::BeforeStartHookError>() {
+                            // The hook's own failure, not a login refusal: the caller keeps
+                            // the turn and its pending turn.
+                            Ok(hook) => return Err(SendTurnError::HookFailed(hook.to_string())),
+                            // A runtime that cannot log in is refused by the launch itself,
+                            // and a store that cannot open by the container ensure.
+                            Err(_) => Ok(()),
+                        },
+                    },
+                    // A join error falls through to the same gate in the container ensure.
+                    Err(_) => Ok(()),
+                };
+                if let Err(blocked) = gate {
+                    // The held session resumes after the login under automatic authority,
+                    // which a stop token fences: admit the explicit revival now. The
+                    // reservation is dropped at once; a stop landing later still wins.
+                    if resume_authority
+                        == crate::process::worker_registry::ResumeAuthority::Explicit
+                    {
+                        if let Err(e) = self
+                            .acp_supervisor
+                            .begin_resume(
+                                id,
+                                crate::acp::supervisor::ResumeKind::Attach,
+                                resume_authority,
+                            )
+                            .await
+                        {
+                            return Err(SendTurnError::ResumeFailed(e));
+                        }
+                    }
+                    tracing::info!(target: "acp.supervisor", session = %id, "turn held for the sandbox login");
+                    // The held session is not respawned, so no startup error would explain the
+                    // queue: publish one, once per hold.
+                    if self.sandbox_login.hold(id, origin, &blocked) {
+                        self.acp_supervisor
+                            .publish_startup_error(id, blocked.to_string());
+                    }
+                    return Err(SendTurnError::LoginRequired(blocked));
+                }
+            }
             match crate::server::acp_reconciler::trigger_resume_background(
                 self,
                 id,
                 resume_authority,
+                origin,
             )
             .await
             {
@@ -1076,7 +1188,7 @@ impl SessionService {
                 id,
                 text.to_string(),
                 attachments,
-                prompt_id,
+                prompt_ids,
                 synthesized,
                 caller.message_origin().map(str::to_string),
             )
@@ -1196,7 +1308,7 @@ impl SessionService {
                     text: &text,
                     attachments: &attachments,
                     woke_idle_dormant: false,
-                    prompt_id: None,
+                    prompt_ids: Vec::new(),
                     synthesized,
                     no_revive: false,
                 },
@@ -1494,6 +1606,29 @@ impl SessionService {
         .await
         .unwrap_or(false);
         Some((result, persisted))
+    }
+
+    /// Whether the session's queue can take `text` as prompt `prompt_id`. Every path that
+    /// appends to the queue asks first, so no path grows it past the bounds: the text cap
+    /// (persisted text is rewritten on every queue mutation) and the depth cap (every
+    /// mutation rewrites the whole session file). Re-enqueuing an existing id replaces its
+    /// row, so it never counts against a full queue. Race-free only under the session's
+    /// prompt-submission guard, which every caller holds across this check and the enqueue.
+    pub(crate) async fn check_queue_room(
+        &self,
+        id: &str,
+        prompt_id: &str,
+        text: &str,
+    ) -> QueueRoom {
+        if text.len() > MAX_QUEUED_TEXT_BYTES {
+            return QueueRoom::TextTooLarge;
+        }
+        let queue = self.queued_prompts_snapshot(id).await;
+        if queue.len() >= MAX_QUEUED_PROMPTS_PER_SESSION && !queue.iter().any(|q| q.id == prompt_id)
+        {
+            return QueueRoom::Full;
+        }
+        QueueRoom::Available
     }
 
     /// Append a prompt to the session's server-owned queue and return the
@@ -1883,7 +2018,10 @@ impl SessionService {
                 || inst.is_archived()
                 || inst.is_snoozed()
                 || inst.is_trashed()
-                || inst.status != crate::session::Status::Idle
+                || !matches!(
+                    inst.status,
+                    crate::session::Status::Idle | crate::session::Status::Running
+                )
             {
                 return;
             }
@@ -1902,16 +2040,17 @@ impl SessionService {
             (caller, agent_key, queue)
         };
 
-        // `Status::Idle` above is a mirror the broadcast listener applies one serial task
-        // behind every session's events, so it still reads Idle for as long as that task is
-        // behind.
-        if self.fold_control_state(id).await.turn_active {
+        let control = self.fold_control_state(id).await;
+        if !control.accepts_queue_drain() {
             return;
         }
 
         // Leading batch up to a clear or compact boundary.
         let profile = crate::acp::agent_profiles::resolve(&agent_key);
         let (sub, combined) = queue_drain_batch(&queue, profile);
+        if profile.is_clear_command(&combined) && control.has_active_background_agent() {
+            return;
+        }
         let caller = match &sub[0].origin_plugin {
             Some(plugin_id) => SessionCaller::PluginMessage {
                 plugin_id: plugin_id.clone(),
@@ -1959,7 +2098,7 @@ impl SessionService {
                     text: &combined,
                     attachments: &attachments,
                     woke_idle_dormant: false,
-                    prompt_id: None,
+                    prompt_ids: sent_ids.clone(),
                     synthesized: false,
                     no_revive: false,
                 },
@@ -2403,6 +2542,8 @@ struct CreationEntry {
     lifecycle: CreationLifecycle,
     progress: CreationProgress,
     published_at: std::time::Instant,
+    /// Fired by a cancel, for work that can stop early, such as an image pull.
+    cancel: tokio_util::sync::CancellationToken,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -2416,6 +2557,15 @@ pub(super) struct CreationGuard {
 }
 
 impl CreationGuard {
+    /// Fires when the creation is cancelled.
+    pub(super) fn cancellation(&self) -> tokio_util::sync::CancellationToken {
+        self.entry
+            .lock()
+            .expect("creation entry poisoned")
+            .cancel
+            .clone()
+    }
+
     pub(super) fn check(&self) -> Result<(), CreationCancelled> {
         if matches!(
             self.entry
@@ -2635,6 +2785,9 @@ fn spec_payload_hash(spec: &StructuredSessionSpec) -> String {
     if let Some(binding) = &spec.import_binding {
         field("import_binding", &format!("{binding:?}"));
     }
+    if spec.pull_latest_image {
+        field("pull_latest_image", "true");
+    }
     use std::fmt::Write;
     let digest = hasher.finalize();
     let mut out = String::with_capacity(digest.len() * 2);
@@ -2717,16 +2870,19 @@ mod tests {
             base_branch: None,
             sandbox: false,
             sandbox_image: None,
+            pull_latest_image: false,
             yolo_mode: false,
             extra_env: Vec::new(),
             before_start_hook_env: Vec::new(),
             extra_args: String::new(),
             command_override: String::new(),
             extra_repo_paths: Vec::new(),
+            workspace: false,
             repo_base_branches: Vec::new(),
             scratch: false,
             trust_hooks: None,
             trust_review: None,
+            skip_on_create: false,
             custom_instruction: None,
             callback_url: None,
             idempotency_key: None,
@@ -2781,6 +2937,80 @@ mod tests {
             );
         }
         assert!(storage.load()?.is_empty());
+        Ok(())
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn plugin_creation_cannot_skip_on_create() -> anyhow::Result<()> {
+        let _home = crate::session::test_support::isolate_app_dir();
+        let app = crate::session::get_app_dir()?;
+        crate::session::purge_owners::initialize(&app)?;
+        crate::tmux::tool_retirement::initialize(&app)?;
+        crate::session::config::update_app_state(|state| {
+            state.has_acknowledged_agent_hooks = true;
+        })?;
+        crate::session::config::update_config(|config| {
+            config.systemd.enabled = false;
+            config.hooks.on_create = vec!["exit 7".into()];
+        })?;
+        let storage = crate::session::Storage::new_unwatched("default")?;
+        let (launcher, launches) = crate::server::test_support::counting_failing_launcher();
+        let state =
+            crate::server::test_support::build_test_app_state_with_launcher(Vec::new(), launcher);
+        crate::server::test_support::refresh_canonical_metadata_for_test(&state).await;
+        let mut spec = test_spec();
+        spec.scratch = true;
+        spec.skip_on_create = true;
+        let error = state
+            .session_service
+            .create_structured_session(spec, Some("cron"), None, None)
+            .await
+            .err()
+            .expect("the hook still runs and fails");
+        assert!(
+            error
+                .chain()
+                .any(|cause| cause.is::<crate::server::api::sessions::CreateHookFailed>()),
+            "{error:#}"
+        );
+        assert_eq!(launches.load(std::sync::atomic::Ordering::SeqCst), 0);
+        assert!(storage.load()?.is_empty());
+        Ok(())
+    }
+
+    /// Skipping setup skips only on_create: on_launch still runs.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn a_create_without_setup_still_runs_on_launch() -> anyhow::Result<()> {
+        let home = crate::session::test_support::isolate_app_dir();
+        let app = crate::session::get_app_dir()?;
+        crate::session::purge_owners::initialize(&app)?;
+        crate::tmux::tool_retirement::initialize(&app)?;
+        crate::session::config::update_app_state(|state| {
+            state.has_acknowledged_agent_hooks = true;
+        })?;
+        let launched = home.path().join("on-launch-ran");
+        crate::session::config::update_config(|config| {
+            config.hooks.on_create = vec!["exit 3".into()];
+            config.hooks.on_launch = vec![format!("touch '{}'", launched.display())];
+        })?;
+        let storage = crate::session::Storage::new_unwatched("default")?;
+        let state = crate::server::test_support::build_test_app_state(Vec::new());
+        crate::server::test_support::refresh_canonical_metadata_for_test(&state).await;
+        let mut spec = test_spec();
+        spec.scratch = true;
+        spec.view = crate::session::View::Terminal;
+        spec.skip_on_create = true;
+        let created =
+            crate::server::session_spawn::spawn_structured_session(&state.session_service, spec)
+                .await;
+        assert!(
+            launched.exists(),
+            "on_launch did not run: {:?}",
+            created.err()
+        );
+        assert!(storage.load()?.iter().any(|row| row.created_without_setup));
         Ok(())
     }
 
@@ -2923,6 +3153,14 @@ mod tests {
             "the initial turn is part of the request identity"
         );
 
+        let mut pulling = test_spec();
+        pulling.pull_latest_image = true;
+        assert_ne!(
+            a,
+            spec_payload_hash(&pulling),
+            "a pull is part of the request identity"
+        );
+
         // Adjacent-field concatenation must not collide.
         let mut shifted_a = test_spec();
         shifted_a.extra_args = "ab".to_string();
@@ -3007,7 +3245,7 @@ mod tests {
                         text: "hi",
                         attachments: &[],
                         woke_idle_dormant: false,
-                        prompt_id: None,
+                        prompt_ids: Vec::new(),
                         synthesized: false,
                         no_revive: false,
                     },
@@ -3026,7 +3264,7 @@ mod tests {
                         text: "hi",
                         attachments: &[],
                         woke_idle_dormant: false,
-                        prompt_id: None,
+                        prompt_ids: Vec::new(),
                         synthesized: false,
                         no_revive: false,
                     },
@@ -3045,7 +3283,7 @@ mod tests {
                         text: "hi",
                         attachments: &[],
                         woke_idle_dormant: false,
-                        prompt_id: None,
+                        prompt_ids: Vec::new(),
                         synthesized: false,
                         no_revive: false,
                     },
@@ -3068,7 +3306,7 @@ mod tests {
                         text: "hi",
                         attachments: &[],
                         woke_idle_dormant: false,
-                        prompt_id: None,
+                        prompt_ids: Vec::new(),
                         synthesized: false,
                         no_revive: false,
                     },
@@ -3087,7 +3325,7 @@ mod tests {
                         text: "hi",
                         attachments: &[],
                         woke_idle_dormant: false,
-                        prompt_id: None,
+                        prompt_ids: Vec::new(),
                         synthesized: false,
                         no_revive: false,
                     },
@@ -3215,6 +3453,7 @@ mod tests {
                 "sess-mid-turn",
                 1,
                 &Event::UserPromptSent {
+                    merged_prompt_ids: Vec::new(),
                     text: "go".into(),
                     attachments: Vec::new(),
                     prompt_id: None,
@@ -4767,5 +5006,205 @@ mod tests {
             service.admits_turn(&message, "missing").await,
             Err(TurnAdmissionError::SessionNotFound)
         );
+    }
+
+    /// A turn for a stopped sandbox that needs the login is refused before any
+    /// resume, and the session is held under the caller's origin.
+    #[cfg(unix)]
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn sandbox_login_queue_send_turn_refuses_before_resume() {
+        use crate::server::sandbox_login::LaunchOrigin;
+        let home = crate::session::test_support::isolate_app_dir();
+        let _auth = crate::session::test_support::unset_claude_auth_routes();
+        let (_runtime, calls) =
+            crate::session::test_support::failing_container_runtime(home.path());
+        let cases = [
+            (SessionCaller::User, LaunchOrigin::Interactive),
+            (
+                SessionCaller::PluginMessage {
+                    plugin_id: "cron".to_string(),
+                },
+                LaunchOrigin::Unattended,
+            ),
+        ];
+        for (n, (caller, origin)) in cases.into_iter().enumerate() {
+            let id = &format!("sess-login-turn-{n}");
+            let mut row = Instance::new("login", "/tmp/aoe-login-turn");
+            row.id = id.to_string();
+            row.view = crate::session::View::Structured;
+            crate::session::test_support::sandbox_needing_login(home.path(), &mut row);
+            let state = crate::server::test_support::build_native_test_app_state(vec![row]).await;
+            let service = &state.session_service;
+
+            let result = service
+                .send_turn(
+                    &caller,
+                    id,
+                    SendTurnRequest {
+                        resume_authority:
+                            crate::process::worker_registry::ResumeAuthority::Explicit,
+                        text: "hi",
+                        attachments: &[],
+                        woke_idle_dormant: false,
+                        prompt_ids: Vec::new(),
+                        synthesized: false,
+                        no_revive: false,
+                    },
+                )
+                .await;
+
+            assert!(
+                matches!(result, Err(SendTurnError::LoginRequired(_))),
+                "{caller:?}"
+            );
+            assert_eq!(service.sandbox_login.held_origin(id), Some(origin));
+            let published: Vec<String> = state
+                .acp_event_store
+                .replay_from(id, 0)
+                .into_iter()
+                .map(|(_, e)| match e {
+                    crate::acp::Event::AgentStartupError { message, .. } => message,
+                    other => format!("unexpected {other:?}"),
+                })
+                .collect();
+            assert_eq!(
+                published,
+                [crate::session::test_support::login_required("claude").to_string()],
+                "{caller:?}: no resume started, so only the login guidance was published"
+            );
+            assert_eq!(
+                service.acp_supervisor.worker_state(id).await,
+                crate::daemon::AcpWorkerState::Absent
+            );
+        }
+        assert_eq!(std::fs::read_to_string(&calls).unwrap_or_default(), "");
+    }
+
+    /// On Apple Container the helper cannot run, so a turn that needs the login is refused
+    /// by the launch, not held: no hold record (so no push and no kept-message episode),
+    /// the refusal is the session's startup error, and the container runtime is never reached.
+    #[cfg(unix)]
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn sandbox_login_apple_container_send_turn_is_refused_not_held() {
+        let home = crate::session::test_support::isolate_app_dir();
+        let _auth = crate::session::test_support::unset_claude_auth_routes();
+        let (_runtime, calls) =
+            crate::session::test_support::failing_container_runtime(home.path());
+        let id = "sess-login-apple";
+        let mut row = Instance::new("login", "/tmp/aoe-login-apple");
+        row.id = id.to_string();
+        row.view = crate::session::View::Structured;
+        crate::session::test_support::sandbox_needing_login(home.path(), &mut row);
+        crate::session::config::update_config(|c| {
+            c.sandbox.container_runtime =
+                crate::session::config::ContainerRuntimeName::AppleContainer;
+        })
+        .unwrap();
+        let state = crate::server::test_support::build_native_test_app_state(vec![row]).await;
+        let service = &state.session_service;
+
+        let result = service
+            .send_turn(
+                &SessionCaller::User,
+                id,
+                SendTurnRequest {
+                    resume_authority: crate::process::worker_registry::ResumeAuthority::Explicit,
+                    text: "hi",
+                    attachments: &[],
+                    woke_idle_dormant: false,
+                    prompt_ids: Vec::new(),
+                    synthesized: false,
+                    no_revive: false,
+                },
+            )
+            .await;
+
+        assert!(
+            !matches!(result, Ok(_) | Err(SendTurnError::LoginRequired(_))),
+            "the launch is refused"
+        );
+        assert!(!service.sandbox_login.is_held(id));
+        let refusal = crate::session::SandboxLoginUnsupported.to_string();
+        tokio::time::timeout(std::time::Duration::from_secs(10), async {
+            loop {
+                let published = state.acp_event_store.replay_from(id, 0).into_iter().any(
+                    |(_, e)| matches!(e, crate::acp::Event::AgentStartupError { message, .. } if message.contains(&refusal)),
+                );
+                if published {
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("the refusal is the session's startup error");
+        assert!(!service.sandbox_login.is_held(id), "still no hold");
+        assert_eq!(std::fs::read_to_string(&calls).unwrap_or_default(), "");
+    }
+
+    /// `host_seed` mode and a sandboxed session of an agent without a login resume as before: no hold, and the
+    /// launch reaches the container runtime.
+    #[cfg(unix)]
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn sandbox_login_queue_send_turn_resumes_outside_the_gate() {
+        for case in ["host_seed", "codex"] {
+            let home = crate::session::test_support::isolate_app_dir();
+            let (_runtime, calls) =
+                crate::session::test_support::failing_container_runtime(home.path());
+            let id = &format!("sess-login-free-{case}");
+            let mut row = Instance::new("login", "/tmp/aoe-login-free");
+            row.id = id.to_string();
+            row.view = crate::session::View::Structured;
+            crate::session::test_support::sandbox_needing_login(home.path(), &mut row);
+            if case == "host_seed" {
+                crate::session::config::update_config(|c| {
+                    c.sandbox.shared_credential =
+                        crate::session::config::SharedCredentialMode::HostSeed;
+                })
+                .unwrap();
+            } else {
+                row.tool = "codex".to_string();
+            }
+            let state = crate::server::test_support::build_native_test_app_state(vec![row]).await;
+            let service = &state.session_service;
+
+            let result = service
+                .send_turn(
+                    &SessionCaller::PluginMessage {
+                        plugin_id: "cron".to_string(),
+                    },
+                    id,
+                    SendTurnRequest {
+                        resume_authority:
+                            crate::process::worker_registry::ResumeAuthority::Explicit,
+                        text: "hi",
+                        attachments: &[],
+                        woke_idle_dormant: false,
+                        prompt_ids: Vec::new(),
+                        synthesized: false,
+                        no_revive: false,
+                    },
+                )
+                .await;
+
+            assert!(
+                !matches!(result, Ok(_) | Err(SendTurnError::LoginRequired(_))),
+                "{case}: the fake runtime fails the resume"
+            );
+            assert!(!service.sandbox_login.is_held(id), "{case}");
+            tokio::time::timeout(std::time::Duration::from_secs(10), async {
+                while std::fs::read_to_string(&calls)
+                    .unwrap_or_default()
+                    .is_empty()
+                {
+                    tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+                }
+            })
+            .await
+            .unwrap_or_else(|_| panic!("{case}: the resume reached the container runtime"));
+        }
     }
 }

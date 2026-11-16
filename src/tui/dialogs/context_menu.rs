@@ -1,5 +1,4 @@
-//! Small popup menu anchored at a screen position, used for right-click
-//! context actions on the sidebar list (Rename / Delete).
+//! Context actions anchored to a sidebar row.
 
 use crossterm::event::{KeyCode, KeyEvent};
 use ratatui::prelude::*;
@@ -49,6 +48,14 @@ pub enum ContextMenuAction {
     ToggleSectionCollapse,
     /// Restore a trashed session.
     Restore,
+    RetryTrash,
+}
+
+pub struct SessionMenuTarget {
+    pub id: String,
+    pub profile: String,
+    pub generation: u64,
+    pub epoch: Option<String>,
 }
 
 pub struct ContextMenuDialog {
@@ -61,7 +68,7 @@ pub struct ContextMenuDialog {
     anchor: (u16, u16),
     /// Last rendered rect, so click-outside needs no layout math.
     last_area: Rect,
-    session_target: Option<(String, String, u64)>,
+    session_target: Option<SessionMenuTarget>,
 }
 
 /// The menu item at `(col, row)`, or `None` on any border, past the last item,
@@ -142,23 +149,37 @@ impl ContextMenuDialog {
         self
     }
 
-    /// A trashed row can only come back out or be deleted for good.
-    pub fn for_trashed_session(anchor: (u16, u16)) -> Self {
+    pub fn for_trashed_session(anchor: (u16, u16), unfinished: bool) -> Self {
         Self::new(
             anchor,
-            vec![
-                (ContextMenuAction::Restore, "Restore"),
-                (ContextMenuAction::Delete, "Delete"),
-            ],
+            if unfinished {
+                vec![(ContextMenuAction::RetryTrash, "Retry Trash")]
+            } else {
+                vec![
+                    (ContextMenuAction::Restore, "Restore"),
+                    (ContextMenuAction::Delete, "Delete"),
+                ]
+            },
         )
     }
 
-    pub fn with_session_target(mut self, id: &str, profile: &str, generation: u64) -> Self {
-        self.session_target = Some((id.to_owned(), profile.to_owned(), generation));
+    pub fn with_session_target(
+        mut self,
+        id: &str,
+        profile: &str,
+        generation: u64,
+        epoch: Option<&str>,
+    ) -> Self {
+        self.session_target = Some(SessionMenuTarget {
+            id: id.to_owned(),
+            profile: profile.to_owned(),
+            generation,
+            epoch: epoch.map(str::to_owned),
+        });
         self
     }
 
-    pub fn session_target(&self) -> Option<&(String, String, u64)> {
+    pub fn session_target(&self) -> Option<&SessionMenuTarget> {
         self.session_target.as_ref()
     }
 
@@ -168,6 +189,7 @@ impl ContextMenuDialog {
                 action,
                 ContextMenuAction::Restore
                     | ContextMenuAction::Delete
+                    | ContextMenuAction::RetryTrash
                     | ContextMenuAction::NewSession
                     | ContextMenuAction::OpenSortPicker
                     | ContextMenuAction::OpenGroupPicker

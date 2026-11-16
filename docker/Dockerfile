@@ -101,7 +101,7 @@ RUN curl -fsSL https://app.primeintellect.ai/prime-agent/install.sh \
 # `gemini --acp`, `vibe-acp`) are already provided by their respective
 # CLIs above.
 RUN npm install -g \
-    @agentclientprotocol/claude-agent-acp@^0.99.1 \
+    @agentclientprotocol/claude-agent-acp@^0.103.0 \
     @agentclientprotocol/codex-acp@latest \
     pi-acp
 

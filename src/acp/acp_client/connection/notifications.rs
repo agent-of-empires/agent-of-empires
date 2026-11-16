@@ -1,26 +1,31 @@
 //! Turn state shared between the notification handler and the command loop,
 //! and the `session/update` handler itself.
 
+use super::subagents::BackgroundReport;
 use crate::acp::agent_profiles::AgentProfile;
 use crate::acp::background_agent::{spawn_tailer, TailerStart, TranscriptSource};
-use crate::acp::state::{BackgroundTaskLaunch, Event};
+use crate::acp::state::{BackgroundTaskLaunch, Event, SubagentRecord};
 use crate::acp::task_transcript::{spawn_task_tailer, ActiveTasks};
-use agent_client_protocol::v1::schema::{SessionId, SessionNotification, SessionUpdate};
+use agent_client_protocol::v1::schema::{
+    ContentBlock, SessionId, SessionNotification, SessionUpdate,
+};
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering};
 use std::sync::Arc;
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, watch};
 use tracing::debug;
 
+use crate::acp::acp_client::aoe_ingress::{AoeIngress, Ingested};
 use crate::acp::acp_client::between_prompt::BetweenPromptTracker;
 use crate::acp::acp_client::lifecycle::{
-    forward_lifecycle_signals, LifecycleEnvelope, TerminalClaim,
+    forward_lifecycle_signals, LifecycleEnvelope, LifecycleSignal, TerminalClaim,
 };
 use crate::acp::acp_client::rate_limit::record_rate_limit_report;
 use crate::acp::acp_client::session_identity::SessionIngress;
 use crate::acp::acp_client::session_sandbox::SessionSandbox;
 use crate::acp::acp_client::tool_context::{
-    restore_wake_tool_title, update_tool_context_cache, ToolCallContextCache, ToolContextCache,
+    restore_wake_tool_title, shell_command, update_tool_context_cache, ToolCallContextCache,
+    ToolContextCache,
 };
 use crate::acp::acp_client::transcript_filter::{is_transcript_event, transcript_event_kind};
 use crate::acp::acp_client::update_events::{
@@ -28,6 +33,8 @@ use crate::acp::acp_client::update_events::{
     CompactionFold, CompactionTracker,
 };
 use crate::acp::acp_client::watchdog::classify_watchdog_notification_signals;
+use crate::acp::acp_client::SessionState;
+use crate::acp::control_protocol::PromptOutcome;
 
 pub(super) fn now_ms() -> i64 {
     chrono::Utc::now().timestamp_millis()
@@ -47,6 +54,9 @@ pub(super) struct Shared {
     /// replayed user messages are the only record of them (#2276). Any other
     /// `user_message_chunk` is the agent echoing a prompt already recorded.
     pub(super) seed_user_replay: AtomicBool,
+    /// The last AoE prompt's text and when it ended (`0` while running), to
+    /// drop an echo that trails its `Stopped`.
+    pub(super) last_prompt: std::sync::Mutex<(String, i64)>,
     /// Epoch-ms of the last inbound notification, for the resume-idle
     /// watchdog.
     pub(super) last_event_at: AtomicI64,
@@ -68,15 +78,29 @@ pub(super) struct Shared {
     /// Reset epochs (unix seconds) per rejected quota window. Cleared at each
     /// prompt and drained when a turn parks; a window that later reports a
     /// non-rejected status is removed (#3028, #3152).
-    pub(super) rate_limit_rejections: std::sync::Mutex<HashMap<String, i64>>,
+    pub(super) rate_limit_rejections: Arc<std::sync::Mutex<std::collections::HashMap<String, i64>>>,
+    pub(super) cancel_deadline: Arc<std::sync::Mutex<Option<tokio::time::Instant>>>,
+    #[cfg(test)]
+    pub(super) cancel_send_gate: Arc<tokio::sync::RwLock<()>>,
+    pub(super) adopted_completion_tx: watch::Sender<Option<PromptOutcome>>,
     /// A stored-session rejection already emitted its context reset.
     pub(super) context_reset_emitted: AtomicBool,
     /// Scoped to one turn; see `AgentMessageDedup` (#2281).
     pub(super) agent_msg_dedup: std::sync::Mutex<AgentMessageDedup>,
     compaction: std::sync::Mutex<CompactionTracker>,
     pub(super) tool_context_cache: ToolContextCache,
+    /// Merged snapshot per subagent session; see `subagents.rs`.
+    pub(super) subagents: std::sync::Mutex<HashMap<String, SubagentRecord>>,
+    /// Background children whose card waits for their final answer; see
+    /// `subagents.rs`.
+    pub(super) background_reports: std::sync::Mutex<HashMap<String, BackgroundReport>>,
+    /// Epoch-ms of the last validated child traffic.
+    pub(super) subagent_activity_at: AtomicI64,
+    /// Epoch-ms of each child's own last validated traffic.
+    pub(super) subagent_seen: std::sync::Mutex<HashMap<String, i64>>,
     bg_transcript_source: TranscriptSource,
     pub(super) bg_tasks: Arc<ActiveTasks>,
+    pub(super) aoe: AoeIngress,
     claude_home: Option<std::path::PathBuf>,
 }
 
@@ -87,7 +111,7 @@ impl Shared {
         session_label: String,
         profile: &'static AgentProfile,
         lifecycle_tx: mpsc::Sender<LifecycleEnvelope>,
-        terminal_claim: Arc<TerminalClaim>,
+        state: Arc<SessionState>,
         prompt_in_flight: Arc<AtomicBool>,
         sandbox: Option<&SessionSandbox>,
         ingress: Arc<SessionIngress>,
@@ -108,28 +132,90 @@ impl Shared {
             profile,
             suppress_history_replay: AtomicBool::new(false),
             seed_user_replay: AtomicBool::new(false),
+            last_prompt: Default::default(),
             last_event_at: AtomicI64::new(now_ms()),
             first_event_after_attach: AtomicBool::new(false),
             prompt_sent_since_attach: AtomicBool::new(false),
-            terminal_claim,
+            terminal_claim: state.terminal_claim.clone(),
             adopted_turn_active: AtomicBool::new(false),
             prompt_in_flight,
             prompt_epoch: AtomicU64::new(0),
             lifecycle_tx,
             between_prompt: BetweenPromptTracker::default(),
-            rate_limit_rejections: Default::default(),
+            rate_limit_rejections: state.rate_limit_rejections.clone(),
+            cancel_deadline: state.cancel_deadline.clone(),
+            #[cfg(test)]
+            cancel_send_gate: state.cancel_send_gate.clone(),
+            adopted_completion_tx: watch::channel(None).0,
             context_reset_emitted: AtomicBool::new(false),
             agent_msg_dedup: Default::default(),
             compaction: Default::default(),
             tool_context_cache: Arc::new(std::sync::Mutex::new(ToolCallContextCache::default())),
+            subagents: Default::default(),
+            background_reports: Default::default(),
+            subagent_activity_at: AtomicI64::new(0),
+            subagent_seen: Default::default(),
             bg_transcript_source,
             bg_tasks: Arc::default(),
+            aoe: AoeIngress::default(),
             claude_home,
         }
     }
 
+    /// Validated child traffic keeps whichever watchdog owns the turn from
+    /// reading a parent that waits on its subagents as silent. Call it before
+    /// publishing events so a full event channel cannot delay the signal.
+    pub(super) async fn note_child_activity(
+        &self,
+        child: &SessionId,
+        local_prompt_signals: bool,
+        epoch: u64,
+    ) {
+        let now = now_ms();
+        self.subagent_seen
+            .lock()
+            .expect("subagent seen mutex poisoned")
+            .insert(child.0.to_string(), now);
+        self.subagent_activity_at.store(now, Ordering::Relaxed);
+        if self.prompt_in_flight.load(Ordering::Relaxed) {
+            forward_lifecycle_signals(
+                local_prompt_signals && epoch != 0,
+                &self.lifecycle_tx,
+                epoch,
+                Some(LifecycleSignal::SubagentActivity),
+                None,
+                &self.session_label,
+            )
+            .await;
+        } else {
+            self.arm_for_subagent_activity();
+        }
+    }
+
+    pub(super) fn arm_for_subagent_activity(&self) {
+        self.between_prompt.observe(
+            Some(&LifecycleSignal::SubagentActivity),
+            None,
+            now_ms(),
+            self.adopted_turn_active.load(Ordering::Relaxed),
+            &self.terminal_claim,
+        );
+    }
+
     pub(super) async fn emit(&self, event: Event) {
         let _ = self.event_tx.send(event).await;
+    }
+
+    /// A claimed terminal must reach the drain even if SDK teardown cancels its caller.
+    pub(super) async fn publish_terminal(&self, reason: String, preceding: Vec<Event>) {
+        let event_tx = self.event_tx.clone();
+        let publication = tokio::spawn(async move {
+            for event in preceding {
+                let _ = event_tx.send(event).await;
+            }
+            let _ = event_tx.send(Event::Stopped { reason }).await;
+        });
+        let _ = publication.await;
     }
 
     /// Publish the native session the lifecycle selected and apply the
@@ -169,6 +255,20 @@ impl Shared {
         }
     }
 
+    /// A user chunk repeating the prompt AoE just finished, arriving within
+    /// the grace after its `Stopped`.
+    fn is_late_echo(&self, update: &SessionUpdate) -> bool {
+        const LATE_ECHO_GRACE_MS: i64 = 2_000;
+        let SessionUpdate::UserMessageChunk(chunk) = update else {
+            return false;
+        };
+        let ContentBlock::Text(text) = &chunk.content else {
+            return false;
+        };
+        let (prompt, ended_ms) = &*self.last_prompt.lock().expect("last prompt mutex poisoned");
+        *ended_ms != 0 && now_ms() - ended_ms < LATE_ECHO_GRACE_MS && text.text.trim() == prompt
+    }
+
     pub(super) fn reset_message_dedup(&self) {
         self.agent_msg_dedup
             .lock()
@@ -181,11 +281,118 @@ impl Shared {
     /// per-prompt watchdog.
     pub(super) async fn handle_notification(
         &self,
-        mut notification: SessionNotification,
+        notification: SessionNotification,
         local_prompt_signals: bool,
     ) {
+        // A frame the contract consumes without delivering (a lease renewal)
+        // still proves the agent is alive.
         self.last_event_at.store(now_ms(), Ordering::Relaxed);
+        self.settle_discarded().await;
+        let epoch = self.prompt_epoch.load(Ordering::Relaxed);
+        let ingested = self
+            .aoe
+            .ingest(notification, local_prompt_signals, epoch, now_ms());
+        self.handle_ingested(ingested).await;
+    }
+
+    /// Frames the session identity dropped still count in the proxy's
+    /// numbering, so a tailer frame anchored after them is not held for
+    /// adapter output that already happened.
+    pub(super) async fn settle_discarded(&self) {
+        let skipped = self.ingress.take_discarded_adapter_frames();
+        if skipped > 0 {
+            let ingested = self.aoe.skip_frames(skipped, now_ms());
+            self.handle_ingested(ingested).await;
+        }
+    }
+
+    async fn handle_ingested(&self, ingested: Ingested) {
+        let (frames, lost) = match ingested {
+            Ingested::Deliver(frames) => (frames, None),
+            Ingested::Lost(reason) => (Vec::new(), Some(reason)),
+            Ingested::DeliverThenLost(frames, reason) => (frames, Some(reason)),
+        };
+        for frame in frames {
+            self.handle_adapter_notification(
+                frame.notification,
+                frame.local_prompt_signals,
+                frame.epoch,
+            )
+            .await;
+        }
+        if let Some(reason) = lost {
+            tracing::warn!(
+                target: "acp.protocol",
+                session = %self.session_label,
+                ?reason,
+                "agent integration lost; ignoring further frames"
+            );
+            self.emit(Event::IntegrationLost { reason }).await;
+        }
+    }
+
+    async fn handle_adapter_notification(
+        &self,
+        mut notification: SessionNotification,
+        local_prompt_signals: bool,
+        epoch: u64,
+    ) {
+        // Subagent traffic never feeds the root session's dedup or compaction
+        // state; it only proves the parent's turn is still live.
+        let from_child = self.ingress.child_route(&notification.session_id).is_some();
         let suppressing = self.suppress_history_replay.load(Ordering::Relaxed);
+        // Replayed children died with the old adapter; ingress already routed them.
+        if suppressing
+            && (from_child
+                || matches!(
+                    notification.update,
+                    SessionUpdate::SubagentUpdate(_)
+                        | SessionUpdate::SessionMessage(_)
+                        | SessionUpdate::SessionMessageChunk(_)
+                ))
+        {
+            tracing::trace!(
+                target: "acp.protocol",
+                session = %self.session_label,
+                "dropping post-load subagent replay frame"
+            );
+            return;
+        }
+        match notification.update {
+            SessionUpdate::SubagentUpdate(update) => {
+                return self
+                    .handle_subagent_update(
+                        notification.session_id,
+                        update,
+                        local_prompt_signals,
+                        epoch,
+                    )
+                    .await;
+            }
+            SessionUpdate::SessionMessage(message) => {
+                return self
+                    .handle_session_message(
+                        notification.session_id,
+                        message,
+                        local_prompt_signals,
+                        epoch,
+                    )
+                    .await;
+            }
+            SessionUpdate::SessionMessageChunk(_) if !from_child => return,
+            update if from_child => {
+                return self
+                    .handle_child_notification(
+                        notification.session_id,
+                        update,
+                        local_prompt_signals,
+                        epoch,
+                    )
+                    .await;
+            }
+            update => notification.update = update,
+        }
+        self.last_event_at.store(now_ms(), Ordering::Relaxed);
         // Drop the adapter's leaked restatement before anything sees it
         // (#2281). Replayed history resets rather than feeds the deduper.
         {
@@ -223,9 +430,8 @@ impl Shared {
         let restored_wake_event = restored_title
             .as_deref()
             .and_then(|title| restored_wake_tool_event(self.profile, &notification.update, title));
-        // One epoch per notification, so its signals belong to the prompt
-        // that was current when it arrived.
-        let epoch = self.prompt_epoch.load(Ordering::Relaxed);
+        // `epoch` is the prompt current when the frame arrived, so its signals
+        // belong to that prompt even if the frame was held.
         let (lifecycle, wakeup) = classify_watchdog_notification_signals(
             &notification.update,
             restored_title.as_deref(),
@@ -254,7 +460,12 @@ impl Shared {
         self.capture_rate_limit(&notification.update);
         let session_id = notification.session_id.0.to_string();
         let update_for_tool_context = notification.update.clone();
+        // A chunk while an AoE prompt is in flight echoes it (#5224). Idle, it
+        // is a Remote Control message from another client.
+        let user_echo =
+            prompt_active || !local_prompt_signals || self.is_late_echo(&notification.update);
         let mut events = if matches!(notification.update, SessionUpdate::UserMessageChunk(_))
+            && user_echo
             && !self.seed_user_replay.load(Ordering::Relaxed)
         {
             Vec::new()
@@ -273,14 +484,16 @@ impl Shared {
             &self.session_label,
         )
         .await;
-        for event in events {
+        for mut event in events {
             if let Event::BackgroundAgentLaunched {
                 agent_id,
                 output_file,
                 ..
             } = &event
             {
-                if !suppressing && !output_file.is_empty() {
+                // A subagents session gets the agent's state from its child
+                // session, so nothing tails the transcript.
+                if !suppressing && !output_file.is_empty() && !self.profile.supports_subagents {
                     spawn_tailer(
                         agent_id.clone(),
                         output_file.clone(),
@@ -301,6 +514,17 @@ impl Shared {
                     "dropping post-load history-replay event"
                 );
                 continue;
+            }
+            if let Event::BackgroundTaskStarted {
+                tool_call_id: Some(call),
+                description,
+                workflow: None,
+                ..
+            } = &mut event
+            {
+                if let Some(command) = shell_command(&self.tool_context_cache, call) {
+                    *description = command;
+                }
             }
             if let Event::BackgroundTaskStarted {
                 task_id,
@@ -338,7 +562,11 @@ impl Shared {
                 self.bg_tasks.stop(task_id);
                 continue;
             }
-            update_tool_context_cache(&self.tool_context_cache, &event, &update_for_tool_context);
+            update_tool_context_cache(
+                &self.tool_context_cache,
+                &mut event,
+                &update_for_tool_context,
+            );
             if self.event_tx.send(event).await.is_err() {
                 break;
             }
@@ -393,30 +621,35 @@ impl Shared {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use agent_client_protocol::v1::schema::{ContentBlock, ContentChunk, TextContent};
+    use agent_client_protocol::v1::schema::{ContentChunk, TextContent};
 
-    async fn user_echo_events(seed_user_replay: bool) -> Vec<Event> {
-        let (event_tx, mut event_rx) = mpsc::channel(8);
+    fn echo_shared(prompt_in_flight: bool) -> (Shared, mpsc::Receiver<Event>) {
+        let (event_tx, event_rx) = mpsc::channel(8);
         let (lifecycle_tx, _lifecycle_rx) = mpsc::channel(8);
         let shared = Shared::new(
             event_tx,
             "s-echo".to_string(),
             &crate::acp::agent_profiles::CLAUDE,
             lifecycle_tx,
-            Arc::new(TerminalClaim::new()),
-            Arc::new(AtomicBool::new(false)),
+            Arc::new(SessionState::default()),
+            Arc::new(AtomicBool::new(prompt_in_flight)),
             None,
             Arc::new(SessionIngress::new(Some(SessionId::from("native")))),
             None,
         );
-        shared
-            .seed_user_replay
-            .store(seed_user_replay, Ordering::Relaxed);
+        (shared, event_rx)
+    }
+
+    async fn user_chunk_events(
+        shared: Shared,
+        mut event_rx: mpsc::Receiver<Event>,
+        local_prompt_signals: bool,
+    ) -> Vec<Event> {
         let chunk = ContentChunk::new(ContentBlock::Text(TextContent::new("hello")));
         shared
             .handle_notification(
                 SessionNotification::new("native", SessionUpdate::UserMessageChunk(chunk)),
-                true,
+                local_prompt_signals,
             )
             .await;
         drop(shared);
@@ -427,13 +660,52 @@ mod tests {
         events
     }
 
+    async fn user_echo_events(
+        seed_user_replay: bool,
+        prompt_in_flight: bool,
+        local_prompt_signals: bool,
+    ) -> Vec<Event> {
+        let (shared, event_rx) = echo_shared(prompt_in_flight);
+        shared
+            .seed_user_replay
+            .store(seed_user_replay, Ordering::Relaxed);
+        user_chunk_events(shared, event_rx, local_prompt_signals).await
+    }
+
     #[tokio::test]
-    async fn user_message_chunk_records_only_while_seeding_import_replay() {
-        // Live echo is already recorded locally (#5224); import replay is not.
-        assert!(user_echo_events(false).await.is_empty());
-        assert!(matches!(
-            user_echo_events(true).await.as_slice(),
-            [Event::UserPromptSent { text, .. }] if text == "hello"
-        ));
+    async fn user_message_chunk_records_replay_and_remote_messages_only() {
+        // Echo of an AoE prompt is already recorded locally (#5224).
+        assert!(user_echo_events(false, true, true).await.is_empty());
+        // Replayed update committed with the session belongs to no live message.
+        assert!(user_echo_events(false, false, false).await.is_empty());
+        // Import replay and an idle Remote Control message are recorded.
+        for (seed, in_flight) in [(true, true), (true, false), (false, false)] {
+            assert!(
+                matches!(
+                    user_echo_events(seed, in_flight, true).await.as_slice(),
+                    [Event::UserPromptSent { text, .. }] if text == "hello"
+                ),
+                "seed={seed} in_flight={in_flight}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn echo_trailing_its_stopped_is_dropped_within_the_grace_only() {
+        // (prompt text, ms since it ended, recorded)
+        for (prompt, ago_ms, recorded) in [
+            ("hello", 100, false),
+            ("hello", 10_000, true),
+            ("other", 100, true),
+        ] {
+            let (shared, event_rx) = echo_shared(false);
+            *shared.last_prompt.lock().unwrap() = (prompt.to_string(), now_ms() - ago_ms);
+            let events = user_chunk_events(shared, event_rx, true).await;
+            assert_eq!(
+                !events.is_empty(),
+                recorded,
+                "{prompt} ended {ago_ms}ms ago"
+            );
+        }
     }
 }

@@ -4,6 +4,7 @@
 //! connection task (see `connection`) that owns the session; this module holds
 //! the public surface, and each concern lives in a submodule.
 
+mod aoe_ingress;
 mod batch;
 mod between_prompt;
 mod close;
@@ -23,6 +24,8 @@ mod permission_handlers;
 mod plan;
 mod rate_limit;
 mod raw_input;
+#[cfg(test)]
+mod recovery_tests;
 mod reset;
 mod resolve_command;
 mod runner;
@@ -41,15 +44,16 @@ mod watchdog;
 
 pub use close::CloseSessionOutcome;
 pub(crate) use connection::CANCEL_ESCALATION_GRACE;
+pub(crate) use control::ControlLoss;
 pub use delete::DeleteSessionOutcome;
-pub use errors::{AcpError, IncompatibleAgentError};
+pub use errors::{is_authentication_failure, AcpError, IncompatibleAgentError};
 pub use list::{list_native_sessions, ListSessionsError};
 pub use reset::ResetSessionOutcome;
 pub use resolve_command::{
     is_bare_command, on_agent_path, resolve_agent_command, ResolvedAgentCommand, Unresolved,
 };
 pub(crate) use runner::wrap_in_scope;
-pub use session_sandbox::SessionSandbox;
+pub use session_sandbox::{effective_launch_env, SessionSandbox};
 pub(crate) use spawn::host_environment_denyreason;
 pub use spawn::SpawnConfig;
 
@@ -125,6 +129,45 @@ pub struct AcpClient {
     connection_shutdown: tokio_util::sync::CancellationToken,
     connection_task: std::sync::Mutex<Option<tokio::task::JoinHandle<()>>>,
     _prime_runtime: Option<crate::process::prime::PrimeCleanupGuard>,
+    control_loss: Option<Arc<std::sync::OnceLock<control::ControlLoss>>>,
+    reattach: Option<Box<ReattachSpec>>,
+}
+
+/// What dialing the same runner again needs; resume sends no session/new or load.
+#[derive(Clone)]
+struct ReattachSpec {
+    socket_path: PathBuf,
+    cwd: PathBuf,
+    additional_dirs: Vec<PathBuf>,
+    sandbox: Option<(SessionSandbox, SandboxPathMap)>,
+    agent_key: String,
+    source_profile: Option<String>,
+    claude_home: Option<PathBuf>,
+    state: Arc<SessionState>,
+}
+
+/// Resources and turn ownership survive replacement of the control connection.
+struct SessionState {
+    terminals: TerminalManager,
+    terminal_claim: Arc<TerminalClaim>,
+    cancel_deadline: Arc<std::sync::Mutex<Option<tokio::time::Instant>>>,
+    rate_limit_rejections: Arc<std::sync::Mutex<HashMap<String, i64>>>,
+    /// Holding its write lock stalls every cancel send.
+    #[cfg(test)]
+    cancel_send_gate: Arc<tokio::sync::RwLock<()>>,
+}
+
+impl Default for SessionState {
+    fn default() -> Self {
+        Self {
+            terminals: TerminalManager::new(),
+            terminal_claim: Arc::new(TerminalClaim::new()),
+            cancel_deadline: Arc::default(),
+            rate_limit_rejections: Arc::default(),
+            #[cfg(test)]
+            cancel_send_gate: Arc::default(),
+        }
+    }
 }
 
 impl Drop for AcpClient {
@@ -195,11 +238,13 @@ struct Launch {
     install_binary: String,
     source_profile: Option<String>,
     default_effort: Option<String>,
+    default_model_config: std::collections::BTreeMap<String, String>,
     default_mode: Option<String>,
     default_model: Option<String>,
     mcp_servers: Vec<McpServer>,
     claude_home: Option<PathBuf>,
     cancellation: tokio_util::sync::CancellationToken,
+    state: Arc<SessionState>,
 }
 
 impl Launch {
@@ -221,23 +266,22 @@ impl Launch {
         let shutdown = tokio_util::sync::CancellationToken::new();
         let pending_responders: PendingResponders = Arc::new(Mutex::new(HashMap::new()));
         let label = self.session_id.0.clone();
+        let mut resources =
+            SessionResources::new(self.cwd, self.additional_dirs, label.clone(), self.sandbox);
+        resources.terminals = self.state.terminals.clone();
         let params = ConnectionParams {
             event_tx,
             cmd_rx,
             child: child.clone(),
             pending_responders: pending_responders.clone(),
-            resources: SessionResources::new(
-                self.cwd,
-                self.additional_dirs,
-                label.clone(),
-                self.sandbox,
-            ),
+            resources,
             mode: self.mode,
             ready_tx,
             profile: self.profile,
             expected_agent: ExpectedAgent::from_command(&self.install_binary),
             source_profile: self.source_profile,
             default_effort: self.default_effort,
+            default_model_config: self.default_model_config,
             default_mode: self.default_mode,
             default_model: self.default_model,
             mcp_servers: self.mcp_servers,
@@ -259,6 +303,8 @@ impl Launch {
             connection_shutdown: shutdown,
             connection_task: std::sync::Mutex::new(Some(task)),
             _prime_runtime: None,
+            control_loss: None,
+            reattach: None,
         };
         (client, ready_rx)
     }
@@ -281,6 +327,8 @@ impl AcpClient {
             connection_shutdown: tokio_util::sync::CancellationToken::new(),
             connection_task: std::sync::Mutex::new(None),
             _prime_runtime: None,
+            control_loss: None,
+            reattach: None,
         };
         (client, event_tx)
     }
@@ -404,6 +452,7 @@ impl AcpClient {
             let name = match cmd {
                 ClientCmd::Prompt(_) => "prompt",
                 ClientCmd::Cancel => "cancel",
+                ClientCmd::CancelChild { .. } => "cancel_child",
                 ClientCmd::ForceStop => "force_stop",
                 ClientCmd::SetMode(_) => "set_mode",
                 ClientCmd::SetConfigOption { .. } => "set_config_option",
@@ -476,10 +525,11 @@ impl AcpClient {
         let sandbox = match &config.sandbox_info {
             // Resolving the workdir touches git2 and may shell out to docker.
             Some(info) => {
-                let (info, cwd) = (info.clone(), config.cwd.clone());
+                let (info, cwd, config_path) =
+                    (info.clone(), config.cwd.clone(), config.config_path.clone());
                 let profile = config.source_profile.clone();
                 let resolved = tokio::task::spawn_blocking(move || {
-                    SessionSandbox::from_info(&info, cwd.as_path(), profile)
+                    SessionSandbox::from_info(&info, cwd.as_path(), &config_path, profile)
                 })
                 .await
                 .map_err(|e| AcpError::Spawn(format!("sandbox resolve task panicked: {e}")))??;
@@ -511,6 +561,7 @@ impl AcpClient {
             install_binary: config.spec.command.clone(),
             source_profile: config.source_profile.clone(),
             default_effort: config.default_effort.clone(),
+            default_model_config: config.default_model_config.clone(),
             default_mode: config.default_mode.clone(),
             default_model: config.default_model.clone(),
             mcp_servers: config.mcp_servers.clone(),
@@ -520,6 +571,7 @@ impl AcpClient {
                 .and_then(|binding| binding.stores.first())
                 .cloned(),
             cancellation: cancellation.clone(),
+            state: Arc::default(),
         };
 
         if let Some(socket_path) = config.socket_path.clone() {
@@ -535,10 +587,21 @@ impl AcpClient {
             let (runner_pid, native_store) =
                 spawn_runner_detached(&config, &socket_path, session_id.0.clone(), runner_sandbox)
                     .await?;
-            let mut client =
-                Self::connect_via_socket(socket_path, launch(sandbox, &native_store), None).await?;
+            let launch = launch(sandbox, &native_store);
+            let reattach = ReattachSpec {
+                socket_path: socket_path.clone(),
+                cwd: launch.cwd.clone(),
+                additional_dirs: launch.additional_dirs.clone(),
+                sandbox: launch.sandbox.clone(),
+                agent_key: config.agent_key.clone(),
+                source_profile: launch.source_profile.clone(),
+                claude_home: launch.claude_home.clone(),
+                state: launch.state.clone(),
+            };
+            let mut client = Self::connect_via_socket(socket_path, launch, None).await?;
             client.runner_pid = Some(runner_pid);
             client.native_store = native_store;
+            client.reattach = Some(Box::new(reattach));
             return Ok(client);
         }
 
@@ -591,7 +654,7 @@ impl AcpClient {
             ));
         }
         let label = launch.session_id.0.clone();
-        let terminal_claim = Arc::new(TerminalClaim::new());
+        let terminal_claim = launch.state.terminal_claim.clone();
         // The reader may see a cached completion right after Attach, before
         // the handshake marks the adopted turn.
         let prompt_in_flight = Arc::new(AtomicBool::new(matches!(
@@ -608,7 +671,7 @@ impl AcpClient {
                 return Err(AcpError::Spawn("runner construction cancelled".into()));
             }
             connected = connect_runner_control_v3(
-                &control_path, events.0.clone(), label.clone(),
+                &control_path, label.clone(),
                 terminal_claim.clone(), prompt_in_flight.clone(),
             ) => connected,
         };
@@ -623,12 +686,14 @@ impl AcpClient {
         // Shuts the runner channel down if the handshake fails or is dropped.
         let mut handshake_control = ShutdownControlOnDrop(Some(control.clone()));
         let install_binary = launch.install_binary.clone();
+        let control_loss = control.loss_handle();
         let runner = RunnerLink {
             control,
-            terminal_claim,
+            state: launch.state.clone(),
             prompt_in_flight,
         };
-        let (client, ready_rx) = launch.start(events, transport, None, Some(runner));
+        let (mut client, ready_rx) = launch.start(events, transport, None, Some(runner));
+        client.control_loss = Some(control_loss);
         if let Err(error) =
             wait_for_handshake(&label, ready_rx, None, &install_binary, deadline).await
         {
@@ -659,38 +724,116 @@ impl AcpClient {
         launch_lease: Option<crate::acp::runner_lifecycle::Lease>,
         claude_home: Option<PathBuf>,
     ) -> Result<Self, AcpError> {
-        // The binary name keeps the compatibility gate active on reattach; an
-        // unknown agent maps to `Other` anyway.
-        let install_binary = crate::acp::AgentRegistry::with_defaults()
-            .get(&agent_key)
-            .map(|spec| spec.command.clone())
-            .unwrap_or_default();
-        let launch = Launch {
-            session_id,
-            mode: ConnectMode::Resume {
-                acp_session_id: stored_acp_session_id,
-                in_flight_turn,
-            },
+        let spec = ReattachSpec {
+            socket_path,
             cwd,
             additional_dirs,
             sandbox,
-            profile: agent_profiles::resolve(&agent_key),
-            install_binary,
+            agent_key,
             source_profile,
+            claude_home,
+            state: Arc::default(),
+        };
+        let mode = ConnectMode::Resume {
+            acp_session_id: stored_acp_session_id,
+            in_flight_turn,
+            live_recovery: None,
+        };
+        Self::resume(spec, session_id, mode, deadline, launch_lease).await
+    }
+
+    async fn resume(
+        spec: ReattachSpec,
+        session_id: AcpSessionId,
+        mode: ConnectMode,
+        deadline: Option<tokio::time::Instant>,
+        launch_lease: Option<crate::acp::runner_lifecycle::Lease>,
+    ) -> Result<Self, AcpError> {
+        // The binary name keeps the compatibility gate active on reattach; an
+        // unknown agent maps to `Other` anyway.
+        let install_binary = crate::acp::AgentRegistry::with_defaults()
+            .get(&spec.agent_key)
+            .map(|agent| agent.command.clone())
+            .unwrap_or_default();
+        let launch = Launch {
+            session_id,
+            mode,
+            cwd: spec.cwd.clone(),
+            additional_dirs: spec.additional_dirs.clone(),
+            sandbox: spec.sandbox.clone(),
+            profile: agent_profiles::resolve(&spec.agent_key),
+            install_binary,
+            source_profile: spec.source_profile.clone(),
             // Resume sends no session/new or load, so defaults and MCP servers
             // were applied on first connect.
             default_effort: None,
+            default_model_config: Default::default(),
             default_mode: None,
             default_model: None,
             mcp_servers: Vec::new(),
-            claude_home,
+            claude_home: spec.claude_home.clone(),
             cancellation: launch_lease
                 .as_ref()
                 .map_or_else(tokio_util::sync::CancellationToken::new, |lease| {
                     lease.cancellation().child_token()
                 }),
+            state: spec.state.clone(),
         };
-        Self::connect_via_socket(socket_path, launch, deadline).await
+        let mut client =
+            Self::connect_via_socket(spec.socket_path.clone(), launch, deadline).await?;
+        client.reattach = Some(Box::new(spec));
+        Ok(client)
+    }
+
+    /// Set once the runner side ended this client's control channel.
+    pub(crate) fn control_loss(&self) -> Option<control::ControlLoss> {
+        self.control_loss.as_ref()?.get().copied()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn test_terminal_claimed(&self) -> bool {
+        self.reattach
+            .as_ref()
+            .is_some_and(|spec| spec.state.terminal_claim.claimed())
+    }
+
+    /// Claims the terminal of the turn `loss` left in flight. `false` when no
+    /// turn was in flight or a path that survived the loss already published it.
+    pub(crate) fn claim_lost_turn(&self, loss: control::ControlLoss) -> bool {
+        loss.turn_in_flight
+            && self
+                .reattach
+                .as_ref()
+                .is_none_or(|spec| spec.state.terminal_claim.claim())
+    }
+
+    /// Dial the same runner again after [`Self::control_loss`]. Ready before
+    /// the resume, whose replay the caller must drain; `AcpSessionAssigned`
+    /// confirms it.
+    pub(crate) async fn reattach(
+        &self,
+        stored_acp_session_id: String,
+        in_flight_turn: bool,
+        deadline: tokio::time::Instant,
+        launch_lease: crate::acp::runner_lifecycle::Lease,
+    ) -> Result<Self, AcpError> {
+        let spec = *self.reattach.clone().ok_or(AcpError::NotRunning)?;
+        let mode = ConnectMode::Resume {
+            acp_session_id: stored_acp_session_id,
+            in_flight_turn,
+            live_recovery: Some(deadline),
+        };
+        let mut client = Self::resume(
+            spec,
+            self.session_id.clone(),
+            mode,
+            Some(deadline),
+            Some(launch_lease),
+        )
+        .await?;
+        client.runner_pid = self.runner_pid;
+        client.native_store = self.native_store.clone();
+        Ok(client)
     }
 
     async fn send_cmd(&self, cmd: ClientCmd) -> Result<(), AcpError> {
@@ -735,6 +878,18 @@ impl AcpClient {
         self.send_cmd(ClientCmd::Cancel).await
     }
 
+    /// Cancel one subagent's work without ending the root turn. False when the
+    /// child is unknown or cannot be cancelled.
+    pub async fn cancel_child(&self, session_id: &str) -> Result<bool, AcpError> {
+        let (respond_to, sent) = oneshot::channel();
+        self.send_cmd(ClientCmd::CancelChild {
+            session_id: session_id.to_string(),
+            respond_to,
+        })
+        .await?;
+        sent.await.map_err(|_| AcpError::AgentExited)
+    }
+
     /// Skip the cancel-escalation grace: an in-flight turn ends as
     /// `user_forced`, which kills and respawns the worker (#1727).
     pub async fn force_cancel(&self) -> Result<(), AcpError> {
@@ -746,10 +901,16 @@ impl AcpClient {
         self.send_cmd(ClientCmd::SetMode(mode_id.to_string())).await
     }
 
-    pub async fn set_config_option(&self, config_id: &str, value: &str) -> Result<(), AcpError> {
+    pub async fn set_config_option(
+        &self,
+        config_id: &str,
+        value: &str,
+        remember: bool,
+    ) -> Result<(), AcpError> {
         self.send_cmd(ClientCmd::SetConfigOption {
             config_id: config_id.to_string(),
             value: value.to_string(),
+            remember,
         })
         .await
     }
