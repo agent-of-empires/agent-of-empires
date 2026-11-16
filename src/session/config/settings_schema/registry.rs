@@ -302,9 +302,11 @@ mod tests {
             "systemd.survive_daemon_restart",
             "systemd.tasks_max",
             "tmux.socket_name",
+            "web.notifications_enabled",
             "web.notify_on_error",
             "web.notify_on_idle",
             "web.notify_on_waiting",
+            "web.notify_on_wake_fire",
         ];
         assert_eq!(paths_where(|d| d.restart), restart);
         assert_eq!(paths_where(|d| d.web_only), ["session.show_session_colors"]);
