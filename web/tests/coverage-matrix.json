@@ -6126,14 +6126,19 @@
       "id": "settings-restart-web-only-flags",
       "kind": "vitest",
       "risk": "medium",
-      "specs": ["src/lib/settingRow.test.ts", "src/components/settings/__tests__/SettingRow.test.tsx"],
+      "specs": [
+        "src/lib/settingRow.test.ts",
+        "src/components/settings/__tests__/SettingRow.test.tsx",
+        "src/components/setup/__tests__/SandboxStep.test.tsx"
+      ],
       "components": [
         "web/src/lib/settingRow.ts",
         "web/src/components/settings/SettingRow.tsx",
         "web/src/components/settings/SchemaSection.tsx",
-        "web/src/components/settings/FormFields.tsx"
+        "web/src/components/settings/FormFields.tsx",
+        "web/src/components/setup/steps/SandboxStep.tsx"
       ],
-      "notes": "Each Settings row shows its label, tags (Needs restart, Web dashboard only, Terminal app only, Structured view only, Linux only), a lock on passphrase rows, the summary as its plain line, and its section.field key with a copy button. Every control is named by its row label. #5302."
+      "notes": "Each Settings row shows its label, tags (Needs restart, Web dashboard only, Terminal app only, Structured view only, Linux only), a lock on passphrase rows, the summary as its plain line (none without a summary, plugin rows included), and its section.field key with a copy button. The setup wizard hides the key. Every control is named by its row label. #5302."
     },
     {
       "id": "settings.row-key-reveal",
@@ -6141,7 +6146,7 @@
       "risk": "low",
       "specs": ["tests/settings-row.spec.ts"],
       "components": ["web/src/components/settings/SettingRow.tsx"],
-      "notes": "With a mouse the key shows on hover and when focus reaches its copy button by Tab, and copies; at 375 it always shows. #5302."
+      "notes": "With a mouse the key is invisible until hover or focus but keeps its line, so rows don't move; Tab reaches its copy button, which copies. At 375 it always shows. #5302."
     }
   ]
 }

@@ -14,10 +14,4 @@ export function settingTags(d: SettingsFieldDescriptor): string[] {
   return TAG_RULES.filter(([, applies]) => applies(d)).map(([tag]) => tag);
 }
 
-/** Plugin manifests have no summary key, so plugin rows keep their description. */
-export function plainLine(d: SettingsFieldDescriptor): string | undefined {
-  if (d.summary) return d.summary;
-  return d.section.startsWith("plugin:") && d.description ? d.description : undefined;
-}
-
 export const settingKey = (d: SettingsFieldDescriptor) => `${d.section}.${d.field}`;

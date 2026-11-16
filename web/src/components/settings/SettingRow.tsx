@@ -2,7 +2,7 @@ import { useId, type ReactNode } from "react";
 import { Check, Copy, Lock } from "lucide-react";
 
 import type { SettingsFieldDescriptor } from "../../lib/types";
-import { plainLine, settingKey, settingTags } from "../../lib/settingRow";
+import { settingKey, settingTags } from "../../lib/settingRow";
 import { COMPACT_COPY_BUTTON_CLASS, useCopy } from "../acp/useCopy";
 import type { RowLabel } from "./rowLabel";
 
@@ -15,24 +15,27 @@ const CONTROL_CLASS: Record<ControlPlacement, string> = {
   block: "col-span-2 pt-2",
 };
 
-// Desktop shows the key on hover or focus; sr-only keeps its copy button reachable by Tab.
+// With a mouse the key shows on hover or focus. Its line keeps its height while hidden, so rows don't jump,
+// and opacity keeps the copy button reachable by Tab.
 const KEY_REVEAL =
-  "sm:pointer-fine:sr-only sm:pointer-fine:group-hover:not-sr-only sm:pointer-fine:group-focus-within:not-sr-only";
+  "sm:pointer-fine:opacity-0 sm:pointer-fine:group-hover:opacity-100 sm:pointer-fine:group-focus-within:opacity-100";
 
 /** A schema setting: label, tags and lock, its plain line, its copyable key, and the control. */
 export function SettingRow({
   descriptor: d,
   placement,
+  hideKey = false,
   children,
 }: {
   descriptor: SettingsFieldDescriptor;
   placement: ControlPlacement;
+  /** The setup wizard leaves out config keys. */
+  hideKey?: boolean;
   children: (row: RowLabel) => ReactNode;
 }) {
   const id = useId();
   const row: RowLabel = { labelId: `${id}-label`, controlId: `${id}-control` };
   const key = settingKey(d);
-  const line = plainLine(d);
   const [copied, copy] = useCopy();
 
   return (
@@ -54,22 +57,24 @@ export function SettingRow({
             <Lock role="img" aria-label="Asks for the passphrase" className="h-[13px] w-[13px] text-text-dim" />
           )}
         </span>
-        {line && <span className="mt-0.5 block text-[13px] leading-normal text-text-secondary">{line}</span>}
+        {d.summary && <span className="mt-0.5 block text-[13px] leading-normal text-text-secondary">{d.summary}</span>}
       </label>
-      <div className={`col-start-1 flex items-center gap-1.5 font-mono text-[11.5px] text-text-dim ${KEY_REVEAL}`}>
-        <span className="truncate">{key}</span>
-        <button
-          type="button"
-          aria-label="Copy config key"
-          onClick={() => void copy(key)}
-          className={COMPACT_COPY_BUTTON_CLASS}
-        >
-          {copied ? <Check className="h-3 w-3" aria-hidden /> : <Copy className="h-3 w-3" aria-hidden />}
-        </button>
-        <span aria-live="polite" className="sr-only">
-          {copied ? "Copied" : ""}
-        </span>
-      </div>
+      {!hideKey && (
+        <div className={`col-start-1 flex items-center gap-1.5 font-mono text-[11.5px] text-text-dim ${KEY_REVEAL}`}>
+          <span className="truncate">{key}</span>
+          <button
+            type="button"
+            aria-label="Copy config key"
+            onClick={() => void copy(key)}
+            className={COMPACT_COPY_BUTTON_CLASS}
+          >
+            {copied ? <Check className="h-3 w-3" aria-hidden /> : <Copy className="h-3 w-3" aria-hidden />}
+          </button>
+          <span aria-live="polite" className="sr-only">
+            {copied ? "Copied" : ""}
+          </span>
+        </div>
+      )}
       <div className={CONTROL_CLASS[placement]}>{children(row)}</div>
     </div>
   );

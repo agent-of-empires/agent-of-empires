@@ -28,6 +28,8 @@ interface Props {
   /** CityHall curation: an allowlist and a denylist of field names. */
   onlyFields?: string[];
   hideFields?: string[];
+  /** The setup wizard shows rows without their config keys. */
+  hideKeys?: boolean;
 }
 
 /** Client-side list-entry check mirroring the server rule. */
@@ -195,6 +197,7 @@ export function SchemaSection({
   focusRequest,
   onlyFields,
   hideFields,
+  hideKeys = false,
 }: Props) {
   const fields = schema.filter(
     (d) =>
@@ -231,7 +234,7 @@ export function SchemaSection({
         data-settings-field={`${d.section}.${d.field}`}
         className={isTarget ? "animate-settings-highlight" : undefined}
       >
-        <SettingRow descriptor={d} placement={placement(d)}>
+        <SettingRow descriptor={d} placement={placement(d)} hideKey={hideKeys}>
           {(row) => node(row)}
         </SettingRow>
       </div>

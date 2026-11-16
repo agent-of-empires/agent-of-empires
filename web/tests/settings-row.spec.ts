@@ -1,6 +1,7 @@
-// #5302: each schema row carries its section.field key with a copy button. With a mouse the key stays out of the way
-// until the row is hovered or focused; on a phone it always shows. jsdom can't evaluate the hover, focus or
-// breakpoint rules, so this spec checks them in a browser. SettingRow.test.tsx pins the rest of the row.
+// #5302: each schema row carries its section.field key with a copy button. With a mouse the key is invisible until
+// the row is hovered or focused, but keeps its line so rows never jump; on a phone it always shows. jsdom can't
+// evaluate the hover, focus or breakpoint rules, so this spec checks them in a browser. SettingRow.test.tsx pins
+// the rest of the row.
 
 import { test, expect } from "./helpers/mockedTest";
 import { mockSettingsApis } from "./helpers/apiMocks";
@@ -84,10 +85,12 @@ async function open(page: Page, tab: string) {
 const row = (page: Page, key: string) => page.locator(`[data-settings-field="${key}"]`);
 const keyText = (page: Page, key: string) => row(page, key).getByText(key, { exact: true });
 
-/** `sr-only` leaves a 1px box, so "shown" means the key has its real width. */
+/** The key line fades in; its box is always laid out. */
 async function shown(key: Locator) {
-  return ((await key.boundingBox())?.width ?? 0) > 20;
+  return (await key.locator("..").evaluate((el) => getComputedStyle(el).opacity)) === "1";
 }
+
+const height = async (l: Locator) => (await l.boundingBox())!.height;
 
 async function shot(page: Page, name: string) {
   if (SHOTS) await page.screenshot({ path: `${SHOTS}/${name}.png`, fullPage: true });
@@ -103,7 +106,16 @@ test.describe("with a mouse", () => {
     expect(await shown(key)).toBe(false);
     await shot(page, "1280-session");
 
-    await row(page, "session.show_session_colors").hover();
+    // Showing a key moves nothing: the hovered row keeps its height and the row below keeps its place.
+    const unread = row(page, "session.unread_indicator");
+    const colors = row(page, "session.show_session_colors");
+    const before = [await height(unread), (await colors.boundingBox())!.y];
+    await unread.hover();
+    await expect.poll(() => shown(keyText(page, "session.unread_indicator"))).toBe(true);
+    expect([await height(unread), (await colors.boundingBox())!.y]).toEqual(before);
+    expect(await shown(key)).toBe(false);
+
+    await colors.hover();
     await expect.poll(() => shown(key)).toBe(true);
     await shot(page, "1280-session-hover");
     await page.mouse.move(0, 0);

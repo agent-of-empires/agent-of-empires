@@ -55,10 +55,15 @@ describe("SettingRow", () => {
       }),
       descriptor({ section: "x", field: "bare", label: "No summary", description: "Developer detail only." }),
     ]);
+    mount([
+      descriptor({ section: "plugin:demo", field: "p", label: "Plugin knob", description: "Developer detail too." }),
+    ]);
     expect(within(rowOf("Has summary")).getByText("What it does for you.")).toBeTruthy();
     expect(screen.queryByText(/Developer detail/)).toBeNull();
     expect(screen.queryByText(/Applies to all profiles/)).toBeNull();
     expect(rowOf("No summary").textContent).toBe("No summaryx.bare");
+    // Plugin manifests carry no summary, so plugin rows show their label and key only, like core rows.
+    expect(rowOf("Plugin knob").textContent).toBe("Plugin knobplugin:demo.p");
   });
 
   it("puts the tags after the label and a lock only on passphrase rows", () => {

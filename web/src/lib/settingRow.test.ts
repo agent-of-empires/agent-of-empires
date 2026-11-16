@@ -1,7 +1,7 @@
 import { describe, expect, it } from "vitest";
 
 import { descriptor } from "../components/settings/__tests__/fixtures";
-import { plainLine, settingTags } from "./settingRow";
+import { settingTags } from "./settingRow";
 
 describe("settingTags", () => {
   it.each([
@@ -28,28 +28,5 @@ describe("settingTags", () => {
     ],
   ])("%s", (_, d, tags) => {
     expect(settingTags(d)).toEqual(tags);
-  });
-});
-
-describe("plainLine", () => {
-  it.each([
-    ["the summary", descriptor({ section: "acp", field: "f", label: "L", summary: "S", description: "D" }), "S"],
-    [
-      "nothing when a core field has no summary",
-      descriptor({ section: "acp", field: "f", label: "L", description: "D" }),
-      undefined,
-    ],
-    [
-      "a plugin field's description, since manifests have no summary",
-      descriptor({ section: "plugin:demo", field: "f", label: "L", description: "D" }),
-      "D",
-    ],
-    [
-      "nothing for a plugin field with no description",
-      descriptor({ section: "plugin:demo", field: "f", label: "L" }),
-      undefined,
-    ],
-  ])("shows %s", (_, d, line) => {
-    expect(plainLine(d)).toBe(line);
   });
 });
