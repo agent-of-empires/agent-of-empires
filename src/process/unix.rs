@@ -117,29 +117,51 @@ pub(super) fn try_wait_group_status(
     cleanup: super::ProcessGroupCleanup,
     cancel: Option<&tokio_util::sync::CancellationToken>,
 ) -> std::io::Result<Option<std::process::ExitStatus>> {
+    let Some(success) = child_exit_success_unreaped(child.id())? else {
+        return Ok(None);
+    };
+    let transferred = cleanup == super::ProcessGroupCleanup::OnFailure
+        && success
+        && cancel.is_none_or(|cancel| !cancel.is_cancelled());
+    // Keep the original process group reserved until the cleanup signal.
+    if !transferred {
+        kill_process_group(child);
+    }
+    child.wait().map(Some)
+}
+
+pub(super) fn child_exited_unreaped(pid: u32) -> std::io::Result<bool> {
+    child_exit_success_unreaped(pid).map(|success| success.is_some())
+}
+
+fn child_exit_success_unreaped(pid: u32) -> std::io::Result<Option<bool>> {
     use nix::libc;
-    // nix gates `waitid` off on macOS, so call libc directly on every Unix.
     let mut info: libc::siginfo_t = unsafe { std::mem::zeroed() };
     let flags = libc::WEXITED | libc::WNOHANG | libc::WNOWAIT;
-    if unsafe { libc::waitid(libc::P_PID, child.id() as libc::id_t, &mut info, flags) } < 0 {
+    if unsafe { libc::waitid(libc::P_PID, pid as libc::id_t, &mut info, flags) } < 0 {
         let error = std::io::Error::last_os_error();
         if error.kind() == std::io::ErrorKind::Interrupted {
             return Ok(None);
         }
         return Err(error);
     }
-    if unsafe { info.si_pid() } == 0 {
+    let observed = unsafe { info.si_pid() };
+    if observed == 0 {
         return Ok(None);
     }
-    let transferred = cleanup == super::ProcessGroupCleanup::OnFailure
-        && info.si_code == libc::CLD_EXITED
-        && unsafe { info.si_status() } == 0
-        && cancel.is_none_or(|cancel| !cancel.is_cancelled());
-    // Retain the exited leader until cleanup so its group ID cannot be reused.
-    if !transferred {
-        kill_process_group(child);
+    if observed != pid as libc::pid_t
+        || !matches!(
+            info.si_code,
+            libc::CLD_EXITED | libc::CLD_KILLED | libc::CLD_DUMPED
+        )
+    {
+        return Err(std::io::Error::other(
+            "unexpected owned-child wait observation",
+        ));
     }
-    child.wait().map(Some)
+    Ok(Some(
+        info.si_code == libc::CLD_EXITED && unsafe { info.si_status() } == 0,
+    ))
 }
 
 fn signal_process_group(child: &Child, signal: nix::sys::signal::Signal) {

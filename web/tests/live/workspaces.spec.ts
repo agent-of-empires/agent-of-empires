@@ -48,7 +48,7 @@ test("press-and-hold drag reorders and round-trips PUT /api/workspace-ordering",
   await page.mouse.down();
   await page.waitForTimeout(250);
   await page.mouse.move(targetBox.x + targetBox.width / 2, targetBox.y + targetBox.height / 2, { steps: 12 });
-  expect((await wrappers.nth(2).getAttribute("class")) ?? "").toContain("ring-2");
+  await expect(wrappers.nth(2)).toHaveClass(/ring-2/);
   const committed = page.waitForResponse(
     (response) => response.url().endsWith("/api/workspace-ordering") && response.request().method() === "PUT",
   );

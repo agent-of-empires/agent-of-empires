@@ -24,6 +24,8 @@ pub enum Capability {
     CreateHookDetail,
     /// See owner diagnostics and the serve instance id.
     OwnerDiagnostics,
+    /// Read a local plugin source directory or install development code.
+    LocalPluginSource,
 }
 
 /// The one decision point for Principal-dependent authority. An absent Principal holds none.
@@ -35,7 +37,8 @@ pub fn authorize(principal: Option<&Principal>, capability: Capability) -> bool 
             | Capability::CreationProgress
             | Capability::NativeInteraction
             | Capability::CreateHookDetail
-            | Capability::OwnerDiagnostics,
+            | Capability::OwnerDiagnostics
+            | Capability::LocalPluginSource,
         ) => true,
         (Some(Principal::Device | Principal::TokenHolder) | None, _) => false,
     }
@@ -59,6 +62,7 @@ mod tests {
             Capability::NativeInteraction,
             Capability::CreateHookDetail,
             Capability::OwnerDiagnostics,
+            Capability::LocalPluginSource,
         ];
         for (principal, expected) in [
             (None, false),

@@ -14,6 +14,34 @@ use tracing_subscriber::Registry;
 
 use crate::session::config::{LoggingConfig, RotationKind};
 
+/// Each pattern keeps capture group 1 (the key) and replaces the value. Quoted values run
+/// through backslash escapes to their closing quote.
+static REDACTORS: LazyLock<[Regex; 6]> = LazyLock::new(|| {
+    [
+        r#"(?i)((?:set-)?cookie["']?\s*[:=]\s*)(?:"(?:\\.|[^"\\])*"|'(?:\\.|[^'\\])*'|[^\r\n]+)"#,
+        r#"(?i)(authorization["']?\s*[:=]\s*")(?:\\.|[^"\\\r\n])+"#,
+        r#"(?i)(authorization["']?\s*[:=]\s*')(?:\\.|[^'\\\r\n])+"#,
+        r#"(?i)(authorization["']?\s*[:=]\s*)[^\s"'][^\r\n]*"#,
+        r#"(?i)((?:\w*token|passphrase|api[_-]?key|\w*password|\w*secret)["']?\s*[:=]\s*)(?:"(?:\\.|[^"\\])*"|'(?:\\.|[^'\\])*'|[^\s&"',;]+)"#,
+        r#"()(?i:gh[pousr]_[A-Za-z0-9_]+|github_pat_[A-Za-z0-9_]+)"#,
+    ]
+    .map(|p| Regex::new(p).expect("static redaction pattern"))
+});
+
+static USERINFO: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"(?i)([a-z][a-z0-9+.-]*://)[^/?#\s@]+@").expect("static redaction pattern")
+});
+
+pub fn redact(text: &str) -> String {
+    let mut redacted = USERINFO.replace_all(text, "${1}[REDACTED]@");
+    for re in REDACTORS.iter() {
+        if let std::borrow::Cow::Owned(next) = re.replace_all(&redacted, "${1}[REDACTED]") {
+            redacted = std::borrow::Cow::Owned(next);
+        }
+    }
+    redacted.into_owned()
+}
+
 /// Contexts whose stdout is the UI or discarded force the file sink.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ProcessContext {
@@ -1014,34 +1042,6 @@ fn apply_filter_file(path: &std::path::Path) {
         std::fs::write(path.with_extension("applied"), directive)
             .expect("publish e2e filter application");
     }
-}
-
-const REDACTED: &str = "[REDACTED]";
-
-/// Each pattern keeps capture group 1 (the key) and replaces the value. Quoted values run
-/// through backslash escapes to their closing quote.
-static REDACTORS: LazyLock<[Regex; 5]> = LazyLock::new(|| {
-    [
-        r#"(?i)((?:set-)?cookie["']?\s*[:=]\s*)(?:"(?:\\.|[^"\\])*"|'(?:\\.|[^'\\])*'|[^\r\n]+)"#,
-        r#"(?i)(authorization["']?\s*[:=]\s*")(?:\\.|[^"\\\r\n])+"#,
-        r#"(?i)(authorization["']?\s*[:=]\s*')(?:\\.|[^'\\\r\n])+"#,
-        r#"(?i)(authorization["']?\s*[:=]\s*)[^\s"'][^\r\n]*"#,
-        r#"(?i)((?:\w*token|passphrase|api[_-]?key|\w*password|\w*secret)["']?\s*[:=]\s*)(?:"(?:\\.|[^"\\])*"|'(?:\\.|[^'\\])*'|[^\s&"',;]+)"#,
-    ]
-    .map(|p| Regex::new(p).expect("static redaction pattern"))
-});
-
-static USERINFO: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r"(?i)([a-z][a-z0-9+.-]*://)[^/?#\s@]+@").expect("static redaction pattern")
-});
-
-/// Strips `user:pass@` from URLs, then secret-looking key/value pairs.
-pub fn redact(text: &str) -> String {
-    let text = USERINFO.replace_all(text, format!("${{1}}{REDACTED}@").as_str());
-    let replacement = format!("${{1}}{REDACTED}");
-    REDACTORS.iter().fold(text.into_owned(), |acc, re| {
-        re.replace_all(&acc, replacement.as_str()).into_owned()
-    })
 }
 
 #[cfg(test)]
