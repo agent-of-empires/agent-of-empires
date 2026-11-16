@@ -374,6 +374,8 @@ impl StagingVolume {
 
     /// The caller must prove all writers stopped before requesting detach.
     pub(super) fn close(&mut self) -> anyhow::Result<()> {
+        use std::os::unix::fs::MetadataExt as _;
+
         if self.closed {
             return Ok(());
         }
