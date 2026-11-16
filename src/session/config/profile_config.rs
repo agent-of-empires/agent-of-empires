@@ -300,6 +300,23 @@ pub fn validate_port_mapping_format(mapping: &str) -> Result<(), String> {
     }
 }
 
+/// Validate a `sandbox.volume_ignores` entry: a relative path (or glob) under
+/// the workspace. `:` would turn the mount into a host bind spec; an absolute
+/// path or a `..` component would escape the workspace.
+pub fn validate_volume_ignore_format(entry: &str) -> Result<(), String> {
+    if entry.is_empty()
+        || entry.starts_with('/')
+        || entry.contains([':', '\0', '\\'])
+        || entry.split('/').any(|part| part == "..")
+    {
+        return Err(
+            "Must be a relative path inside the project, with no ':' or '..' (e.g. node_modules)"
+                .to_string(),
+        );
+    }
+    Ok(())
+}
+
 /// Validate a Linux capability name (`sandbox.cap_add` / `sandbox.cap_drop`).
 pub fn validate_capability_format(cap: &str) -> Result<(), String> {
     let re = regex::Regex::new(r"^[A-Z][A-Z_]+$").unwrap();

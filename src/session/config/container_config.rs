@@ -3329,6 +3329,15 @@ pub(crate) fn build_container_config(
     // since Docker needs concrete mount paths when the container starts.
     let mut resolved_ignore_paths: Vec<String> = Vec::new();
     for ignore in &sandbox_config.volume_ignores {
+        // Repo TOML is only type-checked; an entry like `../..:/host` would
+        // otherwise become a host bind mount.
+        if let Err(reason) = crate::session::validate_volume_ignore_format(ignore) {
+            tracing::warn!(
+                target: "session.profile",
+                "Ignoring sandbox.volume_ignores entry {ignore:?}: {reason}"
+            );
+            continue;
+        }
         if has_glob_metachars(ignore) {
             resolved_ignore_paths.extend(expand_glob_ignore(ignore, &glob_roots));
         } else {
@@ -3415,7 +3424,23 @@ pub(crate) fn build_container_config(
         cpu_limit: sandbox_config.cpu_limit.clone(),
         memory_limit: sandbox_config.memory_limit.clone(),
         cgroup_parent: None,
-        port_mappings: sandbox_config.port_mappings.clone(),
+        port_mappings: sandbox_config
+            .port_mappings
+            .iter()
+            .filter(
+                |mapping| match crate::session::validate_port_mapping_format(mapping) {
+                    Ok(()) => true,
+                    Err(reason) => {
+                        tracing::warn!(
+                            target: "session.profile",
+                            "Ignoring sandbox.port_mappings entry {mapping:?}: {reason}"
+                        );
+                        false
+                    }
+                },
+            )
+            .cloned()
+            .collect(),
         network: sanitize_network(sandbox_config.network.as_deref()),
         selinux_relabel: sandbox_config.selinux_relabel,
         identity_publisher_installed,
@@ -6077,6 +6102,61 @@ extra_run_args = ["--privileged"]
                 "repo-declared selinux_relabel must be dropped"
             );
         }
+    }
+
+    /// A repo `volume_ignores` entry with `:` or `..` must not reach `-v` as a
+    /// host bind mount; `port_mappings` must stay `port:port`.
+    #[test]
+    #[serial_test::serial]
+    fn test_build_container_config_rejects_escaping_repo_volume_ignores() {
+        let (_hg, _, _tmp_base) = BaseGuard::ready();
+        let temp_home = TempDir::new().unwrap();
+        let _home_guard = crate::session::test_support::isolate_home(temp_home.path());
+
+        let project_dir = TempDir::new().unwrap();
+        let config_dir = project_dir.path().join(".agent-of-empires");
+        fs::create_dir_all(&config_dir).unwrap();
+        fs::write(
+            config_dir.join("config.toml"),
+            r#"
+[sandbox]
+volume_ignores = ["node_modules", "../../../../:/host", "a/../../b", "/etc", "x:rw"]
+port_mappings = ["3000:3000", "0.0.0.0:22:22"]
+"#,
+        )
+        .unwrap();
+        git2::Repository::init(project_dir.path()).unwrap();
+
+        let sandbox_info = crate::session::instance::SandboxInfo {
+            provider: None,
+            enabled: true,
+            container_id: None,
+            image: "test:latest".to_string(),
+            container_name: "test-container".to_string(),
+            extra_env: None,
+            custom_instruction: None,
+            before_start_env: Vec::new(),
+            before_start_hook_env: Vec::new(),
+            container_workdir: None,
+        };
+
+        let config = build_container_config(
+            project_dir.path().to_str().unwrap(),
+            &sandbox_info,
+            ContainerAgentSelection::new("claude", None),
+            SandboxYolo::default(),
+            "test-instance-id",
+            None,
+            "",
+        )
+        .unwrap();
+
+        let dir_name = project_dir.path().file_name().unwrap().to_string_lossy();
+        assert_eq!(
+            config.anonymous_volumes,
+            vec![format!("/workspace/{}/node_modules", dir_name)]
+        );
+        assert_eq!(config.port_mappings, vec!["3000:3000".to_string()]);
     }
 
     /// Feature test for #2045: glob volume_ignores entries are expanded against the

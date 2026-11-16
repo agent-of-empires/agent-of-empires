@@ -220,6 +220,8 @@ pub enum ValidationKind {
     EnvList,
     /// `host:container` numeric port entries.
     PortMappingList,
+    /// Relative workspace paths or globs: no `:`, `..`, absolute paths, or NUL.
+    VolumeIgnoreList,
     CapabilityList,
     SecurityOptList,
     /// Empty, `none`, `bridge`, or a named network; `host` would defeat isolation.

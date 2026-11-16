@@ -55,7 +55,7 @@ A repo config is code you did not write, so the keys that decide what AoE launch
 
 `[tmux]`, `[sound]`, and `[diff]` are personal settings and are not read from a repo at all; from `[updates]` a repo may set only `update_check_mode`. `sandbox.environment` is denied because its bare `KEY` and `KEY=$VAR` forms copy host variables into the container, and `default_tool` because session launch prefers an exact `custom_agents` match, which would let a repo select a user-defined host command. `container_runtime` and `shared_credential` are global-only everywhere.
 
-List fields such as `volume_ignores` and `port_mappings` accept either an array or a single string.
+List fields such as `volume_ignores` and `port_mappings` accept either an array or a single string. A `volume_ignores` entry must be a relative path or glob inside the project: entries with `:`, a `..` component, or a leading `/` are rejected (a `:` would make the mount a host bind). A `port_mappings` entry must be `port:port`.
 
 ```toml
 [hooks]

@@ -564,6 +564,7 @@ export type SettingsValidation =
   | { rule: "volume_list" }
   | { rule: "env_list" }
   | { rule: "port_mapping_list" }
+  | { rule: "volume_ignore_list" }
   | { rule: "capability_list" }
   | { rule: "security_opt_list" }
   | { rule: "network" }
