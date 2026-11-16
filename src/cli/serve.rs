@@ -1462,14 +1462,17 @@ async fn validate_launch_args(profile: &str, args: &ServeArgs) -> Result<AuthMod
     } else {
         resolve_auth_mode(args.auth, args.no_auth)
     };
-    validate_auth_combination(
-        auth_mode,
-        args.passphrase.is_some(),
-        host_is_localhost(&args.host),
-        args.behind_proxy,
-        args.remote,
-        &args.host,
-    )?;
+    // Core-only serves the owner-only Unix socket and has no TCP listener to guard.
+    if !args.core_only {
+        validate_auth_combination(
+            auth_mode,
+            args.passphrase.is_some(),
+            host_is_localhost(&args.host),
+            args.behind_proxy,
+            args.remote,
+            &args.host,
+        )?;
+    }
     validate_behind_proxy_allowlist(args.behind_proxy, args.remote, &args.allowed_host)?;
     validate_allowed_hosts(&args.allowed_host)?;
     validate_allowed_origins(&args.allowed_origin)?;

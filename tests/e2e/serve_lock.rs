@@ -194,7 +194,7 @@ fn managed_controls_migrate_historical_launch_before_replay() {
         if protected {
             args.extend(["--passphrase", "legacy-auth"]);
         } else {
-            args.push("--no-auth", "--behind-proxy", "--allowed-host", "127.0.0.1");
+            args.extend(["--no-auth", "--behind-proxy", "--allowed-host", "127.0.0.1"]);
         }
         h.run_cli_ok(&args);
         let app = app_dir_in(h.home_path());
