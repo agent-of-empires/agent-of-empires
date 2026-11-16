@@ -2,7 +2,7 @@
 
 use tracing::{trace, warn};
 
-use super::EventStore;
+use super::{EventStore, ReadConn};
 use crate::acp::state::Event;
 use crate::events::{self, Order, SeqBound};
 
@@ -45,8 +45,11 @@ impl EventStore {
     /// Hand every event with `seq > since` to `visit`, oldest first, one page at a time.
     ///
     /// A separate read transaction keeps pages coherent across retention sweeps without
-    /// holding the writer connection. Writes after the snapshot starts are left for the
-    /// live fold. Returns the last seq visited, or `since` when nothing was visited.
+    /// holding the writer connection. Without an independent reader, one unpaged snapshot
+    /// is collected and released before visiting. If a snapshot cannot start, replay uses
+    /// one unpaged scan rather than risk missing rows between pages. Writes after the
+    /// snapshot starts are left for the live fold. Returns the last seq visited, or `since`
+    /// when nothing was visited.
     pub fn replay_each_paged(
         &self,
         session_id: &str,
@@ -54,6 +57,32 @@ impl EventStore {
         mut visit: impl FnMut(u64, Event),
     ) -> u64 {
         let reader = self.reader();
+        if matches!(&reader, ReadConn::Writer(_)) {
+            let snapshot = match reader.unchecked_transaction() {
+                Ok(snapshot) => Some(snapshot),
+                Err(e) => {
+                    warn!(target: "acp.event_store", "replay snapshot unavailable for {session_id}: {e}");
+                    None
+                }
+            };
+            let events = self
+                .page_on_connection(
+                    &reader,
+                    session_id,
+                    SeqBound::After(since),
+                    Order::Asc,
+                    None,
+                )
+                .events;
+            drop(snapshot);
+            drop(reader);
+            let mut last = since;
+            for (seq, event) in events {
+                last = seq;
+                visit(seq, event);
+            }
+            return last;
+        }
         let Ok(snapshot) = reader.unchecked_transaction() else {
             warn!(target: "acp.event_store", "replay snapshot unavailable for {session_id}");
             let events = self
@@ -65,6 +94,7 @@ impl EventStore {
                     None,
                 )
                 .events;
+            drop(reader);
             let mut last = since;
             for (seq, event) in events {
                 last = seq;
@@ -571,6 +601,32 @@ mod tests {
     }
 
     #[test]
+    fn writer_fallback_releases_its_snapshot_before_visiting() {
+        let store = EventStore::open(std::path::Path::new(":memory:"), 0).unwrap();
+        record_from(
+            &store,
+            "private",
+            1,
+            [Event::ThinkingStarted, Event::ThinkingEnded],
+        );
+        let mut seen = Vec::new();
+        let last = store.replay_each_paged("private", 0, |seq, _| {
+            seen.push(seq);
+            if seq == 1 {
+                assert!(
+                    store.conn.try_lock().is_ok(),
+                    "the writer lock must be released before invoking the visitor"
+                );
+                store.record("private", 3, &Event::ThinkingStarted).unwrap();
+            }
+        });
+
+        assert_eq!(seen, [1, 2]);
+        assert_eq!(last, 2);
+        assert_eq!(seqs(&store.replay_from("private", 2)), [3]);
+    }
+
+    #[test]
     fn a_page_reads_its_bounds_and_rows_from_one_snapshot() {
         let (tmp, store) = open_store(1000);
         record_from(&store, "s-1", 1, (1..=3).map(|_| Event::ThinkingStarted));
@@ -636,9 +692,10 @@ mod tests {
                 2000,
                 &Event::BackgroundTaskStarted {
                     task_id: "task".into(),
-                    tool_call_id: None,
+                    tool_call_id: Some("call-task".into()),
                     description: "test".into(),
                     workflow: None,
+                    started_at: None,
                 },
             )
             .unwrap();
@@ -652,11 +709,40 @@ mod tests {
                 },
             )
             .unwrap();
+        let mut seq = 2002;
+        for i in 0..crate::acp::state::MAX_FINISHED_BACKGROUND_SHELLS + 1 {
+            let task_id = format!("newer-{i}");
+            store
+                .record(
+                    "cold",
+                    seq,
+                    &Event::BackgroundTaskStarted {
+                        task_id: task_id.clone(),
+                        tool_call_id: Some(format!("call-{i}")),
+                        description: "test".into(),
+                        workflow: None,
+                        started_at: None,
+                    },
+                )
+                .unwrap();
+            seq += 1;
+            store
+                .record(
+                    "cold",
+                    seq,
+                    &Event::BackgroundTaskFinished {
+                        task_id,
+                        ended_at: None,
+                    },
+                )
+                .unwrap();
+            seq += 1;
+        }
         record_from(
             &store,
             "cold",
-            2002,
-            (2002..=3007).map(|_| Event::ThinkingEnded),
+            seq,
+            (seq..=3007).map(|_| Event::ThinkingEnded),
         );
         assert_eq!(
             store.unresolved_background_task_ids("cold"),
