@@ -71,7 +71,8 @@ pub(super) struct CreateSessionParams {
     /// First prompt for the new session.
     prompt: Option<String>,
     /// Make the session a sub-session of this top-level session, in the same profile.
-    /// Defaults to the calling session, when there is one.
+    /// Defaults to the calling session when it is top-level, in that profile, and no `group`
+    /// is given.
     parent_session_id: Option<String>,
     /// Retry key: a repeated create with the same key answers with the first one's session, and
     /// does nothing else (the prompt is not delivered again).
@@ -197,9 +198,10 @@ impl McpServer {
         if let Some(refusal) = read_only_refusal(&self.state) {
             return Err(refusal);
         }
-        // Checked like an explicit parent, so a sub-session caller is refused, not orphaned.
-        if params.parent_session_id.is_none() {
-            params.parent_session_id = caller_session_id(&context);
+        if params.parent_session_id.is_none() && params.group.is_empty() {
+            params.parent_session_id = self
+                .caller_as_parent(&context, params.profile.as_deref())
+                .await;
         }
         let structured = params.view == View::Structured;
         // A terminal prompt is typed into the pane once the agent starts, so it gets what
@@ -499,6 +501,27 @@ impl McpServer {
                     && i.source_profile == caller.source_profile
                     && !i.is_trashed()
                     && !i.is_archived()
+            })
+            .map(|i| i.id.clone())
+    }
+
+    /// The caller, when an explicit parent naming it would pass `create_session`'s checks for
+    /// `profile`; otherwise the create stays top-level, as it was before parents defaulted.
+    async fn caller_as_parent(
+        &self,
+        context: &RequestContext<RoleServer>,
+        profile: Option<&str>,
+    ) -> Option<String> {
+        let caller = caller_session_id(context)?;
+        let profile = profile.map_or_else(|| self.state.served_profile().clone(), str::to_string);
+        let instances = self.state.instances.read().await;
+        instances
+            .iter()
+            .find(|i| {
+                i.id == caller
+                    && i.source_profile == profile
+                    && !i.is_trashed()
+                    && i.ensure_can_parent().is_ok()
             })
             .map(|i| i.id.clone())
     }

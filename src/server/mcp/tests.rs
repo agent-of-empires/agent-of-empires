@@ -997,7 +997,11 @@ async fn create_session_stores_a_structured_prompt_and_its_parent() {
     child.id = "child".into();
     child.source_profile = "test".into();
     child.parent_session_id = Some("parent".into());
+    let mut elsewhere = Instance::new("elsewhere", "/tmp/aoe-mcp-elsewhere");
+    elsewhere.id = "elsewhere".into();
+    elsewhere.source_profile = "other".into();
     test_support::seed_instances_on_disk_for_test("test", vec![parent.clone(), child.clone()]);
+    test_support::seed_instances_on_disk_for_test("other", vec![elsewhere.clone()]);
     let (launcher, _launches) = test_support::counting_failing_launcher();
     let secret = std::sync::Arc::new(
         crate::server::session_credential::McpSessionSecret::load_or_generate(
@@ -1009,7 +1013,7 @@ async fn create_session_stores_a_structured_prompt_and_its_parent() {
     );
     let state_secret = secret.clone();
     let state = test_support::build_test_app_state_impl(
-        vec![parent, child],
+        vec![parent, child, elsewhere],
         vecs(&["localhost"]),
         Vec::new(),
         Some(TOKEN.to_string()),
@@ -1048,7 +1052,7 @@ async fn create_session_stores_a_structured_prompt_and_its_parent() {
     for (path, parent_id, code) in refusals {
         let refused = call_result(&app, "create_session", create(path, parent_id)).await;
         assert_eq!(error_code(&refused), Some(code), "{refused}");
-        assert_eq!(state.instances.read().await.len(), 2, "{code}");
+        assert_eq!(state.instances.read().await.len(), 3, "{code}");
     }
 
     let created = call(&app, "create_session", create(project.path(), "parent")).await;
@@ -1070,36 +1074,33 @@ async fn create_session_stores_a_structured_prompt_and_its_parent() {
         Some("review the diff")
     );
 
-    // A caller that names no parent becomes the parent, checked as an explicit one is.
-    let omitted = json!({
-        "path": project.path(), "tool": "claude", "view": "structured", "title": "spawned",
-    });
-    let refused = rpc_as(
-        &app,
-        &secret,
-        "child",
-        tools_call(4, "create_session", omitted.clone()),
-    )
-    .await;
-    assert_eq!(
-        error_code(&refused),
-        Some("parent_is_sub_session"),
-        "{refused}"
-    );
-    let created = rpc_as(
-        &app,
-        &secret,
-        "parent",
-        tools_call(5, "create_session", omitted),
-    )
-    .await;
-    assert_ne!(created["isError"], json!(true), "{created}");
-    let id = created["structuredContent"]["session"]["id"]
-        .as_str()
-        .unwrap();
-    let rows = state.instances.read().await;
-    let row = rows.iter().find(|row| row.id == id).unwrap();
-    assert_eq!(row.parent_session_id.as_deref(), Some("parent"));
+    // A caller that names no parent becomes it only where an explicit parent would pass.
+    // (caller, extra arguments, parent, group)
+    let cases = [
+        ("parent", json!({}), Some("parent"), "team"),
+        ("child", json!({}), None, ""),
+        ("parent", json!({"group": "reviews"}), None, "reviews"),
+        ("elsewhere", json!({}), None, ""),
+    ];
+    for (n, (caller, extra, parent, group)) in cases.into_iter().enumerate() {
+        let mut arguments = json!({
+            "path": project.path(), "tool": "claude", "view": "structured", "title": "spawned",
+        });
+        arguments
+            .as_object_mut()
+            .unwrap()
+            .extend(extra.as_object().unwrap().clone());
+        let call = tools_call(4 + n as i64, "create_session", arguments);
+        let created = rpc_as(&app, &secret, caller, call).await;
+        assert_ne!(created["isError"], json!(true), "{caller}: {created}");
+        let id = created["structuredContent"]["session"]["id"]
+            .as_str()
+            .unwrap();
+        let rows = state.instances.read().await;
+        let row = rows.iter().find(|row| row.id == id).unwrap();
+        assert_eq!(row.parent_session_id.as_deref(), parent, "{caller} {extra}");
+        assert_eq!(row.group_path, group, "{caller} {extra}");
+    }
 }
 
 /// A terminal session's `send` and `read_output` refuse what HTTP refuses, and read a live pane.
@@ -1112,8 +1113,12 @@ async fn terminal_sessions_send_and_read_through_their_pane() {
     let mut stopped = Instance::new("mcp-stopped", "/tmp/aoe-mcp-stopped");
     stopped.source_profile = "default".into();
     let (live_id, stopped_id) = (live.id.clone(), stopped.id.clone());
+    let mut child = Instance::new("mcp-pane-child", "/tmp/aoe-mcp-pane-child");
+    child.source_profile = "default".into();
+    child.parent_session_id = Some(live_id.clone());
+    let child_id = child.id.clone();
     let pane = live.tmux_session().unwrap();
-    let (app, _state) = seeded_app(vec![live, stopped], false).await;
+    let (app, _state, secret) = seeded_app_with_secret(vec![live, stopped, child], false).await;
 
     // (tool, arguments, error code)
     let refusals = [
@@ -1191,6 +1196,13 @@ async fn terminal_sessions_send_and_read_through_their_pane() {
     assert_eq!(sent["disposition"], "sent", "{sent}");
     assert!(sent.get("seq").is_none(), "{sent}");
     pane_shows("typed-by-mcp").await;
+
+    // A terminal parent gets `send_to_parent` typed into its pane, as `send` types it.
+    let call = tools_call(9, "send_to_parent", json!({"message": "from-the-child\n"}));
+    let sent = rpc_as(&app, &secret, &child_id, call).await;
+    assert_eq!(sent["structuredContent"]["disposition"], "sent", "{sent}");
+    assert!(sent["structuredContent"].get("seq").is_none(), "{sent}");
+    pane_shows("from-the-child").await;
 }
 
 /// A retried `idempotency_key` answers with the first create's session and delivers nothing:
@@ -1415,8 +1427,23 @@ async fn send_to_parent_is_listed_and_delivers_only_for_a_live_parent() {
     trashed_parent.trash();
     let mut stranded = structured_session("mcp-stranded");
     stranded.parent_session_id = Some(trashed_parent.id.clone());
-    let (app, state, secret) =
-        seeded_app_with_secret(vec![parent, child, orphan, trashed_parent, stranded], false).await;
+    let mut archived_parent = structured_session("mcp-archived-parent");
+    archived_parent.archive();
+    let mut shelved = structured_session("mcp-shelved");
+    shelved.parent_session_id = Some(archived_parent.id.clone());
+    let mut dangling = structured_session("mcp-dangling");
+    dangling.parent_session_id = Some("no-such-session".into());
+    let rows = vec![
+        parent,
+        child,
+        orphan,
+        trashed_parent,
+        stranded,
+        archived_parent,
+        shelved,
+        dangling,
+    ];
+    let (app, state, secret) = seeded_app_with_secret(rows, false).await;
     let _cmds = state
         .acp_supervisor
         .test_insert_worker_cmd_recording("mcp-parent")
@@ -1428,6 +1455,8 @@ async fn send_to_parent_is_listed_and_delivers_only_for_a_live_parent() {
         (None, false),
         (Some("mcp-orphan"), false),
         (Some("mcp-stranded"), false),
+        (Some("mcp-shelved"), false),
+        (Some("mcp-dangling"), false),
         (Some("mcp-child"), true),
     ];
     for (caller, listed) in cases {
@@ -1471,10 +1500,9 @@ async fn send_to_parent_is_listed_and_delivers_only_for_a_live_parent() {
             );
         }
     }
-    assert!(state
-        .acp_event_store
-        .replay_from("mcp-trashed-parent", 0)
-        .is_empty());
+    for id in ["mcp-trashed-parent", "mcp-archived-parent"] {
+        assert!(state.acp_event_store.replay_from(id, 0).is_empty(), "{id}");
+    }
 
     // Read-only refuses it before anything is delivered.
     let (app, state, secret) = seeded_app_with_secret(
