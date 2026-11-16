@@ -2,8 +2,14 @@ name: Install Rust toolchain
 description: >
   Installs the toolchain pinned in rust-toolchain.toml, so every job builds
   with the same reviewed version rather than whatever `stable` is today.
+  Restores it from cache when possible and retries the download, because
+  static.rust-lang.org connects time out from CI runners.
 
 inputs:
+  toolchain:
+    description: Toolchain to install instead of the one pinned in rust-toolchain.toml (e.g. the MSRV).
+    required: false
+    default: ''
   components:
     description: Extra rustup components, comma separated.
     required: false
@@ -19,8 +25,14 @@ runs:
     - name: Read pinned channel
       id: pin
       shell: bash
+      env:
+        OVERRIDE: ${{ inputs.toolchain }}
       run: |
         set -euo pipefail
+        if [ -n "$OVERRIDE" ]; then
+          echo "channel=$OVERRIDE" >> "$GITHUB_OUTPUT"
+          exit 0
+        fi
         channel="$(python3 - <<'PY'
         import re
         import tomllib
@@ -32,7 +44,49 @@ runs:
         PY
         )"
         echo "channel=$channel" >> "$GITHUB_OUTPUT"
-    - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
+    # Only the toolchain dir is cached; rustup and its proxies come from the runner
+    # image. A two-part MSRV like 1.95 keeps the first patch it cached, fine for a check.
+    - id: cache
+      uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+      with:
+        path: ~/.rustup/toolchains/${{ steps.pin.outputs.channel }}-*
+        key: rustup-${{ runner.os }}-${{ runner.arch }}-${{ steps.pin.outputs.channel }}-${{ inputs.components }}-${{ inputs.targets }}
+    # On a hit nothing touches the network. A failure here falls through to a real install.
+    - id: restored
+      if: steps.cache.outputs.cache-hit == 'true'
+      continue-on-error: true
+      shell: bash
+      env:
+        CHANNEL: ${{ steps.pin.outputs.channel }}
+      run: |
+        rustup default "$CHANNEL" --force-non-host
+        rustc +"$CHANNEL" --version
+        [ -n "${CARGO_INCREMENTAL+set}" ] || echo CARGO_INCREMENTAL=0 >> "$GITHUB_ENV"
+    # dtolnay retries only checksum errors, not connect timeouts, so retry the whole action.
+    - id: try1
+      if: steps.restored.outcome != 'success'
+      continue-on-error: true
+      uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
+      with:
+        toolchain: ${{ steps.pin.outputs.channel }}
+        components: ${{ inputs.components }}
+        targets: ${{ inputs.targets }}
+    - if: steps.try1.outcome == 'failure'
+      shell: bash
+      run: sleep 20
+    - id: try2
+      if: steps.try1.outcome == 'failure'
+      continue-on-error: true
+      uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
+      with:
+        toolchain: ${{ steps.pin.outputs.channel }}
+        components: ${{ inputs.components }}
+        targets: ${{ inputs.targets }}
+    - if: steps.try2.outcome == 'failure'
+      shell: bash
+      run: sleep 60
+    - if: steps.try2.outcome == 'failure'
+      uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
       with:
         toolchain: ${{ steps.pin.outputs.channel }}
         components: ${{ inputs.components }}

@@ -30,6 +30,8 @@ import { PlanStrip } from "./PlanStrip";
 import { ModeSwitchFailedNotice, QueuedPromptsStrip, RejectedPromptsStrip, SessionNoticesStrip } from "./PromptStrips";
 import type { NewSessionLike } from "./ContainerGoneBanner";
 import { SessionBanners } from "./SessionBanners";
+import { composerBlockedReason, containerGoneRemedy } from "./containerGone";
+import type { RecreateContainerBlock } from "../sidebar/sessionActionTargets";
 import { ConfigOptionSwitchFailedNotice } from "./SessionConfigControls";
 import { StartupErrorScreen } from "./StartupErrorScreen";
 import { SystemNotices } from "./SystemNotices";
@@ -71,6 +73,7 @@ interface Props {
   onStartSession?: () => void;
   archivedAt: string | null;
   snoozedUntil: string | null;
+  queuedCount?: number;
   /** Trashed sessions are read-only: no composer or queue strips. */
   trashedAt: string | null;
   /** Restore the trashed workspace; resolves false on failure. */
@@ -80,6 +83,8 @@ interface Props {
   isSandboxed?: boolean;
   /** The Session's title when the dashboard may recreate its container. */
   recreateContainerTitle?: string;
+  /** Why the dashboard can't recreate its container, or null when it can. */
+  recreateContainerBlock: RecreateContainerBlock | null;
   onOpenAgentsPane?: (agentId?: string) => void;
   /** The server is read-only, so the session cannot be interrupted. */
   serverReadOnly?: boolean;
@@ -108,6 +113,7 @@ export function StructuredView(props: Props) {
     compactAliases,
     archivedAt,
     snoozedUntil,
+    queuedCount,
     onOpenFileRef,
     fileRefSession,
   } = props;
@@ -123,6 +129,7 @@ export function StructuredView(props: Props) {
               acpWorkerState={acpWorkerState}
               archivedAt={archivedAt}
               snoozedUntil={snoozedUntil}
+              queuedCount={queuedCount}
               showClearedTurns={showClearedTurns}
             >
               {(ctx) => (
@@ -294,6 +301,7 @@ function AcpChrome({
         onRestarted={ctx.markRestartStarted}
         onRestartFailed={ctx.markRestartFailed}
         recreateContainerTitle={view.recreateContainerTitle}
+        recreateContainerBlock={view.recreateContainerBlock}
         newSession={view.newSessionLike}
       />
 
@@ -451,9 +459,7 @@ function ComposerDock({
   // A send would start the Session, which rebuilds the container without Recreate's warning.
   const blockedReason =
     state.startupError && state.startupCause?.kind === "container_missing"
-      ? view.canRestartAgent
-        ? "Recreate the container to send messages."
-        : "Ask the owner to recreate the container."
+      ? composerBlockedReason(containerGoneRemedy(!!view.canRestartAgent, view.recreateContainerBlock))
       : null;
   return (
     <>

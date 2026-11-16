@@ -265,6 +265,110 @@ pub struct ContextPrimerResponse {
     pub unprocessed_prompt: Option<String>,
 }
 
+/// Whether switching to Terminal view carries the conversation over.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TerminalContext {
+    Continues,
+    StartsFresh,
+    Blocked,
+    /// The Session's own command selects the conversation, so only a switch with no choice runs.
+    CommandDecides,
+}
+
+/// Why a switch to Terminal view starts fresh, can't happen yet, or continues a
+/// conversation other than the one in Structured view. Also the `AoE-Error-Code`
+/// of a refused switch.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TerminalSwitchReason {
+    AgentNotResumable,
+    NoConversationYet,
+    /// With `continues`: Structured view has no conversation yet, so the switch
+    /// resumes the Session's earlier one, from before Structured view.
+    EarlierConversation,
+    ConversationNotBound,
+    Sandboxed,
+    HandoffPending,
+    NoTerminalTool,
+    ContextUnconfirmed,
+    /// Refusal only: the Session changed during the switch.
+    SessionChanged,
+    /// Check only: the Session isn't in Structured view.
+    NotStructured,
+    /// With `command_decides`: the launch command carries a native session selector.
+    CommandSelectsConversation,
+}
+
+impl TerminalSwitchReason {
+    pub const ALL: [Self; 11] = [
+        Self::AgentNotResumable,
+        Self::NoConversationYet,
+        Self::EarlierConversation,
+        Self::ConversationNotBound,
+        Self::Sandboxed,
+        Self::HandoffPending,
+        Self::NoTerminalTool,
+        Self::ContextUnconfirmed,
+        Self::SessionChanged,
+        Self::NotStructured,
+        Self::CommandSelectsConversation,
+    ];
+
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::AgentNotResumable => "agent_not_resumable",
+            Self::NoConversationYet => "no_conversation_yet",
+            Self::EarlierConversation => "earlier_conversation",
+            Self::ConversationNotBound => "conversation_not_bound",
+            Self::Sandboxed => "sandboxed",
+            Self::HandoffPending => "handoff_pending",
+            Self::NoTerminalTool => "no_terminal_tool",
+            Self::ContextUnconfirmed => "context_unconfirmed",
+            Self::SessionChanged => "session_changed",
+            Self::NotStructured => "not_structured",
+            Self::CommandSelectsConversation => "command_selects_conversation",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ContainerState {
+    Running,
+    Stopped,
+}
+
+/// `GET /api/sessions/{id}/acp/terminal-check` response.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TerminalCheckResponse {
+    pub context: TerminalContext,
+    /// Set unless `context` is `continues`, or with it only as `earlier_conversation`.
+    pub reason: Option<TerminalSwitchReason>,
+    pub agent: String,
+    /// Set only for a sandboxed Session.
+    pub container: Option<ContainerState>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TerminalConversation {
+    /// Refuse unless the conversation carries over.
+    Continue,
+    /// Start a new conversation even when this one could carry over.
+    Fresh,
+}
+
+/// Optional `POST /api/sessions/{id}/acp/disable` body. Without one the switch
+/// continues when it can, starts fresh for an Agent or Session with nothing to
+/// carry, and refuses an unbound conversation.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct TerminalSwitchRequest {
+    #[serde(default)]
+    pub conversation: Option<TerminalConversation>,
+}
+
 /// `POST /api/sessions/{id}/acp/switch-agent` body.
 #[derive(Debug, Serialize, Deserialize)]
 pub struct SwitchAgentRequest {

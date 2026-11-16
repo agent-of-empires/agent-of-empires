@@ -57,7 +57,7 @@ pub enum ApprovalDecision {
 
 /// One option the agent offered on `session/request_permission`, kept in
 /// the order it sent them.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct ApprovalOption {
     pub option_id: String,
     pub name: String,
@@ -66,7 +66,7 @@ pub struct ApprovalOption {
 
 /// Mirror of ACP `PermissionOptionKind`, owned here so the wire type the
 /// clients see does not depend on the protocol crate's enum.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum ApprovalOptionKind {
     AllowOnce,

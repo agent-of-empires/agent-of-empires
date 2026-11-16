@@ -5,7 +5,7 @@ import { TerminalSessionStack } from "./TerminalSessionStack";
 import { PairedShellPane, type ShellMode } from "./PairedTerminal";
 import { BackgroundAgentsPanel, type AgentFocus } from "./acp/BackgroundAgentsPanel";
 import { hasStartedBefore } from "./acp/startupWait";
-import { recreateContainerTitle } from "./sidebar/sessionActionTargets";
+import { recreateContainerBlock, recreateContainerTitle } from "./sidebar/sessionActionTargets";
 import type { NewSessionLike } from "./acp/ContainerGoneBanner";
 import { FilesPane } from "./FilesPane";
 import { DiffFileList } from "./diff/DiffFileList";
@@ -183,6 +183,7 @@ export function MobileMainPane({
                     onStartSession={onStartSession && (() => onStartSession(session.id))}
                     archivedAt={session.archived_at ?? null}
                     snoozedUntil={session.snoozed_until ?? null}
+                    queuedCount={session.queued_count}
                     trashedAt={session.trashed_at ?? null}
                     onOpenFileRef={onOpenFileRef}
                     fileRefSession={session}
@@ -190,6 +191,7 @@ export function MobileMainPane({
                     serverReadOnly={readOnly}
                     isSandboxed={session.is_sandboxed}
                     recreateContainerTitle={recreateContainerTitle(session)}
+                    recreateContainerBlock={recreateContainerBlock(session, !!session.archived_at)}
                     onSwitchToTerminal={onSwitchToTerminal ? () => onSwitchToTerminal(session.id) : undefined}
                     onOpenTerminal={onOpenTerminal ? (mode) => onOpenTerminal(session.id, mode) : undefined}
                     canRestartAgent={canRestartAgent}

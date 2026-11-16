@@ -581,12 +581,20 @@ impl<'a> OwnedProcessTree<'a> {
 }
 
 /// Keep the owned leader unreaped until the last group signal, reserving its PID.
+/// SIGKILL follows once the group settles or `grace` expires, whichever is first.
 pub(crate) fn terminate_and_reap_process_group(
     child: &mut Child,
     grace: Duration,
 ) -> std::io::Result<()> {
     platform::terminate_process_group(child);
-    std::thread::sleep(grace);
+    let grace_deadline = Instant::now() + grace;
+    while !unreaped_group_settled(child.id()) {
+        let now = Instant::now();
+        if now >= grace_deadline {
+            break;
+        }
+        std::thread::sleep(WAIT_POLL_INTERVAL.min(grace_deadline - now));
+    }
     platform::kill_process_group(child);
     let _ = child.kill();
     let deadline = Instant::now() + Duration::from_secs(1);
@@ -604,6 +612,20 @@ pub(crate) fn terminate_and_reap_process_group(
         }
         std::thread::sleep(poll.min(deadline.saturating_duration_since(now)));
         poll = (poll * 2).min(WAIT_POLL_INTERVAL);
+    }
+}
+
+/// An unobservable group counts as unsettled, so it waits out the full grace.
+fn unreaped_group_settled(leader: u32) -> bool {
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    {
+        matches!(unix::child_exited_unreaped(leader), Ok(true))
+            && matches!(runner_group_executing(leader), Ok(false))
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    {
+        let _ = leader;
+        false
     }
 }
 
@@ -2220,6 +2242,38 @@ fn signal_process_tree(pid: u32, signal: Signal) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn group_cleanup_kills_a_sigterm_ignoring_descendant_after_the_grace() {
+        use std::io::BufRead;
+
+        let mut command = Command::new("sh");
+        command
+            .args(["-c", "trap '' TERM; sleep 30 & echo ready; wait"])
+            .stdout(Stdio::piped());
+        let mut child = spawn_process_group(&mut command).unwrap();
+        let group = child.id();
+        let mut ready = String::new();
+        std::io::BufReader::new(child.stdout.take().unwrap())
+            .read_line(&mut ready)
+            .unwrap();
+        assert_eq!(ready, "ready\n");
+
+        let grace = Duration::from_millis(300);
+        let started = Instant::now();
+        terminate_and_reap_process_group(&mut child, grace).unwrap();
+        assert!(
+            started.elapsed() >= grace,
+            "a descendant that ignores SIGTERM keeps the group alive for the whole grace"
+        );
+        // SIGKILL is only queued; the descendant exits asynchronously.
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while runner_group_executing(group).unwrap() {
+            assert!(Instant::now() < deadline, "SIGKILL must end the group");
+            std::thread::sleep(WAIT_POLL_INTERVAL);
+        }
+    }
 
     #[cfg(any(target_os = "linux", target_os = "macos"))]
     #[test]

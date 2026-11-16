@@ -143,7 +143,7 @@ fn content_type_for_icon(path: &std::path::Path) -> Option<&'static str> {
     }
 }
 
-/// `GET /api/plugins/{id}/icon`: stream an installed plugin's `icon_asset`
+/// `GET /plugin-icons/{id}`: stream an installed plugin's `icon_asset`
 /// from its install directory. Mirrors `serve_sound_file`'s allowlist-then-read
 /// shape: the manifest path is re-validated and re-joined against the
 /// plugin's own directory rather than trusted from a cached URL. A builtin
@@ -2559,6 +2559,62 @@ id = "voice"
                 "deep_link": false,
             }])
         );
+    }
+
+    /// Under passphrase-only auth an `<img>` load of an installed icon needs a live session
+    /// but not its device binding.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn an_installed_icon_loads_on_an_unbound_session_under_passphrase_auth() {
+        use tower::ServiceExt;
+        let _app_dir = AppDirEnvGuard::new();
+        let dir = crate::plugin::plugins_dir().unwrap().join("acme.logo");
+        std::fs::create_dir_all(dir.join("assets")).unwrap();
+        std::fs::write(
+            dir.join("aoe-plugin.toml"),
+            "id = \"acme.logo\"\nname = \"Logo\"\nversion = \"1.0.0\"\napi_version = 16\nicon_asset = \"assets/icon.png\"\n",
+        )
+        .unwrap();
+        std::fs::write(dir.join("assets/icon.png"), b"png-bytes").unwrap();
+        crate::plugin::reload_registry();
+
+        let login = std::sync::Arc::new(crate::server::login::LoginManager::new(Some("pw")));
+        let session = login.create_session(&[7u8; 32], "203.0.113.7", "t").await;
+        let state = crate::server::test_support::build_test_app_state_with_policy_configured(
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            None,
+            |state| state.login_manager = std::sync::Arc::clone(&login),
+        );
+        let app = crate::server::test_support::build_router_for_test(state);
+        let get =
+            |cookie: Option<String>| {
+                let mut req =
+                    axum::http::Request::get("/plugin-icons/acme.logo").header("host", "127.0.0.1");
+                if let Some(cookie) = cookie {
+                    req = req.header("cookie", cookie);
+                }
+                let mut req = req.body(axum::body::Body::empty()).unwrap();
+                req.extensions_mut().insert(axum::extract::ConnectInfo(
+                    std::net::SocketAddr::from(([203, 0, 113, 7], 5555)),
+                ));
+                app.clone().oneshot(req)
+            };
+        let cookie = format!("aoe_session={session}");
+
+        let resp = get(None).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED, "no session");
+
+        let resp = get(Some(cookie.clone())).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(resp.headers()["content-type"], "image/png");
+        let body = axum::body::to_bytes(resp.into_body(), 1024).await.unwrap();
+        assert_eq!(&body[..], b"png-bytes");
+
+        login.invalidate_session(&session).await;
+        let resp = get(Some(cookie)).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED, "after logout");
     }
 
     #[test]

@@ -4361,7 +4361,26 @@
       "risk": "medium",
       "specs": ["tests/container-gone.spec.ts", "src/components/acp/__tests__/ContainerGoneBanner.test.tsx"],
       "components": ["web/src/components/acp/ContainerGoneBanner.tsx"],
-      "notes": "Where the server refuses a restart (read-only and CityHall), the banner keeps the heading and sentence, adds \"Ask the owner to recreate the container.\" and offers no actions, and the composer's placeholder says the same; Details still shows the server's message."
+      "notes": "Where the server refuses a restart (read-only and CityHall), the banner keeps the heading and says \"This Session's sandbox container is gone. Ask the owner to recreate the container.\" whatever the Session's state, offers no actions, and the composer's placeholder says the same; Details still shows the server's message."
+    },
+    {
+      "id": "acp.container-gone-recreate-unavailable",
+      "kind": "mocked-playwright",
+      "risk": "medium",
+      "issue": "https://github.com/agent-of-empires/agent-of-empires/issues/5729",
+      "specs": [
+        "tests/container-gone.spec.ts",
+        "src/components/acp/__tests__/ContainerGoneBanner.test.tsx",
+        "src/components/__tests__/SessionRowSiblingTargets.test.tsx"
+      ],
+      "components": [
+        "web/src/components/acp/ContainerGoneBanner.tsx",
+        "web/src/components/acp/SessionBanners.tsx",
+        "web/src/components/acp/StructuredView.tsx",
+        "web/src/components/MobileMainPane.tsx",
+        "web/src/App.tsx"
+      ],
+      "notes": "#5729: the banner line, the read-only line and the composer's reason come from one remedy over recreateContainerBlock, the predicate behind the Session menu's Recreate container. Recreate is offered only when that predicate allows it; an archived Session says to unarchive it from the sidebar, a trashed one to restore it from Trash (with a Restore button where the view has one), and one being created or deleted to wait, with the composer saying the same where it's shown. Archived and trashed Sessions have no composer."
     },
     {
       "id": "acp.startup-error-banner-actions",
@@ -4718,8 +4737,21 @@
       "id": "sidebar.queued-count-hook",
       "kind": "vitest",
       "risk": "medium",
-      "specs": ["src/hooks/__tests__/useAcpQueueCount.test.tsx"],
-      "components": ["web/src/components/WorkspaceSidebar.tsx"]
+      "specs": ["src/hooks/__tests__/useAcpQueueCount.test.tsx", "src/hooks/useAcpSession.test.ts"],
+      "components": ["web/src/components/WorkspaceSidebar.tsx"],
+      "notes": "The count is the open session's live queue while it holds one, else the server's queued_count; a stored count or a failed queue list never wins, and a changed polled count re-lists."
+    },
+    {
+      "id": "sidebar.queued-chip-reason",
+      "kind": "mocked-playwright",
+      "risk": "medium",
+      "specs": [
+        "tests/sidebar-queued-chip-reason.spec.ts",
+        "src/components/sidebar/sessionQueuedReason.test.ts",
+        "src/components/__tests__/SessionRowTriage.test.tsx",
+        "src/hooks/__tests__/useSessionsPolling.test.tsx"
+      ],
+      "components": ["web/src/components/sidebar/RowBadges.tsx"]
     },
     {
       "id": "story.sidebar-rate-limit",
@@ -6081,6 +6113,14 @@
         "web/src/components/profiles/ProfilesSection.tsx",
         "web/src/components/sidebar/SessionRowMenu.tsx"
       ]
+    },
+    {
+      "id": "terminal-switch-refusal-text",
+      "kind": "deferred",
+      "issue": "https://github.com/agent-of-empires/agent-of-empires/issues/5651",
+      "risk": "low",
+      "reason": "Copy-only: a refused switch to Terminal view still toasts the server's plain-text message, now reworded; the server pins the text in acp::view tests. The web dialog in the next #5651 PR brings the tested flow.",
+      "components": ["web/src/lib/api.ts", "web/src/App.tsx"]
     }
   ]
 }

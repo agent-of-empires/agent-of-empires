@@ -4,6 +4,8 @@ import { createPortal } from "react-dom";
 import { fetchAgentInstallInfo } from "../../lib/api";
 import { writeClipboard } from "../../lib/clipboard";
 import { RecreateContainerDialog } from "../sidebar/RecreateContainerDialog";
+import type { RecreateContainerBlock } from "../sidebar/sessionActionTargets";
+import { containerGoneRemedy, REMEDY_LINE } from "./containerGone";
 import { RecoveryActionRow, type RecoveryAction } from "./RecoveryActionRow";
 
 export interface NewSessionLike {
@@ -20,8 +22,10 @@ export function ContainerGoneBanner({
   message,
   canRestart,
   recreateContainerTitle,
+  recreateBlock,
   newSession,
   onRecreated,
+  onRestore,
 }: {
   sessionId: string;
   message: string;
@@ -29,13 +33,19 @@ export function ContainerGoneBanner({
   canRestart: boolean;
   /** The Session's title when the dashboard may recreate its container. */
   recreateContainerTitle?: string;
+  /** Why Recreate isn't offered; the line names what to do instead. */
+  recreateBlock: RecreateContainerBlock | null;
   newSession?: NewSessionLike;
   onRecreated?: () => void;
+  /** Restore the trashed Session; resolves false on failure. */
+  onRestore?: () => Promise<boolean> | void;
 }) {
   const [name, setName] = useState("The agent");
   const [recreating, setRecreating] = useState(false);
   const [detailsOpen, setDetailsOpen] = useState(false);
   const [copied, setCopied] = useState(false);
+  const [restoring, setRestoring] = useState(false);
+  const remedy = containerGoneRemedy(canRestart, recreateBlock);
 
   useEffect(() => {
     let alive = true;
@@ -47,10 +57,31 @@ export function ContainerGoneBanner({
     };
   }, [sessionId]);
 
+  // On success the Session leaves the trash and Recreate replaces Restore, so pending resets only on failure.
+  const restore = () => {
+    if (!onRestore) return;
+    setRestoring(true);
+    void Promise.resolve(onRestore()).then(
+      (ok) => {
+        if (ok === false) setRestoring(false);
+      },
+      () => setRestoring(false),
+    );
+  };
   const actions: RecoveryAction[] = canRestart
     ? [
         ...(recreateContainerTitle !== undefined
           ? [{ label: "Recreate container", onClick: () => setRecreating(true), testId: "container-gone-recreate" }]
+          : []),
+        ...(remedy === "restore" && onRestore
+          ? [
+              {
+                label: restoring ? "Restoring…" : "Restore",
+                onClick: restore,
+                disabled: restoring,
+                testId: "container-gone-restore",
+              },
+            ]
           : []),
         ...(newSession
           ? [
@@ -73,14 +104,9 @@ export function ContainerGoneBanner({
     >
       <div role="alert">
         <h2 className="text-sm font-semibold">{name} couldn&apos;t start in Structured view</h2>
-        <p className="mt-1 text-xs text-text-subtle">
-          This Session&apos;s sandbox container is gone. Recreate it to use this Session again.
+        <p data-testid="container-gone-line" className="mt-1 text-xs text-text-subtle">
+          This Session&apos;s sandbox container is gone.{remedy !== "none" && ` ${REMEDY_LINE[remedy]}`}
         </p>
-        {!canRestart && (
-          <p data-testid="container-gone-owner" className="mt-1 text-xs text-text-subtle">
-            Ask the owner to recreate the container.
-          </p>
-        )}
       </div>
       {primary && <RecoveryActionRow primary={primary} secondary={secondary} install={NO_INSTALL} />}
       <div className="mt-3 border-t border-status-error/30 pt-2">
