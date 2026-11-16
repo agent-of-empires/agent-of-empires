@@ -1261,27 +1261,33 @@ mod staging_volume_tests {
         let listener = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
         let address = listener.local_addr().unwrap();
         drop(listener);
-        // LibreSSL's s_server accepts a numeric port, not OpenSSL's host:port.
-        // It binds INADDR_ANY; the fixture sandbox accepts only loopback peers.
-        // See OpenBSD usr.bin/openssl/{s_server,s_socket}.c.
-        let profile = format!(
-            "{STAGING_SANDBOX}\n\
-            (allow network-bind (local tcp \"*:{}\"))\n\
-            (allow network-inbound (remote tcp \"localhost:*\"))",
-            address.port()
-        );
-        let mut child = Command::new("/usr/bin/sandbox-exec")
-            .arg("-p")
-            .arg(profile)
-            .arg("-D")
-            .arg(format!("AOE_STAGING_ROOT={}", volume.root().display()))
-            .arg("/usr/bin/openssl")
-            // -www serves HTTP without reading stdin, unlike interactive mode.
-            .args(["s_server", "-www", "-quiet", "-accept"])
+        let serve = r#"import socket, ssl, sys
+context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+context.load_cert_chain(sys.argv[2], sys.argv[3])
+with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as listener:
+    listener.bind(("127.0.0.1", int(sys.argv[1])))
+    listener.listen(8)
+    while True:
+        connection, _ = listener.accept()
+        connection.settimeout(10)
+        try:
+            with context.wrap_socket(connection, server_side=True) as stream:
+                request = b""
+                while b"\r\n\r\n" not in request:
+                    data = stream.recv(4096)
+                    if not data:
+                        break
+                    request += data
+                    if len(request) > 8192:
+                        raise ValueError("fixture request too large")
+                stream.sendall(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok")
+        except (ssl.SSLError, ConnectionError, TimeoutError):
+            connection.close()
+"#;
+        let mut child = Command::new("python3")
+            .args(["-B", "-c", serve])
             .arg(address.port().to_string())
-            .arg("-cert")
             .arg(&certificate)
-            .arg("-key")
             .arg(&key)
             .stdin(std::process::Stdio::null())
             .stdout(std::process::Stdio::null())
@@ -1358,9 +1364,10 @@ mod staging_volume_tests {
             String::from_utf8_lossy(&output.stderr),
             server.diagnostic()
         );
-        assert!(
-            !output.stdout.is_empty(),
-            "empty TLS response: {}",
+        assert_eq!(
+            output.stdout,
+            b"ok",
+            "unexpected TLS response: {}",
             server.diagnostic()
         );
         volume.close().unwrap();
