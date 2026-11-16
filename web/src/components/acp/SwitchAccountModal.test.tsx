@@ -67,31 +67,24 @@ describe("SwitchAccountModal", () => {
     expect(mockSwitch).toHaveBeenCalledWith("s1", "claude-c");
   });
 
-  it("shows the server's refusal and stays open", async () => {
-    mockSwitch.mockResolvedValue({
-      ok: false,
-      message: "Cannot switch to 'claude-b' without losing the conversation.",
-    });
-    const onClose = renderModal();
-    await screen.findByLabelText("claude-b");
-    fireEvent.click(screen.getByTestId("switch-account-confirm"));
-    expect((await screen.findByTestId("switch-account-error")).textContent).toContain(
-      "without losing the conversation",
-    );
-    expect(onClose).not.toHaveBeenCalled();
-  });
-
-  it("returns focus to Confirm after a refusal even if a frame runs before the commit", async () => {
+  it("shows the server's refusal, stays open, and refocuses Confirm", async () => {
     // A frame that fires before React commits sees Confirm still disabled.
     vi.stubGlobal("requestAnimationFrame", (cb: FrameRequestCallback) => {
       cb(0);
       return 0;
     });
     try {
-      mockSwitch.mockResolvedValue({ ok: false, message: "Nothing changed." });
-      renderModal({ targets: ["claude-b"] });
+      mockSwitch.mockResolvedValue({
+        ok: false,
+        message: "Cannot switch to 'claude-b' without losing the conversation.",
+      });
+      const onClose = renderModal();
+      await screen.findByLabelText("claude-b");
       fireEvent.click(screen.getByTestId("switch-account-confirm"));
-      await screen.findByTestId("switch-account-error");
+      expect((await screen.findByTestId("switch-account-error")).textContent).toContain(
+        "without losing the conversation",
+      );
+      expect(onClose).not.toHaveBeenCalled();
       expect(document.activeElement).toBe(screen.getByTestId("switch-account-confirm"));
     } finally {
       vi.unstubAllGlobals();
