@@ -11,6 +11,56 @@ use tracing::warn;
 use crate::session::mcp::mcp_model::{McpProvenance, ResolvedMcpServer};
 use crate::session::mcp::project_mcp::ProjectMcpTransport;
 
+/// Drop servers a sandboxed session must not receive: remote servers on a loopback host or on
+/// the daemon's own listener, and any remote server carrying a daemon token. `daemon_urls` are
+/// the `serve.url` lines (they embed the token).
+pub fn drop_daemon_servers(
+    servers: Vec<ResolvedMcpServer>,
+    daemon_urls: &[String],
+) -> Vec<ResolvedMcpServer> {
+    let daemon: Vec<reqwest::Url> = daemon_urls
+        .iter()
+        .filter_map(|u| reqwest::Url::parse(u).ok())
+        .collect();
+    let tokens: Vec<&str> = daemon_urls
+        .iter()
+        .filter_map(|u| crate::cli::url::extract_token(u))
+        .collect();
+    servers
+        .into_iter()
+        .filter(|resolved| {
+            let (url, headers) = match &resolved.def.transport {
+                ProjectMcpTransport::Http { url, headers }
+                | ProjectMcpTransport::Sse { url, headers } => (url, headers),
+                ProjectMcpTransport::Stdio { .. } => return true,
+            };
+            let Ok(url) = reqwest::Url::parse(url) else {
+                return true;
+            };
+            let host_is_daemon = url.host_str().is_some_and(|host| {
+                let loopback = host.eq_ignore_ascii_case("localhost")
+                    || host
+                        .trim_matches(['[', ']'])
+                        .parse::<std::net::IpAddr>()
+                        .is_ok_and(|ip| ip.is_loopback());
+                loopback || daemon.iter().any(|d| d.host_str() == Some(host))
+            });
+            let has_token = headers
+                .values()
+                .any(|value| tokens.iter().any(|token| value.contains(token)));
+            let drop = host_is_daemon || has_token;
+            if drop {
+                warn!(
+                    target: "acp.mcp",
+                    server = %resolved.def.name,
+                    "not forwarding a daemon or loopback MCP server into a sandboxed session"
+                );
+            }
+            !drop
+        })
+        .collect()
+}
+
 /// Convert resolved, transport-typed servers (parsed and merged by
 /// `session::mcp::mcp_model`) into ACP `McpServer` values for forwarding through
 /// `session/new` and `session/load`.
@@ -215,6 +265,27 @@ mod tests {
             agent_client_protocol::v1::schema::NewSessionRequest::new("/work").mcp_servers(servers),
         )
         .unwrap()
+    }
+
+    #[test]
+    fn sandboxed_sessions_never_get_daemon_or_loopback_servers() {
+        let json = r#"{ "mcpServers": {
+            "aoe": { "type": "http", "url": "http://127.0.0.1:8080/mcp",
+                     "headers": { "Authorization": "Bearer sekrit" } },
+            "local": { "type": "sse", "url": "http://localhost:9000/sse" },
+            "v6": { "type": "http", "url": "http://[::1]:9000/mcp" },
+            "lan": { "type": "http", "url": "http://192.168.1.5:8080/mcp" },
+            "renamed": { "type": "http", "url": "https://proxy.example.test/mcp",
+                         "headers": { "X-Key": "Bearer sekrit" } },
+            "github": { "type": "http", "url": "https://api.github.test/mcp",
+                        "headers": { "Authorization": "Bearer pat" } },
+            "fs": { "command": "fs-server", "env": { "K": "v" } }
+        } }"#;
+        let daemon = vec!["http://192.168.1.5:8080/?token=sekrit".to_string()];
+        let kept = drop_daemon_servers(resolved(json, McpProvenance::Global), &daemon);
+        let mut kept: Vec<_> = kept.iter().map(|s| s.def.name.as_str()).collect();
+        kept.sort();
+        assert_eq!(kept, ["fs", "github"]);
     }
 
     #[test]

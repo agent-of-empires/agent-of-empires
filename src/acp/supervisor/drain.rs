@@ -1112,6 +1112,7 @@ impl<S: BroadcastSink> Drain<S> {
             McpPaths {
                 cwd: config.cwd.clone(),
                 config_path: config.config_path.clone(),
+                sandboxed: config.sandbox_info.is_some(),
             },
             config.host_environment.clone(),
             claude_config_dir,

@@ -524,6 +524,7 @@ impl<S: BroadcastSink> Supervisor<S> {
             McpPaths {
                 cwd: req.cwd.clone(),
                 config_path: req.config_path.clone(),
+                sandboxed: req.sandbox_info.is_some(),
             },
             host_environment.clone(),
             claude_config_dir,
@@ -1421,9 +1422,11 @@ pub(super) fn discovery_key<'a>(sandboxed: bool, agent: &'a str, native: &'a str
 }
 
 /// `cwd` keys the native per-project lookup; project-local servers load from `config_path`.
+/// `sandboxed` sessions never receive daemon or loopback servers.
 pub(super) struct McpPaths {
     pub(super) cwd: PathBuf,
     pub(super) config_path: PathBuf,
+    pub(super) sandboxed: bool,
 }
 
 pub(super) async fn resolve_mcp_servers(
@@ -1442,8 +1445,7 @@ pub(super) async fn resolve_mcp_servers(
             &agent_key,
             &session,
             profile.as_deref(),
-            &paths.cwd,
-            &paths.config_path,
+            &paths,
             &session_env,
             native_config_override.as_deref(),
         )
@@ -1464,21 +1466,27 @@ fn resolve_mcp_layers(
     agent_key: &str,
     session_id: &str,
     profile: Option<&str>,
-    cwd: &std::path::Path,
-    config_path: &std::path::Path,
+    paths: &McpPaths,
     session_env: &[(String, String)],
     native_config_override: Option<&std::path::Path>,
 ) -> Vec<agent_client_protocol::v1::schema::McpServer> {
     use crate::session::mcp::mcp_model::{resolve_effective, summarize};
 
-    let merged = resolve_effective(
+    let mut merged = resolve_effective(
         agent_key,
         profile,
-        cwd,
-        config_path,
+        &paths.cwd,
+        &paths.config_path,
         session_env,
         native_config_override,
     );
+    if paths.sandboxed {
+        let daemon_urls: Vec<String> = crate::cli::serve::read_serve_urls()
+            .into_iter()
+            .map(|u| u.url)
+            .collect();
+        merged = crate::acp::mcp_config::drop_daemon_servers(merged, &daemon_urls);
+    }
     if !merged.is_empty() {
         info!(
             target: "acp.mcp",
@@ -2704,8 +2712,11 @@ time.sleep(60)
                     "claude",
                     "resolve-test",
                     profile,
-                    &cwd,
-                    &config_path,
+                    &McpPaths {
+                        cwd,
+                        config_path,
+                        sandboxed: false,
+                    },
                     &[],
                     None,
                 )
