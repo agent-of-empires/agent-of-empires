@@ -34,8 +34,8 @@ pub fn drop_daemon_servers(
                 | ProjectMcpTransport::Sse { url, headers } => (url, headers),
                 ProjectMcpTransport::Stdio { .. } => return true,
             };
-            let has_token = headers
-                .values()
+            let has_token = std::iter::once(url)
+                .chain(headers.values())
                 .any(|value| tokens.iter().any(|token| value.contains(token)));
             let host_is_daemon = reqwest::Url::parse(url).is_ok_and(|url| {
                 url.host_str().is_some_and(|host| {
@@ -276,6 +276,7 @@ mod tests {
             "lan": { "type": "http", "url": "http://192.168.1.5:8080/mcp" },
             "unparseable": { "type": "http", "url": "u",
                              "headers": { "Authorization": "Bearer sekrit" } },
+            "urltoken": { "type": "http", "url": "https://proxy.example.test/mcp?token=sekrit" },
             "renamed": { "type": "http", "url": "https://proxy.example.test/mcp",
                          "headers": { "X-Key": "Bearer sekrit" } },
             "github": { "type": "http", "url": "https://api.github.test/mcp",
