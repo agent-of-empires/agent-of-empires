@@ -4541,6 +4541,15 @@ fn session_cfg_store_reresolves_only_after_an_input_edit() {
             "{case}"
         );
     }
+    run_git(
+        repo.path(),
+        &["config", "core.worktree", copy_dir.path().to_str().unwrap()],
+    );
+    assert_eq!(
+        request_at(path, &|| {}),
+        (1, 1, String::new(), Off),
+        "core.worktree edit"
+    );
 
     // A linked worktree's main repo follows a retargeted link in its gitdir path.
     let layout = tempfile::tempdir().expect("tempdir worktree layout");

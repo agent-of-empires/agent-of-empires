@@ -416,11 +416,12 @@ fn fingerprint<'a>(
 /// Never evicts: entries of purged sessions stay until restart, a few KB each.
 #[derive(Default)]
 pub(crate) struct SessionCfgStore {
-    /// `project_path` to its repo config source, with the `.git` and gitdir it was discovered from.
+    /// `project_path` to its repo config source, with the `.git`, gitdir and gitdir `config` it
+    /// was discovered from.
     sources: HashMap<
         String,
         (
-            (Fingerprint, Option<std::path::PathBuf>),
+            (Fingerprint, Option<std::path::PathBuf>, Fingerprint),
             std::path::PathBuf,
         ),
     >,
@@ -494,7 +495,15 @@ impl<'a> SessionCfgCache<'a> {
         if git.content.as_ref().is_ok_and(utf8) && gitdir.is_none() {
             return project.to_path_buf();
         }
-        let discovered_from = (git, gitdir);
+        // `core.worktree` there moves the workdir.
+        let config = fingerprint(
+            &mut self.seen,
+            &gitdir
+                .clone()
+                .unwrap_or_else(|| project.join(".git"))
+                .join("config"),
+        );
+        let discovered_from = (git, gitdir, config.clone());
         if let Some((cached_from, source)) = self.store.sources.get(project_path) {
             if *cached_from == discovered_from {
                 return source.clone();
