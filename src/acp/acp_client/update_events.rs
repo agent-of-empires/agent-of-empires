@@ -931,6 +931,9 @@ mod tests {
         ] {
             let events = claude(update);
             assert_eq!(kinds(&events), want_kinds, "{name}");
+            if let [Event::PlanRemoved { plan_id }] = events.as_slice() {
+                assert_eq!(plan_id, "plan", "{name}");
+            }
             let plan = events.iter().find_map(|e| match e {
                 Event::PlanUpdated { plan } => Some(plan),
                 _ => None,
@@ -951,8 +954,9 @@ mod tests {
     }
 
     /// The strip and the sidebar, rebuilt from the event log after a daemon
-    /// restart, agree: a removal clears only the plan it names, and a driven
-    /// `/clear` (which never reaches the adapter) clears whatever is shown.
+    /// restart, agree: a removal clears only the plan it names, while a driven
+    /// `/clear` (which never reaches the adapter) or an agent switch clears
+    /// whatever is shown.
     #[test]
     fn plan_state_survives_event_log_replay() {
         use crate::acp::event_store::EventStore;
@@ -1017,9 +1021,22 @@ mod tests {
         );
         record(mapped(vec![removed("plan-mode")]));
         assert_eq!(shown(&store), None);
-        record(mapped(vec![checklist(PlanEntryStatus::Pending)]));
-        record(vec![Event::SessionCleared]);
-        assert_eq!(shown(&store), None, "driven /clear");
+        for (name, drop) in [
+            ("driven /clear", Event::SessionCleared),
+            (
+                "agent switch",
+                Event::AgentSwitched {
+                    from: "claude".into(),
+                    to: "codex".into(),
+                    reason: "user".into(),
+                },
+            ),
+        ] {
+            record(mapped(vec![checklist(PlanEntryStatus::Pending)]));
+            assert_eq!(shown(&store), step("a", "Pending"), "{name}");
+            record(vec![drop]);
+            assert_eq!(shown(&store), None, "{name}");
+        }
     }
 
     #[test]

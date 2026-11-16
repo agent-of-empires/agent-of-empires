@@ -81,7 +81,7 @@ const LATER_PLAN_DROP_SQL: &str = "SELECT EXISTS(
      SELECT 1 FROM acp_events
      WHERE session_id = ?1
        AND seq > ?2
-       AND (discriminant = 'SessionCleared'
+       AND (discriminant IN ('SessionCleared', 'AgentSwitched')
             OR (discriminant = 'PlanRemoved'
                 AND json_extract(event_json, '$.PlanRemoved.plan_id') = ?3)))";
 
@@ -132,8 +132,8 @@ fn workflow_agents(conn: &rusqlite::Connection, session_id: &str, run_id: &str) 
 }
 
 impl EventStore {
-    /// The plan the strip shows: `None` once a later clear or matching
-    /// removal dropped it, as `AcpState` folds them.
+    /// The plan the strip shows: `None` once a later clear, agent switch, or
+    /// matching removal dropped it, as `AcpState` folds them.
     pub fn latest_plan(&self, session_id: &str) -> Option<Plan> {
         let conn = self.conn();
         let (seq, json) =
