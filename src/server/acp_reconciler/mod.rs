@@ -206,6 +206,7 @@ pub async fn reconcile_acp_workers(
     respawn_history: &mut HashMap<String, Vec<Instant>>,
     parked: &mut HashSet<String>,
     capacity_deferred: &mut HashSet<String>,
+    stop_notified: &mut HashSet<String>,
 ) {
     let supervisor = &state.acp_supervisor;
     supervisor.retry_pending_teardowns().await;
@@ -293,6 +294,8 @@ pub async fn reconcile_acp_workers(
     parked.retain(|id| live.contains(id));
     respawn_history.retain(|id, _| live.contains(id));
     capacity_deferred.retain(|id| live.contains(id));
+    stop_notified
+        .retain(|id| live.contains(id) && crate::process::worker_registry::stop_requested(id));
 
     // Must precede scheduling: capacity counts registry entries, so dead
     // entries would block legitimate spawns.
@@ -354,24 +357,25 @@ pub async fn reconcile_acp_workers(
             attempted.insert(id);
             continue;
         }
-        // A durable `aoe acp stop` fence refuses every automatic resume, so an
-        // attempt can never succeed: hold the session uncharged instead of letting
-        // a queued prompt spend the crash-loop budget on refusals (#5200).
+        // A stop fences automatic resumes, but is not a crash-loop park.
         if crate::process::worker_registry::stop_requested(&id) {
-            if with_queued_prompts.contains(&id) && parked.insert(id.clone()) {
+            if with_queued_prompts.contains(&id) && !stop_notified.contains(&id) {
                 tracing::info!(
                     target: "acp.supervisor",
                     session = %id,
                     "holding queued prompts: the worker was stopped and waits for an explicit start"
                 );
-                crate::server::api::publish_startup_error_if_current(
+                if crate::server::api::publish_startup_error_if_current(
                     state,
                     &id,
                     &target.source_profile,
                     target.lifecycle_generation,
                     STOP_FENCE_MESSAGE.to_string(),
                 )
-                .await;
+                .await
+                {
+                    stop_notified.insert(id.clone());
+                }
             }
             attempted.insert(id);
             continue;
@@ -1790,11 +1794,8 @@ mod tests {
         worker_registry::admit_resume(id, ResumeAuthority::Explicit, &observed).unwrap();
     }
 
-    /// A queued prompt re-selects a workerless session every tick (#5200). Behind
-    /// a durable `aoe acp stop` fence no automatic attempt can be admitted, so the
-    /// ticks must neither charge nor exhaust the crash-loop budget; the session
-    /// shows one banner naming the stop, a daemon restart with the fence and the
-    /// queue still in place behaves the same, and an explicit start re-arms it.
+    /// A stop holds the queue without spending crash-loop budget or suppressing
+    /// retries after an explicit start clears the fence.
     #[tokio::test]
     #[serial_test::serial]
     async fn durable_user_stop_with_a_queue_does_not_crash_loop() {
@@ -1829,6 +1830,19 @@ mod tests {
             worker_registry::retire_selected(&record).unwrap();
 
             let mut tick = test_fixtures::Tick::default();
+            *state.canonical_health.write().await = crate::daemon::RuntimeHealth::Degraded {
+                code: crate::daemon::ReloadFailureCode::Metadata,
+                profiles: vec!["default".into()],
+            };
+            for _ in 0..2 {
+                tick.run(&state).await;
+            }
+            assert_eq!(count_messages(&state, id, STOP_FENCE_MESSAGE), 0);
+            assert!(!tick.stop_notified.contains(id));
+            assert!(tick.parked.is_empty());
+            assert!(tick.respawn_history.get(id).is_none_or(Vec::is_empty));
+
+            *state.canonical_health.write().await = crate::daemon::RuntimeHealth::Healthy;
             for _ in 0..=2 * RECONCILER_MAX_RESPAWNS_IN_WINDOW {
                 tick.run(&state).await;
             }
@@ -1847,10 +1861,9 @@ mod tests {
                 1,
                 "{status:?}: the banner names the stop"
             );
+            assert!(tick.parked.is_empty());
 
-            // A daemon restart keeps the on-disk fence and the queue but starts
-            // the reconciler with fresh state. The restarted process still holds
-            // the session uncharged and unparked, and shows its own banner once.
+            // Fresh reconciler state models a daemon restart with the same fence.
             let mut tick = test_fixtures::Tick::default();
             for _ in 0..=2 * RECONCILER_MAX_RESPAWNS_IN_WINDOW {
                 tick.run(&state).await;
@@ -1874,8 +1887,8 @@ mod tests {
                 "{status:?}: each process shows the stop banner once"
             );
 
-            // An explicit start clears the fence and requests a respawn, which
-            // gives the session a clean slate; the fake agent then fails to spawn.
+            // Admission clears the fence; even a failed launch must not leave
+            // the queue held by the old stop notice.
             let observed = worker_registry::stop_intent(id).unwrap();
             worker_registry::admit_resume(
                 id,
@@ -1883,7 +1896,6 @@ mod tests {
                 &observed,
             )
             .unwrap();
-            state.acp_supervisor.request_respawn(id);
             tick.run(&state).await;
             assert_eq!(
                 tick.respawn_history.get(id).map_or(0, Vec::len),
@@ -1891,6 +1903,9 @@ mod tests {
                 "{status:?}: the explicit start is a real attempt"
             );
             assert_eq!(test_fixtures::startup_errors(&state, id), 3, "{status:?}");
+            assert!(!tick.stop_notified.contains(id));
+            tick.run(&state).await;
+            assert_eq!(tick.respawn_history.get(id).map_or(0, Vec::len), 2);
         }
     }
 

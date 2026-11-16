@@ -360,6 +360,7 @@ pub(super) async fn maintenance_loop(
     let mut acp_parked: std::collections::HashSet<String> = std::collections::HashSet::new();
     let mut acp_capacity_deferred: std::collections::HashSet<String> =
         std::collections::HashSet::new();
+    let mut acp_stop_notified = std::collections::HashSet::new();
     let mut last_container_check: Option<std::time::Instant> = None;
     let mut last_credential_refresh = std::time::Instant::now();
     let mut last_purge_recovery = std::time::Instant::now() - std::time::Duration::from_secs(30);
@@ -408,6 +409,7 @@ pub(super) async fn maintenance_loop(
             &mut acp_respawn_history,
             &mut acp_parked,
             &mut acp_capacity_deferred,
+            &mut acp_stop_notified,
         )
         .await;
         if rate_limit_parked {
