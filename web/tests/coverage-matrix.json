@@ -4718,8 +4718,21 @@
       "id": "sidebar.queued-count-hook",
       "kind": "vitest",
       "risk": "medium",
-      "specs": ["src/hooks/__tests__/useAcpQueueCount.test.tsx"],
-      "components": ["web/src/components/WorkspaceSidebar.tsx"]
+      "specs": ["src/hooks/__tests__/useAcpQueueCount.test.tsx", "src/hooks/useAcpSession.test.ts"],
+      "components": ["web/src/components/WorkspaceSidebar.tsx"],
+      "notes": "The count is the open session's live queue while it holds one, else the server's queued_count; a stored count or a failed queue list never wins, and a changed polled count re-lists."
+    },
+    {
+      "id": "sidebar.queued-chip-reason",
+      "kind": "mocked-playwright",
+      "risk": "medium",
+      "specs": [
+        "tests/sidebar-queued-chip-reason.spec.ts",
+        "src/components/sidebar/sessionQueuedReason.test.ts",
+        "src/components/__tests__/SessionRowTriage.test.tsx",
+        "src/hooks/__tests__/useSessionsPolling.test.tsx"
+      ],
+      "components": ["web/src/components/sidebar/RowBadges.tsx"]
     },
     {
       "id": "story.sidebar-rate-limit",

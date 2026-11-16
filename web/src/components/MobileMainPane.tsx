@@ -183,6 +183,7 @@ export function MobileMainPane({
                     onStartSession={onStartSession && (() => onStartSession(session.id))}
                     archivedAt={session.archived_at ?? null}
                     snoozedUntil={session.snoozed_until ?? null}
+                    queuedCount={session.queued_count}
                     trashedAt={session.trashed_at ?? null}
                     onOpenFileRef={onOpenFileRef}
                     fileRefSession={session}
