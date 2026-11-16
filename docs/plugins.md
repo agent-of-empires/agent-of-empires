@@ -132,8 +132,8 @@ physical birth across exec; each signal proves the current audit token against
 that birth. Recovered process identities do not gain this authority. Unproven
 custody requires manual recovery. Observation ending does
 not cancel an accepted mutation. This policy adds no cancellation endpoint,
-flag, or configurable timeout, and commands remain unsandboxed: it is not a
-guarantee against malicious commands escaping their owned process scope or
+flag, or configurable timeout. Approved build commands remain unsandboxed;
+process custody does not guarantee containment of malicious commands or
 arbitrary filesystem I/O stalls.
 
 If command settlement or restoration cannot be proven, the host retains
@@ -160,6 +160,32 @@ Release assets are streamed into staging and may only add files: an asset entry
 that would replace a file already in the source tree, or that is a symlink,
 hardlink or special file, is rejected so the disclosed manifest and tree match
 what gets installed.
+
+Preparation uses a private filesystem limited to **1 GiB** before consent.
+Preview and apply operations share exclusion, so concurrent previews cannot
+multiply this allowance. Clone data, downloaded archives and extracted files
+share the same volume. Streamed downloads and decompressed archive data also
+have byte limits; copies and extracted trees allow at most 65,536 entries,
+including implicit directories. Archive metadata read ahead by the tar parser
+has a separate 1 MiB limit.
+An unavailable quota backend fails preparation rather than using an unbounded
+directory. These limits can reject unusually large plugins.
+Linux requires unprivileged user namespaces, `mount`, `unshare`, `nsenter`
+and Bubblewrap. macOS uses `hdiutil` and `sandbox-exec`. Restricted hosts that
+cannot provide these mechanisms refuse preparation.
+Git preparation cannot use host Unix sockets; credential helpers that require
+an SSH agent or desktop keyring may fail even when file-based credentials work.
+The filesystem allowance does not bound Git's memory use or the memory needed
+to hash a source tree.
+
+After consent, publication copies and verifies the prepared tree on the
+installation filesystem before replacing an existing plugin. This copy and
+approved build outputs are outside the pre-consent allowance. An uncertain
+mount or cleanup outcome requires manual recovery, not an unbounded retry.
+The `<app_dir>/.plugin-staging-active` marker records an unfinished mounted
+stage. After a crash, do not remove it or delete its staging directory until
+its writers have exited and any mounted image has been detached.
+Then remove the retained stage and marker before restarting the Daemon.
 
 A plugin lands in `<app_dir>/plugins/<id>/`. GitHub sources are pinned to an exact commit and release-binary workers are downloaded for your platform; local sources must supply their own executable. Set `AOE_GITHUB_CLONE_BASE` to install from a GitHub Enterprise host. Resolved versions (commit, manifest hash, release asset) live in `<app_dir>/plugins.lock`, so an install is reproducible.
 

@@ -94,7 +94,15 @@ pub(super) fn log_recovery<T>(result: &Result<T>) {
         tracing::error!(target: "plugin.install", error = %cause, "plugin mutation ownership retained for recovery");
         cause.push('\n');
         if let Some(marker) = marker {
-            if let Err(persist_error) = std::fs::write(marker, cause) {
+            let persist = (|| -> Result<()> {
+                let mut file = std::fs::File::create(&marker)?;
+                file.write_all(cause.as_bytes())?;
+                file.sync_all()?;
+                std::fs::File::open(marker.parent().expect("recovery marker parent"))?
+                    .sync_all()?;
+                Ok(())
+            })();
+            if let Err(persist_error) = persist {
                 tracing::error!(target: "plugin.install", %persist_error, "plugin recovery marker could not be persisted; manual recovery is required before restarting");
             }
         }
@@ -102,8 +110,67 @@ pub(super) fn log_recovery<T>(result: &Result<T>) {
 }
 
 const OPERATION_LOCK: &str = ".plugin-operation.lock";
+pub(super) const STAGING_MARKER: &str = ".plugin-staging-active";
+static LIVE_STAGING: parking_lot::Mutex<BTreeSet<PathBuf>> =
+    parking_lot::Mutex::new(BTreeSet::new());
+
+#[cfg(test)]
+fn register_staging(marker: &Path) {
+    LIVE_STAGING.lock().insert(marker.to_path_buf());
+}
+
+pub(super) fn create_staging_marker(marker: &Path, mount: &Path) -> Result<()> {
+    // Readers hold this same lock while inspecting evidence, so an acquisition
+    // cannot briefly appear to belong to a crashed process.
+    let mut live = LIVE_STAGING.lock();
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    let mut evidence = options
+        .open(marker)
+        .context("recording plugin staging acquisition")?;
+    let parent = marker
+        .parent()
+        .context("plugin staging marker has no parent")?;
+    let persist = (|| -> Result<()> {
+        writeln!(evidence, "Plugin staging acquisition started; verify the volume and its writers before removing this marker.")?;
+        writeln!(evidence, "mount={}", mount.display())?;
+        evidence
+            .sync_all()
+            .context("persisting plugin staging marker")?;
+        std::fs::File::open(parent)?.sync_all()?;
+        Ok(())
+    })();
+    if let Err(error) = persist {
+        let cleanup = (|| -> Result<()> {
+            std::fs::remove_file(marker)?;
+            std::fs::File::open(parent)?.sync_all()?;
+            Ok(())
+        })();
+        if let Err(cleanup) = cleanup {
+            return Err(super::execution::RecoveryRequired(format!(
+                "plugin staging marker publication failed: {error:#}; marker cleanup unproven: {cleanup:#}"
+            )).into());
+        }
+        return Err(error);
+    }
+    live.insert(marker.to_path_buf());
+    Ok(())
+}
+
+pub(super) fn unregister_staging(marker: &Path) {
+    LIVE_STAGING.lock().remove(marker);
+}
 
 pub(crate) fn check_recovery_evidence() -> Result<()> {
+    check_recovery_evidence_inner(true)
+}
+
+fn check_recovery_evidence_inner(allow_live_staging: bool) -> Result<()> {
     let root = crate::session::get_app_dir()?;
     let required = {
         let state = RECOVERY_STATE.lock();
@@ -112,12 +179,19 @@ pub(crate) fn check_recovery_evidence() -> Result<()> {
     if required {
         bail!("plugin recovery is required in this Daemon process; stop the Daemon, verify owned commands have exited and restore the installation before restarting");
     }
-    let evidence = root.join(".plugin-recovery-required");
-    match std::fs::symlink_metadata(&evidence) {
-        Ok(_) => bail!("plugin recovery evidence exists at {}; stop the Daemon, verify owned commands have exited and restore the installation before removing this file, then restart the Daemon", evidence.display()),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
-        Err(error) => Err(error).context("checking plugin recovery evidence"),
+    let live = LIVE_STAGING.lock();
+    for name in [".plugin-recovery-required", STAGING_MARKER] {
+        let evidence = root.join(name);
+        if name == STAGING_MARKER && allow_live_staging && live.contains(&evidence) {
+            continue;
+        }
+        match std::fs::symlink_metadata(&evidence) {
+            Ok(_) => bail!("plugin recovery evidence exists at {}; stop the Daemon, verify owned commands have exited and restore the installation before removing this file, then restart the Daemon", evidence.display()),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error).context("checking plugin recovery evidence"),
+        }
     }
+    Ok(())
 }
 
 pub(crate) fn begin_operation() -> Result<Arc<StorageFlock>> {
@@ -130,7 +204,7 @@ pub(crate) fn begin_operation() -> Result<Arc<StorageFlock>> {
         .ok_or_else(|| {
             anyhow!("another plugin operation is running; inspect its outcome before retrying")
         })?;
-    check_recovery_evidence()?;
+    check_recovery_evidence_inner(false)?;
     Ok(lock)
 }
 
@@ -616,7 +690,7 @@ pub async fn install(input: &str, assume_yes: bool, dev: bool) -> Result<Install
             std::mem::forget(prepared);
             std::mem::forget(_operation);
         } else {
-            prepared.fetched.close();
+            prepared.fetched.close()?;
         }
         result
     })
@@ -625,7 +699,8 @@ pub async fn install(input: &str, assume_yes: bool, dev: bool) -> Result<Install
 }
 
 pub async fn preview_install(input: &str, dev: bool) -> Result<InstallConsent> {
-    let p = prepare_install(input, dev, None).await?;
+    let operation = begin_operation()?;
+    let p = prepare_install(input, dev, Some(operation)).await?;
     let consent = InstallConsent {
         id: p.id,
         version: p.fetched.manifest.version.clone(),
@@ -679,7 +754,7 @@ pub async fn apply_install(
             std::mem::forget(prepared);
             std::mem::forget(_operation);
         } else {
-            prepared.fetched.close();
+            prepared.fetched.close()?;
         }
         result
     })
@@ -1103,7 +1178,7 @@ where
             std::mem::forget(prepared);
             std::mem::forget(_operation);
         } else {
-            prepared.fetched.close();
+            prepared.fetched.close()?;
         }
         result
     })
@@ -1164,7 +1239,8 @@ async fn changelog_of(p: &Prepared) -> UpdateChangelog {
 }
 
 pub async fn preview_update(id: &str, allow_local_source: bool) -> Result<UpdatePreview> {
-    let prepared = prepare_update(id, allow_local_source, None).await?;
+    let operation = begin_operation()?;
+    let prepared = prepare_update(id, allow_local_source, Some(operation)).await?;
     let preview = if prepared.prior_fingerprint.as_ref() == Some(&prepared.fingerprint)
         && prepared.installed_matches_source
     {
@@ -1234,7 +1310,7 @@ pub async fn apply_update(
             std::mem::forget(prepared);
             std::mem::forget(_operation);
         } else {
-            prepared.fetched.close();
+            prepared.fetched.close()?;
         }
         result
     })
@@ -1659,17 +1735,25 @@ fn confirm_capabilities(
     ))
 }
 
-fn move_into_place(fetched: &FetchedPlugin, final_dir: &std::path::Path) -> Result<()> {
+fn publication_tree(fetched: &FetchedPlugin, final_dir: &Path) -> Result<tempfile::TempDir> {
+    let parent = final_dir
+        .parent()
+        .context("plugin destination has no parent")?;
+    let directory = tempfile::Builder::new()
+        .prefix(".publish-")
+        .tempdir_in(parent)
+        .context("creating destination-local plugin publication directory")?;
+    fetched.copy_for_publication(&directory.path().join("tree"))?;
+    Ok(directory)
+}
+
+fn move_into_place(fetched: &FetchedPlugin, final_dir: &Path) -> Result<()> {
+    let publication = publication_tree(fetched, final_dir)?;
     if final_dir.exists() {
-        std::fs::remove_dir_all(final_dir)
-            .with_context(|| format!("replacing {}", final_dir.display()))?;
+        bail!("plugin destination {} already exists", final_dir.display());
     }
-    std::fs::rename(&fetched.tree, final_dir).with_context(|| {
-        format!(
-            "moving plugin into {} (cross-device staging?)",
-            final_dir.display()
-        )
-    })
+    std::fs::rename(publication.path().join("tree"), final_dir)
+        .with_context(|| format!("publishing plugin into {}", final_dir.display()))
 }
 
 fn build_steps(manifest: &PluginManifest) -> &[BuildStep] {
@@ -1789,6 +1873,10 @@ fn replace_and_build(
         .into());
     }
 
+    // Copy and verify before displacing the prior installation. Rename stays on
+    // the destination filesystem even when acquisition used a private mount.
+    let publication = publication_tree(fetched, final_dir)?;
+
     let had_prior = final_dir.exists();
     if had_prior {
         std::fs::rename(final_dir, &backup_dir)
@@ -1796,12 +1884,8 @@ fn replace_and_build(
     }
 
     let place_and_build = (|| -> Result<()> {
-        std::fs::rename(&fetched.tree, final_dir).with_context(|| {
-            format!(
-                "moving plugin into {} (cross-device staging?)",
-                final_dir.display()
-            )
-        })?;
+        std::fs::rename(publication.path().join("tree"), final_dir)
+            .with_context(|| format!("publishing plugin into {}", final_dir.display()))?;
         build_in_place(
             plugin_id,
             final_dir,
@@ -1935,6 +2019,113 @@ mod tests {
     use crate::session::test_support::isolate_app_dir;
     use aoe_plugin_api::UiSlot;
     use serial_test::serial;
+
+    #[test]
+    #[serial]
+    fn staging_marker_blocks_admission_after_process_ownership_is_lost() {
+        let _home = isolate_app_dir();
+        let marker = crate::session::get_app_dir().unwrap().join(STAGING_MARKER);
+        std::fs::write(&marker, "staging acquisition interrupted").unwrap();
+        assert!(check_recovery_evidence().is_err());
+        assert!(begin_operation().is_err());
+        register_staging(&marker);
+        assert!(check_recovery_evidence().is_ok());
+        assert!(begin_operation().is_err());
+        unregister_staging(&marker);
+        assert!(check_recovery_evidence().is_err());
+        std::fs::remove_file(marker).unwrap();
+        assert!(begin_operation().is_ok());
+    }
+
+    #[tokio::test]
+    #[serial]
+    #[cfg_attr(
+        target_os = "linux",
+        ignore = "requires private user/mount namespaces and bubblewrap"
+    )]
+    async fn staging_volume_failed_publication_copy_preserves_prior_install() {
+        let _home = isolate_app_dir();
+        let source = tempfile::tempdir().unwrap();
+        std::fs::write(
+            source.path().join("aoe-plugin.toml"),
+            "id = \"acme.copy\"\nname = \"Copy\"\nversion = \"1.0.0\"\napi_version = 2\n",
+        )
+        .unwrap();
+        std::fs::write(source.path().join("worker"), b"new").unwrap();
+        let operation = begin_operation().unwrap();
+        let prepared = prepare_install(
+            source.path().to_str().unwrap(),
+            false,
+            Some(operation.clone()),
+        )
+        .await
+        .unwrap();
+        let final_dir = super::super::plugins_dir().unwrap().join("acme.copy");
+        std::fs::create_dir(&final_dir).unwrap();
+        std::fs::write(final_dir.join("old"), b"old").unwrap();
+        let prior = PriorMetadata::capture("acme.copy").unwrap();
+        let changing = prepared.fetched.tree.join("worker");
+        let mut gate = fetch::test_gate::install(&changing, "copy");
+        let destination = final_dir.clone();
+        let task = tokio::task::spawn_blocking(move || {
+            let result = replace_and_build(
+                "acme.copy",
+                &prepared.fetched,
+                &destination,
+                &NodeEnv::new(),
+                &OperationLog::Inherit,
+                || panic!("metadata must not commit before a verified copy"),
+                &prior,
+            );
+            prepared.fetched.close().unwrap();
+            result
+        });
+        tokio::time::timeout(std::time::Duration::from_secs(5), &mut gate.entered)
+            .await
+            .unwrap()
+            .unwrap();
+        std::fs::remove_file(changing).unwrap();
+        gate.release();
+        assert!(task.await.unwrap().is_err());
+        assert_eq!(std::fs::read(final_dir.join("old")).unwrap(), b"old");
+        assert!(!final_dir.with_file_name("acme.copy.bak").exists());
+        assert_eq!(std::fs::read_dir(final_dir).unwrap().count(), 1);
+        drop(operation);
+        assert!(begin_operation().is_ok());
+    }
+
+    #[tokio::test]
+    #[serial]
+    #[cfg_attr(
+        target_os = "linux",
+        ignore = "requires private user/mount namespaces and bubblewrap"
+    )]
+    async fn staging_volume_cleanup_failure_retains_marker_and_operation_lock() {
+        let _home = isolate_app_dir();
+        let source = tempfile::tempdir().unwrap();
+        std::fs::write(
+            source.path().join("aoe-plugin.toml"),
+            "id = \"acme.cleanup\"\nname = \"Cleanup\"\nversion = \"1.0.0\"\napi_version = 2\n",
+        )
+        .unwrap();
+        let operation = begin_operation().unwrap();
+        let prepared = prepare_install(
+            source.path().to_str().unwrap(),
+            false,
+            Some(operation.clone()),
+        )
+        .await
+        .unwrap();
+        let marker = crate::session::get_app_dir().unwrap().join(STAGING_MARKER);
+        std::fs::remove_file(&marker).unwrap();
+        std::fs::create_dir(&marker).unwrap();
+        let result = prepared.fetched.cleanup().await;
+        assert!(super::super::execution::needs_recovery(&result));
+        drop(operation);
+        assert!(marker.is_dir());
+        assert!(check_recovery_evidence().is_err());
+        assert!(begin_operation().is_err());
+    }
 
     #[tokio::test]
     #[serial]
@@ -2332,9 +2523,12 @@ mod tests {
             std::future::ready(NodeEnv::new())
         };
 
-        let declined = prepare_update("acme.upd", true, None).await.unwrap();
+        let operation = begin_operation().unwrap();
+        let declined = prepare_update("acme.upd", true, Some(operation.clone()))
+            .await
+            .unwrap();
         assert!(declined.needs_consent);
-        let err = finish_update(declined, None, begin_operation().unwrap(), provision)
+        let err = finish_update(declined, None, operation, provision)
             .await
             .err();
         assert!(err.is_some_and(|e| e.to_string().contains("update cancelled")));
@@ -2342,13 +2536,16 @@ mod tests {
         assert!(!installed.join("built").exists());
         assert_eq!(installed_version(), "0.1.0");
 
-        let approved = prepare_update("acme.upd", true, None).await.unwrap();
+        let operation = begin_operation().unwrap();
+        let approved = prepare_update("acme.upd", true, Some(operation.clone()))
+            .await
+            .unwrap();
         let grant = CapabilityGrant {
             manifest_hash: approved.manifest_hash.clone(),
             capabilities: approved.capabilities.clone(),
             granted_at: chrono::Utc::now(),
         };
-        finish_update(approved, Some(grant), begin_operation().unwrap(), provision)
+        finish_update(approved, Some(grant), operation, provision)
             .await
             .unwrap();
         assert_eq!(provisioned.load(Ordering::SeqCst), 1);
@@ -2826,6 +3023,20 @@ mod tests {
 
     #[tokio::test]
     #[serial]
+    async fn previews_reject_concurrent_plugin_operations() {
+        let _home = isolate_app_dir();
+        let _operation = begin_operation().unwrap();
+        let install = preview_install("/missing", false).await.unwrap_err();
+        let update = preview_update("missing.plugin", false).await.unwrap_err();
+        for error in [install, update] {
+            assert!(error
+                .to_string()
+                .contains("another plugin operation is running"));
+        }
+    }
+
+    #[tokio::test]
+    #[serial]
     async fn budget_timeout_settles_descendant_before_rollback_and_lease_release() {
         use std::sync::atomic::{AtomicBool, Ordering};
         use std::time::Duration;
@@ -2904,7 +3115,7 @@ else:
                 &NodeEnv::new(),
                 &log,
             );
-            prepared.fetched.close();
+            prepared.fetched.close().unwrap();
             result
         });
         tokio::time::timeout(Duration::from_secs(5), async {

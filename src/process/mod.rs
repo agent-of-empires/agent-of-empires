@@ -105,6 +105,59 @@ pub(crate) fn open_read_nonblocking(path: &std::path::Path) -> std::io::Result<s
     }
 }
 
+#[derive(Debug, thiserror::Error)]
+#[error("staging filesystem acquisition cleanup is unproven: {0}")]
+pub(crate) struct StagingAcquisitionUncertain(pub String);
+
+/// A private filesystem with an enforced allocation ceiling. Unsupported hosts fail closed.
+pub(crate) struct StagingVolume {
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    inner: platform::StagingVolume,
+}
+
+impl StagingVolume {
+    pub(crate) fn create(mount: &Path, limit: u64) -> anyhow::Result<Self> {
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
+        {
+            Ok(Self {
+                inner: platform::StagingVolume::create(mount, limit)?,
+            })
+        }
+        #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+        {
+            let _ = (mount, limit);
+            anyhow::bail!("strict plugin staging filesystems are unavailable on this platform")
+        }
+    }
+
+    pub(crate) fn root(&self) -> &Path {
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
+        {
+            self.inner.root()
+        }
+        #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+        unreachable!("unsupported platforms cannot acquire a staging volume")
+    }
+
+    pub(crate) fn git_command(&self) -> Command {
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
+        {
+            self.inner.git_command()
+        }
+        #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+        unreachable!("unsupported platforms cannot acquire a staging volume")
+    }
+
+    pub(crate) fn close(&mut self) -> anyhow::Result<()> {
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
+        {
+            self.inner.close()
+        }
+        #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+        unreachable!("unsupported platforms cannot acquire a staging volume")
+    }
+}
+
 pub(crate) const LIVE_PANE_ENV_KEYS: [&str; 3] = ["TERM", "TMUX", "TMUX_PANE"];
 
 #[derive(serde::Serialize, serde::Deserialize)]

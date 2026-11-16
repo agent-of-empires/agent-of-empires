@@ -9,6 +9,1154 @@ pub(super) use super::unix::{
     restore_environment_value, terminate_process_group, try_wait_status_hook,
 };
 
+/// A fixed-size disk image. The caller owns the recovery marker and must settle
+/// every Git writer before calling `close`. Deliberately no Drop cleanup: an
+/// interrupted attach or detach must leave its image available for recovery.
+pub(super) struct StagingVolume {
+    root: std::path::PathBuf,
+    image: std::path::PathBuf,
+    image_file: Option<std::fs::File>,
+    image_identity: (u64, u64),
+    image_length: u64,
+    mount_identity: (u64, u64),
+    underlying_identity: (u64, u64),
+    device: String,
+    limit: u64,
+    closed: bool,
+}
+
+// UDRW adds a trailer and may round its allocation to host filesystem blocks.
+// Leave room for both instead of advertising the whole budget as usable space.
+const STAGING_IMAGE_OVERHEAD: u64 = 8 * 1024 * 1024;
+const STAGING_TOOL_OUTPUT: usize = 1024 * 1024;
+
+#[cfg(test)]
+std::thread_local! {
+    static FAIL_STAGING_ATTACH_SPAWN: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+#[derive(Debug, thiserror::Error)]
+#[error("spawning bounded macOS staging tool: {0}")]
+struct StagingToolNotStarted(#[source] std::io::Error);
+
+const STAGING_SANDBOX: &str = r#"
+(version 1)
+(deny default)
+; These commands can mutate files through read-only descriptors, bypassing
+; file-write*. Deny them explicitly even in a deny-default profile.
+(deny system-fcntl (fcntl-command 80 110))
+(allow process-exec process-fork)
+(allow signal (target self))
+(allow file-read*)
+(allow sysctl-read)
+(allow file-write* (subpath (param "AOE_STAGING_ROOT")))
+(allow network-outbound (remote tcp))
+(allow network-outbound (remote udp "*:53"))
+(allow network-outbound (literal "/private/var/run/mDNSResponder"))
+(allow mach-lookup
+    (global-name "com.apple.system.opendirectoryd.libinfo")
+    (global-name "com.apple.SystemConfiguration.configd")
+    (global-name "com.apple.mDNSResponder")
+    (global-name "com.apple.trustd")
+    (global-name "com.apple.trustd.agent"))
+(allow ipc-posix-shm-read-data ipc-posix-shm-read-metadata
+    (ipc-posix-name "apple.shm.notification_center"))
+"#;
+
+impl StagingVolume {
+    pub(super) fn create(private_mount_path: &std::path::Path, limit: u64) -> anyhow::Result<Self> {
+        use std::os::unix::fs::{MetadataExt as _, OpenOptionsExt as _};
+        #[cfg(test)]
+        let fail_attach_spawn = FAIL_STAGING_ATTACH_SPAWN.with(|fail| fail.replace(false));
+        let metadata = std::fs::symlink_metadata(private_mount_path)?;
+        anyhow::ensure!(
+            metadata.is_dir()
+                && metadata.uid() == unsafe { libc::geteuid() }
+                && metadata.mode() & 0o077 == 0,
+            "plugin staging mountpoint must be a private owned directory"
+        );
+        anyhow::ensure!(
+            std::fs::read_dir(private_mount_path)?.next().is_none(),
+            "plugin staging mountpoint must be empty"
+        );
+        let root = private_mount_path.canonicalize()?;
+        root.to_str()
+            .context("plugin staging mountpoint must be valid UTF-8 for sandbox-exec")?;
+        let parent = root
+            .parent()
+            .context("plugin staging mountpoint has no parent")?;
+        let parent_metadata = std::fs::metadata(parent)?;
+        anyhow::ensure!(
+            parent_metadata.uid() == unsafe { libc::geteuid() }
+                && parent_metadata.mode() & 0o077 == 0
+                && parent_metadata.dev() == metadata.dev(),
+            "plugin staging requires a private parent on the same filesystem"
+        );
+        anyhow::ensure!(
+            staging_mount_strings(&staging_statfs(&root)?)?.0 != root,
+            "plugin staging mountpoint is already mounted"
+        );
+        let capacity = limit
+            .checked_sub(STAGING_IMAGE_OVERHEAD)
+            .context("plugin staging budget is too small for a fixed disk image")?
+            / 4096
+            * 4096;
+        anyhow::ensure!(
+            capacity >= 8 * 1024 * 1024,
+            "plugin staging disk image is too small"
+        );
+        let image = root.with_extension("dmg");
+        anyhow::ensure!(
+            std::fs::symlink_metadata(&image)
+                .is_err_and(|e| e.kind() == std::io::ErrorKind::NotFound),
+            "plugin staging image already exists or cannot be inspected"
+        );
+        // Validate availability before allocating the image. Failure is not a
+        // reason to fall back to an unbounded directory.
+        staging_fd_ceiling()?;
+        anyhow::ensure!(
+            std::fs::metadata("/usr/bin/sandbox-exec")?.is_file(),
+            "macOS plugin staging requires sandbox-exec"
+        );
+        anyhow::ensure!(
+            std::fs::metadata("/usr/bin/hdiutil")?.is_file(),
+            "macOS plugin staging requires hdiutil"
+        );
+        let mut create = Command::new("/usr/bin/hdiutil");
+        create
+            .args([
+                "create",
+                "-type",
+                "UDIF",
+                "-layout",
+                "NONE",
+                "-fs",
+                "HFSX",
+                "-volname",
+                "aoe-plugin-staging",
+                "-mode",
+                "0700",
+                "-uid",
+            ])
+            .arg(unsafe { libc::geteuid() }.to_string())
+            .arg("-gid")
+            .arg(unsafe { libc::getegid() }.to_string())
+            .arg("-sectors")
+            .arg((capacity / 512).to_string())
+            .arg(&image);
+        let mut created = false;
+        let mut attach_started = false;
+        let result: anyhow::Result<Self> = (|| {
+            staging_tool(&mut create)?;
+            created = true;
+            let image_file = std::fs::OpenOptions::new()
+                .read(true)
+                .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
+                .open(&image)?;
+            let image_metadata = image_file.metadata()?;
+            anyhow::ensure!(
+                image_metadata.is_file()
+                    && image_metadata.nlink() == 1
+                    && image_metadata.uid() == unsafe { libc::geteuid() }
+                    && image_metadata.len() >= capacity
+                    && image_metadata.len() <= limit
+                    && image_metadata
+                        .blocks()
+                        .checked_mul(512)
+                        .is_some_and(|bytes| bytes <= limit),
+                "plugin staging image identity or size is invalid"
+            );
+            // UDRW has a fixed logical backing length, unlike UDSP/UDSB. Host
+            // filesystem holes do not increase that bound and need not be filled.
+            let mut attach = Command::new("/usr/bin/hdiutil");
+            attach
+                .args([
+                    "attach",
+                    "-plist",
+                    "-nobrowse",
+                    "-noautoopen",
+                    "-noautofsck",
+                    "-owners",
+                    "on",
+                    "-readwrite",
+                    "-mountpoint",
+                ])
+                .arg(&root)
+                .arg(&image);
+            #[cfg(test)]
+            if fail_attach_spawn {
+                use std::os::unix::process::CommandExt as _;
+                // SAFETY: only constructs an OS error; Rust's spawn-error pipe
+                // returns EAGAIN before hdiutil executes or acquires the image.
+                unsafe {
+                    attach.pre_exec(|| Err(std::io::Error::from_raw_os_error(libc::EAGAIN)));
+                }
+            }
+            attach_started = true;
+            let output = staging_tool(&mut attach).inspect_err(|error| {
+                if error.downcast_ref::<StagingToolNotStarted>().is_some() {
+                    attach_started = false;
+                }
+            })?;
+            let attached = staging_plist(&output)?;
+            let device = staging_attached_device(&attached, &root)?;
+            let mount_metadata = std::fs::symlink_metadata(&root)?;
+            let mut volume = Self {
+                root: root.clone(),
+                image: image.clone(),
+                image_identity: metadata_identity(&image_metadata),
+                image_length: image_metadata.len(),
+                image_file: Some(image_file),
+                mount_identity: metadata_identity(&mount_metadata),
+                underlying_identity: metadata_identity(&metadata),
+                device,
+                limit,
+                closed: false,
+            };
+            volume.verify_mounted()?;
+            // A successful attach alone does not prove which image owns the mount.
+            volume.verify_inventory(true)?;
+            // Prove that the installed policy compiles and can launch a child now,
+            // not only when the first untrusted checkout eventually happens.
+            let mut probe = volume.command("/usr/bin/true");
+            if let Err(error) = staging_tool(&mut probe) {
+                if error
+                    .downcast_ref::<super::StagingAcquisitionUncertain>()
+                    .is_some()
+                {
+                    return Err(error);
+                }
+                return match volume.close() {
+                    Ok(()) => Err(error),
+                    Err(cleanup) => Err(error.context(super::StagingAcquisitionUncertain(
+                        format!("cannot clean up rejected macOS staging sandbox: {cleanup:#}"),
+                    ))),
+                };
+            }
+            Ok(volume)
+        })();
+        match result {
+            Ok(volume) => Ok(volume),
+            Err(error) => {
+                if error
+                    .downcast_ref::<super::StagingAcquisitionUncertain>()
+                    .is_some()
+                {
+                    return Err(error);
+                }
+                let unchanged_mountpoint = std::fs::symlink_metadata(&root).is_ok_and(|current| {
+                    metadata_identity(&current) == metadata_identity(&metadata)
+                });
+                if unchanged_mountpoint
+                    && std::fs::symlink_metadata(&image)
+                        .is_err_and(|e| e.kind() == std::io::ErrorKind::NotFound)
+                {
+                    return Err(error);
+                }
+                // Before attach, a completed create can be rolled back only
+                // after inventory proves no device still owns its image.
+                if created
+                    && !attach_started
+                    && unchanged_mountpoint
+                    && staging_remove_unattached_image(&image).is_ok()
+                {
+                    return Err(error);
+                }
+                Err(error.context(super::StagingAcquisitionUncertain(format!(
+                    "macOS staging acquisition left unproven image or mount state at {}",
+                    image.display()
+                ))))
+            }
+        }
+    }
+
+    pub(super) fn root(&self) -> &std::path::Path {
+        &self.root
+    }
+
+    pub(super) fn git_command(&self) -> Command {
+        self.command("git")
+    }
+
+    fn command(&self, program: &str) -> Command {
+        use std::os::unix::process::CommandExt as _;
+        let mut command = Command::new("/usr/bin/sandbox-exec");
+        command
+            .arg("-p")
+            .arg(STAGING_SANDBOX)
+            .arg("-D")
+            .arg(format!("AOE_STAGING_ROOT={}", self.root.display()))
+            .arg(program)
+            .current_dir(&self.root)
+            .env("TMPDIR", &self.root)
+            .env("TMP", &self.root)
+            .env("TEMP", &self.root)
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped());
+        // Determine the exhaustive range before fork. In the child only fcntl
+        // and errno access run; notably, do not close Rust's exec-error pipe.
+        let ceiling = staging_fd_ceiling().map_err(|e| e.raw_os_error().unwrap_or(libc::EIO));
+        let closed = self.closed;
+        unsafe {
+            command.pre_exec(move || {
+                if closed {
+                    return Err(std::io::Error::from_raw_os_error(libc::EBADF));
+                }
+                let ceiling = ceiling.map_err(std::io::Error::from_raw_os_error)?;
+                staging_cloexec_descriptors(ceiling)
+            });
+        }
+        command
+    }
+
+    fn verify_mounted(&mut self) -> anyhow::Result<()> {
+        use std::os::unix::fs::MetadataExt as _;
+        let image = self
+            .image_file
+            .as_ref()
+            .context("plugin staging image is closed")?
+            .metadata()?;
+        anyhow::ensure!(
+            metadata_identity(&std::fs::symlink_metadata(&self.image)?) == self.image_identity
+                && metadata_identity(&image) == self.image_identity
+                && image.len() == self.image_length
+                && image
+                    .blocks()
+                    .checked_mul(512)
+                    .is_some_and(|bytes| bytes <= self.limit),
+            "plugin staging image changed identity or exceeded its physical budget"
+        );
+        let metadata = std::fs::symlink_metadata(&self.root)?;
+        let stat = staging_statfs(&self.root)?;
+        let (mounted_on, mounted_from) = staging_mount_strings(&stat)?;
+        anyhow::ensure!(
+            metadata_identity(&metadata) == self.mount_identity
+                && self.mount_identity.0 != self.underlying_identity.0
+                && metadata.uid() == unsafe { libc::geteuid() }
+                && metadata.mode() & 0o077 == 0
+                && mounted_on == self.root
+                && mounted_from == self.device
+                && stat.f_flags & (libc::MNT_RDONLY as u32 | libc::MNT_IGNORE_OWNERSHIP as u32)
+                    == 0
+                && stat
+                    .f_blocks
+                    .checked_mul(u64::from(stat.f_bsize))
+                    .is_some_and(|bytes| bytes > 0 && bytes <= image.len()),
+            "plugin staging mount identity, ownership or capacity is invalid"
+        );
+        Ok(())
+    }
+
+    fn verify_inventory(&self, attached: bool) -> anyhow::Result<()> {
+        let mut command = Command::new("/usr/bin/hdiutil");
+        command.args(["info", "-plist"]);
+        let inventory = staging_plist(&staging_tool(&mut command)?)?;
+        let images = staging_plist_array(&inventory, "images")?;
+        let mut found = 0;
+        for entry in images.iter() {
+            let record = staging_plist_dictionary(*entry)?;
+            let path = staging_plist_string(&record, "image-path")?;
+            if std::path::Path::new(&path) == self.image {
+                found += 1;
+                anyhow::ensure!(
+                    attached && staging_attached_device(&record, &self.root)? == self.device,
+                    "plugin staging image remains attached or changed device"
+                );
+            }
+        }
+        anyhow::ensure!(
+            found == usize::from(attached),
+            "plugin staging image attachment is ambiguous"
+        );
+        Ok(())
+    }
+
+    /// The caller must prove all writers stopped before requesting detach.
+    pub(super) fn close(&mut self) -> anyhow::Result<()> {
+        if self.closed {
+            return Ok(());
+        }
+        self.verify_mounted()?;
+        self.verify_inventory(true)?;
+        let mut detach = Command::new("/usr/bin/hdiutil");
+        // Never force detach: a busy mount disproves writer settlement.
+        detach.arg("detach").arg(&self.device);
+        staging_tool(&mut detach)?;
+        self.verify_inventory(false)?;
+        let image_metadata = self
+            .image_file
+            .as_ref()
+            .context("plugin staging image is closed")?
+            .metadata()?;
+        anyhow::ensure!(
+            metadata_identity(&std::fs::symlink_metadata(&self.root)?) == self.underlying_identity
+                && staging_mount_strings(&staging_statfs(&self.root)?)?.0 != self.root
+                && metadata_identity(&std::fs::symlink_metadata(&self.image)?)
+                    == self.image_identity
+                && image_metadata.len() == self.image_length
+                && image_metadata
+                    .blocks()
+                    .checked_mul(512)
+                    .is_some_and(|bytes| bytes <= self.limit),
+            "plugin staging detach could not be proven; image retained"
+        );
+        std::fs::remove_file(&self.image)?;
+        // Release the unlinked image before admitting the next staging volume.
+        drop(self.image_file.take());
+        self.closed = true;
+        Ok(())
+    }
+}
+
+fn staging_remove_unattached_image(image: &std::path::Path) -> anyhow::Result<()> {
+    use std::os::unix::fs::MetadataExt as _;
+    let metadata = std::fs::symlink_metadata(image)?;
+    anyhow::ensure!(
+        metadata.is_file() && metadata.nlink() == 1 && metadata.uid() == unsafe { libc::geteuid() },
+        "cannot safely remove rejected staging image"
+    );
+    let mut command = Command::new("/usr/bin/hdiutil");
+    command.args(["info", "-plist"]);
+    let inventory = staging_plist(&staging_tool(&mut command)?)?;
+    for entry in staging_plist_array(&inventory, "images")?.iter() {
+        let record = staging_plist_dictionary(*entry)?;
+        anyhow::ensure!(
+            std::path::Path::new(&staging_plist_string(&record, "image-path")?) != image,
+            "rejected staging image remains attached"
+        );
+    }
+    anyhow::ensure!(
+        metadata_identity(&std::fs::symlink_metadata(image)?) == metadata_identity(&metadata),
+        "rejected staging image changed identity"
+    );
+    std::fs::remove_file(image)?;
+    Ok(())
+}
+
+fn staging_statfs(path: &std::path::Path) -> anyhow::Result<libc::statfs> {
+    use std::os::unix::ffi::OsStrExt as _;
+    let path = std::ffi::CString::new(path.as_os_str().as_bytes())?;
+    let mut stat = std::mem::MaybeUninit::<libc::statfs>::uninit();
+    // SAFETY: path is NUL-terminated and stat points to writable storage.
+    anyhow::ensure!(
+        unsafe { libc::statfs(path.as_ptr(), stat.as_mut_ptr()) } == 0,
+        "cannot inspect staging mount: {}",
+        std::io::Error::last_os_error()
+    );
+    // SAFETY: successful statfs initialized the entire result.
+    Ok(unsafe { stat.assume_init() })
+}
+
+fn staging_mount_strings(stat: &libc::statfs) -> anyhow::Result<(std::path::PathBuf, String)> {
+    use std::os::unix::ffi::OsStrExt as _;
+    fn bytes(value: &[libc::c_char]) -> anyhow::Result<&[u8]> {
+        let end = value
+            .iter()
+            .position(|&b| b == 0)
+            .context("unterminated mount identity")?;
+        // SAFETY: c_char and u8 have identical layouts; the slice remains borrowed.
+        Ok(unsafe { std::slice::from_raw_parts(value.as_ptr().cast(), end) })
+    }
+    Ok((
+        std::path::PathBuf::from(std::ffi::OsStr::from_bytes(bytes(&stat.f_mntonname)?)),
+        std::str::from_utf8(bytes(&stat.f_mntfromname)?)?.to_owned(),
+    ))
+}
+
+fn staging_plist(bytes: &[u8]) -> anyhow::Result<core_foundation::dictionary::CFDictionary> {
+    use core_foundation::{
+        data::CFData,
+        propertylist::{self, CFPropertyList},
+    };
+    let (value, _) = propertylist::create_with_data(CFData::from_buffer(bytes), 0)
+        .map_err(|error| anyhow::anyhow!("invalid disk image property list: {error}"))?;
+    // SAFETY: create_with_data returned an owned Core Foundation property list.
+    let value = unsafe { CFPropertyList::wrap_under_create_rule(value) }.into_CFType();
+    value
+        .downcast()
+        .context("disk image property list is not a dictionary")
+}
+
+fn staging_plist_dictionary(
+    value: *const std::ffi::c_void,
+) -> anyhow::Result<core_foundation::dictionary::CFDictionary> {
+    use core_foundation::base::{CFType, TCFType as _};
+    anyhow::ensure!(!value.is_null(), "null disk image dictionary");
+    // SAFETY: values originate from a live CF property-list array.
+    unsafe { CFType::wrap_under_get_rule(value) }
+        .downcast()
+        .context("disk image entity is not a dictionary")
+}
+
+fn staging_plist_value(
+    dictionary: &core_foundation::dictionary::CFDictionary,
+    key: &str,
+) -> anyhow::Result<core_foundation::base::CFType> {
+    use core_foundation::{
+        base::{CFType, TCFType as _},
+        string::CFString,
+    };
+    let key = CFString::new(key);
+    let value = dictionary
+        .find(key.as_concrete_TypeRef().cast::<std::ffi::c_void>())
+        .context("missing disk image property-list field")?;
+    // SAFETY: find returns a live retained dictionary's CF object.
+    Ok(unsafe { CFType::wrap_under_get_rule(*value) })
+}
+
+fn staging_plist_array(
+    dictionary: &core_foundation::dictionary::CFDictionary,
+    key: &str,
+) -> anyhow::Result<core_foundation::array::CFArray> {
+    staging_plist_value(dictionary, key)?
+        .downcast()
+        .context("disk image field is not an array")
+}
+
+fn staging_plist_string(
+    dictionary: &core_foundation::dictionary::CFDictionary,
+    key: &str,
+) -> anyhow::Result<String> {
+    Ok(staging_plist_value(dictionary, key)?
+        .downcast::<core_foundation::string::CFString>()
+        .context("disk image field is not a string")?
+        .to_string())
+}
+
+fn staging_attached_device(
+    dictionary: &core_foundation::dictionary::CFDictionary,
+    root: &std::path::Path,
+) -> anyhow::Result<String> {
+    let entities = staging_plist_array(dictionary, "system-entities")?;
+    anyhow::ensure!(
+        entities.len() == 1,
+        "fixed staging image must expose exactly one device"
+    );
+    let entity = staging_plist_dictionary(*entities.get(0).context("missing image device")?)?;
+    anyhow::ensure!(
+        std::path::Path::new(&staging_plist_string(&entity, "mount-point")?) == root,
+        "disk image attached at an unexpected mountpoint"
+    );
+    let device = staging_plist_string(&entity, "dev-entry")?;
+    anyhow::ensure!(
+        device
+            .strip_prefix("/dev/disk")
+            .is_some_and(|suffix| !suffix.is_empty() && suffix.bytes().all(|b| b.is_ascii_digit())),
+        "disk image returned an unexpected device identity"
+    );
+    Ok(device)
+}
+
+fn staging_fd_ceiling() -> std::io::Result<i32> {
+    let mut limit = std::mem::MaybeUninit::<libc::rlimit>::uninit();
+    // SAFETY: getrlimit initializes writable limit storage.
+    if unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, limit.as_mut_ptr()) } != 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    // SAFETY: getrlimit succeeded.
+    let limit = unsafe { limit.assume_init() };
+    let mut ceiling = 3u64;
+    for name in [libc::KERN_MAXFILES, libc::KERN_MAXFILESPERPROC] {
+        let mut mib = [libc::CTL_KERN, name];
+        let mut value: libc::c_int = 0;
+        let mut size = std::mem::size_of_val(&value);
+        // SAFETY: the MIB and output buffers have their specified lengths.
+        if unsafe {
+            libc::sysctl(
+                mib.as_mut_ptr(),
+                2,
+                (&mut value as *mut libc::c_int).cast(),
+                &mut size,
+                std::ptr::null_mut(),
+                0,
+            )
+        } != 0
+        {
+            return Err(std::io::Error::last_os_error());
+        }
+        if size != std::mem::size_of_val(&value) || value <= 0 {
+            return Err(std::io::Error::from_raw_os_error(libc::EINVAL));
+        }
+        ceiling = ceiling.max(value as u64);
+    }
+    for bound in [limit.rlim_cur, limit.rlim_max] {
+        if bound != libc::RLIM_INFINITY {
+            ceiling = ceiling.max(bound);
+        }
+    }
+    // Already-open descriptors can survive lowering both resource limits.
+    for entry in std::fs::read_dir("/dev/fd")? {
+        let name = entry?.file_name();
+        let fd = name
+            .to_str()
+            .and_then(|s| s.parse::<u64>().ok())
+            .ok_or_else(|| std::io::Error::from_raw_os_error(libc::EINVAL))?;
+        ceiling = ceiling.max(
+            fd.checked_add(1)
+                .ok_or_else(|| std::io::Error::from_raw_os_error(libc::EOVERFLOW))?,
+        );
+    }
+    i32::try_from(ceiling).map_err(|_| std::io::Error::from_raw_os_error(libc::EOVERFLOW))
+}
+
+fn staging_cloexec_descriptors(ceiling: i32) -> std::io::Result<()> {
+    for fd in 3..ceiling {
+        // SAFETY: fcntl accepts arbitrary descriptor numbers and is
+        // async-signal-safe. Preserve all existing flags and open descriptors.
+        let flags = unsafe { libc::fcntl(fd, libc::F_GETFD) };
+        if flags < 0 {
+            let error = std::io::Error::last_os_error();
+            if error.raw_os_error() == Some(libc::EBADF) {
+                continue;
+            }
+            return Err(error);
+        }
+        if flags & libc::FD_CLOEXEC == 0
+            && unsafe { libc::fcntl(fd, libc::F_SETFD, flags | libc::FD_CLOEXEC) } < 0
+        {
+            return Err(std::io::Error::last_os_error());
+        }
+    }
+    Ok(())
+}
+
+/// System disk-image tools are trusted, but their completion still has a
+/// deadline. Any failure leaves the backing image and caller's recovery marker.
+fn staging_tool(command: &mut Command) -> anyhow::Result<Vec<u8>> {
+    use std::os::fd::AsRawFd as _;
+    use std::time::{Duration, Instant};
+    command
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped());
+    let mut child = command.spawn().map_err(StagingToolNotStarted)?;
+    let mut stdout = child.stdout.take().context("staging tool stdout missing")?;
+    let mut stderr = child.stderr.take().context("staging tool stderr missing")?;
+    let deadline = Instant::now() + Duration::from_secs(90);
+    let result = (|| {
+        for fd in [stdout.as_raw_fd(), stderr.as_raw_fd()] {
+            // SAFETY: both descriptors belong to the live child's pipes.
+            let flags = unsafe { libc::fcntl(fd, libc::F_GETFL) };
+            anyhow::ensure!(
+                flags >= 0
+                    && unsafe { libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK) } == 0,
+                "cannot make staging diagnostics nonblocking"
+            );
+        }
+        fn drain(pipe: &mut impl std::io::Read, bytes: &mut Vec<u8>) -> anyhow::Result<bool> {
+            let mut buffer = [0u8; 8192];
+            // Bound each pass too: continuously writing output must not defer
+            // checking the tool deadline.
+            for _ in 0..128 {
+                match pipe.read(&mut buffer) {
+                    Ok(0) => return Ok(true),
+                    Ok(count) => {
+                        anyhow::ensure!(
+                            bytes.len() + count <= STAGING_TOOL_OUTPUT,
+                            "macOS staging tool exceeded diagnostic limit"
+                        );
+                        bytes.extend_from_slice(&buffer[..count]);
+                    }
+                    Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => return Ok(false),
+                    Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
+                    Err(e) => return Err(e.into()),
+                }
+            }
+            Ok(false)
+        }
+        let mut out = Vec::new();
+        let mut err = Vec::new();
+        let mut status = None;
+        loop {
+            anyhow::ensure!(
+                Instant::now() < deadline,
+                "macOS staging tool deadline expired"
+            );
+            let out_done = drain(&mut stdout, &mut out)?;
+            let err_done = drain(&mut stderr, &mut err)?;
+            if status.is_none() {
+                status = child.try_wait()?;
+            }
+            if let Some(status) = status {
+                if out_done && err_done {
+                    anyhow::ensure!(
+                        status.success(),
+                        "macOS staging tool failed ({status}): {}",
+                        String::from_utf8_lossy(&err)
+                    );
+                    return Ok(out);
+                }
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    })();
+    if let Err(error) = result {
+        if matches!(child.try_wait(), Ok(Some(_))) {
+            return Err(error);
+        }
+        let _ = child.kill();
+        let deadline = Instant::now() + Duration::from_secs(2);
+        loop {
+            match child.try_wait() {
+                Ok(Some(_)) => break,
+                _ if Instant::now() >= deadline => break,
+                _ => std::thread::sleep(Duration::from_millis(10)),
+            }
+        }
+        // Killing hdiutil does not prove an asynchronous DiskImages request
+        // stopped. Preserve evidence even if no attachment is visible yet.
+        return Err(error.context(super::StagingAcquisitionUncertain(
+            "macOS staging tool was interrupted before its completion was proven".to_owned(),
+        )));
+    }
+    result
+}
+
+#[cfg(test)]
+mod staging_volume_tests {
+    #[test]
+    fn rejected_acquisition_without_artifacts_is_not_uncertain() {
+        let parent = tempfile::tempdir().unwrap();
+        std::fs::set_permissions(parent.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+        let mount = parent.path().join("mount");
+        std::fs::create_dir(&mount).unwrap();
+        std::fs::set_permissions(&mount, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let error = match StagingVolume::create(&mount, STAGING_IMAGE_OVERHEAD) {
+            Ok(_) => panic!("insufficient fixed-image budget must fail"),
+            Err(error) => error,
+        };
+        assert!(error
+            .downcast_ref::<super::super::StagingAcquisitionUncertain>()
+            .is_none());
+        assert!(!mount.with_extension("dmg").exists());
+        assert!(mount.is_dir());
+    }
+
+    use super::*;
+    use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
+
+    #[test]
+    fn attach_spawn_failure_removes_proven_unattached_image() {
+        let parent = tempfile::tempdir().unwrap();
+        std::fs::set_permissions(parent.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+        let mount = parent.path().join("mount");
+        std::fs::create_dir(&mount).unwrap();
+        std::fs::set_permissions(&mount, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let identity = metadata_identity(&std::fs::metadata(&mount).unwrap());
+        FAIL_STAGING_ATTACH_SPAWN.with(|fail| fail.set(true));
+        let error = match StagingVolume::create(&mount, 64 * 1024 * 1024) {
+            Ok(_) => panic!("injected attach spawn failure must fail acquisition"),
+            Err(error) => error,
+        };
+        let spawn = error
+            .downcast_ref::<StagingToolNotStarted>()
+            .expect("failure must come from the real Command::spawn");
+        assert_eq!(spawn.0.raw_os_error(), Some(libc::EAGAIN));
+        assert!(error
+            .downcast_ref::<super::super::StagingAcquisitionUncertain>()
+            .is_none());
+        assert!(!mount.with_extension("dmg").exists());
+        assert_eq!(
+            metadata_identity(&std::fs::metadata(&mount).unwrap()),
+            identity
+        );
+        assert!(std::fs::read_dir(&mount).unwrap().next().is_none());
+    }
+
+    fn volume() -> (tempfile::TempDir, StagingVolume) {
+        let parent = tempfile::tempdir().unwrap();
+        std::fs::set_permissions(parent.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+        let mount = parent.path().join("mount");
+        std::fs::create_dir(&mount).unwrap();
+        std::fs::set_permissions(&mount, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let volume = StagingVolume::create(&mount, 64 * 1024 * 1024).unwrap();
+        (parent, volume)
+    }
+
+    fn success(command: &mut Command) -> Vec<u8> {
+        let output = command.output().unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        output.stdout
+    }
+
+    #[test]
+    fn fixed_image_bounds_writes_and_rejects_escape() {
+        let (parent, mut volume) = volume();
+        let image_length = volume
+            .image_file
+            .as_ref()
+            .unwrap()
+            .metadata()
+            .unwrap()
+            .len();
+        let outside = parent.path().join("outside");
+        std::fs::write(&outside, b"unchanged").unwrap();
+        std::os::unix::fs::symlink(&outside, volume.root().join("escape")).unwrap();
+        let mut write = volume.command("/bin/sh");
+        write
+            .arg("-c")
+            .arg("printf allowed > inside; printf denied > escape");
+        assert!(!write.output().unwrap().status.success());
+        assert_eq!(
+            std::fs::read(volume.root().join("inside")).unwrap(),
+            b"allowed"
+        );
+        assert_eq!(std::fs::read(&outside).unwrap(), b"unchanged");
+        let socket = parent.path().join("host.sock");
+        let listener = std::os::unix::net::UnixListener::bind(&socket).unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let mut connect = volume.command("/usr/bin/nc");
+        connect.args(["-z", "-w", "1", "-U"]).arg(&socket);
+        assert!(!connect.output().unwrap().status.success());
+        assert_eq!(
+            listener.accept().unwrap_err().kind(),
+            std::io::ErrorKind::WouldBlock
+        );
+        let mut fill = volume.command("/bin/dd");
+        fill.args(["if=/dev/zero", "of=full", "bs=1048576", "count=64"]);
+        assert!(!fill.output().unwrap().status.success());
+        volume.verify_mounted().unwrap();
+        let metadata = volume.image_file.as_ref().unwrap().metadata().unwrap();
+        assert_eq!(metadata.len(), image_length);
+        assert!(metadata.blocks() * 512 <= 64 * 1024 * 1024);
+        let image = volume.image.clone();
+        volume.close().unwrap();
+        assert!(!image.exists());
+        volume.close().unwrap();
+    }
+
+    #[test]
+    fn readonly_host_fcntls_are_denied() {
+        use std::os::fd::AsRawFd as _;
+        use std::os::macos::fs::MetadataExt as _;
+        const FIXTURE: &str = "AOE_MACOS_STAGING_FCNTL_FIXTURE";
+        const FILES: [&str; 3] = ["canary", "donor", "receiver"];
+        if let Some(fixture) = std::env::var_os(FIXTURE) {
+            let files = FILES.map(|name| {
+                std::fs::File::open(std::path::Path::new(&fixture).join(name)).unwrap()
+            });
+            for file in &files {
+                // SAFETY: F_GETFL only examines the live descriptor.
+                assert_eq!(
+                    unsafe { libc::fcntl(file.as_raw_fd(), libc::F_GETFL) } & libc::O_ACCMODE,
+                    libc::O_RDONLY
+                );
+            }
+            let mut attributes = libc::attrlist {
+                bitmapcount: 5,
+                reserved: 0,
+                commonattr: libc::ATTR_CMN_GEN_COUNT,
+                volattr: 0,
+                dirattr: 0,
+                fileattr: 0,
+                forkattr: 0,
+            };
+            let mut generation = [0u32; 2];
+            // SAFETY: both writable buffers match the requested generation
+            // attribute and remain live for the call.
+            let result = unsafe {
+                libc::fgetattrlist(
+                    files[0].as_raw_fd(),
+                    (&mut attributes as *mut libc::attrlist).cast(),
+                    generation.as_mut_ptr().cast(),
+                    std::mem::size_of_val(&generation),
+                    libc::FSOPT_ATTR_CMN_EXTENDED,
+                )
+            };
+            assert_eq!(result, 0, "{}", std::io::Error::last_os_error());
+            assert_eq!(generation[0] as usize, std::mem::size_of_val(&generation));
+            for (descriptor, selector, argument) in [
+                (files[0].as_raw_fd(), 80, generation[1]),
+                (files[1].as_raw_fd(), 110, files[2].as_raw_fd() as u32),
+            ] {
+                // SAFETY: F_MAKECOMPRESSED receives the queried generation;
+                // F_TRANSFEREXTENTS receives the live receiver descriptor.
+                let result = unsafe { libc::fcntl(descriptor, selector, argument) };
+                let error = std::io::Error::last_os_error();
+                assert_eq!(
+                    result, -1,
+                    "mutating fcntl {selector} unexpectedly succeeded"
+                );
+                assert_eq!(
+                    error.raw_os_error(),
+                    Some(libc::EPERM),
+                    "mutating fcntl {selector} must fail at the sandbox boundary"
+                );
+            }
+            println!("read-only fcntl probes completed");
+            return;
+        }
+        let (parent, mut volume) = volume();
+        let fixture = parent.path().join("fcntl-fixture");
+        std::fs::create_dir(&fixture).unwrap();
+        std::fs::write(fixture.join(FILES[0]), b"outside sandbox canary\n").unwrap();
+        std::fs::write(fixture.join(FILES[2]), []).unwrap();
+        // Keep the donor open in the parent so closing the child's read-only
+        // descriptor cannot discard preallocated extents before verification.
+        let donor = std::fs::File::create(fixture.join(FILES[1])).unwrap();
+        let mut allocation = libc::fstore_t {
+            fst_flags: libc::F_ALLOCATEALL,
+            fst_posmode: libc::F_PEOFPOSMODE,
+            fst_offset: 0,
+            fst_length: 65536,
+            fst_bytesalloc: 0,
+        };
+        // SAFETY: F_PREALLOCATE receives the live allocation structure.
+        assert_eq!(
+            unsafe { libc::fcntl(donor.as_raw_fd(), libc::F_PREALLOCATE, &mut allocation) },
+            0,
+            "{}",
+            std::io::Error::last_os_error()
+        );
+        let snapshot = || {
+            FILES.map(|name| {
+                let path = fixture.join(name);
+                let metadata = std::fs::metadata(&path).unwrap();
+                (
+                    std::fs::read(path).unwrap(),
+                    metadata.blocks(),
+                    metadata.st_flags(),
+                    metadata.mtime(),
+                    metadata.mtime_nsec(),
+                    metadata.ctime(),
+                    metadata.ctime_nsec(),
+                )
+            })
+        };
+        let before = snapshot();
+        assert!(before[1].1 > 0, "extent donor must own allocated blocks");
+        let executable = std::env::current_exe().unwrap();
+        let mut child = volume.command(executable.to_str().unwrap());
+        let module = module_path!().split_once("::").unwrap().1;
+        child
+            .args([
+                "--exact",
+                &format!("{module}::readonly_host_fcntls_are_denied"),
+                "--nocapture",
+            ])
+            .env(FIXTURE, &fixture);
+        let output = staging_tool(&mut child).unwrap();
+        assert!(String::from_utf8_lossy(&output).contains("read-only fcntl probes completed"));
+        assert_eq!(
+            snapshot(),
+            before,
+            "sandbox must preserve host bytes and metadata"
+        );
+        drop(donor);
+        volume.close().unwrap();
+    }
+
+    #[test]
+    fn changed_image_identity_retains_recovery_evidence() {
+        let (_parent, mut volume) = volume();
+        let retained = volume.image.with_extension("retained.dmg");
+        std::fs::rename(&volume.image, &retained).unwrap();
+        std::fs::write(&volume.image, b"unrelated").unwrap();
+        assert!(volume.close().is_err());
+        assert!(retained.exists());
+        assert_eq!(std::fs::read(&volume.image).unwrap(), b"unrelated");
+        std::fs::remove_file(&volume.image).unwrap();
+        std::fs::rename(&retained, &volume.image).unwrap();
+        volume.close().unwrap();
+    }
+
+    #[test]
+    fn git_filter_cannot_write_host() {
+        let (parent, mut volume) = volume();
+        let repository = parent.path().join("source");
+        std::fs::create_dir(&repository).unwrap();
+        success(Command::new("git").arg("init").arg(&repository));
+        std::fs::write(
+            repository.join(".gitattributes"),
+            b"payload filter=boundary\n",
+        )
+        .unwrap();
+        std::fs::write(repository.join("payload"), b"payload\n").unwrap();
+        success(
+            Command::new("git")
+                .arg("-C")
+                .arg(&repository)
+                .args(["add", "."]),
+        );
+        success(Command::new("git").arg("-C").arg(&repository).args([
+            "-c",
+            "user.name=Sandbox Test",
+            "-c",
+            "user.email=sandbox@example.invalid",
+            "-c",
+            "commit.gpgsign=false",
+            "commit",
+            "-m",
+            "fixture",
+        ]));
+        let checkout = volume.root().join("checkout");
+        success(
+            volume
+                .git_command()
+                .arg("clone")
+                .arg("--no-local")
+                .arg("--no-checkout")
+                .arg(&repository)
+                .arg(&checkout),
+        );
+        let outside = parent.path().join("must-not-exist");
+        // Git itself supplies the filter's shell. This exercises inherited
+        // confinement, rather than trusting checkout hooks to remain benign.
+        let filter = format!(
+            "printf denied > '{}'; printf ran > filter-ran; cat",
+            outside.display()
+        );
+        success(
+            volume
+                .git_command()
+                .arg("-C")
+                .arg(&checkout)
+                .arg("-c")
+                .arg(format!("filter.boundary.smudge={filter}"))
+                .args(["checkout", "--force", "HEAD"]),
+        );
+        assert!(!outside.exists());
+        assert_eq!(std::fs::read(checkout.join("filter-ran")).unwrap(), b"ran");
+        assert_eq!(
+            std::fs::read(checkout.join("payload")).unwrap(),
+            b"payload\n"
+        );
+        volume.close().unwrap();
+    }
+
+    #[test]
+    fn cloexec_preserves_spawn_error_pipe() {
+        use std::os::fd::{AsRawFd as _, FromRawFd as _};
+        use std::os::unix::process::CommandExt as _;
+        let parent = tempfile::tempdir().unwrap();
+        let marker = std::fs::File::create(parent.path().join("inherited")).unwrap();
+        // SAFETY: duplicate is newly owned and closed by its File wrapper.
+        let duplicate = unsafe { libc::fcntl(marker.as_raw_fd(), libc::F_DUPFD, 128) };
+        assert!(duplicate >= 128);
+        let duplicate = unsafe { std::fs::File::from_raw_fd(duplicate) };
+        let ceiling = staging_fd_ceiling().unwrap();
+        let mut probe = Command::new("/bin/sh");
+        probe
+            .arg("-c")
+            .arg(format!("test ! -e /dev/fd/{}", duplicate.as_raw_fd()));
+        unsafe {
+            probe.pre_exec(move || staging_cloexec_descriptors(ceiling));
+        }
+        success(&mut probe);
+        let mut missing = Command::new("/aoe-missing-executable-for-cloexec-test");
+        unsafe {
+            missing.pre_exec(move || staging_cloexec_descriptors(ceiling));
+        }
+        assert_eq!(
+            missing.spawn().unwrap_err().kind(),
+            std::io::ErrorKind::NotFound
+        );
+        let mut rejected = Command::new("/usr/bin/true");
+        unsafe {
+            rejected.pre_exec(move || {
+                staging_cloexec_descriptors(ceiling)?;
+                Err(std::io::Error::from_raw_os_error(libc::EACCES))
+            });
+        }
+        assert_eq!(
+            rejected.spawn().unwrap_err().raw_os_error(),
+            Some(libc::EACCES)
+        );
+    }
+
+    #[test]
+    fn sandbox_https_dns_tls() {
+        use std::time::{Duration, Instant};
+        struct Server(std::process::Child);
+        impl Drop for Server {
+            fn drop(&mut self) {
+                let _ = self.0.kill();
+                let _ = self.0.wait();
+            }
+        }
+        let (parent, mut volume) = volume();
+        let certificate = parent.path().join("certificate.pem");
+        let key = parent.path().join("key.pem");
+        let config = parent.path().join("openssl.cnf");
+        std::fs::write(
+            &config,
+            b"[req]\ndistinguished_name=dn\nx509_extensions=ext\n\
+            [dn]\n[ext]\nsubjectAltName=DNS:localhost\nbasicConstraints=critical,CA:TRUE\n\
+            keyUsage=digitalSignature,keyEncipherment,keyCertSign\n",
+        )
+        .unwrap();
+        let mut generate = Command::new("/usr/bin/openssl");
+        generate
+            .args([
+                "req",
+                "-x509",
+                "-newkey",
+                "rsa:2048",
+                "-nodes",
+                "-days",
+                "1",
+                "-subj",
+                "/CN=localhost",
+                "-config",
+            ])
+            .arg(&config)
+            .arg("-keyout")
+            .arg(&key)
+            .arg("-out")
+            .arg(&certificate);
+        staging_tool(&mut generate).unwrap();
+        let listener = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let address = listener.local_addr().unwrap();
+        drop(listener);
+        let mut server = Server(
+            Command::new("/usr/bin/openssl")
+                .args(["s_server", "-www", "-quiet", "-accept"])
+                .arg(address.to_string())
+                .arg("-cert")
+                .arg(&certificate)
+                .arg("-key")
+                .arg(&key)
+                .stdin(std::process::Stdio::null())
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .spawn()
+                .unwrap(),
+        );
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while std::net::TcpStream::connect(address).is_err() {
+            assert!(
+                server.0.try_wait().unwrap().is_none(),
+                "local TLS server exited"
+            );
+            assert!(Instant::now() < deadline, "local TLS server did not start");
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        let mut request = volume.command("/usr/bin/curl");
+        request
+            .args([
+                "--fail",
+                "--silent",
+                "--show-error",
+                "--max-time",
+                "10",
+                "--noproxy",
+                "*",
+                "--cacert",
+            ])
+            .arg(&certificate)
+            .arg(format!("https://localhost:{}/", address.port()));
+        // localhost exercises getaddrinfo without depending on public DNS.
+        // Certificate verification stays enabled against the private fixture.
+        assert!(!success(&mut request).is_empty());
+        volume.close().unwrap();
+    }
+}
+
 pub(crate) const HAS_CODEX_MANAGED_PREFERENCES: bool = true;
 
 const CODEX_PREFERENCES_DOMAIN: &str = "com.openai.codex";

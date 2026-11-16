@@ -14,12 +14,14 @@ use crate::github::{GitHubClient, GitHubClientConfig, GitHubError, DEFAULT_USER_
 use super::source::PluginSource;
 
 pub struct FetchedPlugin {
-    staging: Option<tempfile::TempDir>,
+    staging: Option<Staging>,
     operation: Option<Arc<crate::session::StorageFlock>>,
+    cleanup_safe: bool,
     pub tree: PathBuf,
     pub manifest: PluginManifest,
     pub manifest_bytes: Vec<u8>,
     pub tree_hash: String,
+    publication_hash: String,
     pub source: PluginSource,
     pub requested_ref: Option<String>,
     pub resolved_commit: Option<String>,
@@ -29,31 +31,177 @@ pub struct FetchedPlugin {
     pub(super) budget: super::execution::Budget,
 }
 
+struct Staging {
+    directory: PathBuf,
+    mount: PathBuf,
+    marker: PathBuf,
+    volume: Option<crate::process::StagingVolume>,
+}
+
+impl Staging {
+    fn create(plugins_root: &Path, limit: u64) -> Result<Self> {
+        std::fs::create_dir_all(plugins_root)?;
+        let app_root = plugins_root
+            .parent()
+            .ok_or_else(|| anyhow!("plugin staging has no application directory"))?;
+        let marker = app_root.join(super::install::STAGING_MARKER);
+        // This ordinary temporary directory is still empty and unmounted.
+        let mut temporary = tempfile::Builder::new();
+        temporary.prefix(".staging-");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            temporary.permissions(std::fs::Permissions::from_mode(0o700));
+        }
+        let directory = temporary.tempdir_in(plugins_root)?;
+        let mount = directory.path().join("volume");
+        let mut builder = std::fs::DirBuilder::new();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::DirBuilderExt;
+            builder.mode(0o700);
+        }
+        builder.create(&mount)?;
+        super::install::create_staging_marker(&marker, &mount)?;
+        #[cfg(test)]
+        test_gate::reach(&mount, "staging-acquisition");
+        // From this point onward, no TempDir::drop may traverse the mount.
+        let mut staging = Self {
+            directory: directory.keep(),
+            mount,
+            marker,
+            volume: None,
+        };
+        let acquisition = super::execution::catch_panic(|| {
+            crate::process::StagingVolume::create(&staging.mount, limit)
+        });
+        match acquisition {
+            Ok(volume) => {
+                staging.volume = Some(volume);
+                Ok(staging)
+            }
+            Err(error) => {
+                if error
+                    .downcast_ref::<crate::process::StagingAcquisitionUncertain>()
+                    .is_some()
+                    || error
+                        .downcast_ref::<super::execution::RecoveryRequired>()
+                        .is_some()
+                {
+                    std::mem::forget(staging);
+                    return Err(super::execution::RecoveryRequired(format!(
+                        "strict plugin staging acquisition failed: {error:#}"
+                    ))
+                    .into());
+                }
+                if let Err(cleanup) = staging.close() {
+                    std::mem::forget(staging);
+                    return Err(super::execution::RecoveryRequired(format!(
+                        "strict plugin staging acquisition failed: {error:#}; cleanup unproven: {cleanup:#}"
+                    )).into());
+                }
+                Err(error).context("acquiring strict plugin staging filesystem")
+            }
+        }
+    }
+
+    fn volume(&self) -> &crate::process::StagingVolume {
+        self.volume.as_ref().expect("live staging volume")
+    }
+
+    fn close(&mut self) -> Result<()> {
+        if let Some(volume) = &mut self.volume {
+            volume
+                .close()
+                .context("proving plugin staging volume cleanup")?;
+        }
+        self.volume.take();
+        std::fs::remove_dir_all(&self.directory)
+            .context("removing detached plugin staging directory")?;
+        std::fs::remove_file(&self.marker).context("removing plugin staging marker")?;
+        std::fs::File::open(self.marker.parent().expect("staging marker parent"))?.sync_all()?;
+        super::install::unregister_staging(&self.marker);
+        Ok(())
+    }
+}
+
+impl Drop for Staging {
+    fn drop(&mut self) {
+        // Cleanup is explicit. Unwinding must never detach an uncertain volume.
+        if let Some(volume) = self.volume.take() {
+            std::mem::forget(volume);
+        }
+    }
+}
+
+fn cleanup_staging(
+    mut staging: Staging,
+    operation: Option<Arc<crate::session::StorageFlock>>,
+) -> Result<()> {
+    let result = super::execution::catch_panic(|| staging.close());
+    if let Err(error) = result {
+        let result = Err(super::execution::RecoveryRequired(format!(
+            "plugin staging cleanup unproven: {error:#}"
+        ))
+        .into());
+        super::install::log_recovery::<()>(&result);
+        std::mem::forget((staging, operation));
+        result
+    } else {
+        Ok(())
+    }
+}
+
 impl FetchedPlugin {
-    pub(super) fn close(mut self) {
-        drop(self.staging.take());
+    pub(super) fn close(mut self) -> Result<()> {
+        match self.staging.take() {
+            Some(staging) => cleanup_staging(staging, self.operation.take()),
+            None => Ok(()),
+        }
     }
 
     pub(super) async fn cleanup(self) -> Result<()> {
         tokio::task::spawn_blocking(move || self.close())
             .await
-            .context("plugin staging cleanup task failed")
+            .context("plugin staging cleanup task failed")?
+    }
+
+    pub(super) fn copy_for_publication(&self, destination: &Path) -> Result<()> {
+        // In particular, do not canonicalize a Linux /proc/PID/root staging path.
+        let source = crate::session::AnchoredDir::open(&self.tree)?;
+        let mut budget = CopyBudget {
+            bytes: STAGING_LIMIT,
+            entries: STAGING_ENTRY_LIMIT,
+        };
+        copy_anchored_tree(&source, destination, &mut budget)?;
+        if complete_tree_hash(destination)? != self.publication_hash {
+            bail!("plugin publication copy differs from the approved staging tree");
+        }
+        Ok(())
     }
 }
 
 impl Drop for FetchedPlugin {
     fn drop(&mut self) {
         if let Some(staging) = self.staging.take() {
-            // Cancellation or validation failure must not remove a large tree on a runtime worker.
+            if !self.cleanup_safe {
+                let result = Err(super::execution::RecoveryRequired(
+                    "plugin download cancelled before asynchronous writes settled".to_owned(),
+                )
+                .into());
+                super::install::log_recovery::<()>(&result);
+                std::mem::forget((staging, self.operation.take()));
+                return;
+            }
+            let operation = self.operation.take();
+            // Blocking cleanup owns both resources even if its awaiter is cancelled.
             match tokio::runtime::Handle::try_current() {
                 Ok(runtime) => {
-                    let operation = self.operation.take();
-                    drop(runtime.spawn_blocking(move || {
-                        drop(staging);
-                        drop(operation);
-                    }));
+                    drop(runtime.spawn_blocking(move || cleanup_staging(staging, operation)));
                 }
-                Err(_) => drop(staging),
+                Err(_) => {
+                    let _ = cleanup_staging(staging, operation);
+                }
             }
         }
     }
@@ -111,14 +259,18 @@ fn stage(
     plugins_root: PathBuf,
     clone_url: Option<String>,
 ) -> Result<FetchedPlugin> {
+    stage_with_limit(source, plugins_root, clone_url, STAGING_LIMIT)
+}
+
+fn stage_with_limit(
+    source: PluginSource,
+    plugins_root: PathBuf,
+    clone_url: Option<String>,
+    limit: u64,
+) -> Result<FetchedPlugin> {
     let budget = super::execution::Budget::new();
-    std::fs::create_dir_all(&plugins_root)
-        .with_context(|| format!("creating {}", plugins_root.display()))?;
-    let staging = tempfile::Builder::new()
-        .prefix(".staging-")
-        .tempdir_in(&plugins_root)
-        .context("creating plugin staging dir")?;
-    let tree = staging.path().join("tree");
+    let mut staging = Staging::create(&plugins_root, limit)?;
+    let tree = staging.volume().root().join("tree");
 
     let result = super::execution::catch_panic(|| {
         let (requested_ref, resolved_commit) = match &source {
@@ -129,6 +281,7 @@ fn stage(
                         .expect("github source yields a clone url"),
                     reference.as_deref(),
                     &tree,
+                    &staging,
                     budget,
                 )?;
                 (source.reference().map(String::from), Some(sha))
@@ -149,13 +302,16 @@ fn stage(
             );
         }
         let tree_hash = super::integrity::tree_hash(&tree)?;
+        let publication_hash = complete_tree_hash(&tree)?;
         Ok(FetchedPlugin {
             staging: None,
             operation: None,
+            cleanup_safe: true,
             tree,
             manifest,
             manifest_bytes,
             tree_hash,
+            publication_hash,
             source,
             requested_ref,
             resolved_commit,
@@ -171,15 +327,48 @@ fn stage(
             Ok(fetched)
         }
         Err(error) => {
+            let error = staging_limit_error(error, limit);
             if error
                 .downcast_ref::<super::execution::RecoveryRequired>()
                 .is_some()
             {
-                let retained = staging.keep();
-                tracing::error!(target: "plugin.install", path = %retained.display(), %error, "plugin staging retained for recovery");
+                std::mem::forget(staging);
+            } else if let Err(cleanup_error) = staging.close() {
+                std::mem::forget(staging);
+                return Err(super::execution::RecoveryRequired(format!(
+                    "plugin preparation failed: {error:#}; staging cleanup unproven: {cleanup_error:#}"
+                )).into());
             }
             Err(error)
         }
+    }
+}
+
+fn staging_limit_error(error: anyhow::Error, limit: u64) -> anyhow::Error {
+    let full = error.chain().any(|cause| {
+        cause.downcast_ref::<std::io::Error>().is_some_and(|error| {
+            matches!(
+                error.raw_os_error(),
+                Some(libc::ENOSPC) | Some(libc::EDQUOT)
+            )
+        }) || cause
+            .downcast_ref::<nix::errno::Errno>()
+            .is_some_and(|error| {
+                matches!(
+                    *error,
+                    nix::errno::Errno::ENOSPC | nix::errno::Errno::EDQUOT
+                )
+            })
+    }) || error.downcast_ref::<GitFailed>().is_some_and(|error| {
+        let diagnostic = error.stderr.to_ascii_lowercase();
+        diagnostic.contains("no space left on device") || diagnostic.contains("disk quota exceeded")
+    });
+    if full {
+        error.context(format!(
+            "plugin staging filesystem limit ({limit} bytes) exceeded"
+        ))
+    } else {
+        error
     }
 }
 
@@ -212,15 +401,57 @@ struct GitFailed {
     stderr: String,
 }
 
-fn git_command(args: &[&str], cwd: Option<&Path>) -> Command {
-    let mut cmd = Command::new("git");
-    cmd.args(args)
+fn configure_git(cmd: &mut Command) {
+    // Authentication, certificates and URL rewrites belong to the user's trusted
+    // configuration. The volume confines any writes performed by its helpers.
+    // Do not let inherited repository selectors redirect this fresh checkout.
+    for key in [
+        "GIT_DIR",
+        "GIT_COMMON_DIR",
+        "GIT_WORK_TREE",
+        "GIT_INDEX_FILE",
+        "GIT_OBJECT_DIRECTORY",
+        "GIT_ALTERNATE_OBJECT_DIRECTORIES",
+        "GIT_SHALLOW_FILE",
+        "GIT_CONFIG",
+    ] {
+        cmd.env_remove(key);
+    }
+    // The backend's temporary directory takes precedence over host TMP/TEMP.
+    let temporary = cmd.get_envs().find_map(|(key, value)| {
+        (key == "TMPDIR")
+            .then_some(value)
+            .flatten()
+            .map(std::ffi::OsStr::to_os_string)
+    });
+    if let Some(temporary) = temporary {
+        cmd.env("TMP", &temporary).env("TEMP", temporary);
+    }
+    cmd.env("GIT_TERMINAL_PROMPT", "0")
+        .env("GIT_OPTIONAL_LOCKS", "0")
+        .args([
+            "-c",
+            "core.hooksPath=/dev/null",
+            "-c",
+            "core.fsmonitor=false",
+            "-c",
+            "protocol.ext.allow=never",
+            "-c",
+            "core.autocrlf=false",
+        ])
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
-    if let Some(dir) = cwd {
-        cmd.current_dir(dir);
-    }
+}
+
+fn git_command(args: &[&str], cwd: &Path, staging: &Staging) -> Command {
+    let mut cmd = staging.volume().git_command();
+    configure_git(&mut cmd);
+    cmd.args(["-C"])
+        .arg(cwd)
+        .args(args)
+        .current_dir(&staging.directory)
+        .env("GIT_CEILING_DIRECTORIES", &staging.directory);
     cmd
 }
 
@@ -232,8 +463,13 @@ fn git_failure(args: &[&str], output: &std::process::Output) -> anyhow::Error {
     .into()
 }
 
-fn run_git(args: &[&str], cwd: Option<&Path>, budget: super::execution::Budget) -> Result<String> {
-    let mut cmd = git_command(args, cwd);
+fn run_git(
+    args: &[&str],
+    cwd: &Path,
+    staging: &Staging,
+    budget: super::execution::Budget,
+) -> Result<String> {
+    let mut cmd = git_command(args, cwd, staging);
     let output = budget
         .run(&mut cmd)
         .context("failed to run git (is it installed and on PATH?)")?;
@@ -246,10 +482,11 @@ fn run_git(args: &[&str], cwd: Option<&Path>, budget: super::execution::Budget) 
 /// Clone and checkout stdout is progress noise that no caller reads.
 fn run_git_discarding_stdout(
     args: &[&str],
-    cwd: Option<&Path>,
+    cwd: &Path,
+    staging: &Staging,
     budget: super::execution::Budget,
 ) -> Result<()> {
-    let mut cmd = git_command(args, cwd);
+    let mut cmd = git_command(args, cwd, staging);
     let output = budget
         .run_discarding_stdout(&mut cmd)
         .context("failed to run git (is it installed and on PATH?)")?;
@@ -265,14 +502,55 @@ pub fn ls_remote(url: &str, reference: Option<&str>) -> Result<String> {
             return Ok(r.to_ascii_lowercase());
         }
     }
-    let target = reference.unwrap_or("HEAD");
-    let peeled = format!("{target}^{{}}");
-    let out = run_git(
-        &["ls-remote", url, target, &peeled],
-        None,
-        super::execution::Budget::new(),
-    )?;
-    parse_ls_remote(&out, target)
+    ls_remote_with_operation(url, reference, super::install::begin_operation()?)
+}
+
+pub(super) fn ls_remote_with_operation(
+    url: &str,
+    reference: Option<&str>,
+    operation: Arc<crate::session::StorageFlock>,
+) -> Result<String> {
+    // Credential helpers and trusted transport configuration can write, even
+    // for a reference listing. Give them the same filesystem and exclusion.
+    let operation = Some(operation);
+    let acquisition =
+        super::execution::catch_panic(|| Staging::create(&super::plugins_dir()?, STAGING_LIMIT));
+    let staging = match acquisition {
+        Ok(staging) => staging,
+        Err(error) => {
+            if error
+                .downcast_ref::<super::execution::RecoveryRequired>()
+                .is_some()
+            {
+                let result = Err(error);
+                super::install::log_recovery::<String>(&result);
+                std::mem::forget(operation);
+                return result;
+            }
+            return Err(error);
+        }
+    };
+    let result = super::execution::catch_panic(|| {
+        let target = reference.unwrap_or("HEAD");
+        let peeled = format!("{target}^{{}}");
+        let mut command = git_command(
+            &["ls-remote", "--", url, target, &peeled],
+            &staging.mount,
+            &staging,
+        );
+        let output = super::execution::Budget::new().run(&mut command)?;
+        if !output.status.success() {
+            return Err(git_failure(&["ls-remote"], &output));
+        }
+        parse_ls_remote(&String::from_utf8_lossy(&output.stdout), target)
+    });
+    if super::execution::needs_recovery(&result) {
+        super::install::log_recovery(&result);
+        std::mem::forget((staging, operation));
+    } else {
+        cleanup_staging(staging, operation)?;
+    }
+    result.map_err(|error| staging_limit_error(error, STAGING_LIMIT))
 }
 
 pub async fn latest_release_tag(owner: &str, repo: &str) -> Result<Option<String>> {
@@ -292,24 +570,28 @@ fn is_full_commit_sha(s: &str) -> bool {
     s.len() == 40 && s.bytes().all(|b| b.is_ascii_hexdigit())
 }
 
-/// Prefers an annotated tag's peeled `^{}` commit, which is what the install checks out (#2646).
+/// Match clone --branch precedence, peeling annotated tags only when no branch wins.
 fn parse_ls_remote(out: &str, target: &str) -> Result<String> {
     let mut first = None;
+    let mut peeled = None;
+    let prefer_branch = !target.starts_with("refs/") || target.starts_with("refs/heads/");
+    let branch = target.strip_prefix("refs/heads/").unwrap_or(target);
     for line in out.lines() {
         let Some((sha, name)) = line.split_once('\t') else {
             continue;
         };
-        if name.ends_with("^{}") {
-            return Ok(sha.trim().to_string());
+        if prefer_branch && name.strip_prefix("refs/heads/") == Some(branch) {
+            return Ok(sha.trim().to_owned());
         }
-        first.get_or_insert_with(|| sha.trim().to_string());
+        if name.ends_with("^{}") {
+            peeled.get_or_insert(sha.trim());
+        }
+        first.get_or_insert(sha.trim());
     }
-    first.ok_or_else(|| anyhow!("ref {target:?} not found on the remote"))
-}
-
-fn path_arg(path: &Path) -> Result<&str> {
-    path.to_str()
-        .ok_or_else(|| anyhow!("non-UTF-8 path: {}", path.display()))
+    peeled
+        .or(first)
+        .map(str::to_owned)
+        .ok_or_else(|| anyhow!("ref {target:?} not found on the remote"))
 }
 
 /// `core.autocrlf=false` keeps the checkout byte-identical so tree hashes match across platforms.
@@ -317,70 +599,75 @@ fn git_clone_checkout(
     url: &str,
     reference: Option<&str>,
     dest: &Path,
+    staging: &Staging,
     budget: super::execution::Budget,
 ) -> Result<String> {
-    let dest_str = path_arg(dest)?;
-
-    let shallow = match reference {
-        Some(reference) => run_git_discarding_stdout(
-            &[
-                "-c",
-                "core.autocrlf=false",
-                "clone",
-                "--depth",
-                "1",
-                "--branch",
-                reference,
-                "--",
-                url,
-                dest_str,
-            ],
-            None,
-            budget,
-        ),
-        None => run_git_discarding_stdout(
-            &[
-                "-c",
-                "core.autocrlf=false",
-                "clone",
-                "--depth",
-                "1",
-                "--",
-                url,
-                dest_str,
-            ],
-            None,
-            budget,
-        ),
-    };
-
-    if let Err(error) = shallow {
-        if error.downcast_ref::<GitFailed>().is_none() {
-            return Err(error);
-        }
-        let _ = std::fs::remove_dir_all(dest);
-        run_git_discarding_stdout(
-            &["-c", "core.autocrlf=false", "clone", "--", url, dest_str],
-            None,
-            budget,
-        )?;
-        if let Some(reference) = reference {
-            run_git_discarding_stdout(
-                &[
-                    "-c",
-                    "advice.detachedHead=false",
-                    "checkout",
-                    reference,
-                    "--",
-                ],
-                Some(dest),
-                budget,
-            )?;
-        }
+    // Git runs inside the volume's namespace. Never hand it the parent's /proc root.
+    let native_tree = staging.mount.join("tree");
+    // A full clone supports tags and commit IDs without retrying a quota failure.
+    let mut clone = git_command(
+        &["clone", "--no-checkout", "--", url],
+        &staging.mount,
+        staging,
+    );
+    clone.arg(&native_tree);
+    let output = budget.run_discarding_stdout(&mut clone)?;
+    if !output.status.success() {
+        return Err(git_failure(&["clone"], &output));
     }
-
-    let sha = run_git(&["rev-parse", "HEAD"], Some(dest), budget)?;
-    let _ = std::fs::remove_dir_all(dest.join(".git"));
+    let requested = reference.unwrap_or("HEAD");
+    // Match clone --branch: a short branch name wins over a homonymous tag.
+    // Explicit refs keep their namespace; remote branches have no local head
+    // after --no-checkout except for the repository's default branch.
+    let revision = match reference {
+        Some(reference) if reference.starts_with("refs/heads/") => {
+            format!(
+                "refs/remotes/origin/{}^{{commit}}",
+                &reference["refs/heads/".len()..]
+            )
+        }
+        Some(reference) if !reference.starts_with("refs/") => {
+            format!("refs/remotes/origin/{reference}^{{commit}}")
+        }
+        _ => format!("{requested}^{{commit}}"),
+    };
+    let resolved = run_git(
+        &["rev-parse", "--verify", "--end-of-options", &revision],
+        &native_tree,
+        staging,
+        budget,
+    );
+    let commit = match resolved {
+        Ok(commit) => commit,
+        Err(error)
+            if reference.is_some_and(|reference| !reference.starts_with("refs/"))
+                && error.downcast_ref::<GitFailed>().is_some() =>
+        {
+            let revision = format!("{requested}^{{commit}}");
+            run_git(
+                &["rev-parse", "--verify", "--end-of-options", &revision],
+                &native_tree,
+                staging,
+                budget,
+            )?
+        }
+        Err(error) => return Err(error),
+    };
+    run_git_discarding_stdout(
+        &[
+            "-c",
+            "advice.detachedHead=false",
+            "checkout",
+            "--detach",
+            &commit,
+            "--",
+        ],
+        &native_tree,
+        staging,
+        budget,
+    )?;
+    let sha = run_git(&["rev-parse", "HEAD"], &native_tree, staging, budget)?;
+    std::fs::remove_dir_all(dest.join(".git")).context("removing staged Git metadata")?;
     Ok(sha)
 }
 
@@ -390,13 +677,38 @@ fn copy_tree(src: &Path, dst: &Path) -> Result<()> {
     let root = std::fs::canonicalize(src)
         .with_context(|| format!("resolving plugin source {}", src.display()))?;
     let source = crate::session::AnchoredDir::open(&root)?;
-    copy_anchored_tree(&source, dst)
+    let mut budget = CopyBudget {
+        bytes: STAGING_LIMIT,
+        entries: STAGING_ENTRY_LIMIT,
+    };
+    copy_anchored_tree(&source, dst, &mut budget)
 }
 
-fn copy_anchored_tree(source: &crate::session::AnchoredDir, dst: &Path) -> Result<()> {
+struct CopyBudget {
+    bytes: u64,
+    entries: usize,
+}
+
+fn copy_anchored_tree(
+    source: &crate::session::AnchoredDir,
+    dst: &Path,
+    budget: &mut CopyBudget,
+) -> Result<()> {
     use std::os::unix::fs::MetadataExt;
+    let metadata = std::fs::metadata(source.path())?;
+    let (device, inode) = source.identity()?;
+    let device: u64 = device as _;
+    let inode: u64 = inode as _;
+    if device != metadata.dev() || inode != metadata.ino() {
+        bail!("plugin source directory changed while staging");
+    }
     std::fs::create_dir_all(dst).with_context(|| format!("creating {}", dst.display()))?;
-    for name in source.read_dir_complete(Path::new(""), usize::MAX)? {
+    let names = source.read_dir_complete(Path::new(""), budget.entries.saturating_add(1))?;
+    if names.len() > budget.entries {
+        bail!("plugin staging entry budget exceeded");
+    }
+    budget.entries -= names.len();
+    for name in names {
         if name == ".git" {
             continue;
         }
@@ -421,7 +733,7 @@ fn copy_anchored_tree(source: &crate::session::AnchoredDir, dst: &Path) -> Resul
                         from.display()
                     );
                 }
-                copy_anchored_tree(&child, &to)?;
+                copy_anchored_tree(&child, &to, budget)?;
             }
             libc::S_IFREG => {
                 let mut input = source.open_regular(leaf, usize::MAX)?.ok_or_else(|| {
@@ -439,9 +751,15 @@ fn copy_anchored_tree(source: &crate::session::AnchoredDir, dst: &Path) -> Resul
                         from.display()
                     );
                 }
+                #[cfg(test)]
+                test_gate::reach(&from, "copy-content");
                 let mut output = std::fs::File::create(&to)?;
-                std::io::copy(&mut input, &mut output)
+                let copied = std::io::copy(&mut (&mut input).take(budget.bytes), &mut output)
                     .with_context(|| format!("copying {} to {}", from.display(), to.display()))?;
+                budget.bytes -= copied;
+                if budget.bytes == 0 && input.read(&mut [0])? != 0 {
+                    bail!("plugin staging budget exceeded");
+                }
                 output.set_permissions(metadata.permissions())?;
             }
             _ => bail!(
@@ -450,7 +768,104 @@ fn copy_anchored_tree(source: &crate::session::AnchoredDir, dst: &Path) -> Resul
             ),
         }
     }
+    std::fs::set_permissions(dst, metadata.permissions())?;
     Ok(())
+}
+
+/// Publication proof covers every path, directory, permission bit and file byte.
+/// The consent tree hash deliberately remains the pre-extraction source hash.
+fn complete_tree_hash(tree: &Path) -> Result<String> {
+    use sha2::{Digest, Sha256};
+    use std::os::unix::ffi::OsStrExt;
+    use std::os::unix::fs::MetadataExt;
+    fn visit(
+        root: &crate::session::AnchoredDir,
+        digest: &mut Sha256,
+        budget: &mut CopyBudget,
+        buffer: &mut [u8; 64 * 1024],
+    ) -> Result<()> {
+        let metadata = std::fs::metadata(root.path())?;
+        let (device, inode) = root.identity()?;
+        let device: u64 = device as _;
+        let inode: u64 = inode as _;
+        if device != metadata.dev() || inode != metadata.ino() {
+            bail!("plugin publication directory changed");
+        }
+        digest.update((metadata.mode() & 0o7777).to_le_bytes());
+        let mut names = root.read_dir_complete(Path::new(""), budget.entries.saturating_add(1))?;
+        if names.len() > budget.entries {
+            bail!("plugin staging entry budget exceeded");
+        }
+        budget.entries -= names.len();
+        names.sort_unstable();
+        digest.update((names.len() as u64).to_le_bytes());
+        for name in names {
+            let leaf = Path::new(&name);
+            let stat = root
+                .entry_stat(leaf)?
+                .context("plugin publication entry disappeared")?;
+            let bytes = name.as_os_str().as_bytes();
+            digest.update((bytes.len() as u64).to_le_bytes());
+            digest.update(bytes);
+            match stat.st_mode & libc::S_IFMT {
+                libc::S_IFDIR => {
+                    digest.update(b"d");
+                    let child = root.child(leaf)?;
+                    if child.identity()? != (stat.st_dev, stat.st_ino) {
+                        bail!("plugin publication directory changed");
+                    }
+                    visit(&child, digest, budget, buffer)?;
+                }
+                libc::S_IFREG => {
+                    digest.update(b"f");
+                    let mut file = root
+                        .open_regular(leaf, usize::MAX)?
+                        .context("plugin publication file changed")?;
+                    let metadata = file.metadata()?;
+                    let device: u64 = stat.st_dev as _;
+                    let inode: u64 = stat.st_ino as _;
+                    if metadata.dev() != device || metadata.ino() != inode {
+                        bail!("plugin publication file changed");
+                    }
+                    digest.update((metadata.mode() & 0o7777).to_le_bytes());
+                    digest.update(metadata.len().to_le_bytes());
+                    let mut remaining = metadata.len();
+                    loop {
+                        let count = file.read(buffer)?;
+                        if count == 0 {
+                            break;
+                        }
+                        let count_bytes = count as u64;
+                        budget.bytes = budget
+                            .bytes
+                            .checked_sub(count_bytes)
+                            .context("plugin staging budget exceeded")?;
+                        remaining = remaining
+                            .checked_sub(count_bytes)
+                            .context("plugin publication file grew")?;
+                        digest.update(&buffer[..count]);
+                    }
+                    if remaining != 0 {
+                        bail!("plugin publication file shrank");
+                    }
+                }
+                _ => bail!("plugin publication contains a symlink or special file"),
+            }
+        }
+        Ok(())
+    }
+    let root = crate::session::AnchoredDir::open(tree)?;
+    let mut digest = Sha256::new();
+    visit(
+        &root,
+        &mut digest,
+        &mut CopyBudget {
+            bytes: STAGING_LIMIT,
+            entries: STAGING_ENTRY_LIMIT,
+        },
+        &mut [0u8; 64 * 1024],
+    )?;
+    Ok(sha256_label(&digest.finalize()))
 }
 
 pub(super) fn github_api_base() -> String {
@@ -462,6 +877,10 @@ async fn download_release_binary(
     fetched: FetchedPlugin,
     operation: Option<Arc<crate::session::StorageFlock>>,
 ) -> Result<FetchedPlugin> {
+    let mut fetched = fetched;
+    // A cancelled Tokio file write can outlive its future. Until flush returns,
+    // cancellation must retain the mount and its mutation lock, not clean them.
+    fetched.cleanup_safe = false;
     let download = async {
         let (owner, repo) = match &fetched.source {
             PluginSource::Github { owner, repo, .. } => (owner.as_str(), repo.as_str()),
@@ -510,7 +929,7 @@ async fn download_release_binary(
             .parent()
             .ok_or_else(|| anyhow!("plugin staging tree has no parent directory"))?;
         let asset_path = staging.join(".asset-download");
-        download_asset(&asset.browser_download_url, &asset_path).await?;
+        download_asset(&asset.browser_download_url, &asset_path, STAGING_LIMIT).await?;
         Ok::<_, anyhow::Error>((
             asset_path.to_path_buf(),
             asset.name.clone(),
@@ -519,11 +938,12 @@ async fn download_release_binary(
         ))
     }
     .await;
+    fetched.cleanup_safe = true;
     let (asset_path, name, tag, bin) = match download {
         Ok(download) => download,
         Err(error) => {
             fetched.cleanup().await?;
-            return Err(error);
+            return Err(staging_limit_error(error, STAGING_LIMIT));
         }
     };
     tokio::task::spawn_blocking(move || {
@@ -531,9 +951,14 @@ async fn download_release_binary(
         let mut fetched = fetched;
         let result = super::execution::catch_panic(|| {
             #[cfg(test)]
-            test_gate::reach(&fetched.tree, "asset");
+            test_gate::reach_observed(
+                &fetched.staging.as_ref().expect("staged asset").directory,
+                &fetched.tree,
+                "asset",
+            );
             let sha = sha256_file(&asset_path)?;
             install_asset_into(&fetched.tree, &name, bin.as_deref(), &asset_path)?;
+            fetched.publication_hash = complete_tree_hash(&fetched.tree)?;
             fetched.release_tag = Some(tag);
             fetched.asset_name = Some(name);
             fetched.asset_sha256 = Some(sha);
@@ -542,6 +967,7 @@ async fn download_release_binary(
         match result {
             Ok(()) => Ok(fetched),
             Err(error) => {
+                let error = staging_limit_error(error, STAGING_LIMIT);
                 if error
                     .downcast_ref::<super::execution::RecoveryRequired>()
                     .is_some()
@@ -552,7 +978,7 @@ async fn download_release_binary(
                     std::mem::forget(_operation);
                     result
                 } else {
-                    fetched.close();
+                    fetched.close()?;
                     Err(error)
                 }
             }
@@ -593,7 +1019,7 @@ pub(super) fn render_asset_template<'a>(
     }
 }
 
-async fn download_asset(url: &str, dest: &Path) -> Result<()> {
+async fn download_asset(url: &str, dest: &Path, limit: u64) -> Result<()> {
     use tokio::io::AsyncWriteExt;
     let client = reqwest::Client::builder()
         .user_agent(DEFAULT_USER_AGENT)
@@ -608,7 +1034,13 @@ async fn download_asset(url: &str, dest: &Path) -> Result<()> {
         .await
         .with_context(|| format!("creating {}", dest.display()))?;
     let result: Result<()> = async {
+        let mut remaining = limit;
         while let Some(chunk) = response.chunk().await? {
+            let len = u64::try_from(chunk.len()).context("asset chunk size exceeds u64")?;
+            if len > remaining {
+                bail!("plugin staging budget exceeded");
+            }
+            remaining -= len;
             file.write_all(&chunk)
                 .await
                 .with_context(|| format!("writing {url} to {}", dest.display()))?;
@@ -669,14 +1101,24 @@ fn install_asset_into(
         let source =
             std::fs::File::open(asset).with_context(|| format!("opening {}", asset.display()))?;
         let bin_rel = checked_asset_path(Path::new(bin_rel))?;
-        extract_asset_archive(tree, asset_name, source, Some(&bin_rel))?;
+        match std::fs::symlink_metadata(tree.join(&bin_rel)) {
+            Ok(_) => bail!(
+                "release asset {asset_name:?} would replace the plugin source entry {}",
+                tree.join(&bin_rel).display()
+            ),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error).context("checking release binary source path"),
+        }
+        extract_asset_archive(tree, asset_name, source, Some(&bin_rel), STAGING_LIMIT)?;
         ensure_executable(tree, &bin_rel)
     } else {
         let name = checked_asset_path(Path::new(bin.unwrap_or(asset_name)))?;
         let root = crate::session::AnchoredDir::open(tree)?;
+        let mut remaining = remaining_tree_entries(&root, STAGING_ENTRY_LIMIT)?;
         if let Some(parent) = name.parent().filter(|p| !p.as_os_str().is_empty()) {
-            root.ensure_dir(parent)?;
+            ensure_asset_directories(&root, parent, &mut remaining)?;
         }
+        take_entry(&mut remaining)?;
         let Some(mut output) = root.create_new_regular(&name)? else {
             bail!(
                 "release asset {asset_name:?} would replace the plugin source file {}",
@@ -691,6 +1133,97 @@ fn install_asset_into(
     }
 }
 
+const STAGING_LIMIT: u64 = 1024 * 1024 * 1024;
+const STAGING_ENTRY_LIMIT: usize = 65_536;
+const ARCHIVE_METADATA_LIMIT: u64 = 1024 * 1024;
+
+fn take_entry(remaining: &mut usize) -> Result<()> {
+    *remaining = remaining
+        .checked_sub(1)
+        .context("plugin staging entry budget exceeded")?;
+    Ok(())
+}
+
+fn remaining_tree_entries(
+    root: &crate::session::AnchoredDir,
+    mut remaining: usize,
+) -> Result<usize> {
+    fn count(root: &crate::session::AnchoredDir, remaining: &mut usize) -> Result<()> {
+        let names = root.read_dir_complete(Path::new(""), remaining.saturating_add(1))?;
+        if names.len() > *remaining {
+            bail!("plugin staging entry budget exceeded");
+        }
+        *remaining -= names.len();
+        for name in names {
+            let leaf = Path::new(&name);
+            let stat = root
+                .entry_stat(leaf)?
+                .context("plugin staging entry disappeared")?;
+            if stat.st_mode & libc::S_IFMT == libc::S_IFDIR {
+                count(&root.child(leaf)?, remaining)?;
+            }
+        }
+        Ok(())
+    }
+    count(root, &mut remaining)?;
+    Ok(remaining)
+}
+
+fn ensure_asset_directories(
+    root: &crate::session::AnchoredDir,
+    relative: &Path,
+    remaining: &mut usize,
+) -> Result<()> {
+    let mut current = root.child(Path::new(""))?;
+    for component in relative.components() {
+        let std::path::Component::Normal(name) = component else {
+            bail!("asset directory path is not normalized");
+        };
+        let leaf = Path::new(name);
+        if current.entry_stat(leaf)?.is_none() {
+            take_entry(remaining)?;
+            current.ensure_dir(leaf)?;
+        }
+        current = current.child(leaf)?;
+    }
+    Ok(())
+}
+
+struct BoundedReader<'a, R> {
+    inner: R,
+    remaining: u64,
+    metadata_remaining: &'a std::cell::Cell<Option<u64>>,
+}
+
+impl<R: Read> Read for BoundedReader<'_, R> {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        if buf.is_empty() {
+            return Ok(0);
+        }
+        let metadata = self.metadata_remaining.get();
+        let remaining = self.remaining.min(metadata.unwrap_or(u64::MAX));
+        if remaining == 0 {
+            let mut extra = [0];
+            return match self.inner.read(&mut extra)? {
+                0 => Ok(0),
+                _ if self.remaining == 0 => {
+                    Err(std::io::Error::other("plugin staging budget exceeded"))
+                }
+                _ => Err(std::io::Error::other(
+                    "plugin archive metadata budget exceeded",
+                )),
+            };
+        }
+        let limit = remaining.min(buf.len() as u64) as usize;
+        let read = self.inner.read(&mut buf[..limit])?;
+        self.remaining -= read as u64;
+        if let Some(metadata) = metadata {
+            self.metadata_remaining.set(Some(metadata - read as u64));
+        }
+        Ok(read)
+    }
+}
+
 /// Assets may only add files: a replacement would change the manifest or tree
 /// after the consent fingerprint was computed over the source snapshot.
 fn extract_asset_archive(
@@ -698,17 +1231,57 @@ fn extract_asset_archive(
     asset_name: &str,
     source: std::fs::File,
     executable: Option<&Path>,
+    limit: u64,
+) -> Result<()> {
+    extract_asset_archive_with_limits(
+        tree,
+        asset_name,
+        source,
+        executable,
+        limit,
+        STAGING_ENTRY_LIMIT,
+    )
+}
+
+fn extract_asset_archive_with_limits(
+    tree: &Path,
+    asset_name: &str,
+    source: std::fs::File,
+    executable: Option<&Path>,
+    limit: u64,
+    entry_limit: usize,
 ) -> Result<()> {
     let root = crate::session::AnchoredDir::open(tree)?;
-    let decoder = flate2::read::GzDecoder::new(source);
-    for entry in tar::Archive::new(decoder)
+    let mut remaining = remaining_tree_entries(&root, entry_limit)?;
+    let mut headers_remaining = entry_limit;
+    let metadata_remaining = std::cell::Cell::new(None);
+    let decoder = BoundedReader {
+        inner: flate2::read::GzDecoder::new(source),
+        remaining: limit,
+        metadata_remaining: &metadata_remaining,
+    };
+    let mut archive = tar::Archive::new(decoder);
+    let mut entries = archive
         .entries()
-        .with_context(|| format!("unpacking {asset_name}"))?
-    {
+        .with_context(|| format!("unpacking {asset_name}"))?;
+    loop {
+        // Tar reads PAX and GNU metadata before yielding the entry.
+        metadata_remaining.set(Some(ARCHIVE_METADATA_LIMIT));
+        let next = entries.next();
+        metadata_remaining.set(None);
+        let Some(entry) = next else {
+            break;
+        };
+        take_entry(&mut headers_remaining)?;
         let mut entry = entry.with_context(|| format!("unpacking {asset_name}"))?;
         let kind = entry.header().entry_type();
         // A global PAX header describes later entries and names no path.
         if kind == tar::EntryType::XGlobalHeader {
+            if entry.size() > ARCHIVE_METADATA_LIMIT {
+                bail!("plugin archive metadata budget exceeded");
+            }
+            std::io::copy(&mut entry, &mut std::io::sink())
+                .with_context(|| format!("unpacking {asset_name}"))?;
             continue;
         }
         let mode = entry.header().mode().unwrap_or(0o644) & 0o777;
@@ -720,19 +1293,24 @@ fn extract_asset_archive(
         if normalized.as_os_str().is_empty() {
             // `tar -C dist .` stores a "./" entry for the archive root.
             if kind.is_dir() {
+                std::io::copy(&mut entry, &mut std::io::sink())
+                    .with_context(|| format!("unpacking {asset_name}"))?;
                 continue;
             }
             bail!("plugin path {entry_path:?} is empty");
         }
         let rel = checked_asset_path(&normalized)?;
         if kind.is_dir() {
-            root.ensure_dir(&rel)
+            ensure_asset_directories(&root, &rel, &mut remaining)
+                .with_context(|| format!("unpacking {asset_name}"))?;
+            std::io::copy(&mut entry, &mut std::io::sink())
                 .with_context(|| format!("unpacking {asset_name}"))?;
         } else if kind.is_file() {
             if let Some(parent) = rel.parent().filter(|p| !p.as_os_str().is_empty()) {
-                root.ensure_dir(parent)
+                ensure_asset_directories(&root, parent, &mut remaining)
                     .with_context(|| format!("unpacking {asset_name}"))?;
             }
+            take_entry(&mut remaining)?;
             let Some(mut output) = root.create_new_regular(&rel)? else {
                 bail!(
                     "release asset {asset_name:?} would replace the plugin source entry {}",
@@ -818,6 +1396,188 @@ fn ensure_executable(tree: &Path, rel: &Path) -> Result<()> {
 mod tests {
     use super::*;
 
+    fn publication_fixture(tree: PathBuf) -> FetchedPlugin {
+        let (manifest, manifest_bytes) = read_manifest(&tree).unwrap();
+        FetchedPlugin {
+            staging: None,
+            operation: None,
+            cleanup_safe: true,
+            tree_hash: super::super::integrity::tree_hash(&tree).unwrap(),
+            publication_hash: complete_tree_hash(&tree).unwrap(),
+            source: PluginSource::Local(tree.clone()),
+            tree,
+            manifest,
+            manifest_bytes,
+            requested_ref: None,
+            resolved_commit: None,
+            release_tag: None,
+            asset_name: None,
+            asset_sha256: None,
+            budget: super::super::execution::Budget::new(),
+        }
+    }
+
+    fn write_publication_manifest(tree: &Path) {
+        std::fs::create_dir_all(tree).unwrap();
+        std::fs::write(
+            tree.join("aoe-plugin.toml"),
+            "id = \"acme.stage\"\nname = \"Stage\"\nversion = \"1.0.0\"\napi_version = 2\n",
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn publication_copy_covers_directory_modes_and_post_snapshot_assets() {
+        use std::os::unix::fs::PermissionsExt;
+        let fixture = tempfile::tempdir().unwrap();
+        let tree = fixture.path().join("source");
+        write_publication_manifest(&tree);
+        std::fs::create_dir(tree.join("empty")).unwrap();
+        std::fs::set_permissions(tree.join("empty"), std::fs::Permissions::from_mode(0o751))
+            .unwrap();
+        let mut fetched = publication_fixture(tree.clone());
+        let source_hash = fetched.tree_hash.clone();
+        let asset = fixture.path().join("asset");
+        std::fs::write(&asset, b"worker").unwrap();
+        install_asset_into(&tree, "worker", Some("bin/worker"), &asset).unwrap();
+        fetched.publication_hash = complete_tree_hash(&tree).unwrap();
+        let destination = fixture.path().join("published");
+        fetched.copy_for_publication(&destination).unwrap();
+        assert_eq!(fetched.tree_hash, source_hash);
+        assert_eq!(
+            std::fs::read(destination.join("bin/worker")).unwrap(),
+            b"worker"
+        );
+        assert_eq!(
+            std::fs::metadata(destination.join("empty"))
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o7777,
+            0o751
+        );
+        assert_eq!(
+            std::fs::metadata(destination.join("bin/worker"))
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o7777,
+            0o755
+        );
+        std::fs::set_permissions(tree.join("empty"), std::fs::Permissions::from_mode(0o750))
+            .unwrap();
+        assert!(fetched
+            .copy_for_publication(&fixture.path().join("changed"))
+            .is_err());
+    }
+
+    #[test]
+    fn archive_binary_must_not_chmod_preexisting_source() {
+        use std::os::unix::fs::PermissionsExt;
+        let fixture = tempfile::tempdir().unwrap();
+        let tree = fixture.path().join("tree");
+        write_publication_manifest(&tree);
+        std::fs::write(tree.join("worker"), b"source").unwrap();
+        std::fs::set_permissions(tree.join("worker"), std::fs::Permissions::from_mode(0o640))
+            .unwrap();
+        let before = complete_tree_hash(&tree).unwrap();
+        let asset = fixture.path().join("archive.tgz");
+        let encoder = flate2::write::GzEncoder::new(
+            std::fs::File::create(&asset).unwrap(),
+            flate2::Compression::default(),
+        );
+        let archive = tar::Builder::new(encoder);
+        archive.into_inner().unwrap().finish().unwrap();
+        let error = install_asset_into(&tree, "archive.tgz", Some("worker"), &asset).unwrap_err();
+        assert!(format!("{error:#}").contains("would replace"));
+        assert_eq!(complete_tree_hash(&tree).unwrap(), before);
+    }
+
+    #[test]
+    fn archive_entry_limit_counts_existing_and_implicit_directories() {
+        let fixture = tempfile::tempdir().unwrap();
+        let tree = fixture.path().join("tree");
+        std::fs::create_dir(&tree).unwrap();
+        std::fs::write(tree.join("source"), b"source").unwrap();
+        let asset = fixture.path().join("archive.tgz");
+        let encoder = flate2::write::GzEncoder::new(
+            std::fs::File::create(&asset).unwrap(),
+            flate2::Compression::default(),
+        );
+        let mut archive = tar::Builder::new(encoder);
+        let mut header = tar::Header::new_gnu();
+        header.set_size(0);
+        header.set_mode(0o644);
+        header.set_cksum();
+        archive
+            .append_data(&mut header, "a/b/worker", std::io::empty())
+            .unwrap();
+        archive.into_inner().unwrap().finish().unwrap();
+        let error = extract_asset_archive_with_limits(
+            &tree,
+            "archive.tgz",
+            std::fs::File::open(asset).unwrap(),
+            None,
+            1024 * 1024,
+            3,
+        )
+        .unwrap_err();
+        assert!(format!("{error:#}").contains("entry budget exceeded"));
+        assert!(tree.join("a/b").is_dir());
+        assert!(!tree.join("a/b/worker").exists());
+        assert_eq!(std::fs::read(tree.join("source")).unwrap(), b"source");
+    }
+
+    #[test]
+    #[cfg_attr(
+        target_os = "linux",
+        ignore = "requires private user/mount namespaces and bubblewrap"
+    )]
+    fn staging_volume_high_ratio_archive_hits_filesystem_limit_and_cleans() {
+        let fixture = tempfile::tempdir().unwrap();
+        let source = fixture.path().join("source");
+        write_publication_manifest(&source);
+        let plugins = fixture.path().join("plugins");
+        let fetched = stage_with_limit(
+            PluginSource::Local(source),
+            plugins.clone(),
+            None,
+            32 * 1024 * 1024,
+        )
+        .unwrap();
+        let asset = fetched.tree.parent().unwrap().join("archive.tgz");
+        let encoder = flate2::write::GzEncoder::new(
+            std::fs::File::create(&asset).unwrap(),
+            flate2::Compression::default(),
+        );
+        let mut archive = tar::Builder::new(encoder);
+        let mut header = tar::Header::new_gnu();
+        header.set_size(64 * 1024 * 1024);
+        header.set_mode(0o755);
+        header.set_cksum();
+        archive
+            .append_data(
+                &mut header,
+                "worker",
+                std::io::repeat(0).take(64 * 1024 * 1024),
+            )
+            .unwrap();
+        archive.into_inner().unwrap().finish().unwrap();
+        assert!(std::fs::metadata(&asset).unwrap().len() < 1024 * 1024);
+        let error =
+            install_asset_into(&fetched.tree, "archive.tgz", Some("worker"), &asset).unwrap_err();
+        assert!(
+            format!("{:#}", staging_limit_error(error, 32 * 1024 * 1024))
+                .contains("filesystem limit")
+        );
+        fetched.close().unwrap();
+        assert!(!fixture
+            .path()
+            .join(super::super::install::STAGING_MARKER)
+            .exists());
+        assert_eq!(std::fs::read_dir(plugins).unwrap().count(), 0);
+    }
+
     #[tokio::test]
     async fn asset_task_panics_reach_the_job_panic_boundary() {
         use futures_util::FutureExt;
@@ -838,6 +1598,18 @@ mod tests {
             parse_ls_remote(peeled, "v1").unwrap(),
             "2222222222222222222222222222222222222222"
         );
+        let homonymous =
+            format!("{peeled}\n3333333333333333333333333333333333333333\trefs/heads/v1");
+        for target in ["v1", "refs/heads/v1"] {
+            assert_eq!(
+                parse_ls_remote(&homonymous, target).unwrap(),
+                "3333333333333333333333333333333333333333"
+            );
+        }
+        assert_eq!(
+            parse_ls_remote(&homonymous, "refs/tags/v1").unwrap(),
+            "2222222222222222222222222222222222222222"
+        );
         assert_eq!(
             parse_ls_remote("3333333333333333333333333333333333333333\tHEAD", "HEAD").unwrap(),
             "3333333333333333333333333333333333333333"
@@ -849,9 +1621,11 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::serial]
     fn ls_remote_peels_annotated_tag_to_commit() {
         use crate::git::test_support::run_git;
 
+        let _home = crate::session::test_support::isolate_app_dir();
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path();
         run_git(path, &["init", "-q"]);
@@ -874,6 +1648,166 @@ mod tests {
             "ls_remote should return the peeled commit, not the tag object"
         );
         assert_ne!(resolved, tag_object);
+    }
+
+    #[test]
+    #[serial_test::serial]
+    #[cfg_attr(
+        target_os = "linux",
+        ignore = "requires private user/mount namespaces and bubblewrap"
+    )]
+    fn staging_volume_secondary_branch_preserves_trusted_user_git_configuration() {
+        use crate::git::test_support::run_git;
+        use crate::session::test_support::{isolate_app_dir, EnvGuard};
+        let _home = isolate_app_dir();
+        let fixture = tempfile::tempdir().unwrap();
+        let repo = fixture.path().join("repository");
+        write_publication_manifest(&repo);
+        run_git(&repo, &["init", "-q"]);
+        run_git(&repo, &["add", "."]);
+        run_git(&repo, &["commit", "-qm", "default"]);
+        run_git(&repo, &["checkout", "-qb", "feature/review"]);
+        std::fs::write(repo.join("branch"), b"secondary").unwrap();
+        run_git(&repo, &["add", "."]);
+        run_git(&repo, &["commit", "-qm", "secondary"]);
+        let commit = run_git(&repo, &["rev-parse", "HEAD"]).trim().to_owned();
+        run_git(&repo, &["tag", "-a", "release", "-m", "release"]);
+        run_git(&repo, &["checkout", "-q", "-"]);
+        let tag_commit = run_git(&repo, &["rev-parse", "HEAD"]).trim().to_owned();
+        assert_ne!(tag_commit, commit);
+        run_git(
+            &repo,
+            &["tag", "-a", "feature/review", "-m", "homonymous tag"],
+        );
+        let global = fixture.path().join("gitconfig");
+        let rewrite = format!("url.file://{}.insteadOf", repo.display());
+        let url = "https://plugin-fixture.invalid/repository";
+        run_git(
+            &repo,
+            &["config", "--file", global.to_str().unwrap(), &rewrite, url],
+        );
+        run_git(
+            &repo,
+            &[
+                "config",
+                "--file",
+                global.to_str().unwrap(),
+                "http.extraHeader",
+                "X-AOE-Fixture: preserved",
+            ],
+        );
+        run_git(
+            &repo,
+            &[
+                "config",
+                "--file",
+                global.to_str().unwrap(),
+                "credential.helper",
+                "!printf trusted-helper",
+            ],
+        );
+        let _configuration = EnvGuard::set(&[
+            ("GIT_CONFIG_GLOBAL", global.to_str().unwrap()),
+            ("GIT_CONFIG_NOSYSTEM", "1"),
+        ]);
+        assert_eq!(ls_remote(url, Some("feature/review")).unwrap(), commit);
+        let operation = super::super::install::begin_operation().unwrap();
+        assert_eq!(
+            ls_remote_with_operation(url, Some("feature/review"), operation.clone()).unwrap(),
+            commit
+        );
+        let mut staging =
+            Staging::create(&crate::plugin::plugins_dir().unwrap(), 16 * 1024 * 1024).unwrap();
+        let budget = super::super::execution::Budget::new();
+        assert_eq!(
+            super::run_git(
+                &["config", "--get", "http.extraHeader"],
+                &staging.mount,
+                &staging,
+                budget
+            )
+            .unwrap(),
+            "X-AOE-Fixture: preserved"
+        );
+        assert_eq!(
+            super::run_git(
+                &["config", "--get", "credential.helper"],
+                &staging.mount,
+                &staging,
+                budget
+            )
+            .unwrap(),
+            "!printf trusted-helper"
+        );
+        let tree = staging.volume().root().join("tree");
+        for reference in [
+            "feature/review",
+            "refs/heads/feature/review",
+            "release",
+            "refs/tags/release",
+            commit.as_str(),
+        ] {
+            assert_eq!(
+                git_clone_checkout(url, Some(reference), &tree, &staging, budget).unwrap(),
+                commit
+            );
+            assert_eq!(std::fs::read(tree.join("branch")).unwrap(), b"secondary");
+            std::fs::remove_dir_all(&tree).unwrap();
+        }
+        assert_eq!(
+            git_clone_checkout(
+                url,
+                Some("refs/tags/feature/review"),
+                &tree,
+                &staging,
+                budget
+            )
+            .unwrap(),
+            tag_commit
+        );
+        assert!(!tree.join("branch").exists());
+        std::fs::remove_dir_all(&tree).unwrap();
+        staging.close().unwrap();
+        drop(operation);
+        assert!(super::super::install::begin_operation().is_ok());
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn safe_acquisition_failure_keeps_live_marker_until_proven_cleanup() {
+        let _home = crate::session::test_support::isolate_app_dir();
+        let source = tempfile::tempdir().unwrap();
+        write_publication_manifest(source.path());
+        let operation = super::super::install::begin_operation().unwrap();
+        let root = crate::session::get_app_dir().unwrap();
+        let mut gate = test_gate::install(&root, "staging-acquisition");
+        let plugins = crate::plugin::plugins_dir().unwrap();
+        let input = source.path().to_owned();
+        let task_operation = operation.clone();
+        let task = tokio::task::spawn_blocking(move || {
+            let _operation = task_operation;
+            stage_with_limit(PluginSource::Local(input), plugins, None, 0)
+        });
+        tokio::time::timeout(Duration::from_secs(5), &mut gate.entered)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(root.join(super::super::install::STAGING_MARKER).is_file());
+        assert!(super::super::install::check_recovery_evidence().is_ok());
+        assert!(super::super::install::begin_operation().is_err());
+        gate.release();
+        let result = task.await.unwrap();
+        assert!(result.is_err());
+        assert!(!super::super::execution::needs_recovery(&result));
+        drop(operation);
+        assert!(!root.join(super::super::install::STAGING_MARKER).exists());
+        assert_eq!(
+            std::fs::read_dir(crate::plugin::plugins_dir().unwrap())
+                .unwrap()
+                .count(),
+            0
+        );
+        assert!(super::super::install::begin_operation().is_ok());
     }
 
     #[test]
@@ -1187,11 +2121,12 @@ mod tests {
             std::fs::read(fetched.tree.join("worker")).unwrap(),
             *bytes.lock().unwrap()
         );
+        let source_hash = fetched.tree_hash.clone();
+        fetched.cleanup().await.unwrap();
         let before_injection =
             stage(source.clone(), plugins.clone(), source.github_clone_url()).unwrap();
-        assert_eq!(fetched.tree_hash, before_injection.tree_hash);
+        assert_eq!(source_hash, before_injection.tree_hash);
         before_injection.cleanup().await.unwrap();
-        fetched.cleanup().await.unwrap();
         let consent = crate::plugin::install::preview_install("gh:acme/bin@v1", false)
             .await
             .unwrap();
@@ -1236,7 +2171,31 @@ mod tests {
 
     #[tokio::test]
     #[serial_test::serial]
-    async fn git_budget_exhaustion_never_falls_back_but_checkout_failure_does() {
+    async fn git_budget_and_clone_failure_never_retry() {
+        const CHILD: &str = "_AOE_INTERNAL_GIT_BUDGET_TEST_CHILD";
+        if std::env::var_os(CHILD).is_none() {
+            let output = Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "plugin::fetch::tests::git_budget_and_clone_failure_never_retry",
+                    "--nocapture",
+                ])
+                .env(CHILD, "1")
+                .output()
+                .unwrap();
+            let ran_one = output
+                .stdout
+                .windows(b"running 1 test".len())
+                .any(|window| window == b"running 1 test");
+            assert!(
+                output.status.success() && ran_one,
+                "isolated Git budget test failed:\n{}\n{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            return;
+        }
+
         use std::os::unix::fs::PermissionsExt;
         use std::sync::atomic::{AtomicBool, Ordering};
         static EXPIRED: AtomicBool = AtomicBool::new(false);
@@ -1250,23 +2209,27 @@ mod tests {
         let _expire = ExpireOnDrop;
         let fixture = tempfile::tempdir().unwrap();
         let git = fixture.path().join("git");
-        let calls = fixture.path().join("calls");
-        let ready = fixture.path().join("ready");
+        let staging = Staging::create(&fixture.path().join("plugins"), 16 * 1024 * 1024).unwrap();
+        let calls = staging.volume().root().join("calls");
+        let ready = staging.volume().root().join("ready");
+        let native_calls = staging.mount.join("calls");
+        let native_ready = staging.mount.join("ready");
         std::fs::write(
             &git,
             format!(
                 "#!/bin/sh\nprintf 'call\\n' >> '{}'\n: > '{}'\nwhile :; do sleep 0.01; done\n",
-                calls.display(),
-                ready.display()
+                native_calls.display(),
+                native_ready.display()
             ),
         )
         .unwrap();
         std::fs::set_permissions(&git, std::fs::Permissions::from_mode(0o755)).unwrap();
         let _path = crate::session::test_support::path_prepended(fixture.path());
         let budget = super::super::execution::Budget::controlled_for_test(&EXPIRED);
-        let destination = fixture.path().join("checkout");
+        let destination = staging.volume().root().join("tree");
         let task = tokio::task::spawn_blocking(move || {
-            git_clone_checkout("fixture", Some("v1"), &destination, budget)
+            let error = git_clone_checkout("fixture", Some("v1"), &destination, &staging, budget);
+            (error, staging)
         });
         tokio::time::timeout(Duration::from_secs(5), async {
             while !ready.exists() {
@@ -1276,7 +2239,8 @@ mod tests {
         .await
         .unwrap();
         EXPIRED.store(true, Ordering::SeqCst);
-        let error = task.await.unwrap().unwrap_err();
+        let (result, mut staging) = task.await.unwrap();
+        let error = result.unwrap_err();
         assert!(
             error
                 .downcast_ref::<super::super::execution::Exhausted>()
@@ -1286,14 +2250,37 @@ mod tests {
         assert_eq!(std::fs::read_to_string(&calls).unwrap().lines().count(), 1);
         std::fs::write(&calls, "").unwrap();
         std::fs::write(&git, format!(
-            "#!/bin/sh\nprintf 'call\\n' >> '{}'\nprintf ordinary-checkout-failure >&2\nexit 1\n", calls.display()
+            "#!/bin/sh\nprintf 'call\\n' >> '{}'\nprintf ordinary-checkout-failure >&2\nexit 1\n", native_calls.display()
         )).unwrap();
         EXPIRED.store(false, Ordering::SeqCst);
-        let error =
-            git_clone_checkout("fixture", Some("v1"), &fixture.path().join("retry"), budget)
-                .unwrap_err();
+        let error = git_clone_checkout(
+            "fixture",
+            Some("v1"),
+            &staging.volume().root().join("tree"),
+            &staging,
+            budget,
+        )
+        .unwrap_err();
         assert!(error.to_string().contains("ordinary-checkout-failure"));
-        assert_eq!(std::fs::read_to_string(&calls).unwrap().lines().count(), 2);
+        assert_eq!(std::fs::read_to_string(&calls).unwrap().lines().count(), 1);
+        std::fs::write(&calls, "").unwrap();
+        std::fs::write(&git, format!(
+            "#!/bin/sh\nprintf 'call\\n' >> '{}'\nprintf 'No space left on device' >&2\nexit 1\n", native_calls.display()
+        )).unwrap();
+        let error = git_clone_checkout(
+            "fixture",
+            Some("v1"),
+            &staging.volume().root().join("tree"),
+            &staging,
+            budget,
+        )
+        .unwrap_err();
+        assert!(
+            format!("{:#}", staging_limit_error(error, 16 * 1024 * 1024))
+                .contains("filesystem limit")
+        );
+        assert_eq!(std::fs::read_to_string(&calls).unwrap().lines().count(), 1);
+        staging.close().unwrap();
         let mut success = Command::new("sh");
         success
             .args(["-c", "printf stdout; printf stderr >&2"])
@@ -1388,6 +2375,215 @@ mod tests {
         let mut encoder = archive.into_inner().unwrap();
         encoder.flush().unwrap();
         encoder.finish().unwrap()
+    }
+
+    #[test]
+    fn local_copy_bounds_total_bytes_and_entries() {
+        let work = tempfile::tempdir().unwrap();
+        let source = work.path().join("source");
+        std::fs::create_dir_all(source.join("nested")).unwrap();
+        std::fs::write(source.join("first"), b"1234").unwrap();
+        std::fs::write(source.join("nested/second"), b"5678").unwrap();
+        let anchored = crate::session::AnchoredDir::open(&source).unwrap();
+        for (name, bytes, entries, expected) in [
+            ("exact", 8, 3, None),
+            ("bytes", 7, 3, Some("plugin staging budget exceeded")),
+            (
+                "entries",
+                8,
+                2,
+                Some("plugin staging entry budget exceeded"),
+            ),
+        ] {
+            let dest = work.path().join(name);
+            let mut budget = CopyBudget { bytes, entries };
+            let result = copy_anchored_tree(&anchored, &dest, &mut budget);
+            match expected {
+                None => {
+                    result.unwrap();
+                    assert_eq!(std::fs::read(dest.join("first")).unwrap(), b"1234");
+                    assert_eq!(std::fs::read(dest.join("nested/second")).unwrap(), b"5678");
+                }
+                Some(message) => assert!(format!("{:#}", result.unwrap_err()).contains(message)),
+            }
+            let written: u64 = ["first", "nested/second"]
+                .iter()
+                .filter_map(|name| std::fs::metadata(dest.join(name)).ok())
+                .map(|metadata| metadata.len())
+                .sum();
+            assert!(written <= bytes);
+        }
+    }
+
+    #[tokio::test]
+    async fn local_copy_bounds_file_that_grows_after_open() {
+        use std::io::Write;
+
+        let source = tempfile::tempdir().unwrap();
+        let dest = tempfile::tempdir().unwrap();
+        let entry = source.path().join("file");
+        std::fs::write(&entry, b"1234").unwrap();
+        let mut gate = test_gate::install(&entry, "copy-content");
+        let root = source.path().to_owned();
+        let tree = dest.path().join("tree");
+        let output = tree.join("file");
+        let task = tokio::task::spawn_blocking(move || {
+            let anchored = crate::session::AnchoredDir::open(&root)?;
+            let mut budget = CopyBudget {
+                bytes: 4,
+                entries: 1,
+            };
+            copy_anchored_tree(&anchored, &tree, &mut budget)
+        });
+        tokio::time::timeout(Duration::from_secs(5), &mut gate.entered)
+            .await
+            .unwrap()
+            .unwrap();
+        std::fs::OpenOptions::new()
+            .append(true)
+            .open(entry)
+            .unwrap()
+            .write_all(b"5")
+            .unwrap();
+        gate.release();
+        let error = tokio::time::timeout(Duration::from_secs(5), task)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap_err();
+        assert!(error.to_string().contains("plugin staging budget exceeded"));
+        assert_eq!(std::fs::read(output).unwrap(), b"1234");
+    }
+
+    #[tokio::test]
+    async fn asset_download_bounds_streamed_bytes() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}/asset", listener.local_addr().unwrap());
+        let app = axum::Router::new().route(
+            "/asset",
+            axum::routing::get(|| async {
+                axum::body::Body::from_stream(futures_util::stream::iter([
+                    Ok::<_, std::io::Error>(vec![b'x'; 1024]),
+                ]))
+            }),
+        );
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let work = tempfile::tempdir().unwrap();
+        let complete = work.path().join("complete");
+        download_asset(&url, &complete, 1024).await.unwrap();
+        assert_eq!(std::fs::read(complete).unwrap(), vec![b'x'; 1024]);
+        let limited = work.path().join("limited");
+        let error = download_asset(&url, &limited, 512).await.unwrap_err();
+        assert!(error.to_string().contains("plugin staging budget exceeded"));
+        assert!(std::fs::metadata(limited).unwrap().len() <= 512);
+        server.abort();
+    }
+
+    #[test]
+    fn archive_limit_bounds_file_and_pax_contents() {
+        let work = tempfile::tempdir().unwrap();
+        for (name, kind) in [
+            ("file", tar::EntryType::Regular),
+            ("pax", tar::EntryType::XHeader),
+        ] {
+            let encoder = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+            let mut archive = tar::Builder::new(encoder);
+            let data = vec![b'x'; 4096];
+            let mut header = tar::Header::new_gnu();
+            header.set_entry_type(kind);
+            header.set_size(data.len() as u64);
+            header.set_mode(0o644);
+            header.set_cksum();
+            archive.append_data(&mut header, name, &data[..]).unwrap();
+            let bytes = archive.into_inner().unwrap().finish().unwrap();
+            let asset = work.path().join(format!("{name}.tgz"));
+            std::fs::write(&asset, bytes).unwrap();
+            let tree = work.path().join(name);
+            std::fs::create_dir(&tree).unwrap();
+            let error = extract_asset_archive(
+                &tree,
+                "fixture.tgz",
+                std::fs::File::open(asset).unwrap(),
+                None,
+                1024,
+            )
+            .unwrap_err();
+            assert!(
+                format!("{error:#}").contains("plugin staging budget exceeded"),
+                "{error:#}"
+            );
+        }
+    }
+
+    #[test]
+    fn archive_metadata_is_bounded_without_limiting_file_contents() {
+        let work = tempfile::tempdir().unwrap();
+        let data = vec![b'x'; ARCHIVE_METADATA_LIMIT as usize + 1024];
+        for (name, kind) in [
+            ("pax", tar::EntryType::XHeader),
+            ("global-pax", tar::EntryType::XGlobalHeader),
+            ("long-name", tar::EntryType::GNULongName),
+            ("long-link", tar::EntryType::GNULongLink),
+            ("file", tar::EntryType::Regular),
+        ] {
+            let encoder = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+            let mut archive = tar::Builder::new(encoder);
+            let mut header = tar::Header::new_gnu();
+            header.set_entry_type(kind);
+            header.set_size(data.len() as u64);
+            header.set_mode(0o644);
+            header.set_cksum();
+            archive.append_data(&mut header, name, &data[..]).unwrap();
+            let asset = work.path().join(format!("{name}.tgz"));
+            std::fs::write(&asset, archive.into_inner().unwrap().finish().unwrap()).unwrap();
+            let tree = work.path().join(name);
+            std::fs::create_dir(&tree).unwrap();
+            let result = extract_asset_archive(
+                &tree,
+                "fixture.tgz",
+                std::fs::File::open(asset).unwrap(),
+                None,
+                2 * ARCHIVE_METADATA_LIMIT,
+            );
+            if kind == tar::EntryType::Regular {
+                result.unwrap();
+                assert_eq!(std::fs::read(tree.join(name)).unwrap(), data);
+            } else {
+                let error = result.unwrap_err();
+                assert!(
+                    format!("{error:#}").contains("plugin archive metadata budget exceeded"),
+                    "{error:#}"
+                );
+            }
+        }
+
+        let encoder = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+        let mut archive = tar::Builder::new(encoder);
+        let chunk = &data[..(ARCHIVE_METADATA_LIMIT as usize * 3 / 4)];
+        for kind in [tar::EntryType::XHeader, tar::EntryType::GNULongName] {
+            let mut header = tar::Header::new_gnu();
+            header.set_entry_type(kind);
+            header.set_size(chunk.len() as u64);
+            header.set_mode(0o644);
+            header.set_cksum();
+            archive.append_data(&mut header, "metadata", chunk).unwrap();
+        }
+        let asset = work.path().join("aggregate.tgz");
+        std::fs::write(&asset, archive.into_inner().unwrap().finish().unwrap()).unwrap();
+        let tree = work.path().join("aggregate");
+        std::fs::create_dir(&tree).unwrap();
+        let error = extract_asset_archive(
+            &tree,
+            "aggregate.tgz",
+            std::fs::File::open(asset).unwrap(),
+            None,
+            2 * ARCHIVE_METADATA_LIMIT,
+        )
+        .unwrap_err();
+        assert!(
+            format!("{error:#}").contains("plugin archive metadata budget exceeded"),
+            "{error:#}"
+        );
     }
 
     #[cfg(unix)]
@@ -1567,6 +2763,9 @@ mod tests {
             global.set_mode(0o644);
             global.set_cksum();
             archive.append(&global, &b"comment=x\n"[..]).unwrap();
+            archive
+                .append_pax_extensions([("path", &b"worker"[..])])
+                .unwrap();
             let raw = b"#!/bin/sh\nexit 0\n";
             let mut worker = tar::Header::new_gnu();
             worker.set_entry_type(tar::EntryType::Regular);
@@ -1655,11 +2854,15 @@ pub(crate) mod test_gate {
         }
     }
     pub(crate) fn reach(path: &Path, phase: &'static str) {
+        reach_observed(path, path, phase);
+    }
+
+    pub(crate) fn reach_observed(scope: &Path, path: &Path, phase: &'static str) {
         let hook = {
             let mut hooks = HOOKS.lock().unwrap();
             hooks
                 .iter()
-                .position(|hook| hook.phase == phase && path.starts_with(&hook.path))
+                .position(|hook| hook.phase == phase && scope.starts_with(&hook.path))
                 .map(|index| hooks.remove(index))
         };
         if let Some(hook) = hook {

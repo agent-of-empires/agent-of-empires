@@ -13,6 +13,712 @@ pub(super) use super::unix::{
 
 pub(crate) const HAS_CODEX_MANAGED_PREFERENCES: bool = false;
 
+/// A private mount namespace holds the only writable filesystem used by Git.
+/// Callers must stop and reap every Git command before calling `close`.
+pub(super) struct StagingVolume {
+    holder: Child,
+    root: std::path::PathBuf,
+    mount: std::path::PathBuf,
+    filter: std::sync::Arc<fs::File>,
+    closed: bool,
+}
+
+impl StagingVolume {
+    pub(super) fn create(private_mount_path: &Path, limit: u64) -> anyhow::Result<Self> {
+        use std::io::Read as _;
+        use std::os::fd::AsRawFd as _;
+        use std::os::unix::fs::MetadataExt as _;
+        anyhow::ensure!(
+            cfg!(any(target_arch = "x86_64", target_arch = "aarch64")),
+            "staging seccomp architecture unsupported"
+        );
+        let core_pattern =
+            fs::read("/proc/sys/kernel/core_pattern").context("reading host core dump routing")?;
+        anyhow::ensure!(
+            staging_core_pattern_supported(&core_pattern),
+            "socket-based host core dump routing cannot be bounded"
+        );
+        let page = unsafe { libc::sysconf(libc::_SC_PAGESIZE) };
+        anyhow::ensure!(
+            page > 0 && limit > 0 && limit.is_multiple_of(page as u64),
+            "invalid staging capacity"
+        );
+        let mount = fs::canonicalize(private_mount_path)?;
+        let metadata = fs::symlink_metadata(&mount)?;
+        anyhow::ensure!(
+            metadata.is_dir()
+                && metadata.uid() == unsafe { libc::geteuid() }
+                && metadata.mode() & 0o077 == 0,
+            "staging mountpoint must be a private owned directory"
+        );
+        anyhow::ensure!(
+            fs::read_dir(&mount)?.next().is_none(),
+            "staging mountpoint is not empty"
+        );
+        let filter = std::sync::Arc::new(staging_socket_filter()?);
+        // No fork: the Child PID is the mount-namespace holder throughout its life.
+        // EOF also releases the namespace after a daemon crash; it never unmounts
+        // anything in the host namespace.
+        let script = r#"set -eu
+mount --make-rprivate /
+mount -t tmpfs -o "size=$2,nr_inodes=65536,nosuid,nodev,noexec,mode=700" tmpfs "$1"
+mkdir "$1/tmp" "$1/dev"
+for device in null zero random urandom; do : > "$1/dev/$device"; done
+printf R
+read -r ignored || :
+"#;
+        let mut holder = Command::new("unshare")
+            .args([
+                "--user",
+                "--map-root-user",
+                "--mount",
+                "--",
+                "/bin/sh",
+                "-c",
+                script,
+                "staging",
+            ])
+            .arg(&mount)
+            .arg(limit.to_string())
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .spawn()
+            .context("starting bounded staging namespace")?;
+        let setup = (|| -> anyhow::Result<std::path::PathBuf> {
+            let stdout = holder
+                .stdout
+                .as_mut()
+                .context("missing staging handshake")?;
+            let mut poll = libc::pollfd {
+                fd: stdout.as_raw_fd(),
+                events: libc::POLLIN,
+                revents: 0,
+            };
+            let result = unsafe { libc::poll(&mut poll, 1, 5000) };
+            anyhow::ensure!(
+                result > 0 && poll.revents & libc::POLLIN != 0,
+                "staging namespace handshake failed"
+            );
+            let mut ready = [0];
+            stdout.read_exact(&mut ready)?;
+            anyhow::ensure!(ready == *b"R", "invalid staging namespace handshake");
+            let root = std::path::PathBuf::from(format!("/proc/{}/root", holder.id()))
+                .join(mount.strip_prefix("/")?);
+            let cpath = std::ffi::CString::new(root.as_os_str().as_encoded_bytes())?;
+            let mut stats = std::mem::MaybeUninit::<libc::statfs>::uninit();
+            anyhow::ensure!(
+                unsafe { libc::statfs(cpath.as_ptr(), stats.as_mut_ptr()) } == 0,
+                "cannot inspect staging filesystem: {}",
+                std::io::Error::last_os_error()
+            );
+            let stats = unsafe { stats.assume_init() };
+            let mut mount_stats = std::mem::MaybeUninit::<libc::statvfs>::uninit();
+            anyhow::ensure!(
+                unsafe { libc::statvfs(cpath.as_ptr(), mount_stats.as_mut_ptr()) } == 0,
+                "cannot inspect staging mount options: {}",
+                std::io::Error::last_os_error()
+            );
+            let mount_stats = unsafe { mount_stats.assume_init() };
+            anyhow::ensure!(
+                stats.f_type == libc::TMPFS_MAGIC
+                    && stats.f_blocks.checked_mul(stats.f_bsize as u64) == Some(limit)
+                    && stats.f_files == 65536
+                    && mount_stats.f_flag & (libc::ST_NOSUID | libc::ST_NODEV | libc::ST_NOEXEC)
+                        == (libc::ST_NOSUID | libc::ST_NODEV | libc::ST_NOEXEC),
+                "staging filesystem capacity differs from requested bound"
+            );
+            Ok(root)
+        })();
+        let root = match setup {
+            Ok(root) => root,
+            Err(error) => {
+                stop_staging_child(&mut holder).map_err(|cleanup| {
+                    super::StagingAcquisitionUncertain(format!(
+                        "{error:#}; staging holder cleanup failed: {cleanup:#}"
+                    ))
+                })?;
+                return Err(error);
+            }
+        };
+        let mut volume = Self {
+            holder,
+            root,
+            mount,
+            filter,
+            closed: false,
+        };
+        // Exercise the actual sandbox, not merely the presence of its tools.
+        let probe = (|| -> anyhow::Result<()> {
+            let mut child = volume
+                .sandbox_command("/bin/true")
+                .spawn()
+                .context("probing staging sandbox")?;
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+            loop {
+                let status = match child.try_wait() {
+                    Ok(status) => status,
+                    Err(error) => {
+                        stop_staging_child(&mut child).map_err(|cleanup| {
+                            super::StagingAcquisitionUncertain(format!(
+                                "{error}; staging probe cleanup failed: {cleanup:#}"
+                            ))
+                        })?;
+                        return Err(error).context("waiting for staging sandbox probe");
+                    }
+                };
+                if let Some(status) = status {
+                    anyhow::ensure!(status.success(), "staging sandbox is unavailable");
+                    return Ok(());
+                }
+                if std::time::Instant::now() >= deadline {
+                    stop_staging_child(&mut child).map_err(|cleanup| {
+                        super::StagingAcquisitionUncertain(format!(
+                            "staging probe timed out and cleanup failed: {cleanup:#}"
+                        ))
+                    })?;
+                    anyhow::bail!("staging sandbox probe timed out");
+                }
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+        })();
+        if let Err(error) = probe {
+            volume.close().map_err(|cleanup| {
+                super::StagingAcquisitionUncertain(format!(
+                    "{error:#}; staging volume cleanup failed: {cleanup:#}"
+                ))
+            })?;
+            return Err(error);
+        }
+        Ok(volume)
+    }
+
+    pub(super) fn root(&self) -> &Path {
+        &self.root
+    }
+
+    pub(super) fn git_command(&self) -> Command {
+        let mut command = self.sandbox_command("git");
+        command
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        command
+    }
+
+    fn sandbox_command(&self, executable: &str) -> Command {
+        use std::os::fd::AsRawFd as _;
+        use std::os::unix::process::CommandExt as _;
+        let mut command = Command::new("nsenter");
+        command
+            .arg("--target")
+            .arg(self.holder.id().to_string())
+            .args([
+                "--user",
+                "--mount",
+                "--preserve-credentials",
+                "--",
+                "bwrap",
+                "--die-with-parent",
+                "--unshare-user",
+                "--disable-userns",
+                "--unshare-pid",
+                "--unshare-ipc",
+                "--unshare-uts",
+                "--cap-drop",
+                "ALL",
+                "--ro-bind",
+                "/",
+                "/",
+                "--bind",
+            ])
+            .arg(&self.mount)
+            .arg(&self.mount)
+            .arg("--bind")
+            .arg(self.mount.join("dev"))
+            .arg("/dev");
+        for device in ["null", "zero", "random", "urandom"] {
+            let path = format!("/dev/{device}");
+            command.args(["--dev-bind", &path, &path]);
+        }
+        command
+            .args([
+                "--proc",
+                "/proc",
+                "--remount-ro",
+                "/proc",
+                "--seccomp",
+                "198",
+                "--",
+            ])
+            .arg(executable)
+            .env("TMPDIR", self.mount.join("tmp"));
+        let filter = self.filter.clone();
+        // Reopen the memfd to give concurrent spawns independent file offsets.
+        let filter_path = std::ffi::CString::new(format!("/proc/self/fd/{}", filter.as_raw_fd()))
+            .expect("numeric descriptor contains no NUL");
+        unsafe {
+            command.pre_exec(move || {
+                let _keep_alive = &filter;
+                // A nonzero limit below the minimum core size also suppresses
+                // piped core_pattern handlers, which ignore a zero limit.
+                let core_limit = libc::rlimit {
+                    rlim_cur: 1,
+                    rlim_max: 1,
+                };
+                if libc::setrlimit(libc::RLIMIT_CORE, &core_limit) < 0 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                let fd = libc::open(filter_path.as_ptr(), libc::O_RDONLY | libc::O_CLOEXEC);
+                if fd < 0 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                let result = libc::dup2(fd, 198);
+                if fd != 198 {
+                    libc::close(fd);
+                }
+                if result < 0 || libc::fcntl(198, libc::F_SETFD, 0) < 0 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                Ok(())
+            });
+        }
+        command
+    }
+
+    pub(super) fn close(&mut self) -> anyhow::Result<()> {
+        if !self.closed {
+            stop_staging_child(&mut self.holder)?;
+            self.closed = true;
+        }
+        Ok(())
+    }
+}
+
+fn stop_staging_child(child: &mut Child) -> anyhow::Result<()> {
+    if child.try_wait()?.is_some() {
+        return Ok(());
+    }
+    // The unreaped owned child pins this PID. Never signal a numeric process group.
+    child.kill().context("stopping staging namespace")?;
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    while child.try_wait()?.is_none() {
+        anyhow::ensure!(
+            std::time::Instant::now() < deadline,
+            "staging namespace did not stop"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+    Ok(())
+}
+
+// Socket-based coredump handlers (@ and @@) override RLIMIT_CORE in the kernel.
+// Pipe handlers retain the special one-byte suppression used by the sandbox.
+fn staging_core_pattern_supported(pattern: &[u8]) -> bool {
+    !pattern.starts_with(b"@")
+}
+
+fn staging_socket_filter() -> anyhow::Result<fs::File> {
+    use std::io::Write as _;
+    use std::os::fd::FromRawFd as _;
+    // seccomp_data: nr at 0, arch at 4, args[0] at 16.
+    // Deny AF_UNIX sockets and socketpairs, including abstract host sockets.
+    // Internet sockets remain available. io_uring cannot bypass this filter.
+    // Keep the one-byte core limit immutable, but permit prlimit64 queries.
+    let arch = if cfg!(target_arch = "x86_64") {
+        0xc000003e
+    } else {
+        0xc00000b7
+    };
+    let instruction = |code, jt, jf, k| libc::sock_filter { code, jt, jf, k };
+    let deny = 0x00050000 | libc::EPERM as u32;
+    let filter = [
+        instruction(0x20, 0, 0, 4),
+        instruction(0x15, 1, 0, arch),
+        instruction(0x06, 0, 0, 0x80000000),
+        instruction(0x20, 0, 0, 0),
+        instruction(0x15, 0, 1, libc::SYS_io_uring_setup as u32),
+        instruction(0x06, 0, 0, deny),
+        // Reject x32 syscalls too; their syscall numbers use a separate ABI.
+        instruction(0x45, 0, 1, 0x40000000),
+        instruction(0x06, 0, 0, deny),
+        instruction(0x15, 1, 0, libc::SYS_socket as u32),
+        instruction(0x15, 0, 3, libc::SYS_socketpair as u32),
+        instruction(0x20, 0, 0, 16),
+        instruction(0x15, 0, 1, libc::AF_UNIX as u32),
+        instruction(0x06, 0, 0, deny),
+        instruction(0x20, 0, 0, 0),
+        instruction(0x15, 0, 3, libc::SYS_setrlimit as u32),
+        instruction(0x20, 0, 0, 16),
+        instruction(0x15, 0, 1, libc::RLIMIT_CORE),
+        instruction(0x06, 0, 0, deny),
+        instruction(0x20, 0, 0, 0),
+        instruction(0x15, 0, 8, libc::SYS_prlimit64 as u32),
+        instruction(0x20, 0, 0, 24),
+        instruction(0x15, 0, 6, libc::RLIMIT_CORE),
+        instruction(0x20, 0, 0, 32),
+        instruction(0x15, 1, 0, 0),
+        instruction(0x06, 0, 0, deny),
+        instruction(0x20, 0, 0, 36),
+        instruction(0x15, 1, 0, 0),
+        instruction(0x06, 0, 0, deny),
+        instruction(0x06, 0, 0, 0x7fff0000),
+    ];
+    let raw = unsafe { libc::memfd_create(c"staging-seccomp".as_ptr(), libc::MFD_CLOEXEC) };
+    anyhow::ensure!(raw >= 0, "cannot create staging seccomp filter");
+    let mut file = unsafe { fs::File::from_raw_fd(raw) };
+    let bytes = unsafe {
+        std::slice::from_raw_parts(filter.as_ptr().cast::<u8>(), std::mem::size_of_val(&filter))
+    };
+    file.write_all(bytes)?;
+    // bwrap reads from the current offset.
+    use std::io::Seek as _;
+    file.rewind()?;
+    Ok(file)
+}
+
+#[cfg(test)]
+mod staging_volume_tests {
+    use super::*;
+    use std::io::Read as _;
+
+    #[test]
+    fn core_pattern_classification_rejects_socket_handlers() {
+        for (pattern, supported) in [
+            (b"core\n".as_slice(), true),
+            (b"/tmp/core.%p\n".as_slice(), true),
+            (b"|/usr/lib/systemd/systemd-coredump %P\n".as_slice(), true),
+            (b"@/run/coredump.socket\n".as_slice(), false),
+            (b"@@/run/coredump.socket\n".as_slice(), false),
+            (b"@\n".as_slice(), false),
+            (b"@@\n".as_slice(), false),
+            (b"core@%p\n".as_slice(), true),
+            (b"".as_slice(), true),
+        ] {
+            assert_eq!(staging_core_pattern_supported(pattern), supported);
+        }
+    }
+
+    fn private_mount_fixture() -> tempfile::TempDir {
+        use std::os::unix::fs::PermissionsExt as _;
+        let directory = tempfile::tempdir().unwrap();
+        fs::set_permissions(directory.path(), fs::Permissions::from_mode(0o700)).unwrap();
+        directory
+    }
+
+    fn decision(arch: u32, syscall: u32, argument: u32) -> u32 {
+        decision_with_arguments(arch, syscall, [u64::from(argument), 0, 0])
+    }
+
+    fn decision_with_arguments(arch: u32, syscall: u32, arguments: [u64; 3]) -> u32 {
+        let mut bytes = Vec::new();
+        staging_socket_filter()
+            .unwrap()
+            .read_to_end(&mut bytes)
+            .unwrap();
+        let mut accumulator = 0;
+        let mut pc = 0;
+        loop {
+            let instruction = &bytes[pc * 8..pc * 8 + 8];
+            let code = u16::from_ne_bytes(instruction[..2].try_into().unwrap());
+            let k = u32::from_ne_bytes(instruction[4..].try_into().unwrap());
+            match code {
+                0x20 => {
+                    accumulator = match k {
+                        0 => syscall,
+                        4 => arch,
+                        16 => arguments[0] as u32,
+                        24 => arguments[1] as u32,
+                        32 => arguments[2] as u32,
+                        36 => (arguments[2] >> 32) as u32,
+                        _ => panic!("unexpected seccomp load"),
+                    }
+                }
+                0x15 => {
+                    pc += usize::from(if accumulator == k {
+                        instruction[2]
+                    } else {
+                        instruction[3]
+                    })
+                }
+                0x45 => {
+                    pc += usize::from(if accumulator & k != 0 {
+                        instruction[2]
+                    } else {
+                        instruction[3]
+                    })
+                }
+                0x06 => return k,
+                _ => panic!("unexpected seccomp instruction"),
+            }
+            pc += 1;
+        }
+    }
+
+    #[test]
+    fn seccomp_denies_host_unix_sockets_and_alternate_abis() {
+        let arch = if cfg!(target_arch = "x86_64") {
+            0xc000003e
+        } else {
+            0xc00000b7
+        };
+        let deny = 0x00050000 | libc::EPERM as u32;
+        assert_eq!(
+            decision(arch, libc::SYS_socket as u32, libc::AF_UNIX as u32),
+            deny
+        );
+        assert_eq!(
+            decision(arch, libc::SYS_socketpair as u32, libc::AF_UNIX as u32),
+            deny
+        );
+        assert_eq!(decision(arch, libc::SYS_io_uring_setup as u32, 0), deny);
+        assert_eq!(
+            decision(arch, libc::SYS_socket as u32 | 0x40000000, 1),
+            deny
+        );
+        let foreign_arch = if cfg!(target_arch = "x86_64") {
+            0xc00000b7
+        } else {
+            0xc000003e
+        };
+        assert_eq!(
+            decision(foreign_arch, libc::SYS_socket as u32, 1),
+            0x80000000
+        );
+        // i386 socketcall must never reach the native syscall-number checks.
+        assert_eq!(decision(0x40000003, 102, 1), 0x80000000);
+        assert_eq!(
+            decision(arch, libc::SYS_socket as u32, libc::AF_INET as u32),
+            0x7fff0000
+        );
+        assert_eq!(
+            decision(arch, libc::SYS_socket as u32, libc::AF_INET6 as u32),
+            0x7fff0000
+        );
+        assert_eq!(
+            decision(arch, libc::SYS_setrlimit as u32, libc::RLIMIT_CORE),
+            deny
+        );
+        assert_eq!(
+            decision(arch, libc::SYS_setrlimit as u32, libc::RLIMIT_NOFILE),
+            0x7fff0000
+        );
+        assert_eq!(
+            decision_with_arguments(
+                arch,
+                libc::SYS_prlimit64 as u32,
+                [0, u64::from(libc::RLIMIT_CORE), 0]
+            ),
+            0x7fff0000
+        );
+        for pointer in [1, 1u64 << 32] {
+            assert_eq!(
+                decision_with_arguments(
+                    arch,
+                    libc::SYS_prlimit64 as u32,
+                    [0, u64::from(libc::RLIMIT_CORE), pointer]
+                ),
+                deny
+            );
+        }
+    }
+
+    #[test]
+    fn invalid_capacity_fails_before_mount_setup() {
+        assert!(StagingVolume::create(Path::new("/nonexistent-staging-test"), 0).is_err());
+        assert!(StagingVolume::create(Path::new("/nonexistent-staging-test"), 1).is_err());
+    }
+
+    #[test]
+    #[ignore = "requires unprivileged user namespaces, mount, nsenter, and bubblewrap"]
+    fn real_staging_volume_enforces_capacity_and_releases_namespace() {
+        use std::io::Write as _;
+        let mount = private_mount_fixture();
+        let mut volume = StagingVolume::create(mount.path(), 1024 * 1024).unwrap();
+        let root = volume.root().to_path_buf();
+        let mut file = fs::File::create(root.join("fill")).unwrap();
+        let block = [0u8; 65536];
+        let mut written = 0;
+        loop {
+            match file.write(&block) {
+                Ok(0) => panic!("unexpected zero-length tmpfs write"),
+                Ok(count) => written += count,
+                Err(error) => {
+                    assert_eq!(error.raw_os_error(), Some(libc::ENOSPC));
+                    break;
+                }
+            }
+        }
+        assert!(written <= 1024 * 1024);
+        drop(file);
+        volume.close().unwrap();
+        volume.close().unwrap();
+        assert!(!root.exists());
+        assert!(fs::read_dir(mount.path()).unwrap().next().is_none());
+    }
+
+    #[test]
+    #[ignore = "requires unprivileged user namespaces, mount, nsenter, bubblewrap, and Git"]
+    fn real_git_smudge_cannot_write_host_or_exceed_volume() {
+        let source = tempfile::tempdir().unwrap();
+        let host = tempfile::tempdir().unwrap();
+        let target = host.path().join("protected");
+        fs::write(&target, b"unchanged").unwrap();
+        let fixture_git = |arguments: &[&str]| {
+            let result = Command::new("git")
+                .arg("-C")
+                .arg(source.path())
+                .args(arguments)
+                .env("GIT_CONFIG_NOSYSTEM", "1")
+                .env("GIT_CONFIG_GLOBAL", "/dev/null")
+                .output()
+                .unwrap();
+            assert!(
+                result.status.success(),
+                "{}",
+                String::from_utf8_lossy(&result.stderr)
+            );
+        };
+        fixture_git(&["init"]);
+        fs::write(
+            source.path().join(".gitattributes"),
+            "payload filter=attack\n",
+        )
+        .unwrap();
+        fs::write(source.path().join("payload"), "source readable\n").unwrap();
+        fixture_git(&["add", ".gitattributes", "payload"]);
+        fixture_git(&[
+            "-c",
+            "user.name=Staging Test",
+            "-c",
+            "user.email=staging@example.invalid",
+            "-c",
+            "commit.gpgsign=false",
+            "commit",
+            "-m",
+            "fixture",
+        ]);
+        let mount = private_mount_fixture();
+        let mut volume = StagingVolume::create(mount.path(), 1024 * 1024).unwrap();
+        let clone = |name: &str, smudge: &str| {
+            volume
+                .git_command()
+                .env("GIT_CONFIG_NOSYSTEM", "1")
+                .env("GIT_CONFIG_GLOBAL", "/dev/null")
+                .env("STAGING_HOST_TARGET", &target)
+                .arg("-c")
+                .arg(format!("filter.attack.smudge={smudge}"))
+                .args(["-c", "filter.attack.required=true", "clone", "--no-local"])
+                .arg(source.path())
+                .arg(mount.path().join(name))
+                .output()
+                .unwrap()
+        };
+        let readable = clone("readable", "cat");
+        assert!(
+            readable.status.success(),
+            "{}",
+            String::from_utf8_lossy(&readable.stderr)
+        );
+        assert_eq!(
+            fs::read(volume.root().join("readable/payload")).unwrap(),
+            b"source readable\n"
+        );
+        fs::remove_dir_all(volume.root().join("readable")).unwrap();
+        let hostile = clone(
+            "host-write",
+            "sh -c 'printf attacked > \"$STAGING_HOST_TARGET\"'",
+        );
+        assert!(!hostile.status.success());
+        assert_eq!(fs::read(&target).unwrap(), b"unchanged");
+        fs::remove_dir_all(volume.root().join("host-write")).unwrap();
+        let overflow = clone("overflow", "head -c 2097152 /dev/zero");
+        assert!(!overflow.status.success());
+        assert_eq!(fs::read(&target).unwrap(), b"unchanged");
+        volume.close().unwrap();
+    }
+
+    #[test]
+    #[ignore = "requires unprivileged user namespaces, mount, nsenter, bubblewrap, and /usr/bin/python3"]
+    fn real_sandbox_denies_host_unix_socket() {
+        use std::os::unix::net::UnixListener;
+        let host = tempfile::tempdir().unwrap();
+        let socket = host.path().join("host.sock");
+        let listener = UnixListener::bind(&socket).unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let mount = private_mount_fixture();
+        let mut volume = StagingVolume::create(mount.path(), 1024 * 1024).unwrap();
+        let result = volume
+            .sandbox_command("/usr/bin/python3")
+            .args([
+                "-c",
+                r#"import errno, socket, sys
+for create in (lambda: socket.socket(socket.AF_UNIX),
+               lambda: socket.socketpair(socket.AF_UNIX, socket.SOCK_DGRAM)):
+    try:
+        create()
+    except OSError as error:
+        if error.errno != errno.EPERM:
+            sys.exit(2)
+    else:
+        sys.exit(1)
+"#,
+            ])
+            .arg(&socket)
+            .stdin(Stdio::null())
+            .output()
+            .unwrap();
+        assert!(
+            result.status.success(),
+            "{}",
+            String::from_utf8_lossy(&result.stderr)
+        );
+        assert_eq!(
+            listener.accept().unwrap_err().kind(),
+            std::io::ErrorKind::WouldBlock
+        );
+        volume.close().unwrap();
+    }
+
+    #[test]
+    #[ignore = "requires unprivileged user namespaces, mount, nsenter, bubblewrap, and /usr/bin/python3"]
+    fn real_sandbox_keeps_core_limit_below_minimum() {
+        let mount = private_mount_fixture();
+        let mut volume = StagingVolume::create(mount.path(), 1024 * 1024).unwrap();
+        let result = volume
+            .sandbox_command("/usr/bin/python3")
+            .args([
+                "-c",
+                r#"import ctypes, errno, resource
+assert resource.getrlimit(resource.RLIMIT_CORE) == (1, 1)
+try:
+    resource.setrlimit(resource.RLIMIT_CORE, (0, 1))
+except (OSError, ValueError):
+    pass
+else:
+    raise AssertionError("core limit changed")
+libc = ctypes.CDLL(None, use_errno=True)
+class Limit(ctypes.Structure):
+    _fields_ = [("soft", ctypes.c_uint64), ("hard", ctypes.c_uint64)]
+query = Limit()
+assert libc.prlimit64(0, resource.RLIMIT_CORE, None, ctypes.byref(query)) == 0
+assert (query.soft, query.hard) == (1, 1)
+assert libc.prlimit64(0, resource.RLIMIT_CORE, ctypes.byref(Limit(0, 1)), None) == -1
+assert ctypes.get_errno() == errno.EPERM
+"#,
+            ])
+            .stdin(Stdio::null())
+            .output()
+            .unwrap();
+        assert!(
+            result.status.success(),
+            "{}",
+            String::from_utf8_lossy(&result.stderr)
+        );
+        volume.close().unwrap();
+    }
+}
+
 pub(crate) fn codex_managed_preferences_present() -> bool {
     false
 }
