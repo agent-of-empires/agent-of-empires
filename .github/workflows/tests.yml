@@ -167,7 +167,7 @@ jobs:
           cargo nextest run --no-fail-fast
       - name: Exercise bounded plugin staging
         if: matrix.leg == 'core-rest'
-        run: cargo nextest run --run-ignored only --no-tests=fail -E 'test(process::linux::staging_volume_tests::real_) | test(plugin::fetch::tests::staging_volume_)'
+        run: cargo nextest run --run-ignored only --no-tests=fail -E 'test(staging_volume_)'
       - name: Require scoped cancellation coverage
         if: matrix.leg == 'core-rest'
         env:
