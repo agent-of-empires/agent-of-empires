@@ -138,7 +138,9 @@ pub(crate) async fn project_sessions(state: &Arc<AppState>) -> Vec<SessionRespon
     let misses_before = state
         .list_sessions_resolver_misses
         .load(std::sync::atomic::Ordering::Relaxed);
-    let mut session_cfg_cache = SessionCfgCache::new(&state.list_sessions_resolver_misses);
+    let mut session_cfg_store = state.session_cfg_store.lock().await;
+    let mut session_cfg_cache =
+        SessionCfgCache::new(&mut session_cfg_store, &state.list_sessions_resolver_misses);
     let mut project_override_cache = ProjectRegistryCache::new();
 
     // Overlay custom-agent ACP capability; built-ins were resolved in the
@@ -299,6 +301,7 @@ pub(crate) async fn project_sessions(state: &Arc<AppState>) -> Vec<SessionRespon
         }
     }
 
+    drop(session_cfg_store);
     // Both overlays have run, so the count is final for this request.
     let resolver_misses = state
         .list_sessions_resolver_misses
