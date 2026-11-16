@@ -1481,6 +1481,37 @@ async fn wait_for_returns_on_a_status_broadcast_or_times_out() {
     )
     .await;
     assert_eq!(error_code(&unknown), Some("not_found"));
+
+    // A session being deleted is gone, whether the wait sees it start or end that way, and
+    // even when `states` names it.
+    let subscribers = state.status_tx.receiver_count();
+    let waiter = tokio::spawn({
+        let app = app.clone();
+        async move {
+            call_result(
+                &app,
+                "wait_for",
+                json!({"session_id": id, "states": ["Running"], "timeout_s": 300}),
+            )
+            .await
+        }
+    });
+    await_subscriber(&state, subscribers).await;
+    move_status(&state, id, Status::Deleting).await;
+    let deleted = tokio::time::timeout(std::time::Duration::from_secs(10), waiter)
+        .await
+        .expect("wait_for returned on the deletion")
+        .unwrap();
+    assert_eq!(error_code(&deleted), Some("not_found"), "{deleted}");
+    for timeout_s in [0, 300] {
+        let named = call_result(
+            &app,
+            "wait_for",
+            json!({"session_id": id, "states": ["Deleting"], "timeout_s": timeout_s}),
+        )
+        .await;
+        assert_eq!(error_code(&named), Some("not_found"), "{named}");
+    }
 }
 
 /// With `after_seq`, an `Idle` read before that turn ended is the previous turn's, so the

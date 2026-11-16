@@ -171,11 +171,11 @@ impl McpServer {
         // A terminal session has no event seqs, so there is no turn to wait for.
         let after_seq = params.after_seq.filter(|_| view == View::Structured);
         let timed_out = loop {
-            if self.settled(&id, current, &params.states, after_seq) {
-                break false;
-            }
             if current == Status::Deleting {
                 return Err(not_found(&id));
+            }
+            if self.settled(&id, current, &params.states, after_seq) {
+                break false;
             }
             current = match self.next_change(&id, &mut changes, deadline).await {
                 Woke::Changed(status) => status,
@@ -188,6 +188,9 @@ impl McpServer {
         };
         if timed_out {
             current = self.status_of(&id).await.ok_or_else(|| not_found(&id))?;
+            if current == Status::Deleting {
+                return Err(not_found(&id));
+            }
         }
         let page = after_seq.map(|since| transcript_page(&self.state, &id, since));
         Ok(Json(WaitResult {
