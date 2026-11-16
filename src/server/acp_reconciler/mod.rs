@@ -1793,7 +1793,8 @@ mod tests {
     /// A queued prompt re-selects a workerless session every tick (#5200). Behind
     /// a durable `aoe acp stop` fence no automatic attempt can be admitted, so the
     /// ticks must neither charge nor exhaust the crash-loop budget; the session
-    /// shows one banner naming the stop, and an explicit start re-arms it.
+    /// shows one banner naming the stop, a daemon restart with the fence and the
+    /// queue still in place behaves the same, and an explicit start re-arms it.
     #[tokio::test]
     #[serial_test::serial]
     async fn durable_user_stop_with_a_queue_does_not_crash_loop() {
@@ -1847,6 +1848,32 @@ mod tests {
                 "{status:?}: the banner names the stop"
             );
 
+            // A daemon restart keeps the on-disk fence and the queue but starts
+            // the reconciler with fresh state. The restarted process still holds
+            // the session uncharged and unparked, and shows its own banner once.
+            let mut tick = test_fixtures::Tick::default();
+            for _ in 0..=2 * RECONCILER_MAX_RESPAWNS_IN_WINDOW {
+                tick.run(&state).await;
+            }
+            assert!(
+                worker_registry::stop_requested(id),
+                "{status:?}: the fence survives the restart"
+            );
+            assert!(
+                tick.respawn_history.get(id).is_none_or(Vec::is_empty),
+                "{status:?}: a restart must not charge the budget either"
+            );
+            assert_eq!(
+                test_fixtures::startup_errors(&state, id),
+                2,
+                "{status:?}: one more banner after the restart, no crash-loop park"
+            );
+            assert_eq!(
+                count_messages(&state, id, STOP_FENCE_MESSAGE),
+                2,
+                "{status:?}: each process shows the stop banner once"
+            );
+
             // An explicit start clears the fence and requests a respawn, which
             // gives the session a clean slate; the fake agent then fails to spawn.
             let observed = worker_registry::stop_intent(id).unwrap();
@@ -1863,7 +1890,7 @@ mod tests {
                 1,
                 "{status:?}: the explicit start is a real attempt"
             );
-            assert_eq!(test_fixtures::startup_errors(&state, id), 2, "{status:?}");
+            assert_eq!(test_fixtures::startup_errors(&state, id), 3, "{status:?}");
         }
     }
 
