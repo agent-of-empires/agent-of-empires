@@ -2591,7 +2591,8 @@ fn expand_glob_ignore(entry: &str, roots: &[(String, String)]) -> Vec<String> {
                 continue;
             };
             let rel = rel.to_string_lossy();
-            if rel.is_empty() {
+            // A glob can match `..` (`.?`) or a name containing `:`.
+            if crate::session::validate_volume_ignore_format(&rel).is_err() {
                 continue;
             }
             out.push(format!("{}/{}", container_base, rel));
@@ -3354,6 +3355,7 @@ pub(crate) fn build_container_config(
     let mut seen_ignore = std::collections::HashSet::new();
     let expanded_ignore_paths: Vec<String> = resolved_ignore_paths
         .into_iter()
+        .filter(|path| !path.contains(':'))
         .filter(|path| seen_ignore.insert(path.clone()))
         .filter(|path| {
             !extra_volume_container_paths.iter().any(|extra_path| {
@@ -6157,6 +6159,24 @@ port_mappings = ["3000:3000", "0.0.0.0:22:22"]
             vec![format!("/workspace/{}/node_modules", dir_name)]
         );
         assert_eq!(config.port_mappings, vec!["3000:3000".to_string()]);
+    }
+
+    /// Glob expansion must not yield `:` or `..` paths even when the pattern has none.
+    #[test]
+    fn test_expand_glob_ignore_rejects_colon_and_dotdot_matches() {
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path().join("root");
+        fs::create_dir_all(root.join("cache:x")).unwrap();
+        fs::create_dir_all(root.join("ok")).unwrap();
+        fs::create_dir_all(tmp.path().join("other")).unwrap();
+        let roots = vec![(
+            root.to_str().unwrap().to_string(),
+            "/workspace/p".to_string(),
+        )];
+
+        assert!(expand_glob_ignore("cache?x", &roots).is_empty());
+        assert!(expand_glob_ignore(".?/other", &roots).is_empty());
+        assert_eq!(expand_glob_ignore("o?", &roots), vec!["/workspace/p/ok"]);
     }
 
     /// Feature test for #2045: glob volume_ignores entries are expanded against the
