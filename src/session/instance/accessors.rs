@@ -3,6 +3,9 @@
 
 use super::*;
 
+/// How to bind a Structured view conversation so a switch to Terminal view can carry it.
+pub(crate) const UNBOUND_STORE_HINT: &str = "ACP does not prove a native conversation store; bind its current ID with aoe session set-session-id SESSION ID --store /absolute/claude-store before switching to terminal";
+
 /// A sub-session was named as a new session's parent.
 #[derive(Debug, thiserror::Error)]
 #[error("Cannot create sub-session of a sub-session (single level only)")]
@@ -102,6 +105,8 @@ impl Instance {
             unknown_since: None,
             detection: DetectionState::default(),
             pending_host_env: Vec::new(),
+            launch_admission: None,
+            before_start_minted_for_launch: false,
             capture_started_at: None,
             started_at: None,
             launch_executable: None,
@@ -852,7 +857,7 @@ impl Instance {
                         .is_some_and(|execution| execution.agent == "claude")
             })
             .cloned();
-        let unresolved = "ACP does not prove a native conversation store; bind its current ID with aoe session set-session-id SESSION ID --store /absolute/claude-store before switching to terminal";
+        let unresolved = UNBOUND_STORE_HINT;
         let persisted = self.persisted_observed_store(&sid);
         let resolved = match asserted {
             Some(asserted) => Ok(Some(asserted)),

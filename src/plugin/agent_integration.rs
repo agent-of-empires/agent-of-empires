@@ -1740,6 +1740,13 @@ mode = "native_only"
             assert!(matches!(agent.session_support.unwrap().resume, crate::agents::ResumeStrategy::Flag("--continue")));
             assert_eq!(agent.session_support.unwrap().capture.unwrap().sandbox, crate::agents::SessionCaptureContext::Unsupported);
         }).unwrap();
+        let mut selecting = instance.clone();
+        selecting.extra_args = "--continue".into();
+        assert_eq!(
+            selecting.command_session_selector().as_deref(),
+            Some("--continue"),
+            "the declaration's resume flag decides, as at launch"
+        );
         assert!(replies_configured(&instance));
         assert_eq!(
             owned_status(&instance, false),
