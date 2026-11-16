@@ -1,7 +1,7 @@
 // @vitest-environment jsdom
 
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { cleanup, render, screen, waitFor } from "@testing-library/react";
+import { act, cleanup, render, screen, waitFor } from "@testing-library/react";
 import type { SessionResponse } from "../../lib/types";
 import { makeSession as baseSession } from "./fixtures";
 
@@ -91,6 +91,24 @@ describe("TerminalSessionStack", () => {
       expect(screen.getByTestId("terminal-s2").dataset.active).toBe("false");
       expect(screen.getByTestId("terminal-s3").dataset.active).toBe("true");
     });
+  });
+
+  it("never detaches a kept terminal when switching, which would reset its scroll to the top", async () => {
+    const activate = await mountThreeKeepingTwo();
+    const stack = screen.getByTestId("terminal-s1").parentElement!.parentElement!;
+    const detached: Node[] = [];
+    const record = (records: MutationRecord[]) => detached.push(...records.flatMap((r) => [...r.removedNodes]));
+    const observer = new MutationObserver(record);
+    observer.observe(stack, { childList: true });
+    for (const id of ["s1", "s2", "s1"]) {
+      activate(id, 2);
+      await waitFor(() => expect(screen.getByTestId(`terminal-${id}`).dataset.active).toBe("true"));
+      await act(async () => {});
+    }
+
+    record(observer.takeRecords());
+    observer.disconnect();
+    expect(detached).toEqual([]);
   });
 
   it("normalizes configured limits to the supported range", () => {

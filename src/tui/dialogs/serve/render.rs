@@ -981,7 +981,7 @@ fn error_recovery_keys(mode: ServeMode, transport: Option<TunnelTransport>) -> V
         keys.push("[P] Pick provider");
     }
     if funnel_reset_applies(mode, transport) {
-        keys.push("[R] Reset Funnel");
+        keys.push("[R] Turn off Funnel on its port");
     }
     keys
 }

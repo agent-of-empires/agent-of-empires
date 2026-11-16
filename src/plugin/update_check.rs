@@ -50,7 +50,10 @@ async fn check_one(target: &Target, lock: Result<&Lockfile, &anyhow::Error>) -> 
         available,
         error,
     };
-    let err = |msg: String| status(String::new(), None, Some(msg));
+    let err = |msg: String| {
+        tracing::warn!(target: "plugin.install", plugin = %target.id, error = %msg, "plugin update check failed");
+        status(String::new(), None, Some(crate::logging::redact(&msg)))
+    };
 
     let lock = match lock {
         Ok(lock) => lock,
@@ -129,4 +132,23 @@ async fn resolve_latest_release(source: &PluginSource) -> anyhow::Result<Option<
 
 fn short(commit: &str) -> String {
     commit.chars().take(8).collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn errors_are_redacted() {
+        let target = Target {
+            id: "p".into(),
+            source: "gh:o/r".into(),
+        };
+        let cause =
+            anyhow::anyhow!("clone https://user:hunter2@example.com/o/r failed token=hunter2");
+        let status = check_one(&target, Err(&cause)).await;
+        let error = status.error.unwrap();
+        assert!(!error.contains("hunter2"), "{error}");
+        assert!(error.contains("reading plugins.lock"), "{error}");
+    }
 }

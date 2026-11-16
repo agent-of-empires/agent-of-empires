@@ -764,13 +764,22 @@ pub(crate) async fn ensure_native_container_terminal(
             index,
             size,
             &native,
-            |instance, config| {
-                minted_env = true;
-                drop(scope.take());
-                let result = instance.mint_before_start_env(config);
-                scope = Some(acquire_scope());
-                result
-            },
+            // The namespace and instance guards are given up around the hook and taken back
+            // once the session's slot is free.
+            crate::session::Releasing::new(
+                &mut scope,
+                |scope, instance, config| {
+                    minted_env = true;
+                    drop(scope.take());
+                    instance.mint_before_start_env(config)
+                },
+                |scope, _| {
+                    if scope.is_none() {
+                        **scope = Some(acquire_scope());
+                    }
+                    Ok(())
+                },
+            ),
         )?;
         let _ownership = sample_auxiliary_after_ensure(
             &native,

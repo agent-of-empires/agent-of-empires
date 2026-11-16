@@ -260,6 +260,8 @@ interface QueuedPromptsStripProps {
   soloAliases?: readonly string[];
   /** The Session's Agent, by display name, for the header's tooltip. */
   agent: string;
+  /** Why no row may be sent now; each row's action is disabled with it as the reason. */
+  blockedReason?: string | null;
 }
 
 export function QueuedPromptsStrip({
@@ -274,6 +276,7 @@ export function QueuedPromptsStrip({
   onStopTurn,
   soloAliases = NO_ALIASES,
   agent,
+  blockedReason,
 }: QueuedPromptsStripProps) {
   const isMobile = useIsCoarsePointer();
   const [expanded, setExpanded] = useState(false);
@@ -348,10 +351,13 @@ export function QueuedPromptsStrip({
                 onStartAndSend={onStartAndSend}
                 onStopTurn={onStopTurn}
                 canSendNow={canSendNow}
-                action={isClearAlias(q.text, soloAliases) ? reason.soloAction : reason.action}
+                action={
+                  blockedReason ? "disabled" : isClearAlias(q.text, soloAliases) ? reason.soloAction : reason.action
+                }
                 disabledReason={
-                  // Only a "sends …" reason reads as a sentence after "this message".
+                  blockedReason ??
                   reason.disabledReason ??
+                  // Only a "sends …" reason reads as a sentence after "this message".
                   (reason.reason?.startsWith("sends ") ? `Waiting: this message ${reason.reason}` : undefined)
                 }
               />

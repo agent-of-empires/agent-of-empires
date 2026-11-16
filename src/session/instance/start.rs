@@ -231,7 +231,7 @@ impl Instance {
         drop(lifecycle_lock);
         drop(title_lock);
         let hook_result =
-            self.run_pre_launch_hooks(skip_on_launch, storage, None, Some(generation));
+            self.run_agent_launch_hooks(skip_on_launch, storage, None, Some(generation));
         let (_title_lock, _lifecycle_lock) =
             self.reacquire_launch_locks_after_hooks(storage, generation, hook_result)?;
         if let Some((key, _)) = handoff {

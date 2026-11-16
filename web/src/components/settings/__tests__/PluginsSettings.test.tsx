@@ -89,7 +89,7 @@ const jobResult = (state: "succeeded" | "failed", tail: string, error?: string):
         started_at: 0,
         finished_at: 1,
       },
-      log: { exists: true, tail, lines_returned: 1, truncated: false },
+      log: { path: "/daemon/plugin-jobs/job1.log", exists: true, tail, lines_returned: 1, truncated: false },
     },
   }) as PluginJobResult;
 
@@ -633,11 +633,15 @@ describe("uninstall and job progress", () => {
     await waitFor(() => expect(api.fetchPlugins.mock.calls.length).toBeGreaterThan(before));
   });
 
-  it("shows a failed job's error", async () => {
+  it("shows a failed job's error, bounded tail and actual Daemon-host log path", async () => {
     api.fetchPluginJob.mockResolvedValue(jobResult("failed", "uninstalling", "removing tree failed"));
     await uninstall();
     await click("plugin-uninstall-confirm-button");
     expect((await screen.findByTestId("plugin-job-error")).textContent).toContain("removing tree failed");
+    expect(screen.getByTestId("plugin-job-log").textContent).toContain("uninstalling");
+    expect(screen.getByTestId("plugin-job-host-path").textContent).toContain(
+      "Full log on Daemon host: /daemon/plugin-jobs/job1.log",
+    );
   });
 
   it("treats a vanished job (404) as terminal", async () => {

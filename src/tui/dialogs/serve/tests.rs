@@ -1074,7 +1074,10 @@ fn a_failed_stop_of_a_reopened_launch_loads_identity_before_recovery() {
                 target: crate::cli::serve::tui_control_target().unwrap(),
             }
         } else {
-            JobResult::Reset(Err("fixture reset outcome unknown".to_owned()))
+            JobResult::Reset {
+                port: Some(443),
+                result: Err("fixture reset outcome unknown".to_owned()),
+            }
         });
         wait_for(&mut view, |view| view.pending.is_none());
         if code == 'P' {
@@ -1107,8 +1110,9 @@ impl FunnelFixture {
             &program,
             r#"#!/bin/sh
 case "$1 $2" in
-  "funnel reset")
-    printf 'reset\n' >> "$AOE_TEST_FUNNEL_ROOT/calls"
+  "funnel --https="*)
+    [ "$3" = off ] || exit 1
+    printf 'off %s\n' "${2#--https=}" >> "$AOE_TEST_FUNNEL_ROOT/calls"
     if [ -f "$AOE_TEST_FUNNEL_ROOT/spawn-descendant" ]; then
       /bin/sh -c '
         printf "%s\n" "$$" > "$AOE_TEST_FUNNEL_ROOT/descendant"
@@ -1287,7 +1291,7 @@ fn an_admitted_reset_finishes_once_after_close_and_reopen() {
     assert!(descendant.exited().unwrap());
     assert_eq!(
         std::fs::read_to_string(fixture.root.path().join("calls")).unwrap(),
-        "reset\n"
+        "off 443\n"
     );
     assert_eq!(
         std::fs::read_to_string(fixture.root.path().join("complete")).unwrap(),
@@ -2162,7 +2166,7 @@ fn runtime_owned_shutdown_does_not_hold_terminal_teardown_for_an_admitted_reset(
         assert!(process.exited().unwrap());
         assert_eq!(
             std::fs::read_to_string(fixture.root.path().join("calls")).unwrap(),
-            "reset\n"
+            "off 443\n"
         );
         assert!(fixture.root.path().join("complete").exists());
     }
@@ -2197,7 +2201,7 @@ fn funnel_reset_rediscovers_repaired_identity_without_replaying_the_mutation() {
     assert!(process.exited().unwrap());
     assert_eq!(
         std::fs::read_to_string(fixture.root.path().join("calls")).unwrap(),
-        "reset\n"
+        "off 443\n"
     );
 }
 
@@ -2898,4 +2902,31 @@ fn a_key_drops_a_pending_access_reread_and_restarts_its_interval() {
         );
     }
     assert_eq!(view.access_checked_at, Some(restarted));
+}
+
+#[test]
+#[serial_test::serial]
+fn funnel_reset_turns_off_only_the_configured_port() {
+    let _home = crate::session::test_support::isolate_app_dir();
+    let config = crate::session::config::config_path().unwrap();
+    std::fs::create_dir_all(config.parent().unwrap()).unwrap();
+    std::fs::write(&config, "[serve]\nfunnel_port = \"8443\"\n").unwrap();
+    let fixture = FunnelFixture::new();
+    let mut jobs = ServeJobs::default();
+    let mut view = ServeView::with_state(error_state(), jobs.submitter());
+    view.target = Some(crate::cli::serve::tui_control_target().unwrap());
+    view.handle_key(key('R'));
+    let process = fixture.entered();
+    fixture.release();
+    wait_for(&mut view, |view| view.pending.is_none());
+    assert!(process.exited().unwrap());
+    assert_eq!(
+        std::fs::read_to_string(fixture.root.path().join("calls")).unwrap(),
+        "off 8443\n"
+    );
+    let ServeViewState::Error { message, .. } = &view.state else {
+        panic!("reset did not end in the error view");
+    };
+    assert!(message.contains("--https=8443 off"), "{message}");
+    assert!(!message.contains("reset"), "{message}");
 }
