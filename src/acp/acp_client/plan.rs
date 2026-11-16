@@ -20,13 +20,6 @@ pub(super) fn approval_plan_text(
     Some(plan.to_string())
 }
 
-/// ExitPlanMode ships its markdown in `raw_input.plan`, which has no ACP
-/// `SessionUpdate::Plan` of its own (#1059). `None` for a missing, non-string,
-/// or bullet-less value, which still renders as a generic tool card.
-pub(super) fn extract_plan_from_switch_mode(raw_input: &serde_json::Value) -> Option<Plan> {
-    plan_from_markdown(raw_input.get("plan")?.as_str()?)
-}
-
 /// `None` for text with no bullet lines.
 pub(super) fn plan_from_markdown(plan_text: &str) -> Option<Plan> {
     let steps = parse_plan_steps(plan_text);
@@ -145,21 +138,13 @@ mod tests {
         assert_eq!(kept.as_deref(), Some(long.as_str()));
     }
 
-    /// A plan needs bullets; anything else renders as a generic tool card.
+    /// A plan needs bullets.
     #[test]
     fn plan_extraction_cases() {
-        for raw in [
-            serde_json::json!({}),
-            serde_json::json!({ "plan": 42 }),
-            serde_json::json!({ "plan": "Just a paragraph with no list." }),
-            serde_json::json!({ "plan": "" }),
-        ] {
-            assert!(extract_plan_from_switch_mode(&raw).is_none(), "{raw}");
+        for text in ["Just a paragraph with no list.", ""] {
+            assert!(plan_from_markdown(text).is_none(), "{text}");
         }
-        let plan = extract_plan_from_switch_mode(&serde_json::json!({
-            "plan": "- Step one\n- Step two\n- Step three"
-        }))
-        .expect("plan should parse");
+        let plan = plan_from_markdown("- Step one\n- Step two\n- Step three").expect("plan");
         assert_eq!(plan.steps.len(), 3);
         assert_eq!(plan.steps[0].title, "Step one");
 

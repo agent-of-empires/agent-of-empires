@@ -10,16 +10,14 @@ use crate::acp::state::{
 };
 use agent_client_protocol::schema::MaybeUndefined;
 use agent_client_protocol::v1::schema::{
-    CompactionId, CompactionStatus, ContentBlock, MessageId, NoticeSeverity, SessionId,
-    SessionUpdate, TextContent,
+    CompactionId, CompactionStatus, ContentBlock, MessageId, NoticeSeverity, PlanEntry,
+    PlanUpdateContent, SessionId, SessionUpdate, TextContent,
 };
 use tracing::debug;
 
 use super::config_options::map_acp_config_option;
 use super::lifecycle::{detect_off_protocol_work_completed, OffProtocolWorkKind};
-use super::plan::{
-    extract_plan_from_switch_mode, map_plan_status, plan_from_markdown, plan_status_to_str,
-};
+use super::plan::{map_plan_status, plan_from_markdown, plan_status_to_str};
 use super::raw_input::{
     background_agent_launched_from_value, background_command_launched_from_value,
     background_task_started_from_value, background_task_stopped_from_value, monitor_event_from_raw,
@@ -51,7 +49,8 @@ pub(super) fn is_compact_failure(text: &str) -> bool {
     text.contains("Compacting failed")
 }
 
-/// The model forgot its plan, so a finished compaction clears the plan strip.
+/// Clears the plan strip: after a compaction the model forgot its plan, and
+/// after a `plan_removed` the adapter dropped it.
 fn cleared_plan() -> Event {
     Event::PlanUpdated {
         plan: Plan {
@@ -309,8 +308,68 @@ fn notice_severity_str(severity: &NoticeSeverity) -> &str {
     }
 }
 
+/// TodoWrite arrives as a checklist plan; a synthetic TodoWrite card pair
+/// records each update in the transcript.
+fn checklist_events(entries: Vec<PlanEntry>) -> Vec<Event> {
+    let ts_ms = chrono::Utc::now().timestamp_millis();
+    let seq = SYNTHETIC_TOOL_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let plan_id = format!("plan-{ts_ms}-{seq}");
+    let tool_id = format!("todo-{ts_ms}-{seq}");
+    let todos_json: Vec<serde_json::Value> = entries
+        .iter()
+        .map(|e| {
+            serde_json::json!({
+                "content": e.content,
+                "status": plan_status_to_str(&e.status),
+            })
+        })
+        .collect();
+    let args_preview = serde_json::json!({ "todos": todos_json }).to_string();
+    let steps: Vec<PlanStep> = entries
+        .into_iter()
+        .enumerate()
+        .map(|(i, e)| PlanStep {
+            id: format!("step-{i}"),
+            title: e.content,
+            detail: None,
+            status: map_plan_status(e.status),
+        })
+        .collect();
+    let now = chrono::Utc::now();
+    vec![
+        Event::ToolCallStarted {
+            tool_call: ToolCall {
+                prompt: None,
+                id: tool_id.clone(),
+                name: "TodoWrite".to_string(),
+                kind: "think".to_string(),
+                args_preview,
+                started_at: now,
+                parent_tool_call_id: None,
+                memory_recall: None,
+                diffs: Vec::new(),
+            },
+        },
+        Event::PlanUpdated {
+            plan: Plan {
+                plan_id,
+                version: 1,
+                steps,
+            },
+        },
+        Event::ToolCallCompleted {
+            tool_call_id: tool_id,
+            is_error: false,
+            content: String::new(),
+            output: Vec::new(),
+            completed_at: now,
+            async_subagent: false,
+        },
+    ]
+}
+
 /// Unmapped variants pass through as `RawAgentUpdate`. `profile` gates the
-/// claude-specific synthesis (subagent linkage, ExitPlanMode, wake tools).
+/// claude-specific synthesis (subagent linkage, wake tools).
 pub(super) fn map_update_to_events(
     update: SessionUpdate,
     profile: &'static agent_profiles::AgentProfile,
@@ -425,15 +484,6 @@ pub(super) fn map_update_to_events(
                 .and_then(|p| plan_from_markdown(&p.markdown))
             {
                 events.push(Event::PlanUpdated { plan });
-            } else if profile.supports_exit_plan_mode
-                && matches!(
-                    tc.kind,
-                    agent_client_protocol::v1::schema::ToolKind::SwitchMode
-                )
-            {
-                if let Some(plan) = extract_plan_from_switch_mode(&raw_args) {
-                    events.push(Event::PlanUpdated { plan });
-                }
             }
             events.extend(wake_tool_event(profile, Some(tc.title.as_str()), &raw_args));
             events
@@ -551,67 +601,22 @@ pub(super) fn map_update_to_events(
             }
             events
         }
-        SessionUpdate::Plan(p) => {
-            // TodoWrite arrives as a Plan update; a synthetic TodoWrite card
-            // pair records each update in the transcript.
-            let ts_ms = chrono::Utc::now().timestamp_millis();
-            let seq = SYNTHETIC_TOOL_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            let plan_id = format!("plan-{ts_ms}-{seq}");
-            let tool_id = format!("todo-{ts_ms}-{seq}");
-            let todos_json: Vec<serde_json::Value> = p
-                .entries
-                .iter()
-                .map(|e| {
-                    serde_json::json!({
-                        "content": e.content,
-                        "status": plan_status_to_str(&e.status),
-                    })
-                })
-                .collect();
-            let args_preview = serde_json::json!({ "todos": todos_json }).to_string();
-            let steps: Vec<PlanStep> = p
-                .entries
+        SessionUpdate::Plan(p) => checklist_events(p.entries),
+        // AoE has one plan strip, so ids only pick the renderer: claude-agent-acp
+        // sends the TodoWrite checklist as items under `plan` and the approved
+        // ExitPlanMode plan as markdown under `plan-mode`.
+        SessionUpdate::PlanUpdate(update) => match update.plan {
+            PlanUpdateContent::Items(items) => checklist_events(items.entries),
+            PlanUpdateContent::Markdown(md) => plan_from_markdown(&md.content)
+                .map(|plan| Event::PlanUpdated { plan })
                 .into_iter()
-                .enumerate()
-                .map(|(i, e)| PlanStep {
-                    id: format!("step-{i}"),
-                    title: e.content,
-                    detail: None,
-                    status: map_plan_status(e.status),
-                })
-                .collect();
-            let now = chrono::Utc::now();
-            vec![
-                Event::ToolCallStarted {
-                    tool_call: ToolCall {
-                        prompt: None,
-                        id: tool_id.clone(),
-                        name: "TodoWrite".to_string(),
-                        kind: "think".to_string(),
-                        args_preview,
-                        started_at: now,
-                        parent_tool_call_id: None,
-                        memory_recall: None,
-                        diffs: Vec::new(),
-                    },
-                },
-                Event::PlanUpdated {
-                    plan: Plan {
-                        plan_id,
-                        version: 1,
-                        steps,
-                    },
-                },
-                Event::ToolCallCompleted {
-                    tool_call_id: tool_id,
-                    is_error: false,
-                    content: String::new(),
-                    output: Vec::new(),
-                    completed_at: now,
-                    async_subagent: false,
-                },
-            ]
-        }
+                .collect(),
+            other => {
+                debug!(target: "acp.protocol", ?other, "ignoring unsupported plan_update type");
+                Vec::new()
+            }
+        },
+        SessionUpdate::PlanRemoved(_) => vec![cleared_plan()],
         SessionUpdate::CurrentModeUpdate(mode_update) => {
             let id = mode_update.current_mode_id.0.to_string();
             // The legacy enum also folds gemini ApprovalMode ids (#1819).
@@ -843,25 +848,152 @@ mod tests {
         }
     }
 
-    /// EnterPlanMode is a `switch_mode` tool with no plan: a tool card only.
+    /// #5532: every plan shape feeds the one plan strip and `plan_removed`
+    /// clears it. ExitPlanMode adds no plan of its own, since the adapter
+    /// sends the approved plan as `plan-mode`.
     #[test]
-    fn switch_mode_emits_a_plan_only_when_the_input_carries_one() {
-        for (raw_input, want) in [
+    fn plan_updates_feed_and_clear_the_plan_strip() {
+        use agent_client_protocol::v1::schema::{
+            Plan as AcpPlan, PlanEntryPriority, PlanEntryStatus, PlanRemoved, PlanUpdate, ToolKind,
+        };
+        use serde_json::json;
+        let entry = |s| PlanEntry::new(s, PlanEntryPriority::Medium, PlanEntryStatus::InProgress);
+        let update = |content| SessionUpdate::PlanUpdate(PlanUpdate::new(content));
+        let removed = |id| SessionUpdate::PlanRemoved(PlanRemoved::new(id));
+        let exit_plan_mode = AcpToolCall::new("tc-plan", "ExitPlanMode")
+            .kind(ToolKind::SwitchMode)
+            .raw_input(json!({ "plan": "- a\n- b" }));
+        let mut proposal = AcpToolCall::new("tc-proposal", "Tool");
+        proposal.meta =
+            json!({"aoe": {"v": 1, "key": "k", "plan_proposal": {"markdown": "- a\n- b"}}})
+                .as_object()
+                .cloned();
+        let checklist = ["tool_call_started", "plan_updated", "tool_call_completed"];
+        for (name, update, want_kinds, want_steps) in [
             (
-                serde_json::json!({ "mode": "plan" }),
-                vec!["tool_call_started"],
+                "legacy checklist",
+                SessionUpdate::Plan(AcpPlan::new(vec![entry("a")])),
+                &checklist[..],
+                Some(vec!["a"]),
             ),
             (
-                serde_json::json!({ "plan": "- a\n- b" }),
-                vec!["tool_call_started", "plan_updated"],
+                "checklist",
+                update(PlanUpdateContent::items("plan", vec![entry("a")])),
+                &checklist[..],
+                Some(vec!["a"]),
+            ),
+            (
+                "approved plan",
+                update(PlanUpdateContent::markdown(
+                    "plan-mode",
+                    "# Plan\n\n- a\n- b",
+                )),
+                &["plan_updated"][..],
+                Some(vec!["a", "b"]),
+            ),
+            (
+                "bullet-less approved plan",
+                update(PlanUpdateContent::markdown("plan-mode", "prose")),
+                &[][..],
+                None,
+            ),
+            (
+                "file plan",
+                update(PlanUpdateContent::file("f", "file:///plan.md")),
+                &[][..],
+                None,
+            ),
+            (
+                "checklist removed",
+                removed("plan"),
+                &["plan_updated"][..],
+                Some(vec![]),
+            ),
+            (
+                "approved plan removed",
+                removed("plan-mode"),
+                &["plan_updated"][..],
+                Some(vec![]),
+            ),
+            (
+                "ExitPlanMode",
+                SessionUpdate::ToolCall(exit_plan_mode),
+                &["tool_call_started"][..],
+                None,
+            ),
+            (
+                "plan_proposal",
+                SessionUpdate::ToolCall(proposal),
+                &["tool_call_started", "plan_updated"][..],
+                Some(vec!["a", "b"]),
             ),
         ] {
-            let mut tc = AcpToolCall::new("tc-plan", "EnterPlanMode");
-            tc.kind = agent_client_protocol::v1::schema::ToolKind::SwitchMode;
-            tc.raw_input = Some(raw_input.clone());
-            let events = claude(SessionUpdate::ToolCall(tc));
-            assert_eq!(kinds(&events), want, "{raw_input}");
+            let events = claude(update);
+            assert_eq!(kinds(&events), want_kinds, "{name}");
+            let steps = events.iter().find_map(|e| match e {
+                Event::PlanUpdated { plan } => Some(
+                    plan.steps
+                        .iter()
+                        .map(|s| s.title.as_str())
+                        .collect::<Vec<_>>(),
+                ),
+                _ => None,
+            });
+            assert_eq!(steps, want_steps, "{name}");
         }
+    }
+
+    /// A daemon restart rebuilds the strip and sidebar from the event log:
+    /// the checklist keeps its last state and a removed plan stays removed.
+    #[test]
+    fn plan_state_survives_event_log_replay() {
+        use crate::acp::event_store::EventStore;
+        use crate::acp::state::{AcpSessionId, AcpState, AgentName, PlanStepStatus};
+        use agent_client_protocol::v1::schema::{
+            PlanEntryPriority, PlanEntryStatus, PlanRemoved, PlanUpdate,
+        };
+        let checklist = |status| {
+            SessionUpdate::PlanUpdate(PlanUpdate::new(PlanUpdateContent::items(
+                "plan",
+                vec![PlanEntry::new("a", PlanEntryPriority::Medium, status)],
+            )))
+        };
+        let tmp = tempfile::TempDir::new().unwrap();
+        let store = EventStore::open(&tmp.path().join("acp.db"), 1000).unwrap();
+        let mut seq = 0;
+        let mut record = |updates: Vec<SessionUpdate>| {
+            for event in updates.into_iter().flat_map(claude) {
+                seq += 1;
+                store.record("s", seq, &event).unwrap();
+            }
+        };
+        let replayed = |store: &EventStore| {
+            let mut state =
+                AcpState::new(AcpSessionId("s".into()), AgentName("claude".into()), None);
+            for (seq, event) in store.replay_from("s", 0) {
+                state.apply_event(seq, event).unwrap();
+            }
+            let statuses = |plan: crate::acp::state::Plan| -> Vec<PlanStepStatus> {
+                plan.steps.into_iter().map(|s| s.status).collect()
+            };
+            (
+                state.current_plan.map(statuses),
+                store.latest_plan("s").map(statuses),
+            )
+        };
+
+        record(vec![
+            checklist(PlanEntryStatus::Pending),
+            checklist(PlanEntryStatus::Completed),
+        ]);
+        let done = Some(vec![PlanStepStatus::Done]);
+        assert_eq!(replayed(&store), (done.clone(), done));
+
+        record(vec![
+            SessionUpdate::PlanRemoved(PlanRemoved::new("plan")),
+            SessionUpdate::PlanRemoved(PlanRemoved::new("plan-mode")),
+        ]);
+        assert_eq!(replayed(&store), (Some(vec![]), Some(vec![])));
     }
 
     #[test]
@@ -1797,20 +1929,11 @@ mod tests {
     /// profile, reduces to the same events as the `claudeCode` form.
     #[test]
     fn aoe_primitives_match_the_claude_meta_events() {
-        use agent_client_protocol::v1::schema::{ToolCallLocation, ToolKind};
+        use agent_client_protocol::v1::schema::ToolCallLocation;
         use serde_json::json;
 
-        fn tool_call(
-            meta: serde_json::Value,
-            locations: Vec<ToolCallLocation>,
-            plan_args: bool,
-        ) -> SessionUpdate {
+        fn tool_call(meta: serde_json::Value, locations: Vec<ToolCallLocation>) -> SessionUpdate {
             let mut tc = AcpToolCall::new("t1", "Tool").locations(locations);
-            if plan_args {
-                tc = tc
-                    .kind(ToolKind::SwitchMode)
-                    .raw_input(json!({"plan": "- first\n- second"}));
-            }
             tc.meta = meta.as_object().cloned();
             SessionUpdate::ToolCall(tc)
         }
@@ -1820,7 +1943,6 @@ mod tests {
                 match v {
                     serde_json::Value::Object(m) => {
                         m.remove("started_at");
-                        m.remove("plan_id");
                         m.values_mut().for_each(scrub);
                     }
                     serde_json::Value::Array(a) => a.iter_mut().for_each(scrub),
@@ -1853,18 +1975,11 @@ mod tests {
                 path(),
                 json!({"memory_recall": {"mode": "recall", "paths": ["/m/a.md"]}}),
             ),
-            (
-                "plan",
-                json!({}),
-                vec![],
-                json!({"plan_proposal": {"markdown": "- first\n- second"}}),
-            ),
         ];
         for (name, claude_meta, locations, primitive) in cases {
-            let plan_args = name == "plan";
-            let claude_events = claude(tool_call(claude_meta, locations, plan_args));
+            let claude_events = claude(tool_call(claude_meta, locations));
             let aoe_events = map_update_to_events(
-                tool_call(aoe(primitive), Vec::new(), plan_args),
+                tool_call(aoe(primitive), Vec::new()),
                 &agent_profiles::DEFAULT,
             );
             assert_eq!(stable(aoe_events), stable(claude_events), "{name}");
