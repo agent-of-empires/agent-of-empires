@@ -71,11 +71,20 @@ Docker and Podman honor every run-policy option. Apple Container honors `cap_add
 | Host path | Container path | Mode |
 |-----------|----------------|------|
 | Project directory | `/workspace` | RW |
+| `<repo>/.git/config`, `<repo>/.git/hooks` (bare repo: `config`, `hooks`) | the same path under the repo's mount | RO |
 | `~/.gitconfig` | `/root/.gitconfig` | RO |
 | `~/.ssh/` (with `mount_ssh`) | `/root/.ssh/` | RO |
 | The session's artifact dir | `/aoe/artifacts` | RW |
 | `<agent config>/sandbox-v2/<instance-id>/` | the agent's config path, e.g. `/root/.claude/` | RW |
 | `~/.claude/sandbox-v2/.credentials.json` | `/root/.claude/.credentials.json` | RW |
+
+### Git config and hooks
+
+Git runs a repo's hooks and config-defined commands (`core.sshCommand`, `credential.helper`, `core.fsmonitor`) on whichever machine invokes it. AoE and your own terminal run git on the host against the same repo the sandbox mounts, so a writable `.git/config` or `.git/hooks` would let code in the container execute on the host. AoE therefore mounts both read-only, over the writable repo mount, for every repo it mounts, including the main repo of a worktree.
+
+Inside the container, commands that write `.git/config` fail, for example `git remote add`, `git push -u` (the push succeeds, recording the upstream fails) and `git branch --set-upstream-to`. Run them on the host. Commits, branches, checkouts and refs are unaffected. Installing hooks from inside the container is not possible; install them on the host.
+
+Containers created by an older AoE keep a writable `.git` until you recreate the session. AoE's own host git calls also ignore repo-local `core.fsmonitor`, `core.sshCommand`, `credential.helper`, the `ext::` transport and, except for `git worktree add`, hooks. Set `core.sshCommand` and `credential.helper` in your global git config; repo-local values are not used by AoE.
 
 ### Volume ignores
 

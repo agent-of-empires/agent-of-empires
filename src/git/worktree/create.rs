@@ -47,7 +47,7 @@ impl GitWorktree {
     /// `git fetch <remote> <branch>` with stdin nulled (no passphrase prompts)
     /// and a 10 second bound.
     fn fetch_branch(&self, remote: &str, branch: &str) -> FetchOutcome {
-        let mut cmd = std::process::Command::new("git");
+        let mut cmd = crate::git::command::hardened_git(false);
         cmd.args(["fetch", remote, branch])
             .current_dir(&self.repo_path)
             .stdin(std::process::Stdio::null());
@@ -305,7 +305,7 @@ impl GitWorktree {
     /// exists; that worktree is usable, so the failure becomes a warning.
     fn add_worktree(&self, branch: &str, path: &Path, warnings: &mut Vec<String>) -> Result<()> {
         let t = Instant::now();
-        let output = crate::git::command::run_git(
+        let output = crate::git::command::run_git_with_hooks(
             &self.repo_path,
             ["worktree", "add", path_str(path)?, branch],
         )?;

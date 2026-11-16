@@ -7,7 +7,65 @@
 use std::ffi::OsStr;
 use std::path::Path;
 use std::process::{Command, Output, Stdio};
+use std::sync::OnceLock;
 use std::time::{Duration, Instant};
+
+/// Keys a sandbox can plant in the repo's `.git/config` to run code on the host.
+/// Pinned to the user's own system/global value, or git's default, so repo-local
+/// values are never obeyed.
+const PINNED_KEYS: [(&str, &str); 2] = [("core.sshCommand", "ssh"), ("credential.helper", "")];
+
+fn hardening_args() -> &'static [String] {
+    static ARGS: OnceLock<Vec<String>> = OnceLock::new();
+    ARGS.get_or_init(|| {
+        let mut args: Vec<String> = ["core.fsmonitor=false", "protocol.ext.allow=never"]
+            .into_iter()
+            .flat_map(|kv| ["-c".to_owned(), kv.to_owned()])
+            .collect();
+        for (key, default) in PINNED_KEYS {
+            let user: Vec<String> = ["--system", "--global"]
+                .iter()
+                .filter_map(|scope| {
+                    Command::new("git")
+                        .args(["config", scope, "--get-all", key])
+                        .output()
+                        .ok()
+                })
+                .flat_map(|o| {
+                    String::from_utf8_lossy(&o.stdout)
+                        .lines()
+                        .map(str::to_owned)
+                        .collect::<Vec<_>>()
+                })
+                .collect();
+            // An empty `credential.helper` resets the list the repo config built up.
+            if key == "credential.helper" {
+                args.extend(["-c".to_owned(), format!("{key}=")]);
+            }
+            if user.is_empty() && key != "credential.helper" {
+                args.extend(["-c".to_owned(), format!("{key}={default}")]);
+            }
+            args.extend(
+                user.iter()
+                    .flat_map(|v| ["-c".to_owned(), format!("{key}={v}")]),
+            );
+        }
+        args
+    })
+}
+
+/// `git` with config a sandbox-written `.git/config` cannot steer: no
+/// `core.fsmonitor`, repo-local `core.sshCommand` or `credential.helper`, or
+/// `ext::` transport. Hooks are off unless `hooks`; only `worktree add` opts in.
+pub fn hardened_git(hooks: bool) -> Command {
+    let mut cmd = Command::new("git");
+    cmd.args(hardening_args());
+    if !hooks {
+        cmd.args(["-c", "core.hooksPath=/dev/null"]);
+    }
+    cmd.env("LC_ALL", "C");
+    cmd
+}
 
 /// Run `git <args>` in `cwd`, instrumented with target `git.command`.
 /// Logs a debug line before, then debug (success) or warn (failure)
@@ -20,7 +78,17 @@ where
     I: IntoIterator<Item = S>,
     S: AsRef<OsStr>,
 {
-    run(cwd, args, false, false)
+    run(cwd, args, false, false, false)
+}
+
+/// [`run_git`] that lets the repo's hooks run. Only for `git worktree add`,
+/// whose post-checkout hook is documented behavior.
+pub fn run_git_with_hooks<I, S>(cwd: &Path, args: I) -> std::io::Result<Output>
+where
+    I: IntoIterator<Item = S>,
+    S: AsRef<OsStr>,
+{
+    run(cwd, args, false, false, true)
 }
 
 /// [`run_git`] at background priority, for git commands that delete many files.
@@ -29,10 +97,16 @@ where
     I: IntoIterator<Item = S>,
     S: AsRef<OsStr>,
 {
-    run(cwd, args, false, true)
+    run(cwd, args, false, true, false)
 }
 
-fn run<I, S>(cwd: &Path, args: I, quiet: bool, throttled: bool) -> std::io::Result<Output>
+fn run<I, S>(
+    cwd: &Path,
+    args: I,
+    quiet: bool,
+    throttled: bool,
+    hooks: bool,
+) -> std::io::Result<Output>
 where
     I: IntoIterator<Item = S>,
     S: AsRef<OsStr>,
@@ -48,8 +122,8 @@ where
     );
     // Callers classify several Git failures. Keep diagnostics deterministic
     // instead of depending on the launching shell's locale.
-    let mut command = Command::new("git");
-    command.args(&argv).current_dir(cwd).env("LC_ALL", "C");
+    let mut command = hardened_git(hooks);
+    command.args(&argv).current_dir(cwd);
     if throttled {
         crate::process::throttle_child(&mut command);
     }
@@ -143,11 +217,8 @@ where
         timeout_s = timeout.as_secs(),
         "running git with timeout"
     );
-    let mut cmd = Command::new("git");
-    cmd.args(&argv)
-        .current_dir(cwd)
-        .stdin(Stdio::null())
-        .env("LC_ALL", "C");
+    let mut cmd = hardened_git(false);
+    cmd.args(&argv).current_dir(cwd).stdin(Stdio::null());
     let result = crate::process::run_with_timeout_process_group(&mut cmd, timeout)?;
     let dur = start.elapsed().as_millis() as u64;
     match &result {
@@ -253,6 +324,75 @@ mod tests {
         let result = run_git_with_timeout(tmp.path(), args, Duration::from_millis(10))
             .expect("git should spawn");
         assert!(result.is_none(), "git blocked on the FIFO must time out");
+    }
+
+    /// A sandbox can write the repo's config and hooks; none of it may run on the host.
+    #[cfg(unix)]
+    #[test]
+    fn repo_written_config_and_hooks_do_not_execute() {
+        use std::os::unix::fs::PermissionsExt;
+        let tmp = tempfile::tempdir().unwrap();
+        let repo = tmp.path().join("repo");
+        let marks = tmp.path().join("marks");
+        std::fs::create_dir_all(&marks).unwrap();
+        let script = |name: &str, body: &str| {
+            let path = tmp.path().join(name);
+            std::fs::write(
+                &path,
+                format!("#!/bin/sh\n{body}\ntouch {}/{name}\n", marks.display()),
+            )
+            .unwrap();
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+            path
+        };
+        let git = |args: &[&str]| {
+            let out = run_git(&repo, args).unwrap();
+            assert!(
+                out.status.success(),
+                "{args:?}: {}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+        };
+        std::fs::create_dir(&repo).unwrap();
+        git(&["init", "-q"]);
+        git(&[
+            "-c",
+            "user.name=t",
+            "-c",
+            "user.email=t@t",
+            "commit",
+            "-q",
+            "--allow-empty",
+            "-m",
+            "i",
+        ]);
+        let fsmonitor = script("fsmonitor", "printf '\\0'");
+        let ssh = script("ssh", "exit 1");
+        let hook = script("post-checkout", "");
+        std::fs::create_dir_all(repo.join(".git/hooks")).unwrap();
+        std::fs::copy(&hook, repo.join(".git/hooks/post-checkout")).unwrap();
+        for (k, v) in [
+            ("core.fsmonitor", fsmonitor.to_str().unwrap()),
+            ("core.sshCommand", ssh.to_str().unwrap()),
+        ] {
+            std::process::Command::new("git")
+                .args(["config", k, v])
+                .current_dir(&repo)
+                .status()
+                .unwrap();
+        }
+
+        git(&["status"]);
+        git(&["checkout", "-q", "-b", "a"]);
+        let _ = run_git(&repo, ["ls-remote", "ssh://host/repo"]).unwrap();
+        let ran = |name: &str| marks.join(name).exists();
+        assert!(!ran("fsmonitor"), "core.fsmonitor ran");
+        assert!(!ran("ssh"), "core.sshCommand ran");
+        assert!(!ran("post-checkout"), "hook ran under run_git");
+
+        let out = run_git_with_hooks(&repo, ["checkout", "-q", "-b", "b"]).unwrap();
+        assert!(out.status.success());
+        assert!(ran("post-checkout"), "run_git_with_hooks must keep hooks");
     }
 
     #[test]

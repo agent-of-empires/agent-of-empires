@@ -2655,6 +2655,34 @@ pub(crate) fn preview_glob_volume_ignores(
         .collect())
 }
 
+/// Read-only overlays for each mounted repo's `config` and `hooks`. Git runs
+/// both on the host (hooks, `core.sshCommand`, `core.fsmonitor`, ...), so a
+/// sandbox that could write them would execute code outside the container.
+fn git_exec_surface_overlays(project_volumes: &[VolumeMount]) -> Vec<VolumeMount> {
+    let mut overlays = Vec::new();
+    for v in project_volumes {
+        let host = Path::new(&v.host_path);
+        let (git_dir, rel) = if host.join(".git").is_dir() {
+            (host.join(".git"), ".git/")
+        } else if host.join("objects").is_dir() && host.join("HEAD").is_file() {
+            (host.to_path_buf(), "")
+        } else {
+            continue;
+        };
+        for name in ["config", "hooks"] {
+            let path = git_dir.join(name);
+            if path.exists() {
+                overlays.push(VolumeMount {
+                    host_path: path.to_string_lossy().to_string(),
+                    container_path: format!("{}/{rel}{name}", v.container_path),
+                    read_only: true,
+                });
+            }
+        }
+    }
+    overlays
+}
+
 /// `(host_path, container_path)` pairs for the project mounts, the roots glob
 /// `volume_ignores` are expanded against.
 fn glob_roots(project_volumes: &[VolumeMount]) -> Vec<(String, String)> {
@@ -2855,6 +2883,7 @@ pub(crate) fn build_container_config(
     let glob_roots = glob_roots(&project_volumes);
 
     let mut volumes = project_volumes;
+    volumes.extend(git_exec_surface_overlays(&volumes));
 
     let sandbox_config = launch_config.sandbox();
 
@@ -3840,6 +3869,29 @@ mod tests {
         assert_eq!(
             volumes[0].container_path,
             format!("/workspace/{}", dir_name)
+        );
+    }
+
+    #[test]
+    fn git_exec_surface_overlays_cover_config_and_hooks_read_only() {
+        let (_dir, repo_path) = setup_regular_repo();
+        std::fs::create_dir_all(repo_path.join(".git/hooks")).unwrap();
+        let (volumes, _) = compute_volume_paths(&repo_path, repo_path.to_str().unwrap()).unwrap();
+        let name = repo_path.file_name().unwrap().to_string_lossy();
+
+        let overlays = git_exec_surface_overlays(&volumes);
+
+        let mut got: Vec<(String, bool)> = overlays
+            .iter()
+            .map(|o| (o.container_path.clone(), o.read_only))
+            .collect();
+        got.sort();
+        assert_eq!(
+            got,
+            vec![
+                (format!("/workspace/{name}/.git/config"), true),
+                (format!("/workspace/{name}/.git/hooks"), true),
+            ]
         );
     }
 
