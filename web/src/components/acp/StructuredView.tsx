@@ -30,6 +30,8 @@ import { PlanStrip } from "./PlanStrip";
 import { ModeSwitchFailedNotice, QueuedPromptsStrip, RejectedPromptsStrip, SessionNoticesStrip } from "./PromptStrips";
 import type { NewSessionLike } from "./ContainerGoneBanner";
 import { SessionBanners } from "./SessionBanners";
+import { composerBlockedReason, containerGoneRemedy } from "./containerGone";
+import type { RecreateContainerBlock } from "../sidebar/sessionActionTargets";
 import { ConfigOptionSwitchFailedNotice } from "./SessionConfigControls";
 import { StartupErrorScreen } from "./StartupErrorScreen";
 import { SystemNotices } from "./SystemNotices";
@@ -81,6 +83,8 @@ interface Props {
   isSandboxed?: boolean;
   /** The Session's title when the dashboard may recreate its container. */
   recreateContainerTitle?: string;
+  /** Why the dashboard can't recreate its container, or null when it can. */
+  recreateContainerBlock: RecreateContainerBlock | null;
   onOpenAgentsPane?: (agentId?: string) => void;
   /** The server is read-only, so the session cannot be interrupted. */
   serverReadOnly?: boolean;
@@ -297,6 +301,7 @@ function AcpChrome({
         onRestarted={ctx.markRestartStarted}
         onRestartFailed={ctx.markRestartFailed}
         recreateContainerTitle={view.recreateContainerTitle}
+        recreateContainerBlock={view.recreateContainerBlock}
         newSession={view.newSessionLike}
       />
 
@@ -454,9 +459,7 @@ function ComposerDock({
   // A send would start the Session, which rebuilds the container without Recreate's warning.
   const blockedReason =
     state.startupError && state.startupCause?.kind === "container_missing"
-      ? view.canRestartAgent
-        ? "Recreate the container to send messages."
-        : "Ask the owner to recreate the container."
+      ? composerBlockedReason(containerGoneRemedy(!!view.canRestartAgent, view.recreateContainerBlock))
       : null;
   return (
     <>

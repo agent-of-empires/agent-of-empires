@@ -18,9 +18,21 @@ export type SessionAction =
 
 const isStructured = (s: SessionResponse) => s.view === "structured";
 
+/** Why the dashboard can't recreate a Session's container, or null when it can. Trash wins, as in the stopped banners. */
+export type RecreateContainerBlock = "not_sandboxed" | "trashed" | "archived" | "creating" | "deleting";
+
+export function recreateContainerBlock(s: SessionResponse, archived: boolean): RecreateContainerBlock | null {
+  if (!s.is_sandboxed) return "not_sandboxed";
+  if (s.trashed_at) return "trashed";
+  if (archived) return "archived";
+  if (s.status === "Creating") return "creating";
+  if (s.status === "Deleting") return "deleting";
+  return null;
+}
+
 /** Whether a Session has a container the dashboard may recreate: the Session menu and the startup error screen. */
 export const canRecreateContainer = (s: SessionResponse, archived: boolean) =>
-  s.is_sandboxed && !archived && !s.trashed_at && !["Creating", "Deleting"].includes(s.status);
+  recreateContainerBlock(s, archived) === null;
 
 /** The title the startup error screen's Recreate container needs, or undefined when it isn't offered. */
 export const recreateContainerTitle = (s: SessionResponse) =>
