@@ -81,6 +81,23 @@ describe("SwitchAccountModal", () => {
     expect(onClose).not.toHaveBeenCalled();
   });
 
+  it("returns focus to Confirm after a refusal even if a frame runs before the commit", async () => {
+    // A frame that fires before React commits sees Confirm still disabled.
+    vi.stubGlobal("requestAnimationFrame", (cb: FrameRequestCallback) => {
+      cb(0);
+      return 0;
+    });
+    try {
+      mockSwitch.mockResolvedValue({ ok: false, message: "Nothing changed." });
+      renderModal({ targets: ["claude-b"] });
+      fireEvent.click(screen.getByTestId("switch-account-confirm"));
+      await screen.findByTestId("switch-account-error");
+      expect(document.activeElement).toBe(screen.getByTestId("switch-account-confirm"));
+    } finally {
+      vi.unstubAllGlobals();
+    }
+  });
+
   it.each([
     [[], "No other account can take this conversation over"],
     [null, "Couldn't list the accounts"],

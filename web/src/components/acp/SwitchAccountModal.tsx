@@ -1,4 +1,5 @@
 import { useEffect, useRef, useState, type KeyboardEvent as ReactKeyboardEvent } from "react";
+import { flushSync } from "react-dom";
 import { fetchAccountTargets, switchSessionAccount } from "../../lib/api";
 import type { AuthStatus } from "../../lib/acpTypes";
 
@@ -99,12 +100,17 @@ function SwitchAccountDialog({
     // Submitting disables every control, which would drop focus to the page behind, so park it here.
     dialogRef.current?.focus();
     const result = await switchSessionAccount(sessionId, selected);
-    setSubmitting(false);
-    if (result.ok) onClose();
-    else {
-      setError(result.message ?? "Switching account failed.");
-      requestAnimationFrame(() => confirmRef.current?.focus());
+    if (result.ok) {
+      setSubmitting(false);
+      onClose();
+      return;
     }
+    // Commit first so Confirm is enabled again before it takes focus.
+    flushSync(() => {
+      setSubmitting(false);
+      setError(result.message ?? "Switching account failed.");
+    });
+    confirmRef.current?.focus();
   };
 
   const identity = [authStatus?.label, authStatus?.account?.plan].filter((d): d is string => !!d);
