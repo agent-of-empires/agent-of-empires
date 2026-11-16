@@ -36,7 +36,7 @@ import { clearDraft } from "./lib/acpDrafts";
 import { useOrphanSweep } from "./hooks/useOrphanSweep";
 import { AcpPrefsProvider } from "./lib/acpPrefs";
 import { SessionActionProvider } from "./components/sidebar/SessionActionProvider";
-import { recreateContainerTitle } from "./components/sidebar/sessionActionTargets";
+import { recreateContainerBlock, recreateContainerTitle } from "./components/sidebar/sessionActionTargets";
 import { safeGetItem, safeRemoveItem } from "./lib/safeStorage";
 import { isAutomatedSession } from "./lib/onboarding";
 import { useWorkspaces } from "./hooks/useWorkspaces";
@@ -2199,6 +2199,7 @@ function AppContent({
                             serverReadOnly={caps.readOnly}
                             isSandboxed={session.is_sandboxed}
                             recreateContainerTitle={recreateContainerTitle(session)}
+                            recreateContainerBlock={recreateContainerBlock(session, !!session.archived_at)}
                             onSwitchToTerminal={
                               canSwitchToTerminal ? () => handleSwitchView(session.id, false) : undefined
                             }
