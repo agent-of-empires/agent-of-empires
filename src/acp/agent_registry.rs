@@ -306,8 +306,16 @@ mod tests {
             ("unknown", None, "opencode"),
             ("bad-sp", None, "claude"),
         ] {
+            let with_config = pick_acp_agent_name(&registry, &session, &acp, tool, explicit);
+            assert_eq!(with_config, want, "{tool} / {explicit:?}");
             assert_eq!(
-                pick_acp_agent_name(&registry, &session, &acp, tool, explicit),
+                pick_acp_agent_name_with_default(
+                    &registry,
+                    &session,
+                    acp.resolved_default_agent(),
+                    tool,
+                    explicit,
+                ),
                 want,
                 "{tool} / {explicit:?}"
             );

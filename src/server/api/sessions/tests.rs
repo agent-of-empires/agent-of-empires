@@ -4806,6 +4806,7 @@ async fn list_sessions_advertises_the_running_agents_reset_command() {
         c.session
             .agent_clear_alias
             .insert("bridge".into(), "/new".into());
+        c.acp.default_agent = "bridge".into();
         c.session
             .agent_acp_cmd
             .insert("cursor".into(), "cursor-bridge acp".into());
@@ -4825,6 +4826,7 @@ async fn list_sessions_advertises_the_running_agents_reset_command() {
     };
     let state = crate::server::test_support::build_test_app_state(vec![
         mk("next-bridge", "bridge", true),
+        mk("default-bridge", "unknown", true),
         mk("runs-bridge", "claude", true),
         mk("dead-bridge", "claude", true),
         mk("claude", "claude", true),
@@ -4851,6 +4853,7 @@ async fn list_sessions_advertises_the_running_agents_reset_command() {
         advertised,
         [
             row("next-bridge", &["/new"], &[]),
+            row("default-bridge", &["/new"], &[]),
             row("runs-bridge", &["/new"], &[]),
             row("dead-bridge", &["/clear"], &["/compact"]),
             row("claude", &["/clear"], &["/compact"]),
