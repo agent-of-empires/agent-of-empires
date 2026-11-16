@@ -400,13 +400,41 @@ pub(super) fn custom_agent_acp_capable(
         || crate::acp::inherited_acp_base(tool, &session.agent_detect_as).is_some()
 }
 
-/// Per-request cache for `(profile, repo config source)` config resolution, shared
-/// across the `list_sessions` overlays so a repo-local override is read from
-/// disk once per unique pair rather than once per row. See #2603.
+/// A config input's bytes, or why it could not be read (absent, or a directory).
+type Fingerprint = Result<Vec<u8>, std::io::ErrorKind>;
+
+/// Read `path` once per request, so an input many entries share costs one read.
+fn fingerprint<'a>(
+    seen: &'a mut HashMap<std::path::PathBuf, Fingerprint>,
+    path: &std::path::Path,
+) -> &'a Fingerprint {
+    seen.entry(path.to_path_buf())
+        .or_insert_with(|| std::fs::read(path).map_err(|error| error.kind()))
+}
+
+/// `(profile, repo config source)` config resolutions kept across requests. Each
+/// request revalidates them against the bytes of their input files, so an edit
+/// shows on the next publish. See #5665.
+#[derive(Default)]
+pub(crate) struct SessionCfgStore {
+    /// `project_path` to its repo config source, with the `.git` it was discovered from.
+    sources: HashMap<String, (Fingerprint, std::path::PathBuf)>,
+    entries: HashMap<(String, std::path::PathBuf), StoredSessionCfg>,
+}
+
+struct StoredSessionCfg {
+    /// Read before resolving, so an edit made during the resolve fails the next check.
+    inputs: Vec<(std::path::PathBuf, Fingerprint)>,
+    config: (SessionConfig, StructuredView),
+}
+
+/// One request's view of [`SessionCfgStore`], shared across the `list_sessions`
+/// overlays so a repo-local override is read from disk once per unique pair
+/// rather than once per row. See #2603.
 pub(super) struct SessionCfgCache<'a> {
-    entries: HashMap<(String, std::path::PathBuf), (SessionConfig, StructuredView)>,
-    /// `project_path` to its repo config source; discovery can open the repo through libgit2.
-    sources: HashMap<String, std::path::PathBuf>,
+    store: &'a mut SessionCfgStore,
+    seen: HashMap<std::path::PathBuf, Fingerprint>,
+    checked: std::collections::HashSet<(String, std::path::PathBuf)>,
     #[cfg(test)]
     pub(super) discoveries: usize,
     /// Where this cache reports its disk reads. The counter belongs to the
@@ -418,20 +446,32 @@ pub(super) struct SessionCfgCache<'a> {
 }
 
 impl<'a> SessionCfgCache<'a> {
-    pub(super) fn new(misses: &'a std::sync::atomic::AtomicUsize) -> Self {
+    pub(super) fn new(
+        store: &'a mut SessionCfgStore,
+        misses: &'a std::sync::atomic::AtomicUsize,
+    ) -> Self {
         Self {
-            entries: HashMap::new(),
-            sources: HashMap::new(),
+            store,
+            seen: HashMap::new(),
+            checked: std::collections::HashSet::new(),
             #[cfg(test)]
             discoveries: 0,
             misses,
         }
     }
 
+    /// Discovery can open the repo through libgit2, so it reruns only when `.git` changes.
     fn source(&mut self, project_path: &str) -> std::path::PathBuf {
-        if let Some(source) = self.sources.get(project_path) {
-            return source.clone();
+        let git = fingerprint(
+            &mut self.seen,
+            &std::path::Path::new(project_path).join(".git"),
+        );
+        if let Some((discovered_from, source)) = self.store.sources.get(project_path) {
+            if discovered_from == git {
+                return source.clone();
+            }
         }
+        let git = git.clone();
         #[cfg(test)]
         {
             self.discoveries += 1;
@@ -439,26 +479,51 @@ impl<'a> SessionCfgCache<'a> {
         let source = crate::session::config::repo_config::repo_config_source_path(
             std::path::Path::new(project_path),
         );
-        self.sources
-            .insert(project_path.to_string(), source.clone());
+        self.store
+            .sources
+            .insert(project_path.to_string(), (git, source.clone()));
         source
     }
 
-    /// Resolve `(profile, project_path)`, reading from disk on first miss only.
+    /// Resolve `(profile, project_path)`, reading from disk only when an input changed.
     fn entry(&mut self, profile: &str, project_path: &str) -> &(SessionConfig, StructuredView) {
-        let misses = self.misses;
         // Linked worktrees read their repo config from the main repo, so they share an entry.
-        let source = self.source(project_path);
-        self.entries
-            .entry((profile.to_string(), source))
-            .or_insert_with(|| {
-                misses.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                let config = crate::session::config::repo_config::resolve_config_with_repo_or_warn(
-                    profile,
-                    std::path::Path::new(project_path),
+        let key = (profile.to_string(), self.source(project_path));
+        if self.checked.insert(key.clone()) {
+            let seen = &mut self.seen;
+            let current = self.store.entries.get(&key).is_some_and(|stored| {
+                stored
+                    .inputs
+                    .iter()
+                    .all(|(path, bytes)| fingerprint(seen, path) == bytes)
+            });
+            if !current {
+                self.misses
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                let inputs = crate::session::config::profile_config::resolve_config_inputs(profile)
+                    .into_iter()
+                    .chain(crate::session::config::repo_config::repo_config_inputs(
+                        &key.1,
+                    ))
+                    .map(|path| {
+                        let bytes = fingerprint(seen, &path).clone();
+                        (path, bytes)
+                    })
+                    .collect();
+                let config =
+                    crate::session::config::repo_config::resolve_config_with_repo_source_or_warn(
+                        profile, &key.1,
+                    );
+                self.store.entries.insert(
+                    key.clone(),
+                    StoredSessionCfg {
+                        inputs,
+                        config: (config.session, config.acp.structured_view),
+                    },
                 );
-                (config.session, config.acp.structured_view)
-            })
+            }
+        }
+        &self.store.entries[&key].config
     }
 
     pub(super) fn resolve(&mut self, profile: &str, project_path: &str) -> &SessionConfig {

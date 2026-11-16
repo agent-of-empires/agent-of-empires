@@ -4406,7 +4406,8 @@ fn session_cfg_cache_discovers_a_repeated_main_checkout_once() {
     let path = repo.path().to_str().unwrap();
 
     let misses = AtomicUsize::new(0);
-    let mut cache = super::model::SessionCfgCache::new(&misses);
+    let mut store = super::SessionCfgStore::default();
+    let mut cache = super::model::SessionCfgCache::new(&mut store, &misses);
     for _ in 0..3 {
         cache.resolve("default", path);
         cache.structured_view("default", path);
@@ -4414,6 +4415,53 @@ fn session_cfg_cache_discovers_a_repeated_main_checkout_once() {
 
     assert_eq!(cache.discoveries, 1);
     assert_eq!(misses.load(Ordering::Relaxed), 1);
+}
+
+// Regression witness for #5665: the store outlives a request, so an unchanged
+// config is neither rediscovered nor re-resolved, while any input edit, even one
+// that keeps the file's size, resolves again on the next request.
+#[test]
+#[serial_test::serial]
+fn session_cfg_store_reresolves_only_after_an_input_edit() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    let tmp_home = tempfile::tempdir().expect("tempdir HOME");
+    let _home = crate::session::test_support::isolate_app_dir_at(tmp_home.path());
+    let global = crate::session::get_app_dir()
+        .expect("app dir")
+        .join("config.toml");
+    let repo = tempfile::tempdir().expect("tempdir repo");
+    run_git(repo.path(), &["init", "-q"]);
+    let repo_config = repo.path().join(".agent-of-empires/config.toml");
+    std::fs::create_dir_all(repo_config.parent().unwrap()).unwrap();
+    let path = repo.path().to_str().unwrap();
+
+    let mut store = super::SessionCfgStore::default();
+    let mut request = |edit: &dyn Fn()| {
+        edit();
+        let misses = AtomicUsize::new(0);
+        let mut cache = super::model::SessionCfgCache::new(&mut store, &misses);
+        cache.resolve("default", path);
+        cache.structured_view("default", path);
+        (misses.load(Ordering::Relaxed), cache.discoveries)
+    };
+
+    assert_eq!(request(&|| {}), (1, 1), "first request");
+    assert_eq!(request(&|| {}), (0, 0), "unchanged inputs");
+    let cases: [(&str, &dyn Fn()); 3] = [
+        ("repo config created", &|| {
+            std::fs::write(&repo_config, "# a\n").unwrap()
+        }),
+        ("same-size repo config edit", &|| {
+            std::fs::write(&repo_config, "# b\n").unwrap()
+        }),
+        ("global config edit", &|| {
+            std::fs::write(&global, "# c\n").unwrap()
+        }),
+    ];
+    for (case, edit) in cases {
+        assert_eq!(request(edit), (1, 0), "{case}");
+    }
 }
 
 // Repo roots that differ only in non-UTF-8 bytes must not share a config. APFS rejects such names.
@@ -4452,7 +4500,8 @@ fn session_cfg_cache_keeps_non_utf8_repo_roots_apart() {
         .collect();
 
     let misses = AtomicUsize::new(0);
-    let mut cache = super::model::SessionCfgCache::new(&misses);
+    let mut store = super::SessionCfgStore::default();
+    let mut cache = super::model::SessionCfgCache::new(&mut store, &misses);
     for path in &paths {
         cache.resolve("default", path);
     }

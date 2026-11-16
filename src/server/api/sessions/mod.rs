@@ -59,6 +59,7 @@ pub(crate) use lifecycle::recovery_restart;
 pub use lifecycle::*;
 pub use list::*;
 pub(crate) use model::session_response_from_instance;
+pub(crate) use model::SessionCfgStore;
 use model::*;
 pub use rename::*;
 pub use search::*;

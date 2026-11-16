@@ -210,6 +210,8 @@ pub struct AppState {
     /// cache. Scoped to one `AppState` rather than the process so a
     /// concurrent test cannot leak counts into an assertion.
     pub list_sessions_resolver_misses: std::sync::atomic::AtomicUsize,
+    /// Session config `list_sessions` keeps between publishes.
+    pub(crate) session_cfg_store: tokio::sync::Mutex<crate::server::api::sessions::SessionCfgStore>,
     /// Session ids with an in-flight smart-rename one-shot, so a burst of rapid
     /// first prompts cannot spawn concurrent title generators for the same
     /// session. Synchronous mutex: critical sections are tiny and never span an

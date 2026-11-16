@@ -179,6 +179,18 @@ thread_local! {
     pub(crate) static RESOLVES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
+/// Files [`resolve_config`] reads for `profile`.
+pub(crate) fn resolve_config_inputs(profile: &str) -> Vec<std::path::PathBuf> {
+    [
+        super::config_path(),
+        super::state_path(),
+        crate::session::get_profile_dir_path(profile).map(|dir| dir.join("config.toml")),
+    ]
+    .into_iter()
+    .flatten()
+    .collect()
+}
+
 /// Load effective config for a profile (global + profile overrides merged)
 pub fn resolve_config(profile: &str) -> Result<Config> {
     #[cfg(test)]

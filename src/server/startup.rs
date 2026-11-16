@@ -1112,6 +1112,7 @@ pub(crate) async fn start_server(
         idempotency_locks,
         create_progress: Default::default(),
         list_sessions_resolver_misses: std::sync::atomic::AtomicUsize::new(0),
+        session_cfg_store: Default::default(),
         smart_rename_inflight: std::sync::Mutex::new(std::collections::HashSet::new()),
         smart_rename_attempted: std::sync::Mutex::new(std::collections::HashSet::new()),
         smart_rename_semaphore: tokio::sync::Semaphore::new(
