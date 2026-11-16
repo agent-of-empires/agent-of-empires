@@ -729,6 +729,9 @@ async fn terminal_plan(
     let plan = agent_terminal_plan(state, id, instance, agent, source_event_seq).await?;
     Ok(match plan {
         TerminalPlan::Blocked(_) => plan,
+        // Retirement replaces a pending rebind's command and conversation, so the old command's
+        // selector never reaches the launch.
+        plan if instance.terminal_rebind_pending => plan,
         plan if instance.command_session_selector().is_some() => {
             // The launch refuses the selector beside AoE's own conversation, so refuse before
             // retirement rather than leave the switch owed.
@@ -2019,14 +2022,28 @@ mod tests {
             state.has_acknowledged_agent_hooks = true
         })?;
         let project = tempfile::tempdir()?;
-        let mut row = Instance::new("switched agent", project.path().to_str().unwrap());
-        row.tool = "claude".into();
-        row.view = View::Structured;
-        row.source_profile = "default".into();
-        row.agent_name = Some("codex".into());
-        row.terminal_rebind_pending = true;
-        row.command = "claude --old".into();
-        row.extra_args = "--old-arg".into();
+        let switched = |title: &str, command: &str, sid: Option<&str>| {
+            let mut row = Instance::new(title, project.path().to_str().unwrap());
+            row.tool = "claude".into();
+            row.view = View::Structured;
+            row.source_profile = "default".into();
+            row.agent_name = Some("codex".into());
+            row.terminal_rebind_pending = true;
+            row.command = command.into();
+            row.extra_args = "--old-arg".into();
+            row.agent_session_id = sid.map(Into::into);
+            row
+        };
+        // The rebind replaces the old command and conversation, so the old selector beside
+        // AoE's old id never reaches the launch.
+        let rows = [
+            switched("switched agent", "claude --old", None),
+            switched(
+                "switched agent, old selector",
+                "claude --resume old-id",
+                Some("sid-old"),
+            ),
+        ];
         crate::session::config::update_config(|config| {
             config
                 .session
@@ -2037,29 +2054,45 @@ mod tests {
                 .agent_extra_args
                 .insert("codex".into(), "60".into());
         })?;
-        let _pane = crate::tmux::test_helpers::TmuxTestSession::from_name(
-            crate::tmux::Session::generate_name(&row.id, &row.title),
-        );
-        crate::server::test_support::seed_instances_on_disk_for_test("default", vec![row.clone()]);
-        let state = crate::server::test_support::build_test_app_state(vec![row.clone()]);
+        let _panes: Vec<_> = rows
+            .iter()
+            .map(|row| {
+                crate::tmux::test_helpers::TmuxTestSession::from_name(
+                    crate::tmux::Session::generate_name(&row.id, &row.title),
+                )
+            })
+            .collect();
+        crate::server::test_support::seed_instances_on_disk_for_test("default", rows.to_vec());
+        let state = crate::server::test_support::build_test_app_state(rows.to_vec());
         crate::server::test_support::refresh_canonical_metadata_for_test(&state).await;
 
-        let response = acp_disable(
-            State(state.clone()),
-            Path(row.id.clone()),
-            Default::default(),
-        )
-        .await
-        .into_response();
-
-        assert_eq!(response.status(), StatusCode::OK);
-        let stored = crate::session::Storage::open_unwatched("default")?.load()?;
-        let stored = stored.iter().find(|r| r.id == row.id).unwrap();
-        assert_eq!(stored.view, View::Terminal);
-        assert_eq!(stored.tool, "codex");
-        assert_eq!(stored.command, "sleep");
-        assert_eq!(stored.extra_args, "60");
-        assert!(!stored.terminal_rebind_pending);
+        for row in &rows {
+            let checked = acp_terminal_check(State(state.clone()), Path(row.id.clone())).await;
+            let checked = response_json(checked).await?.1;
+            assert_eq!(
+                checked["context"], "starts_fresh",
+                "{}: {checked}",
+                row.title
+            );
+            assert_eq!(checked["reason"], "agent_not_resumable", "{}", row.title);
+            let response = acp_disable(
+                State(state.clone()),
+                Path(row.id.clone()),
+                Default::default(),
+            )
+            .await
+            .into_response();
+            let (status, json) = response_json(response).await?;
+            assert_eq!(status, StatusCode::OK, "{}: {json}", row.title);
+            let stored = crate::session::Storage::open_unwatched("default")?.load()?;
+            let stored = stored.iter().find(|r| r.id == row.id).unwrap();
+            assert_eq!(stored.view, View::Terminal, "{}", row.title);
+            assert_eq!(stored.tool, "codex");
+            assert_eq!(stored.command, "sleep");
+            assert_eq!(stored.extra_args, "60");
+            assert_eq!(stored.agent_session_id, None, "{}", row.title);
+            assert!(!stored.terminal_rebind_pending);
+        }
         Ok(())
     }
 

@@ -6133,9 +6133,9 @@
     {
       "id": "terminal-switch-command-selector-conflict",
       "kind": "deferred",
-      "issue": "https://github.com/agent-of-empires/agent-of-empires/issues/5727",
+      "issue": "https://github.com/agent-of-empires/agent-of-empires/issues/5651",
       "risk": "low",
-      "reason": "Refusal text is server copy shown verbatim by the switch toast: a switch whose command's own session flag conflicts with AoE's conversation is now refused before retirement with new text, pinned in acp::view tests. No client reads the reason code.",
+      "reason": "Behaviour change without a client flow yet: a switch whose command's own session flag conflicts with AoE's conversation is now refused before retirement, so the Session stays in Structured view, and a handoff already owed from before ends in Terminal view with Error instead of retrying. The dashboard only toasts the server's plain-text refusal; no client reads the new reason code yet. Handler tests in acp::view cover both paths, and the tested web flow comes with the #5651 switch dialog.",
       "components": ["web/src/lib/api.ts", "web/src/App.tsx"]
     }
   ]
