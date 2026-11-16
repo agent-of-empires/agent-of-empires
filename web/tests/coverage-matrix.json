@@ -6124,11 +6124,24 @@
     },
     {
       "id": "settings-restart-web-only-flags",
-      "kind": "deferred",
-      "issue": "https://github.com/agent-of-empires/agent-of-empires/issues/5302",
+      "kind": "vitest",
+      "risk": "medium",
+      "specs": ["src/lib/settingRow.test.ts", "src/components/settings/__tests__/SettingRow.test.tsx"],
+      "components": [
+        "web/src/lib/settingRow.ts",
+        "web/src/components/settings/SettingRow.tsx",
+        "web/src/components/settings/SchemaSection.tsx",
+        "web/src/components/settings/FormFields.tsx"
+      ],
+      "notes": "Each Settings row shows its label, tags (Needs restart, Web dashboard only, Terminal app only, Structured view only, Linux only), a lock on passphrase rows, the summary as its plain line, and its section.field key with a copy button. Every control is named by its row label. #5302."
+    },
+    {
+      "id": "settings.row-key-reveal",
+      "kind": "mocked-playwright",
       "risk": "low",
-      "reason": "Copy only: seven Settings labels lose \"(restart req.)\" and six summaries lose their restart sentence; the schema gains restart and web_only flags, which the row PR renders.",
-      "components": ["web/src/components/settings/SchemaSection.tsx"]
+      "specs": ["tests/settings-row.spec.ts"],
+      "components": ["web/src/components/settings/SettingRow.tsx"],
+      "notes": "With a mouse the key shows on hover and when focus reaches its copy button by Tab, and copies; at 375 it always shows. #5302."
     }
   ]
 }

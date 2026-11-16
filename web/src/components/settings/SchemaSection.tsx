@@ -9,7 +9,9 @@ import {
   TextField,
   ToggleField,
 } from "./FormFields";
+import type { RowLabel } from "./rowLabel";
 import { CUSTOM_SETTINGS_WIDGETS } from "./customWidgetRegistry";
+import { SettingRow, type ControlPlacement } from "./SettingRow";
 import { CronField, DynamicSelectField, ObjectListField } from "./StructuredWidgets";
 
 interface Props {
@@ -43,10 +45,24 @@ function listValidator(validation: SettingsValidation): ((value: string) => stri
   }
 }
 
-function describe(d: SettingsFieldDescriptor): string {
-  if (d.profile_overridable) return d.description;
-  const note = "Applies to all profiles (not profile-overridable).";
-  return d.description ? `${d.description} ${note}` : note;
+/** Custom widgets that edit a map or many values, so they need the row's full width. */
+const WIDE_CUSTOM_WIDGETS = new Set(["logging-targets", "smart-rename-model", "acp-defaults"]);
+
+function placement(d: SettingsFieldDescriptor): ControlPlacement {
+  const w = d.widget;
+  switch (w.kind) {
+    case "toggle":
+      return "toggle";
+    case "list":
+    case "object_list":
+      return "block";
+    case "text":
+      return w.multiline ? "block" : "inline";
+    case "custom":
+      return WIDE_CUSTOM_WIDGETS.has(w.id) || !CUSTOM_SETTINGS_WIDGETS[w.id] ? "block" : "inline";
+    default:
+      return "inline";
+  }
 }
 
 /** Keeps a schema/web mismatch visible instead of silently dropping the field. */
@@ -63,10 +79,11 @@ function renderField(
   d: SettingsFieldDescriptor,
   values: Record<string, unknown>,
   save: (value: unknown) => Promise<boolean>,
+  row: RowLabel,
 ) {
   const raw = values[d.field];
   const widget = d.widget;
-  const common = { label: d.label, description: describe(d) };
+  const common = { label: d.label, row };
   const str = typeof raw === "string" ? raw : "";
 
   switch (widget.kind) {
@@ -100,7 +117,7 @@ function renderField(
       return (
         <SliderField
           key={d.field}
-          {...common}
+          row={row}
           value={typeof raw === "number" ? raw : widget.min}
           onChange={save}
           min={widget.min}
@@ -132,7 +149,7 @@ function renderField(
       return (
         <DynamicSelectField
           key={d.field}
-          {...common}
+          row={row}
           section={d.section}
           source={widget.source}
           dependsOn={widget.depends_on ?? []}
@@ -147,7 +164,7 @@ function renderField(
       return (
         <ObjectListField
           key={d.field}
-          {...common}
+          row={row}
           section={d.section}
           idField={widget.id_field}
           fields={widget.fields}
@@ -162,7 +179,7 @@ function renderField(
       if (!Widget) {
         return <UnsupportedCustomWidget key={d.field} d={d} id={widget.id} />;
       }
-      return <Widget key={d.field} descriptor={{ ...d, description: common.description }} value={raw} save={save} />;
+      return <Widget key={d.field} descriptor={d} row={row} value={raw} save={save} />;
     }
   }
 }
@@ -205,7 +222,7 @@ export function SchemaSection({
     return () => cancelAnimationFrame(raf);
   }, [targetField]);
 
-  const wrap = (d: SettingsFieldDescriptor, node: React.ReactNode) => {
+  const wrap = (d: SettingsFieldDescriptor, node: (row: RowLabel) => React.ReactNode) => {
     const isTarget = d.field === targetField;
     return (
       <div
@@ -214,7 +231,9 @@ export function SchemaSection({
         data-settings-field={`${d.section}.${d.field}`}
         className={isTarget ? "animate-settings-highlight" : undefined}
       >
-        {node}
+        <SettingRow descriptor={d} placement={placement(d)}>
+          {(row) => node(row)}
+        </SettingRow>
       </div>
     );
   };
@@ -237,10 +256,14 @@ export function SchemaSection({
 
   return (
     <div className="space-y-4">
-      {primary.map((d) => wrap(d, renderField(d, values, makeSave(d))))}
+      <div className="divide-y divide-surface-700/40">
+        {primary.map((d) => wrap(d, (row) => renderField(d, values, makeSave(d), row)))}
+      </div>
       {advanced.length > 0 && (
         <CollapsibleSection title="Advanced" subtitle={advancedSubtitle} defaultOpen={targetAdvanced}>
-          {advanced.map((d) => wrap(d, renderField(d, values, makeSave(d))))}
+          <div className="divide-y divide-surface-700/40">
+            {advanced.map((d) => wrap(d, (row) => renderField(d, values, makeSave(d), row)))}
+          </div>
         </CollapsibleSection>
       )}
       {tuiOnly.length > 0 && (
@@ -249,7 +272,9 @@ export function SchemaSection({
           subtitle="Only the aoe terminal app reads these; they do not change this dashboard."
           defaultOpen={targetTuiOnly}
         >
-          {tuiOnly.map((d) => wrap(d, renderField(d, values, makeSave(d))))}
+          <div className="divide-y divide-surface-700/40">
+            {tuiOnly.map((d) => wrap(d, (row) => renderField(d, values, makeSave(d), row)))}
+          </div>
         </CollapsibleSection>
       )}
     </div>
