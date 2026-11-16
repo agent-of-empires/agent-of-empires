@@ -298,10 +298,13 @@ pub enum TerminalSwitchReason {
     NotStructured,
     /// With `command_decides`: the launch command carries a native session selector.
     CommandSelectsConversation,
+    /// With `blocked`: the command's native session selector and AoE's own conversation
+    /// would both reach the launch, which refuses them together.
+    CommandSelectorConflict,
 }
 
 impl TerminalSwitchReason {
-    pub const ALL: [Self; 11] = [
+    pub const ALL: [Self; 12] = [
         Self::AgentNotResumable,
         Self::NoConversationYet,
         Self::EarlierConversation,
@@ -313,6 +316,7 @@ impl TerminalSwitchReason {
         Self::SessionChanged,
         Self::NotStructured,
         Self::CommandSelectsConversation,
+        Self::CommandSelectorConflict,
     ];
 
     pub const fn as_str(self) -> &'static str {
@@ -328,6 +332,7 @@ impl TerminalSwitchReason {
             Self::SessionChanged => "session_changed",
             Self::NotStructured => "not_structured",
             Self::CommandSelectsConversation => "command_selects_conversation",
+            Self::CommandSelectorConflict => "command_selector_conflict",
         }
     }
 }

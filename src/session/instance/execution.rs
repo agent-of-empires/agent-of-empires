@@ -3345,6 +3345,16 @@ impl ConversationState {
             ResumeIntent::Default => self.session_id.is_some(),
         }
     }
+
+    /// Whether AoE holds a conversation for this launch, so a command's own native session
+    /// selector conflicts with it.
+    pub(crate) fn holds_aoe_conversation(&self) -> bool {
+        self.session_id.is_some()
+            || matches!(
+                self.intent,
+                ResumeIntent::Use(_) | ResumeIntent::Fork { .. }
+            )
+    }
 }
 
 impl Instance {

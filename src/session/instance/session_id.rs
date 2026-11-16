@@ -850,12 +850,7 @@ impl Instance {
             .then(|| self.existing_session_selector(&parsed_command.words, agent))
             .flatten()
         {
-            let aoe_has_state = self.agent_session_id.is_some()
-                || matches!(
-                    self.resume_intent,
-                    ResumeIntent::Use(_) | ResumeIntent::Fork { .. }
-                );
-            if aoe_has_state {
+            if self.conversation_state().holds_aoe_conversation() {
                 anyhow::bail!(
                     "{context} command already contains native session selector {selector}; remove it or clear the AoE-managed resume state before launching"
                 );
