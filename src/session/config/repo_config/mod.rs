@@ -293,16 +293,19 @@ pub fn profile_to_repo_config(profile: &ProfileConfig) -> RepoConfig {
 /// Worktree sessions read repo config from the main repo. Only probed when the
 /// path itself has `.git`, so discovery never walks up into an unrelated repo.
 pub fn repo_config_source_path(project_path: &Path) -> PathBuf {
+    discover_repo_config_source(project_path).unwrap_or_else(|| project_path.to_path_buf())
+}
+
+/// [`repo_config_source_path`], or `None` when `.git` exists but its repo cannot be opened.
+pub(crate) fn discover_repo_config_source(project_path: &Path) -> Option<PathBuf> {
     // The empty (scratch) path would probe the launch directory.
     if project_path.as_os_str().is_empty() {
-        return PathBuf::new();
+        return Some(PathBuf::new());
     }
     if project_path.join(".git").exists() {
-        if let Ok(main_repo) = crate::git::GitWorktree::find_main_repo(project_path) {
-            return main_repo;
-        }
+        return crate::git::GitWorktree::find_main_repo(project_path).ok();
     }
-    project_path.to_path_buf()
+    Some(project_path.to_path_buf())
 }
 
 /// Global, then profile, then repo; CityHall overrides are re-pinned last.

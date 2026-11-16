@@ -480,9 +480,13 @@ impl<'a> SessionCfgCache<'a> {
         {
             self.discoveries += 1;
         }
-        let source = crate::session::config::repo_config::repo_config_source_path(
-            std::path::Path::new(project_path),
-        );
+        let project = std::path::Path::new(project_path);
+        // A failed discovery falls back uncached, so the next request retries it.
+        let Some(source) =
+            crate::session::config::repo_config::discover_repo_config_source(project)
+        else {
+            return project.to_path_buf();
+        };
         self.store
             .sources
             .insert(project_path.to_string(), (git, source.clone()));

@@ -4462,6 +4462,17 @@ fn session_cfg_store_reresolves_only_after_an_input_edit() {
     for (case, edit) in cases {
         assert_eq!(request(edit), (1, 0), "{case}");
     }
+
+    // A `.git` whose repo cannot be opened is retried rather than cached.
+    let broken = tempfile::tempdir().expect("tempdir broken repo");
+    std::fs::write(broken.path().join(".git"), "gitdir: /nonexistent\n").unwrap();
+    let broken = broken.path().to_str().unwrap();
+    for _ in 0..2 {
+        let misses = AtomicUsize::new(0);
+        let mut cache = super::model::SessionCfgCache::new(&mut store, &misses);
+        cache.resolve("default", broken);
+        assert_eq!(cache.discoveries, 1, "failed discovery must not be cached");
+    }
 }
 
 // Repo roots that differ only in non-UTF-8 bytes must not share a config. APFS rejects such names.
