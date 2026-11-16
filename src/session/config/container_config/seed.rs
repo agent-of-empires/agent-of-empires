@@ -559,7 +559,8 @@ pub(super) fn sync_agent_config(
                 .context("configuration file has no leaf")?,
         );
         let preserve = preserve_files.contains(&name);
-        if preserve && parent.regular_lookup(leaf)?.is_some() {
+        let existing = parent.regular_lookup(leaf)?;
+        if preserve && existing == Some(true) {
             continue;
         }
         publish_source_file(
@@ -567,7 +568,7 @@ pub(super) fn sync_agent_config(
             &parent,
             leaf,
             boundary,
-            !preserve,
+            !preserve || existing.is_some(),
             ReadAccess::default(),
         )?;
     }
@@ -2306,6 +2307,40 @@ mod tests {
             fs::read(host_active.join("plugins/leak.json")).unwrap(),
             b"HOST_BYTES"
         );
+    }
+
+    #[test]
+    fn preserved_file_replaces_a_planted_link() {
+        let temporary = tempfile::tempdir().unwrap();
+        let source = temporary.path().join("source");
+        let active = temporary.path().join("active");
+        let host_file = temporary.path().join("host-file");
+        for path in [&source, &active] {
+            fs::create_dir_all(path).unwrap();
+        }
+        fs::write(source.join("settings.json"), b"{}").unwrap();
+        fs::write(&host_file, b"HOST_BYTES").unwrap();
+        std::os::unix::fs::symlink(&host_file, active.join("settings.json")).unwrap();
+        let mount = AGENT_CONFIG_MOUNTS
+            .iter()
+            .find(|mount| mount.tool_name == "claude")
+            .unwrap();
+        let boundary = NativeStateBoundary::for_fixture(&source, &active, mount).unwrap();
+        sync_agent_config(
+            &source,
+            &active,
+            &["settings.json"],
+            &[],
+            &[],
+            &["settings.json"],
+            &boundary,
+        )
+        .unwrap();
+        assert!(!fs::symlink_metadata(active.join("settings.json"))
+            .unwrap()
+            .file_type()
+            .is_symlink());
+        assert_eq!(fs::read(&host_file).unwrap(), b"HOST_BYTES");
     }
 
     #[test]

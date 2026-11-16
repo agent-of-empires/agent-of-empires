@@ -18,6 +18,14 @@ pub enum SymlinkPolicy {
 }
 
 impl SymlinkPolicy {
+    /// A sandbox config lives in a directory the container can write.
+    pub(super) fn for_target(target: super::HookInstallTarget) -> Self {
+        match target {
+            super::HookInstallTarget::Host => Self::Follow,
+            super::HookInstallTarget::Sandbox => Self::Never,
+        }
+    }
+
     /// The content to merge into, or `None` when absent. Under `Never` anything
     /// but a regular file reads as absent, checked and read on one `O_NOFOLLOW` fd.
     pub(crate) fn read(self, path: &Path) -> Result<Option<String>> {
@@ -180,5 +188,69 @@ mod tests {
         let started = std::time::Instant::now();
         with_config_lock(&target, "json.lock", || Ok(())).unwrap();
         assert!(started.elapsed() < std::time::Duration::from_millis(500));
+    }
+
+    #[test]
+    fn sandbox_installers_do_not_write_through_a_planted_link() {
+        use crate::hooks::test_support::agent_events;
+        use crate::hooks::HookInstallTarget::Sandbox;
+
+        type Install = fn(&Path) -> Result<()>;
+        let cases: [(&str, &str, Install); 7] = [
+            ("settings.json", "claude", |p| {
+                crate::hooks::install_hooks(p, agent_events("claude", &[]), Sandbox)
+            }),
+            ("hooks.json", "cursor", |p| {
+                crate::hooks::install_cursor_hooks_with_events(
+                    p,
+                    Sandbox,
+                    &agent_events("cursor", &[]),
+                )
+            }),
+            ("config.toml", "kimi", |p| {
+                crate::hooks::install_kimi_hooks_with_events(p, Sandbox, &agent_events("kimi", &[]))
+            }),
+            ("aoe-hooks.json", "kiro", |p| {
+                crate::hooks::install_kiro_hooks_with_events(p, Sandbox, &agent_events("kiro", &[]))
+            }),
+            ("config.yaml", "hermes", |p| {
+                crate::hooks::install_hermes_hooks_with_events(
+                    p,
+                    Sandbox,
+                    &agent_events("hermes", &[]),
+                )
+            }),
+            (crate::hooks::HERMES_ALLOWLIST_FILE, "hermes", |p| {
+                crate::hooks::install_hermes_hooks_with_events(
+                    &p.with_file_name("config.yaml"),
+                    Sandbox,
+                    &agent_events("hermes", &[]),
+                )
+            }),
+            ("config.toml", "settl", |p| {
+                crate::hooks::install_settl_hooks_with_events(
+                    p,
+                    Sandbox,
+                    &agent_events("settl", &[]),
+                )
+            }),
+        ];
+        for (file, agent, install) in cases {
+            let tmp = tempfile::tempdir().unwrap();
+            let sandbox = tmp.path().join("sandbox");
+            std::fs::create_dir_all(&sandbox).unwrap();
+            let host_file = tmp.path().join("host-file");
+            std::fs::write(&host_file, "HOST_BYTES").unwrap();
+            let path = sandbox.join(file);
+            std::os::unix::fs::symlink(&host_file, &path).unwrap();
+
+            let _ = install(&path);
+
+            assert_eq!(
+                std::fs::read_to_string(&host_file).unwrap(),
+                "HOST_BYTES",
+                "{agent} {file}: a link in the sandbox store redirected the write"
+            );
+        }
     }
 }
