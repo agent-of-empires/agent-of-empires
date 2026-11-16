@@ -1888,11 +1888,10 @@ pub struct SessionConfig {
     pub unread_indicator: bool,
 
     /// Show per-session color labels: the colored dot on sidebar rows and the
-    /// `Color` section in the session context menu. Web dashboard only; the TUI
-    /// does not render session colors. Turning this off hides them without
-    /// forbidding anything, `aoe session color` and the REST endpoint keep
-    /// working and stored values are preserved, so flipping back reveals them
-    /// again.
+    /// `Color` section in the session context menu. Turning this off hides
+    /// them without forbidding anything, `aoe session color` and the REST
+    /// endpoint keep working and stored values are preserved, so flipping back
+    /// reveals them again.
     ///
     /// `global_only`: the dashboard resolves one settings object for the whole
     /// client, not one per workspace, and the sidebar mixes sessions from
