@@ -4475,6 +4475,13 @@ fn session_cfg_store_reresolves_only_after_an_input_edit() {
         assert_eq!(request(edit), (1, 0), "{case}");
     }
 
+    // An empty profile shares the entry of the default profile it names.
+    let misses = AtomicUsize::new(0);
+    let mut cache = super::model::SessionCfgCache::new(&mut store, &misses);
+    cache.resolve("", path);
+    cache.resolve(&crate::session::config::effective_profile(""), path);
+    assert_eq!(misses.load(Ordering::Relaxed), 1, "empty profile");
+
     // A `.git` whose repo cannot be opened is retried rather than cached.
     let broken = tempfile::tempdir().expect("tempdir broken repo");
     std::fs::write(broken.path().join(".git"), "gitdir: /nonexistent\n").unwrap();

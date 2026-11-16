@@ -4221,27 +4221,38 @@ fn config_save_lock() -> &'static Mutex<()> {
     LOCK.get_or_init(|| Mutex::new(()))
 }
 
-pub(super) fn read_optional_config(path: &std::path::Path) -> Result<Option<String>> {
-    match fs::read_to_string(path) {
-        Ok(content) => Ok(Some(content)),
+/// One read of a config file. On error, whether the path itself exists: a
+/// dangling link is not an absent file.
+pub(crate) type FileRead = std::result::Result<std::sync::Arc<[u8]>, (std::io::ErrorKind, bool)>;
+
+/// How config resolution reads its files, so a caller can resolve from bytes it already holds.
+pub(crate) type ReadFile<'a> = &'a dyn Fn(&Path) -> FileRead;
+
+pub(crate) fn read_file(path: &Path) -> FileRead {
+    fs::read(path)
+        .map(std::sync::Arc::from)
+        .map_err(|error| (error.kind(), fs::symlink_metadata(path).is_ok()))
+}
+
+pub(super) fn read_optional_config(path: &Path, read: ReadFile) -> Result<Option<String>> {
+    match read(path) {
+        Ok(bytes) => Ok(Some(String::from_utf8(bytes.to_vec())?)),
         // A missing file is optional; a broken link or an unreadable path is not.
-        Err(error)
-            if error.kind() == std::io::ErrorKind::NotFound
-                && fs::symlink_metadata(path)
-                    .is_err_and(|error| error.kind() == std::io::ErrorKind::NotFound) =>
-        {
-            Ok(None)
-        }
-        Err(error) => Err(error.into()),
+        Err((std::io::ErrorKind::NotFound, false)) => Ok(None),
+        Err((kind, _)) => Err(std::io::Error::from(kind).into()),
     }
 }
 
 impl Config {
     /// Read config.toml without the obsolete inline app_state table.
     fn load_raw_table() -> Result<toml::Table> {
+        Self::load_raw_table_via(&read_file)
+    }
+
+    fn load_raw_table_via(read: ReadFile) -> Result<toml::Table> {
         let path = config_path()?;
         let result = (|| {
-            let mut table: toml::Table = match read_optional_config(&path)? {
+            let mut table: toml::Table = match read_optional_config(&path, read)? {
                 Some(content) => toml::from_str(&content)?,
                 None => toml::Table::new(),
             };
@@ -4253,7 +4264,11 @@ impl Config {
     }
 
     pub fn load() -> Result<Self> {
-        let table = Self::load_raw_table()?;
+        Self::load_via(&read_file)
+    }
+
+    pub(crate) fn load_via(read: ReadFile) -> Result<Self> {
+        let table = Self::load_raw_table_via(read)?;
         let mut config: Config = table.try_into().map_err(|error: toml::de::Error| {
             let error = anyhow::Error::new(error);
             match config_path() {
@@ -4261,7 +4276,7 @@ impl Config {
                 Err(_) => error,
             }
         })?;
-        config.app_state = AppStateConfig::load()?;
+        config.app_state = AppStateConfig::load_via(read)?;
         Ok(config)
     }
 
@@ -4377,9 +4392,13 @@ impl AppStateConfig {
     /// Read `state.toml` (fields at the TOML top level, not nested under an
     /// `[app_state]` table). A missing file deserializes to defaults.
     pub fn load() -> Result<Self> {
+        Self::load_via(&read_file)
+    }
+
+    fn load_via(read: ReadFile) -> Result<Self> {
         let path = state_path()?;
         let result = (|| {
-            let table: toml::Table = match read_optional_config(&path)? {
+            let table: toml::Table = match read_optional_config(&path, read)? {
                 Some(content) => toml::from_str(&content)?,
                 None => toml::Table::new(),
             };

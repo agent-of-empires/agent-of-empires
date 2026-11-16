@@ -1,6 +1,7 @@
 //! Backend conversion to wire responses and per-request config resolution.
 
 use super::*;
+use crate::session::config::FileRead as Fingerprint;
 use crate::session::config::StructuredView;
 use crate::session::projection::SessionProjection;
 use chrono::{DateTime, Utc};
@@ -400,20 +401,13 @@ pub(super) fn custom_agent_acp_capable(
         || crate::acp::inherited_acp_base(tool, &session.agent_detect_as).is_some()
 }
 
-/// A config input's bytes, or why it could not be read (absent, or a directory).
-/// On a read error, whether the path itself exists: a dangling link is not an absent file.
-type Fingerprint = Result<std::sync::Arc<[u8]>, (std::io::ErrorKind, bool)>;
-
 /// Read `path` once per request, so an input many entries share costs one read.
 fn fingerprint<'a>(
     seen: &'a mut HashMap<std::path::PathBuf, Fingerprint>,
     path: &std::path::Path,
 ) -> &'a Fingerprint {
-    seen.entry(path.to_path_buf()).or_insert_with(|| {
-        std::fs::read(path)
-            .map(std::sync::Arc::from)
-            .map_err(|error| (error.kind(), std::fs::symlink_metadata(path).is_ok()))
-    })
+    seen.entry(path.to_path_buf())
+        .or_insert_with(|| crate::session::config::read_file(path))
 }
 
 /// `(profile, repo config source)` config resolutions kept across requests. Each
@@ -428,7 +422,7 @@ pub(crate) struct SessionCfgStore {
 }
 
 struct StoredSessionCfg {
-    /// Read before resolving, so an edit made during the resolve fails the next check.
+    /// Every file the resolve read, with the bytes it parsed.
     inputs: Vec<(std::path::PathBuf, Fingerprint)>,
     config: (SessionConfig, StructuredView),
 }
@@ -440,6 +434,7 @@ pub(super) struct SessionCfgCache<'a> {
     store: &'a mut SessionCfgStore,
     seen: HashMap<std::path::PathBuf, Fingerprint>,
     checked: std::collections::HashSet<(String, std::path::PathBuf)>,
+    default_profile: Option<String>,
     #[cfg(test)]
     pub(super) discoveries: usize,
     /// Where this cache reports its disk reads. The counter belongs to the
@@ -459,6 +454,7 @@ impl<'a> SessionCfgCache<'a> {
             store,
             seen: HashMap::new(),
             checked: std::collections::HashSet::new(),
+            default_profile: None,
             #[cfg(test)]
             discoveries: 0,
             misses,
@@ -496,6 +492,16 @@ impl<'a> SessionCfgCache<'a> {
 
     /// Resolve `(profile, project_path)`, reading from disk only when an input changed.
     fn entry(&mut self, profile: &str, project_path: &str) -> &(SessionConfig, StructuredView) {
+        // Resolving `""` would read the default profile's name from disk, past the fingerprints,
+        // so key and resolve by the name itself.
+        let profile = match profile {
+            "" => self
+                .default_profile
+                .get_or_insert_with(|| crate::session::config::effective_profile(""))
+                .clone(),
+            named => named.to_string(),
+        };
+        let profile = profile.as_str();
         // Linked worktrees read their repo config from the main repo, so they share an entry.
         let key = (profile.to_string(), self.source(project_path));
         if self.checked.insert(key.clone()) {
@@ -509,24 +515,24 @@ impl<'a> SessionCfgCache<'a> {
             if !current {
                 self.misses
                     .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                let inputs = crate::session::config::profile_config::resolve_config_inputs(profile)
-                    .into_iter()
-                    .chain(crate::session::config::repo_config::repo_config_inputs(
-                        &key.1,
-                    ))
-                    .map(|path| {
-                        let bytes = fingerprint(seen, &path).clone();
-                        (path, bytes)
-                    })
-                    .collect();
+                // Resolve from the fingerprinted bytes, so the stored config matches its inputs.
+                let seen = std::cell::RefCell::new(seen);
+                let inputs = std::cell::RefCell::new(Vec::new());
+                let read = |path: &std::path::Path| {
+                    let bytes = fingerprint(&mut seen.borrow_mut(), path).clone();
+                    inputs
+                        .borrow_mut()
+                        .push((path.to_path_buf(), bytes.clone()));
+                    bytes
+                };
                 let config =
                     crate::session::config::repo_config::resolve_config_with_repo_source_or_warn(
-                        profile, &key.1,
+                        profile, &key.1, &read,
                     );
                 self.store.entries.insert(
                     key.clone(),
                     StoredSessionCfg {
-                        inputs,
+                        inputs: inputs.into_inner(),
                         config: (config.session, config.acp.structured_view),
                     },
                 );

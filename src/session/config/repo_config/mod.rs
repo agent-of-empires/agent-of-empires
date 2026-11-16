@@ -82,44 +82,27 @@ fn resolved_repo_config_path(project_path: &Path) -> Option<PathBuf> {
         .find(|path| path.exists())
 }
 
-/// Files [`load_repo_config`] may read for `source`.
-pub(crate) fn repo_config_inputs(source: &Path) -> Vec<PathBuf> {
-    if source.as_os_str().is_empty() {
-        return Vec::new();
-    }
-    // Like the loader, consult the legacy path only when the primary is absent.
-    let primary = source.join(REPO_CONFIG_PATH);
-    if fs::symlink_metadata(&primary).is_ok() {
-        return vec![primary];
-    }
-    vec![primary, source.join(LEGACY_REPO_CONFIG_PATH)]
-}
-
 /// Loads `.agent-of-empires/config.toml`, falling back to the legacy
 /// `.aoe/config.toml`. `None` when absent, empty, or for the empty (scratch) path.
 pub fn load_repo_config(project_path: &Path) -> Result<Option<RepoConfig>> {
+    load_repo_config_via(project_path, &super::read_file)
+}
+
+fn load_repo_config_via(project_path: &Path, read: super::ReadFile) -> Result<Option<RepoConfig>> {
     // An empty path would resolve relative to the launch directory.
     if project_path.as_os_str().is_empty() {
         return Ok(None);
     }
     let config_path = project_path.join(REPO_CONFIG_PATH);
-    let (config_path, is_legacy) = match fs::symlink_metadata(&config_path) {
-        Ok(_) => (config_path, false),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+    let (config_path, is_legacy, content) = match read(&config_path) {
+        Err((std::io::ErrorKind::NotFound, false)) => {
             let legacy_path = project_path.join(LEGACY_REPO_CONFIG_PATH);
-            match fs::symlink_metadata(&legacy_path) {
-                Ok(_) => (legacy_path, true),
-                Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-                Err(error) => {
-                    return Err(error)
-                        .with_context(|| format!("Failed to inspect {}", legacy_path.display()))
-                }
+            match read(&legacy_path) {
+                Err((std::io::ErrorKind::NotFound, false)) => return Ok(None),
+                content => (legacy_path, true, content),
             }
         }
-        Err(error) => {
-            return Err(error)
-                .with_context(|| format!("Failed to inspect {}", config_path.display()))
-        }
+        content => (config_path, false, content),
     };
 
     if resolves_to_global_config(&config_path) {
@@ -135,7 +118,9 @@ pub fn load_repo_config(project_path: &Path) -> Result<Option<RepoConfig>> {
         );
     }
 
-    let content = fs::read_to_string(&config_path)
+    let content = content
+        .map_err(|(kind, _)| anyhow::Error::from(std::io::Error::from(kind)))
+        .and_then(|bytes| Ok(String::from_utf8(bytes.to_vec())?))
         .with_context(|| format!("Failed to read {}", config_path.display()))?;
     if content.trim().is_empty() {
         return Ok(None);
@@ -324,13 +309,22 @@ pub fn resolve_config_with_repo(profile: &str, project_path: &Path) -> Result<Co
 /// Like [`resolve_config_with_repo`], degrading a bad repo config to the
 /// profile config and a bad profile config to defaults.
 pub fn resolve_config_with_repo_or_warn(profile: &str, project_path: &Path) -> Config {
-    resolve_config_with_repo_source_or_warn(profile, &repo_config_source_path(project_path))
+    resolve_config_with_repo_source_or_warn(
+        profile,
+        &repo_config_source_path(project_path),
+        &super::read_file,
+    )
 }
 
-/// [`resolve_config_with_repo_or_warn`] for an already discovered repo config source.
-pub fn resolve_config_with_repo_source_or_warn(profile: &str, source: &Path) -> Config {
-    let base = profile_config::resolve_config_or_warn(profile);
-    let mut merged = match load_repo_config(source) {
+/// [`resolve_config_with_repo_or_warn`] for an already discovered repo config
+/// source, reading every config file through `read`.
+pub(crate) fn resolve_config_with_repo_source_or_warn(
+    profile: &str,
+    source: &Path,
+    read: super::ReadFile,
+) -> Config {
+    let base = profile_config::resolve_config_or_warn_via(profile, read);
+    let mut merged = match load_repo_config_via(source, read) {
         Ok(Some(repo_config)) => merge_repo_config(base, &repo_config),
         Ok(None) => base,
         Err(e) => {
@@ -428,6 +422,35 @@ mod tests {
         for section in ["host_hooks", "tmux", "sound"] {
             assert!(allowed.get(section).is_none(), "{section}");
         }
+    }
+
+    /// The session config cache stores a resolve under the bytes it fingerprinted (#5665),
+    /// so every config file must come through `read`, none from disk.
+    #[test]
+    #[serial_test::serial]
+    fn resolve_with_repo_source_reads_only_through_the_reader() {
+        let home = tempfile::tempdir().unwrap();
+        let _home = crate::session::test_support::isolate_app_dir_at(home.path());
+        let repo = tempfile::tempdir().unwrap();
+        let global = crate::session::config::config_path().unwrap();
+        let repo_config = repo.path().join(REPO_CONFIG_PATH);
+        let read = |path: &Path| -> super::super::FileRead {
+            if path == global {
+                Ok(b"[acp]\nstructured_view = \"off\"\n".as_slice().into())
+            } else if path == repo_config {
+                Ok(b"[worktree]\nauto_cleanup = false\n".as_slice().into())
+            } else {
+                Err((std::io::ErrorKind::NotFound, false))
+            }
+        };
+
+        let config = resolve_config_with_repo_source_or_warn("default", repo.path(), &read);
+
+        assert_eq!(
+            config.acp.structured_view,
+            super::super::StructuredView::Off
+        );
+        assert!(!config.worktree.auto_cleanup);
     }
 
     /// A repo pointing `default_tool` at the user's own custom agent would launch its command (#3154).
