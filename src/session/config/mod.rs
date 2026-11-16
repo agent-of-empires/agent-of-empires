@@ -296,8 +296,9 @@ pub struct LoggingConfig {
     /// effect.
     #[serde(default)]
     #[setting(
-        label = "Write to (restart req.)",
+        label = "Write to",
         widget = "select",
+        restart,
         options = "file:file,stdout:stdout",
         global_only,
         advanced,
@@ -309,8 +310,9 @@ pub struct LoggingConfig {
     /// absolute paths are used verbatim. Restart aoe for changes.
     #[serde(default = "default_file_path")]
     #[setting(
-        label = "File (restart req.)",
+        label = "File",
         widget = "text",
+        restart,
         global_only,
         advanced,
         summary = "A name goes in AoE's app data folder; a full path is used as is."
@@ -321,8 +323,9 @@ pub struct LoggingConfig {
     /// rotation. Restart aoe for changes.
     #[serde(default)]
     #[setting(
-        label = "Rotation (restart req.)",
+        label = "Rotation",
         widget = "select",
+        restart,
         options = "size:size,never:never",
         global_only,
         advanced
@@ -332,8 +335,9 @@ pub struct LoggingConfig {
     /// Rotation threshold in MiB. Ignored when rotation = never.
     #[serde(default = "default_max_size_mib")]
     #[setting(
-        label = "Max size MiB (restart req.)",
+        label = "Max size MiB",
         widget = "number",
+        restart,
         min = 0,
         global_only,
         advanced
@@ -343,8 +347,9 @@ pub struct LoggingConfig {
     /// How many rotated files to retain (.1 through .keep_count).
     #[serde(default = "default_keep_count")]
     #[setting(
-        label = "Keep (restart req.)",
+        label = "Keep",
         widget = "number",
+        restart,
         min = 0,
         global_only,
         advanced,
@@ -359,8 +364,9 @@ pub struct LoggingConfig {
     /// polling endpoints. Off by default keeps the log readable.
     #[serde(default = "default_show_spans")]
     #[setting(
-        label = "Show where each line came from (restart req.)",
+        label = "Show where each line came from",
         widget = "toggle",
+        restart,
         global_only,
         advanced,
         summary = "Adds context to each line. Makes the log longer."
@@ -493,11 +499,12 @@ pub struct AcpConfig {
     #[setting(
         label = "Most Agents running at once",
         widget = "number",
+        restart,
         min = 1,
         validate = "range:1",
         global_only,
         advanced,
-        summary = "How many Structured view Sessions can have their Agent running at the same time. Lower it to save memory. Applies after the Daemon restarts."
+        summary = "How many Structured view Sessions can have their Agent running at the same time. Lower it to save memory."
     )]
     pub max_concurrent_workers: u32,
     /// Per-session retention cap on acp events. 0 = unlimited (default);
@@ -1584,8 +1591,9 @@ pub struct SessionConfig {
     /// start. 0 keeps the default (50).
     #[serde(default = "default_session_id_poller_max_threads")]
     #[setting(
-        label = "Conversation lookup threads (restart req.)",
+        label = "Conversation lookup threads",
         widget = "number",
+        restart,
         min = 0,
         global_only,
         advanced,
@@ -1896,6 +1904,7 @@ pub struct SessionConfig {
     #[setting(
         label = "Session colors",
         widget = "toggle",
+        web_only,
         category = "Interaction",
         global_only,
         summary = "A colored dot on each row, and Color in the Session menu."
@@ -2634,8 +2643,9 @@ pub struct WebConfig {
     #[setting(
         label = "A Session needs you",
         widget = "toggle",
+        restart,
         global_only,
-        summary = "The Agent is waiting for your answer or approval. Applies after the Daemon restarts."
+        summary = "The Agent is waiting for your answer or approval."
     )]
     pub notify_on_waiting: bool,
 
@@ -2646,14 +2656,20 @@ pub struct WebConfig {
     #[setting(
         label = "A Session finishes",
         widget = "toggle",
+        restart,
         global_only,
-        summary = "The Agent is done and the Session is Idle. Applies after the Daemon restarts."
+        summary = "The Agent is done and the Session is Idle."
     )]
     pub notify_on_idle: bool,
 
     /// Default: send a push when a session errors (Running to Error).
     #[serde(default = "default_true")]
-    #[setting(label = "A Session hits an error", widget = "toggle", global_only)]
+    #[setting(
+        label = "A Session hits an error",
+        widget = "toggle",
+        restart,
+        global_only
+    )]
     pub notify_on_error: bool,
 
     /// Default: send a push when an acp session's ScheduleWakeup timer
@@ -3694,6 +3710,7 @@ pub struct TmuxConfig {
     #[setting(
         label = "Separate tmux server",
         widget = "optional_text",
+        restart,
         global_only,
         web = "local_only:changes which tmux server hosts your sessions on this machine",
         summary = "Keeps AoE's Sessions apart from your other tmux sessions. Enter a short name, like aoe. Change it when no Sessions are running."
@@ -3732,6 +3749,7 @@ pub struct SystemdSettings {
     #[setting(
         label = "Run Sessions in systemd scopes",
         widget = "toggle",
+        restart,
         global_only,
         summary = "Does nothing if systemd isn't available."
     )]
@@ -3742,6 +3760,7 @@ pub struct SystemdSettings {
     #[setting(
         label = "Slice",
         widget = "text",
+        restart,
         validate = "systemd_slice",
         global_only,
         summary = "Must end in .slice. {profile} becomes the Profile name and {session} the Session's id."
@@ -3753,6 +3772,7 @@ pub struct SystemdSettings {
     #[setting(
         label = "Keep Sessions running when the Daemon restarts",
         widget = "toggle",
+        restart,
         global_only
     )]
     pub survive_daemon_restart: bool,
@@ -3762,6 +3782,7 @@ pub struct SystemdSettings {
     #[setting(
         label = "Memory limit per Session",
         widget = "optional_text",
+        restart,
         validate = "memory_limit",
         global_only,
         advanced,
@@ -3774,6 +3795,7 @@ pub struct SystemdSettings {
     #[setting(
         label = "Limit processes per Session",
         widget = "number",
+        restart,
         min = 0,
         max = 4194304,
         validate = "range:0:4194304",
