@@ -1589,7 +1589,9 @@ impl App {
 
     fn render(&mut self, frame: &mut Frame) {
         let start = std::time::Instant::now();
-        self.clear_expired_status();
+        if self.update_status.as_ref().is_some_and(|s| s.is_expired()) {
+            self.update_status = None;
+        }
         let live = self.home.store_move_status_line();
         let bar = UpdateBar::pick(
             self.update_status.as_ref().map(|s| s.text.as_str()),
@@ -1706,16 +1708,10 @@ impl App {
         self.home.instances().any(|i| i.is_sandboxed())
     }
 
-    fn clear_expired_status(&mut self) {
-        if self.update_status.as_ref().is_some_and(|s| s.is_expired()) {
-            self.update_status = None;
-        }
-    }
-
     /// Ctrl+X on the update bar: acts on the line on screen and returns whether one was.
     /// The live sandbox line has nothing to dismiss, so the key is spent without effect.
+    /// Expired statuses are cleared only by draw: until then they are the line on screen.
     fn dismiss_update_bar(&mut self) -> bool {
-        self.clear_expired_status();
         let live = self.home.store_move_status_line();
         match UpdateBar::pick(
             self.update_status.as_ref().map(|s| s.text.as_str()),
@@ -1746,7 +1742,6 @@ impl App {
 
     /// The Update key on the sandbox image line opens the pull prompt; returns whether it did.
     fn pull_from_update_bar(&mut self) -> bool {
-        self.clear_expired_status();
         let live = self.home.store_move_status_line();
         let Some(UpdateBar::ImageUpdate(update)) = UpdateBar::pick(
             self.update_status.as_ref().map(|s| s.text.as_str()),
@@ -3566,6 +3561,38 @@ mod tests {
         app.handle_key(CTRL_X, &mut terminal).await.unwrap();
         assert!(app.update_info.is_none());
         assert_eq!(dismissed(), Some("1.1.0".into()));
+    }
+
+    /// A status that expires after it was drawn is still the line on screen until the next
+    /// draw, so Ctrl+X dismisses it and not the AoE update it hid.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn dismiss_acts_on_a_drawn_status_that_has_since_expired() {
+        let _home = crate::session::test_support::isolate_app_dir();
+        crate::session::get_profile_dir("test").unwrap();
+        let (mut app, mut terminal) = key_app();
+        app.update_info = Some(app_update());
+        app.update_status = Some(UpdateStatus::transient("restart failed".into()));
+        let mut screen = Terminal::new(ratatui::backend::TestBackend::new(100, 30)).unwrap();
+        screen.draw(|f| app.render(f)).unwrap();
+        let drawn = screen
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|c| c.symbol())
+            .collect::<String>();
+        assert!(drawn.contains("restart failed") && !drawn.contains("update available"));
+
+        app.update_status.as_mut().unwrap().expires_at = Some(std::time::Instant::now());
+        app.handle_key(CTRL_X, &mut terminal).await.unwrap();
+        assert!(app.update_status.is_none());
+        assert_eq!(app.update_info, Some(app_update()));
+        assert_eq!(app.dismissed_update_version, None);
+        assert_eq!(
+            AppStateConfig::load().unwrap().dismissed_update_version,
+            None
+        );
     }
 
     /// The store-move line has nothing to dismiss: Ctrl+X and the pull key leave the image
