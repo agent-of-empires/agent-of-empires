@@ -237,7 +237,7 @@ function AgentDefaultsCard({
   );
 }
 
-export function AcpDefaultsWidget({ descriptor, value, save }: CustomWidgetProps) {
+export function AcpDefaultsWidget({ value, save, row }: CustomWidgetProps) {
   const [agents, setAgents] = useState<AgentInfo[]>([]);
   const [catalog, setCatalog] = useState<Record<string, AgentOptionEntry>>({});
   const [rawOpen, setRawOpen] = useState(false);
@@ -275,12 +275,7 @@ export function AcpDefaultsWidget({ descriptor, value, save }: CustomWidgetProps
   };
 
   return (
-    <div className="space-y-3">
-      <div>
-        <label className="block text-sm text-text-bright">{descriptor.label}</label>
-        {descriptor.description && <div className="text-xs text-text-dim mt-0.5">{descriptor.description}</div>}
-      </div>
-
+    <div role="group" aria-labelledby={row.labelId} className="space-y-3">
       {acpAgents.length === 0 ? (
         <p className="text-xs text-text-dim">No ACP-capable agents detected.</p>
       ) : (

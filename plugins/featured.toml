@@ -56,7 +56,7 @@ versions = {"1.0.0" = "sha256:1c4ed57deca62072ff0ebd061e4c849028f3a2ed25b35c25a4
 source = "gh:agent-of-empires/plugin-linear"
 versions = {"0.1.0" = "sha256:d83d52337a66bded91103cb88778cbbbee0f639e68b15d68d7981cd54c51a49f"}
 
-# Released and pinned at `v0.1.0`, so an install with no `@ref` resolves that
+# Released and pinned at `v0.1.2`, so an install with no `@ref` resolves that
 # tag instead of a moving default branch.
 #
 # plugin-freebuf 0.1.0 is intentionally unpinned: its build wrote `node_modules/`
@@ -66,9 +66,10 @@ versions = {"0.1.0" = "sha256:d83d52337a66bded91103cb88778cbbbee0f639e68b15d68d7
 # `.aoe-build/`.
 #
 # plugin-freebuf v0.1.1 @ 3514c04904aebde7473cf4a3f90f3975fe8a93c5
+# plugin-freebuf v0.1.2 @ 6bdb1285cc47fc888856983a6edba89ab1bc0dff
 [plugins."agent-of-empires.aoe-freebuf"]
 source = "gh:agent-of-empires/plugin-freebuf"
-versions = {"0.1.1" = "sha256:b4174e233f643d6d565e75b6d88968d3e5f28f5c14e15008e25f47475d94b743"}
+versions = {"0.1.1" = "sha256:b4174e233f643d6d565e75b6d88968d3e5f28f5c14e15008e25f47475d94b743", "0.1.2" = "sha256:db372d659a0bf23c64b036937ac7e875871bdf6b6af60471b8707ebfa06df4b5"}
 
 # Released and pinned at `v0.5.0`, so an install with no `@ref` resolves that
 # tag instead of a moving default branch.

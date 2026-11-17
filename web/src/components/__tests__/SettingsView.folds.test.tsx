@@ -3,7 +3,7 @@
 // persist-after-expand path lives in tests/settings-advanced-fold.spec.ts.
 
 import { beforeEach, describe, expect, it, vi } from "vitest";
-import { fireEvent, render, screen, waitFor } from "@testing-library/react";
+import { fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { SettingsView } from "../SettingsView";
 import * as api from "../../lib/api";
 
@@ -106,12 +106,9 @@ function fieldInputByLabel(
   label: string,
   type: "number" | "text",
 ): HTMLInputElement | HTMLTextAreaElement {
-  const labels = Array.from(container.querySelectorAll("label"));
-  const match = labels.find((l) => l.textContent === label);
-  const selector = type === "text" ? 'input[type="text"], textarea' : `input[type="${type}"]`;
-  const input = match?.parentElement?.querySelector(selector);
-  expect(input).toBeTruthy();
-  return input as HTMLInputElement | HTMLTextAreaElement;
+  return within(container).getByRole(type === "number" ? "spinbutton" : "textbox", { name: label }) as
+    | HTMLInputElement
+    | HTMLTextAreaElement;
 }
 
 function commit(input: HTMLInputElement | HTMLTextAreaElement, value: string) {
@@ -120,26 +117,16 @@ function commit(input: HTMLInputElement | HTMLTextAreaElement, value: string) {
   fireEvent.blur(input);
 }
 
-// ToggleField renders a label div next to a role=switch button inside a flex
-// row; click the switch that pairs with the given label.
 function clickToggle(container: HTMLElement, label: string) {
-  const labelDiv = Array.from(container.querySelectorAll("div")).find(
-    (d) => d.textContent === label && d.querySelector("*") === null,
-  );
-  const row = labelDiv?.parentElement?.parentElement;
-  const sw = row?.querySelector('button[role="switch"]') as HTMLButtonElement;
-  expect(sw).toBeTruthy();
-  fireEvent.click(sw);
+  fireEvent.click(within(container).getByRole("switch", { name: label }));
 }
 
-// ListField: open its add input, type a value, submit with Enter. Scoped to
-// the ListField whose header carries `label`.
+// ListField: open its add input unless a rejected entry left it open, type a value, submit with Enter.
 function addListItem(container: HTMLElement, label: string, value: string) {
-  const labelEl = Array.from(container.querySelectorAll("label")).find((l) => l.textContent === label);
-  const root = labelEl?.parentElement?.parentElement as HTMLElement;
-  const addBtn = labelEl?.parentElement?.querySelector("button");
-  if (addBtn) fireEvent.click(addBtn);
-  const input = root.querySelector('input[type="text"]') as HTMLInputElement;
+  const list = within(within(container).getByRole("group", { name: label }));
+  const add = list.queryByRole("button", { name: "+ Add" });
+  if (add) fireEvent.click(add);
+  const input = list.getByRole("textbox", { name: label });
   fireEvent.change(input, { target: { value } });
   fireEvent.keyDown(input, { key: "Enter" });
 }
