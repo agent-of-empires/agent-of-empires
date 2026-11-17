@@ -43,7 +43,7 @@ pub fn drop_daemon_servers(
                         || host
                             .trim_matches(['[', ']'])
                             .parse::<std::net::IpAddr>()
-                            .is_ok_and(|ip| ip.is_loopback());
+                            .is_ok_and(|ip| ip.to_canonical().is_loopback());
                     loopback || daemon.iter().any(|d| d.host_str() == Some(host))
                 })
             });
@@ -272,6 +272,7 @@ mod tests {
             "aoe": { "type": "http", "url": "http://127.0.0.1:8080/mcp",
                      "headers": { "Authorization": "Bearer sekrit" } },
             "local": { "type": "sse", "url": "http://localhost:9000/sse" },
+            "mapped": { "type": "http", "url": "http://[::ffff:127.0.0.1]:9000/mcp" },
             "v6": { "type": "http", "url": "http://[::1]:9000/mcp" },
             "lan": { "type": "http", "url": "http://192.168.1.5:8080/mcp" },
             "unparseable": { "type": "http", "url": "u",
