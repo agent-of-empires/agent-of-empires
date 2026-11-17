@@ -2380,6 +2380,12 @@ impl SessionFeed {
             }]);
         requests
     }
+
+    /// The Daemon's report that the store move finished: no progress left.
+    #[cfg(test)]
+    pub(crate) fn finish_sandbox_progress_for_test(&self) {
+        self.sandbox_progress.send_replace(Vec::new());
+    }
 }
 
 impl Default for SessionFeed {

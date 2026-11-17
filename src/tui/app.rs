@@ -3525,6 +3525,19 @@ mod tests {
 
     const CTRL_X: KeyEvent = KeyEvent::new(KeyCode::Char('x'), KeyModifiers::CONTROL);
 
+    /// One frame, as the event loop draws before each key; returns the screen text.
+    fn draw(app: &mut App) -> String {
+        let mut screen = Terminal::new(ratatui::backend::TestBackend::new(100, 30)).unwrap();
+        screen.draw(|f| app.render(f)).unwrap();
+        screen
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|c| c.symbol())
+            .collect()
+    }
+
     /// #5747: each Ctrl+X acts on the line on screen, never one hidden behind it.
     #[tokio::test]
     #[serial_test::serial]
@@ -3573,15 +3586,7 @@ mod tests {
         let (mut app, mut terminal) = key_app();
         app.update_info = Some(app_update());
         app.update_status = Some(UpdateStatus::transient("restart failed".into()));
-        let mut screen = Terminal::new(ratatui::backend::TestBackend::new(100, 30)).unwrap();
-        screen.draw(|f| app.render(f)).unwrap();
-        let drawn = screen
-            .backend()
-            .buffer()
-            .content()
-            .iter()
-            .map(|c| c.symbol())
-            .collect::<String>();
+        let drawn = draw(&mut app);
         assert!(drawn.contains("restart failed") && !drawn.contains("update available"));
 
         app.update_status.as_mut().unwrap().expires_at = Some(std::time::Instant::now());
@@ -3618,6 +3623,57 @@ mod tests {
         assert_eq!(app.dismissed_image_digest, None);
         assert_eq!(AppStateConfig::load().unwrap().dismissed_image_digest, None);
         assert!(app.home.confirm_dialog.is_none());
+    }
+
+    /// #5773: the store move finishes after its line is drawn and before the next frame. The
+    /// keys act on the line that was drawn, so they neither dismiss nor pull the image update
+    /// the finished move uncovered.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn keys_act_on_the_drawn_store_move_line_after_the_move_finishes() {
+        let mut acted = Vec::new();
+        for (label, key) in [
+            ("Ctrl+X", CTRL_X),
+            ("pull key", KeyEvent::from(KeyCode::Char('u'))),
+        ] {
+            // Its own app dir, so one key's persisted dismissal can't show up under the other.
+            let _home = crate::session::test_support::isolate_app_dir();
+            crate::session::get_profile_dir("test").unwrap();
+            let (mut app, mut terminal) = key_app();
+            let _lane = app
+                .home
+                .session_feed
+                .show_sandbox_progress_for_test("copying files");
+            app.image_update = Some(image_update());
+            assert!(draw(&mut app).contains("moving the agent store"), "{label}");
+
+            app.home.session_feed.finish_sandbox_progress_for_test();
+            assert!(app.home.store_move_status_line().is_none(), "{label}");
+            app.handle_key(key, &mut terminal).await.unwrap();
+            let effects = [
+                (
+                    "cleared image_update",
+                    app.image_update != Some(image_update()),
+                ),
+                (
+                    "set dismissed_image_digest",
+                    app.dismissed_image_digest.is_some(),
+                ),
+                (
+                    "persisted dismissed_image_digest",
+                    AppStateConfig::load()
+                        .unwrap()
+                        .dismissed_image_digest
+                        .is_some(),
+                ),
+                ("opened the pull prompt", app.home.confirm_dialog.is_some()),
+            ];
+            for (effect, _) in effects.iter().filter(|(_, happened)| *happened) {
+                acted.push(format!("{label} {effect}"));
+            }
+        }
+        // Both keys are checked before failing, so each one's outcome shows.
+        assert!(acted.is_empty(), "acted on a line not on screen: {acted:?}");
     }
 
     /// The pull key is the registry's Update chord: bare `u`, or Ctrl+U under strict hotkeys.
