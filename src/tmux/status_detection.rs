@@ -2228,6 +2228,12 @@ Tips for getting started:
         );
         let gemini_trust_unnumbered =
             GEMINI_FOLDER_TRUST_PROMPT.replace("1. Trust folder (", "Trust folder (");
+        // A composer repeating the choice label must not stand in for the dialog's row.
+        let composer = " >   Type your message or @path/to/file";
+        let gemini_composer_repeats =
+            GEMINI_AFTER_TRUST.replace(composer, " > explain 1. Trust folder (proj)");
+        let gemini_composer_repeats_wrapped =
+            GEMINI_AFTER_TRUST.replace(composer, " > explain 1. Trust folder\n   (proj)");
         // (agent, screen, deciding rule, status)
         let cases = [
             (
@@ -2286,6 +2292,18 @@ Tips for getting started:
                 gemini_trust_unnumbered.as_str(),
                 "folder_trust_prompt",
                 Status::Waiting,
+            ),
+            (
+                "gemini",
+                gemini_composer_repeats.as_str(),
+                "no_rule",
+                Status::Idle,
+            ),
+            (
+                "gemini",
+                gemini_composer_repeats_wrapped.as_str(),
+                "no_rule",
+                Status::Idle,
             ),
         ];
         for (agent, screen, rule, status) in cases {

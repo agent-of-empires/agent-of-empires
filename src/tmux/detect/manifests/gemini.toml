@@ -1,8 +1,9 @@
 id = "gemini"
 
+# The trust dialog's first choice row, inside its border, so neither quoted
+# prose nor a composer repeating the label can stand in for it.
 [markers.trust_choice]
-contains = ["1. trust folder ("]
-wrap = 2
+line_regex = ['(?i)^\x{2502}\s*(?:\x{25CF}\s*)?1\.\s+trust folder\b']
 
 [[rules]]
 extends = "interrupt_hint"
@@ -23,7 +24,11 @@ priority = 955
 region = "collapsed_recent"
 visible = true
 contains = ["do you trust the files in this folder?", "trust folder (", "don't trust"]
-not = [{ region = "after(trust_choice)", line_regex = ['^\s*>(?:\s|$)'] }]
+not = [
+  { region = "after(trust_choice)", line_regex = ['^\s*>(?:\s|$)'] },
+  # Quoted in the transcript: a composer is up and no bordered dialog row is.
+  { region = "whole_recent", line_regex = ['^\s*>(?:\s|$)'], not = [{ region = "whole_recent", line_regex = ['(?i)^\s*\x{2502}.*\btrust folder\b'] }] },
+]
 
 [[rules]]
 extends = "approval_prompt"
