@@ -137,18 +137,16 @@ fn render_choice_picker(
     });
     // The highlighted option carries its own detail, so the answer being
     // considered reads in full without opening the web form.
+    let detail_style = Style::default()
+        .fg(theme.dimmed)
+        .add_modifier(Modifier::ITALIC);
     let mut detail = Vec::new();
     if let Some(Some(text)) = picker.details.get(picker.selected) {
-        let style = Style::default()
-            .fg(theme.dimmed)
-            .add_modifier(Modifier::ITALIC);
-        wrap_line_into(
-            Line::styled(format!("· {text}"), style),
-            body_width,
-            &mut detail,
-        );
-        cap_rows(&mut detail, CHOICE_DETAIL_MAX_ROWS, style);
+        push_detail_rows(text, body_width, detail_style, &mut detail);
     }
+    // Capped at the reserved height rather than the constant, so a short
+    // terminal ends on the marker instead of dropping rows silently.
+    cap_rows(&mut detail, detail_rows, detail_style);
     // Padded to the reserved height so the option rows keep their position.
     detail.resize(detail_rows, Line::default());
     lines.extend(detail);
@@ -160,12 +158,17 @@ fn render_choice_picker(
 fn detail_row_count(detail: &str, width: u16) -> usize {
     let style = Style::default().add_modifier(Modifier::ITALIC);
     let mut wrapped = Vec::new();
-    wrap_line_into(
-        Line::styled(format!("· {detail}"), style),
-        width,
-        &mut wrapped,
-    );
+    push_detail_rows(detail, width, style, &mut wrapped);
     wrapped.len()
+}
+
+/// Wrap one option's detail into `rows`: the bullet opens the first source line
+/// and later lines align under the text.
+fn push_detail_rows(detail: &str, width: u16, style: Style, rows: &mut Vec<Line<'static>>) {
+    for (index, line) in detail.lines().enumerate() {
+        let prefix = if index == 0 { "· " } else { "  " };
+        wrap_line_into(Line::styled(format!("{prefix}{line}"), style), width, rows);
+    }
 }
 
 /// Context rows a choice picker shows above its options, and detail rows it
@@ -3364,6 +3367,90 @@ mod tests {
         assert_eq!(
             with_detail.y, without_detail.y,
             "the option rows must keep their place when the detail shrinks"
+        );
+    }
+
+    /// An option detail written over several lines has to read as those lines:
+    /// the popup has no other way to show a break, so losing it runs two
+    /// sentences together.
+    #[test]
+    fn question_picker_keeps_the_lines_of_a_multiline_detail() {
+        use super::super::state::{ChoicePicker, ChoicePurpose};
+        let mut state = test_state();
+        state.choice = Some(ChoicePicker {
+            title: " Which store? ".into(),
+            context: None,
+            options: vec![
+                ("a".into(), "Postgres".into()),
+                ("b".into(), "SQLite".into()),
+            ],
+            details: vec![
+                Some("Use the managed one\nOnly for the new service".into()),
+                None,
+            ],
+            selected: 0,
+            purpose: ChoicePurpose::Mode,
+        });
+        let rows = render_rows(&state, 80, 24, true);
+        let dump = rows.join("\n");
+        assert!(
+            rows.iter().any(|row| row.contains("· Use the managed one")),
+            "the detail's first line is missing:\n{dump}"
+        );
+        assert!(
+            rows.iter()
+                .any(|row| row.contains("Only for the new service")),
+            "the detail's second line is missing:\n{dump}"
+        );
+        assert!(
+            !rows
+                .iter()
+                .any(|row| row.contains("managed one") && row.contains("Only for the new service")),
+            "the detail's lines ran together:\n{dump}"
+        );
+    }
+
+    /// A detail clipped by a short terminal ends on the marker, so a cut
+    /// sentence never reads as the whole of it.
+    #[test]
+    fn question_picker_marks_a_detail_clipped_to_the_reserved_height() {
+        use super::super::state::{ChoicePicker, ChoicePurpose};
+        let tail = "and the tail of this answer must not survive the clip";
+        let mut state = test_state();
+        state.choice = Some(ChoicePicker {
+            title: " Which store? ".into(),
+            context: None,
+            options: vec![
+                ("a".into(), "Postgres".into()),
+                ("b".into(), "SQLite".into()),
+            ],
+            details: vec![
+                Some(format!(
+                    "This answer needs more rows than the popup can spare here, {tail}"
+                )),
+                None,
+            ],
+            selected: 0,
+            purpose: ChoicePurpose::Mode,
+        });
+        let rows = render_rows(&state, 40, 8, true);
+        let dump = rows.join("\n");
+        assert!(
+            rows.iter().any(|row| row.contains("· This answer needs")),
+            "the detail has to start on screen:\n{dump}"
+        );
+        let marker_rows: Vec<&String> = rows
+            .iter()
+            .filter(|row| row.trim_matches(['│', ' ']) == "…")
+            .collect();
+        assert_eq!(
+            marker_rows.len(),
+            1,
+            "a clipped detail must end on a marker row of its own:\n{dump}"
+        );
+        assert!(
+            !dump.contains("must not survive"),
+            "the clip must still drop the tail:\n{dump}"
         );
     }
 
