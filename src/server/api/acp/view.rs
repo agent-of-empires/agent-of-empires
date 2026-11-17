@@ -1286,11 +1286,26 @@ fn commit_terminal_in(
     })
 }
 
+/// A session id whose next `finish_handoff_in` runs this hook before canonical adoption.
+#[cfg(test)]
+type FinishAdoptionHook = (String, Box<dyn FnOnce() + Send>);
+#[cfg(test)]
+static BEFORE_FINISH_ADOPTION: std::sync::Mutex<Option<FinishAdoptionHook>> =
+    std::sync::Mutex::new(None);
+
 fn finish_handoff_in(
     native: &crate::server::session_store::NativeSessionStore,
     session_id: &str,
     key: HandoffKey,
 ) -> anyhow::Result<()> {
+    #[cfg(test)]
+    {
+        let mut armed = BEFORE_FINISH_ADOPTION.lock().unwrap();
+        if armed.as_ref().is_some_and(|(id, _)| id == session_id) {
+            let (_, hook) = armed.take().unwrap();
+            crate::server::session_store::before_next_adoption_for_test(hook);
+        }
+    }
     use crate::session::{LifecycleOperation, LifecycleReservationError, TerminalHandoffStage};
     let profile = native.storage().profile();
     let profile_identity = native.storage().bound_profile_identity()?;
@@ -1758,14 +1773,27 @@ fn drive_terminal_handoff(
                             .acp_event_store
                             .delete_session_checked(&cleanup_id)?;
                         cleanup_state.acp_control_cache.forget(&cleanup_id);
-                        finish_handoff_in(&native, &cleanup_id, key)?;
+                        match finish_handoff_in(&native, &cleanup_id, key) {
+                            Ok(()) => {}
+                            // The removal is on disk; only canonical adoption failed, which
+                            // `update_owned` also counts as landed. A retry finds no handoff, so
+                            // this is the last chance to report the ending.
+                            Err(error)
+                                if ended && error.is::<crate::session::SessionCommitApplied>() =>
+                            {
+                                tracing::warn!(target: "acp.switch", session = %cleanup_id, %error, "ended handoff removed before canonical adoption failed");
+                            }
+                            Err(error) => return Err(error),
+                        }
                         if ended {
                             // Runtime only: kept on the published row, which the commit just
                             // replaced, never on disk.
                             current.terminal_handoff = None;
                             current.status = Status::Error;
                             current.last_error = Some(command_selector_ended(&cleanup_id));
-                            native.adopt_runtime_fields(&current)?;
+                            if let Err(error) = native.adopt_runtime_fields(&current) {
+                                tracing::warn!(target: "acp.switch", session = %cleanup_id, %error, "ended handoff's remedy not published");
+                            }
                         }
                         Ok(ended)
                     })
@@ -5102,21 +5130,33 @@ mod tests {
             row
         };
         let kept = attempted("owed own selector, pane kept");
-        // (row, earlier attempt, resumed by a retried switch rather than recovery)
+        #[derive(PartialEq)]
+        enum Resume {
+            Switch,
+            Recovery,
+            // A retried switch whose handoff removal commits but fails canonical adoption.
+            SwitchAdoptionFails,
+        }
+        // (row, earlier attempt, what resumes the cleanup)
         let cases = [
-            (flag_removed.clone(), Tried::Never, true),
-            (id_cleared.clone(), Tried::Never, false),
+            (flag_removed.clone(), Tried::Never, Resume::Switch),
+            (id_cleared.clone(), Tried::Never, Resume::Recovery),
             (
                 attempted("owed own selector, refused, by switch"),
                 Tried::Refused,
-                true,
+                Resume::Switch,
             ),
             (
                 attempted("owed own selector, refused, by recovery"),
                 Tried::Refused,
-                false,
+                Resume::Recovery,
             ),
-            (kept.clone(), Tried::KeptPane, true),
+            (kept.clone(), Tried::KeptPane, Resume::Switch),
+            (
+                owed("owed own selector, adoption fails"),
+                Tried::Never,
+                Resume::SwitchAdoptionFails,
+            ),
         ];
         let rows: Vec<_> = cases.iter().map(|case| case.0.clone()).collect();
         let _panes: Vec<_> = rows
@@ -5148,7 +5188,7 @@ mod tests {
         };
 
         let mut kept_pane = None;
-        for (held, tried, by_switch) in &cases {
+        for (held, tried, resume) in &cases {
             // Reserve as a daemon without the refusal did; the switch then drives it.
             {
                 let (native, durable) = load_handoff_row(&state, "default", &held.id).await?;
@@ -5297,7 +5337,20 @@ mod tests {
             assert_eq!(intent.stage, HandoffStage::ProjectionCleanupOwed);
             assert_eq!(pending.view, View::Terminal);
             db.execute_batch("DROP TRIGGER refuse_handoff_delete")?;
-            if *by_switch {
+            if *resume == Resume::SwitchAdoptionFails {
+                let failing = state.clone();
+                *BEFORE_FINISH_ADOPTION.lock().unwrap() = Some((
+                    held.id.clone(),
+                    Box::new(move || {
+                        failing
+                            .canonical_metadata
+                            .blocking_write()
+                            .profiles
+                            .retain(|profile| profile.name != "default");
+                    }),
+                ));
+            }
+            if *resume != Resume::Recovery {
                 // A retried switch drives the cleanup and still answers with the coded refusal.
                 let response = switch().await.into_response();
                 let status = response.status();
@@ -5325,10 +5378,34 @@ mod tests {
             assert_eq!(ended.view, View::Terminal);
             let cached = find_instance(&state, &held.id).await.unwrap();
             assert_eq!(cached.status, Status::Error);
-            assert_eq!(
-                cached.last_error.as_deref(),
-                Some(command_selector_ended(&held.id).as_str())
-            );
+            if *resume == Resume::SwitchAdoptionFails {
+                // The 409 above is the only place the remedy reaches: the degraded store keeps
+                // the stale published row, and `last_error` is runtime only, so reconciliation
+                // rebuilds the row from disk without it, as after a daemon restart.
+                assert!(cached.last_error.is_none());
+                assert_ne!(
+                    *state.canonical_health.read().await,
+                    crate::daemon::RuntimeHealth::Healthy
+                );
+                crate::server::test_support::refresh_canonical_metadata_for_test(&state).await;
+                crate::server::test_support::accept_runtime_read_cache_for_test(&state).await;
+                assert_eq!(
+                    *state.canonical_health.read().await,
+                    crate::daemon::RuntimeHealth::Healthy
+                );
+                let reconciled = find_instance(&state, &held.id).await.unwrap();
+                assert!(reconciled.terminal_handoff.is_none());
+                assert_eq!(reconciled.view, View::Terminal);
+                assert_eq!(reconciled.status, Status::Error);
+                assert!(reconciled.last_error.is_none());
+                // The ended switch is in Terminal view, so a retry just reports that.
+                assert_eq!(switch().await.into_response().status(), StatusCode::OK);
+            } else {
+                assert_eq!(
+                    cached.last_error.as_deref(),
+                    Some(command_selector_ended(&held.id).as_str())
+                );
+            }
             assert!(!argv.exists(), "the refused launch ran nothing");
         }
 
