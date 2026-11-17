@@ -145,6 +145,16 @@ pub struct App {
     /// Debounce for structured preview-on-select, so fast navigation doesn't
     /// connect a WebSocket per keystroke.
     preview_mount_pending: Option<(String, std::time::Instant)>,
+    /// A preview mount in flight and the row it targets. Connecting replays the
+    /// session's whole transcript, so it runs off the event loop.
+    structured_mount: Option<(
+        String,
+        tokio::sync::oneshot::Receiver<
+            Result<crate::tui::structured_view::embedded::EmbeddedView, String>,
+        >,
+    )>,
+    /// The row whose mount failed, so reselecting it doesn't retry every tick.
+    structured_mount_failed: Option<String>,
     /// Cleared on failure so the user can retry.
     pending_install_version: Option<String>,
     /// The running binary keeps its old version until restart, so this stops
@@ -343,6 +353,8 @@ impl App {
             mosh_active,
             pending_structured_view_open: None,
             preview_mount_pending: None,
+            structured_mount: None,
+            structured_mount_failed: None,
             pending_view_switch: None,
             pending_smart_rename: None,
             dashboard_launch: None,
@@ -1503,7 +1515,8 @@ impl App {
                 needs_full_refresh = true;
             }
 
-            needs_full_refresh |= self.reconcile_structured_preview().await;
+            needs_full_refresh |= self.reconcile_structured_preview();
+            needs_full_refresh |= self.poll_structured_mount();
 
             // Same cadence keeps the embedded composer caret blinking.
             if let Some(view) = self.home.structured_preview.as_mut() {
@@ -2491,9 +2504,73 @@ impl App {
             Ok(view) => {
                 self.home.structured_preview = Some(view);
                 self.preview_mount_pending = None;
+                self.structured_mount_failed = None;
             }
             Err(e) => {
                 self.set_status(format!("structured view: {e}"));
+            }
+        }
+    }
+
+    /// Connect a preview mount off the event loop. Selecting a row must never
+    /// wait on this: the connect replays every transcript page in turn, which is
+    /// long enough that awaiting it here freezes both render and input.
+    fn start_structured_mount(
+        &mut self,
+        endpoint: crate::daemon::DaemonEndpoint,
+        session_id: &str,
+    ) {
+        use crate::tui::structured_view::embedded::EmbeddedView;
+
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        let mount_session = session_id.to_owned();
+        tokio::spawn(async move {
+            let result = EmbeddedView::connect(endpoint, &mount_session)
+                .await
+                .map_err(|e| e.to_string());
+            let _ = tx.send(result);
+        });
+        self.structured_mount = Some((session_id.to_owned(), rx));
+    }
+
+    /// Install a finished preview mount, or drop one the selection left behind.
+    /// Returns true when the preview pane changed.
+    fn poll_structured_mount(&mut self) -> bool {
+        use tokio::sync::oneshot::error::TryRecvError;
+
+        let Some((target, mut rx)) = self.structured_mount.take() else {
+            return false;
+        };
+        let result = match rx.try_recv() {
+            Ok(result) => result,
+            Err(TryRecvError::Empty) => {
+                self.structured_mount = Some((target, rx));
+                return false;
+            }
+            Err(TryRecvError::Closed) => Err("structured view: mount was cancelled".to_owned()),
+        };
+        self.clear_preview_mount_pending();
+        let wanted = self.home.selected_structured_session().as_deref() == Some(target.as_str());
+        // Enter may have opened the same session while this connected. That view
+        // owns the keyboard, so a preview landing later must not replace it.
+        let opened = self
+            .home
+            .structured_preview
+            .as_ref()
+            .is_some_and(|view| view.is_active());
+        match result {
+            Ok(view) if wanted && !opened => {
+                self.structured_mount_failed = None;
+                self.home.structured_preview = Some(view);
+                true
+            }
+            Ok(_) => false,
+            Err(e) => {
+                if wanted {
+                    self.structured_mount_failed = Some(target);
+                }
+                self.set_status(e);
+                false
             }
         }
     }
@@ -2509,9 +2586,10 @@ impl App {
     }
 
     /// Keep a streaming preview mounted for the selected structured session,
-    /// debounced and only while a daemon is already reachable. Returns true if
+    /// debounced and only while a daemon is already reachable. Only starts the
+    /// mount; `poll_structured_mount` installs it once it lands. Returns true if
     /// the mount set changed.
-    async fn reconcile_structured_preview(&mut self) -> bool {
+    fn reconcile_structured_preview(&mut self) -> bool {
         self.home.enforce_trash_read_only();
         let retained = self
             .home
@@ -2592,6 +2670,14 @@ impl App {
             self.clear_preview_mount_pending();
             return self.home.structured_preview.take().is_some();
         };
+        if self.structured_mount_failed.as_deref() == Some(sid.as_str()) {
+            // The row already failed to connect: keep the "press Enter" page
+            // rather than retrying it on every tick.
+            self.clear_preview_mount_pending();
+            return false;
+        }
+        // Any other row's failure is retried when the user comes back to it.
+        self.structured_mount_failed = None;
         // Cheap discovery only: a down daemon keeps the "press Enter"
         // placeholder, and a stale mount is dropped.
         let Ok(endpoint) = crate::acp::client::discover() else {
@@ -2599,6 +2685,13 @@ impl App {
             return self.home.structured_preview.take().is_some();
         };
         self.home.structured_preview_pending = true;
+        if self
+            .structured_mount
+            .as_ref()
+            .is_some_and(|(target, _)| *target == sid)
+        {
+            return false;
+        }
         const PREVIEW_MOUNT_DEBOUNCE: Duration = Duration::from_millis(120);
         let now = std::time::Instant::now();
         match &self.preview_mount_pending {
@@ -2616,8 +2709,7 @@ impl App {
             return false;
         }
         let sid = self.preview_mount_pending.take().unwrap().0;
-        self.connect_embedded_structured(endpoint, &sid).await;
-        self.home.structured_preview_pending = false;
+        self.start_structured_mount(endpoint, &sid);
         true
     }
 
@@ -3488,6 +3580,185 @@ pub enum Action {
 mod tests {
     use super::*;
 
+    /// An app whose selected row is a previewable structured session, with the
+    /// row's id so a mount can name it.
+    fn app_on_a_structured_row() -> (App, crate::session::test_support::AppDirGuard, String) {
+        let (app, guard, ids) = app_on_two_structured_rows();
+        (app, guard, ids[0].clone())
+    }
+
+    /// Two structured rows, with the first selected.
+    fn app_on_two_structured_rows() -> (App, crate::session::test_support::AppDirGuard, Vec<String>)
+    {
+        use crate::session::{GroupTree, Instance, Storage, View};
+        let guard = crate::session::test_support::isolate_app_dir();
+        crate::session::get_profile_dir("test").unwrap();
+        let mut rows = Vec::new();
+        for title in ["first", "second"] {
+            let mut inst = Instance::new(title, &format!("/tmp/{title}"));
+            inst.view = View::Structured;
+            inst.source_profile = "test".into();
+            rows.push(inst);
+        }
+        Storage::new_unwatched("test")
+            .unwrap()
+            .update(|instances, groups| {
+                *instances = rows.clone();
+                *groups = GroupTree::new_with_groups(instances, &[]).get_all_groups();
+                Ok(())
+            })
+            .unwrap();
+        let mut app = App::new(
+            "test",
+            AvailableTools::with_tools(&[]),
+            false,
+            false,
+            crate::file_watch::FileWatchService::noop(),
+        )
+        .unwrap();
+        app.home.sidebar_source = crate::tui::session_feed::SidebarSource::Daemon;
+        let ids: Vec<String> = rows.iter().map(|row| row.id.clone()).collect();
+        app.home.selected_session = Some(ids[0].clone());
+        assert_eq!(
+            app.home.selected_structured_session(),
+            Some(ids[0].clone()),
+            "fixture must select a previewable structured row"
+        );
+        (app, guard, ids)
+    }
+
+    /// Seeking through the list must not wait on the preview: the connect runs
+    /// on its own task, and this poll installs it only once it lands on the row
+    /// that is still selected.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn a_structured_mount_lands_off_the_event_loop() {
+        use crate::tui::structured_view::embedded::EmbeddedView;
+        let (mut app, _guard, id) = app_on_a_structured_row();
+
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        app.structured_mount = Some((id.clone(), rx));
+        app.home.structured_preview_pending = true;
+        assert!(!app.poll_structured_mount(), "still connecting");
+        assert!(app.structured_mount.is_some(), "the mount stays queued");
+        assert!(app.home.structured_preview.is_none());
+
+        assert!(tx.send(Ok(EmbeddedView::for_test(&id))).is_ok());
+        assert!(app.poll_structured_mount(), "the landed mount redraws");
+        assert_eq!(
+            app.home.structured_preview.as_ref().map(|v| v.session_id()),
+            Some(id.as_str())
+        );
+        assert!(
+            !app.home.structured_preview_pending,
+            "the placeholder must clear once the transcript is mounted"
+        );
+    }
+
+    /// A connect that finishes after the user kept moving is dropped, not
+    /// painted over the row they are on now.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn a_structured_mount_for_a_row_left_behind_is_dropped() {
+        use crate::tui::structured_view::embedded::EmbeddedView;
+        let (mut app, _guard, id) = app_on_a_structured_row();
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        app.structured_mount = Some((id.clone(), rx));
+        app.home.selected_session = None;
+
+        assert!(tx.send(Ok(EmbeddedView::for_test(&id))).is_ok());
+        assert!(!app.poll_structured_mount());
+        assert!(app.home.structured_preview.is_none());
+    }
+
+    /// A failed connect reports once and leaves the row on its "press Enter"
+    /// page instead of retrying the socket on every tick.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn a_failed_structured_mount_is_not_retried_while_selected() {
+        let (mut app, _guard, id) = app_on_a_structured_row();
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        app.structured_mount = Some((id.clone(), rx));
+        assert!(tx
+            .send(Err("structured view: ws connect failed".to_owned()))
+            .is_ok());
+
+        assert!(!app.poll_structured_mount());
+        assert_eq!(app.structured_mount_failed.as_deref(), Some(id.as_str()));
+        assert!(app
+            .update_status
+            .as_ref()
+            .is_some_and(|s| s.text.contains("ws connect failed")));
+        assert!(
+            !app.reconcile_structured_preview(),
+            "a row that already failed is not remounted"
+        );
+        assert!(app.structured_mount.is_none());
+        assert!(!app.home.structured_preview_pending);
+    }
+
+    /// Enter opens the same session while the preview connect is still running;
+    /// that opened view owns the keyboard and must survive the late arrival.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn a_late_mount_does_not_replace_the_open_view() {
+        use crate::tui::structured_view::embedded::EmbeddedView;
+        let (mut app, _guard, id) = app_on_a_structured_row();
+        let mut opened = EmbeddedView::for_test(&id);
+        opened.activate();
+        app.home.structured_preview = Some(opened);
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        app.structured_mount = Some((id.clone(), rx));
+
+        assert!(tx.send(Ok(EmbeddedView::for_test(&id))).is_ok());
+        assert!(!app.poll_structured_mount());
+        assert!(
+            app.home
+                .structured_preview
+                .as_ref()
+                .is_some_and(|v| v.is_active()),
+            "the view the user opened keeps the keyboard"
+        );
+    }
+
+    /// A failed row is retried once the user has been on another row, so one
+    /// bad connect does not disable the preview for the rest of the session.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn a_failed_structured_row_is_retried_after_leaving_it() {
+        let (mut app, _guard, ids) = app_on_two_structured_rows();
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        app.structured_mount = Some((ids[0].clone(), rx));
+        assert!(tx.send(Err("ws connect failed".to_owned())).is_ok());
+        assert!(!app.poll_structured_mount());
+        assert_eq!(
+            app.structured_mount_failed.as_deref(),
+            Some(ids[0].as_str())
+        );
+
+        app.home.selected_session = Some(ids[1].clone());
+        app.reconcile_structured_preview();
+        assert_eq!(
+            app.structured_mount_failed, None,
+            "the failure is forgotten so returning to the row retries it"
+        );
+    }
+
+    /// An in-flight mount is not restarted by the next tick's reconcile.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn an_in_flight_structured_mount_is_not_started_twice() {
+        let (mut app, _guard, id) = app_on_a_structured_row();
+        let (_tx, rx) = tokio::sync::oneshot::channel();
+        app.structured_mount = Some((id, rx));
+
+        assert!(!app.reconcile_structured_preview());
+        assert!(
+            app.structured_mount.is_some(),
+            "the running mount is kept, not replaced"
+        );
+    }
+
     #[tokio::test]
     #[serial_test::serial]
     async fn startup_onboarding_preserves_saved_state_during_config_edits() {
@@ -4028,7 +4299,7 @@ mod tests {
         tokio::time::timeout(Duration::from_secs(5), async {
             loop {
                 ticker.tick().await;
-                app.reconcile_structured_preview().await;
+                app.reconcile_structured_preview();
                 terminal
                     .draw(|frame| {
                         app.home
@@ -4159,7 +4430,7 @@ mod tests {
         tokio::time::timeout(Duration::from_secs(8), async {
             loop {
                 ticker.tick().await;
-                app.reconcile_structured_preview().await;
+                app.reconcile_structured_preview();
                 terminal
                     .draw(|frame| {
                         app.home
