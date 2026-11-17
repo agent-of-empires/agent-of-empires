@@ -3099,7 +3099,7 @@ mod tests {
             McpSessionSecret::load_or_generate(&temp.path().join("mcp_session_secret")).unwrap(),
         );
         let _endpoint = EndpointGuard::install(DaemonEndpoint {
-            host_url: "http://127.0.0.1:4321".into(),
+            host_url: Some("http://127.0.0.1:4321".into()),
             sandbox_url: None,
             sandbox_socket: None,
             secret: secret.clone(),

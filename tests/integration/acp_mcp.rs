@@ -129,7 +129,7 @@ enabled = false
             })
             .collect(),
         &[],
-        mcp_config::PluginCredentials::Literal(&[]),
+        mcp_config::PluginCredentials::None,
     );
 
     let client = AcpClient::spawn(config, AcpSessionId("mcp-codex-disabled".into()))
@@ -188,7 +188,7 @@ async fn new_session_receives_expanded_and_unresolved_mcp_auth_headers() {
     config.mcp_servers = mcp_config::project_servers_to_acp(
         servers,
         &session_env,
-        mcp_config::PluginCredentials::Literal(&[]),
+        mcp_config::PluginCredentials::None,
     );
 
     let client = AcpClient::spawn(config, AcpSessionId("mcp-header-expansion".into()))

@@ -1055,6 +1055,7 @@ pub(crate) async fn start_server(
         record_daemon_endpoint(
             listener.local_addr()?,
             &allowed_hosts,
+            allow_plaintext_remote,
             plugin_socket_probe(plugin_socket.is_some()),
             mcp_session_secret.clone(),
         );
@@ -1743,11 +1744,13 @@ fn mcp_session_secret(
 }
 
 /// Plugin entries need session credentials; none without the secret. Sandboxes use the plugin
-/// socket when bound, else the sandbox URL, which needs a non-loopback bind and
-/// `host.containers.internal` in `allowed_hosts` (the list the DNS-rebinding gate enforces).
+/// socket when bound, else the sandbox URL, which needs a wildcard bind,
+/// `host.containers.internal` in `allowed_hosts` (the list the DNS-rebinding gate enforces)
+/// and `allow_plaintext_remote`: a URL the plaintext gate would reject is not published.
 fn record_daemon_endpoint(
     addr: SocketAddr,
     allowed_hosts: &[String],
+    allow_plaintext_remote: bool,
     sandbox_socket: Option<fn(&str) -> crate::server::daemon_endpoint::SandboxSocket>,
     secret: Option<Arc<crate::server::session_credential::McpSessionSecret>>,
 ) {
@@ -1755,8 +1758,8 @@ fn record_daemon_endpoint(
         host_url_for, sandbox_url_for, set_daemon_endpoint, DaemonEndpoint,
     };
     set_daemon_endpoint(secret.map(|secret| DaemonEndpoint {
-        host_url: host_url_for(addr),
-        sandbox_url: sandbox_url_for(addr, allowed_hosts),
+        host_url: host_url_for(addr, allow_plaintext_remote),
+        sandbox_url: sandbox_url_for(addr, allowed_hosts, allow_plaintext_remote),
         sandbox_socket,
         secret,
     }));
@@ -1832,17 +1835,47 @@ mod tests {
         record_daemon_endpoint(
             "0.0.0.0:8123".parse().unwrap(),
             &allowed,
+            true,
             None,
-            Some(secret),
+            Some(secret.clone()),
         );
         let endpoint = daemon_endpoint().expect("recorded");
-        assert_eq!(endpoint.host_url, "http://127.0.0.1:8123");
+        assert_eq!(endpoint.host_url.as_deref(), Some("http://127.0.0.1:8123"));
         assert_eq!(
             endpoint.sandbox_url.as_deref(),
             Some("http://host.containers.internal:8123")
         );
 
-        record_daemon_endpoint("127.0.0.1:8123".parse().unwrap(), &allowed, None, None);
+        // Plaintext remote access off: the gate would answer a sandbox with 426, so no
+        // sandbox URL is published; a specific-interface bind has no host URL either.
+        record_daemon_endpoint(
+            "0.0.0.0:8123".parse().unwrap(),
+            &allowed,
+            false,
+            None,
+            Some(secret.clone()),
+        );
+        let endpoint = daemon_endpoint().expect("recorded");
+        assert_eq!(endpoint.host_url.as_deref(), Some("http://127.0.0.1:8123"));
+        assert_eq!(endpoint.sandbox_url, None);
+        record_daemon_endpoint(
+            "192.0.2.7:8123".parse().unwrap(),
+            &allowed,
+            false,
+            None,
+            Some(secret),
+        );
+        let endpoint = daemon_endpoint().expect("recorded");
+        assert_eq!(endpoint.host_url, None);
+        assert_eq!(endpoint.sandbox_url, None);
+
+        record_daemon_endpoint(
+            "127.0.0.1:8123".parse().unwrap(),
+            &allowed,
+            true,
+            None,
+            None,
+        );
         assert!(daemon_endpoint().is_none(), "no secret clears the endpoint");
     }
 
