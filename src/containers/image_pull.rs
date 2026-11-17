@@ -2,13 +2,15 @@
 //! running pull as a waiter, so a second caller never starts a second runtime process.
 
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, LazyLock, Mutex, MutexGuard};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use serde::Serialize;
 use tokio_util::sync::CancellationToken;
 
 use super::error::{DockerError, Result};
+use super::pull_progress::{LayerUpdate, Progress, ProgressSnapshot};
 
 /// How often a waiter checks its own cancellation.
 const CANCEL_POLL: Duration = Duration::from_millis(50);
@@ -61,8 +63,10 @@ impl PullFailureReason {
 #[serde(tag = "state", rename_all = "snake_case")]
 pub enum PullState {
     Idle,
-    Running,
+    Running(ProgressSnapshot),
     Done,
+    /// Ended by an explicit `cancel`; a pull its last waiter left ends `Idle`.
+    Cancelled,
     /// `message` is `reason`'s shared wording; `error` is the runtime's output, for Details.
     Failed {
         reason: PullFailureReason,
@@ -78,16 +82,35 @@ pub(crate) struct PullKey {
 }
 
 struct Flight {
-    /// Cancelled when the last waiter leaves; kills the runtime process.
+    /// Tells this flight apart from a later one for the same key.
+    id: u64,
+    /// Cancelled when the last waiter leaves or on [`cancel`]; kills the runtime process.
     kill: CancellationToken,
     state: Mutex<FlightState>,
     finished: Condvar,
+    progress: Mutex<Progress>,
+}
+
+/// What a running pull is handed: the token that kills it, and where its progress goes.
+pub(crate) struct PullContext<'a> {
+    pub kill: &'a CancellationToken,
+    pub(crate) progress: &'a Mutex<Progress>,
+}
+
+impl PullContext<'_> {
+    pub(crate) fn report(&self, update: LayerUpdate) {
+        lock(self.progress).apply(update);
+    }
 }
 
 struct FlightState {
     waiters: usize,
     outcome: Option<Result<()>>,
+    /// Set by [`cancel`]: the pull ends `Cancelled` for every waiter.
+    cancel_requested: bool,
 }
+
+static NEXT_FLIGHT: AtomicU64 = AtomicU64::new(0);
 
 impl Flight {
     /// Gives up one waiter's place; the last one out kills the pull. Returns whether it was last.
@@ -123,7 +146,7 @@ pub(crate) struct Waiter {
 /// Joins `key`'s running pull, or starts `pull` on its own thread when none is running.
 pub(crate) fn join_with<F>(key: PullKey, pull: F) -> Waiter
 where
-    F: FnOnce(&CancellationToken) -> Result<()> + Send + 'static,
+    F: FnOnce(&PullContext) -> Result<()> + Send + 'static,
 {
     let mut flights = lock(&FLIGHTS);
     if let Some(Entry::Running(flight)) = flights.get(&key) {
@@ -139,12 +162,15 @@ where
         }
     }
     let flight = Arc::new(Flight {
+        id: NEXT_FLIGHT.fetch_add(1, Ordering::Relaxed),
         kill: CancellationToken::new(),
         state: Mutex::new(FlightState {
             waiters: 1,
             outcome: None,
+            cancel_requested: false,
         }),
         finished: Condvar::new(),
+        progress: Mutex::default(),
     });
     flights.insert(key.clone(), Entry::Running(flight.clone()));
     drop(flights);
@@ -152,8 +178,12 @@ where
     let image = key.image.clone();
     std::thread::spawn(move || {
         let started = std::time::Instant::now();
+        let context = PullContext {
+            kill: &runner.kill,
+            progress: &runner.progress,
+        };
         // A panic still finishes the flight; otherwise its waiters and every later joiner hang.
-        let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| pull(&runner.kill)))
+        let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| pull(&context)))
             .unwrap_or_else(|_| {
                 Err(DockerError::ImagePullFailed {
                     runtime: key.runtime,
@@ -174,7 +204,8 @@ where
         let mut flights = lock(&FLIGHTS);
         // A pull started after this one was killed owns the entry now.
         if matches!(flights.get(&key), Some(Entry::Running(f)) if Arc::ptr_eq(f, &runner)) {
-            match finished_state(&outcome) {
+            let cancel_requested = lock(&runner.state).cancel_requested;
+            match finished_state(&outcome, cancel_requested) {
                 Some(state) => flights.insert(key, Entry::Finished(state)),
                 None => flights.remove(&key),
             };
@@ -190,9 +221,10 @@ where
     }
 }
 
-fn finished_state(outcome: &Result<()>) -> Option<PullState> {
+fn finished_state(outcome: &Result<()>, cancel_requested: bool) -> Option<PullState> {
     match outcome {
         Ok(()) => Some(PullState::Done),
+        Err(DockerError::Cancelled(_)) if cancel_requested => Some(PullState::Cancelled),
         Err(DockerError::Cancelled(_)) => None,
         Err(error) => {
             let reason = match error {
@@ -218,6 +250,10 @@ impl Waiter {
             if let Some(outcome) = &state.outcome {
                 return match outcome {
                     Ok(()) => Ok(()),
+                    // Still joined: this caller didn't cancel, so it learns the pull was cancelled.
+                    Err(DockerError::Cancelled(_)) if self.joined && state.cancel_requested => {
+                        Err(DockerError::PullCancelled(self.image.clone()))
+                    }
                     Err(error) => Err(reissue(error)),
                 };
             }
@@ -234,6 +270,10 @@ impl Waiter {
                 .unwrap_or_else(|e| e.into_inner())
                 .0;
         }
+    }
+
+    pub(crate) fn flight_id(&self) -> u64 {
+        self.flight.id
     }
 }
 
@@ -276,10 +316,47 @@ fn reissue(error: &DockerError) -> DockerError {
 /// The running pull's state, or the last one's outcome.
 pub(crate) fn state(key: &PullKey) -> PullState {
     match lock(&FLIGHTS).get(key) {
-        Some(Entry::Running(_)) => PullState::Running,
+        Some(Entry::Running(flight)) => PullState::Running(lock(&flight.progress).snapshot()),
         Some(Entry::Finished(state)) => state.clone(),
         None => PullState::Idle,
     }
+}
+
+/// The id of `key`'s running pull, to match against [`Waiter::flight_id`].
+pub(crate) fn running_flight_id(key: &PullKey) -> Option<u64> {
+    match lock(&FLIGHTS).get(key) {
+        Some(Entry::Running(flight)) => Some(flight.id),
+        _ => None,
+    }
+}
+
+/// Cancels `key`'s running pull for every waiter and waits up to `backstop` for it to end.
+/// Returns the state then, which with no running pull is just the current one.
+pub(crate) fn cancel(key: &PullKey, backstop: Duration) -> PullState {
+    let running = match lock(&FLIGHTS).get(key) {
+        Some(Entry::Running(flight)) => {
+            lock(&flight.state).cancel_requested = true;
+            flight.kill.cancel();
+            Some(flight.clone())
+        }
+        _ => None,
+    };
+    if let Some(flight) = running {
+        let deadline = Instant::now() + backstop;
+        let mut guard = lock(&flight.state);
+        while guard.outcome.is_none() {
+            let left = deadline.saturating_duration_since(Instant::now());
+            if left.is_zero() {
+                break;
+            }
+            guard = flight
+                .finished
+                .wait_timeout(guard, left)
+                .unwrap_or_else(|e| e.into_inner())
+                .0;
+        }
+    }
+    state(key)
 }
 
 /// How many callers are waiting on `key`'s running pull; 0 when none is running.
@@ -332,7 +409,7 @@ mod tests {
         let calls = Arc::new(AtomicUsize::new(0));
         let counted = |result: fn() -> Result<()>, release: Option<mpsc::Receiver<()>>| {
             let calls = calls.clone();
-            move |_: &CancellationToken| {
+            move |_: &PullContext| {
                 calls.fetch_add(1, Ordering::SeqCst);
                 if let Some(release) = release {
                     release.recv().unwrap();
@@ -346,7 +423,7 @@ mod tests {
             counted(|| Err(failed(PullFailureReason::Auth)), Some(gate)),
         );
         let second = join_with(shared.clone(), counted(|| Ok(()), None));
-        assert_eq!(state(&shared), PullState::Running);
+        assert!(matches!(state(&shared), PullState::Running(_)));
         release.send(()).unwrap();
 
         let never = CancellationToken::new();
@@ -384,7 +461,8 @@ mod tests {
         let (dying_tx, dying_rx) = mpsc::channel();
         let (exit_tx, exit_rx) = mpsc::channel::<()>();
         // Sees the kill, then stays alive until the test lets it exit.
-        let pull = move |kill: &CancellationToken| {
+        let pull = move |pull: &PullContext| {
+            let kill = pull.kill;
             token_tx.send(kill.clone()).unwrap();
             while !kill.is_cancelled() {
                 std::thread::sleep(Duration::from_millis(5));
@@ -394,7 +472,7 @@ mod tests {
             Err(DockerError::Cancelled("pull".into()))
         };
         let first = join_with(killed.clone(), pull);
-        let second = join_with(killed.clone(), |_: &CancellationToken| Ok(()));
+        let second = join_with(killed.clone(), |_: &PullContext| Ok(()));
         let kill = token_rx.recv_timeout(DEADLINE).expect("the pull starts");
         let cancelled = CancellationToken::new();
         cancelled.cancel();
@@ -413,7 +491,7 @@ mod tests {
             .recv_timeout(DEADLINE)
             .expect("the last waiter kills the pull");
 
-        let fresh = join_with(killed.clone(), |_: &CancellationToken| Ok(()));
+        let fresh = join_with(killed.clone(), |_: &PullContext| Ok(()));
         assert!(
             within("a newcomer's pull", move || fresh
                 .wait(&CancellationToken::new()))
@@ -438,10 +516,58 @@ mod tests {
     }
 
     #[test]
+    fn an_explicit_cancel_ends_the_pull_for_every_waiter_as_cancelled() {
+        let cancelled = key("Docker", "explicit-cancel");
+        let (started_tx, started) = mpsc::channel();
+        let first = join_with(cancelled.clone(), move |pull: &PullContext| {
+            started_tx.send(()).unwrap();
+            while !pull.kill.is_cancelled() {
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            Err(DockerError::Cancelled("pull".into()))
+        });
+        let second = join_with(cancelled.clone(), |_: &PullContext| Ok(()));
+        started.recv_timeout(DEADLINE).expect("the pull starts");
+        let waiting: Vec<_> = [first, second]
+            .into_iter()
+            .map(|waiter| {
+                let (tx, rx) = mpsc::channel();
+                std::thread::spawn(move || tx.send(waiter.wait(&CancellationToken::new())));
+                rx
+            })
+            .collect();
+
+        let after = within("a cancel", {
+            let cancelled = cancelled.clone();
+            move || cancel(&cancelled, DEADLINE)
+        });
+        assert_eq!(after, PullState::Cancelled);
+        for result in waiting {
+            assert!(
+                matches!(
+                    result.recv_timeout(DEADLINE).expect("the waiter returns"),
+                    Err(DockerError::PullCancelled(image)) if image == "explicit-cancel"
+                ),
+                "a waiter that didn't cancel learns the pull was cancelled"
+            );
+        }
+        assert_eq!(
+            cancel(&cancelled, DEADLINE),
+            PullState::Cancelled,
+            "a repeat answers the same"
+        );
+        assert_eq!(
+            cancel(&key("Docker", "never-pulled"), DEADLINE),
+            PullState::Idle
+        );
+    }
+
+    #[test]
     fn a_waiter_dropped_without_waiting_leaves_the_last_cancel_to_kill() {
         let dropped = key("Docker", "dropped");
         let (token_tx, token_rx) = mpsc::channel();
-        let first = join_with(dropped.clone(), move |kill: &CancellationToken| {
+        let first = join_with(dropped.clone(), move |pull: &PullContext| {
+            let kill = pull.kill;
             token_tx.send(kill.clone()).unwrap();
             while !kill.is_cancelled() {
                 std::thread::sleep(Duration::from_millis(5));
@@ -449,7 +575,7 @@ mod tests {
             Err(DockerError::Cancelled("pull".into()))
         });
         let kill = token_rx.recv_timeout(DEADLINE).expect("the pull starts");
-        drop(join_with(dropped.clone(), |_: &CancellationToken| Ok(())));
+        drop(join_with(dropped.clone(), |_: &PullContext| Ok(())));
         let cancelled = CancellationToken::new();
         cancelled.cancel();
 
@@ -461,13 +587,17 @@ mod tests {
             kill.is_cancelled(),
             "the dropped waiter doesn't keep the pull alive"
         );
-        assert_eq!(state(&dropped), PullState::Idle, "the killed pull ended");
+        assert_eq!(
+            state(&dropped),
+            PullState::Idle,
+            "a pull its last waiter left isn't cancelled for anyone"
+        );
     }
 
     #[test]
     fn a_panicking_pull_fails_its_waiters_and_frees_the_key() {
         let panicked = key("Docker", "panicked");
-        let waiter = join_with(panicked.clone(), |_: &CancellationToken| -> Result<()> {
+        let waiter = join_with(panicked.clone(), |_: &PullContext| -> Result<()> {
             panic!("runtime pull blew up")
         });
         assert!(matches!(
@@ -483,7 +613,7 @@ mod tests {
         let calls = Arc::new(AtomicUsize::new(0));
         let next = join_with(panicked.clone(), {
             let calls = calls.clone();
-            move |_: &CancellationToken| {
+            move |_: &PullContext| {
                 calls.fetch_add(1, Ordering::SeqCst);
                 Ok(())
             }

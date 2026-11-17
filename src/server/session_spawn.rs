@@ -134,23 +134,31 @@ fn pull_latest(
     progress: Option<&crate::server::create_progress::CreateProgress>,
     cancel: &tokio_util::sync::CancellationToken,
 ) -> anyhow::Result<()> {
-    use crate::containers::error::DockerError;
     if let Some(progress) = progress {
         progress.set_stage(crate::server::create_progress::CreateStage::PullingImage);
     }
     let runtime = crate::containers::get_container_runtime();
-    match runtime.pull_image_until_cancelled(image, cancel) {
-        Ok(()) => {
-            crate::server::api::invalidate_sandbox_image_status(&runtime, image);
-            Ok(())
+    runtime
+        .pull_image_until_cancelled(image, cancel)
+        .map_err(create_pull_error)?;
+    crate::server::api::invalidate_sandbox_image_status(&runtime, image);
+    Ok(())
+}
+
+/// A create's own cancel stops the create; a pull cancelled for everyone fails it.
+fn create_pull_error(error: crate::containers::error::DockerError) -> anyhow::Error {
+    use crate::containers::error::DockerError;
+    match error {
+        DockerError::Cancelled(_) => crate::server::session_service::CreationCancelled.into(),
+        DockerError::ImagePullFailed { image, detail, .. } => {
+            ImageUpdateFailed { image, detail }.into()
         }
-        Err(DockerError::Cancelled(_)) => {
-            Err(crate::server::session_service::CreationCancelled.into())
+        DockerError::PullCancelled(image) => ImageUpdateFailed {
+            image,
+            detail: "the image update was cancelled".into(),
         }
-        Err(DockerError::ImagePullFailed { image, detail, .. }) => {
-            Err(ImageUpdateFailed { image, detail }.into())
-        }
-        Err(other) => Err(other.into()),
+        .into(),
+        other => other.into(),
     }
 }
 
@@ -1203,6 +1211,22 @@ pub(crate) async fn finish_structured_launch(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_pull_cancelled_for_everyone_fails_the_create_but_its_own_cancel_stops_it() {
+        use crate::containers::error::DockerError;
+        let own = create_pull_error(DockerError::Cancelled("pull of img".into()));
+        assert!(own
+            .downcast_ref::<crate::server::session_service::CreationCancelled>()
+            .is_some());
+
+        let shared = create_pull_error(DockerError::PullCancelled("img".into()));
+        let failed = shared
+            .downcast_ref::<ImageUpdateFailed>()
+            .expect("the create fails instead of reading as cancelled");
+        assert_eq!(failed.image, "img");
+        assert_eq!(failed.detail, "the image update was cancelled");
+    }
 
     #[test]
     fn only_a_cli_terminal_create_with_nothing_to_run_or_pull_skips_a_running_runtime() {
