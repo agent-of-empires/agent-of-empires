@@ -388,9 +388,13 @@ mod tests {
                     }
                 }
             });
-            swapped_rx
+            if swapped_rx
                 .recv_timeout(std::time::Duration::from_secs(30))
-                .expect("swapper completed no swap cycle");
+                .is_err()
+            {
+                done.store(true, Ordering::SeqCst);
+                panic!("swapper completed no swap cycle");
+            }
             for _ in 0..3000 {
                 ok_writes +=
                     handle_write(&policy, "s", &root.join("a/f.txt"), "pwn").is_ok() as usize;
