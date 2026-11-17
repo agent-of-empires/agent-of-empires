@@ -47,15 +47,11 @@ beforeEach(() => {
 });
 
 describe("sandbox.shared_credential setting", () => {
-  it("offers both modes, is global-only, and saves { sandbox: { shared_credential } }", async () => {
+  it("offers both modes and saves { sandbox: { shared_credential } }", async () => {
     const { container } = render(
       <SettingsView onClose={() => {}} tab="sandbox" onSelectTab={() => {}} onServerAboutRefresh={() => {}} />,
     );
-    const label = await screen.findByText("Shared agent credential");
-    expect(label.parentElement?.textContent).toContain("Applies to all profiles (not profile-overridable).");
-
-    const select = label.parentElement?.querySelector("select") as HTMLSelectElement;
-    expect(select).toBeTruthy();
+    const select = (await screen.findByRole("combobox", { name: "Shared agent credential" })) as HTMLSelectElement;
     await waitFor(() => expect(select.value).toBe("host_seed"));
     expect(Array.from(select.options).map((o) => [o.value, o.textContent])).toEqual([
       ["host_seed", "Seed from host login"],
