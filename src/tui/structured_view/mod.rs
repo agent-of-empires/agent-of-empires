@@ -989,6 +989,16 @@ async fn handle_terminal_event(
             open_toggle_picker(state);
             Ok(false)
         }
+        Intent::ToggleThinking => {
+            state.show_full_thinking = !state.show_full_thinking;
+            let message = if state.show_full_thinking {
+                "showing full thinking"
+            } else {
+                "thinking collapsed to a preview"
+            };
+            set_toast(state, toast_deadline, message.into(), ToastKind::Info);
+            Ok(false)
+        }
         Intent::AnswerElicitation => {
             start_elicitation_answer(state, toast_deadline);
             Ok(false)

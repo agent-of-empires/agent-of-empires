@@ -893,6 +893,7 @@ pub(super) fn wrapped_transcript(
         &state.transcript,
         theme,
         state.path_roots.as_ref(),
+        state.show_full_thinking,
         tool_output,
     );
     let mut wrapped: Vec<Line<'static>> = Vec::with_capacity(lines.len());
@@ -1525,6 +1526,7 @@ fn transcript_lines(
     transcript: &AcpTranscript,
     theme: &Theme,
     path_roots: Option<&SessionPathRoots>,
+    full_thinking: bool,
     tool_output: ToolOutputMode,
 ) -> Vec<Line<'static>> {
     let rows = &transcript.server_rows;
@@ -1593,7 +1595,11 @@ fn transcript_lines(
                     text.push_str(&rows[i].text);
                     i += 1;
                 }
-                out.push(thinking_preview_line(&text));
+                if full_thinking {
+                    out.extend(thinking_lines(&text, theme));
+                } else {
+                    out.push(thinking_preview_line(&text));
+                }
                 out.push(Line::default());
                 continue;
             }
@@ -1779,7 +1785,37 @@ fn subagent_badge(state: SubagentState, theme: &Theme) -> Span<'static> {
     Span::styled(format!(" · {text}"), Style::default().fg(color))
 }
 
-/// One dim preview per thought: the TUI has no expansion state to show it all.
+/// A thought in full, dimmed so it never competes with the agent's answer.
+fn thinking_lines(text: &str, theme: &Theme) -> Vec<Line<'static>> {
+    let body = crate::tui::markdown::render(text);
+    if text.trim().is_empty() || body.is_empty() {
+        return vec![Line::from(Span::styled(
+            "· Thinking: …",
+            Style::default()
+                .fg(theme.hint)
+                .add_modifier(Modifier::DIM | Modifier::ITALIC),
+        ))];
+    }
+    body.into_iter()
+        .enumerate()
+        .map(|(index, mut line)| {
+            line.spans.insert(
+                0,
+                Span::styled(
+                    if index == 0 { "· " } else { "  " },
+                    Style::default().fg(theme.hint),
+                ),
+            );
+            line.style = line.style.add_modifier(Modifier::DIM);
+            for span in &mut line.spans {
+                span.style = span.style.add_modifier(Modifier::DIM);
+            }
+            line
+        })
+        .collect()
+}
+
+/// One dim preview per thought, for when the transcript is collapsed.
 fn thinking_preview_line(text: &str) -> Line<'static> {
     const MAX_CHARS: usize = 120;
     let first = text
@@ -2941,6 +2977,7 @@ mod tests {
             &t,
             &Theme::default(),
             None,
+            false,
             ToolOutputMode::Compact,
         ));
         assert!(!out.contains("#4656.The waiter"), "{out:?}");
@@ -2966,7 +3003,7 @@ mod tests {
             thought(&long, "t-b"),
         ]);
         let lines: Vec<String> =
-            transcript_lines(&t, &Theme::default(), None, ToolOutputMode::Compact)
+            transcript_lines(&t, &Theme::default(), None, false, ToolOutputMode::Compact)
                 .iter()
                 .map(|line| line.spans.iter().map(|s| s.content.as_ref()).collect())
                 .filter(|line: &String| !line.is_empty())
@@ -2977,6 +3014,21 @@ mod tests {
                 "· Thinking: Weighing options…".to_string(),
                 format!("· Thinking: {}…", "é".repeat(120)),
             ]
+        );
+
+        // Expanded, the same thoughts render whole: every line, no elision.
+        let expanded: Vec<String> =
+            transcript_lines(&t, &Theme::default(), None, true, ToolOutputMode::Compact)
+                .iter()
+                .map(|line| line.spans.iter().map(|s| s.content.as_ref()).collect())
+                .filter(|line: &String| !line.trim().is_empty())
+                .collect();
+        let body = expanded.join("\n");
+        assert!(body.contains("Weighing options"), "{body:?}");
+        assert!(body.contains("second line"), "{body:?}");
+        assert!(
+            body.contains(&long),
+            "the full thought, not a preview: {body:?}"
         );
     }
 
@@ -3023,6 +3075,7 @@ mod tests {
             &t,
             &Theme::default(),
             None,
+            false,
             ToolOutputMode::Compact,
         ));
         assert_eq!(out.matches("Compaction summary").count(), 1, "{out:?}");
@@ -3079,7 +3132,7 @@ mod tests {
     }
 
     fn tool_lines(t: &AcpTranscript) -> Vec<String> {
-        transcript_lines(t, &Theme::default(), None, ToolOutputMode::Compact)
+        transcript_lines(t, &Theme::default(), None, false, ToolOutputMode::Compact)
             .iter()
             .map(line_text)
             .filter(|line| !line.is_empty())

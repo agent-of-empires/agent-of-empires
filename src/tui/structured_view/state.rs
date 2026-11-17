@@ -122,6 +122,10 @@ pub struct StructuredViewState {
     /// resolve the `u16::MAX` "stick to bottom" sentinel to a concrete position.
     /// Interior-mutable: the render borrows the state immutably. See `apply_scroll`.
     pub last_scroll_max: std::cell::Cell<u16>,
+    /// Whether thoughts render in full instead of as one preview line
+    /// (transcript `e`). Reasoning is often the part that explains a turn, so
+    /// collapsing is a choice rather than the only option.
+    pub show_full_thinking: bool,
     /// Context-window percentage at which the status line nudges toward `/compact`,
     /// or `None` when off or the fetch failed. Read from the daemon's `/api/about`,
     /// not local config, so a remote-attached view honours that daemon (#3253).
@@ -350,6 +354,7 @@ impl StructuredViewState {
             auto_presented_elicitation: None,
             last_scroll_max: std::cell::Cell::new(0),
             compaction_reminder_percent: None,
+            show_full_thinking: false,
         }
     }
 
