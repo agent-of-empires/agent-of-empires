@@ -520,10 +520,8 @@ mod tests {
                 DiskSpace,
             ),
             (
-                "manifest unknown",
-                include_str!(
-                    "../../tests/fixtures/pull-stderr/source-quoted-other-manifest-unknown.txt"
-                ),
+                "docker other, tag not found",
+                include_str!("../../tests/fixtures/pull-stderr/docker-29.5.2-other-not-found.txt"),
                 Other,
             ),
             (

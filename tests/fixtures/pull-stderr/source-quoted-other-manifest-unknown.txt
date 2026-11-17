@@ -1,7 +1,0 @@
-# runtime: none; source-quoted, not a capture
-# source: moby's "manifest for %s not found" wrapping the registry's "manifest unknown":
-# https://github.com/moby/moby/blob/06db1734267bf7770914b417bff6556d835bf8cc/daemon/internal/distribution/errors.go#L57
-# https://github.com/distribution/distribution/blob/5d73bd2c35e6fe82aadb2d5c9367411df0840f49/registry/api/errcode/register.go#L147
-# assembled from those two lines; the image name is a placeholder
-# stderr follows
-Error response from daemon: manifest for ghcr.io/agent-of-empires/aoe-sandbox:missing not found: manifest unknown
