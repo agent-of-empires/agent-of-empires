@@ -1322,8 +1322,10 @@ impl HomeView {
         }
 
         if let (Some(idx), Some(bar)) = (update_bar_idx, update_bar) {
-            self.render_update_bar(frame, main_chunks[idx], theme, bar);
-            self.update_bar_drawn = true;
+            let row = main_chunks[idx];
+            self.render_update_bar(frame, row, theme, bar);
+            // A terminal too small for every footer row can leave this one empty.
+            self.update_bar_drawn = !row.is_empty();
         }
 
         // Render dialogs on top

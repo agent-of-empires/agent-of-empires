@@ -3722,6 +3722,25 @@ mod tests {
         assert_eq!(app.drawn_bar, on_screen);
     }
 
+    /// A terminal too small for the update bar's row shows no line, so its keys have nothing
+    /// to act on.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn a_terminal_too_small_for_the_update_bar_records_no_line() {
+        let _home = crate::session::test_support::isolate_app_dir();
+        crate::session::get_profile_dir("test").unwrap();
+        let (mut app, _terminal) = key_app();
+        app.image_update = Some(image_update());
+        for (width, height) in [(100, 1), (100, 0), (0, 30)] {
+            let mut screen =
+                Terminal::new(ratatui::backend::TestBackend::new(width, height)).unwrap();
+            screen.draw(|f| app.render(f)).unwrap();
+            assert_eq!(app.drawn_bar, None, "{width}x{height}");
+        }
+        draw(&mut app);
+        assert!(app.drawn_bar.is_some(), "a full-size frame draws the bar");
+    }
+
     /// The pull key is the registry's Update chord: bare `u`, or Ctrl+U under strict hotkeys.
     #[tokio::test]
     #[serial_test::serial]
