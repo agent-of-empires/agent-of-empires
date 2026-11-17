@@ -116,8 +116,8 @@ pub(crate) use instance::{
 };
 pub(crate) use instance::{Handoff, Held, SandboxPin, Unserved};
 pub(crate) use instance::{
-    TerminalHandoffContext, TerminalHandoffIntent, TerminalHandoffKey, TerminalHandoffStage,
-    TerminalHandoffUnbornFence,
+    TerminalHandoffContext, TerminalHandoffIntent, TerminalHandoffKey, TerminalHandoffOutcome,
+    TerminalHandoffStage, TerminalHandoffUnbornFence,
 };
 #[cfg(test)]
 pub(crate) use move_journal::{
