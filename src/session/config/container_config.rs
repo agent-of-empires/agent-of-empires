@@ -2691,9 +2691,12 @@ fn git_exec_surface_overlays(
             protect.push((admin.join("config.worktree"), false));
             protect.push((admin.join("commondir"), false));
             protect.push((admin.join("gitdir"), false));
-            if let Some(workdir) = repo.workdir() {
-                protect.push((canon(workdir).join(".git"), false));
-            }
+        }
+        // A `.git` file can redirect host git to a gitdir the sandbox controls,
+        // also when that gitdir is the common dir (bare-backed root, submodule).
+        let dot_git = canon(repo.workdir().unwrap_or(&candidate)).join(".git");
+        if dot_git.is_file() {
+            protect.push((dot_git, false));
         }
         for (path, is_dir) in protect {
             if !path.exists() {
@@ -3983,8 +3986,15 @@ mod tests {
                 &["config.worktree", "commondir", "gitdir"],
             ));
             want.push(format!("{base}/{}/.git", wt.display()));
+            want.push(format!("{base}/.git"));
             want.sort();
             assert_eq!(overlays_of(&volumes, std::slice::from_ref(&worktree)), want);
+
+            // The bare-backed root's own `.git` pointer is protected too.
+            let mut root_want = expect(&format!("{base}/{}", common.display()), &main_files);
+            root_want.push(format!("{base}/.git"));
+            root_want.sort();
+            assert_eq!(overlays_of(&volumes, &[]), root_want);
         }
 
         // A repo a workspace mount covers without a volume of its own.
