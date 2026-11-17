@@ -135,6 +135,8 @@ pub(crate) fn prove_staging_custody_gone(
     writers: &[StagingProcess],
     previous_boot: bool,
 ) -> anyhow::Result<()> {
+    #[cfg(not(target_os = "linux"))]
+    let _ = previous_boot;
     match custody {
         StagingCustody::Prepared if writers.is_empty() => Ok(()),
         #[cfg(target_os = "linux")]
