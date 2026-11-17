@@ -1399,7 +1399,7 @@ impl SessionService {
             );
             target
                 .tmux_session()?
-                .send_keys_with_delay(&typed, crate::agents::send_keys_enter_delay(&target.tool))
+                .send_keys_with_delay(&typed, target.send_keys_enter_delay())
         })
         .await
         .map_err(anyhow::Error::from)
