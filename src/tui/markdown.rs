@@ -224,7 +224,12 @@ impl MarkdownBuilder {
             // not collapse into one wrapped paragraph.
             Event::Html(text) | Event::InlineHtml(text) => {
                 if self.html == HtmlMode::Literal {
-                    self.push_literal(&text);
+                    // A row is one line built from its cells, so a tag written
+                    // inside a cell belongs to that cell, not to a later line.
+                    match self.table_row.as_mut().and_then(|row| row.last_mut()) {
+                        Some(cell) => cell.push_str(&text),
+                        None => self.push_literal(&text),
+                    }
                 }
             }
             Event::SoftBreak if !self.in_code_block => self.flush(),
@@ -430,5 +435,27 @@ mod tests {
             wrap_line_into(case.input, case.width, &mut actual);
             assert_eq!(actual, case.expected, "{}", case.name);
         }
+    }
+
+    #[test]
+    fn literal_html_stays_in_its_table_cell() {
+        let lines = MarkdownBuilder::render_with(
+            "| Choice |\n| --- |\n| before <b>yes</b> after |",
+            HtmlMode::Literal,
+        );
+        let rows: Vec<String> = lines
+            .iter()
+            .map(|line| {
+                line.spans
+                    .iter()
+                    .map(|span| span.content.as_ref())
+                    .collect()
+            })
+            .collect();
+        assert_eq!(
+            rows,
+            vec!["Choice".to_string(), "before <b>yes</b> after".to_string()],
+            "the tag stays with the text of the cell it was written in"
+        );
     }
 }
