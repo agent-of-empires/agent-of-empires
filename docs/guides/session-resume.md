@@ -120,6 +120,8 @@ When a launch requests resume, AoE preserves an unknown stored ID and attempts i
 
 An inconclusive resume or fresh-pinned probe, a missing created-pane identity on a fresh launch, or an unknown query of an existing pane returns `launch_indeterminate`, never ready success. Observation errors and stabilization expiry prove neither death nor loaded history.
 
+During resume or fresh-pinned stabilization, a live pane that remains classified as a foreground shell until the deadline returns `launch_indeterminate` with cause `stabilization_expired`. AoE withholds sends, attach preparation and restart wake input instead of treating elapsed time or the launch command as readiness. Inspect the retained pane before retrying. Normal AoE-created panes use a protected environment wrapper that is excluded from this foreground-shell classification.
+
 AoE preserves the pane, process, conversation association, capture poller and scope ownership on this outcome. It releases only its own launch reservation when storage permits, without teardown even if release fails. The observed sandbox workdir is retained unless a concurrent change supersedes its container context. Sends, attach preparation and restart wake messages stop at this refusal. Inspect the existing pane and restore tmux access before retrying; do not assume that the Agent needs a replacement. This does not restrict an explicit owned Stop.
 
 An indeterminate creation still finalizes its idempotency key: its durable status changes from `Creating` to `Starting`, never to ready. A keyed retry returns that same session without another launch. If durable finalization fails, the request reports unavailable; the existing lifecycle work queue can finalize only that same generation after storage recovers. A concurrent status or launch generation is not overwritten. A later ensure rechecks live-pane readiness, using the existing shell and command-override exemptions. Hook readiness must match the active launch, conversation ID and execution binding; another launch's status cannot authorize input.
@@ -270,6 +272,11 @@ legacy Restart action; use only the current server-authorized recovery choices.
 | Restart Same | Revalidate the exact qualified conversation selection and restart it, without sending previous input or a wake message. |
 | Stop | Explicitly stop the currently owned runtime through the ordinary Stop admission. This does not delete its native history. |
 | Fresh / launch without restore flags | Abandon pending AoE input and attachments, stop the admitted outgoing runtime, and launch without AoE restore flags. Do not replay blocked or possibly accepted input. Keep native and transcript history. |
+
+Web terminal Attach opens a passive view of the exact observed pane, including
+retained output on an Error session. It cannot type, resize, claim ownership or
+start an Agent. If that pane or its selection changes, observation stops rather
+than following a replacement. Refresh the session before attaching again.
 
 Repair provider settings or authentication in the Agent before composing new
 input. If the Agent reports its own retry or backoff, that remains Agent work:

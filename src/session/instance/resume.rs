@@ -3217,7 +3217,7 @@ mod tests {
                 assert_eq!(command, base_command, "{tool}: rejected command changed");
             }
             assert_eq!(
-                build_resume_flags(tool, sid, true).is_empty(),
+                build_resume_flags(crate::agents::get_agent(tool), sid, true).is_empty(),
                 !resume_supported,
                 "{tool}: direct resume flags"
             );
@@ -5401,7 +5401,8 @@ exec sleep 60
                     let native: serde_json::Value =
                         serde_json::from_slice(&std::fs::read(&ready).unwrap()).unwrap();
                     let args = native["argv"].as_array().unwrap();
-                    let expected = shell_words::split(&build_resume_flags("omp", SID, true)).unwrap();
+                    let expected =
+                        shell_words::split(&build_resume_flags(row.resolved_agent(), SID, true)).unwrap();
                     assert!(!expected.is_empty());
                     assert!(args.windows(expected.len()).any(|words| {
                         words.iter().zip(&expected).all(|(word, expected)| word.as_str() == Some(expected.as_str()))

@@ -507,6 +507,12 @@ pub async fn update_session_archive(
             if worker_state.cityhall_mode && !row.is_structured() {
                 return Err(LifecycleTargetError::CityHall.into());
             }
+            if row.has_pending_trash() {
+                return Err(crate::session::LifecycleReservationError::Busy(LifecycleOperation::Trash).into());
+            }
+            if row.is_trashed() {
+                return Err(LifecycleTargetError::Blocked(crate::session::StartBlocked::Trashed).into());
+            }
             let now = chrono::Utc::now();
             if matches!(row.status, Status::Creating | Status::Deleting)
                 || row.has_fresh_lifecycle_reservation(now) {
@@ -886,6 +892,9 @@ pub async fn trash_session(
                 .ok_or(LifecycleTargetError::Missing)?;
             if worker_state.cityhall_mode && !row.is_structured() {
                 return Err(LifecycleTargetError::CityHall.into());
+            }
+            if body.expected_profile.as_deref().is_some_and(|profile| profile != store.storage().profile()) {
+                return Err(crate::session::LifecycleReservationError::Superseded.into());
             }
             if body.expected_generation.is_some_and(|generation| generation != row.lifecycle_generation) {
                 return Err(crate::session::LifecycleReservationError::Superseded.into());
@@ -1307,7 +1316,7 @@ pub async fn force_smart_rename(
         &config_path,
     );
     let config = &resolved.session;
-    if let Err(reason) = crate::session::smart_rename::check_eligible_resolved(
+    if let Err(reason) = crate::session::smart_rename::check_eligible_with_declarations(
         true,
         true,
         true,
@@ -1316,7 +1325,7 @@ pub async fn force_smart_rename(
         &config.smart_rename_agent,
         sandboxed,
         &command,
-        &config.agent_command_override,
+        config,
     ) {
         return api_error(StatusCode::CONFLICT, reason.as_str(), reason.user_message());
     }
@@ -1469,7 +1478,7 @@ pub async fn summarize_session(
         &config.session.smart_rename_agent,
         sandboxed,
         &command,
-        &config.session.agent_command_override,
+        &config.session,
     ) {
         use crate::session::smart_rename::SkipReason;
         let (status, message) = match reason {
@@ -2705,6 +2714,59 @@ pub(super) async fn apply_update_restart(
     .await
 }
 
+/// `GET /api/sessions/{id}/account-targets`: the configured tool names this session can swap to
+/// without losing its conversation. Names only; `agent_config_dir` paths never leave the host.
+pub async fn session_account_targets(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<String>,
+) -> axum::response::Response {
+    if let Some(response) = crate::server::api::read_only_block(&state)
+        .or_else(|| crate::server::api::cityhall_block(&state))
+    {
+        return response;
+    }
+    let Some(row) = crate::server::api::find_instance(&state, &id).await else {
+        return crate::server::api::session_not_found();
+    };
+    match tokio::task::spawn_blocking(move || account_targets(&row)).await {
+        Ok(targets) => Json(serde_json::json!({ "targets": targets })).into_response(),
+        Err(_) => StatusCode::INTERNAL_SERVER_ERROR.into_response(),
+    }
+}
+
+pub(super) fn account_targets(row: &Instance) -> Vec<String> {
+    if !row.is_structured() {
+        return Vec::new();
+    }
+    let profile = row.effective_profile();
+    let config = crate::session::config::profile_config::resolve_config_or_warn(&profile);
+    let mut names: Vec<&str> = crate::agents::agent_names();
+    names.extend(config.session.custom_agents.keys().map(String::as_str));
+    names.extend(
+        config
+            .session
+            .agent_config_dir
+            .iter()
+            .filter(|(_, dir)| crate::session::config::is_resolvable_agent_config_dir(dir))
+            .map(|(name, _)| name.as_str()),
+    );
+    names.sort_unstable();
+    names.dedup();
+    names
+        .into_iter()
+        .filter(|name| *name != row.tool)
+        .filter(|name| {
+            let body = crate::daemon::RestartSessionBody {
+                tool: Some((*name).to_owned()),
+                require_account_carry: true,
+                ..Default::default()
+            };
+            account_swap_refusal(row, &body).is_none()
+        })
+        .map(str::to_owned)
+        .collect()
+}
+
 /// Why a restart that demands an account swap (`require_account_carry`) is malformed: the
 /// tool to switch to, or what makes the swap impossible whatever the configuration says.
 fn account_swap_precondition<'a>(
@@ -2997,6 +3059,7 @@ fn reserve_structured_restart(
 }
 
 struct PreparedQuotaRestart {
+    park_seq: u64,
     resets_at: chrono::DateTime<chrono::Utc>,
     continuation: Option<crate::server::acp_reconciler::PreparedContinuation>,
 }
@@ -3013,6 +3076,9 @@ struct StructuredRestartLaunch {
     reservation: Option<crate::acp::supervisor::ResumeReservation>,
     reason: &'static str,
     quota: Option<PreparedQuotaRestart>,
+    /// A limit rejecting this launch is the target account's: it comes back on the error and
+    /// parks nothing.
+    defers_rate_limit: bool,
 }
 
 /// Without auto-resume a terminal launch starts a fresh conversation and still reports success,
@@ -3042,14 +3108,9 @@ pub(super) async fn discard_stale_continuation(
     }
 }
 
-/// After an account swap out of a rate-limit park: same sequence as `/acp/spawn`, with the
-/// submission authority covering the checks and the install. Returns whether the interrupted
-/// prompt (or a queued one) is now the next turn, so the default wake message can give way.
-///
-/// A restart that was superseded meanwhile (a stop or a newer launch) installs nothing. An explicit
-/// wake message takes precedence over the interrupted prompt, but the manual breadcrumb still
-/// disarms the auto-resume budget exactly once.
-/// A failed durable breadcrumb aborts the restart rather than authorizing its default wake.
+/// Select the next turn before publishing its durable quota release.
+/// Deferred failover also requires the captured park and a current owner.
+#[allow(clippy::too_many_arguments)]
 pub(super) async fn continue_interrupted_prompt(
     state: &Arc<AppState>,
     id: &str,
@@ -3058,15 +3119,24 @@ pub(super) async fn continue_interrupted_prompt(
     explicit_wake: bool,
     submission: &tokio::sync::OwnedMutexGuard<()>,
     prepared: Option<crate::server::acp_reconciler::PreparedContinuation>,
+    expected_park_seq: Option<u64>,
 ) -> Result<bool, crate::acp::supervisor::SupervisorError> {
     let current = state.instances.read().await.iter().any(|row| {
         row.id == id
             && row.lifecycle_generation == generation
             && row.launch_is_finalized()
             && row.ensure_startable().is_ok()
+            && (expected_park_seq.is_none()
+                || (row.status != Status::Stopped && !row.is_idle_dormant()))
     });
     if !current {
-        return Ok(false);
+        return if expected_park_seq.is_some() {
+            Err(crate::acp::supervisor::SupervisorError::SpawnCancelled(
+                id.to_owned(),
+            ))
+        } else {
+            Ok(false)
+        };
     }
     let selected = if explicit_wake {
         None
@@ -3076,11 +3146,59 @@ pub(super) async fn continue_interrupted_prompt(
         let outcome = prepared.outcome(state, id, submission).await?;
         Some((prepared, outcome))
     };
-    // Published while this task still owns the submission authority, so a newer limit and its
-    // automatic resume cannot slip in between and be disarmed by an older breadcrumb.
-    state
-        .acp_supervisor
-        .publish_rate_limit_auto_resumed(id, resets_at, true)?;
+    if let Some(expected_park_seq) = expected_park_seq {
+        use crate::acp::supervisor::SupervisorError;
+        let store = Arc::clone(&state.acp_event_store);
+        let probe_id = id.to_owned();
+        // Read the frontier first so a concurrent append invalidates this release.
+        let (frontier, park) = tokio::task::spawn_blocking(move || -> anyhow::Result<_> {
+            let frontier = store.highest_seq(&probe_id)?;
+            let park = store.rate_limit_park(&probe_id)?;
+            Ok((frontier, park))
+        })
+        .await
+        .map_err(|_| SupervisorError::NativeStoreUnavailable)?
+        .map_err(|_| SupervisorError::NativeStoreUnavailable)?;
+        match park {
+            crate::acp::event_store::ControlKnowledge::Known(Some(park))
+                if park.seq == expected_park_seq
+                    && !park.cap_reached
+                    && park.last_resume_attempt_ms.is_none() => {}
+            crate::acp::event_store::ControlKnowledge::Indeterminate => {
+                return Err(SupervisorError::ControlStateUnavailable);
+            }
+            _ => return Err(SupervisorError::SpawnCancelled(id.to_owned())),
+        }
+        let control = state
+            .session_service
+            .fold_control_state(id)
+            .await
+            .map_err(|_| SupervisorError::ControlStateUnavailable)?;
+        if !control.connection_ready
+            || control.connection_unavailable.is_some()
+            || control.turn_active
+        {
+            return Err(SupervisorError::SpawnCancelled(id.to_owned()));
+        }
+        let current = state.instances.read().await.iter().any(|row| {
+            row.id == id
+                && row.lifecycle_generation == generation
+                && row.launch_is_finalized()
+                && row.ensure_startable().is_ok()
+                && row.status != Status::Stopped
+                && !row.is_idle_dormant()
+        });
+        if !current || crate::process::worker_registry::stop_requested(id) {
+            return Err(SupervisorError::SpawnCancelled(id.to_owned()));
+        }
+        state
+            .acp_supervisor
+            .publish_rate_limit_auto_resumed_if_seq(id, resets_at, frontier)?;
+    } else {
+        state
+            .acp_supervisor
+            .publish_rate_limit_auto_resumed(id, resets_at, true)?;
+    }
     if explicit_wake {
         // The caller clears stale pending only after this durable publication
         // succeeds, still under submission authority and before the spawn.
@@ -3107,6 +3225,76 @@ pub(super) async fn continue_interrupted_prompt(
         ))
 }
 
+async fn finish_deferred_quota_restart(
+    state: &Arc<AppState>,
+    id: &str,
+    generation: u64,
+    profile: &str,
+    wake_requested: bool,
+    prepared: PreparedQuotaRestart,
+) -> anyhow::Result<bool> {
+    state.acp_supervisor.wait_until_ready(id).await?;
+    let namespace = state.profile_namespace.read().await;
+    let submission = state.session_service.prompt_submission(id).await;
+    let lock = state.instance_lock(id).await;
+    let guard = lock.lock().await;
+    let current = state.instances.read().await.iter().any(|row| {
+        row.id == id
+            && row.lifecycle_generation == generation
+            && row.source_profile == profile
+            && row.launch_is_finalized()
+            && row.ensure_startable().is_ok()
+            && row.status != Status::Stopped
+            && !row.is_idle_dormant()
+    });
+    if !current || crate::process::worker_registry::stop_requested(id) {
+        return Err(crate::acp::supervisor::SupervisorError::SpawnCancelled(id.to_owned()).into());
+    }
+    let park_seq = prepared.park_seq;
+    let continued = continue_interrupted_prompt(
+        state,
+        id,
+        generation,
+        prepared.resets_at,
+        wake_requested,
+        &submission,
+        prepared.continuation,
+        Some(park_seq),
+    )
+    .await?;
+    discard_stale_continuation(state, id, true, wake_requested).await;
+    let pending = state
+        .instances
+        .read()
+        .await
+        .iter()
+        .any(|row| row.id == id && row.pending_initial_turn.is_some());
+    // Delivery retains submission, never the instance lock.
+    drop(guard);
+    drop(namespace);
+    if continued {
+        let delivery = crate::server::acp_reconciler::QuotaDelivery::new(park_seq);
+        let handled = if pending {
+            state
+                .session_service
+                .drain_pending_initial_turn_with_submission(id, &submission, Some(&delivery))
+                .await
+        } else {
+            state
+                .session_service
+                .drain_queued_prompts_with_submission(id, &submission, Some(&delivery))
+                .await
+        };
+        if !handled {
+            return Err(
+                crate::acp::supervisor::SupervisorError::SpawnCancelled(id.to_owned()).into(),
+            );
+        }
+    }
+    drop(submission);
+    Ok(continued)
+}
+
 async fn finish_structured_restart(
     state: &Arc<AppState>,
     id: &str,
@@ -3131,6 +3319,7 @@ async fn finish_structured_restart(
             reservation,
             reason: _,
             quota,
+            defers_rate_limit,
         } = launch;
         let quota = if account_swap { quota } else { None };
         let wake_requested = wake.is_some();
@@ -3204,17 +3393,21 @@ async fn finish_structured_restart(
         Ok::<_, anyhow::Error>((started, Arc::new(native), wake, reservation))
     })
     .await??;
-        // Past the pre-launch hooks and the reservation, so a refused launch keeps the turn; still
-        // under the submission authority, so the new worker cannot drain it before the wake.
-        let resumes_rate_limit = quota.is_some();
-        let continued = match quota {
-            Some(prepared) => continue_interrupted_prompt(
-                state, id, generation, prepared.resets_at, wake_requested,
-                &submission, prepared.continuation,
-            ).await?,
-            None => false,
+        // Automatic failover keeps the park until the replacement really starts.
+        let (deferred_quota, continued) = if defers_rate_limit {
+            (quota, false)
+        } else {
+            let resumes_rate_limit = quota.is_some();
+            let continued = match quota {
+                Some(prepared) => continue_interrupted_prompt(
+                    state, id, generation, prepared.resets_at, wake_requested,
+                    &submission, prepared.continuation, None,
+                ).await?,
+                None => false,
+            };
+            discard_stale_continuation(state, id, resumes_rate_limit, wake_requested).await;
+            (None, continued)
         };
-        discard_stale_continuation(state, id, resumes_rate_limit, wake_requested).await;
         let agent = state
             .acp_supervisor
             .pick_agent_for_tool(
@@ -3241,6 +3434,9 @@ async fn finish_structured_restart(
             namespace: Some(state.profile_namespace.clone()),
             native_scope: None,
         });
+        if defers_rate_limit {
+            reservation.lease().defer_rate_limit_rejection();
+        }
         let profile = started.source_profile.clone();
         drop(guard);
         drop(submission);
@@ -3254,6 +3450,12 @@ async fn finish_structured_restart(
             state, native, id, generation, spawned,
         )
         .await?;
+        let continued = match deferred_quota {
+            Some(prepared) => Box::pin(finish_deferred_quota_restart(
+                state, id, generation, &profile, wake_requested, prepared,
+            )).await?,
+            None => continued,
+        };
         let wake = if continued { String::new() } else { wake };
         if !wake.is_empty() {
             let state = state.clone();
@@ -3323,14 +3525,40 @@ async fn finish_structured_restart(
             if let Some(response) = lifecycle_rejection(state, &error) {
                 return response;
             }
+            if let Some(response) = sandbox_migration_response(state, id, &error).await {
+                return response;
+            }
+            if let Some(crate::acp::supervisor::SupervisorError::Acp(failure)) =
+                error.downcast_ref::<crate::acp::supervisor::SupervisorError>()
+            {
+                if failure.is_authentication_failure() {
+                    tracing::warn!(target: "http.api.sessions", session = %id, %error, "structured restart failed: the agent is not logged in");
+                    return api_error(
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        AGENT_AUTH_FAILED,
+                        "The agent could not authenticate: Authentication required",
+                    );
+                }
+                if let crate::acp::acp_client::AcpError::RateLimited(info) = failure {
+                    tracing::warn!(target: "http.api.sessions", session = %id, %error, "structured restart failed: the agent is rate limited");
+                    return (
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        Json(serde_json::json!({
+                            "error": AGENT_RATE_LIMITED,
+                            "message": "The agent is rate limited",
+                            "status": info.status,
+                            "resets_at": info.resets_at,
+                            "kind": info.kind,
+                        })),
+                    )
+                        .into_response();
+                }
+            }
             if let Some(cause) = error.downcast_ref::<crate::acp::supervisor::SupervisorError>() {
                 return crate::server::api::acp::supervisor_error_response(
                     "structured restart refused",
                     cause,
                 );
-            }
-            if let Some(response) = sandbox_migration_response(state, id, &error).await {
-                return response;
             }
             tracing::warn!(target: "http.api.sessions", session = %id, %error, "structured restart failed");
             api_error(
@@ -3353,6 +3581,11 @@ pub(super) enum AgentPreparation {
 enum RestartOrigin {
     Explicit,
     StartupRecovery,
+    /// An automatic account failover decided on this event-log head and lifecycle generation.
+    Failover {
+        park_seq: u64,
+        generation: u64,
+    },
 }
 
 fn restart_reason(
@@ -3415,6 +3648,7 @@ pub(super) async fn prepare_agent_session(
         restart,
         None,
         RestartOrigin::Explicit,
+        None,
     )
     .await
 }
@@ -3441,8 +3675,285 @@ pub(super) async fn prepare_captured_terminal_session(
         None,
         None,
         RestartOrigin::Explicit,
+        None,
     )
     .await
+}
+
+/// Error code of a restart whose agent refused to start for want of a login.
+const AGENT_AUTH_FAILED: &str = "agent_auth_failed";
+
+/// Error code of a restart whose agent refused to start on a rate limit.
+const AGENT_RATE_LIMITED: &str = "agent_rate_limited";
+
+fn rate_limit_of(body: &serde_json::Value) -> Option<crate::acp::state::RateLimitInfo> {
+    Some(crate::acp::state::RateLimitInfo {
+        status: body["status"].as_str()?.to_owned(),
+        resets_at: body["resets_at"]
+            .as_str()
+            .and_then(|at| chrono::DateTime::parse_from_rfc3339(at).ok())
+            .map(|at| at.with_timezone(&chrono::Utc)),
+        kind: body["kind"].as_str()?.to_owned(),
+    })
+}
+
+/// Why a failover swap did not happen.
+#[derive(Debug, Clone)]
+pub(crate) struct FailoverError {
+    /// A retry cannot help for this park: the swap is refused by design.
+    /// Anything else (a worker that was still stopping, a failed spawn, a log head that moved
+    /// without ending the park) may clear by itself.
+    pub permanent: bool,
+    /// The target account's agent refused to start for want of a login.
+    pub target_auth_failed: bool,
+    /// The target account's agent refused to start on a rate limit of its own.
+    pub target_rate_limit: Option<crate::acp::state::RateLimitInfo>,
+    pub message: String,
+}
+
+impl FailoverError {
+    fn from_response(status: StatusCode, body: Option<&serde_json::Value>) -> Self {
+        let code = body
+            .and_then(|body| body["error"].as_str())
+            .unwrap_or_default();
+        let message = body
+            .and_then(|body| body["message"].as_str())
+            .unwrap_or("no detail");
+        Self {
+            permanent: code == "account_swap_unavailable",
+            target_auth_failed: code == AGENT_AUTH_FAILED,
+            target_rate_limit: (code == AGENT_RATE_LIMITED)
+                .then(|| body.and_then(rate_limit_of))
+                .flatten(),
+            message: format!("{status}: {message}"),
+        }
+    }
+}
+
+/// Switch a rate-limit-parked structured session to another account of the same agent,
+/// continuing the interrupted prompt. `expected_seq` is the event-log head the failover
+/// decision read: under the submission authority and the instance lock, the swap proceeds only
+/// if the session is still parked on that head with no worker, so a prompt, a manual resume or
+/// the timed auto-resume that landed meanwhile wins and nothing is sent twice. `generation` is
+/// the row's lifecycle generation at the decision: a stop that landed since is the owner's and
+/// is never consumed.
+pub(crate) async fn failover_account_swap(
+    state: &Arc<AppState>,
+    id: &str,
+    tool: &str,
+    expected_seq: u64,
+    generation: u64,
+) -> Result<(), FailoverError> {
+    failover_account_swap_with(state, id, tool, expected_seq, generation, async {}).await
+}
+
+/// `after_restart` runs once the restart returned, before the failure is handled: the point
+/// where another lifecycle operation can complete.
+pub(super) async fn failover_account_swap_with(
+    state: &Arc<AppState>,
+    id: &str,
+    tool: &str,
+    expected_seq: u64,
+    generation: u64,
+    after_restart: impl std::future::Future<Output = ()>,
+) -> Result<(), FailoverError> {
+    let claim = Arc::new(FailoverClaim::default());
+    let response = Box::pin(prepare_agent_session_inner(
+        state.clone(),
+        id.to_owned(),
+        AgentPreparationInput {
+            body: Ok(None),
+            captured: None,
+            physical: None,
+        },
+        AgentPreparation::Restart,
+        Some(Arc::new(crate::daemon::RestartSessionBody {
+            tool: Some(tool.to_owned()),
+            require_account_carry: true,
+            ..Default::default()
+        })),
+        None,
+        RestartOrigin::Failover {
+            park_seq: expected_seq,
+            generation,
+        },
+        Some(claim.clone()),
+    ))
+    .await;
+    after_restart.await;
+    let status = response.status();
+    if status.is_success() {
+        return Ok(());
+    }
+    let body = axum::body::to_bytes(response.into_body(), 64 * 1024)
+        .await
+        .ok()
+        .and_then(|bytes| serde_json::from_slice::<serde_json::Value>(&bytes).ok());
+    let found = claim.found.lock().unwrap_or_else(|e| e.into_inner()).take();
+    if let Some(before) = found {
+        let owned = claim
+            .owned_generation
+            .load(std::sync::atomic::Ordering::Acquire);
+        restore_account(state, id, tool, before, owned).await;
+    }
+    Err(FailoverError::from_response(status, body.as_ref()))
+}
+
+/// What a failover's restart records under its own locks, for the rollback to read: the row's
+/// account as the restart found it, and the newest generation the restart reserved (0 when none).
+#[derive(Default)]
+struct FailoverClaim {
+    found: std::sync::Mutex<Option<AccountIdentity>>,
+    owned_generation: std::sync::atomic::AtomicU64,
+}
+
+/// The account, conversation bindings and selection authority found before a failover swap.
+struct AccountIdentity {
+    tool: String,
+    detect_as: String,
+    agent_session_binding: Option<crate::session::ConversationBinding>,
+    resume_binding: Option<crate::session::ConversationBinding>,
+    acp_establishment: Option<crate::acp::establishment::AcpEstablishment>,
+}
+
+impl AccountIdentity {
+    fn of(row: &Instance) -> Self {
+        Self {
+            tool: row.tool.clone(),
+            detect_as: row.detect_as.clone(),
+            agent_session_binding: row.agent_session_binding.clone(),
+            resume_binding: row.resume_binding.clone(),
+            acp_establishment: row.acp_establishment.clone(),
+        }
+    }
+}
+
+/// Restore only the failed swap's account, bindings and dormancy marker.
+/// Its captured runner and native checkpoint retire before rollback; a live
+/// worker or a newer lifecycle generation wins.
+async fn restore_account(
+    state: &Arc<AppState>,
+    id: &str,
+    target: &str,
+    before: AccountIdentity,
+    owned_generation: u64,
+) {
+    if owned_generation == 0 {
+        return;
+    }
+    let lock = state.instance_lock(id).await;
+    let _guard = lock.lock().await;
+    let profile = {
+        let rows = state.instances.read().await;
+        let Some(row) = rows.iter().find(|row| row.id == id) else {
+            return;
+        };
+        row.source_profile.clone()
+    };
+    let mut owned_generation = owned_generation;
+    if state.acp_supervisor.is_running(id).await {
+        return;
+    }
+    let Ok(captured) = state.acp_supervisor.capture_retirement(id) else {
+        return;
+    };
+    if captured
+        .lease
+        .as_ref()
+        .is_some_and(|lease| lease.defers_rate_limit_rejection())
+    {
+        if !state.acp_supervisor.binding_producer_is_current(&captured) {
+            return;
+        }
+        let worker_state = Arc::clone(state);
+        let session = id.to_owned();
+        let profile = profile.clone();
+        let expected_tool = target.to_owned();
+        let checkpoint = tokio::task::spawn_blocking(move || -> anyhow::Result<u64> {
+            use crate::session::SessionStore;
+            let native = crate::server::session_store::NativeSessionStore::open(
+                Arc::clone(&worker_state),
+                &profile,
+                Some(session.clone()),
+            )?;
+            let _lifecycle = native.storage().acquire_instance_lifecycle_lock(&session)?;
+            let row = native
+                .load()?
+                .into_iter()
+                .find(|row| row.id == session)
+                .ok_or(crate::session::SessionGone)?;
+            anyhow::ensure!(
+                row.lifecycle_generation == owned_generation && row.tool == expected_tool,
+                crate::session::LifecycleReservationError::Superseded
+            );
+            let retirement = crate::server::acp_events::BindingRetirement::prepare_captured(
+                &worker_state,
+                captured,
+                &row,
+                native.storage(),
+            )?;
+            retirement.activate();
+            retirement.commit_under_native_lock(&native)?;
+            worker_state
+                .acp_supervisor
+                .acknowledge_retirement(&retirement.target)?;
+            let row = native
+                .load()?
+                .into_iter()
+                .find(|row| row.id == session)
+                .ok_or(crate::session::SessionGone)?;
+            Ok(row.lifecycle_generation)
+        })
+        .await
+        .map_err(anyhow::Error::from)
+        .and_then(|result| result);
+        match checkpoint {
+            Ok(generation) => owned_generation = generation,
+            Err(error) => {
+                tracing::warn!(target: "http.api.sessions", session = %id, %error,
+                    "failed failover retains its original retirement checkpoint");
+                return;
+            }
+        }
+        if state.acp_supervisor.is_running(id).await {
+            return;
+        }
+    }
+    let worker_state = state.clone();
+    let session = id.to_owned();
+    let target = target.to_owned();
+    let restored = tokio::task::spawn_blocking(move || -> anyhow::Result<()> {
+        use crate::session::SessionStore;
+        let native = crate::server::session_store::NativeSessionStore::open(
+            worker_state,
+            &profile,
+            Some(session.clone()),
+        )?;
+        (&native as &dyn SessionStore).update(|rows, _| {
+            let Some(row) = rows.iter_mut().find(|row| row.id == session) else {
+                return Ok(());
+            };
+            if row.lifecycle_generation != owned_generation {
+                return Ok(());
+            }
+            row.idle_dormant_since = None;
+            if row.tool == target && before.tool != target {
+                row.tool = before.tool;
+                row.detect_as = before.detect_as;
+                row.agent_session_binding = before.agent_session_binding;
+                row.resume_binding = before.resume_binding;
+                row.acp_establishment = before.acp_establishment;
+            }
+            Ok(())
+        })
+    })
+    .await;
+    if let Err(error) = restored
+        .map_err(anyhow::Error::from)
+        .and_then(|result| result)
+    {
+        tracing::warn!(target: "http.api.sessions", session = %id, %error, "could not restore the account after a failed failover swap");
+    }
 }
 
 pub(crate) async fn recovery_restart(
@@ -3465,10 +3976,12 @@ pub(crate) async fn recovery_restart(
         })),
         Some(expected_generation),
         RestartOrigin::StartupRecovery,
+        None,
     )
     .await
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn prepare_agent_session_inner(
     state: Arc<AppState>,
     id: String,
@@ -3477,6 +3990,7 @@ async fn prepare_agent_session_inner(
     restart: Option<Arc<crate::daemon::RestartSessionBody>>,
     expected_generation: Option<u64>,
     restart_origin: RestartOrigin,
+    failover_claim: Option<Arc<FailoverClaim>>,
 ) -> axum::response::Response {
     let resume_policy = match (restart_origin, preparation) {
         (RestartOrigin::StartupRecovery, _) => crate::session::ResumeAttemptPolicy::Automatic,
@@ -3497,6 +4011,8 @@ async fn prepare_agent_session_inner(
     if state.read_only {
         return crate::server::api::read_only_response();
     }
+    #[cfg(test)]
+    launch_hook_gate::pause(&id, launch_hook_gate::Stage::BeforeLocks).await;
     let namespace = state.profile_namespace.read().await;
     if *state.canonical_health.read().await != crate::daemon::RuntimeHealth::Healthy {
         return StatusCode::SERVICE_UNAVAILABLE.into_response();
@@ -3539,6 +4055,46 @@ async fn prepare_agent_session_inner(
     }
     if preparation == AgentPreparation::Ensure && instance.is_structured() {
         return StatusCode::BAD_REQUEST.into_response();
+    }
+    if let RestartOrigin::Failover {
+        park_seq: expected_seq,
+        generation,
+    } = restart_origin
+    {
+        // Idle reaping and status polling stop or dormant a row without bumping its generation,
+        // so the status checks are not covered by the comparison.
+        if instance.lifecycle_generation != generation
+            || instance.status == Status::Stopped
+            || instance.is_idle_dormant()
+        {
+            return api_error(
+                StatusCode::CONFLICT,
+                "park_changed",
+                "The session was stopped or restarted since the failover was decided".to_string(),
+            );
+        }
+        let store = Arc::clone(&state.acp_event_store);
+        let probe_id = id.clone();
+        let still_parked = tokio::task::spawn_blocking(move || -> anyhow::Result<bool> {
+            use crate::acp::event_store::ControlKnowledge::Known;
+            Ok(matches!(store.rate_limit_park(&probe_id)?, Known(Some(_)))
+                && store.highest_seq(&probe_id)? == expected_seq)
+        })
+        .await;
+        let still_parked = matches!(still_parked, Ok(Ok(true)));
+        if !still_parked || state.acp_supervisor.is_running(&id).await {
+            return api_error(
+                StatusCode::CONFLICT,
+                "park_changed",
+                "The session moved on since the failover was decided".to_string(),
+            );
+        }
+        // The account the rollback returns to is the one found under these locks: a restart
+        // that changed it since the decision was made is not this swap's to undo.
+        if let Some(claim) = &failover_claim {
+            *claim.found.lock().unwrap_or_else(|e| e.into_inner()) =
+                Some(AccountIdentity::of(&instance));
+        }
     }
     if state.cityhall_mode && !instance.is_structured() {
         return crate::server::api::cityhall_response();
@@ -3623,7 +4179,7 @@ async fn prepare_agent_session_inner(
             Err(error) => return structured_lifecycle_error(&state, error.into()),
         };
         match marker {
-            Some(resets_at) => {
+            Some((park_seq, resets_at)) => {
                 let continuation = if body.wake_message.is_some() {
                     None
                 } else {
@@ -3633,6 +4189,7 @@ async fn prepare_agent_session_inner(
                     }
                 };
                 Some(PreparedQuotaRestart {
+                    park_seq,
                     resets_at,
                     continuation,
                 })
@@ -3643,6 +4200,7 @@ async fn prepare_agent_session_inner(
         None
     };
     let mut resume_reservation = None;
+    // Automatic failover must not consume an owner's stop.
     if instance.is_structured()
         && matches!(restart_origin, RestartOrigin::Explicit)
         && (instance.status == Status::Stopped || instance.is_idle_dormant())
@@ -3684,6 +4242,12 @@ async fn prepare_agent_session_inner(
         };
         let binding_target = binding.target.clone();
         let needs_retirement = resume_reservation.is_none();
+        if let Some(claim) = &failover_claim {
+            claim.owned_generation.store(
+                reserved.lifecycle_generation,
+                std::sync::atomic::Ordering::Release,
+            );
+        }
         let stopped = if resume_reservation.is_some() {
             Ok(())
         } else {
@@ -3763,6 +4327,7 @@ async fn prepare_agent_session_inner(
         }
     };
     let worker_state = state.clone();
+    let worker_claim = failover_claim.clone();
     let result = tokio::task::spawn_blocking(move || -> anyhow::Result<_> {
         use crate::session::SessionStore;
         let profile = instance.source_profile.clone();
@@ -4075,6 +4640,12 @@ async fn prepare_agent_session_inner(
             };
             return Ok((None, prepared));
         };
+        if let Some(claim) = &worker_claim {
+            claim.owned_generation.store(
+                started.lifecycle_generation,
+                std::sync::atomic::Ordering::Release,
+            );
+        }
         // The final capture can move an unbound id, so the copy follows the admitted row's ids.
         if let Some(carry) = conversation_carry.as_mut() {
             carry.retarget(crate::session::conversation_carry::conversation_ids(
@@ -4138,6 +4709,8 @@ async fn prepare_agent_session_inner(
     drop(guard);
     drop(submission);
     drop(namespace);
+    #[cfg(test)]
+    launch_hook_gate::pause(&id, launch_hook_gate::Stage::BeforeHooks).await;
     let reason = restart_reason(restart_origin, restart.as_deref());
     let requested_wake_message = restart.as_ref().and_then(|body| body.wake_message.clone());
     let hooked = match result {
@@ -4185,6 +4758,7 @@ async fn prepare_agent_session_inner(
                     reservation: resume_reservation,
                     reason,
                     quota,
+                    defers_rate_limit: matches!(restart_origin, RestartOrigin::Failover { .. }),
                 },
             )
             .await;
@@ -4541,6 +5115,59 @@ pub(super) async fn sandbox_migration_response(
         Ok(snapshot) => crate::server::runtime::mutation_response(&snapshot.value.cursor, response),
         Err(_) => StatusCode::SERVICE_UNAVAILABLE.into_response(),
     })
+}
+
+/// Holds one session's restart at a named point, so a test can run another operation there.
+#[cfg(test)]
+pub(super) mod launch_hook_gate {
+    #[derive(Clone, Copy, PartialEq, Eq)]
+    pub(in crate::server::api::sessions) enum Stage {
+        /// Before the restart takes its submission and instance locks.
+        BeforeLocks,
+        /// After the locks are released, before the pre-launch hooks run.
+        BeforeHooks,
+    }
+
+    type Gate = (
+        String,
+        Stage,
+        tokio::sync::oneshot::Sender<()>,
+        tokio::sync::oneshot::Receiver<()>,
+    );
+    static GATE: std::sync::Mutex<Option<Gate>> = std::sync::Mutex::new(None);
+
+    /// Arms the gate for `id` at `stage`: the receiver fires once a restart waits there, and
+    /// sending on the returned sender lets it go on.
+    pub(in crate::server::api::sessions) fn arm(
+        id: &str,
+        stage: Stage,
+    ) -> (
+        tokio::sync::oneshot::Receiver<()>,
+        tokio::sync::oneshot::Sender<()>,
+    ) {
+        let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+        *GATE.lock().unwrap() = Some((id.to_owned(), stage, entered_tx, release_rx));
+        (entered_rx, release_tx)
+    }
+
+    pub(super) async fn pause(id: &str, stage: Stage) {
+        let gate = {
+            let mut gate = GATE.lock().unwrap();
+            if gate
+                .as_ref()
+                .is_some_and(|(session, at, _, _)| session == id && *at == stage)
+            {
+                gate.take()
+            } else {
+                None
+            }
+        };
+        if let Some((_, _, entered, release)) = gate {
+            let _ = entered.send(());
+            let _ = release.await;
+        }
+    }
 }
 
 #[cfg(all(test, unix))]
@@ -5998,13 +6625,16 @@ mod restart_wake_tests {
                     .session_service
                     .set_pending_initial_turn(&id, "existing pending work".into(), Vec::new())
                     .await;
-                let resets_at = match crate::server::api::acp::rate_limit_resume_probe(&state, &id)
-                    .await
-                    .unwrap()
-                {
-                    crate::acp::event_store::ControlKnowledge::Known(Some(resets_at)) => resets_at,
-                    marker => panic!("expected the original quota marker, got {marker:?}"),
-                };
+                let (park_seq, resets_at) =
+                    match crate::server::api::acp::rate_limit_resume_probe(&state, &id)
+                        .await
+                        .unwrap()
+                    {
+                        crate::acp::event_store::ControlKnowledge::Known(Some(resets_at)) => {
+                            resets_at
+                        }
+                        marker => panic!("expected the original quota marker, got {marker:?}"),
+                    };
                 // A real restart retires the original before reserving a replacement; detaching
                 // alone correctly refuses Spawn while that retained physical owner stays alive.
                 live.client.shutdown().await.unwrap();
@@ -6061,7 +6691,9 @@ mod restart_wake_tests {
                         wake: Some("explicit replacement wake".into()),
                         reservation: None,
                         reason: "user",
+                        defers_rate_limit: false,
                         quota: Some(PreparedQuotaRestart {
+                            park_seq,
                             resets_at,
                             continuation: None,
                         }),

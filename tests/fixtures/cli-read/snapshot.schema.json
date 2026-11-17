@@ -373,6 +373,10 @@
         "expected": {
           "description": "Opaque server-issued concurrency selection token, not Native authority. May be empty when observation is unavailable and all writes are refused.",
           "type": "string"
+        },
+        "observe_expected": {
+          "description": "Opaque equality token for the exact observed terminal pane. It grants no Native input authority.",
+          "type": ["string", "null"]
         }
       }
     },

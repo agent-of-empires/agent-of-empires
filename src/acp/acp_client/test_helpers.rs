@@ -125,13 +125,21 @@ impl super::AcpClient {
             .is_none());
     }
 
-    pub(crate) async fn with_sdk_test_options<F: Future>(
+    pub(crate) fn gate_connection_loss_publication(&self, gate: SdkTestGate) {
+        assert!(self
+            .connection_state
+            .test_connection_loss_published
+            .lock()
+            .unwrap()
+            .replace(gate)
+            .is_none());
+    }
+
+    pub(crate) fn with_sdk_test_options<F: Future>(
         options: SdkTestOptions,
         future: F,
-    ) -> F::Output {
-        SDK_TEST_OPTIONS
-            .scope(std::sync::Mutex::new(Some(options)), future)
-            .await
+    ) -> impl Future<Output = F::Output> {
+        SDK_TEST_OPTIONS.scope(std::sync::Mutex::new(Some(options)), Box::pin(future))
     }
 
     pub(super) fn observe_sdk_output(
@@ -447,7 +455,7 @@ async fn original_human_decisions_cross_pending_and_applied_without_current_auth
                                     Some(serde_json::json!({"jsonrpc":"2.0","id":id,"result":result}))
                                 },
                             );
-                            let original = scope.spawn(config, "original-human-prime").await.unwrap();
+                            let original = Box::pin(scope.spawn(config, "original-human-prime")).await.unwrap();
                             original.ready().await;
                             assert_eq!(original.selected_native_session(), selected);
                             Some(original)
@@ -480,9 +488,9 @@ async fn original_human_decisions_cross_pending_and_applied_without_current_auth
                             },
                         );
                         let mut client = if let Some(original) = selected {
-                            scope.retained_after(original, config, "original-human-load").await
+                            Box::pin(scope.retained_after(original, config, "original-human-load")).await
                         } else {
-                            scope.spawn(config, "original-human-new").await.unwrap()
+                            Box::pin(scope.spawn(config, "original-human-new")).await.unwrap()
                         };
                         let actual = client.actual();
                         let owner = client.connected_runner().expect("the actual constructor's physical owner");

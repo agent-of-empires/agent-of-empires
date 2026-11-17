@@ -1090,7 +1090,9 @@ impl ProjectionState {
             {
                 let emissions = self.emissions.lock().expect("SDK projection lock");
                 match emissions.window.as_ref() {
-                    Some(window) if window.wire_closed => return !window.lost,
+                    Some(window) if window.wire_closed && window.wire_forwarded => {
+                        return !window.lost
+                    }
                     Some(window)
                         if !window.lost
                             && window
@@ -2034,6 +2036,57 @@ impl WeakEventSender {
 mod metadata_tests {
     use super::*;
     use crate::acp::state::BackgroundAgentStatus;
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn replay_wait_requires_forwarded_marker_after_sdk_closure() {
+        crate::acp::supervisor::test_support::managed::with_managed(|scope| {
+            Box::pin(async move {
+                let directory = scope.tempdir();
+                let (config, _native) =
+                    scope.native_peer(directory.path().into(), "gemini", "gemini", |request| {
+                        let result = match request["method"].as_str().unwrap() {
+                            "initialize" => {
+                                serde_json::json!({"protocolVersion":1,"agentCapabilities":{}})
+                            }
+                            "session/new" => serde_json::json!({"sessionId":"forwarded-original"}),
+                            other => panic!("unexpected Native request: {other}"),
+                        };
+                        Some(
+                            serde_json::json!({"jsonrpc":"2.0","id":request["id"],"result":result}),
+                        )
+                    });
+                let client = scope
+                    .spawn(config, "replay-forwarding-boundary")
+                    .await
+                    .unwrap();
+                client.ready().await;
+                let projection = client.actual().establishment_projection().unwrap();
+                let marker = {
+                    let mut emissions = projection.emissions.lock().unwrap();
+                    let window = emissions.window.as_mut().unwrap();
+                    assert!(window.wire_closed && !window.lost);
+                    let marker = super::super::control_protocol::SessionReplayed {
+                        attempt_id: window.attempt.id,
+                        closure: window.receipt.as_ref().unwrap().replay,
+                        delivery: window.wire_range.unwrap(),
+                    };
+                    // Model the SDK consuming the write before the sender records forwarding.
+                    window.wire_forwarded = false;
+                    marker
+                };
+                let wait = projection.wait_wire();
+                tokio::pin!(wait);
+                assert!(
+                    futures_util::poll!(wait.as_mut()).is_pending(),
+                    "SDK closure alone must not release the replay completion barrier"
+                );
+                projection.wire_forwarded(&marker);
+                assert!(wait.await);
+            })
+        })
+        .await;
+    }
 
     #[test]
     fn host_tracking_end_keeps_allocation_without_claiming_native_outcome() {

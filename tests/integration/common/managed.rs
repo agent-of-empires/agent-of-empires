@@ -165,6 +165,35 @@ impl ManagedClient {
         }
     }
 
+    pub(crate) async fn refresh_after_control_loss(&mut self) {
+        let previous = self.actual();
+        let owner = previous.connected_runner().unwrap();
+        let replacement = tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                let replacement = {
+                    let workers = self.supervisor.workers.lock().await;
+                    workers.get(&self.id).and_then(|handle| {
+                        if Arc::ptr_eq(&handle.client, &previous) {
+                            return None;
+                        }
+                        assert_eq!(handle.lease, self.lease);
+                        assert_eq!(handle.client.connected_runner(), Some(owner));
+                        Some(Arc::clone(&handle.client))
+                    })
+                };
+                if let Some(replacement) = replacement {
+                    break replacement;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("same-lease control recovery installs a new SDK");
+        replacement.wait_until_usable().await.unwrap();
+        self.client = replacement;
+        self.ready().await;
+    }
+
     pub(crate) async fn pause_drain(&self) -> crate::acp::supervisor::teardown::TestDrainPause {
         self.supervisor
             .test_pause_drain(&self.lease, &self.client)
@@ -230,6 +259,10 @@ impl ManagedClient {
 
     pub async fn shutdown(&self) -> anyhow::Result<()> {
         self.retirement.retire().await
+    }
+
+    pub(crate) async fn retire_connection(&self) -> anyhow::Result<()> {
+        self.retirement.retire_with_mode(true).await
     }
 
     pub(crate) async fn stop_session(&self) {
@@ -563,6 +596,10 @@ impl ManagedRetirement {
     }
 
     async fn retire(&self) -> anyhow::Result<()> {
+        self.retire_with_mode(false).await
+    }
+
+    async fn retire_with_mode(&self, connection_only: bool) -> anyhow::Result<()> {
         use crate::session::SessionStore as _;
         use std::sync::atomic::Ordering;
 
@@ -587,10 +624,17 @@ impl ManagedRetirement {
         } else {
             &self.target
         };
-        self.state
-            .acp_supervisor
-            .shutdown_captured_and_wait(&id, target, Duration::from_secs(5))
-            .await?;
+        if connection_only {
+            self.state
+                .acp_supervisor
+                .retire_captured_connection_for_test(target)
+                .await?;
+        } else {
+            self.state
+                .acp_supervisor
+                .shutdown_captured_and_wait(&id, target, Duration::from_secs(5))
+                .await?;
+        }
         let Some(prepared) = prepared else {
             self.completed.store(true, Ordering::Release);
             return Ok(());
@@ -725,6 +769,7 @@ pub struct ManagedScope {
     states: Vec<Arc<AppState>>,
     retirements: Vec<Arc<ManagedRetirement>>,
     inputs: Arc<InputBindings>,
+    launcher_override: Arc<Mutex<Option<Launcher>>>,
     leases: Arc<Mutex<Vec<Lease>>>,
     native_launches: Arc<Mutex<Vec<NativeLaunch>>>,
     options: Arc<Mutex<Option<SdkTestOptions>>>,
@@ -758,9 +803,27 @@ where
     with_managed_capacity(retained_events, 64, body).await;
 }
 
+pub(crate) async fn with_managed_configuration<F>(configure: impl FnOnce(&mut AppState), body: F)
+where
+    F: for<'a> FnOnce(&'a mut ManagedScope) -> Pin<Box<dyn Future<Output = ()> + 'a>>,
+{
+    with_managed_configured(1000, 64, configure, body).await;
+}
+
 pub(crate) async fn with_managed_capacity<F>(
     retained_events: usize,
     max_concurrent_workers: u32,
+    body: F,
+) where
+    F: for<'a> FnOnce(&'a mut ManagedScope) -> Pin<Box<dyn Future<Output = ()> + 'a>>,
+{
+    with_managed_configured(retained_events, max_concurrent_workers, |_| {}, body).await;
+}
+
+async fn with_managed_configured<F>(
+    retained_events: usize,
+    max_concurrent_workers: u32,
+    configure: impl FnOnce(&mut AppState),
     body: F,
 ) where
     F: for<'a> FnOnce(&'a mut ManagedScope) -> Pin<Box<dyn Future<Output = ()> + 'a>>,
@@ -813,11 +876,13 @@ pub(crate) async fn with_managed_capacity<F>(
     let runner_override: Arc<Mutex<Option<(PathBuf, RunnerInspection)>>> = Arc::default();
     let directories: Arc<Mutex<Vec<Arc<tempfile::TempDir>>>> = Arc::default();
     let native_launches: Arc<Mutex<Vec<NativeLaunch>>> = Arc::default();
+    let launcher_override: Arc<Mutex<Option<Launcher>>> = Arc::default();
     let launcher: Launcher = {
         let inputs = inputs.clone();
         let leases = leases.clone();
         let directories = directories.clone();
         let native_launches = native_launches.clone();
+        let launcher_override = Arc::clone(&launcher_override);
         Arc::new(move |mut actual, session_id| {
             let lease = actual
                 .launch_lease
@@ -826,6 +891,10 @@ pub(crate) async fn with_managed_capacity<F>(
                 .clone();
             leases.lock().unwrap().push(lease.clone());
             inputs.entered.notify_waiters();
+            let next_launcher = launcher_override.lock().unwrap().clone();
+            if let Some(launcher) = next_launcher {
+                return launcher(actual, session_id);
+            }
             let inputs = inputs.clone();
             let directories = directories.clone();
             let native_launches = native_launches.clone();
@@ -905,7 +974,7 @@ pub(crate) async fn with_managed_capacity<F>(
         Vec::new(),
         None,
         (Some(store), 8192),
-        |_| {},
+        configure,
         |supervisor| {
             let mut supervisor = supervisor.with_launcher(launcher);
             supervisor.max_concurrent_workers = max_concurrent_workers;
@@ -916,6 +985,7 @@ pub(crate) async fn with_managed_capacity<F>(
     let mut scope = ManagedScope {
         state,
         inputs,
+        launcher_override,
         leases,
         native_launches,
         options,
@@ -972,6 +1042,69 @@ pub(crate) async fn with_managed_capacity<F>(
 }
 
 impl ManagedScope {
+    /// Observe the immutable proof already owned by this original launcher.
+    /// Does not arm or replace inspect_next_runner, so existing callers keep their probes.
+    pub(crate) fn original_native_proof(&self, lease: &Lease) -> NativeSpawnProof {
+        let launches = self.native_launches.lock().unwrap();
+        let launch = launches
+            .iter()
+            .find(|launch| launch.lease == *lease)
+            .expect("the original belongs to this managed launcher");
+        launch
+            .inspection
+            .native_spawn_proof(lease)
+            .expect("read the original parent's Native spawn proof")
+            .expect("the original actually spawned its Native peer")
+    }
+
+    /// Route subsequent real launches without replacing the host or its lifecycle table.
+    pub(crate) fn route_future_launches(&mut self, launcher: Launcher) {
+        *self.launcher_override.lock().unwrap() = Some(launcher);
+    }
+
+    pub(crate) async fn observe_external_state(
+        &mut self,
+        state: Arc<AppState>,
+        id: String,
+    ) -> ManagedClient {
+        let events = state.acp_events_tx.subscribe();
+        self.installed_on(state, id, events).await
+    }
+
+    pub(crate) fn retain_external_native(
+        &mut self,
+        client: &ManagedClient,
+        pid: u32,
+        birth: crate::process::ProcessBirthIdentity,
+    ) {
+        let runner = client
+            .lease
+            .spawned_runner()
+            .expect("captured external runner");
+        assert_ne!(pid, std::process::id());
+        assert_eq!(
+            crate::process::process_birth_identity(pid).unwrap(),
+            Some(birth.clone())
+        );
+        assert_eq!(
+            crate::process::parent_and_argv0(pid).map(|(parent, _)| parent),
+            Some(runner.pid)
+        );
+        assert_eq!(
+            crate::process::process_birth_identity(runner.pid)
+                .unwrap()
+                .map(|birth| birth.fingerprint()),
+            runner.birth_fingerprint,
+        );
+        self.native_births.push(NativeSpawnProof {
+            session_id: client.id.clone(),
+            producer: client.lease.producer_id(),
+            runner,
+            pid,
+            birth,
+        });
+        self.capture_native();
+    }
     pub(crate) fn inspect_next_runner(
         &mut self,
         test_name: &str,
@@ -1638,7 +1771,25 @@ socket.on('error', error => { console.error(error); process.exit(1); });
         between: impl FnOnce() -> F,
     ) -> ManagedClient {
         let options = self.options.lock().unwrap().take().unwrap_or_default();
-        original.ready().await;
+        let client = original.actual();
+        let deadline = tokio::time::Instant::now() + crate::acp::supervisor::WORKER_READY_TIMEOUT;
+        tokio::time::timeout_at(deadline, client.wait_until_usable())
+            .await
+            .expect("original SDK bootstrap deadline")
+            .expect("original SDK remains usable before detach");
+        let projection = client
+            .establishment_projection()
+            .expect("original projection");
+        assert!(
+            projection.applied().is_some(),
+            "original establishment is Applied"
+        );
+        assert!(
+            projection
+                .processed_through(projection.emission_cut(), deadline)
+                .await,
+            "original bootstrap reached its actual publication frontier"
+        );
         let row = crate::session::Storage::open_unwatched("test")
             .unwrap()
             .load_instances_complete()
@@ -1681,13 +1832,13 @@ socket.on('error', error => { console.error(error); process.exit(1); });
         let events = state.acp_events_tx.subscribe();
         AcpClient::with_sdk_test_options(
             options,
-            supervisor.attach(
+            Box::pin(supervisor.attach(
                 row.id.clone(),
                 row.project_path.into(),
                 Vec::new(),
                 in_flight_turn,
                 None,
-            ),
+            )),
         )
         .await
         .expect("actual retained owner attachment");
@@ -2024,10 +2175,8 @@ socket.on('error', error => { console.error(error); process.exit(1); });
         });
         self.inputs
             .bind(row.id.clone(), row.lifecycle_generation, inputs);
-        self.state
-            .acp_supervisor
-            // Explicit retained Load keeps the controller's genuine reservation.
-            .spawn_inner(request, reservation)
+        // Explicit retained Load keeps the controller's genuine reservation.
+        Box::pin(self.state.acp_supervisor.spawn_inner(request, reservation))
             .await
             .expect("genuine retained Load launch");
         self.installed(row.id, events).await
@@ -2228,29 +2377,19 @@ socket.on('error', error => { console.error(error); process.exit(1); });
             if let Some(owner) = lease.spawned_runner() {
                 let mut native_known = false;
                 let mut native_closed = true;
-                for launch in launches
+                for proof in self
+                    .native_births
                     .iter()
-                    .filter(|launch| launch.lease.spawned_runner() == Some(owner))
+                    .filter(|proof| proof.runner == owner && proof.session_id == lease.session_id())
                 {
                     native_known = true;
-                    match launch.inspection.native_spawn_proof(&launch.lease) {
-                        Ok(Some(proof)) => {
-                            match crate::process::process_birth_identity(proof.pid) {
-                                Ok(current) => {
-                                    native_closed &= current.as_ref() != Some(&proof.birth)
-                                }
-                                Err(error) => {
-                                    native_closed = false;
-                                    errors.push(format!(
-                                        "original native closure comparison failed: {error}"
-                                    ));
-                                }
-                            }
-                        }
-                        Ok(None) => native_closed = false,
+                    match crate::process::process_birth_identity(proof.pid) {
+                        Ok(current) => native_closed &= current.as_ref() != Some(&proof.birth),
                         Err(error) => {
                             native_closed = false;
-                            errors.push(format!("original native proof read failed; original parent retained: {error:#}"));
+                            errors.push(format!(
+                                "original native closure comparison failed: {error}"
+                            ));
                         }
                     }
                 }

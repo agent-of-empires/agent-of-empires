@@ -138,6 +138,7 @@ fn recovery_snapshot() -> serde_json::Value {
         guidance: "Inspect the current runtime".into(),
         actions: RecoveryActions::default(),
         expected: "opaque selection".to_owned(),
+        observe_expected: None,
     };
     snapshot["data"]["sessions"][0]["last_error_evidence"] =
         serde_json::to_value(evidence).unwrap();
@@ -262,7 +263,13 @@ fn published_snapshot_accepts_recovery_and_unknown_optional_metadata() {
     assert_eq!(evidence.runtime, RuntimeEvidence::Unknown);
     assert_eq!(evidence.blocking_scope, None);
     assert_eq!(evidence.retryable, None);
-    for field in ["evidence", "uncertainty"] {
+    snapshot["data"]["sessions"][0]["recovery"]["observe_expected"] =
+        serde_json::json!("exact-pane");
+    let parsed = accepts(&snapshot);
+    let recovery = parsed.sessions[0].recovery.as_ref().unwrap();
+    assert_eq!(recovery.observe_expected.as_deref(), Some("exact-pane"));
+    assert!(!recovery.actions.retry_operation);
+    for field in ["evidence", "uncertainty", "observe_expected"] {
         snapshot["data"]["sessions"][0]["recovery"]
             .as_object_mut()
             .unwrap()
@@ -308,6 +315,7 @@ fn published_snapshot_rejects_invalid_recovery_shapes() {
         ("/guidance", serde_json::Value::Null),
         ("/uncertainty", serde_json::json!(false)),
         ("/expected", serde_json::json!(1)),
+        ("/observe_expected", serde_json::json!(1)),
         ("/actions", serde_json::json!({"attach": false})),
         ("/actions/stop", serde_json::json!("false")),
         ("/actions/extra", serde_json::json!(false)),

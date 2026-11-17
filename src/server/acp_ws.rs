@@ -1309,8 +1309,10 @@ mod tests {
                 description: None,
                 state: SubagentState::Running,
                 stop_reason: None,
+                error: None,
                 cancel_capable: true,
                 model: None,
+                background: false,
             },
             at: chrono::DateTime::from_timestamp(0, 0).unwrap(),
         };

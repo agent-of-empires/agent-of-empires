@@ -43,10 +43,9 @@ use super::commands::{ConnectMode, QueuedClientCmd};
 use super::control::DaemonControlClient;
 use super::errors::{acp_internal_error, AcpError};
 use super::fs_handlers::{handle_read_text_file, handle_write_text_file};
-use super::lifecycle::TerminalClaim;
 use super::pending::PendingResponders;
 use super::permission_handlers::{handle_elicitation_request, handle_permission_request};
-use super::rate_limit::captured_rate_limit_resets_at;
+use super::rate_limit::captured_rate_limit_reset;
 use super::session_identity::{
     spawn_native_callback, PendingIngress, RequestPolicy, SessionIngress,
     SessionIngressNotification,
@@ -55,7 +54,7 @@ use super::terminal_handlers::{
     handle_create_terminal, handle_kill_terminal, handle_release_terminal, handle_terminal_output,
     handle_wait_for_terminal_exit,
 };
-use super::SessionResources;
+use super::{SessionResources, SessionState};
 use notifications::Shared;
 
 /// After a cancel, declare the adapter unresponsive if no prompt response
@@ -73,10 +72,13 @@ pub(crate) struct ConnectionState {
     unavailable: OnceLock<AcpConnectionUnavailability>,
     reported: AtomicBool,
     usable: AtomicBool,
+    bootstrap_finished: AtomicBool,
     ordered_loss: AtomicBool,
     intentional_stop: AtomicBool,
     foreground_finished: AtomicBool,
     establishment_declined: AtomicBool,
+    pub(super) original_establishment_rejection:
+        std::sync::Mutex<Option<(crate::acp::establishment::AttemptId, Arc<serde_json::Value>)>>,
     pub(super) admission: std::sync::Mutex<()>,
     pub(super) initial_prompt: std::sync::Mutex<Option<super::commands::InitialPromptState>>,
     sdk_closing: AtomicBool,
@@ -124,6 +126,8 @@ pub(crate) struct ConnectionState {
     pub(super) test_native_session_seen: std::sync::Mutex<Option<oneshot::Sender<()>>>,
     #[cfg(test)]
     pub(super) test_update: std::sync::Mutex<Option<super::SdkTestGate>>,
+    #[cfg(test)]
+    pub(crate) test_connection_loss_published: std::sync::Mutex<Option<super::SdkTestGate>>,
     #[cfg(test)]
     pub(super) test_session_update: std::sync::Mutex<
         Option<(
@@ -351,12 +355,17 @@ impl ConnectionState {
         self.unavailable_wake.notify_waiters();
     }
 
+    pub(super) fn finish_bootstrap(&self) {
+        self.bootstrap_finished.store(true, Ordering::Release);
+        self.unavailable_wake.notify_waiters();
+    }
+
     pub(super) async fn wait_until_usable(&self) -> Result<(), AcpError> {
         loop {
             let changed = self.unavailable_wake.notified();
             tokio::pin!(changed);
             changed.as_mut().enable();
-            if self.admit(|| self.ready())? {
+            if self.admit(|| self.ready() && self.bootstrap_finished.load(Ordering::Acquire))? {
                 return Ok(());
             }
             changed.await;
@@ -494,9 +503,7 @@ impl ConnectionState {
 }
 pub(super) struct RunnerLink {
     pub(super) control: Arc<DaemonControlClient>,
-    /// Shared with the control reader, which claims an adopted turn's
-    /// completion so the fallback watchdogs stand down.
-    pub(super) terminal_claim: Arc<TerminalClaim>,
+    pub(super) state: Arc<SessionState>,
     pub(super) prompt_in_flight: Arc<AtomicBool>,
 }
 
@@ -525,6 +532,278 @@ pub(super) struct ConnectionParams {
     pub(super) shutdown: tokio_util::sync::CancellationToken,
     #[cfg(test)]
     pub(super) tracking_observer: Option<oneshot::Sender<super::test_helpers::TrackingObservation>>,
+}
+
+#[cfg(test)]
+pub(super) async fn test_local_silent_orphan_cancel_recovery() {
+    use crate::acp::acp_client::commands::{ClientCmd, QueuedClientCmd};
+    use crate::acp::event_sender::SdkEvent;
+    use agent_client_protocol::v1::schema::{ContentBlock, TextContent};
+    use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
+    use tokio_util::compat::{TokioAsyncReadCompatExt, TokioAsyncWriteCompatExt};
+
+    struct LocalActor {
+        peer: tokio::io::DuplexStream,
+        commands: mpsc::Sender<QueuedClientCmd>,
+        events: mpsc::Receiver<SdkEvent>,
+        task: tokio::task::JoinHandle<agent_client_protocol::Result<()>>,
+        state: Arc<ConnectionState>,
+        in_flight: Arc<AtomicBool>,
+    }
+
+    async fn local_actor(
+        retained: Arc<SessionState>,
+        in_flight: bool,
+        adopted: bool,
+    ) -> LocalActor {
+        let (daemon, peer) = tokio::io::duplex(64 * 1024);
+        let (read, write) = tokio::io::split(daemon);
+        let (event_tx, events) = mpsc::channel(32);
+        let (lifecycle_tx, lifecycle_rx) = mpsc::channel(32);
+        let (commands, cmd_rx) = mpsc::channel(8);
+        let state = Arc::new(ConnectionState::default());
+        let in_flight = Arc::new(AtomicBool::new(in_flight));
+        let id = SessionId::from("local-orphan");
+        let ingress = Arc::new(SessionIngress::new(Some(id.clone())));
+        let shared = Arc::new(Shared::new(
+            event_tx.into(),
+            "local-orphan".into(),
+            &crate::acp::agent_profiles::GEMINI,
+            lifecycle_tx,
+            retained,
+            Arc::clone(&in_flight),
+            None,
+            ingress,
+            None,
+            Arc::clone(&state),
+            None,
+            Arc::default(),
+        ));
+        shared.adopted_turn_active.store(adopted, Ordering::Release);
+        let notifications = Arc::clone(&shared);
+        let closed = Arc::clone(&state);
+        let (entered, connected) = oneshot::channel();
+        let task = tokio::spawn(async move {
+            Client
+                .v1()
+                .name("local-orphan-actor-test")
+                .on_close(move |_connection| {
+                    let closed = Arc::clone(&closed);
+                    async move {
+                        closed.observe(AcpConnectionSource::Sdk, AcpConnectionCause::IncomingEnded);
+                        closed.mark_ordered_loss();
+                        Err(acp_internal_error(
+                            "local test peer closed its actual duplex".into(),
+                        ))
+                    }
+                })
+                .on_receive_notification(
+                    move |notification: SessionIngressNotification, _cx| {
+                        let shared = Arc::clone(&notifications);
+                        async move {
+                            let SessionIngressNotification::Update(params) = notification else {
+                                return Ok(());
+                            };
+                            let (notification, bytes) =
+                                SessionIngressNotification::decode_update(params, false)?;
+                            let notification =
+                                shared.ingress.capture_notification(notification, false);
+                            if let Some((notification, _guard)) =
+                                shared.ingress.notification(notification, bytes).await?
+                            {
+                                shared.handle_notification(notification, true).await;
+                            }
+                            Ok(())
+                        }
+                    },
+                    agent_client_protocol::on_receive_notification!(),
+                )
+                .connect_with(
+                    ByteStreams::new(write.compat_write(), read.compat()),
+                    move |connection: ConnectionTo<Agent>| async move {
+                        entered.send(()).expect("local actor starts");
+                        command_loop::Session {
+                            connection,
+                            shared,
+                            control: None,
+                            acp_session_id: id,
+                            channels: super::config_options::SessionChannels::default(),
+                            steering_capable: false,
+                            close_capable: false,
+                            source_profile: None,
+                            default_effort: None,
+                            default_model_config: Default::default(),
+                            default_mode: None,
+                            default_model: None,
+                            agent_cwd: std::env::temp_dir(),
+                            mcp_servers: Vec::new(),
+                            cmd_rx,
+                            lifecycle_rx,
+                            pending_prompts: Default::default(),
+                            pending_reset: None,
+                        }
+                        .run()
+                        .await
+                    },
+                )
+                .await
+        });
+        tokio::time::timeout(Duration::from_secs(5), connected)
+            .await
+            .unwrap()
+            .unwrap();
+        LocalActor {
+            peer,
+            commands,
+            events,
+            task,
+            state,
+            in_flight,
+        }
+    }
+
+    async fn data(events: &mut mpsc::Receiver<SdkEvent>) -> Event {
+        let event = tokio::time::timeout(Duration::from_secs(5), events.recv())
+            .await
+            .unwrap()
+            .expect("local actor publishes");
+        let SdkEvent::Data(data) = event else {
+            panic!("a local actor cannot manufacture a private Native barrier");
+        };
+        assert_eq!(data.metadata.native_origin, None);
+        assert_eq!(
+            data.metadata
+                .operation
+                .and_then(|operation| operation.outcome),
+            None
+        );
+        (*data.event).clone()
+    }
+
+    let retained = Arc::new(SessionState::default());
+    let send_gate = retained.cancel_send_gate.write().await;
+    let mut first = local_actor(Arc::clone(&retained), false, false).await;
+    first
+        .commands
+        .send(QueuedClientCmd {
+            command: ClientCmd::Prompt(vec![ContentBlock::Text(TextContent::new("local orphan"))]),
+            scope: None,
+            correlation: None,
+        })
+        .await
+        .unwrap();
+    let mut line = String::new();
+    tokio::time::timeout(
+        Duration::from_secs(5),
+        BufReader::new(&mut first.peer).read_line(&mut line),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    let prompt: serde_json::Value = serde_json::from_str(&line).unwrap();
+    assert_eq!(prompt["method"], "session/prompt");
+    assert_eq!(prompt["params"]["sessionId"], "local-orphan");
+    let progress = serde_json::json!({
+        "jsonrpc":"2.0","method":"session/update","params":{
+            "sessionId":"local-orphan","update":{
+                "sessionUpdate":"agent_message_chunk",
+                "content":{"type":"text","text":"actual local progress"}
+            }
+        }
+    });
+    first
+        .peer
+        .write_all(format!("{progress}\n").as_bytes())
+        .await
+        .unwrap();
+    loop {
+        if matches!(data(&mut first.events).await, Event::AgentMessageChunk { text, .. } if text == "actual local progress")
+        {
+            break;
+        }
+    }
+    let grace = tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            if let Some(grace) = retained.cancel_deadline.lock().unwrap().clone() {
+                break grace;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("actual local orphan watchdog arms before blocked cancel send");
+    assert!(
+        grace.scope.is_none(),
+        "only this local path has no Native request context"
+    );
+    assert_eq!(grace.turn, retained.terminal_claim.current_turn());
+    assert!(!retained.terminal_claim.claimed());
+    let captured_active = first.in_flight.load(Ordering::Acquire);
+    assert!(captured_active);
+    let mut byte = [0_u8; 1];
+    assert!(
+        tokio::time::timeout(Duration::from_millis(20), first.peer.read(&mut byte))
+            .await
+            .is_err(),
+        "the held local cancel cannot reach its peer"
+    );
+    tokio::time::pause();
+    tokio::time::advance(Duration::from_secs(6)).await;
+    tokio::time::resume();
+    first.peer.shutdown().await.unwrap();
+    let result = tokio::time::timeout(Duration::from_secs(5), first.task)
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(
+        result.is_err(),
+        "actual local peer EOF terminates its original SDK"
+    );
+    assert!(first.state.loss().is_some());
+    assert!(
+        !retained.terminal_claim.claimed(),
+        "EOF is not a successful local response"
+    );
+    while let Ok(event) = first.events.try_recv() {
+        let SdkEvent::Data(data) = event else {
+            panic!("unexpected Native barrier")
+        };
+        assert!(!matches!(
+            data.event.as_ref(),
+            Event::Stopped { .. } | Event::AgentStartupError { .. }
+        ));
+    }
+    drop(send_gate);
+    let mut second = local_actor(Arc::clone(&retained), captured_active, true).await;
+    let recovered = retained.cancel_deadline.lock().unwrap().clone().unwrap();
+    assert_eq!(recovered.deadline, grace.deadline);
+    assert_eq!(recovered.turn, grace.turn);
+    assert!(recovered.scope.is_none());
+    assert!(
+        tokio::time::timeout_at(
+            grace.deadline - Duration::from_millis(1),
+            second.events.recv()
+        )
+        .await
+        .is_err(),
+        "local recovery preserves only the original remaining grace"
+    );
+    let stopped = data(&mut second.events).await;
+    assert!(matches!(stopped, Event::Stopped { reason } if reason == "agent_unresponsive"));
+    let result = tokio::time::timeout(Duration::from_secs(5), second.task)
+        .await
+        .unwrap()
+        .unwrap();
+    result.expect("recovered local command actor exits normally after its one escalation");
+    assert!(retained.terminal_claim.claimed());
+    assert_eq!(retained.terminal_claim.current_turn(), grace.turn);
+    assert!(retained.cancel_deadline.lock().unwrap().is_none());
+    assert!(
+        tokio::time::timeout(Duration::from_secs(2), second.events.recv())
+            .await
+            .unwrap()
+            .is_none()
+    );
 }
 
 /// Handlers compute an answer without knowing whether the request arrived over
@@ -623,13 +902,9 @@ pub(super) async fn run_connection_task<W, R>(
     } = params;
     let label = resources.label.clone();
     let (lifecycle_tx, lifecycle_rx) = mpsc::channel(128);
-    let (control, terminal_claim, prompt_in_flight) = match runner {
-        Some(r) => (Some(r.control), r.terminal_claim, r.prompt_in_flight),
-        None => (
-            None,
-            Arc::new(TerminalClaim::new()),
-            Arc::new(AtomicBool::new(false)),
-        ),
+    let (control, state, prompt_in_flight) = match runner {
+        Some(r) => (Some(r.control), r.state, r.prompt_in_flight),
+        None => (None, Arc::default(), Arc::new(AtomicBool::new(false))),
     };
     let _control_shutdown = super::control::ShutdownControlOnDrop(control.clone());
     // A runner owns identity across daemons, so its ingress is the one that
@@ -659,7 +934,7 @@ pub(super) async fn run_connection_task<W, R>(
         label.clone(),
         profile,
         lifecycle_tx,
-        terminal_claim,
+        state,
         prompt_in_flight,
         resources.sandbox.as_ref(),
         ingress.clone(),
@@ -1164,6 +1439,7 @@ pub(super) async fn run_connection_task<W, R>(
     };
 
     pending_responders.lock().await.clear();
+
     if let Err(e) = &result {
         if !shutdown.is_cancelled() && !cancellation.is_cancelled() {
             report_connection_error(e, &shared, &ready_tx).await;
@@ -1178,6 +1454,9 @@ pub(super) async fn run_connection_task<W, R>(
         || connection_state
             .establishment_declined
             .load(Ordering::Acquire))
+        && !connection_state
+            .loss()
+            .is_some_and(|loss| loss.source == AcpConnectionSource::Control)
         && !connection_state.is_stopping()
         && !shutdown.is_cancelled()
         && !cancellation.is_cancelled()
@@ -1255,16 +1534,16 @@ async fn report_connection_error(
         shared.publish_connection_unavailable().await;
         return;
     }
-    let resets_at =
-        captured_rate_limit_resets_at(&shared.rate_limit_rejections, chrono::Utc::now());
-    let rate_limit = super::rate_limit::classify_rate_limit_error(e, resets_at).or_else(|| {
-        super::rate_limit::classify_rate_limit_from_message(&e.message, resets_at).map(
-            |mut info| {
-                info.status = super::errors::public_error_message(e);
-                info
-            },
-        )
-    });
+    let resets_at = captured_rate_limit_reset(&shared.rate_limit_rejections, chrono::Utc::now());
+    let rate_limit =
+        super::rate_limit::classify_rate_limit_error(e, resets_at.as_ref()).or_else(|| {
+            super::rate_limit::classify_rate_limit_from_message(&e.message, resets_at.as_ref()).map(
+                |mut info| {
+                    info.status = super::errors::public_error_message(e);
+                    info
+                },
+            )
+        });
     if let Some(tx) = ready_tx.lock().await.take() {
         // A handshake-time limit fails the spawn as rate-limited so the
         // supervisor parks instead of burning respawn budget (#3514).
@@ -1298,13 +1577,10 @@ async fn report_connection_error(
             .await;
     } else {
         let _ = event_tx
-            .send(Event::AgentStartupError {
-                message: format!(
-                    "ACP connection failed: {}",
-                    super::errors::public_error_message(e)
-                ),
-                native_subject: None,
-            })
+            .send(Event::startup_error(format!(
+                "ACP connection failed: {}",
+                super::errors::public_error_message(e)
+            )))
             .await;
     }
 }

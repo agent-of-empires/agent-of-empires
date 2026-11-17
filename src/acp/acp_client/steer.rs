@@ -417,7 +417,9 @@ done
                                     .await;
                                 }
                             }
-                            Event::Stopped { .. } => saw_stopped = true,
+                            Event::Stopped { reason } if reason == "prompt_complete" => {
+                                saw_stopped = true
+                            }
                             _ => {}
                         }
                         let completed = scope
@@ -464,11 +466,15 @@ done
                     }
                     assert!(!projected.compacting, "real completion releases compaction");
                     let expected_sid = format!("sid-{}", generation + 1);
-                    assert!(matches!(
-                        client.reset_session("/clear").await.unwrap(),
-                        crate::acp::acp_client::ResetSessionOutcome::Reset { new_acp_session_id }
-                            if new_acp_session_id == expected_sid
-                    ));
+                    let outcome = client.reset_session("/clear").await.unwrap();
+                    assert!(
+                        matches!(
+                            &outcome,
+                            crate::acp::acp_client::ResetSessionOutcome::Reset { new_acp_session_id }
+                                if new_acp_session_id == &expected_sid
+                        ),
+                        "contended={contended:?}; generation={generation}; expected={expected_sid}; outcome={outcome:?}"
+                    );
                     let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
                     loop {
                         let event = tokio::time::timeout_at(deadline, client.next_event())

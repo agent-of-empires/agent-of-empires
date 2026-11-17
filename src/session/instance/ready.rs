@@ -110,6 +110,7 @@ struct NativeInputWitness {
 enum NativeFenceUse {
     Input,
     Observation,
+    PaneObservation,
     OriginalHistory,
 }
 
@@ -237,6 +238,13 @@ impl NativeInputFence {
         self.lock_scoped_project(NativeFenceUse::Observation, |_| true, project, nonblocking)
     }
 
+    pub(crate) fn lock_pane_observation_project<T>(
+        &self,
+        project: impl FnOnce(&Instance, &Storage) -> Result<T>,
+    ) -> Result<Option<(StorageFlock, T)>> {
+        self.lock_scoped_project(NativeFenceUse::PaneObservation, |_| true, project, true)
+    }
+
     fn lock_scoped(&self, purpose: NativeFenceUse) -> Result<StorageFlock> {
         self.lock_scoped_matching(purpose, |_| true, false)?
             .context(NativeInputError::Ownership)
@@ -338,6 +346,12 @@ impl NativeInputFence {
             anyhow::ensure!(matches(row), LifecycleReservationError::Superseded);
             if purpose == NativeFenceUse::Observation {
                 anyhow::ensure!(row.is_structured(), LifecycleReservationError::Superseded);
+            } else if purpose == NativeFenceUse::PaneObservation {
+                anyhow::ensure!(
+                    !row.is_structured()
+                        && !matches!(row.status, Status::Creating | Status::Deleting),
+                    LifecycleReservationError::Superseded
+                );
             } else if input {
                 anyhow::ensure!(
                     !row.has_fresh_lifecycle_reservation(Utc::now()),
@@ -688,6 +702,62 @@ mod tests {
             Some(&LifecycleReservationError::Superseded)
         );
         assert_eq!(std::fs::read(storage.sessions_path())?, replacement);
+        Ok(())
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn pane_observation_reads_error_without_input_and_revokes_changed_incarnation() -> Result<()> {
+        let _app = crate::session::test_support::isolate_app_dir();
+        let (storage, row) = input_fixture("pane-observation")?;
+        storage.update(|rows, _| {
+            rows[0].status = Status::Error;
+            rows[0].archived_at = Some(Utc::now());
+            Ok(())
+        })?;
+        let fence = NativeInputFence::capture_route(
+            &row.source_profile,
+            &row.id,
+            row.created_at,
+            row.lifecycle_generation,
+            true,
+            None,
+        )?;
+        assert!(fence.lock().is_err(), "observation does not grant input");
+        let observer = NativeInputFence::capture_route(
+            &row.source_profile,
+            &row.id,
+            row.created_at,
+            row.lifecycle_generation,
+            true,
+            None,
+        )?;
+        assert!(
+            observer.lock_observation().is_err(),
+            "ACP observation stays structured-only"
+        );
+        let exclusion = observer.store.acquire_lifecycle_lock()?;
+        assert!(
+            observer
+                .lock_pane_observation_project::<()>(|_, _| {
+                    anyhow::bail!("contended observation must not sample the pane")
+                })?
+                .is_none(),
+            "passive observation must not wait for lifecycle exclusion"
+        );
+        drop(exclusion);
+        drop(
+            observer
+                .lock_pane_observation_project(|row, _| Ok(row.status))?
+                .expect("terminal Error remains readable"),
+        );
+        storage.update(|rows, _| {
+            rows[0].lifecycle_generation += 1;
+            Ok(())
+        })?;
+        assert!(observer
+            .lock_pane_observation_project(|_, _| Ok(()))
+            .is_err());
         Ok(())
     }
 

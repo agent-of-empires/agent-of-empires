@@ -3,6 +3,7 @@ import type { CreateProgress } from "../../lib/types";
 
 const STAGE_LABEL: Record<CreateProgress["stage"], string> = {
   preparing: "Setting up workspace",
+  pulling_image: "Pulling latest image",
   starting_container: "Starting container",
   running_hooks: "Running on_create hooks",
   starting: "Starting session",
@@ -33,6 +34,9 @@ export function CreateProgressView({ progress }: { progress: CreateProgress | nu
           ...
         </span>
       </div>
+      {progress?.stage === "pulling_image" && (
+        <p className="text-xs text-text-secondary">A large image can take a few minutes to download.</p>
+      )}
       {progress?.hook && (
         <p className="text-xs font-mono text-text-secondary break-all" data-testid="create-progress-hook">
           $ {progress.hook}

@@ -12,6 +12,7 @@ import { useWebSettings } from "../hooks/useWebSettings";
 import { invalidateRetainedImeContext } from "../lib/mobileKeyboardProxy";
 import { TerminalConnectionBanners } from "./TerminalConnectionBanners";
 import { SessionRecoveryBanner } from "./acp/SessionBanners";
+import { SessionErrorPanel } from "./SessionErrorPanel";
 import { ensureSession, ensureTerminal, isStartRefusal, pasteImage } from "../lib/api";
 import { armClipboardWrite, writeClipboard } from "../lib/clipboard";
 import type { ArmedClipboardWrite } from "../lib/clipboard";
@@ -107,6 +108,32 @@ export function LiveTerminalView({
   const [ensureError, setEnsureError] = useState<string | null>(null);
   // An archived or trashed session stays refused until unarchived or restored, so Retry is pointless.
   const [ensureRetryable, setEnsureRetryable] = useState(true);
+  // A launch (a Restart's included) holds the lifecycle reservation while the row reads Starting, and refuses an
+  // ensure sent meanwhile; that ensure is sent again once the Session leaves Starting.
+  const [ensureAfterStart, setEnsureAfterStart] = useState(false);
+  // An Error Session isn't started on open, which would clear the error it reports (#5055); Restart starts it.
+  const errored = surface === "agent" && session.status === "Error";
+  // One deleted from the panel keeps it, without Restart.
+  const [wasErrored, setWasErrored] = useState(errored);
+  if (errored !== wasErrored && (errored || session.status !== "Deleting")) setWasErrored(errored);
+  const errorHeld = errored || (wasErrored && session.status === "Deleting");
+  const terminalReadOnly = readOnly || recovery !== null;
+  const [observeTarget, setObserveTarget] = useState<{
+    sessionId: string;
+    expected: string;
+    observeExpected: string;
+  } | null>(null);
+  const [observationError, setObservationError] = useState<string | null>(null);
+  const observing =
+    observeTarget !== null &&
+    observeTarget.sessionId === session.id &&
+    recoveryCurrent &&
+    session.recovery?.actions.attach === true &&
+    observeTarget.expected === session.recovery.expected &&
+    observeTarget.observeExpected === session.recovery.observe_expected;
+  const observationPath = observing
+    ? `${base.wsPath}?observe=true&expected=${encodeURIComponent(observeTarget.expected)}&observe_expected=${encodeURIComponent(observeTarget.observeExpected)}`
+    : wsPath;
   const clipboardArmRef = useRef<ArmedClipboardWrite | null>(null);
   const receiveAgentClipboard = useCallback((text: string) => {
     const armed = clipboardArmRef.current;
@@ -149,9 +176,9 @@ export function LiveTerminalView({
   }, [stripCollapseKey]);
   // Read-only live routes observe existing panes; their backend fences forbid creation, claims and resizing.
   const live = useLiveTerminal(
-    readOnly || ensureState === "ready" || recovery ? session.id : null,
-    readOnly,
-    wsPath,
+    observing ? session.id : !recovery && !errorHeld && (readOnly || ensureState === "ready") ? session.id : null,
+    terminalReadOnly,
+    observationPath,
     receiveAgentClipboard,
     clearPipeNoticeDismissal,
   );
@@ -160,11 +187,17 @@ export function LiveTerminalView({
   const inputRef = useRef<HTMLTextAreaElement | null>(null);
   const { keyboardHeight, keyboardOpen } = useMobileKeyboard(inputRef);
   const [inputFocused, setInputFocused] = useState(false);
-  const policyRef = useRef({ readOnly, sessionId: session.id, surface, terminalIndex });
+  // A new policy object revokes write admission, so only these fences replace it.
+  const policyRef = useRef({ readOnly: terminalReadOnly, errorHeld, sessionId: session.id, surface, terminalIndex });
   useLayoutEffect(() => {
-    policyRef.current = { readOnly, sessionId: session.id, surface, terminalIndex };
-    if (readOnly) inputRef.current?.blur();
-  }, [readOnly, session.id, surface, terminalIndex]);
+    policyRef.current = { readOnly: terminalReadOnly, errorHeld, sessionId: session.id, surface, terminalIndex };
+    if (terminalReadOnly) inputRef.current?.blur();
+  }, [terminalReadOnly, errorHeld, session.id, surface, terminalIndex]);
+  const awaitingStart = ensureAfterStart && session.status === "Starting";
+  const startRef = useRef({ status: session.status, awaitingStart });
+  useLayoutEffect(() => {
+    startRef.current = { status: session.status, awaitingStart };
+  }, [session.status, awaitingStart]);
   useLayoutEffect(
     () => () => {
       policyRef.current.readOnly = true;
@@ -205,6 +238,7 @@ export function LiveTerminalView({
   // Where the Tab escape took focus from: the terminal's input or App's keyboard proxy.
   const escapeOriginRef = useRef<HTMLElement | null>(null);
   const takeControl = useCallback(() => {
+    if (policyRef.current.readOnly) return;
     // The strip unmounts once claiming, so focus goes back to where it was; a touch tap restores nothing, so no
     // soft keyboard opens.
     if (document.activeElement === takeControlRef.current) {
@@ -282,13 +316,17 @@ export function LiveTerminalView({
     return true;
   }, [viewOnly, holdShown]);
   const slowWhileOwner =
-    !readOnly && live.state.connected && live.state.isOwner && live.state.transportReason === "pipe_owned";
+    !terminalReadOnly && live.state.connected && live.state.isOwner && live.state.transportReason === "pipe_owned";
   const reconnectClaiming = useCallback(() => {
     clearPipeNoticeDismissal();
     reconnectAndClaim();
   }, [clearPipeNoticeDismissal, reconnectAndClaim]);
   useEffect(() => {
     const key = `${session.id}:${surface}:${terminalIndex}`;
+    if (terminalReadOnly) {
+      publishLivePane(key, null);
+      return;
+    }
     publishLivePane(key, {
       sessionId: session.id,
       surface,
@@ -303,6 +341,7 @@ export function LiveTerminalView({
     session.id,
     surface,
     terminalIndex,
+    terminalReadOnly,
     viewOnly,
     takeControl,
     slowWhileOwner,
@@ -344,6 +383,8 @@ export function LiveTerminalView({
     setEnsureState("pending");
     setEnsureWarning(null);
     setEnsureError(null);
+    setObserveTarget(null);
+    setObservationError(null);
   }
   const lastEnsuredSessionIdRef = useRef<string | null>(null);
   const captureWriteAdmission = useCallback(() => {
@@ -398,6 +439,8 @@ export function LiveTerminalView({
     ensureRequestRef.current = controller;
     setEnsureError(null);
     setEnsureState("pending");
+    setEnsureAfterStart(false);
+    const sentWhileStarting = startRef.current.status === "Starting";
     const ensure =
       surface === "agent"
         ? ensureSession(session.id, controller.signal)
@@ -409,6 +452,8 @@ export function LiveTerminalView({
           lastEnsuredSessionIdRef.current = session.id;
           setEnsureWarning(res.message ?? null);
           setEnsureState("ready");
+        } else if (res.error === "lifecycle_busy" && sentWhileStarting) {
+          setEnsureAfterStart(true);
         } else {
           setEnsureState("error");
           setEnsureError(res.message ?? "Could not start session.");
@@ -424,13 +469,24 @@ export function LiveTerminalView({
   const shelved = !!session.archived_at || !!session.trashed_at;
   useEffect(() => {
     const policy = policyRef.current;
-    if (policy.readOnly) return;
+    if (policy.readOnly || policy.errorHeld || startRef.current.awaitingStart) return;
     if (lastEnsuredSessionIdRef.current === policy.sessionId) {
       if (consumePendingTerminalFocus(focusTarget, focusIndex)) focusSelf();
       return;
     }
     retryEnsure();
-  }, [session.id, shelved, readOnly, focusSelf, focusTarget, focusIndex, retryEnsure]);
+  }, [
+    session.id,
+    shelved,
+    readOnly,
+    errorHeld,
+    ensureAfterStart,
+    awaitingStart,
+    focusSelf,
+    focusTarget,
+    focusIndex,
+    retryEnsure,
+  ]);
 
   // Drain a pending focus latch once the pane is mounted.
   useEffect(() => {
@@ -483,6 +539,8 @@ export function LiveTerminalView({
     if (inputFocused) ta.blur();
     else ta.focus();
   }, [inputFocused]);
+
+  if (errorHeld && !recovery) return <SessionErrorPanel session={session} readOnly={readOnly} />;
 
   if (!readOnly && !recovery && ensureState === "pending") {
     return (
@@ -538,8 +596,26 @@ export function LiveTerminalView({
           recovery={recovery}
           current={recoveryCurrent && session.recovery != null}
           readOnly={readOnly}
-          onAttach={live.manualReconnect}
-          onRestarted={live.manualReconnect}
+          onAttach={() => {
+            const current = session.recovery;
+            if (!recoveryCurrent || !current?.actions.attach) {
+              setObservationError("The current observation permission is unavailable.");
+              return;
+            }
+            if (!current.expected || !current.observe_expected) {
+              setObservationError("No exact terminal observation is available. Refresh the current observation.");
+              return;
+            }
+            setObservationError(null);
+            if (observing) live.manualReconnect();
+            else
+              setObserveTarget({
+                sessionId: session.id,
+                expected: current.expected,
+                observeExpected: current.observe_expected,
+              });
+          }}
+          onRestarted={() => setObserveTarget(null)}
           onRetryOperation={() => {
             const current = session.recovery;
             if (!recoveryCurrent || !current?.actions.retry_operation) return;
@@ -552,6 +628,8 @@ export function LiveTerminalView({
           }}
         />
       )}
+      {observationError && <div role="alert">{observationError}</div>}
+      {observing && <div>Observing existing terminal. Use Compose retry for a new operation.</div>}
       <TerminalConnectionBanners
         connected={live.state.connected}
         reconnecting={live.state.reconnecting}
@@ -585,7 +663,7 @@ export function LiveTerminalView({
       >
         <MobileLiveTerminal
           frame={live.state.frame}
-          readOnly={readOnly}
+          readOnly={terminalReadOnly}
           liveStats={live.state.stats}
           transport={live.state.transport}
           armAgentClipboard={armAgentClipboard}
@@ -611,16 +689,16 @@ export function LiveTerminalView({
           bottomAlign={surface === "agent"}
           keyboardOpen={keyboardOpen}
         />
-        {!readOnly && coarse && live.state.connected && (
+        {!terminalReadOnly && coarse && live.state.connected && (
           <KeyboardFab keyboardOpen={inputFocused} onToggle={toggleKeyboard} />
         )}
-        {!readOnly && coarse && live.state.connected && webSettings.showArrowJoystick && (
+        {!terminalReadOnly && coarse && live.state.connected && webSettings.showArrowJoystick && (
           <ArrowJoystick onArrow={sendArrow} />
         )}
       </div>
 
       <LiveControlStrip
-        mode={readOnly ? "read-only" : viewOnly && !claiming ? "view-only" : null}
+        mode={readOnly ? "read-only" : !recovery && viewOnly && !claiming ? "view-only" : null}
         hold={holdShown}
         ownerKind={live.state.ownerKind}
         lag={live.state.transportReason === "pipe_owned"}
@@ -631,7 +709,7 @@ export function LiveTerminalView({
         takeControlRef={takeControlRef}
       />
 
-      {!readOnly && coarse && live.state.connected && (
+      {!terminalReadOnly && coarse && live.state.connected && (
         <MobileTerminalToolbar
           keys={webSettings.mobileToolbarKeys}
           captureWriteAdmission={captureWriteAdmission}

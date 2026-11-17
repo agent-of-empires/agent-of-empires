@@ -44,7 +44,7 @@ export function SessionBanners({
   startingAgent: string | null;
   /** False where the server refuses a restart: read-only and CityHall dashboards. */
   canRestart?: boolean;
-  onStartupRestarted?: (epoch: number, stoppedSent: boolean) => void;
+  onStartupRestarted?: (epoch: number, stoppedSent: boolean, retriedError?: string) => void;
   onRestartFailed?: (epoch: number, message: string, stoppedSent: boolean) => void;
   acpWorkerState: "absent" | "resuming" | "running" | "stopping";
   trashedAt: string | null;
@@ -96,6 +96,10 @@ export function SessionBanners({
           acpWorkerState={acpWorkerState}
           canRecover={canRestart && state.connectionUnavailable === null}
           sentStopped={state.restartStoppedSent}
+          retriedError={state.retriedError}
+          restartEpoch={state.restartEpoch}
+          onRetryStarted={(epoch, message) => onStartupRestarted?.(epoch, false, message)}
+          onRetryFailed={(epoch, message) => onRestartFailed?.(epoch, message, false)}
           onSwitchToTerminal={onSwitchToTerminal}
         />
       )}
@@ -157,7 +161,12 @@ export function SessionBanners({
           </PulseBanner>
         )
       )}
-      {!reason && showWorkerStoppingBanner({ acpWorkerState, startupError }) && <WorkerStoppingBanner />}
+      {!reason &&
+        showWorkerStoppingBanner({
+          acpWorkerState,
+          startupError,
+          restartInFlight: state.restartInFlight,
+        }) && <WorkerStoppingBanner />}
       {state.nextWakeupAt && idle && (
         <ScheduledWakeupBanner wakeAt={state.nextWakeupAt} reason={state.nextWakeupReason} />
       )}

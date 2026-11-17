@@ -627,6 +627,7 @@ mod tests {
             guidance: "Observe ongoing Agent work.".into(),
             actions: crate::session::RecoveryActions::default(),
             expected: "selection".into(),
+            observe_expected: None,
         };
         let output = Text::from("VISIBLE_NATIVE_OUTPUT");
         for height in [5, 24] {

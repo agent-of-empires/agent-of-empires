@@ -69,7 +69,7 @@ fn rate_limit_resume_marker_resets_at(
 pub(in crate::server::api) async fn rate_limit_resume_probe(
     state: &AppState,
     id: &str,
-) -> Result<ControlKnowledge<Option<DateTime<Utc>>>, SupervisorError> {
+) -> Result<ControlKnowledge<Option<(u64, DateTime<Utc>)>>, SupervisorError> {
     let store = Arc::clone(&state.acp_event_store);
     let id_for_probe = id.to_string();
     let park = tokio::task::spawn_blocking(move || store.rate_limit_park(&id_for_probe))
@@ -77,10 +77,10 @@ pub(in crate::server::api) async fn rate_limit_resume_probe(
         .map_err(|_| SupervisorError::NativeStoreUnavailable)?
         .map_err(|_| SupervisorError::NativeStoreUnavailable)?;
     Ok(match park {
-        Known(park) => Known(rate_limit_resume_marker_resets_at(
-            park.as_ref(),
-            Utc::now(),
-        )),
+        Known(park) => Known(park.and_then(|park| {
+            rate_limit_resume_marker_resets_at(Some(&park), Utc::now())
+                .map(|resets_at| (park.seq, resets_at))
+        })),
         Indeterminate => Indeterminate,
     })
 }

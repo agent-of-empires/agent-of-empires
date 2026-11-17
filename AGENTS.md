@@ -112,9 +112,7 @@ template, and [MAINTAINERS.md](MAINTAINERS.md) for review and merge rules.
 - Do not request reviewers; CODEOWNERS routes each PR.
 - Keep a PR within one owner area where possible; split changes that cross
   areas.
-- When reviewing, tag each requested change P1, P2 or P3 per the
-  [rubric](CONTRIBUTING.md#review-rubric), say what would satisfy it, and file
-  P3s as issues.
+- When reviewing, follow the [rubric](CONTRIBUTING.md#review-rubric).
 
 Codecov gates web changes at 75% patch coverage and prevents a project drop
 beyond its threshold. Do not add tautological tests merely to move coverage.

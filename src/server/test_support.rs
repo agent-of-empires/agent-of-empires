@@ -300,6 +300,7 @@ pub(crate) fn build_test_app_state_with_event_capacity(
         session_service,
         token_manager: Arc::new(TokenManager::new(token, Duration::from_secs(3600))),
         login_manager: Arc::new(login::LoginManager::new(None)),
+        mcp_session_secret: None,
         passkey_manager: Arc::new(super::passkeys::PasskeyManager::in_memory()),
         rate_limiter: Arc::new(RateLimiter::new()),
         behind_tunnel: false,
@@ -830,10 +831,25 @@ pub(crate) async fn managed_control_session(
     agent_key: &str,
     options: Option<serde_json::Value>,
 ) -> ManagedControlSession {
+    managed_control_session_as(scope, label, agent_key, agent_key, options, false, None).await
+}
+
+#[cfg(test)]
+pub(crate) async fn managed_control_session_as(
+    scope: &mut crate::acp::supervisor::test_support::managed::ManagedScope,
+    label: &str,
+    agent_key: &str,
+    tool: &str,
+    options: Option<serde_json::Value>,
+    steering: bool,
+    native_store: Option<std::path::PathBuf>,
+) -> ManagedControlSession {
     let project = scope.tempdir();
-    let native_store = crate::session::get_app_dir()
-        .unwrap()
-        .join("managed-control-native-store");
+    let native_store = native_store.unwrap_or_else(|| {
+        crate::session::get_app_dir()
+            .unwrap()
+            .join("managed-control-native-store")
+    });
     std::fs::create_dir_all(&native_store).unwrap();
     scope.save_environment(&["CLAUDE_CONFIG_DIR"]);
     std::env::set_var("CLAUDE_CONFIG_DIR", &native_store);
@@ -860,11 +876,19 @@ pub(crate) async fn managed_control_session(
     let (config, native) = scope.native_peer(
         project.path().into(),
         agent_key,
-        agent_key,
+        tool,
         move |request| match request["method"].as_str().unwrap() {
-            "initialize" => Some(serde_json::json!({"jsonrpc":"2.0","id":request["id"],
-                "result":{"protocolVersion":1,"agentCapabilities":{"loadSession":true},
-                    "_meta":{"ompAutonomousTurns":{"version":1}}}})),
+            "initialize" => Some(serde_json::json!({
+                "jsonrpc":"2.0", "id":request["id"],
+                "result":{
+                    "protocolVersion":1,
+                    "agentCapabilities":{"loadSession":true},
+                    "_meta":{
+                        "ompAutonomousTurns":{"version":1},
+                        "steering":{"supported":steering}
+                    }
+                }
+            })),
             "session/new" | "session/load" => {
                 let sid = if request["method"] == "session/new" {
                     serde_json::Value::String(response_sid.clone())
@@ -893,6 +917,9 @@ pub(crate) async fn managed_control_session(
                 sent.send(request.clone()).unwrap();
                 None
             }
+            "_session/steering" if steering => Some(serde_json::json!({
+                "jsonrpc":"2.0","id":request["id"],"result":{"outcome":"injected"}
+            })),
             "session/cancel" => None,
             other => panic!("unexpected Native method: {other}"),
         },
@@ -900,21 +927,24 @@ pub(crate) async fn managed_control_session(
     let mut client = scope.spawn(config, label).await.unwrap();
     client.ready().await;
     tokio::time::timeout(Duration::from_secs(10), async {
+        let mut assigned = false;
+        let mut capabilities = false;
         loop {
             let event = client
                 .next_event()
                 .await
                 .expect("actual original assignment");
-            if matches!(&event, crate::acp::Event::AcpSessionAssigned {
+            assigned |= matches!(&event, crate::acp::Event::AcpSessionAssigned {
                 acp_session_id, connection_ready: true, native_subject: Some(_),
-            } if acp_session_id == &sid)
-            {
-                break;
-            }
+            } if acp_session_id == &sid);
+            capabilities |= matches!(&event, crate::acp::Event::PromptCapabilities { .. });
             assert!(!matches!(
                 event,
                 crate::acp::Event::AgentStartupError { .. }
             ));
+            if assigned && capabilities {
+                break;
+            }
         }
     })
     .await
@@ -954,12 +984,162 @@ pub(crate) async fn managed_control_session(
         .expect("actual runner birth");
     assert_eq!(Some(owner), client.lease.spawned_runner());
     assert_ne!(owner.pid, std::process::id());
+    // Query the proof already owned by the original launcher; do not replace any
+    // inspection or SDK probe that an existing caller armed before this helper.
+    let proof = scope.original_native_proof(&client.lease);
+    assert_eq!(proof.runner, owner);
+    assert_ne!(proof.pid, std::process::id());
+    assert_eq!(
+        crate::process::process_birth_identity(proof.pid)
+            .unwrap()
+            .as_ref(),
+        Some(&proof.birth),
+        "readiness belongs to this original Native incarnation",
+    );
     ManagedControlSession {
         client,
         native,
         state,
         sid,
         prompts,
+    }
+}
+
+#[cfg(test)]
+impl ManagedControlSession {
+    pub(crate) async fn wait_control(
+        &self,
+        predicate: impl Fn(&crate::acp::state::AcpState) -> bool,
+    ) -> crate::acp::state::AcpState {
+        tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                let control = self
+                    .state
+                    .session_service
+                    .fold_control_state(self.id())
+                    .await
+                    .unwrap();
+                if predicate(&control) {
+                    return control;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("actual Native control reaches the asserted boundary")
+    }
+
+    pub(crate) async fn park_window(
+        &mut self,
+        text: &str,
+        kind: &str,
+        resets_at: chrono::DateTime<chrono::Utc>,
+    ) {
+        let request = self.start_prompt(text).await;
+        self.native
+            .send(serde_json::json!({
+                "jsonrpc":"2.0", "method":"session/update", "params":{
+                    "sessionId":self.sid,
+                    "update":{
+                        "sessionUpdate":"usage_update", "used":10, "size":100,
+                        "cost":{"amount":0.1,"currency":"USD"},
+                        "_meta":{"_claude/rateLimit":{
+                            "status":"rejected", "rateLimitType":kind,
+                            "resetsAt":resets_at.timestamp()
+                        }}
+                    }
+                }
+            }))
+            .await;
+        // The response and usage notification share the same original peer's ordered stream.
+        self.finish_prompt(&request, Some("rate_limit")).await;
+        let park = match self
+            .state
+            .acp_event_store
+            .rate_limit_park(self.id())
+            .unwrap()
+        {
+            crate::acp::event_store::ControlKnowledge::Known(Some(park)) => park,
+            other => panic!("the original result must establish its known park: {other:?}"),
+        };
+        let info = park
+            .info
+            .expect("the original rejected quota window is retained");
+        assert_eq!(info.kind, kind);
+        assert_eq!(info.resets_at.unwrap().timestamp(), resets_at.timestamp());
+    }
+
+    /// Reuse the first-I/O path from supervisor::launch's managed resource fixtures.
+    pub(crate) async fn start_background(
+        &mut self,
+        agent: bool,
+        output_file: &std::path::Path,
+    ) -> uuid::Uuid {
+        use crate::acp::Event;
+        let update = if agent {
+            serde_json::json!({
+                "sessionUpdate":"tool_call_update", "toolCallId":"tool-background",
+                "_meta":{"claudeCode":{"toolName":"Agent","toolResponse":{
+                    "agentId":"agent", "description":"research", "prompt":"research",
+                    "resolvedModel":"model", "outputFile":output_file,
+                    "status":"async_launched"
+                }}}
+            })
+        } else {
+            serde_json::json!({
+                "sessionUpdate":"tool_call_update", "toolCallId":"tool-background",
+                "_meta":{"claudeCode":{"toolName":"Bash","toolResponse":{
+                    "backgroundTaskId":"task"
+                }}}
+            })
+        };
+        let matching = |event: &Event| {
+            if agent {
+                matches!(event, Event::BackgroundAgentLaunched { agent_id, .. } if agent_id == "agent")
+            } else {
+                matches!(event, Event::BackgroundTaskStarted { task_id, .. } if task_id == "task")
+            }
+        };
+        tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                self.native
+                    .send(serde_json::json!({
+                        "jsonrpc":"2.0", "method":"session/update",
+                        "params":{"sessionId":self.sid,"update":update}
+                    }))
+                    .await;
+                while !matching(
+                    &self
+                        .client
+                        .next_event()
+                        .await
+                        .expect("original resource observer"),
+                ) {}
+                if let Some(allocation) = self
+                    .state
+                    .acp_event_store
+                    .replay_from(self.id(), 0)
+                    .unwrap()
+                    .iter()
+                    .find_map(|stored| {
+                        matching(stored.event.as_ref())
+                            .then(|| {
+                                stored
+                                    .metadata
+                                    .resource_witness
+                                    .as_ref()
+                                    .map(|w| w.allocation)
+                            })
+                            .flatten()
+                    })
+                {
+                    return allocation;
+                }
+                // A genuinely new observation, never a promoted history row, retries first I/O.
+            }
+        })
+        .await
+        .expect("the original resource reaches first I/O and mints its witness")
     }
 }
 
@@ -982,4 +1162,17 @@ pub(crate) fn sql_projection_metadata() -> crate::acp::event_sender::EventMetada
         }),
         ..EventMetadata::history()
     }
+}
+
+/// A launcher whose agent rejects `initialize` for want of a login, as the connection task
+/// reports it before the handshake completes.
+#[cfg(test)]
+pub(crate) fn unauthenticated_launcher() -> crate::acp::supervisor::Launcher {
+    Arc::new(|_config, _id| {
+        Box::pin(async {
+            Err::<crate::acp::acp_client::AcpClient, _>(crate::acp::acp_client::AcpError::Spawn(
+                "ACP connection failed: Authentication required".into(),
+            ))
+        })
+    })
 }

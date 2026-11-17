@@ -12,7 +12,7 @@ interface Props {
   /** Soft keyboard height above the home-indicator inset, which the sheet adds since its parent drops it. */
   bottomInset: number;
   /** Whether the pane will receive the text. */
-  onSubmit: (text: string, submit: boolean) => boolean;
+  onSubmit: (text: string, submit: boolean) => boolean | Promise<boolean>;
   onClose: (refocusTerminal: boolean) => void;
 }
 
@@ -31,6 +31,16 @@ export function TerminalComposeSheet({
   const textRef = useRef<HTMLTextAreaElement>(null);
   const dialogRef = useRef<HTMLDivElement>(null);
   const [empty, setEmpty] = useState(() => freshDraft || !drafts.get(draftKey)?.trim());
+  const [pending, setPending] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+  const pendingRef = useRef(false);
+  const mountedRef = useRef(true);
+  useLayoutEffect(() => {
+    mountedRef.current = true;
+    return () => {
+      mountedRef.current = false;
+    };
+  }, []);
 
   const grow = useCallback(() => {
     const ta = textRef.current;
@@ -50,11 +60,39 @@ export function TerminalComposeSheet({
 
   const deliver = (submit: boolean, keepTyping = !submit) => {
     const text = textRef.current?.value ?? "";
-    if (readOnly || !text.trim() || !onSubmit(text, submit)) return;
-    if (!freshDraft) drafts.delete(draftKey);
-    // A tapped Send drops the keyboard; Insert and the hardware chord keep typing in the terminal.
-    if (!keepTyping) textRef.current?.blur();
-    onClose(keepTyping);
+    if (readOnly || pendingRef.current || !text.trim() || (freshDraft && !submit)) return;
+    const accepted = () => {
+      if (!mountedRef.current) return;
+      if (!freshDraft) drafts.delete(draftKey);
+      if (!keepTyping) textRef.current?.blur();
+      onClose(keepTyping);
+    };
+    setError(null);
+    let result: boolean | Promise<boolean>;
+    try {
+      result = onSubmit(text, submit);
+    } catch (cause) {
+      setError(cause instanceof Error ? cause.message : "The operation could not be sent.");
+      return;
+    }
+    if (typeof result === "boolean") {
+      if (result) accepted();
+      return;
+    }
+    pendingRef.current = true;
+    setPending(true);
+    void result
+      .then((ok) => {
+        if (ok) accepted();
+        else if (mountedRef.current) setError("The operation was refused. Your draft is retained.");
+      })
+      .catch((cause: unknown) => {
+        if (mountedRef.current) setError(cause instanceof Error ? cause.message : "The operation could not be sent.");
+      })
+      .finally(() => {
+        pendingRef.current = false;
+        if (mountedRef.current) setPending(false);
+      });
   };
 
   const onKeyDown = (e: ReactKeyboardEvent<HTMLDivElement>) => {
@@ -98,6 +136,7 @@ export function TerminalComposeSheet({
           aria-label="Message"
           defaultValue={freshDraft ? "" : (drafts.get(draftKey) ?? "")}
           placeholder="Type, dictate, or long-press to paste"
+          disabled={pending}
           rows={2}
           onInput={(e) => {
             const value = e.currentTarget.value;
@@ -109,23 +148,30 @@ export function TerminalComposeSheet({
           style={{ fontSize: "16px" }}
           className="w-full max-h-[40vh] resize-none overflow-y-auto bg-surface-950 border border-surface-700 rounded-md px-2 py-1.5 text-text-primary placeholder:text-text-dim focus:border-brand-600 focus:outline-none"
         />
+        {error && (
+          <div role="alert" className="text-status-error">
+            {error}
+          </div>
+        )}
         {/* preventDefault keeps the keyboard up until the terminal input takes focus. */}
         <div className="flex items-center gap-2" onMouseDown={(e) => e.preventDefault()}>
           <button type="button" className={`${action} text-text-secondary`} onClick={() => onClose(false)}>
             Close
           </button>
           <span className="flex-1" />
+          {!freshDraft && (
+            <button
+              type="button"
+              disabled={readOnly || empty || pending}
+              className={`${action} border border-surface-700 text-text-primary active:bg-surface-800`}
+              onClick={() => deliver(false)}
+            >
+              Insert
+            </button>
+          )}
           <button
             type="button"
-            disabled={readOnly || empty}
-            className={`${action} border border-surface-700 text-text-primary active:bg-surface-800`}
-            onClick={() => deliver(false)}
-          >
-            Insert
-          </button>
-          <button
-            type="button"
-            disabled={readOnly || empty}
+            disabled={readOnly || empty || pending}
             className={`${action} px-4 font-semibold bg-brand-600 text-white active:bg-brand-700`}
             onClick={() => deliver(true)}
           >

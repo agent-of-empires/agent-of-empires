@@ -4,6 +4,7 @@ pub(super) use super::AppState;
 
 use axum::{http::StatusCode, response::Response};
 mod acp;
+pub(crate) use acp::{submit_prompt, PromptSubmission, PromptSubmitError, PromptSubmitted};
 mod client_log;
 mod file_provenance;
 mod git;
@@ -18,6 +19,7 @@ mod projects;
 mod queue;
 mod sandbox_image;
 pub(crate) mod sessions;
+mod setup;
 mod skills;
 pub(crate) mod system;
 mod telemetry;
@@ -55,6 +57,11 @@ pub use plugins::{
     set_plugin_enabled, start_plugin_install, start_plugin_uninstall,
 };
 pub use projects::{create_project, delete_project, list_projects, update_project};
+#[cfg(test)]
+pub(crate) use sandbox_image::status_generation_for_test as sandbox_image_status_generation_for_test;
+pub(crate) use sandbox_image::{
+    create_pull_refusal, invalidate_status as invalidate_sandbox_image_status,
+};
 pub use sandbox_image::{sandbox_image_dismiss, sandbox_image_pull, sandbox_image_status};
 pub use sessions::{
     abandon_purge, attach_session_project, cancel_creation, create_session,
@@ -62,11 +69,12 @@ pub use sessions::{
     ensure_container_terminal, ensure_session, ensure_terminal, ensure_tool, force_smart_rename,
     get_recent_projects, kill_terminal, list_sessions, paste_image, preview_volume_ignores_globs,
     read_output, recreate_container, rename_session, restart_for_update, restart_session,
-    restore_session, review_creation_trust, search_sessions, send_message, serve_session_artifact,
-    session_diff_file, session_diff_file_raw, session_diff_files, session_file, session_file_raw,
-    set_worktree_name, start_session, stop_auxiliary, stop_session, summarize_session,
-    touch_session_access, touch_session_input_recency, trash_session, update_session_archive,
-    update_session_color, update_session_diff_base, update_session_favorite, update_session_group,
+    restore_session, review_creation_trust, save_session_file, search_sessions, send_message,
+    serve_session_artifact, session_account_targets, session_diff_file, session_diff_file_raw,
+    session_diff_files, session_file, session_file_raw, set_worktree_name, start_session,
+    stop_auxiliary, stop_session, summarize_session, touch_session_access,
+    touch_session_input_recency, trash_session, update_session_archive, update_session_color,
+    update_session_diff_base, update_session_favorite, update_session_group,
     update_session_notifications, update_session_pin, update_session_snooze, update_session_unread,
     update_workspace_ordering, OutputQuery, SendMessageRequest,
 };
@@ -74,6 +82,7 @@ pub(crate) use sessions::{
     lifecycle_rejection, persist_session_update, purge_expired_trash, reconcile_trashed_worktrees,
     reconcile_worktree_paths, trash_sweep_interval,
 };
+pub use setup::{get_setup, get_setup_runtimes, patch_setup};
 pub use skills::{
     adopt_skill, create_skill, delete_skill, edit_skill, list_skills, read_skill, sync_skills,
 };
@@ -229,6 +238,9 @@ pub(super) fn session_not_found() -> axum::response::Response {
     )
 }
 
+/// Why `aoe serve --read-only` refused a change.
+pub(crate) const READ_ONLY_MESSAGE: &str = "Server is in read-only mode";
+
 /// Canonical 403 body for `aoe serve --read-only`.
 pub(super) fn read_only_response() -> axum::response::Response {
     use axum::response::IntoResponse as _;
@@ -237,7 +249,7 @@ pub(super) fn read_only_response() -> axum::response::Response {
         crate::daemon::ApiErrorCode::ReadOnly.header(),
         axum::Json(serde_json::json!({
             "error": "read_only",
-            "message": "Server is in read-only mode"
+            "message": READ_ONLY_MESSAGE
         })),
     )
         .into_response()
@@ -449,6 +461,7 @@ mod tests {
             (Method::PATCH, "/api/theme"),
             (Method::POST, "/api/sandbox/image-pull"),
             (Method::POST, "/api/sandbox/image-dismiss"),
+            (Method::PUT, "/api/sessions/missing/file"),
         ] {
             let mut request = Request::builder()
                 .method(method.clone())

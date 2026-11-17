@@ -13,19 +13,44 @@ export function connectionRetriesExhausted({
   return status !== "open" && !reconnecting && retryCount >= maxRetries;
 }
 
+/** A Retry from the startup error banner is running; its startup line replaces the banner. */
+export function isRetryingStart(state: Pick<AcpState, "restartInFlight" | "retriedError">): boolean {
+  return state.restartInFlight && state.retriedError !== null;
+}
+
+/** The empty state while the Agent can't start, or until a Retry has started it. */
+export function notRunningCopy(
+  state: Pick<
+    AcpState,
+    | "restartInFlight"
+    | "retriedError"
+    | "startupError"
+    | "connectionReady"
+    | "nativeSnapshotSeq"
+    | "connectionUnavailable"
+  >,
+  name: string,
+): string | null {
+  if (nativeInputAvailable(state) || state.connectionUnavailable !== null) return null;
+  const subject = name.charAt(0).toUpperCase() + name.slice(1);
+  if (isRetryingStart(state)) return `${subject} isn't running yet.`;
+  return state.startupError ? `${subject} isn't running.` : null;
+}
+
 /** The Agent's session ran before, so an older Session is known before its events load. An import has
  *  its id from creation but has never run here. */
 export function hasStartedBefore(session: Pick<SessionResponse, "acp_session_id" | "import_pending">): boolean {
   return !!session.acp_session_id && !session.import_pending;
 }
 
-/** Wait for current input authority, not initialization events or historical session IDs. */
+/** Wait for current input authority, including a Retry on a previously started session. */
 export function isNewSessionStarting(
   state: AcpState,
   connection: ConnectionRetryState & Pick<AcpContext, "hasEverOpened">,
   acpWorkerState: "absent" | "resuming" | "running" | "stopping",
   startedBefore: boolean,
 ): boolean {
+  if (isRetryingStart(state)) return !connectionRetriesExhausted(connection);
   if (
     startedBefore ||
     nativeInputAvailable(state) ||

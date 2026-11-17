@@ -5,16 +5,16 @@
 macro_rules! native_channel_loss_sql {
     ($json:literal) => {
         concat!(
-            "(json_extract(",
+            "(CASE WHEN discriminant = 'AcpConnectionUnavailable' THEN json_extract(",
             $json,
             ", '$.AcpConnectionUnavailable.source') IN ('sdk','control','native')",
             " AND json_type(",
             $json,
-            ", '$.AcpConnectionUnavailable.native_subject.kind.AdmissionRefusal') IS NULL)"
+            ", '$.AcpConnectionUnavailable.native_subject.kind.AdmissionRefusal') IS NULL ELSE 0 END)"
         )
     };
 }
-
+mod account_limits;
 mod attachments;
 pub(crate) mod control;
 mod establishment;
@@ -38,6 +38,7 @@ use super::event_sender::EventScope;
 use super::state::Event;
 use crate::events;
 
+pub use account_limits::{AccountState, WindowLimit};
 pub use attachments::AttachmentBlob;
 pub use control::ControlKnowledge;
 pub(crate) use establishment::EstablishmentSeal;
@@ -408,6 +409,7 @@ impl EventStore {
             }
         }
         identity::install(&mut conn)?;
+        account_limits::ensure_schema(&conn).context("create account limits table")?;
         let private_database: bool = conn.query_row(
             "SELECT file = '' FROM pragma_database_list WHERE name = 'main'",
             [],

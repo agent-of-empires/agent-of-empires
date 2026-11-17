@@ -1048,10 +1048,17 @@ impl<S: BroadcastSink> Supervisor<S> {
                 if matches!(err, AcpError::IncompatibleAgent(_)) {
                     self.mark_incompatible_binary(session_id, &config.spec.command);
                 }
-                publish_rejection(&err, |event| {
-                    self.publish_next(session_id, event);
-                });
+                let deferred =
+                    matches!(err, AcpError::RateLimited(_)) && lease.defers_rate_limit_rejection();
+                if !deferred {
+                    publish_rejection(&err, |event| {
+                        self.publish_next(session_id, event);
+                    });
+                }
                 self.reap_failed_launch(&lease).await;
+                if matches!(err, AcpError::RateLimited(_)) && !deferred {
+                    self.rate_limit_wake.notify_one();
+                }
                 return Err(SupervisorError::Acp(err));
             }
         };
@@ -1780,7 +1787,7 @@ impl<S: BroadcastSink> Supervisor<S> {
     /// and release the scope it created, while the lease still holds the
     /// session. A first launch has no previous runner to keep. Under a pending
     /// stop the scope is released even when no runner of this generation exists.
-    async fn reap_failed_launch(&self, lease: &Lease) {
+    pub(super) async fn reap_failed_launch(&self, lease: &Lease) {
         if lease.is_borrowed_attach() {
             return;
         }
@@ -2149,10 +2156,7 @@ pub(super) fn publish_rejection(err: &AcpError, mut publish: impl FnMut(Event)) 
             publish(Event::IncompatibleAgent {
                 detail: payload.detail.clone(),
             });
-            publish(Event::AgentStartupError {
-                message: payload.message.clone(),
-                native_subject: None,
-            });
+            publish(Event::startup_error(payload.message.clone()));
         }
         // The provider limit parks the session rather than reporting a crash.
         AcpError::RateLimited(info) => {

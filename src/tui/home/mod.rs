@@ -50,8 +50,8 @@ use crate::tmux::AvailableTools;
 use super::dialogs::ServeView;
 use super::dialogs::{
     AttachProjectDialog, ChangelogDialog, CommandPaletteDialog, ConfirmDialog, ContextMenuDialog,
-    GroupDeleteOptionsDialog, GroupPickerDialog, HooksInstallDialog, InfoDialog, IntroDialog,
-    NewSessionData, NewSessionDialog, NoAgentsDialog, ProfilePickerDialog,
+    CreateHookFailedDialog, GroupDeleteOptionsDialog, GroupPickerDialog, HooksInstallDialog,
+    InfoDialog, IntroDialog, NewSessionData, NewSessionDialog, NoAgentsDialog, ProfilePickerDialog,
     ProjectSessionPickerDialog, ProjectsDialog, RenameDialog, RepoTrustDialog, RestartDialog,
     SnoozeDurationDialog, SortPickerDialog, UnifiedDeleteDialog, UpdateConfirmDialog,
     WorktreeNameDialog,
@@ -91,6 +91,13 @@ pub(super) struct SessionDialogTarget {
     lifecycle_generation: u64,
 }
 
+pub(super) struct TrashDialogTarget {
+    session_id: String,
+    source_profile: String,
+    lifecycle_generation: u64,
+    epoch: String,
+}
+
 pub(super) struct SessionDeleteDialog {
     dialog: UnifiedDeleteDialog,
     target: SessionDialogTarget,
@@ -99,6 +106,10 @@ pub(super) struct SessionDeleteDialog {
 
 pub(super) enum PermissionResponseTarget {
     Terminal(String),
+    Declared {
+        session_id: String,
+        agent: crate::plugin::agent_integration::DeclaredAgent,
+    },
     Structured {
         session_id: String,
         nonce: String,
@@ -194,8 +205,19 @@ pub(super) enum CreationConfirmation {
     Canonical(crate::daemon::SessionResponse),
 }
 
+/// What the wizard submitted, kept so a creation refused by its `on_create` hook can be sent
+/// again without re-filling the form.
+#[derive(Clone)]
+pub(super) struct CreationRequest {
+    pub(super) data: NewSessionData,
+    pub(super) trust_hooks: Option<bool>,
+    pub(super) trust_review: Option<crate::daemon::CreationTrustFingerprint>,
+    pub(super) skip_on_create: bool,
+}
+
 /// A display-only creation placeholder and its retained completion proof.
 pub(super) struct PendingCreation {
+    pub(super) request: CreationRequest,
     /// The daemon's session id, known once a reservation or progress entry
     /// names this creation.
     pub(super) daemon_id: Option<String>,
@@ -262,6 +284,7 @@ pub struct HomeView {
     pub(super) group_by: GroupByMode,
     pub(super) row_tag_mode: crate::session::config::RowTagMode,
     pub(super) show_activity_age: bool,
+    pub(super) show_structured_badge: bool,
     /// Forward captured OSC 52 writes unless `[tmux] clipboard` is disabled.
     /// Tmux's own clipboard options cannot govern this in-process path.
     pub(super) agent_clipboard_forward: bool,
@@ -289,10 +312,14 @@ pub struct HomeView {
     pub(super) group_rename_context: Option<GroupRenameContext>,
     pub(super) session_dialog_target: Option<SessionDialogTarget>,
     pub(super) repo_trust_dialog: Option<RepoTrustDialog>,
+    /// A creation refused by its `on_create` hook, and the request its choices resubmit.
+    pub(super) create_hook_failed: Option<(CreateHookFailedDialog, CreationRequest)>,
     pub(super) pending_repo_trust_data: Option<NewSessionData>,
     /// Canonical daemon-reviewed configuration fingerprint for the pending
     /// approval. Approval is never persisted locally before daemon validation.
     pub(super) pending_repo_trust_fingerprint: Option<crate::daemon::CreationTrustFingerprint>,
+    /// Create without setup, carried through the trust prompt a resubmit reopened.
+    pub(super) pending_repo_trust_skip_on_create: bool,
     pub(super) hooks_install_dialog: Option<HooksInstallDialog>,
     pub(super) pending_hooks_install_data: Option<NewSessionData>,
     pub(super) volume_ignores_glob_dialog: Option<ConfirmDialog>,
@@ -321,9 +348,12 @@ pub struct HomeView {
     pub(super) skills_manager_dialog: Option<crate::tui::dialogs::SkillsManagerDialog>,
     pub(super) command_palette: Option<CommandPaletteDialog>,
     pub(super) serve_view: Option<ServeView>,
+    pub(super) serve_jobs: super::dialogs::ServeJobs,
     pub(super) connections_view: Option<super::dialogs::ConnectionsView>,
     pub(super) pending_dashboard_launch: Option<super::dialogs::ServeLaunchRequest>,
+    pub(super) pending_dashboard_stop: Option<super::app::DashboardStopRequest>,
     pub(super) dashboard_launch: Option<super::dialogs::DashboardLaunch>,
+    pub(super) dashboard_stop: Option<super::dialogs::DashboardStop>,
     pub(super) update_confirm_dialog: Option<UpdateConfirmDialog>,
     pub(super) telemetry_consent_dialog: Option<super::dialogs::TelemetryConsentDialog>,
     pub(super) tips_dialog: Option<super::dialogs::TipsDialog>,
@@ -349,10 +379,15 @@ pub struct HomeView {
     pub(super) live_send_resize_retry_at: Option<std::time::Instant>,
     pub(super) live_send_pending_leader: bool,
     pub(super) hover_cell: Option<(u16, u16)>,
-    pub(super) status_flash: Option<(String, std::time::Instant)>,
+    pub(super) status_flash: Option<overlays::StatusFlash>,
     pub(super) live_send_ctrl_c_flash_until: Option<std::time::Instant>,
+    /// Session whose live control another window took, until the selection moves or live
+    /// mode starts again.
+    pub(super) live_takeover: Option<live_send::TakenLive>,
     pub(super) sidebar_collapsed: bool,
     pub(super) sidebar_position: crate::session::config::SidebarPosition,
+
+    pub(super) narrow_layout: crate::session::config::NarrowLayout,
     pub(super) passive_pane_synced: std::collections::HashMap<String, PassiveSynced>,
     pub(super) passive_pane_declined:
         std::collections::HashMap<String, ((u16, u16), std::time::Instant)>,
@@ -384,7 +419,7 @@ pub struct HomeView {
     pub(super) structured_transcript_painted: bool,
     /// Exact canonical purge owner captured when Force Remove confirmation opens.
     pub(super) pending_force_remove_session: Option<(String, std::num::NonZeroU64)>,
-    pub(super) pending_trash_session: Option<SessionDialogTarget>,
+    pub(super) pending_trash_session: Option<TrashDialogTarget>,
     pub(super) pending_dialog_click_action: Option<crate::tui::app::Action>,
     pub(super) search_active: bool,
     pub(super) search_query: Input,

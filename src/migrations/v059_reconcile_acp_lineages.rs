@@ -9,6 +9,8 @@ pub fn run() -> Result<()> {
     super::v057_acp_budget_knowledge::run()?;
     super::v054_retained_history_identity::run()?;
     super::v055_global_max_concurrent_workers::run()?;
+    super::v056_launch_resolved_executable::run()?;
+    super::v057_worker_launch_executable::run()?;
     reconcile_autonomous_metadata()?;
     tracing::info!(target: "migrations.v059", "Reconciled ACP establishment, scope, publication, budget, retained identity and global worker cap");
     Ok(())
@@ -87,6 +89,8 @@ mod tests {
         Legacy53,
         Main54,
         Main55,
+        Main56,
+        Main57,
         Acp54,
         Acp55,
         Acp56,
@@ -195,7 +199,9 @@ mod tests {
 
     fn prepare_history(history: History, conn: &Connection) {
         match history {
-            History::Main54 | History::Main55 => v054_retained_history_identity::run().unwrap(),
+            History::Main54 | History::Main55 | History::Main56 | History::Main57 => {
+                v054_retained_history_identity::run().unwrap();
+            }
             History::Acp54
             | History::Acp55
             | History::Acp56
@@ -205,8 +211,14 @@ mod tests {
             }
             History::Legacy53 => {}
         }
-        if matches!(history, History::Main55) {
+        if matches!(history, History::Main55 | History::Main56 | History::Main57) {
             v055_global_max_concurrent_workers::run().unwrap();
+        }
+        if matches!(history, History::Main56 | History::Main57) {
+            v056_launch_resolved_executable::run().unwrap();
+        }
+        if matches!(history, History::Main57) {
+            v057_worker_launch_executable::run().unwrap();
         }
         if matches!(
             history,
@@ -235,8 +247,8 @@ mod tests {
             History::Legacy53 => 53,
             History::Main54 | History::Acp54 => 54,
             History::Main55 | History::Acp55 => 55,
-            History::Acp56 => 56,
-            History::Acp57 => 57,
+            History::Main56 | History::Acp56 => 56,
+            History::Main57 | History::Acp57 => 57,
             History::Frontier58 => 58,
         };
         set_version(version).unwrap();
@@ -343,6 +355,8 @@ mod tests {
             History::Legacy53,
             History::Main54,
             History::Main55,
+            History::Main56,
+            History::Main57,
             History::Acp54,
             History::Acp55,
             History::Acp56,
@@ -425,7 +439,7 @@ mod tests {
         fs::create_dir_all(&app).unwrap();
         seed_profiles(&app);
         let conn = seed_legacy_database(&app);
-        prepare_history(History::Main55, &conn);
+        prepare_history(History::Main57, &conn);
         let old_identity = identity(&conn).unwrap();
         let marker = fs::read(app.join(VERSION_FILE)).unwrap();
         let other = app.join("profiles/other/config.toml");
@@ -473,7 +487,7 @@ mod tests {
             fs::create_dir_all(&app).unwrap();
             seed_profiles(&app);
             let conn = seed_legacy_database(&app);
-            prepare_history(History::Main55, &conn);
+            prepare_history(History::Main57, &conn);
             if malformed_scope {
                 conn.execute_batch("ALTER TABLE acp_events ADD COLUMN scope TEXT")
                     .unwrap();
@@ -513,7 +527,7 @@ mod tests {
         fs::create_dir_all(&app).unwrap();
         seed_profiles(&app);
         let conn = seed_legacy_database(&app);
-        prepare_history(History::Main55, &conn);
+        prepare_history(History::Main57, &conn);
         let malformed = br#"[{"id":"5959595959595959","acp_establishment":{"version":999}}]"#;
         fs::write(app.join("sessions.json"), malformed).unwrap();
         let marker = fs::read(app.join(VERSION_FILE)).unwrap();

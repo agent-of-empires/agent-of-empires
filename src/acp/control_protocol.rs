@@ -407,7 +407,6 @@ pub struct NativePromptCompletionEvidence {
 }
 
 /// Daemon-minted completion barrier, ordered behind preceding SDK notifications.
-/// Adopted payloads contain the bounded public diagnostic, never raw error envelopes.
 #[derive(
     Debug, Clone, Default, Serialize, Deserialize, agent_client_protocol::JsonRpcNotification,
 )]
@@ -457,11 +456,20 @@ impl AdoptedPromptDiagnostic {
 
     pub(crate) fn inherit_rate_limit_hint(
         &mut self,
-        hint: impl FnOnce() -> Option<chrono::DateTime<chrono::Utc>>,
+        hint: impl FnOnce() -> Option<(String, chrono::DateTime<chrono::Utc>)>,
     ) {
         if let crate::acp::state::Event::RateLimit { info } = &mut self.0 {
-            if info.resets_at.is_none() {
-                info.resets_at = hint();
+            if info.resets_at.is_none() || info.kind.is_empty() || info.kind == "rate_limit" {
+                if let Some((kind, resets_at)) = hint() {
+                    if info.kind.is_empty() || info.kind == "rate_limit" {
+                        info.kind = if kind.is_empty() {
+                            "rate_limit".into()
+                        } else {
+                            kind
+                        };
+                    }
+                    info.resets_at.get_or_insert(resets_at);
+                }
             }
         }
     }

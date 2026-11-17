@@ -5,7 +5,9 @@ export type FailureAction =
   | "launch_without_sandbox"
   | "change_image"
   | "choose_project"
-  | "try_again";
+  | "try_again"
+  | "create_without_setup"
+  | "launch_with_current_image";
 
 export const FAILURE_ACTION_LABEL: Record<FailureAction, string> = {
   retry_runtime: "Retry",
@@ -13,6 +15,8 @@ export const FAILURE_ACTION_LABEL: Record<FailureAction, string> = {
   change_image: "Change image",
   choose_project: "Choose Project",
   try_again: "Try again",
+  create_without_setup: "Create without setup",
+  launch_with_current_image: "Launch with current image",
 };
 
 export interface FailureView {
@@ -32,6 +36,7 @@ export interface FailureView {
 
 const STEP: Record<CreateStage, string> = {
   preparing: "It failed while preparing the Session.",
+  pulling_image: "It failed while pulling the latest Sandbox image.",
   starting_container: "It failed while starting the container.",
   running_hooks: "It failed while running the on_create hooks.",
   starting: "It failed while starting the Agent.",
@@ -40,7 +45,9 @@ const STEP: Record<CreateStage, string> = {
 const GENERIC_MESSAGE = "Failed to create session";
 
 /** The form fields a failure blames: once one changes, the box describes a form that's gone. */
-export function failureFields(failure: CreateFailure): readonly ("path" | "sandboxEnabled" | "sandboxImage")[] {
+export function failureFields(
+  failure: CreateFailure,
+): readonly ("path" | "sandboxEnabled" | "sandboxImage" | "pullLatestImage")[] {
   switch (failure.code) {
     case "working_dir_missing":
     case "hook_failed":
@@ -49,6 +56,10 @@ export function failureFields(failure: CreateFailure): readonly ("path" | "sandb
       return ["sandboxEnabled"];
     case "sandbox_image_pull_failed":
       return ["sandboxEnabled", "sandboxImage"];
+    case "sandbox_image_update_failed":
+    case "pull_disabled":
+    case "unknown_image":
+      return ["sandboxEnabled", "sandboxImage", "pullLatestImage"];
     default:
       return failure.code === "create_failed" && failure.stage === "starting_container"
         ? ["sandboxEnabled", "sandboxImage"]
@@ -60,7 +71,11 @@ export function failureFields(failure: CreateFailure): readonly ("path" | "sandb
  *  Container runtime still down. */
 export function failureView(
   failure: CreateFailure,
-  { sandboxEnabled, runtimeDown }: { sandboxEnabled: boolean; runtimeDown: boolean },
+  {
+    sandboxEnabled,
+    runtimeDown,
+    canSkipSetup = true,
+  }: { sandboxEnabled: boolean; runtimeDown: boolean; canSkipSetup?: boolean },
 ): FailureView {
   const base = {
     step: failure.stage ? STEP[failure.stage] : null,
@@ -88,13 +103,28 @@ export function failureView(
         row: "sandbox",
         cue: "image pull failed",
       };
+    // A failed latest-image pull, or one the Daemon refused (pulling off, or an image it doesn't list). Nothing
+    // was created, so the image already on the Daemon still works.
+    case "sandbox_image_update_failed":
+    case "pull_disabled":
+    case "unknown_image":
+      return {
+        ...base,
+        title: "Couldn't pull the latest image",
+        step: "The session wasn't created.",
+        primary: "launch_with_current_image",
+        secondary: null,
+        row: "sandbox",
+        cue: "image pull failed",
+      };
     case "hook_failed":
       // In a Sandbox the Repo hooks run inside the container, so turning it off is no fix.
       return {
         ...base,
         title: "An on_create hook failed",
         primary: "try_again",
-        secondary: null,
+        // CityHall servers refuse to skip setup.
+        secondary: canSkipSetup ? "create_without_setup" : null,
         row: null,
         cue: null,
         showOutput: true,

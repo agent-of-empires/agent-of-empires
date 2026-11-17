@@ -1395,22 +1395,16 @@ impl PluginManagerDialog {
         }
         if !consent.agent_integrations.is_empty() {
             lines.push(Line::from(Span::styled(
-                "Agent launch commands (run as you when launched):",
+                "Agent declarations (commands run as you when launched):",
                 Style::default().fg(theme.waiting),
             )));
             for agent in &consent.agent_integrations {
-                lines.push(Line::from(Span::styled(
-                    format!(
-                        "  {}: {}",
-                        agent.tool,
-                        agent
-                            .command
-                            .as_deref()
-                            .map(crate::plugin::agent_integration::display_command)
-                            .unwrap_or_else(|| "No launch command declared".to_string())
-                    ),
-                    Style::default().fg(theme.dimmed),
-                )));
+                for line in crate::plugin::agent_integration::consent_lines(agent) {
+                    lines.push(Line::from(Span::styled(
+                        format!("  {line}"),
+                        Style::default().fg(theme.dimmed),
+                    )));
+                }
             }
         }
         if !consent.ui.is_empty() {
@@ -1516,22 +1510,16 @@ impl PluginManagerDialog {
         }
         if !consent.agent_integrations.is_empty() {
             lines.push(Line::from(Span::styled(
-                "Agent launch commands (run as you when launched):",
+                "Agent declarations (commands run as you when launched):",
                 Style::default().fg(theme.waiting),
             )));
             for agent in &consent.agent_integrations {
-                lines.push(Line::from(Span::styled(
-                    format!(
-                        "  {}: {}",
-                        agent.tool,
-                        agent
-                            .command
-                            .as_deref()
-                            .map(crate::plugin::agent_integration::display_command)
-                            .unwrap_or_else(|| "No launch command declared".to_string())
-                    ),
-                    Style::default().fg(theme.dimmed),
-                )));
+                for line in crate::plugin::agent_integration::consent_lines(agent) {
+                    lines.push(Line::from(Span::styled(
+                        format!("  {line}"),
+                        Style::default().fg(theme.dimmed),
+                    )));
+                }
             }
         }
         lines.push(Line::from(""));
@@ -1607,22 +1595,16 @@ impl PluginManagerDialog {
         }
         if !consent.agent_integrations.is_empty() {
             lines.push(Line::from(Span::styled(
-                "Agent launch commands (run as you when launched):",
+                "Agent declarations (commands run as you when launched):",
                 Style::default().fg(theme.waiting),
             )));
             for agent in &consent.agent_integrations {
-                lines.push(Line::from(Span::styled(
-                    format!(
-                        "  {}: {}",
-                        agent.tool,
-                        agent
-                            .command
-                            .as_deref()
-                            .map(crate::plugin::agent_integration::display_command)
-                            .unwrap_or_else(|| "No launch command declared".to_string())
-                    ),
-                    Style::default().fg(theme.dimmed),
-                )));
+                for line in crate::plugin::agent_integration::consent_lines(agent) {
+                    lines.push(Line::from(Span::styled(
+                        format!("  {line}"),
+                        Style::default().fg(theme.dimmed),
+                    )));
+                }
             }
         }
         lines.push(Line::from(""));

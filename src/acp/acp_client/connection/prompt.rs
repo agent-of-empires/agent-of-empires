@@ -24,7 +24,7 @@ use crate::acp::acp_client::errors::{acp_internal_error, prompt_runtime_error, A
 use crate::acp::acp_client::lifecycle::{LifecycleSignal, OffProtocolWorkKind};
 use crate::acp::acp_client::opencode::recover_opencode_prompt_error;
 use crate::acp::acp_client::rate_limit::{
-    captured_rate_limit_resets_at, classify_rate_limit_error, clear_captured_rejections,
+    captured_rate_limit_reset, classify_rate_limit_error, clear_captured_rejections,
     take_rate_limit_from_captured_rejection,
 };
 use crate::acp::acp_client::reset::ResetSessionOutcome;
@@ -112,7 +112,7 @@ enum Flow {
 #[derive(Default)]
 struct TurnFlags {
     shutdown: bool,
-    rate_limited: bool,
+    rate_limit: Option<RateLimitInfo>,
     force_stopped: bool,
     prompt_orphaned: bool,
     agent_unresponsive: bool,
@@ -135,6 +135,7 @@ struct Turn {
     sender: EventSender,
     result_current: bool,
     flags: TurnFlags,
+    preceding: Vec<Event>,
     watchdog: SilentOrphanWatchdog,
     cfg: SilentOrphanWatchdogConfig,
     orphan_check_enabled: bool,
@@ -151,11 +152,9 @@ impl Turn {
             .apply_signal(signal, Instant::now(), chrono::Utc::now(), self.cfg);
     }
 
-    fn start_cancel_grace(&mut self) {
+    fn start_cancel_grace(&mut self, deadline: Instant) {
         self.flags.cancelling = true;
-        self.cancel_grace
-            .as_mut()
-            .reset(Instant::now() + CANCEL_ESCALATION_GRACE);
+        self.cancel_grace.as_mut().reset(deadline);
     }
 }
 
@@ -289,9 +288,11 @@ impl Session {
             }
         }
 
+        let publication = shared.state.publication.lock().await;
         let admission = tokio::select! {
             biased;
             _ = initial_prompt_cancelled(cancellation.as_ref()) => {
+                drop(publication);
                 self.settle_initial_prompt(&scope, correlation, false).await;
                 return Ok(false);
             }
@@ -345,6 +346,7 @@ impl Session {
                     0,
                 );
                 let terminal_epoch = shared.terminal_claim.begin_turn();
+                *shared.cancel_deadline.lock().unwrap() = None;
                 shared.prompt_in_flight.store(true, Ordering::Release);
                 if !native {
                     shared.between_prompt.reset_for_prompt();
@@ -357,6 +359,7 @@ impl Session {
                 Some((epoch, terminal_epoch))
             }) => admitted,
         };
+        drop(publication);
 
         let (epoch, terminal_epoch) = match admission {
             Ok(Some(admitted)) => admitted,
@@ -395,6 +398,7 @@ impl Session {
             sender,
             result_current: true,
             flags: TurnFlags::default(),
+            preceding: Vec::new(),
             watchdog: SilentOrphanWatchdog::default(),
             cfg: SilentOrphanWatchdogConfig {
                 base_grace,
@@ -682,6 +686,14 @@ impl Session {
                 turn.sender = turn.sender.historical();
             }
         }
+        let original_capture = if native && native_correlated && evidence_matches {
+            self.shared.ingress.take_original_rate_limit_reset(
+                evidence.as_deref().expect("matching Native evidence"),
+                chrono::Utc::now(),
+            )
+        } else {
+            None
+        };
 
         let (result, correlated) = match result {
             PromptResult::Correlated(result) => {
@@ -703,22 +715,14 @@ impl Session {
                 return Err(acp_internal_error("ACP connection unavailable".into()));
             }
             PromptResult::Abandoned => {
-                publish_scoped(
-                    &self.shared,
-                    native,
-                    &turn.scope,
-                    &turn.sender,
-                    Event::PromptRuntimeError {
-                        message: "Prompt completion was not observed".into(),
-                        evidence: Some(crate::session::OperationErrorEvidence::new(
-                            crate::session::ErrorEvidenceSource::LocalPromptResult,
-                            crate::session::ErrorOperation::Prompt,
-                        )),
-                        native_subject: None,
-                    },
-                    false,
-                )
-                .await;
+                turn.preceding.push(Event::PromptRuntimeError {
+                    message: "Prompt completion was not observed".into(),
+                    evidence: Some(crate::session::OperationErrorEvidence::new(
+                        crate::session::ErrorEvidenceSource::LocalPromptResult,
+                        crate::session::ErrorOperation::Prompt,
+                    )),
+                    native_subject: None,
+                });
                 turn.flags.prompt_failed = true;
                 return Ok(Flow::Break);
             }
@@ -733,23 +737,17 @@ impl Session {
                         self.shared
                             .terminal_claim
                             .with_current_epoch(turn.terminal_epoch, || {
-                                self.take_parking_rejection()
+                                take_rate_limit_from_captured_rejection(
+                                    &self.shared.rate_limit_rejections,
+                                    chrono::Utc::now(),
+                                )
                             })
                             .flatten()
                     })
                     .ok()
                     .flatten();
                     if let Some(info) = parking {
-                        publish_scoped(
-                            &self.shared,
-                            native,
-                            &turn.scope,
-                            &turn.sender,
-                            Event::RateLimit { info },
-                            false,
-                        )
-                        .await;
-                        turn.flags.rate_limited = true;
+                        turn.flags.rate_limit = Some(info);
                     }
                 }
                 return Ok(Flow::Break);
@@ -757,12 +755,14 @@ impl Session {
             Err(error) => error,
         };
 
-        let resets_at = if turn.result_current {
-            current_effect(&turn.scope, native, || {
+        let captured = if native {
+            original_capture
+        } else if turn.result_current {
+            current_effect(&turn.scope, false, || {
                 self.shared
                     .terminal_claim
                     .with_current_epoch(turn.terminal_epoch, || {
-                        captured_rate_limit_resets_at(
+                        captured_rate_limit_reset(
                             &self.shared.rate_limit_rejections,
                             chrono::Utc::now(),
                         )
@@ -776,19 +776,10 @@ impl Session {
         };
 
         if let Some(info) = correlated
-            .then(|| classify_rate_limit_error(&error, resets_at))
+            .then(|| classify_rate_limit_error(&error, captured.as_ref()))
             .flatten()
         {
-            publish_scoped(
-                &self.shared,
-                native,
-                &turn.scope,
-                &turn.sender,
-                Event::RateLimit { info },
-                false,
-            )
-            .await;
-            turn.flags.rate_limited = true;
+            turn.flags.rate_limit = Some(info);
             return Ok(Flow::Break);
         }
 
@@ -805,34 +796,44 @@ impl Session {
                 evidence.reported_code = None;
             }
         }
-        publish_scoped(
-            &self.shared,
-            native,
-            &turn.scope,
-            &turn.sender,
-            diagnostic,
-            false,
-        )
-        .await;
+        turn.preceding.push(diagnostic);
         turn.flags.prompt_failed = true;
         Ok(Flow::Break)
     }
 
-    /// The adapter can end a limited turn normally, so a still-future rejected
-    /// window captured during it is the only evidence; park like the error path.
-    fn take_parking_rejection(&self) -> Option<RateLimitInfo> {
-        let shared = &self.shared;
-        let info = take_rate_limit_from_captured_rejection(
-            &shared.rate_limit_rejections,
-            chrono::Utc::now(),
-        )?;
-        info!(
-            target: "acp.protocol",
-            session = %shared.session_label,
-            resets_at = ?info.resets_at,
-            "prompted turn ended on a rejected rate-limit window; parking session"
-        );
-        Some(info)
+    /// Starts the cancel escalation grace once and returns its deadline; a
+    /// repeated cancel keeps the original deadline.
+    pub(super) async fn request_cancel(
+        &self,
+        scope: &Option<NativeRequestContext>,
+        turn: u64,
+    ) -> AcpResult<(Instant, bool)> {
+        current_effect_wait(
+            scope.as_ref(),
+            self.control.is_some(),
+            &self.shared.connection_state,
+            || {
+                self.shared.terminal_claim.with_current_epoch(turn, || {
+                    let mut current = self.shared.cancel_deadline.lock().unwrap();
+                    match current.as_ref() {
+                        Some(grace) if grace.turn == turn => Some((grace.deadline, false)),
+                        Some(_) => None,
+                        None => {
+                            let deadline = Instant::now() + CANCEL_ESCALATION_GRACE;
+                            *current = Some(crate::acp::acp_client::CancelGrace {
+                                deadline,
+                                turn,
+                                scope: scope.clone(),
+                            });
+                            Some((deadline, true))
+                        }
+                    }
+                })
+            },
+        )
+        .await?
+        .flatten()
+        .ok_or_else(|| acp_internal_error("NotIssued: cancellation turn was superseded".into()))
     }
 
     async fn reject_busy(&self, text: String, scope: &Option<NativeRequestContext>) {
@@ -911,22 +912,49 @@ impl Session {
                     debug!(target: "acp.protocol", %error, "cancel not issued");
                     return Ok(Flow::Continue);
                 }
+                if current_effect_wait(
+                    turn.scope.as_ref(),
+                    native,
+                    &self.shared.connection_state,
+                    || (),
+                )
+                .await
+                .is_err()
+                {
+                    return Ok(Flow::Continue);
+                }
+                let (deadline, newly_armed) =
+                    match self.request_cancel(&scope, turn.terminal_epoch).await {
+                        Ok(armed) => armed,
+                        Err(_) => return Ok(Flow::Continue),
+                    };
+                turn.start_cancel_grace(deadline);
                 if let Err(error) = self.send_cancel(scope.clone()).await {
                     // A stale/refused Cancel must not drop the admitted prompt
                     // future or leave its original SDK slot unsettled.
                     warn!(target: "acp.protocol", %error, "cancel not issued");
                     return Ok(Flow::Continue);
                 }
-                if current_effect(&scope, native, || ()).is_err()
-                    || current_effect(&turn.scope, native, || ()).is_err()
+                if current_effect_wait(scope.as_ref(), native, &self.shared.connection_state, || ())
+                    .await
+                    .is_err()
+                    || current_effect_wait(
+                        turn.scope.as_ref(),
+                        native,
+                        &self.shared.connection_state,
+                        || (),
+                    )
+                    .await
+                    .is_err()
                 {
                     return Ok(Flow::Continue);
                 }
-                if !turn.flags.cancelling {
-                    turn.start_cancel_grace();
+                if newly_armed {
                     let escalates_at = chrono::Utc::now()
-                        + chrono::Duration::from_std(CANCEL_ESCALATION_GRACE)
-                            .unwrap_or_else(|_| chrono::Duration::seconds(10));
+                        + chrono::Duration::from_std(
+                            deadline.saturating_duration_since(Instant::now()),
+                        )
+                        .unwrap_or_default();
                     let sender = scoped_sender(&self.shared, native, &scope);
                     publish_scoped(
                         &self.shared,
@@ -1126,16 +1154,23 @@ impl Session {
             return Flow::Continue;
         }
 
-        let fire = turn.watchdog.should_fire(Instant::now(), turn.cfg)
+        let subagents_active = self.shared.subagent_working(now_ms());
+        let fire = turn
+            .watchdog
+            .should_fire(Instant::now(), turn.cfg, subagents_active)
             && !self.shared.aoe.leases.working(now_ms());
         let off_protocol = turn.watchdog.off_protocol_work_seen();
-        if fire && turn.watchdog.cost_seen() && off_protocol.is_none() {
+        let grace_secs = turn
+            .watchdog
+            .effective_grace(turn.cfg, subagents_active)
+            .as_secs();
+        if fire && turn.watchdog.cost_seen() && off_protocol.is_none() && !subagents_active {
             // The turn finished but the PromptResponse never came: end cleanly
             // as prompt_complete with no flag set (#2237).
             info!(
                 target: "acp.protocol",
                 session = %self.shared.session_label,
-                grace_secs = turn.watchdog.effective_grace(turn.cfg).as_secs(),
+                grace_secs,
                 "silent-orphan watchdog: turn wrapped up (cost-populated usage) without PromptResponse; ending cleanly as prompt_complete"
             );
             // The runner may still be running the turn; without this the next
@@ -1150,6 +1185,11 @@ impl Session {
         }
 
         turn.flags.prompt_orphaned = true;
+        let Ok((deadline, _)) = self.request_cancel(&turn.scope, turn.terminal_epoch).await else {
+            turn.flags.prompt_orphaned = false;
+            return Flow::Continue;
+        };
+        turn.start_cancel_grace(deadline);
         if let Err(error) = self.send_cancel(turn.scope.clone()).await {
             // Permission may have expired during the await. That is not evidence
             // that the native agent ignored a cancellation.
@@ -1163,9 +1203,6 @@ impl Session {
         }
 
         turn.flags.orphan_cancel_sent = true;
-        if !turn.flags.cancelling {
-            turn.start_cancel_grace();
-        }
         Flow::Continue
     }
 
@@ -1250,32 +1287,25 @@ impl Session {
             if let Some(message) =
                 recover_opencode_prompt_error(&self.acp_session_id.0, prompt_started_at_ms)
             {
-                publish_scoped(
-                    &shared,
-                    native,
-                    &turn.scope,
-                    &turn.sender,
-                    Event::PromptRuntimeError {
-                        message,
-                        evidence: Some(crate::session::OperationErrorEvidence::new(
-                            crate::session::ErrorEvidenceSource::TranscriptRecovery,
-                            crate::session::ErrorOperation::Prompt,
-                        )),
-                        native_subject: None,
-                    },
-                    false,
-                )
-                .await;
+                turn.preceding.push(Event::PromptRuntimeError {
+                    message,
+                    evidence: Some(crate::session::OperationErrorEvidence::new(
+                        crate::session::ErrorEvidenceSource::TranscriptRecovery,
+                        crate::session::ErrorOperation::Prompt,
+                    )),
+                    native_subject: None,
+                });
                 turn.flags.prompt_failed = true;
             }
         }
 
+        let rate_limited = turn.flags.rate_limit.is_some();
         let flags = &turn.flags;
         let reason = if flags.prompt_failed {
             "prompt_failed"
         } else {
             terminal_stop_reason(
-                flags.rate_limited,
+                rate_limited,
                 flags.force_stopped,
                 flags.prompt_orphaned,
                 flags.agent_unresponsive,
@@ -1284,7 +1314,7 @@ impl Session {
                 flags.orphan_cancel_sent && finished,
             )
         };
-        let failed = flags.prompt_failed || flags.rate_limited;
+        let failed = flags.prompt_failed || rate_limited;
 
         // Original local slot settlement is independent of Native row generation.
         // A later SDK terminal epoch still prevents settling somebody else's slot.
@@ -1293,6 +1323,9 @@ impl Session {
             .claim_epoch(turn.terminal_epoch, failed);
 
         if claimed {
+            if let Some(info) = turn.flags.rate_limit.take() {
+                turn.preceding.push(Event::RateLimit { info });
+            }
             if turn.result_current {
                 let _ = current_effect(&turn.scope, native, || {
                     shared
@@ -1311,26 +1344,33 @@ impl Session {
                 });
             }
 
-            if !publish_scoped(
-                &shared,
-                native,
-                &turn.scope,
-                &turn.sender,
-                Event::Stopped {
-                    reason: reason.into(),
-                },
-                !turn.flags.result_observed,
-            )
-            .await
+            if !shared
+                .publish_terminal(
+                    turn.terminal_epoch,
+                    turn.sender,
+                    turn.scope.clone(),
+                    reason.into(),
+                    std::mem::take(&mut turn.preceding),
+                    turn.flags.result_observed,
+                )
+                .await
             {
                 return false;
             }
+        }
+        if claimed
+            && !native
+            && turn.result_current
+            && current_effect(&turn.scope, native, || ()).is_ok()
+            && shared.subagent_working(now_ms())
+        {
+            shared.arm_for_subagent_activity().await;
         }
         info!(
             target: "acp.protocol",
             session = %shared.session_label,
             reason,
-            agent_stop_reason = ?flags.agent_stop_reason,
+            agent_stop_reason = ?turn.flags.agent_stop_reason,
             duration_ms = now_ms() - prompt_started_at_ms,
             "turn finished; original local prompt slot settled"
         );

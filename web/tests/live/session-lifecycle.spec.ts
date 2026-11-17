@@ -172,7 +172,13 @@ test("enabling structured view reaps owned panes and preserves an unverified too
   // #1869: owned panes must not leave unreachable shells after the view switch.
   const title = "modeswitch";
   const { serve, sessionId } = await startAcpSession(spawnServe, { title, tool: "claude" });
-  const session = (await listSessions(serve.baseUrl)).find((s) => s.id === sessionId)!;
+  let session = (await listSessions(serve.baseUrl)).find((s) => s.id === sessionId)!;
+  await expect
+    .poll(async () => {
+      session = (await listSessions(serve.baseUrl)).find((s) => s.id === sessionId)!;
+      return typeof session?.acp_session_id === "string" && session.acp_session_id.length > 0;
+    })
+    .toBe(true);
   const acpSessionId = session.acp_session_id as string;
   expect(acpSessionId).toEqual(expect.any(String));
   expect(acpSessionId).not.toBe("");

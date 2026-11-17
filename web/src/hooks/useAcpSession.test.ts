@@ -1549,7 +1549,7 @@ describe("live panel cancellation authority", () => {
       const regions = view.getAllByRole("region", { name: /^(desktop|mobile) background work$/ });
       expect(regions).toHaveLength(2);
       for (const region of regions) {
-        fireEvent.click(within(region).getByRole("button", { name: "Stop", exact: true }));
+        fireEvent.click(within(region).getByTitle("Interrupt the session and stop running sub-agents"));
         expect(within(region).getByRole("alertdialog")).toBeTruthy();
       }
       expect(posts("/cancel")).toEqual([]);
@@ -1589,9 +1589,12 @@ describe("live panel cancellation authority", () => {
       const regions = view.getAllByRole("region", { name: /^(desktop|mobile) background work$/ });
       expect(regions).toHaveLength(2);
       for (const region of regions) {
+        fireEvent.click(within(region).getByTitle("Stop this sub-agent"));
+        expect(posts("/cancel")).toEqual([]);
         fireEvent.click(within(region).getByRole("button", { name: "Stop sub-agent" }));
+        await flushAsync();
         const previousRootPosts = posts("/acp/cancel").length;
-        fireEvent.click(within(region).getByRole("button", { name: "Stop", exact: true }));
+        fireEvent.click(within(region).getByTitle("Interrupt the session and stop running sub-agents"));
         expect(posts("/acp/cancel")).toHaveLength(previousRootPosts);
         expect(within(region).getByRole("alertdialog").textContent).toContain("interrupts the main agent");
         fireEvent.click(within(region).getByRole("button", { name: "Interrupt session" }));
@@ -1630,6 +1633,7 @@ describe("live panel cancellation authority", () => {
     await flushAsync();
     const view = renderView(panelElements(id), { wrapper: profileWrapper });
     const region = view.getByRole("region", { name: "desktop background work" });
+    fireEvent.click(within(region).getByTitle("Stop this sub-agent"));
     const stop = within(region).getByRole("button", { name: "Stop sub-agent" });
     clickAtCommit = () => stop.click();
     await act(async () => {
@@ -1644,6 +1648,7 @@ describe("live panel cancellation authority", () => {
       lastSocket().message(currentControlSnapshot(hook.result.current.state, { ready: true }, 20));
     });
     expect(nativeInputAvailable(hook.result.current.state)).toBe(true);
+    fireEvent.click(within(region).getByTitle("Stop this sub-agent"));
     await act(async () => {
       fireEvent.click(within(region).getByRole("button", { name: "Stop sub-agent" }));
     });
@@ -1664,9 +1669,11 @@ describe("live panel cancellation authority", () => {
     await flushAsync();
     const view = renderView(panelElements(id), { wrapper: profileWrapper });
     for (const region of view.getAllByRole("region", { name: /^(desktop|mobile) background work$/ })) {
+      fireEvent.click(within(region).getByTitle("Stop this sub-agent"));
       fireEvent.click(within(region).getByRole("button", { name: "Stop sub-agent" }));
+      await flushAsync();
       const previousRootPosts = posts("/acp/cancel").length;
-      fireEvent.click(within(region).getByRole("button", { name: "Stop", exact: true }));
+      fireEvent.click(within(region).getByTitle("Interrupt the session and stop running sub-agents"));
       expect(posts("/acp/cancel")).toHaveLength(previousRootPosts);
       expect(within(region).getByRole("alertdialog").textContent).toContain("interrupts the main agent");
       fireEvent.click(within(region).getByRole("button", { name: "Interrupt session" }));
@@ -1697,6 +1704,7 @@ describe("live panel cancellation authority", () => {
     await flushAsync();
     const view = renderView(panelElements(id), { wrapper: profileWrapper });
     for (const region of view.getAllByRole("region", { name: /^(desktop|mobile) background work$/ })) {
+      fireEvent.click(within(region).getByTitle("Stop this sub-agent"));
       fireEvent.click(within(region).getByRole("button", { name: "Stop sub-agent" }));
       expect(await within(region).findByText(/Could not stop subagent \(409\)/)).toBeTruthy();
     }
@@ -1746,6 +1754,7 @@ describe("live panel cancellation authority", () => {
 
       view.rerender(panelElements(nextId));
       const region = view.getByRole("region", { name: "mobile background work" });
+      fireEvent.click(within(region).getByTitle("Stop this sub-agent"));
       fireEvent.click(within(region).getByRole("button", { name: "Stop sub-agent" }));
       await flushAsync();
       expect(posts("/cancel")).toEqual([

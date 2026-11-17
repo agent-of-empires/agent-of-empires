@@ -8,8 +8,13 @@ use chrono::{DateTime, Utc};
 
 use super::{is_resumable, query_control, query_store, resolve_per_profile, AppState};
 use crate::acp::event_store::ControlKnowledge::{Indeterminate, Known};
-use crate::acp::state::RATE_LIMIT_EXHAUSTED_RETRIES_REASON;
+use crate::acp::state::{RateLimitInfo, RATE_LIMIT_EXHAUSTED_RETRIES_REASON};
 use crate::acp::supervisor::SupervisorError;
+
+mod failover;
+#[cfg(test)]
+pub(crate) use failover::in_flight as failover_in_flight;
+pub(crate) use failover::{pending_target as failover_target, Settings as FailoverSettings};
 
 pub(super) const RATE_LIMIT_RESUME_INTERVAL: Duration = Duration::from_secs(15);
 
@@ -41,6 +46,21 @@ fn rate_limit_resume_at(
     {
         Some(floor) if floor > resets_plus_grace => floor,
         _ => resets_plus_grace,
+    }
+}
+
+/// When a park's window is expected to end: the reported reset plus grace, else the
+/// unknown-reset schedule for the redeliveries spent.
+fn scheduled_resume_at(
+    info: &crate::acp::state::RateLimitInfo,
+    recorded_at_ms: i64,
+    streak: i64,
+) -> DateTime<Utc> {
+    match info.resets_at {
+        Some(resets_at) => {
+            rate_limit_resume_at(resets_at, recorded_at_ms, RATE_LIMIT_AUTO_RESUME_GRACE_SECS)
+        }
+        None => rate_limit_unknown_reset_retry_at(recorded_at_ms, streak),
     }
 }
 
@@ -239,6 +259,10 @@ pub(crate) struct QuotaDelivery {
 }
 
 impl QuotaDelivery {
+    pub(crate) fn new(park_seq: u64) -> Self {
+        Self { park_seq }
+    }
+
     pub(crate) fn park_seq(&self) -> u64 {
         self.park_seq
     }
@@ -291,39 +315,50 @@ pub(crate) async fn resume_rate_limited(
     {
         return Err(crate::acp::acp_client::AcpError::ConnectionUnavailable(unavailable).into());
     }
+    let Known(streak) = query_control(
+        &state.acp_event_store,
+        id,
+        "quota release budget",
+        |store, id| store.rate_limit_redelivery_streak(id),
+    )
+    .await?
+    else {
+        return Err(SupervisorError::ControlStateUnavailable);
+    };
     let mut resume_at = park
         .info
         .as_ref()
         .and_then(|info| info.resets_at)
         .unwrap_or_else(Utc::now);
     if matches!(kind, QuotaResume::Automatic { .. }) {
-        let enabled = resolve_per_profile([profile.clone()].into_iter(), |config| {
-            config.acp.rate_limit_auto_resume
+        let settings = resolve_per_profile([profile.clone()].into_iter(), |config| {
+            (
+                config.acp.rate_limit_auto_resume,
+                failover::Settings::of(config),
+            )
         })
         .await;
-        if !enabled.get(&profile).copied().unwrap_or(false) {
+        let (enabled, failover_settings) = settings.get(&profile).cloned().unwrap_or_default();
+        if !enabled {
             return Ok(());
         }
-    }
-    let streak = query_control(
-        &state.acp_event_store,
-        id,
-        "quota release budget",
-        |store, id| store.rate_limit_redelivery_streak(id),
-    )
-    .await?;
-    let Known(streak) = streak else {
-        return Err(SupervisorError::ControlStateUnavailable);
-    };
-    if matches!(kind, QuotaResume::Automatic { .. }) {
-        resume_at = match park.info.as_ref().and_then(|info| info.resets_at) {
-            Some(reset) => rate_limit_resume_at(
-                reset,
-                park.recorded_at_ms,
-                RATE_LIMIT_AUTO_RESUME_GRACE_SECS,
-            ),
-            None => rate_limit_unknown_reset_retry_at(park.recorded_at_ms, streak),
+        let info = park.info.clone().unwrap_or_else(RateLimitInfo::undated);
+        let reported = if failover_settings.enabled {
+            let row = {
+                let rows = state.instances.read().await;
+                rows.iter()
+                    .find(|row| row.id == id && is_resumable(row))
+                    .cloned()
+            };
+            match row {
+                Some(row) => failover::reported_deadline(state, &row, &info).await,
+                None => return Err(SupervisorError::SpawnCancelled(id.to_owned())),
+            }
+        } else {
+            None
         };
+        resume_at =
+            reported.unwrap_or_else(|| scheduled_resume_at(&info, park.recorded_at_ms, streak));
         if let Some(attempt) = park
             .last_resume_attempt_ms
             .and_then(DateTime::from_timestamp_millis)
@@ -515,29 +550,23 @@ fn schedule_quota_release(
 }
 
 /// Schedule due quota work without waiting for readiness on the global tick.
-pub(super) async fn reap_rate_limit_resumes(
+pub(crate) async fn reap_rate_limit_resumes(
     state: &Arc<AppState>,
     attempted: &mut HashSet<String>,
     parked: &HashSet<String>,
 ) {
-    let candidates: Vec<(String, String, bool)> = {
+    let candidates: Vec<crate::session::Instance> = {
         let instances = state.instances.read().await;
         instances
             .iter()
             .filter(|i| is_resumable(i))
-            .map(|i| {
-                (
-                    i.id.clone(),
-                    i.source_profile.clone(),
-                    !i.queued_prompts.is_empty(),
-                )
-            })
+            .cloned()
             .collect()
     };
     let mut eligible = Vec::new();
     for candidate in candidates {
-        if parked.contains(&candidate.0) {
-            tracing::trace!(target: "acp.supervisor", session = %candidate.0, "rate-limit auto-resume: skipped, session is crash-loop parked");
+        if parked.contains(&candidate.id) {
+            tracing::trace!(target: "acp.supervisor", session = %candidate.id, "rate-limit auto-resume: skipped, session is crash-loop parked");
         } else {
             eligible.push(candidate);
         }
@@ -545,16 +574,37 @@ pub(super) async fn reap_rate_limit_resumes(
     if eligible.is_empty() {
         return;
     }
-    let enabled_by_profile = resolve_per_profile(eligible.iter().map(|c| c.1.clone()), |c| {
-        c.acp.rate_limit_auto_resume
-    })
-    .await;
+    let settings_by_profile =
+        resolve_per_profile(eligible.iter().map(|row| row.source_profile.clone()), |c| {
+            (c.acp.rate_limit_auto_resume, failover::Settings::of(c))
+        })
+        .await;
 
     let now = Utc::now();
-    for (id, profile, has_queued_prompts) in eligible {
+    for row in eligible {
+        let id = row.id.clone();
+        let has_queued_prompts = !row.queued_prompts.is_empty();
         let skip = |reason: &str| {
             tracing::trace!(target: "acp.supervisor", session = %id, "rate-limit auto-resume: skipped, {reason}");
         };
+        if !matches!(
+            state
+                .session_service
+                .prompt_native_unavailability(&id)
+                .await,
+            Ok(None)
+        ) {
+            skip("native ownership is unavailable");
+            continue;
+        }
+        let workerless = !state.acp_supervisor.is_running(&id).await;
+        let (auto_resume, failover_settings) = settings_by_profile
+            .get(&row.source_profile)
+            .cloned()
+            .unwrap_or_default();
+        if workerless && failover_settings.enabled {
+            failover::note_auth_failure(state, &row).await;
+        }
         let Ok(Known(Some(park))) = query_control(
             &state.acp_event_store,
             &id,
@@ -576,12 +626,7 @@ pub(super) async fn reap_rate_limit_resumes(
             }
             continue;
         }
-        if !enabled_by_profile.get(&profile).copied().unwrap_or(false) {
-            skip("not enabled for this profile");
-            continue;
-        }
-        // A pruned `RateLimit` row has no reset time and follows the unknown-reset schedule.
-        let reset = park.info.as_ref().and_then(|info| info.resets_at);
+        let info = park.info.clone().unwrap_or_else(RateLimitInfo::undated);
         let Ok(Known(streak)) = query_control(
             &state.acp_event_store,
             &id,
@@ -592,14 +637,51 @@ pub(super) async fn reap_rate_limit_resumes(
         else {
             continue;
         };
-        let mut resume_at = match reset {
-            Some(resets_at) => rate_limit_resume_at(
-                resets_at,
-                park.recorded_at_ms,
-                RATE_LIMIT_AUTO_RESUME_GRACE_SECS,
-            ),
-            None => rate_limit_unknown_reset_retry_at(park.recorded_at_ms, streak),
+        let reported = if failover_settings.enabled {
+            failover::reported_deadline(state, &row, &info).await
+        } else {
+            None
         };
+        let scheduled_at =
+            reported.unwrap_or_else(|| scheduled_resume_at(&info, park.recorded_at_ms, streak));
+        // A park a swap or resume already touched belongs to the account it ran on then.
+        let first_sight = park.last_resume_attempt_ms.is_none();
+        if workerless && failover_settings.enabled && first_sight && reported.is_none() {
+            failover::record_limit(state, &row, &info, scheduled_at, park.recorded_at_ms).await;
+        }
+        let Ok(latest_seq) = query_control(
+            &state.acp_event_store,
+            &id,
+            "rate-limit latest-seq",
+            |s, id| s.highest_seq(id),
+        )
+        .await
+        else {
+            continue;
+        };
+        // Below the redelivery cap only: an entirely limited pool finds no target and
+        // falls through to the timed resume, whose budget ends in the terminal park.
+        if workerless
+            && failover_settings.enabled
+            && first_sight
+            && streak < RATE_LIMIT_AUTO_RESUME_MAX_REDELIVERIES
+            && failover::maybe_fail_over(
+                state,
+                &row,
+                &failover_settings.accounts,
+                latest_seq,
+                park.recorded_at_ms,
+            )
+            .await
+        {
+            skip("an account failover owns this park");
+            continue;
+        }
+        if !auto_resume {
+            skip("not enabled for this profile");
+            continue;
+        }
+        let mut resume_at = scheduled_at;
         // A resume that fired but got no worker retries on the minimum park window.
         if let Some(last_attempt) = park
             .last_resume_attempt_ms

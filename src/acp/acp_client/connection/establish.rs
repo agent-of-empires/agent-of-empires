@@ -253,15 +253,17 @@ pub(super) async fn establish(
             "agent supports _session/steering; mid-turn prompts will be injected into the running turn"
         );
     }
-    let arm_resume_watchdog = matches!(
-        &ctx.mode,
+    let (adopted_turn, live_recovery) = match &ctx.mode {
         ConnectMode::Resume {
-            in_flight_turn: true,
+            in_flight_turn,
+            unsuccessful_main,
+            live_recovery,
             ..
-        }
-    );
+        } => (*in_flight_turn && !*unsuccessful_main, *live_recovery),
+        ConnectMode::Fresh => (false, None),
+    };
     shared.adopted_turn_active.store(
-        arm_resume_watchdog && shared.connection_state.loss().is_none(),
+        adopted_turn && shared.connection_state.loss().is_none(),
         Ordering::Relaxed,
     );
     info!(
@@ -298,7 +300,9 @@ pub(super) async fn establish(
         pending_reset: None,
     };
     session.acp_session_id = match ctx.mode {
-        ConnectMode::Resume { acp_session_id, .. } => session.resume(acp_session_id).await?,
+        ConnectMode::Resume { acp_session_id, .. } => {
+            session.resume(acp_session_id, live_recovery).await?
+        }
         ConnectMode::Fresh => {
             session
                 .fresh(
@@ -323,7 +327,11 @@ pub(super) async fn establish(
     session.apply_default_model().await;
     session.apply_default_effort().await;
     session.apply_default_model_config().await;
-    if session.control.is_none() && arm_resume_watchdog && shared.connection_state.loss().is_none()
+    shared.connection_state.finish_bootstrap();
+    if session.control.is_none()
+        && adopted_turn
+        && live_recovery.is_none()
+        && shared.connection_state.loss().is_none()
     {
         spawn_resume_idle_watchdog(shared, &session.connection);
     }
@@ -387,11 +395,21 @@ fn spawn_resume_idle_watchdog(shared: Arc<Shared>, connection: &ConnectionTo<Age
 }
 
 impl Session {
-    async fn resume(&self, stored: String) -> Result<SessionId, agent_client_protocol::Error> {
+    async fn resume(
+        &self,
+        stored: String,
+        resume_by: Option<tokio::time::Instant>,
+    ) -> Result<SessionId, agent_client_protocol::Error> {
         let control = self.control.as_ref().ok_or_else(|| {
             acp_internal_error("native adoption requires the owned control protocol".into())
         })?;
-        let result = control.resume_session().await.map(SessionId::from);
+        let result = match resume_by {
+            Some(deadline) => tokio::time::timeout_at(deadline, control.resume_session())
+                .await
+                .unwrap_or_else(|_| Err(acp_internal_error("runner resume timed out".into()))),
+            None => control.resume_session().await,
+        }
+        .map(SessionId::from);
         if let Ok(id) = &result {
             if !stored.is_empty() && stored != id.0.as_ref() {
                 control.projection.lost();

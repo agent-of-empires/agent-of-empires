@@ -164,6 +164,7 @@ export function useLiveTerminal(
     if (!sessionId) {
       pendingInputRef.current = null;
       ownerKnownRef.current = false;
+      setState(() => INITIAL_STATE);
       return;
     }
 

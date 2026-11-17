@@ -1241,7 +1241,7 @@ impl ScriptedAcpAgent {
         std::fs::write(
             &script,
             r#"
-import json, os, sys
+import json, os, sys, time
 if "--version" in sys.argv:
     print("0.99.1")
     sys.exit(0)
@@ -1268,6 +1268,16 @@ for line in sys.stdin:
         native = "native-%s-%s" % (os.getpid(), new_count)
         result = {"sessionId": native, "modes": modes}
     elif method == "session/load":
+        rejection = os.environ.get("AOE_TEST_LOAD_REJECTION")
+        if rejection:
+            release = os.environ["AOE_TEST_LOAD_RELEASE"]
+            deadline = time.monotonic() + 10
+            while not os.path.exists(release):
+                if time.monotonic() >= deadline:
+                    raise RuntimeError("original load rejection was not released")
+                time.sleep(0.005)
+            send({"jsonrpc": "2.0", "id": request["id"], "error": json.loads(rejection)})
+            continue
         native = params["sessionId"]
         result = {"modes": modes}
     elif method == "session/prompt":
@@ -1303,12 +1313,22 @@ for line in sys.stdin:
         }
     }
 
-    pub(crate) fn launcher(&self, owned_runner: bool) -> Launcher {
+    pub(crate) fn managed_launcher(&self) -> Launcher {
+        let thread = std::thread::current();
+        let (executable, _) =
+            crate::process::runner::test_support::managed_runner::RunnerInspection::prepare(
+                self._directory.path(),
+                thread.name().expect("managed libtest name"),
+            );
+        self.launcher_with_runner(Some(executable))
+    }
+
+    fn launcher_with_runner(&self, executable: Option<PathBuf>) -> Launcher {
+        let owned_runner = executable.is_some();
         let script = self.script.clone();
         let capture = self.capture.clone();
         let pid_file = self.pid_file.clone();
         let leases = self.leases.clone();
-        let executable = owned_runner.then(cargo_runner_executable);
         Arc::new(move |mut config, session_id| {
             let script = script.clone();
             let capture = capture.clone();
@@ -1499,7 +1519,6 @@ for line in sys.stdin:
             }
             wait_original_reaped(owner.pid, birth).await;
         }
-        self.native.lock().unwrap().take();
         self.leases.lock().unwrap().clear();
     }
 }
@@ -1515,39 +1534,6 @@ impl Drop for ScriptedAcpAgent {
             }
         }
     }
-}
-
-fn cargo_runner_executable() -> PathBuf {
-    let candidate = std::env::var_os("AOE_TEST_ACP_RUNNER_EXE")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| {
-            let executable = std::env::current_exe().expect("current Cargo test executable");
-            let deps = executable.parent().expect("Cargo test executable parent");
-            assert_eq!(
-                deps.file_name(),
-                Some(std::ffi::OsStr::new("deps")),
-                "set AOE_TEST_ACP_RUNNER_EXE to this candidate's freshly built aoe binary"
-            );
-            let profile = deps.parent().expect("Cargo profile directory");
-            let binary = format!("aoe{}", std::env::consts::EXE_SUFFIX);
-            if let Some(target) = std::env::var_os("CARGO_TARGET_DIR") {
-                let target = PathBuf::from(target);
-                let target = if target.is_absolute() {
-                    target
-                } else {
-                    std::env::current_dir()
-                        .expect("Cargo test working directory")
-                        .join(target)
-                };
-                target.join(profile.file_name().unwrap()).join(binary)
-            } else {
-                profile.join(binary)
-            }
-        });
-    assert!(candidate.is_file(),
-        "real owned-runner fixture requires this candidate's aoe binary at {}; run cargo build --bin aoe before a targeted --lib run, or supply AOE_TEST_ACP_RUNNER_EXE; full cargo test/nextest builds the integration binary",
-        candidate.display());
-    candidate
 }
 
 pub(crate) fn pause_owned_installation() -> (

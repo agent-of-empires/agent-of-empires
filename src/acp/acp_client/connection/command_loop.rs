@@ -233,6 +233,14 @@ impl Session {
         &self,
         scope: Option<NativeRequestContext>,
     ) -> Result<(), agent_client_protocol::Error> {
+        #[cfg(test)]
+        let _gate = tokio::select! {
+            biased;
+            _ = self.shared.connection_state.wait_unavailable() => {
+                return Err(acp_internal_error("ACP connection unavailable".into()));
+            }
+            gate = self.shared.cancel_send_gate.read() => gate,
+        };
         match self.control.as_ref() {
             Some(control) => {
                 let context = scope.ok_or_else(|| {
@@ -252,7 +260,8 @@ impl Session {
                         "NotIssued: native cancel requires operation permission".into(),
                     ));
                 }
-                current_effect(&Some(context.clone()), true, || ())?;
+                current_effect_wait(Some(&context), true, &self.shared.connection_state, || ())
+                    .await?;
                 control
                     .cancel(context.scope)
                     .await
@@ -340,20 +349,22 @@ impl Session {
         let native = self.control.is_some();
         let sender = scoped_sender(&shared, native, &scope);
 
-        let admission = current_effect(&scope, native, || {
-            if self
-                .channels
-                .model_option
-                .as_ref()
-                .is_some_and(|option| option.id == config_id)
-            {
-                self.default_model = Some(value.clone());
-            }
-            if remember {
-                self.default_model_config
-                    .insert(config_id.clone(), value.clone());
-            }
-        });
+        let admission =
+            current_effect_wait(scope.as_ref(), native, &shared.connection_state, || {
+                if self
+                    .channels
+                    .model_option
+                    .as_ref()
+                    .is_some_and(|option| option.id == config_id)
+                {
+                    self.default_model = Some(value.clone());
+                }
+                if remember {
+                    self.default_model_config
+                        .insert(config_id.clone(), value.clone());
+                }
+            })
+            .await;
 
         if let Err(error) = admission {
             publish_scoped(
@@ -518,6 +529,17 @@ impl Session {
                 ));
             }
 
+            let shared = Arc::clone(&self.shared);
+            let cancel_grace = shared
+                .cancel_deadline
+                .lock()
+                .unwrap()
+                .clone()
+                .filter(|grace| {
+                    shared.connection_state.loss().is_none()
+                        && !shared.connection_state.is_stopping()
+                        && current_effect(&grace.scope, self.control.is_some(), || ()).is_ok()
+                });
             let reset_deadline = self
                 .pending_reset
                 .as_ref()
@@ -546,6 +568,53 @@ impl Session {
                         return Err(acp_internal_error(
                             "agent connection unavailable".into(),
                         ));
+                    }
+                    _ = async {
+                        match cancel_grace.as_ref() {
+                            Some(grace) => tokio::time::sleep_until(grace.deadline).await,
+                            None => std::future::pending().await,
+                        }
+                    } => {
+                        let grace = cancel_grace.expect("armed cancellation deadline");
+                        let publication = shared.state.publication.lock().await;
+                        if shared.terminal_claim.current_turn() != grace.turn
+                            || shared.terminal_claim.claimed()
+                            || !shared.prompt_in_flight.load(Ordering::Acquire)
+                        {
+                            let mut current = shared.cancel_deadline.lock().unwrap();
+                            if current.as_ref().is_some_and(|current|
+                                current.turn == grace.turn && current.deadline == grace.deadline)
+                            {
+                                *current = None;
+                            }
+                            continue;
+                        }
+                        let sender = scoped_sender(&shared, self.control.is_some(), &grace.scope);
+                        let permit = sender.reserve().await
+                            .map_err(|_| acp_internal_error("agent connection unavailable".into()))?;
+                        let published = current_effect(&grace.scope, self.control.is_some(), || {
+                            shared.connection_state.admit(|| {
+                                shared.terminal_claim.claim_and_publish(
+                                    grace.turn,
+                                    || shared.prompt_in_flight.load(Ordering::Acquire),
+                                    || {
+                                        shared.adopted_turn_active.store(false, Ordering::Release);
+                                        permit.send(Event::Stopped { reason: "agent_unresponsive".into() });
+                                        shared.prompt_in_flight.store(false, Ordering::Release);
+                                        *shared.cancel_deadline.lock().unwrap() = None;
+                                        shared.local_prompt_settled.notify_waiters();
+                                    },
+                                )
+                            })
+                        }).ok().and_then(Result::ok).unwrap_or(false);
+                        if published {
+                            shared.between_prompt.deactivate();
+                        }
+                        drop(publication);
+                        if published {
+                            break;
+                        }
+                        continue;
                     }
                     command = self.cmd_rx.recv() => command,
                     completed = async {
@@ -642,8 +711,40 @@ impl Session {
                         debug!(target: "acp.protocol", %error, "cancel not issued");
                         continue;
                     }
+                    let adopted = self.shared.adopted_turn_active.load(Ordering::Acquire)
+                        && self.shared.prompt_in_flight.load(Ordering::Acquire);
+                    let grace = if adopted {
+                        let turn = self.shared.terminal_claim.current_turn();
+                        match self.request_cancel(&scope, turn).await {
+                            Ok(grace) => Some(grace),
+                            Err(_) => continue,
+                        }
+                    } else {
+                        None
+                    };
                     if let Err(error) = self.send_cancel(scope.clone()).await {
                         warn!(target: "acp.protocol", %error, "idle cancel failed");
+                        continue;
+                    }
+                    if let Some((deadline, newly_armed)) = grace {
+                        if newly_armed {
+                            let escalates_at = chrono::Utc::now()
+                                + chrono::Duration::from_std(
+                                    deadline.saturating_duration_since(tokio::time::Instant::now()),
+                                )
+                                .unwrap_or_default();
+                            let sender =
+                                scoped_sender(&self.shared, self.control.is_some(), &scope);
+                            publish_scoped(
+                                &self.shared,
+                                self.control.is_some(),
+                                &scope,
+                                &sender,
+                                Event::CancelRequested { escalates_at },
+                                true,
+                            )
+                            .await;
+                        }
                         continue;
                     }
                     if self.stand_down_idle_completion(&scope) {
@@ -774,10 +875,12 @@ impl Session {
         if shared.connection_state.loss().is_some() {
             return;
         }
-        let Some(cost_seen) = shared
-            .between_prompt
-            .take_idle_fire(now_ms(), shared.aoe.leases.working(now_ms()))
-        else {
+        shared.expire_silent_subagents(now_ms()).await;
+        let Some(cost_seen) = shared.between_prompt.take_idle_fire(
+            now_ms(),
+            shared.aoe.leases.working(now_ms()),
+            shared.subagent_working(now_ms()),
+        ) else {
             return;
         };
         let adopted = shared.adopted_turn_active.swap(false, Ordering::Relaxed);
@@ -789,7 +892,6 @@ impl Session {
             if !shared.terminal_claim.claim_failed() {
                 return;
             }
-            shared.between_prompt.deactivate();
             shared
                 .emit_while_available([
                     Event::RateLimit { info },
@@ -1271,16 +1373,40 @@ impl Session {
                         let admission = if let Err(message) = &clear_after_seq {
                             Err(message.clone())
                         } else if projected && ready && pending.proposal.current().await {
-                            current_effect(&scope, native, || {
-                                self.acp_session_id = response.session_id.clone();
-                                self.channels = SessionChannels::new(
-                                    response.modes.as_ref(),
-                                    response.config_options.as_deref(),
-                                );
-                                shared.terminal_claim.clear_failed_outcome();
-                                shared.connection_state.record_usable();
+                            tokio::time::timeout_at(
+                                pending.deadline,
+                                current_effect_wait(
+                                    scope.as_ref(),
+                                    native,
+                                    &shared.connection_state,
+                                    || {
+                                        if (native
+                                            && !self.control.as_ref().is_some_and(|control| {
+                                                control.native_session_ready()
+                                            }))
+                                            || shared.connection_state.is_stopping()
+                                        {
+                                            return Err(
+                                                "native reset channel is unavailable".to_owned()
+                                            );
+                                        }
+                                        self.acp_session_id = response.session_id.clone();
+                                        self.channels = SessionChannels::new(
+                                            response.modes.as_ref(),
+                                            response.config_options.as_deref(),
+                                        );
+                                        shared.terminal_claim.clear_failed_outcome();
+                                        shared.connection_state.record_usable();
+                                        Ok(())
+                                    },
+                                ),
+                            )
+                            .await
+                            .map_err(|_| {
+                                "native reset continuation exceeded its deadline".to_owned()
                             })
-                            .map_err(|error| public_error_message(&error))
+                            .and_then(|result| result.map_err(|error| public_error_message(&error)))
+                            .and_then(|result| result)
                         } else {
                             Err("native reset was superseded or its channel is unavailable".into())
                         };
@@ -1643,6 +1769,74 @@ mod tests {
 
     #[tokio::test]
     #[serial_test::serial]
+    async fn reset_continuation_waits_for_original_registry_without_reissuing_new() {
+        with_managed(|scope| Box::pin(async move {
+            let directory = scope.tempdir();
+            let requests = Arc::new(std::sync::Mutex::new(Vec::<serde_json::Value>::new()));
+            let received = Arc::clone(&requests);
+            let mut new_sessions = 0;
+            let (config, _native) = scope.native_peer(
+                directory.path().into(), "gemini", "gemini", move |request| {
+                    received.lock().unwrap().push(request.clone());
+                    let result = match request["method"].as_str().unwrap() {
+                        "initialize" => serde_json::json!({"protocolVersion":1,"agentCapabilities":{}}),
+                        "session/new" => {
+                            new_sessions += 1;
+                            serde_json::json!({"sessionId":format!("reset-original-{new_sessions}")})
+                        }
+                        "session/prompt" => serde_json::json!({"stopReason":"end_turn"}),
+                        other => panic!("unexpected Native request: {other}"),
+                    };
+                    Some(serde_json::json!({"jsonrpc":"2.0","id":request["id"],"result":result}))
+                },
+            );
+            let mut client = scope.spawn(config, "reset-original-contention").await.unwrap();
+            client.ready().await;
+            let actual = client.actual();
+            let (gate, release, entered) = scope.gate();
+            assert!(actual.connection_state.test_establishment_usable.lock().unwrap().replace(gate).is_none());
+            let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+            let proposal = client.prepare_reset(deadline).await;
+            let reset = actual.reset_session("/clear", proposal, deadline, deadline + Duration::from_secs(5));
+            tokio::pin!(reset);
+            assert!(futures_util::poll!(reset.as_mut()).is_pending());
+            tokio::time::timeout(Duration::from_secs(10), entered).await.unwrap().unwrap();
+            let registry = crate::process::worker_registry::try_registry_lock(&client.id)
+                .unwrap().expect("hold the original physical runner's registry");
+            let (busy, observed) = oneshot::channel();
+            assert!(actual.connection_state.test_prompt_admission_busy.lock().unwrap().replace(busy).is_none());
+            assert!(release.release());
+            tokio::time::timeout(Duration::from_secs(10), async {
+                tokio::select! {
+                    busy = observed => busy.expect("the continuation observes physical exclusion"),
+                    result = reset.as_mut() => panic!("reset completed before exclusion released: {result:?}"),
+                }
+            }).await.expect("the real reset continuation reaches its physical guard");
+            assert_eq!(requests.lock().unwrap().iter().filter(|request| request["method"] == "session/new").count(), 2);
+            drop(registry);
+            let outcome = reset.await.unwrap();
+            assert!(matches!(&outcome, ResetSessionOutcome::Reset { new_acp_session_id }
+                if new_acp_session_id == "reset-original-2"), "{outcome:?}");
+            assert_eq!(actual.selected_native_session(), "reset-original-2");
+            client.send_prompt("new explicit input after reset", &[]).await.unwrap();
+            tokio::time::timeout(Duration::from_secs(10), async {
+                while let Some(event) = client.next_event().await {
+                    if matches!(event, Event::Stopped { reason } if reason == "prompt_complete") {
+                        return;
+                    }
+                }
+                panic!("original Native ended before its prompt terminal");
+            }).await.unwrap();
+            let requests = requests.lock().unwrap();
+            assert_eq!(requests.iter().filter(|request| request["method"] == "session/new").count(), 2);
+            let prompts = requests.iter().filter(|request| request["method"] == "session/prompt").collect::<Vec<_>>();
+            assert_eq!(prompts.len(), 1);
+            assert_eq!(prompts[0]["params"]["sessionId"], "reset-original-2");
+        })).await;
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
     async fn reset_write_fence_releases_or_expires_with_an_actual_read_admission() {
         for expire in [false, true] {
             with_managed(|scope| Box::pin(async move {
@@ -1695,8 +1889,10 @@ mod tests {
                 tokio::pin!(later);
                 assert!(futures_util::poll!(later.as_mut()).is_pending());
                 if expire {
-                    assert!(matches!(reset.as_mut().await.unwrap(), ResetSessionOutcome::Failed { message }
-                        if message == "reset deadline expired while callbacks were in flight"));
+                    let outcome = reset.as_mut().await.unwrap();
+                    assert!(matches!(outcome, ResetSessionOutcome::Failed { message }
+                        if message == "reset deadline expired while callbacks were in flight"
+                            || message == "agent did not settle session/new before the reset deadline"));
                     assert!(held.is_some());
                     drop(later.as_mut().await);
                     native.send(serde_json::json!({"jsonrpc":"2.0","method":"session/update","params":{
@@ -1704,10 +1900,39 @@ mod tests {
                         "content":{"type":"text","text":"non-parked progress after expiry"}}
                     }})).await;
                     tokio::time::timeout(Duration::from_secs(10), async {
-                        loop {
-                            if matches!(client.next_event().await, Some(Event::AgentMessageChunk { text, .. })
-                                if text == "non-parked progress after expiry") { break; }
+                        let mut original_expiry = false;
+                        let mut original_stopped = false;
+                        let mut progress = false;
+                        while !original_stopped || !progress {
+                            match client.next_event().await {
+                                Some(Event::PromptRuntimeError { message, .. }) => {
+                                    assert_eq!(
+                                        message,
+                                        "reset deadline expired while callbacks were in flight"
+                                    );
+                                    original_expiry = true;
+                                }
+                                Some(Event::Stopped { reason })
+                                    if reason == "session_reset_failed" =>
+                                {
+                                    assert!(original_expiry);
+                                    original_stopped = true;
+                                }
+                                Some(Event::AgentMessageChunk { text, .. })
+                                    if text == "non-parked progress after expiry" =>
+                                {
+                                    progress = true;
+                                }
+                                Some(Event::AgentStartupError { .. }
+                                    | Event::AcpConnectionUnavailable { .. }) =>
+                                {
+                                    panic!("callback-fence expiry must preserve its original Native");
+                                }
+                                Some(_) => {}
+                                None => panic!("original ingress ended after fence expiry"),
+                            }
                         }
+                        assert!(original_expiry);
                     }).await.expect("expiry releases original SDK progress while its non-parked admission remains held");
                     assert_eq!(ingress.current(), Some(old.clone()));
                     assert_eq!(received.lock().unwrap().iter().filter(|request| request["method"] == "session/new").count(), 1);

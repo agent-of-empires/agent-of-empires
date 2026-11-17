@@ -32,10 +32,12 @@ const live = vi.hoisted(() => ({
   sendPaste: vi.fn(() => true),
   reconnectAndClaim: vi.fn(),
   onGridTransport: undefined as (() => void) | undefined,
+  observation: null as null | { id: unknown; readOnly: unknown; path: unknown },
 }));
 
 vi.mock("../../hooks/useLiveTerminal", () => ({
   useLiveTerminal: (_id: unknown, _readOnly: unknown, _path: unknown, _clip: unknown, onGrid: () => void) => {
+    live.observation = { id: _id, readOnly: _readOnly, path: _path };
     live.onGridTransport = onGrid;
     return { ...live, maxRetries: 7, claim: vi.fn(), reconnectAndClaim: live.reconnectAndClaim };
   },
@@ -73,6 +75,7 @@ const recovery = (over: Partial<SessionRecovery> = {}): SessionRecovery => ({
   guidance: "Observe the retained conversation before writing another operation.",
   actions: { attach: true, retry_operation: true, restart_same: false, stop: true, fresh: false },
   expected: "opaque-exact-binding",
+  observe_expected: "opaque-exact-pane",
   ...over,
 });
 const fetchSpy = vi.fn<typeof fetch>();
@@ -98,18 +101,30 @@ afterEach(() => {
 });
 
 describe("terminal shared recovery", () => {
-  it("mounts and observes a failed operation without ensuring, replacing or resending", () => {
+  it("observes the exact failed pane read-only and revokes stale selection without ensuring or resending", () => {
     const projection = recovery();
-    render(
+    const session = makeSession({ id: "original", status: "Error", recovery: projection });
+    const { rerender } = render(<LiveTerminalView readOnly={false} recoveryCurrent session={session} />);
+    expect(screen.getByText(projection.diagnostic)).toBeTruthy();
+    expect(live.observation?.id).toBeNull();
+    fireEvent.click(screen.getByTestId("session-recovery-attach"));
+    expect(live.observation).toEqual({
+      id: "original",
+      readOnly: true,
+      path: "live-ws?observe=true&expected=opaque-exact-binding&observe_expected=opaque-exact-pane",
+    });
+    expect(live.manualReconnect).not.toHaveBeenCalled();
+    rerender(
       <LiveTerminalView
         readOnly={false}
         recoveryCurrent
-        session={makeSession({ id: "original", status: "Error", recovery: projection })}
+        session={{
+          ...session,
+          recovery: recovery({ observe_expected: "replacement-pane" }),
+        }}
       />,
     );
-    expect(screen.getByText(projection.diagnostic)).toBeTruthy();
-    fireEvent.click(screen.getByTestId("session-recovery-attach"));
-    expect(live.manualReconnect).toHaveBeenCalledOnce();
+    expect(live.observation?.id).toBeNull();
     expect(live.ensureSession).not.toHaveBeenCalled();
     expect(live.sendData).not.toHaveBeenCalled();
     expect(live.sendPaste).not.toHaveBeenCalled();
@@ -131,8 +146,11 @@ describe("terminal shared recovery", () => {
       />,
     );
     fireEvent.click(screen.getByTestId("session-recovery-restart-same"));
-    await waitFor(() => expect(live.manualReconnect).toHaveBeenCalledOnce());
-    expect(fetchSpy).toHaveBeenCalledOnce();
+    await waitFor(() => expect(fetchSpy).toHaveBeenCalledOnce());
+    await waitFor(() =>
+      expect((screen.getByTestId("session-recovery-restart-same") as HTMLButtonElement).disabled).toBe(false),
+    );
+    expect(live.manualReconnect).not.toHaveBeenCalled();
     expect(live.ensureSession).not.toHaveBeenCalled();
     expect(live.sendPaste).not.toHaveBeenCalled();
     expect(screen.getByText(projection.diagnostic)).toBeTruthy();

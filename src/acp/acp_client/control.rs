@@ -62,14 +62,15 @@ pub(super) struct DaemonControlClient {
     /// starts prompts in order, so the next that many starts belong to them.
     /// Only touched under the `completion` lock.
     abandoned_starts: Arc<AtomicUsize>,
-    /// A matched local outcome held until the crate reaches its
-    /// [`PromptCompletedMarker`], or until one of the reader's relays fails.
+    /// Outcomes awaiting their ordered [`PromptCompletedMarker`].
     settled: Arc<std::sync::Mutex<Option<LocalOutcome>>>,
     raw_fd: RawFd,
     peer_identity: crate::acp::runner_lifecycle::RunnerIdentity,
     peer_process: crate::process::CapturedProcess,
     correlation: Arc<std::sync::Mutex<ShimCorrelation>>,
     reverse_changed: Arc<tokio::sync::Notify>,
+    closed_locally: Arc<AtomicBool>,
+    loss: Arc<std::sync::OnceLock<ControlLoss>>,
 }
 
 struct ApplicationSlot {
@@ -135,6 +136,14 @@ struct LocalOutcome {
     correlation: Option<crate::acp::establishment::NativeOperationCorrelation>,
     tx: oneshot::Sender<ControlPromptResult>,
     result: ControlPromptResult,
+}
+/// The runner side ended a channel this daemon did not close. The runner may
+/// still be alive and attachable.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct ControlLoss {
+    /// `None` for a clean EOF.
+    pub(crate) io_error: Option<std::io::ErrorKind>,
+    pub(crate) turn_in_flight: bool,
 }
 
 #[derive(Debug, PartialEq)]
@@ -662,13 +671,14 @@ impl DaemonControlClient {
         self.shutdown();
     }
     pub(super) fn shutdown(&self) {
-        self.connection_state.observe(
-            AcpConnectionSource::Control,
-            AcpConnectionCause::ForwardPumpEnded,
-        );
+        self.closed_locally.store(true, AtomicOrdering::Release);
         // SAFETY: `self` keeps this exact socket alive for the call.
         unsafe { libc::shutdown(self.raw_fd, libc::SHUT_RDWR) };
         self.clear_correlation();
+    }
+
+    pub(super) fn loss_handle(&self) -> Arc<std::sync::OnceLock<ControlLoss>> {
+        Arc::clone(&self.loss)
     }
 
     async fn send(&self, body: ControlBody) -> Result<(), AcpError> {
@@ -1162,11 +1172,12 @@ pub(super) async fn wait_runner_registration(
 pub(super) async fn connect_runner_control(
     control_path: &std::path::Path,
     session_label: String,
-    terminal_claim: Arc<TerminalClaim>,
+    state: Arc<super::SessionState>,
     prompt_in_flight: Arc<std::sync::atomic::AtomicBool>,
     expected_owner: crate::acp::runner_lifecycle::RunnerIdentity,
     projection: Arc<crate::acp::event_sender::ProjectionState>,
 ) -> Result<(Arc<DaemonControlClient>, tokio::io::DuplexStream), AcpError> {
+    let terminal_claim = Arc::clone(&state.terminal_claim);
     let bound = runner_socket_deadline();
     let refused = |reason, observed_protocol| {
         AcpError::RetainedRuntimeUnavailable(Box::new(
@@ -1332,7 +1343,9 @@ pub(super) async fn connect_runner_control(
     let reader_shim_write = shim_write.clone();
     let reader_correlation = correlation.clone();
     let reader_reverse_changed = Arc::clone(&reverse_changed);
-    let ingress = Arc::new(SessionIngress::default());
+    let ingress = Arc::new(SessionIngress::with_original_quota(Arc::clone(
+        &state.original_quota,
+    )));
     let connection_state = Arc::new(ConnectionState::default());
     #[cfg(test)]
     let _ = connection_state.test_shim.set(shim_write.clone());
@@ -1347,6 +1360,9 @@ pub(super) async fn connect_runner_control(
     let reader_application = Arc::clone(&application);
     let establishment_context = Arc::new(std::sync::Mutex::new((None, None)));
     let reader_establishment_context = Arc::clone(&establishment_context);
+    let closed_locally = Arc::new(AtomicBool::new(false));
+    let loss = Arc::new(std::sync::OnceLock::new());
+    let (reader_closed_locally, reader_loss) = (closed_locally.clone(), loss.clone());
     let client = Arc::new(DaemonControlClient {
         correlation: Arc::clone(&correlation),
         reverse_changed,
@@ -1365,6 +1381,8 @@ pub(super) async fn connect_runner_control(
         raw_fd,
         peer_identity: expected_owner,
         peer_process,
+        closed_locally,
+        loss,
     });
     let _ = client.connection_state.control.set(Arc::downgrade(&client));
     #[cfg(test)]
@@ -1379,6 +1397,23 @@ pub(super) async fn connect_runner_control(
         .set(Arc::clone(&prompt_in_flight));
     let reader_control = Arc::downgrade(&client);
     tokio::spawn(async move {
+        let record_loss = |io_error| {
+            if reader_closed_locally.load(AtomicOrdering::Acquire) {
+                return;
+            }
+            let loss = ControlLoss {
+                io_error,
+                turn_in_flight: reader_prompt_in_flight.load(AtomicOrdering::Relaxed),
+            };
+            warn!(
+                target: "acp.protocol",
+                session = %reader_session,
+                io_error = ?loss.io_error,
+                turn_in_flight = loss.turn_in_flight,
+                "runner closed the control channel"
+            );
+            let _ = reader_loss.set(loss);
+        };
         async {
             let mut native_loss_relayed = false;
             loop {
@@ -1508,6 +1543,19 @@ pub(super) async fn connect_runner_control(
                                         }
                                     }
                                 }
+                            }
+                            ControlBody::EstablishmentFailed {
+                                receipt,
+                                error,
+                                origin: control_protocol::HandshakeFailureOrigin::NativeResponse,
+                                original_delivery: true,
+                                ..
+                            } => {
+                                *reader_connection_state.original_establishment_rejection
+                                    .lock().expect("original establishment rejection") =
+                                    Some((receipt.attempt.id, Arc::clone(error)));
+                                reader_ingress.revoke_requests();
+                                reader_connection_state.decline_establishment();
                             }
                             ControlBody::EstablishmentFailed { .. } => {
                                 reader_ingress.revoke_requests();
@@ -1693,9 +1741,9 @@ pub(super) async fn connect_runner_control(
                                 &reader_connection_state,
                             )
                             .await
-                            {
-                                return;
-                            }
+                        {
+                            return;
+                        }
                         }
                         else if let Some(adopted) = prepare_adopted_completion(
                             prompt_req_id, outcome, evidence, &reader_completion,
@@ -1916,26 +1964,22 @@ pub(super) async fn connect_runner_control(
                     }
                     Ok(Some(_)) => {}
                     Ok(None) => {
+                        record_loss(None);
                         reader_connection_state.observe(
-                            crate::acp::state::AcpConnectionSource::Control,
-                            crate::acp::state::AcpConnectionCause::IncomingEnded,
+                            AcpConnectionSource::Control,
+                            AcpConnectionCause::IncomingEnded,
                         );
                         return;
                     }
-                    Err(e) => {
-                        reader_connection_state.observe(
-                            crate::acp::state::AcpConnectionSource::Control,
-                            if e.downcast_ref::<std::io::Error>().is_some() {
-                                crate::acp::state::AcpConnectionCause::ReadFailed
-                            } else {
-                                crate::acp::state::AcpConnectionCause::ProtocolEnded
-                            },
-                        );
-                        debug!(
-                            target: "acp.protocol",
-                            session = %reader_session,
-                            "runner control read ended: {e}"
-                        );
+                    Err(error) => {
+                        let cause = if let Some(io) = error.downcast_ref::<std::io::Error>() {
+                            record_loss(Some(io.kind()));
+                            AcpConnectionCause::ReadFailed
+                        } else {
+                            AcpConnectionCause::ProtocolEnded
+                        };
+                        reader_connection_state.observe(AcpConnectionSource::Control, cause);
+                        debug!(target: "acp.protocol", session = %reader_session, %error, "runner control read ended");
                         return;
                     }
                 }
@@ -1955,8 +1999,7 @@ pub(super) async fn connect_runner_control(
         reader_reverse_changed.notify_waiters();
         {
             let mut completion = reader_completion.lock().expect("completion mutex poisoned");
-            // EOF aborts a local waiter, not an adopted marker already ordered
-            // into the SDK pipe. Explicit local activation still supersedes it.
+            // EOF aborts a pending waiter, not an already queued completion.
             if matches!(*completion, PromptCompletion::Pending { .. }) {
                 *completion = PromptCompletion::LocalIdle;
             }
@@ -2183,19 +2226,22 @@ pub(super) async fn connect_runner_control(
 /// Unknown successful stop reasons retain the existing completion fallback.
 pub(super) fn control_outcome_reason(
     outcome: &crate::acp::control_protocol::PromptOutcome,
-) -> String {
+) -> &'static str {
     use crate::acp::control_protocol::PromptOutcome;
     match outcome {
         PromptOutcome::Completed {
             stop_reason: Some(r),
         } => match r.as_str() {
             // The adapter spells it both ways.
-            "rate_limited" | "rate_limit" => "rate_limited".to_string(),
-            "cancelled" | "max_tokens" | "refusal" | "max_turn_requests" => r.clone(),
-            _ => "prompt_complete".to_string(),
+            "rate_limited" | "rate_limit" => "rate_limited",
+            "cancelled" => "cancelled",
+            "max_tokens" => "max_tokens",
+            "refusal" => "refusal",
+            "max_turn_requests" => "max_turn_requests",
+            _ => "prompt_complete",
         },
-        PromptOutcome::Completed { stop_reason: None } => "prompt_complete".to_string(),
-        PromptOutcome::Error { .. } | PromptOutcome::Aborted => "prompt_failed".to_string(),
+        PromptOutcome::Completed { stop_reason: None } => "prompt_complete",
+        PromptOutcome::Error { .. } | PromptOutcome::Aborted => "prompt_failed",
     }
 }
 
@@ -2204,7 +2250,7 @@ fn adopted_prompt_completion(
 ) -> (Option<control_protocol::AdoptedPromptDiagnostic>, String) {
     let reason = control_outcome_reason(&outcome);
     match prompt_outcome_to_response(outcome) {
-        Ok(_) => (None, reason),
+        Ok(_) => (None, reason.into()),
         Err(error) => {
             if let Some(info) = classify_rate_limit_error(&error, None) {
                 (
@@ -2335,7 +2381,10 @@ pub(super) async fn publish_adopted_completion(
     control: &DaemonControlClient,
     in_flight: &std::sync::atomic::AtomicBool,
     terminal: &TerminalClaim,
-    calendar_hint: impl FnOnce() -> Option<chrono::DateTime<chrono::Utc>>,
+    calendar_hint: impl FnOnce(
+        &control_protocol::NativePromptCompletionEvidence,
+    ) -> Option<(String, chrono::DateTime<chrono::Utc>)>,
+    publication: Option<tokio::sync::OwnedMutexGuard<()>>,
 ) -> AdoptedCompletionPublication {
     use crate::acp::event_sender::EventMetadata;
     use crate::acp::protocol::{
@@ -2360,6 +2409,7 @@ pub(super) async fn publish_adopted_completion(
     {
         return AdoptedCompletionPublication::Rejected;
     }
+    let original_hint = evidence.as_deref().and_then(calendar_hint);
     let native_outcome = match (evidence.as_ref(), outcome_kind) {
         (Some(_), AdoptedPromptOutcomeKind::Completed) => Some(AcpOriginalRequestResult::Succeeded),
         (Some(_), AdoptedPromptOutcomeKind::Error) => Some(AcpOriginalRequestResult::Failed),
@@ -2402,50 +2452,45 @@ pub(super) async fn publish_adopted_completion(
         return AdoptedCompletionPublication::Rejected;
     }
     let sender = events.with_metadata(metadata);
-    let count = 1 + usize::from(diagnostic.is_some());
-    let Ok(mut permits) = sender.reserve_many(count).await else {
-        return AdoptedCompletionPublication::Rejected;
+    let failed = matches!(reason.as_str(), "prompt_failed" | "rate_limited");
+    let local_turn = {
+        let completion = control
+            .completion
+            .lock()
+            .expect("completion mutex poisoned");
+        let local_match = matches!(&*completion, PromptCompletion::Adopted(Some(head))
+            if matches_adopted_head(head, prompt_req_id, evidence.as_deref()))
+            && in_flight.load(AtomicOrdering::Acquire);
+        turn.filter(|_| local_match)
+            .filter(|turn| terminal.claim_epoch(*turn, failed))
     };
-    let completion = control
-        .completion
-        .lock()
-        .expect("completion mutex poisoned");
-    let local_match = matches!(&*completion, PromptCompletion::Adopted(Some(head))
-        if matches_adopted_head(head, prompt_req_id, evidence.as_deref()))
-        && in_flight.load(AtomicOrdering::Acquire);
-    if local_match {
-        if let Some(diagnostic) = &mut diagnostic {
-            diagnostic.inherit_rate_limit_hint(calendar_hint);
+    if local_turn.is_none() && native_outcome.is_none() {
+        return AdoptedCompletionPublication::Rejected;
+    }
+    let _publication = if local_turn.is_some() {
+        publication
+    } else {
+        None
+    };
+    if let Some(diagnostic) = &mut diagnostic {
+        diagnostic.inherit_rate_limit_hint(|| original_hint);
+    }
+    if let Some(event) = diagnostic {
+        if sender.send(event.into_event()).await.is_err() {
+            return AdoptedCompletionPublication::Rejected;
         }
     }
-    let failed = matches!(reason.as_str(), "prompt_failed" | "rate_limited");
-    let mut reason = Some(reason);
-    let mut publish = || {
-        if let Some(event) = diagnostic.take() {
-            permits
-                .next()
-                .expect("diagnostic permit")
-                .send(event.into_event());
-        }
-        permits
-            .next()
-            .expect("terminal permit")
-            .send(Event::Stopped {
-                reason: reason.take().expect("terminal reason"),
-            });
-    };
-    if let Some(turn) = turn.filter(|_| local_match) {
-        if terminal.claim_epoch(turn, failed)
-            && terminal.publish_claimed(turn, failed, || {
-                publish();
-                in_flight.store(false, AtomicOrdering::Release);
-            })
-        {
+    if sender.send(Event::Stopped { reason }).await.is_err() {
+        return AdoptedCompletionPublication::Rejected;
+    }
+    if let Some(turn) = local_turn {
+        if terminal.publish_claimed(turn, failed, || {
+            in_flight.store(false, AtomicOrdering::Release);
+        }) {
             return AdoptedCompletionPublication::Settled(turn);
         }
     }
     if native_outcome.is_some() {
-        publish();
         AdoptedCompletionPublication::Historical
     } else {
         AdoptedCompletionPublication::Rejected
@@ -3111,7 +3156,7 @@ mod tests {
                     let (events, mut received) = mpsc::channel::<SdkEvent>(4);
                     let events: crate::acp::event_sender::EventSender = events.into();
                     let publication = publish_adopted_completion(
-                        *adopted, &events, &control, &in_flight, &terminal, || None,
+                        *adopted, &events, &control, &in_flight, &terminal, |_| None, None,
                     ).await;
                     assert!(matches!(publication, AdoptedCompletionPublication::Historical));
                     let data = match received.recv().await.unwrap() {
@@ -3414,7 +3459,7 @@ mod tests {
             let events: crate::acp::event_sender::EventSender = events.into();
             events.send(Event::AvailableCommandsUpdated { commands: vec![] }).await.unwrap();
             let publication = publish_adopted_completion(
-                *adopted, &events, &control, &in_flight, &terminal, || None,
+                *adopted, &events, &control, &in_flight, &terminal, |_| None, None,
             );
             tokio::pin!(publication);
             assert!(futures_util::poll!(publication.as_mut()).is_pending());
@@ -3496,7 +3541,10 @@ mod tests {
         connect_runner_control(
             control,
             session.into(),
-            terminal,
+            Arc::new(super::super::SessionState {
+                terminal_claim: terminal,
+                ..Default::default()
+            }),
             in_flight,
             fixture_owner(),
             Arc::new(crate::acp::event_sender::ProjectionState::read_only(None)),
@@ -4575,7 +4623,7 @@ mod tests {
                             cause: crate::acp::state::AcpConnectionCause::IncomingEnded, ..
                         }));
                         assert!(!control.peer_process.exited().unwrap());
-                        assert!(!task.is_finished(), "socket EOF is not the owned child's death");
+                        assert_eq!(actual.connected_runner(), Some(control.peer_identity()), "SDK EOF preserves the captured Native owner");
                         phase.store(13, AtomicOrdering::Relaxed);
                         let _ = control.cancel(operation_scope.clone()).await;
                         let request: agent_client_protocol::v1::schema::PromptRequest =
@@ -4911,5 +4959,310 @@ mod tests {
             assert!(!terminal.claimed());
             peer.await.unwrap();
         }
+    }
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn managed_historical_quota_keeps_only_its_written_window() {
+        use crate::acp::event_sender::EventScope;
+        use crate::acp::protocol::AcpPromptObservation;
+        use crate::acp::supervisor::test_support::managed::with_managed;
+
+        with_managed(|scope| Box::pin(async move {
+            for report_next in [false, true] {
+                let mut fixture = ManagedControlFixture::new(scope).await;
+                let original = fixture.start_prompt("original quota before adoption").await;
+                let mut fixture = fixture.adopt_in_flight(scope).await;
+                let actual = fixture.client.actual();
+                let control = actual.test_control();
+                let state = actual.test_connection_state();
+                let terminal = state.test_terminal.get().unwrap().clone();
+                let in_flight = state.test_in_flight.get().unwrap().clone();
+                let head = match &*control.completion.lock().unwrap() {
+                    PromptCompletion::Adopted(Some(head)) => head.clone(),
+                    _ => panic!("actual adoption retains the original head"),
+                };
+                let before = fixture.store.highest_seq(&fixture.client.id).unwrap();
+                fixture.native.send(serde_json::json!({
+                    "jsonrpc":"2.0", "method":"session/update", "params":{
+                        "sessionId":original["params"]["sessionId"],
+                        "update":{"sessionUpdate":"usage_update", "used":100, "size":200,
+                            "_meta":{"_claude/rateLimit":{
+                                "status":"rejected", "rateLimitType":"weekly",
+                                "resetsAt":4_102_444_800_i64
+                            }}
+                        }
+                    }
+                })).await;
+                real_control_deadline(async {
+                    loop {
+                        if matches!(fixture.next_event().await,
+                            Event::UsageUpdated { usage } if usage.used == 100)
+                        {
+                            break;
+                        }
+                    }
+                }).await;
+
+                let next = fixture.start_prompt("next explicit input while original is pending").await;
+                let (next_scope, next_window) = real_pending_scope(&control, &next).await;
+                let next_turn = terminal.current_turn();
+                assert_ne!(next_window, head.window_id);
+                assert!(!terminal.claimed());
+                assert!(in_flight.load(AtomicOrdering::Acquire));
+
+                // Both requests are physically outstanding, so this report is Ambiguous.
+                fixture.native.send(serde_json::json!({
+                    "jsonrpc":"2.0", "method":"session/update", "params":{
+                        "sessionId":original["params"]["sessionId"],
+                        "update":{"sessionUpdate":"usage_update", "used":101, "size":200,
+                            "_meta":{"_claude/rateLimit":{
+                                "status":"rejected", "rateLimitType":"weekly",
+                                "resetsAt":4_102_445_000_i64
+                            }}
+                        }
+                    }
+                })).await;
+                real_control_deadline(async {
+                    loop {
+                        if matches!(fixture.next_event().await,
+                            Event::UsageUpdated { usage } if usage.used == 101)
+                        {
+                            break;
+                        }
+                    }
+                }).await;
+                fixture.native.send(serde_json::json!({
+                    "jsonrpc":"2.0", "id":original["id"], "error":{
+                        "code":-32000, "message":"original quota refusal",
+                        "data":{"errorKind":"rate_limit"}
+                    }
+                })).await;
+                let original_events = real_events_until_stopped(&mut fixture, "rate_limited").await;
+                let original_quotas: Vec<_> = original_events.iter().filter_map(|event| {
+                    match event { Event::RateLimit { info } => Some(info), _ => None }
+                }).collect();
+                assert_eq!(original_quotas.len(), 1);
+                assert_eq!(original_quotas[0].kind, "weekly");
+                assert_eq!(original_quotas[0].resets_at.unwrap().timestamp(), 4_102_444_800);
+                assert_eq!(terminal.current_turn(), next_turn);
+                assert!(!terminal.claimed());
+                assert!(in_flight.load(AtomicOrdering::Acquire));
+                assert_eq!(real_pending_scope(&control, &next).await, (next_scope.clone(), next_window));
+                let stored = fixture.store.replay_from(&fixture.client.id, before).unwrap();
+                let quota = stored.iter().find(|stored| {
+                    matches!(stored.event.as_ref(), Event::RateLimit { .. })
+                        && stored.metadata.native_prompt_id == original["id"].as_i64()
+                }).expect("historical original quota was published");
+                assert_eq!(quota.metadata.scope, EventScope::HistoryOnly);
+                assert_eq!(quota.metadata.operation.unwrap().correlation, head.scope.correlation().unwrap());
+                assert_eq!(quota.metadata.prompt_observation, Some(
+                    AcpPromptObservation::Written { window_id: head.window_id }
+                ));
+                assert!(stored.iter().any(|stored| {
+                    matches!(stored.event.as_ref(), Event::UsageUpdated { usage } if usage.used == 101)
+                        && stored.metadata.prompt_observation == Some(AcpPromptObservation::Ambiguous)
+                }));
+
+                if report_next {
+                    fixture.native.send(serde_json::json!({
+                        "jsonrpc":"2.0", "method":"session/update", "params":{
+                            "sessionId":next["params"]["sessionId"],
+                            "update":{"sessionUpdate":"usage_update", "used":102, "size":200,
+                                "_meta":{"_claude/rateLimit":{
+                                    "status":"rejected", "rateLimitType":"five_hour",
+                                    "resetsAt":4_102_444_900_i64
+                                }}
+                            }
+                        }
+                    })).await;
+                    real_control_deadline(async {
+                        loop {
+                            if matches!(fixture.next_event().await,
+                                Event::UsageUpdated { usage } if usage.used == 102)
+                            {
+                                break;
+                            }
+                        }
+                    }).await;
+                }
+                fixture.native.send(serde_json::json!({
+                    "jsonrpc":"2.0", "id":next["id"], "error":{
+                        "code":-32000, "message":"next quota refusal",
+                        "data":{"errorKind":"rate_limit"}
+                    }
+                })).await;
+                let next_events = real_events_until_stopped(&mut fixture, "rate_limited").await;
+                let next_quotas: Vec<_> = next_events.iter().filter_map(|event| {
+                    match event { Event::RateLimit { info } => Some(info), _ => None }
+                }).collect();
+                assert_eq!(next_quotas.len(), 1);
+                if report_next {
+                    assert_eq!(next_quotas[0].kind, "five_hour");
+                    assert_eq!(next_quotas[0].resets_at.unwrap().timestamp(), 4_102_444_900);
+                } else {
+                    assert_eq!(next_quotas[0].kind, "rate_limit");
+                    assert_eq!(next_quotas[0].resets_at, None);
+                }
+                assert_eq!(fixture.native.requests().iter().filter(|method| *method == "session/prompt").count(), 2);
+                fixture.client.shutdown().await.unwrap();
+            }
+        })).await;
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn managed_quota_hints_keep_physical_custody_and_normalize_unnamed_windows() {
+        use crate::acp::state::NativePhysicalSource;
+        use crate::acp::supervisor::test_support::managed::with_managed;
+
+        with_managed(|scope| {
+            Box::pin(async move {
+                for rebased in [false, true] {
+                    for adopted in [false, true] {
+                        for named in [false, true] {
+                            let mut fixture = ManagedControlFixture::new(scope).await;
+                            let receipt = fixture
+                                .client
+                                .actual()
+                                .establishment_projection()
+                                .unwrap()
+                                .receipt_snapshot()
+                                .unwrap();
+                            let physical = NativePhysicalSource::from_receipt(&receipt).unwrap();
+
+                            if rebased {
+                                let mut row = scope
+                                    .state
+                                    .instances
+                                    .read()
+                                    .await
+                                    .iter()
+                                    .find(|row| row.id == fixture.client.id)
+                                    .unwrap()
+                                    .clone();
+                                let generation = row.lifecycle_generation;
+                                {
+                                    let storage = crate::session::Storage::open_reference(
+                                        &row.source_profile,
+                                    )
+                                    .unwrap();
+                                    let _native =
+                                        storage.acquire_instance_lifecycle_lock(&row.id).unwrap();
+                                    row.advance_auxiliary_generation_in(&storage).unwrap();
+                                    assert!(row.lifecycle_generation > generation);
+                                }
+                                // Refresh only from the genuinely persisted lifecycle mutation.
+                                let mut rows = scope.state.instances.write().await;
+                                *rows
+                                    .iter_mut()
+                                    .find(|current| current.id == fixture.client.id)
+                                    .unwrap() = row;
+                            }
+
+                            let before = fixture.store.highest_seq(&fixture.client.id).unwrap();
+                            let request = fixture
+                                .start_prompt("quota hint after genuine admission")
+                                .await;
+                            let control = fixture.client.actual().test_control();
+                            let (original_scope, window) =
+                                real_pending_scope(&control, &request).await;
+                            let origin = original_scope.origin(Some(&receipt)).unwrap();
+                            assert_eq!(origin.owner, Some(control.peer_identity()));
+                            assert_eq!(origin.attempt_id, physical.witness.attempt_id);
+                            assert_eq!(origin.producer, physical.witness.producer);
+                            assert_eq!(origin == physical.witness, !rebased);
+                            assert_eq!(origin.generation == physical.witness.generation, !rebased);
+                            if adopted {
+                                fixture = fixture.adopt_in_flight(scope).await;
+                            }
+
+                            let mut report = serde_json::json!({
+                                "status":"rejected", "resetsAt":4_102_444_800_i64
+                            });
+                            if named {
+                                report["rateLimitType"] = serde_json::json!("weekly");
+                            }
+                            fixture.native.send(serde_json::json!({
+                            "jsonrpc":"2.0", "method":"session/update", "params":{
+                                "sessionId":request["params"]["sessionId"],
+                                "update":{"sessionUpdate":"usage_update", "used":100, "size":200,
+                                    "_meta":{"_claude/rateLimit":report}}
+                            }
+                        })).await;
+                            fixture
+                                .native
+                                .send(serde_json::json!({
+                                    "jsonrpc":"2.0", "id":request["id"], "error":{
+                                        "code":-32000, "message":"genuine original quota refusal",
+                                        "data":{"errorKind":"rate_limit"}
+                                    }
+                                }))
+                                .await;
+                            let events =
+                                real_events_until_stopped(&mut fixture, "rate_limited").await;
+                            let quotas: Vec<_> = events
+                                .iter()
+                                .filter_map(|event| match event {
+                                    Event::RateLimit { info } => Some(info),
+                                    _ => None,
+                                })
+                                .collect();
+                            assert_eq!(quotas.len(), 1);
+                            assert_eq!(quotas[0].kind, if named { "weekly" } else { "rate_limit" });
+                            assert_eq!(quotas[0].resets_at.unwrap().timestamp(), 4_102_444_800);
+                            assert_one_real_stopped(
+                                &fixture,
+                                before,
+                                &request,
+                                &original_scope,
+                                window,
+                            );
+                            let stored = fixture
+                                .store
+                                .replay_from(&fixture.client.id, before)
+                                .unwrap();
+                            let quota = stored
+                                .iter()
+                                .find(|entry| {
+                                    matches!(entry.event.as_ref(), Event::RateLimit { .. })
+                                        && entry.metadata.native_prompt_id == request["id"].as_i64()
+                                })
+                                .unwrap();
+                            assert_eq!(quota.metadata.native_origin, Some(origin));
+                            assert_eq!(
+                                quota.metadata.operation.unwrap().correlation,
+                                original_scope.correlation().unwrap()
+                            );
+                            assert_eq!(
+                                quota.metadata.prompt_observation,
+                                Some(crate::acp::protocol::AcpPromptObservation::Written {
+                                    window_id: window,
+                                })
+                            );
+                            assert_eq!(
+                                fixture
+                                    .native
+                                    .requests()
+                                    .iter()
+                                    .filter(|method| *method == "session/new")
+                                    .count(),
+                                1
+                            );
+                            assert_eq!(
+                                fixture
+                                    .native
+                                    .requests()
+                                    .iter()
+                                    .filter(|method| *method == "session/prompt")
+                                    .count(),
+                                1
+                            );
+                            fixture.client.shutdown().await.unwrap();
+                        }
+                    }
+                }
+            })
+        })
+        .await;
     }
 }

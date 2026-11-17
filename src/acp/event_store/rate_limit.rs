@@ -3,7 +3,7 @@
 use anyhow::{Context, Result};
 use rusqlite::{params, Connection, OptionalExtension};
 
-use super::{ControlKnowledge, EventStore};
+use super::{decode_logged, ControlKnowledge, EventStore};
 use crate::acp::state::{Event, RateLimitInfo};
 use crate::events;
 
@@ -130,6 +130,34 @@ impl EventStore {
                 ControlKnowledge::Indeterminate => ControlKnowledge::Indeterminate,
             })
         })
+    }
+
+    /// The newest startup error and its recorded time (epoch ms), unless a session
+    /// assignment followed it: an assigned worker got past login.
+    pub fn unassigned_startup_error(&self, session_id: &str) -> Option<(String, i64)> {
+        let (json, created_at, assigned): (String, i64, bool) = self
+            .conn()
+            .query_row(
+                "SELECT event_json, created_at, EXISTS(
+                     SELECT 1 FROM acp_events a
+                     WHERE a.session_id = ?1 AND a.seq > e.seq
+                       AND a.discriminant = 'AcpSessionAssigned')
+                 FROM acp_events e
+                 WHERE e.session_id = ?1 AND e.discriminant = 'AgentStartupError'
+                 ORDER BY e.seq DESC LIMIT 1",
+                params![session_id],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .optional()
+            .ok()
+            .flatten()?;
+        if assigned {
+            return None;
+        }
+        match decode_logged(&json, session_id, "unassigned_startup_error")? {
+            Event::AgentStartupError { message, .. } => Some((message, created_at)),
+            _ => None,
+        }
     }
 }
 
@@ -511,10 +539,7 @@ mod tests {
             (
                 vec![
                     resume(false),
-                    Event::AgentStartupError {
-                        message: "spawn failed".into(),
-                        native_subject: None,
-                    },
+                    Event::startup_error("spawn failed"),
                     user_prompt("later explicit"),
                 ],
                 0,

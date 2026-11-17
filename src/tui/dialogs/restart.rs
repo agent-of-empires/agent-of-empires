@@ -758,6 +758,7 @@ mod tests {
                 fresh,
             },
             expected: "selection-a".into(),
+            observe_expected: None,
         }
     }
 

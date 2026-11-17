@@ -71,6 +71,7 @@ pub struct SessionRecovery {
     pub guidance: std::borrow::Cow<'static, str>,
     pub actions: RecoveryActions,
     pub expected: String,
+    pub observe_expected: Option<String>,
 }
 
 /// Inputs are observations, never worker presence or historical Ready events.
@@ -183,6 +184,12 @@ impl SessionRecovery {
             } else {
                 "Repair authentication or provider settings in the agent. Same preserves the qualified selection and sends no previous input. Fresh explicitly abandons pending AoE input, never replays prior input, and retains native and transcript history. Omitting AoE restore flags does not prevent an undeclared wrapper from restoring its own history.".into()
             },
+            observe_expected: row
+                .agent_pane
+                .physical
+                .as_deref()
+                .filter(|_| !row.is_structured())
+                .and_then(|physical| recovery_observation_selection(&expected, physical).ok()),
             actions,
             expected,
         })
@@ -247,6 +254,32 @@ pub(crate) fn recovery_selection(
     Ok(token)
 }
 
+pub(crate) fn recovery_observation_selection(
+    expected: &str,
+    physical: &super::LegacyToolObservation,
+) -> anyhow::Result<String> {
+    use sha2::{Digest, Sha256};
+    struct ObservationDigest(Sha256);
+    impl std::io::Write for ObservationDigest {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            self.0.update(bytes);
+            Ok(bytes.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+    let mut digest = ObservationDigest(Sha256::new());
+    digest.0.update(b"aoe-session-recovery-observation-v1\0");
+    serde_json::to_writer(&mut digest, &(expected, physical))?;
+    use std::fmt::Write;
+    let mut token = String::with_capacity(64);
+    for byte in digest.0.finalize() {
+        write!(token, "{byte:02x}")?;
+    }
+    Ok(token)
+}
+
 pub(crate) fn terminal_recovery_observation(row: &Instance) -> RecoveryObservation<'_> {
     use super::{PanePresence, RuntimeEvidence};
     let owned = row.agent_pane.state == PanePresence::Alive
@@ -265,7 +298,7 @@ pub(crate) fn terminal_recovery_observation(row: &Instance) -> RecoveryObservati
     {
         crate::session::config::profile_config::resolve_config(&row.effective_profile())
             .and_then(|config| {
-                Instance::execution_agent_for(&row.tool, row.get_tool_command(), &config.session)
+                Instance::execution_agent_for(&row.tool, &row.get_tool_command(), &config.session)
             })
             .err()
             .and_then(|error| error.downcast_ref::<super::ManagedResumeCause>().copied())

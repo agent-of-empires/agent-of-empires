@@ -771,8 +771,10 @@ mod tests {
             description: None,
             state,
             stop_reason: None,
+            error: None,
             cancel_capable,
             model: None,
+            background: false,
         };
         let cases = [
             (vec![], None),
@@ -1018,6 +1020,7 @@ mod tests {
             guidance: "Repair the provider in the existing Agent.".into(),
             actions: crate::session::RecoveryActions::default(),
             expected: "selection-a".into(),
+            observe_expected: None,
         });
         transcript.apply_reduced_state(4, failed, &[], true);
         transcript.revoke_native_authority();

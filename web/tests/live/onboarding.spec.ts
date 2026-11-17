@@ -11,6 +11,12 @@ import { commitAll, initWorkingRepo, writeFiles } from "../helpers/gitFixture";
 const presentAsRealBrowser = (page: Page) =>
   page.addInitScript(() => Object.defineProperty(navigator, "webdriver", { get: () => false }));
 
+/** Leave the setup wizard for later so `/` opens the dashboard, as "Go to dashboard" does. */
+async function deferSetup(page: Page, baseUrl: string) {
+  const res = await page.request.patch(`${baseUrl}/api/setup`, { data: { deferred: true } });
+  expect(res.ok(), "failed to defer setup").toBeTruthy();
+}
+
 type ApiJson = {
   app_state?: { has_seen_web_tour?: boolean };
   tips?: { id: string; seen?: boolean }[];
@@ -48,10 +54,8 @@ test("first-run tutorial: auto-launch, skip, persist, re-trigger, and the Settin
   const disableTipsRes = await page.request.post(`${serve.baseUrl}/api/tips/show`, { data: { enabled: false } });
   expect(disableTipsRes.ok(), "failed to disable tips before tutorial isolation").toBeTruthy();
 
+  await deferSetup(page, serve.baseUrl);
   await page.goto(serve.baseUrl);
-  // #1834: the theme welcome shows first.
-  await expect(page.getByRole("heading", { name: "Welcome to Agent of Empires" })).toBeVisible({ timeout: 10_000 });
-  await page.getByRole("button", { name: "Continue" }).click();
 
   await expect(firstStep).toBeVisible({ timeout: 10_000 });
   const skip = page.getByRole("button", { name: "Skip tour", exact: true });
@@ -70,7 +74,6 @@ test("first-run tutorial: auto-launch, skip, persist, re-trigger, and the Settin
   await page.reload();
   await expect(page.getByRole("button", { name: "Go to dashboard" })).toBeVisible();
   await expect(firstStep).toBeHidden();
-  await expect(page.getByRole("heading", { name: "Welcome to Agent of Empires" })).toBeHidden();
 
   // #4594: a Settings tab intro folds into "About" and stays folded across a reload.
   const intro = page.getByRole("region", { name: "About this tab" });
@@ -148,8 +151,8 @@ test.describe("tips", () => {
 
   test("tips: auto-pops on startup and marks the shown tip seen", async ({ page, serve }) => {
     await presentAsRealBrowser(page);
-    // Clear the earlier onboarding phases: theme welcome (localStorage) and tour (server).
-    await page.addInitScript(() => window.localStorage.setItem("aoe-welcome-seen", "1"));
+    // Clear the earlier onboarding phases: setup (deferred) and tour (server).
+    await deferSetup(page, serve.baseUrl);
     await page.request.post(`${serve.baseUrl}/api/app-state/web-tour-seen`);
     const postSeen = page.waitForResponse(
       (r) => r.url().includes("/api/app-state/tip-seen") && r.request().method() === "POST",
