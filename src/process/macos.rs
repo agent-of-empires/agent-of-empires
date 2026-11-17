@@ -556,8 +556,7 @@ fn staging_image_identity(path: &std::path::Path) -> anyhow::Result<Option<(u64,
     {
         Ok(file) => {
             let metadata = file.metadata()?;
-            anyhow::ensure!(metadata.is_file(), "inventory image is not a regular file");
-            Ok(Some(metadata_identity(&metadata)))
+            Ok(metadata.is_file().then(|| metadata_identity(&metadata)))
         }
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
         Err(error) => {
@@ -3210,6 +3209,13 @@ mod tests {
             )
             .unwrap()
         };
+        let sparse_bundle = parent.path().join("foreign.sparsebundle");
+        std::fs::create_dir(&sparse_bundle).unwrap();
+        let bundled_inventory = without_entities(&sparse_bundle);
+        assert!(verify(&bundled_inventory, true)
+            .unwrap_err()
+            .is::<StagingInventoryMissing>());
+        assert!(staging_verify_unattached_inventory(&bundled_inventory, image_identity).is_ok());
         let incomplete_foreign = without_entities(&other_image);
         assert!(verify(&incomplete_foreign, true)
             .unwrap_err()
@@ -3304,6 +3310,12 @@ mod tests {
         std::fs::remove_file(&image).unwrap();
         symlink(parent.path().join("retained.dmg"), &image).unwrap();
         assert!(verify(&inventory, true).is_err());
+        std::fs::remove_file(&image).unwrap();
+        std::fs::create_dir(&image).unwrap();
+        let owned_directory = snapshot(std::slice::from_ref(&image), &root, "/dev/disk42");
+        assert!(!verify(&owned_directory, true)
+            .unwrap_err()
+            .is::<StagingInventoryMissing>());
     }
 
     use super::*;
