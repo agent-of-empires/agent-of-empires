@@ -1,0 +1,31 @@
+# runtime: docker 29.5.2
+# command: docker pull docker.io/library/python:3.12-bookworm
+# captured: 2026-11-18T00:39:15Z
+# exit: 0, the retry 2 s after the cancel run; stderr was empty, stdout follows
+3.12-bookworm: Pulling from library/python
+2bdb40ec27b2: Pulling fs layer
+df8af2c9772e: Pulling fs layer
+6458fc480f83: Pulling fs layer
+f59e747f549e: Pulling fs layer
+1e5033b2efa3: Pulling fs layer
+a31a98848e2c: Pulling fs layer
+92caadca69c9: Pulling fs layer
+2bdb40ec27b2: Already exists
+8ae3f2b88215: Already exists
+8d4d29ee957b: Download complete
+1e5033b2efa3: Download complete
+92caadca69c9: Download complete
+6458fc480f83: Download complete
+f59e747f549e: Download complete
+df8af2c9772e: Download complete
+f59e747f549e: Pull complete
+92caadca69c9: Pull complete
+df8af2c9772e: Pull complete
+a31a98848e2c: Download complete
+1e5033b2efa3: Pull complete
+a31a98848e2c: Pull complete
+2bdb40ec27b2: Pull complete
+6458fc480f83: Pull complete
+Digest: sha256:4209fae09a3e20afd863e528bfddc235da5fd5977983e1996cd54cc9a72e6267
+Status: Downloaded newer image for python:3.12-bookworm
+docker.io/library/python:3.12-bookworm

@@ -1,0 +1,14 @@
+# runtime: docker 29.5.2
+# command: docker pull docker.io/library/python:3.12-bookworm
+# captured: 2026-11-18T00:39:12Z
+# exit: 143, SIGTERM to the process group 1 s in, after 2 done lines; stderr was empty, stdout follows
+3.12-bookworm: Pulling from library/python
+6458fc480f83: Pulling fs layer
+a31a98848e2c: Pulling fs layer
+f59e747f549e: Pulling fs layer
+df8af2c9772e: Pulling fs layer
+2bdb40ec27b2: Pulling fs layer
+1e5033b2efa3: Pulling fs layer
+92caadca69c9: Pulling fs layer
+2bdb40ec27b2: Download complete
+8ae3f2b88215: Download complete

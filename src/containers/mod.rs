@@ -3,6 +3,7 @@ pub mod error;
 mod execution;
 pub mod image_pull;
 pub mod image_update;
+pub mod pull_progress;
 mod runtime;
 pub(crate) mod runtime_base;
 pub mod stats;
