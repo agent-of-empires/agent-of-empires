@@ -133,11 +133,14 @@ impl GitWorktree {
             return Ok(main_repo);
         }
         let repo = open_repo_at(path).map_err(|_| GitError::NotAGitRepo)?;
-        // libgit2 takes the workdir from the admin dir, so check against the path opened.
-        if let Some(main_repo) = Self::find_main_repo_from_worktree_gitdir(repo.path())
-            .filter(|_| Self::admin_points_back_to(repo.path(), path))
-        {
-            return Ok(main_repo);
+        // libgit2 takes the workdir from the admin dir, so check against the path opened,
+        // and keep that path when the link is rejected.
+        if let Some(main_repo) = Self::find_main_repo_from_worktree_gitdir(repo.path()) {
+            return Ok(if Self::admin_points_back_to(repo.path(), path) {
+                main_repo
+            } else {
+                path.to_path_buf()
+            });
         }
         if let Some(workdir) = repo.workdir() {
             return Ok(workdir.to_path_buf());
@@ -190,10 +193,17 @@ impl GitWorktree {
         } else {
             admin.join(back)
         };
+        let git_file = workdir.join(".git");
         matches!(
-            (back.canonicalize(), workdir.join(".git").canonicalize()),
-            (Ok(a), Ok(b)) if a == b
+            (Self::without_final_link(&back), Self::without_final_link(&git_file)),
+            (Some(a), Some(b)) if a == b
         )
+    }
+
+    /// `path` with its parent canonicalized and its last component left alone, so a
+    /// `.git` symlink to another worktree's gitfile does not borrow that file's identity.
+    fn without_final_link(path: &Path) -> Option<PathBuf> {
+        Some(path.parent()?.canonicalize().ok()?.join(path.file_name()?))
     }
 
     /// The main repo of a linked worktree's canonical `gitdir`, or `None` if it is not one.
@@ -567,6 +577,7 @@ mod tests {
     /// A sandbox mounts its worktree read-write and can rewrite `<worktree>/.git`.
     /// A `gitdir:` line aimed at another host repo's `worktrees/<name>` admin dir
     /// must not make that repo the main repo, whichever way it is read.
+    #[cfg(unix)]
     #[test]
     fn rewritten_gitdir_cannot_redirect_the_main_repo() {
         let (real, _repo) = init_repo();
@@ -598,13 +609,24 @@ mod tests {
         .unwrap();
         let victim_main = victim.path().canonicalize().unwrap();
         let resolved = GitWorktree::find_main_repo(&worktree).unwrap();
-        assert_ne!(resolved, victim_main, "redirected to another host repo");
+        let victim_wt = victim_wt.canonicalize().unwrap();
+        let foreign = |resolved: &Path| resolved == victim_main || resolved == victim_wt;
+        assert!(!foreign(&resolved), "redirected to another host repo");
         assert!(GitWorktree::gitfile_target(
             &worktree,
             &std::fs::read_to_string(worktree.join(".git")).unwrap()
         )
         .and_then(|g| GitWorktree::find_main_repo_from_worktree_gitdir(&g))
-        .is_none_or(|m| m != victim_main));
+        .is_none_or(|m| !foreign(&m)));
+
+        // A `.git` that is a symlink to the other worktree's gitfile carries its back-pointer.
+        std::fs::remove_file(worktree.join(".git")).unwrap();
+        std::os::unix::fs::symlink(victim_wt.join(".git"), worktree.join(".git")).unwrap();
+        let resolved = GitWorktree::find_main_repo(&worktree).unwrap();
+        assert!(
+            !foreign(&resolved),
+            "symlinked .git redirected: {resolved:?}"
+        );
     }
 
     #[test]
