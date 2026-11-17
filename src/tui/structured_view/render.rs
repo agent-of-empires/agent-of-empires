@@ -92,17 +92,34 @@ fn render_choice_picker(
     let Some(picker) = &state.choice else {
         return;
     };
+    // Body width inside the popup: its border and horizontal padding.
+    let body_width = composer_area.width.saturating_sub(4);
+    // Rows the popup can paint above the composer, less its two borders.
+    let budget = (composer_area.y as usize).saturating_sub(2);
+    // The detail block is reserved at its fullest across the open options, so
+    // moving to another option cannot resize the popup and slide the rows out
+    // from under the pointer.
+    let detail_rows = picker
+        .details
+        .iter()
+        .flatten()
+        .map(|detail| detail_row_count(detail, body_width))
+        .max()
+        .unwrap_or(0)
+        .min(CHOICE_DETAIL_MAX_ROWS)
+        .min(budget.saturating_sub(1));
+    // The answers come first: context is what gets dropped on a short terminal,
+    // never the option the user is about to accept.
     let (first, mut lines) = window_rows(
         composer_area,
-        8,
+        budget.saturating_sub(detail_rows).min(8),
         picker.selected,
         prev_first,
         &picker.options,
         |(_, label)| vec![label.clone()],
     );
     let rows = lines.len();
-    // Body width inside the popup: its border and horizontal padding.
-    let body_width = composer_area.width.saturating_sub(4);
+    let context_cap = CHOICE_CONTEXT_MAX_ROWS.min(budget.saturating_sub(rows + detail_rows));
     let context_rows = picker.context.as_deref().map_or(0, |context| {
         let style = Style::default().fg(theme.hint);
         let mut wrapped = Vec::new();
@@ -113,28 +130,42 @@ fn render_choice_picker(
                 &mut wrapped,
             );
         }
-        cap_rows(&mut wrapped, CHOICE_CONTEXT_MAX_ROWS, style);
+        cap_rows(&mut wrapped, context_cap, style);
         let count = wrapped.len() as u16;
         lines.splice(0..0, wrapped);
         count
     });
     // The highlighted option carries its own detail, so the answer being
     // considered reads in full without opening the web form.
-    if let Some(Some(detail)) = picker.details.get(picker.selected) {
+    let mut detail = Vec::new();
+    if let Some(Some(text)) = picker.details.get(picker.selected) {
         let style = Style::default()
             .fg(theme.dimmed)
             .add_modifier(Modifier::ITALIC);
-        let mut wrapped = Vec::new();
         wrap_line_into(
-            Line::styled(format!("· {detail}"), style),
+            Line::styled(format!("· {text}"), style),
             body_width,
-            &mut wrapped,
+            &mut detail,
         );
-        cap_rows(&mut wrapped, CHOICE_DETAIL_MAX_ROWS, style);
-        lines.extend(wrapped);
+        cap_rows(&mut detail, CHOICE_DETAIL_MAX_ROWS, style);
     }
+    // Padded to the reserved height so the option rows keep their position.
+    detail.resize(detail_rows, Line::default());
+    lines.extend(detail);
     let drawn = render_popup_above(frame, composer_area, theme, picker.title.clone(), lines);
     record_picker(state, PickerKind::Choice, drawn, first, rows, context_rows);
+}
+
+/// Rows `detail` takes at `width`, counted the way it is painted.
+fn detail_row_count(detail: &str, width: u16) -> usize {
+    let style = Style::default().add_modifier(Modifier::ITALIC);
+    let mut wrapped = Vec::new();
+    wrap_line_into(
+        Line::styled(format!("· {detail}"), style),
+        width,
+        &mut wrapped,
+    );
+    wrapped.len()
 }
 
 /// Context rows a choice picker shows above its options, and detail rows it
@@ -148,7 +179,11 @@ fn cap_rows(rows: &mut Vec<Line<'static>>, max: usize, style: Style) {
     if rows.len() <= max {
         return;
     }
-    rows.truncate(max.saturating_sub(1));
+    if max == 0 {
+        rows.clear();
+        return;
+    }
+    rows.truncate(max - 1);
     rows.push(Line::styled("…", style));
 }
 
@@ -299,7 +334,12 @@ fn approval_shelf_height(state: &StructuredViewState, width: u16) -> u16 {
     let Some(row) = selected_pending_approval(state) else {
         return 0;
     };
-    let body = approval_body_rows(row, state.path_roots.as_ref(), width.saturating_sub(4));
+    let body = approval_body_rows(
+        row,
+        state.path_roots.as_ref(),
+        width.saturating_sub(4),
+        APPROVAL_BODY_MAX_ROWS,
+    );
     2 + body.len() as u16 + 1
 }
 
@@ -530,7 +570,13 @@ fn render_approval_shelf(
             height: inner.height - 1,
             ..inner
         };
-        let body = approval_body_lines(row, state.path_roots.as_ref(), theme, body_area.width);
+        let body = approval_body_lines(
+            row,
+            state.path_roots.as_ref(),
+            theme,
+            body_area.width,
+            body_area.height as usize,
+        );
         frame.render_widget(Paragraph::new(body), body_area);
     }
     let actions_area = Rect {
@@ -623,16 +669,17 @@ fn approval_body_rows(
     row: &PendingApproval,
     path_roots: Option<&SessionPathRoots>,
     width: u16,
+    max_rows: usize,
 ) -> Vec<(Line<'static>, ApprovalRowKind)> {
     let mut rows: Vec<(Line<'static>, ApprovalRowKind)> = Vec::new();
     let args = parse_args_object(&row.args);
     let target = args.as_ref().and_then(|args| tool_target(&row.kind, args));
     for (text, primary) in approval_body_entries(row) {
+        let is_command = primary && matches!(target, Some(ToolTarget::Command(_)));
         let text = match (target.as_ref(), primary) {
             (Some(ToolTarget::Path(_)), true) => {
                 relative_display_path(&text, path_roots).to_string()
             }
-            (Some(ToolTarget::Command(_)), true) => format!("$ {text}"),
             _ => text,
         };
         let kind = if primary {
@@ -641,12 +688,20 @@ fn approval_body_rows(
             ApprovalRowKind::Detail
         };
         let mut wrapped = Vec::new();
-        wrap_line_into(Line::raw(text), width, &mut wrapped);
+        // A command may run over several lines, and wrapping it as one would run
+        // those lines together: the shelf must show what would actually run.
+        for (index, logical) in text.split('\n').enumerate() {
+            let prefix = if is_command && index == 0 { "$ " } else { "" };
+            wrap_line_into(Line::raw(format!("{prefix}{logical}")), width, &mut wrapped);
+        }
         rows.extend(wrapped.into_iter().map(|line| (line, kind)));
     }
-    if rows.len() > APPROVAL_BODY_MAX_ROWS {
-        let hidden = rows.len() - (APPROVAL_BODY_MAX_ROWS - 1);
-        rows.truncate(APPROVAL_BODY_MAX_ROWS - 1);
+    // The shelf's real height wins: a capped body would otherwise be clipped by
+    // the paragraph, hiding rows without saying so.
+    let cap = max_rows.clamp(1, APPROVAL_BODY_MAX_ROWS);
+    if rows.len() > cap {
+        let hidden = rows.len() - (cap - 1);
+        rows.truncate(cap - 1);
         rows.push((
             Line::raw(format!("… +{hidden} more")),
             ApprovalRowKind::Hidden,
@@ -661,8 +716,9 @@ fn approval_body_lines(
     path_roots: Option<&SessionPathRoots>,
     theme: &Theme,
     width: u16,
+    max_rows: usize,
 ) -> Vec<Line<'static>> {
-    approval_body_rows(row, path_roots, width)
+    approval_body_rows(row, path_roots, width, max_rows)
         .into_iter()
         .map(|(mut line, kind)| {
             let style = match kind {
@@ -3206,6 +3262,109 @@ mod tests {
         let dump = render_dump(&state, 40, 24);
         assert!(dump.contains("step-0"), "{dump}");
         assert!(dump.contains(" more"), "the rest is counted: {dump}");
+
+        // A shelf clamped by a short terminal clips the paragraph, so the count
+        // has to come from the height it really has.
+        let dump = render_dump(&state, 40, 12);
+        assert!(
+            dump.contains(" more"),
+            "a clipped body still counts what it dropped: {dump}"
+        );
+    }
+
+    /// A command that runs over several lines is shown as it will run, not run
+    /// together the way a single wrapped line would show it.
+    #[test]
+    fn approval_shelf_keeps_the_lines_of_a_multiline_command() {
+        let mut state = test_state();
+        state.transcript.pending_approvals = vec![PendingApproval {
+            nonce: "n-1".into(),
+            title: "Bash".into(),
+            kind: "execute".into(),
+            args: serde_json::json!({ "command": "echo ok\nrm -rf build" }).to_string(),
+            destructive: false,
+            options: Vec::new(),
+            choice: false,
+        }];
+        state.selected_approval = Some("n-1".into());
+        state.focus = Focus::Approval;
+        let lines = render_rows(&state, 80, 24, true);
+        let dump = lines.join("\n");
+        assert!(
+            lines.iter().any(|line| line.contains("$ echo ok")),
+            "the command's pilot line is missing:\n{dump}"
+        );
+        assert!(
+            lines.iter().any(|line| line.contains("rm -rf build")),
+            "the command's second line is missing:\n{dump}"
+        );
+        assert!(
+            !lines
+                .iter()
+                .any(|line| line.contains("echo ok") && line.contains("rm -rf build")),
+            "the command's lines ran together:\n{dump}"
+        );
+    }
+
+    /// A question whose lead-in is longer than the room above the composer must
+    /// still show its answers: they are what the keys act on.
+    #[test]
+    fn question_picker_keeps_its_options_visible_on_a_short_terminal() {
+        use super::super::state::{ChoicePicker, ChoicePurpose};
+        let mut state = test_state();
+        state.choice = Some(ChoicePicker {
+            title: " Which store? ".into(),
+            context: Some(
+                (0..6)
+                    .map(|i| format!("line {i} of the lead-in"))
+                    .collect::<Vec<_>>()
+                    .join("\n"),
+            ),
+            options: vec![
+                ("a".into(), "Postgres".into()),
+                ("b".into(), "SQLite".into()),
+            ],
+            details: vec![Some("Managed, boring, already there".into()), None],
+            selected: 0,
+            purpose: ChoicePurpose::Mode,
+        });
+        let dump = render_dump(&state, 60, 12);
+        assert!(
+            dump.contains("Postgres") && dump.contains("SQLite"),
+            "the answers must stay on screen:\n{dump}"
+        );
+    }
+
+    /// Moving between options must not resize the popup: it is bottom-anchored,
+    /// so a shorter detail would slide the options out from under the pointer.
+    #[test]
+    fn question_picker_option_rows_hold_still_while_the_detail_changes() {
+        use super::super::state::{ChoicePicker, ChoicePurpose};
+        let mut state = test_state();
+        state.choice = Some(ChoicePicker {
+            title: " Which store? ".into(),
+            context: None,
+            options: vec![
+                ("a".into(), "Postgres".into()),
+                ("b".into(), "SQLite".into()),
+            ],
+            details: vec![
+                Some("Managed, boring, already there and worth its own rows".into()),
+                None,
+            ],
+            selected: 0,
+            purpose: ChoicePurpose::Mode,
+        });
+        let _ = render_dump(&state, 80, 24);
+        let with_detail = state.mouse_targets.borrow().picker.expect("picker").rows;
+
+        state.choice.as_mut().unwrap().selected = 1;
+        let _ = render_dump(&state, 80, 24);
+        let without_detail = state.mouse_targets.borrow().picker.expect("picker").rows;
+        assert_eq!(
+            with_detail.y, without_detail.y,
+            "the option rows must keep their place when the detail shrinks"
+        );
     }
 
     /// Two agent messages render as two bubbles; one streamed message
