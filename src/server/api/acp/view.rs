@@ -4106,7 +4106,13 @@ mod tests {
             .map(|value| value.to_str().unwrap().to_string());
         let bytes = axum::body::to_bytes(response.into_body(), usize::MAX).await?;
         let Some(code) = code else {
-            return Ok((status, serde_json::from_slice(&bytes)?));
+            let json = serde_json::from_slice(&bytes).map_err(|error| {
+                anyhow::anyhow!(
+                    "uncoded terminal response {status}: {:?}: {error}",
+                    String::from_utf8_lossy(&bytes)
+                )
+            })?;
+            return Ok((status, json));
         };
         let message = String::from_utf8(bytes.to_vec())?;
         assert!(
@@ -4743,8 +4749,7 @@ mod tests {
         }
         assert!(!argv.exists(), "a refused switch launched the agent");
 
-        // A no-choice switch whose reservation lands but whose adoption fails stays pending. A
-        // retry with a choice is refused as before reservation, not driven into the command.
+        // Failed adoption leaves a reservation; a choice must not drive its command.
         {
             let (native, durable) = load_handoff_row(&state, "default", &reserved.id).await?;
             let cached = find_instance(&state, &reserved.id).await.unwrap();
@@ -4777,6 +4782,8 @@ mod tests {
             .unwrap_err();
             assert!(error.is::<HandoffReserved>(), "{error:#}");
             crate::server::test_support::refresh_canonical_metadata_for_test(&state).await;
+            // Settle reservation cleanup before taking the recovery snapshot.
+            state.runtime.work.drain().await;
             crate::server::test_support::accept_runtime_read_cache_for_test(&state).await;
         }
         let checked = acp_terminal_check(State(state.clone()), Path(reserved.id.clone())).await;
