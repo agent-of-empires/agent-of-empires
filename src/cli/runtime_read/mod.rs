@@ -25,6 +25,7 @@ use self::dto::{
     parse_hello, parse_snapshot, validate_cross_message, validate_hello, validate_snapshot,
     HelloParseError,
 };
+pub(crate) use self::endpoint::env_url_is_unset;
 /// Re-exported so an out-of-process harness can aim a read at a chosen
 /// endpoint; production callers use [`read_request_source`].
 pub use self::endpoint::ReadRequestSource;

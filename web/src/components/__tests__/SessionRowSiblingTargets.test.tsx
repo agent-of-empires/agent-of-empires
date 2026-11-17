@@ -5,7 +5,12 @@ import { cleanup, fireEvent, screen } from "@testing-library/react";
 
 import type { SessionResponse } from "../../lib/types";
 import { EMPTY_OPTIMISTIC, optimisticForRow, optimisticKey, withOverride } from "../../lib/sidebarOptimistic";
-import { recreateContainerTitle, resolveActionTargets } from "../sidebar/sessionActionTargets";
+import {
+  recreateContainerBlock,
+  recreateContainerTitle,
+  resolveActionTargets,
+  type RecreateContainerBlock,
+} from "../sidebar/sessionActionTargets";
 import { makeSession, makeWorkspace, openRowMenu, stubFetch } from "./fixtures";
 
 const sibling = (id: string, over: Partial<SessionResponse> = {}) => makeSession({ id, title: `title ${id}`, ...over });
@@ -49,10 +54,23 @@ describe("resolveActionTargets", () => {
     expect(ids(t.switchView)).toEqual(["acp", "fork", "capable"]);
   });
 
-  it("gives the startup error screen a title only for a Session the menu could recreate", () => {
-    expect(recreateContainerTitle(sibling("boxed", { status: "Running", is_sandboxed: true }))).toBe("title boxed");
-    expect(recreateContainerTitle(sibling("host", { status: "Running" }))).toBeUndefined();
-    expect(recreateContainerTitle(sibling("archived", { is_sandboxed: true, archived_at: "x" }))).toBeUndefined();
+  it("says why a container can't be recreated, and titles only a Session the menu could recreate", () => {
+    const boxed = { status: "Running", is_sandboxed: true } as const;
+    const rows: [Partial<SessionResponse>, RecreateContainerBlock | null][] = [
+      [boxed, null],
+      [{ status: "Running" }, "not_sandboxed"],
+      [{ ...boxed, archived_at: "x" }, "archived"],
+      [{ ...boxed, trashed_at: "x" }, "trashed"],
+      // Trash wins, as in the stopped banners: restoring is the first step.
+      [{ ...boxed, trashed_at: "x", archived_at: "x" }, "trashed"],
+      [{ ...boxed, status: "Creating" }, "creating"],
+      [{ ...boxed, status: "Deleting" }, "deleting"],
+    ];
+    const got = rows.map(([over]) => {
+      const s = sibling("s", over);
+      return [recreateContainerBlock(s, !!s.archived_at), recreateContainerTitle(s) ?? null];
+    });
+    expect(got).toEqual(rows.map(([, block]) => [block, block === null ? "title s" : null]));
   });
 
   it("hides Start while an archive is pending, and allows it once unarchiving", () => {

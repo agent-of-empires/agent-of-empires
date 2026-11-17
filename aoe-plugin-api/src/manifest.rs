@@ -746,19 +746,61 @@ fn declaration_value_ok(value: &str) -> bool {
     value.len() <= 4096 && value.chars().all(declaration_character_ok)
 }
 
+/// A worker RPC method name: dotted identifier segments, nothing else.
+fn declaration_method_ok(method: &str) -> bool {
+    (1..=64).contains(&method.len())
+        && method.split('.').all(|segment| {
+            !segment.is_empty()
+                && !segment.starts_with(|c: char| c.is_ascii_digit())
+                && segment
+                    .bytes()
+                    .all(|c| c.is_ascii_alphanumeric() || c == b'_' || c == b'-')
+        })
+}
+
 fn validate_agent_declaration(
     i: usize,
     integration: &crate::agent_integration::AgentIntegrationContribution,
     status_integration: bool,
+    worker_runtime: bool,
     check: &mut impl FnMut(bool, String),
 ) {
     use crate::agent_integration::{
         AgentCaptureBackend, AgentCaptureContext, AgentKeyDeclaration, AgentResumeDeclaration,
-        AgentYoloDeclaration,
+        AgentYoloDeclaration, SESSION_ID_TIMEOUT_MS_MAX, SESSION_ID_TIMEOUT_MS_MIN,
     };
+    if let Some(session_id) = &integration.session_id {
+        check(
+            declaration_method_ok(&session_id.method),
+            format!(
+                "agent_integrations[{i}].session_id.method must be a worker RPC method name like \
+                 \"omp.session_id\""
+            ),
+        );
+        if let Some(method) = &session_id.launch_method {
+            check(
+                declaration_method_ok(method),
+                format!(
+                    "agent_integrations[{i}].session_id.launch_method must be a worker RPC method \
+                     name like \"omp.session_id.launch\""
+                ),
+            );
+        }
+        check(
+            (SESSION_ID_TIMEOUT_MS_MIN..=SESSION_ID_TIMEOUT_MS_MAX).contains(&session_id.timeout_ms),
+            format!(
+                "agent_integrations[{i}].session_id.timeout_ms must be {SESSION_ID_TIMEOUT_MS_MIN}..={SESSION_ID_TIMEOUT_MS_MAX}"
+            ),
+        );
+        check(
+            worker_runtime,
+            format!("agent_integrations[{i}].session_id requires the plugin to declare a [runtime] worker"),
+        );
+    }
     if integration.launch.is_none()
         && integration.detection.is_none()
         && integration.reply_fallback.is_none()
+        && integration.session_id.is_none()
     {
         return;
     }
@@ -1237,15 +1279,45 @@ impl PluginManifest {
             .capabilities
             .iter()
             .any(|capability| capability.as_str() == "session.integration");
+        let worker_runtime = self.runtime.is_some();
         for (i, integration) in self.agent_integrations.iter().enumerate() {
-            validate_agent_declaration(i, integration, status_integration, &mut check);
+            validate_agent_declaration(
+                i,
+                integration,
+                status_integration,
+                worker_runtime,
+                &mut check,
+            );
             check(
                 self.api_version >= 21
                     || (integration.launch.is_none()
                         && integration.detection.is_none()
-                        && integration.reply_fallback.is_none()),
+                        && integration.reply_fallback.is_none()
+                        && integration.session_id.is_none()),
                 format!("agent_integrations[{i}] declarations require api_version >= 21"),
             );
+            check(
+                self.api_version >= 22 || integration.session_id.is_none(),
+                format!("agent_integrations[{i}].session_id requires api_version >= 22"),
+            );
+            if let Some(delay) = integration
+                .launch
+                .as_ref()
+                .and_then(|launch| launch.send_keys_enter_delay_ms)
+            {
+                check(
+                    self.api_version >= 22,
+                    format!(
+                        "agent_integrations[{i}].launch.send_keys_enter_delay_ms requires api_version >= 22"
+                    ),
+                );
+                check(
+                    delay <= 2_000,
+                    format!(
+                        "agent_integrations[{i}].launch.send_keys_enter_delay_ms must be at most 2000"
+                    ),
+                );
+            }
             check(
                 if status_integration {
                     !integration.provider_versions.is_empty()

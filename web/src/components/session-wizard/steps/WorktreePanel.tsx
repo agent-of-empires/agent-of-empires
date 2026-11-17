@@ -3,6 +3,7 @@ import { fetchWorktrees, type WorktreeInfo } from "../../../lib/api";
 import { useBranchSuggestions } from "./branchSuggestions";
 import { ToggleRow } from "./Toggle";
 import type { WizardData } from "../wizardReducer";
+import { hasFinePointer } from "../../../lib/platform";
 
 interface Props {
   data: WizardData;
@@ -20,6 +21,7 @@ export function WorktreePanel({ data, onChange }: Props) {
       <input
         id="wizard-worktree-branch"
         type="text"
+        autoFocus={hasFinePointer()}
         value={data.worktreeBranch}
         onChange={(e) => onChange("worktreeBranch", e.target.value)}
         placeholder="Uses session title if empty"

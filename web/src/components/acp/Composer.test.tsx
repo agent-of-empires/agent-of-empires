@@ -127,6 +127,16 @@ describe("toolbar and send", () => {
     expect(send.disabled).toBe(true);
   });
 
+  it("sends nothing while blocked, even text a restored draft put there, and says why", () => {
+    const enqueuePrompt = vi.fn();
+    const { textarea } = mount({ blockedReason: "Recreate the container to send messages.", enqueuePrompt });
+    fireEvent.change(textarea(), { target: { value: "restored draft" } });
+    expect([textarea().disabled, textarea().placeholder]).toEqual([true, "Recreate the container to send messages."]);
+    expect((screen.getByRole("button", { name: "Send message" }) as HTMLButtonElement).disabled).toBe(true);
+    fireEvent.keyDown(textarea(), { key: "Enter" });
+    expect(enqueuePrompt).not.toHaveBeenCalled();
+  });
+
   it.each([
     [{ amount: 0.42, currency: "USD" }, 120_000, "60%"],
     [null, 50_000, "25%"],

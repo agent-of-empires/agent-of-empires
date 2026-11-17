@@ -433,6 +433,150 @@ fn runtime_requires_worker_capability() {
 }
 
 #[test]
+fn send_keys_enter_delay_requires_api_22_and_caps_at_two_seconds() {
+    let declaration = "[[agent_integrations]]\ntool = \"example\"\ncommand = \"example\"\n\
+                       [agent_integrations.launch]\n\
+                       send_keys_enter_delay_ms = 150\n";
+
+    let parsed = parse(22, declaration);
+    assert_eq!(
+        parsed.agent_integrations[0]
+            .launch
+            .as_ref()
+            .and_then(|launch| launch.send_keys_enter_delay_ms),
+        Some(150)
+    );
+    assert_eq!(
+        PluginManifest::from_toml_str(&toml::to_string(&parsed).unwrap())
+            .expect("round-trips")
+            .agent_integrations[0]
+            .launch
+            .as_ref()
+            .and_then(|launch| launch.send_keys_enter_delay_ms),
+        Some(150)
+    );
+
+    let errors = invalid(21, declaration);
+    assert!(
+        errors
+            .iter()
+            .any(|error| error.contains("send_keys_enter_delay_ms requires api_version >= 22")),
+        "{errors:?}"
+    );
+
+    let errors = invalid(22, &declaration.replace("150", "2001"));
+    assert!(
+        errors
+            .iter()
+            .any(|error| error.contains("send_keys_enter_delay_ms must be at most 2000")),
+        "{errors:?}"
+    );
+
+    parse(22, &declaration.replace("150", "2000"));
+}
+
+#[test]
+fn session_id_capture_requires_api_22_and_a_worker_runtime() {
+    let runtime = "capabilities = [\"runtime.worker\"]\n\
+                   [runtime]\n\
+                   kind = \"command\"\n\
+                   command = [\".venv/bin/worker\"]\n";
+    let declaration = "[[agent_integrations]]\ntool = \"example\"\ncommand = \"example\"\n\
+                       [agent_integrations.session_id]\n\
+                       method = \"example.session_id\"\n";
+    let body = format!("{runtime}{declaration}");
+
+    let parsed = parse(22, &body);
+    let session_id = parsed.agent_integrations[0]
+        .session_id
+        .as_ref()
+        .expect("declared");
+    assert_eq!(session_id.timeout_ms, 5_000);
+    assert!(session_id.launch_method.is_none());
+    assert_eq!(
+        PluginManifest::from_toml_str(&toml::to_string(&parsed).unwrap())
+            .expect("round-trips")
+            .agent_integrations[0]
+            .session_id,
+        parsed.agent_integrations[0].session_id
+    );
+
+    let errors = invalid(21, &body);
+    assert!(
+        errors
+            .iter()
+            .any(|error| error.contains("session_id requires api_version >= 22")),
+        "{errors:?}"
+    );
+
+    let errors = invalid(22, declaration);
+    assert!(
+        errors
+            .iter()
+            .any(|error| error
+                .contains("session_id requires the plugin to declare a [runtime] worker")),
+        "{errors:?}"
+    );
+}
+
+#[test]
+fn session_id_rejects_invalid_methods_and_timeouts() {
+    let runtime = "capabilities = [\"runtime.worker\"]\n\
+                   [runtime]\n\
+                   kind = \"command\"\n\
+                   command = [\".venv/bin/worker\"]\n";
+    let body = |session_id: &str| {
+        format!(
+            "{runtime}[[agent_integrations]]\ntool = \"example\"\ncommand = \"example\"\n\
+             [agent_integrations.session_id]\n{session_id}"
+        )
+    };
+
+    for method in [
+        "\"\"",
+        "\"example session\"",
+        "\"1example\"",
+        "\"example..id\"",
+    ] {
+        let errors = invalid(22, &body(&format!("method = {method}\n")));
+        assert!(
+            errors
+                .iter()
+                .any(|error| error.contains("session_id.method must be a worker RPC method name")),
+            "{method}: {errors:?}"
+        );
+    }
+    let errors = invalid(
+        22,
+        &body("method = \"example.session_id\"\nlaunch_method = \"example launch\"\n"),
+    );
+    assert!(
+        errors.iter().any(
+            |error| error.contains("session_id.launch_method must be a worker RPC method name")
+        ),
+        "{errors:?}"
+    );
+    for timeout in [0, 249, 30_001] {
+        let errors = invalid(
+            22,
+            &body(&format!(
+                "method = \"example.session_id\"\ntimeout_ms = {timeout}\n"
+            )),
+        );
+        assert!(
+            errors
+                .iter()
+                .any(|error| error.contains("session_id.timeout_ms must be")),
+            "{timeout}: {errors:?}"
+        );
+    }
+    parse(
+        22,
+        &body("method = \"example.session_id\"\nlaunch_method = \"example.session_id.launch\"\ntimeout_ms = 1000\n"),
+    );
+}
+
+#[test]
 fn runtime_specs_parse() {
     let m = parse(
         2,

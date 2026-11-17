@@ -204,6 +204,10 @@ pub fn dispatch(
             ctx.require(CAP_SESSION_WRITE)?;
             session_meta_cas(state, ctx, params)
         }
+        "session.capture.set" => {
+            ctx.require(CAP_SESSION_WRITE)?;
+            session_capture_set(state, ctx, params)
+        }
         "sessions.list" => {
             ctx.require(CAP_SESSION_READ)?;
             sessions_list(state, params)
@@ -372,6 +376,70 @@ fn session_meta_set(
         )));
     }
     Ok(json!({ "ok": true }))
+}
+
+/// Adopt a session id the declaring plugin captured for one of its rows.
+///
+/// The plugin owns the provider's store, so it reports what it found; the host
+/// keeps the write on the capture path the pollers use, which refuses a sid
+/// another row owns, honours capture excludes and the launch pin.
+///
+/// The report names no execution and no launch, so the id is stored unscoped
+/// and a late report for an earlier launch is applied to whatever the row holds
+/// now. See `docs/plugin-api.md` for the contract this places on a worker.
+fn session_capture_set(
+    state: &HostApiState,
+    ctx: &PluginRpcContext,
+    params: &Value,
+) -> Result<Value, DispatchError> {
+    let session_id = str_param(params, "session_id")?.to_string();
+    let captured = str_param(params, "agent_session_id")?;
+    if !crate::session::capture::is_valid_session_id(captured) {
+        return Err(DispatchError::invalid_params(
+            "\"agent_session_id\" is not a session id",
+        ));
+    }
+    let storage = state
+        .storage()
+        .map_err(|error| DispatchError::internal(error.to_string()))?;
+    let instance = storage
+        .load()
+        .map_err(|error| DispatchError::internal(error.to_string()))?
+        .into_iter()
+        .find(|instance| instance.id == session_id)
+        .ok_or_else(|| DispatchError::invalid_params(format!("unknown session {session_id:?}")))?;
+    if !super::agent_integration::owns_capture(&instance, &ctx.plugin_id) {
+        return Err(DispatchError::with_kind(
+            codes::FORBIDDEN,
+            "not_capture_owner",
+            "this plugin does not own session-id capture for the session's tool",
+        ));
+    }
+    let expected = instance.conversation_state();
+    let mut observation =
+        crate::session::poller::SessionIdObservation::unguarded(captured.to_string());
+    // The report carries no launch identity, so stamp the row's current launch:
+    // the observation's own launch check would otherwise refuse every row that
+    // has an active execution. The transaction CAS against `expected` still
+    // covers a relaunch that lands between this read and the write.
+    observation.execution = expected.active.clone();
+    let commit = crate::session::persist_session_with_storage(
+        &storage,
+        &session_id,
+        &observation,
+        &expected,
+    );
+    match commit.outcome {
+        crate::session::SidWrite::Applied => Ok(json!({ "applied": true })),
+        crate::session::SidWrite::PinnedForeign => {
+            Ok(json!({ "applied": false, "reason": "pinned" }))
+        }
+        crate::session::SidWrite::OwnershipConflict => {
+            Ok(json!({ "applied": false, "reason": "owned_elsewhere" }))
+        }
+        crate::session::SidWrite::Skipped => Ok(json!({ "applied": false, "reason": "stale" })),
+        crate::session::SidWrite::Failed => Err(DispatchError::internal("capture write failed")),
+    }
 }
 
 fn session_meta_cas(
@@ -1516,5 +1584,240 @@ mod tests {
             "voice",
         );
         dispatch(&state, &c, "ui.state.set", &action(true)).unwrap();
+    }
+
+    /// Install an approved plugin that declares session-id capture for `tool`.
+    fn install_capture_plugin(plugin_id: &str, tool: &str) {
+        let manifest = format!(
+            r#"id = "{plugin_id}"
+name = "Capture"
+version = "1.0.0"
+api_version = 22
+capabilities = ["runtime.worker"]
+
+[runtime]
+kind = "command"
+system = true
+command = ["node"]
+
+[[agent_integrations]]
+tool = "{tool}"
+command = "{tool}"
+
+[agent_integrations.session_id]
+method = "{tool}.session_id"
+"#
+        );
+        let dir = crate::plugin::plugins_dir().unwrap().join(plugin_id);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("aoe-plugin.toml"), &manifest).unwrap();
+        crate::session::update_config(|config| {
+            config.plugins.insert(
+                plugin_id.to_string(),
+                crate::session::PluginConfig {
+                    grant: Some(crate::session::CapabilityGrant {
+                        manifest_hash: aoe_plugin_api::PluginManifest::hash_bytes(
+                            manifest.as_bytes(),
+                        ),
+                        capabilities: vec!["runtime.worker".into()],
+                        granted_at: chrono::Utc::now(),
+                    }),
+                    ..Default::default()
+                },
+            );
+        })
+        .unwrap();
+        crate::plugin::reload_registry();
+    }
+
+    /// Seed one row for `tool` in `cwd` and return its id.
+    fn seed_row(
+        cwd: &std::path::Path,
+        tool: &str,
+        f: &dyn Fn(&mut crate::session::Instance),
+    ) -> String {
+        let mut inst = crate::session::Instance::new("capture", &cwd.to_string_lossy());
+        inst.tool = tool.to_string();
+        f(&mut inst);
+        let id = inst.id.clone();
+        crate::session::Storage::new_unwatched("default")
+            .unwrap()
+            .update(|instances, _groups| {
+                instances.push(inst.clone());
+                Ok(())
+            })
+            .unwrap();
+        id
+    }
+
+    fn row(id: &str) -> crate::session::Instance {
+        crate::session::Storage::new_unwatched("default")
+            .unwrap()
+            .load()
+            .unwrap()
+            .into_iter()
+            .find(|inst| inst.id == id)
+            .expect("row exists")
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn a_declaring_plugin_adopts_a_captured_session_id() {
+        let tmp = tempfile::tempdir().unwrap();
+        let _reload = crate::plugin::ReloadRegistryOnDrop;
+        let _home = crate::session::test_support::isolate_app_dir_at(tmp.path());
+        install_capture_plugin("acme.capture", "capture-helper");
+        let id = seed_row(tmp.path(), "capture-helper", &|_| {});
+        let state = state(tmp.path());
+
+        let set = |sid: &str| {
+            dispatch(
+                &state,
+                &ctx_for("acme.capture", &[CAP_SESSION_WRITE]),
+                "session.capture.set",
+                &json!({ "session_id": id, "agent_session_id": sid }),
+            )
+        };
+
+        assert_eq!(set("session-abc").unwrap(), json!({ "applied": true }));
+        assert_eq!(row(&id).agent_session_id.as_deref(), Some("session-abc"));
+        assert!(
+            row(&id).agent_session_binding.is_none(),
+            "a bare report names no execution, so the id is stored unscoped"
+        );
+        assert_eq!(
+            set("session-abc").unwrap(),
+            json!({ "applied": true }),
+            "a repeat of the same id is harmless"
+        );
+        assert_eq!(
+            set("session-def").unwrap(),
+            json!({ "applied": true }),
+            "the owner may follow a conversation into a new store entry"
+        );
+        assert_eq!(row(&id).agent_session_id.as_deref(), Some("session-def"));
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn capture_writes_stay_inside_the_owner_and_the_pin() {
+        let tmp = tempfile::tempdir().unwrap();
+        let _reload = crate::plugin::ReloadRegistryOnDrop;
+        let _home = crate::session::test_support::isolate_app_dir_at(tmp.path());
+        install_capture_plugin("acme.capture", "capture-helper");
+        let owned = seed_row(tmp.path(), "capture-helper", &|_| {});
+        let pinned = seed_row(tmp.path(), "capture-helper", &|inst| {
+            inst.resume_intent = crate::session::ResumeIntent::Use("pinned-sid".into());
+            inst.agent_session_id = Some("pinned-sid".into());
+        });
+        let undeclared = seed_row(tmp.path(), "other-tool", &|_| {});
+        let state = state(tmp.path());
+
+        let set = |plugin: &str, caps: &[&str], id: &str| {
+            dispatch(
+                &state,
+                &ctx_for(plugin, caps),
+                "session.capture.set",
+                &json!({ "session_id": id, "agent_session_id": "session-abc" }),
+            )
+        };
+
+        assert_eq!(
+            set("acme.capture", &[CAP_SESSION_WRITE], &pinned).unwrap(),
+            json!({ "applied": false, "reason": "pinned" }),
+            "a launch pin to another conversation is never overwritten"
+        );
+        assert_eq!(row(&pinned).agent_session_id.as_deref(), Some("pinned-sid"));
+
+        // Nothing declares `other-tool`, so no plugin owns its capture.
+        let err = set("acme.capture", &[CAP_SESSION_WRITE], &undeclared).unwrap_err();
+        assert_eq!(err.code, codes::FORBIDDEN);
+        assert_eq!(
+            err.data.as_ref().and_then(|d| d["kind"].as_str()),
+            Some("not_capture_owner")
+        );
+        assert_eq!(row(&undeclared).agent_session_id, None);
+
+        // A second declaration for the same tool makes ownership ambiguous, so
+        // neither plugin may attribute an id.
+        install_capture_plugin("acme.rival", "capture-helper");
+        for plugin in ["acme.capture", "acme.rival"] {
+            let err = set(plugin, &[CAP_SESSION_WRITE], &owned).unwrap_err();
+            assert_eq!(err.code, codes::FORBIDDEN, "{plugin}");
+        }
+        assert_eq!(row(&owned).agent_session_id, None);
+
+        let err = set("acme.capture", &[CAP_SESSION_READ], &owned).unwrap_err();
+        assert_eq!(err.code, codes::FORBIDDEN, "needs session.write");
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn capture_refuses_a_peer_owned_or_excluded_id() {
+        let tmp = tempfile::tempdir().unwrap();
+        let _reload = crate::plugin::ReloadRegistryOnDrop;
+        let _home = crate::session::test_support::isolate_app_dir_at(tmp.path());
+        install_capture_plugin("acme.capture", "capture-helper");
+        let holder = seed_row(tmp.path(), "capture-helper", &|inst| {
+            inst.agent_session_id = Some("session-peer".into());
+        });
+        let target = seed_row(tmp.path(), "capture-helper", &|inst| {
+            inst.retroactive_capture_excludes
+                .insert(crate::session::ConversationBinding::unknown(
+                    "session-excluded",
+                ));
+        });
+        let state = state(tmp.path());
+
+        let set = |id: &str, sid: &str| {
+            dispatch(
+                &state,
+                &ctx_for("acme.capture", &[CAP_SESSION_WRITE]),
+                "session.capture.set",
+                &json!({ "session_id": id, "agent_session_id": sid }),
+            )
+            .unwrap()
+        };
+
+        assert_eq!(
+            set(&target, "session-peer"),
+            json!({ "applied": false, "reason": "owned_elsewhere" }),
+            "a peer row durably owns the id"
+        );
+        assert_eq!(
+            row(&holder).agent_session_id.as_deref(),
+            Some("session-peer")
+        );
+        assert_eq!(row(&target).agent_session_id, None);
+
+        assert_eq!(
+            set(&target, "session-excluded"),
+            json!({ "applied": false, "reason": "stale" }),
+            "the row refuses this id through a capture exclude"
+        );
+        assert_eq!(row(&target).agent_session_id, None);
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn capture_rejects_a_malformed_session_id() {
+        let tmp = tempfile::tempdir().unwrap();
+        let _reload = crate::plugin::ReloadRegistryOnDrop;
+        let _home = crate::session::test_support::isolate_app_dir_at(tmp.path());
+        install_capture_plugin("acme.capture", "capture-helper");
+        let id = seed_row(tmp.path(), "capture-helper", &|_| {});
+        let state = state(tmp.path());
+
+        for agent_session_id in ["--resume", "", &"s".repeat(257)] {
+            let err = dispatch(
+                &state,
+                &ctx_for("acme.capture", &[CAP_SESSION_WRITE]),
+                "session.capture.set",
+                &json!({ "session_id": id, "agent_session_id": agent_session_id }),
+            )
+            .unwrap_err();
+            assert_eq!(err.code, codes::INVALID_PARAMS, "{agent_session_id:?}");
+        }
+        assert_eq!(row(&id).agent_session_id, None);
     }
 }

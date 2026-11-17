@@ -24,6 +24,36 @@ pub struct AgentIntegrationContribution {
     pub detection: Option<AgentDetectionDeclaration>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reply_fallback: Option<AgentReplyDeclaration>,
+    /// Requires API 22 and a host that implements the capture protocol.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session_id: Option<AgentSessionIdDeclaration>,
+}
+
+/// Session-id capture owned by the plugin worker.
+///
+/// The host owns the write only: it accepts a shape-checked report through the
+/// guarded capture path, so the provider's stores and wire formats stay in the
+/// plugin instead of in the host. The fields below describe the host-driven
+/// polling that a later host version will add; this one validates them without
+/// calling them.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AgentSessionIdDeclaration {
+    /// Worker RPC that will return `{ session_id, generation }` per poll.
+    pub method: String,
+    /// Worker RPC that will return the launch wrapper and the tmux env it publishes.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub launch_method: Option<String>,
+    /// Deadline for one future call. A timeout means no capture for that poll.
+    #[serde(default = "default_session_id_timeout_ms")]
+    pub timeout_ms: u64,
+}
+
+pub const SESSION_ID_TIMEOUT_MS_MIN: u64 = 250;
+pub const SESSION_ID_TIMEOUT_MS_MAX: u64 = 30_000;
+
+fn default_session_id_timeout_ms() -> u64 {
+    5_000
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
@@ -45,6 +75,10 @@ pub struct AgentLaunchDeclaration {
     pub install_hint: Option<String>,
     #[serde(default)]
     pub host_only: bool,
+    /// Pause between typing a message into the agent's pane and sending Enter,
+    /// for an agent whose composer reads a fast burst as a paste and drops it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub send_keys_enter_delay_ms: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub resume: Option<AgentResumeDeclaration>,
     #[serde(default, skip_serializing_if = "Option::is_none")]

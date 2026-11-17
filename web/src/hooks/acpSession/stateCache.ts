@@ -12,13 +12,7 @@ import {
   type SubagentRecord,
   type WorkflowRun,
 } from "../../lib/acpTypes";
-import {
-  STORAGE_KEY_PREFIX,
-  STATE_TTL_MS,
-  clearQueueCount,
-  setQueueCount,
-  type PersistedEntry,
-} from "../../lib/acpStateStorage";
+import { STORAGE_KEY_PREFIX, STATE_TTL_MS, type PersistedEntry } from "../../lib/acpStateStorage";
 import { safeSetItem } from "../../lib/safeStorage";
 
 const STATE_CACHE_CAP = 32;
@@ -104,9 +98,7 @@ export function persistState(sessionId: string, state: AcpState): void {
   const key = storageKey(sessionId);
   const body = JSON.stringify({ savedAt: Date.now(), state: toPersistedState(state) } satisfies PersistedEntry);
   // On a quota failure evict one entry and retry once; the cache is best effort.
-  if (safeSetItem(key, body) || (evictOldestPersistedAcpState(key) && safeSetItem(key, body))) {
-    setQueueCount(sessionId, state.queuedPrompts.length);
-  }
+  if (!safeSetItem(key, body) && evictOldestPersistedAcpState(key)) safeSetItem(key, body);
 }
 
 // Rows with no user prompt and older history pending would open mid-turn. Drop the rows and cursor so replay
@@ -265,5 +257,4 @@ export function clearAcpCache(sessionId?: string): void {
     stateCache.delete(sessionId);
     removePersisted(() => [storageKey(sessionId)]);
   }
-  clearQueueCount(sessionId);
 }

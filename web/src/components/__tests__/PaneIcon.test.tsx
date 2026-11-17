@@ -8,11 +8,11 @@ import { PaneIcon } from "../PaneIcon";
 describe("PaneIcon", () => {
   it("renders the icon_asset image, outranking the resolved fallback icon", async () => {
     const { findByTestId } = render(
-      <PaneIcon icon={GitBranch} iconAssetUrl="/api/plugins/acme.widget/icon" className="size-4" testId="icon" />,
+      <PaneIcon icon={GitBranch} iconAssetUrl="/plugin-icons/acme.widget" className="size-4" testId="icon" />,
     );
     const icon = await findByTestId("icon");
     expect(icon.tagName).toBe("IMG");
-    expect(icon.getAttribute("src")).toBe("/api/plugins/acme.widget/icon");
+    expect(icon.getAttribute("src")).toBe("/plugin-icons/acme.widget");
   });
 
   it("falls back to the resolved icon component when there is no icon_asset", () => {

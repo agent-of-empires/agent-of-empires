@@ -58,6 +58,14 @@ fn expand(input: DeriveInput) -> syn::Result<proc_macro2::TokenStream> {
         let overridable = !attrs.global_only;
         let advanced = attrs.advanced;
         let tui_only = attrs.tui_only;
+        let web_only = attrs.web_only;
+        let restart = attrs.restart;
+        if tui_only && web_only {
+            return Err(syn::Error::new_spanned(
+                field,
+                "a setting cannot be both `tui_only` and `web_only`",
+            ));
+        }
         let label = attrs.label.unwrap_or_else(|| humanize(&field_name));
         let description = attrs
             .desc
@@ -84,6 +92,8 @@ fn expand(input: DeriveInput) -> syn::Result<proc_macro2::TokenStream> {
                 validation: #validation,
                 advanced: #advanced,
                 tui_only: #tui_only,
+                web_only: #web_only,
+                restart: #restart,
                 default: ::core::option::Option::None,
                 per_project: false,
             }
@@ -155,6 +165,8 @@ struct FieldAttrs {
     global_only: bool,
     advanced: bool,
     tui_only: bool,
+    web_only: bool,
+    restart: bool,
     label: Option<String>,
     desc: Option<String>,
     summary: Option<String>,
@@ -190,6 +202,8 @@ fn parse_field_attrs(field: &syn::Field, field_name: &str) -> syn::Result<FieldA
                 "global_only" => out.global_only = true,
                 "advanced" => out.advanced = true,
                 "tui_only" => out.tui_only = true,
+                "web_only" => out.web_only = true,
+                "restart" => out.restart = true,
                 "multiline" => out.multiline = true,
                 "mono" => out.mono = true,
                 "label" => out.label = Some(meta.value()?.parse::<LitStr>()?.value()),
