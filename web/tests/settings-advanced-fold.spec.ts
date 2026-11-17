@@ -78,7 +78,8 @@ const SCHEMA = [
   {
     section: "logging",
     field: "output",
-    label: "Output (restart req.)",
+    label: "Write to",
+    restart: true,
     widget: {
       kind: "select",
       options: [
