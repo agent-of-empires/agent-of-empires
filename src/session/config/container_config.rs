@@ -2943,7 +2943,10 @@ pub(crate) fn build_container_config(
             .collect(),
         None => vec![project_path.to_path_buf()],
     };
-    volumes.extend(git_exec_surface_overlays(&volumes, &git_candidates)?);
+    // A runtime that mounts read-only volumes read-write would get no-op overlays.
+    if crate::containers::get_container_runtime().supports_read_only_volumes() {
+        volumes.extend(git_exec_surface_overlays(&volumes, &git_candidates)?);
+    }
 
     let sandbox_config = launch_config.sandbox();
 
