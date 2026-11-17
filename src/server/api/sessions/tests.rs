@@ -4601,6 +4601,14 @@ fn session_cfg_store_reresolves_only_after_an_input_edit() {
         format!("gitdir: {}/.git/worktrees/w\n", current.display()),
     )
     .unwrap();
+    // Git records the worktree in each admin dir; a link is only real if it does.
+    for repo in ["a", "b"] {
+        std::fs::write(
+            layout.path().join(repo).join(".git/worktrees/w/gitdir"),
+            format!("{}\n", worktree.join(".git").display()),
+        )
+        .unwrap();
+    }
     let worktree = worktree.to_str().unwrap();
     let link = |repo: &str| {
         let _ = std::fs::remove_file(&current);
