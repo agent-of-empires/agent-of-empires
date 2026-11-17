@@ -1438,57 +1438,37 @@ pub(super) async fn resolve_mcp_servers(
     native_config_override: Option<PathBuf>,
     failure: &'static str,
 ) -> Vec<agent_client_protocol::v1::schema::McpServer> {
+    use crate::session::mcp::mcp_model::summarize;
+
     let agent_key = agent_key.to_string();
-    let session = session_id.to_string();
-    let daemon = if paths.sandboxed {
-        Some(crate::acp::mcp_config::DaemonIdentity::current().await)
-    } else {
-        None
-    };
-    tokio::task::spawn_blocking(move || {
+    let env = session_env.clone();
+    let sandboxed = paths.sandboxed;
+    let resolved = tokio::task::spawn_blocking(move || {
         resolve_mcp_layers(
             &agent_key,
-            &session,
             profile.as_deref(),
             &paths,
             &session_env,
             native_config_override.as_deref(),
-            daemon.as_ref(),
         )
     })
-    .await
-    .unwrap_or_else(|e| {
-        warn!(
-            target: "acp.mcp",
-            session = %session_id,
-            error = %e,
-            "{failure}; forwarding no servers"
-        );
-        Vec::new()
-    })
-}
-
-fn resolve_mcp_layers(
-    agent_key: &str,
-    session_id: &str,
-    profile: Option<&str>,
-    paths: &McpPaths,
-    session_env: &[(String, String)],
-    native_config_override: Option<&std::path::Path>,
-    daemon: Option<&crate::acp::mcp_config::DaemonIdentity>,
-) -> Vec<agent_client_protocol::v1::schema::McpServer> {
-    use crate::session::mcp::mcp_model::{resolve_effective, summarize};
-
-    let mut merged = resolve_effective(
-        agent_key,
-        profile,
-        &paths.cwd,
-        &paths.config_path,
-        session_env,
-        native_config_override,
-    );
-    if let Some(daemon) = daemon {
-        merged = crate::acp::mcp_config::drop_daemon_servers(merged, daemon);
+    .await;
+    let mut merged = match resolved {
+        Ok(merged) => merged,
+        Err(e) => {
+            warn!(
+                target: "acp.mcp",
+                session = %session_id,
+                error = %e,
+                "{failure}; forwarding no servers"
+            );
+            return Vec::new();
+        }
+    };
+    // Read the accepted tokens after the definitions so they cover every token those hold.
+    if sandboxed {
+        let daemon = crate::acp::mcp_config::DaemonIdentity::current().await;
+        merged = crate::acp::mcp_config::drop_daemon_servers(merged, &daemon);
     }
     if !merged.is_empty() {
         info!(
@@ -1499,7 +1479,24 @@ fn resolve_mcp_layers(
             "forwarding MCP servers"
         );
     }
-    crate::acp::mcp_config::project_servers_to_acp(merged, session_env)
+    crate::acp::mcp_config::project_servers_to_acp(merged, &env)
+}
+
+fn resolve_mcp_layers(
+    agent_key: &str,
+    profile: Option<&str>,
+    paths: &McpPaths,
+    session_env: &[(String, String)],
+    native_config_override: Option<&std::path::Path>,
+) -> Vec<crate::session::mcp::mcp_model::ResolvedMcpServer> {
+    crate::session::mcp::mcp_model::resolve_effective(
+        agent_key,
+        profile,
+        &paths.cwd,
+        &paths.config_path,
+        session_env,
+        native_config_override,
+    )
 }
 
 /// Apply current model pins and effort defaults to a cached respawn config,
@@ -2710,23 +2707,20 @@ time.sleep(60)
         let resolve = |profile: Option<&'static str>,
                        cwd: std::path::PathBuf,
                        config_path: std::path::PathBuf| async move {
-            let merged = tokio::task::spawn_blocking(move || {
-                resolve_mcp_layers(
-                    "claude",
-                    "resolve-test",
-                    profile,
-                    &McpPaths {
-                        cwd,
-                        config_path,
-                        sandboxed: false,
-                    },
-                    &[],
-                    None,
-                    None,
-                )
-            })
-            .await
-            .unwrap();
+            let merged = resolve_mcp_servers(
+                "claude",
+                "resolve-test",
+                profile.map(String::from),
+                McpPaths {
+                    cwd,
+                    config_path,
+                    sandboxed: false,
+                },
+                Vec::new(),
+                None,
+                "resolve failed",
+            )
+            .await;
             let val = serde_json::to_value(&merged).unwrap();
             let mut names: Vec<String> = val
                 .as_array()
