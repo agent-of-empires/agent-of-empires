@@ -95,7 +95,9 @@ versions = {"0.5.0" = "sha256:a2d718a00808b815ae6f3dcd7b05f6a81fdb6fedf642cb8883
 # rejects the manifest in `PluginManifest::from_toml_str` and records a load
 # error while `opencode` keeps its bundled launch and pane detection. The
 # provider extension lives in the same repository but is installed inside
-# OpenCode; without it the host keeps the session's pane status.
+# OpenCode, so install it first: once approved, this declaration owns status and
+# a session with no report reads as Unknown. Disabling or uninstalling the
+# plugin returns the session to pane detection.
 #
 # plugin-opencode v0.1.1 @ 84a4049
 [plugins."agent-of-empires.opencode"]

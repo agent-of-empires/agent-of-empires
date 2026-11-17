@@ -68,20 +68,24 @@ fn warn_ambiguous(tool: &str, error: &anyhow::Error) {
     }
 }
 
-/// Tools already reported with an unsupported provider version, so the warning
-/// fires once per `(tool, version)` rather than on every status tick.
+/// The last version reported per tool: the warning fires once per
+/// `(tool, version)` without letting a report-controlled string grow the set.
 static UNSUPPORTED_WARNED: std::sync::LazyLock<
-    std::sync::Mutex<std::collections::HashSet<(String, String)>>,
-> = std::sync::LazyLock::new(|| std::sync::Mutex::new(std::collections::HashSet::new()));
+    std::sync::Mutex<std::collections::HashMap<String, String>>,
+> = std::sync::LazyLock::new(|| std::sync::Mutex::new(std::collections::HashMap::new()));
 
 fn warn_unsupported_provider(tool: &str, version: &str, declared: &[String]) {
+    // The provider wrote this string, so keep control characters out of the log.
+    let version = version.escape_default().to_string();
     let mut warned = UNSUPPORTED_WARNED
         .lock()
         .unwrap_or_else(|error| error.into_inner());
-    if warned.insert((tool.to_owned(), version.to_owned())) {
-        tracing::warn!(target: "plugin.agents", %tool, %version, supported = %declared.join(" or "),
-            "provider integration reports a version its declaration does not support; leaving status to pane detection");
+    if warned.get(tool).is_some_and(|seen| seen == &version) {
+        return;
     }
+    warned.insert(tool.to_owned(), version.clone());
+    tracing::warn!(target: "plugin.agents", %tool, %version, supported = %declared.join(" or "),
+        "provider integration reports a version its declaration does not support; leaving status to pane detection");
 }
 
 fn warn_reserved(plugin: &str, tool: &str, builtin: &str) {
@@ -2674,6 +2678,23 @@ command = "acme-omp-shim"
             owned_status(&instance, false),
             None,
             "an unsupported provider must keep pane detection instead of reading as an owned Unknown"
+        );
+        assert!(
+            super::snapshot(&instance).is_none(),
+            "no reply dialog may open for a provider version the declaration does not describe"
+        );
+        let error = respond(
+            &instance,
+            &report,
+            AgentIntegrationResponse::Approval {
+                choice: IntegrationApprovalChoice::Allow,
+            },
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(
+            error.contains("19.0.0") && error.contains("provider_versions"),
+            "a reply on an unlisted provider version must name the version and the declaration: {error}"
         );
 
         report.provider_version = "18.11.1".into();
