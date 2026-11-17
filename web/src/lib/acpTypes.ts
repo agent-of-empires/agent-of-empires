@@ -677,6 +677,9 @@ export interface AcpState {
   restartStoppedSent: boolean;
   /** Why a restart failed after its stop, which unmounts the startup line; the stopped banner shows it. Not persisted. */
   restartFailure: string | null;
+  /** The startup error a Retry is retrying, kept while it runs and on the error that ends it, so its banner
+   *  can say whether the cause changed. Not persisted. */
+  retriedError: string | null;
   /** Lowest loaded seq; older history pages load with `?before=<oldestSeq>`. */
   oldestSeq: number;
   lagged: boolean;
@@ -795,6 +798,7 @@ export type BackgroundAgentStatus =
   | "running"
   | "stalled"
   | "completed"
+  | "stopped"
   | "detached"
   | "error"
   | "requires_action"
@@ -811,8 +815,12 @@ export interface SubagentRecord {
   description?: string | null;
   state: SubagentState;
   stop_reason?: string | null;
+  /** The message an `error` stop carried. */
+  error?: string | null;
   cancel_capable: boolean;
   model?: string | null;
+  /** Launched in the background: its card stays open until it goes idle. */
+  background?: boolean;
 }
 
 export interface BackgroundAgentTool {
@@ -878,6 +886,8 @@ export interface BackgroundAgent {
   lastText: string | null;
   result: string | null;
   warning: string | null;
+  /** The error message its RFD child stopped with; never a completion warning. */
+  error?: string | null;
 }
 
 export interface RejectedPrompt {
@@ -1102,6 +1112,7 @@ export function emptyAcpState(): AcpState {
     restartEpoch: 0,
     restartStoppedSent: false,
     restartFailure: null,
+    retriedError: null,
     oldestSeq: 0,
     lagged: false,
     startupError: null,
@@ -1228,6 +1239,7 @@ function isSteeredContinuation(state: AcpState, precedingTurnActive: boolean): b
 
 function applyNewTurnResets(next: AcpState): void {
   next.startupError = null;
+  if (!next.restartInFlight) next.retriedError = null;
   next.lastError = null;
   next.lastErrorEvidence = null;
   next.interactionError = null;
@@ -1552,7 +1564,9 @@ function applyRawEvent(state: AcpState, frame: AcpFrame, rawTurnActive: boolean,
     next.hostPromptIntent = null;
     next.establishmentRevision = null;
     next.startupError = event.AgentStartupError.message;
+    const retried = state.restartInFlight ? state.retriedError : null;
     endRestart(next);
+    next.retriedError = retried;
     next.agentUnresponsive = false;
     closeTurn(next);
     return next;
@@ -1668,6 +1682,7 @@ function applyRawEvent(state: AcpState, frame: AcpFrame, rawTurnActive: boolean,
     next.lastError = null;
     next.lastErrorEvidence = null;
     next.interactionError = null;
+    next.retriedError = null;
     next.lastAgentSwitch = { from, to, reason, at: now };
     // The switch emits Stopped { user_stopped } first; keep its banner hidden through the handshake.
     next.workerStopped = false;
@@ -1727,7 +1742,7 @@ function applyRawEvent(state: AcpState, frame: AcpFrame, rawTurnActive: boolean,
       // a terminal Stalled record (the tailer's own abort timeout) carries
       // endedAt too, and the status check alone would let a late Progress
       // reopen it, contradicting hasActiveBackgroundAgent's endedAt-keyed read.
-      if (a.endedAt || a.status === "completed" || a.status === "detached" || a.status === "error") return a;
+      if (a.endedAt || ["completed", "stopped", "detached", "error"].includes(a.status)) return a;
       return {
         ...a,
         status: e.status,
@@ -1810,14 +1825,15 @@ function applyRawEvent(state: AcpState, frame: AcpFrame, rawTurnActive: boolean,
 /** Fold a child's state; only a raw update's timestamp may supply a new end. */
 function reconcileChild(a: BackgroundAgent, child: SubagentRecord, at?: string): BackgroundAgent {
   const status = subagentStatus(child);
+  const error = child.error ?? null;
   const endedAt = at === undefined ? a.endedAt : child.state === "idle" ? (a.endedAt ?? at) : null;
-  return a.status === status && a.endedAt === endedAt ? a : { ...a, status, endedAt };
+  return a.status === status && a.endedAt === endedAt && a.error === error ? a : { ...a, status, error, endedAt };
 }
 
 /** The agent status a child's session state stands for. */
 export function subagentStatus(child: SubagentRecord): BackgroundAgentStatus {
   if (child.state !== "idle") return child.state;
-  return child.stop_reason === "error" ? "error" : "completed";
+  return child.stop_reason === "error" ? "error" : child.stop_reason === "cancelled" ? "stopped" : "completed";
 }
 
 /** Task ids can be reused, so only the run still open on `taskId` is closed. */
@@ -1834,6 +1850,7 @@ function endRestart(next: AcpState): void {
   next.restartInFlight = false;
   next.restartEpoch += 1;
   next.restartFailure = null;
+  next.retriedError = null;
 }
 
 /** Fold a self-contained run of frames from an empty state, e.g. an older history page. */
@@ -2106,17 +2123,24 @@ export function deriveTurnActive(
   return state.serverTurnActive || state.inflightPromptIds.length > 0;
 }
 
-/** Outstanding background sub-agent (async Task) or task, mirroring
- *  `AcpState::has_active_background_agent`: agents are keyed on `endedAt`
- *  rather than status, since a stalled agent's own terminal completion counts
- *  as done. */
-export function hasActiveBackgroundAgent(state: Pick<AcpState, "backgroundAgents" | "backgroundTasks">): boolean {
-  return state.backgroundTasks.length > 0 || state.backgroundAgents.some((a) => a.endedAt === null);
+/** Outstanding background sub-agent (async Task), task, or running RFD child.
+ *  Agents are keyed on `endedAt` rather than status, since a stalled agent's own
+ *  terminal completion counts as done. */
+export function hasActiveBackgroundAgent(
+  state: Pick<AcpState, "backgroundAgents" | "backgroundTasks" | "subagents">,
+): boolean {
+  return (
+    state.backgroundTasks.length > 0 ||
+    state.backgroundAgents.some((a) => a.endedAt === null) ||
+    state.subagents.some((s) => s.state === "running" || s.state === "requires_action")
+  );
 }
 
 /** Display-only busy signal for the runtime spinner. Distinct from `turnActive`,
  *  which tracks only the main turn because send-vs-queue composer gating reads it. */
-export function isVisiblyBusy(state: Pick<AcpState, "turnActive" | "backgroundAgents" | "backgroundTasks">): boolean {
+export function isVisiblyBusy(
+  state: Pick<AcpState, "turnActive" | "backgroundAgents" | "backgroundTasks" | "subagents">,
+): boolean {
   return state.turnActive || hasActiveBackgroundAgent(state);
 }
 

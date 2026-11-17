@@ -194,6 +194,23 @@ pub fn pick_free_port() -> u16 {
     panic!("could not find an unissued ephemeral port after 64 attempts");
 }
 
+/// True while `pid` runs. An exited process waiting to be reaped counts as gone, since a
+/// container's PID 1 may never reap it.
+#[cfg(target_os = "linux")]
+pub fn pid_alive(pid: i32) -> bool {
+    let Ok(stat) = std::fs::read_to_string(format!("/proc/{pid}/stat")) else {
+        return false;
+    };
+    stat.rsplit_once(") ")
+        .and_then(|(_, fields)| fields.split_ascii_whitespace().next())
+        .is_some_and(|state| !matches!(state, "Z" | "X"))
+}
+
+#[cfg(not(target_os = "linux"))]
+pub fn pid_alive(pid: i32) -> bool {
+    nix::sys::signal::kill(nix::unistd::Pid::from_raw(pid), None).is_ok()
+}
+
 /// Poll until the daemon accepts a TCP connection on `port`. The parent
 /// `aoe serve --daemon` returns as soon as it has spawned the child, so a
 /// successful exit doesn't prove the child bound the port; this is the
@@ -1332,6 +1349,12 @@ last_seen_version = "{}"
     /// the many fast, steady-state waits that follow.
     pub fn wait_for_ready(&self) {
         self.wait_for_timeout(" aoe ", Duration::from_secs(30));
+    }
+
+    /// Observe input processing, then await every mutation admitted by that input.
+    pub fn wait_for_processed_mutations(&self) {
+        self.synchronize_input();
+        self.wait_for_runtime_ready();
     }
 
     /// Wait until the runtime is connected, has applied every change this TUI sent, and grants

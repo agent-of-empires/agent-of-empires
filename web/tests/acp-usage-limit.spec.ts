@@ -63,6 +63,112 @@ test.describe("at 375px", () => {
   });
 });
 
+test("a limited Session switches to another account and sees a refusal plainly", async ({ page }) => {
+  const resetsAt = new Date(Date.now() + 2 * 3600_000 + 30_000).toISOString();
+  const mock = await mockAcpSession(page, {
+    title: "story-switch-account",
+    rateLimitAutoResume: false,
+    reducedState: {
+      rate_limit: { status: "limited", resets_at: resetsAt, kind: "usage" },
+      auth_status: { kind: "account", label: "Claude Max", account: { email: "me@example.com", plan: "Max" } },
+    },
+  });
+  await page.route("**/api/agents", (r) => r.fulfill({ json: [agent("claude")] }));
+  await page.route("**/api/sessions/*/account-targets", (r) => r.fulfill({ json: { targets: ["claude-b"] } }));
+  const restarts: unknown[] = [];
+  let refuse = true;
+  await page.route("**/api/sessions/*/restart", async (r) => {
+    restarts.push(r.request().postDataJSON());
+    if (refuse) {
+      refuse = false;
+      await r.fulfill({
+        status: 409,
+        json: { error: "account_swap_unavailable", message: "Cannot switch to 'claude-b'. Nothing changed." },
+      });
+    } else {
+      await r.fulfill({ json: {} });
+    }
+  });
+  await openStructuredSession(page, mock);
+
+  await page.getByTestId("usage-limit-switch-account").click();
+  const dialog = page.getByTestId("switch-account-modal");
+  await expect(dialog).toContainText("copied into the other account's store");
+  await expect(dialog).toContainText("uncached on the new account");
+  await expect(dialog).toContainText("Claude Max");
+  await expect(dialog).not.toContainText("me@example.com");
+
+  await dialog.getByTestId("switch-account-confirm").click();
+  await expect(dialog.getByTestId("switch-account-error")).toHaveText("Cannot switch to 'claude-b'. Nothing changed.");
+
+  await dialog.getByTestId("switch-account-confirm").click();
+  await expect(dialog).toBeHidden();
+  expect(restarts).toEqual([
+    { tool: "claude-b", require_account_carry: true },
+    { tool: "claude-b", require_account_carry: true },
+  ]);
+});
+
+test("the switch-account dialog keeps Tab inside it with a non-first account selected", async ({ page }) => {
+  const resetsAt = new Date(Date.now() + 2 * 3600_000 + 30_000).toISOString();
+  const mock = await mockAcpSession(page, {
+    title: "story-switch-account-focus",
+    rateLimitAutoResume: false,
+    reducedState: { rate_limit: { status: "limited", resets_at: resetsAt, kind: "usage" } },
+  });
+  await page.route("**/api/agents", (r) => r.fulfill({ json: [agent("claude")] }));
+  await page.route("**/api/sessions/*/account-targets", (r) =>
+    r.fulfill({ json: { targets: ["claude-b", "claude-c"] } }),
+  );
+  await openStructuredSession(page, mock);
+
+  await page.getByTestId("usage-limit-switch-account").click();
+  const dialog = page.getByTestId("switch-account-modal");
+  const second = dialog.getByLabel("claude-c");
+  await second.check();
+  await expect(second).toBeFocused();
+
+  // The checked radio is the group's only tab stop, so Shift+Tab from it must wrap, not leave.
+  await page.keyboard.press("Shift+Tab");
+  await expect(dialog.getByTestId("switch-account-confirm")).toBeFocused();
+  await page.keyboard.press("Tab");
+  await expect(second).toBeFocused();
+});
+
+test("the switch-account dialog keeps focus inside it while the restart is pending", async ({ page }) => {
+  const resetsAt = new Date(Date.now() + 2 * 3600_000 + 30_000).toISOString();
+  const mock = await mockAcpSession(page, {
+    title: "story-switch-account-busy",
+    rateLimitAutoResume: false,
+    reducedState: { rate_limit: { status: "limited", resets_at: resetsAt, kind: "usage" } },
+  });
+  await page.route("**/api/agents", (r) => r.fulfill({ json: [agent("claude")] }));
+  await page.route("**/api/sessions/*/account-targets", (r) => r.fulfill({ json: { targets: ["claude-b"] } }));
+  let release!: () => void;
+  const held = new Promise<void>((resolve) => (release = resolve));
+  await page.route("**/api/sessions/*/restart", async (r) => {
+    await held;
+    await r.fulfill({ status: 409, json: { error: "account_swap_unavailable", message: "Nothing changed." } });
+  });
+  await openStructuredSession(page, mock);
+
+  await page.getByTestId("usage-limit-switch-account").click();
+  const dialog = page.getByTestId("switch-account-modal");
+  await dialog.getByTestId("switch-account-confirm").click();
+  await expect(dialog.getByTestId("switch-account-confirm")).toBeDisabled();
+
+  // Every control is disabled while busy, so focus must sit on the dialog and Tab must not leave.
+  await expect(dialog).toBeFocused();
+  await page.keyboard.press("Tab");
+  await expect(dialog).toBeFocused();
+  await page.keyboard.press("Shift+Tab");
+  await expect(dialog).toBeFocused();
+
+  release();
+  await expect(dialog.getByTestId("switch-account-error")).toHaveText("Nothing changed.");
+  await expect(dialog.getByTestId("switch-account-confirm")).toBeFocused();
+});
+
 test("Turn on opens the Session profile's auto-resume row and highlights it", async ({ page }) => {
   const mock = await mockAcpSession(page, {
     title: "story-usage-limit-setting",

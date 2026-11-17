@@ -29,6 +29,31 @@ async function mockBrowse(page: Page, entries: { name: string; is_git_repo?: boo
   });
 }
 
+/** Hold a GET until `release()`; `requested` resolves once the app has sent it. */
+async function gateRoute(page: Page, url: string, json: unknown) {
+  let release!: () => void;
+  const gate = new Promise<void>((r) => (release = r));
+  const requested = page.waitForRequest(url);
+  await page.route(url, async (r) => {
+    await gate;
+    await r.fulfill({ json });
+  });
+  return { requested, release };
+}
+
+/** A built-in ACP agent the Import session tab offers. */
+const builtin = (name: string, acp_command: string) => ({
+  name,
+  kind: "builtin",
+  binary: name,
+  host_only: false,
+  installed: true,
+  install_hint: "",
+  acp_capable: true,
+  acp_installed: true,
+  acp_command,
+});
+
 /** A pick returns to the form, whose Project row names it. */
 async function expectSelected(page: Page, path: string) {
   await expect(wizard(page).getByTestId("wizard-project-row")).toContainText(path);
@@ -65,12 +90,108 @@ test.describe("project tabs", () => {
     await expectSelected(page, "/home/user/z-project");
   });
 
+  test("Recent and Browse tabs focus their search box on open", async ({ page }) => {
+    await mockBrowse(page, [{ name: "alpha" }]);
+    await startWizard(page);
+    await openPanel(page, "Project");
+    await expect(page.getByLabel("Search projects")).toBeFocused();
+    await page.getByRole("button", { name: "Browse", exact: true }).click();
+    await expect(page.getByPlaceholder("Type to filter...")).toBeFocused();
+  });
+
+  test("Recent search does not take focus moved to Done while projects load", async ({ page }) => {
+    await startWizard(page);
+    const { requested, release } = await gateRoute(page, "**/api/recent-projects", { projects: [] });
+    await openPanel(page, "Project");
+    await requested;
+    const done = wizard(page).getByRole("button", { name: "Done" });
+    await done.focus();
+    release();
+    await expect(page.getByLabel("Search projects")).toBeVisible();
+    // Enter reaches Done only if the search box did not take focus on load.
+    await page.keyboard.press("Enter");
+    await expect(done).toBeHidden();
+  });
+
+  test("Browse filter does not take focus moved to Done while projects load", async ({ page }) => {
+    await mockBrowse(page, [{ name: "alpha" }]);
+    await startWizard(page, { sessions: [], project: false });
+    const { requested, release } = await gateRoute(page, "**/api/recent-projects", { projects: [] });
+    await openWizard(page);
+    await requested;
+    const done = wizard(page).getByRole("button", { name: "Done" });
+    await done.focus();
+    // DirectoryBrowser requests from a microtask queued in the same effect flush as the focus guard.
+    const browsed = page.waitForRequest("**/api/filesystem/**");
+    release();
+    await browsed;
+    await expect(done).toBeFocused();
+  });
+
+  test("opening from the sidebar New project session button focuses the search box", async ({ page }) => {
+    await startWizard(page, { project: false });
+    // No blur first: the button stays focused behind the wizard, as it does for a real click.
+    await page.getByRole("button", { name: "New project session" }).click();
+    await expect(page.getByLabel("Search projects")).toBeFocused();
+  });
+
+  // Each tab's field remounts when a Retry reload finishes; `settled` waits until its focus effect has run.
+  const retryCases = [
+    {
+      tab: "Browse",
+      field: (page: Page) => page.getByPlaceholder("Type to filter..."),
+      // DirectoryBrowser requests from a microtask queued in the same effect flush as the focus guard.
+      settled: (page: Page) => page.waitForRequest("**/api/filesystem/**"),
+    },
+    {
+      tab: "Clone URL",
+      field: (page: Page) => page.locator("#clone-url"),
+      // Native autoFocus would run in the commit that mounts the field.
+      settled: (page: Page) => expect(page.locator("#clone-url")).toBeVisible(),
+    },
+    {
+      tab: "Import session",
+      field: (page: Page) => page.getByLabel("Agent to import from"),
+      // The picker lists sessions from the same effect flush as the focus guard.
+      settled: (page: Page) => page.waitForRequest("**/api/importable-sessions**"),
+    },
+  ];
+  for (const { tab, field, settled } of retryCases) {
+    test(`a projects retry on the ${tab} tab does not take focus moved to Done`, async ({ page }) => {
+      await mockBrowse(page, [{ name: "alpha" }]);
+      await page.route("**/api/importable-sessions**", (r) => r.fulfill({ json: { sessions: [], truncated: false } }));
+      await startWizard(page, { agents: [builtin("claude", "claude-agent-acp")] });
+      let release!: () => void;
+      const gate = new Promise<void>((r) => (release = r));
+      let calls = 0;
+      await page.route("**/api/projects**", async (r) => {
+        if (++calls === 1) return r.fulfill({ status: 500, json: {} });
+        await gate;
+        await r.fulfill({ json: [{ name: "example", path: "/tmp/example", scope: "global" }] });
+      });
+      await openPanel(page, "Project");
+      const w = wizard(page);
+      await w.getByRole("button", { name: tab, exact: true }).click();
+      await expect(field(page)).toBeFocused();
+      const retried = page.waitForRequest("**/api/projects**");
+      await w.getByRole("button", { name: "Retry" }).click();
+      await retried;
+      const done = w.getByRole("button", { name: "Done" });
+      await done.focus();
+      const reloaded = settled(page);
+      release();
+      await reloaded;
+      await expect(done).toBeFocused();
+    });
+  }
+
   test("Clone tab gates the button on a non-blank URL and Advanced reveals destination + shallow", async ({ page }) => {
     await startWizard(page, { project: false });
     await openWizard(page);
     await page.getByRole("button", { name: "Clone URL", exact: true }).click();
     const cloneBtn = page.getByRole("button", { name: "Clone repository" });
     const urlInput = page.locator("#clone-url");
+    await expect(urlInput).toBeFocused();
     await expect(cloneBtn).toBeDisabled();
     await urlInput.fill("https://github.com/user/repo.git");
     await expect(cloneBtn).toBeEnabled();
@@ -97,6 +218,20 @@ test.describe("project new session", () => {
     await page.getByRole("button", { name: "New session in example" }).click();
     await expect(wizard(page).getByTestId("wizard-agent-row")).toContainText("vibe");
   });
+
+  test("a project with no sessions opens with the Yolo and Sandbox defaults on (#5639)", async ({ page }) => {
+    await startWizard(page, {
+      docker: true,
+      sessions: [],
+      projects: [{ name: "example", path: "/work/example", scope: "global", pinned: false }],
+      settings: { session: { yolo_mode_default: true }, sandbox: { enabled_by_default: true } },
+      project: false,
+    });
+    await page.getByRole("button", { name: "New session in example" }).click();
+    for (const label of ["Run in a safe container", "Yolo mode"]) {
+      await expect(wizard(page).getByRole("switch", { name: label })).toHaveAttribute("aria-checked", "true");
+    }
+  });
 });
 
 test.describe("extra repos", () => {
@@ -115,6 +250,41 @@ test.describe("extra repos", () => {
     return { picker, chip, input: page.getByPlaceholder("/path/to/another/repo") };
   }
 
+  test("search box is focused on open", async ({ page }) => {
+    const { picker } = await openPicker(page);
+    await expect(picker.getByLabel("Search projects")).toBeFocused();
+  });
+
+  test("path input is focused when there are no other projects", async ({ page }) => {
+    await startWizard(page, { projects: [{ name: "primary", path: "/tmp/example", scope: "global" }] });
+    await openPanel(page, "Extra repos");
+    await expect(page.getByText(/No other projects to add/)).toBeVisible();
+    await expect(page.getByPlaceholder("/path/to/another/repo")).toBeFocused();
+  });
+
+  test("focus waits for projects to load and never overrides the user's choice", async ({ page }) => {
+    await startWizard(page, {
+      projects: [
+        { name: "primary", path: "/tmp/example", scope: "global" },
+        { name: "shared-lib", path: "/tmp/shared-lib", scope: "global" },
+      ],
+    });
+    const { requested, release } = await gateRoute(page, "**/api/recent-projects", { projects: [] });
+    await openPanel(page, "Extra repos");
+    await requested;
+    const input = page.getByPlaceholder("/path/to/another/repo");
+    await expect(input).not.toBeFocused();
+    await input.click();
+    await input.pressSequentially("/tmp/other");
+    release();
+    const picker = page.getByTestId("extra-repos-picker");
+    await expect(picker.getByLabel("Search projects")).toBeVisible();
+    // React flushes the load commit's effects before rendering this keystroke, which lands in the path input only if focus stayed.
+    await page.keyboard.press("x");
+    await expect(input).toHaveValue("/tmp/otherx");
+    await expect(input).toBeFocused();
+  });
+
   test("saved projects render without the primary and toggle as chips", async ({ page }) => {
     const { picker, chip } = await openPicker(page);
     await expect(picker.getByText("Projects", { exact: true })).toBeVisible();
@@ -124,6 +294,17 @@ test.describe("extra repos", () => {
     await expect(page.getByText("1 selected")).toBeVisible();
     await page.getByRole("button", { name: "Remove shared-lib" }).click();
     await expect(page.getByText("none")).toBeVisible();
+  });
+});
+
+test.describe("search autofocus on touch", () => {
+  test.use({ hasTouch: true, isMobile: true });
+
+  test("project search stays unfocused so the keyboard does not cover the list", async ({ page }) => {
+    await startWizard(page);
+    await openPanel(page, "Project");
+    await expect(page.getByLabel("Search projects")).toBeVisible();
+    await expect(page.getByLabel("Search projects")).not.toBeFocused();
   });
 });
 
@@ -181,18 +362,6 @@ test.describe("scratch sessions", () => {
 });
 
 test.describe("import session", () => {
-  const builtin = (name: string, acp_command: string) => ({
-    name,
-    kind: "builtin",
-    binary: name,
-    host_only: false,
-    installed: true,
-    install_hint: "",
-    acp_capable: true,
-    acp_installed: true,
-    acp_command,
-  });
-
   test("imports a pi session through the generic tab", async ({ page }) => {
     const importedProfiles: (string | null)[] = [];
     await page.route("**/api/importable-sessions**", (r) => {
@@ -225,6 +394,10 @@ test.describe("import session", () => {
     const w = wizard(page);
     await w.getByRole("button", { name: "Import session", exact: true }).click();
     const agent = w.getByLabel("Agent to import from");
+    await expect(agent).toBeFocused();
+    await page.keyboard.press("s");
+    await expect(page).not.toHaveURL(/settings/);
+    await expect(agent).toBeFocused();
     await expect(agent).toHaveValue("claude");
     await agent.selectOption("pi");
     await w.getByRole("button").filter({ hasText: "Refactor the parser" }).click();

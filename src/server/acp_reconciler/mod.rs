@@ -21,6 +21,9 @@ use crate::session::Instance;
 
 #[cfg(test)]
 pub(crate) use rate_limit::install_rate_limit_continuation;
+#[cfg(test)]
+pub(crate) use rate_limit::{failover_in_flight, reap_rate_limit_resumes};
+pub(crate) use rate_limit::{failover_target, FailoverSettings};
 pub(crate) use rate_limit::{
     install_prepared_continuation, resolve_continuation, ContinuationOutcome, PreparedContinuation,
 };
@@ -734,7 +737,9 @@ async fn drain_queued_prompts(state: &Arc<AppState>) {
                 !i.queued_prompts.is_empty()
                     && matches!(
                         i.status,
-                        crate::session::Status::Idle | crate::session::Status::Error
+                        crate::session::Status::Idle
+                            | crate::session::Status::Running
+                            | crate::session::Status::Error
                     )
                     && is_untriaged_structured(i)
             })
@@ -743,6 +748,10 @@ async fn drain_queued_prompts(state: &Arc<AppState>) {
     };
     for (id, dormant) in candidates {
         let service = Arc::clone(&state.session_service);
+        if !matches!(service.fold_control_state(&id).await, Ok(control) if control.accepts_queue_drain())
+        {
+            continue;
+        }
         if state.acp_supervisor.is_running(&id).await {
             crate::task_util::spawn_supervised(
                 "acp.queue_drain",
@@ -883,6 +892,7 @@ mod tests {
             base_branch: None,
             sandbox: false,
             sandbox_image: None,
+            pull_latest_image: false,
             yolo_mode: false,
             extra_env: Vec::new(),
             before_start_hook_env: Vec::new(),
@@ -894,6 +904,7 @@ mod tests {
             scratch: false,
             trust_hooks: None,
             trust_review: None,
+            skip_on_create: false,
             custom_instruction: None,
             callback_url: None,
             idempotency_key: None,
@@ -2029,6 +2040,206 @@ mod tests {
             attempts + 1,
             "the kept request respawns the session once the teardown ends"
         );
+    }
+
+    #[tokio::test]
+    async fn queue_drain_preserves_a_deliberately_stopped_dormant_session() {
+        use crate::session::{Instance, Status, View};
+
+        let _app_dir = crate::session::test_support::isolate_app_dir();
+        let id = "stopped-with-queue";
+        let mut inst = Instance::new(id, "/tmp/aoe-stopped-with-queue");
+        inst.id = id.into();
+        inst.view = View::Structured;
+        inst.status = Status::Stopped;
+        inst.mark_idle_dormant();
+        inst.queued_prompts.push(test_fixtures::queued_prompt());
+        let state = crate::server::test_support::build_test_app_state(vec![inst]);
+        let mut tick = test_fixtures::Tick::default();
+        for _ in 0..3 {
+            tick.run(&state).await;
+        }
+        let instances = state.instances.read().await;
+        assert!(
+            instances[0].is_idle_dormant(),
+            "a deliberate stop must stay dormant"
+        );
+        assert!(
+            !tick.attempted.contains(id),
+            "queue drain must not attempt a stopped session"
+        );
+        assert_eq!(instances[0].queued_prompts.len(), 1);
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn queue_drain_ignores_background_work_but_preserves_foreground_barriers() {
+        use crate::acp::supervisor::test_support::managed::with_managed;
+        use crate::acp::Event;
+        use crate::server::test_support;
+        use std::io::Write as _;
+
+        with_managed(|scope| Box::pin(async move {
+            for (name, text, drains) in [
+                ("task", "follow up", true),
+                ("agent", "follow up", true),
+                ("main", "follow up", false),
+                ("notification", "follow up", false),
+                ("cancel", "follow up", false),
+                ("compact", "follow up", false),
+                ("clear", "/clear", false),
+            ] {
+                let agent = if name == "agent" { "codex" } else { "claude" };
+                let mut live = test_support::managed_control_session(
+                    scope, name, agent, None,
+                ).await;
+                let id = live.id().to_owned();
+                let state = live.state.clone();
+                let row = state.instances.read().await.iter()
+                    .find(|row| row.id == id).unwrap().clone();
+                let task_transcript = if name != "agent" {
+                let binding = live.client.actual().native_store.as_ref()
+                    .filter(|binding| binding.agent == "claude" && binding.filesystem == "host")
+                    .expect("the actual original owns its Claude resource store").clone();
+                let store_root = binding.stores.first().unwrap();
+                let task_transcript = store_root.join("projects")
+                    .join(crate::session::capture::encode_claude_project_path(&row.project_path))
+                    .join(format!("{}.jsonl", live.sid));
+                std::fs::create_dir_all(task_transcript.parent().unwrap()).unwrap();
+                std::fs::write(&task_transcript, "").unwrap();
+                    Some(task_transcript)
+                } else {
+                    None
+                };
+                let output = scope.tempdir();
+                let agent_transcript = output.path().join("agent.jsonl");
+                std::fs::write(&agent_transcript, "").unwrap();
+                let request = live.start_prompt("go").await;
+                let allocation = live.start_background(name == "agent", &agent_transcript).await;
+                assert!(state.acp_event_store.replay_from(&id, 0).unwrap().iter().any(|stored| {
+                    stored.metadata.resource_ref == Some(allocation)
+                        && stored.metadata.resource_witness.as_ref()
+                            .is_some_and(|witness| witness.allocation == allocation)
+                }), "{name}: background work is a real first-I/O allocation, not history");
+                if !matches!(name, "main" | "cancel") {
+                    live.finish_prompt(&request, None).await;
+                    let control = live.wait_control(|control| !control.turn_active).await;
+                    assert!(control.has_active_background_agent(), "{name}");
+                    assert_eq!(control.sidebar_status(), crate::session::Status::Running,
+                        "the display remains busy for the actual background allocation");
+                }
+                if name == "notification" {
+                    let run = uuid::Uuid::new_v4();
+                    live.native.send(serde_json::json!({
+                        "jsonrpc":"2.0","method":"_omp/autonomous_turn/start",
+                        "params":{"version":1,"sessionId":live.sid,"runId":run,"source":"irc"}
+                    })).await;
+                    live.native.send(serde_json::json!({
+                        "jsonrpc":"2.0","method":"session/update","params":{
+                            "sessionId":live.sid,"update":{
+                                "sessionUpdate":"agent_message_chunk",
+                                "content":{"type":"text","text":"result"}
+                            }
+                        }
+                    })).await;
+                    tokio::time::timeout(Duration::from_secs(10), async {
+                        while !matches!(live.client.next_event().await.expect("actual own output"),
+                            Event::AgentMessageChunk { text, .. } if text == "result") {}
+                    }).await.unwrap();
+                    let control = live.wait_control(|control| control.native_autonomous_active).await;
+                    assert_eq!(control.sidebar_status(), crate::session::Status::Running);
+                }
+                if name == "cancel" {
+                    live.client.cancel_prompt().await.unwrap();
+                    live.wait_control(|control| control.cancelling).await;
+                    tokio::time::timeout(Duration::from_secs(10), async {
+                        while !live.native.requests().iter().any(|method| method == "session/cancel") {
+                            tokio::task::yield_now().await;
+                        }
+                    }).await.expect("the actual original received cancel");
+                }
+                if name == "compact" {
+                    let run = uuid::Uuid::new_v4();
+                    live.native.send(serde_json::json!({
+                        "jsonrpc":"2.0","method":"_omp/autonomous_turn/start",
+                        "params":{"version":1,"sessionId":live.sid,"runId":run,
+                            "source":"scheduled_continuation"}
+                    })).await;
+                    live.native.send(serde_json::json!({
+                        "jsonrpc":"2.0","method":"session/update","params":{
+                            "sessionId":live.sid,"update":{
+                                "sessionUpdate":"compaction_update",
+                                "compactionId":"queue-background-compact", "status":"in_progress"
+                            }
+                        }
+                    })).await;
+                    live.wait_control(|control| control.compacting).await;
+                }
+                // Preserve the original test's busy display input. Native control and
+                // readiness continue to come only from this original's real events.
+                state.instances.write().await.iter_mut().find(|row| row.id == id).unwrap()
+                    .status = crate::session::Status::Running;
+                let prompt_count = || live.native.requests().iter()
+                    .filter(|method| method.as_str() == "session/prompt").count();
+                let before = prompt_count();
+                state.session_service.enqueue_prompt(
+                    &id, "q".into(), text.into(), Vec::new(), None, None,
+                ).await.unwrap();
+                if drains {
+                    drain_queued_prompts(&state).await;
+                    tokio::time::timeout(Duration::from_secs(10), async {
+                        while !state.session_service.queued_prompts_snapshot(&id).await.is_empty() {
+                            tokio::task::yield_now().await;
+                        }
+                    }).await.expect("reconciler must deliver while background work runs");
+                    let delivered = live.next_prompt().await;
+                    assert_eq!(delivered["params"]["prompt"][0]["text"], text, "{name}");
+                } else {
+                    // Await the real delivery path before asserting non-delivery.
+                    state.session_service.drain_queued_prompts_once(&id).await;
+                    assert_eq!(state.session_service.queued_prompts_snapshot(&id).await.len(), 1, "{name}");
+                }
+                let after = live.native.requests().iter()
+                    .filter(|method| method.as_str() == "session/prompt").count();
+                assert_eq!(after - before, usize::from(drains), "{name}");
+                if name == "clear" {
+                    // End the same actual task through its original transcript. Its
+                    // real tailer publishes the matching resource_ref terminal.
+                    let line = serde_json::json!({
+                        "type":"queue-operation", "operation":"enqueue",
+                        "timestamp":chrono::Utc::now().to_rfc3339(),
+                        "content":"<task-notification>\n<task-id>task</task-id>\n<tool-use-id>tool-background</tool-use-id>\n<status>completed</status>\n</task-notification>"
+                    });
+                    let mut file = std::fs::OpenOptions::new().append(true)
+                        .open(task_transcript.as_ref().unwrap()).unwrap();
+                    writeln!(file, "{line}").unwrap();
+                    file.flush().unwrap();
+                    tokio::time::timeout(Duration::from_secs(10), async {
+                        loop {
+                            let event = live.client.next_event().await.expect("original task observer");
+                            if matches!(event, Event::BackgroundTaskFinished { task_id, .. } if task_id == "task") {
+                                assert!(state.acp_event_store.replay_from(&id, 0).unwrap().iter().any(|stored| {
+                                    stored.metadata.resource_ref == Some(allocation)
+                                        && matches!(stored.event.as_ref(), Event::BackgroundTaskFinished { task_id, .. }
+                                            if task_id == "task")
+                                }));
+                                break;
+                            }
+                        }
+                    }).await.expect("the original allocation's tailer publishes its actual end");
+                    live.wait_control(|control| !control.has_active_background_agent()).await;
+                    let resets_before = live.native.requests().iter()
+                        .filter(|method| method.as_str() == "session/new").count();
+                    state.session_service.drain_queued_prompts_once(&id).await;
+                    assert!(state.session_service.queued_prompts_snapshot(&id).await.is_empty());
+                    let resets_after = live.native.requests().iter()
+                        .filter(|method| method.as_str() == "session/new").count();
+                    assert_eq!(resets_after, resets_before + 1,
+                        "the queued /clear issues one genuine Native reset");
+                }
+                live.client.shutdown().await.unwrap();
+            }
+        })).await;
     }
 
     /// Wake-on-drain: a dormant session with a queue must be woken, or its

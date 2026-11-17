@@ -13,7 +13,7 @@ use super::{
     NON_SUBSTANTIVE_EVENT_DISCRIMINANTS,
 };
 use crate::acp::approvals::{Approval, Nonce};
-use crate::acp::state::{BackgroundTaskLaunch, Event, Plan, WorkflowAgents};
+use crate::acp::state::{BackgroundTaskLaunch, Event, Plan, SubagentRecord, WorkflowAgents};
 use crate::events;
 
 /// A background agent silent this long without completing no longer holds a turn open.
@@ -94,6 +94,22 @@ const UNRESOLVED_BACKGROUND_TASKS_SQL: &str =
                  IS json_extract(started.qualification_json, '$.resource_ref')
        )
      ORDER BY started.seq ASC";
+
+/// Each subagent's latest snapshot, where it is still working. An
+/// `AgentSwitched` drops the children announced before it. SQLite takes the
+/// bare `event_json` from the `MAX(seq)` row of each group.
+const OPEN_SUBAGENTS_SQL: &str = "SELECT latest.event_json
+     FROM (SELECT event_json, MAX(seq) AS seq
+           FROM acp_events
+           WHERE session_id = ?1
+             AND discriminant = 'SubagentUpdated'
+             AND seq > COALESCE((SELECT MAX(seq) FROM acp_events
+                                 WHERE session_id = ?1
+                                   AND discriminant = 'AgentSwitched'), 0)
+           GROUP BY json_extract(event_json, '$.SubagentUpdated.subagent.session_id')) AS latest
+     WHERE json_extract(latest.event_json, '$.SubagentUpdated.subagent.state')
+           IN ('running', 'requires_action')
+     ORDER BY latest.seq ASC";
 
 /// Group child allocations once for all retained workflow parents.
 fn workflow_agents(
@@ -273,7 +289,7 @@ impl EventStore {
                 .query_row(
                     "SELECT event_json FROM acp_events
                      WHERE session_id = ?1
-                       AND json_extract(event_json, '$.UserPromptSent') IS NOT NULL
+                       AND discriminant = 'UserPromptSent'
                      ORDER BY seq ASC
                      LIMIT 1",
                     params![session_id],
@@ -296,19 +312,28 @@ impl EventStore {
         session_id: &str,
         max_agent_bytes: usize,
     ) -> Option<(String, String)> {
-        let rows = query_strings(
-            &self.conn(),
-            "SELECT event_json FROM acp_events
-             WHERE session_id = ?1
-             ORDER BY seq ASC",
-            "first_turn_context",
+        // Streamed, so the read ends with the first turn rather than loading the whole history.
+        let conn = self.conn();
+        let what = "first_turn_context";
+        let mut stmt = logged(
+            conn.prepare(
+                "SELECT event_json FROM acp_events
+                 WHERE session_id = ?1
+                 ORDER BY seq ASC",
+            ),
+            what,
             session_id,
-        );
+        )?;
+        let rows = logged(
+            stmt.query_map(params![session_id], |row| row.get::<_, String>(0)),
+            what,
+            session_id,
+        )?;
         let mut first_prompt: Option<String> = None;
         let mut agent = String::new();
         for event in rows
-            .iter()
-            .filter_map(|json| decode_logged(json, session_id, "first_turn_context"))
+            .filter_map(|row| row.ok())
+            .filter_map(|json| decode_logged(&json, session_id, what))
         {
             match event {
                 Event::UserPromptSent { text, .. } if first_prompt.is_none() => {
@@ -400,6 +425,32 @@ impl EventStore {
             "unresolved_background_task_ids",
             session_id,
         )
+    }
+
+    /// Subagents whose latest snapshot is still working, for the dead-worker
+    /// close-out.
+    pub fn open_subagents(&self, session_id: &str) -> Vec<SubagentRecord> {
+        query_strings(
+            &self.conn(),
+            OPEN_SUBAGENTS_SQL,
+            "open_subagents",
+            session_id,
+        )
+        .iter()
+        .filter_map(
+            |json| match decode_logged(json, session_id, "open_subagents")? {
+                Event::SubagentUpdated { subagent, .. } => Some(subagent),
+                _ => None,
+            },
+        )
+        .collect()
+    }
+
+    fn has_open_subagent(&self, session_id: &str) -> Result<bool> {
+        Ok(self
+            .reader()
+            .prepare_cached(OPEN_SUBAGENTS_SQL)?
+            .exists(params![session_id])?)
     }
 
     pub fn has_unresolved_background_tasks(&self, session_id: &str) -> bool {
@@ -587,12 +638,12 @@ impl EventStore {
             concat!("SELECT json_extract(event_json, '$.ElicitationRequested.elicitation.nonce') AS nonce
              FROM acp_events
              WHERE session_id = ?1
-               AND json_extract(event_json, '$.ElicitationRequested') IS NOT NULL
+               AND discriminant = 'ElicitationRequested'
                AND json_extract(event_json, '$.ElicitationRequested.elicitation.nonce') NOT IN (
                    SELECT json_extract(event_json, '$.ElicitationResolved.nonce')
                    FROM acp_events
                    WHERE session_id = ?1
-                     AND json_extract(event_json, '$.ElicitationResolved') IS NOT NULL
+                     AND discriminant = 'ElicitationResolved'
                )
                AND NOT EXISTS (
                    SELECT 1 FROM acp_events loss
@@ -649,8 +700,8 @@ impl EventStore {
     pub fn holds_live_work(&self, session_id: &str) -> Result<ControlKnowledge<bool>> {
         use ControlKnowledge::{Indeterminate, Known};
         let open = self.has_open_turn(session_id)?;
-        if open == Known(true) {
-            return Ok(open);
+        if open == Known(true) || self.has_open_subagent(session_id)? {
+            return Ok(Known(true));
         }
         Ok(match (open, self.has_unhandled_finish(session_id)?) {
             (_, Known(true)) => Known(true),
@@ -717,12 +768,12 @@ impl EventStore {
                          SELECT json_extract(event_json, '$.BackgroundAgentLaunched.agent_id') AS aid,
                                 created_at
                            FROM acp_events WHERE session_id = ?1
-                             AND json_extract(event_json, '$.BackgroundAgentLaunched') IS NOT NULL
+                             AND discriminant = 'BackgroundAgentLaunched'
                          UNION ALL
                          SELECT json_extract(event_json, '$.BackgroundAgentProgress.agent_id'),
                                 created_at
                            FROM acp_events WHERE session_id = ?1
-                             AND json_extract(event_json, '$.BackgroundAgentProgress') IS NOT NULL
+                             AND discriminant = 'BackgroundAgentProgress'
                      )
                      WHERE aid IS NOT NULL
                      GROUP BY aid
@@ -731,7 +782,7 @@ impl EventStore {
                    AND started.aid NOT IN (
                      SELECT json_extract(event_json, '$.BackgroundAgentCompleted.agent_id')
                        FROM acp_events WHERE session_id = ?1
-                         AND json_extract(event_json, '$.BackgroundAgentCompleted') IS NOT NULL
+                         AND discriminant = 'BackgroundAgentCompleted'
                    )",
                 params![session_id, stale_cutoff],
                 |row| row.get(0),
@@ -756,23 +807,17 @@ impl EventStore {
             session_id,
         )
         .flatten()?;
-        let clauses = NON_SUBSTANTIVE_EVENT_DISCRIMINANTS
-            .iter()
-            .map(|_| "AND event_json NOT LIKE ?")
+        let placeholders = std::iter::repeat_n("?", NON_SUBSTANTIVE_EVENT_DISCRIMINANTS.len())
             .collect::<Vec<_>>()
-            .join("\n                   ");
+            .join(",");
         let sql = format!(
             "SELECT event_json, created_at FROM acp_events
-                 WHERE session_id = ?
-                   {clauses}
+                 WHERE session_id = ? AND discriminant NOT IN ({placeholders})
                  ORDER BY seq DESC
                  LIMIT 1"
         );
-        let bind = std::iter::once(session_id.to_string()).chain(
-            NON_SUBSTANTIVE_EVENT_DISCRIMINANTS
-                .iter()
-                .map(|name| format!("{{\"{name}\":%")),
-        );
+        let bind =
+            std::iter::once(session_id).chain(NON_SUBSTANTIVE_EVENT_DISCRIMINANTS.iter().copied());
         let (json, substantive_at_ms): (String, i64) = logged(
             conn.query_row(&sql, rusqlite::params_from_iter(bind), |row| {
                 Ok((row.get(0)?, row.get(1)?))
@@ -798,8 +843,7 @@ impl EventStore {
                 concat!(
                     "SELECT MAX(seq) FROM acp_events
                  WHERE session_id = ?1
-                   AND (json_extract(event_json, '$.Stopped') IS NOT NULL
-                     OR json_extract(event_json, '$.AgentStartupError') IS NOT NULL
+                   AND (discriminant IN ('Stopped', 'AgentStartupError')
                      OR ",
                     native_channel_loss_sql!("event_json"),
                     ")"
@@ -817,13 +861,13 @@ impl EventStore {
                 "SELECT 1 FROM acp_events
                  WHERE session_id = ?1
                    AND seq > ?2
-                   AND json_extract(event_json, '$.ToolCallStarted') IS NOT NULL
+                   AND discriminant = 'ToolCallStarted'
                    AND json_extract(event_json, '$.ToolCallStarted.tool_call.id') NOT IN (
                        SELECT json_extract(event_json, '$.ToolCallCompleted.tool_call_id')
                          FROM acp_events
                         WHERE session_id = ?1
                           AND seq > ?2
-                          AND json_extract(event_json, '$.ToolCallCompleted') IS NOT NULL
+                          AND discriminant = 'ToolCallCompleted'
                           -- `x NOT IN (a, NULL)` is NULL, which would hide every open call.
                           AND json_extract(event_json, '$.ToolCallCompleted.tool_call_id') IS NOT NULL
                    )
@@ -961,13 +1005,7 @@ mod tests {
                 Known(false),
             ),
             (
-                vec![
-                    user_prompt("go"),
-                    Event::AgentStartupError {
-                        message: "boom".into(),
-                        native_subject: None,
-                    },
-                ],
+                vec![user_prompt("go"), Event::startup_error("boom")],
                 Known(false),
                 Known(false),
             ),
@@ -1168,6 +1206,72 @@ mod tests {
         for (i, (events, holds)) in cases.into_iter().enumerate() {
             let id = format!("s-{i}");
             record_projection(&store, &id, 1, events);
+            assert_eq!(
+                store.holds_live_work(&id).unwrap(),
+                ControlKnowledge::Known(holds),
+                "case {i}"
+            );
+        }
+    }
+
+    /// A child's latest snapshot decides; a switch drops the old agent's children.
+    #[test]
+    fn a_working_child_holds_live_work_until_it_idles() {
+        use crate::acp::state::SubagentState;
+        let (_tmp, store) = open_store(1000);
+        let child = |id: &str, state| Event::SubagentUpdated {
+            subagent: SubagentRecord {
+                session_id: id.into(),
+                parent_session_id: "root".into(),
+                provenance: None,
+                parent_tool_call_id: Some("msg-1".into()),
+                title: None,
+                description: None,
+                state,
+                stop_reason: None,
+                error: None,
+                cancel_capable: true,
+                model: None,
+                background: true,
+            },
+            at: chrono::Utc::now(),
+        };
+        let switched = Event::AgentSwitched {
+            from: "claude".into(),
+            to: "codex".into(),
+            reason: "user".into(),
+        };
+        let root_done = || {
+            [
+                user_prompt("go"),
+                Event::ThinkingStarted,
+                stopped("prompt_complete"),
+            ]
+        };
+        // (events after the root's terminal, holds live work)
+        let cases = [
+            (vec![child("a", SubagentState::Running)], true),
+            (vec![child("a", SubagentState::RequiresAction)], true),
+            (vec![child("a", SubagentState::Unknown)], false),
+            (
+                vec![
+                    child("a", SubagentState::Running),
+                    child("a", SubagentState::Idle),
+                ],
+                false,
+            ),
+            (
+                vec![
+                    child("a", SubagentState::Running),
+                    child("b", SubagentState::Idle),
+                ],
+                true,
+            ),
+            (vec![child("a", SubagentState::Running), switched], false),
+        ];
+        for (i, (events, holds)) in cases.into_iter().enumerate() {
+            let id = format!("c-{i}");
+            record_projection(&store, &id, 1, root_done().into_iter().chain(events));
             assert_eq!(
                 store.holds_live_work(&id).unwrap(),
                 ControlKnowledge::Known(holds),
@@ -2152,6 +2256,116 @@ mod tests {
             .map(|launch| launch.agent_id)
             .collect();
         assert_eq!(tracking, ["a2", "other-run", "plain"]);
+    }
+
+    /// Probes find event types through the indexed `discriminant` column, never by
+    /// parsing every row. Each assertion fails if its query parses the malformed row.
+    #[test]
+    fn probes_do_not_parse_unrelated_rows() {
+        use crate::acp::elicitations::Elicitation;
+        let (_tmp, store) = open_store(0);
+        let nonce = Nonce::new();
+        let elicitation = Event::ElicitationRequested {
+            elicitation: Elicitation {
+                nonce: nonce.clone(),
+                message: "Pick".into(),
+                title: None,
+                description: None,
+                tool_call_id: None,
+                questions: Vec::new(),
+                requested_at: chrono::Utc::now(),
+                resolved: None,
+            },
+        };
+        let tool_done = |id: &str| Event::ToolCallCompleted {
+            tool_call_id: id.into(),
+            is_error: false,
+            content: String::new(),
+            output: Vec::new(),
+            completed_at: chrono::Utc::now(),
+            async_subagent: false,
+        };
+        record_projection(
+            &store,
+            "s-1",
+            1,
+            [
+                user_prompt("first"),
+                Event::ThinkingStarted,
+                agent_chunk("first turn"),
+                stopped("prompt_complete"),
+                user_prompt("second"),
+                Event::ThinkingStarted,
+                bg_launched("bg-1", ""),
+                elicitation,
+                Event::ToolCallStarted {
+                    tool_call: tool_call("tc-open"),
+                },
+                Event::ToolCallStarted {
+                    tool_call: tool_call("tc-done"),
+                },
+                tool_done("tc-done"),
+            ],
+        );
+        // An unprompted turn the rate limit interrupted.
+        record_projection(
+            &store,
+            "s-2",
+            1,
+            [
+                Event::SessionCleared,
+                Event::ThinkingStarted,
+                agent_chunk("work"),
+            ],
+        );
+        let mut outcome = store
+            .replay_from("s-2", 0)
+            .unwrap()
+            .last()
+            .unwrap()
+            .metadata
+            .clone();
+        outcome.operation.as_mut().unwrap().outcome =
+            Some(crate::acp::protocol::AcpOriginalRequestResult::Failed);
+        store
+            .record("s-2", 4, &stopped("rate_limited"), &outcome)
+            .unwrap();
+        {
+            let conn = store.hold_writer();
+            for (id, seq) in [("s-1", 12), ("s-2", 5)] {
+                events::insert_event(&conn, &store.schema, id, seq, "{\"Opaque\":{", 0).unwrap();
+            }
+        }
+
+        assert_eq!(store.unresolved_elicitation_nonces("s-1"), [nonce]);
+        assert_eq!(
+            store.has_in_flight_turn("s-1").unwrap(),
+            ControlKnowledge::Known(true)
+        );
+        assert_eq!(
+            store.rate_limit_interrupted_agent_turn("s-2").unwrap(),
+            ControlKnowledge::Known(true)
+        );
+        // Fails closed (true) if a tool filter parses the malformed row, still in this epoch.
+        assert!(store.has_open_tool_call_in_epoch("s-1"));
+        store
+            .record(
+                "s-1",
+                13,
+                &tool_done("tc-open"),
+                &super::EventMetadata::history(),
+            )
+            .unwrap();
+        assert!(!store.has_open_tool_call_in_epoch("s-1"));
+        // A closed prompt leaves the background agent as the open work.
+        let terminal = stopped("prompt_complete");
+        store
+            .record("s-1", 14, &terminal, &super::EventMetadata::host(&terminal))
+            .unwrap();
+        assert_eq!(
+            store.has_in_flight_turn("s-1").unwrap(),
+            ControlKnowledge::Known(true)
+        );
     }
 
     fn bg_launched(agent_id: &str, output_file: &str) -> Event {

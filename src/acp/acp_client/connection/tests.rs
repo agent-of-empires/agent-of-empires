@@ -238,6 +238,7 @@ async fn auth_status_is_cleared_per_adapter_process() {
                 acp_session_id: "s-auth".into(),
                 in_flight_turn: false,
                 unsuccessful_main: false,
+                live_recovery: None,
             };
             let cases = [
                 ("silent replacement", fresh(), false, vec![false]),
@@ -271,6 +272,7 @@ async fn auth_bootstrap_exceeding_public_and_shim_capacity_reaches_ready_before_
                     acp_session_id: "s-auth".into(),
                     in_flight_turn: false,
                     unsuccessful_main: false,
+                    live_recovery: None,
                 },
             ] {
                 let fresh = matches!(&mode, ConnectMode::Fresh);
@@ -1047,6 +1049,7 @@ async fn transport_and_protocol_failure_remain_fatal_across_turn_ownership() {
         acp_session_id: "s-eof".into(),
         in_flight_turn: true,
         unsuccessful_main: false,
+        live_recovery: None,
     });
     let mut fake = spawn_fake_connection(scope, "s-eof", resume, mode == "after_error", move |id| {
         entered.send(()).unwrap();
@@ -1142,6 +1145,7 @@ Some(ConnectMode::Resume {
     acp_session_id: "s-rejected".into(),
     in_flight_turn: false,
     unsuccessful_main: false,
+    live_recovery: None,
 }),
 false,
 move |id| {

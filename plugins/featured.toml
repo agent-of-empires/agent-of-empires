@@ -47,3 +47,25 @@ versions = {"1.0.0" = "sha256:b98ab9304a9906bd33acdcc5b4c1f5e9d6eb44db442d7409f8
 [plugins."agent-of-empires.kanban"]
 source = "gh:agent-of-empires/plugin-kanban"
 versions = {"1.0.0" = "sha256:1c4ed57deca62072ff0ebd061e4c849028f3a2ed25b35c25a4886a45733cc866"}
+
+# Released and pinned at `v0.1.0`, so an install with no `@ref` resolves that
+# tag instead of a moving default branch.
+#
+# plugin-linear v0.1.0 @ 69383b7a844f737f810118085b9178c53987e3b8
+[plugins."agent-of-empires.linear"]
+source = "gh:agent-of-empires/plugin-linear"
+versions = {"0.1.0" = "sha256:d83d52337a66bded91103cb88778cbbbee0f639e68b15d68d7981cd54c51a49f"}
+
+# Released and pinned at `v0.1.1`, so an install with no `@ref` resolves that
+# tag instead of a moving default branch.
+#
+# plugin-freebuf 0.1.0 is intentionally unpinned: its build wrote `node_modules/`
+# (with `.bin` symlinks) and `dist/` into the source root, so the load-time
+# tree_hash no longer matched and the reserved-namespace gate skipped the plugin
+# right after a featured install. Fixed in 0.1.1, which builds under
+# `.aoe-build/`.
+#
+# plugin-freebuf v0.1.1 @ 3514c04904aebde7473cf4a3f90f3975fe8a93c5
+[plugins."agent-of-empires.aoe-freebuf"]
+source = "gh:agent-of-empires/plugin-freebuf"
+versions = {"0.1.1" = "sha256:b4174e233f643d6d565e75b6d88968d3e5f28f5c14e15008e25f47475d94b743"}

@@ -39,7 +39,7 @@ describe("MobileRightPanelPicker", () => {
     expect(screen.getByTestId("mobile-right-panel-pick-paired").getAttribute("aria-current")).toBe("true");
   });
 
-  it("shows the Sub agents and Files entries and selects them when available", () => {
+  it("shows the Background and Files entries and selects them when available", () => {
     const { onSelect } = setup({ availablePanes: ["diff", "files", "agents"] });
     fireEvent.click(screen.getByTestId("mobile-right-panel-pick-agents"));
     expect(onSelect).toHaveBeenCalledWith("agents");

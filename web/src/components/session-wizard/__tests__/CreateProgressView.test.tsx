@@ -33,3 +33,14 @@ describe("CreateProgressView", () => {
     expect(out.scrollTop).toBe(out.scrollHeight);
   });
 });
+
+it.each<[CreateProgress["stage"], boolean]>([
+  ["pulling_image", true],
+  ["running_hooks", false],
+])("at %s, says a slow download is expected: %s", (stage, hint) => {
+  render(<CreateProgressView progress={{ stage, hook: null, output: [] }} />);
+  expect(screen.getByTestId("create-progress").textContent?.includes("Pulling latest image")).toBe(
+    stage === "pulling_image",
+  );
+  expect(screen.queryByText("A large image can take a few minutes to download.") !== null).toBe(hint);
+});

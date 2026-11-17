@@ -11,7 +11,7 @@ use crate::acp::approvals::ApprovalDecision;
 use crate::acp::elicitations::ElicitationOutcome;
 use crate::acp::event_sender::{AcpEventData, EventScope};
 use crate::acp::event_store::{AttachmentBlob, UnresolvedBackgroundAgentLaunch};
-use crate::acp::state::{BackgroundAgentStatus, Event};
+use crate::acp::state::{BackgroundAgentStatus, Event, SubagentState};
 
 impl<S: BroadcastSink> Supervisor<S> {
     pub(super) fn publish_next(&self, session_id: &str, event: Event) -> u64 {
@@ -26,13 +26,7 @@ impl<S: BroadcastSink> Supervisor<S> {
 
     /// Publish an `AgentStartupError` for a session whose worker never came online.
     pub fn publish_startup_error(&self, session_id: &str, message: String) {
-        self.publish_next(
-            session_id,
-            Event::AgentStartupError {
-                message,
-                native_subject: None,
-            },
-        );
+        self.publish_next(session_id, Event::startup_error(message));
     }
 
     /// A retained runtime refused admission; this is not a native I/O/death
@@ -303,6 +297,34 @@ impl<S: BroadcastSink> Supervisor<S> {
             .ok_or(super::SupervisorError::NativeStoreUnavailable)
     }
 
+    /// Refuse a deferred release if its checked event frontier changed.
+    pub(crate) fn publish_rate_limit_auto_resumed_if_seq(
+        &self,
+        session_id: &str,
+        resets_at: chrono::DateTime<chrono::Utc>,
+        expected_seq: u64,
+    ) -> Result<(), super::SupervisorError> {
+        match self
+            .sink
+            .queue_persisted(
+                session_id,
+                Arc::clone(&self.next_seqs),
+                AcpEventData::from_host(Event::RateLimitAutoResumed {
+                    resets_at,
+                    manual: true,
+                }),
+                Some(expected_seq),
+            )
+            .wait()
+        {
+            Some((_, true)) => Ok(()),
+            Some((_, false)) => Err(super::SupervisorError::NativeStoreUnavailable),
+            None => Err(super::SupervisorError::SpawnCancelled(
+                session_id.to_owned(),
+            )),
+        }
+    }
+
     /// Close a turn that was in flight when the previous daemon died.
     pub fn synthesize_stopped_for_orphan(&self, session_id: &str, reason: &str) {
         let seq = self.publish_next(
@@ -528,7 +550,28 @@ pub(super) fn complete_stopped_worker_work<S: BroadcastSink>(
             }
         }
     }
+    for event in cancelled_open_subagents(sink, session_id) {
+        if !publish_next_persisted(sink, next_seqs, session_id, AcpEventData::from_host(event)).1 {
+            return false;
+        }
+    }
     true
+}
+
+/// A dead worker's working subagents will never report their idle, so each
+/// closes as cancelled.
+pub(super) fn cancelled_open_subagents<S: BroadcastSink>(sink: &S, session_id: &str) -> Vec<Event> {
+    sink.open_subagents(session_id)
+        .into_iter()
+        .map(|mut subagent| {
+            subagent.state = SubagentState::Idle;
+            subagent.stop_reason = Some("cancelled".into());
+            Event::SubagentUpdated {
+                subagent,
+                at: chrono::Utc::now(),
+            }
+        })
+        .collect()
 }
 
 fn publish_background_agent_detached<S: BroadcastSink>(

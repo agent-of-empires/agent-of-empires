@@ -8,7 +8,7 @@ A manifest carries two independent version axes.
 
 | Key | Meaning |
 |---|---|
-| `api_version` | The manifest *schema* version. The current schema is `20`. The host rejects a manifest whose `api_version` is newer than it supports. |
+| `api_version` | The manifest *schema* version. The current schema is `22`. The host rejects a manifest whose `api_version` is newer than it supports. |
 | `aoe_version` | A semver requirement on the *host app* version, e.g. `">=1.11.0, <2.0.0"`. The host refuses to install, and skips loading, a plugin whose requirement excludes the running version. Optional; requires `api_version >= 4`. |
 
 Each key below notes the `api_version` it needs. Target the newest schema your plugin uses, and set `aoe_version` to the host range you have tested.
@@ -19,7 +19,7 @@ Each key below notes the `api_version` it needs. Target the newest schema your p
 id = "dev.example.my-plugin"
 name = "My Plugin"
 version = "0.1.0"
-api_version = 20
+api_version = 22
 aoe_version = ">=1.11.0, <2.0.0"
 description = "What the plugin does."
 capabilities = ["runtime.worker"]
@@ -30,13 +30,13 @@ capabilities = ["runtime.worker"]
 | `id` | string | yes | Plugin id (see [Plugin id](#plugin-id)). Namespaces config, events, and action names. |
 | `name` | string | yes | Human-readable display name. |
 | `version` | string | yes | Semantic version of the plugin. |
-| `api_version` | integer | yes | Manifest schema version, `1` to `20`. |
+| `api_version` | integer | yes | Manifest schema version, `1` to `22`. |
 | `description` | string | no | Shown in plugin listings. Defaults to empty. |
 | `aoe_version` | string | no | Host-app semver requirement. Requires `api_version >= 4`. |
 | `capabilities` | array of string | no | Runtime grants the worker needs (see [Capabilities](#capabilities)). A manifest with `[runtime]` must declare `runtime.worker`. Static contributions need none; provider-native agent status and replies require `session.integration`. |
 | `screenshots` | array | no | Up to 8. Requires `api_version >= 5`. See [Screenshots](#screenshots). |
 | `setting_defaults` | table | no | Overrides for core host settings, keyed by canonical path (e.g. `"theme.idle_decay_minutes"`). Resolution is user value, then plugin override, then core default. |
-| `agent_integrations` | array of tables | no | Agent tools may declare provider-native communication or optional launch metadata. Requires `api_version >= 19`; provider-native status and replies require `session.integration`. |
+| `agent_integrations` | array of tables | no | Agent tools may declare provider-native communication or optional launch metadata. Requires `api_version >= 19`; the launch, detection, and reply-fallback extensions require API 21, and the session-id capture extension requires API 22, each with a host implementing them. Provider-native status and replies require `session.integration`. |
 
 ## Agent integrations
 
@@ -65,15 +65,69 @@ replies = true
 | `command` | string | no | Launch command: optional literal `NAME=value` assignments, then the executable, then free-form agent arguments. |
 | `replies` | boolean | no | Explicitly enable provider-native prompt replies; defaults to false. Requires `session.integration`. Status-only integrations do not take over quick-response actions. |
 
-Installing a plugin with agent integrations requires explicit approval. The install preview and CLI/TUI prompts show each tool and its exact command. Updates require approval when they add an agent integration or change a launch command; removals alone do not. AoE runs the declared command as the user only when that agent is launched.
+Installing a plugin with agent integrations requires explicit approval. The install preview and CLI/TUI/web prompts show each tool, its command, and its agent declarations. Control and format characters are displayed as escapes. Updates require approval when an integration is added or any declaration changes; removals alone do not. AoE runs the declared command as the user only when that agent is launched.
 
 The host matches status integrations to terminal sessions and rejects missing, malformed, or unsupported runtime versions before consuming reports or sending replies. The runtime extension must also enforce supported versions before activation. These requirements are independent of the plugin's `version`, AoE host `api_version` / `aoe_version`, and report/reply `schema_version`. Launch-only agent declarations do not enable provider-native status or replies.
 
-Launch, detection, and reply-fallback declarations for the planned API 21 are
-not accepted by this host. API 20 agent integrations remain supported. The
-staged schema rejects control and Unicode format characters in launch flags,
-instruction templates, environment values, install hints, and literal reply keys.
-Resume declarations require OMP capture in at least one pane-scoped context.
+For status, a session's own integration takes precedence; an unowned tool may use the integration selected by its detection alias. Reply ownership remains tied to the session's own tool.
+
+### Launch, detection, and reply-fallback declarations (API 21)
+
+These declarations require API 21 and a host that implements them. API 20 hosts reject them; API 20 agent integrations remain supported. Built-in agents and aliases retain precedence. An approved, enabled API 21 OMP launch declaration supersedes the bundled OMP launch contract, including for existing sessions with no stored command; provider status and replies still require their capability and valid reports. If that declaration is absent, disabled, or not approved, the bundled OMP launch, pane detection, and capture fallback remain available. A plugin-omp release declaring API 21 behavior is a separate prerequisite for the cutover.
+
+Launch flags, instruction templates, environment values, install hints, and literal reply keys reject control and Unicode format characters.
+
+```toml
+capabilities = ["session.integration"]
+
+[[agent_integrations]]
+tool = "example-agent"
+command = "example-agent"
+provider_versions = ["^1.0"]
+replies = false
+
+[agent_integrations.launch]
+aliases = ["example"]
+oneshot_flag = "-p"
+instruction_flag = "--prompt={}"
+model_flag = "--model"
+host_only = false
+install_hint = "Install example-agent from its vendor"
+
+[agent_integrations.launch.container_env]
+EXAMPLE_HOME = "/state"
+
+[agent_integrations.launch.yolo]
+kind = "flag"
+flag = "--auto-approve"
+
+[agent_integrations.launch.resume]
+kind = "flag"
+flag = "--resume"
+
+[agent_integrations.launch.capture]
+backend = "omp"
+host = "pane_scoped"
+sandbox = "unsupported"
+
+[agent_integrations.detection]
+mode = "native_only"
+
+[agent_integrations.reply_fallback]
+allow = [{ kind = "named", value = "Enter" }]
+deny = [{ kind = "literal", value = "n" }]
+```
+
+The example's `detection` requires `session.integration` in the manifest's capabilities. Every declaration type, `session_id` included, requires a nonblank `command`: the plugin must contribute the tool it captures for, because only the plugin that owns a tool may attribute an id to a session using it.
+
+- `launch.aliases` are unique lowercase agent ids, distinct from the tool. `oneshot_flag` and `model_flag` are single shell-safe flags. `instruction_flag` has one `{}` placeholder, as a whole argument or after `=`, and otherwise contains shell-safe words.
+- `launch.yolo` is `kind = "flag"` with `flag`, `kind = "always"`, or `kind = "env"` with `key` and `value`. An `always` declaration applies while active without changing the session's saved Yolo preference. `container_env` is applied to sandbox launches. Protected environment names are rejected.
+- `launch.resume` is `kind = "flag"` with `flag`, `kind = "flag_pair"` with `existing` and `new_session`, or `kind = "subcommand"` with `command`. Resume and capture require each other. Capture supports only backend `omp`, with `pane_scoped` in at least one of `host` or `sandbox` and `pane_scoped` or `unsupported` in the other.
+- `detection.mode = "native_only"` requires `session.integration`; the integration owns status rather than falling back to pane parsing when a report is missing or invalid.
+- `session_id` declares that the plugin worker owns session-id capture for the tool, so the provider's store layout and wire formats stay in the plugin. It requires `api_version >= 22` and a manifest that declares a `[runtime]` worker. The declared worker reports what it captured with the `session.capture.set` RPC, taking `session_id` (the session to attribute) and `agent_session_id` (the provider's id) and requiring `session.write`. Only the plugin that owns the session's tool may report; any other caller gets `not_capture_owner`. The host applies the id through `persist_session_with_storage`, the guarded observation path the pollers use, and answers `applied = false` with one of three reasons: `pinned` (the row pins a different conversation for its next launch), `owned_elsewhere` (another session durably owns the id), or `stale` (the row changed since the host read it, or the id is capture-excluded).
+
+A report is not tied to a launch. The host mints no launch token and the call carries none, so it cannot tell which launch produced the id, and a report that arrives late for an earlier launch is applied to whatever the row holds at that moment, subject to the reasons above. A worker must report only the id its current launch produced and stop reporting once that launch is gone. The id is also stored without an execution binding, because the report names no execution to scope it to: peer ownership and capture excludes are then judged over the whole id namespace rather than a single conversation's store. Polling, with its launch-scoped generations, is what will close both gaps. `method`, `launch_method` and `timeout_ms` are reserved for host-driven polling and are validated but not yet called by this host version: hosts do not poll the worker, apply a `launch_method` wrapper, or enforce `timeout_ms`, so a plugin must not rely on them yet. When they are implemented, `method` will be the per-poll worker RPC that returns `session_id` with the generation it was captured for, `launch_method` an optional RPC returning the launch wrapper and tmux environment the capture needs, and `timeout_ms` a per-call bound defaulting to 5000 and valid from 250 to 30000. Method names are dotted identifiers like `omp.session_id`.
+- `reply_fallback` contains nonempty `allow` and `deny` arrays, and an optional nonempty `allow_always` array, of literal or named keys. Named keys are `Enter`, `Tab`, `Escape`, `Space`, `Backspace`, `Up`, `Down`, `Left`, `Right`, `Home`, `End`, `PageUp`, `PageDown`, and `F1` through `F12`. Fallback is allowed only with `replies = false` and does not automatically approve a prompt.
 
 For reply-enabled integrations, the provider report's `reply_keys` must contain at most eight distinct function-key names from `F1` through `F12`; the host rejects a report with more than eight keys or any duplicate. AoE sends those keys only after the user submits a response. A status-only report may omit `reply_keys` or send an empty array. Prompts are ignored unless the integration enables replies and the report supplies wake keys. Missing or invalid reports for reply-enabled integrations never fall back to terminal approval keystrokes.
 
@@ -99,7 +153,7 @@ Capabilities gate plugin resource access and host interactions. They are prompte
 |---|---|
 | `runtime.worker` | Launching a plugin worker and using its base host RPCs. Required for either runtime kind. |
 | `session.read` | Reading sessions of the host's profile: the attached session, `sessions.list`, and the `session.status.changed` (`api_version >= 14`) and `session.lifecycle.changed` (`api_version >= 19`) notifications. |
-| `session.write` | Mutating any session of the profile: `session.meta.set`/`cas`, and archive/trash from a plugin page. |
+| `session.write` | Mutating any session of the profile: `session.meta.set`/`cas`, `session.capture.set` for a tool the plugin owns and declares `session_id` for, and archive/trash from a plugin page. |
 | `config.read` | Reading host or other-plugin configuration (not the plugin's own settings). |
 | `config.write` | Writing host or other-plugin configuration. |
 | `process.spawn` | Spawning processes beyond the plugin's own worker. |

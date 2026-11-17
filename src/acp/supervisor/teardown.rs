@@ -520,6 +520,28 @@ impl RetirementResources {
         }));
     }
 
+    /// A reattach supersedes a lost connection, keeping any close it owed.
+    pub(super) fn replace_client(&self, lost: &Arc<AcpClient>, next: &Arc<AcpClient>) {
+        use std::sync::atomic::Ordering;
+        let mut clients = lock_recover(&self.clients);
+        let Some(slot) = clients.iter_mut().find(|slot| {
+            slot.as_ref()
+                .is_some_and(|entry| Arc::ptr_eq(&entry.client, lost))
+        }) else {
+            drop(clients);
+            return self.record_client(next, false);
+        };
+        let close = slot
+            .as_ref()
+            .is_some_and(|entry| entry.close_requested.load(Ordering::Acquire));
+        *slot = Some(Arc::new(RetiringClient {
+            client: Arc::clone(next),
+            close_requested: std::sync::atomic::AtomicBool::new(close),
+            close_done: std::sync::atomic::AtomicBool::new(false),
+            shutdown_done: std::sync::atomic::AtomicBool::new(false),
+        }));
+    }
+
     pub(super) fn record_worker(&self, handle: WorkerHandle) {
         if is_test_worker(&handle) {
             self.emit_events
@@ -1254,6 +1276,40 @@ impl<S: BroadcastSink> Supervisor<S> {
         .await?
         .map(|lease| IdleRetirement { lease })
         .ok_or_else(|| SupervisorError::Superseded(session_id.into()))
+    }
+
+    #[cfg(test)]
+    pub(crate) async fn retire_captured_connection_for_test(
+        &self,
+        target: &RetirementTarget,
+    ) -> anyhow::Result<()> {
+        let lease = target.lease.as_ref().expect("captured connection lease");
+        {
+            let mut workers = self.workers.lock().await;
+            let mut lifecycle = lock_recover(&self.lifecycle);
+            anyhow::ensure!(
+                lifecycle
+                    .running(lease.session_id())
+                    .is_some_and(|(current, owner)| {
+                        current == *lease && owner == target.identity
+                    }),
+                "captured connection was superseded"
+            );
+            anyhow::ensure!(
+                matches!(
+                    lifecycle.begin_connection_retirement(lease),
+                    crate::acp::runner_lifecycle::StopDecision::TearDown { .. }
+                ),
+                "captured connection cannot retire"
+            );
+            let worker = workers
+                .remove(lease.session_id())
+                .expect("the captured connection owns its worker");
+            assert_eq!(worker.lease, *lease);
+            lease.retirement().record_worker(worker);
+        }
+        self.settle_accepted_stop(lease).await;
+        Ok(())
     }
 
     pub(crate) async fn settle_idle_retirement(&self, retirement: IdleRetirement) {
@@ -3528,6 +3584,30 @@ mod tests {
                 &crate::acp::event_sender::EventMetadata::history(),
             )
             .unwrap();
+        store
+            .record(
+                session,
+                3,
+                &Event::SubagentUpdated {
+                    subagent: crate::acp::state::SubagentRecord {
+                        session_id: "child".into(),
+                        parent_session_id: "root".into(),
+                        provenance: None,
+                        parent_tool_call_id: Some("tc-1".into()),
+                        title: None,
+                        description: None,
+                        state: crate::acp::state::SubagentState::RequiresAction,
+                        stop_reason: None,
+                        error: None,
+                        cancel_capable: true,
+                        model: None,
+                        background: true,
+                    },
+                    at: chrono::Utc::now(),
+                },
+                &crate::acp::event_sender::EventMetadata::history(),
+            )
+            .unwrap();
         let (dead_pid, birth) = {
             let mut child = std::process::Command::new("/bin/sh")
                 .args(["-c", "exit 0"])
@@ -3556,6 +3636,22 @@ mod tests {
 
         assert!(store.unresolved_background_task_ids(session).is_empty());
         assert!(store.unresolved_background_agent_ids(session).is_empty());
+        assert!(store.open_subagents(session).is_empty());
+        let mut state = crate::acp::state::AcpState::new(
+            AcpSessionId(session.into()),
+            crate::acp::state::AgentName("claude".into()),
+            None,
+        );
+        for stored in store.replay_from(session, 0).unwrap() {
+            state
+                .apply_scoped_event(stored.seq, stored.event.as_ref(), &stored.metadata)
+                .unwrap();
+        }
+        assert_eq!(
+            state.background_agents[0].status,
+            BackgroundAgentStatus::Detached,
+            "the child's cancel must not overwrite its agent's detach"
+        );
     }
 
     #[tokio::test]

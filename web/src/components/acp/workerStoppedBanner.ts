@@ -20,6 +20,11 @@ export function pickWorkerStoppedVariant(args: {
   return args.workerStopping ? "none" : "generic";
 }
 
-export function showWorkerStoppingBanner(args: { acpWorkerState: string; startupError: string | null }): boolean {
-  return args.acpWorkerState === "stopping" && !args.startupError;
+/** This dashboard's own restart stops the Worker too; its startup line covers that stop. */
+export function showWorkerStoppingBanner(args: {
+  acpWorkerState: string;
+  startupError: string | null;
+  restartInFlight?: boolean;
+}): boolean {
+  return args.acpWorkerState === "stopping" && !args.startupError && !args.restartInFlight;
 }

@@ -1241,7 +1241,7 @@ impl ScriptedAcpAgent {
         std::fs::write(
             &script,
             r#"
-import json, os, sys
+import json, os, sys, time
 if "--version" in sys.argv:
     print("0.99.1")
     sys.exit(0)
@@ -1268,6 +1268,16 @@ for line in sys.stdin:
         native = "native-%s-%s" % (os.getpid(), new_count)
         result = {"sessionId": native, "modes": modes}
     elif method == "session/load":
+        rejection = os.environ.get("AOE_TEST_LOAD_REJECTION")
+        if rejection:
+            release = os.environ["AOE_TEST_LOAD_RELEASE"]
+            deadline = time.monotonic() + 10
+            while not os.path.exists(release):
+                if time.monotonic() >= deadline:
+                    raise RuntimeError("original load rejection was not released")
+                time.sleep(0.005)
+            send({"jsonrpc": "2.0", "id": request["id"], "error": json.loads(rejection)})
+            continue
         native = params["sessionId"]
         result = {"modes": modes}
     elif method == "session/prompt":
@@ -1304,11 +1314,25 @@ for line in sys.stdin:
     }
 
     pub(crate) fn launcher(&self, owned_runner: bool) -> Launcher {
+        self.launcher_with_runner(owned_runner.then(cargo_runner_executable))
+    }
+
+    pub(crate) fn managed_launcher(&self) -> Launcher {
+        let thread = std::thread::current();
+        let (executable, _) =
+            crate::process::runner::test_support::managed_runner::RunnerInspection::prepare(
+                self._directory.path(),
+                thread.name().expect("managed libtest name"),
+            );
+        self.launcher_with_runner(Some(executable))
+    }
+
+    fn launcher_with_runner(&self, executable: Option<PathBuf>) -> Launcher {
+        let owned_runner = executable.is_some();
         let script = self.script.clone();
         let capture = self.capture.clone();
         let pid_file = self.pid_file.clone();
         let leases = self.leases.clone();
-        let executable = owned_runner.then(cargo_runner_executable);
         Arc::new(move |mut config, session_id| {
             let script = script.clone();
             let capture = capture.clone();
@@ -1499,7 +1523,6 @@ for line in sys.stdin:
             }
             wait_original_reaped(owner.pid, birth).await;
         }
-        self.native.lock().unwrap().take();
         self.leases.lock().unwrap().clear();
     }
 }

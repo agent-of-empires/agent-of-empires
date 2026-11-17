@@ -35,6 +35,8 @@ export interface WizardData {
   yoloMode: boolean;
   sandboxEnabled: boolean;
   sandboxImage: string;
+  /** "Pull latest image first"; null until the user chooses, so the offer's default applies. */
+  pullLatestImage: boolean | null;
   extraEnv: string[];
   hookEnv: string[];
   extraRepoPaths: string[];
@@ -142,6 +144,7 @@ export const initialData: WizardData = {
   yoloMode: false,
   sandboxEnabled: false,
   sandboxImage: "",
+  pullLatestImage: null,
   extraEnv: [],
   hookEnv: [],
   extraRepoPaths: [],
