@@ -16,6 +16,7 @@ use serde::{Deserialize, Serialize};
 use tokio::time::Instant;
 
 use super::{api_error, cityhall_block, read_only_block};
+use crate::containers::image_pull::PullState;
 use crate::containers::image_update::{self, ImageCheck};
 use crate::containers::ContainerRuntime;
 use crate::server::AppState;
@@ -157,38 +158,6 @@ where
             error: "registry_bad_response".into(),
         }
     })
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
-#[serde(tag = "state", rename_all = "snake_case")]
-pub enum PullState {
-    Idle,
-    Running,
-    Done,
-    /// `error` carries the Container runtime's stderr.
-    Failed {
-        error: String,
-    },
-}
-
-static PULLS: LazyLock<Mutex<HashMap<ImageKey, PullState>>> = LazyLock::new(Mutex::default);
-
-/// Marks the image running unless it already is; true when the caller should start the pull.
-fn claim_pull(pulls: &mut HashMap<ImageKey, PullState>, key: &ImageKey) -> bool {
-    if pulls.get(key) == Some(&PullState::Running) {
-        return false;
-    }
-    pulls.insert(key.clone(), PullState::Running);
-    true
-}
-
-fn pull_state(key: &ImageKey) -> PullState {
-    PULLS
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .get(key)
-        .cloned()
-        .unwrap_or(PullState::Idle)
 }
 
 /// What the Daemon would sandbox with. Only these are checked or pulled, so a request can't
@@ -388,7 +357,7 @@ pub async fn sandbox_image_status(
             .iter()
             .any(|i| i.is_sandboxed());
     Json(ImageStatusResponse {
-        pull: pull_state(&key),
+        pull: runtime.pull_state(&image),
         pull_blocked: pull_blocked(&state, &configured),
         pull_command: runtime.pull_command(&image),
         runtime: runtime.display_name(),
@@ -458,44 +427,16 @@ pub async fn sandbox_image_pull(
         Err(resp) => return resp,
     };
     let key = configured.key(image.clone());
-    let started = claim_pull(&mut PULLS.lock().unwrap_or_else(|e| e.into_inner()), &key);
-    if started {
-        let runtime = configured.runtime;
-        tokio::spawn(async move {
-            let pulled = key.image.clone();
-            let started = std::time::Instant::now();
-            let result = tokio::task::spawn_blocking(move || {
-                ContainerRuntime::from(runtime).pull_image(&pulled)
-            })
-            .await;
-            let outcome = match result {
-                Ok(Ok(())) => PullState::Done,
-                Ok(Err(e)) => PullState::Failed {
-                    error: e.to_string(),
-                },
-                Err(e) => PullState::Failed {
-                    error: format!("pull task failed: {e}"),
-                },
-            };
-            let duration_ms = started.elapsed().as_millis();
-            match &outcome {
-                PullState::Failed { error } => {
-                    tracing::warn!(target: "containers.image", image = %key.image, ok = false, duration_ms, %error, "image pull finished")
-                }
-                _ => {
-                    tracing::info!(target: "containers.image", image = %key.image, ok = true, duration_ms, "image pull finished")
-                }
-            }
-            STATUS
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .invalidate(&key);
-            PULLS
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .insert(key, outcome);
-        });
-    }
+    // Registered now, so the next status read already sees it running.
+    let waiter = ContainerRuntime::from(configured.runtime).join_pull(&image);
+    tokio::task::spawn_blocking(move || {
+        // A pull the dashboard asked for is never cancelled by a create that joined it.
+        let _ = waiter.wait(&tokio_util::sync::CancellationToken::new());
+        STATUS
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .invalidate(&key);
+    });
     (
         StatusCode::ACCEPTED,
         Json(serde_json::json!({ "image": image, "pull": PullState::Running })),
@@ -828,28 +769,6 @@ mod tests {
         }
     }
 
-    #[test]
-    fn only_one_pull_per_image_and_runtime_runs_at_a_time() {
-        let mut pulls = HashMap::new();
-        let docker = key("Docker", "img");
-        assert!(claim_pull(&mut pulls, &docker));
-        assert!(!claim_pull(&mut pulls, &docker), "already running");
-        assert!(claim_pull(&mut pulls, &key("Docker", "other")), "per image");
-        assert!(claim_pull(&mut pulls, &key("Podman", "img")), "per runtime");
-        for finished in [
-            PullState::Done,
-            PullState::Failed {
-                error: "denied".into(),
-            },
-        ] {
-            pulls.insert(docker.clone(), finished);
-            assert!(
-                claim_pull(&mut pulls, &docker),
-                "a finished pull can be retried"
-            );
-        }
-    }
-
     #[tokio::test]
     #[serial_test::serial]
     async fn an_unreadable_configuration_refuses_status_and_pull() {
@@ -891,11 +810,7 @@ mod tests {
                 "{label}"
             );
             assert!(
-                PULLS
-                    .lock()
-                    .unwrap()
-                    .values()
-                    .all(|p| *p != PullState::Running),
+                !crate::containers::image_pull::any_running(),
                 "{label}: no pull started"
             );
             std::fs::write(&path, original).unwrap();
