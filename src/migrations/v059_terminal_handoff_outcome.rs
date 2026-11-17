@@ -51,13 +51,24 @@ fn migrate_file(path: &Path) -> Result<()> {
         if fields.contains_key("outcome") {
             continue;
         }
-        let outcome = outcome_of(fields).with_context(|| {
+        let outcome = (|| -> Result<Value> {
+            let outcome = serde_json::to_value(outcome_of(fields)?)?;
+            // Validate a copy, as v048 does, so a malformed handoff is refused, not rewritten.
+            let mut copy = fields.clone();
+            copy.insert("outcome".into(), outcome.clone());
+            let intent: crate::session::TerminalHandoffIntent =
+                serde_json::from_value(Value::Object(copy))
+                    .context("existing terminal handoff authority is malformed")?;
+            intent.validate_relationships()?;
+            Ok(outcome)
+        })()
+        .with_context(|| {
             format!(
                 "invalid terminal handoff at session row {index} in {}",
                 path.display()
             )
         })?;
-        fields.insert("outcome".into(), serde_json::to_value(outcome)?);
+        fields.insert("outcome".into(), outcome);
         recorded += 1;
     }
     if recorded > 0 {
@@ -195,12 +206,16 @@ mod tests {
         }
         let row = Instance::new("pending", "/tmp/repo");
         let intent = pending(&row, TerminalHandoffContext::Discard);
-        for corrupt in [json!("not a handoff"), json!({"mode": "unknown"})] {
+        let corruptions: [fn(&mut Value); 4] = [
+            |row| row["terminal_handoff"] = json!("not a handoff"),
+            |row| row["terminal_handoff"]["context"] = json!({"mode": "unknown"}),
+            // Context and target are valid, so only the whole handoff shows these.
+            |row| row["terminal_handoff"]["id"] = json!("not-a-uuid"),
+            |row| row["terminal_handoff"]["target_generation"] = json!(1),
+        ];
+        for corrupt in corruptions {
             let mut value = written_before(&row, &intent)?;
-            match corrupt {
-                Value::String(_) => value["terminal_handoff"] = corrupt,
-                _ => value["terminal_handoff"]["context"] = corrupt,
-            }
+            corrupt(&mut value);
             let bytes = serde_json::to_vec(&json!([value]))?;
             std::fs::write(&path, &bytes)?;
             assert!(migrate_file(&path).is_err());
@@ -247,6 +262,37 @@ mod tests {
             assert_eq!(handoff.id, intent.id);
             assert_eq!(loaded[0].conversation_state(), row.conversation_state());
         }
+        Ok(())
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn a_component_repaired_after_v059_gets_its_outcome_on_recovery() -> Result<()> {
+        let home = tempfile::tempdir()?;
+        let _home = crate::session::test_support::isolate_app_dir_at(home.path());
+        let app = crate::session::get_app_dir()?;
+        let storage = crate::session::Storage::new_unwatched("default")?;
+        std::fs::write(storage.sessions_path(), b"{")?;
+        std::fs::write(app.join(".schema_version"), "58")?;
+        crate::migrations::run_migrations()?;
+        assert_eq!(
+            crate::migrations::get_current_version(),
+            crate::migrations::CURRENT_VERSION
+        );
+        assert_eq!(std::fs::read(storage.sessions_path())?, b"{");
+
+        let row = Instance::new("repaired", "/tmp/repo");
+        let intent = pending(&row, TerminalHandoffContext::Discard);
+        let repaired = serde_json::to_vec(&json!([written_before(&row, &intent)?]))?;
+        std::fs::write(storage.sessions_path(), &repaired)?;
+        assert!(storage.load().is_err(), "the repaired row has no outcome");
+
+        crate::migrations::recovery::reconcile_repaired_components()?;
+
+        let loaded = storage.load()?;
+        let handoff = loaded[0].terminal_handoff.as_deref().expect("kept handoff");
+        assert_eq!(handoff.outcome, TerminalHandoffOutcome::Fresh);
+        assert_eq!(handoff.id, intent.id);
         Ok(())
     }
 }
