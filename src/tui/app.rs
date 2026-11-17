@@ -2505,6 +2505,15 @@ impl App {
                 self.home.structured_preview = Some(view);
                 self.preview_mount_pending = None;
                 self.structured_mount_failed = None;
+                // Enter mounted this session itself: a connect still queued for it
+                // would land on a view the user is already typing into.
+                if self
+                    .structured_mount
+                    .as_ref()
+                    .is_some_and(|(target, _)| target == session_id)
+                {
+                    self.structured_mount = None;
+                }
             }
             Err(e) => {
                 self.set_status(format!("structured view: {e}"));
@@ -2522,19 +2531,26 @@ impl App {
     ) {
         use crate::tui::structured_view::embedded::EmbeddedView;
 
-        let (tx, rx) = tokio::sync::oneshot::channel();
+        let (mut tx, rx) = tokio::sync::oneshot::channel();
         let mount_session = session_id.to_owned();
         tokio::spawn(async move {
-            let result = EmbeddedView::connect(endpoint, &mount_session)
-                .await
-                .map_err(|e| e.to_string());
+            // A mount the selection left behind replays the whole transcript for
+            // nobody unless it is cut short when the receiver goes away.
+            let result = tokio::select! {
+                result = EmbeddedView::connect(endpoint, &mount_session) => {
+                    result.map_err(|e| e.to_string())
+                }
+                _ = tx.closed() => return,
+            };
             let _ = tx.send(result);
         });
         self.structured_mount = Some((session_id.to_owned(), rx));
     }
 
     /// Install a finished preview mount, or drop one the selection left behind.
-    /// Returns true when the preview pane changed.
+    /// Returns true when the pane or its loading state changed, which a discarded
+    /// mount also does: the placeholder and any error status are only painted by
+    /// a redraw.
     fn poll_structured_mount(&mut self) -> bool {
         use tokio::sync::oneshot::error::TryRecvError;
 
@@ -2551,26 +2567,27 @@ impl App {
         };
         self.clear_preview_mount_pending();
         let wanted = self.home.selected_structured_session().as_deref() == Some(target.as_str());
-        // Enter may have opened the same session while this connected. That view
-        // owns the keyboard, so a preview landing later must not replace it.
-        let opened = self
+        // The target may have mounted while this connected, whether Enter opened
+        // it or it is a view the user has since left. Either way it already holds
+        // a draft that a replacement would drop.
+        let mounted = self
             .home
             .structured_preview
             .as_ref()
-            .is_some_and(|view| view.is_active());
+            .is_some_and(|view| view.session_id() == target.as_str());
         match result {
-            Ok(view) if wanted && !opened => {
+            Ok(view) if wanted && !mounted => {
                 self.structured_mount_failed = None;
                 self.home.structured_preview = Some(view);
                 true
             }
-            Ok(_) => false,
+            Ok(_) => true,
             Err(e) => {
                 if wanted {
                     self.structured_mount_failed = Some(target);
+                    self.set_status(e);
                 }
-                self.set_status(e);
-                false
+                true
             }
         }
     }
@@ -2591,6 +2608,17 @@ impl App {
     /// the mount set changed.
     fn reconcile_structured_preview(&mut self) -> bool {
         self.home.enforce_trash_read_only();
+        // A failure is remembered only for the row it belongs to, so the early
+        // returns below cannot strand it on a row the user has come back to.
+        let selecting_failed_row = self
+            .structured_mount_failed
+            .as_deref()
+            .is_some_and(|failed| {
+                self.home.selected_structured_session().as_deref() == Some(failed)
+            });
+        if !selecting_failed_row {
+            self.structured_mount_failed = None;
+        }
         let retained = self
             .home
             .selected_session
@@ -2676,8 +2704,6 @@ impl App {
             self.clear_preview_mount_pending();
             return false;
         }
-        // Any other row's failure is retried when the user comes back to it.
-        self.structured_mount_failed = None;
         // Cheap discovery only: a down daemon keeps the "press Enter"
         // placeholder, and a stale mount is dropped.
         let Ok(endpoint) = crate::acp::client::discover() else {
@@ -3667,7 +3693,7 @@ mod tests {
         app.home.selected_session = None;
 
         assert!(tx.send(Ok(EmbeddedView::for_test(&id))).is_ok());
-        assert!(!app.poll_structured_mount());
+        assert!(app.poll_structured_mount(), "the placeholder clears");
         assert!(app.home.structured_preview.is_none());
     }
 
@@ -3683,7 +3709,7 @@ mod tests {
             .send(Err("structured view: ws connect failed".to_owned()))
             .is_ok());
 
-        assert!(!app.poll_structured_mount());
+        assert!(app.poll_structured_mount(), "the error status is painted");
         assert_eq!(app.structured_mount_failed.as_deref(), Some(id.as_str()));
         assert!(app
             .update_status
@@ -3711,13 +3737,33 @@ mod tests {
         app.structured_mount = Some((id.clone(), rx));
 
         assert!(tx.send(Ok(EmbeddedView::for_test(&id))).is_ok());
-        assert!(!app.poll_structured_mount());
+        assert!(app.poll_structured_mount());
         assert!(
             app.home
                 .structured_preview
                 .as_ref()
                 .is_some_and(|v| v.is_active()),
             "the view the user opened keeps the keyboard"
+        );
+    }
+
+    /// Selecting a row may leave the list entirely. That path returns before
+    /// the mount retry, and it must still forget the old row's failure.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn a_failed_structured_row_is_forgotten_after_selecting_nothing() {
+        let (mut app, _guard, id) = app_on_a_structured_row();
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        app.structured_mount = Some((id.clone(), rx));
+        assert!(tx.send(Err("ws connect failed".to_owned())).is_ok());
+        assert!(app.poll_structured_mount());
+        assert_eq!(app.structured_mount_failed.as_deref(), Some(id.as_str()));
+
+        app.home.selected_session = None;
+        app.reconcile_structured_preview();
+        assert_eq!(
+            app.structured_mount_failed, None,
+            "a failure belongs to the row it happened on"
         );
     }
 
@@ -3730,7 +3776,7 @@ mod tests {
         let (tx, rx) = tokio::sync::oneshot::channel();
         app.structured_mount = Some((ids[0].clone(), rx));
         assert!(tx.send(Err("ws connect failed".to_owned())).is_ok());
-        assert!(!app.poll_structured_mount());
+        assert!(app.poll_structured_mount(), "the error status is painted");
         assert_eq!(
             app.structured_mount_failed.as_deref(),
             Some(ids[0].as_str())
@@ -3741,6 +3787,31 @@ mod tests {
         assert_eq!(
             app.structured_mount_failed, None,
             "the failure is forgotten so returning to the row retries it"
+        );
+    }
+
+    /// Leaving a view the user typed into does not unmount it, so a duplicate
+    /// connect landing afterwards must not take its draft away.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn a_late_mount_does_not_replace_a_view_the_user_left() {
+        use crate::tui::structured_view::embedded::EmbeddedView;
+        let (mut app, _guard, id) = app_on_a_structured_row();
+        app.home.structured_preview = Some(EmbeddedView::for_test(&id));
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        app.structured_mount = Some((id.clone(), rx));
+
+        assert!(tx.send(Ok(EmbeddedView::for_test(&id))).is_ok());
+        assert!(
+            app.poll_structured_mount(),
+            "the pending placeholder clears"
+        );
+        assert!(
+            app.home
+                .structured_preview
+                .as_ref()
+                .is_some_and(|v| v.session_id() == id),
+            "the mounted view is kept rather than rebuilt underneath the user"
         );
     }
 

@@ -273,6 +273,11 @@ async fn setup_view(endpoint: DaemonEndpoint, session_id: &str) -> Result<ViewSe
             ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
             loop {
                 ticker.tick().await;
+                // Checked before the poll so a view nobody holds stops here even
+                // while every poll keeps failing.
+                if plugin_tx.is_closed() {
+                    break;
+                }
                 let snapshot = match http.plugin_ui_state().await {
                     Ok(snapshot) => snapshot,
                     // A fixed env credential cannot recover inside this view.
