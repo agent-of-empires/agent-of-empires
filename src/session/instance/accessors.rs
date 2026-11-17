@@ -263,6 +263,23 @@ impl Instance {
         })
     }
 
+    /// The pause to leave between typing into this session's pane and Enter.
+    ///
+    /// Only the program a declaration actually owns is paced by it. The
+    /// effective identity rules out a custom wrapper, command override, stored
+    /// command or ambiguous claim first, so those keep the built-in table's
+    /// pace for their tool instead of inheriting another program's delay.
+    pub(crate) fn send_keys_enter_delay(&self) -> u64 {
+        let declared = self.declared_agent().and_then(|agent| {
+            agent
+                .contribution()
+                .launch
+                .as_ref()
+                .and_then(|launch| launch.send_keys_enter_delay_ms)
+        });
+        declared.unwrap_or_else(|| crate::agents::send_keys_enter_delay(&self.tool))
+    }
+
     fn declared_session_support(
         &self,
         sandboxed: bool,

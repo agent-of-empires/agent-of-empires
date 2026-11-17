@@ -4066,6 +4066,7 @@ async fn prepare_agent_session_inner(
                 profile: profile.clone(),
             })
         };
+        let mut wake = None;
         if matches!(
             outcome,
             Some(
@@ -4077,16 +4078,22 @@ async fn prepare_agent_session_inner(
             let wake_message =
                 select_restart_wake_message(restart_origin, requested_wake_message, &profile);
             if !wake_message.is_empty() {
-                crate::session::restart::spawn_wake_worker(
-                    id.clone(),
-                    row.title.clone(),
-                    row.tool.clone(),
-                    wake_message,
-                    Some((profile.clone(), generation)),
-                );
+                wake = Some((wake_message, row.clone()));
             }
         }
         drop(rows);
+        if let Some((wake_message, wake_row)) = wake {
+            // The pace reads configuration, so it resolves outside the guard.
+            let delay = wake_row.send_keys_enter_delay();
+            crate::session::restart::spawn_wake_worker(
+                id.clone(),
+                wake_row.title.clone(),
+                wake_row.tool.clone(),
+                wake_message,
+                Some((profile.clone(), generation)),
+                delay,
+            );
+        }
         tracing::info!(target: "session.restart", session = %id, view = "terminal", reason, "session restarted");
         return crate::server::runtime::session_mutation_response(
             &state,

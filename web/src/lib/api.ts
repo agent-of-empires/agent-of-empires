@@ -845,6 +845,7 @@ export interface PluginAgentLaunch {
   container_env?: Record<string, string>;
   install_hint?: string;
   host_only?: boolean;
+  send_keys_enter_delay_ms?: number;
   resume?:
     | { kind: "flag"; flag: string }
     | { kind: "flag_pair"; existing: string; new_session: string }
