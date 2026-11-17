@@ -476,9 +476,9 @@ fn tab_enters_live_send_only_for_a_selected_session() {
 
 #[test]
 #[serial]
-fn tab_does_not_start_live_send_for_acp_session() {
-    // Acp sessions are not tmux-backed, so Tab must refuse with a visible "no tmux pane"
-    // toast (a silent no-op reads as a broken key) and never enqueue an EnterLiveSend that
+fn tab_opens_the_structured_view_instead_of_live_send() {
+    // An ACP session has no pane to relay keystrokes into, so its live form is the
+    // native view: Tab and Enter attach it and never enqueue an EnterLiveSend that
     // would fail downstream.
     let mut env = create_test_env_with_sessions(1);
     env.view.cursor = 0;
@@ -500,11 +500,8 @@ fn tab_does_not_start_live_send_for_acp_session() {
         .view
         .handle_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE), None);
     assert!(
-        matches!(
-            &action,
-            Some(Action::SetTransientStatus(msg)) if msg.contains("no tmux pane")
-        ),
-        "Tab on a structured row must surface the no-tmux-pane toast, got {action:?}"
+        matches!(&action, Some(Action::OpenStructuredView(open)) if *open == id),
+        "Tab on a structured row must attach its view, got {action:?}"
     );
     assert!(env.view.live_send.is_none());
 }
