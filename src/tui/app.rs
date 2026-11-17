@@ -4931,6 +4931,73 @@ mod tests {
         );
     }
 
+    /// #5766: the Serve key that opened Connections opens the Web dashboard from any row, in
+    /// either mode. On the offline and outdated takeovers, where only r and q act, it does
+    /// nothing.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn the_serve_key_in_connections_opens_the_web_dashboard_except_on_a_takeover() {
+        use crate::tui::dialogs::{ConnectionsView, DaemonAttention as A, DialogResult, WebState};
+        use crate::tui::session_feed::SidebarSource;
+        let _home = crate::session::test_support::isolate_app_dir();
+        crate::session::get_profile_dir("test").unwrap();
+        for (strict, key) in [
+            (
+                false,
+                KeyEvent::new(KeyCode::Char('R'), KeyModifiers::SHIFT),
+            ),
+            (
+                true,
+                KeyEvent::new(KeyCode::Char('r'), KeyModifiers::CONTROL),
+            ),
+        ] {
+            let mut app = App::new(
+                "test",
+                AvailableTools::with_tools(&[]),
+                true,
+                false,
+                crate::file_watch::FileWatchService::noop(),
+            )
+            .unwrap();
+            app.home.strict_hotkeys = strict;
+            // The Daemon row comes first and is selected, so Enter would do nothing here.
+            app.home.connections_view =
+                Some(ConnectionsView::new(Some(A::ReadOnly), WebState::Off));
+            app.home.handle_key(key, None);
+            assert!(app.home.connections_view.is_none(), "strict={strict}");
+            assert!(
+                app.home.serve_view.is_some(),
+                "strict={strict}: opens the Web dashboard"
+            );
+
+            for attention in [
+                A::Offline,
+                A::Outdated(crate::daemon::DaemonIncarnation::sample("old")),
+            ] {
+                let case = format!("strict={strict} {attention:?}");
+                app.home.serve_view = None;
+                app.home.sidebar_source = SidebarSource::Disconnected;
+                app.home.offline_attention = attention;
+                assert!(!app.handle_runtime_gate_key(key), "{case}");
+                assert!(app.home.serve_view.is_none(), "{case}");
+                assert!(app.home.connections_view.is_none(), "{case}");
+                assert!(app.daemon_restart.is_none(), "{case}");
+                assert_eq!(
+                    app.home.sidebar_source,
+                    SidebarSource::Disconnected,
+                    "{case}"
+                );
+                assert!(
+                    matches!(
+                        ConnectionsView::offline(attention, None, false).handle_key(key, strict),
+                        DialogResult::Continue
+                    ),
+                    "{case}: the takeover view ignores it"
+                );
+            }
+        }
+    }
+
     #[tokio::test]
     #[serial_test::serial]
     async fn r_restarts_only_a_restartable_daemon_and_reports_the_outcome() {

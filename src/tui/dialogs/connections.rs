@@ -6,6 +6,7 @@ use ratatui::prelude::*;
 use ratatui::widgets::*;
 
 use super::DialogResult;
+use crate::tui::home::bindings::{self, ActionId};
 use crate::tui::styles::Theme;
 
 /// Why the Daemon row is listed. A healthy Daemon has no row.
@@ -220,9 +221,13 @@ impl ConnectionsView {
         self.daemon.is_some_and(DaemonAttention::is_takeover)
     }
 
-    /// Enter on the Web dashboard row submits; the Daemon row has nothing to open.
-    pub fn handle_key(&mut self, key: KeyEvent) -> DialogResult<()> {
+    /// Enter on the Web dashboard row submits; the Daemon row has nothing to open. The Serve
+    /// key that opened the hub submits from any row, except on a takeover.
+    pub fn handle_key(&mut self, key: KeyEvent, strict: bool) -> DialogResult<()> {
         let rows = self.rows();
+        if !self.offline_takeover() && bindings::is_bound(ActionId::Serve, strict, &key) {
+            return DialogResult::Submit(());
+        }
         match key.code {
             KeyCode::Esc | KeyCode::Char('q') => DialogResult::Cancel,
             KeyCode::Up => {
@@ -624,7 +629,7 @@ mod tests {
     #[test]
     fn enter_opens_only_the_web_dashboard_row() {
         let press = |view: &mut ConnectionsView, code| {
-            view.handle_key(KeyEvent::new(code, KeyModifiers::NONE))
+            view.handle_key(KeyEvent::new(code, KeyModifiers::NONE), false)
         };
         let mut view = ConnectionsView::new(None, WebState::Off);
         assert!(matches!(

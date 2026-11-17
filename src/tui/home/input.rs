@@ -2496,7 +2496,7 @@ impl HomeView {
         }
 
         if let Some(view) = &mut self.connections_view {
-            match view.handle_key(key) {
+            match view.handle_key(key, self.strict_hotkeys) {
                 DialogResult::Continue => {}
                 DialogResult::Cancel => self.connections_view = None,
                 DialogResult::Submit(()) => {
