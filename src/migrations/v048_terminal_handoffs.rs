@@ -47,7 +47,7 @@ fn migrate_file(path: &Path) -> Result<()> {
             .filter(|value| !value.is_null())
         {
             (|| -> Result<()> {
-                // v059 records the outcome; these relationships don't read it.
+                // v060 records the outcome; these relationships don't read it.
                 let mut intent = intent.clone();
                 if let Some(fields) = intent.as_object_mut() {
                     fields.entry("outcome").or_insert_with(|| "fresh".into());

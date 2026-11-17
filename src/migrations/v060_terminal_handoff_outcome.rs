@@ -33,12 +33,12 @@ fn migrate_file(path: &Path) -> Result<()> {
     let mut rows: Value = match serde_json::from_slice(&bytes) {
         Ok(rows) => rows,
         Err(error) => {
-            tracing::warn!(target: "migrations.v059", path = %path.display(), %error, "Preserved unreadable session component; repair it and run aoe migrate");
+            tracing::warn!(target: "migrations.v060", path = %path.display(), %error, "Preserved unreadable session component; repair it and run aoe migrate");
             return Ok(());
         }
     };
     let Some(rows) = rows.as_array_mut() else {
-        tracing::warn!(target: "migrations.v059", path = %path.display(), "Preserved invalid session component; repair it and run aoe migrate");
+        tracing::warn!(target: "migrations.v060", path = %path.display(), "Preserved invalid session component; repair it and run aoe migrate");
         return Ok(());
     };
     let mut recorded = 0;
@@ -81,7 +81,7 @@ fn migrate_file(path: &Path) -> Result<()> {
     if recorded > 0 {
         crate::session::backup_before_migration(path)?;
         crate::session::atomic_write(path, serde_json::to_vec_pretty(&rows)?.as_slice())?;
-        tracing::info!(target: "migrations.v059", path = %path.display(), recorded, "Recorded terminal handoff outcomes");
+        tracing::info!(target: "migrations.v060", path = %path.display(), recorded, "Recorded terminal handoff outcomes");
     }
     Ok(())
 }
@@ -119,7 +119,7 @@ mod tests {
         intent
     }
 
-    /// A row as a build before v059 wrote it: its handoff has no `outcome`.
+    /// A row as a build before v060 wrote it: its handoff has no `outcome`.
     fn written_before(row: &Instance, intent: &TerminalHandoffIntent) -> Result<Value> {
         let mut value = serde_json::to_value(row)?;
         let mut handoff = serde_json::to_value(intent)?;
@@ -259,7 +259,7 @@ mod tests {
     #[test]
     #[serial_test::serial]
     fn a_handoff_written_before_the_migration_loads_as_it_was_read() -> Result<()> {
-        // From 47, v048 validates the handoff before v059 records its outcome.
+        // From 47, v048 validates the handoff before v060 records its outcome.
         for version in ["47", "58"] {
             let home = tempfile::tempdir()?;
             let _home = crate::session::test_support::isolate_app_dir_at(home.path());
@@ -298,7 +298,7 @@ mod tests {
 
     #[test]
     #[serial_test::serial]
-    fn a_component_repaired_after_v059_gets_its_outcome_on_recovery() -> Result<()> {
+    fn a_component_repaired_after_v060_gets_its_outcome_on_recovery() -> Result<()> {
         let home = tempfile::tempdir()?;
         let _home = crate::session::test_support::isolate_app_dir_at(home.path());
         let app = crate::session::get_app_dir()?;
