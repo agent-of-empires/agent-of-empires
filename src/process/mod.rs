@@ -735,7 +735,7 @@ fn wait_with_timeout_inner_with_clock(
 /// The caller keeps control of stdin; pipe it to null when the child might
 /// prompt (SSH passphrases, credential helpers).
 pub fn run_with_timeout(cmd: &mut Command, timeout: Duration) -> std::io::Result<Option<Output>> {
-    run_with_timeout_inner(cmd, timeout, false, None)
+    run_with_timeout_inner(cmd, timeout, false, None, None)
 }
 
 /// [`run_with_timeout`] that also kills the child once `cancel` fires, returning `Ok(None)`.
@@ -744,7 +744,7 @@ pub fn run_until_cancelled(
     timeout: Duration,
     cancel: &CancellationToken,
 ) -> std::io::Result<Option<Output>> {
-    run_with_timeout_inner(cmd, timeout, false, Some(cancel))
+    run_with_timeout_inner(cmd, timeout, false, Some(cancel), None)
 }
 
 /// [`run_with_timeout`] variant that makes the child a process-group leader
@@ -761,6 +761,7 @@ pub fn run_with_timeout_process_group(
         cmd,
         timeout,
         cfg!(any(target_os = "linux", target_os = "macos")),
+        None,
         None,
     )
 }
@@ -797,7 +798,54 @@ pub(crate) fn run_until_cancelled_process_group(
         timeout,
         cfg!(any(target_os = "linux", target_os = "macos")),
         Some(cancel),
+        None,
     )
+}
+
+/// [`run_until_cancelled_process_group`] that also passes `on_output` each stream's bytes while
+/// the child runs, at most one poll interval after they are written.
+pub(crate) fn run_until_cancelled_process_group_observed(
+    cmd: &mut Command,
+    timeout: Duration,
+    cancel: &CancellationToken,
+    on_output: &mut dyn FnMut(OutputStream, &[u8]),
+) -> std::io::Result<Option<Output>> {
+    platform::configure_process_group(cmd);
+    run_with_timeout_inner(
+        cmd,
+        timeout,
+        cfg!(any(target_os = "linux", target_os = "macos")),
+        Some(cancel),
+        Some(on_output),
+    )
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum OutputStream {
+    Stdout,
+    Stderr,
+}
+
+/// Reads what a child appended to its capture files since the last call.
+struct OutputTail<'a> {
+    stdout: std::fs::File,
+    stderr: std::fs::File,
+    forward: &'a mut dyn FnMut(OutputStream, &[u8]),
+}
+
+impl OutputTail<'_> {
+    /// Best effort: a failed read loses progress, not the captured output.
+    fn forward_new(&mut self) {
+        let mut buf = [0u8; 8192];
+        for (stream, file) in [
+            (OutputStream::Stdout, &mut self.stdout),
+            (OutputStream::Stderr, &mut self.stderr),
+        ] {
+            while let Ok(n @ 1..) = file.read(&mut buf) {
+                (self.forward)(stream, &buf[..n]);
+            }
+        }
+    }
 }
 
 fn run_with_timeout_inner(
@@ -805,16 +853,42 @@ fn run_with_timeout_inner(
     timeout: Duration,
     kill_process_group: bool,
     cancel: Option<&CancellationToken>,
+    on_output: Option<&mut dyn FnMut(OutputStream, &[u8])>,
 ) -> std::io::Result<Option<Output>> {
     let mut stdout_file = tempfile::NamedTempFile::new()?;
     let mut stderr_file = tempfile::NamedTempFile::new()?;
     cmd.stdout(Stdio::from(stdout_file.reopen()?));
     cmd.stderr(Stdio::from(stderr_file.reopen()?));
+    // Separate handles, so tailing doesn't move the offsets the final read starts from.
+    let mut tail = match on_output {
+        Some(forward) => Some(OutputTail {
+            stdout: stdout_file.reopen()?,
+            stderr: stderr_file.reopen()?,
+            forward,
+        }),
+        None => None,
+    };
     let mut child = cmd.spawn()?;
 
-    let Some(status) =
-        wait_with_timeout_inner(&mut child, timeout, kill_process_group, false, cancel)?
-    else {
+    let waited = match tail.as_mut() {
+        None => wait_with_timeout_inner(&mut child, timeout, kill_process_group, false, cancel)?,
+        Some(tail) => wait_with_timeout_inner_with_clock(
+            &mut child,
+            timeout,
+            kill_process_group,
+            false,
+            cancel,
+            Instant::now,
+            |pause| {
+                tail.forward_new();
+                std::thread::sleep(pause);
+            },
+        )?,
+    };
+    if let Some(tail) = tail.as_mut() {
+        tail.forward_new();
+    }
+    let Some(status) = waited else {
         return Ok(None);
     };
     // Regular files, rather than pipes drained by background threads, keep
@@ -2931,6 +3005,72 @@ finally:
         assert!(output.status.success());
         assert_eq!(output.stdout, b"out");
         assert_eq!(output.stderr, b"err");
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn observed_output_arrives_while_the_child_still_runs() {
+        use std::io::Write as _;
+        use std::sync::mpsc;
+        const DEADLINE: Duration = Duration::from_secs(10);
+        let dir = tempfile::tempdir().unwrap();
+        let gate = dir.path().join("gate");
+        nix::unistd::mkfifo(&gate, nix::sys::stat::Mode::S_IRWXU).unwrap();
+
+        let (chunk_tx, chunks) = mpsc::channel();
+        let (done_tx, done) = mpsc::channel();
+        let child_gate = gate.clone();
+        std::thread::spawn(move || {
+            let mut cmd = Command::new("sh");
+            // Blocks opening the FIFO until the test opens its write end.
+            cmd.args([
+                "-c",
+                "printf 'first\\n'; read x < \"$1\"; printf 'last\\n' >&2",
+                "sh",
+            ])
+            .arg(&child_gate);
+            let mut forward = |stream: OutputStream, bytes: &[u8]| {
+                let _ = chunk_tx.send((stream, bytes.to_vec()));
+            };
+            let _ = done_tx.send(run_until_cancelled_process_group_observed(
+                &mut cmd,
+                Duration::from_secs(30),
+                &CancellationToken::new(),
+                &mut forward,
+            ));
+        });
+
+        let mut received: Vec<(OutputStream, Vec<u8>)> = Vec::new();
+        let read = |received: &[(OutputStream, Vec<u8>)], stream| {
+            received
+                .iter()
+                .filter(|(s, _)| *s == stream)
+                .flat_map(|(_, b)| b.iter().copied())
+                .collect::<Vec<u8>>()
+        };
+        while read(&received, OutputStream::Stdout) != b"first\n" {
+            received.push(chunks.recv_timeout(DEADLINE).expect("first line forwarded"));
+        }
+        assert!(
+            done.try_recv().is_err(),
+            "the child is still blocked on the gate"
+        );
+
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(&gate)
+            .unwrap()
+            .write_all(b"go\n")
+            .unwrap();
+        let output = done
+            .recv_timeout(DEADLINE)
+            .expect("the child exits once released")
+            .unwrap()
+            .expect("no timeout");
+        received.extend(chunks.try_iter());
+        assert_eq!(read(&received, OutputStream::Stderr), b"last\n");
+        assert_eq!(output.stdout, b"first\n", "the final capture is unaffected");
+        assert_eq!(output.stderr, b"last\n");
     }
 
     #[test]
