@@ -162,6 +162,7 @@ impl HomeView {
             pending_repo_trust_data: None,
             pending_repo_trust_fingerprint: None,
             pending_repo_trust_skip_on_create: false,
+            pending_repo_trust_recovery: None,
             hooks_install_dialog: None,
             pending_hooks_install_data: None,
             volume_ignores_glob_dialog: None,
