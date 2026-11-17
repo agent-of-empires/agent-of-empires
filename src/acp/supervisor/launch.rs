@@ -1644,12 +1644,33 @@ pub(super) async fn resolve_mcp_servers(
     // Plugin credentials ride the entries as `${NAME}` references, so the hooks above never
     // see a value. An agent that expands references gets the values in its environment, which
     // other local users cannot read, unlike the command line its entries end up on. Any other
-    // agent gets the literal value in its entries.
+    // agent gets no plugin-served entries rather than a literal value on that command line.
     if !crate::acp::agent_profiles::resolve(agent_key).expands_mcp_env_refs {
+        let (plugin_served, resolved): (Vec<ResolvedMcpServer>, Vec<ResolvedMcpServer>) = resolved
+            .into_iter()
+            .partition(|server| matches!(server.provenance, McpProvenance::Plugin { .. }));
+        let mut skipped: std::collections::BTreeMap<&str, Vec<&str>> = Default::default();
+        for server in &plugin_served {
+            if let McpProvenance::Plugin { plugin_id } = &server.provenance {
+                skipped
+                    .entry(plugin_id.as_str())
+                    .or_default()
+                    .push(&server.def.name);
+            }
+        }
+        for (plugin_id, keys) in skipped {
+            crate::acp::mcp_rewrite::report_serve_failure(
+                plugin_id,
+                &format!(
+                    "This session's agent does not expand MCP credential references, so these MCP servers are not forwarded to it: {}.",
+                    keys.join(", ")
+                ),
+            );
+        }
         let servers = crate::acp::mcp_config::project_servers_to_acp(
             resolved,
             &projection_env,
-            PluginCredentials::Literal(&minted),
+            PluginCredentials::None,
         );
         return ResolvedMcp::without_credentials(servers);
     }
@@ -3172,7 +3193,7 @@ time.sleep(60)
             .unwrap(),
         );
         let endpoint = crate::server::daemon_endpoint::DaemonEndpoint {
-            host_url: "http://127.0.0.1:4321".into(),
+            host_url: Some("http://127.0.0.1:4321".into()),
             sandbox_url: None,
             sandbox_socket: None,
             secret: secret.clone(),
@@ -3312,7 +3333,7 @@ time.sleep(60)
     }
 
     /// An agent that expands `${VAR}` gets references in `session/new` and the values as
-    /// environment pairs; any other agent keeps the literal values and gets no pairs.
+    /// environment pairs; any other agent gets no plugin-served entries and no credential.
     #[tokio::test]
     #[serial_test::serial]
     async fn plugin_credentials_reach_the_agent_by_reference_only_where_it_expands() {
@@ -3374,9 +3395,23 @@ time.sleep(60)
             } else {
                 assert!(out.credentials.is_empty(), "{agent}");
                 for (_, _, c) in &credentials {
-                    assert!(message.contains(c.as_str()), "{agent}: {message}");
+                    assert!(!message.contains(c.as_str()), "{agent}: {message}");
                     assert!(!message.contains(&credential_var_name(c)), "{agent}");
                 }
+                for key in ["acme_a__docs", "acme_b__git"] {
+                    assert!(!message.contains(key), "{agent}: {message}");
+                }
+                let mut skipped: Vec<_> = rewriter
+                    .skipped()
+                    .into_iter()
+                    .map(|(plugin, text)| (plugin, text.contains("does not expand")))
+                    .collect();
+                skipped.sort();
+                assert_eq!(
+                    skipped,
+                    [("acme.a".to_string(), true), ("acme.b".to_string(), true)],
+                    "{agent}: each plugin is told its servers were skipped"
+                );
             }
             let requests = rewriter.requests.lock().unwrap();
             for request in requests.iter() {
@@ -3857,11 +3892,12 @@ time.sleep(60)
                 "failed",
             )
             .await;
-            let wanted = if expands {
-                var.reference()
-            } else {
-                var.value.clone()
-            };
+            if !expands {
+                assert!(out.servers.is_empty(), "{agent}: {:?}", out.servers);
+                assert!(out.credentials.is_empty(), "{agent}");
+                continue;
+            }
+            let wanted = var.reference();
             let mut values = Vec::new();
             for server in &out.servers {
                 match server {
@@ -3881,12 +3917,11 @@ time.sleep(60)
             let mut want = vec![format!("Bearer {wanted}"), wanted.clone()];
             want.sort();
             assert_eq!(values, want, "{agent}");
-            let pairs: Vec<(String, String)> = if expands {
-                vec![(var.name.clone(), var.value.clone())]
-            } else {
-                Vec::new()
-            };
-            assert_eq!(out.credentials, pairs.into(), "{agent}");
+            assert_eq!(
+                out.credentials,
+                vec![(var.name.clone(), var.value.clone())].into(),
+                "{agent}"
+            );
         }
     }
 
@@ -3967,7 +4002,13 @@ time.sleep(60)
                 })
                 .collect();
             got.sort();
-            assert_eq!(got, ["acme_b__git"], "{agent}");
+            // The agent that expands no reference gets no plugin-served entry at all.
+            let want: &[&str] = if agent == "claude" {
+                &["acme_b__git"]
+            } else {
+                &[]
+            };
+            assert_eq!(got, want, "{agent}");
             let message = serde_json::to_string(&out.servers).unwrap();
             let docs = secret.plugin_server_credential_for("acme.a", "docs", "sess-t");
             let git = secret.plugin_server_credential_for("acme.b", "git", "sess-t");
@@ -3976,10 +4017,7 @@ time.sleep(60)
             if agent == "claude" {
                 assert_eq!(out.credentials, vec![(git_name, git)].into(), "{agent}");
             } else {
-                assert!(
-                    message.contains(&git),
-                    "{agent}: the owner gets its literal"
-                );
+                assert!(!message.contains(&git), "{agent}: no literal is written");
                 assert!(out.credentials.is_empty(), "{agent}");
             }
         }
@@ -4045,6 +4083,11 @@ time.sleep(60)
                 "failed",
             )
             .await;
+            if !expands {
+                assert!(out.servers.is_empty(), "{agent}: {:?}", out.servers);
+                assert!(out.credentials.is_empty(), "{agent}");
+                continue;
+            }
             assert_eq!(out.servers.len(), 1, "{agent}: only the owner survives");
             assert!(
                 matches!(&out.servers[0], McpServer::Http(s) if s.name == "served"),
@@ -4052,17 +4095,12 @@ time.sleep(60)
                 out.servers
             );
             let message = serde_json::to_string(&out.servers).unwrap();
-            if expands {
-                assert!(!message.contains(&var.value), "{agent}");
-                assert!(message.contains(&var.reference()), "{agent}");
-                assert_eq!(
-                    out.credentials,
-                    vec![(var.name.clone(), var.value.clone())].into()
-                );
-            } else {
-                assert!(message.contains(&var.value), "{agent}");
-                assert!(out.credentials.is_empty());
-            }
+            assert!(!message.contains(&var.value), "{agent}");
+            assert!(message.contains(&var.reference()), "{agent}");
+            assert_eq!(
+                out.credentials,
+                vec![(var.name.clone(), var.value.clone())].into()
+            );
         }
     }
 

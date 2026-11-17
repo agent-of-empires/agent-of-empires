@@ -191,7 +191,14 @@ impl McpRewriter for PluginMcpRewriter {
         Box::pin(async move {
             let registry = crate::plugin::registry();
             let caller = self.host.as_deref().map(|h| h as &dyn WorkerCall);
-            servers_for_session(caller, registry.active().map(|p| &p.manifest), ctx).await
+            servers_for_session(
+                caller,
+                registry
+                    .active()
+                    .map(|p| (&p.manifest, p.manifest_hash.as_str())),
+                ctx,
+            )
+            .await
         })
     }
 
@@ -562,7 +569,7 @@ mod tests {
 
     fn endpoint(dir: &std::path::Path, sandbox_url: Option<&str>) -> DaemonEndpoint {
         DaemonEndpoint {
-            host_url: "http://127.0.0.1:4321".into(),
+            host_url: Some("http://127.0.0.1:4321".into()),
             sandbox_url: sandbox_url.map(str::to_string),
             sandbox_socket: None,
             secret: Arc::new(McpSessionSecret::load_or_generate(&dir.join("secret")).unwrap()),

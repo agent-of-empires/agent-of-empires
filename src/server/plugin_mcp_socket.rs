@@ -206,16 +206,26 @@ mod linux {
                 return SandboxSocket::Unchecked;
             }
         };
-        socket_reach(&inspected, &dir, || shares_kernel(&container))
+        socket_reach(
+            &inspected,
+            &dir,
+            || shares_kernel(&container),
+            || user_can_open(&container),
+            || has_node(&container),
+        )
     }
 
-    /// The container must mount this daemon's directory and run on the host kernel: a
-    /// VM-backed runtime (Docker Desktop, a Podman machine, Apple Container) cannot connect
-    /// a host socket. `same_kernel` is `None` when that cannot be checked.
+    /// The container must mount this daemon's directory, run on the host kernel (a
+    /// VM-backed runtime such as Docker Desktop, a Podman machine or Apple Container cannot
+    /// connect a host socket) and run as a user who can open the daemon user's private
+    /// directory and socket, in an image that has the `node` the forwarder runs on.
+    /// `same_kernel`, `user_access` and `has_node` are `None` when that cannot be checked.
     pub(crate) fn socket_reach(
         inspected: &InspectedContainer,
         dir: &Path,
         same_kernel: impl FnOnce() -> Option<bool>,
+        user_access: impl FnOnce() -> Option<bool>,
+        has_node: impl FnOnce() -> Option<bool>,
     ) -> SandboxSocket {
         let ours = |host: &str| {
             Path::new(host) == dir
@@ -235,9 +245,72 @@ mod linux {
             return SandboxSocket::OtherKernel;
         }
         match same_kernel() {
+            Some(true) => {}
+            Some(false) => return SandboxSocket::OtherKernel,
+            None => return SandboxSocket::Unchecked,
+        }
+        match user_access() {
+            Some(true) => {}
+            Some(false) => return SandboxSocket::NoAccess,
+            None => return SandboxSocket::Unchecked,
+        }
+        match has_node() {
             Some(true) => SandboxSocket::Reachable,
-            Some(false) => SandboxSocket::OtherKernel,
+            Some(false) => SandboxSocket::NoNode,
             None => SandboxSocket::Unchecked,
+        }
+    }
+
+    /// Whether the user a command in the container runs as can traverse the mounted
+    /// directory and write the socket, as the agent's tools will. `None` when that cannot be
+    /// checked (no `sh`, a stopped container, a timeout).
+    fn user_can_open(container: &crate::containers::DockerContainer) -> Option<bool> {
+        let cmd = [
+            "sh".to_string(),
+            "-c".to_string(),
+            format!("test -x {CONTAINER_DIR} && test -w {CONTAINER_DIR}/{SOCKET_FILE}"),
+        ];
+        let argv = container.build_exec_argv("", &cmd);
+        let (program, args) = argv.split_first()?;
+        let mut command = std::process::Command::new(program);
+        command
+            .args(args)
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null());
+        let out = crate::process::run_with_timeout(&mut command, std::time::Duration::from_secs(5))
+            .ok()
+            .flatten()?;
+        match out.status.code() {
+            Some(0) => Some(true),
+            Some(1) => Some(false),
+            _ => None,
+        }
+    }
+
+    /// Whether the container's default user has a `node` on its `PATH`. `None` when that
+    /// cannot be checked (no `sh`, a stopped container, a timeout).
+    fn has_node(container: &crate::containers::DockerContainer) -> Option<bool> {
+        let cmd = [
+            "sh".to_string(),
+            "-c".to_string(),
+            "command -v node".to_string(),
+        ];
+        let argv = container.build_exec_argv("", &cmd);
+        let (program, args) = argv.split_first()?;
+        let mut command = std::process::Command::new(program);
+        command
+            .args(args)
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null());
+        let out = crate::process::run_with_timeout(&mut command, std::time::Duration::from_secs(5))
+            .ok()
+            .flatten()?;
+        match out.status.code() {
+            Some(0) => Some(true),
+            Some(1) => Some(false),
+            _ => None,
         }
     }
 
@@ -722,11 +795,67 @@ mod linux {
             ];
             for (case, container, same_kernel, want) in cases {
                 assert_eq!(
-                    socket_reach(&container, &dir, || same_kernel),
+                    socket_reach(
+                        &container,
+                        &dir,
+                        || same_kernel,
+                        || Some(true),
+                        || Some(true)
+                    ),
                     want,
                     "{case}"
                 );
             }
+            // The container's user is checked last, and only for a mounted, same-kernel
+            // container: a user that cannot open the private directory gets no socket route.
+            let mounted = inspected(&dir, CONTAINER_DIR, None);
+            let reach =
+                |kernel, user, node| socket_reach(&mounted, &dir, || kernel, || user, || node);
+            assert_eq!(
+                reach(Some(true), Some(false), Some(true)),
+                SandboxSocket::NoAccess,
+                "user cannot open the socket"
+            );
+            assert_eq!(
+                reach(Some(true), None, Some(true)),
+                SandboxSocket::Unchecked,
+                "user access unreadable"
+            );
+            assert_eq!(
+                reach(Some(false), Some(false), Some(false)),
+                SandboxSocket::OtherKernel,
+                "the kernel is judged first"
+            );
+            assert_eq!(
+                reach(Some(true), Some(true), Some(false)),
+                SandboxSocket::NoNode,
+                "the image has no node"
+            );
+            assert_eq!(
+                reach(Some(true), Some(true), None),
+                SandboxSocket::Unchecked,
+                "node presence unreadable"
+            );
+            assert_eq!(
+                reach(Some(true), Some(false), Some(false)),
+                SandboxSocket::NoAccess,
+                "access is judged before node"
+            );
+            assert_eq!(
+                reach(Some(true), Some(true), Some(true)),
+                SandboxSocket::Reachable
+            );
+            let unmounted = inspected(&dir, "/elsewhere", None);
+            assert_eq!(
+                socket_reach(
+                    &unmounted,
+                    &dir,
+                    || panic!("no probe without the mount"),
+                    || panic!("no probe without the mount"),
+                    || panic!("no probe without the mount")
+                ),
+                SandboxSocket::Unmounted
+            );
         }
 
         /// Concurrent writers never trip over each other's temporary file.

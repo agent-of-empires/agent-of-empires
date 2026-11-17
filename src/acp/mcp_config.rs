@@ -125,8 +125,9 @@ pub enum PluginCredentials<'a> {
     /// The agent expands references from its own environment: an owner's references pass
     /// through, even in an `Authorization` header, so the value never reaches the command line.
     Reference(&'a [McpCredentialVar]),
-    /// The agent does not expand them: the owner gets the literal value in place of each.
-    Literal(&'a [McpCredentialVar]),
+    /// The agent does not expand them, and a literal value would sit on its command line, so
+    /// no reference is honoured: an entry that mentions the credential namespace is dropped.
+    None,
 }
 
 /// Convert resolved, transport-typed servers (parsed and merged by
@@ -137,7 +138,10 @@ pub fn project_servers_to_acp(
     session_env: &[(String, String)],
     credentials: PluginCredentials<'_>,
 ) -> Vec<McpServer> {
-    let (PluginCredentials::Reference(vars) | PluginCredentials::Literal(vars)) = credentials;
+    let vars = match credentials {
+        PluginCredentials::Reference(vars) => vars,
+        PluginCredentials::None => &[],
+    };
     servers
         .into_iter()
         .filter_map(|resolved| {
@@ -149,7 +153,7 @@ pub fn project_servers_to_acp(
             } else {
                 session_env
             };
-            let mut server = resolved.def;
+            let server = resolved.def;
             let owned: Vec<&McpCredentialVar> = vars
                 .iter()
                 .filter(|var| var.owns(&server.name, &server.transport))
@@ -161,15 +165,7 @@ pub fn project_servers_to_acp(
                 warn_dropped(&server.name);
                 return None;
             }
-            let mut kept: Vec<&str> = Vec::new();
-            match credentials {
-                PluginCredentials::Reference(_) => {
-                    kept = owned.iter().map(|var| var.name.as_str()).collect()
-                }
-                PluginCredentials::Literal(_) => {
-                    substitute_references(&mut server.transport, &owned)
-                }
-            }
+            let kept: Vec<&str> = owned.iter().map(|var| var.name.as_str()).collect();
             let projected = match server.transport {
                 ProjectMcpTransport::Stdio { command, args, env } => McpServer::Stdio(
                     McpServerStdio::new(server.name, command)
@@ -237,21 +233,6 @@ fn mentions_credential_namespace(transport: &ProjectMcpTransport) -> bool {
         }
         ProjectMcpTransport::Http { url, headers } | ProjectMcpTransport::Sse { url, headers } => {
             hit(url) || map_hit(headers)
-        }
-    }
-}
-
-/// Replaces each owned credential reference in the places aoe puts one: header and env values.
-fn substitute_references(transport: &mut ProjectMcpTransport, owned: &[&McpCredentialVar]) {
-    let values = match transport {
-        ProjectMcpTransport::Stdio { env, .. } => env,
-        ProjectMcpTransport::Http { headers, .. } | ProjectMcpTransport::Sse { headers, .. } => {
-            headers
-        }
-    };
-    for value in values.values_mut() {
-        for var in owned {
-            *value = value.replace(&var.reference(), &var.value);
         }
     }
 }
@@ -471,9 +452,10 @@ mod tests {
     }
 
     /// The owner keeps its reference (an `Authorization` one too) for an agent that expands
-    /// them and gets the value otherwise, whatever provenance it carries.
+    /// them. For any other agent it is dropped, so no value reaches its command line, whatever
+    /// provenance the entry carries.
     #[test]
-    fn the_owning_entry_keeps_its_reference_or_gets_the_value() {
+    fn the_owning_entry_keeps_its_reference_or_is_dropped() {
         let (json, vars) = minted();
         for provenance in [
             McpProvenance::Plugin {
@@ -492,16 +474,15 @@ mod tests {
             );
             assert_eq!(token(&kept).as_deref(), Some(REF));
 
-            let literal = project_servers_to_acp(
-                resolved(&json, provenance),
-                &[],
-                PluginCredentials::Literal(&vars),
+            let none =
+                project_servers_to_acp(resolved(&json, provenance), &[], PluginCredentials::None);
+            assert_eq!(header(&none, "web", "Authorization"), None);
+            assert_eq!(token(&none), None);
+            let wire = serde_json::to_string(&none).unwrap();
+            assert!(
+                !wire.contains("fake-credential") && !wire.contains(REF),
+                "{wire}"
             );
-            assert_eq!(
-                header(&literal, "web", "Authorization").as_deref(),
-                Some("Bearer fake-credential")
-            );
-            assert_eq!(token(&literal).as_deref(), Some("fake-credential"));
         }
     }
 
@@ -569,10 +550,7 @@ mod tests {
                     r#"{{ "mcpServers": {{ "foreign": {} , "plain": {{ "command": "ok" }} }} }}"#,
                     foreign(field)
                 );
-                for mode in [
-                    PluginCredentials::Reference(&vars),
-                    PluginCredentials::Literal(&vars),
-                ] {
+                for mode in [PluginCredentials::Reference(&vars), PluginCredentials::None] {
                     let out =
                         project_servers_to_acp(resolved(&json, provenance.clone()), &[], mode);
                     assert_eq!(names(&out), ["plain"], "{field} {provenance:?}");
@@ -605,10 +583,7 @@ mod tests {
                 agent: "claude".into(),
             },
         ] {
-            for mode in [
-                PluginCredentials::Reference(&vars),
-                PluginCredentials::Literal(&vars),
-            ] {
+            for mode in [PluginCredentials::Reference(&vars), PluginCredentials::None] {
                 let out = project_servers_to_acp(
                     resolved(assembled, provenance.clone()),
                     &session_env,
@@ -641,14 +616,19 @@ mod tests {
         for (label, from, to, survivor) in variants {
             assert!(json.contains(from), "{label}");
             let text = json.replace(from, to);
-            for mode in [
+            let out = project_servers_to_acp(
+                resolved(&text, McpProvenance::ProjectLocal),
+                &[],
                 PluginCredentials::Reference(&vars),
-                PluginCredentials::Literal(&vars),
-            ] {
-                let out =
-                    project_servers_to_acp(resolved(&text, McpProvenance::ProjectLocal), &[], mode);
-                assert_eq!(names(&out), [survivor], "{label}");
-            }
+            );
+            assert_eq!(names(&out), [survivor], "{label}");
+            // An agent that expands no reference keeps none of the entries that carry one.
+            let out = project_servers_to_acp(
+                resolved(&text, McpProvenance::ProjectLocal),
+                &[],
+                PluginCredentials::None,
+            );
+            assert!(names(&out).is_empty(), "{label}: {:?}", names(&out));
         }
     }
 
@@ -664,10 +644,7 @@ mod tests {
             .replace("\"web\"", "\"web2\"")
             .replace("\"sock\"", "\"sock2\"");
         for text in [tampered, rekeyed] {
-            for mode in [
-                PluginCredentials::Reference(&vars),
-                PluginCredentials::Literal(&vars),
-            ] {
+            for mode in [PluginCredentials::Reference(&vars), PluginCredentials::None] {
                 let out = project_servers_to_acp(
                     resolved(
                         &text,
@@ -687,7 +664,7 @@ mod tests {
         project_servers_to_acp(
             resolved(json, McpProvenance::Global),
             &[],
-            PluginCredentials::Literal(&[]),
+            PluginCredentials::None,
         )
     }
 
@@ -699,7 +676,7 @@ mod tests {
         let servers = project_servers_to_acp(
             resolved(json, provenance),
             session_env,
-            PluginCredentials::Literal(&[]),
+            PluginCredentials::None,
         );
         serde_json::to_value(
             agent_client_protocol::v1::schema::NewSessionRequest::new("/work").mcp_servers(servers),

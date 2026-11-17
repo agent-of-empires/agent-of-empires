@@ -1437,6 +1437,37 @@ mod tests {
             (app, seen)
         }
 
+        /// A reply far larger than the stdout pipe buffer is still written whole when stdin
+        /// closes right after the request: `process.exit` would drop what is still buffered.
+        #[tokio::test]
+        async fn forwarder_flushes_a_large_reply_before_exiting() {
+            if !node() {
+                return;
+            }
+            const SIZE: usize = 3 << 20;
+            let temp = tempfile::tempdir().unwrap();
+            let fake = fake(Some("sess-1"), || {
+                Some(Ok(
+                    json!({"content": [{"type": "text", "text": "x".repeat(SIZE)}]}),
+                ))
+            });
+            let (socket, _server) = serve_unix(temp.path(), fake.app);
+            let request = json!({"jsonrpc": "2.0", "id": 1, "method": "tools/call", "params": {
+            "name": "echo", "arguments": {}, "_meta": {
+                "io.modelcontextprotocol/protocolVersion": "2026-07-28",
+                "io.modelcontextprotocol/clientCapabilities": {},
+                "io.modelcontextprotocol/clientInfo": {"name": "t", "version": "1"},
+            }}})
+            .to_string();
+            let lines = run(temp.path(), &socket, &[request]).await;
+            assert_eq!(lines.len(), 1, "one reply line");
+            let reply: Value = serde_json::from_str(&lines[0]).expect("the reply is whole JSON");
+            assert_eq!(
+                reply["result"]["content"][0]["text"].as_str().map(str::len),
+                Some(SIZE)
+            );
+        }
+
         #[tokio::test]
         async fn forwarder_bridges_stdio_to_the_endpoint_over_the_socket() {
             if !node() {
