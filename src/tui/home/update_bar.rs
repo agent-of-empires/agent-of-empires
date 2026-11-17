@@ -1,5 +1,5 @@
-//! The one line the update bar shows. Drawing and the bar's keys both go through
-//! [`UpdateBar::pick`], so a key only ever acts on the line on screen.
+//! The one line the update bar shows. Drawing picks it with [`UpdateBar::pick`] and records
+//! it as a [`DrawnBar`]; the bar's keys act on that record, so they only touch the line on screen.
 
 use crate::containers::image_update::ImageUpdate;
 use crate::update::UpdateInfo;
@@ -36,6 +36,31 @@ impl<'a> UpdateBar<'a> {
         image_update
             .filter(|_| !pull_in_flight)
             .map(Self::ImageUpdate)
+    }
+}
+
+/// The line last drawn, owned so it outlives the frame. A key acts on it only while the
+/// state it names is still current; otherwise the key is spent without effect.
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) enum DrawnBar {
+    Status(String),
+    Live,
+    AppUpdate { version: String },
+    ImageUpdate { digest: String },
+}
+
+impl From<UpdateBar<'_>> for DrawnBar {
+    fn from(bar: UpdateBar<'_>) -> Self {
+        match bar {
+            UpdateBar::Status(s) => Self::Status(s.to_string()),
+            UpdateBar::Live(_) => Self::Live,
+            UpdateBar::AppUpdate(info) => Self::AppUpdate {
+                version: info.latest_version.clone(),
+            },
+            UpdateBar::ImageUpdate(update) => Self::ImageUpdate {
+                digest: update.remote_digest.clone(),
+            },
+        }
     }
 }
 

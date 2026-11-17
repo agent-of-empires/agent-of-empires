@@ -12,7 +12,7 @@ use std::path::PathBuf;
 use std::process::Stdio;
 use std::time::Duration;
 
-use super::home::update_bar::UpdateBar;
+use super::home::update_bar::{DrawnBar, UpdateBar};
 use super::home::{bindings, HomeView, TerminalMode};
 use super::styles::Theme;
 use crate::containers::image_update::ImageUpdate;
@@ -120,6 +120,8 @@ pub struct App {
     image_pull_rx: Option<tokio::sync::oneshot::Receiver<anyhow::Result<()>>>,
     /// Snoozed via Ctrl+x while the registry still resolves to this digest.
     dismissed_image_digest: Option<String>,
+    /// The update bar's last drawn line: the only one its keys act on.
+    drawn_bar: Option<DrawnBar>,
     /// Optional so it can be dropped before spawning children: its stdin
     /// reader thread would compete with `tmux attach`.
     event_stream: Option<EventStream>,
@@ -336,6 +338,7 @@ impl App {
             image_update_rx: None,
             image_pull_rx: None,
             dismissed_image_digest,
+            drawn_bar: None,
             // Crossterm's stream needs a live event reader, which tests lack.
             event_stream: (!cfg!(test)).then(EventStream::new),
             mouse_captured: crate::tui::mouse_capture_requested(&config.session) && !mosh_active,
@@ -1600,6 +1603,7 @@ impl App {
             self.image_update.as_ref(),
             self.image_pull_rx.is_some(),
         );
+        self.drawn_bar = bar.map(DrawnBar::from);
         // Reset so a frame that skips the preview path reports zero.
         self.home.preview_timings = Default::default();
         self.home.render(frame, frame.area(), &self.theme, bar);
@@ -1708,52 +1712,62 @@ impl App {
         self.home.instances().any(|i| i.is_sandboxed())
     }
 
-    /// Ctrl+X on the update bar: acts on the line on screen and returns whether one was.
-    /// The live sandbox line has nothing to dismiss, so the key is spent without effect.
+    /// Ctrl+X on the update bar: returns whether a line was drawn. It dismisses that line if
+    /// it is still current; a live line, or one whose state has since changed, spends the key.
     /// Expired statuses are cleared only by draw: until then they are the line on screen.
     fn dismiss_update_bar(&mut self) -> bool {
-        let live = self.home.store_move_status_line();
-        match UpdateBar::pick(
-            self.update_status.as_ref().map(|s| s.text.as_str()),
-            live.as_deref(),
-            self.update_info.as_ref(),
-            self.image_update.as_ref(),
-            self.image_pull_rx.is_some(),
-        ) {
-            None => return false,
-            Some(UpdateBar::Live(_)) => {}
+        let Some(drawn) = &self.drawn_bar else {
+            return false;
+        };
+        match drawn {
+            DrawnBar::Live => {}
             // A pull keeps running and reports its outcome as a new status.
-            Some(UpdateBar::Status(_)) => self.update_status = None,
-            Some(UpdateBar::AppUpdate(info)) => {
-                let v = info.latest_version.clone();
-                self.dismissed_update_version = Some(v.clone());
-                persist_dismissed_update_version(Some(v));
-                self.update_info = None;
+            DrawnBar::Status(text) => {
+                if self.update_status.as_ref().is_some_and(|s| &s.text == text) {
+                    self.update_status = None;
+                }
             }
-            Some(UpdateBar::ImageUpdate(update)) => {
-                let digest = update.remote_digest.clone();
-                self.dismissed_image_digest = Some(digest.clone());
-                persist_dismissed_image_digest(Some(digest));
-                self.image_update = None;
+            DrawnBar::AppUpdate { version } => {
+                if self
+                    .update_info
+                    .as_ref()
+                    .is_some_and(|info| &info.latest_version == version)
+                {
+                    self.dismissed_update_version = Some(version.clone());
+                    persist_dismissed_update_version(Some(version.clone()));
+                    self.update_info = None;
+                }
+            }
+            DrawnBar::ImageUpdate { digest } => {
+                if self
+                    .image_update
+                    .as_ref()
+                    .is_some_and(|update| &update.remote_digest == digest)
+                {
+                    self.dismissed_image_digest = Some(digest.clone());
+                    persist_dismissed_image_digest(Some(digest.clone()));
+                    self.image_update = None;
+                }
             }
         }
         true
     }
 
-    /// The Update key on the sandbox image line opens the pull prompt; returns whether it did.
+    /// The Update key on a drawn sandbox image line: opens the pull prompt if that update is
+    /// still current and no pull runs, and otherwise spends the key. Any other drawn line
+    /// returns false, leaving the key to the home Update action.
     fn pull_from_update_bar(&mut self) -> bool {
-        let live = self.home.store_move_status_line();
-        let Some(UpdateBar::ImageUpdate(update)) = UpdateBar::pick(
-            self.update_status.as_ref().map(|s| s.text.as_str()),
-            live.as_deref(),
-            self.update_info.as_ref(),
-            self.image_update.as_ref(),
-            self.image_pull_rx.is_some(),
-        ) else {
+        let Some(DrawnBar::ImageUpdate { digest }) = &self.drawn_bar else {
             return false;
         };
-        let image = update.image.clone();
-        self.home.prompt_pull_sandbox_image(image);
+        if let Some(update) = self
+            .image_update
+            .as_ref()
+            .filter(|update| &update.remote_digest == digest && self.image_pull_rx.is_none())
+        {
+            let image = update.image.clone();
+            self.home.prompt_pull_sandbox_image(image);
+        }
         true
     }
 
@@ -3554,6 +3568,7 @@ mod tests {
         app.image_pull_rx = Some(pull_rx);
         let dismissed = || AppStateConfig::load().unwrap().dismissed_update_version;
 
+        draw(&mut app);
         app.handle_key(CTRL_X, &mut terminal).await.unwrap();
         assert!(app.update_status.is_none());
         assert_eq!(app.update_info, Some(app_update()));
@@ -3567,10 +3582,12 @@ mod tests {
             .as_ref()
             .is_some_and(|s| s.text.starts_with("sandbox image updated")));
 
+        draw(&mut app);
         app.handle_key(CTRL_X, &mut terminal).await.unwrap();
         assert!(app.update_status.is_none());
         assert_eq!(app.update_info, Some(app_update()));
 
+        draw(&mut app);
         app.handle_key(CTRL_X, &mut terminal).await.unwrap();
         assert!(app.update_info.is_none());
         assert_eq!(dismissed(), Some("1.1.0".into()));
@@ -3614,6 +3631,7 @@ mod tests {
             .show_sandbox_progress_for_test("copying files");
         assert!(app.home.store_move_status_line().is_some());
         app.image_update = Some(image_update());
+        assert!(draw(&mut app).contains("moving the agent store"));
 
         app.handle_key(CTRL_X, &mut terminal).await.unwrap();
         app.handle_key(KeyEvent::from(KeyCode::Char('u')), &mut terminal)
@@ -3692,6 +3710,7 @@ mod tests {
             let (mut app, mut terminal) = key_app();
             app.home.strict_hotkeys = strict;
             app.image_update = Some(image_update());
+            draw(&mut app);
             app.handle_key(key, &mut terminal).await.unwrap();
             assert_eq!(
                 app.home.confirm_dialog.is_some(),
