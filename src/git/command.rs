@@ -367,6 +367,7 @@ mod tests {
             "i",
         ]);
         let fsmonitor = script("fsmonitor", "printf '\\0'");
+        let fsmonitor_wt = script("fsmonitor-wt", "printf '\\0'");
         let ssh = script("ssh", "exit 1");
         let hook = script("post-checkout", "");
         std::fs::create_dir_all(repo.join(".git/hooks")).unwrap();
@@ -374,6 +375,7 @@ mod tests {
         for (k, v) in [
             ("core.fsmonitor", fsmonitor.to_str().unwrap()),
             ("core.sshCommand", ssh.to_str().unwrap()),
+            ("extensions.worktreeConfig", "true"),
         ] {
             std::process::Command::new("git")
                 .args(["config", k, v])
@@ -381,6 +383,12 @@ mod tests {
                 .status()
                 .unwrap();
         }
+
+        std::fs::write(
+            repo.join(".git/config.worktree"),
+            format!("[core]\n\tfsmonitor = {}\n", fsmonitor_wt.display()),
+        )
+        .unwrap();
 
         // Control: running the fixture does leave its marker.
         assert!(std::process::Command::new(&ssh).status().is_ok());
@@ -392,6 +400,7 @@ mod tests {
         let _ = run_git(&repo, ["ls-remote", "ssh://host/repo"]).unwrap();
         let ran = |name: &str| marks.join(name).exists();
         assert!(!ran("fsmonitor"), "core.fsmonitor ran");
+        assert!(!ran("fsmonitor-wt"), "config.worktree fsmonitor ran");
         assert!(!ran("ssh"), "core.sshCommand ran");
         assert!(!ran("post-checkout"), "hook ran under run_git");
 

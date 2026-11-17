@@ -2655,14 +2655,17 @@ pub(crate) fn preview_glob_volume_ignores(
         .collect())
 }
 
-/// Read-only overlays for each repo's `config` and `hooks`. Git runs both on
-/// the host (hooks, `core.sshCommand`, `core.fsmonitor`, ...), so a sandbox
-/// that could write them would execute code outside the container.
+/// Read-only overlays for the git metadata host git follows and executes
+/// from: `config`, `hooks`, `config.worktree` (read once
+/// `extensions.worktreeConfig` is set) and, for a linked worktree, its `.git`
+/// file plus the admin dir's `commondir` and `gitdir` pointers. A sandbox that
+/// could write any of them would execute code outside the container, or
+/// redirect host git to metadata it controls.
 ///
-/// Candidates are every mounted path plus `repo_paths` (repos a workspace mount
-/// covers without a volume of their own). Each resolves to its common git dir,
-/// which is mapped through the mount containing it. A missing `hooks` dir is
-/// created, otherwise the sandbox could create it; failing to is an error.
+/// Candidates are every mounted path plus `repo_paths` (the project path and
+/// the repos and worktrees a mount covers without a root of their own). Each path is mapped
+/// through the mount containing it. Missing `hooks` and `config.worktree` are
+/// created, otherwise the sandbox could create them; failing to is an error.
 fn git_exec_surface_overlays(
     project_volumes: &[VolumeMount],
     repo_paths: &[PathBuf],
@@ -2678,28 +2681,47 @@ fn git_exec_surface_overlays(
             continue;
         };
         let common = canon(repo.commondir());
-        let Some((volume, root)) = project_volumes
-            .iter()
-            .map(|v| (v, canon(Path::new(&v.host_path))))
-            .filter(|(_, root)| common.starts_with(root))
-            .max_by_key(|(_, root)| root.as_os_str().len())
-        else {
-            continue;
-        };
-        let rel = common.strip_prefix(&root).unwrap_or(Path::new(""));
-        for name in ["config", "hooks"] {
-            if name == "hooks" {
-                std::fs::create_dir_all(common.join(name))
-                    .with_context(|| format!("creating {}/hooks", common.display()))?;
+        let admin = canon(repo.path());
+        let mut protect = vec![
+            (common.join("config"), false),
+            (common.join("hooks"), true),
+            (common.join("config.worktree"), false),
+        ];
+        if admin != common {
+            protect.push((admin.join("config.worktree"), false));
+            protect.push((admin.join("commondir"), false));
+            protect.push((admin.join("gitdir"), false));
+            if let Some(workdir) = repo.workdir() {
+                protect.push((canon(workdir).join(".git"), false));
             }
+        }
+        for (path, is_dir) in protect {
+            if !path.exists() {
+                if is_dir {
+                    std::fs::create_dir_all(&path)
+                        .with_context(|| format!("creating {}", path.display()))?;
+                } else if path.file_name().is_some_and(|n| n == "config.worktree") {
+                    std::fs::File::create(&path)
+                        .with_context(|| format!("creating {}", path.display()))?;
+                } else {
+                    continue;
+                }
+            }
+            let Some((volume, root)) = project_volumes
+                .iter()
+                .map(|v| (v, canon(Path::new(&v.host_path))))
+                .filter(|(_, root)| path.starts_with(root))
+                .max_by_key(|(_, root)| root.as_os_str().len())
+            else {
+                continue;
+            };
             let container_path = Path::new(&volume.container_path)
-                .join(rel)
-                .join(name)
+                .join(path.strip_prefix(&root).unwrap_or(Path::new("")))
                 .to_string_lossy()
                 .to_string();
             if !overlays.iter().any(|o| o.container_path == container_path) {
                 overlays.push(VolumeMount {
-                    host_path: common.join(name).to_string_lossy().to_string(),
+                    host_path: path.to_string_lossy().to_string(),
                     container_path,
                     read_only: true,
                 });
@@ -2909,15 +2931,16 @@ pub(crate) fn build_container_config(
     let glob_roots = glob_roots(&project_volumes);
 
     let mut volumes = project_volumes;
-    let workspace_repos: Vec<PathBuf> = workspace_info
-        .map(|ws| {
-            ws.repos
-                .iter()
-                .map(|r| PathBuf::from(&r.main_repo_path))
-                .collect()
-        })
-        .unwrap_or_default();
-    volumes.extend(git_exec_surface_overlays(&volumes, &workspace_repos)?);
+    let git_candidates: Vec<PathBuf> = match workspace_info {
+        Some(ws) => ws
+            .repos
+            .iter()
+            .flat_map(|r| [&r.main_repo_path, &r.worktree_path])
+            .map(PathBuf::from)
+            .collect(),
+        None => vec![project_path.to_path_buf()],
+    };
+    volumes.extend(git_exec_surface_overlays(&volumes, &git_candidates)?);
 
     let sandbox_config = launch_config.sandbox();
 
@@ -3907,48 +3930,61 @@ mod tests {
     }
 
     #[test]
-    fn git_exec_surface_overlays_cover_config_and_hooks_read_only() {
+    fn git_exec_surface_overlays_cover_config_pointers_and_worktree_config() {
         let overlays_of = |volumes: &[VolumeMount], repos: &[PathBuf]| {
-            let mut got: Vec<(String, bool)> = git_exec_surface_overlays(volumes, repos)
-                .unwrap()
-                .iter()
-                .map(|o| (o.container_path.clone(), o.read_only))
-                .collect();
+            let overlays = git_exec_surface_overlays(volumes, repos).unwrap();
+            assert!(overlays.iter().all(|o| o.read_only));
+            let mut got: Vec<String> = overlays.into_iter().map(|o| o.container_path).collect();
             got.sort();
             got
         };
-        let protected = |base: &str| {
-            vec![
-                (format!("{base}/config"), true),
-                (format!("{base}/hooks"), true),
-            ]
+        let expect = |base: &str, names: &[&str]| {
+            let mut v: Vec<String> = names.iter().map(|n| format!("{base}/{n}")).collect();
+            v.sort();
+            v
         };
+        let main_files = ["config", "config.worktree", "hooks"];
 
-        // Plain repo; the missing hooks dir is created so it can be overlaid.
+        // Plain repo; missing hooks and config.worktree are created to be overlaid.
         let (_dir, repo_path) = setup_regular_repo();
         std::fs::remove_dir_all(repo_path.join(".git/hooks")).ok();
         let (volumes, _) = compute_volume_paths(&repo_path, repo_path.to_str().unwrap()).unwrap();
         let name = repo_path.file_name().unwrap().to_string_lossy();
         assert_eq!(
             overlays_of(&volumes, &[]),
-            protected(&format!("/workspace/{name}/.git"))
+            expect(&format!("/workspace/{name}/.git"), &main_files)
         );
         assert!(repo_path.join(".git/hooks").is_dir());
+        assert!(repo_path.join(".git/config.worktree").is_file());
 
-        // Bare layout: `.git` is a file pointing at `.bare`.
+        // Bare layout: the worktree's `.git` is a writable pointer file, so the
+        // file, the admin dir's pointers and its config.worktree are overlaid.
         let (_bare_dir, bare_root, worktree) = setup_bare_repo_with_worktree();
         if worktree.exists() {
             let (volumes, _) = compute_volume_paths(&worktree, worktree.to_str().unwrap()).unwrap();
-            let rel = git2::Repository::open(&worktree).unwrap();
-            let common = rel.commondir().canonicalize().unwrap();
-            let rel = common
-                .strip_prefix(bare_root.canonicalize().unwrap())
-                .unwrap();
-            let name = bare_root.file_name().unwrap().to_string_lossy();
-            assert_eq!(
-                overlays_of(&volumes, &[]),
-                protected(&format!("/workspace/{name}/{}", rel.display()))
+            let repo = git2::Repository::open(&worktree).unwrap();
+            let root = bare_root.canonicalize().unwrap();
+            let rel = |p: &Path| {
+                p.canonicalize()
+                    .unwrap()
+                    .strip_prefix(&root)
+                    .unwrap()
+                    .to_owned()
+            };
+            let (common, admin) = (rel(repo.commondir()), rel(repo.path()));
+            let wt = rel(&worktree);
+            let base = format!(
+                "/workspace/{}",
+                bare_root.file_name().unwrap().to_string_lossy()
             );
+            let mut want = expect(&format!("{base}/{}", common.display()), &main_files);
+            want.extend(expect(
+                &format!("{base}/{}", admin.display()),
+                &["config.worktree", "commondir", "gitdir"],
+            ));
+            want.push(format!("{base}/{}/.git", wt.display()));
+            want.sort();
+            assert_eq!(overlays_of(&volumes, &[worktree.clone()]), want);
         }
 
         // A repo a workspace mount covers without a volume of its own.
@@ -3963,7 +3999,7 @@ mod tests {
         assert!(overlays_of(&volumes, &[]).is_empty());
         assert_eq!(
             overlays_of(&volumes, &[nested]),
-            protected("/workspace/ws/main-repo/.git")
+            expect("/workspace/ws/main-repo/.git", &main_files)
         );
     }
 
