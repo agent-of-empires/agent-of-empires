@@ -786,6 +786,8 @@ fn lookup(session: &str) -> Option<Arc<VtChannel>> {
         .and_then(Weak::upgrade)
 }
 
+/// A failed channel's pane id may name a dead pane or, after a tmux server
+/// restart renumbers panes, another session's pane.
 pub(crate) fn live_channel_pane_id(session: &str) -> Option<String> {
     lookup(session)
         .filter(|channel| channel.is_alive())
@@ -4543,13 +4545,13 @@ mod tests {
     }
 
     #[test]
-    fn paste_after_recreate_reaches_the_new_pane_while_the_old_channel_is_held() {
+    fn paste_ignores_the_pane_id_held_by_a_failed_channel() {
         if !crate::tmux::test_helpers::tmux_available() {
             eprintln!("Skipping test: tmux not available");
             return;
         }
-        // Keeps the server up across the kill so the recreated pane gets a new id.
-        let keeper = crate::tmux::test_helpers::TmuxTestSession::new("aoe_test_vt_keeper");
+        // Also keeps the server up across the kill so the recreated pane gets a new id.
+        let other = crate::tmux::test_helpers::TmuxTestSession::new("aoe_test_vt_other");
         let guard = crate::tmux::test_helpers::TmuxTestSession::new("aoe_test_vt_recreate");
         let create = |name: &str| {
             let mut args: Vec<String> = ["new-session", "-d", "-s", name, "cat"]
@@ -4563,45 +4565,55 @@ mod tests {
                 .expect("tmux new-session");
             assert!(output.status.success());
         };
-        create(keeper.name());
+        let capture = |pane: &str| {
+            let output = crate::tmux::tmux_command()
+                .args(["capture-pane", "-p", "-t", pane])
+                .output()
+                .expect("tmux capture-pane");
+            String::from_utf8_lossy(&output.stdout).into_owned()
+        };
+        create(other.name());
         create(guard.name());
-        let old_pane = crate::tmux::test_helpers::only_pane_id(guard.name());
-
-        let dir = tempfile::tempdir().expect("tempdir");
-        let (mut held, lifecycle) = dummy_channel(guard.name(), dir.path());
-        Arc::get_mut(&mut held).expect("unshared").target = old_pane.clone();
-        VtLifecycle::fail(&lifecycle);
-        REGISTRY
-            .lock()
-            .unwrap()
-            .insert(guard.name().to_string(), Arc::downgrade(&held));
-
+        let dead_pane = crate::tmux::test_helpers::only_pane_id(guard.name());
         let killed = crate::tmux::tmux_command()
             .args(["kill-session", "-t", guard.name()])
             .output()
             .expect("tmux kill-session");
         assert!(killed.status.success());
         create(guard.name());
-        let new_pane = crate::tmux::test_helpers::only_pane_id(guard.name());
-        assert_ne!(old_pane, new_pane);
+        let live_pane = crate::tmux::test_helpers::only_pane_id(guard.name());
+        assert_ne!(dead_pane, live_pane);
+        let other_pane = crate::tmux::test_helpers::only_pane_id(other.name());
 
-        crate::tmux::Session::from_name(guard.name())
-            .paste_text("after-recreate")
-            .expect("paste must target the recreated pane");
-        let deadline = Instant::now() + Duration::from_secs(5);
-        loop {
-            let output = crate::tmux::tmux_command()
-                .args(["capture-pane", "-p", "-t", &new_pane])
-                .output()
-                .expect("tmux capture-pane");
-            if String::from_utf8_lossy(&output.stdout).contains("after-recreate") {
-                break;
+        // The second case is the state after a tmux server restart renumbers
+        // panes from %0: the held id names another session's live pane.
+        for (held_target, text) in [(&dead_pane, "after-recreate"), (&other_pane, "after-reuse")] {
+            let dir = tempfile::tempdir().expect("tempdir");
+            let (mut held, lifecycle) = dummy_channel(guard.name(), dir.path());
+            Arc::get_mut(&mut held).expect("unshared").target = held_target.clone();
+            VtLifecycle::fail(&lifecycle);
+            REGISTRY
+                .lock()
+                .unwrap()
+                .insert(guard.name().to_string(), Arc::downgrade(&held));
+
+            crate::tmux::Session::from_name(guard.name())
+                .paste_text(text)
+                .unwrap_or_else(|e| panic!("paste holding {held_target} failed: {e}"));
+            let deadline = Instant::now() + Duration::from_secs(5);
+            while !capture(&live_pane).contains(text) {
+                assert!(
+                    Instant::now() < deadline,
+                    "paste holding {held_target} never reached {live_pane}"
+                );
+                std::thread::sleep(Duration::from_millis(10));
             }
-            assert!(Instant::now() < deadline, "paste never reached {new_pane}");
-            std::thread::sleep(Duration::from_millis(10));
+            REGISTRY.lock().unwrap().remove(guard.name());
         }
-
-        REGISTRY.lock().unwrap().remove(guard.name());
+        assert!(
+            !capture(&other_pane).contains("after-reuse"),
+            "a reused pane id must not route the paste into another session"
+        );
     }
 
     #[test]
