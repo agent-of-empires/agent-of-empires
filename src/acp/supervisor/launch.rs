@@ -1440,6 +1440,11 @@ pub(super) async fn resolve_mcp_servers(
 ) -> Vec<agent_client_protocol::v1::schema::McpServer> {
     let agent_key = agent_key.to_string();
     let session = session_id.to_string();
+    let daemon = if paths.sandboxed {
+        Some(crate::acp::mcp_config::DaemonIdentity::current().await)
+    } else {
+        None
+    };
     tokio::task::spawn_blocking(move || {
         resolve_mcp_layers(
             &agent_key,
@@ -1448,6 +1453,7 @@ pub(super) async fn resolve_mcp_servers(
             &paths,
             &session_env,
             native_config_override.as_deref(),
+            daemon.as_ref(),
         )
     })
     .await
@@ -1469,6 +1475,7 @@ fn resolve_mcp_layers(
     paths: &McpPaths,
     session_env: &[(String, String)],
     native_config_override: Option<&std::path::Path>,
+    daemon: Option<&crate::acp::mcp_config::DaemonIdentity>,
 ) -> Vec<agent_client_protocol::v1::schema::McpServer> {
     use crate::session::mcp::mcp_model::{resolve_effective, summarize};
 
@@ -1480,12 +1487,8 @@ fn resolve_mcp_layers(
         session_env,
         native_config_override,
     );
-    if paths.sandboxed {
-        let daemon_urls: Vec<String> = crate::cli::serve::read_serve_urls()
-            .into_iter()
-            .map(|u| u.url)
-            .collect();
-        merged = crate::acp::mcp_config::drop_daemon_servers(merged, &daemon_urls);
+    if let Some(daemon) = daemon {
+        merged = crate::acp::mcp_config::drop_daemon_servers(merged, daemon);
     }
     if !merged.is_empty() {
         info!(
@@ -2718,6 +2721,7 @@ time.sleep(60)
                         sandboxed: false,
                     },
                     &[],
+                    None,
                     None,
                 )
             })

@@ -11,21 +11,36 @@ use tracing::warn;
 use crate::session::mcp::mcp_model::{McpProvenance, ResolvedMcpServer};
 use crate::session::mcp::project_mcp::ProjectMcpTransport;
 
+/// What identifies the daemon to a sandboxed session's MCP set.
+pub struct DaemonIdentity {
+    /// Tokens the daemon accepts, grace token included. `None` when this process has no token
+    /// authority; remote servers are then dropped, since none can be proven token-free.
+    pub tokens: Option<Vec<String>>,
+    /// Host names the daemon is reachable on, from `serve.url`. Best effort: only the token
+    /// check is authoritative.
+    pub hosts: Vec<String>,
+}
+
+impl DaemonIdentity {
+    pub async fn current() -> Self {
+        let hosts = crate::cli::serve::read_serve_urls()
+            .iter()
+            .filter_map(|u| reqwest::Url::parse(&u.url).ok())
+            .filter_map(|u| u.host_str().map(str::to_owned))
+            .collect();
+        Self {
+            tokens: crate::server::token::accepted_daemon_tokens().await,
+            hosts,
+        }
+    }
+}
+
 /// Drop servers a sandboxed session must not receive: remote servers on a loopback host or on
-/// the daemon's own listener, and any remote server carrying a daemon token. `daemon_urls` are
-/// the `serve.url` lines (they embed the token).
+/// the daemon's own listener, and any remote server carrying an accepted daemon token.
 pub fn drop_daemon_servers(
     servers: Vec<ResolvedMcpServer>,
-    daemon_urls: &[String],
+    daemon: &DaemonIdentity,
 ) -> Vec<ResolvedMcpServer> {
-    let daemon: Vec<reqwest::Url> = daemon_urls
-        .iter()
-        .filter_map(|u| reqwest::Url::parse(u).ok())
-        .collect();
-    let tokens: Vec<&str> = daemon_urls
-        .iter()
-        .filter_map(|u| crate::cli::url::extract_token(u))
-        .collect();
     servers
         .into_iter()
         .filter(|resolved| {
@@ -34,9 +49,11 @@ pub fn drop_daemon_servers(
                 | ProjectMcpTransport::Sse { url, headers } => (url, headers),
                 ProjectMcpTransport::Stdio { .. } => return true,
             };
-            let has_token = std::iter::once(url)
-                .chain(headers.values())
-                .any(|value| tokens.iter().any(|token| value.contains(token)));
+            let credential_risk = daemon.tokens.as_ref().is_none_or(|tokens| {
+                std::iter::once(url)
+                    .chain(headers.values())
+                    .any(|value| tokens.iter().any(|token| value.contains(token.as_str())))
+            });
             let host_is_daemon = reqwest::Url::parse(url).is_ok_and(|url| {
                 url.host_str().is_some_and(|host| {
                     let loopback = host.eq_ignore_ascii_case("localhost")
@@ -44,10 +61,10 @@ pub fn drop_daemon_servers(
                             .trim_matches(['[', ']'])
                             .parse::<std::net::IpAddr>()
                             .is_ok_and(|ip| ip.to_canonical().is_loopback());
-                    loopback || daemon.iter().any(|d| d.host_str() == Some(host))
+                    loopback || daemon.hosts.iter().any(|h| h == host)
                 })
             });
-            let drop = host_is_daemon || has_token;
+            let drop = host_is_daemon || credential_risk;
             if drop {
                 warn!(
                     target: "acp.mcp",
@@ -269,26 +286,49 @@ mod tests {
     #[test]
     fn sandboxed_sessions_never_get_daemon_or_loopback_servers() {
         let json = r#"{ "mcpServers": {
-            "aoe": { "type": "http", "url": "http://127.0.0.1:8080/mcp",
+            "aoe": { "type": "http", "url": "http://127.0.0.1:9000/mcp",
                      "headers": { "Authorization": "Bearer sekrit" } },
             "local": { "type": "sse", "url": "http://localhost:9000/sse" },
             "mapped": { "type": "http", "url": "http://[::ffff:127.0.0.1]:9000/mcp" },
             "v6": { "type": "http", "url": "http://[::1]:9000/mcp" },
-            "lan": { "type": "http", "url": "http://192.168.1.5:8080/mcp" },
+            "lan": { "type": "http", "url": "http://192.168.1.5:9000/mcp" },
             "unparseable": { "type": "http", "url": "u",
                              "headers": { "Authorization": "Bearer sekrit" } },
             "urltoken": { "type": "http", "url": "https://proxy.example.test/mcp?token=sekrit" },
+            "previous": { "type": "http", "url": "https://alias.example.test/mcp",
+                          "headers": { "Authorization": "Bearer prev-token" } },
             "renamed": { "type": "http", "url": "https://proxy.example.test/mcp",
                          "headers": { "X-Key": "Bearer sekrit" } },
             "github": { "type": "http", "url": "https://api.github.test/mcp",
                         "headers": { "Authorization": "Bearer pat" } },
             "fs": { "command": "fs-server", "env": { "K": "v" } }
         } }"#;
-        let daemon = vec!["http://192.168.1.5:8080/?token=sekrit".to_string()];
-        let kept = drop_daemon_servers(resolved(json, McpProvenance::Global), &daemon);
-        let mut kept: Vec<_> = kept.iter().map(|s| s.def.name.as_str()).collect();
-        kept.sort();
-        assert_eq!(kept, ["fs", "github"]);
+        let names = |daemon: &DaemonIdentity| {
+            let kept = drop_daemon_servers(resolved(json, McpProvenance::Global), daemon);
+            let mut kept: Vec<_> = kept.iter().map(|s| s.def.name.clone()).collect();
+            kept.sort();
+            kept
+        };
+        let tokens = Some(vec!["sekrit".to_string(), "prev-token".to_string()]);
+        let daemon = DaemonIdentity {
+            tokens: tokens.clone(),
+            hosts: vec!["192.168.1.5".to_string()],
+        };
+        assert_eq!(names(&daemon), ["fs", "github"]);
+
+        // An unreadable or half-written `serve.url` leaves no hosts; tokens still decide.
+        let no_hosts = DaemonIdentity {
+            tokens,
+            hosts: Vec::new(),
+        };
+        assert_eq!(names(&no_hosts), ["fs", "github", "lan"]);
+
+        // Without a token authority no remote server can be proven token-free.
+        let no_authority = DaemonIdentity {
+            tokens: None,
+            hosts: Vec::new(),
+        };
+        assert_eq!(names(&no_authority), ["fs"]);
     }
 
     #[test]
