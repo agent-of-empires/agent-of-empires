@@ -80,6 +80,7 @@ pub struct SessionSequence {
     retired: bool,
 }
 type SharedSet = Arc<std::sync::Mutex<HashSet<String>>>;
+
 type RestartRequests = Arc<std::sync::Mutex<HashMap<String, (u64, CancellationToken)>>>;
 type SpawnRequests = Arc<std::sync::Mutex<SpawnRequestState>>;
 
@@ -258,6 +259,8 @@ pub struct Supervisor<S: BroadcastSink> {
     force_respawn: SharedSet,
     /// Reconsider canonical admission next tick without resetting budgets or granting creation.
     startup_requeues: SharedSet,
+    /// Signalled once a worker has ended on a provider rate limit, so the reconciler reacts at once.
+    rate_limit_wake: Arc<tokio::sync::Notify>,
     /// Sessions whose isolated native identity is not durable yet.
     pending_context_resets: SharedSet,
     /// Sessions whose crashed worker the drain task relaunched in place.
@@ -673,6 +676,7 @@ impl<S: BroadcastSink> Supervisor<S> {
             incompatible_binaries: Arc::default(),
             force_respawn: Arc::default(),
             startup_requeues: Arc::default(),
+            rate_limit_wake: Arc::default(),
             pending_context_resets: Arc::default(),
             respawned_in_place: Arc::default(),
             max_concurrent_workers,
@@ -720,6 +724,11 @@ impl<S: BroadcastSink> Supervisor<S> {
 
     pub fn take_respawn_requests(&self) -> Vec<String> {
         lock_recover(&self.force_respawn).drain().collect()
+    }
+
+    /// Resolves after a worker ended on a rate limit; one wake is kept if nobody was waiting.
+    pub async fn rate_limit_parked(&self) {
+        self.rate_limit_wake.notified().await;
     }
 
     pub(crate) fn take_startup_requeues(&self) -> Vec<String> {

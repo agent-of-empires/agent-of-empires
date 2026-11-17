@@ -15,7 +15,6 @@
 
 - [ ] New and existing tests pass
 - [ ] Documentation was updated where necessary
-- [ ] For UI changes: included screenshot or recording
 
 ## Test Coverage Analysis
 

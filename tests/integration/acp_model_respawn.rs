@@ -535,14 +535,75 @@ async fn second_reset_keeps_a_toggle_turned_off_after_the_first() {
                     tokio::time::sleep(Duration::from_millis(20)).await;
                 }
             };
-            client.reset_session("/clear").await.unwrap();
-            client
+            let first_reset = client.reset_session("/clear").await.unwrap();
+            assert!(matches!(
+                first_reset,
+                crate::acp::acp_client::ResetSessionOutcome::Reset { .. }
+            ));
+            tokio::time::timeout(Duration::from_secs(10), async {
+                loop {
+                    match client
+                        .next_event()
+                        .await
+                        .expect("first reset remains observable")
+                    {
+                        Event::Stopped { reason } if reason == "session_reset" => break,
+                        Event::AgentStartupError { message, .. }
+                        | Event::PromptRuntimeError { message, .. } => {
+                            panic!("first reset failed: {message}");
+                        }
+                        Event::AcpConnectionUnavailable { .. } => {
+                            panic!("first reset lost its actual Native");
+                        }
+                        _ => {}
+                    }
+                }
+            })
+            .await
+            .expect("first reset's original terminal is durably published before the live pick");
+
+            let mut acknowledgements = client.subscribe_publications();
+            let correlation = client
                 .set_config_option("ultracode", "off", true, None)
                 .await
                 .unwrap();
+            tokio::time::timeout(Duration::from_secs(10), async {
+                loop {
+                    let frame = acknowledgements.recv().await.expect("live pick ACK stream");
+                    if frame.session_id != client.id
+                        || frame.operation.map(|operation| operation.correlation)
+                            != Some(correlation)
+                    {
+                        continue;
+                    }
+                    match frame.event.as_ref() {
+                        Event::ConfigOptionsUpdated { options }
+                            if options.iter().any(|option| {
+                                option.id == "ultracode" && option.current_value == "off"
+                            }) =>
+                        {
+                            assert_eq!(
+                                frame.operation.and_then(|operation| operation.outcome),
+                                Some(crate::acp::protocol::AcpOriginalRequestResult::Succeeded)
+                            );
+                            break;
+                        }
+                        Event::ConfigOptionSwitchFailed { reason, .. } => {
+                            panic!("the exact live pick failed: {reason}");
+                        }
+                        other => panic!("unexpected exact live pick outcome: {other:?}"),
+                    }
+                }
+            })
+            .await
+            .expect("the exact off pick settles before the second Fresh revokes its scope");
             await_config_option(&mut client, "ultracode", "off").await;
             wait_for(7).await;
-            client.reset_session("/clear").await.unwrap();
+            let second_reset = client.reset_session("/clear").await.unwrap();
+            assert!(matches!(
+                second_reset,
+                crate::acp::acp_client::ResetSessionOutcome::Reset { .. }
+            ));
             let _ = client.shutdown().await;
 
             let recorded = std::fs::read_to_string(&record_path).unwrap_or_default();

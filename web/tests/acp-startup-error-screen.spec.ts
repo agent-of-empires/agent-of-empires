@@ -1,4 +1,4 @@
-// The adapter compatibility screen: the setting unlocks Update on focus, and the phone layout.
+// The adapter compatibility screen: the setting unlocks Update on focus, and the phone layout with Recreate container.
 
 import type { Page } from "@playwright/test";
 
@@ -12,6 +12,7 @@ async function openRefusedSession(page: Page) {
   const mock = await mockAcpSession(page, {
     title: "story-adapter-out-of-date",
     nativeAvailable: false,
+    sessionFields: { is_sandboxed: true },
     initialEvents: [
       {
         IncompatibleAgent: {
@@ -58,6 +59,7 @@ test("turning the setting on unlocks Update when the page regains focus", async 
   await page.evaluate(() => window.dispatchEvent(new Event("focus")));
   await expect(update).toBeEnabled();
   await expect(screen.getByTestId("startup-error-step-1")).toContainText("Done");
+  await expect(screen.getByRole("button", { name: "Recreate container" })).toBeVisible();
 });
 
 test.describe("at 375px", () => {
@@ -79,5 +81,21 @@ test.describe("at 375px", () => {
       () => document.documentElement.scrollWidth - document.documentElement.clientWidth,
     );
     expect(overflow).toBeLessThanOrEqual(0);
+  });
+
+  test("Recreate container fits beside the others and opens its confirmation on screen", async ({ page }) => {
+    const { screen } = await openRefusedSession(page);
+    const recreate = screen.getByRole("button", { name: "Recreate container" });
+    await expect(recreate).toBeInViewport({ ratio: 1 });
+    await recreate.click();
+    const dialog = page.getByRole("dialog", { name: "Recreate container" });
+    await expect(dialog).toContainText("story-adapter-out-of-date");
+    await expect(page.getByTestId("recreate-container-confirm")).toBeInViewport({ ratio: 1 });
+    const overflow = await page.evaluate(
+      () => document.documentElement.scrollWidth - document.documentElement.clientWidth,
+    );
+    expect(overflow).toBeLessThanOrEqual(0);
+    await dialog.getByRole("button", { name: "Cancel" }).click();
+    await expect(dialog).toBeHidden();
   });
 });

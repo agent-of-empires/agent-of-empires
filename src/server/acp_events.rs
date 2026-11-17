@@ -515,6 +515,18 @@ pub(super) async fn acp_event_listener(state: Arc<AppState>) {
                 &inflight,
             )
         };
+        // `try_smart_rename` refuses these too, but only after the history read.
+        let should_rename = should_rename
+            && state
+                .instances
+                .read()
+                .await
+                .iter()
+                .find(|i| i.id == frame.session_id)
+                .is_some_and(|i| {
+                    i.is_structured()
+                        && crate::session::civilizations::is_default_civ_name(&i.title)
+                });
         if should_rename {
             if let Some((first_user_prompt, agent_prose)) =
                 state.acp_event_store.first_turn_context(
@@ -2170,8 +2182,8 @@ pub(super) fn derive_acp_session_change(event: &crate::acp::Event) -> Option<Acp
 pub(crate) enum StatusPolicy {
     Authoritative,
     /// A no-op while the sidebar sits on a status only the main turn may
-    /// resolve: `Waiting`, `Stopped` or `Error`. Used only by the
-    /// `Background*` arms (#4001).
+    /// resolve: `Waiting`, `Stopped` or `Error`. Used only by background
+    /// work events (#4001).
     Background,
     /// Only takes effect from `Error` or `Stopped`: a fresh worker attached.
     Heal,
@@ -2202,7 +2214,8 @@ pub(crate) fn status_policy(event: &crate::acp::Event) -> Option<StatusPolicy> {
             ..
         }
         | Event::BackgroundAgentCompleted { .. }
-        | Event::BackgroundTaskFinished { .. } => Some(StatusPolicy::Background),
+        | Event::BackgroundTaskFinished { .. }
+        | Event::SubagentUpdated { .. } => Some(StatusPolicy::Background),
         Event::RateLimitAutoResumed { .. } => Some(StatusPolicy::Heal),
         _ => None,
     }
@@ -2695,6 +2708,7 @@ mod tests {
             Event::AgentStartupError {
                 message: "retained failure".into(),
                 native_subject: None,
+                cause: None,
             },
             Event::AcpSessionAssigned {
                 acp_session_id: "retained identity".into(),
@@ -3275,6 +3289,7 @@ mod tests {
         let event = Arc::new(Event::AgentStartupError {
             message: "retained startup diagnostic".into(),
             native_subject: None,
+            cause: None,
         });
         let gate = assignment_listener_gate_for_test(&id, Some(8));
         for (seq, event) in [
@@ -3627,13 +3642,7 @@ mod tests {
                 },
                 Some(Authoritative),
             ),
-            (
-                Event::AgentStartupError {
-                    message: "boom".into(),
-                    native_subject: None,
-                },
-                Some(Authoritative),
-            ),
+            (Event::startup_error("boom"), Some(Authoritative)),
             (
                 Event::ApprovalResolved {
                     nonce: Nonce("x".into()),
@@ -3651,6 +3660,26 @@ mod tests {
             ),
             (progress(BackgroundAgentStatus::Running), Some(Background)),
             (progress(BackgroundAgentStatus::Completed), None),
+            (
+                Event::SubagentUpdated {
+                    subagent: crate::acp::state::SubagentRecord {
+                        session_id: "child".into(),
+                        parent_session_id: "root".into(),
+                        provenance: None,
+                        parent_tool_call_id: None,
+                        title: None,
+                        description: None,
+                        state: crate::acp::state::SubagentState::Idle,
+                        stop_reason: Some("end_turn".into()),
+                        error: None,
+                        cancel_capable: false,
+                        model: None,
+                        background: true,
+                    },
+                    at: chrono::Utc::now(),
+                },
+                Some(Background),
+            ),
             (
                 Event::AcpSessionAssigned {
                     acp_session_id: "a".into(),
@@ -4506,6 +4535,10 @@ mod tests {
                     initial_listener.abort();
                     let _ = initial_listener.await;
                     let mut publications = live.client.subscribe_publications();
+                    let (loss_gate, original_drain, loss_published) = scope.gate();
+                    live.client
+                        .actual()
+                        .gate_connection_loss_publication(loss_gate);
                     inspection.query("close-control").await;
                     tokio::time::timeout(std::time::Duration::from_secs(10), async {
                         while live.client.connection_unavailable().is_none() {
@@ -4532,7 +4565,26 @@ mod tests {
                     assert_eq!(loss.native_origin.unwrap().owner, owner);
                     assert_eq!(loss.native_subject.unwrap().owner, owner);
                     assert_eq!(loss.worker_generation, Some(live.client.lease.epoch()));
-                    let original_drain = live.client.pause_drain().await;
+                    tokio::time::timeout(std::time::Duration::from_secs(10), loss_published)
+                        .await
+                        .unwrap()
+                        .expect("the original loss publishes before recovery");
+                    let folded = live
+                        .state
+                        .session_service
+                        .fold_control_state(&id)
+                        .await
+                        .unwrap();
+                    assert_eq!(
+                        folded.connection_unavailable,
+                        live.client.connection_unavailable(),
+                        "the current original connection retains its actual Control loss"
+                    );
+                    assert_eq!(
+                        folded.sidebar_status(),
+                        Status::Error,
+                        "the actual Control loss denies current input"
+                    );
                     seed_acp_statuses(live.state.clone()).await;
                     let failed = await_row(
                         &live.state,
@@ -4542,7 +4594,7 @@ mod tests {
                     )
                     .await;
                     let error_baseline = failed.last_error.clone();
-                    drop(original_drain);
+                    assert!(original_drain.release());
                     let gate = assignment_listener_gate_for_test(&id, None);
                     let (listener, handoff) = prepare_managed_listener(scope);
                     let attached = scope

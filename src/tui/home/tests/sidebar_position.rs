@@ -1,5 +1,5 @@
 use super::*;
-use crate::session::config::{update_config, SidebarPosition};
+use crate::session::config::{update_config, NarrowLayout, SidebarPosition};
 use crate::tui::styles::load_theme;
 use ratatui::{backend::TestBackend, buffer::Buffer, layout::Rect, Terminal};
 
@@ -174,6 +174,176 @@ fn sidebar_divider_drag_ends_when_the_divider_disappears() {
             );
         }
     }
+}
+
+/// `one_pane` gives the list the whole narrow screen instead of stacking a preview under
+/// it, and the list closes all four borders since no preview owns the bottom seam.
+#[test]
+#[serial]
+fn narrow_one_pane_gives_the_list_the_whole_screen() {
+    let mut env = create_test_env_with_sessions(3);
+    env.view.narrow_layout = NarrowLayout::OnePane;
+    for width in [20, 60, 79] {
+        let buf = render(&mut env.view, width);
+        let height = env.view.main_area_height;
+        assert_eq!(
+            env.view.list_area,
+            Rect::new(4, 2, width, height),
+            "{width}"
+        );
+        assert_eq!(env.view.preview_outer_area, Rect::default(), "{width}");
+        assert_eq!(env.view.preview_pane_area, Rect::default(), "{width}");
+        assert_eq!(env.view.divider_row, None, "{width}");
+        assert_ne!(env.view.list_inner_area, Rect::default(), "{width}");
+        assert_eq!(buf[(4, 2)].symbol(), "╭", "{width}");
+        assert_eq!(
+            buf[(4 + width - 1, 2 + height - 1)].symbol(),
+            "╯",
+            "{width}"
+        );
+    }
+}
+
+/// `one_pane` hands the whole narrow screen to the preview while live mode relays keys,
+/// and clears the hidden list's hit rects.
+#[test]
+#[serial]
+fn narrow_one_pane_gives_live_mode_the_whole_screen() {
+    let mut env = create_test_env_with_sessions(3);
+    env.view.narrow_layout = NarrowLayout::OnePane;
+    let width = 60;
+    render(&mut env.view, width);
+    env.view.live_send = Some(live_send_state("s1", "one", "aoe_one"));
+    render(&mut env.view, width);
+    let height = env.view.main_area_height;
+    assert_eq!(env.view.preview_outer_area, Rect::new(4, 2, width, height));
+    assert_eq!(env.view.list_area, Rect::default());
+    assert_eq!(env.view.list_inner_area, Rect::default());
+    assert_eq!(env.view.diagnostics_area, Rect::default());
+    assert_eq!(env.view.divider_row, None);
+}
+
+/// A collapsed sidebar left over from a wider window does not shrink `one_pane` to a
+/// three-column strip, and the list draws no collapse affordance it cannot honor.
+#[test]
+#[serial]
+fn narrow_one_pane_ignores_a_collapsed_sidebar() {
+    let mut env = create_test_env_with_sessions(3);
+    env.view.narrow_layout = NarrowLayout::OnePane;
+    env.view.sidebar_collapsed = true;
+    let width = 60;
+    render(&mut env.view, width);
+    assert_eq!(env.view.expand_strip_area, Rect::default());
+    assert_eq!(env.view.list_area.width, width);
+    assert_eq!(env.view.collapse_button_area, Rect::default());
+}
+
+/// The System Health takeover is painted through the preview, so `one_pane` gives it the
+/// whole narrow screen instead of hiding it behind the list.
+#[test]
+#[serial]
+fn narrow_one_pane_shows_the_system_health_takeover() {
+    let mut env = create_test_env_with_sessions(3);
+    env.view.narrow_layout = NarrowLayout::OnePane;
+    env.view.system_health_open = true;
+    let width = 60;
+    render(&mut env.view, width);
+    let height = env.view.main_area_height;
+    assert_eq!(env.view.preview_outer_area, Rect::new(4, 2, width, height));
+    assert_eq!(env.view.list_area, Rect::default());
+}
+
+/// A Structured view Session has no live mode, so its interactive transcript is the signal
+/// that swaps `one_pane` over to the preview, the same way live-send is for a terminal.
+#[test]
+#[serial]
+fn narrow_one_pane_swaps_to_an_interactive_structured_session() {
+    let mut inst = Instance::new("acp", "/tmp/acp");
+    inst.view = crate::session::View::Structured;
+    let mut env = seeded_env(test_home(), &[inst.clone()], true);
+    env.view.select_session_by_id(&inst.id);
+    env.view.view_mode = ViewMode::Structured;
+    env.view.narrow_layout = NarrowLayout::OnePane;
+    let width = 60;
+    render(&mut env.view, width);
+    assert_eq!(env.view.list_area.width, width);
+    assert_eq!(
+        env.view.preview_outer_area,
+        Rect::default(),
+        "a read-only transcript does not take the screen"
+    );
+
+    let mut structured = crate::tui::structured_view::embedded::EmbeddedView::for_test(&inst.id);
+    structured.activate();
+    env.view.structured_preview = Some(structured);
+    render(&mut env.view, width);
+    let height = env.view.main_area_height;
+    assert_eq!(env.view.preview_outer_area, Rect::new(4, 2, width, height));
+    assert_eq!(env.view.list_area, Rect::default());
+
+    env.view.structured_preview.as_mut().unwrap().deactivate();
+    render(&mut env.view, width);
+    assert_eq!(env.view.list_area.width, width);
+    assert_eq!(env.view.preview_outer_area, Rect::default());
+}
+
+/// Enter on a trashed Session opens its retained transcript, which takes the `one_pane`
+/// screen until Esc hands it back to the list.
+#[test]
+#[serial]
+fn narrow_one_pane_keeps_the_stack_for_a_retained_reader() {
+    let mut inst = Instance::new("gone", "/tmp/gone");
+    inst.trash();
+    let mut env = seeded_env(test_home(), &[inst.clone()], true);
+    env.view.narrow_layout = NarrowLayout::OnePane;
+    env.view.trashed_section_collapsed = false;
+    env.view.flat_items = env.view.build_flat_items();
+    env.view.update_selected();
+    let width = 60;
+    render(&mut env.view, width);
+    env.view.select_session_by_id(&inst.id);
+    assert_eq!(env.view.selected_session.as_deref(), Some(inst.id.as_str()));
+    render(&mut env.view, width);
+    assert_eq!(
+        env.view.preview_outer_area,
+        Rect::default(),
+        "browsing keeps the list full screen"
+    );
+
+    env.view.activate_selected_session();
+    assert!(env.view.retained_reader_focused());
+    render(&mut env.view, width);
+    let height = env.view.main_area_height;
+    assert_eq!(env.view.preview_outer_area, Rect::new(4, 2, width, height));
+    assert_eq!(env.view.list_area, Rect::default());
+
+    env.view.handle_key(key(KeyCode::Esc), None);
+    assert!(!env.view.retained_reader_focused());
+    render(&mut env.view, width);
+    assert_eq!(env.view.list_area.width, width);
+    assert_eq!(env.view.preview_outer_area, Rect::default());
+}
+
+/// `big_preview` squeezes the stacked list to its minimum while live mode relays keys.
+#[test]
+#[serial]
+fn narrow_big_preview_shrinks_the_list_in_live_mode() {
+    let mut env = create_test_env_with_sessions(3);
+    env.view.narrow_layout = NarrowLayout::BigPreview;
+    let width = 60;
+    render(&mut env.view, width);
+    let browsing_list_height = env.view.list_area.height;
+    let browsing_preview_height = env.view.preview_outer_area.height;
+    env.view.live_send = Some(live_send_state("s1", "one", "aoe_one"));
+    render(&mut env.view, width);
+    assert_eq!(
+        env.view.list_area.height, 5,
+        "the list keeps only its floor"
+    );
+    assert!(
+        env.view.preview_outer_area.height > browsing_preview_height,
+        "live mode grows the preview ({browsing_list_height} -> list height 5)"
+    );
 }
 
 /// Temporary stacking must preserve the chosen side and requested width.

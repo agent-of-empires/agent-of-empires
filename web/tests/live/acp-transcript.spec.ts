@@ -109,17 +109,24 @@ test("original Native partial tool output survives a correlated prompt failure u
 test("structured view prompt carries an image attachment end to end", async ({ spawnServe }) => {
   // #1000, #965
   const { serve, sessionId } = await startAcpSession(spawnServe, { title: "acp-attach", fakeAcpScript: IMAGE_CAPABLE });
+  await expect
+    .poll(async () =>
+      (
+        (await replayFrames(serve.baseUrl, sessionId)) as { event?: { PromptCapabilities?: { image: boolean } } }[]
+      ).some(({ event }) => event?.PromptCapabilities?.image === true),
+    )
+    .toBe(true);
   const prompt = (text: string, attachment: object) =>
     postAcp(serve.baseUrl, sessionId, "/prompt", { text, attachments: [attachment] });
 
-  expect2xx(
-    await prompt("what is in this image?", {
-      kind: "image",
-      mime_type: "image/png",
-      data: PNG_1X1_B64,
-      name: "shot.png",
-    }),
-  );
+  const response = await prompt("what is in this image?", {
+    kind: "image",
+    mime_type: "image/png",
+    data: PNG_1X1_B64,
+    name: "shot.png",
+  });
+  expect(response.status).toBeGreaterThanOrEqual(200);
+  expect(response.status, await response.text()).toBeLessThan(300);
 
   // The persisted UserPromptSent carries a metadata-only ref to the stored blob.
   const attachment = async () =>
@@ -176,14 +183,21 @@ test("uploaded image in a user message is capped in height and never overflows",
     title: "acp-image-size",
     fakeAcpScript: IMAGE_CAPABLE,
   });
-  expect2xx(
-    await postAcp(serve.baseUrl, sessionId, "/prompt", {
-      text: "tall picture",
-      attachments: [
-        { kind: "image", mime_type: "image/png", data: solidPng(100, 1200).toString("base64"), name: "tall.png" },
-      ],
-    }),
-  );
+  await expect
+    .poll(async () =>
+      (
+        (await replayFrames(serve.baseUrl, sessionId)) as { event?: { PromptCapabilities?: { image: boolean } } }[]
+      ).some(({ event }) => event?.PromptCapabilities?.image === true),
+    )
+    .toBe(true);
+  const response = await postAcp(serve.baseUrl, sessionId, "/prompt", {
+    text: "tall picture",
+    attachments: [
+      { kind: "image", mime_type: "image/png", data: solidPng(100, 1200).toString("base64"), name: "tall.png" },
+    ],
+  });
+  expect(response.status).toBeGreaterThanOrEqual(200);
+  expect(response.status, await response.text()).toBeLessThan(300);
 
   await openStructuredView(page, serve, sessionId);
   const image = page.locator("img.acp-artifact-image");

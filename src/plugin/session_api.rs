@@ -515,6 +515,7 @@ async fn admit_and_create(
         // the agent, so it rides on session.create.
         sandbox: req.sandbox,
         sandbox_image: None,
+        pull_latest_image: false,
         yolo_mode: false,
         extra_env: Vec::new(),
         before_start_hook_env: Vec::new(),
@@ -528,6 +529,7 @@ async fn admit_and_create(
         scratch,
         trust_hooks: None,
         trust_review: None,
+        skip_on_create: false,
         custom_instruction: None,
         // Plugin-created sessions have no request-level dispatcher callback
         // or idempotency key; that surface is REST-only (#3156). Plugin

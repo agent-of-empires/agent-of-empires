@@ -613,11 +613,7 @@ mod tests {
             assert!(p.text.contains(want), "missing {want:?}");
         }
 
-        // An unprocessed prompt is split out only when the agent never answered.
-        let startup_error = Event::AgentStartupError {
-            message: "ACP connection failed".into(),
-            native_subject: None,
-        };
+        let startup_error = Event::startup_error("ACP connection failed");
         // (events, unprocessed prompt, rendered turns)
         let cases = [
             (

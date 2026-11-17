@@ -297,3 +297,65 @@ fn removed_integration_session_reports_response_not_sent() {
         );
     }
 }
+
+#[test]
+#[serial]
+fn declared_response_reports_missing_or_changed_session() {
+    let manifest: aoe_plugin_api::PluginManifest = toml::from_str(
+        "id = \"acme.reply\"\nname = \"Reply\"\nversion = \"1.0.0\"\napi_version = 21\n[[agent_integrations]]\ntool = \"reply-helper\"\ncommand = \"reply-helper\"\n",
+    )
+    .unwrap();
+    let registry = std::sync::Arc::new(crate::plugin::registry::PluginRegistry::from_test_plugins(
+        vec![crate::plugin::registry::LoadedPlugin {
+            manifest,
+            enabled: true,
+            trust: aoe_plugin_api::TrustLevel::Community,
+            validation: crate::plugin::registry::ValidationState::Local,
+            source: None,
+            dir: None,
+            manifest_hash: String::new(),
+            granted: true,
+        }],
+    ));
+    let agent = crate::plugin::agent_integration::declared_agent(
+        registry,
+        "reply-helper",
+        std::iter::empty(),
+    )
+    .unwrap();
+    let mut env = create_test_env_empty();
+    let _driver = env.view.session_feed.terminal_driver_for_test();
+    let id = add_session_with_tool(&mut env.view, "session-one", "reply-helper");
+    env.view.execute_declared_permission_response(
+        &id,
+        crate::tui::dialogs::PermissionResponseChoice::Allow,
+        &agent,
+    );
+    assert_eq!(
+        env.view.info_dialog.as_ref().unwrap().title(),
+        "Response Not Sent"
+    );
+    env.view.info_dialog = None;
+    env.view.session_feed.set_native_permission_for_test(false);
+    env.view.execute_declared_permission_response(
+        &id,
+        crate::tui::dialogs::PermissionResponseChoice::Allow,
+        &agent,
+    );
+    assert_eq!(
+        env.view.info_dialog.as_ref().unwrap().title(),
+        "Respond Failed"
+    );
+    env.view.session_feed.set_native_permission_for_test(true);
+    env.view.info_dialog = None;
+    env.view.instances.shift_remove(&id);
+    env.view.execute_declared_permission_response(
+        &id,
+        crate::tui::dialogs::PermissionResponseChoice::Allow,
+        &agent,
+    );
+    assert_eq!(
+        env.view.info_dialog.as_ref().unwrap().title(),
+        "Respond Failed"
+    );
+}

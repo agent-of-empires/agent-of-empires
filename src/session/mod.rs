@@ -79,15 +79,17 @@ pub use groups::{
 #[cfg(test)]
 pub(crate) use instance::install_aliases;
 pub(crate) use instance::resolved_agent_for;
+pub(crate) use instance::resume_profile_config;
 #[cfg(all(test, unix))]
 pub(crate) use instance::test_helpers::frozen_test_helper;
 #[cfg(test)]
 pub(crate) use instance::test_helpers::{publish_host_pi_transcript, seed_claude_transcript};
 #[cfg(test)]
 pub(crate) use instance::ActiveExecution;
+pub(crate) use instance::CAPTURE_FAILED_RULE;
 pub(crate) use instance::{
-    duplicate_session_error, is_duplicate_session, HostHookApprovalRequired, PassiveStatusPatch,
-    ResumeIntent, SidWrite, ToolLaunchUnavailable,
+    duplicate_session_error, is_duplicate_session, persist_session_with_storage,
+    HostHookApprovalRequired, PassiveStatusPatch, ResumeIntent, SidWrite, ToolLaunchUnavailable,
 };
 pub(crate) use instance::{
     host_hook_agent, host_hook_disclosure, host_hook_disclosure_config_with_repo,
@@ -107,7 +109,7 @@ pub use instance::{
 pub(crate) use instance::{
     ConversationState, LaunchFinalizationPending, LaunchReservation, ManagedResumeRefused,
     NativeInputError, NativeInputFence, ResumeAttemptPolicy, ResumeLaunchOptions,
-    TerminalContextResume,
+    ResumeProfileConfig, TerminalContextResume,
 };
 pub use instance::{
     ErrorBlockingScope, ErrorEvidenceGeneration, ErrorEvidenceSource, ErrorOperation, ErrorOrigin,

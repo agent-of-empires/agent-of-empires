@@ -264,7 +264,7 @@ impl<S: BroadcastSink> Supervisor<S> {
     pub async fn wait_until_ready(&self, session_id: &str) -> Result<(), SupervisorError> {
         let deadline = tokio::time::Instant::now() + WORKER_READY_TIMEOUT;
         self.wait_for_worker(session_id, WORKER_READY_TIMEOUT).await;
-        let client = {
+        let (client, lease) = {
             let workers = tokio::time::timeout_at(deadline, self.workers.lock())
                 .await
                 .map_err(|_| crate::acp::establishment::EstablishmentRefusal::Unconfirmed)?;
@@ -277,7 +277,7 @@ impl<S: BroadcastSink> Supervisor<S> {
             {
                 return Err(SupervisorError::SpawnCancelled(session_id.into()));
             }
-            Arc::clone(&handle.client)
+            (Arc::clone(&handle.client), handle.lease.clone())
         };
         let expected = if let Some(projection) = client.establishment_projection() {
             use crate::acp::event_sender::EstablishmentResolution;
@@ -307,6 +307,35 @@ impl<S: BroadcastSink> Supervisor<S> {
             let applied = match settled {
                 EstablishmentResolution::Applied(postimage) => postimage,
                 EstablishmentResolution::Blocked => {
+                    if lease.defers_rate_limit_rejection() {
+                        if let Some(rejection) = client.original_establishment_rejection(attempt_id)
+                        {
+                            {
+                                let mut workers = self.workers.lock().await;
+                                let mut lifecycle = lock_recover(&self.lifecycle);
+                                if lifecycle.current_lease(session_id).as_ref() != Some(&lease)
+                                    || !workers.get(session_id).is_some_and(|handle| {
+                                        handle.lease == lease
+                                            && Arc::ptr_eq(&handle.client, &client)
+                                    })
+                                {
+                                    return Err(SupervisorError::Superseded(session_id.into()));
+                                }
+                                if !matches!(
+                                    lifecycle.begin_connection_retirement(&lease),
+                                    crate::acp::runner_lifecycle::StopDecision::TearDown { .. }
+                                ) {
+                                    return Err(SupervisorError::SpawnCancelled(session_id.into()));
+                                }
+                                let handle = workers
+                                    .remove(session_id)
+                                    .expect("the checked failed original worker is current");
+                                lease.retirement().record_worker(handle);
+                            }
+                            self.reap_failed_launch(&lease).await;
+                            return Err(SupervisorError::Acp(rejection));
+                        }
+                    }
                     return Err(crate::acp::establishment::EstablishmentRefusal::Unresolved.into());
                 }
                 _ => {
@@ -319,6 +348,10 @@ impl<S: BroadcastSink> Supervisor<S> {
             tokio::time::timeout_at(deadline, client.wait_until_usable())
                 .await
                 .map_err(|_| crate::acp::establishment::EstablishmentRefusal::Unconfirmed)??;
+            let cut = projection.emission_cut();
+            if !projection.processed_through(cut, deadline).await {
+                return Err(crate::acp::establishment::EstablishmentRefusal::Unconfirmed.into());
+            }
             Some(applied)
         } else {
             None

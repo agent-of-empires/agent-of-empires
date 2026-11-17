@@ -21,12 +21,16 @@ use super::{
     ResumeReservation, SeqMap, SharedSet, Supervisor, SupervisorError, WorkerKind, Workers,
     MAX_RESPAWNS_IN_WINDOW, RESPAWN_BACKOFF, RESTART_WINDOW,
 };
-use crate::acp::acp_client::{AcpError, SpawnConfig};
+use crate::acp::acp_client::{AcpClient, AcpError, ControlLoss, SpawnConfig};
 use crate::acp::event_sender::{AcpEventData, EventScope, SdkEvent};
 use crate::acp::runner_lifecycle::{
-    InstallError, Lease, LifecycleTable, ProcessControl, RunnerIdentity,
+    InstallError, Lease, LifecycleTable, PrimeOwnership, ProcessControl, RunnerIdentity,
 };
-use crate::acp::state::{AcpSessionId, Event};
+
+/// Bounds recovery of a live runner whose control channel closed.
+const CONTROL_REATTACH_ATTEMPTS: u32 = 3;
+const CONTROL_REATTACH_DEADLINE: Duration = Duration::from_secs(3);
+use crate::acp::state::{AcpSessionId, Event, StartupCause};
 use crate::process::worker_registry;
 
 #[cfg(test)]
@@ -85,6 +89,7 @@ impl<S: BroadcastSink> Supervisor<S> {
     ) -> JoinHandle<()> {
         let drain = Drain {
             history_scope: lease.native_scope().ok().flatten(),
+            projection: lease.retirement().establishment_projection(),
             session_id,
             sink: Arc::clone(&self.sink),
             workers: Arc::clone(&self.workers),
@@ -95,6 +100,8 @@ impl<S: BroadcastSink> Supervisor<S> {
             launcher: Arc::clone(&self.launcher),
             notify: Arc::clone(&self.worker_notify),
             startup_requeues: Arc::clone(&self.startup_requeues),
+            rate_limit_wake: Arc::clone(&self.rate_limit_wake),
+            recovery: None,
             pending_context_resets: Arc::clone(&self.pending_context_resets),
             context_reset: if identity_only { None } else { context_reset },
             identity_only,
@@ -121,6 +128,7 @@ struct Drain<S> {
     session_id: String,
     identity_only: bool,
     history_scope: Option<crate::acp::state::NativeObservationScope>,
+    projection: Option<Arc<crate::acp::event_sender::ProjectionState>>,
     sink: Arc<S>,
     workers: Workers,
     next_seqs: Arc<SeqMap>,
@@ -130,6 +138,8 @@ struct Drain<S> {
     launcher: Launcher,
     notify: Arc<tokio::sync::Notify>,
     startup_requeues: SharedSet,
+    rate_limit_wake: Arc<tokio::sync::Notify>,
+    recovery: Option<Recovery>,
     pending_context_resets: SharedSet,
     context_reset: Option<PendingContextReset>,
     respawned_in_place: SharedSet,
@@ -166,6 +176,12 @@ struct StreamEnd {
     startup_rate_limited: bool,
     startup_failed: bool,
     superseded: bool,
+    established: bool,
+}
+
+struct Recovery {
+    loss: ControlLoss,
+    attempts: u32,
 }
 
 /// Mutable stream effects have exactly one owner in ordered completion.
@@ -299,9 +315,10 @@ impl<S: BroadcastSink> Drain<S> {
                     "startup rate-limited; leaving continuation to the quota governor"
                 );
                 self.drop_handle(&lease).await;
+                self.rate_limit_wake.notify_one();
                 return;
             }
-            if end.startup_failed {
+            if end.startup_failed && self.recovery.is_none() {
                 info!(
                     target: "acp.supervisor",
                     session = %self.session_id,
@@ -322,6 +339,15 @@ impl<S: BroadcastSink> Drain<S> {
                 self.drop_handle(&lease).await;
                 return;
             }
+            if !end.agent_unresponsive {
+                let (returned, next_inbound) = self.recover_control_loss(&lease, &end).await;
+                self = returned;
+                if let Some(next_inbound) = next_inbound {
+                    inbound = next_inbound;
+                    continue;
+                }
+            }
+            self.recovery = None;
             let (returned, config) = self.approve_respawn(&lease).await;
             self = returned;
             let Some(config) = config else {
@@ -348,6 +374,7 @@ impl<S: BroadcastSink> Drain<S> {
         lease: &Lease,
         data: &mut AcpEventData,
         mut replay: Option<(u64, &mut crate::acp::event_store::ReplayCommit)>,
+        control_loss: Option<(&AcpClient, ControlLoss)>,
     ) -> OwnedPublication {
         loop {
             match self
@@ -357,6 +384,7 @@ impl<S: BroadcastSink> Drain<S> {
                     replay
                         .as_mut()
                         .map(|(ordinal, replay)| (*ordinal, &mut **replay)),
+                    control_loss,
                 )
                 .await
             {
@@ -442,6 +470,7 @@ impl<S: BroadcastSink> Drain<S> {
         lease: &Lease,
         data: &mut AcpEventData,
         replay: Option<(u64, &mut crate::acp::event_store::ReplayCommit)>,
+        control_loss: Option<(&AcpClient, ControlLoss)>,
     ) -> Result<OwnedPublication, PublicationWait> {
         let workers = self.workers.lock().await;
         let installed = lock_recover(&self.lifecycle)
@@ -459,6 +488,21 @@ impl<S: BroadcastSink> Drain<S> {
         let pending_request = data.pending_request.clone();
         if !installed && pending_request.is_none() && data.metadata.native_origin.is_none() {
             return Ok(OwnedPublication::Superseded);
+        }
+        if let Some((client, _)) = control_loss {
+            let lifecycle = lock_recover(&self.lifecycle);
+            if !installed
+                || !lifecycle
+                    .running(&self.session_id)
+                    .is_some_and(|(current, _)| current == *lease)
+                || lease.cancellation().is_cancelled()
+                || worker_registry::stop_requested(&self.session_id)
+                || !workers.get(&self.session_id).is_some_and(|handle| {
+                    handle.lease == *lease && std::ptr::eq(handle.client.as_ref(), client)
+                })
+            {
+                return Ok(OwnedPublication::Superseded);
+            }
         }
         let pending_guard = if let Some(publication) = &pending_request {
             if !Arc::ptr_eq(publication.event(), &data.event)
@@ -549,6 +593,24 @@ impl<S: BroadcastSink> Drain<S> {
                 None => Ok(OwnedPublication::Superseded),
             };
         }
+        if let Some((client, loss)) = control_loss {
+            if !installed
+                || !lifecycle
+                    .running(&self.session_id)
+                    .is_some_and(|(current, _)| current == *lease)
+                || lease.cancellation().is_cancelled()
+                || worker_registry::stop_requested(&self.session_id)
+                || !workers.get(&self.session_id).is_some_and(|handle| {
+                    handle.lease == *lease && std::ptr::eq(handle.client.as_ref(), client)
+                })
+            {
+                return Ok(OwnedPublication::Superseded);
+            }
+            if matches!(data.event.as_ref(), Event::Stopped { .. }) && !client.claim_lost_turn(loss)
+            {
+                return Ok(OwnedPublication::Discarded);
+            }
+        }
         if let Event::PromptRuntimeError {
             evidence: Some(_), ..
         } = data.event.as_ref()
@@ -600,7 +662,22 @@ impl<S: BroadcastSink> Drain<S> {
     ) {
         loop {
             match self.try_publish_connection_loss(lease, loss).await {
-                Ok(()) => return,
+                Ok(()) => {
+                    #[cfg(test)]
+                    {
+                        let gate = loss
+                            .connection
+                            .test_connection_loss_published
+                            .lock()
+                            .unwrap()
+                            .take();
+                        if let Some((entered, release)) = gate {
+                            let _ = entered.send(());
+                            let _ = release.await;
+                        }
+                    }
+                    return;
+                }
                 Err(wait) => {
                     if !wait
                         .settled(
@@ -717,7 +794,7 @@ impl<S: BroadcastSink> Drain<S> {
     ) -> crate::acp::event_sender::EstablishmentResolution {
         use crate::acp::establishment::EstablishmentRefusal;
         use crate::acp::event_sender::EstablishmentResolution;
-        let Some(projection) = lease.retirement().establishment_projection() else {
+        let Some(projection) = self.projection.clone() else {
             return EstablishmentResolution::Unconfirmed;
         };
         if !projection
@@ -939,7 +1016,7 @@ impl<S: BroadcastSink> Drain<S> {
         notice.metadata.scope = EventScope::SessionCurrent;
         notice.current_scope = Some(context);
         matches!(
-            self.publish_owned(lease, &mut notice, None).await,
+            self.publish_owned(lease, &mut notice, None, None).await,
             OwnedPublication::Published { .. }
         )
     }
@@ -1003,6 +1080,7 @@ impl<S: BroadcastSink> Drain<S> {
         let publication = super::WorkerPublication::new(async move {
             let mut completion = completion.lock().await;
             let drain = completion.drain.take().expect("ordered EOF delivered once");
+            completion.end.established = completion.established;
             let end = std::mem::take(&mut completion.end);
             let _ = done.send((drain, end));
         });
@@ -1050,7 +1128,7 @@ impl<S: BroadcastSink> Drain<S> {
             }
             SdkEvent::Data(data) => data,
         };
-        let projection = lease.retirement().establishment_projection();
+        let projection = self.projection.clone();
         let mut processed = projection
             .as_deref()
             .and_then(|state| state.received_event());
@@ -1066,12 +1144,18 @@ impl<S: BroadcastSink> Drain<S> {
                     .unwrap_or_else(|| crate::acp::event_store::ReplayCommit::new(attempt, first)),
             )
         });
+        let recovery_diagnostic = self.recovery.is_some()
+            && matches!(data.event.as_ref(), Event::AgentStartupError { .. })
+            && data.metadata.native_origin.is_none();
+        if recovery_diagnostic {
+            end.startup_failed = true;
+        }
         let publication = if matches!(data.event.as_ref(), Event::AgentStartupError { .. })
-            && self.restart_intended()
+            && (self.restart_intended() || recovery_diagnostic)
         {
             OwnedPublication::Discarded
         } else {
-            self.publish_owned(lease, &mut data, ordinal.zip(replay.as_mut()))
+            self.publish_owned(lease, &mut data, ordinal.zip(replay.as_mut()), None)
                 .await
         };
         if let Some(journal) = data.journal_publication.take() {
@@ -1113,9 +1197,13 @@ impl<S: BroadcastSink> Drain<S> {
                 _ => {}
             },
             Event::AgentStartupError { .. } if !*established => end.startup_failed = true,
-            Event::AcpSessionAssigned { .. } => {
+            Event::AcpSessionAssigned {
+                connection_ready: true,
+                ..
+            } => {
                 *established = true;
                 end.startup_rate_limited = false;
+                self.recovery = None;
             }
             _ => {}
         }
@@ -1301,6 +1389,295 @@ impl<S: BroadcastSink> Drain<S> {
         )
     }
 
+    /// A runner that closed only its control channel still owns its agent and
+    /// turn, so dial it again under the same lease rather than replace it.
+    /// Reports the loss when the worker cannot be recovered that way.
+    async fn recover_control_loss(
+        mut self,
+        lease: &Lease,
+        end: &StreamEnd,
+    ) -> (Self, Option<mpsc::Receiver<SdkEvent>>) {
+        let recovery = self.recovery.take().filter(|_| !end.established);
+        let observed = {
+            let workers = self.workers.lock().await;
+            workers
+                .get(&self.session_id)
+                .filter(|handle| handle.lease == *lease)
+                .filter(|handle| {
+                    !matches!(&handle.kind, WorkerKind::Runner { spawn_config }
+                    if spawn_config.uses_native_prime())
+                })
+                .filter(|handle| {
+                    handle.client.connection_unavailable().is_none_or(|loss| {
+                        loss.source != crate::acp::state::AcpConnectionSource::Native
+                    })
+                })
+                .map(|handle| (Arc::clone(&handle.client), handle.client.control_loss()))
+        };
+        let Some((client, observed)) = observed else {
+            return (self, None);
+        };
+        let (loss, attempts) = match recovery {
+            Some(recovery) if end.startup_failed || observed.is_some() => {
+                (recovery.loss, recovery.attempts)
+            }
+            Some(recovery) => {
+                self = self.report_control_loss(lease, client, recovery.loss).await;
+                return (self, None);
+            }
+            None => match observed {
+                Some(loss) => (loss, 0),
+                None => return (self, None),
+            },
+        };
+        match self
+            .reattach_same_runner(lease, &client, loss, attempts)
+            .await
+        {
+            Some((inbound, recovery)) => {
+                self.recovery = Some(recovery);
+                (self, Some(inbound))
+            }
+            None => {
+                self = self.report_control_loss(lease, client, loss).await;
+                (self, None)
+            }
+        }
+    }
+
+    async fn report_control_loss(
+        self,
+        lease: &Lease,
+        client: Arc<AcpClient>,
+        loss: ControlLoss,
+    ) -> Self {
+        let sink = Arc::clone(&self.sink);
+        let lease = lease.clone();
+        let (done, finished) = tokio::sync::oneshot::channel();
+        let publication = super::WorkerPublication::new(async move {
+            for event in [
+                Event::Stopped {
+                    reason: "runner_control_lost".into(),
+                },
+                Event::startup_error("ACP connection failed: runner control channel closed"),
+            ] {
+                let mut data = AcpEventData::from_host(event);
+                if matches!(
+                    self.publish_owned(&lease, &mut data, None, Some((&client, loss)))
+                        .await,
+                    OwnedPublication::Superseded
+                ) {
+                    break;
+                }
+            }
+            let _ = done.send(self);
+        });
+        if let Some(publication) = sink.publish_from_worker(publication) {
+            publication.complete().await;
+        }
+        finished
+            .await
+            .expect("ordered control loss publication completed")
+    }
+
+    /// Dials the runner until one attempt is installed. The client bounds the
+    /// wait for resume confirmation while the drain publishes its replay.
+    async fn reattach_same_runner(
+        &mut self,
+        lease: &Lease,
+        lost: &Arc<AcpClient>,
+        loss: ControlLoss,
+        attempts: u32,
+    ) -> Option<(mpsc::Receiver<SdkEvent>, Recovery)> {
+        let session_id = &self.session_id;
+        if lease.prime() != PrimeOwnership::NotPrime {
+            return None;
+        }
+        let identity = lock_recover(&self.lifecycle)
+            .running(session_id)
+            .filter(|(current, _)| current == lease)
+            .and_then(|(_, identity)| identity)
+            .filter(|identity| identity.birth_fingerprint.is_some())?;
+        for attempt in attempts + 1..=CONTROL_REATTACH_ATTEMPTS {
+            if attempt > 1 {
+                tokio::time::sleep(RESPAWN_BACKOFF).await;
+            }
+            let resume_by = tokio::time::Instant::now() + CONTROL_REATTACH_DEADLINE;
+            let record = loop {
+                if lease.cancellation().is_cancelled()
+                    || worker_registry::stop_requested(session_id)
+                    || tokio::time::Instant::now() >= resume_by
+                    || !lock_recover(&self.lifecycle)
+                        .running(session_id)
+                        .is_some_and(|(current, owner)| {
+                            current == *lease && owner == Some(identity)
+                        })
+                {
+                    return None;
+                }
+                match worker_registry::load_strict(session_id) {
+                    Ok(Some(record))
+                        if identity.owns_record(&record)
+                            && worker_registry::is_record_live(&record) =>
+                    {
+                        break record
+                    }
+                    Err(error) if error.is::<worker_registry::RegistryBusy>() => {
+                        tokio::task::yield_now().await;
+                    }
+                    _ => {
+                        info!(
+                            target: "acp.supervisor",
+                            session = %session_id,
+                            pid = identity.pid,
+                            "runner that lost its control channel is gone or replaced; not reattaching"
+                        );
+                        return None;
+                    }
+                }
+            };
+            let stored_acp_session_id = record.stored_acp_session_id?;
+            // Charge only a verified live runner, so a dead one pays just its respawn.
+            if attempt == 1 && !self.admit_reattach(lease).await {
+                return None;
+            }
+            let attempt_result = tokio::time::timeout_at(
+                resume_by,
+                lost.reattach(
+                    stored_acp_session_id,
+                    loss.turn_in_flight,
+                    resume_by,
+                    lease.clone(),
+                ),
+            )
+            .await
+            .unwrap_or(Err(AcpError::AttachTimedOut));
+            match attempt_result {
+                Ok(next) => {
+                    let inbound = self
+                        .install_reattached(lease, identity, lost, next, loss)
+                        .await?;
+                    let recovery = Recovery {
+                        loss,
+                        attempts: attempt,
+                    };
+                    return Some((inbound, recovery));
+                }
+                Err(error) => warn!(
+                    target: "acp.supervisor",
+                    session = %session_id,
+                    attempt,
+                    %error,
+                    "reattach after control channel loss failed"
+                ),
+            }
+        }
+        None
+    }
+
+    /// Reattaches share the respawn budget, so a channel that keeps closing
+    /// ends in the ordinary park.
+    async fn admit_reattach(&self, lease: &Lease) -> bool {
+        let mut workers = self.workers.lock().await;
+        let Some(handle) = workers
+            .get_mut(&self.session_id)
+            .filter(|handle| handle.lease == *lease)
+        else {
+            return false;
+        };
+        let now = Instant::now();
+        handle
+            .restart_history
+            .retain(|t| *t >= now - RESTART_WINDOW);
+        if handle.restart_history.len() as u32 >= MAX_RESPAWNS_IN_WINDOW {
+            return false;
+        }
+        handle.restart_history.push(now);
+        true
+    }
+
+    /// Installs a reattached client only if the lease and runner identity are
+    /// still current and no stop was requested; otherwise releases it.
+    async fn install_reattached(
+        &mut self,
+        lease: &Lease,
+        identity: RunnerIdentity,
+        lost: &Arc<AcpClient>,
+        mut client: AcpClient,
+        loss: ControlLoss,
+    ) -> Option<mpsc::Receiver<SdkEvent>> {
+        let session_id = &self.session_id;
+        let inbound = client.take_inbound()?;
+        let client = Arc::new(client);
+        lease.retirement().replace_client(lost, &client);
+        let installed = {
+            let mut workers = self.workers.lock().await;
+            let current = !worker_registry::stop_requested(session_id)
+                && lock_recover(&self.lifecycle)
+                    .running(session_id)
+                    .is_some_and(|(current, running)| {
+                        current == *lease && running == Some(identity)
+                    });
+            match workers.get_mut(session_id).filter(|handle| {
+                current && handle.lease == *lease && Arc::ptr_eq(&handle.client, lost)
+            }) {
+                Some(handle) => {
+                    handle.client = Arc::clone(&client);
+                    true
+                }
+                None => false,
+            }
+        };
+        if !installed {
+            // Whatever won owns the runner; release only this channel.
+            let _ = client.shutdown().await;
+            return None;
+        }
+        // The runner settled the lost channel's reverse calls, and the lost
+        // connection's tailers ended with it.
+        super::publish::cancel_orphaned_requests_on(&*self.sink, &self.next_seqs, session_id);
+        let recovery = (|| -> anyhow::Result<_> {
+            let agents = super::publish::collect_resumable_background_agent_launches(
+                &*self.sink,
+                &self.next_seqs,
+                session_id,
+            )?;
+            let tasks = self.sink.unresolved_background_task_launches(session_id)?;
+            Ok((agents, tasks))
+        })();
+        match recovery {
+            Ok((agents, tasks)) => {
+                if !agents.is_empty() {
+                    let _ = client.resume_background_tailing(agents).await;
+                }
+                if !tasks.is_empty() {
+                    let _ = client.resume_task_tailing(tasks).await;
+                }
+            }
+            Err(error) => {
+                warn!(target: "acp.resource", session = session_id, %error,
+                    "resource tracking could not be restored");
+                self.publish(Event::SessionNotice {
+                    key: Some("resource-recovery".into()),
+                    severity: "warning".into(),
+                    title: "Background tracking could not be restored".into(),
+                    description: Some(
+                        "Retained history is preserved; no resource reader was started.".into(),
+                    ),
+                });
+            }
+        }
+        info!(
+            target: "acp.supervisor",
+            session = %session_id,
+            pid = identity.pid,
+            turn_in_flight = loss.turn_in_flight,
+            "reattached to the same runner after its control channel closed"
+        );
+        self.projection = client.establishment_projection();
+        Some(inbound)
+    }
+
     /// Decide whether the closed worker respawns, publishing why when it does not.
     async fn approve_respawn(self, lease: &Lease) -> (Self, Option<SpawnConfig>) {
         let session_id = &self.session_id;
@@ -1338,7 +1715,7 @@ impl<S: BroadcastSink> Drain<S> {
                 let (done, finished) = tokio::sync::oneshot::channel();
                 let publication = super::WorkerPublication::new(async move {
                     let published = matches!(
-                        self.publish_owned(&original, &mut error, None).await,
+                        self.publish_owned(&original, &mut error, None, None).await,
                         OwnedPublication::Published { .. }
                     );
                     let _ = done.send((self, published));
@@ -1397,7 +1774,7 @@ impl<S: BroadcastSink> Drain<S> {
     /// Relaunch the worker under a fresh respawn epoch; returns the new lease
     /// and event stream once it is installed.
     async fn respawn(
-        &self,
+        &mut self,
         lease: &Lease,
         mut config: SpawnConfig,
     ) -> Option<(Lease, mpsc::Receiver<SdkEvent>)> {
@@ -1411,7 +1788,17 @@ impl<S: BroadcastSink> Drain<S> {
                 let _ = entered.send(());
             }
         }
-        tokio::time::sleep(RESPAWN_BACKOFF).await;
+        let container = config
+            .sandbox_info
+            .as_ref()
+            .filter(|sandbox| sandbox.enabled)
+            .map(|sandbox| sandbox.container_name.clone());
+        let (_, container_gone) = tokio::join!(tokio::time::sleep(RESPAWN_BACKOFF), async {
+            match container {
+                Some(name) => sandbox_container_gone(name).await,
+                None => false,
+            }
+        });
         // Retag the existing handle while both admission gates are held.
         // This is still the same drain/client; launch_epoch remains unchanged.
         let mut retry = false;
@@ -1485,6 +1872,24 @@ impl<S: BroadcastSink> Drain<S> {
             }
             return None;
         }
+        // A respawn can't reach a removed container; only an explicit start rebuilds it.
+        if container_gone {
+            warn!(
+                target: "acp.supervisor",
+                session = %session_id,
+                "sandbox container is gone; parking session instead of respawning"
+            );
+            if lock_recover(&self.lifecycle).convert_to_stopping(&respawn_lease) {
+                self.publish(Event::AgentStartupError {
+                    message: "This Session's sandbox container is gone. Recreate it or start a new Session and container."
+                        .into(),
+                    cause: Some(StartupCause::ContainerMissing),
+                    native_subject: None,
+                });
+                self.finish_cancelled(&respawn_lease, previous).await;
+            }
+            return None;
+        }
 
         if original_prime != crate::acp::runner_lifecycle::PrimeOwnership::NotPrime {
             if previous.is_some() {
@@ -1514,7 +1919,9 @@ impl<S: BroadcastSink> Drain<S> {
                         let _workers = self.workers.lock().await;
                         let lifecycle = lock_recover(&self.lifecycle);
                         if lifecycle.current_lease(session_id).as_ref() == Some(&respawn_lease) {
-                            self.publish(Event::AgentStartupError { message: "Prime native termination is unproven; replacement remains blocked".into(), native_subject: None });
+                            self.publish(Event::startup_error(
+                                "Prime native termination is unproven; replacement remains blocked",
+                            ));
                         }
                     }
                     self.settle_retirement(&respawn_lease, settlement).await;
@@ -1720,6 +2127,7 @@ impl<S: BroadcastSink> Drain<S> {
         );
         lock_recover(&self.incompatible_binaries).remove(session_id);
         lock_recover(&self.respawned_in_place).insert(session_id.clone());
+        self.projection = client.establishment_projection();
         Some((respawn_lease, inbound))
     }
 
@@ -1876,6 +2284,7 @@ impl<S: BroadcastSink> Drain<S> {
         e: AcpError,
     ) {
         let session_id = &self.session_id;
+        let rate_limited = matches!(e, AcpError::RateLimited(_));
         let launched = respawn_lease.spawned_runner().or_else(|| {
             worker_registry::load(session_id)
                 .ok()
@@ -1922,10 +2331,9 @@ impl<S: BroadcastSink> Drain<S> {
                         .insert(session_id.clone(), config.spec.command.clone());
                 }
                 if !publish_rejection(&e, |event| self.publish(event)) {
-                    self.publish(Event::AgentStartupError {
-                        message: format!("ACP agent respawn failed: {e}"),
-                        native_subject: None,
-                    });
+                    self.publish(Event::startup_error(format!(
+                        "ACP agent respawn failed: {e}"
+                    )));
                 }
             }
         }
@@ -1940,6 +2348,9 @@ impl<S: BroadcastSink> Drain<S> {
                 super::teardown::tear_down_lease(&*self.process_control, respawn_lease, false)
                     .await;
             self.settle_retirement(respawn_lease, settlement).await;
+        }
+        if rate_limited {
+            self.rate_limit_wake.notify_one();
         }
     }
 
@@ -1956,6 +2367,22 @@ impl<S: BroadcastSink> Drain<S> {
             super::teardown::tear_down_lease(&*self.process_control, respawn_lease, false).await;
         self.settle_retirement(respawn_lease, settlement).await;
     }
+}
+
+/// Whether the sandbox container `name` is known to be gone. A runtime error, or a probe
+/// slower than the respawn backoff, is unknown rather than gone; the slow probe is killed.
+async fn sandbox_container_gone(name: String) -> bool {
+    let cancel = tokio_util::sync::CancellationToken::new();
+    // Also kills the probe when a cancelled respawn drops this future.
+    let _kill = cancel.clone().drop_guard();
+    let probe = tokio::task::spawn_blocking(move || {
+        crate::containers::get_container_runtime()
+            .does_container_exist_until_cancelled(&name, &cancel)
+    });
+    matches!(
+        tokio::time::timeout(RESPAWN_BACKOFF, probe).await,
+        Ok(Ok(Ok(false)))
+    )
 }
 
 async fn restart_decision(
@@ -2085,6 +2512,7 @@ mod tests {
             session_id: id.into(),
             identity_only: false,
             history_scope: None,
+            projection: original.retirement().establishment_projection(),
             sink: Arc::clone(&supervisor.sink),
             workers: Arc::clone(&supervisor.workers),
             next_seqs: Arc::clone(&supervisor.next_seqs),
@@ -2094,6 +2522,8 @@ mod tests {
             launcher: Arc::clone(&supervisor.launcher),
             notify: Arc::clone(&supervisor.worker_notify),
             startup_requeues: Arc::clone(&supervisor.startup_requeues),
+            rate_limit_wake: Arc::clone(&supervisor.rate_limit_wake),
+            recovery: None,
             pending_context_resets: Arc::clone(&supervisor.pending_context_resets),
             context_reset: None,
             respawned_in_place: Arc::clone(&supervisor.respawned_in_place),
@@ -3285,6 +3715,148 @@ mod tests {
         );
     }
 
+    /// A crash respawn parks a sandboxed Session whose container is known gone, and goes
+    /// ahead when the runtime can't say: an error, or a probe slower than the backoff.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn a_crash_respawn_parks_only_when_the_sandbox_container_is_gone() {
+        use std::os::unix::fs::PermissionsExt;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let (_home, tmp) = isolate_home();
+        crate::session::config::update_config(|config| {
+            config.sandbox.container_runtime = crate::session::ContainerRuntimeName::Docker
+        })
+        .unwrap();
+        let bin = tmp.path().join("bin");
+        std::fs::create_dir(&bin).unwrap();
+        let root = tmp.path().display();
+        // `alive` is the container; a slow probe blocks until it is killed.
+        std::fs::write(
+            bin.join("docker"),
+            format!(
+                "#!/bin/sh\ncase \"$1 $2\" in \"container inspect\")\n\
+                 case \"$(cat {root}/mode)\" in\n\
+                 unreachable) echo 'Cannot connect to the Docker daemon at unix:///x. Is the docker daemon running?' >&2; exit 1 ;;\n\
+                 slow) echo $$ > {root}/slow.pid; while :; do sleep 0.05; done ;;\n\
+                 esac\n\
+                 [ -e {root}/alive ] && exit 0\n\
+                 echo \"Error: No such container: $3\" >&2; exit 1 ;;\nesac\nexit 0\n"
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(bin.join("docker"), std::fs::Permissions::from_mode(0o755))
+            .unwrap();
+        let _path = crate::session::test_support::path_prepended(&bin);
+        // (mode, container alive after the crash, parks)
+        for (mode, alive, parks) in [
+            ("gone", false, true),
+            ("present", true, false),
+            ("unreachable", false, false),
+            ("slow", false, false),
+        ] {
+            let id = format!("s-container-{mode}");
+            std::fs::write(tmp.path().join("mode"), mode).unwrap();
+            // The container exists while the worker runs.
+            std::fs::write(tmp.path().join("alive"), "").unwrap();
+            let control =
+                Arc::new(crate::acp::runner_lifecycle::test_support::FakeProcessControl::default());
+            control.alive(4242).alive(4343);
+            let launches = Arc::new(AtomicUsize::new(0));
+            let launched = Arc::new(tokio::sync::Notify::new());
+            let launcher: Launcher = {
+                let (launches, launched) = (Arc::clone(&launches), Arc::clone(&launched));
+                Arc::new(move |config: SpawnConfig, id: AcpSessionId| {
+                    let (launches, launched) = (Arc::clone(&launches), Arc::clone(&launched));
+                    Box::pin(async move {
+                        let lease = config.launch_lease.as_ref().unwrap();
+                        lease.record_scope(worker_registry::ScopeOwnership::Unscoped);
+                        assert!(
+                            lease.record_runner(attested_test_identity(4343, config.generation))
+                        );
+                        save_attested_test_record(&id.0, 4343, config.generation);
+                        launches.fetch_add(1, Ordering::SeqCst);
+                        launched.notify_one();
+                        Err(AcpError::Spawn("dial deadline".into()))
+                    })
+                })
+            };
+            let sink = VecSink::new();
+            let sup = Arc::new(
+                Supervisor::new(sink.clone())
+                    .with_process_control(control.clone())
+                    .with_launcher(launcher),
+            );
+            save_attested_test_record(&id, 4242, 0);
+            let socket = worker_registry::socket_path_for(&id).unwrap();
+            let mut config = runner_config(socket);
+            config.sandbox_info = Some(sandbox_info());
+            let lease = sup
+                .test_install_runner(&id, config, Some(attested_test_identity(4242, 0)))
+                .await;
+            let (inbound_tx, inbound_rx) = mpsc::channel(4);
+            let drain = sup.start_drain_task(id.clone(), lease, inbound_rx, None);
+            if !alive {
+                std::fs::remove_file(tmp.path().join("alive")).unwrap();
+            }
+            drop(inbound_tx);
+            if mode == "slow" {
+                tokio::time::timeout(Duration::from_secs(5), launched.notified())
+                    .await
+                    .expect("a slow probe must not hold back the respawn");
+                // The cap kills the blocked inspect rather than leaving it to its own timeout.
+                let pid: i32 = std::fs::read_to_string(tmp.path().join("slow.pid"))
+                    .unwrap()
+                    .trim()
+                    .parse()
+                    .unwrap();
+                let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+                // SAFETY: signal 0 only asks whether the probe's PID still exists.
+                while unsafe { libc::kill(pid, 0) } == 0 {
+                    assert!(
+                        tokio::time::Instant::now() < deadline,
+                        "the capped probe still runs"
+                    );
+                    tokio::time::sleep(Duration::from_millis(20)).await;
+                }
+            }
+            tokio::time::timeout(Duration::from_secs(5), drain)
+                .await
+                .expect("drain task must finish")
+                .unwrap();
+
+            assert_eq!(
+                launches.load(Ordering::SeqCst),
+                usize::from(!parks),
+                "{mode}"
+            );
+            let typed: Vec<String> = sink
+                .frames
+                .lock()
+                .unwrap()
+                .iter()
+                .filter_map(|(_, _, event)| match event {
+                    Event::AgentStartupError {
+                        message,
+                        cause: Some(StartupCause::ContainerMissing),
+                        ..
+                    } => Some(message.clone()),
+                    _ => None,
+                })
+                .collect();
+            let expected: &[&str] = if parks {
+                &["This Session's sandbox container is gone. Recreate it or start a new Session and container."]
+            } else {
+                &[]
+            };
+            assert_eq!(typed, expected, "{mode}");
+            assert_eq!(
+                sup.worker_state(&id).await,
+                AcpWorkerState::Absent,
+                "{mode}"
+            );
+        }
+    }
+
     fn seed_row(id: &str) -> (crate::session::Storage, String) {
         let mut inst = crate::session::Instance::new(id, "/tmp");
         inst.id = id.into();
@@ -3940,6 +4512,7 @@ mod tests {
                         session_id: id.clone(),
                         identity_only: false,
                         history_scope: lease.native_scope().unwrap(),
+                        projection: lease.retirement().establishment_projection(),
                         sink: Arc::clone(&supervisor.sink),
                         workers: Arc::clone(&supervisor.workers),
                         next_seqs: Arc::clone(&supervisor.next_seqs),
@@ -3949,6 +4522,8 @@ mod tests {
                         launcher: Arc::clone(&supervisor.launcher),
                         notify: Arc::clone(&supervisor.worker_notify),
                         startup_requeues: Arc::clone(&supervisor.startup_requeues),
+                        rate_limit_wake: Arc::clone(&supervisor.rate_limit_wake),
+                        recovery: None,
                         pending_context_resets: Arc::clone(&supervisor.pending_context_resets),
                         context_reset: None,
                         respawned_in_place: Arc::clone(&supervisor.respawned_in_place),
@@ -3960,7 +4535,7 @@ mod tests {
                         native_subject: None,
                     });
                     assert!(matches!(
-                        drain.publish_owned(&lease, &mut data, None).await,
+                        drain.publish_owned(&lease, &mut data, None, None).await,
                         OwnedPublication::Superseded
                     ));
                     supervisor.sink.flush();
@@ -4034,17 +4609,19 @@ mod tests {
                 };
                 let drain = Drain {
                         session_id: id.clone(), identity_only: false, history_scope: old.native_scope().unwrap(),
+                        projection: old.retirement().establishment_projection(),
                         sink: Arc::clone(&supervisor.sink), workers: Arc::clone(&supervisor.workers),
                         next_seqs: Arc::clone(&supervisor.next_seqs), incompatible_binaries: Arc::clone(&supervisor.incompatible_binaries),
                         lifecycle: Arc::clone(&supervisor.lifecycle), process_control: Arc::clone(&supervisor.process_control),
                         launcher: Arc::clone(&supervisor.launcher), notify: Arc::clone(&supervisor.worker_notify),
                         startup_requeues: Arc::clone(&supervisor.startup_requeues),
+                        rate_limit_wake: Arc::clone(&supervisor.rate_limit_wake), recovery: None,
                         pending_context_resets: Arc::clone(&supervisor.pending_context_resets), context_reset: None,
                         respawned_in_place: Arc::clone(&supervisor.respawned_in_place), receive_owner: None,
                     };
                 for event in [error(), Event::Stopped { reason: "prompt_failed".into() }] {
                     let mut data = AcpEventData::from_history(event);
-                    assert!(matches!(drain.publish_owned(&old, &mut data, None).await, OwnedPublication::Superseded));
+                    assert!(matches!(drain.publish_owned(&old, &mut data, None, None).await, OwnedPublication::Superseded));
                 }
                 let (closed, inbound) = mpsc::channel(1);
                 drop(closed);

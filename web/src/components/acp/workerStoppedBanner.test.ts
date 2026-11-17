@@ -26,10 +26,15 @@ describe("pickWorkerStoppedVariant", () => {
 
 describe("showWorkerStoppingBanner", () => {
   it.each([
-    ["stopping", null, true],
-    ["stopping", "missing API key", false],
-    ["resuming", null, false],
-  ])("%s with startupError %s -> %s", (acpWorkerState, startupError, expected) => {
-    expect(showWorkerStoppingBanner({ acpWorkerState, startupError })).toBe(expected);
-  });
+    ["stopping", null, false, true],
+    ["stopping", "missing API key", false, false],
+    ["resuming", null, false, false],
+    // This dashboard's own restart: its startup line covers the stop.
+    ["stopping", null, true, false],
+  ])(
+    "%s with startupError %s, restart in flight %s -> %s",
+    (acpWorkerState, startupError, restartInFlight, expected) => {
+      expect(showWorkerStoppingBanner({ acpWorkerState, startupError, restartInFlight })).toBe(expected);
+    },
+  );
 });

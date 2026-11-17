@@ -1419,7 +1419,13 @@ mod tests {
                     .highest_seq(&f._managed.id)
                     .unwrap()
                     + 1;
-                assert_eq!(state.sidebar_status(), Status::Running);
+                assert_eq!(
+                    state.sidebar_status(),
+                    Status::Running,
+                    "before resumed tailing: unavailable={:?}, phase={:?}",
+                    state.connection_unavailable,
+                    state.sidebar_phase,
+                );
                 f.active.stop("t-1");
                 f.spawn(TailerStart::Resumed).await;
                 let finished = f.next().await;

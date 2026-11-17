@@ -99,9 +99,16 @@ fn try_subprocess(_text: &str) -> Result<&'static str, String> {
 const SUBPROCESS_WAIT: std::time::Duration = std::time::Duration::from_millis(500);
 
 fn run_subprocess(cmd: &'static str, args: &[&str], text: &str) -> Result<&'static str, String> {
+    use std::io::Seek;
+    // A helper that never reads must not block before the wait deadline starts.
+    let mut input = tempfile::tempfile().map_err(|e| format!("{cmd} stdin: {e}"))?;
+    input
+        .write_all(text.as_bytes())
+        .and_then(|_| input.rewind())
+        .map_err(|e| format!("{cmd} stdin write: {e}"))?;
     let mut child = match Command::new(cmd)
         .args(args)
-        .stdin(Stdio::piped())
+        .stdin(Stdio::from(input))
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .spawn()
@@ -109,34 +116,14 @@ fn run_subprocess(cmd: &'static str, args: &[&str], text: &str) -> Result<&'stat
         Ok(c) => c,
         Err(e) => return Err(format!("{cmd} spawn: {e}")),
     };
-    if let Some(mut stdin) = child.stdin.take() {
-        if let Err(e) = stdin.write_all(text.as_bytes()) {
+    match crate::process::wait_with_timeout(&mut child, SUBPROCESS_WAIT) {
+        Ok(Some(status)) if status.success() => Ok(cmd),
+        Ok(Some(status)) => Err(format!("{cmd} exit {status}")),
+        Ok(None) => Err(format!("{cmd} timed out after {:?}", SUBPROCESS_WAIT)),
+        Err(error) => {
             let _ = child.kill();
             let _ = child.wait();
-            return Err(format!("{cmd} stdin write: {e}"));
-        }
-        // Drop closes stdin, signalling EOF to the helper so it
-        // exits its read loop instead of waiting for more bytes.
-    }
-    let deadline = std::time::Instant::now() + SUBPROCESS_WAIT;
-    loop {
-        match child.try_wait() {
-            Ok(Some(status)) => {
-                return if status.success() {
-                    Ok(cmd)
-                } else {
-                    Err(format!("{cmd} exit {status}"))
-                };
-            }
-            Ok(None) => {
-                if std::time::Instant::now() >= deadline {
-                    let _ = child.kill();
-                    let _ = child.wait();
-                    return Err(format!("{cmd} timed out after {:?}", SUBPROCESS_WAIT));
-                }
-                std::thread::sleep(std::time::Duration::from_millis(10));
-            }
-            Err(e) => return Err(format!("{cmd} wait: {e}")),
+            Err(format!("{cmd} wait: {error}"))
         }
     }
 }
@@ -169,4 +156,93 @@ fn write_osc52(bytes: &[u8]) -> std::io::Result<()> {
     }
     write!(stdout, "\x1b]52;c;{}\x07", encoded)?;
     stdout.flush()
+}
+
+#[cfg(all(test, unix))]
+mod tests {
+    use super::*;
+
+    #[test]
+    #[serial_test::serial]
+    fn a_clipboard_helper_that_never_reads_cannot_hold_its_input_writer() {
+        use std::os::unix::fs::OpenOptionsExt;
+
+        struct ReleaseGate(std::fs::File);
+        impl Drop for ReleaseGate {
+            fn drop(&mut self) {
+                let _ = self.0.write_all(b"release\n");
+            }
+        }
+
+        let _environment = crate::session::test_support::EnvGuard::read_lock();
+        let fixture = tempfile::tempdir().unwrap();
+        let entered = fixture.path().join("entered");
+        let path = fixture.path().join("gate");
+        nix::unistd::mkfifo(
+            &path,
+            nix::sys::stat::Mode::S_IRUSR | nix::sys::stat::Mode::S_IWUSR,
+        )
+        .unwrap();
+        let marker = entered.clone();
+        let (finished, received) = std::sync::mpsc::sync_channel(1);
+        std::thread::scope(|scope| {
+            let release = ReleaseGate(
+                std::fs::OpenOptions::new()
+                    .read(true)
+                    .write(true)
+                    .custom_flags(nix::libc::O_NONBLOCK)
+                    .open(&path)
+                    .unwrap(),
+            );
+            let worker = scope.spawn(move || {
+                let payload = "x".repeat(MAX_BYTES);
+                let result = run_subprocess(
+                    "sh",
+                    &[
+                        "-c",
+                        "printf '%s\\n' \"$$\" > \"$1\"; read -r line < \"$2\"",
+                        "sh",
+                        marker.to_str().unwrap(),
+                        path.to_str().unwrap(),
+                    ],
+                    &payload,
+                );
+                assert!(finished.send(result).is_ok());
+            });
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+            let pid = loop {
+                if let Some(pid) = std::fs::read_to_string(&entered)
+                    .ok()
+                    .and_then(|raw| raw.trim().parse::<i32>().ok())
+                    .filter(|pid| *pid > 0)
+                {
+                    break nix::unistd::Pid::from_raw(pid);
+                }
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "clipboard fixture did not enter"
+                );
+                std::thread::yield_now();
+            };
+            let result = received.recv_timeout(std::time::Duration::from_secs(2));
+            let reaped_before_release =
+                nix::sys::wait::waitpid(pid, Some(nix::sys::wait::WaitPidFlag::WNOHANG));
+            if matches!(
+                reaped_before_release,
+                Ok(nix::sys::wait::WaitStatus::StillAlive)
+            ) {
+                let _ = nix::sys::signal::kill(pid, nix::sys::signal::Signal::SIGKILL);
+                let _ = nix::sys::wait::waitpid(pid, None);
+            }
+            drop(release);
+            worker.join().unwrap();
+            assert!(
+                matches!(reaped_before_release, Err(nix::errno::Errno::ECHILD)),
+                "helper must exit and be reaped before FIFO release: {reaped_before_release:?}"
+            );
+            assert!(result
+                .expect("stdin write outlived the helper deadline")
+                .is_err());
+        });
+    }
 }

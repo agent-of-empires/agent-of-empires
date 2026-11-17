@@ -161,6 +161,8 @@ struct Construction {
     child_wait_completed: tokio::sync::watch::Sender<Option<bool>>,
     original_constructor_obligations: std::sync::atomic::AtomicUsize,
     original_constructor_notify: std::sync::OnceLock<Arc<tokio::sync::Notify>>,
+    /// A rate limit rejecting this launch belongs to its caller, which reads it from the error.
+    defers_rate_limit_rejection: std::sync::atomic::AtomicBool,
 }
 
 impl Default for Construction {
@@ -191,6 +193,7 @@ impl Default for Construction {
             original_constructor_notify: std::sync::OnceLock::new(),
             admissions: std::sync::atomic::AtomicU64::new(0),
             owned_child_wait_pending: std::sync::atomic::AtomicBool::new(false),
+            defers_rate_limit_rejection: std::sync::atomic::AtomicBool::new(false),
         }
     }
 }
@@ -800,6 +803,20 @@ impl Lease {
     pub(crate) fn admissions(&self) -> u64 {
         self.construction
             .admissions
+            .load(std::sync::atomic::Ordering::Acquire)
+    }
+
+    /// A rate limit rejecting this launch publishes no park and wakes nothing: the caller owns
+    /// the outcome. Only this lease's launch is affected, never a newer one of the session.
+    pub(crate) fn defer_rate_limit_rejection(&self) {
+        self.construction
+            .defers_rate_limit_rejection
+            .store(true, std::sync::atomic::Ordering::Release);
+    }
+
+    pub(crate) fn defers_rate_limit_rejection(&self) -> bool {
+        self.construction
+            .defers_rate_limit_rejection
             .load(std::sync::atomic::Ordering::Acquire)
     }
 

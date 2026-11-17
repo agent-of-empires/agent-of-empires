@@ -1,6 +1,8 @@
 //! Subagent sessions: the ACP subagents RFD's child sessions, which share the
 //! parent's connection and arrive addressed to their own session id.
 
+use std::collections::HashMap;
+
 use agent_client_protocol::schema::MaybeUndefined;
 use agent_client_protocol::v1::schema::{
     ContentBlock, SessionId, SessionMessage, SessionUpdate, StateUpdate, SubagentUpdate,
@@ -8,14 +10,26 @@ use agent_client_protocol::v1::schema::{
 
 use super::notifications::Shared;
 use crate::acp::acp_client::config_options::map_acp_config_option;
+use crate::acp::acp_client::lifecycle::ASYNC_AGENT_LAUNCHED;
 use crate::acp::acp_client::session_identity::ChildRoute;
 use crate::acp::acp_client::tool_context::{capture_tool_context_input, update_tool_context_cache};
 use crate::acp::acp_client::tool_output::preview_args;
 use crate::acp::acp_client::update_events::map_update_to_events;
+use crate::acp::acp_client::watchdog::OFF_PROTOCOL_WORK_GRACE_FLOOR;
 use crate::acp::event_sender::EventSender;
 use crate::acp::state::{
     ConfigOptionCategory, Event, SubagentRecord, SubagentState, ToolCall, ToolOutputBlock,
 };
+
+/// A background child's card, open until the child goes idle, and the text
+/// of its latest message: its answer once it ends.
+#[derive(Debug)]
+pub(super) struct BackgroundReport {
+    tool_call_id: String,
+    provenance: Option<std::sync::Arc<crate::acp::event_sender::NativeChildProvenance>>,
+    message_id: Option<String>,
+    text: String,
+}
 
 fn patch<T>(slot: &mut Option<T>, incoming: MaybeUndefined<T>) {
     match incoming {
@@ -26,7 +40,7 @@ fn patch<T>(slot: &mut Option<T>, incoming: MaybeUndefined<T>) {
 }
 
 fn apply_state(record: &mut SubagentRecord, state: MaybeUndefined<StateUpdate>) {
-    let (state, stop_reason) = match state {
+    let (state, stop) = match state {
         MaybeUndefined::Undefined => return,
         MaybeUndefined::Null => (SubagentState::Unknown, None),
         MaybeUndefined::Value(StateUpdate::Running(_)) => (SubagentState::Running, None),
@@ -35,31 +49,88 @@ fn apply_state(record: &mut SubagentRecord, state: MaybeUndefined<StateUpdate>) 
         }
         MaybeUndefined::Value(StateUpdate::Idle(idle)) => {
             // The reason is an open string: the RFD reserves future values.
-            let reason = idle
+            let stop = idle
                 .stop_reason
-                .and_then(|reason| serde_json::to_value(reason).ok())
-                .and_then(|value| value.get("stopReason")?.as_str().map(str::to_owned));
-            (SubagentState::Idle, reason)
+                .and_then(|reason| serde_json::to_value(reason).ok());
+            (SubagentState::Idle, stop)
         }
         MaybeUndefined::Value(_) => (SubagentState::Unknown, None),
     };
+    let field = |key: &str| {
+        let value = stop.as_ref()?.get(key)?;
+        value.as_str().map(str::to_owned)
+    };
     record.state = state;
-    record.stop_reason = stop_reason;
+    record.stop_reason = field("stopReason");
+    record.error = stop.as_ref().and_then(|stop| {
+        stop.get("error")?
+            .get("message")?
+            .as_str()
+            .map(str::to_owned)
+    });
+}
+
+fn heard_within_floor(seen: &HashMap<String, i64>, child: &str, now_ms: i64) -> bool {
+    let floor = OFF_PROTOCOL_WORK_GRACE_FLOOR.as_millis() as i64;
+    seen.get(child).is_some_and(|at| now_ms - at < floor)
 }
 
 impl Shared {
+    /// A child still holds its parent's turn open. One silent past the
+    /// off-protocol floor lost its idle update, so it stops counting, whatever
+    /// its siblings send.
+    pub(super) fn subagent_working(&self, now_ms: i64) -> bool {
+        let seen = self
+            .subagent_seen
+            .lock()
+            .expect("subagent seen mutex poisoned");
+        self.subagents
+            .lock()
+            .expect("subagents mutex poisoned")
+            .iter()
+            .any(|(id, record)| record.state.is_active() && heard_within_floor(&seen, id, now_ms))
+    }
+
+    /// Publish each child that fell silent past the floor as cancelled, so the
+    /// log stops counting it. Its idle state keeps it from publishing twice.
+    /// Check and edit share both locks, so a concurrent update is never
+    /// overwritten.
+    pub(super) async fn expire_silent_subagents(&self, now_ms: i64) {
+        let expired: Vec<SubagentRecord> = {
+            let seen = self
+                .subagent_seen
+                .lock()
+                .expect("subagent seen mutex poisoned");
+            self.subagents
+                .lock()
+                .expect("subagents mutex poisoned")
+                .iter_mut()
+                .filter(|(id, record)| {
+                    record.state.is_active() && !heard_within_floor(&seen, id, now_ms)
+                })
+                .map(|(_, record)| {
+                    record.state = SubagentState::Idle;
+                    record.stop_reason = Some("cancelled".into());
+                    record.clone()
+                })
+                .collect()
+        };
+        for subagent in expired {
+            self.emit(Event::SubagentUpdated {
+                subagent,
+                at: chrono::Utc::now(),
+            })
+            .await;
+        }
+    }
+
     /// A running child would lose its routes if the conversation reset.
     pub(super) fn has_active_subagent(&self) -> bool {
         self.subagents
             .lock()
             .expect("subagents mutex poisoned")
             .values()
-            .any(|record| {
-                matches!(
-                    record.state,
-                    SubagentState::Running | SubagentState::RequiresAction
-                )
-            })
+            .any(|record| record.state.is_active())
     }
 
     /// Merge `edit` into the child's snapshot and publish the result.
@@ -80,8 +151,10 @@ impl Shared {
             description: None,
             state: SubagentState::default(),
             stop_reason: None,
+            error: None,
             cancel_capable: route.1.cancel_capable,
             model: None,
+            background: false,
         };
         // A late frame retains its display history, never the replacement's live cache.
         let current_route = self
@@ -131,6 +204,57 @@ impl Shared {
             apply_state(record, update.state);
         })
         .await;
+        self.finish_background_report(sender, route, &child).await;
+    }
+
+    /// An idle background child's answer, or its error, completes its card.
+    /// A cancelled or orphaned one leaves it open for the turn's end to mark stopped.
+    async fn finish_background_report(
+        &self,
+        sender: &EventSender,
+        route: &(SessionId, ChildRoute),
+        child: &SessionId,
+    ) {
+        let (stop_reason, error) = {
+            let subagents = self.subagents.lock().expect("subagents mutex poisoned");
+            match subagents
+                .get(child.0.as_ref())
+                .filter(|record| record.provenance == route.1.provenance)
+            {
+                Some(record) if record.state == SubagentState::Idle => {
+                    (record.stop_reason.clone(), record.error.clone())
+                }
+                _ => return,
+            }
+        };
+        // Any other stop keeps the report for a later end_turn or error.
+        let is_error = match stop_reason.as_deref() {
+            Some("end_turn") => false,
+            Some("error") => true,
+            _ => return,
+        };
+        let report = {
+            let mut reports = self
+                .background_reports
+                .lock()
+                .expect("background reports mutex poisoned");
+            if !reports
+                .get(child.0.as_ref())
+                .is_some_and(|report| report.provenance == route.1.provenance)
+            {
+                return;
+            }
+            reports.remove(child.0.as_ref())
+        };
+        let Some(report) = report else {
+            return;
+        };
+        let text = match error {
+            Some(error) if is_error => error,
+            _ => report.text,
+        };
+        self.emit_card_completion(sender, report.tool_call_id, text, is_error)
+            .await;
     }
 
     /// `session` is the session the message arrived on. The adapter hides the
@@ -171,7 +295,7 @@ impl Shared {
             )
             .await;
         } else if *recipient == session && child_of_session(sender) {
-            self.complete_delegation_card(events, route, sender, text)
+            self.complete_delegation_card(events, route, sender, &message.message_id.0, text)
                 .await;
         }
     }
@@ -243,6 +367,7 @@ impl Shared {
         sender: &EventSender,
         route: &(SessionId, ChildRoute),
         child: &SessionId,
+        message_id: &str,
         reply: String,
     ) {
         let Some(tool_call_id) = self
@@ -255,10 +380,46 @@ impl Shared {
         else {
             return;
         };
+        // The adapter sends an async launch's acknowledgement as its reply
+        // when the Agent call lacks `run_in_background`.
+        let launch_notice = message_id == format!("{tool_call_id}:reply")
+            && reply
+                .lines()
+                .any(|line| line.trim_start().starts_with(ASYNC_AGENT_LAUNCHED));
+        if !launch_notice {
+            return self
+                .emit_card_completion(sender, tool_call_id, reply, false)
+                .await;
+        }
+        self.background_reports
+            .lock()
+            .expect("background reports mutex poisoned")
+            .insert(
+                child.0.to_string(),
+                BackgroundReport {
+                    tool_call_id,
+                    provenance: route.1.provenance.clone(),
+                    message_id: None,
+                    text: String::new(),
+                },
+            );
+        self.publish_subagent(sender, route, &route.1.parent, child, |record| {
+            record.background = true
+        })
+        .await;
+    }
+
+    async fn emit_card_completion(
+        &self,
+        sender: &EventSender,
+        tool_call_id: String,
+        reply: String,
+        is_error: bool,
+    ) {
         let _ = sender
             .send(Event::ToolCallCompleted {
                 tool_call_id,
-                is_error: false,
+                is_error,
                 output: vec![ToolOutputBlock::Text {
                     text: reply.clone(),
                 }],
@@ -270,7 +431,8 @@ impl Shared {
     }
 
     /// Only a child's tool calls and model reach the transcript; its own
-    /// messages and lifecycle must never read as the root session's.
+    /// lifecycle must never read as the root session's. A background child's
+    /// latest message is kept as its answer.
     pub(super) async fn handle_child_notification(
         &self,
         sender: &EventSender,
@@ -283,7 +445,39 @@ impl Shared {
                 self.handle_subagent_update(sender, route, child, nested)
                     .await
             }
+            SessionUpdate::AgentMessageChunk(chunk) => {
+                let ContentBlock::Text(text) = chunk.content else {
+                    return;
+                };
+                let id = chunk.message_id.map(|id| id.0.to_string());
+                let mut reports = self
+                    .background_reports
+                    .lock()
+                    .expect("background reports mutex poisoned");
+                if let Some(report) = reports
+                    .get_mut(child.0.as_ref())
+                    .filter(|report| report.provenance == route.1.provenance)
+                {
+                    if id.is_some() && id != report.message_id {
+                        report.message_id = id;
+                        report.text.clear();
+                    }
+                    report.text.push_str(&text.text);
+                }
+            }
             tool @ (SessionUpdate::ToolCall(_) | SessionUpdate::ToolCallUpdate(_)) => {
+                // Prose before a tool call is not the child's answer.
+                if matches!(tool, SessionUpdate::ToolCall(_)) {
+                    if let Some(report) = self
+                        .background_reports
+                        .lock()
+                        .expect("background reports mutex poisoned")
+                        .get_mut(child.0.as_ref())
+                        .filter(|report| report.provenance == route.1.provenance)
+                    {
+                        report.text.clear();
+                    }
+                }
                 let link = self
                     .subagents
                     .lock()
@@ -335,13 +529,16 @@ impl Shared {
 
 #[cfg(test)]
 mod tests {
+    use super::super::notifications::now_ms;
     use super::*;
-    use crate::acp::acp_client::lifecycle::TerminalClaim;
+    use crate::acp::acp_client::lifecycle::LifecycleSignal;
     use crate::acp::acp_client::session_identity::SessionIngress;
+    use crate::acp::acp_client::SessionState;
     use crate::acp::agent_profiles::CLAUDE;
     use agent_client_protocol::v1::schema::SessionNotification;
-    use std::sync::atomic::AtomicBool;
+    use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::Arc;
+    use std::time::Duration;
     use tokio::sync::mpsc;
 
     fn notification(value: serde_json::Value) -> SessionNotification {
@@ -404,7 +601,7 @@ mod tests {
             "test".into(),
             &CLAUDE,
             lifecycle_tx,
-            Arc::new(TerminalClaim::new()),
+            Arc::new(SessionState::default()),
             Arc::new(AtomicBool::new(false)),
             None,
             ingress.clone(),
@@ -479,6 +676,145 @@ mod tests {
         assert_eq!(linked.title.as_deref(), Some("Explore"));
         assert!(linked.cancel_capable);
         assert_eq!(linked.state, SubagentState::Running);
+    }
+
+    /// A `session/load` replays every past child. Its children died with the
+    /// old adapter, so the replay publishes nothing and arms nothing, but
+    /// still routes.
+    #[tokio::test]
+    async fn load_replay_publishes_no_subagent_traffic() {
+        let ingress = Arc::new(SessionIngress::new(Some("root".to_string().into())));
+        let (event_tx, events) = mpsc::channel(16);
+        let (lifecycle_tx, mut lifecycle) = mpsc::channel(16);
+        let shared = Shared::new(
+            event_tx.into(),
+            "test".into(),
+            &CLAUDE,
+            lifecycle_tx,
+            Arc::new(SessionState::default()),
+            Arc::new(AtomicBool::new(true)),
+            None,
+            ingress.clone(),
+            None,
+            Arc::default(),
+            None,
+            Arc::default(),
+        );
+        shared.prompt_epoch.store(1, Ordering::Relaxed);
+        shared
+            .suppress_history_replay
+            .store(true, Ordering::Relaxed);
+        for frame in [
+            serde_json::to_value(announce("root", "running")).unwrap(),
+            delegation("tool-1", "child", "find the bug"),
+            serde_json::json!({
+                "sessionId": "child",
+                "update": { "sessionUpdate": "tool_call", "toolCallId": "child-tool",
+                            "title": "Read", "kind": "read", "status": "completed" },
+            }),
+            serde_json::json!({
+                "sessionId": "root",
+                "update": { "sessionUpdate": "subagent_update", "sessionId": "child",
+                            "state": { "state": "idle", "stopReason": "end_turn" } },
+            }),
+        ] {
+            feed(&ingress, &shared, frame).await;
+        }
+
+        assert!(ingress.child_route(&"child".to_string().into()).is_some());
+        assert!(!shared.has_active_subagent());
+        assert!(lifecycle.try_recv().is_err());
+        let events = drain(shared, events).await;
+        assert!(events.is_empty(), "{events:?}");
+    }
+
+    /// A background launch's acknowledgement is not the child's answer: the
+    /// card stays open, marked background, and completes with the child's
+    /// last message once it ends. A cancelled child leaves it open (#5612).
+    #[tokio::test]
+    async fn background_launch_completes_with_the_childs_answer() {
+        let notice = "Async agent launched successfully. (internal metadata) agentId: a1";
+        let chunk = |id: &str, text: &str| {
+            serde_json::json!({
+                "sessionId": "child",
+                "update": { "sessionUpdate": "agent_message_chunk", "messageId": id,
+                            "content": { "type": "text", "text": text } },
+            })
+        };
+        for (stop, want) in [
+            ("end_turn", Some(("The answer is 42.", false))),
+            ("error", Some(("Authentication required", true))),
+            ("cancelled", None),
+        ] {
+            let (ingress, shared, events) = harness();
+            for frame in [
+                serde_json::to_value(announce("root", "running")).unwrap(),
+                delegation("tool-1", "child", "dig"),
+                to_parent("tool-1:reply", "child", notice),
+                chunk("m1", "Let me look."),
+                serde_json::json!({
+                    "sessionId": "child",
+                    "update": { "sessionUpdate": "tool_call", "toolCallId": "child-tool",
+                                "title": "Read", "kind": "read", "status": "pending" },
+                }),
+                chunk("m2", "The answer"),
+                chunk("m2", " is 42."),
+                // An idle snapshot with no reason is not the outcome yet.
+                serde_json::json!({
+                    "sessionId": "root",
+                    "update": { "sessionUpdate": "subagent_update", "sessionId": "child",
+                                "state": { "state": "idle" } },
+                }),
+                serde_json::json!({
+                    "sessionId": "root",
+                    "update": { "sessionUpdate": "subagent_update", "sessionId": "child",
+                                "state": { "state": "idle", "stopReason": stop,
+                                           "error": { "code": -32000, "message": "Authentication required" } } },
+                }),
+            ] {
+                feed(&ingress, &shared, frame).await;
+            }
+            let events = drain(shared, events).await;
+            assert!(
+                events.iter().any(|e| matches!(
+                    e,
+                    Event::SubagentUpdated { subagent, .. } if subagent.background
+                )),
+                "{stop}: no background snapshot in {events:?}"
+            );
+            let completions: Vec<_> = events
+                .iter()
+                .filter_map(|e| match e {
+                    Event::ToolCallCompleted {
+                        tool_call_id,
+                        content,
+                        is_error,
+                        ..
+                    } if tool_call_id == "tool-1" => Some((content.as_str(), *is_error)),
+                    _ => None,
+                })
+                .collect();
+            match want {
+                Some(completion) => assert_eq!(completions, [completion], "{stop}"),
+                None => assert!(completions.is_empty(), "{stop}: {completions:?}"),
+            }
+        }
+
+        // Only the launch's own reply is an acknowledgement.
+        let (ingress, shared, events) = harness();
+        feed(
+            &ingress,
+            &shared,
+            serde_json::to_value(announce("root", "running")).unwrap(),
+        )
+        .await;
+        feed(&ingress, &shared, delegation("tool-1", "child", "dig")).await;
+        feed(&ingress, &shared, to_parent("handback-1", "child", notice)).await;
+        let events = drain(shared, events).await;
+        assert!(events.iter().any(|e| matches!(
+            e,
+            Event::ToolCallCompleted { content, .. } if content == notice
+        )));
     }
 
     /// A foreground reply and a hand-back report both complete the card with
@@ -605,7 +941,7 @@ mod tests {
             "test".into(),
             &CLAUDE,
             lifecycle_tx,
-            Arc::new(TerminalClaim::new()),
+            Arc::new(SessionState::default()),
             Arc::new(AtomicBool::new(false)),
             None,
             ingress.clone(),
@@ -655,105 +991,272 @@ mod tests {
         assert_eq!(flags, [false, true]);
     }
 
+    /// A child silent past the floor stops holding the turn even while a
+    /// sibling keeps sending traffic, and is published cancelled exactly once.
+    #[tokio::test]
+    async fn a_silent_child_stops_holding_the_turn_whatever_its_siblings_send() {
+        let (_ingress, shared, events) = harness();
+        let floor = OFF_PROTOCOL_WORK_GRACE_FLOOR.as_millis() as i64;
+        let now = now_ms();
+        let child = |id: &str, state| SubagentRecord {
+            session_id: id.into(),
+            parent_session_id: "root".into(),
+            provenance: None,
+            parent_tool_call_id: None,
+            title: None,
+            description: None,
+            state,
+            stop_reason: None,
+            error: None,
+            cancel_capable: true,
+            model: None,
+            background: false,
+        };
+        for (id, state, seen) in [
+            ("stale", SubagentState::Running, now - floor - 1),
+            ("sibling", SubagentState::Idle, now),
+        ] {
+            shared
+                .subagents
+                .lock()
+                .unwrap()
+                .insert(id.into(), child(id, state));
+            shared.subagent_seen.lock().unwrap().insert(id.into(), seen);
+        }
+        assert!(!shared.subagent_working(now));
+        shared
+            .subagent_seen
+            .lock()
+            .unwrap()
+            .insert("stale".into(), now);
+        assert!(shared.subagent_working(now));
+
+        shared.expire_silent_subagents(now).await;
+        assert!(shared.subagent_working(now), "a heard child is not expired");
+        let later = now + floor;
+        shared.expire_silent_subagents(later).await;
+        shared.expire_silent_subagents(later).await;
+        let published: Vec<_> = drain(shared, events)
+            .await
+            .into_iter()
+            .filter_map(|event| match event {
+                Event::SubagentUpdated { subagent, .. } => {
+                    Some((subagent.session_id, subagent.state, subagent.stop_reason))
+                }
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            published,
+            [(
+                "stale".to_string(),
+                SubagentState::Idle,
+                Some("cancelled".to_string())
+            )]
+        );
+    }
+
     /// A child's tool calls nest under the Agent card that spawned it, while
     /// its messages and lifecycle never reach the root session's transcript.
+    /// Accepted child traffic keeps the parent's turn live for whichever
+    /// watchdog owns it (#5611).
     #[tokio::test]
-    async fn child_traffic_nests_tool_calls_and_stays_out_of_the_root_turn() {
-        let ingress = Arc::new(SessionIngress::new(Some("root".to_string().into())));
-        let (event_tx, events) = mpsc::channel(16);
-        let (lifecycle_tx, mut lifecycle) = mpsc::channel(16);
-        let shared = Shared::new(
-            event_tx.into(),
-            "test".into(),
-            &CLAUDE,
-            lifecycle_tx,
-            Arc::new(TerminalClaim::new()),
-            Arc::new(AtomicBool::new(false)),
-            None,
-            ingress.clone(),
-            None,
-            Arc::default(),
-            None,
-            Arc::default(),
-        );
-        feed(
-            &ingress,
-            &shared,
-            serde_json::to_value(announce("root", "running")).unwrap(),
-        )
-        .await;
-        feed(
-            &ingress,
-            &shared,
-            delegation("tool-1", "child", "look around"),
-        )
-        .await;
-        feed(
-            &ingress,
-            &shared,
-            serde_json::json!({
-                "sessionId": "child",
-                "update": { "sessionUpdate": "tool_call", "toolCallId": "child-tool",
-                            "title": "Read", "kind": "read", "status": "pending" },
-            }),
-        )
-        .await;
-        feed(
-            &ingress,
-            &shared,
-            serde_json::json!({
-                "sessionId": "child",
-                "update": { "sessionUpdate": "agent_message_chunk",
-                            "content": { "type": "text", "text": "child prose" } },
-            }),
-        )
-        .await;
-        feed(
-            &ingress,
-            &shared,
-            serde_json::json!({
-                "sessionId": "stranger",
-                "update": { "sessionUpdate": "tool_call", "toolCallId": "x",
-                            "title": "Read", "kind": "read", "status": "pending" },
-            }),
-        )
-        .await;
-        feed(
-            &ingress,
-            &shared,
-            serde_json::to_value(announce("child", "idle")).unwrap(),
-        )
-        .await;
-        let mut events = drain(shared, events).await.into_iter();
+    async fn child_traffic_nests_tool_calls_and_keeps_the_parent_turn_live() {
+        for in_flight in [false, true] {
+            let ingress = Arc::new(SessionIngress::new(Some("root".to_string().into())));
+            let (event_tx, events) = mpsc::channel(16);
+            let (lifecycle_tx, mut lifecycle) = mpsc::channel(16);
+            let shared = Shared::new(
+                event_tx.into(),
+                "test".into(),
+                &CLAUDE,
+                lifecycle_tx,
+                Arc::new(SessionState::default()),
+                Arc::new(AtomicBool::new(in_flight)),
+                None,
+                ingress.clone(),
+                None,
+                Arc::default(),
+                None,
+                Arc::default(),
+            );
+            shared.prompt_epoch.store(1, Ordering::Relaxed);
+            feed(
+                &ingress,
+                &shared,
+                serde_json::to_value(announce("root", "running")).unwrap(),
+            )
+            .await;
+            feed(
+                &ingress,
+                &shared,
+                delegation("tool-1", "child", "look around"),
+            )
+            .await;
+            feed(
+                &ingress,
+                &shared,
+                serde_json::json!({
+                    "sessionId": "child",
+                    "update": { "sessionUpdate": "tool_call", "toolCallId": "child-tool",
+                                "title": "Read", "kind": "read", "status": "pending" },
+                }),
+            )
+            .await;
+            feed(
+                &ingress,
+                &shared,
+                serde_json::json!({
+                    "sessionId": "child",
+                    "update": { "sessionUpdate": "agent_message_chunk",
+                                "content": { "type": "text", "text": "child prose" } },
+                }),
+            )
+            .await;
+            feed(
+                &ingress,
+                &shared,
+                serde_json::json!({
+                    "sessionId": "child",
+                    "update": { "sessionUpdate": "session_message_chunk", "messageId": "m1",
+                                "content": { "type": "text", "text": "to a sibling" } },
+                }),
+            )
+            .await;
+            feed(
+                &ingress,
+                &shared,
+                serde_json::json!({
+                    "sessionId": "stranger",
+                    "update": { "sessionUpdate": "tool_call", "toolCallId": "x",
+                                "title": "Read", "kind": "read", "status": "pending" },
+                }),
+            )
+            .await;
+            feed(
+                &ingress,
+                &shared,
+                serde_json::to_value(announce("child", "idle")).unwrap(),
+            )
+            .await;
+            let fed = now_ms();
+            if in_flight {
+                // The stranger and self-announcement produce no activity.
+                for _ in 0..5 {
+                    let envelope = lifecycle.try_recv().expect("child activity signal");
+                    assert_eq!(envelope.epoch, 1);
+                    assert!(matches!(envelope.signal, LifecycleSignal::SubagentActivity));
+                }
+            } else {
+                let active = shared.subagent_working(fed);
+                assert!(active);
+                let between = &shared.between_prompt;
+                assert_eq!(between.take_idle_fire(fed + 120_000, false, active), None);
+                let floor = OFF_PROTOCOL_WORK_GRACE_FLOOR.as_millis() as i64;
+                assert_eq!(
+                    between.take_idle_fire(fed + floor, false, active),
+                    Some(false)
+                );
+            }
+            let mut events = drain(shared, events).await.into_iter();
 
-        let Some(Event::SubagentUpdated { subagent, .. }) = events.next() else {
-            panic!("expected the announcement first");
-        };
-        assert_eq!(subagent.session_id, "child");
-        assert_eq!(subagent.parent_session_id, "root");
-        assert_eq!(subagent.parent_tool_call_id, None);
-        assert_eq!(subagent.title.as_deref(), Some("Explore"));
-        assert_eq!(subagent.state, SubagentState::Running);
-        assert!(subagent.cancel_capable);
+            let Some(Event::SubagentUpdated { subagent, .. }) = events.next() else {
+                panic!("expected the announcement first");
+            };
+            assert_eq!(subagent.session_id, "child");
+            assert_eq!(subagent.parent_session_id, "root");
+            assert_eq!(subagent.parent_tool_call_id, None);
+            assert_eq!(subagent.title.as_deref(), Some("Explore"));
+            assert_eq!(subagent.state, SubagentState::Running);
+            assert!(subagent.cancel_capable);
 
-        let Some(Event::ToolCallStarted { tool_call: card }) = events.next() else {
-            panic!("expected the delegation card");
-        };
-        assert_eq!(card.id, "tool-1");
-        let Some(Event::SubagentUpdated { subagent, .. }) = events.next() else {
-            panic!("expected the linked snapshot");
-        };
-        assert_eq!(subagent.parent_tool_call_id.as_deref(), Some("tool-1"));
+            let Some(Event::ToolCallStarted { tool_call: card }) = events.next() else {
+                panic!("expected the delegation card");
+            };
+            assert_eq!(card.id, "tool-1");
+            let Some(Event::SubagentUpdated { subagent, .. }) = events.next() else {
+                panic!("expected the linked snapshot");
+            };
+            assert_eq!(subagent.parent_tool_call_id.as_deref(), Some("tool-1"));
 
-        let Some(Event::ToolCallStarted { tool_call }) = events.next() else {
-            panic!("expected the child's tool call");
-        };
-        assert_eq!(tool_call.id, "child-tool");
-        assert_eq!(tool_call.parent_tool_call_id.as_deref(), Some("tool-1"));
+            let Some(Event::ToolCallStarted { tool_call }) = events.next() else {
+                panic!("expected the child's tool call");
+            };
+            assert_eq!(tool_call.id, "child-tool");
+            assert_eq!(tool_call.parent_tool_call_id.as_deref(), Some("tool-1"));
 
-        // The child's own announcement of itself is rejected (self-parenting),
-        // so nothing else was published: no message, no stranger, no signal.
-        assert!(events.next().is_none());
-        assert!(lifecycle.try_recv().is_err());
+            // The child's own announcement of itself is rejected (self-parenting),
+            // so nothing else was published: no message, no stranger, no signal.
+            assert!(events.next().is_none());
+            assert!(lifecycle.try_recv().is_err());
+        }
+    }
+
+    /// The liveness signal precedes the event publish, so a full event
+    /// channel cannot starve the watchdog (#5611).
+    #[tokio::test]
+    async fn child_activity_is_signalled_before_events_publish() {
+        let tool_call = serde_json::json!({
+            "sessionId": "child",
+            "update": { "sessionUpdate": "tool_call", "toolCallId": "child-tool",
+                        "title": "Read", "kind": "read", "status": "pending" },
+        });
+        let announcement = serde_json::to_value(announce("root", "running")).unwrap();
+        let delegated = delegation("tool-1", "child", "go");
+        for (name, setup, frame) in [
+            ("subagent_update", vec![], announcement.clone()),
+            (
+                "session_message",
+                vec![announcement.clone()],
+                delegated.clone(),
+            ),
+            ("child update", vec![announcement, delegated], tool_call),
+        ] {
+            let ingress = Arc::new(SessionIngress::new(Some("root".to_string().into())));
+            let (event_tx, mut events) = mpsc::channel(16);
+            let (lifecycle_tx, mut lifecycle) = mpsc::channel(16);
+            let shared = Arc::new(Shared::new(
+                event_tx.clone().into(),
+                "test".into(),
+                &CLAUDE,
+                lifecycle_tx,
+                Arc::new(SessionState::default()),
+                Arc::new(AtomicBool::new(true)),
+                None,
+                ingress.clone(),
+                None,
+                Arc::default(),
+                None,
+                Arc::default(),
+            ));
+            shared.prompt_epoch.store(1, Ordering::Relaxed);
+            for frame in setup {
+                feed(&ingress, &shared, frame).await;
+            }
+            while events.try_recv().is_ok() {}
+            while lifecycle.try_recv().is_ok() {}
+            let filler = || Event::Stopped {
+                reason: "filler".into(),
+            };
+            while event_tx
+                .try_send(crate::acp::event_sender::SdkEvent::Data(
+                    crate::acp::event_sender::AcpEventData::from_history(filler()),
+                ))
+                .is_ok()
+            {}
+
+            let task = tokio::spawn({
+                let (ingress, shared) = (ingress.clone(), shared.clone());
+                async move { feed(&ingress, &shared, frame).await }
+            });
+            let env = tokio::time::timeout(Duration::from_secs(5), lifecycle.recv())
+                .await
+                .unwrap_or_else(|_| panic!("{name}: no signal while events are blocked"))
+                .expect("lifecycle channel open");
+            assert!(matches!(env.signal, LifecycleSignal::SubagentActivity));
+            assert!(!task.is_finished(), "{name}: event send did not block");
+            drop(events);
+            task.await.unwrap();
+        }
     }
 }

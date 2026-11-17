@@ -127,6 +127,7 @@ test("Restart on the startup line replaces a start stuck in session/new, again i
 
   // The caption's advice: sending again reaches the replacement once, counted after its turn ends.
   await composer.fill(PROMPT);
+  await expect(page.getByRole("button", { name: "Send message", exact: true })).toBeEnabled({ timeout: 15_000 });
   await composer.press("Enter");
   await expect
     .poll(

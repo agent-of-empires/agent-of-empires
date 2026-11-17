@@ -285,6 +285,7 @@ fn take_control_metadata(
 #[derive(Default)]
 pub(super) struct SessionIngress {
     state: StateMutex<IdentityState>,
+    original_quota: Arc<StateMutex<OriginalQuotaCaptures>>,
     projection: StateMutex<std::sync::Weak<crate::acp::event_sender::ProjectionState>>,
     pub(super) fence: RwLock<()>,
     /// Requests awaiting the human with the fence released.
@@ -456,6 +457,95 @@ pub(super) struct OriginalIngressHistory {
     constructor: std::sync::OnceLock<Arc<crate::acp::establishment::NativeConstructorObservation>>,
 }
 
+#[derive(Default)]
+pub(super) struct OriginalQuotaCaptures {
+    windows: Vec<OriginalWindowQuota>,
+    reports: usize,
+    name_bytes: usize,
+}
+
+struct OriginalWindowQuota {
+    history: Arc<OriginalIngressHistory>,
+    window_id: crate::acp::protocol::AcpPromptWindowId,
+    rejections: HashMap<String, i64>,
+}
+
+impl OriginalQuotaCaptures {
+    fn record(
+        &mut self,
+        history: &Arc<OriginalIngressHistory>,
+        window_id: crate::acp::protocol::AcpPromptWindowId,
+        meta: &Option<agent_client_protocol::v1::schema::Meta>,
+    ) -> Result<(), ()> {
+        use super::rate_limit::{rate_limit_rejection_from_meta, recovered_rate_limit_window};
+        let index = self.windows.iter().position(|window| {
+            window.window_id == window_id
+                && window.history.original.same_source(
+                    &history.original.attempt,
+                    history.original.owner,
+                    history.original.store.as_ref(),
+                )
+        });
+        if let Some(rejection) = rate_limit_rejection_from_meta(meta) {
+            let exists = index.is_some_and(|index| {
+                self.windows[index]
+                    .rejections
+                    .contains_key(&rejection.window)
+            });
+            if !exists
+                && (self.reports >= MAX_PENDING_UPDATES
+                    || rejection.window.len() > MAX_PENDING_BYTES - self.name_bytes)
+            {
+                return Err(());
+            }
+            let index = match index {
+                Some(index) => index,
+                None => {
+                    self.windows.push(OriginalWindowQuota {
+                        history: Arc::clone(history),
+                        window_id,
+                        rejections: HashMap::new(),
+                    });
+                    self.windows.len() - 1
+                }
+            };
+            if !exists {
+                self.reports += 1;
+                self.name_bytes += rejection.window.len();
+            }
+            self.windows[index]
+                .rejections
+                .insert(rejection.window, rejection.resets_at_secs);
+            return Ok(());
+        }
+        if let (Some(index), Some(quota_window)) = (index, recovered_rate_limit_window(meta)) {
+            if let Some((name, _)) = self.windows[index].rejections.remove_entry(quota_window) {
+                self.reports -= 1;
+                self.name_bytes -= name.len();
+            }
+            if self.windows[index].rejections.is_empty() {
+                self.windows.swap_remove(index);
+            }
+        }
+        Ok(())
+    }
+
+    fn take(
+        &mut self,
+        evidence: &crate::acp::control_protocol::NativePromptCompletionEvidence,
+        now: chrono::DateTime<chrono::Utc>,
+    ) -> Option<super::rate_limit::CapturedReset> {
+        let index = self.windows.iter().position(|window| {
+            window.window_id == evidence.window_id
+                && window.history.accepts_quota_completion(evidence)
+        })?;
+        let window = self.windows.swap_remove(index);
+        self.reports -= window.rejections.len();
+        self.name_bytes -= window.rejections.keys().map(String::len).sum::<usize>();
+        super::rate_limit::latest_future_reset(window.rejections.iter(), now)
+    }
+}
+
 impl std::fmt::Debug for OriginalIngressHistory {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("OriginalIngressHistory")
@@ -465,6 +555,30 @@ impl std::fmt::Debug for OriginalIngressHistory {
 }
 
 impl OriginalIngressHistory {
+    fn accepts_quota_completion(
+        &self,
+        evidence: &crate::acp::control_protocol::NativePromptCompletionEvidence,
+    ) -> bool {
+        let receipt = &evidence.receipt;
+        let expected = crate::acp::state::NativeEventOrigin::owned_attempt(
+            &self.original.attempt,
+            Some(self.original.owner),
+        );
+        crate::acp::state::NativePhysicalSource::from_receipt(receipt)
+            .is_some_and(|source| Some(source.witness) == expected)
+            && self
+                .original
+                .same_source(&receipt.attempt, receipt.owner, receipt.store.as_ref())
+            && receipt.replay.closed
+            && !receipt.replay.lost
+            && receipt
+                .session_id()
+                .is_some_and(|session| self.accepts_session(session))
+            && evidence.scope.owner() == Some(self.original.owner)
+            && evidence.scope.origin(Some(receipt)) == Some(evidence.origin)
+            && evidence.scope.correlation().is_some()
+    }
+
     pub(super) fn accepts_session(&self, session: &str) -> bool {
         self.original.known_session_id() == Some(session)
             || self
@@ -624,6 +738,79 @@ enum RequestAdmission {
 }
 
 impl SessionIngress {
+    pub(super) fn with_original_quota(
+        original_quota: Arc<StateMutex<OriginalQuotaCaptures>>,
+    ) -> Self {
+        Self {
+            original_quota,
+            ..Self::default()
+        }
+    }
+
+    /// Captures original evidence without granting Current permission.
+    pub(super) fn capture_original_rate_limit(&self, update: &IngressUpdate) -> bool {
+        use crate::acp::protocol::AcpPromptObservation;
+        if update.suppress_replay {
+            return true;
+        }
+        let Some(history) = update
+            .history
+            .as_ref()
+            .filter(|history| history.accepts_session(update.notification.session_id.0.as_ref()))
+        else {
+            return true;
+        };
+        let Some(physical) = update.evidence.physical_source else {
+            return true;
+        };
+        if update.original_source != Some(physical.witness)
+            || crate::acp::state::NativeEventOrigin::owned_attempt(
+                &history.original.attempt,
+                Some(history.original.owner),
+            ) != Some(physical.witness)
+        {
+            return true;
+        }
+        let Some(AcpPromptObservation::Written { window_id }) = update.evidence.prompt_observation
+        else {
+            return true;
+        };
+        let SessionUpdate::UsageUpdate(usage) = &update.notification.update else {
+            return true;
+        };
+        let recorded = self
+            .original_quota
+            .lock()
+            .expect("original quota captures")
+            .record(history, window_id, &usage.meta);
+        if recorded.is_ok() {
+            return true;
+        }
+        let mut state = self.state.lock().expect("ingress identity");
+        if let Some(pending) = state.pending.as_mut() {
+            pending.updates.clear();
+            pending.encoded_bytes = 0;
+        }
+        state.failed = true;
+        drop(state);
+        self.projection_lost();
+        self.changed.notify_waiters();
+        self.failure.notify_one();
+        false
+    }
+
+    /// Consumes only this authenticated original's exact Written window.
+    pub(super) fn take_original_rate_limit_reset(
+        &self,
+        evidence: &crate::acp::control_protocol::NativePromptCompletionEvidence,
+        now: chrono::DateTime<chrono::Utc>,
+    ) -> Option<super::rate_limit::CapturedReset> {
+        self.original_quota
+            .lock()
+            .expect("original quota captures")
+            .take(evidence, now)
+    }
+
     pub(super) fn set_autonomous_negotiated(&self, enabled: bool) {
         self.state
             .lock()
@@ -1241,7 +1428,12 @@ impl SessionIngress {
                 .receipt
                 .as_ref()
                 .and_then(|receipt| receipt.session_id())
-                == Some(update.notification.session_id.0.as_ref())
+                .is_some_and(|session| {
+                    session == update.notification.session_id.0.as_ref()
+                        || update.child_route.as_ref().is_some_and(|(_, route)| {
+                            session == route.parent.0.as_ref() && context.origin() == route.source
+                        })
+                })
         });
         update.metadata_scope = matches!(
             &update.notification.update,

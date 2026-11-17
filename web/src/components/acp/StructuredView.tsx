@@ -16,7 +16,7 @@ import {
   visibleSessionNotices,
 } from "../../lib/acpTypes";
 import { useAgentDisplayNames } from "../../lib/agentDisplayName";
-import { isNewSessionStarting } from "./startupWait";
+import { isNewSessionStarting, notRunningCopy } from "./startupWait";
 import { AgentProfileProvider, useClearAliases, useCompactAliases } from "../../lib/agentProfileContext";
 import { queuedReason } from "./queuedReason";
 import { conversationFontSizeRem } from "../../lib/conversationFontSize";
@@ -57,6 +57,8 @@ interface Props {
   acpWorkerState: WorkerState;
   /** Whether rate-limit auto-resume is on for this session's profile. */
   rateLimitAutoResume?: boolean;
+  /** `SessionResponse.rate_limit_failover_to`: the account the daemon is moving this limited session to. */
+  rateLimitFailoverTo?: string;
   /** The profile's Structured view settings; null where Settings can't be edited. */
   settingsHref?: string | null;
   /** Session `tool` registry key; selects the AgentProfile. */
@@ -80,6 +82,8 @@ interface Props {
   onOpenFileRef?: (ref: FileRef) => void;
   fileRefSession?: FileRefSession | null;
   isSandboxed?: boolean;
+  /** The Session's title when the dashboard may recreate its container. */
+  recreateContainerTitle?: string;
   onOpenAgentsPane?: (agentId?: string) => void;
   /** The server is read-only, so the session cannot be interrupted. */
   serverReadOnly?: boolean;
@@ -207,6 +211,7 @@ function AcpChrome({
   const startingAgent = isNewSessionStarting(state, ctx, acpWorkerState, !!view.startedBefore)
     ? agentName(state.agent ?? acpAgent)
     : null;
+  const notRunning = notRunningCopy(state, agentName(state.agent ?? acpAgent));
   // Neither can start until restored or unarchived, so nothing here may send (#4116).
   const readOnly = !!view.trashedAt || !!view.archivedAt;
   const nativeReady = status === "open" && nativeInputAvailable(state);
@@ -242,7 +247,12 @@ function AcpChrome({
   if (state.incompatibleAgent && !nativeReady) {
     return (
       <div className="flex h-full flex-col bg-surface-900 text-text-primary">
-        <StartupErrorScreen detail={state.incompatibleAgent} sessionId={sessionId} isSandboxed={view.isSandboxed} />
+        <StartupErrorScreen
+          detail={state.incompatibleAgent}
+          sessionId={sessionId}
+          isSandboxed={view.isSandboxed}
+          recreateContainerTitle={view.recreateContainerTitle}
+        />
       </div>
     );
   }
@@ -301,7 +311,7 @@ function AcpChrome({
             <div ref={messagesContentRef} className="mx-auto max-w-3xl xl:max-w-4xl 2xl:max-w-5xl px-4 py-6">
               {!readOnly && (
                 <ThreadPrimitive.Empty>
-                  <EmptyState onPick={ctx.sendPrompt} />
+                  <EmptyState onPick={ctx.sendPrompt} notRunning={notRunning} />
                 </ThreadPrimitive.Empty>
               )}
 
@@ -454,9 +464,12 @@ function ComposerDock({
     <>
       <UsageLimitSection
         sessionId={sessionId}
+        currentTool={view.tool ?? ""}
+        authStatus={state.authStatus}
         agent={state.agent ?? acpAgent}
         rateLimit={state.rateLimit}
         autoResume={view.rateLimitAutoResume}
+        failoverTo={view.rateLimitFailoverTo}
         retriesExhausted={state.rateLimitRetriesExhausted === true}
         settingsHref={view.settingsHref ?? null}
         onPrefill={(text) => setPrimerPrefill({ id: `rate-limit-recovery-${Date.now()}`, text })}
@@ -587,7 +600,13 @@ function ComposerDock({
   );
 }
 
-function EmptyState({ onPick }: { onPick: (text: string) => Promise<void> }) {
+function EmptyState({ onPick, notRunning }: { onPick: (text: string) => Promise<void>; notRunning: string | null }) {
+  if (notRunning)
+    return (
+      <div data-testid="acp-empty-not-running" className="mt-12 text-center text-sm text-text-muted">
+        {notRunning}
+      </div>
+    );
   return (
     <div className="mt-12 flex flex-col items-center gap-4 text-center">
       <div className="text-sm text-text-muted">Ask the agent anything about this workspace.</div>

@@ -650,17 +650,19 @@ describe("turnActive: daemon truth plus an optimistic overlay (#3417)", () => {
     });
     const active = [bg(null)];
 
-    expect(hasActiveBackgroundAgent({ backgroundAgents: [], backgroundTasks: [] })).toBe(false);
+    expect(hasActiveBackgroundAgent({ backgroundAgents: [], backgroundTasks: [], subagents: [] })).toBe(false);
     expect(
       hasActiveBackgroundAgent({
         backgroundAgents: active,
         backgroundTasks: [],
+        subagents: [],
       }),
     ).toBe(true);
     expect(
       hasActiveBackgroundAgent({
         backgroundAgents: [bg("2026-06-27T00:00:10Z")],
         backgroundTasks: [],
+        subagents: [],
       }),
     ).toBe(false);
 
@@ -669,6 +671,7 @@ describe("turnActive: daemon truth plus an optimistic overlay (#3417)", () => {
         turnActive: false,
         backgroundAgents: [],
         backgroundTasks: [],
+        subagents: [],
       }),
     ).toBe(false);
     expect(
@@ -676,6 +679,7 @@ describe("turnActive: daemon truth plus an optimistic overlay (#3417)", () => {
         turnActive: true,
         backgroundAgents: [],
         backgroundTasks: [],
+        subagents: [],
       }),
     ).toBe(true);
     expect(
@@ -683,6 +687,7 @@ describe("turnActive: daemon truth plus an optimistic overlay (#3417)", () => {
         turnActive: false,
         backgroundAgents: active,
         backgroundTasks: [],
+        subagents: [],
       }),
     ).toBe(true);
   });

@@ -794,7 +794,7 @@ pub(crate) fn carry_fork_parent(instance: &mut Instance) -> Result<()> {
 /// Whether AoE knows where this agent keeps one conversation inside its config
 /// root. Teaching another agent to carry means giving it a locator alongside
 /// [`claude_transcripts_for`].
-fn carries_transcript(agent: &'static AgentDef) -> bool {
+fn carries_transcript(agent: &'static AgentDef<'static>) -> bool {
     agent
         .session_support
         .as_ref()
@@ -830,7 +830,7 @@ fn config_root(
     instance: &Instance,
     profile: &str,
     tool: &str,
-    agent: &'static AgentDef,
+    agent: &'static AgentDef<'static>,
     home: &Path,
 ) -> Option<PathBuf> {
     let declared = resolve_config_or_warn(profile)
@@ -851,6 +851,28 @@ fn config_root(
         &instance.resolved_host_environment(),
     )
     .ok()
+}
+
+/// The config root `tool` reads for this host session, which identifies the account behind it.
+/// `None` for a sandboxed row (its store is per container), an unresolvable root, or an agent
+/// whose conversation AoE cannot locate in a config root: the host root resolves Claude's home.
+pub(crate) fn host_account_root(instance: &Instance, profile: &str, tool: &str) -> Option<PathBuf> {
+    if instance.is_sandboxed() {
+        return None;
+    }
+    let agent = crate::session::resolved_agent_for(profile, tool, &instance.detect_as)?;
+    if !carries_transcript(agent) {
+        return None;
+    }
+    config_root(instance, profile, tool, agent, &dirs::home_dir()?)
+}
+
+/// The directory `[session.agent_config_dir]` declares for `tool` under `profile`, if any.
+/// Unlike [`host_account_root`] it never falls back to the environment or the agent's default.
+pub(crate) fn declared_account_dir(profile: &str, tool: &str) -> Option<PathBuf> {
+    resolve_config_or_warn(profile)
+        .session
+        .agent_config_dir_for(tool, &dirs::home_dir()?)
 }
 
 /// Every `projects/<encoded-cwd>/<sid>.jsonl` under `root`.

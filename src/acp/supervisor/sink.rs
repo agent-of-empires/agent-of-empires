@@ -10,7 +10,7 @@ use crate::acp::event_sender::{AcpEventData, EventMetadata, EventScope};
 use crate::acp::event_store::{
     AttachmentBlob, EventStore, RecordDisposition, UnresolvedBackgroundAgentLaunch,
 };
-use crate::acp::state::{BackgroundTaskLaunch, Event, RateLimitInfo};
+use crate::acp::state::{BackgroundTaskLaunch, Event, RateLimitInfo, SubagentRecord};
 
 /// Destination for published events; test sinks override only what they observe.
 pub trait BroadcastSink: Send + Sync + 'static {
@@ -123,6 +123,10 @@ pub trait BroadcastSink: Send + Sync + 'static {
         _session_id: &str,
     ) -> anyhow::Result<Vec<BackgroundTaskLaunch>> {
         anyhow::bail!("a durable event store is required to restore resource tracking")
+    }
+    /// Subagents whose latest snapshot on disk is still working.
+    fn open_subagents(&self, _session_id: &str) -> Vec<SubagentRecord> {
+        Vec::new()
     }
     /// The same rows, carrying `output_file` so `Supervisor::attach` can
     /// resume tailing a sub-agent that survived a daemon restart.
@@ -608,6 +612,10 @@ impl BroadcastSink for ChannelSink {
     ) -> anyhow::Result<Vec<BackgroundTaskLaunch>> {
         self.flushed_store()
             .unresolved_background_task_launches(session_id)
+    }
+
+    fn open_subagents(&self, session_id: &str) -> Vec<SubagentRecord> {
+        self.flushed_store().open_subagents(session_id)
     }
 
     fn unresolved_background_agent_launches(

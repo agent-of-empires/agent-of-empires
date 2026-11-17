@@ -897,6 +897,39 @@ pub(crate) fn first_pane_id_with_deadline(
         .next()
 }
 
+/// A successful inventory on the same server proves the exact target absent.
+fn no_current_target_proves_absent(
+    stderr: &str,
+    target: &str,
+    deadline: &crate::tmux::TmuxCommandDeadline,
+    socket: Option<&str>,
+) -> bool {
+    if !stderr
+        .lines()
+        .any(|line| line.trim() == "no current target")
+    {
+        return false;
+    }
+    let target = target.strip_suffix(':').unwrap_or(target);
+    let name = target.strip_prefix('=');
+    let mut command = socket.map_or_else(
+        crate::tmux::tmux_query_command,
+        crate::tmux::tmux_query_command_for_socket,
+    );
+    deadline
+        .run(command.args(["list-sessions", "-F", "#{session_id} #{session_name}"]))
+        .is_ok_and(|inventory| {
+            inventory.status.success()
+                && std::str::from_utf8(&inventory.stdout).is_ok_and(|rows| {
+                    rows.split_terminator('\n').all(|row| {
+                        row.split_once(' ').is_some_and(|(id, session)| {
+                            name.map_or(id != target, |name| session != name)
+                        })
+                    })
+                })
+        })
+}
+
 enum PaneListLookup {
     Panes(Vec<String>),
     Missing,
@@ -967,10 +1000,12 @@ fn pane_ids_for_target_classified(
         Err(error) => return PaneListLookup::Unknown(error.into()),
     };
     if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
         return if tmux_no_server_running(&output.stderr)
-            || String::from_utf8_lossy(&output.stderr)
+            || stderr
                 .lines()
                 .any(|line| line.trim().starts_with("can't find session:"))
+            || no_current_target_proves_absent(&stderr, target, deadline, socket)
         {
             PaneListLookup::Missing
         } else {
@@ -1048,6 +1083,33 @@ pub(crate) fn classify_pane_probe(succeeded: bool, stdout: &str, stderr: &[u8]) 
 /// separate existence gate) use [`probe_pane`] instead.
 pub fn is_pane_dead(session_name: &str) -> bool {
     probe_pane(session_name) == PaneProbe::Dead
+}
+
+/// Whether any pane in any window of `session_name` may still run a process.
+/// An unreadable answer counts as live: only a confirmed absence frees the checkout.
+pub(crate) fn session_has_live_pane(session_name: &str) -> bool {
+    let target = format!("={session_name}:");
+    let mut cmd = crate::tmux::tmux_query_command();
+    cmd.args(["list-panes", "-s", "-t", &target, "-F", "#{pane_dead}"]);
+    let Ok(output) = crate::tmux::run_tmux_command_with_timeout(&mut cmd) else {
+        return true;
+    };
+    classify_live_panes(output.status.success(), &output.stdout, &output.stderr)
+}
+
+fn classify_live_panes(succeeded: bool, stdout: &[u8], stderr: &[u8]) -> bool {
+    if !succeeded {
+        let stderr = String::from_utf8_lossy(stderr);
+        let gone = tmux_no_server_running(stderr.as_bytes())
+            || stderr
+                .lines()
+                .any(|line| line.trim().starts_with("can't find session:"));
+        return !gone;
+    }
+    stdout.is_empty()
+        || String::from_utf8_lossy(stdout)
+            .lines()
+            .any(|l| l.trim() != "1")
 }
 
 pub(crate) fn pane_current_command(session_name: &str) -> Option<String> {
@@ -1195,9 +1257,10 @@ pub fn tmux_prefix_display() -> &'static str {
 /// Kill a session, accepting only confirmed session or server absence.
 /// Callers refresh the session cache after success.
 pub(crate) fn kill_session_if_present(name: &str) -> Result<()> {
+    let target = format!("={name}");
     let output = crate::tmux::tmux_query_command()
         .args(["kill-session", "-t"])
-        .arg(format!("={name}"))
+        .arg(&target)
         .output()?;
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
@@ -1206,22 +1269,12 @@ pub(crate) fn kill_session_if_present(name: &str) -> Result<()> {
                 .lines()
                 .any(|line| line.trim().starts_with("can't find session:"));
         if !absent {
-            let confirmed_missing = stderr
-                .lines()
-                .any(|line| line.trim() == "no current target")
-                && crate::tmux::run_tmux_command_with_timeout(
-                    crate::tmux::tmux_query_command().args([
-                        "list-sessions",
-                        "-F",
-                        "#{session_name}",
-                    ]),
-                )
-                .is_ok_and(|inventory| {
-                    inventory.status.success()
-                        && std::str::from_utf8(&inventory.stdout).is_ok_and(|names| {
-                            !names.split_terminator('\n').any(|session| session == name)
-                        })
-                });
+            let confirmed_missing = no_current_target_proves_absent(
+                &stderr,
+                &target,
+                &crate::tmux::TmuxCommandDeadline::new(),
+                None,
+            );
             if !confirmed_missing {
                 bail!("Failed to kill tmux session '{}': {}", name, stderr);
             }
@@ -2140,6 +2193,17 @@ mod tests {
                 "the private server must be live and empty"
             );
             kill_session_if_present("missing|proof").unwrap();
+            assert!(
+                matches!(
+                    first_window_pane_ids_classified(
+                        "missing|proof",
+                        &crate::tmux::TmuxCommandDeadline::new(),
+                        None,
+                    ),
+                    PaneListLookup::Missing
+                ),
+                "an empty server must classify the pane list as Missing"
+            );
             let still_empty = inventory();
             assert!(still_empty.status.success() && still_empty.stdout.is_empty());
             assert!(
@@ -2872,5 +2936,34 @@ mod pane_probe_tests {
     fn probe_pane_rejects_an_empty_session_name() {
         assert_eq!(probe_pane(""), PaneProbe::Missing);
         assert!(!is_pane_dead(""));
+    }
+
+    #[test]
+    fn live_pane_classification_fails_safe() {
+        let cases: [(&str, bool, &[u8], &[u8], bool); 8] = [
+            ("all dead", true, b"1\n1\n", b"", false),
+            ("secondary alive", true, b"1\n0\n", b"", true),
+            ("first alive", true, b"0\n1\n", b"", true),
+            ("empty success", true, b"", b"", true),
+            ("garbage output", true, b"?\n", b"", true),
+            (
+                "session gone",
+                false,
+                b"",
+                b"can't find session: x\n",
+                false,
+            ),
+            (
+                "no server",
+                false,
+                b"",
+                b"no server running on /tmp/s\n",
+                false,
+            ),
+            ("other failure", false, b"", b"boom\n", true),
+        ];
+        for (case, ok, out, err, expected) in cases {
+            assert_eq!(classify_live_panes(ok, out, err), expected, "{case}");
+        }
     }
 }
