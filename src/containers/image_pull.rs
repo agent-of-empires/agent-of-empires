@@ -89,6 +89,18 @@ struct FlightState {
     outcome: Option<Result<()>>,
 }
 
+impl Flight {
+    /// Gives up one waiter's place; the last one out kills the pull. Returns whether it was last.
+    fn leave(&self, state: &mut FlightState) -> bool {
+        state.waiters -= 1;
+        if state.waiters > 0 {
+            return false;
+        }
+        self.kill.cancel();
+        true
+    }
+}
+
 enum Entry {
     Running(Arc<Flight>),
     Finished(PullState),
@@ -104,6 +116,8 @@ fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
 pub(crate) struct Waiter {
     flight: Arc<Flight>,
     image: String,
+    /// Still counted in the flight's waiters.
+    joined: bool,
 }
 
 /// Joins `key`'s running pull, or starts `pull` on its own thread when none is running.
@@ -120,6 +134,7 @@ where
             return Waiter {
                 flight: flight.clone(),
                 image: key.image,
+                joined: true,
             };
         }
     }
@@ -168,7 +183,11 @@ where
         lock(&runner.state).outcome = Some(outcome);
         runner.finished.notify_all();
     });
-    Waiter { flight, image }
+    Waiter {
+        flight,
+        image,
+        joined: true,
+    }
 }
 
 fn finished_state(outcome: &Result<()>) -> Option<PullState> {
@@ -193,9 +212,8 @@ impl Waiter {
     /// Waits for the pull. A cancelled caller leaves it running for the other waiters. The last
     /// one kills it and waits for the outcome, so no runtime process outlives the caller and a
     /// pull that finishes inside the kill's grace still counts.
-    pub(crate) fn wait(self, cancel: &CancellationToken) -> Result<()> {
+    pub(crate) fn wait(mut self, cancel: &CancellationToken) -> Result<()> {
         let mut state = lock(&self.flight.state);
-        let mut killing = false;
         loop {
             if let Some(outcome) = &state.outcome {
                 return match outcome {
@@ -203,13 +221,11 @@ impl Waiter {
                     Err(error) => Err(reissue(error)),
                 };
             }
-            if !killing && cancel.is_cancelled() {
-                state.waiters -= 1;
-                if state.waiters > 0 {
+            if self.joined && cancel.is_cancelled() {
+                self.joined = false;
+                if !self.flight.leave(&mut state) {
                     return Err(DockerError::Cancelled(format!("pull of {}", self.image)));
                 }
-                self.flight.kill.cancel();
-                killing = true;
             }
             state = self
                 .flight
@@ -217,6 +233,20 @@ impl Waiter {
                 .wait_timeout(state, CANCEL_POLL)
                 .unwrap_or_else(|e| e.into_inner())
                 .0;
+        }
+    }
+}
+
+/// A waiter dropped without `wait` leaves like a cancelled one, so it can't keep alive a pull
+/// nobody waits for. It doesn't block for the outcome.
+impl Drop for Waiter {
+    fn drop(&mut self) {
+        if !self.joined {
+            return;
+        }
+        let mut state = lock(&self.flight.state);
+        if state.outcome.is_none() {
+            self.flight.leave(&mut state);
         }
     }
 }
@@ -405,6 +435,33 @@ mod tests {
             PullState::Done,
             "the killed pull leaves the newcomer's outcome alone"
         );
+    }
+
+    #[test]
+    fn a_waiter_dropped_without_waiting_leaves_the_last_cancel_to_kill() {
+        let dropped = key("Docker", "dropped");
+        let (token_tx, token_rx) = mpsc::channel();
+        let first = join_with(dropped.clone(), move |kill: &CancellationToken| {
+            token_tx.send(kill.clone()).unwrap();
+            while !kill.is_cancelled() {
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            Err(DockerError::Cancelled("pull".into()))
+        });
+        let kill = token_rx.recv_timeout(DEADLINE).expect("the pull starts");
+        drop(join_with(dropped.clone(), |_: &CancellationToken| Ok(())));
+        let cancelled = CancellationToken::new();
+        cancelled.cancel();
+
+        assert!(matches!(
+            within("the last waiter's cancel", move || first.wait(&cancelled)),
+            Err(DockerError::Cancelled(_))
+        ));
+        assert!(
+            kill.is_cancelled(),
+            "the dropped waiter doesn't keep the pull alive"
+        );
+        assert_eq!(state(&dropped), PullState::Idle, "the killed pull ended");
     }
 
     #[test]
