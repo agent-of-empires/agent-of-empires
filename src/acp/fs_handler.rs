@@ -4,6 +4,7 @@
 
 use std::io::{self, Read};
 use std::path::{Component, Path, PathBuf};
+use std::sync::Arc;
 
 use nix::errno::Errno;
 use thiserror::Error;
@@ -65,27 +66,47 @@ impl SandboxPathMap {
     }
 }
 
+/// An allowed root opened once, so later renames or symlink swaps of its
+/// pathname cannot change which directory requests resolve against.
+#[derive(Debug, Clone)]
+struct PinnedRoot {
+    canonical: PathBuf,
+    dir: Option<Arc<AnchoredDir>>,
+}
+
 /// Per-session allowed-roots policy.
 #[derive(Debug, Clone)]
 pub struct FsPolicy {
     pub allowed_roots: Vec<PathBuf>,
+    pinned: Vec<PinnedRoot>,
     /// When set, agent-reported paths are translated through this map
     /// before the inside-roots check.
     pub sandbox_map: Option<SandboxPathMap>,
 }
 
 impl FsPolicy {
+    /// Pins every root that opens now; build the policy before untrusted
+    /// code can touch the roots.
     pub fn new(roots: Vec<PathBuf>) -> Self {
+        let pinned = roots
+            .iter()
+            .map(|root| {
+                let canonical = root.canonicalize().unwrap_or_else(|_| root.clone());
+                let dir = AnchoredDir::open(&canonical).ok().map(Arc::new);
+                PinnedRoot { canonical, dir }
+            })
+            .collect();
         Self {
             allowed_roots: roots,
+            pinned,
             sandbox_map: None,
         }
     }
 
     pub fn with_sandbox_map(roots: Vec<PathBuf>, map: SandboxPathMap) -> Self {
         Self {
-            allowed_roots: roots,
             sandbox_map: Some(map),
+            ..Self::new(roots)
         }
     }
 
@@ -99,10 +120,10 @@ impl FsPolicy {
         })
     }
 
-    /// Open the allowed root holding `path` and return it with the path
-    /// relative to it. Later opens walk that relative path with `O_NOFOLLOW`
-    /// per component, so a swapped directory cannot redirect them.
-    fn anchor(&self, path: &Path) -> Result<(AnchoredDir, PathBuf), FsError> {
+    /// Return the pinned root holding `path` and the path relative to it.
+    /// Opens walk that relative path with `O_NOFOLLOW` per component, so a
+    /// swapped directory cannot redirect them.
+    fn anchor(&self, path: &Path) -> Result<(Arc<AnchoredDir>, PathBuf), FsError> {
         let mut normal = PathBuf::new();
         for component in self.translate(path)?.components() {
             match component {
@@ -115,11 +136,15 @@ impl FsPolicy {
                 other => normal.push(other),
             }
         }
-        for root in &self.allowed_roots {
-            let canonical = root.canonicalize().unwrap_or_else(|_| root.clone());
-            for prefix in [root.as_path(), canonical.as_path()] {
+        for (root, pinned) in self.allowed_roots.iter().zip(&self.pinned) {
+            for prefix in [root.as_path(), pinned.canonical.as_path()] {
                 if let Ok(relative) = normal.strip_prefix(prefix) {
-                    let dir = AnchoredDir::open(&canonical).map_err(|e| anchored_error(e, root))?;
+                    let dir = pinned.dir.clone().ok_or_else(|| {
+                        FsError::Io(io::Error::new(
+                            io::ErrorKind::NotFound,
+                            format!("session root was not available: {}", root.display()),
+                        ))
+                    })?;
                     return Ok((dir, relative.to_path_buf()));
                 }
             }
@@ -299,12 +324,45 @@ mod tests {
         ));
     }
 
-    /// A directory flipping to a symlink to an outside directory mid-request
-    /// must never redirect a write there.
+    #[cfg(unix)]
+    #[test]
+    fn replacing_the_root_after_the_policy_is_built_is_not_followed() {
+        let temp = tempfile::tempdir().unwrap();
+        let parent = temp.path().canonicalize().unwrap();
+        let root = parent.join("wt");
+        let moved = parent.join("moved");
+        let outside = parent.join("outside");
+        for dir in [&root, &outside] {
+            std::fs::create_dir(dir).unwrap();
+        }
+        std::fs::write(root.join("f.txt"), "in").unwrap();
+        std::fs::write(outside.join("f.txt"), "secret").unwrap();
+        let policy = FsPolicy::new(vec![root.clone()]);
+
+        std::fs::rename(&root, &moved).unwrap();
+        std::os::unix::fs::symlink(&outside, &root).unwrap();
+
+        assert_eq!(
+            handle_read(&policy, "s", &root.join("f.txt")).unwrap(),
+            "in"
+        );
+        handle_write(&policy, "s", &root.join("f.txt"), "new").unwrap();
+        handle_write(&policy, "s", &root.join("d/g.txt"), "new").unwrap();
+        assert_eq!(std::fs::read_to_string(moved.join("f.txt")).unwrap(), "new");
+        assert!(moved.join("d/g.txt").exists());
+        assert_eq!(
+            std::fs::read_to_string(outside.join("f.txt")).unwrap(),
+            "secret"
+        );
+        assert!(!outside.join("d").exists());
+    }
+
+    /// Supplemental: a directory flipping to a symlink to an outside
+    /// directory while writes run must never redirect a write there.
     #[cfg(unix)]
     #[test]
     fn swapping_a_directory_for_a_symlink_never_escapes_the_root() {
-        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
         let temp = tempfile::tempdir().unwrap();
         let root = temp.path().canonicalize().unwrap();
         let outside_dir = tempfile::tempdir().unwrap();
@@ -313,21 +371,35 @@ mod tests {
         std::fs::create_dir(root.join("a")).unwrap();
 
         let done = AtomicBool::new(false);
+        let swaps = AtomicUsize::new(0);
+        let (swapped_tx, swapped_rx) = std::sync::mpsc::channel();
+        let mut ok_writes = 0;
         std::thread::scope(|scope| {
             scope.spawn(|| {
-                while !done.load(Ordering::Relaxed) {
-                    let _ = std::fs::rename(root.join("a"), root.join("a_real"));
-                    let _ = std::os::unix::fs::symlink(&outside, root.join("a"));
-                    let _ = std::fs::remove_file(root.join("a"));
-                    let _ = std::fs::rename(root.join("a_real"), root.join("a"));
+                while !done.load(Ordering::SeqCst) {
+                    let cycle =
+                        std::fs::rename(root.join("a"), root.join("a_real")).and_then(|()| {
+                            std::os::unix::fs::symlink(&outside, root.join("a"))?;
+                            std::fs::remove_file(root.join("a"))?;
+                            std::fs::rename(root.join("a_real"), root.join("a"))
+                        });
+                    if cycle.is_ok() && swaps.fetch_add(1, Ordering::SeqCst) == 0 {
+                        swapped_tx.send(()).unwrap();
+                    }
                 }
             });
+            swapped_rx
+                .recv_timeout(std::time::Duration::from_secs(30))
+                .expect("swapper completed no swap cycle");
             for _ in 0..3000 {
-                let _ = handle_write(&policy, "s", &root.join("a/f.txt"), "pwn");
+                ok_writes +=
+                    handle_write(&policy, "s", &root.join("a/f.txt"), "pwn").is_ok() as usize;
                 let _ = handle_write(&policy, "s", &root.join("a/d/f.txt"), "pwn");
             }
-            done.store(true, Ordering::Relaxed);
+            done.store(true, Ordering::SeqCst);
         });
+        assert!(swaps.load(Ordering::SeqCst) > 0);
+        assert!(ok_writes > 0, "no write succeeded while swapping");
         assert_eq!(std::fs::read_dir(&outside).unwrap().count(), 0);
     }
 
