@@ -1148,8 +1148,8 @@ export function fetchPluginSessions(pluginId: string): Promise<{ sessions: Recor
 
 /** The host's aggregated UI-state snapshot. Returns an empty state (not null)
  *  shape on the server when no plugin host is running. */
-export function fetchPluginUiState(): Promise<PluginUiState | null> {
-  return fetchJson<PluginUiState>("/api/plugins/ui-state");
+export function fetchPluginUiState(init?: RequestInit): Promise<PluginUiState | null> {
+  return fetchJson<PluginUiState>("/api/plugins/ui-state", init);
 }
 
 /** Lets the next frame load of a page's `url` authenticate when device binding is on; the ticket rides an HttpOnly cookie. */

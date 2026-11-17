@@ -16,6 +16,7 @@ use serde::{Deserialize, Serialize};
 use tokio::time::Instant;
 
 use super::{api_error, cityhall_block, read_only_block};
+use crate::containers::image_pull::PullState;
 use crate::containers::image_update::{self, ImageCheck};
 use crate::containers::ContainerRuntime;
 use crate::server::AppState;
@@ -103,6 +104,10 @@ impl StatusCache {
 }
 
 static STATUS: LazyLock<Mutex<StatusCache>> = LazyLock::new(Mutex::default);
+/// The key's dashboard waiter, by the id its cleanup checks. One per running pull, so repeated
+/// POSTs don't each hold a blocking thread for the whole pull.
+static DASHBOARD_WAITERS: LazyLock<Mutex<HashMap<ImageKey, u64>>> = LazyLock::new(Mutex::default);
+static NEXT_DASHBOARD_WAITER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 /// One registry check per image and runtime at a time, so callers arriving together share it.
 static CHECK_TURNS: LazyLock<Mutex<HashMap<ImageKey, Arc<tokio::sync::Mutex<()>>>>> =
     LazyLock::new(Mutex::default);
@@ -157,38 +162,6 @@ where
             error: "registry_bad_response".into(),
         }
     })
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
-#[serde(tag = "state", rename_all = "snake_case")]
-pub enum PullState {
-    Idle,
-    Running,
-    Done,
-    /// `error` carries the Container runtime's stderr.
-    Failed {
-        error: String,
-    },
-}
-
-static PULLS: LazyLock<Mutex<HashMap<ImageKey, PullState>>> = LazyLock::new(Mutex::default);
-
-/// Marks the image running unless it already is; true when the caller should start the pull.
-fn claim_pull(pulls: &mut HashMap<ImageKey, PullState>, key: &ImageKey) -> bool {
-    if pulls.get(key) == Some(&PullState::Running) {
-        return false;
-    }
-    pulls.insert(key.clone(), PullState::Running);
-    true
-}
-
-fn pull_state(key: &ImageKey) -> PullState {
-    PULLS
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .get(key)
-        .cloned()
-        .unwrap_or(PullState::Idle)
 }
 
 /// What the Daemon would sandbox with. Only these are checked or pulled, so a request can't
@@ -388,7 +361,7 @@ pub async fn sandbox_image_status(
             .iter()
             .any(|i| i.is_sandboxed());
     Json(ImageStatusResponse {
-        pull: pull_state(&key),
+        pull: runtime.pull_state(&image),
         pull_blocked: pull_blocked(&state, &configured),
         pull_command: runtime.pull_command(&image),
         runtime: runtime.display_name(),
@@ -458,44 +431,28 @@ pub async fn sandbox_image_pull(
         Err(resp) => return resp,
     };
     let key = configured.key(image.clone());
-    let started = claim_pull(&mut PULLS.lock().unwrap_or_else(|e| e.into_inner()), &key);
-    if started {
-        let runtime = configured.runtime;
-        tokio::spawn(async move {
-            let pulled = key.image.clone();
-            let started = std::time::Instant::now();
-            let result = tokio::task::spawn_blocking(move || {
-                ContainerRuntime::from(runtime).pull_image(&pulled)
-            })
-            .await;
-            let outcome = match result {
-                Ok(Ok(())) => PullState::Done,
-                Ok(Err(e)) => PullState::Failed {
-                    error: e.to_string(),
-                },
-                Err(e) => PullState::Failed {
-                    error: format!("pull task failed: {e}"),
-                },
-            };
-            let duration_ms = started.elapsed().as_millis();
-            match &outcome {
-                PullState::Failed { error } => {
-                    tracing::warn!(target: "containers.image", image = %key.image, ok = false, duration_ms, %error, "image pull finished")
-                }
-                _ => {
-                    tracing::info!(target: "containers.image", image = %key.image, ok = true, duration_ms, "image pull finished")
-                }
-            }
+    let runtime = ContainerRuntime::from(configured.runtime);
+    let mut waiters = DASHBOARD_WAITERS.lock().unwrap_or_else(|e| e.into_inner());
+    // Joined under the map's lock, so two POSTs can't both add a waiter to one pull.
+    if !(waiters.contains_key(&key) && runtime.pull_state(&image) == PullState::Running) {
+        // Registered now, so the next status read already sees it running.
+        let waiter = runtime.join_pull(&image);
+        let id = NEXT_DASHBOARD_WAITER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        waiters.insert(key.clone(), id);
+        tokio::task::spawn_blocking(move || {
+            // A pull the dashboard asked for is never cancelled by a create that joined it.
+            let _ = waiter.wait(&tokio_util::sync::CancellationToken::new());
             STATUS
                 .lock()
                 .unwrap_or_else(|e| e.into_inner())
                 .invalidate(&key);
-            PULLS
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .insert(key, outcome);
+            let mut waiters = DASHBOARD_WAITERS.lock().unwrap_or_else(|e| e.into_inner());
+            if waiters.get(&key) == Some(&id) {
+                waiters.remove(&key);
+            }
         });
     }
+    drop(waiters);
     (
         StatusCode::ACCEPTED,
         Json(serde_json::json!({ "image": image, "pull": PullState::Running })),
@@ -828,33 +785,80 @@ mod tests {
         }
     }
 
-    #[test]
-    fn only_one_pull_per_image_and_runtime_runs_at_a_time() {
-        let mut pulls = HashMap::new();
-        let docker = key("Docker", "img");
-        assert!(claim_pull(&mut pulls, &docker));
-        assert!(!claim_pull(&mut pulls, &docker), "already running");
-        assert!(claim_pull(&mut pulls, &key("Docker", "other")), "per image");
-        assert!(claim_pull(&mut pulls, &key("Podman", "img")), "per runtime");
-        for finished in [
-            PullState::Done,
-            PullState::Failed {
-                error: "denied".into(),
-            },
-        ] {
-            pulls.insert(docker.clone(), finished);
-            assert!(
-                claim_pull(&mut pulls, &docker),
-                "a finished pull can be retried"
-            );
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn posts_during_a_running_pull_share_one_dashboard_waiter() {
+        use crate::containers::image_pull;
+        // An image no other test pulls, so its flight and status counter are this test's.
+        const IMAGE: &str = "aoe-test/repeated-pull-posts:latest";
+        let _app = crate::session::test_support::isolate_app_dir();
+        crate::session::update_config(|c| {
+            c.sandbox.allow_image_pull = true;
+            c.sandbox.default_image = IMAGE.into();
+        })
+        .unwrap();
+        let state = crate::server::test_support::build_test_app_state(Vec::new());
+        let runtime = ContainerRuntime::from(ContainerRuntimeName::default());
+        let pull_key = image_pull::PullKey {
+            runtime: runtime.display_name(),
+            image: IMAGE.into(),
+        };
+        let (open, gate) = std::sync::mpsc::channel::<()>();
+        let held = image_pull::join_with(pull_key.clone(), move |_| {
+            let _ = gate.recv();
+            Ok(())
+        });
+        let before = status_generation_for_test(&runtime, IMAGE);
+        for post in 0..5 {
+            let resp = sandbox_image_pull(
+                State(state.clone()),
+                axum::http::HeaderMap::new(),
+                axum::body::Bytes::new(),
+            )
+            .await;
+            let (code, body) = json(resp).await;
+            assert_eq!(code, StatusCode::ACCEPTED, "POST {post}: {body}");
         }
+        assert_eq!(
+            image_pull::waiters_for_test(&pull_key),
+            2,
+            "this test's waiter and one dashboard waiter"
+        );
+        open.send(()).unwrap();
+        held.wait(&tokio_util::sync::CancellationToken::new())
+            .unwrap();
+        let key = runtime_key(&runtime, IMAGE);
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        while DASHBOARD_WAITERS
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .contains_key(&key)
+        {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the dashboard waiter never finished"
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert_eq!(
+            status_generation_for_test(&runtime, IMAGE),
+            before + 1,
+            "the status is invalidated once, when the pull ends"
+        );
     }
 
     #[tokio::test]
     #[serial_test::serial]
     async fn an_unreadable_configuration_refuses_status_and_pull() {
+        // An image no other test pulls, so its pull state can only come from this test.
+        const IMAGE: &str = "aoe-test/unreadable-config:latest";
         let _app = crate::session::test_support::isolate_app_dir();
-        crate::session::update_config(|c| c.sandbox.allow_image_pull = false).unwrap();
+        crate::session::update_config(|c| {
+            c.sandbox.allow_image_pull = false;
+            c.sandbox.default_image = IMAGE.into();
+        })
+        .unwrap();
+        let runtime = ContainerRuntime::from(ContainerRuntimeName::default());
         let dir = crate::session::get_app_dir().unwrap();
         let state = crate::server::test_support::build_test_app_state(Vec::new());
         // (file made unreadable, what it breaks)
@@ -890,12 +894,9 @@ mod tests {
                 StatusCode::INTERNAL_SERVER_ERROR,
                 "{label}"
             );
-            assert!(
-                PULLS
-                    .lock()
-                    .unwrap()
-                    .values()
-                    .all(|p| *p != PullState::Running),
+            assert_eq!(
+                runtime.pull_state(IMAGE),
+                PullState::Idle,
                 "{label}: no pull started"
             );
             std::fs::write(&path, original).unwrap();

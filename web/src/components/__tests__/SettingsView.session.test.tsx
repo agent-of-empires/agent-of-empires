@@ -2,7 +2,7 @@
 // Schema-driven Session and Structured view rows persist through the profile settings path, as in the TUI.
 
 import { beforeEach, describe, expect, it, vi } from "vitest";
-import { fireEvent, render, screen, waitFor } from "@testing-library/react";
+import { fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { SettingsView } from "../SettingsView";
 import * as api from "../../lib/api";
 
@@ -63,17 +63,8 @@ async function renderTab(tab: string, session: Record<string, unknown> = {}, wai
   return view;
 }
 
-/** The switch on the toggle row whose caption is `label`. The caption is plain
- *  text beside the control, not a `<label>`, and several ancestors share its
- *  text, so match the leaf and walk up to the row. Not by position: the section
- *  holds several switches in schema order. */
 function toggleByLabel(container: HTMLElement, label: string): HTMLButtonElement {
-  const caption = Array.from(container.querySelectorAll("div")).find(
-    (el) => el.children.length === 0 && el.textContent === label,
-  );
-  const button = caption?.closest("div.justify-between")?.querySelector("button[role=switch]");
-  expect(button).toBeTruthy();
-  return button as HTMLButtonElement;
+  return within(container).getByRole("switch", { name: label }) as HTMLButtonElement;
 }
 
 function commit(input: HTMLInputElement | HTMLTextAreaElement, value: string) {
@@ -83,9 +74,7 @@ function commit(input: HTMLInputElement | HTMLTextAreaElement, value: string) {
 }
 
 const autoStopInput = (container: HTMLElement) =>
-  Array.from(container.querySelectorAll("label"))
-    .find((l) => l.textContent === "Auto-stop idle sessions (s)")!
-    .parentElement!.querySelector('input[type="number"]') as HTMLInputElement;
+  within(container).getByRole("spinbutton", { name: "Auto-stop idle sessions (s)" }) as HTMLInputElement;
 
 const expectSaved = (patch: Record<string, unknown>) =>
   waitFor(() => expect(vi.mocked(api.updateSettings)).toHaveBeenCalledWith(patch, "main"));
