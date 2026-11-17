@@ -23,6 +23,8 @@ jobs:
   validate:
     name: Validate Version
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
     # Required-reviewer gate. Pauses every release (tag push or manual
     # dispatch) until njbrake approves in the Actions UI. The whole pipeline
     # waits here, so no build compute or release publish runs without sign-off.
@@ -56,6 +58,8 @@ jobs:
 
   build:
     needs: validate
+    permissions:
+      contents: read
     uses: ./.github/workflows/build-binaries.yml
     with:
       # RELEASE_REF; `env` is not available to a reusable workflow call.
@@ -128,6 +132,8 @@ jobs:
     name: Publish to ClawHub
     needs: release
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
     env:
       CLAWHUB_TOKEN: ${{ secrets.CLAWHUB_TOKEN }}
     steps:
