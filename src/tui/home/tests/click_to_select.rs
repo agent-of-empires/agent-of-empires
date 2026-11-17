@@ -521,6 +521,15 @@ fn structured_click_leaves_a_relay_on_another_session() {
         env.view.live_send.is_none(),
         "keystrokes must follow the selection"
     );
+
+    // The next key has to reach the UI: a relay left on the row the user left is
+    // handled before anything else and swallows it, so the help toggle only
+    // lands when the click really ended the relay.
+    env.view.handle_key(key(KeyCode::Char('?')), None);
+    assert!(
+        env.view.show_help,
+        "the next key must reach the UI, not the previous session's relay"
+    );
 }
 
 #[test]
