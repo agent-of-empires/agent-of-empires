@@ -21,6 +21,7 @@ fn discover_user_config(envs: &[(&str, &Path)]) -> Option<Vec<(String, String)>>
             "config",
             scope,
             "--includes",
+            "--null",
             "--get-regexp",
             r"^(core\.sshcommand|credential\.helper)$",
         ])
@@ -33,8 +34,8 @@ fn discover_user_config(envs: &[(&str, &Path)]) -> Option<Vec<(String, String)>>
         }
         found.extend(
             String::from_utf8_lossy(&out.stdout)
-                .lines()
-                .filter_map(|l| l.split_once(' '))
+                .split('\0')
+                .filter_map(|record| record.split_once('\n'))
                 .map(|(k, v)| (k.to_owned(), v.to_owned())),
         );
     }
@@ -493,6 +494,27 @@ mod tests {
         let found =
             discover_user_config(&[("GIT_CONFIG_SYSTEM", none), ("GIT_CONFIG_GLOBAL", &missing)]);
         assert_eq!(found, Some(vec![]));
+    }
+
+    #[test]
+    fn user_config_discovery_keeps_multiline_values() {
+        let tmp = tempfile::tempdir().unwrap();
+        let global = tmp.path().join("gitconfig");
+        std::fs::write(
+            &global,
+            "[credential]\n\thelper = \"!f() {\\n echo x\\n}; f\"\n",
+        )
+        .unwrap();
+        let none = Path::new("/dev/null");
+        let found =
+            discover_user_config(&[("GIT_CONFIG_SYSTEM", none), ("GIT_CONFIG_GLOBAL", &global)]);
+        assert_eq!(
+            found,
+            Some(vec![(
+                "credential.helper".into(),
+                "!f() {\n echo x\n}; f".into()
+            )])
+        );
     }
 
     #[test]
