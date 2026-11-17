@@ -478,8 +478,9 @@ fn tab_enters_live_send_only_for_a_selected_session() {
 #[serial]
 fn tab_opens_the_structured_view_instead_of_live_send() {
     // An ACP session has no pane to relay keystrokes into, so its live form is the
-    // native view: Tab and Enter attach it and never enqueue an EnterLiveSend that
-    // would fail downstream.
+    // native view: Tab attaches it and never enqueues an EnterLiveSend that would
+    // fail downstream. Enter reaches the same view through its own key path, which
+    // the default-attach-mode tests cover.
     let mut env = create_test_env_with_sessions(1);
     env.view.cursor = 0;
     env.view.update_selected();

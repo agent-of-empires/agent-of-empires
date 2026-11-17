@@ -6390,8 +6390,16 @@ impl HomeView {
                     None
                 } else if self.structured_view_selected(&id) {
                     // The live form of a structured row is its native view, which
-                    // only Enter or the live-send chord opens: a click selects it
-                    // and leaves a relay aimed elsewhere alone.
+                    // only Enter or the live-send chord opens: a click selects it.
+                    // A relay aimed at another session ends, so keystrokes follow
+                    // the selection instead of reaching the row left behind.
+                    if self
+                        .live_send
+                        .as_ref()
+                        .is_some_and(|state| state.session_id != id)
+                    {
+                        self.exit_live_send_if_active();
+                    }
                     None
                 } else {
                     self.start_live_send()
@@ -6968,9 +6976,11 @@ impl HomeView {
     /// explicit view-switch call sites that invoke it.
     pub(super) fn maybe_auto_start_live_send(&mut self) -> Option<Action> {
         let id = self.selected_session.clone()?;
-        // The setting starts a relay, and a structured view is not one: a plain
-        // view switch must not open it full-screen.
+        // The setting starts a relay, and a structured view has no pane to relay
+        // into: it must not open the view full-screen, and a relay left running
+        // from a pane view would keep stealing the keys this view shows.
         if self.structured_view_selected(&id) {
+            self.exit_live_send_if_active();
             return None;
         }
         if !self.live_send_on_view_switch(&id) {
