@@ -11,6 +11,22 @@ pub(crate) fn render(text: &str) -> Vec<Line<'static>> {
     MarkdownBuilder::render(text)
 }
 
+/// Parse Markdown for a surface that quotes text rather than formatting it, so
+/// tags the parser reports as HTML stay visible instead of disappearing.
+pub(crate) fn render_keeping_html(text: &str) -> Vec<Line<'static>> {
+    MarkdownBuilder::render_with(text, HtmlMode::Literal)
+}
+
+/// Whether tags the parser reports as HTML are dropped or painted as text.
+#[derive(Clone, Copy, Default, PartialEq, Eq)]
+enum HtmlMode {
+    /// Agent replies are formatted output: markup is meant to style them.
+    #[default]
+    Drop,
+    /// A quoted thought keeps whatever the model wrote.
+    Literal,
+}
+
 /// Parse Markdown and wrap it to the available terminal width.
 pub(crate) fn render_wrapped(text: &str, width: u16) -> Vec<Line<'static>> {
     let mut wrapped = Vec::new();
@@ -42,11 +58,19 @@ struct MarkdownBuilder {
     /// Open-table state: cells of the in-progress row; rows are flushed
     /// pipe-separated (the TUI has no column layout pass).
     table_row: Option<Vec<String>>,
+    html: HtmlMode,
 }
 
 impl MarkdownBuilder {
     fn render(text: &str) -> Vec<Line<'static>> {
-        let mut builder = MarkdownBuilder::default();
+        Self::render_with(text, HtmlMode::Drop)
+    }
+
+    fn render_with(text: &str, html: HtmlMode) -> Vec<Line<'static>> {
+        let mut builder = MarkdownBuilder {
+            html,
+            ..MarkdownBuilder::default()
+        };
         let options =
             pulldown_cmark::Options::ENABLE_STRIKETHROUGH | pulldown_cmark::Options::ENABLE_TABLES;
         for event in pulldown_cmark::Parser::new_ext(text, options) {
@@ -198,6 +222,11 @@ impl MarkdownBuilder {
             // A soft break renders as a real line break, matching how Claude
             // Code prints agent output: a reply formatted one item per line must
             // not collapse into one wrapped paragraph.
+            Event::Html(text) | Event::InlineHtml(text) => {
+                if self.html == HtmlMode::Literal {
+                    self.push_literal(&text);
+                }
+            }
             Event::SoftBreak if !self.in_code_block => self.flush(),
             Event::HardBreak => self.flush(),
             Event::Rule => {
@@ -220,6 +249,19 @@ impl MarkdownBuilder {
         let style = Style::default().add_modifier(self.active_modifier() | extra);
         self.lines
             .push(Line::from(Span::styled(cells.join(" │ "), style)));
+    }
+
+    /// Paint HTML the parser kept as plain dim text, one row per line of it.
+    fn push_literal(&mut self, text: &str) {
+        let mut parts = text.split('\n').peekable();
+        while let Some(part) = parts.next() {
+            if !part.is_empty() {
+                self.push_span(part, Modifier::DIM);
+            }
+            if parts.peek().is_some() {
+                self.flush();
+            }
+        }
     }
 
     /// Split code-block text on newlines, flushing one styled line per

@@ -733,7 +733,16 @@ fn render_transcript(
     let max = total.saturating_sub(text_area.height);
     // Lets a scroll step resolve the stick-to-bottom sentinel first.
     state.last_scroll_max.set(max);
-    let first = state.scroll_offset.min(max);
+    let mut first = state.scroll_offset.get().min(max);
+    // A projection that grew above the reader moved their row; put the content
+    // they were reading back at the top of the pane.
+    if let Some(anchor) = state.take_scroll_anchor() {
+        if let Some(index) = anchor_offset(&text.lines, &anchor, first) {
+            first = index.min(max);
+            state.scroll_offset.set(first);
+        }
+    }
+    state.note_top_line(text.lines.get(first as usize).map(line_text));
     let para = Paragraph::new(text).scroll((first, 0));
     frame.render_widget(para, text_area);
     TranscriptGeometry {
@@ -741,6 +750,33 @@ fn render_transcript(
         first_line: first as usize,
         total_lines: total as usize,
     }
+}
+
+/// The plain content of one rendered row.
+fn line_text(line: &Line<'static>) -> String {
+    line.spans
+        .iter()
+        .map(|span| span.content.as_ref())
+        .collect()
+}
+
+/// Row index of `anchor` closest to `hint`, so a blank or repeated row keeps
+/// the reader near where they were instead of jumping to the first match.
+fn anchor_offset(lines: &[Line<'static>], anchor: &str, hint: u16) -> Option<u16> {
+    let mut best: Option<(u16, usize)> = None;
+    for (index, line) in lines.iter().enumerate() {
+        if index > u16::MAX as usize {
+            break;
+        }
+        if line_text(line) != anchor {
+            continue;
+        }
+        let distance = (index as u16).abs_diff(hint);
+        if best.is_none_or(|(closest, _)| distance < closest) {
+            best = Some((distance, index));
+        }
+    }
+    best.map(|(_, index)| index as u16)
 }
 
 const METADATA_CARD_MAX_WIDTH: u16 = 72;
@@ -1251,7 +1287,7 @@ fn render_status(
             Style::default().fg(theme.error),
         ));
     }
-    if state.scroll_offset != u16::MAX {
+    if state.scroll_offset.get() != u16::MAX {
         spans.push(Span::styled(
             " · G latest ",
             Style::default().fg(theme.hint),
@@ -1787,7 +1823,9 @@ fn subagent_badge(state: SubagentState, theme: &Theme) -> Span<'static> {
 
 /// A thought in full, dimmed so it never competes with the agent's answer.
 fn thinking_lines(text: &str, theme: &Theme) -> Vec<Line<'static>> {
-    let body = crate::tui::markdown::render(text);
+    // A thought is quoted, not formatted: markup the parser would swallow as
+    // HTML still reads as the model wrote it.
+    let body = crate::tui::markdown::render_keeping_html(text);
     if text.trim().is_empty() || body.is_empty() {
         return vec![Line::from(Span::styled(
             "· Thinking: …",
@@ -2480,6 +2518,20 @@ mod tests {
         render_rows(state, w, h, true).concat()
     }
 
+    /// Render once and report where the transcript landed, so a test can check
+    /// the row the pane starts on.
+    fn render_geometry(state: &StructuredViewState, w: u16, h: u16) -> TranscriptGeometry {
+        let theme = crate::tui::styles::load_theme_with_mode("empire", false);
+        let mut terminal = Terminal::new(TestBackend::new(w, h)).expect("terminal");
+        let mut geometry = None;
+        terminal
+            .draw(|f| {
+                geometry = Some(render(f, f.area(), &theme, state, true));
+            })
+            .expect("draw");
+        geometry.expect("geometry")
+    }
+
     /// Server transcript rows folded from events, as the daemon ships them.
     fn server_rows(events: &[Event]) -> Vec<TranscriptRow> {
         let mut m = crate::acp::transcript::TranscriptModel::new();
@@ -3029,6 +3081,73 @@ mod tests {
         assert!(
             body.contains(&long),
             "the full thought, not a preview: {body:?}"
+        );
+    }
+
+    /// A thought is a quote, not formatted output: markup inside it must not be
+    /// swallowed by the parser and leave the thought looking empty.
+    #[test]
+    fn an_expanded_thought_keeps_markup_it_quotes() {
+        let thought = |text: &str, id: &str| Event::AgentThoughtChunk {
+            text: text.into(),
+            message_id: Some(id.into()),
+        };
+        let mut t = AcpTranscript::new("s-1");
+        t.server_rows = server_rows(&[thought("<div>\nCompare both alternatives.\n</div>", "t-a")]);
+        let body = joined(&transcript_lines(
+            &t,
+            &Theme::default(),
+            None,
+            true,
+            ToolOutputMode::Compact,
+        ));
+        assert!(body.contains("Compare both alternatives."), "{body:?}");
+    }
+
+    /// Expanding a thought above the reader grows the transcript under them, so
+    /// the row they were reading has to stay at the top of the pane.
+    #[test]
+    fn expanding_a_thought_keeps_the_reader_on_their_row() {
+        let chunk = |text: &str, id: &str| Event::AgentMessageChunk {
+            text: text.into(),
+            message_id: Some(id.into()),
+        };
+        let thought = |text: &str, id: &str| Event::AgentThoughtChunk {
+            text: text.into(),
+            message_id: Some(id.into()),
+        };
+        let mut state = test_state();
+        let mut events = vec![thought(
+            "first thought\nweighing the options\nchecking the second one\nsettling on one",
+            "t-a",
+        )];
+        for index in 0..12 {
+            events.push(chunk(
+                &format!("reply number {index}"),
+                &format!("m-{index}"),
+            ));
+        }
+        state.transcript.server_rows = server_rows(&events);
+
+        // Scroll back into the replies, then expand the thought above them. The
+        // projection separates rows with blanks, so land on a reply rather than
+        // one of them.
+        state.scroll_offset.set(2);
+        let before = render_geometry(&state, 60, 20);
+        let top_before = render_rows(&state, 60, 20, true)[before.text_area.y as usize]
+            .trim()
+            .to_string();
+        assert!(!top_before.is_empty(), "the pane must start on a row");
+
+        state.anchor_scroll_to_top_line();
+        state.show_full_thinking = true;
+        let after = render_geometry(&state, 60, 20);
+        let top_after = render_rows(&state, 60, 20, true)[after.text_area.y as usize]
+            .trim()
+            .to_string();
+        assert_eq!(
+            top_after, top_before,
+            "the reader keeps the row they were on"
         );
     }
 
