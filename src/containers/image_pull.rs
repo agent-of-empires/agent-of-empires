@@ -253,13 +253,6 @@ pub(crate) fn state(key: &PullKey) -> PullState {
 }
 
 #[cfg(test)]
-pub(crate) fn any_running() -> bool {
-    lock(&FLIGHTS)
-        .values()
-        .any(|entry| matches!(entry, Entry::Running(_)))
-}
-
-#[cfg(test)]
 mod tests {
     use super::*;
     use std::sync::atomic::{AtomicUsize, Ordering};

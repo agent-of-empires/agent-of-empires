@@ -772,8 +772,15 @@ mod tests {
     #[tokio::test]
     #[serial_test::serial]
     async fn an_unreadable_configuration_refuses_status_and_pull() {
+        // An image no other test pulls, so its pull state can only come from this test.
+        const IMAGE: &str = "aoe-test/unreadable-config:latest";
         let _app = crate::session::test_support::isolate_app_dir();
-        crate::session::update_config(|c| c.sandbox.allow_image_pull = false).unwrap();
+        crate::session::update_config(|c| {
+            c.sandbox.allow_image_pull = false;
+            c.sandbox.default_image = IMAGE.into();
+        })
+        .unwrap();
+        let runtime = ContainerRuntime::from(ContainerRuntimeName::default());
         let dir = crate::session::get_app_dir().unwrap();
         let state = crate::server::test_support::build_test_app_state(Vec::new());
         // (file made unreadable, what it breaks)
@@ -809,8 +816,9 @@ mod tests {
                 StatusCode::INTERNAL_SERVER_ERROR,
                 "{label}"
             );
-            assert!(
-                !crate::containers::image_pull::any_running(),
+            assert_eq!(
+                runtime.pull_state(IMAGE),
+                PullState::Idle,
                 "{label}: no pull started"
             );
             std::fs::write(&path, original).unwrap();
