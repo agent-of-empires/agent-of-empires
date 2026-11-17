@@ -72,8 +72,30 @@ const STAGING_SANDBOX: &str = r#"
     (ipc-posix-name "apple.shm.notification_center"))
 "#;
 
+pub(super) fn prove_staging_host_mount_absent(mount: &std::path::Path) -> anyhow::Result<()> {
+    anyhow::ensure!(
+        staging_mount_strings(&staging_statfs(mount)?)?.0 != mount,
+        "plugin staging path remains mounted"
+    );
+    anyhow::ensure!(
+        std::fs::symlink_metadata(mount.with_extension("dmg"))
+            .is_err_and(|error| error.kind() == std::io::ErrorKind::NotFound),
+        "plugin staging image remains present or its absence is unknown"
+    );
+    Ok(())
+}
+
 impl StagingVolume {
+    #[cfg(test)]
     pub(super) fn create(private_mount_path: &std::path::Path, limit: u64) -> anyhow::Result<Self> {
+        Self::create_recorded(private_mount_path, limit, |_| Ok(tempfile::tempfile()?))
+    }
+
+    pub(super) fn create_recorded(
+        private_mount_path: &std::path::Path,
+        limit: u64,
+        mut record: impl FnMut(super::StagingCustody) -> anyhow::Result<std::fs::File>,
+    ) -> anyhow::Result<Self> {
         use std::os::unix::fs::{MetadataExt as _, OpenOptionsExt as _};
         #[cfg(test)]
         let fail_attach_spawn = FAIL_STAGING_ATTACH_SPAWN.with(|fail| fail.replace(false));
@@ -155,6 +177,9 @@ impl StagingVolume {
             .arg(&image);
         let mut created = false;
         let mut attachment_may_exist = false;
+        // A disk image can outlive its creator and its daemon. Until a future
+        // native inventory proves ownership and detach, retain crash evidence.
+        record(super::StagingCustody::Uncertain)?;
         let result: anyhow::Result<Self> = (|| {
             staging_tool(&mut create)?;
             created = true;
@@ -291,6 +316,10 @@ impl StagingVolume {
 
     pub(super) fn root(&self) -> &std::path::Path {
         &self.root
+    }
+
+    pub(super) fn limit(&self) -> u64 {
+        self.limit
     }
 
     pub(super) fn git_command(&self) -> Command {

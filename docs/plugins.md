@@ -85,6 +85,9 @@ Daemon runtime workers. Started blocking work owns staging and mutation exclusio
 until it finishes, even when its observer disappears. Local staging rejects
 symlinks and special files through descriptor-anchored, nonblocking reads;
 `.git` is excluded, while empty directories and executable file modes survive.
+Local paths use an ordinary owned staging directory, without the remote size,
+entry-count or quota-backend requirements. The copied snapshot and publication
+checks still apply.
 Explicit CLI updates reapply even unchanged sources, so they can restore missing
 plugin files. They use the preview fingerprint and preserve the enabled state.
 
@@ -149,7 +152,7 @@ and owned workers have physically exited, then restore the intended installation
 Remove any marker only after recovery, then restart the Daemon to release
 retained in-process ownership. If marker persistence failed, a new Daemon cannot
 reconstruct that memory fence: complete manual recovery before restarting.
-Restart alone is not recovery.
+A restart does not clear unproven mutation ownership.
 Tree publication and target config/lock entries share one rollback boundary.
 The previous tree stays backed up until both metadata writes commit. Restoration
 preserves the prior enabled, source, dev, grant, dismissal and settings values
@@ -161,31 +164,51 @@ that would replace a file already in the source tree, or that is a symlink,
 hardlink or special file, is rejected so the disclosed manifest and tree match
 what gets installed.
 
-Preparation uses a private filesystem limited to **1 GiB** before consent.
-Preview and apply operations share exclusion, so concurrent previews cannot
-multiply this allowance. Clone data, downloaded archives and extracted files
-share the same volume. Streamed downloads and decompressed archive data also
-have byte limits; copies and extracted trees allow at most 65,536 entries,
-including implicit directories. Archive metadata read ahead by the tar parser
-has a separate 1 MiB limit.
-An unavailable quota backend fails preparation rather than using an unbounded
-directory. These limits can reject unusually large plugins.
-Linux requires unprivileged user namespaces, `mount`, `unshare`, `nsenter`
-and Bubblewrap. macOS uses `hdiutil` and `sandbox-exec`. Restricted hosts that
-cannot provide these mechanisms refuse preparation.
+Remote GitHub preparation uses a private filesystem with a **1 GiB** ceiling
+before consent. Preview and apply operations share exclusion, so concurrent
+previews cannot multiply this allowance. Clone data, downloaded archives and
+extracted files share the same volume. Streamed downloads and decompressed
+archive data also have byte limits; remote source trees and extracted assets
+allow at most 65,536 entries, including implicit directories. Archive metadata
+read ahead by the tar parser has a separate 1 MiB limit. Standard branches and
+tags clone shallow-first; other references may need more history.
+
+Linux uses RAM/swap-backed tmpfs, charged to the process's memory cgroup.
+Its data ceiling is reduced to at most one quarter of available RAM or remaining
+visible cgroup memory, whichever is lower, rounded down to whole pages.
+The inode budget reserves 1,024 entries beyond the source-entry ceiling when
+memory permits, and is reduced on memory-constrained hosts. These are snapshots,
+not memory reservations: concurrent pressure or Git allocations can still exhaust
+memory. The filesystem allowance is not a total process-memory limit.
+
+An unavailable quota backend fails remote preparation rather than using an
+unbounded or periodically monitored directory. These limits can reject large
+plugins. Linux requires readable memory accounting, unprivileged user/mount/PID
+namespaces, `mount`, `unshare`, `nsenter` and Bubblewrap. macOS uses a fixed-size
+disk image through `hdiutil` and `sandbox-exec`. Restricted hosts that cannot
+provide these mechanisms refuse remote preparation and reference checks.
 Git preparation cannot use host Unix sockets; credential helpers that require
 an SSH agent or desktop keyring may fail even when file-based credentials work.
-The filesystem allowance does not bound Git's memory use or the memory needed
-to hash a source tree.
 
 After consent, publication copies and verifies the prepared tree on the
 installation filesystem before replacing an existing plugin. This copy and
 approved build outputs are outside the pre-consent allowance. An uncertain
 mount or cleanup outcome requires manual recovery, not an unbounded retry.
-The `<app_dir>/.plugin-staging-active` marker records an unfinished mounted
-stage. After a crash, do not remove it or delete its staging directory until
-its writers have exited and any mounted image has been detached.
-Then remove the retained stage and marker before restarting the Daemon.
+The `<app_dir>/.plugin-staging-active` journal records native staging ownership.
+Startup and worker admission can retire an abandoned pre-consent journal only
+after proving its recorded owners, PID namespace and native supervisor groups
+have exited and its original host mountpoint is unchanged. This does not erase
+other recovery evidence. Partial journals, legacy markers and interrupted
+publication remain fenced; a started macOS image operation also requires manual
+inspection when ownership is uncertain.
+Same-boot Linux recovery requires the original PID namespace. After a reboot,
+recovery requires a matching, nonempty machine identity; missing or foreign
+identity leaves the journal fenced.
+
+For manual recovery, stop the Daemon and verify that writers have exited and any
+mounted image has been detached before deleting its staging directory or journal.
+Legacy markers have no reconstructible process ownership and remain preserved
+with `.plugin-recovery-required` by the data migration.
 
 A plugin lands in `<app_dir>/plugins/<id>/`. GitHub sources are pinned to an exact commit and release-binary workers are downloaded for your platform; local sources must supply their own executable. Set `AOE_GITHUB_CLONE_BASE` to install from a GitHub Enterprise host. Resolved versions (commit, manifest hash, release asset) live in `<app_dir>/plugins.lock`, so an install is reproducible.
 

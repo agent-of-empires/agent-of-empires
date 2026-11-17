@@ -80,7 +80,7 @@ pub(super) fn log_recovery<T>(result: &Result<T>) {
     if let Err(error) = result {
         let marker = match crate::session::get_app_dir() {
             Ok(root) => {
-                let marker = root.join(".plugin-recovery-required");
+                let marker = root.join(RECOVERY_MARKER);
                 RECOVERY_STATE.lock().roots.insert(root);
                 Some(marker)
             }
@@ -109,8 +109,9 @@ pub(super) fn log_recovery<T>(result: &Result<T>) {
     }
 }
 
-const OPERATION_LOCK: &str = ".plugin-operation.lock";
-pub(super) const STAGING_MARKER: &str = ".plugin-staging-active";
+pub(crate) const OPERATION_LOCK: &str = ".plugin-operation.lock";
+pub(crate) const STAGING_MARKER: &str = ".plugin-staging-active";
+pub(crate) const RECOVERY_MARKER: &str = ".plugin-recovery-required";
 static LIVE_STAGING: parking_lot::Mutex<BTreeSet<PathBuf>> =
     parking_lot::Mutex::new(BTreeSet::new());
 
@@ -119,30 +120,300 @@ fn register_staging(marker: &Path) {
     LIVE_STAGING.lock().insert(marker.to_path_buf());
 }
 
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct StagingEvidence {
+    schema: u32,
+    owner_pid: u32,
+    owner_birth: crate::process::ProcessBirthIdentity,
+    #[cfg(target_os = "linux")]
+    owner_scope: crate::process::StagingRecoveryScope,
+    mount: PathBuf,
+    directory_identity: (u64, u64),
+    mount_identity: (u64, u64),
+    custody: crate::process::StagingCustody,
+}
+
+fn staging_directory_identity(directory: &crate::session::AnchoredDir) -> Result<(u64, u64)> {
+    let (device, inode) = directory.identity()?;
+    #[cfg(target_os = "macos")]
+    let device = device as u64;
+    Ok((device, inode))
+}
+
+fn staging_evidence(
+    root: &crate::session::AnchoredDir,
+) -> Result<(StagingEvidence, Vec<crate::process::StagingProcess>)> {
+    use std::io::Read as _;
+    let file = root
+        .open_regular(Path::new(STAGING_MARKER), 1024 * 1024)?
+        .context("plugin staging evidence is missing or not a bounded regular file")?;
+    crate::process::validate_recovery_file(&file)?;
+    let mut bytes = Vec::new();
+    file.take(1024 * 1024 + 1).read_to_end(&mut bytes)?;
+    anyhow::ensure!(
+        bytes.len() <= 1024 * 1024,
+        "plugin staging journal exceeds its bound"
+    );
+    anyhow::ensure!(
+        bytes.last() == Some(&b'\n'),
+        "incomplete plugin staging journal"
+    );
+    let mut lines = bytes[..bytes.len() - 1].split(|byte| *byte == b'\n');
+    let mut evidence: StagingEvidence =
+        serde_json::from_slice(lines.next().context("missing plugin staging header")?)
+            .context("plugin staging evidence has no complete ownership proof")?;
+    anyhow::ensure!(
+        evidence.schema == 1,
+        "unsupported plugin staging evidence schema"
+    );
+    anyhow::ensure!(
+        evidence.owner_pid > 1
+            && evidence.owner_pid <= i32::MAX as u32
+            && !evidence.owner_birth.boot_id.is_empty()
+            && !evidence.owner_birth.start_id.is_empty(),
+        "incomplete staging owner identity"
+    );
+    uuid::Uuid::parse_str(&evidence.owner_birth.boot_id)
+        .context("invalid staging owner boot identity")?;
+    #[cfg(target_os = "linux")]
+    anyhow::ensure!(
+        evidence
+            .owner_birth
+            .start_id
+            .strip_prefix("proc:")
+            .is_some_and(|start| start.parse::<u64>().is_ok_and(|start| start > 0)),
+        "invalid staging owner birth identity"
+    );
+    #[cfg(target_os = "macos")]
+    anyhow::ensure!(
+        evidence
+            .owner_birth
+            .start_id
+            .strip_prefix("audit:")
+            .is_some_and(
+                |token| token.len() == 64 && token.bytes().all(|byte| byte.is_ascii_hexdigit())
+            ),
+        "invalid staging owner birth identity"
+    );
+    let mut writers = Vec::new();
+    for line in lines {
+        let mut fields = std::str::from_utf8(line)?.split_ascii_whitespace();
+        if line == b"U" {
+            evidence.custody = crate::process::StagingCustody::Uncertain;
+            continue;
+        }
+        anyhow::ensure!(fields.next() == Some("W"), "unknown staging journal record");
+        let pid: u32 = fields
+            .next()
+            .context("missing staging writer PID")?
+            .parse()?;
+        let start: u64 = fields
+            .next()
+            .context("missing staging writer birth")?
+            .parse()?;
+        anyhow::ensure!(
+            pid > 1 && start > 0 && fields.next().is_none(),
+            "invalid staging writer identity"
+        );
+        writers.push(crate::process::StagingProcess {
+            pid,
+            birth: crate::process::ProcessBirthIdentity {
+                boot_id: evidence.owner_birth.boot_id.clone(),
+                start_id: format!("proc:{start}"),
+            },
+        });
+    }
+    Ok((evidence, writers))
+}
+
+pub(crate) fn record_staging_custody(
+    mount: &Path,
+    custody: crate::process::StagingCustody,
+) -> Result<std::fs::File> {
+    let app = mount
+        .parent()
+        .and_then(Path::parent)
+        .and_then(Path::parent)
+        .context("staging mount has no application root")?;
+    let root = crate::session::AnchoredDir::open(app)?;
+    let (mut evidence, writers) = staging_evidence(&root)?;
+    anyhow::ensure!(
+        writers.is_empty(),
+        "staging custody cannot replace admitted writers"
+    );
+    anyhow::ensure!(
+        evidence.owner_pid == std::process::id()
+            && crate::process::process_birth_identity(evidence.owner_pid)?.as_ref()
+                == Some(&evidence.owner_birth)
+            && app.join(&evidence.mount) == mount,
+        "plugin staging custody does not belong to this process"
+    );
+    evidence.custody = custody;
+    let mut bytes = serde_json::to_vec(&evidence)?;
+    bytes.push(b'\n');
+    root.bind_file(std::ffi::OsStr::new(STAGING_MARKER))?
+        .replace(&bytes)?;
+    root.sync()
+        .context("persisting staging custody replacement")?;
+    open_staging_journal(&root, app)
+}
+
+fn open_staging_journal(root: &crate::session::AnchoredDir, app: &Path) -> Result<std::fs::File> {
+    use nix::fcntl::{open, openat, OFlag};
+    use nix::sys::stat::Mode;
+    use std::os::unix::fs::MetadataExt as _;
+    let parent = open(
+        app,
+        OFlag::O_RDONLY | OFlag::O_DIRECTORY | OFlag::O_NOFOLLOW | OFlag::O_CLOEXEC,
+        Mode::empty(),
+    )?;
+    let fd = openat(
+        &parent,
+        STAGING_MARKER,
+        OFlag::O_WRONLY | OFlag::O_APPEND | OFlag::O_NOFOLLOW | OFlag::O_CLOEXEC,
+        Mode::empty(),
+    )?;
+    let journal = std::fs::File::from(fd);
+    crate::process::validate_recovery_file(&journal)?;
+    let observed = root
+        .open_regular(Path::new(STAGING_MARKER), 1024 * 1024)?
+        .context("staging journal changed before opening")?;
+    anyhow::ensure!(
+        (journal.metadata()?.dev(), journal.metadata()?.ino())
+            == (observed.metadata()?.dev(), observed.metadata()?.ino()),
+        "staging journal identity changed"
+    );
+    Ok(journal)
+}
+
+pub(super) fn mark_staging_publication(marker: &Path) -> Result<()> {
+    let app = marker
+        .parent()
+        .context("staging marker has no application root")?;
+    let root = crate::session::AnchoredDir::open(app)?;
+    let (evidence, _) = staging_evidence(&root)?;
+    anyhow::ensure!(
+        evidence.owner_pid == std::process::id()
+            && crate::process::process_birth_identity(evidence.owner_pid)?.as_ref()
+                == Some(&evidence.owner_birth),
+        "staging publication owner changed"
+    );
+    let mut journal = open_staging_journal(&root, app)?;
+    journal.write_all(b"U\n")?;
+    journal.sync_all()?;
+    Ok(())
+}
+
+fn recover_staging(root_path: &Path) -> Result<()> {
+    let root = crate::session::AnchoredDir::open(root_path)?;
+    let marker_identity = root
+        .entry_stat(Path::new(STAGING_MARKER))?
+        .context("staging marker disappeared before recovery")?;
+    let (evidence, writers) = staging_evidence(&root)?;
+    let boot = crate::process::boot_id().context("plugin staging boot identity unavailable")?;
+    let previous_boot = boot != evidence.owner_birth.boot_id;
+    #[cfg(target_os = "linux")]
+    evidence.owner_scope.prove_current(previous_boot)?;
+    if let crate::process::StagingCustody::LinuxPidNamespace { holder, init } = &evidence.custody {
+        anyhow::ensure!(
+            holder.birth.boot_id == evidence.owner_birth.boot_id
+                && init.birth.boot_id == evidence.owner_birth.boot_id,
+            "staging namespace and owner boot identities differ"
+        );
+    }
+    if !previous_boot {
+        match crate::process::process_birth_identity(evidence.owner_pid)? {
+            Some(current) if current != evidence.owner_birth => {
+                bail!("plugin staging owner PID was reused; native resource inventory is required")
+            }
+            Some(_) if crate::process::process_executing(evidence.owner_pid)? => {
+                bail!("plugin staging owner is still live")
+            }
+            _ => {}
+        }
+    }
+    crate::process::prove_staging_custody_gone(&evidence.custody, &writers, previous_boot)?;
+    let mut components = evidence.mount.components();
+    anyhow::ensure!(
+        components
+            .next()
+            .is_some_and(|part| part.as_os_str() == "plugins")
+            && components.next().is_some_and(|part| part
+                .as_os_str()
+                .to_str()
+                .is_some_and(|name| name.starts_with(".staging-")))
+            && components
+                .next()
+                .is_some_and(|part| part.as_os_str() == "volume")
+            && components.next().is_none(),
+        "plugin staging evidence names an unexpected mount"
+    );
+    let directory = evidence
+        .mount
+        .parent()
+        .context("missing staging directory")?;
+    let anchored = root.child(directory)?;
+    let mount = anchored.child(Path::new("volume"))?;
+    anyhow::ensure!(
+        staging_directory_identity(&anchored)? == evidence.directory_identity
+            && staging_directory_identity(&mount)? == evidence.mount_identity
+            && mount.read_dir_complete(Path::new(""), 1)?.is_empty()
+            && anchored.read_dir_complete(Path::new(""), 2)?
+                == [std::ffi::OsString::from("volume")],
+        "plugin staging mount or directory identity changed"
+    );
+    crate::process::prove_staging_host_mount_absent(&root_path.join(&evidence.mount))?;
+    // Kernel resources are gone. Leave the empty anchored directories untouched;
+    // marker retirement must not gain recursive deletion authority.
+    let current = root
+        .entry_stat(Path::new(STAGING_MARKER))?
+        .context("staging marker disappeared during recovery")?;
+    anyhow::ensure!(
+        current.st_dev == marker_identity.st_dev
+            && current.st_ino == marker_identity.st_ino
+            && current.st_mode == marker_identity.st_mode,
+        "staging marker identity changed during recovery"
+    );
+    root.remove_file(Path::new(STAGING_MARKER))?;
+    root.sync()?;
+    Ok(())
+}
+
 pub(super) fn create_staging_marker(marker: &Path, mount: &Path) -> Result<()> {
     // Readers hold this same lock while inspecting evidence, so an acquisition
     // cannot briefly appear to belong to a crashed process.
     let mut live = LIVE_STAGING.lock();
-    let mut options = std::fs::OpenOptions::new();
-    options.write(true).create_new(true);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt;
-        options.mode(0o600);
-    }
-    let mut evidence = options
-        .open(marker)
-        .context("recording plugin staging acquisition")?;
     let parent = marker
         .parent()
         .context("plugin staging marker has no parent")?;
+    let root = crate::session::AnchoredDir::open(parent)?;
+    let relative = mount.strip_prefix(parent)?;
+    let directory = relative
+        .parent()
+        .context("staging mount has no directory")?;
+    let evidence_record = StagingEvidence {
+        schema: 1,
+        owner_pid: std::process::id(),
+        owner_birth: crate::process::process_birth_identity(std::process::id())?
+            .context("plugin staging owner birth identity unavailable")?,
+        #[cfg(target_os = "linux")]
+        owner_scope: crate::process::StagingRecoveryScope::capture()?,
+        mount: relative.to_path_buf(),
+        directory_identity: staging_directory_identity(&root.child(directory)?)?,
+        mount_identity: staging_directory_identity(&root.child(relative)?)?,
+        custody: crate::process::StagingCustody::Prepared,
+    };
+    let mut evidence = root
+        .create_new_regular(Path::new(STAGING_MARKER))?
+        .context("plugin staging evidence already exists")?;
     let persist = (|| -> Result<()> {
-        writeln!(evidence, "Plugin staging acquisition started; verify the volume and its writers before removing this marker.")?;
-        writeln!(evidence, "mount={}", mount.display())?;
+        serde_json::to_writer(&mut evidence, &evidence_record)?;
+        evidence.write_all(b"\n")?;
         evidence
             .sync_all()
             .context("persisting plugin staging marker")?;
-        std::fs::File::open(parent)?.sync_all()?;
+        root.sync()?;
         Ok(())
     })();
     if let Err(error) = persist {
@@ -166,7 +437,24 @@ pub(super) fn unregister_staging(marker: &Path) {
     LIVE_STAGING.lock().remove(marker);
 }
 
+pub(crate) fn recover_stale_staging() -> Result<()> {
+    let root = crate::session::get_app_dir()?;
+    let live = LIVE_STAGING.lock();
+    if live.contains(&root.join(STAGING_MARKER)) {
+        return Ok(());
+    }
+    match std::fs::symlink_metadata(root.join(STAGING_MARKER)) {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(error).context("inspecting plugin staging evidence"),
+        Ok(_) => {}
+    }
+    let _operation = crate::session::try_acquire_storage_flock(&root, OPERATION_LOCK)?
+        .context("another plugin operation owns staging recovery")?;
+    recover_staging(&root)
+}
+
 pub(crate) fn check_recovery_evidence() -> Result<()> {
+    recover_stale_staging()?;
     check_recovery_evidence_inner(true)
 }
 
@@ -180,7 +468,7 @@ fn check_recovery_evidence_inner(allow_live_staging: bool) -> Result<()> {
         bail!("plugin recovery is required in this Daemon process; stop the Daemon, verify owned commands have exited and restore the installation before restarting");
     }
     let live = LIVE_STAGING.lock();
-    for name in [".plugin-recovery-required", STAGING_MARKER] {
+    for name in [RECOVERY_MARKER, STAGING_MARKER] {
         let evidence = root.join(name);
         if name == STAGING_MARKER && allow_live_staging && live.contains(&evidence) {
             continue;
@@ -204,6 +492,11 @@ pub(crate) fn begin_operation() -> Result<Arc<StorageFlock>> {
         .ok_or_else(|| {
             anyhow!("another plugin operation is running; inspect its outcome before retrying")
         })?;
+    if !LIVE_STAGING.lock().contains(&root.join(STAGING_MARKER))
+        && std::fs::symlink_metadata(root.join(STAGING_MARKER)).is_ok()
+    {
+        recover_staging(&root).context("recovering abandoned plugin staging")?;
+    }
     check_recovery_evidence_inner(false)?;
     Ok(lock)
 }
@@ -1832,6 +2125,7 @@ fn with_publication<T>(
     final_dir: &Path,
     publish: impl FnOnce(&Path) -> Result<T>,
 ) -> Result<T> {
+    fetched.begin_publication()?;
     let parent = final_dir
         .parent()
         .context("plugin destination has no parent")?;
@@ -2160,6 +2454,371 @@ mod tests {
     use crate::session::test_support::isolate_app_dir;
     use aoe_plugin_api::UiSlot;
     use serial_test::serial;
+
+    #[test]
+    #[ignore = "subprocess fixture for staging crash recovery"]
+    fn staging_crash_child() {
+        use std::io::{Read as _, Write as _};
+        use std::os::unix::fs::DirBuilderExt as _;
+        use std::os::unix::net::UnixStream;
+        let Some(root) = std::env::var_os("AOE_STAGING_CRASH_ROOT") else {
+            return;
+        };
+        let root = PathBuf::from(root);
+        let phase = std::env::var("AOE_STAGING_CRASH_PHASE").unwrap();
+        #[cfg(target_os = "linux")]
+        if phase == "foreign" {
+            let error = recover_staging(&root).unwrap_err();
+            assert!(
+                error.to_string().contains("different PID namespace"),
+                "{error:#}"
+            );
+            assert!(root.join(STAGING_MARKER).exists());
+            return;
+        }
+        let _operation = crate::session::try_acquire_storage_flock(&root, OPERATION_LOCK)
+            .unwrap()
+            .unwrap();
+        let mount = root.join("plugins/.staging-crash/volume");
+        std::fs::DirBuilder::new()
+            .recursive(true)
+            .mode(0o700)
+            .create(&mount)
+            .unwrap();
+        create_staging_marker(&root.join(STAGING_MARKER), &mount).unwrap();
+        let mut volume = (phase != "prepared")
+            .then(|| crate::process::StagingVolume::create(&mount, 1024 * 1024).unwrap());
+        let mut writer = if phase == "writers" {
+            let mut command = volume.as_ref().unwrap().git_command();
+            command.args([
+                "-c",
+                "alias.hold=!exec /bin/sh -c 'exec 3>\"$TMPDIR/writer\"; printf x >&3; printf W; while :; do :; done'",
+                "hold",
+            ]);
+            let mut child = command.spawn().unwrap();
+            let mut ready = [0];
+            child
+                .stdout
+                .as_mut()
+                .unwrap()
+                .read_exact(&mut ready)
+                .unwrap();
+            assert_eq!(ready, *b"W");
+            Some(child)
+        } else {
+            None
+        };
+        let mut control =
+            UnixStream::connect(std::env::var_os("AOE_STAGING_CRASH_CONTROL").unwrap()).unwrap();
+        control.write_all(b"R").unwrap();
+        let mut release = [0];
+        let _ = control.read(&mut release);
+        if let Some(writer) = &mut writer {
+            let _ = writer.kill();
+            let _ = writer.wait();
+        }
+        if let Some(volume) = &mut volume {
+            volume.close().unwrap();
+        }
+    }
+
+    fn crash_staging_and_recover(phase: &str) {
+        use std::io::Read as _;
+        use std::os::unix::net::UnixListener;
+        use std::time::{Duration, Instant};
+        struct Daemon(std::process::Child);
+        impl Drop for Daemon {
+            fn drop(&mut self) {
+                let _ = self.0.kill();
+                let _ = self.0.wait();
+            }
+        }
+        let _home = isolate_app_dir();
+        let root = crate::session::get_app_dir().unwrap();
+        let control_dir = tempfile::tempdir_in("/tmp").unwrap();
+        let socket = control_dir.path().join("control");
+        let listener = UnixListener::bind(&socket).unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let mut daemon = Daemon(
+            std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "plugin::install::tests::staging_crash_child",
+                    "--ignored",
+                    "--nocapture",
+                ])
+                .env("AOE_STAGING_CRASH_ROOT", &root)
+                .env("AOE_STAGING_CRASH_PHASE", phase)
+                .env("AOE_STAGING_CRASH_CONTROL", &socket)
+                .stdout(Stdio::null())
+                .spawn()
+                .unwrap(),
+        );
+        let deadline = Instant::now() + Duration::from_secs(15);
+        let mut control = loop {
+            match listener.accept() {
+                Ok((control, _)) => break control,
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                    assert!(
+                        daemon.0.try_wait().unwrap().is_none(),
+                        "staging daemon exited before its phase gate"
+                    );
+                    assert!(
+                        Instant::now() < deadline,
+                        "staging daemon did not reach phase gate"
+                    );
+                    std::thread::yield_now();
+                }
+                Err(error) => panic!("staging control failed: {error}"),
+            }
+        };
+        control
+            .set_read_timeout(Some(Duration::from_secs(15)))
+            .unwrap();
+        let mut ready = [0];
+        control.read_exact(&mut ready).unwrap();
+        assert_eq!(ready, *b"R");
+        assert!(
+            recover_stale_staging().is_err(),
+            "live operation exclusion must hold"
+        );
+        assert!(
+            recover_staging(&root).is_err(),
+            "live owner must retain staging"
+        );
+        assert!(begin_operation().is_err());
+        let anchored = crate::session::AnchoredDir::open(&root).unwrap();
+        let original = anchored
+            .read_regular(Path::new(STAGING_MARKER), 1024 * 1024)
+            .unwrap()
+            .unwrap();
+
+        #[cfg(target_os = "linux")]
+        if phase == "writers" {
+            let (evidence, writers) = staging_evidence(&anchored).unwrap();
+            let crate::process::StagingCustody::LinuxPidNamespace { init, .. } = evidence.custody
+            else {
+                panic!("missing PID namespace custody")
+            };
+            let members =
+                crate::process::runner_group_identities(writers.last().unwrap().pid).unwrap();
+            assert!(
+                members.len() >= 2,
+                "writer must have entered its PID namespace"
+            );
+            let handles: Vec<_> = members
+                .iter()
+                .map(|member| {
+                    crate::process::CapturedProcess::capture(
+                        member.pid,
+                        &crate::process::ProcessBirthIdentity {
+                            boot_id: init.birth.boot_id.clone(),
+                            start_id: member.start_id.clone(),
+                        },
+                    )
+                    .unwrap()
+                    .unwrap()
+                })
+                .collect();
+            let init_handle = crate::process::CapturedProcess::capture(init.pid, &init.birth)
+                .unwrap()
+                .unwrap();
+            init_handle.signal(libc::SIGKILL).unwrap();
+            let deadline = Instant::now() + Duration::from_secs(5);
+            while handles.iter().any(|handle| !handle.exited().unwrap()) {
+                assert!(
+                    Instant::now() < deadline,
+                    "kernel did not tear down live staging writers"
+                );
+                assert!(
+                    daemon.0.try_wait().unwrap().is_none(),
+                    "daemon must stay alive during init teardown"
+                );
+                std::thread::yield_now();
+            }
+            assert!(
+                recover_stale_staging().is_err(),
+                "init exit must not bypass live operation exclusion"
+            );
+        }
+
+        daemon.0.kill().unwrap();
+        daemon.0.wait().unwrap();
+        #[cfg(target_os = "linux")]
+        if phase != "prepared" {
+            let mut foreign = std::process::Command::new("unshare")
+                .args([
+                    "--user",
+                    "--map-root-user",
+                    "--mount",
+                    "--pid",
+                    "--fork",
+                    "--kill-child=KILL",
+                    "--mount-proc",
+                    "--",
+                ])
+                .arg(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "plugin::install::tests::staging_crash_child",
+                    "--ignored",
+                    "--nocapture",
+                ])
+                .env("AOE_STAGING_CRASH_ROOT", &root)
+                .env("AOE_STAGING_CRASH_PHASE", "foreign")
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::piped())
+                .spawn()
+                .unwrap();
+            let deadline = Instant::now() + Duration::from_secs(5);
+            let status = loop {
+                if let Some(status) = foreign.try_wait().unwrap() {
+                    break status;
+                }
+                if Instant::now() >= deadline {
+                    let _ = foreign.kill();
+                    let _ = foreign.wait();
+                    panic!("foreign PID namespace recovery did not finish");
+                }
+                std::thread::yield_now();
+            };
+            assert!(
+                status.success(),
+                "{}",
+                std::io::read_to_string(foreign.stderr.take().unwrap()).unwrap()
+            );
+            assert_eq!(
+                anchored
+                    .read_regular(Path::new(STAGING_MARKER), 1024 * 1024)
+                    .unwrap()
+                    .unwrap(),
+                original
+            );
+        }
+        let (mut evidence, _) = staging_evidence(&anchored).unwrap();
+        evidence.owner_pid = std::process::id();
+        evidence.owner_birth = crate::process::process_birth_identity(std::process::id())
+            .unwrap()
+            .unwrap();
+        let save_header = |evidence: &StagingEvidence| {
+            let mut bytes = serde_json::to_vec(evidence).unwrap();
+            bytes.push(b'\n');
+            anchored
+                .bind_file(std::ffi::OsStr::new(STAGING_MARKER))
+                .unwrap()
+                .replace(&bytes)
+                .unwrap();
+        };
+        save_header(&evidence);
+        assert!(
+            recover_staging(&root).is_err(),
+            "live owner must not be reclaimed"
+        );
+        let last = evidence.owner_birth.start_id.pop().unwrap();
+        evidence
+            .owner_birth
+            .start_id
+            .push(if last == '0' { '1' } else { '0' });
+        save_header(&evidence);
+        assert!(
+            recover_staging(&root).is_err(),
+            "reused PID must not match old custody"
+        );
+        evidence.owner_pid = daemon.0.id();
+        evidence.owner_birth = serde_json::from_slice::<StagingEvidence>(
+            original.split(|byte| *byte == b'\n').next().unwrap(),
+        )
+        .unwrap()
+        .owner_birth;
+        evidence.custody = crate::process::StagingCustody::Uncertain;
+        save_header(&evidence);
+        assert!(
+            recover_staging(&root).is_err(),
+            "unknown native resources must remain Recovery"
+        );
+        anchored
+            .bind_file(std::ffi::OsStr::new(STAGING_MARKER))
+            .unwrap()
+            .replace(&original[..original.len() - 1])
+            .unwrap();
+        assert!(
+            recover_staging(&root).is_err(),
+            "torn journal must remain Recovery"
+        );
+        let mut publication = original.clone();
+        publication.extend_from_slice(b"U\n");
+        anchored
+            .bind_file(std::ffi::OsStr::new(STAGING_MARKER))
+            .unwrap()
+            .replace(&publication)
+            .unwrap();
+        assert!(
+            recover_staging(&root).is_err(),
+            "publication may have orphaned non-journalled builds"
+        );
+        anchored
+            .bind_file(std::ffi::OsStr::new(STAGING_MARKER))
+            .unwrap()
+            .replace(&original)
+            .unwrap();
+        if phase == "prepared" {
+            let outside = tempfile::tempdir().unwrap();
+            std::fs::write(outside.path().join("retained"), b"untouched").unwrap();
+            let mount = root.join("plugins/.staging-crash/volume");
+            let saved = mount.with_file_name("saved");
+            std::fs::rename(&mount, &saved).unwrap();
+            std::os::unix::fs::symlink(outside.path(), &mount).unwrap();
+            assert!(
+                recover_staging(&root).is_err(),
+                "recovery must not follow a replaced mountpoint"
+            );
+            assert_eq!(
+                std::fs::read(outside.path().join("retained")).unwrap(),
+                b"untouched"
+            );
+            std::fs::remove_file(&mount).unwrap();
+            std::fs::rename(&saved, &mount).unwrap();
+        }
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            match recover_stale_staging() {
+                Ok(()) => break,
+                Err(error) => {
+                    assert!(
+                        Instant::now() < deadline,
+                        "settled staging was not reclaimed: {error:#}"
+                    );
+                    std::thread::yield_now();
+                }
+            }
+        }
+        assert!(check_recovery_evidence().is_ok());
+        assert!(begin_operation().is_ok());
+        assert!(!root.join(STAGING_MARKER).exists());
+        assert!(
+            std::fs::read_dir(root.join("plugins/.staging-crash/volume"))
+                .unwrap()
+                .next()
+                .is_none()
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn startup_reclaims_preacquisition_after_real_daemon_crash() {
+        crash_staging_and_recover("prepared");
+    }
+
+    #[test]
+    #[serial]
+    #[cfg(target_os = "linux")]
+    #[ignore = "requires private user/PID/mount namespaces, nsenter, Git, and bubblewrap"]
+    fn startup_reclaims_bounded_linux_volume_after_real_daemon_crash() {
+        for phase in ["volume", "writers"] {
+            crash_staging_and_recover(phase);
+        }
+    }
 
     #[test]
     fn owned_cleanup_unlinks_legacy_and_internal_links_without_changing_targets() {
@@ -2616,19 +3275,60 @@ mod tests {
     async fn staging_volume_cleanup_failure_retains_marker_and_operation_lock() {
         let _home = isolate_app_dir();
         let source = tempfile::tempdir().unwrap();
+        let repo = source.path().join("acme/cleanup.git");
+        std::fs::create_dir_all(&repo).unwrap();
+        let _git_paths = crate::session::test_support::EnvGuard::unset(&[
+            "GIT_DIR",
+            "GIT_WORK_TREE",
+            "GIT_INDEX_FILE",
+            "GIT_OBJECT_DIRECTORY",
+            "GIT_ALTERNATE_OBJECT_DIRECTORIES",
+            "GIT_COMMON_DIR",
+            "GIT_CONFIG_COUNT",
+            "GIT_CONFIG_PARAMETERS",
+            "GIT_TEMPLATE_DIR",
+        ]);
+        let clone_base = format!("file://{}", source.path().display());
+        let _git = crate::session::test_support::EnvGuard::set(&[
+            ("AOE_GITHUB_CLONE_BASE", clone_base.as_str()),
+            ("GIT_CONFIG_GLOBAL", "/dev/null"),
+            ("GIT_CONFIG_NOSYSTEM", "1"),
+        ]);
         std::fs::write(
-            source.path().join("aoe-plugin.toml"),
+            repo.join("aoe-plugin.toml"),
             "id = \"acme.cleanup\"\nname = \"Cleanup\"\nversion = \"1.0.0\"\napi_version = 2\n",
         )
         .unwrap();
+        for args in [
+            ["init", "--initial-branch=main"].as_slice(),
+            ["add", "aoe-plugin.toml"].as_slice(),
+            [
+                "-c",
+                "user.name=Fixture",
+                "-c",
+                "user.email=fixture@example.test",
+                "commit",
+                "-m",
+                "fixture",
+            ]
+            .as_slice(),
+        ] {
+            let output = std::process::Command::new("git")
+                .arg("-C")
+                .arg(&repo)
+                .args(args)
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "{}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
         let operation = begin_operation().unwrap();
-        let prepared = prepare_install(
-            source.path().to_str().unwrap(),
-            false,
-            Some(operation.clone()),
-        )
-        .await
-        .unwrap();
+        let prepared = prepare_install("gh:acme/cleanup", false, Some(operation.clone()))
+            .await
+            .unwrap();
         let marker = crate::session::get_app_dir().unwrap().join(STAGING_MARKER);
         std::fs::remove_file(&marker).unwrap();
         std::fs::create_dir(&marker).unwrap();

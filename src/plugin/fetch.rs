@@ -34,11 +34,32 @@ pub struct FetchedPlugin {
 struct Staging {
     directory: PathBuf,
     mount: PathBuf,
-    marker: PathBuf,
+    marker: Option<PathBuf>,
     volume: Option<crate::process::StagingVolume>,
 }
 
 impl Staging {
+    fn create_local(plugins_root: &Path) -> Result<Self> {
+        std::fs::create_dir_all(plugins_root)?;
+        let directory = tempfile::Builder::new()
+            .prefix(".staging-")
+            .tempdir_in(plugins_root)
+            .context("creating local plugin staging dir")?
+            .keep();
+        Ok(Self {
+            mount: directory.clone(),
+            directory,
+            marker: None,
+            volume: None,
+        })
+    }
+
+    fn root(&self) -> &Path {
+        self.volume
+            .as_ref()
+            .map_or(self.mount.as_path(), |volume| volume.root())
+    }
+
     fn create(plugins_root: &Path, limit: u64) -> Result<Self> {
         std::fs::create_dir_all(plugins_root)?;
         let app_root = plugins_root
@@ -69,7 +90,7 @@ impl Staging {
         let mut staging = Self {
             directory: directory.keep(),
             mount,
-            marker,
+            marker: Some(marker),
             volume: None,
         };
         let acquisition = super::execution::catch_panic(|| {
@@ -118,9 +139,11 @@ impl Staging {
         self.volume.take();
         super::install::remove_owned_tree(&self.directory)
             .context("removing detached plugin staging directory")?;
-        std::fs::remove_file(&self.marker).context("removing plugin staging marker")?;
-        std::fs::File::open(self.marker.parent().expect("staging marker parent"))?.sync_all()?;
-        super::install::unregister_staging(&self.marker);
+        if let Some(marker) = &self.marker {
+            std::fs::remove_file(marker).context("removing plugin staging marker")?;
+            std::fs::File::open(marker.parent().expect("staging marker parent"))?.sync_all()?;
+            super::install::unregister_staging(marker);
+        }
         Ok(())
     }
 }
@@ -153,6 +176,17 @@ fn cleanup_staging(
 }
 
 impl FetchedPlugin {
+    pub(super) fn begin_publication(&self) -> Result<()> {
+        if let Some(marker) = self
+            .staging
+            .as_ref()
+            .and_then(|staging| staging.marker.as_deref())
+        {
+            super::install::mark_staging_publication(marker)?;
+        }
+        Ok(())
+    }
+
     pub(super) fn close(mut self) -> Result<()> {
         match self.staging.take() {
             Some(staging) => cleanup_staging(staging, self.operation.take()),
@@ -169,12 +203,11 @@ impl FetchedPlugin {
     pub(super) fn copy_for_publication(&self, destination: &Path) -> Result<()> {
         // In particular, do not canonicalize a Linux /proc/PID/root staging path.
         let source = crate::session::AnchoredDir::open(&self.tree)?;
-        let mut budget = CopyBudget {
-            bytes: STAGING_LIMIT,
-            entries: STAGING_ENTRY_LIMIT,
-        };
+        let mut budget = CopyBudget::for_source(&self.source);
         copy_anchored_tree(&source, destination, &mut budget)?;
-        if complete_tree_hash(destination)? != self.publication_hash {
+        if complete_tree_hash_with_budget(destination, CopyBudget::for_source(&self.source))?
+            != self.publication_hash
+        {
             bail!("plugin publication copy differs from the approved staging tree");
         }
         Ok(())
@@ -268,9 +301,26 @@ fn stage_with_limit(
     clone_url: Option<String>,
     limit: u64,
 ) -> Result<FetchedPlugin> {
+    stage_with_limits(source, plugins_root, clone_url, limit, STAGING_ENTRY_LIMIT)
+}
+
+fn stage_with_limits(
+    source: PluginSource,
+    plugins_root: PathBuf,
+    clone_url: Option<String>,
+    limit: u64,
+    entry_limit: usize,
+) -> Result<FetchedPlugin> {
     let budget = super::execution::Budget::new();
-    let mut staging = Staging::create(&plugins_root, limit)?;
-    let tree = staging.volume().root().join("tree");
+    let mut staging = match &source {
+        PluginSource::Github { .. } => Staging::create(&plugins_root, limit)?,
+        PluginSource::Local(_) => Staging::create_local(&plugins_root)?,
+    };
+    let limit = staging
+        .volume
+        .as_ref()
+        .map_or(limit, crate::process::StagingVolume::limit);
+    let tree = staging.root().join("tree");
 
     let result = super::execution::catch_panic(|| {
         #[cfg(test)]
@@ -304,7 +354,10 @@ fn stage_with_limit(
             );
         }
         let tree_hash = super::integrity::tree_hash(&tree)?;
-        let publication_hash = complete_tree_hash(&tree)?;
+        let publication_hash = complete_tree_hash_with_budget(
+            &tree,
+            CopyBudget::for_source_with_limits(&source, limit, entry_limit),
+        )?;
         #[cfg(test)]
         test_gate::reach_observed(&staging.directory, &tree, "source-prepared");
         Ok(FetchedPlugin {
@@ -331,7 +384,11 @@ fn stage_with_limit(
             Ok(fetched)
         }
         Err(error) => {
-            let error = staging_limit_error(error, limit);
+            let error = if staging.volume.is_some() {
+                staging_limit_error(error, limit)
+            } else {
+                error
+            };
             if error
                 .downcast_ref::<super::execution::RecoveryRequired>()
                 .is_some()
@@ -363,10 +420,9 @@ fn staging_limit_error(error: anyhow::Error, limit: u64) -> anyhow::Error {
                     nix::errno::Errno::ENOSPC | nix::errno::Errno::EDQUOT
                 )
             })
-    }) || error.downcast_ref::<GitFailed>().is_some_and(|error| {
-        let diagnostic = error.stderr.to_ascii_lowercase();
-        diagnostic.contains("no space left on device") || diagnostic.contains("disk quota exceeded")
-    });
+    }) || error
+        .downcast_ref::<GitFailed>()
+        .is_some_and(GitFailed::is_quota_failure);
     if full {
         error.context(format!(
             "plugin staging filesystem limit ({limit} bytes) exceeded"
@@ -403,6 +459,22 @@ fn read_manifest(tree: &Path) -> Result<(PluginManifest, Vec<u8>)> {
 struct GitFailed {
     command: String,
     stderr: String,
+}
+
+impl GitFailed {
+    fn is_quota_failure(&self) -> bool {
+        let diagnostic = self.stderr.to_ascii_lowercase();
+        diagnostic.contains("no space left on device") || diagnostic.contains("disk quota exceeded")
+    }
+
+    fn is_missing_clone_branch(&self, reference: &str) -> bool {
+        !self.is_quota_failure()
+            && self.stderr.lines().any(|line| {
+                line.strip_prefix("fatal: Remote branch ")
+                    .and_then(|line| line.strip_suffix(" not found in upstream origin"))
+                    == Some(reference)
+            })
+    }
 }
 
 fn configure_git(cmd: &mut Command) {
@@ -534,6 +606,7 @@ pub(super) fn ls_remote_with_operation(
             return Err(error);
         }
     };
+    let limit = staging.volume().limit();
     let result = super::execution::catch_panic(|| {
         let target = reference.unwrap_or("HEAD");
         let peeled = format!("{target}^{{}}");
@@ -554,7 +627,7 @@ pub(super) fn ls_remote_with_operation(
     } else {
         cleanup_staging(staging, operation)?;
     }
-    result.map_err(|error| staging_limit_error(error, STAGING_LIMIT))
+    result.map_err(|error| staging_limit_error(error, limit))
 }
 
 pub async fn latest_release_tag(owner: &str, repo: &str) -> Result<Option<String>> {
@@ -574,26 +647,19 @@ fn is_full_commit_sha(s: &str) -> bool {
     s.len() == 40 && s.bytes().all(|b| b.is_ascii_hexdigit())
 }
 
-/// Match clone --branch precedence, peeling annotated tags only when no branch wins.
+/// Preserve lock pins: an annotated tag's peeled commit wins over the first match.
 fn parse_ls_remote(out: &str, target: &str) -> Result<String> {
     let mut first = None;
-    let mut peeled = None;
-    let prefer_branch = !target.starts_with("refs/") || target.starts_with("refs/heads/");
-    let branch = target.strip_prefix("refs/heads/").unwrap_or(target);
     for line in out.lines() {
         let Some((sha, name)) = line.split_once('\t') else {
             continue;
         };
-        if prefer_branch && name.strip_prefix("refs/heads/") == Some(branch) {
-            return Ok(sha.trim().to_owned());
-        }
         if name.ends_with("^{}") {
-            peeled.get_or_insert(sha.trim());
+            return Ok(sha.trim().to_owned());
         }
         first.get_or_insert(sha.trim());
     }
-    peeled
-        .or(first)
+    first
         .map(str::to_owned)
         .ok_or_else(|| anyhow!("ref {target:?} not found on the remote"))
 }
@@ -608,54 +674,60 @@ fn git_clone_checkout(
 ) -> Result<String> {
     // Git runs inside the volume's namespace. Never hand it the parent's /proc root.
     let native_tree = staging.mount.join("tree");
-    // A full clone supports tags and commit IDs without retrying a quota failure.
     let mut clone = git_command(
-        &["clone", "--origin", "origin", "--no-checkout", "--", url],
+        &[
+            "clone",
+            "--origin",
+            "origin",
+            "--depth",
+            "1",
+            "--no-checkout",
+        ],
         &staging.mount,
         staging,
     );
-    clone.arg(&native_tree);
-    let output = budget.run_discarding_stdout(&mut clone)?;
-    if !output.status.success() {
-        return Err(git_failure(&["clone"], &output));
+    if let Some(reference) = reference {
+        clone.args(["--branch", reference]);
     }
-    let requested = reference.unwrap_or("HEAD");
-    // Match clone --branch: a short branch name wins over a homonymous tag.
-    // Explicit refs keep their namespace; remote branches have no local head
-    // after --no-checkout except for the repository's default branch.
-    let revision = match reference {
-        Some(reference) if reference.starts_with("refs/heads/") => {
-            format!(
-                "refs/remotes/origin/{}^{{commit}}",
-                &reference["refs/heads/".len()..]
-            )
+    clone.args(["--", url]).arg(&native_tree).env("LC_ALL", "C");
+    let output = budget.run_discarding_stdout(&mut clone)?;
+    let commit = if output.status.success() {
+        run_git(&["rev-parse", "HEAD"], &native_tree, staging, budget)?
+    } else {
+        let error = git_failure(&["clone"], &output);
+        if !reference.is_some_and(|reference| {
+            error
+                .downcast_ref::<GitFailed>()
+                .is_some_and(|error| error.is_missing_clone_branch(reference))
+        }) {
+            return Err(error);
         }
-        Some(reference) if !reference.starts_with("refs/") => {
-            format!("refs/remotes/origin/{reference}^{{commit}}")
+        if dest.try_exists()? {
+            super::install::remove_owned_tree(dest)
+                .context("removing unresolved shallow Git checkout")?;
         }
-        _ => format!("{requested}^{{commit}}"),
-    };
-    let resolved = run_git(
-        &["rev-parse", "--verify", "--end-of-options", &revision],
-        &native_tree,
-        staging,
-        budget,
-    );
-    let commit = match resolved {
-        Ok(commit) => commit,
-        Err(error)
-            if reference.is_some_and(|reference| !reference.starts_with("refs/"))
-                && error.downcast_ref::<GitFailed>().is_some() =>
-        {
-            let revision = format!("{requested}^{{commit}}");
-            run_git(
-                &["rev-parse", "--verify", "--end-of-options", &revision],
-                &native_tree,
-                staging,
-                budget,
-            )?
+        let mut clone = git_command(
+            &["clone", "--origin", "origin", "--no-checkout", "--", url],
+            &staging.mount,
+            staging,
+        );
+        clone.arg(&native_tree);
+        let output = budget.run_discarding_stdout(&mut clone)?;
+        if !output.status.success() {
+            return Err(git_failure(&["clone"], &output));
         }
-        Err(error) => return Err(error),
+        let requested = reference.expect("only unresolved references retry");
+        let revision = if let Some(branch) = requested.strip_prefix("refs/heads/") {
+            format!("refs/remotes/origin/{branch}^{{commit}}")
+        } else {
+            format!("{requested}^{{commit}}")
+        };
+        run_git(
+            &["rev-parse", "--verify", "--end-of-options", &revision],
+            &native_tree,
+            staging,
+            budget,
+        )?
     };
     run_git_discarding_stdout(
         &[
@@ -671,6 +743,8 @@ fn git_clone_checkout(
         budget,
     )?;
     let sha = run_git(&["rev-parse", "HEAD"], &native_tree, staging, budget)?;
+    #[cfg(test)]
+    test_gate::reach_observed(&staging.directory, dest, "git-checkout");
     super::install::remove_owned_tree(&dest.join(".git"))
         .context("removing staged Git metadata")?;
     Ok(sha)
@@ -682,16 +756,33 @@ fn copy_tree(src: &Path, dst: &Path) -> Result<()> {
     let root = std::fs::canonicalize(src)
         .with_context(|| format!("resolving plugin source {}", src.display()))?;
     let source = crate::session::AnchoredDir::open(&root)?;
-    let mut budget = CopyBudget {
-        bytes: STAGING_LIMIT,
-        entries: STAGING_ENTRY_LIMIT,
-    };
+    let mut budget = CopyBudget::unlimited();
     copy_anchored_tree(&source, dst, &mut budget)
 }
 
 struct CopyBudget {
     bytes: u64,
     entries: usize,
+}
+
+impl CopyBudget {
+    fn unlimited() -> Self {
+        Self {
+            bytes: u64::MAX,
+            entries: usize::MAX,
+        }
+    }
+
+    fn for_source(source: &PluginSource) -> Self {
+        Self::for_source_with_limits(source, STAGING_LIMIT, STAGING_ENTRY_LIMIT)
+    }
+
+    fn for_source_with_limits(source: &PluginSource, bytes: u64, entries: usize) -> Self {
+        match source {
+            PluginSource::Github { .. } => Self { bytes, entries },
+            PluginSource::Local(_) => Self::unlimited(),
+        }
+    }
 }
 
 fn copy_anchored_tree(
@@ -780,6 +871,16 @@ fn copy_anchored_tree(
 /// Publication proof covers every path, directory, permission bit and file byte.
 /// The consent tree hash deliberately remains the pre-extraction source hash.
 fn complete_tree_hash(tree: &Path) -> Result<String> {
+    complete_tree_hash_with_budget(
+        tree,
+        CopyBudget {
+            bytes: STAGING_LIMIT,
+            entries: STAGING_ENTRY_LIMIT,
+        },
+    )
+}
+
+fn complete_tree_hash_with_budget(tree: &Path, mut budget: CopyBudget) -> Result<String> {
     use sha2::{Digest, Sha256};
     use std::os::unix::ffi::OsStrExt;
     use std::os::unix::fs::MetadataExt;
@@ -861,15 +962,7 @@ fn complete_tree_hash(tree: &Path) -> Result<String> {
     }
     let root = crate::session::AnchoredDir::open(tree)?;
     let mut digest = Sha256::new();
-    visit(
-        &root,
-        &mut digest,
-        &mut CopyBudget {
-            bytes: STAGING_LIMIT,
-            entries: STAGING_ENTRY_LIMIT,
-        },
-        &mut [0u8; 64 * 1024],
-    )?;
+    visit(&root, &mut digest, &mut budget, &mut [0u8; 64 * 1024])?;
     Ok(sha256_label(&digest.finalize()))
 }
 
@@ -883,6 +976,11 @@ async fn download_release_binary(
     operation: Option<Arc<crate::session::StorageFlock>>,
 ) -> Result<FetchedPlugin> {
     let mut fetched = fetched;
+    let limit = fetched
+        .staging
+        .as_ref()
+        .and_then(|staging| staging.volume.as_ref())
+        .map_or(STAGING_LIMIT, crate::process::StagingVolume::limit);
     // A cancelled Tokio file write can outlive its future. Until flush returns,
     // cancellation must retain the mount and its mutation lock, not clean them.
     fetched.cleanup_safe = false;
@@ -934,7 +1032,7 @@ async fn download_release_binary(
             .parent()
             .ok_or_else(|| anyhow!("plugin staging tree has no parent directory"))?;
         let asset_path = staging.join(".asset-download");
-        download_asset(&asset.browser_download_url, &asset_path, STAGING_LIMIT).await?;
+        download_asset(&asset.browser_download_url, &asset_path, limit).await?;
         Ok::<_, anyhow::Error>((
             asset_path.to_path_buf(),
             asset.name.clone(),
@@ -948,7 +1046,7 @@ async fn download_release_binary(
         Ok(download) => download,
         Err(error) => {
             fetched.cleanup().await?;
-            return Err(staging_limit_error(error, STAGING_LIMIT));
+            return Err(staging_limit_error(error, limit));
         }
     };
     tokio::task::spawn_blocking(move || {
@@ -972,7 +1070,7 @@ async fn download_release_binary(
         match result {
             Ok(()) => Ok(fetched),
             Err(error) => {
-                let error = staging_limit_error(error, STAGING_LIMIT);
+                let error = staging_limit_error(error, limit);
                 if error
                     .downcast_ref::<super::execution::RecoveryRequired>()
                     .is_some()
@@ -1139,7 +1237,7 @@ fn install_asset_into(
 }
 
 const STAGING_LIMIT: u64 = 1024 * 1024 * 1024;
-const STAGING_ENTRY_LIMIT: usize = 65_536;
+pub(crate) const STAGING_ENTRY_LIMIT: usize = 65_536;
 const ARCHIVE_METADATA_LIMIT: u64 = 1024 * 1024;
 
 fn take_entry(remaining: &mut usize) -> Result<()> {
@@ -1539,14 +1637,18 @@ mod tests {
         ignore = "requires private user/mount namespaces and bubblewrap"
     )]
     fn staging_volume_high_ratio_archive_hits_filesystem_limit_and_cleans() {
+        use crate::git::test_support::run_git;
         let fixture = tempfile::tempdir().unwrap();
         let source = fixture.path().join("source");
         write_publication_manifest(&source);
+        run_git(&source, &["init", "-q"]);
+        run_git(&source, &["add", "."]);
+        run_git(&source, &["commit", "-qm", "fixture"]);
         let plugins = fixture.path().join("plugins");
         let fetched = stage_with_limit(
-            PluginSource::Local(source),
+            PluginSource::parse("gh:acme/archive").unwrap(),
             plugins.clone(),
-            None,
+            Some(format!("file://{}", source.display())),
             32 * 1024 * 1024,
         )
         .unwrap();
@@ -1605,15 +1707,19 @@ mod tests {
         );
         let homonymous =
             format!("{peeled}\n3333333333333333333333333333333333333333\trefs/heads/v1");
-        for target in ["v1", "refs/heads/v1"] {
+        for target in ["v1", "refs/tags/v1"] {
             assert_eq!(
                 parse_ls_remote(&homonymous, target).unwrap(),
-                "3333333333333333333333333333333333333333"
+                "2222222222222222222222222222222222222222"
             );
         }
         assert_eq!(
-            parse_ls_remote(&homonymous, "refs/tags/v1").unwrap(),
-            "2222222222222222222222222222222222222222"
+            parse_ls_remote(
+                "3333333333333333333333333333333333333333\trefs/heads/v1",
+                "refs/heads/v1",
+            )
+            .unwrap(),
+            "3333333333333333333333333333333333333333"
         );
         assert_eq!(
             parse_ls_remote("3333333333333333333333333333333333333333\tHEAD", "HEAD").unwrap(),
@@ -1674,7 +1780,7 @@ mod tests {
         let mut staging = Staging {
             directory: directory.clone(),
             mount,
-            marker: marker.clone(),
+            marker: Some(marker.clone()),
             volume: None,
         };
 
@@ -1684,13 +1790,13 @@ mod tests {
         assert!(!marker.exists());
     }
 
-    #[test]
+    #[tokio::test]
     #[serial_test::serial]
     #[cfg_attr(
         target_os = "linux",
         ignore = "requires private user/mount namespaces and bubblewrap"
     )]
-    fn staging_volume_secondary_branch_preserves_trusted_user_git_configuration() {
+    async fn staging_volume_secondary_branch_preserves_trusted_user_git_configuration() {
         use crate::git::test_support::run_git;
         use crate::session::test_support::{isolate_app_dir, EnvGuard};
         let _home = isolate_app_dir();
@@ -1754,14 +1860,15 @@ mod tests {
             ("GIT_CONFIG_GLOBAL", global.to_str().unwrap()),
             ("GIT_CONFIG_NOSYSTEM", "1"),
         ]);
-        assert_eq!(ls_remote(url, Some("feature/review")).unwrap(), commit);
+        assert_eq!(ls_remote(url, Some("feature/review")).unwrap(), tag_commit);
         let operation = super::super::install::begin_operation().unwrap();
         assert_eq!(
             ls_remote_with_operation(url, Some("feature/review"), operation.clone()).unwrap(),
-            commit
+            tag_commit
         );
-        let mut staging =
-            Staging::create(&crate::plugin::plugins_dir().unwrap(), 16 * 1024 * 1024).unwrap();
+        let staging = Arc::new(
+            Staging::create(&crate::plugin::plugins_dir().unwrap(), 16 * 1024 * 1024).unwrap(),
+        );
         let budget = super::super::execution::Budget::new();
         assert_eq!(
             super::run_git(
@@ -1794,33 +1901,43 @@ mod tests {
             "upstream"
         );
         let tree = staging.volume().root().join("tree");
-        for reference in [
-            "feature/review",
-            "refs/heads/feature/review",
-            "release",
-            "refs/tags/release",
-            commit.as_str(),
+        for (reference, expected, shallow) in [
+            (None, tag_commit.as_str(), true),
+            (Some("feature/review"), commit.as_str(), true),
+            (Some("refs/heads/feature/review"), commit.as_str(), false),
+            (Some("release"), commit.as_str(), true),
+            (Some("refs/tags/release"), commit.as_str(), false),
+            (Some(commit.as_str()), commit.as_str(), false),
+            (Some(tag_commit.as_str()), tag_commit.as_str(), false),
+            (Some("refs/tags/feature/review"), tag_commit.as_str(), false),
         ] {
-            assert_eq!(
-                git_clone_checkout(url, Some(reference), &tree, &staging, budget).unwrap(),
-                commit
-            );
-            assert_eq!(std::fs::read(tree.join("branch")).unwrap(), b"secondary");
+            let mut gate = test_gate::install(&staging.directory, "git-checkout");
+            let task_staging = staging.clone();
+            let reference = reference.map(str::to_owned);
+            let destination = tree.clone();
+            let task = tokio::task::spawn_blocking(move || {
+                git_clone_checkout(
+                    url,
+                    reference.as_deref(),
+                    &destination,
+                    &task_staging,
+                    budget,
+                )
+            });
+            tokio::time::timeout(Duration::from_secs(5), &mut gate.entered)
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(tree.join(".git/shallow").exists(), shallow);
+            let configuration = std::fs::read_to_string(tree.join(".git/config")).unwrap();
+            assert!(configuration.contains("[remote \"origin\"]"));
+            assert!(!configuration.contains("[remote \"upstream\"]"));
+            gate.release();
+            assert_eq!(task.await.unwrap().unwrap(), expected);
+            assert_eq!(tree.join("branch").exists(), expected == commit);
             std::fs::remove_dir_all(&tree).unwrap();
         }
-        assert_eq!(
-            git_clone_checkout(
-                url,
-                Some("refs/tags/feature/review"),
-                &tree,
-                &staging,
-                budget
-            )
-            .unwrap(),
-            tag_commit
-        );
-        assert!(!tree.join("branch").exists());
-        std::fs::remove_dir_all(&tree).unwrap();
+        let mut staging = Arc::try_unwrap(staging).ok().expect("finished Git task");
         staging.close().unwrap();
         drop(operation);
         assert!(super::super::install::begin_operation().is_ok());
@@ -1830,17 +1947,19 @@ mod tests {
     #[serial_test::serial]
     async fn safe_acquisition_failure_keeps_live_marker_until_proven_cleanup() {
         let _home = crate::session::test_support::isolate_app_dir();
-        let source = tempfile::tempdir().unwrap();
-        write_publication_manifest(source.path());
         let operation = super::super::install::begin_operation().unwrap();
         let root = crate::session::get_app_dir().unwrap();
         let mut gate = test_gate::install(&root, "staging-acquisition");
         let plugins = crate::plugin::plugins_dir().unwrap();
-        let input = source.path().to_owned();
         let task_operation = operation.clone();
         let task = tokio::task::spawn_blocking(move || {
             let _operation = task_operation;
-            stage_with_limit(PluginSource::Local(input), plugins, None, 0)
+            stage_with_limit(
+                PluginSource::parse("gh:acme/acquisition").unwrap(),
+                plugins,
+                Some("unused://".to_owned()),
+                0,
+            )
         });
         tokio::time::timeout(Duration::from_secs(5), &mut gate.entered)
             .await
@@ -2321,23 +2440,34 @@ mod tests {
         .unwrap_err();
         assert!(error.to_string().contains("ordinary-checkout-failure"));
         assert_eq!(std::fs::read_to_string(&calls).unwrap().lines().count(), 1);
-        std::fs::write(&calls, "").unwrap();
-        std::fs::write(&git, format!(
-            "#!/bin/sh\nprintf 'call\\n' >> '{}'\nprintf 'No space left on device' >&2\nexit 1\n", native_calls.display()
-        )).unwrap();
-        let error = git_clone_checkout(
-            "fixture",
-            Some("v1"),
-            &staging.volume().root().join("tree"),
-            &staging,
-            budget,
-        )
-        .unwrap_err();
-        assert!(
-            format!("{:#}", staging_limit_error(error, 16 * 1024 * 1024))
-                .contains("filesystem limit")
-        );
-        assert_eq!(std::fs::read_to_string(&calls).unwrap().lines().count(), 1);
+        for diagnostic in [
+            "No space left on device",
+            "Disk quota exceeded",
+            "fatal: Remote branch v1 not found in upstream origin\\nNo space left on device",
+        ] {
+            std::fs::write(&calls, "").unwrap();
+            std::fs::write(
+                &git,
+                format!(
+                    "#!/bin/sh\nprintf 'call\\n' >> '{}'\nprintf '{diagnostic}' >&2\nexit 1\n",
+                    native_calls.display()
+                ),
+            )
+            .unwrap();
+            let error = git_clone_checkout(
+                "fixture",
+                Some("v1"),
+                &staging.volume().root().join("tree"),
+                &staging,
+                budget,
+            )
+            .unwrap_err();
+            assert!(
+                format!("{:#}", staging_limit_error(error, 16 * 1024 * 1024))
+                    .contains("filesystem limit")
+            );
+            assert_eq!(std::fs::read_to_string(&calls).unwrap().lines().count(), 1);
+        }
         staging.close().unwrap();
         let mut success = Command::new("sh");
         success
@@ -2436,7 +2566,81 @@ mod tests {
     }
 
     #[test]
-    fn local_copy_bounds_total_bytes_and_entries() {
+    #[serial_test::serial]
+    fn local_staging_ignores_remote_limits_and_freezes_source() {
+        let _home = crate::session::test_support::isolate_app_dir();
+        let fixture = tempfile::tempdir().unwrap();
+        let source = fixture.path().join("source");
+        write_publication_manifest(&source);
+        std::fs::write(source.join("payload"), b"local snapshot").unwrap();
+        let plugins = crate::plugin::plugins_dir().unwrap();
+        let operation = super::super::install::begin_operation().unwrap();
+        let mut fetched = stage_with_limits(
+            PluginSource::Local(source.clone()),
+            plugins.clone(),
+            None,
+            1,
+            1,
+        )
+        .unwrap();
+        fetched.operation = Some(operation);
+        let staging = fetched.staging.as_ref().unwrap();
+        assert!(staging.volume.is_none());
+        assert!(staging.marker.is_none());
+        assert!(staging.directory.starts_with(&plugins));
+        assert!(!crate::session::get_app_dir()
+            .unwrap()
+            .join(super::super::install::STAGING_MARKER)
+            .exists());
+        assert!(super::super::install::begin_operation().is_err());
+        std::fs::write(source.join("payload"), b"changed source").unwrap();
+        let destination = fixture.path().join("published");
+        fetched.copy_for_publication(&destination).unwrap();
+        assert_eq!(
+            std::fs::read(destination.join("payload")).unwrap(),
+            b"local snapshot"
+        );
+        for (bytes, entries, expected) in [
+            (1, usize::MAX, "plugin staging budget exceeded"),
+            (u64::MAX, 1, "plugin staging entry budget exceeded"),
+        ] {
+            let error =
+                complete_tree_hash_with_budget(&fetched.tree, CopyBudget { bytes, entries })
+                    .unwrap_err();
+            assert!(format!("{error:#}").contains(expected));
+        }
+        let asset = fixture.path().join("remote.tgz");
+        std::fs::write(&asset, gzip(&[("worker", Some(b"remote"), 0o755)])).unwrap();
+        for (bytes, entries, expected) in [
+            (1, STAGING_ENTRY_LIMIT, "plugin staging budget exceeded"),
+            (STAGING_LIMIT, 1, "plugin staging entry budget exceeded"),
+        ] {
+            let error = extract_asset_archive_with_limits(
+                &fetched.tree,
+                "remote.tgz",
+                std::fs::File::open(&asset).unwrap(),
+                None,
+                bytes,
+                entries,
+            )
+            .unwrap_err();
+            assert!(format!("{error:#}").contains(expected));
+        }
+        std::fs::write(fetched.tree.join("payload"), b"changed staging").unwrap();
+        assert!(fetched
+            .copy_for_publication(&fixture.path().join("changed"))
+            .is_err());
+        fetched.close().unwrap();
+        assert_eq!(std::fs::read_dir(&plugins).unwrap().count(), 0);
+        assert!(super::super::install::begin_operation().is_ok());
+        assert_eq!(
+            std::fs::read(source.join("payload")).unwrap(),
+            b"changed source"
+        );
+    }
+
+    #[test]
+    fn remote_copy_bounds_total_bytes_and_entries() {
         let work = tempfile::tempdir().unwrap();
         let source = work.path().join("source");
         std::fs::create_dir_all(source.join("nested")).unwrap();
@@ -2474,7 +2678,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn local_copy_bounds_file_that_grows_after_open() {
+    async fn remote_copy_bounds_file_that_grows_after_open() {
         use std::io::Write;
 
         let source = tempfile::tempdir().unwrap();
