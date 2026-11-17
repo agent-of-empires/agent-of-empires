@@ -124,6 +124,12 @@ mod tests {
         std::fs::remove_file(&link).unwrap();
         std::fs::write(&link, b"x").unwrap();
         std::fs::set_permissions(&link, std::fs::Permissions::from_mode(0o644)).unwrap();
-        assert_eq!(super::restrict(dir.path()).unwrap(), 2);
+        // A failed pass may already have restricted the sibling, depending on directory order.
+        super::restrict(dir.path()).unwrap();
+        assert_eq!(super::restrict(dir.path()).unwrap(), 0);
+        for path in [&link, &sibling] {
+            let mode = std::fs::metadata(path).unwrap().permissions().mode() & 0o777;
+            assert_eq!(mode, 0o600, "{}", path.display());
+        }
     }
 }
