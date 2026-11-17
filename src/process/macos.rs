@@ -423,8 +423,7 @@ impl StagingVolume {
         if self.closed {
             return Ok(());
         }
-        self.verify_mounted()?;
-        self.verify_inventory(true)?;
+        self.wait_for_inventory()?;
         let mut detach = Command::new("/usr/bin/hdiutil");
         // Never force detach: a busy mount disproves writer settlement.
         detach.arg("detach").arg(&self.device);
@@ -601,22 +600,24 @@ fn staging_verify_inventory(
         if attached && !matches {
             // Unrelated catalogue entries may outlive detach and device reuse.
             // Only a claim on the anchored mount contradicts this attachment.
-            for entity in staging_plist_array(&record, "system-entities")?.iter() {
-                let entity = staging_plist_dictionary(*entity)?;
-                let claimed_mount = staging_plist_optional_string(&entity, "mount-point")?;
-                let claims_mount = match claimed_mount {
-                    Some(path) => {
-                        std::path::Path::new(&path) == root
-                            || std::fs::metadata(&path).is_ok_and(|metadata| {
-                                metadata_identity(&metadata) == mount_identity
-                            })
-                    }
-                    None => false,
-                };
-                anyhow::ensure!(
-                    !claims_mount,
-                    "another inventory image claims the staging mount: {path}"
-                );
+            if let Some(entities) = staging_plist_optional_array(&record, "system-entities")? {
+                for entity in entities.iter() {
+                    let entity = staging_plist_dictionary(*entity)?;
+                    let claimed_mount = staging_plist_optional_string(&entity, "mount-point")?;
+                    let claims_mount = match claimed_mount {
+                        Some(path) => {
+                            std::path::Path::new(&path) == root
+                                || std::fs::metadata(&path).is_ok_and(|metadata| {
+                                    metadata_identity(&metadata) == mount_identity
+                                })
+                        }
+                        None => false,
+                    };
+                    anyhow::ensure!(
+                        !claims_mount,
+                        "another inventory image claims the staging mount: {path}"
+                    );
+                }
             }
         }
         paths.push((path, identity));
@@ -724,6 +725,26 @@ fn staging_plist_string(
         .downcast::<core_foundation::string::CFString>()
         .context("disk image field is not a string")?
         .to_string())
+}
+
+fn staging_plist_optional_array(
+    dictionary: &core_foundation::dictionary::CFDictionary,
+    key: &str,
+) -> anyhow::Result<Option<core_foundation::array::CFArray>> {
+    use core_foundation::{
+        base::{CFType, TCFType as _},
+        string::CFString,
+    };
+    let key = CFString::new(key);
+    dictionary
+        .find(key.as_concrete_TypeRef().cast::<std::ffi::c_void>())
+        .map(|value| {
+            // SAFETY: find returns a live retained dictionary's CF object.
+            unsafe { CFType::wrap_under_get_rule(*value) }
+                .downcast()
+                .context("disk image field is not an array")
+        })
+        .transpose()
 }
 
 fn staging_plist_optional_string(
@@ -3176,6 +3197,27 @@ mod tests {
         assert!(staging_verify_unattached_inventory(&recycled, image_identity).is_ok());
         assert!(staging_verify_unattached_inventory(&incomplete, image_identity).is_err());
         std::fs::write(&other_image, b"unrelated image").unwrap();
+        let without_entities = |path: &std::path::Path| {
+            staging_plist(
+                format!(
+                    "<?xml version=\"1.0\"?><plist version=\"1.0\"><dict>\
+                    <key>images</key><array><dict>\
+                    <key>image-path</key><string>{}</string>\
+                    </dict></array></dict></plist>",
+                    path.display()
+                )
+                .as_bytes(),
+            )
+            .unwrap()
+        };
+        let incomplete_foreign = without_entities(&other_image);
+        assert!(verify(&incomplete_foreign, true)
+            .unwrap_err()
+            .is::<StagingInventoryMissing>());
+        let incomplete_owned = without_entities(&image);
+        assert!(!verify(&incomplete_owned, true)
+            .unwrap_err()
+            .is::<StagingInventoryMissing>());
         let empty = snapshot(&[], &root, "/dev/disk42");
         assert!(verify(&empty, false).is_ok());
         let error = verify(&empty, true).unwrap_err().to_string();
