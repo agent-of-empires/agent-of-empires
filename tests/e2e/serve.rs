@@ -2739,9 +2739,9 @@ fn cli_serve_restart_replays_launch_state() {
         "--host",
         "0.0.0.0",
         "--no-auth",
+        // Invalid on purpose: --behind-proxy without --allowed-host fails
+        // validate_behind_proxy_allowlist, before the running core is stopped.
         "--behind-proxy",
-        "--allowed-host",
-        "127.0.0.1",
     ]);
     assert!(!invalid.status.success());
     assert!(
