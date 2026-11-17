@@ -5,26 +5,47 @@ use anyhow::Result;
 
 const PREFIXES: [&str; 3] = ["acp_events.db", "plugin_events.db", "cockpit_events.db"];
 
+/// Follows symlinks. A missing path has nothing to restrict; any other error aborts so the
+/// migration is retried instead of stamped complete over a readable log.
+#[cfg(unix)]
+fn restrict_file(path: &std::path::Path) -> Result<usize> {
+    use std::os::unix::fs::PermissionsExt;
+    let meta = match std::fs::metadata(path) {
+        Ok(meta) => meta,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(0),
+        Err(err) => return Err(err.into()),
+    };
+    if !meta.is_file() || meta.permissions().mode() & 0o077 == 0 {
+        return Ok(0);
+    }
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))?;
+    Ok(1)
+}
+
 #[cfg(unix)]
 fn restrict(dir: &std::path::Path) -> Result<usize> {
-    use std::os::unix::fs::PermissionsExt;
     let mut changed = 0;
     for entry in std::fs::read_dir(dir)? {
         let entry = entry?;
         let name = entry.file_name();
         let Some(name) = name.to_str() else { continue };
-        let path = entry.path();
-        // metadata follows symlinks, so a linked log restricts its target.
-        let Ok(meta) = std::fs::metadata(&path) else {
-            continue;
-        };
-        if !PREFIXES.iter().any(|p| name.starts_with(p)) || !meta.is_file() {
+        if !PREFIXES.iter().any(|p| name.starts_with(p)) {
             continue;
         }
-        let mode = meta.permissions().mode();
-        if mode & 0o077 != 0 {
-            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))?;
-            changed += 1;
+        let path = entry.path();
+        changed += restrict_file(&path)?;
+        // SQLite names sidecars after the resolved path of a symlinked log.
+        match std::fs::canonicalize(&path) {
+            Ok(target) if target != path => {
+                for suffix in ["-wal", "-shm"] {
+                    let mut sidecar = target.clone().into_os_string();
+                    sidecar.push(suffix);
+                    changed += restrict_file(sidecar.as_ref())?;
+                }
+            }
+            Ok(_) => {}
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+            Err(err) => return Err(err.into()),
         }
     }
     Ok(changed)
@@ -66,12 +87,17 @@ mod tests {
         std::fs::write(&target, b"x").unwrap();
         std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o644)).unwrap();
         std::os::unix::fs::symlink(&target, dir.path().join("cockpit_events.db")).unwrap();
-        assert_eq!(super::restrict(dir.path()).unwrap(), 7);
+        let target_wal = dir.path().join("history.sqlite-wal");
+        std::fs::write(&target_wal, b"x").unwrap();
+        std::fs::set_permissions(&target_wal, std::fs::Permissions::from_mode(0o644)).unwrap();
+        assert_eq!(super::restrict(dir.path()).unwrap(), 8);
         assert_eq!(super::restrict(dir.path()).unwrap(), 0);
-        assert_eq!(
-            std::fs::metadata(&target).unwrap().permissions().mode() & 0o777,
-            0o600
-        );
+        for restricted in [&target, &target_wal] {
+            assert_eq!(
+                std::fs::metadata(restricted).unwrap().permissions().mode() & 0o777,
+                0o600
+            );
+        }
         for name in names {
             let mode = std::fs::metadata(dir.path().join(name))
                 .unwrap()
@@ -84,5 +110,20 @@ mod tests {
                 "{name}"
             );
         }
+    }
+
+    #[test]
+    fn unreadable_log_aborts_then_succeeds_after_repair() {
+        let dir = tempfile::tempdir().unwrap();
+        let link = dir.path().join("acp_events.db");
+        std::os::unix::fs::symlink(&link, &link).unwrap();
+        let sibling = dir.path().join("plugin_events.db");
+        std::fs::write(&sibling, b"x").unwrap();
+        std::fs::set_permissions(&sibling, std::fs::Permissions::from_mode(0o644)).unwrap();
+        assert!(super::restrict(dir.path()).is_err());
+        std::fs::remove_file(&link).unwrap();
+        std::fs::write(&link, b"x").unwrap();
+        std::fs::set_permissions(&link, std::fs::Permissions::from_mode(0o644)).unwrap();
+        assert_eq!(super::restrict(dir.path()).unwrap(), 2);
     }
 }
