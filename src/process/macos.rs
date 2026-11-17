@@ -332,17 +332,32 @@ pub(super) fn processes_matching(
 }
 
 pub(super) fn runner_group_executing(group: u32) -> anyhow::Result<bool> {
+    runner_group_executing_before(
+        group,
+        std::time::Instant::now() + std::time::Duration::from_secs(2),
+    )
+}
+
+pub(super) fn runner_group_executing_before(
+    group: u32,
+    deadline: std::time::Instant,
+) -> anyhow::Result<bool> {
+    let deadline = deadline.min(std::time::Instant::now() + std::time::Duration::from_secs(2));
     let mut command = Command::new("ps");
     command
         .args(["-A", "-o", "pid=,pgid=,stat="])
         .env("LC_ALL", "C");
-    let output = crate::session::capture::run_with_timeout_limit(
+    let output = crate::session::capture::run_with_deadline_limit(
         command,
-        std::time::Duration::from_secs(2),
+        deadline,
         "runner group census",
         1024 * 1024,
     )?;
     for line in std::str::from_utf8(&output)?.lines() {
+        anyhow::ensure!(
+            std::time::Instant::now() < deadline,
+            "runner group census timed out"
+        );
         let mut fields = line.split_ascii_whitespace();
         fields
             .next()

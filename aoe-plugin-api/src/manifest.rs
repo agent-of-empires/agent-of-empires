@@ -1300,6 +1300,24 @@ impl PluginManifest {
                 self.api_version >= 22 || integration.session_id.is_none(),
                 format!("agent_integrations[{i}].session_id requires api_version >= 22"),
             );
+            if let Some(delay) = integration
+                .launch
+                .as_ref()
+                .and_then(|launch| launch.send_keys_enter_delay_ms)
+            {
+                check(
+                    self.api_version >= 22,
+                    format!(
+                        "agent_integrations[{i}].launch.send_keys_enter_delay_ms requires api_version >= 22"
+                    ),
+                );
+                check(
+                    delay <= 2_000,
+                    format!(
+                        "agent_integrations[{i}].launch.send_keys_enter_delay_ms must be at most 2000"
+                    ),
+                );
+            }
             check(
                 if status_integration {
                     !integration.provider_versions.is_empty()

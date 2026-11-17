@@ -1731,6 +1731,10 @@ fn is_safe_agent_name(name: &str) -> bool {
         && !name.contains('\\')
 }
 
+/// The built-in pause for `tool` between typing and Enter.
+///
+/// A declared integration paces through `Instance::send_keys_enter_delay`,
+/// which keeps this table as the fallback for every program it does not own.
 pub fn send_keys_enter_delay(tool: &str) -> u64 {
     get_agent(tool)
         .map(|a| a.send_keys_enter_delay_ms)

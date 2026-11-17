@@ -26,6 +26,8 @@ function mergeSession(session: SessionResponse, previous: SessionResponse): Sess
     rate_limit_auto_resume: session.rate_limit_auto_resume ?? previous.rate_limit_auto_resume,
     // Omitted when false, and mutation responses never resolve it: keep the polled value.
     structured_view_off: session.structured_view_off ?? previous.structured_view_off,
+    // Only the list sets it.
+    queue_reason: session.queue_reason ?? previous.queue_reason,
   };
 }
 

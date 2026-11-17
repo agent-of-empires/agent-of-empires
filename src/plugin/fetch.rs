@@ -89,9 +89,20 @@ pub(super) async fn fetch(
             Some(RuntimeSpec::ReleaseBinary { .. })
         )
     {
-        download_release_binary(fetched, operation).await
+        // Keep staging and the lease until asynchronous file operations finish.
+        await_asset_download(tokio::spawn(download_release_binary(fetched, operation))).await
     } else {
         Ok(fetched)
+    }
+}
+
+async fn await_asset_download(
+    task: tokio::task::JoinHandle<Result<FetchedPlugin>>,
+) -> Result<FetchedPlugin> {
+    match task.await {
+        Ok(result) => result,
+        Err(error) if error.is_panic() => std::panic::resume_unwind(error.into_panic()),
+        Err(error) => Err(error).context("plugin asset download task failed"),
     }
 }
 
@@ -178,7 +189,9 @@ const MAX_MANIFEST_BYTES: usize = 256 * 1024;
 
 fn read_manifest(tree: &Path) -> Result<(PluginManifest, Vec<u8>)> {
     let root = crate::session::AnchoredDir::open(tree)?;
-    let Some(mut file) = root.open_regular(Path::new("aoe-plugin.toml"), MAX_MANIFEST_BYTES)?
+    let Some(bytes) = root
+        .read_regular(Path::new("aoe-plugin.toml"), MAX_MANIFEST_BYTES)
+        .with_context(|| format!("reading {}", tree.join("aoe-plugin.toml").display()))?
     else {
         bail!(
             "no regular aoe-plugin.toml of at most {MAX_MANIFEST_BYTES} bytes at {}; \
@@ -187,9 +200,6 @@ fn read_manifest(tree: &Path) -> Result<(PluginManifest, Vec<u8>)> {
             tree.join("aoe-plugin.toml").display()
         );
     };
-    let mut bytes = Vec::new();
-    file.read_to_end(&mut bytes)
-        .with_context(|| format!("reading {}", tree.join("aoe-plugin.toml").display()))?;
     let text = std::str::from_utf8(&bytes).context("aoe-plugin.toml is not valid UTF-8")?;
     let manifest = PluginManifest::from_toml_str(text).map_err(|e| anyhow!("{e}"))?;
     Ok((manifest, bytes))
@@ -584,7 +594,7 @@ pub(super) fn render_asset_template<'a>(
 }
 
 async fn download_asset(url: &str, dest: &Path) -> Result<()> {
-    use std::io::Write;
+    use tokio::io::AsyncWriteExt;
     let client = reqwest::Client::builder()
         .user_agent(DEFAULT_USER_AGENT)
         .timeout(Duration::from_secs(300))
@@ -594,14 +604,24 @@ async fn download_asset(url: &str, dest: &Path) -> Result<()> {
     if !status.is_success() {
         bail!("downloading {url} failed: HTTP {status}");
     }
-    let mut file =
-        std::fs::File::create(dest).with_context(|| format!("creating {}", dest.display()))?;
-    while let Some(chunk) = response.chunk().await? {
-        file.write_all(&chunk)
-            .with_context(|| format!("writing {url} to {}", dest.display()))?;
+    let mut file = tokio::fs::File::create(dest)
+        .await
+        .with_context(|| format!("creating {}", dest.display()))?;
+    let result: Result<()> = async {
+        while let Some(chunk) = response.chunk().await? {
+            file.write_all(&chunk)
+                .await
+                .with_context(|| format!("writing {url} to {}", dest.display()))?;
+        }
+        Ok(())
     }
-    file.flush()
-        .with_context(|| format!("writing {url} to {}", dest.display()))
+    .await;
+    let flush = file
+        .flush()
+        .await
+        .with_context(|| format!("writing {url} to {}", dest.display()));
+    result?;
+    flush
 }
 
 fn sha256_file(path: &Path) -> Result<String> {
@@ -797,6 +817,18 @@ fn ensure_executable(tree: &Path, rel: &Path) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn asset_task_panics_reach_the_job_panic_boundary() {
+        use futures_util::FutureExt;
+
+        let task: tokio::task::JoinHandle<Result<FetchedPlugin>> =
+            tokio::spawn(async { panic!("private-panic-payload") });
+        let panic = std::panic::AssertUnwindSafe(await_asset_download(task))
+            .catch_unwind()
+            .await;
+        assert!(panic.is_err());
+    }
 
     #[test]
     fn parse_ls_remote_prefers_the_peeled_tag_and_a_pinned_sha_skips_the_remote() {
@@ -1018,6 +1050,13 @@ mod tests {
         run_git(&repo, &["tag", "v1"]);
         let bytes = Arc::new(Mutex::new(b"#!/bin/sh\nexit 0\n".to_vec()));
         let download = bytes.clone();
+        let pause = Arc::new(Mutex::new(
+            None::<(
+                tokio::sync::oneshot::Sender<()>,
+                tokio::sync::oneshot::Receiver<()>,
+            )>,
+        ));
+        let pause_download = pause.clone();
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let base = format!("http://{}", listener.local_addr().unwrap());
         let release_base = base.clone();
@@ -1029,7 +1068,14 @@ mod tests {
             }))
             .route("/asset", axum::routing::get(move || {
                 let download = download.clone();
-                async move { download.lock().unwrap().clone() }
+                let pause = pause_download.lock().unwrap().take();
+                async move {
+                    if let Some((entered, release)) = pause {
+                        let _ = entered.send(());
+                        let _ = release.await;
+                    }
+                    download.lock().unwrap().clone()
+                }
             }));
         let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
         let _env = EnvGuard::set(&[
@@ -1041,6 +1087,38 @@ mod tests {
         ]);
         let source = PluginSource::parse("gh:acme/bin@v1").unwrap();
         let plugins = crate::plugin::plugins_dir().unwrap();
+        let (entered, waiting) = tokio::sync::oneshot::channel();
+        let (release, released) = tokio::sync::oneshot::channel();
+        *pause.lock().unwrap() = Some((entered, released));
+        let operation = crate::plugin::install::begin_operation().unwrap();
+        let staged_source = source.clone();
+        let task = tokio::spawn(async move { fetch(&staged_source, Some(operation)).await });
+        tokio::time::timeout(Duration::from_secs(5), waiting)
+            .await
+            .unwrap()
+            .unwrap();
+        task.abort();
+        assert!(matches!(task.await, Err(error) if error.is_cancelled()));
+        assert!(crate::plugin::install::begin_operation().is_err());
+        release.send(()).unwrap();
+        let operation = tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                if let Ok(operation) = crate::plugin::install::begin_operation() {
+                    break operation;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        assert!(!std::fs::read_dir(&plugins).unwrap().any(|entry| {
+            entry
+                .unwrap()
+                .file_name()
+                .to_string_lossy()
+                .starts_with(".staging-")
+        }));
+        drop(operation);
         let mut gate = test_gate::install(&plugins, "asset");
         let operation = crate::plugin::install::begin_operation().unwrap();
         let staged_source = source.clone();

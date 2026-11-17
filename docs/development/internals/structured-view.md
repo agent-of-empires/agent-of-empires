@@ -160,6 +160,12 @@ receipt. Only the foreground confirmation actually painted by that frame receive
 authority; a covering notice does not authorize a hidden prompt. Cancellation and
 option navigation remain available while output is pending.
 
+Sidebar input requires the emitted row-model and layout grant. Canonical
+rebuilds revoke it independently of preview and confirmation grants.
+Double-click pairing follows the same session or profile-qualified group,
+not a reused screen coordinate. Preview focus alone does not change the emitted
+row map.
+
 Handoff admission finishes leave-screen controls before disabling raw input,
 dropping the event stream, probing an editor, or preparing and starting a child.
 Backpressure safely refuses the operation with retry feedback. After an admitted

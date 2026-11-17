@@ -1061,6 +1061,7 @@ impl HomeView {
         image_update: Option<&ImageUpdate>,
     ) {
         self.painted_confirmation = None;
+        self.painted_rows = None;
         // Hidden bars and takeover views must not retain clickable regions.
         self.footer_buttons.clear();
         self.tips_badge_rect = None;
@@ -1683,6 +1684,9 @@ impl HomeView {
             ];
             let para = Paragraph::new(empty_text).alignment(Alignment::Center);
             frame.render_widget(para, inner);
+            if !inner.is_empty() {
+                self.painted_rows = Some(self.rows_paint());
+            }
             return;
         }
 
@@ -1927,6 +1931,9 @@ impl HomeView {
             if self.search_active && !self.has_overlay_above_search() {
                 set_prefixed_input_cursor_position(frame, search_area, "/", &self.search_query);
             }
+        }
+        if !inner.is_empty() {
+            self.painted_rows = Some(self.rows_paint());
         }
     }
 

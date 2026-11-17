@@ -10,7 +10,8 @@ use crate::agents::ResolvedHookEvent;
 
 use super::command::{hook_command_session_id, json_command_is_aoe, status_command_for_event};
 use super::config_io::{
-    log_installed, log_removed, log_unchanged, parse_json_or_empty, with_config_lock, write_json,
+    log_installed, log_removed, log_unchanged, parse_json_or_empty, with_config_lock,
+    with_config_lock_policy, write_json, SymlinkPolicy,
 };
 use super::HookInstallTarget;
 
@@ -89,11 +90,9 @@ pub fn install_hooks(
     if events.as_ref().is_empty() && !settings_path.exists() {
         return Ok(());
     }
-    with_config_lock(settings_path, "json.lock", || {
-        let content = settings_path
-            .exists()
-            .then(|| std::fs::read_to_string(settings_path))
-            .transpose()?;
+    let policy = SymlinkPolicy::for_target(target);
+    with_config_lock_policy(settings_path, "json.lock", policy, || {
+        let content = policy.read(settings_path)?;
         let mut settings = parse_json_or_empty(content, settings_path);
         let before = settings.clone();
 
@@ -130,7 +129,10 @@ pub fn install_hooks(
             log_unchanged(settings_path);
             return Ok(());
         }
-        write_json(settings_path, &settings)?;
+        policy.write(
+            settings_path,
+            serde_json::to_string_pretty(&settings)?.as_bytes(),
+        )?;
         log_installed(settings_path);
         Ok(())
     })
@@ -206,11 +208,12 @@ pub fn install_cursor_hooks_with_events(
     if events.is_empty() && !config_path.exists() {
         return Ok(());
     }
-    with_config_lock(config_path, "json.lock", || {
-        let mut config = if config_path.exists() {
-            read_cursor_hooks(config_path)?
-        } else {
-            serde_json::json!({})
+    let policy = SymlinkPolicy::for_target(target);
+    with_config_lock_policy(config_path, "json.lock", policy, || {
+        let mut config = match policy.read(config_path)? {
+            Some(raw) => serde_json::from_str(&raw)
+                .with_context(|| format!("parsing Cursor hooks at {}", config_path.display()))?,
+            None => serde_json::json!({}),
         };
         let before = config.clone();
         let root = config
@@ -241,7 +244,10 @@ pub fn install_cursor_hooks_with_events(
         if config == before {
             return Ok(());
         }
-        write_json(config_path, &config)
+        policy.write(
+            config_path,
+            serde_json::to_string_pretty(&config)?.as_bytes(),
+        )
     })
 }
 

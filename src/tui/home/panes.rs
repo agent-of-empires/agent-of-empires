@@ -423,6 +423,7 @@ impl HomeView {
     /// Toggle terminal mode between Container and Host for a session
     pub fn toggle_terminal_mode(&mut self, session_id: &str) {
         self.cancel_native_attachment();
+        self.invalidate_rows();
         let current = self.get_terminal_mode(session_id);
         let new_mode = match current {
             TerminalMode::Container => TerminalMode::Host,

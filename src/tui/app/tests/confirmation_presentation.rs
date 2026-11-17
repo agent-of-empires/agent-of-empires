@@ -413,3 +413,140 @@ async fn home_visible_mouse_discard_restores_the_actual_theme_preview() {
     assert_eq!(app.theme_name, saved_theme);
     assert_eq!(std::fs::read(&config_path).unwrap(), config_before);
 }
+
+#[tokio::test]
+#[serial_test::serial]
+async fn home_pending_frame_cannot_route_mouse_to_reordered_sessions() {
+    use crate::session::config::{ClickAction, GroupByMode, SortOrder};
+    use crate::session::{Instance, Item, Status, Storage, View};
+
+    let root = tempfile::tempdir().unwrap();
+    let _home = crate::session::test_support::isolate_app_dir_at(root.path());
+    crate::session::get_profile_dir("test").unwrap();
+    crate::session::config::update_config(|config| {
+        config.session.click_action = ClickAction::SelectOnly;
+    })
+    .unwrap();
+    crate::session::config::update_app_state(|state| {
+        state.group_by = Some(GroupByMode::Manual);
+        state.sort_order = Some(SortOrder::Custom);
+    })
+    .unwrap();
+    let rows: Vec<_> = ["Painted A", "Painted B", "Painted C"]
+        .into_iter()
+        .enumerate()
+        .map(|(index, title)| {
+            let mut row = Instance::new(title, root.path().to_str().unwrap());
+            row.source_profile = "test".into();
+            row.status = Status::Stopped;
+            row.created_at = chrono::Utc::now() - chrono::Duration::seconds(3 - index as i64);
+            row.sort_index = Some(index as u32);
+            row
+        })
+        .collect();
+    let storage = Storage::new_unwatched("test").unwrap();
+    storage
+        .update(|stored, groups| {
+            *stored = rows.clone();
+            *groups = Vec::new();
+            Ok(())
+        })
+        .unwrap();
+    let state = crate::server::test_support::build_test_app_state(rows.clone());
+    crate::server::test_support::refresh_canonical_metadata_for_test(&state).await;
+    let mut snapshot = state.runtime.publish(&state).await.unwrap().value.clone();
+    for row in &mut snapshot.contents.sessions {
+        row.view = View::Terminal;
+    }
+    let mut app = App::new(
+        "test",
+        AvailableTools::with_tools(&["claude"]),
+        true,
+        false,
+        crate::file_watch::FileWatchService::noop(),
+    )
+    .unwrap();
+    app.home.view_mode = crate::tui::home::ViewMode::Terminal;
+    app.home
+        .session_feed
+        .publish_for_test(crate::tui::session_feed::SessionFeedResult::Snapshot(
+            std::sync::Arc::new(snapshot.clone()),
+        ));
+    app.home.apply_session_feed_before_input();
+    app.home.select_session_by_id(&rows[0].id);
+    assert!(app.home.retained_preview.is_none());
+    assert!(app.home.structured_preview.is_none());
+
+    let (mut master, slave) = private_terminal();
+    let mut control = slave.try_clone().unwrap();
+    let (_output_guard, _) = install_test_output(slave);
+    let mut terminal = output_test_terminal();
+    let mut emitted = Vec::new();
+    present(&mut app, &mut terminal, &mut master, &mut emitted);
+    let old_index = app
+        .home
+        .flat_items
+        .iter()
+        .position(|item| matches!(item, Item::Session { id, .. } if id == &rows[0].id))
+        .unwrap();
+    let col = app.home.list_inner_area.x + 2;
+    let screen_row = app.home.list_inner_area.y + old_index as u16;
+
+    block_terminal(&mut control);
+    crate::tui::terminal_output::request_redraw();
+    app.draw(&mut terminal).unwrap();
+    assert!(app.pending_presentation.is_some());
+    for order in [[1, 0, 2], [2, 0, 1]] {
+        snapshot.cursor.revision += 1;
+        for (index, sort_index) in order.into_iter().enumerate() {
+            snapshot
+                .contents
+                .sessions
+                .iter_mut()
+                .find(|row| row.id == rows[index].id)
+                .unwrap()
+                .sort_index = Some(sort_index);
+        }
+        app.home.session_feed.publish_for_test(
+            crate::tui::session_feed::SessionFeedResult::Snapshot(std::sync::Arc::new(
+                snapshot.clone(),
+            )),
+        );
+        app.home.apply_session_feed_before_input();
+    }
+    assert_eq!(
+        app.home.selected_session.as_deref(),
+        Some(rows[0].id.as_str())
+    );
+    assert!(
+        matches!(&app.home.flat_items[old_index], Item::Session { id, .. } if id == &rows[1].id),
+        "the old painted coordinate must now name another session"
+    );
+    resume_terminal(&control);
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    while app.pending_presentation.is_some() {
+        assert!(std::time::Instant::now() < deadline);
+        drain_terminal(&mut master, &mut emitted);
+        app.draw(&mut terminal).unwrap();
+    }
+    let cursor = app.home.cursor;
+    assert!(app.home.handle_click(col, screen_row).is_none());
+    assert_eq!(
+        app.home.selected_session.as_deref(),
+        Some(rows[0].id.as_str()),
+        "an old output receipt must not authorize a different session"
+    );
+    assert!(!app.home.handle_right_click(col, screen_row));
+    assert!(app.home.context_menu.is_none());
+    assert!(!app.home.handle_scroll_down(col, screen_row));
+    assert_eq!(app.home.cursor, cursor);
+
+    crate::tui::terminal_output::request_redraw();
+    app.draw(&mut terminal).unwrap();
+    present(&mut app, &mut terminal, &mut master, &mut emitted);
+    assert!(app.home.handle_click(col, screen_row).is_none());
+    assert_eq!(
+        app.home.selected_session.as_deref(),
+        Some(rows[1].id.as_str())
+    );
+}

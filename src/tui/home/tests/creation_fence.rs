@@ -120,14 +120,11 @@ fn session_actions_refuse_the_creating_stub() {
     assert!(view.rename_dialog.is_none());
     assert!(view.status_flash_text().is_some());
 
-    // A menu whose every entry would refuse the row is never opened. The
-    // sidebar geometry is only known once the list rects are set, exactly as
-    // `right_click_context_menu` does.
     view.status_flash = None;
-    view.list_inner_area = ratatui::layout::Rect::new(1, 1, 28, 10);
-    view.list_area = ratatui::layout::Rect::new(0, 0, 30, 12);
-    let row = 1 + view.cursor as u16;
-    assert!(view.handle_right_click(5, row));
+    render_geometry(&mut view);
+    let list = view.list_inner_area;
+    let row = list.y + view.cursor as u16;
+    assert!(view.handle_right_click(list.x, row));
     assert!(view.context_menu.is_none(), "no menu for the creating stub");
     assert!(view.status_flash_text().is_some());
 
@@ -860,7 +857,31 @@ fn a_resubmit_reviews_trust_again_once_the_hooks_change() {
                 .as_ref()
                 .map(|d| d.title.as_str());
             assert_eq!(kept, Some("Hooked"), "{change}");
+            // An answer refused before it is sent returns to the setup-failed dialog,
+            // with the request, its new review and the Create-without-setup choice.
+            view.session_feed.set_mutation_permission_for_test(false);
             view.handle_key(key(KeyCode::Char('y')), None);
+            let (_, now) = creation_trust_review(&data()).unwrap();
+            let kept = view.create_hook_failed.as_ref().map(|(_, r)| {
+                (
+                    r.data.title.clone(),
+                    r.trust_review.clone(),
+                    r.skip_on_create,
+                )
+            });
+            assert_eq!(
+                kept,
+                Some((
+                    "Hooked".to_string(),
+                    Some(now),
+                    key_code == KeyCode::Char('s')
+                )),
+                "{change}"
+            );
+            view.handle_key(key(KeyCode::Esc), None);
+            view.session_feed.set_mutation_permission_for_test(true);
+            view.handle_key(key(key_code), None);
+            assert!(view.create_hook_failed.is_none(), "{change}");
         }
         let second = fail(CommandFailure::Rejected("done".into()));
         let (_, now) = creation_trust_review(&data()).unwrap();

@@ -96,6 +96,7 @@ struct PendingPresentation {
     retained: Option<u64>,
     structured: Option<u64>,
     confirmation: Option<super::home::ConfirmationToken>,
+    rows: Option<super::home::HomeRowsPaint>,
 }
 
 pub struct App {
@@ -525,6 +526,7 @@ impl App {
                     .as_ref()
                     .map(|view| view.interaction_revision()),
                 confirmation: self.home.painted_confirmation,
+                rows: self.home.painted_rows,
             });
         }
         let matching = self
@@ -548,6 +550,11 @@ impl App {
                 };
             self.home.presentation_ready &= structured_matches;
             self.home.acknowledge_confirmation(pending.confirmation);
+            self.home.acknowledge_rows(pending.rows);
+            if pending.rows.is_some() && !self.home.rows_presented() {
+                super::terminal_output::request_redraw();
+                self.needs_redraw = true;
+            }
         } else {
             self.home.invalidate_presentation();
             self.host_title.invalidate();
@@ -557,7 +564,9 @@ impl App {
             super::terminal_output::request_redraw();
         }
         #[cfg(feature = "e2e-tests")]
-        if self.home.presentation_ready {
+        if self.home.presentation_ready
+            && (self.home.painted_rows.is_none() || self.home.rows_presented())
+        {
             e2e_report_runtime(self.home.runtime_settled());
         }
         Ok(())
@@ -805,7 +814,9 @@ impl App {
             tokio::select! {
                 event = self.event_stream.as_mut().expect("event_stream missing").next() => {
                     // Keys reach the view before the next draw, so no dialog is promoted here.
-                    self.home.apply_session_feed_before_input();
+                    if self.home.apply_session_feed_before_input() {
+                        self.needs_redraw = true;
+                    }
                     self.home.enforce_trash_read_only();
                     if self.home.selected_is_trashed() {
                         self.close_embedded_structured();
@@ -825,7 +836,7 @@ impl App {
                                     break;
                                 }
                             }
-                            Some(Ok(Event::Resize(_, _))) => {}
+                            Some(Ok(Event::Resize(_, _))) => self.home.invalidate_rows(),
                             None => break,
                             _ => continue,
                         }
@@ -922,6 +933,7 @@ impl App {
                                             Event::Key(k) => { self.handle_key(k, terminal).await?; }
                                             Event::Paste(text) => { self.home.handle_paste(&text); }
                                             Event::Resize(_, _) => {
+                                                self.home.invalidate_rows();
                                                 self.home.invalidate_presentation();
                                                 self.needs_redraw = true;
                                                 super::terminal_output::request_redraw();
@@ -1296,7 +1308,7 @@ impl App {
                             continue;
                         }
                         Some(Ok(Event::Resize(_, _))) => {
-                            // Redraw so viewport-driven layout re-evaluates.
+                            self.home.invalidate_rows();
                             self.draw(terminal)?;
                             continue;
                         }

@@ -9,7 +9,7 @@ use super::bindings::{self, ActionId};
 use super::live_send::LiveKey;
 use super::{
     live_send, DragKind, HomeView, NamespaceIntent, PermissionResponseTarget, PreviewSelection,
-    TerminalMode, ViewMode,
+    RowClick, RowClickTarget, TerminalMode, ViewMode,
 };
 use crate::session::config::repo_config;
 use crate::session::config::{
@@ -788,13 +788,14 @@ impl HomeView {
         if recovery_only {
             self.cancel_native_attachment();
             self.exit_live_send_if_active();
-            self.view_mode = if toggle_current
+            let mode = if toggle_current
                 && matches!(&self.view_mode, ViewMode::Tool(current) if current == &tool_name)
             {
                 ViewMode::Structured
             } else {
                 ViewMode::Tool(tool_name)
             };
+            self.set_view_mode(mode);
             self.preview_scroll_offset = 0;
             self.tool_preview_cache = super::PreviewCache::default();
             return None;
@@ -815,10 +816,10 @@ impl HomeView {
                 // The pending native preparation was bound to the mode being
                 // left, so its lease must not outlive it.
                 self.cancel_native_attachment();
-                self.view_mode = ViewMode::Structured;
+                self.set_view_mode(ViewMode::Structured);
                 return None;
             } else {
-                self.view_mode = ViewMode::Tool(tool_name.clone());
+                self.set_view_mode(ViewMode::Tool(tool_name.clone()));
                 self.preview_scroll_offset = 0;
                 self.tool_preview_cache = super::PreviewCache::default();
             }
@@ -1400,6 +1401,7 @@ impl HomeView {
 
     pub(in crate::tui) fn invalidate_presentation(&mut self) {
         self.presentation_ready = false;
+        self.presented_rows = None;
         self.presented_confirmation = None;
         if let Some(view) = self.structured_preview.as_mut() {
             view.invalidate_presentation();
@@ -1855,26 +1857,9 @@ impl HomeView {
             if let Some(result) = dialog.handle_click(col, row) {
                 match result {
                     DialogResult::Continue => {}
-                    DialogResult::Cancel => {
-                        self.repo_trust_dialog = None;
-                        self.pending_repo_trust_data = None;
-                        self.pending_repo_trust_fingerprint = None;
-                        self.pending_repo_trust_skip_on_create = false;
-                    }
+                    DialogResult::Cancel => self.cancel_repo_trust(),
                     DialogResult::Submit(action) => {
-                        self.repo_trust_dialog = None;
-                        let fingerprint = self.pending_repo_trust_fingerprint.take();
-                        let skip = std::mem::take(&mut self.pending_repo_trust_skip_on_create);
-                        if let Some(data) = self.pending_repo_trust_data.take() {
-                            let decision = match action {
-                                RepoTrustAction::Trust { .. } => {
-                                    RepoTrustDecision::Approve(fingerprint)
-                                }
-                                RepoTrustAction::Skip { .. } => RepoTrustDecision::Refuse,
-                            };
-                            let emit = self.create_session_with_hooks(data, decision, skip);
-                            self.pending_dialog_click_action = emit;
-                        }
+                        self.pending_dialog_click_action = self.submit_repo_trust(action);
                     }
                 }
             }
@@ -2711,26 +2696,8 @@ impl HomeView {
         if let Some(dialog) = &mut self.repo_trust_dialog {
             match dialog.handle_key(key) {
                 DialogResult::Continue => {}
-                DialogResult::Cancel => {
-                    self.repo_trust_dialog = None;
-                    self.pending_repo_trust_data = None;
-                    self.pending_repo_trust_fingerprint = None;
-                    self.pending_repo_trust_skip_on_create = false;
-                }
-                DialogResult::Submit(action) => {
-                    self.repo_trust_dialog = None;
-                    let fingerprint = self.pending_repo_trust_fingerprint.take();
-                    let skip = std::mem::take(&mut self.pending_repo_trust_skip_on_create);
-                    if let Some(data) = self.pending_repo_trust_data.take() {
-                        let decision = match action {
-                            RepoTrustAction::Trust { .. } => {
-                                RepoTrustDecision::Approve(fingerprint)
-                            }
-                            RepoTrustAction::Skip { .. } => RepoTrustDecision::Refuse,
-                        };
-                        return self.create_session_with_hooks(data, decision, skip);
-                    }
-                }
+                DialogResult::Cancel => self.cancel_repo_trust(),
+                DialogResult::Submit(action) => return self.submit_repo_trust(action),
             }
             return None;
         }
@@ -3302,7 +3269,7 @@ impl HomeView {
             }
             KeyCode::Esc if matches!(self.view_mode, ViewMode::Tool(_)) => {
                 self.cancel_native_attachment();
-                self.view_mode = ViewMode::Structured;
+                self.set_view_mode(ViewMode::Structured);
                 return None;
             }
             _ => {}
@@ -3565,7 +3532,7 @@ impl HomeView {
             ActionId::ToolPicker => {
                 if matches!(self.view_mode, ViewMode::Tool(_)) {
                     self.cancel_native_attachment();
-                    self.view_mode = ViewMode::Structured;
+                    self.set_view_mode(ViewMode::Structured);
                 } else if self.has_tool_targets() {
                     self.open_tool_picker();
                 }
@@ -3596,10 +3563,10 @@ impl HomeView {
                 // pending native preparation is bound to the mode it was
                 // prepared for.
                 self.cancel_native_attachment();
-                self.view_mode = match self.view_mode {
+                self.set_view_mode(match self.view_mode {
                     ViewMode::Structured => ViewMode::Terminal,
                     ViewMode::Terminal | ViewMode::Tool(_) => ViewMode::Structured,
-                };
+                });
                 if matches!(self.view_mode, ViewMode::Terminal) {
                     if let Some(action) = self.maybe_auto_start_live_send() {
                         return Some(action);
@@ -5437,6 +5404,9 @@ impl HomeView {
                 return false;
             }
             if self.hit_list(col, row) {
+                if !self.rows_presented() {
+                    return false;
+                }
                 self.move_cursor(-1);
                 return true;
             }
@@ -5592,8 +5562,9 @@ impl HomeView {
     /// space inside the list opens the empty-sidebar menu, and anywhere else is a no-op so
     /// the caller falls through.
     pub fn handle_right_click(&mut self, col: u16, row: u16) -> bool {
-        // `resolve_row_to_index` already short-circuits while any non-live-send overlay is
-        // open and inside the diff takeover, so no extra gating here.
+        if !self.rows_presented() {
+            return false;
+        }
         let anchor = (col.saturating_add(1), row.saturating_add(1));
         if let Some(idx) = self.resolve_row_to_index(col, row) {
             if self.cursor != idx {
@@ -6111,6 +6082,9 @@ impl HomeView {
     /// Fires only when no overlay is up and the diff view is closed, so a click on an
     /// empty list under a modal doesn't punch through.
     pub fn handle_empty_list_click(&mut self, col: u16, row: u16) -> bool {
+        if !self.rows_presented() {
+            return false;
+        }
         if self.has_non_live_send_overlay() || self.diff_view.is_some() {
             return false;
         }
@@ -6441,70 +6415,64 @@ impl HomeView {
         col: u16,
         row: u16,
     ) -> Option<Action> {
+        if !self.rows_presented() {
+            return None;
+        }
         let abs_idx = self.resolve_row_to_index(col, row)?;
 
-        let is_double_click = matches!(
-            self.last_click,
-            Some((prev_time, _, prev_row))
-                if prev_row == row
-                    && now.duration_since(prev_time) <= DOUBLE_CLICK_THRESHOLD
-        );
-        self.last_click = Some((now, col, row));
-
-        let item = self.flat_items[abs_idx].clone();
-        if is_double_click {
-            // The first click already selected the row and toggled a group, so the second
-            // only activates a session; re-toggling would undo the first and flicker.
-            //
-            // `cursor` is re-synced to `abs_idx` before activating because anything
-            // between the clicks (an arrow key, a poll-driven re-sort) can move it, and
-            // `activate_selected_session()` reads `selected_session`, which tracks the
-            // cursor rather than the click target.
-            return match item {
-                Item::Session { .. } => {
-                    if self.cursor != abs_idx {
-                        self.cursor = abs_idx;
-                        self.update_selected();
-                    }
-                    self.activate_selected_session()
+        let target = match &self.flat_items[abs_idx] {
+            Item::Session { id, .. } => RowClickTarget::Session(id.clone()),
+            Item::Group { path, profile, .. } => RowClickTarget::Group {
+                path: path.clone(),
+                profile: profile.clone(),
+            },
+        };
+        let is_double_click = self.last_click.as_ref().is_some_and(|previous| {
+            previous.row == row
+                && previous.target == target
+                && now.duration_since(previous.at) <= DOUBLE_CLICK_THRESHOLD
+        });
+        let action = match &target {
+            RowClickTarget::Group { path, .. } => {
+                if !is_double_click {
+                    self.toggle_group_collapsed(path);
                 }
-                Item::Group { .. } => None,
-            };
-        }
-
-        match item {
-            Item::Group { path, .. } => {
-                self.toggle_group_collapsed(&path);
                 None
             }
-            Item::Session { id, .. } => {
-                self.system_health_open = false;
+            RowClickTarget::Session(id) => {
                 if self.cursor != abs_idx {
                     self.cursor = abs_idx;
                     self.update_selected();
                 }
-                // Shelved rows select without preparing a pane.
-                let archived = self
-                    .get_instance(&id)
-                    .map(|inst| inst.is_archived() || inst.is_trashed())
-                    .unwrap_or(false);
-                // SelectOnly also leaves any existing live-send target.
-                if archived
-                    || matches!(
-                        self.click_action(&id),
-                        Some(crate::session::ClickAction::SelectOnly)
-                    )
-                {
-                    // Do not leave keystrokes aimed at the previously live row.
-                    if let Some(state) = self.live_send.clone() {
-                        self.exit_live_send_and_restore_sizing(&state);
-                    }
-                    None
+                if is_double_click {
+                    self.activate_selected_session()
                 } else {
-                    self.start_live_send()
+                    self.system_health_open = false;
+                    let shelved = self
+                        .get_instance(id)
+                        .is_some_and(|inst| inst.is_archived() || inst.is_trashed());
+                    if shelved
+                        || matches!(
+                            self.click_action(id),
+                            Some(crate::session::ClickAction::SelectOnly)
+                        )
+                    {
+                        if let Some(state) = self.live_send.clone() {
+                            self.exit_live_send_and_restore_sizing(&state);
+                        }
+                        None
+                    } else {
+                        self.start_live_send()
+                    }
                 }
             }
-        }
+        };
+        self.last_click = Some(RowClick {
+            at: now,
+            row,
+            target,
+        });
+        action
     }
 
     /// A double-click on the preview pane produces the same `Action` a sidebar
@@ -6816,6 +6784,9 @@ impl HomeView {
                 return false;
             }
             if self.hit_list(col, row) {
+                if !self.rows_presented() {
+                    return false;
+                }
                 self.move_cursor(1);
                 return true;
             }
@@ -7914,6 +7885,7 @@ impl HomeView {
         skip_on_create: bool,
     ) -> Option<Action> {
         use crate::session::TrustSurface;
+        self.pending_repo_trust_recovery = None;
         // A fingerprint we cannot build can only refuse.
         let (trust, fingerprint) = match creation_trust_review(&data) {
             Ok(review) => review,
@@ -7983,6 +7955,42 @@ impl HomeView {
         self.pending_repo_trust_data = Some(data);
         self.pending_repo_trust_fingerprint = Some(fingerprint);
         self.pending_repo_trust_skip_on_create = skip_on_create;
+        None
+    }
+
+    pub(super) fn cancel_repo_trust(&mut self) {
+        self.repo_trust_dialog = None;
+        self.pending_repo_trust_data = None;
+        self.pending_repo_trust_fingerprint = None;
+        self.pending_repo_trust_skip_on_create = false;
+        self.pending_repo_trust_recovery = None;
+    }
+
+    /// Applies the answer to the open trust prompt. A prompt a setup-failed resubmit reopened
+    /// returns to that dialog when the send is refused.
+    pub(super) fn submit_repo_trust(&mut self, action: RepoTrustAction) -> Option<Action> {
+        self.repo_trust_dialog = None;
+        let fingerprint = self.pending_repo_trust_fingerprint.take();
+        let skip_on_create = std::mem::take(&mut self.pending_repo_trust_skip_on_create);
+        let recovery = self.pending_repo_trust_recovery.take();
+        let data = self.pending_repo_trust_data.take()?;
+        let decision = match action {
+            RepoTrustAction::Trust { .. } => RepoTrustDecision::Approve(fingerprint),
+            RepoTrustAction::Skip { .. } => RepoTrustDecision::Refuse,
+        };
+        let Some(dialog) = recovery else {
+            return self.create_session_with_hooks(data, decision, skip_on_create);
+        };
+        let (trust_hooks, trust_review) = decision.into_request();
+        let request = super::CreationRequest {
+            data,
+            trust_hooks,
+            trust_review,
+            skip_on_create,
+        };
+        if let Err(request) = self.submit_creation(request) {
+            self.create_hook_failed = Some((dialog, *request));
+        }
         None
     }
 

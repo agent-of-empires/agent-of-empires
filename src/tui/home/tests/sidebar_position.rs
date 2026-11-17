@@ -18,6 +18,7 @@ fn render(view: &mut HomeView, width: u16) -> Buffer {
             );
         })
         .unwrap();
+    view.acknowledge_rows(view.painted_rows);
     terminal.backend().buffer().clone()
 }
 

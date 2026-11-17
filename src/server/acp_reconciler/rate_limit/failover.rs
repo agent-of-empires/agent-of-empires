@@ -7,6 +7,7 @@
 
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, LazyLock, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 
@@ -51,6 +52,15 @@ static RETRIES: LazyLock<Mutex<Retries>> = LazyLock::new(Mutex::default);
 
 /// Pool entries already warned about, so a misconfigured name logs once.
 static WARNED: LazyLock<Mutex<HashSet<String>>> = LazyLock::new(Mutex::default);
+
+/// Whether the account table is currently unreadable and already reported, so a persistent fault
+/// logs once instead of on every pass for every parked session.
+static STATE_UNREADABLE: AtomicBool = AtomicBool::new(false);
+
+/// Marks the start of an outage; `true` only for the first failure since the last good read.
+fn begin_outage(flag: &AtomicBool) -> bool {
+    !flag.swap(true, Ordering::Relaxed)
+}
 
 fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
     mutex
@@ -178,14 +188,19 @@ pub(super) fn select_target<'a>(
     pool.iter().find(|account| {
         account.key != current_key
             && match state_of(&account.key) {
-                Ok(state) => state.is_none_or(|state| state.has_headroom(now_ms)),
+                Ok(state) => {
+                    STATE_UNREADABLE.store(false, Ordering::Relaxed);
+                    state.is_none_or(|state| state.has_headroom(now_ms))
+                }
                 Err(error) => {
-                    tracing::warn!(
-                        target: "acp.supervisor",
-                        account = %account.tool,
-                        %error,
-                        "rate-limit failover: account state unreadable; not a target"
-                    );
+                    if begin_outage(&STATE_UNREADABLE) {
+                        tracing::error!(
+                            target: "acp.supervisor",
+                            account = %account.tool,
+                            %error,
+                            "rate-limit failover: account state unreadable; no account is a target until it reads again"
+                        );
+                    }
                     false
                 }
             }
@@ -641,6 +656,18 @@ mod tests {
             None,
             "a failed lookup alone never yields a target"
         );
+    }
+
+    #[test]
+    fn an_unreadable_table_is_reported_once_per_outage() {
+        let flag = AtomicBool::new(false);
+        assert!(begin_outage(&flag));
+        assert!(
+            !begin_outage(&flag),
+            "the same outage is not reported again"
+        );
+        flag.store(false, Ordering::Relaxed);
+        assert!(begin_outage(&flag), "a later outage is");
     }
 
     /// A login failure the target's launch reported is recorded against the target, but only

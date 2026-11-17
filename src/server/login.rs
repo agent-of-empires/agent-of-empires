@@ -298,13 +298,16 @@ impl LoginManager {
                 && t.plugin_id == plugin_id
                 && t.page_id == page_id
         });
-        matches
-            && self
-                .sessions
-                .read()
-                .await
-                .get(session_id)
-                .is_some_and(|s| now < s.expires_at)
+        matches && self.session_live(session_id).await
+    }
+
+    /// Whether `session_id` names an unexpired session, without checking its device binding.
+    pub async fn session_live(&self, session_id: &str) -> bool {
+        self.sessions
+            .read()
+            .await
+            .get(session_id)
+            .is_some_and(|s| Instant::now() < s.expires_at)
     }
 
     /// Mark a session as elevated (passphrase confirmed) for `ELEVATION_LIFETIME`.

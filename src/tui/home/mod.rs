@@ -243,6 +243,37 @@ pub(in crate::tui) struct ConfirmationToken {
     input: u64,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(in crate::tui) struct HomeRowsPaint {
+    revision: u64,
+    cursor: usize,
+    search_bar_visible: bool,
+    list_width: u16,
+    list_height: Option<u16>,
+    sidebar_position: crate::session::config::SidebarPosition,
+    sidebar_collapsed: bool,
+    narrow_layout: crate::session::config::NarrowLayout,
+    show_diagnostics: bool,
+    show_shortcut_bar: bool,
+    show_last_prompt: bool,
+    non_live_overlay: bool,
+}
+
+#[derive(PartialEq, Eq)]
+enum RowClickTarget {
+    Session(String),
+    Group {
+        path: String,
+        profile: Option<String>,
+    },
+}
+
+struct RowClick {
+    at: std::time::Instant,
+    row: u16,
+    target: RowClickTarget,
+}
+
 pub struct HomeView {
     pub(super) storages: HashMap<String, Storage>,
     pub(super) active_profile: Option<String>,
@@ -316,6 +347,9 @@ pub struct HomeView {
     pub(super) pending_repo_trust_fingerprint: Option<crate::daemon::CreationTrustFingerprint>,
     /// Create without setup, carried through the trust prompt a resubmit reopened.
     pub(super) pending_repo_trust_skip_on_create: bool,
+    /// The setup-failed dialog whose resubmit reopened the trust prompt, so an answer the
+    /// daemon link refuses returns to it instead of losing the request.
+    pub(super) pending_repo_trust_recovery: Option<CreateHookFailedDialog>,
     pub(super) hooks_install_dialog: Option<HooksInstallDialog>,
     pub(super) pending_hooks_install_data: Option<NewSessionData>,
     pub(super) volume_ignores_glob_dialog: Option<ConfirmDialog>,
@@ -414,6 +448,9 @@ pub struct HomeView {
     /// `preview_text_view` maps transcript rows rather than the tmux capture.
     pub(super) structured_transcript_painted: bool,
     pub(in crate::tui) presentation_ready: bool,
+    rows_revision: u64,
+    pub(in crate::tui) painted_rows: Option<HomeRowsPaint>,
+    presented_rows: Option<HomeRowsPaint>,
     pub(in crate::tui) painted_confirmation: Option<ConfirmationToken>,
     pub(super) presented_confirmation: Option<ConfirmationToken>,
     pub(super) confirmation_input_revision: u64,
@@ -496,7 +533,7 @@ pub struct HomeView {
     pub(super) footer_buttons: Vec<(crossterm::event::KeyEvent, Rect)>,
     pub(super) footer_hover: Option<crossterm::event::KeyEvent>,
     pub(super) mouse_pos: Option<(u16, u16)>,
-    pub(super) last_click: Option<(std::time::Instant, u16, u16)>,
+    last_click: Option<RowClick>,
 
     pub(super) last_preview_click: Option<(std::time::Instant, u16, u16)>,
 

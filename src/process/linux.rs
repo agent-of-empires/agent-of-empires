@@ -1373,9 +1373,27 @@ fn foreign_process_permission_error(error: &std::io::Error, owner: Option<u32>, 
 }
 
 pub(super) fn runner_group_executing(group: u32) -> anyhow::Result<bool> {
+    runner_group_executing_with_deadline(group, None)
+}
+
+pub(super) fn runner_group_executing_before(
+    group: u32,
+    deadline: std::time::Instant,
+) -> anyhow::Result<bool> {
+    runner_group_executing_with_deadline(group, Some(deadline))
+}
+
+fn runner_group_executing_with_deadline(
+    group: u32,
+    deadline: Option<std::time::Instant>,
+) -> anyhow::Result<bool> {
     use std::io::Read as _;
     let mut bytes = [0u8; 1024];
     for entry in fs::read_dir("/proc")? {
+        anyhow::ensure!(
+            deadline.is_none_or(|deadline| std::time::Instant::now() < deadline),
+            "runner group census timed out"
+        );
         let entry = entry?;
         let Ok(pid) = entry.file_name().to_string_lossy().parse::<u32>() else {
             continue;
