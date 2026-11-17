@@ -7,51 +7,77 @@
 use std::ffi::OsStr;
 use std::path::Path;
 use std::process::{Command, Output, Stdio};
-use std::sync::OnceLock;
+use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
-/// Keys a sandbox can plant in the repo's `.git/config` to run code on the host.
-/// Pinned to the user's own system/global value, or git's default, so repo-local
-/// values are never obeyed.
-const PINNED_KEYS: [(&str, &str); 2] = [("core.sshCommand", "ssh"), ("credential.helper", "")];
+/// The user's own system/global `core.sshCommand` and `credential.helper`,
+/// as lowercase `(key, value)` pairs. `None` when git cannot answer within the
+/// deadline (a stalled `include.path`) or fails to spawn.
+fn discover_user_config(envs: &[(&str, &Path)]) -> Option<Vec<(String, String)>> {
+    let mut found = Vec::new();
+    for scope in ["--system", "--global"] {
+        let mut cmd = Command::new("git");
+        cmd.args([
+            "config",
+            scope,
+            "--includes",
+            "--get-regexp",
+            r"^(core\.sshcommand|credential\.helper)$",
+        ])
+        .envs(envs.iter().copied())
+        .stdin(Stdio::null());
+        let out = crate::process::run_with_timeout(&mut cmd, Duration::from_secs(2)).ok()??;
+        found.extend(
+            String::from_utf8_lossy(&out.stdout)
+                .lines()
+                .filter_map(|l| l.split_once(' '))
+                .map(|(k, v)| (k.to_owned(), v.to_owned())),
+        );
+    }
+    Some(found)
+}
 
-fn hardening_args() -> &'static [String] {
-    static ARGS: OnceLock<Vec<String>> = OnceLock::new();
-    ARGS.get_or_init(|| {
-        let mut args: Vec<String> = ["core.fsmonitor=false", "protocol.ext.allow=never"]
+/// `-c` overrides that pin what a repo-local config could use to run code on
+/// the host: repo values never apply, the user's own do.
+fn build_hardening_args(user: &[(String, String)]) -> Vec<String> {
+    let values = |key: &str| -> Vec<String> {
+        user.iter()
+            .filter(|(k, _)| k == key)
+            .map(|(_, v)| v.clone())
+            .collect()
+    };
+    let mut kv = vec![
+        "core.fsmonitor=false".to_owned(),
+        "protocol.ext.allow=never".to_owned(),
+    ];
+    let ssh = values("core.sshcommand");
+    if ssh.is_empty() {
+        kv.push("core.sshCommand=ssh".to_owned());
+    }
+    kv.extend(ssh.into_iter().map(|v| format!("core.sshCommand={v}")));
+    // An empty `credential.helper` resets the list the repo config built up.
+    kv.push("credential.helper=".to_owned());
+    kv.extend(
+        values("credential.helper")
             .into_iter()
-            .flat_map(|kv| ["-c".to_owned(), kv.to_owned()])
-            .collect();
-        for (key, default) in PINNED_KEYS {
-            let user: Vec<String> = ["--system", "--global"]
-                .iter()
-                .filter_map(|scope| {
-                    Command::new("git")
-                        .args(["config", scope, "--includes", "--get-all", key])
-                        .output()
-                        .ok()
-                })
-                .flat_map(|o| {
-                    String::from_utf8_lossy(&o.stdout)
-                        .lines()
-                        .map(str::to_owned)
-                        .collect::<Vec<_>>()
-                })
-                .collect();
-            // An empty `credential.helper` resets the list the repo config built up.
-            if key == "credential.helper" {
-                args.extend(["-c".to_owned(), format!("{key}=")]);
-            }
-            if user.is_empty() && key != "credential.helper" {
-                args.extend(["-c".to_owned(), format!("{key}={default}")]);
-            }
-            args.extend(
-                user.iter()
-                    .flat_map(|v| ["-c".to_owned(), format!("{key}={v}")]),
-            );
-        }
-        args
-    })
+            .map(|v| format!("credential.helper={v}")),
+    );
+    kv.into_iter()
+        .flat_map(|kv| ["-c".to_owned(), kv])
+        .collect()
+}
+
+/// Cached only after a complete discovery, so a timed-out one is retried.
+fn hardening_args() -> Vec<String> {
+    static CACHE: Mutex<Option<Vec<String>>> = Mutex::new(None);
+    let mut cache = CACHE.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(args) = cache.as_ref() {
+        return args.clone();
+    }
+    match discover_user_config(&[]) {
+        Some(user) => cache.insert(build_hardening_args(&user)).clone(),
+        None => build_hardening_args(&[]),
+    }
 }
 
 /// `git` with config a sandbox-written `.git/config` cannot steer: no
@@ -376,6 +402,7 @@ mod tests {
             ("core.fsmonitor", fsmonitor.to_str().unwrap()),
             ("core.sshCommand", ssh.to_str().unwrap()),
             ("extensions.worktreeConfig", "true"),
+            ("core.hooksPath", repo.join(".git/hooks").to_str().unwrap()),
         ] {
             std::process::Command::new("git")
                 .args(["config", k, v])
@@ -407,6 +434,46 @@ mod tests {
         let out = run_git_with_hooks(&repo, ["checkout", "-q", "-b", "b"]).unwrap();
         assert!(out.status.success());
         assert!(ran("post-checkout"), "run_git_with_hooks must keep hooks");
+    }
+
+    /// A stalled `include.path` must not hang discovery, and a plain one is read.
+    #[cfg(unix)]
+    #[test]
+    fn user_config_discovery_is_bounded_and_follows_includes() {
+        let tmp = tempfile::tempdir().unwrap();
+        let included = tmp.path().join("included");
+        std::fs::write(&included, "[core]\n\tsshCommand = my-ssh\n").unwrap();
+        let fifo = tmp.path().join("stalled");
+        assert!(Command::new("mkfifo")
+            .arg(&fifo)
+            .status()
+            .unwrap()
+            .success());
+        let global = |include: &Path| {
+            let path = tmp.path().join("gitconfig");
+            std::fs::write(
+                &path,
+                format!("[include]\n\tpath = {}\n", include.display()),
+            )
+            .unwrap();
+            path
+        };
+        let none = Path::new("/dev/null");
+
+        let ok = global(&included);
+        let found =
+            discover_user_config(&[("GIT_CONFIG_SYSTEM", none), ("GIT_CONFIG_GLOBAL", &ok)]);
+        assert_eq!(
+            found,
+            Some(vec![("core.sshcommand".into(), "my-ssh".into())])
+        );
+
+        let stalled = global(&fifo);
+        let start = Instant::now();
+        let found =
+            discover_user_config(&[("GIT_CONFIG_SYSTEM", none), ("GIT_CONFIG_GLOBAL", &stalled)]);
+        assert_eq!(found, None);
+        assert!(start.elapsed() < Duration::from_secs(10));
     }
 
     #[test]
