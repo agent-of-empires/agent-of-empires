@@ -267,11 +267,11 @@ pub struct FieldDescriptor {
     /// Read only by the TUI; the web folds it apart from dashboard settings.
     #[serde(default)]
     pub tui_only: bool,
-    /// Read only by the web dashboard; the TUI tags it.
+    /// Read only by the web dashboard; both surfaces tag it.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub web_only: bool,
     /// Read once when an AoE process starts, so a change applies after AoE
-    /// restarts; the TUI tags it.
+    /// restarts; both surfaces tag it.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub restart: bool,
     /// Manifest default for plugin fields; core fields always have a value in `Config`.

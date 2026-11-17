@@ -1,5 +1,7 @@
 import { useId, useState, type ReactNode } from "react";
 
+import { rowInputProps, type RowLabel } from "./rowLabel";
+
 const CONTROL = "w-full bg-surface-900 border border-surface-700 rounded-md px-3 py-2 text-sm text-text-primary";
 const FOCUS = "focus:border-brand-600 focus:outline-none";
 
@@ -8,13 +10,16 @@ function FieldShell({
   label,
   description,
   labelClassName,
+  row,
   children,
 }: {
   label?: string;
   description?: string;
   labelClassName?: string;
+  row?: RowLabel;
   children: ReactNode;
 }) {
+  if (row) return <>{children}</>;
   return (
     <div>
       {label !== undefined && (
@@ -131,29 +136,36 @@ export function ToggleField({
   description,
   checked,
   onChange,
+  row,
 }: {
   label: string;
   description?: string;
   checked: boolean;
   onChange: (v: boolean) => void;
+  row?: RowLabel;
 }) {
+  const toggle = (
+    <button
+      type="button"
+      role="switch"
+      aria-checked={checked}
+      {...(row ? rowInputProps(row) : { "aria-label": label })}
+      onClick={() => onChange(!checked)}
+      className={`relative inline-flex h-6 w-10 shrink-0 items-center rounded-full transition-colors cursor-pointer ${checked ? "bg-brand-600" : "bg-surface-700"}`}
+    >
+      <span
+        className={`inline-block h-4 w-4 rounded-full bg-white shadow-sm transition-transform ${checked ? "translate-x-5" : "translate-x-1"}`}
+      />
+    </button>
+  );
+  if (row) return toggle;
   return (
     <div className="flex items-center justify-between gap-3">
       <div>
         <div className="text-sm text-text-primary">{label}</div>
         {description && <div className="text-xs text-text-dim mt-0.5">{description}</div>}
       </div>
-      <button
-        type="button"
-        role="switch"
-        aria-checked={checked}
-        onClick={() => onChange(!checked)}
-        className={`relative inline-flex h-6 w-10 shrink-0 items-center rounded-full transition-colors cursor-pointer ${checked ? "bg-brand-600" : "bg-surface-700"}`}
-      >
-        <span
-          className={`inline-block h-4 w-4 rounded-full bg-white shadow-sm transition-transform ${checked ? "translate-x-5" : "translate-x-1"}`}
-        />
-      </button>
+      {toggle}
     </div>
   );
 }
@@ -166,6 +178,7 @@ export function TextField({
   placeholder,
   mono,
   multiline,
+  row,
 }: {
   label: string;
   description?: string;
@@ -174,6 +187,7 @@ export function TextField({
   placeholder?: string;
   mono?: boolean;
   multiline?: boolean;
+  row?: RowLabel;
 }) {
   const draft = useDraft(value, (next) => {
     if (next !== value) onChange(next);
@@ -181,9 +195,10 @@ export function TextField({
 
   const cls = `${CONTROL} placeholder:text-text-dim ${FOCUS} ${mono ? "font-mono" : ""}`;
   return (
-    <FieldShell label={label} description={description}>
+    <FieldShell label={label} description={description} row={row}>
       {multiline ? (
         <textarea
+          {...rowInputProps(row)}
           {...draft.props}
           onKeyDown={(e) => {
             if (e.key === "Enter" && !e.shiftKey) {
@@ -198,6 +213,7 @@ export function TextField({
       ) : (
         <input
           type="text"
+          {...rowInputProps(row)}
           {...draft.props}
           onKeyDown={(e) => {
             if (e.key === "Enter") draft.commit();
@@ -217,6 +233,7 @@ export function SelectField({
   onChange,
   options,
   labelClassName,
+  row,
 }: {
   label: string;
   description?: string;
@@ -225,10 +242,16 @@ export function SelectField({
   options: { value: string; label: string }[];
   /** Overrides the label classes; `""` hides the label. */
   labelClassName?: string;
+  row?: RowLabel;
 }) {
   return (
-    <FieldShell label={label || undefined} description={description} labelClassName={labelClassName}>
-      <select value={value} onChange={(e) => onChange(e.target.value)} className={`${CONTROL} ${FOCUS}`}>
+    <FieldShell label={label || undefined} description={description} labelClassName={labelClassName} row={row}>
+      <select
+        {...rowInputProps(row)}
+        value={value}
+        onChange={(e) => onChange(e.target.value)}
+        className={`${CONTROL} ${FOCUS}`}
+      >
         {options.map((opt) => (
           <option key={opt.value} value={opt.value}>
             {opt.label}
@@ -246,6 +269,7 @@ export function NumberField({
   onChange,
   min,
   max,
+  row,
 }: {
   label: string;
   description?: string;
@@ -253,6 +277,7 @@ export function NumberField({
   onChange: (v: number) => void;
   min?: number;
   max?: number;
+  row?: RowLabel;
 }) {
   const draft = useDraft(String(value), (next) => {
     const n = Number(next);
@@ -260,9 +285,10 @@ export function NumberField({
   });
 
   return (
-    <FieldShell label={label} description={description}>
+    <FieldShell label={label} description={description} row={row}>
       <input
         type="number"
+        {...rowInputProps(row)}
         {...draft.props}
         onKeyDown={(e) => {
           if (e.key === "Enter") draft.commit();
@@ -276,40 +302,37 @@ export function NumberField({
 }
 
 export function SliderField({
-  label,
-  description,
   value,
   onChange,
   min,
   max,
   step,
   formatValue,
+  row,
 }: {
-  label: string;
-  description?: string;
   value: number;
   onChange: (v: number) => void;
   min: number;
   max: number;
   step: number;
   formatValue?: (v: number) => string;
+  row: RowLabel;
 }) {
   return (
-    <div>
-      <div className="flex items-center justify-between mb-1">
-        <label className="text-sm text-text-bright">{label}</label>
-        <span className="text-sm font-mono text-text-primary">{formatValue ? formatValue(value) : value}</span>
-      </div>
-      {description && <div className="text-xs text-text-dim mb-1">{description}</div>}
+    <div className="flex items-center gap-3">
       <input
         type="range"
+        {...rowInputProps(row)}
         min={min}
         max={max}
         step={step}
         value={value}
         onChange={(e) => onChange(Number(e.target.value))}
-        className="w-full accent-brand-600 h-1.5"
+        className="w-36 accent-brand-600 h-1.5"
       />
+      <span className="min-w-8 text-right text-sm font-mono text-text-primary">
+        {formatValue ? formatValue(value) : value}
+      </span>
     </div>
   );
 }
@@ -338,6 +361,7 @@ export function ListField({
   onChange,
   placeholder,
   validate,
+  row,
 }: {
   label: string;
   description?: string;
@@ -345,8 +369,10 @@ export function ListField({
   onChange: (items: string[]) => void;
   placeholder?: string;
   validate?: (value: string) => string | null;
+  row?: RowLabel;
 }) {
-  const inputId = useId();
+  const ownId = useId();
+  const inputId = row?.controlId ?? ownId;
   const [adding, setAdding] = useState(false);
   const [draft, setDraft] = useState("");
   const [error, setError] = useState<string | null>(null);
@@ -394,6 +420,7 @@ export function ListField({
       <div className="flex gap-2">
         <input
           id={inputId}
+          aria-labelledby={row?.labelId}
           type="text"
           value={draft}
           onChange={(e) => {
@@ -423,22 +450,26 @@ export function ListField({
     </div>
   );
 
+  const addButton = !adding && editing === null && (
+    <button onClick={() => setAdding(true)} className="text-xs text-brand-500 hover:text-brand-400 cursor-pointer">
+      + Add
+    </button>
+  );
   return (
-    <div>
-      <div className="flex items-center justify-between mb-1">
-        <label htmlFor={inputId} className="text-sm text-text-bright">
-          {label}
-        </label>
-        {!adding && editing === null && (
-          <button
-            onClick={() => setAdding(true)}
-            className="text-xs text-brand-500 hover:text-brand-400 cursor-pointer"
-          >
-            + Add
-          </button>
-        )}
-      </div>
-      {description && <div className="text-xs text-text-dim mb-2">{description}</div>}
+    <div role={row ? "group" : undefined} aria-labelledby={row?.labelId}>
+      {row ? (
+        addButton && <div className="flex justify-end mb-1">{addButton}</div>
+      ) : (
+        <>
+          <div className="flex items-center justify-between mb-1">
+            <label htmlFor={inputId} className="text-sm text-text-bright">
+              {label}
+            </label>
+            {addButton}
+          </div>
+          {description && <div className="text-xs text-text-dim mb-2">{description}</div>}
+        </>
+      )}
       {items.length === 0 && !adding && <div className="text-xs text-text-dim italic py-2">No items configured</div>}
       <div className="space-y-1 max-h-[320px] overflow-y-auto">
         {items.map((item, i) =>

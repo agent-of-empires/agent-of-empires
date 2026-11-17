@@ -1,0 +1,7 @@
+# runtime: docker 29.5.2
+# command: docker pull ghcr.io/agent-of-empires/aoe-capture-1794863764:latest
+# captured: 2026-11-16T21:16:04Z
+# exit and stderr follow
+Error response from daemon: error from registry: denied
+denied
+# exit: 1

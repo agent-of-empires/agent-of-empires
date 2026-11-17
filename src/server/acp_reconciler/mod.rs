@@ -84,6 +84,9 @@ fn park_message(project_path: &str) -> String {
     }
 }
 
+/// Banner for a session whose queued prompts wait behind a durable stop.
+const STOP_FENCE_MESSAGE: &str = "Structured view worker was stopped (aoe acp stop); queued prompts wait until the session is started again.";
+
 #[derive(Debug, Clone)]
 enum ResumeOutcome {
     Attached,
@@ -203,6 +206,7 @@ pub async fn reconcile_acp_workers(
     respawn_history: &mut HashMap<String, Vec<Instant>>,
     parked: &mut HashSet<String>,
     capacity_deferred: &mut HashSet<String>,
+    stop_notified: &mut HashSet<String>,
 ) {
     let supervisor = &state.acp_supervisor;
     supervisor.retry_pending_teardowns().await;
@@ -290,6 +294,8 @@ pub async fn reconcile_acp_workers(
     parked.retain(|id| live.contains(id));
     respawn_history.retain(|id, _| live.contains(id));
     capacity_deferred.retain(|id| live.contains(id));
+    stop_notified
+        .retain(|id| live.contains(id) && crate::process::worker_registry::stop_requested(id));
 
     // Must precede scheduling: capacity counts registry entries, so dead
     // entries would block legitimate spawns.
@@ -348,6 +354,30 @@ pub async fn reconcile_acp_workers(
         }
         // Waiting on the sandbox login spends no respawn budget.
         if login.is_held(&id) {
+            attempted.insert(id);
+            continue;
+        }
+        // A stop fences automatic resumes, but is not a crash-loop park.
+        if crate::process::worker_registry::stop_requested(&id) {
+            if with_queued_prompts.contains(&id)
+                && !stop_notified.contains(&id)
+                && crate::server::api::publish_startup_error_if_current(
+                    state,
+                    &id,
+                    &target.source_profile,
+                    target.lifecycle_generation,
+                    STOP_FENCE_MESSAGE.to_string(),
+                )
+                .await
+            {
+                // Logged once per notice; a refused publication retries next tick.
+                tracing::info!(
+                    target: "acp.supervisor",
+                    session = %id,
+                    "holding queued prompts: the worker was stopped and waits for an explicit start"
+                );
+                stop_notified.insert(id.clone());
+            }
             attempted.insert(id);
             continue;
         }
@@ -1149,6 +1179,8 @@ mod tests {
                 .acp_supervisor
                 .test_insert_worker_cmd_recording(name)
                 .await;
+            let _live =
+                crate::acp::supervisor::test_support::save_agent_record(name, "claude", true);
             let sink = ChannelSink::new(
                 state.acp_events_tx.clone(),
                 Arc::clone(&state.acp_event_store),
@@ -1431,6 +1463,7 @@ mod tests {
             .acp_supervisor
             .test_insert_worker_cmd_recording(id)
             .await;
+        let _live = crate::acp::supervisor::test_support::save_agent_record(id, "claude", true);
         state.acp_supervisor.test_publish_worker_attached(id);
         state.instances.write().await[0].status = crate::session::Status::Idle;
         service.drain_queued_prompts_once(id).await;
@@ -1550,6 +1583,7 @@ mod tests {
             .acp_supervisor
             .test_insert_worker_cmd_recording(id)
             .await;
+        let _live = crate::acp::supervisor::test_support::save_agent_record(id, "claude", true);
         state.acp_supervisor.test_publish_worker_attached(id);
         state.instances.write().await[0].status = crate::session::Status::Idle;
         service.drain_queued_prompts_once(id).await;
@@ -1763,5 +1797,131 @@ mod tests {
         assert!(tick.parked.is_empty());
         let observed = worker_registry::stop_intent(id).unwrap();
         worker_registry::admit_resume(id, ResumeAuthority::Explicit, &observed).unwrap();
+    }
+
+    /// A stop holds the queue without spending crash-loop budget or suppressing
+    /// retries after an explicit start clears the fence.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn durable_user_stop_with_a_queue_does_not_crash_loop() {
+        use crate::process::worker_registry::{self, WorkerRecord};
+        use crate::session::Status;
+
+        for status in [Status::Idle, Status::Error] {
+            let id = "sess-stopped-queued";
+            let (_home, state, project) = test_fixtures::test_state(id);
+            {
+                let mut instances = state.instances.write().await;
+                instances[0].status = status;
+                instances[0]
+                    .queued_prompts
+                    .push(test_fixtures::queued_prompt());
+            }
+            let record = WorkerRecord::new(
+                id.into(),
+                std::process::id(),
+                worker_registry::socket_path_for(id).unwrap(),
+                "aoe-agent".into(),
+                "aoe-agent".into(),
+                project.path().to_path_buf(),
+                None,
+                vec![],
+                vec![],
+                None,
+                None,
+            );
+            worker_registry::save(&record).unwrap();
+            worker_registry::request_stop(&record).unwrap();
+            worker_registry::retire_selected(&record).unwrap();
+
+            let mut tick = test_fixtures::Tick::default();
+            *state.canonical_health.write().await = crate::daemon::RuntimeHealth::Degraded {
+                code: crate::daemon::ReloadFailureCode::Metadata,
+                profiles: vec!["default".into()],
+            };
+            for _ in 0..2 {
+                tick.run(&state).await;
+            }
+            assert_eq!(count_messages(&state, id, STOP_FENCE_MESSAGE), 0);
+            assert!(!tick.stop_notified.contains(id));
+            assert!(tick.parked.is_empty());
+            assert!(tick.respawn_history.get(id).is_none_or(Vec::is_empty));
+
+            *state.canonical_health.write().await = crate::daemon::RuntimeHealth::Healthy;
+            for _ in 0..=2 * RECONCILER_MAX_RESPAWNS_IN_WINDOW {
+                tick.run(&state).await;
+            }
+
+            assert!(
+                tick.respawn_history.get(id).is_none_or(Vec::is_empty),
+                "{status:?}: a fenced session must not charge the budget"
+            );
+            assert_eq!(
+                test_fixtures::startup_errors(&state, id),
+                1,
+                "{status:?}: one banner for the stop, no crash-loop park"
+            );
+            assert_eq!(
+                count_messages(&state, id, STOP_FENCE_MESSAGE),
+                1,
+                "{status:?}: the banner names the stop"
+            );
+            assert!(tick.parked.is_empty());
+
+            // Fresh reconciler state models a daemon restart with the same fence.
+            let mut tick = test_fixtures::Tick::default();
+            for _ in 0..=2 * RECONCILER_MAX_RESPAWNS_IN_WINDOW {
+                tick.run(&state).await;
+            }
+            assert!(
+                worker_registry::stop_requested(id),
+                "{status:?}: the fence survives the restart"
+            );
+            assert!(
+                tick.respawn_history.get(id).is_none_or(Vec::is_empty),
+                "{status:?}: a restart must not charge the budget either"
+            );
+            assert_eq!(
+                test_fixtures::startup_errors(&state, id),
+                2,
+                "{status:?}: one more banner after the restart, no crash-loop park"
+            );
+            assert_eq!(
+                count_messages(&state, id, STOP_FENCE_MESSAGE),
+                2,
+                "{status:?}: each process shows the stop banner once"
+            );
+
+            // Admission clears the fence; even a failed launch must not leave
+            // the queue held by the old stop notice.
+            let observed = worker_registry::stop_intent(id).unwrap();
+            worker_registry::admit_resume(
+                id,
+                worker_registry::ResumeAuthority::Explicit,
+                &observed,
+            )
+            .unwrap();
+            tick.run(&state).await;
+            assert_eq!(
+                tick.respawn_history.get(id).map_or(0, Vec::len),
+                1,
+                "{status:?}: the explicit start is a real attempt"
+            );
+            assert_eq!(test_fixtures::startup_errors(&state, id), 3, "{status:?}");
+            assert!(!tick.stop_notified.contains(id));
+            tick.run(&state).await;
+            assert_eq!(tick.respawn_history.get(id).map_or(0, Vec::len), 2);
+        }
+    }
+
+    fn count_messages(state: &AppState, id: &str, text: &str) -> usize {
+        state
+            .acp_event_store
+            .replay_from(id, 0)
+            .into_iter()
+            .filter(|(_, e)| {
+                matches!(e, crate::acp::Event::AgentStartupError { message, .. } if message == text)
+            })
+            .count()
     }
 }

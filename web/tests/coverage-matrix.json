@@ -42,7 +42,7 @@
         "web/src/components/settings/PluginUpdateConsentModal.tsx",
         "web/src/components/settings/agentIntegrationDetails.ts"
       ],
-      "notes": "Install and update consent expose agent launch, detection and reply declarations as text with control and format characters made visible."
+      "notes": "Install and update consent expose agent launch, detection and reply declarations as text with control and format characters made visible, including the declared Enter delay so a timing-only change is visible."
     },
     {
       "id": "settings.plugin-agent-consent-browser",
@@ -3390,7 +3390,7 @@
       "id": "acp.background-agents",
       "kind": "vitest",
       "risk": "medium",
-      "notes": "The Background pane: shells and sub-agents filtered by kind and grouped Running and Recent, a child's detail built from the same rows as its thread card, and Claude Workflow runs grouped by run and phase.",
+      "notes": "The Background pane: shells and sub-agents filtered by kind and grouped Running and Recent, a child's detail built from the same rows as its thread card, and Claude Workflow runs grouped by run and phase. A Workflow call stays a workflow card when a permission start retitles it, and reads \"Preparing workflow script\" until the call returns.",
       "specs": [
         "src/components/acp/__tests__/BackgroundAgentsPanel.test.tsx",
         "src/lib/acpTypes.reducer.test.ts",
@@ -3899,6 +3899,20 @@
         "src/server/acp_events.rs",
         "src/server/session_service.rs"
       ]
+    },
+    {
+      "id": "acp.custom-agent-reset-alias",
+      "kind": "live-playwright",
+      "risk": "high",
+      "specs": ["tests/live/acp-session-history.spec.ts"],
+      "components": [
+        "src/acp/agent_profiles.rs",
+        "src/acp/supervisor/",
+        "src/server/api/sessions/list.rs",
+        "src/server/session_service.rs",
+        "src/session/config/mod.rs"
+      ],
+      "notes": "A custom ACP agent's `session.agent_clear_alias` drives the same fresh `session/new` as the Claude `/clear` and Codex `/new` stories, which this reuses. Rust tests cover what is specific to a custom agent: the queue drain keeps the reset as its own turn and leaves later rows queued (`the_queue_drain_keeps_a_custom_reset_as_its_own_turn`); the solo hold, drain, publication and session list use the agent the worker runs, else the one its next spawn picks (`a_custom_reset_is_classified_by_the_agent_the_session_runs`, `list_sessions_advertises_the_running_agents_reset_command`); publication keeps the classification the drain cut with (`a_carried_classification_decides_the_published_turn`); a built-in agent, including a registry agent without a profile, ignores its entry."
     },
     {
       "id": "acp.idle-dormant-wake",
@@ -6124,11 +6138,29 @@
     },
     {
       "id": "settings-restart-web-only-flags",
-      "kind": "deferred",
-      "issue": "https://github.com/agent-of-empires/agent-of-empires/issues/5302",
+      "kind": "vitest",
+      "risk": "medium",
+      "specs": [
+        "src/lib/settingRow.test.ts",
+        "src/components/settings/__tests__/SettingRow.test.tsx",
+        "src/components/setup/__tests__/SandboxStep.test.tsx"
+      ],
+      "components": [
+        "web/src/lib/settingRow.ts",
+        "web/src/components/settings/SettingRow.tsx",
+        "web/src/components/settings/SchemaSection.tsx",
+        "web/src/components/settings/FormFields.tsx",
+        "web/src/components/setup/steps/SandboxStep.tsx"
+      ],
+      "notes": "Each Settings row shows its label, tags (Needs restart, Web dashboard only, Terminal app only, Structured view only, Linux only), a lock on passphrase rows, the summary as its plain line (none without a summary, plugin rows included), and its section.field key with a copy button. The setup wizard hides the key. Every control is named by its row label. #5302."
+    },
+    {
+      "id": "settings.row-key-reveal",
+      "kind": "mocked-playwright",
       "risk": "low",
-      "reason": "Copy only: seven Settings labels lose \"(restart req.)\" and six summaries lose their restart sentence; the schema gains restart and web_only flags, which the row PR renders.",
-      "components": ["web/src/components/settings/SchemaSection.tsx"]
+      "specs": ["tests/settings-row.spec.ts"],
+      "components": ["web/src/components/settings/SettingRow.tsx"],
+      "notes": "With a mouse the key is invisible until hover or focus but keeps its line, so rows don't move; Tab reaches its copy button, which copies. At 375 it always shows. #5302."
     },
     {
       "id": "terminal-switch-command-selector-conflict",

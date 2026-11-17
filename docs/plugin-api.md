@@ -93,6 +93,7 @@ instruction_flag = "--prompt={}"
 model_flag = "--model"
 host_only = false
 install_hint = "Install example-agent from its vendor"
+send_keys_enter_delay_ms = 150
 
 [agent_integrations.launch.container_env]
 EXAMPLE_HOME = "/state"
@@ -121,6 +122,7 @@ deny = [{ kind = "literal", value = "n" }]
 The example's `detection` requires `session.integration` in the manifest's capabilities. Every declaration type, `session_id` included, requires a nonblank `command`: the plugin must contribute the tool it captures for, because only the plugin that owns a tool may attribute an id to a session using it.
 
 - `launch.aliases` are unique lowercase agent ids, distinct from the tool. `oneshot_flag` and `model_flag` are single shell-safe flags. `instruction_flag` has one `{}` placeholder, as a whole argument or after `=`, and otherwise contains shell-safe words.
+- `launch.send_keys_enter_delay_ms` is the pause, in milliseconds, that the host leaves between typing a message into the agent's pane and sending Enter. Some agents read a fast burst as a paste and drop the Enter, which leaves the message as an unsent draft that looks like a running session. It requires `api_version >= 22` and is capped at 2000. An agent that declares nothing falls back to the host's built-in pause for its tool.
 - `launch.yolo` is `kind = "flag"` with `flag`, `kind = "always"`, or `kind = "env"` with `key` and `value`. An `always` declaration applies while active without changing the session's saved Yolo preference. `container_env` is applied to sandbox launches. Protected environment names are rejected.
 - `launch.resume` is `kind = "flag"` with `flag`, `kind = "flag_pair"` with `existing` and `new_session`, or `kind = "subcommand"` with `command`. Resume and capture require each other. Capture supports only backend `omp`, with `pane_scoped` in at least one of `host` or `sandbox` and `pane_scoped` or `unsupported` in the other.
 - `detection.mode = "native_only"` requires `session.integration`; the integration owns status rather than falling back to pane parsing when a report is missing or invalid.

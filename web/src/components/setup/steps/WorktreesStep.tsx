@@ -24,6 +24,7 @@ export function WorktreesStep({ schema, values, onSaveField }: Props) {
           values={values}
           onSaveField={onSaveField}
           onlyFields={FIELDS}
+          hideKeys
         />
       </div>
       {template && (
