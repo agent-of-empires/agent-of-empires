@@ -75,6 +75,10 @@ pub struct AgentLaunchDeclaration {
     pub install_hint: Option<String>,
     #[serde(default)]
     pub host_only: bool,
+    /// Pause between typing a message into the agent's pane and sending Enter,
+    /// for an agent whose composer reads a fast burst as a paste and drops it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub send_keys_enter_delay_ms: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub resume: Option<AgentResumeDeclaration>,
     #[serde(default, skip_serializing_if = "Option::is_none")]

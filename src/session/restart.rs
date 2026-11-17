@@ -85,7 +85,8 @@ pub fn perform_restart(request: RestartRequest) -> RestartResult {
     // pane-readiness probe.
     let should_wake = launched_agent(&outcome);
     if should_wake && !wake_message.is_empty() {
-        spawn_wake_worker(session_id.clone(), title, tool, wake_message, None);
+        let delay = instance.send_keys_enter_delay();
+        spawn_wake_worker(session_id.clone(), title, tool, wake_message, None, delay);
     }
 
     RestartResult {
@@ -115,6 +116,7 @@ pub(crate) fn spawn_wake_worker(
     tool: String,
     wake_message: String,
     identity: Option<(String, u64)>,
+    delay: u64,
 ) {
     let spawn_result = std::thread::Builder::new()
         .name(format!("aoe-restart-wake/{}", session_id))
@@ -142,7 +144,6 @@ pub(crate) fn spawn_wake_worker(
             if !tmux_session.exists() {
                 return;
             }
-            let delay = crate::agents::send_keys_enter_delay(&tool);
             if let Some((profile, generation)) = identity {
                 let current = crate::session::Storage::new_unwatched(&profile)
                     .and_then(|storage| storage.load())

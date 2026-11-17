@@ -832,7 +832,8 @@ fn prompt_refusal(id: &str, error: PromptSubmitError) -> CallToolResult {
         PromptSubmitError::SessionNotFound
         | PromptSubmitError::Turn(SendTurnError::SessionNotFound) => not_found(id),
         PromptSubmitError::WorkerNotReady
-        | PromptSubmitError::Turn(SendTurnError::WorkerNotReady) => tool_error(
+        | PromptSubmitError::Turn(SendTurnError::WorkerNotReady)
+        | PromptSubmitError::Turn(SendTurnError::AgentChanged) => tool_error(
             "busy",
             "The session's agent is not ready yet; try again shortly",
         ),

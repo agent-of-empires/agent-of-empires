@@ -21,7 +21,9 @@ pub use help::HelpOverlay;
 pub use list_picker::{ListPicker, ListPickerResult};
 pub use preview::{format_scroll_indicator, Preview};
 pub use text::{fixed_width, prefix_within_width, rendered_width, truncate_to_width};
-pub(crate) use text_input::{focused_input_spans, input_scroll, visible_slice};
+pub(crate) use text_input::{
+    focused_input_spans, input_cursor_position, input_scroll, visible_slice,
+};
 pub use text_input::{
     longest_common_prefix, render_text_field, render_text_field_with_ghost,
     set_input_cursor_position, set_prefixed_input_cursor_position, GroupGhostCompletion,
