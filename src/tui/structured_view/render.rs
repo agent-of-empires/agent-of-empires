@@ -3247,7 +3247,10 @@ mod tests {
             message_id: Some(id.into()),
         };
         let mut t = AcpTranscript::new("s-1");
-        t.server_rows = server_rows(&[thought("<div>\nCompare both alternatives.\n</div>", "t-a")]);
+        t.set_rows(server_rows(&[thought(
+            "<div>\nCompare both alternatives.\n</div>",
+            "t-a",
+        )]));
         let body = joined(&transcript_lines(
             &t,
             &Theme::default(),
@@ -3281,7 +3284,7 @@ mod tests {
                 &format!("m-{index}"),
             ));
         }
-        state.transcript.server_rows = server_rows(&events);
+        state.transcript.set_rows(server_rows(&events));
 
         // Scroll back into the replies, then expand the thought above them. The
         // projection separates rows with blanks, so land on a reply rather than
