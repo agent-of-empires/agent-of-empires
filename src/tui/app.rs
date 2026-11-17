@@ -1603,10 +1603,12 @@ impl App {
             self.image_update.as_ref(),
             self.image_pull_rx.is_some(),
         );
-        self.drawn_bar = bar.map(DrawnBar::from);
         // Reset so a frame that skips the preview path reports zero.
         self.home.preview_timings = Default::default();
         self.home.render(frame, frame.area(), &self.theme, bar);
+        self.drawn_bar = bar
+            .filter(|_| self.home.update_bar_drawn)
+            .map(DrawnBar::from);
         // Sampled: only frames over the 16ms budget and live-send frames.
         let elapsed = start.elapsed();
         let in_live = self.home.live_send.is_some();
@@ -3692,6 +3694,32 @@ mod tests {
         }
         // Both keys are checked before failing, so each one's outcome shows.
         assert!(acted.is_empty(), "acted on a line not on screen: {acted:?}");
+    }
+
+    /// A takeover view hides the update bar, so its keys have no line to act on until the
+    /// bar is drawn again.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn a_takeover_view_clears_the_drawn_update_bar() {
+        let _home = crate::session::test_support::isolate_app_dir();
+        crate::session::get_profile_dir("test").unwrap();
+        let (mut app, _terminal) = key_app();
+        app.image_update = Some(image_update());
+        let on_screen = Some(DrawnBar::ImageUpdate {
+            digest: image_update().remote_digest,
+        });
+        draw(&mut app);
+        assert_eq!(app.drawn_bar, on_screen);
+
+        app.home.settings_view = Some(
+            crate::tui::settings::SettingsView::new(&app.home.config_profile(), None).unwrap(),
+        );
+        draw(&mut app);
+        assert_eq!(app.drawn_bar, None, "settings hides the bar");
+
+        app.home.settings_view = None;
+        draw(&mut app);
+        assert_eq!(app.drawn_bar, on_screen);
     }
 
     /// The pull key is the registry's Update chord: bare `u`, or Ctrl+U under strict hotkeys.

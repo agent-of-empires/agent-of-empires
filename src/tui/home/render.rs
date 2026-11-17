@@ -1059,6 +1059,7 @@ impl HomeView {
         // Hidden bars and takeover views must not retain clickable regions.
         self.footer_buttons.clear();
         self.tips_badge_rect = None;
+        self.update_bar_drawn = false;
         if !self.show_shortcut_bar {
             self.footer_hover = None;
             self.tips_badge_hovered = false;
@@ -1322,6 +1323,7 @@ impl HomeView {
 
         if let (Some(idx), Some(bar)) = (update_bar_idx, update_bar) {
             self.render_update_bar(frame, main_chunks[idx], theme, bar);
+            self.update_bar_drawn = true;
         }
 
         // Render dialogs on top
