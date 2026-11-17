@@ -763,10 +763,17 @@ impl SettingsView {
             Span::raw("")
         };
 
-        let label = Line::from(vec![
+        let mut spans = vec![
             Span::styled(field.label.clone(), label_style),
             override_indicator,
-        ]);
+        ];
+        spans.extend(
+            field
+                .tags()
+                .into_iter()
+                .map(|tag| Span::styled(format!(" · {tag}"), Style::default().fg(theme.dimmed))),
+        );
+        let label = Line::from(spans);
 
         frame.render_widget(Paragraph::new(label), area);
 
@@ -1589,6 +1596,57 @@ mod status_message_tests {
         }
     }
 
+    /// Schema flags render as tags on the label line, and a plain row has none.
+    #[test]
+    #[serial]
+    fn schema_flags_render_as_tags_after_the_label() {
+        let (_temp, _guard, mut view) = fresh_view();
+        let theme = load_theme("empire");
+        let schema_field = |label: &str, restart: bool, web_only: bool| SettingField {
+            kind: FieldKind::Schema {
+                section: "logging".to_string(),
+                field: label.to_lowercase(),
+                widget: WidgetKind::Toggle,
+                validation: ValidationKind::None,
+                profile_overridable: false,
+                restart,
+                web_only,
+            },
+            ..bool_field(label, "")
+        };
+        view.fields = vec![
+            schema_field("Restarted", true, false),
+            schema_field("Webbed", false, true),
+            schema_field("Plain", false, false),
+        ];
+        view.fields_scroll_offset = 0;
+
+        let area = Rect::new(0, 0, 60, 20);
+        let mut terminal = Terminal::new(TestBackend::new(60, 20)).unwrap();
+        terminal
+            .draw(|f| view.render_fields(f, area, &theme, true, None))
+            .unwrap();
+        let buf = terminal.backend().buffer().clone();
+        let line_of = |label: &str| {
+            (0..buf.area().height)
+                .map(|y| row_text(&buf, y))
+                .find(|row| row.contains(label))
+                .unwrap_or_else(|| panic!("no row for {label}:\n{}", buffer_text(&buf)))
+        };
+
+        let restarted = line_of("Restarted");
+        assert!(
+            restarted.contains("Restarted · Needs restart"),
+            "{restarted}"
+        );
+        assert!(!restarted.contains("Web dashboard only"), "{restarted}");
+        let webbed = line_of("Webbed");
+        assert!(webbed.contains("Webbed · Web dashboard only"), "{webbed}");
+        assert!(!webbed.contains("Needs restart"), "{webbed}");
+        let plain = line_of("Plain");
+        assert!(!plain.contains('·'), "{plain}");
+    }
+
     /// A field clipped to a partial row at the bottom of the panel must not
     /// paint past it, over the border or into the footer.
     #[test]
@@ -1974,6 +2032,8 @@ mod status_message_tests {
                 widget: WidgetKind::OptionalText { mono: false },
                 validation: ValidationKind::MemoryLimit,
                 profile_overridable: true,
+                restart: false,
+                web_only: false,
             },
             label: "Memory Limit".to_string(),
             description: "Memory ceiling for sandbox containers.".to_string(),

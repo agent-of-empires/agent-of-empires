@@ -6121,6 +6121,14 @@
       "risk": "low",
       "reason": "Copy-only: a refused switch to Terminal view still toasts the server's plain-text message, now reworded; the server pins the text in acp::view tests. The web dialog in the next #5651 PR brings the tested flow.",
       "components": ["web/src/lib/api.ts", "web/src/App.tsx"]
+    },
+    {
+      "id": "settings-restart-web-only-flags",
+      "kind": "deferred",
+      "issue": "https://github.com/agent-of-empires/agent-of-empires/issues/5302",
+      "risk": "low",
+      "reason": "Copy only: seven Settings labels lose \"(restart req.)\" and six summaries lose their restart sentence; the schema gains restart and web_only flags, which the row PR renders.",
+      "components": ["web/src/components/settings/SchemaSection.tsx"]
     }
   ]
 }

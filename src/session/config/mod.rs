@@ -292,12 +292,12 @@ pub struct LoggingConfig {
     pub targets: std::collections::BTreeMap<String, String>,
 
     /// Where tracing lands: file (default) or stdout. TUI / daemon child /
-    /// runner coerce to file regardless. Restart aoe for changes to take
-    /// effect.
+    /// runner coerce to file regardless.
     #[serde(default)]
     #[setting(
-        label = "Write to (restart req.)",
+        label = "Write to",
         widget = "select",
+        restart,
         options = "file:file,stdout:stdout",
         global_only,
         advanced,
@@ -306,11 +306,12 @@ pub struct LoggingConfig {
     pub output: SinkKind,
 
     /// Log file location. Relative paths resolve under the app data dir;
-    /// absolute paths are used verbatim. Restart aoe for changes.
+    /// absolute paths are used verbatim.
     #[serde(default = "default_file_path")]
     #[setting(
-        label = "File (restart req.)",
+        label = "File",
         widget = "text",
+        restart,
         global_only,
         advanced,
         summary = "A name goes in AoE's app data folder; a full path is used as is."
@@ -318,11 +319,12 @@ pub struct LoggingConfig {
     pub file_path: String,
 
     /// size rotates when the live file crosses the threshold; never disables
-    /// rotation. Restart aoe for changes.
+    /// rotation.
     #[serde(default)]
     #[setting(
-        label = "Rotation (restart req.)",
+        label = "Rotation",
         widget = "select",
+        restart,
         options = "size:size,never:never",
         global_only,
         advanced
@@ -332,8 +334,9 @@ pub struct LoggingConfig {
     /// Rotation threshold in MiB. Ignored when rotation = never.
     #[serde(default = "default_max_size_mib")]
     #[setting(
-        label = "Max size MiB (restart req.)",
+        label = "Max size MiB",
         widget = "number",
+        restart,
         min = 0,
         global_only,
         advanced
@@ -343,8 +346,9 @@ pub struct LoggingConfig {
     /// How many rotated files to retain (.1 through .keep_count).
     #[serde(default = "default_keep_count")]
     #[setting(
-        label = "Keep (restart req.)",
+        label = "Keep",
         widget = "number",
+        restart,
         min = 0,
         global_only,
         advanced,
@@ -359,8 +363,9 @@ pub struct LoggingConfig {
     /// polling endpoints. Off by default keeps the log readable.
     #[serde(default = "default_show_spans")]
     #[setting(
-        label = "Show where each line came from (restart req.)",
+        label = "Show where each line came from",
         widget = "toggle",
+        restart,
         global_only,
         advanced,
         summary = "Adds context to each line. Makes the log longer."
@@ -488,16 +493,17 @@ pub struct AcpConfig {
     )]
     pub allowed_agents: Vec<String>,
     /// Hard cap on simultaneously running acp agent subprocesses;
-    /// additional sessions queue. Takes effect when the Daemon starts.
+    /// additional sessions queue.
     #[serde(default = "default_max_workers")]
     #[setting(
         label = "Most Agents running at once",
         widget = "number",
+        restart,
         min = 1,
         validate = "range:1",
         global_only,
         advanced,
-        summary = "How many Structured view Sessions can have their Agent running at the same time. Lower it to save memory. Applies after the Daemon restarts."
+        summary = "How many Structured view Sessions can have their Agent running at the same time. Lower it to save memory."
     )]
     pub max_concurrent_workers: u32,
     /// Per-session retention cap on acp events. 0 = unlimited (default);
@@ -1580,12 +1586,12 @@ pub struct SessionConfig {
     /// session id live; with more live sessions than this, the overflow's
     /// ids stop refreshing until another session stops. Process-wide:
     /// applied once at startup from the effective config of the profile the
-    /// process was launched with, so a change takes effect on the next
-    /// start. 0 keeps the default (50).
+    /// process was launched with. 0 keeps the default (50).
     #[serde(default = "default_session_id_poller_max_threads")]
     #[setting(
-        label = "Conversation lookup threads (restart req.)",
+        label = "Conversation lookup threads",
         widget = "number",
+        restart,
         min = 0,
         global_only,
         advanced,
@@ -1882,11 +1888,10 @@ pub struct SessionConfig {
     pub unread_indicator: bool,
 
     /// Show per-session color labels: the colored dot on sidebar rows and the
-    /// `Color` section in the session context menu. Web dashboard only; the TUI
-    /// does not render session colors. Turning this off hides them without
-    /// forbidding anything, `aoe session color` and the REST endpoint keep
-    /// working and stored values are preserved, so flipping back reveals them
-    /// again.
+    /// `Color` section in the session context menu. Turning this off hides
+    /// them without forbidding anything, `aoe session color` and the REST
+    /// endpoint keep working and stored values are preserved, so flipping back
+    /// reveals them again.
     ///
     /// `global_only`: the dashboard resolves one settings object for the whole
     /// client, not one per workspace, and the sidebar mixes sessions from
@@ -1896,6 +1901,7 @@ pub struct SessionConfig {
     #[setting(
         label = "Session colors",
         widget = "toggle",
+        web_only,
         category = "Interaction",
         global_only,
         summary = "A colored dot on each row, and Color in the Session menu."
@@ -2623,8 +2629,9 @@ pub struct WebConfig {
     #[setting(
         label = "Notifications for every browser",
         widget = "toggle",
+        restart,
         global_only,
-        summary = "Off stops notifications in every browser and hides the Turn on button. Applies to every Profile, after the Daemon restarts."
+        summary = "Off stops notifications in every browser and hides the Turn on button. Applies to every Profile."
     )]
     pub notifications_enabled: bool,
 
@@ -2634,8 +2641,9 @@ pub struct WebConfig {
     #[setting(
         label = "A Session needs you",
         widget = "toggle",
+        restart,
         global_only,
-        summary = "The Agent is waiting for your answer or approval. Applies after the Daemon restarts."
+        summary = "The Agent is waiting for your answer or approval."
     )]
     pub notify_on_waiting: bool,
 
@@ -2646,14 +2654,20 @@ pub struct WebConfig {
     #[setting(
         label = "A Session finishes",
         widget = "toggle",
+        restart,
         global_only,
-        summary = "The Agent is done and the Session is Idle. Applies after the Daemon restarts."
+        summary = "The Agent is done and the Session is Idle."
     )]
     pub notify_on_idle: bool,
 
     /// Default: send a push when a session errors (Running to Error).
     #[serde(default = "default_true")]
-    #[setting(label = "A Session hits an error", widget = "toggle", global_only)]
+    #[setting(
+        label = "A Session hits an error",
+        widget = "toggle",
+        restart,
+        global_only
+    )]
     pub notify_on_error: bool,
 
     /// Default: send a push when an acp session's ScheduleWakeup timer
@@ -2663,8 +2677,9 @@ pub struct WebConfig {
     #[setting(
         label = "A scheduled wake-up fires",
         widget = "toggle",
+        restart,
         global_only,
-        summary = "When an Agent set itself a timer to check back. Skipped if you were using AoE in the last 30 seconds. Applies after the Daemon restarts."
+        summary = "When an Agent set itself a timer to check back. Skipped if you were using AoE in the last 30 seconds."
     )]
     pub notify_on_wake_fire: bool,
 
@@ -2675,8 +2690,9 @@ pub struct WebConfig {
     #[setting(
         label = "Let other apps control AoE",
         widget = "toggle",
+        restart,
         global_only,
-        summary = "Apps like Claude Code can list your Sessions through MCP. Read-only for now. Works when aoe serve uses the access link without a passphrase, or --auth none. Applies after the Daemon restarts."
+        summary = "Apps like Claude Code can list your Sessions through MCP. Read-only for now. Works when aoe serve uses the access link without a passphrase, or --auth none."
     )]
     pub mcp_enabled: bool,
 }
@@ -3689,11 +3705,12 @@ pub struct TmuxConfig {
     /// Run aoe's sessions on a private tmux server with this socket name (tmux
     /// `-L`), so your own `tmux ls` and hand-managed sessions stay separate
     /// from aoe's. Leave empty to share the default tmux server (the current
-    /// behavior). A bare name, not a path; takes effect on the next aoe start.
+    /// behavior). A bare name, not a path.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[setting(
         label = "Separate tmux server",
         widget = "optional_text",
+        restart,
         global_only,
         web = "local_only:changes which tmux server hosts your sessions on this machine",
         summary = "Keeps AoE's Sessions apart from your other tmux sessions. Enter a short name, like aoe. Change it when no Sessions are running."
@@ -3727,41 +3744,45 @@ pub fn default_systemd_slice() -> String {
 pub struct SystemdSettings {
     /// Place every new session in its own transient systemd scope. No-op when
     /// the systemd user manager is unreachable. Existing scopes are still
-    /// stopped with their sessions when off. Applies after an aoe restart.
+    /// stopped with their sessions when off.
     #[serde(default = "default_true")]
     #[setting(
         label = "Run Sessions in systemd scopes",
         widget = "toggle",
+        restart,
         global_only,
         summary = "Does nothing if systemd isn't available."
     )]
     pub enabled: bool,
 
-    /// Slice for the session scopes; must end in `.slice`. `{profile}` and `{session}` expand to the escaped profile name and session id. Applies after an aoe restart.
+    /// Slice for the session scopes; must end in `.slice`. `{profile}` and `{session}` expand to the escaped profile name and session id.
     #[serde(default = "default_systemd_slice")]
     #[setting(
         label = "Slice",
         widget = "text",
+        restart,
         validate = "systemd_slice",
         global_only,
         summary = "Must end in .slice. {profile} becomes the Profile name and {session} the Session's id."
     )]
     pub slice: String,
 
-    /// Keep sessions running when the aoe daemon service stops. Applies after an aoe restart.
+    /// Keep sessions running when the aoe daemon service stops.
     #[serde(default = "default_true")]
     #[setting(
         label = "Keep Sessions running when the Daemon restarts",
         widget = "toggle",
+        restart,
         global_only
     )]
     pub survive_daemon_restart: bool,
 
-    /// Per-session memory cap (e.g. `4G`, `512M`). Empty means unlimited. Applies after an aoe restart.
+    /// Per-session memory cap (e.g. `4G`, `512M`). Empty means unlimited.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[setting(
         label = "Memory limit per Session",
         widget = "optional_text",
+        restart,
         validate = "memory_limit",
         global_only,
         advanced,
@@ -3769,11 +3790,12 @@ pub struct SystemdSettings {
     )]
     pub memory_max: Option<String>,
 
-    /// Per-session task cap. 0 means unlimited. Applies after an aoe restart.
+    /// Per-session task cap. 0 means unlimited.
     #[serde(default)]
     #[setting(
         label = "Limit processes per Session",
         widget = "number",
+        restart,
         min = 0,
         max = 4194304,
         validate = "range:0:4194304",
