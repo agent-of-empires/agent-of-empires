@@ -1704,6 +1704,9 @@ fn drive_terminal_handoff(
                             );
                             intent.stage = HandoffStage::ProjectionCleanupOwed;
                             if ended {
+                                // Means "this switch's launch went ahead", which an ending makes
+                                // false even after an earlier attempt set it.
+                                intent.launch_started = false;
                                 row.status = Status::Error;
                             }
                             Ok(())
@@ -5050,9 +5053,8 @@ mod tests {
         Ok(())
     }
 
-    /// A switch owed from before the refusal above: its launch refuses the command's selector
-    /// beside AoE's id on every retry, so the handoff ends, and a restart without the selector
-    /// launches.
+    /// A switch owed with the command's own selector beside AoE's id ends, whether or not a launch
+    /// was already attempted, and a restart without the selector launches.
     #[tokio::test]
     #[serial_test::serial]
     async fn an_owed_switch_the_command_selector_refuses_ends_and_a_restart_launches(
@@ -5086,7 +5088,37 @@ mod tests {
         };
         let flag_removed = owed("owed own selector, flag removed");
         let id_cleared = owed("owed own selector, id cleared");
-        let rows = vec![flag_removed.clone(), id_cleared.clone()];
+        // An earlier attempt leaves `launch_started` set: refused before a pane, or with its pane
+        // kept when the daemon stopped before moving the stage on.
+        #[derive(PartialEq)]
+        enum Tried {
+            Never,
+            Refused,
+            KeptPane,
+        }
+        let attempted = |title: &str| {
+            let mut row = owed(title);
+            row.command = "claude".into();
+            row
+        };
+        let kept = attempted("owed own selector, pane kept");
+        // (row, earlier attempt, resumed by a retried switch rather than recovery)
+        let cases = [
+            (flag_removed.clone(), Tried::Never, true),
+            (id_cleared.clone(), Tried::Never, false),
+            (
+                attempted("owed own selector, refused, by switch"),
+                Tried::Refused,
+                true,
+            ),
+            (
+                attempted("owed own selector, refused, by recovery"),
+                Tried::Refused,
+                false,
+            ),
+            (kept.clone(), Tried::KeptPane, true),
+        ];
+        let rows: Vec<_> = cases.iter().map(|case| case.0.clone()).collect();
         let _panes: Vec<_> = rows
             .iter()
             .map(|row| {
@@ -5115,7 +5147,8 @@ mod tests {
             Ok(rows.into_iter().find(|r| r.id == id).unwrap())
         };
 
-        for held in &rows {
+        let mut kept_pane = None;
+        for (held, tried, by_switch) in &cases {
             // Reserve as a daemon without the refusal did; the switch then drives it.
             {
                 let (native, durable) = load_handoff_row(&state, "default", &held.id).await?;
@@ -5141,13 +5174,6 @@ mod tests {
                 .await??;
             }
             assert!(stored(&held.id)?.terminal_handoff.is_some());
-            // The first cleanup fails after the skipped launch is saved, so the outcome must
-            // survive into a resumed cleanup.
-            db.execute(
-                "INSERT OR REPLACE INTO acp_rate_limit_budgets (session_id, spent, armed) VALUES (?1,2,1)",
-                [&held.id],
-            )?;
-            db.execute_batch(&format!("CREATE TRIGGER refuse_handoff_delete BEFORE DELETE ON acp_rate_limit_budgets WHEN OLD.session_id = '{}' BEGIN SELECT RAISE(ABORT, 'durable handoff cleanup blocked'); END;", held.id))?;
             let switch = || {
                 acp_disable(
                     State(state.clone()),
@@ -5155,6 +5181,112 @@ mod tests {
                     axum::body::Bytes::from_static(b""),
                 )
             };
+            if *tried != Tried::Never {
+                let set_command = |command: &'static str| -> anyhow::Result<()> {
+                    crate::session::Storage::open_unwatched("default")?.update(|rows, _| {
+                        rows.iter_mut().find(|r| r.id == held.id).unwrap().command = command.into();
+                        Ok(())
+                    })
+                };
+                // The launch rereads its row after the hooks, so a selector added while they run
+                // reaches preflight past the switch's own check: refused after the reservation
+                // set `launch_started`, before any receipt or pane.
+                let entered = project.path().join("hook-entered");
+                let release = project.path().join("hook-release");
+                crate::session::config::update_config(|config| {
+                    config.hooks.on_launch = vec![format!(
+                        ": > '{}'; while [ ! -e '{}' ]; do sleep 0.01; done",
+                        entered.display(),
+                        release.display()
+                    )]
+                })?;
+                let launching = tokio::spawn(acp_disable(
+                    State(state.clone()),
+                    Path(held.id.clone()),
+                    axum::body::Bytes::from_static(b""),
+                ));
+                let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+                while !entered.exists() {
+                    assert!(std::time::Instant::now() < deadline, "the launch hook ran");
+                    tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+                }
+                set_command("claude --resume old-id")?;
+                std::fs::write(&release, "")?;
+                let refused = launching.await?.into_response();
+                assert!(!refused.status().is_success(), "the launch refused it");
+                crate::session::config::update_config(|config| config.hooks.on_launch.clear())?;
+                std::fs::remove_file(&entered)?;
+                std::fs::remove_file(&release)?;
+                let tried_row = stored(&held.id)?;
+                let intent = tried_row
+                    .terminal_handoff
+                    .as_ref()
+                    .expect("launch still owed");
+                assert_eq!(intent.stage, HandoffStage::TerminalLaunchOwed);
+                assert!(intent.launch_started, "{}", held.title);
+                assert!(intent.launch.is_none(), "refused before the receipt");
+                if *tried == Tried::KeptPane {
+                    // A retry without the selector launches its pane, and the daemon stops before
+                    // the switch moves the stage on; the selector then comes back.
+                    set_command("claude")?;
+                    crate::server::test_support::accept_runtime_read_cache_for_test(&state).await;
+                    let (native, mut launch) =
+                        load_handoff_row(&state, "default", &held.id).await?;
+                    let key = handoff_key(&launch)?;
+                    let driver = Arc::new(
+                        crate::session::try_acquire_terminal_handoff_driver(&held.id)?.unwrap(),
+                    );
+                    tokio::task::spawn_blocking(move || {
+                        launch.start_terminal_handoff_in(&native, key, &driver, true)
+                    })
+                    .await??;
+                    set_command("claude --resume old-id")?;
+                    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+                    while !argv.exists() {
+                        assert!(std::time::Instant::now() < deadline, "the kept pane ran");
+                        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+                    }
+                    // Pane ids are never reused within a tmux server; the PID lookup is not
+                    // available in every environment.
+                    kept_pane =
+                        crate::tmux::first_pane_id(stored(&held.id)?.tmux_session()?.name());
+                    assert!(kept_pane.is_some());
+                    std::fs::remove_file(&argv)?;
+                }
+                crate::server::test_support::accept_runtime_read_cache_for_test(&state).await;
+            }
+            // The first cleanup fails after the skipped launch is saved, so the outcome must
+            // survive into a resumed cleanup.
+            db.execute(
+                "INSERT OR REPLACE INTO acp_rate_limit_budgets (session_id, spent, armed) VALUES (?1,2,1)",
+                [&held.id],
+            )?;
+            db.execute_batch(&format!("CREATE TRIGGER refuse_handoff_delete BEFORE DELETE ON acp_rate_limit_budgets WHEN OLD.session_id = '{}' BEGIN SELECT RAISE(ABORT, 'durable handoff cleanup blocked'); END;", held.id))?;
+            // Each fixture has the shape its row claims right before the switch under test.
+            let before = stored(&held.id)?;
+            let intent = before.terminal_handoff.as_ref().unwrap();
+            let shape = (intent.stage, intent.launch_started, intent.launch.is_some());
+            match tried {
+                Tried::Never => assert_eq!(
+                    shape,
+                    (HandoffStage::RetirementPending, false, false),
+                    "{}",
+                    held.title
+                ),
+                Tried::Refused => assert_eq!(
+                    shape,
+                    (HandoffStage::TerminalLaunchOwed, true, false),
+                    "{}",
+                    held.title
+                ),
+                Tried::KeptPane => {
+                    assert_eq!(shape, (HandoffStage::TerminalLaunchOwed, true, true));
+                    let pane = before.tmux_session()?;
+                    assert!(pane.exists_live() && !pane.is_pane_dead());
+                    assert_eq!(crate::tmux::first_pane_id(pane.name()), kept_pane);
+                }
+            }
+            assert_eq!(before.command, "claude --resume old-id", "{}", held.title);
             let interrupted = switch().await.into_response();
             assert_eq!(interrupted.status(), StatusCode::SERVICE_UNAVAILABLE);
             let pending = stored(&held.id)?;
@@ -5165,7 +5297,7 @@ mod tests {
             assert_eq!(intent.stage, HandoffStage::ProjectionCleanupOwed);
             assert_eq!(pending.view, View::Terminal);
             db.execute_batch("DROP TRIGGER refuse_handoff_delete")?;
-            if held.id == flag_removed.id {
+            if *by_switch {
                 // A retried switch drives the cleanup and still answers with the coded refusal.
                 let response = switch().await.into_response();
                 let status = response.status();
@@ -5226,6 +5358,12 @@ mod tests {
                 "claude --resume old-id",
                 "--resume old-id\n",
             ),
+            (
+                &kept,
+                Some("claude".to_string()),
+                "claude",
+                "--session-id sid-held\n",
+            ),
         ] {
             let _ = std::fs::remove_file(&argv);
             let response = crate::server::api::restart_session(
@@ -5249,6 +5387,14 @@ mod tests {
             assert_eq!(restarted.command, command, "{}", row.title);
             assert!(restarted.terminal_handoff.is_none());
         }
+        // The remedy replaces the pane the earlier attempt kept, rather than skipping on it.
+        let restarted = stored(&kept.id)?.tmux_session()?;
+        let replaced = crate::tmux::first_pane_id(restarted.name());
+        assert!(restarted.exists_live() && !restarted.is_pane_dead());
+        assert!(
+            replaced.is_some() && replaced != kept_pane,
+            "{kept_pane:?} -> {replaced:?}"
+        );
         let cleared = stored(&id_cleared.id)?;
         assert_eq!(cleared.agent_session_id, None, "the clear dropped AoE's id");
         Ok(())
