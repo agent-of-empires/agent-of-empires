@@ -8,7 +8,10 @@ no-default-features = false
 [advisories]
 # Deny any crate with a known security vulnerability
 version = 2
-ignore = []
+ignore = [
+    # chrono is unmaintained with no safe upgrade; replace it in a separate change.
+    "RUSTSEC-2026-0543",
+]
 
 # License policy
 [licenses]
