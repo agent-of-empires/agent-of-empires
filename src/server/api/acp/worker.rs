@@ -1536,6 +1536,7 @@ mod tests {
             &mut std::collections::HashMap::new(),
             &mut std::collections::HashSet::new(),
             &mut std::collections::HashSet::new(),
+            &mut std::collections::HashSet::new(),
         )
         .await;
         assert_eq!(starts.load(Ordering::SeqCst), 0);
@@ -1987,6 +1988,7 @@ mod tests {
                 &mut std::collections::HashSet::new(),
                 &mut crate::server::acp_reconciler::ReapCadence::default(),
                 &mut std::collections::HashMap::new(),
+                &mut std::collections::HashSet::new(),
                 &mut std::collections::HashSet::new(),
                 &mut std::collections::HashSet::new(),
             )

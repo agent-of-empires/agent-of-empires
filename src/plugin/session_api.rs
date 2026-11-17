@@ -2608,6 +2608,7 @@ mod tests {
             &mut Default::default(),
             &mut Default::default(),
             &mut Default::default(),
+            &mut Default::default(),
         )
         .await;
     }
