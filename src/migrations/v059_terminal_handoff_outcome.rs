@@ -16,9 +16,16 @@ fn run_in(app_dir: &Path) -> Result<()> {
 }
 
 fn migrate_file(path: &Path) -> Result<()> {
-    if !path.try_exists()? {
-        return Ok(());
-    }
+    let metadata = match std::fs::symlink_metadata(path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(error.into()),
+    };
+    anyhow::ensure!(
+        metadata.file_type().is_file(),
+        "terminal handoff migration requires a regular sessions file: {}",
+        path.display()
+    );
     let directory = path.parent().context("sessions file has no parent")?;
     let _lock =
         crate::session::acquire_storage_flock(directory, crate::session::STORAGE_LOCK_FILENAME)?;
@@ -222,6 +229,30 @@ mod tests {
             assert_eq!(std::fs::read(&path)?, bytes);
             assert!(crate::session::migration_backups(&path)?.is_empty());
         }
+        Ok(())
+    }
+
+    #[test]
+    fn a_symlinked_sessions_file_is_refused_and_kept() -> Result<()> {
+        let root = tempfile::tempdir()?;
+        let target = root.path().join("elsewhere.json");
+        let path = root.path().join("sessions.json");
+        let row = Instance::new("pending", "/tmp/repo");
+        let intent = pending(&row, TerminalHandoffContext::Discard);
+        let bytes = serde_json::to_vec(&json!([written_before(&row, &intent)?]))?;
+        std::fs::write(&target, &bytes)?;
+        std::os::unix::fs::symlink(&target, &path)?;
+
+        let error = migrate_file(&path).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("requires a regular sessions file"),
+            "{error:#}"
+        );
+        assert_eq!(std::fs::read_link(&path)?, target);
+        assert_eq!(std::fs::read(&target)?, bytes);
+        assert!(crate::session::migration_backups(&path)?.is_empty());
         Ok(())
     }
 
