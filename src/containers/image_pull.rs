@@ -252,6 +252,15 @@ pub(crate) fn state(key: &PullKey) -> PullState {
     }
 }
 
+/// How many callers are waiting on `key`'s running pull; 0 when none is running.
+#[cfg(test)]
+pub(crate) fn waiters_for_test(key: &PullKey) -> usize {
+    match lock(&FLIGHTS).get(key) {
+        Some(Entry::Running(flight)) => lock(&flight.state).waiters,
+        _ => 0,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

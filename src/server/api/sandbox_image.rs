@@ -104,6 +104,10 @@ impl StatusCache {
 }
 
 static STATUS: LazyLock<Mutex<StatusCache>> = LazyLock::new(Mutex::default);
+/// The key's dashboard waiter, by the id its cleanup checks. One per running pull, so repeated
+/// POSTs don't each hold a blocking thread for the whole pull.
+static DASHBOARD_WAITERS: LazyLock<Mutex<HashMap<ImageKey, u64>>> = LazyLock::new(Mutex::default);
+static NEXT_DASHBOARD_WAITER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 /// One registry check per image and runtime at a time, so callers arriving together share it.
 static CHECK_TURNS: LazyLock<Mutex<HashMap<ImageKey, Arc<tokio::sync::Mutex<()>>>>> =
     LazyLock::new(Mutex::default);
@@ -427,16 +431,28 @@ pub async fn sandbox_image_pull(
         Err(resp) => return resp,
     };
     let key = configured.key(image.clone());
-    // Registered now, so the next status read already sees it running.
-    let waiter = ContainerRuntime::from(configured.runtime).join_pull(&image);
-    tokio::task::spawn_blocking(move || {
-        // A pull the dashboard asked for is never cancelled by a create that joined it.
-        let _ = waiter.wait(&tokio_util::sync::CancellationToken::new());
-        STATUS
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .invalidate(&key);
-    });
+    let runtime = ContainerRuntime::from(configured.runtime);
+    let mut waiters = DASHBOARD_WAITERS.lock().unwrap_or_else(|e| e.into_inner());
+    // Joined under the map's lock, so two POSTs can't both add a waiter to one pull.
+    if !(waiters.contains_key(&key) && runtime.pull_state(&image) == PullState::Running) {
+        // Registered now, so the next status read already sees it running.
+        let waiter = runtime.join_pull(&image);
+        let id = NEXT_DASHBOARD_WAITER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        waiters.insert(key.clone(), id);
+        tokio::task::spawn_blocking(move || {
+            // A pull the dashboard asked for is never cancelled by a create that joined it.
+            let _ = waiter.wait(&tokio_util::sync::CancellationToken::new());
+            STATUS
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .invalidate(&key);
+            let mut waiters = DASHBOARD_WAITERS.lock().unwrap_or_else(|e| e.into_inner());
+            if waiters.get(&key) == Some(&id) {
+                waiters.remove(&key);
+            }
+        });
+    }
+    drop(waiters);
     (
         StatusCode::ACCEPTED,
         Json(serde_json::json!({ "image": image, "pull": PullState::Running })),
@@ -767,6 +783,68 @@ mod tests {
                 ),
             }
         }
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn posts_during_a_running_pull_share_one_dashboard_waiter() {
+        use crate::containers::image_pull;
+        // An image no other test pulls, so its flight and status counter are this test's.
+        const IMAGE: &str = "aoe-test/repeated-pull-posts:latest";
+        let _app = crate::session::test_support::isolate_app_dir();
+        crate::session::update_config(|c| {
+            c.sandbox.allow_image_pull = true;
+            c.sandbox.default_image = IMAGE.into();
+        })
+        .unwrap();
+        let state = crate::server::test_support::build_test_app_state(Vec::new());
+        let runtime = ContainerRuntime::from(ContainerRuntimeName::default());
+        let pull_key = image_pull::PullKey {
+            runtime: runtime.display_name(),
+            image: IMAGE.into(),
+        };
+        let (open, gate) = std::sync::mpsc::channel::<()>();
+        let held = image_pull::join_with(pull_key.clone(), move |_| {
+            let _ = gate.recv();
+            Ok(())
+        });
+        let before = status_generation_for_test(&runtime, IMAGE);
+        for post in 0..5 {
+            let resp = sandbox_image_pull(
+                State(state.clone()),
+                axum::http::HeaderMap::new(),
+                axum::body::Bytes::new(),
+            )
+            .await;
+            let (code, body) = json(resp).await;
+            assert_eq!(code, StatusCode::ACCEPTED, "POST {post}: {body}");
+        }
+        assert_eq!(
+            image_pull::waiters_for_test(&pull_key),
+            2,
+            "this test's waiter and one dashboard waiter"
+        );
+        open.send(()).unwrap();
+        held.wait(&tokio_util::sync::CancellationToken::new())
+            .unwrap();
+        let key = runtime_key(&runtime, IMAGE);
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        while DASHBOARD_WAITERS
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .contains_key(&key)
+        {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the dashboard waiter never finished"
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert_eq!(
+            status_generation_for_test(&runtime, IMAGE),
+            before + 1,
+            "the status is invalidated once, when the pull ends"
+        );
     }
 
     #[tokio::test]
