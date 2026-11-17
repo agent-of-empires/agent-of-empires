@@ -522,21 +522,27 @@ fn staging_remove_unattached_image(image: &std::path::Path) -> anyhow::Result<()
     let mut command = Command::new("/usr/bin/hdiutil");
     command.args(["info", "-plist"]);
     let inventory = staging_plist(&staging_tool(&mut command)?)?;
-    for entry in staging_plist_array(&inventory, "images")?.iter() {
-        let record = staging_plist_dictionary(*entry)?;
-        let path = staging_plist_string(&record, "image-path")?;
-        anyhow::ensure!(
-            staging_image_identity(std::path::Path::new(&path))?
-                .with_context(|| format!("cannot resolve inventory image identity: {path}"))?
-                != metadata_identity(&metadata),
-            "rejected staging image remains attached: {path}"
-        );
-    }
+    staging_verify_unattached_inventory(&inventory, metadata_identity(&metadata))?;
     anyhow::ensure!(
         metadata_identity(&std::fs::symlink_metadata(image)?) == metadata_identity(&metadata),
         "rejected staging image changed identity"
     );
     std::fs::remove_file(image)?;
+    Ok(())
+}
+
+fn staging_verify_unattached_inventory(
+    inventory: &core_foundation::dictionary::CFDictionary,
+    image_identity: (u64, u64),
+) -> anyhow::Result<()> {
+    for entry in staging_plist_array(inventory, "images")?.iter() {
+        let record = staging_plist_dictionary(*entry)?;
+        let path = staging_plist_string(&record, "image-path")?;
+        anyhow::ensure!(
+            staging_image_identity(std::path::Path::new(&path))? != Some(image_identity),
+            "rejected staging image remains attached: {path}"
+        );
+    }
     Ok(())
 }
 
@@ -3123,6 +3129,7 @@ mod tests {
         );
         assert!(verify(&inventory, true).is_ok());
         assert!(verify(&inventory, false).is_err());
+        assert!(staging_verify_unattached_inventory(&inventory, image_identity).is_err());
         let images = [image.clone(), aliased_image.clone()];
         let duplicate = snapshot(&images, &root, "/dev/disk42");
         assert!(verify(&duplicate, true).is_err());
@@ -3166,6 +3173,8 @@ mod tests {
         std::fs::remove_file(&other_image).unwrap();
         assert!(verify(&incomplete, true).is_ok());
         assert!(verify(&recycled, false).is_ok());
+        assert!(staging_verify_unattached_inventory(&recycled, image_identity).is_ok());
+        assert!(staging_verify_unattached_inventory(&incomplete, image_identity).is_err());
         std::fs::write(&other_image, b"unrelated image").unwrap();
         let empty = snapshot(&[], &root, "/dev/disk42");
         assert!(verify(&empty, false).is_ok());
