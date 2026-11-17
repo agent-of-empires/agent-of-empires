@@ -103,11 +103,9 @@ impl FsPolicy {
         }
     }
 
-    pub fn with_sandbox_map(roots: Vec<PathBuf>, map: SandboxPathMap) -> Self {
-        Self {
-            sandbox_map: Some(map),
-            ..Self::new(roots)
-        }
+    pub fn with_map(mut self, map: SandboxPathMap) -> Self {
+        self.sandbox_map = Some(map);
+        self
     }
 
     fn translate(&self, path: &Path) -> Result<PathBuf, FsError> {
@@ -241,7 +239,7 @@ mod tests {
         std::fs::write(root.join("file.txt"), "hello").unwrap();
         let canonical = root.canonicalize().unwrap();
         let map = SandboxPathMap::new(vec![(PathBuf::from("/workspace/proj"), root.clone())]);
-        let policy = FsPolicy::with_sandbox_map(vec![root.clone()], map);
+        let policy = FsPolicy::new(vec![root.clone()]).with_map(map);
         for inside in [
             root.join("file.txt"),
             PathBuf::from("/workspace/proj/file.txt"),
