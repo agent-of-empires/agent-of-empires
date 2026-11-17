@@ -45,20 +45,30 @@ pub(super) fn parse_plan_steps(text: &str) -> Vec<PlanStep> {
     });
 
     let mut steps = Vec::new();
-    let mut fence: Option<(char, usize)> = None;
+    // Open fence: char, run length, and the column its container starts at.
+    let mut fence: Option<(char, usize, usize)> = None;
+    // Content column of the last list item, which may hold its own fences.
+    let mut item_col: Option<usize> = None;
     for line in text.lines() {
-        let run = fence_run(line);
-        if let Some((ch, len)) = fence {
-            if run.is_some_and(|(c, n, rest)| c == ch && n >= len && rest.trim().is_empty()) {
+        let indent = line.len() - line.trim_start_matches(' ').len();
+        if let Some((ch, len, base)) = fence {
+            if fence_run(line, base)
+                .is_some_and(|(c, n, rest)| c == ch && n >= len && rest.trim().is_empty())
+            {
                 fence = None;
             }
             continue;
         }
-        if let Some((ch, len, _)) = run {
-            fence = Some((ch, len));
+        if !line.trim().is_empty() && item_col.is_some_and(|col| indent < col) {
+            item_col = None;
+        }
+        let base = item_col.unwrap_or(0);
+        if let Some((ch, len, _)) = fence_run(line, base) {
+            fence = Some((ch, len, base));
             continue;
         }
         if let Some(caps) = bullet.captures(line) {
+            item_col = caps.get(1).map(|m| m.start());
             let raw_title = caps.get(1).map(|m| m.as_str()).unwrap_or("");
             let title = strip_markdown_emphasis(raw_title);
             if title.is_empty() {
@@ -75,9 +85,15 @@ pub(super) fn parse_plan_steps(text: &str) -> Vec<PlanStep> {
     steps
 }
 
-/// The fence char, run length and remainder of a CommonMark fence line.
-fn fence_run(line: &str) -> Option<(char, usize, &str)> {
-    let trimmed = line.trim_start();
+/// The fence char, run length and remainder of a CommonMark fence line in a
+/// container starting at column `base`. Four or more spaces past `base` make
+/// it indented code, not a fence.
+fn fence_run(line: &str, base: usize) -> Option<(char, usize, &str)> {
+    let trimmed = line.trim_start_matches(' ');
+    let indent = line.len() - trimmed.len();
+    if indent < base || indent - base > 3 {
+        return None;
+    }
     let ch = trimmed.chars().next().filter(|c| matches!(c, '`' | '~'))?;
     let len = trimmed.len() - trimmed.trim_start_matches(ch).len();
     let rest = &trimmed[len..];
@@ -188,19 +204,32 @@ mod tests {
             assert!(matches!(s.status, PlanStepStatus::Pending));
         }
 
-        // CommonMark closing fences: same char, at least the opener's length,
-        // nothing but whitespace after.
-        for (fenced, closed) in [
-            ("~~~\n~~~literal\n- hidden\n~~~  ", true),
-            ("````\n```\n- hidden\n````", true),
-            ("```rust\n- hidden\n~~~\n`````", true),
-            ("~~~\n- hidden\n```", false),
-            ("````\n- hidden\n```", false),
+        // CommonMark fences: a closer uses the opener's char, is at least as
+        // long, and has nothing but whitespace after. At most 3 spaces of
+        // indent past the container; more is indented code.
+        for (md, want) in [
+            ("~~~\n~~~literal\n- hidden\n~~~  \n- after", &["after"][..]),
+            ("````\n```\n- hidden\n````\n- after", &["after"]),
+            ("```rust\n- hidden\n~~~\n`````\n- after", &["after"]),
+            ("~~~\n- hidden\n```\n- after", &[]),
+            ("````\n- hidden\n```\n- after", &[]),
+            (
+                "# Plan\n\n    ```text\n    example\n\n- Run tests",
+                &["Run tests"],
+            ),
+            ("   ~~~\n- hidden\n   ~~~\n- after", &["after"]),
+            ("```\n- hidden\n    ```\n```\n- after", &["after"]),
+            (
+                "- step\n  ```\n  - hidden\n  ```\n- after",
+                &["step", "after"],
+            ),
+            (
+                "1. step\n       ```\n   - sub\n- after",
+                &["step", "sub", "after"],
+            ),
         ] {
-            let md = format!("{fenced}\n- after");
-            let titles: Vec<String> = parse_plan_steps(&md).into_iter().map(|s| s.title).collect();
-            let want: &[&str] = if closed { &["after"] } else { &[] };
-            assert_eq!(titles, want, "{fenced:?}");
+            let titles: Vec<String> = parse_plan_steps(md).into_iter().map(|s| s.title).collect();
+            assert_eq!(titles, want, "{md:?}");
         }
 
         {
