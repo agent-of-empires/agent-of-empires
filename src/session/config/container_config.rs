@@ -3984,7 +3984,7 @@ mod tests {
             ));
             want.push(format!("{base}/{}/.git", wt.display()));
             want.sort();
-            assert_eq!(overlays_of(&volumes, &[worktree.clone()]), want);
+            assert_eq!(overlays_of(&volumes, std::slice::from_ref(&worktree)), want);
         }
 
         // A repo a workspace mount covers without a volume of its own.
