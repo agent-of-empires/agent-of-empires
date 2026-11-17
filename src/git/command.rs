@@ -27,6 +27,10 @@ fn discover_user_config(envs: &[(&str, &Path)]) -> Option<Vec<(String, String)>>
         .envs(envs.iter().copied())
         .stdin(Stdio::null());
         let out = crate::process::run_with_timeout(&mut cmd, Duration::from_secs(2)).ok()??;
+        // 1 is "no match"; anything else is an unreadable config.
+        if !matches!(out.status.code(), Some(0 | 1)) {
+            return None;
+        }
         found.extend(
             String::from_utf8_lossy(&out.stdout)
                 .lines()
@@ -474,6 +478,21 @@ mod tests {
             discover_user_config(&[("GIT_CONFIG_SYSTEM", none), ("GIT_CONFIG_GLOBAL", &stalled)]);
         assert_eq!(found, None);
         assert!(start.elapsed() < Duration::from_secs(10));
+    }
+
+    #[test]
+    fn user_config_discovery_rejects_unreadable_config() {
+        let tmp = tempfile::tempdir().unwrap();
+        let broken = tmp.path().join("gitconfig");
+        std::fs::write(&broken, "[core\n\tsshCommand = my-ssh\n").unwrap();
+        let none = Path::new("/dev/null");
+        let found =
+            discover_user_config(&[("GIT_CONFIG_SYSTEM", none), ("GIT_CONFIG_GLOBAL", &broken)]);
+        assert_eq!(found, None);
+        let missing = tmp.path().join("absent");
+        let found =
+            discover_user_config(&[("GIT_CONFIG_SYSTEM", none), ("GIT_CONFIG_GLOBAL", &missing)]);
+        assert_eq!(found, Some(vec![]));
     }
 
     #[test]
