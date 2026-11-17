@@ -213,6 +213,22 @@ pub fn pick_acp_agent_name(
     tool: &str,
     explicit_override: Option<&str>,
 ) -> String {
+    pick_acp_agent_name_with_default(
+        registry,
+        session,
+        acp.resolved_default_agent(),
+        tool,
+        explicit_override,
+    )
+}
+
+pub(crate) fn pick_acp_agent_name_with_default(
+    registry: &AgentRegistry,
+    session: &crate::session::config::SessionConfig,
+    default_agent: &str,
+    tool: &str,
+    explicit_override: Option<&str>,
+) -> String {
     if let Some(name) = explicit_override.filter(|name| !name.is_empty()) {
         return name.to_string();
     }
@@ -229,7 +245,7 @@ pub fn pick_acp_agent_name(
     if tool == "claude" {
         "claude".into()
     } else {
-        acp.resolved_default_agent().to_string()
+        default_agent.to_string()
     }
 }
 
@@ -290,8 +306,16 @@ mod tests {
             ("unknown", None, "opencode"),
             ("bad-sp", None, "claude"),
         ] {
+            let with_config = pick_acp_agent_name(&registry, &session, &acp, tool, explicit);
+            assert_eq!(with_config, want, "{tool} / {explicit:?}");
             assert_eq!(
-                pick_acp_agent_name(&registry, &session, &acp, tool, explicit),
+                pick_acp_agent_name_with_default(
+                    &registry,
+                    &session,
+                    acp.resolved_default_agent(),
+                    tool,
+                    explicit,
+                ),
                 want,
                 "{tool} / {explicit:?}"
             );
