@@ -103,6 +103,29 @@ describe("usePluginUiState refresh indicator", () => {
   });
 });
 
+describe("usePluginUiState hung request", () => {
+  it("abandons a request that never settles after 15s and polls again", async () => {
+    // Native AbortSignal.timeout ignores fake timers; route it through the faked setTimeout.
+    vi.spyOn(AbortSignal, "timeout").mockImplementation((ms) => {
+      const controller = new AbortController();
+      setTimeout(() => controller.abort(), ms);
+      return controller.signal;
+    });
+    fetchMock.mockImplementationOnce(
+      (init) => new Promise((resolve) => init?.signal?.addEventListener("abort", () => resolve(null))),
+    );
+    fetchMock.mockResolvedValue(snapshot());
+    const { result } = renderHook(() => usePluginUiState());
+    await tick(300);
+    expect(result.current.isRefreshing).toBe(true);
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+    await tick(15_000);
+    await tick(3000);
+    expect(fetchMock).toHaveBeenCalledTimes(2);
+    expect(result.current.isRefreshing).toBe(false);
+  });
+});
+
 describe("usePluginUiState pages", () => {
   it("is null before the first snapshot, then keeps one identity while pages are unchanged", async () => {
     const page = {

@@ -5,6 +5,8 @@ import { reportError, reportInfo, reportOpenLink } from "../lib/toastBus";
 const POLL_INTERVAL = 3000;
 const BOOST_INTERVAL = 500;
 const BOOST_MS = 15000;
+// A request that never settles would park the poll loop forever.
+const REQUEST_TIMEOUT_MS = 15_000;
 
 function toast(n: PluginUiNotification): void {
   const message = n.body ? `${n.title}: ${n.body}` : n.title;
@@ -66,7 +68,7 @@ export function usePluginUiState() {
         if (!cancelled) setIsRefreshing(true);
       }, REFRESH_INDICATOR_DELAY);
       try {
-        const state = await fetchPluginUiState();
+        const state = await fetchPluginUiState({ signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS) });
         if (cancelled || state === null) return;
         setEntries(state.entries);
         setRevisions(state.revisions ?? {});
