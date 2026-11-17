@@ -42,7 +42,7 @@
         "web/src/components/settings/PluginUpdateConsentModal.tsx",
         "web/src/components/settings/agentIntegrationDetails.ts"
       ],
-      "notes": "Install and update consent expose agent launch, detection and reply declarations as text with control and format characters made visible."
+      "notes": "Install and update consent expose agent launch, detection and reply declarations as text with control and format characters made visible, including the declared Enter delay so a timing-only change is visible."
     },
     {
       "id": "settings.plugin-agent-consent-browser",
@@ -826,6 +826,13 @@
       "components": ["web/src/hooks/useAcpSession.ts", "web/src/lib/api.ts"]
     },
     {
+      "id": "acp.login-required-queued-prompt",
+      "kind": "vitest",
+      "risk": "medium",
+      "specs": ["src/hooks/useAcpSession.test.ts"],
+      "components": ["web/src/hooks/useAcpSession.ts", "web/src/hooks/acpSession/reducer.ts"]
+    },
+    {
       "id": "acp.server-queue",
       "kind": "vitest",
       "risk": "medium",
@@ -996,6 +1003,13 @@
         "src/hooks/__tests__/useSettingsCommands.test.tsx"
       ],
       "components": ["web/src/components/SettingsView.tsx", "web/src/hooks/useSettingsCommands.ts"]
+    },
+    {
+      "id": "settings.shared-credential",
+      "kind": "vitest",
+      "risk": "medium",
+      "specs": ["src/components/settings/__tests__/SharedCredentialSetting.test.tsx"],
+      "components": ["web/src/components/SettingsView.tsx", "web/src/components/settings/FormFields.tsx"]
     },
     {
       "id": "settings.session-auto-stop-idle",
@@ -3376,7 +3390,7 @@
       "id": "acp.background-agents",
       "kind": "vitest",
       "risk": "medium",
-      "notes": "The Background pane: shells and sub-agents filtered by kind and grouped Running and Recent, a child's detail built from the same rows as its thread card, and Claude Workflow runs grouped by run and phase.",
+      "notes": "The Background pane: shells and sub-agents filtered by kind and grouped Running and Recent, a child's detail built from the same rows as its thread card, and Claude Workflow runs grouped by run and phase. A Workflow call stays a workflow card when a permission start retitles it, and reads \"Preparing workflow script\" until the call returns.",
       "specs": [
         "src/components/acp/__tests__/BackgroundAgentsPanel.test.tsx",
         "src/lib/acpTypes.reducer.test.ts",
@@ -3887,6 +3901,20 @@
       ]
     },
     {
+      "id": "acp.custom-agent-reset-alias",
+      "kind": "live-playwright",
+      "risk": "high",
+      "specs": ["tests/live/acp-session-history.spec.ts"],
+      "components": [
+        "src/acp/agent_profiles.rs",
+        "src/acp/supervisor/",
+        "src/server/api/sessions/list.rs",
+        "src/server/session_service.rs",
+        "src/session/config/mod.rs"
+      ],
+      "notes": "A custom ACP agent's `session.agent_clear_alias` drives the same fresh `session/new` as the Claude `/clear` and Codex `/new` stories, which this reuses. Rust tests cover what is specific to a custom agent: the queue drain keeps the reset as its own turn and leaves later rows queued (`the_queue_drain_keeps_a_custom_reset_as_its_own_turn`); the solo hold, drain, publication and session list use the agent the worker runs, else the one its next spawn picks (`a_custom_reset_is_classified_by_the_agent_the_session_runs`, `list_sessions_advertises_the_running_agents_reset_command`); publication keeps the classification the drain cut with (`a_carried_classification_decides_the_published_turn`); a built-in agent, including a registry agent without a profile, ignores its entry."
+    },
+    {
       "id": "acp.idle-dormant-wake",
       "kind": "vitest",
       "risk": "high",
@@ -4316,6 +4344,59 @@
       "notes": "Auth-required startup errors name the agent's own sign-in step from signInSteps.ts: Claude gets claude auth login and ANTHROPIC_API_KEY, Codex gets codex login (codex login --device-auth in a Container) and OPENAI_API_KEY, other agents get generic sign-in copy with no Claude or Codex commands. A sandboxed Session with install off runs the command inside the container and points new Sessions at the dashboard's \"Sandbox image update available\" banner, which offers Update now to pull it or shows the command to run, never at the TUI."
     },
     {
+      "id": "acp.container-gone-banner",
+      "kind": "mocked-playwright",
+      "risk": "high",
+      "specs": [
+        "tests/container-gone.spec.ts",
+        "src/components/acp/__tests__/ContainerGoneBanner.test.tsx",
+        "src/hooks/acpSession/reducer.test.ts",
+        "src/hooks/acpSession/stateCache.test.ts",
+        "src/components/session-wizard/__tests__/SessionWizard.test.tsx",
+        "src/components/acp/Composer.test.tsx",
+        "src/components/acp/QueuedPromptsStrip.test.tsx"
+      ],
+      "components": [
+        "web/src/components/acp/ContainerGoneBanner.tsx",
+        "web/src/components/acp/Composer.tsx",
+        "web/src/components/acp/PromptStrips.tsx",
+        "web/src/components/acp/StructuredView.tsx",
+        "web/src/components/acp/SessionBanners.tsx",
+        "web/src/components/sidebar/RecreateContainerDialog.tsx",
+        "web/src/components/session-wizard/SessionWizard.tsx",
+        "web/src/components/MobileMainPane.tsx",
+        "web/src/App.tsx"
+      ],
+      "notes": "An AgentStartupError with cause container_missing shows this banner instead of the generic one: no Retry or Use Terminal view, Recreate container (primary, full width at 375px) and New Session in the Project, named as its sidebar header (alias, else folder name). The composer is disabled with \"Recreate the container to send messages.\" as its placeholder, since a send would start the Session and rebuild the container without the warning; a queued row's Start and send is disabled with the same reason, and the compaction reminder's Compact now isn't offered; an untyped startup error leaves all three as on main. Recreate confirms through the Session menu's dialog and, once the Daemon accepts it, hands over to the startup line as a Retry does. New Session opens the wizard with the Project, Agent, Group and Structured view (kept over a Terminal view profile default, not over off), title empty, sandbox and yolo from the defaults. The cause is set and cleared wherever the startup error is, a later untyped error replaces it, and it persists with the cached state."
+    },
+    {
+      "id": "acp.container-gone-read-only",
+      "kind": "mocked-playwright",
+      "risk": "medium",
+      "specs": ["tests/container-gone.spec.ts", "src/components/acp/__tests__/ContainerGoneBanner.test.tsx"],
+      "components": ["web/src/components/acp/ContainerGoneBanner.tsx"],
+      "notes": "Where the server refuses a restart (read-only and CityHall), the banner keeps the heading and says \"This Session's sandbox container is gone. Ask the owner to recreate the container.\" whatever the Session's state, offers no actions, and the composer's placeholder says the same; Details still shows the server's message."
+    },
+    {
+      "id": "acp.container-gone-recreate-unavailable",
+      "kind": "mocked-playwright",
+      "risk": "medium",
+      "issue": "https://github.com/agent-of-empires/agent-of-empires/issues/5729",
+      "specs": [
+        "tests/container-gone.spec.ts",
+        "src/components/acp/__tests__/ContainerGoneBanner.test.tsx",
+        "src/components/__tests__/SessionRowSiblingTargets.test.tsx"
+      ],
+      "components": [
+        "web/src/components/acp/ContainerGoneBanner.tsx",
+        "web/src/components/acp/SessionBanners.tsx",
+        "web/src/components/acp/StructuredView.tsx",
+        "web/src/components/MobileMainPane.tsx",
+        "web/src/App.tsx"
+      ],
+      "notes": "#5729: the banner line, the read-only line and the composer's reason come from one remedy over recreateContainerBlock, the predicate behind the Session menu's Recreate container. Recreate is offered only when that predicate allows it; an archived Session says to unarchive it from the sidebar, a trashed one to restore it from Trash (with a Restore button where the view has one), and one being created or deleted to wait, with the composer saying the same where it's shown. Archived and trashed Sessions have no composer."
+    },
+    {
       "id": "acp.startup-error-banner-actions",
       "kind": "mocked-playwright",
       "risk": "medium",
@@ -4670,8 +4751,21 @@
       "id": "sidebar.queued-count-hook",
       "kind": "vitest",
       "risk": "medium",
-      "specs": ["src/hooks/__tests__/useAcpQueueCount.test.tsx"],
-      "components": ["web/src/components/WorkspaceSidebar.tsx"]
+      "specs": ["src/hooks/__tests__/useAcpQueueCount.test.tsx", "src/hooks/useAcpSession.test.ts"],
+      "components": ["web/src/components/WorkspaceSidebar.tsx"],
+      "notes": "The count is the open session's live queue while it holds one, else the server's queued_count; a stored count or a failed queue list never wins, and a changed polled count re-lists."
+    },
+    {
+      "id": "sidebar.queued-chip-reason",
+      "kind": "mocked-playwright",
+      "risk": "medium",
+      "specs": [
+        "tests/sidebar-queued-chip-reason.spec.ts",
+        "src/components/sidebar/sessionQueuedReason.test.ts",
+        "src/components/__tests__/SessionRowTriage.test.tsx",
+        "src/hooks/__tests__/useSessionsPolling.test.tsx"
+      ],
+      "components": ["web/src/components/sidebar/RowBadges.tsx"]
     },
     {
       "id": "story.sidebar-rate-limit",
@@ -6033,6 +6127,22 @@
         "web/src/components/profiles/ProfilesSection.tsx",
         "web/src/components/sidebar/SessionRowMenu.tsx"
       ]
+    },
+    {
+      "id": "terminal-switch-refusal-text",
+      "kind": "deferred",
+      "issue": "https://github.com/agent-of-empires/agent-of-empires/issues/5651",
+      "risk": "low",
+      "reason": "Copy-only: a refused switch to Terminal view still toasts the server's plain-text message, now reworded; the server pins the text in acp::view tests. The web dialog in the next #5651 PR brings the tested flow.",
+      "components": ["web/src/lib/api.ts", "web/src/App.tsx"]
+    },
+    {
+      "id": "settings-restart-web-only-flags",
+      "kind": "deferred",
+      "issue": "https://github.com/agent-of-empires/agent-of-empires/issues/5302",
+      "risk": "low",
+      "reason": "Copy only: seven Settings labels lose \"(restart req.)\" and six summaries lose their restart sentence; the schema gains restart and web_only flags, which the row PR renders.",
+      "components": ["web/src/components/settings/SchemaSection.tsx"]
     }
   ]
 }

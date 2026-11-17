@@ -5,6 +5,7 @@ import { MemoryRouter } from "react-router-dom";
 
 import type { AgentInfo } from "../../lib/types";
 import { setAgentNames } from "../../lib/agentDisplayName";
+import { clearPendingSwitchAccount, requestSwitchAccount } from "../../lib/switchAccountTrigger";
 import { UsageLimitBanner, UsageLimitSection } from "./UsageLimitBanner";
 
 vi.mock("../../lib/api", () => ({
@@ -13,9 +14,19 @@ vi.mock("../../lib/api", () => ({
   fetchAcpAgents: vi.fn(),
   switchAcpAgent: vi.fn(),
   fetchContextPrimer: vi.fn(),
+  switchSessionAccount: vi.fn(),
 }));
+vi.mock("../../lib/toastBus", () => ({ reportError: vi.fn() }));
 
-import { fetchAccountTargets, fetchAcpAgents, fetchAgents, fetchContextPrimer, switchAcpAgent } from "../../lib/api";
+import {
+  fetchAccountTargets,
+  fetchAcpAgents,
+  fetchAgents,
+  fetchContextPrimer,
+  switchAcpAgent,
+  switchSessionAccount,
+} from "../../lib/api";
+import { reportError } from "../../lib/toastBus";
 
 const NOW = new Date("2026-10-22T10:00:00Z");
 const IN_2H = "2026-10-22T12:00:00Z";
@@ -24,6 +35,7 @@ const PARIS = "Internal error: You've hit your weekly limit · resets 4am (Europ
 const at = (iso: string) => new Date(iso).toLocaleTimeString([], { hour: "numeric", minute: "2-digit" });
 
 afterEach(() => {
+  clearPendingSwitchAccount();
   cleanup();
   vi.useRealTimers();
   vi.unstubAllGlobals();
@@ -306,6 +318,56 @@ describe("UsageLimitSection", () => {
     mountSection();
     fireEvent.click(await screen.findByTestId("usage-limit-switch-account"));
     expect(await screen.findByLabelText("claude-b")).toBeTruthy();
+  });
+
+  it.each([
+    ["limited", LIMITED, "usage-limit-failover"],
+    ["not limited", null, "switch-account-status"],
+  ])("switches in the background with an inline status when %s, and toasts a refusal", async (_l, limit, statusId) => {
+    vi.mocked(fetchAccountTargets).mockResolvedValue(["claude-b"]);
+    let settle!: (result: { ok: boolean; message?: string }) => void;
+    vi.mocked(switchSessionAccount).mockReturnValue(new Promise((resolve) => (settle = resolve)));
+    const { limit: setLimit } = mountSection();
+    setLimit(limit);
+    if (limit) fireEvent.click(await screen.findByTestId("usage-limit-switch-account"));
+    else act(() => requestSwitchAccount("s-1"));
+    // Confirm stays disabled until the names load.
+    await screen.findByLabelText("claude-b");
+    fireEvent.click(screen.getByTestId("switch-account-confirm"));
+
+    // The dialog is gone while the restart runs; only the inline status remains.
+    expect(screen.queryByTestId("switch-account-modal")).toBeNull();
+    expect(screen.getByTestId(statusId).textContent).toContain("Switching to claude-b…");
+    expect(switchSessionAccount).toHaveBeenCalledWith("s-1", "claude-b");
+
+    await act(async () => settle({ ok: false, message: "Nothing changed." }));
+    expect(screen.queryByTestId(statusId)).toBeNull();
+    expect(reportError).toHaveBeenCalledWith("Nothing changed.");
+  });
+
+  it("keeps the switch status across an unmount, and blocks a second switch, until the restart settles", async () => {
+    vi.mocked(fetchAccountTargets).mockResolvedValue(["claude-b"]);
+    let settle!: (result: { ok: boolean }) => void;
+    vi.mocked(switchSessionAccount).mockReturnValue(new Promise((resolve) => (settle = resolve)));
+    mountSection();
+    fireEvent.click(await screen.findByTestId("usage-limit-switch-account"));
+    await screen.findByLabelText("claude-b");
+    fireEvent.click(screen.getByTestId("switch-account-confirm"));
+    cleanup();
+
+    // The user came back to the Session before the restart settled.
+    mountSection();
+    expect(screen.getByTestId("usage-limit-failover").textContent).toContain("Switching to claude-b…");
+    expect(screen.queryByTestId("usage-limit-switch-account")).toBeNull();
+
+    await act(async () => settle({ ok: true }));
+    expect(screen.queryByTestId("usage-limit-failover")).toBeNull();
+  });
+
+  it("shows the pending failover as a status line once the limit has cleared", async () => {
+    const { limit } = mountSection(vi.fn(), "claude-b");
+    limit(null);
+    expect((await screen.findByTestId("switch-account-status")).textContent).toContain("Switching to claude-b…");
   });
 
   it("replaces the choice with the pending failover, and restores it when the failover is dropped", async () => {

@@ -1,22 +1,23 @@
 // @vitest-environment jsdom
 //
-// Switch-account dialog: names come from the server, confirm posts the restart
-// route through switchSessionAccount, and a refusal is shown as the server worded it.
+// Switch-account dialog: names come from the server, confirm hands the pick to the
+// caller and closes at once.
 
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
 
+import { stubMatchMedia } from "../../hooks/__tests__/fixtures";
+import { FOCUS_TERMINAL_EVENT } from "../../lib/terminalFocus";
 import { SwitchAccountModal } from "./SwitchAccountModal";
 
 vi.mock("../../lib/api", () => ({
   fetchAccountTargets: vi.fn(),
-  switchSessionAccount: vi.fn(),
 }));
 
-import { fetchAccountTargets, switchSessionAccount } from "../../lib/api";
+import { fetchAccountTargets } from "../../lib/api";
 
 const mockTargets = vi.mocked(fetchAccountTargets);
-const mockSwitch = vi.mocked(switchSessionAccount);
+const onSwitch = vi.fn();
 
 const authStatus = {
   kind: "account" as const,
@@ -32,6 +33,7 @@ function renderModal(props: Partial<React.ComponentProps<typeof SwitchAccountMod
       sessionId="s1"
       currentTool="claude-a"
       authStatus={authStatus}
+      onSwitch={onSwitch}
       onClose={onClose}
       {...props}
     />,
@@ -42,7 +44,6 @@ function renderModal(props: Partial<React.ComponentProps<typeof SwitchAccountMod
 beforeEach(() => {
   vi.clearAllMocks();
   mockTargets.mockResolvedValue(["claude-b", "claude-c"]);
-  mockSwitch.mockResolvedValue({ ok: true });
 });
 afterEach(cleanup);
 
@@ -59,26 +60,12 @@ describe("SwitchAccountModal", () => {
     expect(dialog.textContent).not.toContain("someone@example.com");
   });
 
-  it("confirms the picked account and closes on success", async () => {
+  it("hands the picked account to the caller and closes at once", async () => {
     const onClose = renderModal();
     fireEvent.click(await screen.findByLabelText("claude-c"));
     fireEvent.click(screen.getByTestId("switch-account-confirm"));
-    await waitFor(() => expect(onClose).toHaveBeenCalled());
-    expect(mockSwitch).toHaveBeenCalledWith("s1", "claude-c");
-  });
-
-  it("shows the server's refusal and stays open", async () => {
-    mockSwitch.mockResolvedValue({
-      ok: false,
-      message: "Cannot switch to 'claude-b' without losing the conversation.",
-    });
-    const onClose = renderModal();
-    await screen.findByLabelText("claude-b");
-    fireEvent.click(screen.getByTestId("switch-account-confirm"));
-    expect((await screen.findByTestId("switch-account-error")).textContent).toContain(
-      "without losing the conversation",
-    );
-    expect(onClose).not.toHaveBeenCalled();
+    expect(onSwitch).toHaveBeenCalledWith("claude-c");
+    expect(onClose).toHaveBeenCalledTimes(1);
   });
 
   it.each([
@@ -104,7 +91,7 @@ describe("SwitchAccountModal", () => {
     const confirm = screen.getByTestId("switch-account-confirm") as HTMLButtonElement;
     expect(confirm.disabled).toBe(true);
     fireEvent.click(confirm);
-    expect(mockSwitch).not.toHaveBeenCalled();
+    expect(onSwitch).not.toHaveBeenCalled();
   });
 
   it("focuses Cancel while accounts load, then Confirm once it is enabled", async () => {
@@ -135,6 +122,41 @@ describe("SwitchAccountModal", () => {
     fireEvent.keyDown(document, { key: "Escape" });
     fireEvent.click(screen.getByRole("button", { name: "Cancel" }));
     expect(onClose).toHaveBeenCalledTimes(2);
-    expect(mockSwitch).not.toHaveBeenCalled();
+    expect(onSwitch).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    ["the opener is still there", true, false, []],
+    ["the switch removed the opener", false, false, ["composer"]],
+    ["the switch removed the opener on touch, where the composer would open the keyboard", false, true, []],
+  ])("on close, restores focus when %s", async (_l, openerStays, coarse, expected) => {
+    const originalMatchMedia = window.matchMedia;
+    stubMatchMedia(coarse, "(pointer: coarse)");
+    const opener = document.createElement("button");
+    document.body.append(opener);
+    opener.focus();
+    const focusEvents: string[] = [];
+    const onEvent = (e: Event) => focusEvents.push((e as CustomEvent).detail.target);
+    window.addEventListener(FOCUS_TERMINAL_EVENT, onEvent);
+    const { unmount } = render(
+      <SwitchAccountModal
+        open
+        sessionId="s1"
+        currentTool="claude-a"
+        authStatus={null}
+        onSwitch={onSwitch}
+        onClose={vi.fn()}
+      />,
+    );
+    await screen.findByLabelText("claude-b");
+    if (!openerStays) opener.remove();
+    unmount();
+    window.removeEventListener(FOCUS_TERMINAL_EVENT, onEvent);
+    window.matchMedia = originalMatchMedia;
+    if (openerStays) {
+      expect(document.activeElement).toBe(opener);
+      opener.remove();
+    }
+    expect(focusEvents).toEqual(expected);
   });
 });

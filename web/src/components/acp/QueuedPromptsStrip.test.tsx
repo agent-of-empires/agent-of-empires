@@ -35,6 +35,7 @@ function renderWithProfile(
     onStopTurn?: () => void;
     reason?: QueuedReason;
     agent?: string;
+    blockedReason?: string;
   } = {},
 ) {
   return render(
@@ -51,6 +52,7 @@ function renderWithProfile(
         reason={opts.reason ?? IDLE}
         soloAliases={[...(SERVER_CLEAR_ALIASES[toolKey] ?? []), ...(SERVER_COMPACT_ALIASES[toolKey] ?? [])]}
         agent={opts.agent ?? "Claude Code"}
+        blockedReason={opts.blockedReason}
       />
     </AgentProfileProvider>,
   );
@@ -174,6 +176,21 @@ describe("QueuedPromptsStrip", () => {
       fireEvent.click(btn);
       expect(calls).toEqual([call]);
     }
+  });
+
+  it("blocks Start and send with the composer's reason while the container is gone", () => {
+    const calls: string[] = [];
+    const why = "Recreate the container to send messages.";
+    const buttons = renderWithProfile("claude", [mk("a", "go"), mk("b", "/compact")], {
+      reason: { label: "Queued", reason: "why", action: "startAndSend", soloAction: "startAndSend" },
+      onStartAndSend: () => calls.push("start"),
+      blockedReason: why,
+    }).getAllByTestId("queued-send-now");
+    for (const btn of buttons) {
+      expect([btn.getAttribute("aria-disabled"), btn.getAttribute("aria-label")]).toEqual(["true", why]);
+      fireEvent.click(btn);
+    }
+    expect(calls).toEqual([]);
   });
 
   it.each<[string, Partial<QueuedReason>, boolean, string | null]>([

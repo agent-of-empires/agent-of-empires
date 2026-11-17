@@ -4,8 +4,10 @@ import { act, renderHook, waitFor } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import { emptyAcpState } from "../lib/acpTypes";
-import { STATE_TTL_MS, STORAGE_KEY_PREFIX } from "../lib/acpStateStorage";
-import { reportAcpInteraction, type ServerQueuedPrompt } from "../lib/api";
+import { STATE_TTL_MS, STORAGE_KEY_PREFIX, getLiveQueueCount } from "../lib/acpStateStorage";
+import { listServerQueue, reportAcpInteraction, type ServerQueuedPrompt } from "../lib/api";
+import type { SessionResponse } from "../lib/types";
+import { cacheGet } from "./acpSession/stateCache";
 import { ACP_DIAL_TIMEOUT_MS, ACP_MAX_RETRIES, ACP_WS_STALE_MS, acpRetryDelayMs } from "./acpSession/useAcpConnection";
 import {
   FakeWebSocket,
@@ -18,12 +20,13 @@ import {
   type Call,
   type Route,
 } from "./__tests__/acpHarness";
+import { useQueuedCounts } from "./useAcpQueueCount";
 import { clearAcpCache, useAcpSession } from "./useAcpSession";
 
-vi.mock("../lib/api", async (importActual) => ({
-  ...(await importActual<typeof import("../lib/api")>()),
-  reportAcpInteraction: vi.fn(),
-}));
+vi.mock("../lib/api", async (importActual) => {
+  const actual = await importActual<typeof import("../lib/api")>();
+  return { ...actual, reportAcpInteraction: vi.fn(), listServerQueue: vi.fn(actual.listServerQueue) };
+});
 
 type HookArgs = Parameters<typeof useAcpSession>;
 
@@ -668,6 +671,57 @@ describe("sendPrompt outcomes", () => {
     });
   });
 
+  // The daemon kept the prompt for the sandbox login: a queue row, not a rejected send, and the
+  // banner says what to run.
+  it("treats a 409 login-required prompt with a queued_id as queued and shows the login guidance", async () => {
+    const message = `sandbox login required for claude: run \`aoe sandbox login --tool claude\``;
+    calls = installAcpFakes(({ url }) =>
+      url.includes("/acp/prompt")
+        ? json(
+            {
+              error: "sandbox_login_required",
+              message,
+              queued_id: "0b6f1c1e-3c55-4b8e-9a51-2f3d4c5b6a79",
+            },
+            409,
+          )
+        : undefined,
+    );
+    const { result } = render("sess-login", "absent", null, null);
+    await flushAsync();
+    await act(() => result.current.sendPrompt("after the login"));
+    await flushAsync();
+    expect(result.current.state.queuedPrompts.map((q) => q.text)).toEqual(["after the login"]);
+    expect(result.current.state.lastError).toBeNull();
+    expect(result.current.state.startupError).toBe(message);
+  });
+
+  // A failing `before_start` hook: the daemon kept the prompt (502 with a queue id). It is a queue
+  // row, not a rejected send, so a retry does not enqueue it twice, and the banner says so in plain
+  // words without the daemon's text.
+  it("treats a 502 before_start_hook_failed prompt with a queued_id as queued, with a plain message", async () => {
+    calls = installAcpFakes(({ url }) =>
+      url.includes("/acp/prompt")
+        ? json(
+            {
+              error: "before_start_hook_failed",
+              message: "the before_start hook failed",
+              queued_id: "5d1f0a52-9e0b-4a47-8d0e-6f1b2c3d4e5f",
+            },
+            502,
+          )
+        : undefined,
+    );
+    const { result } = render("sess-hook-failed", "absent", null, null);
+    await flushAsync();
+    await act(() => result.current.sendPrompt("once the hook works"));
+    await flushAsync();
+    expect(result.current.state.queuedPrompts.map((q) => q.text)).toEqual(["once the hook works"]);
+    expect(result.current.state.lastError).toBeNull();
+    expect(result.current.state.startupError).toMatch(/before_start hook failed; your message is queued/);
+    expect(result.current.state.startupError).not.toMatch(/502|\{/);
+  });
+
   // A 503 that is not `worker_not_ready` is a real failure: it keeps its banner and the prompt
   // is not silently parked on the queue.
   it("does not re-enqueue a 503 that is not worker_not_ready", async () => {
@@ -731,6 +785,19 @@ describe("server queue", () => {
   let serverQueue: Map<string, ServerQueuedPrompt>;
   let serverBusy: boolean;
   let workerDown: boolean;
+  // Set to hold the queue list's response until it resolves.
+  let queueListHeld: Promise<void> | null;
+  let queueListStarted: (() => void) | null;
+  let queueListFails: boolean;
+  // Set to hold each queue POST's response until it resolves.
+  let queuePostHeld: Promise<void> | null;
+  let queuePostStarted: (() => void) | null;
+  // Rows the Daemon delivers as soon as their first POST commits.
+  let deliveredOnPost: Set<string>;
+  // Holds a POST before it commits, so a DELETE meanwhile finds nothing.
+  let queuePostUncommitted: Promise<void> | null;
+  // Holds a DELETE of one row before it is applied.
+  let queueDeleteHeld: Promise<void> | null;
   const row = (id: string, text: string, extra: Partial<ServerQueuedPrompt> = {}): ServerQueuedPrompt => ({
     id,
     seq: serverQueue.size,
@@ -743,15 +810,54 @@ describe("server queue", () => {
     serverQueue = new Map();
     serverBusy = false;
     workerDown = false;
+    queueListHeld = null;
+    queueListStarted = null;
+    queueListFails = false;
+    queuePostHeld = null;
+    queuePostStarted = null;
+    deliveredOnPost = new Set();
+    queuePostUncommitted = null;
+    queueDeleteHeld = null;
     vi.mocked(reportAcpInteraction).mockClear();
+    vi.mocked(listServerQueue).mockClear();
     calls = installAcpFakes(({ url, method, body }) => {
       if (url.includes("/queue")) {
         const item = url.match(/\/queue\/([^/?]+)/)?.[1];
-        if (method === "GET") return json([...serverQueue.values()].sort((a, b) => a.seq - b.seq));
+        if (method === "GET") {
+          queueListStarted?.();
+          if (queueListFails) return new Response("unavailable", { status: 503 });
+          const list = () => json([...serverQueue.values()].sort((a, b) => a.seq - b.seq));
+          return queueListHeld ? queueListHeld.then(list) : list();
+        }
+        if (method === "POST" && queuePostUncommitted) {
+          const parsed = JSON.parse(body!) as { id: string; text: string };
+          const held = queuePostUncommitted;
+          queuePostStarted?.();
+          return held.then(() => {
+            serverQueue.set(parsed.id, row(parsed.id, parsed.text));
+            return json(serverQueue.get(parsed.id));
+          });
+        }
         if (method === "POST") {
           const parsed = JSON.parse(body!) as { id: string; text: string };
           serverQueue.set(parsed.id, row(parsed.id, parsed.text));
-          return json(serverQueue.get(parsed.id));
+          queuePostStarted?.();
+          const saved = serverQueue.get(parsed.id);
+          if (deliveredOnPost.delete(parsed.id)) serverQueue.delete(parsed.id);
+          return queuePostHeld ? queuePostHeld.then(() => json(saved)) : json(saved);
+        }
+        if (method === "PATCH" && item) {
+          const existing = serverQueue.get(decodeURIComponent(item));
+          if (!existing) return new Response("queued prompt not found", { status: 404 });
+          existing.text = (JSON.parse(body!) as { text: string }).text;
+          return new Response(null, { status: 204 });
+        }
+        if (method === "DELETE" && item && queueDeleteHeld) {
+          return queueDeleteHeld.then(() =>
+            serverQueue.delete(decodeURIComponent(item))
+              ? new Response(null, { status: 204 })
+              : new Response("queued prompt not found", { status: 404 }),
+          );
         }
         if (method === "DELETE" && item && !serverQueue.delete(decodeURIComponent(item))) {
           return new Response("queued prompt not found", { status: 404 });
@@ -785,6 +891,485 @@ describe("server queue", () => {
     await flushAsync();
     return hook;
   }
+
+  it("lends the sidebar its queue count only from the queue list after an open until the close", async () => {
+    const id = "sess-live-count";
+    const persisted = ["p1", "p2", "p3"].map((pid) => ({ id: pid, text: pid, queuedAt: "2026-01-01T00:00:00.000Z" }));
+    localStorage.setItem(
+      `${STORAGE_KEY_PREFIX}${id}`,
+      JSON.stringify({ savedAt: Date.now(), state: { ...emptyAcpState(), queuedPrompts: persisted } }),
+    );
+    serverQueue.set("q1", row("q1", "held"));
+    const hook = render(id);
+    await flushAsync();
+    // The persisted copy is on screen but isn't the Daemon's queue.
+    expect(hook.result.current.state.queuedPrompts).toHaveLength(3);
+    expect(getLiveQueueCount(id)).toBeUndefined();
+
+    const list = Promise.withResolvers<void>();
+    const started = Promise.withResolvers<void>();
+    queueListHeld = list.promise;
+    queueListStarted = started.resolve;
+    lastSocket().open();
+    await started.promise;
+    // Open, but the Daemon's list hasn't arrived: the persisted copy still isn't lent.
+    expect(getLiveQueueCount(id)).toBeUndefined();
+    queueListHeld = null;
+    list.resolve();
+    await waitFor(() => expect(getLiveQueueCount(id)).toBe(1));
+
+    // A row queued here counts before any session list could report it.
+    serverBusy = true;
+    lastSocket().message({ session_id: id, seq: 1, event: { UserPromptSent: { text: "kick" } } });
+    await flushAsync();
+    act(() => void hook.result.current.sendPrompt("follow-up"));
+    await flushAsync();
+    expect(getLiveQueueCount(id)).toBe(2);
+
+    lastSocket().drop();
+    await flushAsync();
+    expect(getLiveQueueCount(id)).toBeUndefined();
+
+    lastSocket().open();
+    await flushAsync();
+    expect(getLiveQueueCount(id)).toBe(2);
+    hook.unmount();
+    expect(getLiveQueueCount(id)).toBeUndefined();
+  });
+
+  it("falls back to the Daemon's count when a queue list fails, and re-lists when the polled count changes", async () => {
+    const id = "sess-polled";
+    const persisted = ["p1", "p2"].map((pid) => ({ id: pid, text: pid, queuedAt: "2026-01-01T00:00:00.000Z" }));
+    localStorage.setItem(
+      `${STORAGE_KEY_PREFIX}${id}`,
+      JSON.stringify({ savedAt: Date.now(), state: { ...emptyAcpState(), queuedPrompts: persisted } }),
+    );
+    serverQueue.set("q1", row("q1", "first"));
+    queueListFails = true;
+    const hook = renderHook(
+      ({ polled }: { polled: number }) => ({
+        acp: useAcpSession(id, "running", null, null, polled),
+        chip: useQueuedCounts([{ id, queued_count: polled } as SessionResponse]),
+      }),
+      { wrapper: profileWrapper, initialProps: { polled: 1 } },
+    );
+    await flushAsync();
+    lastSocket().open();
+    await waitFor(() => expect(listServerQueue).toHaveBeenCalledTimes(1));
+    // The hook's continuation was registered on this promise first, so it has run once this settles.
+    await act(async () => {
+      await vi.mocked(listServerQueue).mock.results[0]!.value;
+    });
+    expect(getLiveQueueCount(id)).toBeUndefined();
+    expect(hook.result.current.chip).toEqual([1]);
+    // The rows on screen are still the persisted copy, so changing them lends no count either.
+    expect(hook.result.current.acp.state.queuedPrompts.map((q) => q.id)).toEqual(["p1", "p2"]);
+    act(() => hook.result.current.acp.removeQueuedPrompt("p1"));
+    expect(getLiveQueueCount(id)).toBeUndefined();
+    expect(hook.result.current.chip).toEqual([1]);
+
+    // Another tab queues a row; the next poll reports it and this tab re-lists.
+    queueListFails = false;
+    serverQueue.set("q2", row("q2", "from another tab"));
+    hook.rerender({ polled: 2 });
+    await waitFor(() => expect(getLiveQueueCount(id)).toBe(2));
+    expect(hook.result.current.chip).toEqual([2]);
+    expect(hook.result.current.acp.state.queuedPrompts.map((q) => q.text)).toEqual(["first", "from another tab"]);
+
+    // A refresh that fails after a list succeeded stops lending this tab's now stale count.
+    queueListFails = true;
+    serverQueue.set("q3", row("q3", "third"));
+    hook.rerender({ polled: 3 });
+    await waitFor(() => expect(getLiveQueueCount(id)).toBeUndefined());
+    expect(hook.result.current.chip).toEqual([3]);
+    expect(hook.result.current.acp.state.queuedPrompts.map((q) => q.text)).toEqual(["first", "from another tab"]);
+    queueListFails = false;
+    hook.rerender({ polled: 4 });
+    await waitFor(() => expect(getLiveQueueCount(id)).toBe(3));
+    hook.unmount();
+  });
+
+  it("re-sends each unconfirmed row once when the polled count changes mid-migration, and drops one delivered meanwhile", async () => {
+    const id = "sess-migrating";
+    const queuedAt = "2026-01-01T00:00:00.000Z";
+    const state = {
+      ...emptyAcpState(),
+      queuedPrompts: ["u1", "u2", "u3"].map((pid) => ({ id: pid, text: pid, queuedAt, pending: true })),
+    };
+    localStorage.setItem(`${STORAGE_KEY_PREFIX}${id}`, JSON.stringify({ savedAt: Date.now(), state }));
+    const hook = renderHook(({ polled }: { polled: number }) => useAcpSession(id, "running", null, null, polled), {
+      wrapper: profileWrapper,
+      initialProps: { polled: 0 },
+    });
+    await flushAsync();
+    const post = Promise.withResolvers<void>();
+    const started = Promise.withResolvers<void>();
+    queuePostHeld = post.promise;
+    queuePostStarted = started.resolve;
+    lastSocket().open();
+    await started.promise;
+    // The first POST commits, which moves the poll, and the Daemon delivers it before its response arrives.
+    hook.rerender({ polled: 1 });
+    await flushAsync();
+    serverQueue.delete("u1");
+    queuePostHeld = null;
+    post.resolve();
+    await waitFor(() => expect(hook.result.current.state.queuedPrompts.map((q) => q.id)).toEqual(["u2", "u3"]));
+    expect(posts("/queue").map((c) => JSON.parse(c.body!).id)).toEqual(["u1", "u2", "u3"]);
+    expect(serverQueue.has("u1")).toBe(false);
+    expect(hook.result.current.state.queuedPrompts.every((q) => !q.pending)).toBe(true);
+    hook.unmount();
+  });
+
+  it("retries a failed queue list a bounded number of times, and stops on success or cleanup", async () => {
+    vi.useFakeTimers();
+    const id = "sess-list-retry";
+    const lists = () => calls.filter((c) => c.method === "GET" && c.url.includes("/queue")).length;
+    queueListFails = true;
+    const hook = renderHook(({ polled }: { polled: number }) => useAcpSession(id, "running", null, null, polled), {
+      wrapper: profileWrapper,
+      initialProps: { polled: 1 },
+    });
+    await flushAsync();
+    lastSocket().open();
+    await flushAsync();
+    expect(lists()).toBe(1);
+    // The server recovers while the poll keeps reporting the same count.
+    await act(() => vi.advanceTimersByTimeAsync(1999));
+    expect(lists()).toBe(1);
+    await act(() => vi.advanceTimersByTimeAsync(1));
+    expect(lists()).toBe(2);
+    queueListFails = false;
+    serverQueue.set("q1", row("q1", "recovered"));
+    await act(() => vi.advanceTimersByTimeAsync(5000));
+    expect(lists()).toBe(3);
+    expect(hook.result.current.state.queuedPrompts.map((q) => q.text)).toEqual(["recovered"]);
+    expect(getLiveQueueCount(id)).toBe(1);
+    // Past every delay, but short of the socket's staleness timeout.
+    await act(() => vi.advanceTimersByTimeAsync(20_000));
+    expect(lists()).toBe(3);
+
+    // Failing every time, it gives up after its last delay until the next trigger.
+    queueListFails = true;
+    hook.rerender({ polled: 2 });
+    await flushAsync();
+    expect(lists()).toBe(4);
+    await act(() => vi.advanceTimersByTimeAsync(2000 + 5000 + 15000));
+    expect(lists()).toBe(7);
+    await act(() => vi.advanceTimersByTimeAsync(20_000));
+    expect(lists()).toBe(7);
+
+    // A pending retry ends with the effect.
+    hook.rerender({ polled: 3 });
+    await flushAsync();
+    expect(lists()).toBe(8);
+    hook.unmount();
+    await act(() => vi.advanceTimersByTimeAsync(60_000));
+    expect(lists()).toBe(8);
+  });
+
+  it.each([
+    ["opens another Session", "switch"],
+    ["closes it", "unmount"],
+  ] as const)("confirms a re-sent row in its Session's stored state when the user %s mid-POST", async (_, leave) => {
+    const a = `sess-left-${leave}`;
+    const queuedAt = "2026-01-01T00:00:00.000Z";
+    const state = {
+      ...emptyAcpState(),
+      queuedPrompts: [{ id: "u1", text: "u1", queuedAt, pending: true }],
+    };
+    localStorage.setItem(`${STORAGE_KEY_PREFIX}${a}`, JSON.stringify({ savedAt: Date.now(), state }));
+    const first = renderHook(({ id }: { id: string }) => useAcpSession(id, "running"), {
+      wrapper: profileWrapper,
+      initialProps: { id: a },
+    });
+    await flushAsync();
+    const post = Promise.withResolvers<void>();
+    const started = Promise.withResolvers<void>();
+    queuePostHeld = post.promise;
+    queuePostStarted = started.resolve;
+    lastSocket().open();
+    await started.promise;
+    // The user leaves A; the Daemon then delivers u1 before its response arrives.
+    if (leave === "switch") first.rerender({ id: "sess-elsewhere" });
+    else first.unmount();
+    await flushAsync();
+    serverQueue.delete("u1");
+    queuePostHeld = null;
+    post.resolve();
+    await waitFor(() => expect(cacheGet(a)?.queuedPrompts).toMatchObject([{ id: "u1", pending: false }]));
+    if (leave === "switch") first.unmount();
+
+    const lists = () => calls.filter((c) => c.method === "GET" && c.url.includes("/queue") && c.url.includes(a)).length;
+    const listed = lists();
+    const again = render(a);
+    await flushAsync();
+    lastSocket().open();
+    await waitFor(() => expect(lists()).toBeGreaterThan(listed));
+    await waitFor(() => expect(again.result.current.state.queuedPrompts).toEqual([]));
+    expect(posts("/queue").map((c) => JSON.parse(c.body!).id)).toEqual(["u1"]);
+    expect(serverQueue.has("u1")).toBe(false);
+    again.unmount();
+  });
+
+  it("runs one re-send per Session across a close and reopen mid-POST, so a delivered row isn't posted again", async () => {
+    const a = "sess-remount";
+    const queuedAt = "2026-01-01T00:00:00.000Z";
+    const pending = ["A", "B", "C"].map((id) => ({ id, text: id, queuedAt, pending: true }));
+    const state = { ...emptyAcpState(), queuedPrompts: pending };
+    localStorage.setItem(`${STORAGE_KEY_PREFIX}${a}`, JSON.stringify({ savedAt: Date.now(), state }));
+    const postIds = () => posts("/queue").map((c) => JSON.parse(c.body!).id as string);
+    const lists = () => calls.filter((c) => c.method === "GET" && c.url.includes("/queue") && c.url.includes(a)).length;
+    deliveredOnPost.add("B");
+    const first = render(a);
+    await flushAsync();
+    const post = Promise.withResolvers<void>();
+    const started = Promise.withResolvers<void>();
+    queuePostHeld = post.promise;
+    queuePostStarted = started.resolve;
+    lastSocket().open();
+    await started.promise;
+    queuePostHeld = null;
+    queuePostStarted = null;
+    // The user closes and reopens A while A's first POST is held.
+    first.unmount();
+    const again = render(a);
+    await flushAsync();
+    lastSocket().open();
+    await flushAsync();
+    const listed = lists();
+    post.resolve();
+    // The reopened hook lists only after every re-send for A has settled.
+    await waitFor(() => expect(lists()).toBeGreaterThan(listed));
+    const shown = () => again.result.current.state.queuedPrompts;
+    await waitFor(() => expect(shown().map((q) => q.id)).toEqual(["A", "C"]));
+    expect(shown().some((q) => q.pending)).toBe(false);
+    expect(postIds()).toEqual(["A", "B", "C"]);
+    expect([...serverQueue.keys()]).toEqual(["A", "C"]);
+    again.unmount();
+  });
+
+  it.each([
+    ["opens another Session", "switch"],
+    ["closes it", "unmount"],
+  ] as const)("confirms a prompt queued while open in its stored state when the user %s mid-POST", async (_, leave) => {
+    const a = `sess-queued-${leave}`;
+    const lists = () => calls.filter((c) => c.method === "GET" && c.url.includes("/queue") && c.url.includes(a)).length;
+    const first = renderHook(({ id }: { id: string }) => useAcpSession(id, "running"), {
+      wrapper: profileWrapper,
+      initialProps: { id: a },
+    });
+    await flushAsync();
+    lastSocket().open();
+    await flushAsync();
+    const post = Promise.withResolvers<void>();
+    const started = Promise.withResolvers<void>();
+    queuePostHeld = post.promise;
+    queuePostStarted = started.resolve;
+    workerDown = true;
+    await act(() => first.result.current.sendPrompt("later"));
+    await started.promise;
+    queuePostHeld = null;
+    queuePostStarted = null;
+    workerDown = false;
+    // The user leaves A; the Daemon then delivers the row before its response arrives.
+    if (leave === "switch") first.rerender({ id: "sess-elsewhere" });
+    else first.unmount();
+    await flushAsync();
+    serverQueue.clear();
+    post.resolve();
+    await waitFor(() => expect(cacheGet(a)?.queuedPrompts).toMatchObject([{ text: "later", pending: false }]));
+    if (leave === "switch") first.unmount();
+
+    const listed = lists();
+    const again = render(a);
+    await flushAsync();
+    lastSocket().open();
+    await waitFor(() => expect(lists()).toBeGreaterThan(listed));
+    await waitFor(() => expect(again.result.current.state.queuedPrompts).toEqual([]));
+    expect(posts("/queue")).toHaveLength(1);
+    expect(serverQueue.size).toBe(0);
+    again.unmount();
+  });
+
+  it.each([
+    ["removes B", "remove", ["A", "C"]],
+    ["clears the queue", "clear", []],
+  ] as const)("posts no row the user %s while an earlier re-send POST is held", async (_, action, kept) => {
+    const a = `sess-removed-${action}`;
+    const queuedAt = "2026-01-01T00:00:00.000Z";
+    const pending = ["A", "B", "C"].map((id) => ({ id, text: id, queuedAt, pending: true }));
+    localStorage.setItem(
+      `${STORAGE_KEY_PREFIX}${a}`,
+      JSON.stringify({ savedAt: Date.now(), state: { ...emptyAcpState(), queuedPrompts: pending } }),
+    );
+    const postIds = () => posts("/queue").map((c) => JSON.parse(c.body!).id as string);
+    const lists = () => calls.filter((c) => c.method === "GET" && c.url.includes("/queue") && c.url.includes(a)).length;
+    const hook = render(a);
+    await flushAsync();
+    const post = Promise.withResolvers<void>();
+    const started = Promise.withResolvers<void>();
+    queuePostHeld = post.promise;
+    queuePostStarted = started.resolve;
+    lastSocket().open();
+    await started.promise;
+    queuePostHeld = null;
+    queuePostStarted = null;
+    act(() => (action === "remove" ? hook.result.current.removeQueuedPrompt("B") : hook.result.current.clearQueue()));
+    const listed = lists();
+    post.resolve();
+    await waitFor(() => expect(lists()).toBeGreaterThan(listed));
+    await waitFor(() => expect(hook.result.current.state.queuedPrompts.map((q) => q.id)).toEqual(kept));
+    expect(postIds()).toEqual(["A", ...kept.filter((id) => id !== "A")]);
+    expect([...serverQueue.keys()]).toEqual(kept);
+    hook.unmount();
+  });
+
+  it("deletes a re-sent row again when the user removes it while its POST is in flight", async () => {
+    const a = "sess-removed-in-flight";
+    const queuedAt = "2026-01-01T00:00:00.000Z";
+    localStorage.setItem(
+      `${STORAGE_KEY_PREFIX}${a}`,
+      JSON.stringify({
+        savedAt: Date.now(),
+        state: { ...emptyAcpState(), queuedPrompts: [{ id: "B", text: "B", queuedAt, pending: true }] },
+      }),
+    );
+    const deletes = () => calls.filter((c) => c.method === "DELETE" && c.url.includes("/queue/B")).length;
+    const lists = () => calls.filter((c) => c.method === "GET" && c.url.includes("/queue") && c.url.includes(a)).length;
+    const hook = render(a);
+    await flushAsync();
+    const commit = Promise.withResolvers<void>();
+    const started = Promise.withResolvers<void>();
+    queuePostUncommitted = commit.promise;
+    queuePostStarted = started.resolve;
+    lastSocket().open();
+    await started.promise;
+    queuePostUncommitted = null;
+    queuePostStarted = null;
+    // The DELETE reaches the server before B's POST commits, so it finds nothing.
+    act(() => hook.result.current.removeQueuedPrompt("B"));
+    await waitFor(() => expect(deletes()).toBe(1));
+    const listed = lists();
+    const redelete = Promise.withResolvers<void>();
+    queueDeleteHeld = redelete.promise;
+    commit.resolve();
+    await waitFor(() => expect(deletes()).toBe(2));
+    // The list after the re-send waits for that DELETE, so it can't show B again.
+    await flushAsync();
+    expect(lists()).toBe(listed);
+    queueDeleteHeld = null;
+    redelete.resolve();
+    await waitFor(() => expect(lists()).toBeGreaterThan(listed));
+    expect(serverQueue.has("B")).toBe(false);
+    expect(hook.result.current.state.queuedPrompts).toEqual([]);
+    expect(posts("/queue").map((c) => JSON.parse(c.body!).id)).toEqual(["B"]);
+    hook.unmount();
+  });
+
+  it.each([
+    ["before its POST runs", "before"],
+    ["while its POST is in flight", "in-flight"],
+  ] as const)("re-sends the latest text of a row the user edits %s", async (_, when) => {
+    const a = `sess-edited-${when}`;
+    const queuedAt = "2026-01-01T00:00:00.000Z";
+    const pending = ["A", "B"].map((id) => ({ id, text: id, queuedAt, pending: true }));
+    localStorage.setItem(
+      `${STORAGE_KEY_PREFIX}${a}`,
+      JSON.stringify({ savedAt: Date.now(), state: { ...emptyAcpState(), queuedPrompts: pending } }),
+    );
+    const lists = () => calls.filter((c) => c.method === "GET" && c.url.includes("/queue") && c.url.includes(a)).length;
+    const hook = render(a);
+    await flushAsync();
+    const release = Promise.withResolvers<void>();
+    const started = Promise.withResolvers<void>();
+    // Before: A's POST is held after it commits. In flight: B's own POST is held before it commits,
+    // so the edit's PATCH finds nothing.
+    if (when === "before") queuePostHeld = release.promise;
+    else {
+      queuePostStarted = () => {
+        if (posts("/queue").length === 1) queuePostUncommitted = release.promise;
+      };
+    }
+    const bStarted = () => posts("/queue").some((c) => JSON.parse(c.body!).id === "B");
+    if (when === "before") queuePostStarted = started.resolve;
+    lastSocket().open();
+    if (when === "before") await started.promise;
+    else await waitFor(() => expect(bStarted()).toBe(true));
+    queuePostHeld = null;
+    queuePostStarted = null;
+    queuePostUncommitted = null;
+    act(() => hook.result.current.editQueuedPrompt("B", "B edited"));
+    await waitFor(() => expect(calls.some((c) => c.method === "PATCH")).toBe(true));
+    const listed = lists();
+    release.resolve();
+    await waitFor(() => expect(lists()).toBeGreaterThan(listed));
+    expect(serverQueue.get("B")?.text).toBe("B edited");
+    // An edit before the POST runs is posted as is; one in flight is patched after the save.
+    const postedB = posts("/queue").filter((c) => JSON.parse(c.body!).id === "B");
+    expect(postedB.map((c) => JSON.parse(c.body!).text)).toEqual([when === "before" ? "B edited" : "B"]);
+    expect(hook.result.current.state.queuedPrompts.map((q) => q.text)).toEqual(["A", "B edited"]);
+    hook.unmount();
+  });
+
+  it("deletes a prompt queued while open again when the user removes it before its POST commits", async () => {
+    const a = "sess-queued-removed";
+    const lists = () => calls.filter((c) => c.method === "GET" && c.url.includes("/queue") && c.url.includes(a)).length;
+    const hook = await openSession(a);
+    const commit = Promise.withResolvers<void>();
+    const started = Promise.withResolvers<void>();
+    queuePostUncommitted = commit.promise;
+    queuePostStarted = started.resolve;
+    workerDown = true;
+    await act(() => hook.result.current.sendPrompt("later"));
+    await started.promise;
+    queuePostUncommitted = null;
+    queuePostStarted = null;
+    workerDown = false;
+    const id = hook.result.current.state.queuedPrompts[0]!.id;
+    const deletes = () => calls.filter((c) => c.method === "DELETE" && c.url.includes(`/queue/${id}`)).length;
+    act(() => hook.result.current.removeQueuedPrompt(id));
+    await waitFor(() => expect(deletes()).toBe(1));
+    commit.resolve();
+    await waitFor(() => expect(deletes()).toBe(2));
+    expect(serverQueue.has(id)).toBe(false);
+    // The next list doesn't bring it back.
+    const listed = lists();
+    hook.rerender();
+    act(() => hook.result.current.manualReconnect());
+    await flushAsync();
+    lastSocket().open();
+    await waitFor(() => expect(lists()).toBeGreaterThan(listed));
+    expect(hook.result.current.state.queuedPrompts).toEqual([]);
+    hook.unmount();
+  });
+
+  it("confirms a re-sent row in the open hook under StrictMode, so a delivered one is dropped", async () => {
+    const a = "sess-strict";
+    const queuedAt = "2026-01-01T00:00:00.000Z";
+    const state = {
+      ...emptyAcpState(),
+      queuedPrompts: [{ id: "u1", text: "u1", queuedAt, pending: true }],
+    };
+    localStorage.setItem(`${STORAGE_KEY_PREFIX}${a}`, JSON.stringify({ savedAt: Date.now(), state }));
+    const hook = renderHook(() => useAcpSession(a, "running"), { wrapper: profileWrapper, reactStrictMode: true });
+    await flushAsync();
+    const post = Promise.withResolvers<void>();
+    const started = Promise.withResolvers<void>();
+    queuePostHeld = post.promise;
+    queuePostStarted = started.resolve;
+    lastSocket().open();
+    await started.promise;
+    serverQueue.delete("u1");
+    queuePostHeld = null;
+    const lists = () => calls.filter((c) => c.method === "GET" && c.url.includes("/queue") && c.url.includes(a)).length;
+    const listed = lists();
+    post.resolve();
+    await waitFor(() => expect(lists()).toBeGreaterThan(listed));
+    await waitFor(() => expect(hook.result.current.state.queuedPrompts).toEqual([]));
+    expect(posts("/queue").map((c) => JSON.parse(c.body!).id)).toEqual(["u1"]);
+    hook.unmount();
+  });
 
   it("shows the row the daemon reports when it parks a busy-turn prompt", async () => {
     const { result } = await openBusy("sess-busy");

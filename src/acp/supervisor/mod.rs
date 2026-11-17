@@ -35,7 +35,9 @@ use crate::daemon::{AcpWorkerStart, AcpWorkerStartKind, AcpWorkerState};
 use crate::session::SandboxInfo;
 pub(crate) use teardown::{RetirementResources, RetirementTarget};
 
-pub(crate) use agents::{apply_agent_command_override, command_override_for_spawn};
+pub(crate) use agents::{
+    apply_agent_command_override, command_override_for_spawn, Classified, SessionAgent,
+};
 pub(crate) use launch::{host_spawn_environment, with_durable_launch};
 pub use sink::{BroadcastSink, ChannelSink, Persisted};
 
@@ -130,10 +132,13 @@ pub enum PromptDisposition {
 
 /// A published user prompt: how to route its text, and the seq of its
 /// `UserPromptSent` event, which is `None` when that event was not persisted.
+/// `last_seq` is the last seq the publication authored, past `seq` when a
+/// forwarded clear also published `SessionCleared`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct PublishedPrompt {
     pub disposition: PromptDisposition,
     pub seq: Option<u64>,
+    pub last_seq: Option<u64>,
 }
 
 /// How this supervisor acquired the worker.
@@ -219,6 +224,10 @@ pub struct Supervisor<S: BroadcastSink> {
     worker_notify: Arc<tokio::sync::Notify>,
     #[cfg(test)]
     worker_waits: tokio::sync::broadcast::Sender<String>,
+    #[cfg(test)]
+    agent_key_gate: std::sync::Mutex<Option<test_support::AgentKeyGate>>,
+    #[cfg(test)]
+    prompt_publish_gate: std::sync::Mutex<Option<Arc<tokio::sync::Barrier>>>,
     /// Build-stale sessions draining a turn before the reconciler respawns them.
     respawn_pending: SharedSet,
     /// Sessions parked on a compatibility rejection, keyed to the failing binary.
@@ -500,6 +509,10 @@ impl<S: BroadcastSink> Supervisor<S> {
             worker_notify: Arc::default(),
             #[cfg(test)]
             worker_waits: tokio::sync::broadcast::channel(64).0,
+            #[cfg(test)]
+            agent_key_gate: std::sync::Mutex::new(None),
+            #[cfg(test)]
+            prompt_publish_gate: std::sync::Mutex::new(None),
             respawn_pending: Arc::default(),
             incompatible_binaries: Arc::default(),
             force_respawn: Arc::default(),

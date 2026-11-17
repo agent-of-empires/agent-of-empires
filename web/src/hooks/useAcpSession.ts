@@ -24,6 +24,7 @@ import {
 import { classifyResolveResponse, reducer, type Action } from "./acpSession/reducer";
 import { ACP_MAX_RETRIES, useAcpConnection } from "./acpSession/useAcpConnection";
 import { cacheGet, cacheSet, sweepExpiredStorage } from "./acpSession/stateCache";
+import { setLiveQueueCount } from "../lib/acpStateStorage";
 import { useLatestRef } from "./useLatestRef";
 
 export { reducer, transcriptDeltaAction, type Action } from "./acpSession/reducer";
@@ -66,12 +67,33 @@ function jsonPost(body: unknown): RequestInit {
   return { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) };
 }
 
-async function safeText(res: Response): Promise<string> {
+async function safeText(res: Response, limit = 200): Promise<string> {
   try {
-    return (await res.text()).slice(0, 200);
+    return (await res.text()).slice(0, limit);
   } catch {
     return "";
   }
+}
+
+/** Shown when the daemon kept a prompt because the session's `before_start` hook failed: plain words, never the hook's output. */
+const HOOK_FAILED_QUEUED_MESSAGE =
+  "The session's before_start hook failed; your message is queued and will be sent when it works.";
+
+/** The queue id of a prompt the daemon kept until the session can launch (sandbox login or `before_start` hook), with what to tell the user. */
+function keptPrompt(status: number, body: string): { queuedId: string; message: string } | undefined {
+  try {
+    const parsed = JSON.parse(body) as { error?: unknown; queued_id?: unknown; message?: unknown };
+    if (typeof parsed.queued_id !== "string") return undefined;
+    if (status === 409 && parsed.error === "sandbox_login_required") {
+      return { queuedId: parsed.queued_id, message: typeof parsed.message === "string" ? parsed.message : "" };
+    }
+    if (status === 502 && parsed.error === "before_start_hook_failed") {
+      return { queuedId: parsed.queued_id, message: HOOK_FAILED_QUEUED_MESSAGE };
+    }
+  } catch {
+    // Not JSON: a plain-text error.
+  }
+  return undefined;
 }
 
 function describeError(e: unknown): string {
@@ -98,6 +120,94 @@ async function postReportingErrors(
   }
 }
 
+// POSTs of queued rows belong to the Session, not to a mounted hook. Re-sends of rows the server
+// never confirmed and prompts queued while open run one after another, and each skips a row an
+// earlier one posted. A removal or edit meanwhile finds no row on the server yet, so it is applied
+// to the POST, or after it when the POST was already in flight.
+interface QueuePosts {
+  tail: Promise<void>;
+  posted: Set<string>;
+  removed: Set<string>;
+  edited: Map<string, string>;
+}
+const queuePosts = new Map<string, QueuePosts>();
+// The mounted hooks showing each Session; with none, an acknowledgment goes to its stored state.
+const queueAckTargets = new Map<string, Set<Dispatch<Action>>>();
+
+function acknowledgeQueued(sessionId: string, action: Action): void {
+  const targets = queueAckTargets.get(sessionId);
+  if (targets?.size) {
+    for (const target of targets) target(action);
+    return;
+  }
+  const stored = cacheGet(sessionId);
+  if (stored) cacheSet(sessionId, reducer(stored, action));
+}
+
+function postQueuedInOrder(sessionId: string, task: (entry: QueuePosts) => Promise<void>): Promise<void> {
+  const entry = queuePosts.get(sessionId) ?? {
+    tail: Promise.resolve(),
+    posted: new Set<string>(),
+    removed: new Set<string>(),
+    edited: new Map<string, string>(),
+  };
+  const run = entry.tail.then(() => task(entry));
+  entry.tail = run;
+  queuePosts.set(sessionId, entry);
+  const settle = () => {
+    if (queuePosts.get(sessionId)?.tail === run) queuePosts.delete(sessionId);
+  };
+  run.then(settle, settle);
+  return run;
+}
+
+/** Posts one row and confirms it; false only when its POST failed. */
+async function postQueuedRow(
+  sessionId: string,
+  entry: QueuePosts,
+  row: Parameters<typeof enqueueServerPrompt>[1],
+): Promise<boolean> {
+  if (entry.posted.has(row.id) || entry.removed.has(row.id)) return true;
+  let sent = entry.edited.get(row.id) ?? row.text;
+  const saved = await enqueueServerPrompt(sessionId, { ...row, text: sent });
+  if (!saved) return false;
+  // A DELETE or PATCH sent while this POST was in flight may have reached the server first.
+  if (entry.removed.has(row.id)) {
+    await removeServerQueuedPrompt(sessionId, row.id);
+    return true;
+  }
+  let latest = entry.edited.get(row.id);
+  while (latest !== undefined && latest !== sent) {
+    sent = latest;
+    await editServerQueuedPrompt(sessionId, row.id, sent);
+    latest = entry.edited.get(row.id);
+  }
+  entry.posted.add(row.id);
+  // Confirmed, so a list that no longer has it (delivered) drops it instead of keeping it to re-send.
+  acknowledgeQueued(sessionId, { kind: "confirm_queued_prompt", id: row.id });
+  return true;
+}
+
+function migrateQueue(sessionId: string, rows: QueuedPrompt[]): Promise<void> {
+  return postQueuedInOrder(sessionId, async (entry) => {
+    for (const q of rows) {
+      await postQueuedRow(sessionId, entry, { id: q.id, text: q.text, attachments: q.attachments });
+    }
+  });
+}
+
+function markQueuedRemoved(sessionId: string, ids: Iterable<string>): void {
+  const entry = queuePosts.get(sessionId);
+  if (entry) for (const id of ids) entry.removed.add(id);
+}
+
+function markQueuedEdited(sessionId: string, id: string, text: string): void {
+  queuePosts.get(sessionId)?.edited.set(id, text);
+}
+
+/** Waits before re-listing after a failed queue list; then the next poll change or turn retries. */
+const QUEUE_LIST_RETRY_MS = [2000, 5000, 15000];
+
 // A UUID v4 even on plain-HTTP LAN hosts, where `crypto.randomUUID` is unavailable.
 function optimisticPromptId(): string {
   const c = globalThis.crypto;
@@ -116,6 +226,8 @@ export function useAcpSession(
   workerState: "absent" | "resuming" | "running" | "stopping" = "running",
   archivedAt: string | null = null,
   snoozedUntil: string | null = null,
+  /** The session list's `queued_count`; a change means another client may have changed the queue. */
+  polledQueuedCount?: number,
 ) {
   sweepExpiredStorage();
   const [state, dispatch] = useReducer(reducer, sessionId, initialState);
@@ -208,10 +320,18 @@ export function useAcpSession(
           }),
         );
         if (!res.ok) {
-          const detail = await safeText(res);
+          const body = await safeText(res, Infinity);
+          const detail = body.slice(0, 200);
           if (res.status === 409 && detail.startsWith("queued_prompt_gone")) {
             dispatch({ kind: "rollback_optimistic_prompt", id: promptId });
             return { kind: "queued_gone" };
+          }
+          const kept = keptPrompt(res.status, body);
+          if (kept) {
+            dispatch({ kind: "rollback_optimistic_prompt", id: promptId });
+            // The queue cannot advance until the login: say what to run.
+            if (kept.message) dispatch({ kind: "blocked_launch", message: kept.message });
+            return { kind: "queued", queuedId: kept.queuedId };
           }
           const rejected = res.status >= 400 && res.status < 500;
           // The worker is not up yet (idle-stopped or parked): the caller re-queues it, so no banner.
@@ -256,17 +376,13 @@ export function useAcpSession(
       const id = `q-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
       dispatch({ kind: "enqueue_prompt", id, text, attachments });
       reportAcpInteraction("prompt_queued");
-      void (async () => {
-        const row = await enqueueServerPrompt(sessionId, { id, text, attachments });
-        dispatch(
-          row
-            ? { kind: "confirm_queued_prompt", id }
-            : {
-                kind: "error",
-                message: "Couldn't queue your message on the server; it may not send. Remove it and try again.",
-              },
-        );
-      })();
+      void postQueuedInOrder(sessionId, async (entry) => {
+        if (await postQueuedRow(sessionId, entry, { id, text, attachments })) return;
+        dispatch({
+          kind: "error",
+          message: "Couldn't queue your message on the server; it may not send. Remove it and try again.",
+        });
+      });
     },
     [sessionId],
   );
@@ -307,39 +423,79 @@ export function useAcpSession(
     [sessionId, archivedAtRef, snoozedUntilRef, dispatchPromptNow, enqueueServer, showServerQueued],
   );
 
-  // The daemon owns and drains the queue; re-list on connect and at each turn change. The first
-  // list per session re-sends rows the server never confirmed; a confirmed row missing from the
-  // server was drained and must not be re-created.
-  const queueMigratedRef = useRef<Set<string>>(new Set());
+  // The daemon owns and drains the queue; re-list on connect, at each turn change, and when the
+  // polled count changes (not whenever it differs: optimistic rows here differ until the next
+  // poll). The first list per session waits for rows the server never confirmed to be re-sent,
+  // once each; a rerun must not cancel that. A confirmed row missing from the server was
+  // drained and must not be re-created.
+  const queueMigrationRef = useRef<Map<string, Promise<void>>>(new Map());
+  useEffect(() => {
+    if (!sessionId) return;
+    const targets = queueAckTargets.get(sessionId) ?? new Set<Dispatch<Action>>();
+    queueAckTargets.set(sessionId, targets.add(dispatch));
+    return () => {
+      targets.delete(dispatch);
+      if (!targets.size && queueAckTargets.get(sessionId) === targets) queueAckTargets.delete(sessionId);
+    };
+  }, [sessionId]);
+  // The sidebar badge takes this browser's count only between the first queue list after an open and the close.
+  const queueListedRef = useRef(false);
+  useEffect(() => {
+    if (!sessionId || status !== "open") return;
+    return () => {
+      queueListedRef.current = false;
+      setLiveQueueCount(sessionId, null);
+    };
+  }, [sessionId, status]);
+  useEffect(() => {
+    // eslint-disable-next-line react-you-might-not-need-an-effect/no-event-handler -- syncs reducer state to the sidebar's store
+    if (!sessionId || status !== "open" || !queueListedRef.current) return;
+    setLiveQueueCount(sessionId, state.queuedPrompts.length);
+  }, [sessionId, status, state.queuedPrompts]);
   useEffect(() => {
     if (!sessionId || status !== "open") return;
     let cancelled = false;
+    let migration = queueMigrationRef.current.get(sessionId);
+    if (!migration) {
+      migration = migrateQueue(
+        sessionId,
+        queuedPromptsRef.current.filter((q) => q.pending),
+      );
+      queueMigrationRef.current.set(sessionId, migration);
+    }
+    const migrated = migration;
+    let retry: ReturnType<typeof setTimeout> | undefined;
     void (async () => {
-      if (!queueMigratedRef.current.has(sessionId)) {
-        queueMigratedRef.current.add(sessionId);
-        for (const q of queuedPromptsRef.current) {
-          if (cancelled) return;
-          if (!q.pending) continue;
-          await enqueueServerPrompt(sessionId, {
-            id: q.id,
-            text: q.text,
-            attachments: q.attachments,
-          });
+      await migrated;
+      for (const delay of [...QUEUE_LIST_RETRY_MS, null]) {
+        const rows = await listServerQueue(sessionId);
+        if (cancelled) return;
+        if (rows !== null) {
+          queueListedRef.current = true;
+          dispatch({ kind: "hydrate_server_queue", rows });
+          return;
         }
+        // A failed list must not replace the rows on screen. The sidebar falls back to the polled
+        // count while this retries, then waits for the next trigger.
+        queueListedRef.current = false;
+        setLiveQueueCount(sessionId, null);
+        if (delay === null) return;
+        await new Promise((resolve) => (retry = setTimeout(resolve, delay)));
       }
-      const rows = await listServerQueue(sessionId);
-      if (!cancelled) dispatch({ kind: "hydrate_server_queue", rows });
     })();
     return () => {
       cancelled = true;
+      clearTimeout(retry);
     };
-  }, [sessionId, status, state.turnActive, queuedPromptsRef]);
+  }, [sessionId, status, state.turnActive, queuedPromptsRef, polledQueuedCount]);
 
   // Queue mutations are optimistic; a failed server call is corrected by the next hydrate.
   const removeQueuedPrompt = useCallback(
     (id: string) => {
       dispatch({ kind: "dequeue_prompt", id });
-      if (sessionId) void removeServerQueuedPrompt(sessionId, id);
+      if (!sessionId) return;
+      markQueuedRemoved(sessionId, [id]);
+      void removeServerQueuedPrompt(sessionId, id);
     },
     [sessionId],
   );
@@ -347,15 +503,22 @@ export function useAcpSession(
   const editQueuedPrompt = useCallback(
     (id: string, text: string) => {
       dispatch({ kind: "edit_queued_prompt", id, text });
-      if (sessionId) void editServerQueuedPrompt(sessionId, id, text);
+      if (!sessionId) return;
+      markQueuedEdited(sessionId, id, text);
+      void editServerQueuedPrompt(sessionId, id, text);
     },
     [sessionId],
   );
 
   const clearQueue = useCallback(() => {
     dispatch({ kind: "clear_queue" });
-    if (sessionId) void clearServerQueue(sessionId);
-  }, [sessionId]);
+    if (!sessionId) return;
+    markQueuedRemoved(
+      sessionId,
+      queuedPromptsRef.current.map((q) => q.id),
+    );
+    void clearServerQueue(sessionId);
+  }, [sessionId, queuedPromptsRef]);
 
   // Never bind this to Escape: an accidental press would abort work the user meant to keep.
   const cancelPrompt = useCallback(async () => {

@@ -324,8 +324,19 @@ pub fn set_input_cursor_position(
     prefix_width: usize,
     input: &Input,
 ) {
+    if let Some(position) = input_cursor_position(area, prefix_width, input) {
+        frame.set_cursor_position(position);
+    }
+}
+
+/// Where [`set_input_cursor_position`] puts the cursor, for callers that draw off-screen.
+pub(crate) fn input_cursor_position(
+    area: Rect,
+    prefix_width: usize,
+    input: &Input,
+) -> Option<Position> {
     if area.width == 0 || area.height == 0 {
-        return;
+        return None;
     }
 
     let available_width = area.width.saturating_sub(prefix_width as u16) as usize;
@@ -336,7 +347,7 @@ pub fn set_input_cursor_position(
     let cursor_col = prefix_width.saturating_add(visible_cursor);
     let max_col = area.width.saturating_sub(1) as usize;
     let x = area.x.saturating_add(cursor_col.min(max_col) as u16);
-    frame.set_cursor_position(Position::new(x, area.y));
+    Some(Position::new(x, area.y))
 }
 
 #[cfg(test)]

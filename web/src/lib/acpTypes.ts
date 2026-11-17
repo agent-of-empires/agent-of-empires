@@ -299,6 +299,9 @@ export type IncompatibleAgentDetail =
       reason: string;
     };
 
+/** Mirror of `StartupCause` in src/acp/state.rs; the event leaves it out when nothing was diagnosed. */
+export type StartupCause = { kind: "container_missing" };
+
 /** Mirror of `IntegrationLostReason` in src/acp/state.rs. */
 export type IntegrationLostReason =
   | { kind: "contract_violation"; detail: string }
@@ -430,7 +433,7 @@ export type AcpEvent =
   | { AgentThoughtChunk: { text: string; message_id?: string } }
   | { CancelRequested: { escalates_at: string } }
   | { Stopped: { reason: string } }
-  | { AgentStartupError: { message: string } }
+  | { AgentStartupError: { message: string; cause?: StartupCause } }
   | { PromptRuntimeError: { message: string } }
   | { IncompatibleAgent: { detail: IncompatibleAgentDetail } }
   | { IntegrationLost: { reason: IntegrationLostReason } }
@@ -626,6 +629,8 @@ export interface AcpState {
   oldestSeq: number;
   lagged: boolean;
   startupError: string | null;
+  /** Why `startupError` happened, when the Daemon said; set and cleared with it. */
+  startupCause: StartupCause | null;
   /** Adapter compatibility failure; replaces the session view with `StartupErrorScreen`. */
   incompatibleAgent: IncompatibleAgentDetail | null;
   lastError: string | null;
@@ -1036,6 +1041,7 @@ export function emptyAcpState(): AcpState {
     oldestSeq: 0,
     lagged: false,
     startupError: null,
+    startupCause: null,
     incompatibleAgent: null,
     lastError: null,
     turnActive: false,
@@ -1084,6 +1090,7 @@ function isSteeredContinuation(state: AcpState): boolean {
 
 function applyNewTurnResets(next: AcpState): void {
   next.startupError = null;
+  next.startupCause = null;
   if (!next.restartInFlight) next.retriedError = null;
   next.lastError = null;
   // The cancel phase is server-owned; only the escalation deadline is ours.
@@ -1295,13 +1302,17 @@ export function applyEvent(state: AcpState, frame: AcpFrame): AcpState {
     next.startupError = `Agent integration lost: ${
       reason.kind === "contract_violation" ? reason.detail : reason.kind.replace("_", " ")
     }`;
+    next.startupCause = null;
     next.agentUnresponsive = false;
     closeTurn(next);
     return next;
   }
   if ("AgentStartupError" in event) {
     next.startupError = event.AgentStartupError.message;
-    const retried = state.restartInFlight ? state.retriedError : null;
+    next.startupCause =
+      event.AgentStartupError.cause?.kind === "container_missing" ? { kind: "container_missing" } : null;
+    // A diagnosed cause gets its own banner, which doesn't compare with a Retry's error.
+    const retried = state.restartInFlight && !next.startupCause ? state.retriedError : null;
     endRestart(next);
     next.retriedError = retried;
     next.agentUnresponsive = false;
@@ -1358,6 +1369,7 @@ export function applyEvent(state: AcpState, frame: AcpFrame): AcpState {
     next.sessionAssigned = true;
     endRestart(next);
     next.startupError = null;
+    next.startupCause = null;
     next.lastError = null;
     next.incompatibleAgent = null;
     next.workerStopped = false;
@@ -1412,6 +1424,7 @@ export function applyEvent(state: AcpState, frame: AcpFrame): AcpState {
     next.sessionUsage = null;
     next.usageBaseline = null;
     next.startupError = null;
+    next.startupCause = null;
     next.retriedError = null;
     next.lastAgentSwitch = { from, to, reason, at: now };
     // The switch emits Stopped { user_stopped } first; keep its banner hidden through the handshake.

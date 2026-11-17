@@ -63,7 +63,7 @@ impl LoadedPlugin {
             description: self.manifest.description.clone(),
             icon: self.manifest.icon.clone(),
             icon_asset_url: (self.manifest.icon_asset.is_some() && self.dir.is_some())
-                .then(|| format!("/api/plugins/{}/icon", self.id())),
+                .then(|| format!("/plugin-icons/{}", self.id())),
             enabled: self.enabled,
             builtin: self.builtin(),
             validation: self.validation.as_str().to_string(),

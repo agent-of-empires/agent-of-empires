@@ -120,7 +120,7 @@ jobs:
         id: msrv
         run: |
           python3 -c 'import tomllib; print("version=" + tomllib.load(open("Cargo.toml", "rb"))["package"]["rust-version"])' >> "$GITHUB_OUTPUT"
-      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
+      - uses: ./.github/actions/rust-toolchain
         with:
           toolchain: ${{ steps.msrv.outputs.version }}
       - uses: ./.github/actions/kache

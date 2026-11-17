@@ -385,7 +385,7 @@ pub(crate) fn read_terminal_until(master: &mut File, bytes: &mut Vec<u8>, needle
 #[test]
 #[serial_test::serial]
 fn pending_frame_flush_then_control_backpressure_retains_ordered_restore() {
-    let (master, slave) = private_terminal();
+    let (mut master, slave) = private_terminal();
     let mut control = slave.try_clone().unwrap();
     let (_guard, output) = install_test_output(slave);
     let payload = "OLD-FRAME|".repeat(32_768);
@@ -445,17 +445,12 @@ fn pending_frame_flush_then_control_backpressure_retains_ordered_restore() {
             break;
         }
     }
-    while !drainer
-        .bytes
-        .lock()
-        .unwrap()
-        .windows(b"AFTER-CONTROL-RESTORE".len())
-        .any(|bytes| bytes == b"AFTER-CONTROL-RESTORE")
-    {
+    let mut received = drainer.finish();
+    while !received.ends_with(b"AFTER-CONTROL-RESTORE") {
         assert!(Instant::now() < deadline);
+        drain_terminal(&mut master, &mut received);
         std::thread::yield_now();
     }
-    let received = drainer.finish();
     assert_eq!(draws, 1);
     assert!(
         received.starts_with(payload.as_bytes()),

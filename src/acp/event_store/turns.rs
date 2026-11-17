@@ -441,6 +441,24 @@ impl EventStore {
         .collect()
     }
 
+    /// Whether a turn ended (`Stopped` or `AgentStartupError`) after `seq`. `None` when the
+    /// query failed.
+    pub fn turn_ended_after(&self, session_id: &str, seq: u64) -> Option<bool> {
+        logged(
+            self.conn().query_row(
+                "SELECT EXISTS (
+                     SELECT 1 FROM acp_events
+                     WHERE session_id = ?1
+                       AND seq > ?2
+                       AND discriminant IN ('Stopped', 'AgentStartupError'))",
+                params![session_id, seq as i64],
+                |row| row.get::<_, bool>(0),
+            ),
+            "turn_ended_after query",
+            session_id,
+        )
+    }
+
     /// Nonces of `ElicitationRequested` events with no matching `ElicitationResolved`.
     pub fn unresolved_elicitation_nonces(&self, session_id: &str) -> Vec<Nonce> {
         query_strings(

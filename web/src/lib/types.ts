@@ -83,6 +83,10 @@ export interface SessionResponse {
   rate_limit_auto_resume?: boolean;
   /** Account tool name the daemon is about to fail this parked session over to; absent when none. */
   rate_limit_failover_to?: string;
+  /** Messages on the Daemon's queue; absent when none. */
+  queued_count?: number;
+  /** What the Daemon's queue waits on, as a prompt sent now would be told. Only the list sets it. */
+  queue_reason?: QueueReasonWire;
   smart_rename?: "inactive" | "pending" | "running";
   /** Still carries its auto-generated name (more reliable than `smart_rename`). */
   default_name?: boolean;
@@ -486,6 +490,9 @@ export interface ImportableSession {
 }
 
 export type AcpWorkerState = "absent" | "resuming" | "running" | "stopping";
+
+/** Why a session's server queue is waiting (the Daemon's `QueueReason`). */
+export type QueueReasonWire = "turn_active" | "cancelling" | "compacting" | "worker_down" | "integration_lost";
 
 // Settings schema mirrors `crate::session::config::settings_schema` (`GET /api/settings/schema`).
 
