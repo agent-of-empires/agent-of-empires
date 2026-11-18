@@ -5140,6 +5140,8 @@ mod tests {
                 .env("LANG", "C")
                 .env("LC_ALL", "C")
                 .env("LC_CTYPE", "C")
+                // tmux treats a set TMUX as UTF-8 before it reads the locale.
+                .env_remove("TMUX")
                 .output()
                 .unwrap();
             let stdout = String::from_utf8_lossy(&child.stdout);
