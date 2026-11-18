@@ -629,7 +629,10 @@ enum ApprovalRowKind {
 
 /// One line of the approval's request payload. `primary` marks the command or
 /// path the call is about, which leads the body.
-fn approval_body_entries(row: &PendingApproval) -> Vec<(String, bool)> {
+fn approval_body_entries(
+    row: &PendingApproval,
+    target: Option<&ToolTarget>,
+) -> Vec<(String, bool)> {
     let Some(args) = parse_args_object(&row.args) else {
         let raw = row.args.trim();
         return if raw.is_empty() {
@@ -638,9 +641,15 @@ fn approval_body_entries(row: &PendingApproval) -> Vec<(String, bool)> {
             vec![(raw.to_string(), true)]
         };
     };
-    let primary_key = CMD_KEYS
+    // The kind decides which argument leads: a path-based call that also carries a
+    // command string must not promote it over the path the call is about.
+    let keys: Vec<&str> = match target {
+        Some(ToolTarget::Path(_)) => PATH_KEYS.to_vec(),
+        Some(ToolTarget::Command(_)) => CMD_KEYS.to_vec(),
+        None => CMD_KEYS.iter().chain(PATH_KEYS).copied().collect(),
+    };
+    let primary_key = keys
         .iter()
-        .chain(PATH_KEYS)
         .find(|key| args.get(**key).is_some_and(|value| value.is_string()));
     let mut entries = Vec::new();
     if let Some(key) = primary_key {
@@ -664,6 +673,18 @@ fn approval_body_entries(row: &PendingApproval) -> Vec<(String, bool)> {
     entries
 }
 
+/// Render control characters as the control pictures that occupy one cell each,
+/// so a tab or an escape byte is visible instead of vanishing into its neighbors.
+fn visible_controls(text: &str) -> String {
+    text.chars()
+        .map(|c| match c {
+            '\t' => '\u{2409}',
+            c if c.is_ascii_control() => char::from_u32(0x2400 + c as u32).unwrap_or('\u{fffd}'),
+            c => c,
+        })
+        .collect()
+}
+
 /// The request detail, wrapped to `width` and capped at
 /// [`APPROVAL_BODY_MAX_ROWS`], unstyled. The shelf's height and the rows it
 /// paints both come from here, so the reserved space cannot disagree with the
@@ -677,7 +698,7 @@ fn approval_body_rows(
     let mut rows: Vec<(Line<'static>, ApprovalRowKind)> = Vec::new();
     let args = parse_args_object(&row.args);
     let target = args.as_ref().and_then(|args| tool_target(&row.kind, args));
-    for (text, primary) in approval_body_entries(row) {
+    for (text, primary) in approval_body_entries(row, target.as_ref()) {
         let is_command = primary && matches!(target, Some(ToolTarget::Command(_)));
         let text = match (target.as_ref(), primary) {
             (Some(ToolTarget::Path(_)), true) => {
@@ -695,7 +716,13 @@ fn approval_body_rows(
         // those lines together: the shelf must show what would actually run.
         for (index, logical) in text.split('\n').enumerate() {
             let prefix = if is_command && index == 0 { "$ " } else { "" };
-            wrap_line_into(Line::raw(format!("{prefix}{logical}")), width, &mut wrapped);
+            // Ratatui drops control characters, so a tab would silently join words:
+            // show them instead, wrapped as they will read on screen.
+            wrap_line_into(
+                Line::raw(format!("{prefix}{}", visible_controls(logical))),
+                width,
+                &mut wrapped,
+            );
         }
         rows.extend(wrapped.into_iter().map(|line| (line, kind)));
     }
@@ -3306,6 +3333,60 @@ mod tests {
                 .iter()
                 .any(|line| line.contains("echo ok") && line.contains("rm -rf build")),
             "the command's lines ran together:\n{dump}"
+        );
+    }
+
+    /// A command's control characters are shown, not dropped: a tab would
+    /// otherwise join the words either side of it on screen.
+    #[test]
+    fn approval_shelf_shows_a_tab_in_the_command() {
+        let mut state = test_state();
+        state.transcript.pending_approvals = vec![PendingApproval {
+            nonce: "n-1".into(),
+            title: "Bash".into(),
+            kind: "execute".into(),
+            args: serde_json::json!({ "command": "echo\tok" }).to_string(),
+            destructive: false,
+            options: Vec::new(),
+            choice: false,
+        }];
+        state.selected_approval = Some("n-1".into());
+        state.focus = Focus::Approval;
+        let lines = render_rows(&state, 80, 24, true);
+        let dump = lines.join("\n");
+        assert!(
+            lines.iter().any(|line| line.contains("echo\u{2409}ok")),
+            "the tab is shown as one cell rather than dropped:\n{dump}"
+        );
+    }
+
+    /// The kind decides the leading argument: a path-based call that also
+    /// carries a command string must not promote that string over the path.
+    #[test]
+    fn approval_body_entries_lead_with_the_kinds_own_target() {
+        let row = PendingApproval {
+            nonce: "n-1".into(),
+            title: "Edit".into(),
+            kind: "edit".into(),
+            args: serde_json::json!({ "command": "touch /tmp/x", "path": "src/a.rs" }).to_string(),
+            destructive: false,
+            options: Vec::new(),
+            choice: false,
+        };
+        let target = ToolTarget::Path("src/a.rs");
+        let entries = approval_body_entries(&row, Some(&target));
+        assert_eq!(
+            entries
+                .first()
+                .map(|(text, primary)| (text.as_str(), *primary)),
+            Some(("src/a.rs", true)),
+            "the edited path leads: {entries:?}"
+        );
+        assert!(
+            entries
+                .iter()
+                .any(|(text, primary)| !*primary && text.contains("touch /tmp/x")),
+            "the command stays a detail: {entries:?}"
         );
     }
 
