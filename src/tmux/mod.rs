@@ -230,10 +230,11 @@ pub(crate) fn tmux_command() -> Command {
 /// non-`ECONNREFUSED` connect failure, and glibc localizes `strerror` by
 /// `LC_MESSAGES`, so on a non-English host the `(No such file or directory)`
 /// ENOENT marker for an absent socket (#3337) would not match. `LC_ALL` is
-/// removed so it cannot override that. Global `-u` forces UTF-8 session names
-/// even when the caller has `LC_CTYPE=C` or when `LC_ALL` was the only UTF-8
-/// locale source. Used by the status-query callers (which classify via
-/// [`tmux_no_server_running`]) and by `kill_session_if_present`. NOT folded into
+/// removed so it cannot override that. Global `-u` keeps format output intact
+/// (separators, session names, pane titles) even when the caller has
+/// `LC_CTYPE=C` or when `LC_ALL` was the only UTF-8 locale source, since tmux
+/// prints anything outside printable ASCII as `_` to a non-UTF-8 client. Used
+/// for every query whose output aoe parses, and by `kill_session_if_present`. NOT folded into
 /// [`tmux_command`]: the interactive attach/switch-client/capture-pane paths must
 /// keep the user's locale for UTF-8 and status-bar rendering, and `-u` would
 /// assert UTF-8 to a terminal that may not be.

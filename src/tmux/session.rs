@@ -5164,12 +5164,25 @@ mod tests {
             .success());
         let pane = only_pane_id(&session_name);
         wait_for_pane_command(&pane, "sleep");
+        let title = "π ⠋ working";
+        assert!(crate::tmux::tmux_query_command()
+            .args(["select-pane", "-t", &pane, "-T", title])
+            .status()
+            .expect("set pane title")
+            .success());
         let pid = pane_field(&pane, "#{pane_pid}");
-        let cases = [(
-            "pane PID",
-            crate::process::get_pane_pid(&session_name).map(|pid| pid.to_string()),
-            pid.as_str(),
-        )];
+        let cases = [
+            (
+                "pane PID",
+                crate::process::get_pane_pid(&session_name).map(|pid| pid.to_string()),
+                pid.as_str(),
+            ),
+            (
+                "pane title",
+                crate::tmux::utils::pane_title(&session_name),
+                title,
+            ),
+        ];
         for (query, read, expected) in cases {
             assert_eq!(read.as_deref(), Some(expected), "{query}");
         }
