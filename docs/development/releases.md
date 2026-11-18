@@ -86,12 +86,14 @@ diff -ruN --exclude=Cargo.lock --exclude=target \
 
 The local delta is the Unix Mio consumer and its regression tests, standalone
 workspace metadata, test-only dependencies, and removal of unnecessary closure
-parentheses in `src/terminal/sys/unix.rs` (warning-only). Existing upstream tests, parser,
-optional backends, and published feature choices remain intact. Saved control
-events retain their order; a TTY hint retained across a return cannot authorize a
-blocking read.
-The patch reevaluates readiness through the existing registration and poll.
-It does not eliminate every race with a concurrent competing input consumer.
+parentheses in `src/terminal/sys/unix.rs` (warning-only), filtered-event
+conservation, and EventStream error/waker delivery. Parser behavior, optional
+backends, and published feature choices remain intact. Saved controls retain
+their order. Each TTY readiness permits one read; incomplete input retains its
+parser bytes while polling the remaining deadline. EOF and hard read errors
+reach the stream once, then end that stream. Its worker wakes the latest task.
+Readiness is reevaluated through the existing registration and poll. This does
+not eliminate every race with a concurrent competing input consumer.
 
 Preserve the complete MIT notices while this source is present. When selecting
 an official replacement, verify the relevant behavior rather than requiring the
@@ -112,10 +114,11 @@ CARGO_BUILD_JOBS=1 cargo test --lib child_handoff_restores_real_raw_input_before
 
 The CI helper seeds the fork's ignored lockfile from the project lock, rejects
 production dependency drift or a libc/use-dev-tty backend switch, and requires all
-18 real-consumer regressions to execute. The standalone suite is not covered by
-root workspace tests. A forced ordering of an actual fetched batch establishes a
-conditional consumer contract, not the original macOS event order. The blocking
-stale cases verify completed private-alias consumption, not end-to-end App handoff.
+21 real-consumer regressions, plus the Linux-only PTY-master EIO case, to execute.
+The standalone suite is not covered by root workspace tests. A forced ordering
+of an actual fetched batch establishes a conditional consumer contract, not the
+original macOS event order. The blocking stale cases verify completed
+private-alias consumption, not end-to-end App handoff.
 Root terminal checks and native kqueue coverage are still required.
 
 Coverage is 16 real PTY controls plus two real Unix stream socketpair full-buffer
@@ -123,6 +126,9 @@ controls on both Linux and macOS. The latter retain the complete 1025-byte prequ
 one actual 1024-byte read, and original one-byte tail. Their writer stays open
 through the final zero-time poll. These two cases do **not** prove a 1024-byte
 terminal read on Darwin; the other 16 cases retain their real terminal-mode checks.
+Additional cases cover incomplete CSI timeout and cancellation with later
+completion, socket EOF, Linux PTY-master EIO, skipped-event conservation, and
+latest-task error delivery. Native macOS validation remains required.
 
 The prototype release archives carry `LICENSE`, `THIRD_PARTY_NOTICES.md`, and all of `licenses/`.
 Both prototype Nix packages include the patch's notice and install complete notices under
