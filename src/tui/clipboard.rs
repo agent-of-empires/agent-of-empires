@@ -782,7 +782,7 @@ mod tests {
     #[test]
     fn ordered_executor_coalesces_pending_copies_and_rejects_late_preparation() {
         let (entered, started) = std::sync::mpsc::channel();
-        let (release, gate) = std::sync::mpsc::channel();
+        let (release_sender, gate) = std::sync::mpsc::channel();
         let written = Arc::new(Mutex::new(Vec::new()));
         let output = Arc::clone(&written);
         let executor = Executor::start(move |mut file, _, _| {
@@ -791,7 +791,7 @@ mod tests {
             file.read_to_string(&mut text)?;
             entered.send(text.clone()).unwrap();
             if text == "first" {
-                gate.recv().unwrap();
+                gate.recv().map_err(io::Error::other)?;
             }
             output.lock().unwrap().push(text);
             Ok(CopyReport {
@@ -801,6 +801,8 @@ mod tests {
             })
         })
         .unwrap();
+        // Release the writer before joining it during unwinding.
+        let release = release_sender;
         let file = |text: &str| {
             let mut file = tempfile::tempfile().unwrap();
             file.write_all(text.as_bytes()).unwrap();
@@ -845,13 +847,15 @@ mod tests {
 #[serial_test::serial]
 fn live_feedback_waits_for_actual_output_and_reports_failure() {
     let (entered, started) = std::sync::mpsc::channel();
-    let (release, gate) = std::sync::mpsc::channel();
+    let (release_sender, gate) = std::sync::mpsc::channel();
     let executor = Executor::start(move |_, _, _| {
         entered.send(()).unwrap();
-        gate.recv().unwrap();
+        gate.recv().map_err(io::Error::other)?;
         Err(io::Error::other("desktop and terminal output refused"))
     })
     .unwrap();
+    // Release the writer before joining it during unwinding.
+    let release = release_sender;
     executor.activate_for_test();
     let admission = copy_to_clipboard("must not claim copied");
     assert!(admission.starts_with("Copy queued"), "{admission}");
