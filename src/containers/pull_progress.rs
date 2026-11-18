@@ -105,7 +105,7 @@ impl LineBuffer {
     pub(crate) fn push(&mut self, bytes: &[u8], mut on_line: impl FnMut(&str)) {
         for &byte in bytes {
             if byte == b'\n' || byte == b'\r' {
-                if !self.partial.is_empty() && !self.overflowed {
+                if !self.partial.is_empty() {
                     on_line(&String::from_utf8_lossy(&self.partial));
                 }
                 self.partial.clear();
