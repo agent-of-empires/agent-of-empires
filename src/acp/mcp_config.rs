@@ -48,6 +48,22 @@ fn canonical_host(host: &str) -> String {
     }
 }
 
+/// The raw value plus each further percent-decoding of it, so a token spelled with escapes in
+/// the userinfo, path, query or fragment is still found.
+fn decoded_forms(value: &str) -> Vec<String> {
+    let mut forms = vec![value.to_owned()];
+    while forms.len() < 5 {
+        let decoded = percent_encoding::percent_decode_str(forms.last().expect("non-empty"))
+            .decode_utf8_lossy()
+            .into_owned();
+        if forms.last() == Some(&decoded) {
+            break;
+        }
+        forms.push(decoded);
+    }
+    forms
+}
+
 fn is_loopback_host(canonical: &str) -> bool {
     canonical == "localhost"
         || canonical.ends_with(".localhost")
@@ -71,9 +87,11 @@ pub fn drop_daemon_servers(
                 ProjectMcpTransport::Stdio { .. } => return true,
             };
             let credential_risk = daemon.tokens.as_ref().is_none_or(|tokens| {
-                std::iter::once(url)
-                    .chain(headers.values())
-                    .any(|value| tokens.iter().any(|token| value.contains(token.as_str())))
+                std::iter::once(url).chain(headers.values()).any(|value| {
+                    decoded_forms(value)
+                        .iter()
+                        .any(|form| tokens.iter().any(|token| form.contains(token.as_str())))
+                })
             });
             let host_is_daemon = reqwest::Url::parse(url).is_ok_and(|url| {
                 url.host_str().is_some_and(|host| {
@@ -337,6 +355,31 @@ mod tests {
         // Without a token authority no remote server can be proven token-free.
         let no_authority = DaemonIdentity::new(None, []);
         assert_eq!(names(&no_authority), ["fs"]);
+    }
+
+    #[test]
+    fn escaped_tokens_in_any_url_component_are_still_found() {
+        let daemon = DaemonIdentity::new(Some(vec!["abcdef0123".into()]), []);
+        for (url, header, dropped) in [
+            ("https://p.example.test/%61bcdef0123", "", true),
+            ("https://p.example.test/mcp?k=%61bcdef0123", "", true),
+            ("https://u:%61bcdef0123@p.example.test/mcp", "", true),
+            ("https://p.example.test/mcp#%61bcdef0123", "", true),
+            ("https://p.example.test/mcp?k=%2561bcdef0123", "", true),
+            ("https://p.example.test/mcp", "Bearer %61bcdef0123", true),
+            (
+                "https://p.example.test/mcp?k=%61bcdef9999",
+                "Bearer other",
+                false,
+            ),
+        ] {
+            let json = format!(
+                r#"{{ "mcpServers": {{ "x": {{ "type": "http", "url": "{url}",
+                    "headers": {{ "Authorization": "{header}" }} }} }} }}"#
+            );
+            let kept = drop_daemon_servers(resolved(&json, McpProvenance::Global), &daemon);
+            assert_eq!(kept.is_empty(), dropped, "{url} {header}");
+        }
     }
 
     #[test]
