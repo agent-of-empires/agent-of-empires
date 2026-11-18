@@ -52,6 +52,9 @@ pub(crate) struct Progress {
     phase: Option<PullPhase>,
     known: HashSet<String>,
     done: HashSet<String>,
+    /// Done before announced: Docker's containerd store can report a cached layer before its
+    /// `Pulling fs layer` (moby v29.5.2 `daemon/containerd/image_pull.go:149` vs `:198`).
+    done_unannounced: HashSet<String>,
 }
 
 /// What `image-status` reports for a running pull; counts are absent until a layer line parses.
@@ -67,17 +70,26 @@ pub struct ProgressSnapshot {
 
 impl Progress {
     pub(crate) fn apply(&mut self, LayerUpdate { id, done }: LayerUpdate) {
-        if !done {
-            self.known.insert(id);
-        } else if self.known.contains(&id) {
-            self.done.insert(id);
-        }
         // Decided by the output, never by when a status read happens. Docker announces every
-        // layer before any finishes, so a done line that finishes the known set is the last.
-        let phase = if !self.known.is_empty() && self.done.len() == self.known.len() {
-            PullPhase::Unpacking
-        } else {
+        // layer before any finishes, so a done line that finishes the known set is the last; an
+        // announcement never moves the phase.
+        let phase = if !done {
+            if self.done_unannounced.remove(&id) {
+                self.done.insert(id.clone());
+            }
+            self.known.insert(id);
             PullPhase::Downloading
+        } else {
+            if self.known.contains(&id) {
+                self.done.insert(id);
+            } else {
+                self.done_unannounced.insert(id);
+            }
+            if self.done.len() == self.known.len() && !self.known.is_empty() {
+                PullPhase::Unpacking
+            } else {
+                PullPhase::Downloading
+            }
         };
         self.phase = self.phase.max(Some(phase));
     }
@@ -151,6 +163,48 @@ mod tests {
         LayerUpdate {
             id: id.into(),
             done,
+        }
+    }
+
+    /// A layer reported done before its announcement counts once announced; an id never
+    /// announced stays uncounted, and the late announcement alone doesn't start unpacking.
+    #[test]
+    fn a_layer_done_before_its_announcement_counts_once_announced() {
+        use PullPhase::*;
+        let cases: Vec<(
+            &str,
+            Vec<LayerUpdate>,
+            (Option<PullPhase>, Option<u32>, Option<u32>),
+        )> = vec![
+            (
+                "cached layer reported early",
+                vec![layer("a", false), layer("b", true), layer("b", false)],
+                (Some(Downloading), Some(1), Some(2)),
+            ),
+            (
+                "repeated early report",
+                vec![layer("b", true), layer("b", true), layer("b", false)],
+                (Some(Downloading), Some(1), Some(1)),
+            ),
+            (
+                "its own later done line",
+                vec![layer("b", true), layer("b", false), layer("b", true)],
+                (Some(Unpacking), Some(1), Some(1)),
+            ),
+            (
+                "never announced",
+                vec![layer("a", false), layer("c", true)],
+                (Some(Downloading), Some(0), Some(1)),
+            ),
+        ];
+        for (case, events, expected) in cases {
+            let mut progress = Progress::default();
+            for event in events {
+                progress.apply(event);
+                assert!(progress.done.is_subset(&progress.known), "{case}");
+            }
+            let s = progress.snapshot();
+            assert_eq!((s.phase, s.layers_done, s.layers_known), expected, "{case}");
         }
     }
 
@@ -265,6 +319,7 @@ mod tests {
             if let Some(update) = docker_layer(line) {
                 progress.apply(update);
             }
+            assert!(progress.done.is_subset(&progress.known), "{line}");
             each(line, &mut progress);
         }
         progress
@@ -342,5 +397,11 @@ mod tests {
             (end.phase, end.layers_done, end.layers_known),
             (Some(Unpacking), Some(7), Some(7))
         );
+        // Blobs Docker reports done but never announces are not layers.
+        for (name, progress) in [("cancel", &cancel), ("retry", &retry)] {
+            for blob in ["8ae3f2b88215", "8d4d29ee957b"] {
+                assert!(!progress.known.contains(blob), "{name}: {blob}");
+            }
+        }
     }
 }
