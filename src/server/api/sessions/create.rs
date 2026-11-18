@@ -1873,6 +1873,13 @@ pub(super) fn public_create_session_error(e: &anyhow::Error) -> (&'static str, S
                     format!("Couldn't pull the Sandbox image {image}."),
                 )
             }
+            // A missing image's pull, cancelled for everyone while this create waited on it.
+            Some(DockerError::PullCancelled(image)) => {
+                return (
+                    "sandbox_image_pull_failed",
+                    format!("Couldn't pull the Sandbox image {image}: the pull was cancelled."),
+                )
+            }
             _ => {}
         }
     }

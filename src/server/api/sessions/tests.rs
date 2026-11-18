@@ -5851,6 +5851,16 @@ fn public_create_session_error_forwards_typed_causes_as_fixed_templates() {
             ),
         ),
         (
+            "missing image pull cancelled for everyone",
+            anyhow::Error::from(DockerError::PullCancelled("ghcr.io/acme/sandbox:1".into()))
+                .context("ensure image"),
+            (
+                "sandbox_image_pull_failed",
+                "Couldn't pull the Sandbox image ghcr.io/acme/sandbox:1: the pull was cancelled."
+                    .into(),
+            ),
+        ),
+        (
             "working dir missing",
             BuildRefusal::WorkingDirMissing("/home/alice/secret-project".into()).into(),
             (
