@@ -4933,7 +4933,8 @@ mod tests {
 
     /// #5766: the Serve key that opened Connections opens the Web dashboard from any row, in
     /// either mode, but a held key stays in Connections. On the offline and outdated takeovers,
-    /// where only r and q act, it does nothing.
+    /// where only r and q act, it does nothing. Hold timing is `ConnectionsView`'s own test;
+    /// this one checks the hub is opened at the opening press's time.
     #[tokio::test]
     #[serial_test::serial]
     async fn the_serve_key_in_connections_opens_the_web_dashboard_except_on_a_takeover() {
@@ -4961,9 +4962,26 @@ mod tests {
             .unwrap();
             app.home.strict_hotkeys = strict;
             // A held key opens Connections, then never reaches the Serve screen, whose restart
-            // and reset use the same key.
+            // and reset use the same key. Times come from `before`, not the wall clock, so a
+            // stalled test can't make the hold look like a separate press.
+            let before = std::time::Instant::now();
+            app.home.handle_key(key, None);
+            let hub = app
+                .home
+                .connections_view
+                .as_mut()
+                .expect("the key opens Connections");
+            let later = |ms| before + std::time::Duration::from_millis(ms);
+            assert!(
+                matches!(
+                    hub.handle_key(key, strict, later(150)),
+                    DialogResult::Continue
+                ),
+                "strict={strict}: a repeat just after the opening press stays"
+            );
+            let repeat = KeyEvent::new_with_kind(key.code, key.modifiers, KeyEventKind::Repeat);
             for _ in 0..30 {
-                app.home.handle_key(key, None);
+                app.home.handle_key(repeat, None);
             }
             assert!(app.home.connections_view.is_some(), "strict={strict}: held");
             assert!(app.home.serve_view.is_none(), "strict={strict}: held");
