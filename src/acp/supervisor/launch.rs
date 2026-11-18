@@ -125,11 +125,7 @@ impl<S: BroadcastSink> Supervisor<S> {
         {
             return Err(SupervisorError::SpawnCancelled(session_id.to_string()));
         }
-        let admission_error = if restart.is_none() {
-            request_state.admission_error(session_id)
-        } else {
-            None
-        };
+        let admission_error = request_state.admission_error(session_id, restart.is_some());
         if let Some(error) = admission_error {
             return Err(error);
         }
@@ -186,10 +182,8 @@ impl<S: BroadcastSink> Supervisor<S> {
             .is_some_and(CancellationToken::is_cancelled)
         {
             Some(SupervisorError::SpawnCancelled(session_id.to_string()))
-        } else if restart.is_none() {
-            request_state.admission_error(session_id)
         } else {
-            None
+            request_state.admission_error(session_id, restart.is_some())
         };
         if let Some(error) = admission_error {
             table.abandon(&lease);
@@ -1668,6 +1662,36 @@ time.sleep(60)
             supervisor.worker_state("s-restart").await,
             AcpWorkerState::Absent
         );
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn restart_admission_respects_purge_but_allows_its_own_stop_fence() {
+        for purging in [false, true] {
+            let _home = crate::session::test_support::isolate_app_dir();
+            let supervisor = Supervisor::new(VecSink::new());
+            let id = "s-restart-purge";
+            let restart = supervisor.try_begin_restart_with_reason(id).await.unwrap();
+            let _stop = supervisor
+                .begin_stop_request(id, "user_stopped", None, false)
+                .await;
+            let _purge = purging.then(|| supervisor.fence_spawn_admission(id));
+            let result = supervisor
+                .begin_resume_with_restart_claim(
+                    id,
+                    ResumeKind::SpawnFirst,
+                    crate::process::worker_registry::ResumeAuthority::Explicit,
+                    Some(&restart),
+                    None,
+                )
+                .await;
+            if purging {
+                assert!(matches!(result, Err(SupervisorError::TeardownPending(_))));
+                assert_eq!(supervisor.worker_state(id).await, AcpWorkerState::Absent);
+            } else {
+                assert!(matches!(result, Ok(ResumeReservationOutcome::Reserved(_))));
+            }
+        }
     }
 
     fn mcp_names(servers: &[agent_client_protocol::v1::schema::McpServer]) -> Vec<&str> {

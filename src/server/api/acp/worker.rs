@@ -356,6 +356,13 @@ async fn restart_acp_inner(state: Arc<AppState>, id: String, req: SpawnAcpReques
             )
                 .into_response();
         }
+        Err(crate::acp::supervisor::RestartClaimConflict::Purge) => {
+            return (
+                StatusCode::CONFLICT,
+                "purge_in_progress: permanent deletion is in progress for this session",
+            )
+                .into_response();
+        }
     };
     let Some(preflight_instance) = find_instance(&state, &id).await else {
         return session_not_found();

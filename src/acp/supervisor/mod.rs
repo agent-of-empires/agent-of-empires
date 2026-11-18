@@ -86,13 +86,15 @@ struct SpawnFence {
 }
 
 impl SpawnRequestState {
-    fn admission_error(&self, session_id: &str) -> Option<SupervisorError> {
-        self.stop_fences.get(session_id).map(|fence| {
-            if fence.stop_owners == 0 {
-                SupervisorError::TeardownPending(session_id.to_string())
-            } else {
-                SupervisorError::SpawnCancelled(session_id.to_string())
-            }
+    fn admission_error(&self, session_id: &str, restarting: bool) -> Option<SupervisorError> {
+        let fence = self.stop_fences.get(session_id)?;
+        if restarting && fence.owners == fence.stop_owners {
+            return None;
+        }
+        Some(if restarting || fence.stop_owners == 0 {
+            SupervisorError::TeardownPending(session_id.to_string())
+        } else {
+            SupervisorError::SpawnCancelled(session_id.to_string())
         })
     }
 }
@@ -284,6 +286,7 @@ pub(crate) struct RestartRequestGuard {
 pub(crate) enum RestartClaimConflict {
     Switch,
     Restart,
+    Purge,
 }
 
 /// Cancellation for a request that is still acquiring launch guards or
@@ -732,7 +735,7 @@ impl<S: BroadcastSink> Supervisor<S> {
         session_id: &str,
     ) -> Result<PendingSpawnGuard, SupervisorError> {
         let mut requests = lock_recover(&self.spawn_requests);
-        if let Some(error) = requests.admission_error(session_id) {
+        if let Some(error) = requests.admission_error(session_id, false) {
             return Err(error);
         }
         if lock_recover(&self.restart_requests).contains_key(session_id) {
@@ -891,6 +894,13 @@ impl<S: BroadcastSink> Supervisor<S> {
     ) -> Result<RestartRequestGuard, RestartClaimConflict> {
         let _workers = self.workers.lock().await;
         let spawn_requests = lock_recover(&self.spawn_requests);
+        if spawn_requests
+            .stop_fences
+            .get(session_id)
+            .is_some_and(|fence| fence.owners > fence.stop_owners)
+        {
+            return Err(RestartClaimConflict::Purge);
+        }
         if spawn_requests.switches.contains_key(session_id) {
             return Err(RestartClaimConflict::Switch);
         }
@@ -992,7 +1002,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn restart_and_switch_claims_exclude_each_other() {
+    async fn restart_claims_exclude_switches_and_purge_fences() {
         let sup = Supervisor::new(VecSink::new());
         let switching = sup.begin_switch_request("s").unwrap();
         assert!(sup.try_begin_restart_with_reason("s").await.is_err());
@@ -1010,6 +1020,13 @@ mod tests {
         drop(restart);
         assert!(sup.begin_switch_request("s").is_ok());
         assert!(sup.begin_spawn_request("s").is_ok());
+        let purge = sup.fence_spawn_admission("s");
+        assert!(matches!(
+            sup.try_begin_restart_with_reason("s").await,
+            Err(RestartClaimConflict::Purge)
+        ));
+        drop(purge);
+        assert!(sup.try_begin_restart_with_reason("s").await.is_ok());
     }
 
     #[tokio::test]
