@@ -3113,24 +3113,43 @@ finally:
         );
     }
 
-    /// A cancelled run returns without draining the backlog its child left unread. Passes go on
-    /// only for the bounded kill grace, which reaches a small part of the backlog; the old final
-    /// drain forwarded all of it.
+    /// A cancelled run returns without draining the backlog its child left unread. After the
+    /// cancel, passes run only for the kill's 250 ms grace, which reaches a small part of the
+    /// backlog; the old final drain forwarded all of it.
     #[test]
     #[cfg(unix)]
     fn a_cancel_is_not_held_behind_the_unread_backlog() {
         const BACKLOG: usize = 16 << 20;
+        let dir = tempfile::tempdir().unwrap();
+        let written = dir.path().join("written");
         let mut cmd = Command::new("sh");
-        // `ready` follows the whole backlog, so the cancel comes once it is all written.
+        // `written` appears once the backlog and `ready` are both out.
         cmd.args([
             "-c",
-            &format!("head -c {BACKLOG} /dev/zero; echo ready >&2; exec sleep 600"),
-        ]);
+            &format!("head -c {BACKLOG} /dev/zero; echo ready >&2; : > \"$1\"; exec sleep 600"),
+            "sh",
+        ])
+        .arg(&written);
         let cancel = CancellationToken::new();
-        let mut forwarded = 0usize;
-        let mut forward = |stream: OutputStream, bytes: &[u8]| match stream {
-            OutputStream::Stdout => forwarded += bytes.len(),
-            OutputStream::Stderr => cancel.cancel(),
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let (mut forwarded, mut at_cancel) = (0usize, None);
+        let mut forward = |stream: OutputStream, bytes: &[u8]| {
+            // Hold the first pass until the child is done writing, so it reads `ready` in the
+            // same pass however the child was scheduled.
+            while !written.exists() {
+                assert!(
+                    Instant::now() < deadline,
+                    "the child never wrote its backlog"
+                );
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            match stream {
+                OutputStream::Stdout => forwarded += bytes.len(),
+                OutputStream::Stderr => {
+                    at_cancel.get_or_insert(forwarded);
+                    cancel.cancel();
+                }
+            }
         };
         let result = run_until_cancelled_process_group_observed(
             &mut cmd,
@@ -3140,6 +3159,11 @@ finally:
         )
         .unwrap();
         assert!(result.is_none(), "cancelled");
+        assert_eq!(
+            at_cancel,
+            Some(TAIL_PASS_LIMIT),
+            "one bounded pass came first"
+        );
         assert!(
             forwarded < BACKLOG / 2,
             "forwarded {forwarded} of {BACKLOG} bytes: the backlog was drained"
