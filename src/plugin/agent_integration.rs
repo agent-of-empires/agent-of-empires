@@ -1135,8 +1135,9 @@ pub fn respond(
     let current = match read_report(&instance.id, &instance.tool, plugin)? {
         ReportRead::Snapshot(report) => report,
         ReportRead::UnsupportedVersion { version, declared } => bail!(
-            "provider version {version} is outside the integration's provider_versions ({}); \
+            "provider version {} is outside the integration's provider_versions ({}); \
              the session keeps pane detection",
+            version.escape_default(),
             declared.join(", ")
         ),
         ReportRead::Absent => bail!("provider integration report is unavailable"),
