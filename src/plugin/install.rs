@@ -3328,7 +3328,7 @@ mod tests {
             );
         }
         let operation = begin_operation().unwrap();
-        let prepared = prepare_install("gh:acme/cleanup", false, Some(operation.clone()))
+        let prepared = prepare_install("gh:acme/cleanup@main", false, Some(operation.clone()))
             .await
             .unwrap();
         let marker = crate::session::get_app_dir().unwrap().join(STAGING_MARKER);
