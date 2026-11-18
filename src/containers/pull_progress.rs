@@ -25,6 +25,10 @@ pub(crate) struct LayerUpdate {
 /// Docker's classic image store prints only `Already exists` for a cached layer, with no
 /// `Pulling fs layer` (moby v24 `distribution/xfer/download.go`), so there the counts cover
 /// only the layers the pull fetches.
+///
+/// Assumes every layer is announced before any finishes, as both captures show; no Docker store
+/// orders this (each layer's announce and fetch run concurrently), so a later announcement would
+/// find the phase already latched at Unpacking.
 pub(crate) fn docker_layer(line: &str) -> Option<LayerUpdate> {
     let (id, status) = line.split_once(": ")?;
     if id.len() != 12 || !id.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f')) {
