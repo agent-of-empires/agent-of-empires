@@ -15,24 +15,45 @@ use crate::session::mcp::project_mcp::ProjectMcpTransport;
 pub struct DaemonIdentity {
     /// Tokens the daemon accepts, grace token included. `None` when this process has no token
     /// authority; remote servers are then dropped, since none can be proven token-free.
-    pub tokens: Option<Vec<String>>,
-    /// Host names the daemon is reachable on, from `serve.url`. Best effort: only the token
-    /// check is authoritative.
-    pub hosts: Vec<String>,
+    tokens: Option<Vec<String>>,
+    /// Canonical host names the daemon is reachable on, from `serve.url`. Best effort: only the
+    /// token check is authoritative.
+    hosts: Vec<String>,
 }
 
 impl DaemonIdentity {
+    pub fn new(tokens: Option<Vec<String>>, hosts: impl IntoIterator<Item = String>) -> Self {
+        let hosts = hosts.into_iter().map(|h| canonical_host(&h)).collect();
+        Self { tokens, hosts }
+    }
+
     pub async fn current() -> Self {
         let hosts = crate::cli::serve::read_serve_urls()
             .iter()
             .filter_map(|u| reqwest::Url::parse(&u.url).ok())
             .filter_map(|u| u.host_str().map(str::to_owned))
-            .collect();
-        Self {
-            tokens: crate::server::token::accepted_daemon_tokens().await,
-            hosts,
-        }
+            .collect::<Vec<_>>();
+        Self::new(crate::server::token::accepted_daemon_tokens().await, hosts)
     }
+}
+
+/// One comparable spelling per host: no brackets, no root dot, lowercase, IPv4-mapped IPv6
+/// folded to IPv4.
+fn canonical_host(host: &str) -> String {
+    let host = host.trim_matches(['[', ']']);
+    let host = host.strip_suffix('.').unwrap_or(host).to_ascii_lowercase();
+    match host.parse::<std::net::IpAddr>() {
+        Ok(ip) => ip.to_canonical().to_string(),
+        Err(_) => host,
+    }
+}
+
+fn is_loopback_host(canonical: &str) -> bool {
+    canonical == "localhost"
+        || canonical.ends_with(".localhost")
+        || canonical
+            .parse::<std::net::IpAddr>()
+            .is_ok_and(|ip| ip.is_loopback())
 }
 
 /// Drop servers a sandboxed session must not receive: remote servers on a loopback host or on
@@ -56,12 +77,8 @@ pub fn drop_daemon_servers(
             });
             let host_is_daemon = reqwest::Url::parse(url).is_ok_and(|url| {
                 url.host_str().is_some_and(|host| {
-                    let loopback = host.eq_ignore_ascii_case("localhost")
-                        || host
-                            .trim_matches(['[', ']'])
-                            .parse::<std::net::IpAddr>()
-                            .is_ok_and(|ip| ip.to_canonical().is_loopback());
-                    loopback || daemon.hosts.iter().any(|h| h == host)
+                    let host = canonical_host(host);
+                    is_loopback_host(&host) || daemon.hosts.contains(&host)
                 })
             });
             let drop = host_is_daemon || credential_risk;
@@ -310,25 +327,44 @@ mod tests {
             kept
         };
         let tokens = Some(vec!["sekrit".to_string(), "prev-token".to_string()]);
-        let daemon = DaemonIdentity {
-            tokens: tokens.clone(),
-            hosts: vec!["192.168.1.5".to_string()],
-        };
+        let daemon = DaemonIdentity::new(tokens.clone(), ["192.168.1.5".to_string()]);
         assert_eq!(names(&daemon), ["fs", "github"]);
 
         // An unreadable or half-written `serve.url` leaves no hosts; tokens still decide.
-        let no_hosts = DaemonIdentity {
-            tokens,
-            hosts: Vec::new(),
-        };
+        let no_hosts = DaemonIdentity::new(tokens, []);
         assert_eq!(names(&no_hosts), ["fs", "github", "lan"]);
 
         // Without a token authority no remote server can be proven token-free.
-        let no_authority = DaemonIdentity {
-            tokens: None,
-            hosts: Vec::new(),
-        };
+        let no_authority = DaemonIdentity::new(None, []);
         assert_eq!(names(&no_authority), ["fs"]);
+    }
+
+    #[test]
+    fn equivalent_host_spellings_make_the_same_forwarding_decision() {
+        let daemon = DaemonIdentity::new(
+            Some(vec!["sekrit".into()]),
+            [
+                "Host.Example.Test.".to_string(),
+                "::ffff:192.168.1.5".to_string(),
+            ],
+        );
+        for (url, dropped) in [
+            ("http://LOCALHOST:9000/mcp", true),
+            ("http://localhost.:9000/mcp", true),
+            ("http://foo.localhost:9000/mcp", true),
+            ("http://[::ffff:7f00:1]:9000/mcp", true),
+            ("http://127.1:9000/mcp", true),
+            ("http://host.example.test:9000/mcp", true),
+            ("http://HOST.example.test.:9000/mcp", true),
+            ("http://192.168.1.5:9000/mcp", true),
+            ("http://[::ffff:192.168.1.5]:9000/mcp", true),
+            ("http://other.example.test:9000/mcp", false),
+        ] {
+            let json =
+                format!(r#"{{ "mcpServers": {{ "x": {{ "type": "http", "url": "{url}" }} }} }}"#);
+            let kept = drop_daemon_servers(resolved(&json, McpProvenance::Global), &daemon);
+            assert_eq!(kept.is_empty(), dropped, "{url}");
+        }
     }
 
     #[test]
