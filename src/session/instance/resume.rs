@@ -596,35 +596,65 @@ impl Instance {
     }
 
     /// Give back a restart's reservation without failing the row: its admitted fields return to
-    /// what they were, and the poller the restart stopped starts again.
+    /// what they were, and the poller the restart stopped starts again. A write that fails is
+    /// tried once more; if that fails too, the stored reservation is left to expire.
     fn withdraw_reserved_restart(
         &mut self,
         storage: &dyn crate::session::SessionStore,
         generation: u64,
         admitted: &crate::session::background_processes::AdmittedRestart,
     ) -> Result<()> {
-        let released = storage.update(|instances, _groups| {
-            let Some(stored) = instances.iter_mut().find(|row| row.id == self.id) else {
-                return Ok(false);
-            };
-            if !stored
-                .release_lifecycle_reservation_if_owned(LifecycleOperation::Launch, generation)
-            {
-                return Ok(false);
+        let id = self.id.clone();
+        let attempt = || {
+            storage.update(|instances, _groups| {
+                let Some(stored) = instances.iter_mut().find(|row| row.id == id) else {
+                    return Ok(false);
+                };
+                if stored
+                    .release_lifecycle_reservation_if_owned(LifecycleOperation::Launch, generation)
+                {
+                    admitted.restore(stored);
+                    return Ok(true);
+                }
+                // An earlier attempt landed: nothing has reserved the row since.
+                Ok(stored.lifecycle_generation == generation
+                    && stored.lifecycle_reservation.is_none())
+            })
+        };
+        let landed = |error: &anyhow::Error| error.is::<crate::session::SessionCommitApplied>();
+        let released = match attempt() {
+            Err(error) if !landed(&error) => attempt(),
+            first => first,
+        };
+        let released = match released {
+            Ok(released) => released,
+            Err(error) if landed(&error) => true,
+            Err(error) => {
+                tracing::warn!(target: "session.lifecycle", session = %self.id, %error,
+                    "a refused restart couldn't give back its reservation; the row may show Starting until it expires");
+                self.give_back_reserved_restart(storage, generation, admitted);
+                return Err(error);
             }
-            admitted.restore(stored);
-            Ok(true)
-        })?;
+        };
         anyhow::ensure!(
             released,
             crate::session::LifecycleReservationError::Superseded
         );
+        self.give_back_reserved_restart(storage, generation, admitted);
+        Ok(())
+    }
+
+    fn give_back_reserved_restart(
+        &mut self,
+        storage: &dyn crate::session::SessionStore,
+        generation: u64,
+        admitted: &crate::session::background_processes::AdmittedRestart,
+    ) {
         self.release_lifecycle_reservation_if_owned(LifecycleOperation::Launch, generation);
         admitted.restore(self);
         if let Err(error) = self.maybe_start_poller_since_in(CaptureStorage::Scoped(storage)) {
             tracing::warn!(target: "session.capture", session = %self.id, %error, "poller restart after a withdrawn restart failed");
         }
-        Ok(())
     }
 
     /// Tear down the outgoing pane, carry the conversation, then build the
@@ -892,83 +922,250 @@ mod tests {
 
     use crate::session::instance::launch_command::build_resume_flags;
 
+    /// Fails the next `failures` commits, before the write or after it lands.
+    struct FlakyStore {
+        storage: crate::session::storage::Storage,
+        failures: std::sync::Mutex<usize>,
+        commits: std::sync::atomic::AtomicUsize,
+        fail: Fail,
+    }
+
+    #[derive(Clone, Copy, Debug)]
+    enum Fail {
+        BeforeWrite,
+        AfterWrite,
+        AfterWriteApplied,
+    }
+
+    impl crate::session::SessionStore for FlakyStore {
+        fn storage(&self) -> &crate::session::storage::Storage {
+            &self.storage
+        }
+        fn load(&self) -> Result<Vec<Instance>> {
+            self.storage.load()
+        }
+        fn check_available(&self) -> Result<()> {
+            self.storage.check_available()
+        }
+        fn configuration(&self, profile: Option<&str>) -> Result<crate::session::config::Config> {
+            self.storage.configuration(profile)
+        }
+        fn commit(&self, mutation: &mut crate::session::SessionMutation<'_>) -> Result<()> {
+            use std::sync::atomic::Ordering::SeqCst;
+            self.commits.fetch_add(1, SeqCst);
+            let failing = {
+                let mut left = self.failures.lock().unwrap();
+                let failing = *left > 0;
+                *left = left.saturating_sub(1);
+                failing
+            };
+            match (failing, self.fail) {
+                (false, _) => self.storage.commit(mutation),
+                (true, Fail::BeforeWrite) => anyhow::bail!("injected failure before the write"),
+                (true, Fail::AfterWrite) => {
+                    self.storage.commit(mutation)?;
+                    anyhow::bail!("injected failure after the write")
+                }
+                (true, Fail::AfterWriteApplied) => {
+                    self.storage.commit(mutation)?;
+                    Err(anyhow::anyhow!("injected failure after the write")
+                        .context(crate::session::SessionCommitApplied))
+                }
+            }
+        }
+        fn managed_capture_store_is_exclusive(
+            &self,
+            current: &Instance,
+            backend: crate::agents::SessionCaptureBackend,
+            current_store: &std::path::Path,
+        ) -> Result<bool> {
+            self.storage
+                .managed_capture_store_is_exclusive(current, backend, current_store)
+        }
+        fn commit_sandbox_checkpoint(
+            &self,
+            checkpoint: crate::migrations::v027_isolate_sandbox_stores::LockedSandboxCheckpoint<'_>,
+        ) -> Result<()> {
+            self.storage.commit_sandbox_checkpoint(checkpoint)
+        }
+        fn migrate_sandbox_store(
+            &self,
+            id: &str,
+            runtime: &crate::containers::ContainerRuntime,
+        ) -> Result<()> {
+            self.storage.migrate_sandbox_store(id, runtime)
+        }
+    }
+
     /// A restart the background-process recheck refuses gives its reservation back without
-    /// failing the row: the admitted fields return and the poller it stopped runs again.
+    /// failing the row: the admitted fields nobody changed since return, and the poller it
+    /// stopped runs again, whether its write lands first time, on the retry, or not at all.
     #[test]
     #[serial_test::serial]
     fn a_withdrawn_restart_leaves_the_row_and_its_poller_as_they_were() {
+        use std::sync::atomic::Ordering::SeqCst;
         let _budget = crate::session::poller::test_support::IsolatedBudget::with_ceiling(1);
         let temp = tempfile::tempdir().unwrap();
         let _home = crate::session::test_support::isolate_app_dir_at(temp.path());
+        // (case, failing commits, how, edits during the hooks, withdrawn, commits)
+        let cases = [
+            ("first time", 0, Fail::BeforeWrite, false, true, 1),
+            ("on the retry", 1, Fail::BeforeWrite, false, true, 2),
+            ("both attempts fail", 2, Fail::BeforeWrite, false, false, 2),
+            (
+                "first landed, seen on the retry",
+                1,
+                Fail::AfterWrite,
+                false,
+                true,
+                2,
+            ),
+            (
+                "first landed, said so",
+                1,
+                Fail::AfterWriteApplied,
+                false,
+                true,
+                1,
+            ),
+            (
+                "a snooze set during the hooks",
+                0,
+                Fail::BeforeWrite,
+                true,
+                true,
+                1,
+            ),
+        ];
+        for (case, failures, fail, edited, withdrawn, commits) in cases {
+            let store = FlakyStore {
+                storage: crate::session::storage::Storage::new_unwatched("withdrawn").unwrap(),
+                failures: std::sync::Mutex::new(0),
+                commits: 0.into(),
+                fail,
+            };
+            let mut row = Instance::new("withdrawn", "/tmp/withdrawn");
+            row.source_profile = "withdrawn".to_string();
+            row.status = Status::Idle;
+            row.snooze(60);
+            store
+                .storage
+                .update(|instances, _groups| {
+                    *instances = vec![row.clone()];
+                    Ok(())
+                })
+                .unwrap();
+            let before = store.storage.load().unwrap().remove(0);
+            let admitted = store
+                .storage
+                .update(|instances, _groups| {
+                    crate::session::background_processes::AdmittedRestart::admit(
+                        &mut instances[0],
+                        |row| {
+                            row.try_acquire_lifecycle_reservation(
+                                LifecycleOperation::Launch,
+                                Instance::LIFECYCLE_RESERVATION_TTL,
+                                chrono::Utc::now(),
+                            )?;
+                            row.unsnooze();
+                            row.touch_last_accessed();
+                            row.last_error = None;
+                            row.status = Status::Starting;
+                            Ok(())
+                        },
+                    )
+                })
+                .unwrap();
+            let mut inst = store.storage.load().unwrap().remove(0);
+            let generation = inst.lifecycle_generation;
+            if edited {
+                store
+                    .storage
+                    .update(|instances, _groups| {
+                        instances[0].snooze(30);
+                        Ok(())
+                    })
+                    .unwrap();
+            }
+            let edit = store.storage.load().unwrap().remove(0).snoozed_until;
+            assert!(!inst.capture_poller.is_running(), "{case}");
+
+            *store.failures.lock().unwrap() = failures;
+            let result = inst.withdraw_reserved_restart(&store, generation, &admitted);
+            assert_eq!(result.is_ok(), withdrawn, "{case}: {result:?}");
+            assert_eq!(store.commits.load(SeqCst), commits, "{case}");
+            let after = store.storage.load().unwrap().remove(0);
+            if withdrawn {
+                assert!(after.lifecycle_reservation.is_none(), "{case}");
+                assert_eq!(after.status, before.status, "{case}");
+                assert_eq!(after.last_accessed_at, before.last_accessed_at, "{case}");
+                let snooze = if edited { edit } else { before.snoozed_until };
+                assert_eq!(after.snoozed_until, snooze, "{case}");
+            } else {
+                assert!(
+                    after.lifecycle_reservation_is_owned(LifecycleOperation::Launch, generation),
+                    "{case}: the stored reservation is left to expire"
+                );
+            }
+            assert_eq!(inst.status, before.status, "{case}");
+            assert!(inst.lifecycle_reservation.is_none(), "{case}");
+            assert!(inst.capture_poller.is_running(), "{case}");
+            inst.capture_poller.stop();
+        }
+
+        // A reservation a peer has since taken, and what it wrote, are left alone.
         let storage = crate::session::storage::Storage::new_unwatched("withdrawn").unwrap();
-        let mut inst = Instance::new("withdrawn", "/tmp/withdrawn");
-        inst.source_profile = "withdrawn".to_string();
-        inst.status = Status::Idle;
-        inst.last_error = Some("an earlier failure".to_string());
-        storage
+        let mut inst = storage.load().unwrap().remove(0);
+        let admitted = storage
             .update(|instances, _groups| {
-                instances.push(inst.clone());
-                Ok(())
+                crate::session::background_processes::AdmittedRestart::admit(
+                    &mut instances[0],
+                    |row| {
+                        row.try_acquire_lifecycle_reservation(
+                            LifecycleOperation::Launch,
+                            Instance::LIFECYCLE_RESERVATION_TTL,
+                            chrono::Utc::now(),
+                        )?;
+                        Ok(())
+                    },
+                )
             })
             .unwrap();
-        assert_eq!(inst.maybe_start_poller(), PollerStart::Started);
-        let before = storage.load().unwrap().remove(0);
-
-        let admitted = crate::session::background_processes::AdmittedRestart::of(&before);
-        inst.acquire_lifecycle_reservation(
-            &storage,
-            LifecycleOperation::Launch,
-            Some(Status::Starting),
-        )
-        .unwrap();
-        let generation = inst.lifecycle_generation;
+        let generation = storage.load().unwrap().remove(0).lifecycle_generation;
         storage
             .update(|instances, _groups| {
                 let row = &mut instances[0];
-                row.touch_last_accessed();
-                row.last_error = None;
+                row.release_lifecycle_reservation_if_owned(LifecycleOperation::Launch, generation);
+                row.try_acquire_lifecycle_reservation(
+                    LifecycleOperation::Launch,
+                    Instance::LIFECYCLE_RESERVATION_TTL,
+                    chrono::Utc::now(),
+                )?;
+                row.status = Status::Starting;
+                row.snooze(30);
                 Ok(())
             })
             .unwrap();
-        inst.capture_poller.stop();
-
-        inst.withdraw_reserved_restart(&storage, generation, &admitted)
-            .unwrap();
-        let after = storage.load().unwrap().remove(0);
-        assert_eq!(after.status, before.status);
-        assert_eq!(after.last_error, before.last_error);
-        assert_eq!(after.last_accessed_at, before.last_accessed_at);
-        assert!(after.lifecycle_reservation.is_none());
-        assert_eq!(inst.status, before.status);
-        assert!(inst.capture_poller.is_running());
-        inst.capture_poller.stop();
-
-        // A reservation a peer has since taken, and what it wrote, are left alone.
-        let mut peer = storage.load().unwrap().remove(0);
-        peer.acquire_lifecycle_reservation(
-            &storage,
-            LifecycleOperation::Launch,
-            Some(Status::Starting),
-        )
-        .unwrap();
-        assert_ne!(peer.lifecycle_generation, generation);
-        storage
-            .update(|instances, _groups| {
-                instances[0].snooze(30);
-                Ok(())
-            })
-            .unwrap();
-        assert!(inst
+        let err = inst
             .withdraw_reserved_restart(&storage, generation, &admitted)
-            .is_err());
+            .unwrap_err();
+        assert!(
+            err.is::<crate::session::LifecycleReservationError>(),
+            "{err}"
+        );
         let kept = storage.load().unwrap().remove(0);
         assert!(kept
             .lifecycle_reservation
             .as_ref()
-            .is_some_and(|held| held.generation == peer.lifecycle_generation));
+            .is_some_and(|held| held.generation != generation));
         assert_eq!(kept.status, Status::Starting);
         assert!(kept.snoozed_until.is_some(), "the peer's snooze stays");
+        assert!(
+            !inst.capture_poller.is_running(),
+            "the peer's launch owns the poller"
+        );
     }
+
     use crate::session::instance::test_helpers::{install_aliases, seed_claude_transcript};
     use serial_test::serial;
     use tempfile::tempdir;

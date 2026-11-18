@@ -83,13 +83,21 @@ pub(crate) struct ProcessRecheck {
     pub(crate) admitted: AdmittedRestart,
 }
 
-/// The fields a restart's admission changes, as they were before it, so a late refusal can put
-/// them back. The admission takes a check only on a restart that changes no setting.
+/// The fields a restart's admission changes, as they were before and after it, so a late
+/// refusal can put back those nobody has changed since. The admission takes a check only on a
+/// restart that changes no setting.
 #[derive(Debug, Clone)]
 pub(crate) struct AdmittedRestart {
-    status: crate::session::Status,
+    before: Admitted,
+    after: Admitted,
     last_error: Option<String>,
     last_error_check: Option<std::time::Instant>,
+}
+
+/// The stored fields an admission changes.
+#[derive(Debug, Clone, PartialEq)]
+struct Admitted {
+    status: crate::session::Status,
     last_accessed_at: Option<chrono::DateTime<chrono::Utc>>,
     archived_at: Option<chrono::DateTime<chrono::Utc>>,
     snoozed_until: Option<chrono::DateTime<chrono::Utc>>,
@@ -97,12 +105,10 @@ pub(crate) struct AdmittedRestart {
     idle_entered_at: Option<chrono::DateTime<chrono::Utc>>,
 }
 
-impl AdmittedRestart {
-    pub(crate) fn of(row: &Instance) -> Self {
+impl Admitted {
+    fn of(row: &Instance) -> Self {
         Self {
             status: row.status,
-            last_error: row.last_error.clone(),
-            last_error_check: row.last_error_check,
             last_accessed_at: row.last_accessed_at,
             archived_at: row.archived_at,
             snoozed_until: row.snoozed_until,
@@ -110,16 +116,63 @@ impl AdmittedRestart {
             idle_entered_at: row.idle_entered_at,
         }
     }
+}
 
+impl AdmittedRestart {
+    /// Runs `admit` on `row`, recording the fields on either side of it.
+    pub(crate) fn admit(
+        row: &mut Instance,
+        admit: impl FnOnce(&mut Instance) -> anyhow::Result<()>,
+    ) -> anyhow::Result<Self> {
+        let before = Admitted::of(row);
+        let (last_error, last_error_check) = (row.last_error.clone(), row.last_error_check);
+        admit(row)?;
+        Ok(Self {
+            before,
+            after: Admitted::of(row),
+            last_error,
+            last_error_check,
+        })
+    }
+
+    /// Puts back each stored field still holding what the admission set. A field changed since
+    /// keeps its new value, unless the change set the very value the admission had, which can't
+    /// be told apart without a per-edit revision. The error, never stored, is always put back.
     pub(crate) fn restore(&self, row: &mut Instance) {
-        row.status = self.status;
+        fn put_back<T: PartialEq + Clone>(field: &mut T, before: &T, after: &T) {
+            if field == after {
+                field.clone_from(before);
+            }
+        }
+        let (before, after) = (&self.before, &self.after);
+        put_back(&mut row.status, &before.status, &after.status);
+        put_back(
+            &mut row.last_accessed_at,
+            &before.last_accessed_at,
+            &after.last_accessed_at,
+        );
+        put_back(
+            &mut row.archived_at,
+            &before.archived_at,
+            &after.archived_at,
+        );
+        put_back(
+            &mut row.snoozed_until,
+            &before.snoozed_until,
+            &after.snoozed_until,
+        );
+        put_back(
+            &mut row.idle_dormant_since,
+            &before.idle_dormant_since,
+            &after.idle_dormant_since,
+        );
+        put_back(
+            &mut row.idle_entered_at,
+            &before.idle_entered_at,
+            &after.idle_entered_at,
+        );
         row.last_error.clone_from(&self.last_error);
         row.last_error_check = self.last_error_check;
-        row.last_accessed_at = self.last_accessed_at;
-        row.archived_at = self.archived_at;
-        row.snoozed_until = self.snoozed_until;
-        row.idle_dormant_since = self.idle_dormant_since;
-        row.idle_entered_at = self.idle_entered_at;
     }
 }
 

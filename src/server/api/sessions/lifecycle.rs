@@ -3829,10 +3829,11 @@ async fn prepare_agent_session_inner(
                 }
                 if let Some(body) = &worker_restart {
                     row.source_profile.clone_from(&profile);
-                    *admitted = Some(crate::session::background_processes::AdmittedRestart::of(
-                        row,
-                    ));
-                    admit_restart(row, body, account_swap)?;
+                    *admitted = Some(
+                        crate::session::background_processes::AdmittedRestart::admit(row, |row| {
+                            admit_restart(row, body, account_swap)
+                        })?,
+                    );
                     return Ok(Some(row.clone()));
                 }
                 let now = chrono::Utc::now();
