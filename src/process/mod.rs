@@ -830,7 +830,8 @@ pub(crate) fn run_until_cancelled_process_group(
 }
 
 /// [`run_until_cancelled_process_group`] that also passes `on_output` each stream's bytes while
-/// the child runs, at most one poll interval after they are written.
+/// the child runs, best effort: usually by the next poll, later behind a backlog of more than
+/// one pass.
 pub(crate) fn run_until_cancelled_process_group_observed(
     cmd: &mut Command,
     timeout: Duration,
@@ -893,6 +894,10 @@ fn run_with_timeout_inner(
     cancel: Option<&CancellationToken>,
     on_output: Option<&mut dyn FnMut(OutputStream, &[u8])>,
 ) -> std::io::Result<Option<Output>> {
+    // Before any setup, so a cancelled run can't fail on it instead.
+    if cancel.is_some_and(CancellationToken::is_cancelled) {
+        return Ok(None);
+    }
     let mut stdout_file = tempfile::NamedTempFile::new()?;
     let mut stderr_file = tempfile::NamedTempFile::new()?;
     cmd.stdout(Stdio::from(stdout_file.reopen()?));
@@ -926,12 +931,13 @@ fn run_with_timeout_inner(
             },
         )?,
     };
-    if let Some(tail) = tail.as_mut() {
-        tail.forward_new(None);
-    }
     let Some(status) = waited else {
         return Ok(None);
     };
+    // Only a child that exited drains: a killed one's backlog would hold back its outcome.
+    if let Some(tail) = tail.as_mut() {
+        tail.forward_new(None);
+    }
     // Regular files, rather than pipes drained by background threads, keep
     // output capture bounded when a descendant outlives the direct child. A
     // read reaches the current EOF without waiting for every inherited writer
@@ -3081,6 +3087,34 @@ finally:
         assert_eq!(pass(None), total, "the final pass drains to the end");
     }
 
+    /// A cancelled run returns without draining the backlog its child left unread.
+    #[test]
+    #[cfg(unix)]
+    fn a_cancel_is_not_held_behind_the_unread_backlog() {
+        let mut cmd = Command::new("sh");
+        cmd.args(["-c", "head -c 1048576 /dev/zero; exec sleep 600"]);
+        let cancel = CancellationToken::new();
+        let mut forwarded = 0usize;
+        let mut forward = |_: OutputStream, bytes: &[u8]| {
+            forwarded += bytes.len();
+            if forwarded >= TAIL_PASS_LIMIT {
+                cancel.cancel();
+            }
+        };
+        let result = run_until_cancelled_process_group_observed(
+            &mut cmd,
+            Duration::from_secs(30),
+            &cancel,
+            &mut forward,
+        )
+        .unwrap();
+        assert!(result.is_none(), "cancelled");
+        assert!(
+            forwarded <= 2 * TAIL_PASS_LIMIT,
+            "forwarded {forwarded} bytes after the cancel"
+        );
+    }
+
     #[test]
     #[cfg(unix)]
     fn observed_output_arrives_while_the_child_still_runs() {
@@ -3150,14 +3184,17 @@ finally:
         use std::io::Read;
         use std::os::fd::AsRawFd;
         use std::os::unix::{net::UnixStream, process::CommandExt};
+        // The cancel case's timeout: kills the child if the cancel never comes.
+        const WATCHDOG: Duration = Duration::from_secs(60);
 
         for cancelled in [false, true] {
             let (mut pid_reader, pid_writer) = UnixStream::pair().unwrap();
             pid_reader
                 .set_read_timeout(Some(Duration::from_secs(5)))
                 .unwrap();
+            // Outlives the watchdog, so only a kill ends it.
             let mut cmd = Command::new("sleep");
-            cmd.arg("5");
+            cmd.arg("600");
             unsafe {
                 cmd.pre_exec(move || {
                     let pid = libc::getpid().to_ne_bytes();
@@ -3189,7 +3226,7 @@ finally:
                         pid
                     }
                 });
-                let result = run_until_cancelled(&mut cmd, Duration::from_secs(60), &cancel);
+                let result = run_until_cancelled(&mut cmd, WATCHDOG, &cancel);
                 (result.unwrap(), canceller.join().unwrap())
             } else {
                 let result = run_with_timeout(&mut cmd, Duration::from_millis(300)).unwrap();
@@ -3200,10 +3237,15 @@ finally:
                 result.is_none(),
                 "cancelled={cancelled}: child must be killed"
             );
-            assert!(
-                start.elapsed() < Duration::from_secs(4),
-                "cancelled={cancelled}: wait should return promptly, not block on the child"
-            );
+            let elapsed = start.elapsed();
+            if cancelled {
+                assert!(elapsed < WATCHDOG, "the cancel killed it, not the watchdog");
+            } else {
+                assert!(
+                    elapsed < Duration::from_secs(4),
+                    "the deadline returns promptly, not when the child would exit"
+                );
+            }
         }
     }
 
