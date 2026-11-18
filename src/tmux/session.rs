@@ -5121,6 +5121,47 @@ mod tests {
 
     #[test]
     #[serial_test::serial]
+    /// #5850: a tmux client without a UTF-8 locale prints the tab in the lookup's format as `_`.
+    fn the_pane_pid_resolves_without_a_utf8_locale() {
+        if !tmux_available() {
+            eprintln!("Skipping test: tmux not available");
+            return;
+        }
+        let guard = TmuxTestSession::new("aoe_test_pane_pid_locale");
+        let session_name = guard.name().to_string();
+        let mut args: Vec<String> = ["new-session", "-d", "-s", &session_name, "sleep 30"]
+            .iter()
+            .map(|arg| arg.to_string())
+            .collect();
+        append_pane_base_index_args(&mut args, &session_name);
+        assert!(crate::tmux::tmux_command()
+            .args(&args)
+            .status()
+            .expect("tmux new-session")
+            .success());
+        let pane = only_pane_id(&session_name);
+        wait_for_pane_command(&pane, "sleep");
+        let expected = pane_field(&pane, "#{pane_pid}")
+            .parse::<u32>()
+            .expect("pane PID");
+
+        const LOCALE: [&str; 3] = ["LANG", "LC_ALL", "LC_CTYPE"];
+        let saved = LOCALE.map(|key| (key, std::env::var_os(key)));
+        for key in LOCALE {
+            std::env::set_var(key, "C");
+        }
+        let resolved = crate::process::get_pane_pid(&session_name);
+        for (key, value) in saved {
+            match value {
+                Some(value) => std::env::set_var(key, value),
+                None => std::env::remove_var(key),
+            }
+        }
+        assert_eq!(resolved, Some(expected));
+    }
+
+    #[test]
+    #[serial_test::serial]
     /// Regression test for #488: when a user creates a split pane and makes it
     /// active, is_pane_dead and is_pane_running_shell must still target the
     /// agent's pane (pane 0), not the active split pane.
