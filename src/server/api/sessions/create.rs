@@ -1629,12 +1629,27 @@ pub(super) async fn run_create_task<T>(
         let stage = progress.stage();
         if let Some(failure) = create_failure(e, stage, reference) {
             log_create_failure(e, stage, reference);
-            if let Some(key) = key {
+            if let Some(key) = key.filter(|_| !lost_shared_pull(e)) {
                 failures.record_failure(key, failure);
             }
         }
     }
     result
+}
+
+/// A create whose image pull was cancelled for everyone provisioned nothing, so a same-key
+/// retry may run again once the image can be pulled.
+fn lost_shared_pull(e: &anyhow::Error) -> bool {
+    use crate::containers::error::DockerError;
+    e.chain().any(|cause| {
+        cause
+            .downcast_ref::<crate::server::session_spawn::ImageUpdateFailed>()
+            .is_some_and(|failed| failed.cancelled)
+            || matches!(
+                cause.downcast_ref::<DockerError>(),
+                Some(DockerError::PullCancelled(_))
+            )
+    })
 }
 
 pub(super) fn log_create_failure(

@@ -10964,6 +10964,42 @@ fn the_failure_log_names_a_context_wrapped_cause() {
     );
 }
 
+/// A create that lost its image pull to a shared cancel is not replayed, so a same-key retry
+/// runs again once the image can be pulled. Any other failure is replayed.
+#[tokio::test]
+async fn a_create_whose_shared_pull_was_cancelled_is_not_replayed() {
+    use crate::containers::error::DockerError;
+    use crate::server::session_spawn::ImageUpdateFailed;
+    let failed = |cancelled| ImageUpdateFailed {
+        image: "img".into(),
+        detail: String::new(),
+        cancelled,
+    };
+    let cases: Vec<(&str, anyhow::Error, bool)> = vec![
+        ("latest pull cancelled", failed(true).into(), false),
+        (
+            "missing image pull cancelled",
+            anyhow::Error::from(DockerError::PullCancelled("img".into())).context("ensure image"),
+            false,
+        ),
+        ("latest pull failed", failed(false).into(), true),
+    ];
+    for (case, error, replayed) in cases {
+        let failures = crate::server::create_progress::CreateProgressRegistry::default();
+        let progress = crate::server::create_progress::CreateProgress::default();
+        let result = run_create_task(
+            async { Err::<(), _>(error) },
+            &failures,
+            &progress,
+            Some(case),
+            "ref",
+        )
+        .await;
+        assert!(result.is_err(), "{case}");
+        assert_eq!(failures.recent_failure(case).is_some(), replayed, "{case}");
+    }
+}
+
 /// A create that panics after its request is gone is still logged under its reference
 /// and recorded, so a same-key retry replays it instead of running the create again.
 #[tokio::test]
