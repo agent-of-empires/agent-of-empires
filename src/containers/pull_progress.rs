@@ -171,30 +171,31 @@ mod tests {
     #[test]
     fn a_layer_done_before_its_announcement_counts_once_announced() {
         use PullPhase::*;
-        let cases: Vec<(
-            &str,
-            Vec<LayerUpdate>,
-            (Option<PullPhase>, Option<u32>, Option<u32>),
-        )> = vec![
+        let snap = |phase, done, known| ProgressSnapshot {
+            phase: Some(phase),
+            layers_done: Some(done),
+            layers_known: Some(known),
+        };
+        let cases: Vec<(&str, Vec<LayerUpdate>, ProgressSnapshot)> = vec![
             (
                 "cached layer reported early",
                 vec![layer("a", false), layer("b", true), layer("b", false)],
-                (Some(Downloading), Some(1), Some(2)),
+                snap(Downloading, 1, 2),
             ),
             (
                 "repeated early report",
                 vec![layer("b", true), layer("b", true), layer("b", false)],
-                (Some(Downloading), Some(1), Some(1)),
+                snap(Downloading, 1, 1),
             ),
             (
                 "its own later done line",
                 vec![layer("b", true), layer("b", false), layer("b", true)],
-                (Some(Unpacking), Some(1), Some(1)),
+                snap(Unpacking, 1, 1),
             ),
             (
                 "never announced",
                 vec![layer("a", false), layer("c", true)],
-                (Some(Downloading), Some(0), Some(1)),
+                snap(Downloading, 0, 1),
             ),
         ];
         for (case, events, expected) in cases {
@@ -203,8 +204,7 @@ mod tests {
                 progress.apply(event);
                 assert!(progress.done.is_subset(&progress.known), "{case}");
             }
-            let s = progress.snapshot();
-            assert_eq!((s.phase, s.layers_done, s.layers_known), expected, "{case}");
+            assert_eq!(progress.snapshot(), expected, "{case}");
         }
     }
 
