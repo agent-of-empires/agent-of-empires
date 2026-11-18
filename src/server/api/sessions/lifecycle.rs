@@ -116,7 +116,8 @@ pub async fn update_session_favorite(
 }
 
 /// Ignore or unignore a session managed by another session. The row stays
-/// live and present; archive, snooze, and trash are untouched.
+/// live and present; archive, snooze, and trash are untouched. Ignoring an
+/// archived or trashed session is refused because those states outrank it.
 pub async fn update_session_ignored(
     State(state): State<Arc<AppState>>,
     Path(id): Path<String>,
@@ -141,6 +142,15 @@ pub async fn update_session_ignored(
         let Some(instance) = instances.iter().find(|instance| instance.id == id) else {
             return crate::server::api::session_not_found();
         };
+        // Archive and trash outrank ignore; ignoring a sunk row would persist a state
+        // the rest of the dashboard reads as archived or trashed.
+        if body.ignored && (instance.is_archived() || instance.is_trashed()) {
+            return crate::server::api::start_blocked_response(if instance.is_trashed() {
+                crate::session::StartBlocked::Trashed
+            } else {
+                crate::session::StartBlocked::Archived
+            });
+        }
         instance.source_profile.clone()
     };
     let ignored = body.ignored;

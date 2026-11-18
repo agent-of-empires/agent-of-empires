@@ -5517,7 +5517,11 @@
       "id": "triage.ignore-managed-session",
       "kind": "vitest",
       "risk": "medium",
-      "specs": ["src/lib/api.test.ts", "src/lib/__tests__/sidebarSort.test.ts"],
+      "specs": [
+        "src/lib/api.test.ts",
+        "src/lib/__tests__/sidebarSort.test.ts",
+        "src/components/__tests__/SessionRowMenuOrder.test.tsx"
+      ],
       "components": [
         "web/src/lib/api.ts",
         "web/src/lib/sidebarSort.ts",

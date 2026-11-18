@@ -550,10 +550,14 @@ fn group_members<'a>(
     })
 }
 
-/// True for a favorited session that is actively pinnable: not archived, not trashed, and not
-/// snoozed.
+/// True for a favorited session that is actively pinnable: not archived, not trashed, not
+/// snoozed, and not ignored.
 pub(crate) fn is_live_favorite(inst: &Instance) -> bool {
-    !inst.is_archived() && !inst.is_trashed() && !inst.is_snoozed() && inst.is_favorited()
+    !inst.is_archived()
+        && !inst.is_trashed()
+        && !inst.is_snoozed()
+        && !inst.is_ignored()
+        && inst.is_favorited()
 }
 
 /// True when the group at `path` (including nested sub-groups) has at least one live favorited
@@ -607,8 +611,8 @@ fn attention_tier(inst: &Instance) -> u8 {
         || inst.is_trashed()
         || inst.pane_dead_observed
     {
-        // Tier 99 sinks: archived and snoozed (snoozed = temporary archive, wakes automatically
-        // when timer expires).
+        // Tier 99 sinks: archived, ignored, and snoozed (snoozed = temporary archive that wakes
+        // automatically when its timer expires).
         return 99;
     }
     inst.status.attention_tier()

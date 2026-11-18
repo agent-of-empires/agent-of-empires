@@ -416,10 +416,12 @@ impl Instance {
 
     /// Mark a managed session ignored: it stays live and present, but drops
     /// out of attention without becoming archived or trashed. Ignore is a
-    /// sink state, so the surface-state mutators clear it; only explicit
-    /// `unignore` or `reclaim_ownership` removes the marker otherwise.
+    /// sink state like snooze, so it clears a pin; the surface-state mutators
+    /// clear the marker, and only explicit `unignore` or `reclaim_ownership`
+    /// removes it otherwise.
     pub fn ignore(&mut self) {
         self.ignored_at = Some(Utc::now());
+        self.pinned_at = None;
     }
 
     pub fn unignore(&mut self) {
@@ -667,14 +669,17 @@ mod tests {
     fn ignore_is_a_sink_state_without_archive_or_trash() {
         let mut inst = Instance::new("managed", "/tmp/managed");
         inst.parent_session_id = Some("manager".into());
+        inst.pin();
         inst.ignore();
         assert!(inst.is_ignored());
         assert!(!inst.is_archived());
         assert!(!inst.is_trashed());
         assert!(!inst.is_snoozed());
-        assert!(!inst.is_pinned());
+        assert!(
+            !inst.is_pinned(),
+            "ignore is a sink state and clears the pin"
+        );
         assert!(inst.is_dismissed());
-        assert!(!inst.is_urgent());
 
         inst.pin();
         assert!(

@@ -59,11 +59,11 @@ _Avoid_: delete, hard delete
 Hiding a Session until a chosen time. Expired snoozes lift on their own.
 
 **Ignored**:
-A Session managed by another Session, hidden from attention without being Archived or Trashed. It stays live and present. Archive, Pin, Favorite, or Snooze cancels Ignore, and Archive takes precedence over it; Ignore itself changes no other state. Reclaiming ownership clears the manager link and Ignore together.
+A Session managed by another Session, hidden from attention without being Archived or Trashed. It stays live and present. Archive, Pin, Favorite, or Snooze cancels Ignore, and Archive takes precedence over it; Ignoring clears a Pin but changes no other state. Reclaiming ownership clears the manager link and Ignore together.
 _Avoid_: archived, snoozed, deleted
 
 **Managed session**:
-A Session whose `parent_session_id` names the Session that created or drives it. The manager is metadata, not a bucket: the row still appears in the list unless Ignored.
+A Session whose `parent_session_id` names the Session that created or drives it. The manager is metadata, not a bucket: the row still appears in the list even while Ignored, which only removes it from attention.
 
 **Dismissed**:
 A Session that is trashed, snoozed, archived or ignored. The "do not bother me" states as one set.

@@ -2690,6 +2690,62 @@ async fn ignore_session_keeps_the_row_live_and_reports_its_manager() -> anyhow::
     Ok(())
 }
 
+/// Archive and trash outrank ignore, so the endpoint refuses instead of
+/// persisting a contradictory sink state.
+#[tokio::test]
+#[serial_test::serial]
+async fn ignore_refuses_an_archived_or_trashed_session() -> anyhow::Result<()> {
+    use axum::body::to_bytes;
+    let _guard = crate::session::test_support::isolate_app_dir();
+    let mut archived = Instance::new("archived ignore", "/tmp/archived-ignore");
+    archived.source_profile = "receipt".into();
+    archived.parent_session_id = Some("manager".into());
+    archived.archive();
+    let mut trashed = Instance::new("trashed ignore", "/tmp/trashed-ignore");
+    trashed.source_profile = "receipt".into();
+    trashed.parent_session_id = Some("manager".into());
+    trashed.trash();
+    let archived_id = archived.id.clone();
+    let trashed_id = trashed.id.clone();
+    let rows = vec![archived, trashed];
+    let state = crate::server::test_support::build_test_app_state(rows.clone());
+    let storage = Storage::new("receipt", state.file_watch.clone())?;
+    storage.update(|stored, _| {
+        stored.extend(rows);
+        Ok(())
+    })?;
+    *state.canonical_metadata.write().await =
+        crate::server::reload::load_all_profiles(&state.file_watch)?.metadata;
+    state.runtime.publish(&state).await?;
+
+    for (id, expected) in [
+        (archived_id.clone(), "session_archived"),
+        (trashed_id.clone(), "session_trashed"),
+    ] {
+        let response = update_session_ignored(
+            State(state.clone()),
+            Path(id),
+            Ok(Json(UpdateIgnoredBody { ignored: true })),
+        )
+        .await
+        .into_response();
+        assert_eq!(response.status(), StatusCode::CONFLICT, "{expected}");
+        let body = to_bytes(response.into_body(), usize::MAX).await?;
+        let json: serde_json::Value = serde_json::from_slice(&body)?;
+        assert_eq!(json["error"], expected);
+    }
+
+    let stored = storage.load()?;
+    for id in [&archived_id, &trashed_id] {
+        let row = stored
+            .iter()
+            .find(|row| row.id == *id)
+            .expect("row persisted");
+        assert!(!row.is_ignored(), "{id}");
+    }
+    Ok(())
+}
+
 /// Taking ownership back clears the manager link and the ignore marker in one
 /// commit, while the row identity, conversation binding, and unrelated triage
 /// timestamps survive.
@@ -2703,8 +2759,7 @@ async fn reclaim_ownership_clears_manager_and_ignore_in_one_commit() -> anyhow::
     row.parent_session_id = Some("manager".into());
     row.agent_session_id = Some("native-conversation".into());
     row.ignore();
-    row.pin();
-    row.ignore();
+    row.pinned_at = Some(chrono::Utc::now());
     let id = row.id.clone();
     let state = crate::server::test_support::build_test_app_state(vec![row.clone()]);
     let storage = Storage::new("receipt", state.file_watch.clone())?;
