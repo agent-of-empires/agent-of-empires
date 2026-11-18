@@ -9830,11 +9830,196 @@ async fn restart_for_update_refuses_a_session_that_is_not_out_of_date() {
         let response = restart_for_update(
             axum::extract::State(state.clone()),
             axum::extract::Path(id.to_string()),
+            Ok(None),
         )
         .await
         .into_response();
         assert_eq!(response.status(), expected, "{id}");
     }
+}
+
+/// #5762: a restart that asks for the check names the shells the Agent started and stops
+/// nothing until each one, by PID and start, is confirmed.
+#[tokio::test]
+#[serial_test::serial]
+async fn an_update_restart_names_the_agents_background_shells_before_stopping_them() {
+    if crate::tmux::tmux_command().arg("-V").output().is_err() {
+        eprintln!("tmux not available; skipping");
+        return;
+    }
+    let _home = crate::session::test_support::isolate_app_dir();
+    let project = tempfile::tempdir().unwrap();
+    let agent = project.path().join("agent");
+    let second = project.path().join("second");
+    std::fs::write(
+        &agent,
+        format!(
+            "#!/bin/sh\nbash -c 'sleep 600; :' &\nwhile [ ! -e {0} ]; do sleep 0.05; done\n\
+             bash -c 'sleep 700; :' &\nwait\n",
+            second.display()
+        ),
+    )
+    .unwrap();
+    use std::os::unix::fs::PermissionsExt as _;
+    std::fs::set_permissions(&agent, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let agent = std::fs::canonicalize(&agent).unwrap();
+
+    let mut inst = make_test_instance();
+    inst.source_profile = "default".to_string();
+    inst.project_path = project.path().to_str().unwrap().to_owned();
+    inst.status = Status::Idle;
+    inst.launch_executable = Some(agent.clone());
+    inst.launch_resolved_executable = Some(agent.clone());
+    let mut unrecorded = inst.clone();
+    unrecorded.launch_executable = None;
+    unrecorded.launch_resolved_executable = None;
+    // The check runs before the shelved-row refusal, so an archived copy shows a restart got
+    // past it without launching anything.
+    let shelved = |row: &Instance| {
+        let mut row = row.clone();
+        row.archive();
+        row.status = Status::Idle;
+        row
+    };
+    let id = inst.id.clone();
+    let pane = crate::tmux::Session::generate_name(&id, &inst.title);
+    let created = crate::tmux::tmux_command()
+        .args(["new-session", "-d", "-s", &pane, agent.to_str().unwrap()])
+        .status();
+    if !created.map(|status| status.success()).unwrap_or(false) {
+        eprintln!("tmux new-session failed; skipping");
+        return;
+    }
+    let _pane_guard = crate::tmux::test_helpers::TmuxTestSession::from_name(pane.clone());
+    crate::tmux::refresh_session_cache();
+    let pane_pid: u32 = String::from_utf8(
+        crate::tmux::tmux_command()
+            .args(["display", "-p", "-t", &pane, "#{pane_pid}"])
+            .output()
+            .unwrap()
+            .stdout,
+    )
+    .unwrap()
+    .trim()
+    .parse()
+    .unwrap();
+    let sleeping = |count: usize| {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        loop {
+            let tree = crate::process::process_tree_commands(pane_pid).unwrap();
+            let sleeps = tree
+                .iter()
+                .filter(|sample| sample.argv.first().is_some_and(|arg| arg == "sleep"))
+                .filter(|sample| sample.argv.get(1).is_some_and(|arg| arg != "0.05"))
+                .count();
+            if sleeps == count || std::time::Instant::now() > deadline {
+                return sleeps;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+    };
+    assert_eq!(sleeping(1), 1);
+
+    let restart =
+        |row: &Instance, stop_processes: Vec<crate::daemon::ProcessIdentity>, unclassified| {
+            let row = row.clone();
+            let id = id.clone();
+            async move {
+                Storage::new_unwatched("default")
+                    .unwrap()
+                    .update(|rows, _| {
+                        *rows = vec![row.clone()];
+                        Ok(())
+                    })
+                    .unwrap();
+                let state = crate::server::test_support::build_test_app_state(vec![row]);
+                crate::server::test_support::refresh_canonical_metadata_for_test(&state).await;
+                let body = crate::daemon::RestartSessionBody {
+                    only_if_idle: true,
+                    stop_processes: Some(stop_processes),
+                    stop_unclassified: unclassified,
+                    ..Default::default()
+                };
+                let response = lifecycle::prepare_agent_session(
+                    state,
+                    id,
+                    Ok(None),
+                    lifecycle::AgentPreparation::Restart,
+                    Some(Arc::new(body)),
+                )
+                .await;
+                let status = response.status();
+                let body = axum::body::to_bytes(response.into_body(), 64 * 1024)
+                    .await
+                    .unwrap();
+                (
+                    status,
+                    serde_json::from_slice::<serde_json::Value>(&body).unwrap_or_default(),
+                )
+            }
+        };
+    let identities = |body: &serde_json::Value| -> Vec<crate::daemon::ProcessIdentity> {
+        body["processes"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|entry| {
+                serde_json::from_value(serde_json::json!({
+                    "pid": entry["pid"], "start_id": entry["start_id"],
+                }))
+                .unwrap()
+            })
+            .collect()
+    };
+
+    let (status, first) = restart(&inst, vec![], false).await;
+    assert_eq!(status, StatusCode::CONFLICT, "{first}");
+    assert_eq!(first["error"], "background_processes");
+    assert_eq!(first["classified"], true);
+    assert_eq!(first["total"], 1);
+    assert_eq!(
+        first["processes"][0]["argv"],
+        serde_json::json!(["sleep", "600"])
+    );
+    assert!(first["processes"][0]["elapsed_secs"].as_u64().unwrap() < 60);
+    assert_eq!(sleeping(1), 1, "a refusal stops nothing");
+
+    // A process that started after the list was shown refuses the confirm with both listed.
+    std::fs::write(&second, "").unwrap();
+    assert_eq!(sleeping(2), 2);
+    let (status, refreshed) = restart(&inst, identities(&first), false).await;
+    assert_eq!(status, StatusCode::CONFLICT, "{refreshed}");
+    assert_eq!(refreshed["total"], 2);
+    let argv: Vec<_> = refreshed["processes"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|entry| entry["argv"].clone())
+        .collect();
+    assert_eq!(
+        argv,
+        [
+            serde_json::json!(["sleep", "600"]),
+            serde_json::json!(["sleep", "700"])
+        ]
+    );
+
+    // Confirming exactly what was found lets the restart past the check.
+    let (_, confirmed) = restart(&shelved(&inst), identities(&refreshed), false).await;
+    assert_eq!(confirmed["error"], "session_archived", "{confirmed}");
+    let (_, unconfirmed) = restart(&shelved(&inst), identities(&first), false).await;
+    assert_eq!(
+        unconfirmed["error"], "background_processes",
+        "{unconfirmed}"
+    );
+
+    // Without a recorded launch the Agent can't be told apart: a generic refusal, until accepted.
+    let (status, generic) = restart(&unrecorded, vec![], false).await;
+    assert_eq!(status, StatusCode::CONFLICT, "{generic}");
+    assert_eq!(generic["classified"], false);
+    let (_, accepted) = restart(&shelved(&unrecorded), vec![], true).await;
+    assert_eq!(accepted["error"], "session_archived", "{accepted}");
+    assert_eq!(sleeping(2), 2, "nothing was stopped");
 }
 
 #[tokio::test]
@@ -9870,7 +10055,7 @@ async fn update_restart_of_a_structured_session_defers_to_the_reconciler() {
     inst.id = "structured-agent".to_string();
     inst.view = crate::session::View::Structured;
     let state = crate::server::test_support::build_test_app_state(vec![inst.clone()]);
-    let response = apply_update_restart(&state, inst.id.clone(), inst).await;
+    let response = apply_update_restart(&state, inst.id.clone(), inst, Default::default()).await;
     assert_eq!(response.status(), StatusCode::ACCEPTED);
     assert_eq!(
         state.acp_supervisor.respawn_pending_ids(),

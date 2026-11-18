@@ -793,6 +793,89 @@ pub(super) fn foreign_runner_group_absent(pid: u32) -> anyhow::Result<bool> {
     let ruid = unsafe { libc::getuid() };
     Ok((info.pbsi_uid != uid || info.pbsi_ruid != ruid) && !runner_group_executing(pid)?)
 }
+/// `samples` with each one's command line, executable and age. `ps` joins arguments with spaces,
+/// so they are split on whitespace here. A process that exited, or whose PID now names another
+/// process, is left out.
+pub(super) fn describe_processes(
+    samples: Vec<super::PrimeProcessSample>,
+) -> anyhow::Result<Vec<super::CommandSample>> {
+    if samples.is_empty() {
+        return Ok(Vec::new());
+    }
+    let pids: Vec<String> = samples.iter().map(|s| s.identity.pid.to_string()).collect();
+    let mut command = Command::new("ps");
+    command.args(["-o", "pid=,etime=,args=", "-p", &pids.join(",")]);
+    let output = crate::session::capture::run_with_timeout_limit(
+        command,
+        std::time::Duration::from_secs(2),
+        "process command census",
+        1024 * 1024,
+    )?;
+    let mut rows = HashMap::new();
+    for line in String::from_utf8_lossy(&output).lines() {
+        let mut fields = line.split_ascii_whitespace();
+        let (Some(pid), Some(etime)) = (fields.next(), fields.next()) else {
+            continue;
+        };
+        let (Ok(pid), Some(elapsed)) = (pid.parse::<u32>(), parse_etime(etime)) else {
+            continue;
+        };
+        rows.insert(
+            pid,
+            (elapsed, fields.map(str::to_owned).collect::<Vec<_>>()),
+        );
+    }
+    let mut described = Vec::new();
+    for sample in samples {
+        let pid = sample.identity.pid;
+        let Some((elapsed_secs, argv)) = rows.remove(&pid) else {
+            continue;
+        };
+        let exe = executable_path(pid);
+        if process_start_id(pid)?.as_ref() != Some(&sample.identity.start_id) {
+            continue;
+        }
+        described.push(super::CommandSample {
+            identity: sample.identity,
+            parent: sample.parent,
+            exe,
+            argv,
+            elapsed_secs,
+        });
+    }
+    Ok(described)
+}
+
+fn executable_path(pid: u32) -> Option<std::path::PathBuf> {
+    use std::os::unix::ffi::OsStrExt as _;
+    let mut buffer = vec![0u8; libc::PROC_PIDPATHINFO_MAXSIZE as usize];
+    let len = unsafe {
+        libc::proc_pidpath(
+            pid as libc::c_int,
+            buffer.as_mut_ptr().cast(),
+            buffer.len() as u32,
+        )
+    };
+    (len > 0).then(|| std::ffi::OsStr::from_bytes(&buffer[..len as usize]).into())
+}
+
+/// `ps`'s `etime`: `[[dd-]hh:]mm:ss`.
+fn parse_etime(etime: &str) -> Option<u64> {
+    let (days, clock) = match etime.split_once('-') {
+        Some((days, clock)) => (days.parse::<u64>().ok()?, clock),
+        None => (0, etime),
+    };
+    let mut secs = 0u64;
+    let parts: Vec<_> = clock.split(':').collect();
+    if !(2..=3).contains(&parts.len()) {
+        return None;
+    }
+    for part in parts {
+        secs = secs * 60 + part.parse::<u64>().ok()?;
+    }
+    Some(days * 86_400 + secs)
+}
+
 pub(super) fn process_tree_samples(
     root: &super::PrimeProcessIdentity,
 ) -> anyhow::Result<Vec<super::PrimeProcessSample>> {
@@ -1530,6 +1613,20 @@ impl super::SleepInhibit for CaffeinateInhibitor {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn ps_elapsed_time_reads_in_seconds() {
+        for (etime, secs) in [
+            ("00:05", Some(5)),
+            ("12:34", Some(754)),
+            ("01:00:00", Some(3600)),
+            ("2-03:04:05", Some(2 * 86_400 + 3 * 3600 + 4 * 60 + 5)),
+            ("5", None),
+            ("a:b", None),
+        ] {
+            assert_eq!(parse_etime(etime), secs, "{etime}");
+        }
+    }
 
     #[test]
     fn codex_managed_preferences_refuse_either_key() {

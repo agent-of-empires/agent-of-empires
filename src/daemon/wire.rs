@@ -484,6 +484,31 @@ pub struct RestartSessionBody {
     /// Refuse, before anything stops, unless `tool` is an account swap that keeps the conversation.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub require_account_carry: bool,
+    /// `Some` refuses, under the lifecycle locks, a restart that would stop a background process
+    /// not listed (#5762); absent skips the check.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stop_processes: Option<Vec<ProcessIdentity>>,
+    /// With `stop_processes`, restart even when the check can't tell the Agent from what it
+    /// started.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub stop_unclassified: bool,
+}
+
+/// `POST /api/sessions/{id}/restart-for-update`; an empty body skips the background check.
+#[derive(Debug, Default, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RestartForUpdateBody {
+    pub stop_processes: Option<Vec<ProcessIdentity>>,
+    #[serde(default)]
+    pub stop_unclassified: bool,
+}
+
+/// A process by its PID and start, so a reused PID isn't taken for the one confirmed.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ProcessIdentity {
+    pub pid: u32,
+    pub start_id: String,
 }
 
 #[derive(Debug, Serialize, Deserialize)]

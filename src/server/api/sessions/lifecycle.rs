@@ -2147,10 +2147,18 @@ pub async fn recreate_container(
 pub async fn restart_for_update(
     State(state): State<Arc<AppState>>,
     Path(id): Path<String>,
+    body: Result<
+        Option<Json<crate::daemon::RestartForUpdateBody>>,
+        axum::extract::rejection::JsonRejection,
+    >,
 ) -> axum::response::Response {
     if let Some(resp) = cityhall_block_non_structured(&state, &id).await {
         return resp;
     }
+    let check = match body {
+        Ok(body) => body.map(|Json(body)| body).unwrap_or_default(),
+        Err(rejection) => return rejection.into_response(),
+    };
     let instance = {
         let instances = state.instances.read().await;
         let Some(inst) = instances.iter().find(|i| i.id == id) else {
@@ -2177,7 +2185,38 @@ pub async fn restart_for_update(
             "Session is busy or its agent is not out of date".to_string(),
         );
     }
-    apply_update_restart(&state, id, instance).await
+    apply_update_restart(&state, id, instance, check).await
+}
+
+/// The refusal for a restart that would stop background processes `body` didn't confirm.
+async fn background_processes_refusal(
+    instance: &Instance,
+    body: &crate::daemon::RestartSessionBody,
+) -> Option<axum::response::Response> {
+    use crate::session::background_processes::{pane_census, refusal, PaneCensus};
+    let confirmed: Vec<_> = body
+        .stop_processes
+        .iter()
+        .flatten()
+        .map(|identity| crate::process::PrimeProcessIdentity {
+            pid: identity.pid,
+            start_id: identity.start_id.clone(),
+        })
+        .collect();
+    let row = instance.clone();
+    let census = tokio::task::spawn_blocking(move || pane_census(&row))
+        .await
+        .unwrap_or(PaneCensus::Unclassified);
+    let fields = refusal(census, &confirmed, body.stop_unclassified)?;
+    let code = crate::daemon::ApiErrorCode::BackgroundProcesses;
+    let mut payload = serde_json::json!({
+        "error": code.as_str(),
+        "message": "The restart would stop background processes that were not confirmed",
+    });
+    if let (Some(payload), serde_json::Value::Object(fields)) = (payload.as_object_mut(), fields) {
+        payload.extend(fields);
+    }
+    Some((code.status(), code.header(), Json(payload)).into_response())
 }
 
 /// Restart an eligible session onto the updated agent.
@@ -2185,6 +2224,7 @@ pub(super) async fn apply_update_restart(
     state: &Arc<AppState>,
     id: String,
     instance: Instance,
+    check: crate::daemon::RestartForUpdateBody,
 ) -> axum::response::Response {
     if instance.is_structured() {
         // The reconciler terminates the worker once its turn drains and respawns it against the
@@ -2212,6 +2252,8 @@ pub(super) async fn apply_update_restart(
     let body = crate::daemon::RestartSessionBody {
         wake_message: Some(String::new()),
         only_if_idle: true,
+        stop_processes: check.stop_processes,
+        stop_unclassified: check.stop_unclassified,
         ..Default::default()
     };
     prepare_agent_session(
@@ -3407,6 +3449,15 @@ async fn prepare_agent_session_inner(
             "not_eligible",
             "Session is busy or its agent is not out of date".to_string(),
         );
+    }
+    // Structured workers are stopped by their reconciler, not here, so they skip the check.
+    if let Some(body) = restart
+        .as_ref()
+        .filter(|body| body.stop_processes.is_some() && !instance.is_structured())
+    {
+        if let Some(response) = background_processes_refusal(&instance, body).await {
+            return response;
+        }
     }
     // #4116: a shelved row refuses every start path with its own code, decided on
     // the row this request reloaded. It answers before the lifecycle reservation,

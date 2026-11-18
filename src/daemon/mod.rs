@@ -40,14 +40,14 @@ pub use wire::{
     CreationTrustReview, DefaultProfileBody, DeleteGroupBody, DeleteGroupMode, DeleteGroupOutcome,
     DeleteProfileQuery, DeleteSessionBody, EmptyTrashBody, EmptyTrashOutcome, EnsureToolBody,
     GroupLocation, GroupSessionFailure, GroupSessionFailureCode, GroupSessionOutcome,
-    ListSessionsQuery, MoveDirection, MoveGroupBody, PendingApproval, PlanSummary,
+    ListSessionsQuery, MoveDirection, MoveGroupBody, PendingApproval, PlanSummary, ProcessIdentity,
     PromptAttachmentKind, PromptAttachmentRef, PurgeOutcome, QueuedPromptEntry, RenameOutcome,
     RenameProfileBody, RenameSessionBody, ReorderBody, ReorderOutcome, RepoBaseInput,
-    RestartOutcome, RestartSessionBody, RestoreOutcome, SessionResponse, SessionsEnvelope,
-    SetWorktreeNameBody, StartSessionBody, StopAuxiliaryBody, TerminalSize, TerminalTarget,
-    TerminalTargetStatus, TrashOutcome, TrashRelocationOutcome, TrashSessionBody, Tristate,
-    UpdateArchiveBody, UpdateColorBody, UpdateDiffBaseBody, UpdateFavoriteBody, UpdateGroupBody,
-    UpdateNotificationsBody, UpdatePinBody, UpdateSnoozeBody, UpdateUnreadBody,
+    RestartForUpdateBody, RestartOutcome, RestartSessionBody, RestoreOutcome, SessionResponse,
+    SessionsEnvelope, SetWorktreeNameBody, StartSessionBody, StopAuxiliaryBody, TerminalSize,
+    TerminalTarget, TerminalTargetStatus, TrashOutcome, TrashRelocationOutcome, TrashSessionBody,
+    Tristate, UpdateArchiveBody, UpdateColorBody, UpdateDiffBaseBody, UpdateFavoriteBody,
+    UpdateGroupBody, UpdateNotificationsBody, UpdatePinBody, UpdateSnoozeBody, UpdateUnreadBody,
     WorkspaceRepoSummary, WorktreeEditOutcome,
 };
 pub use wire::{
@@ -269,6 +269,9 @@ fn daemon_status_message(status: StatusCode, code: Option<ApiErrorCode>, body: &
         Some(ApiErrorCode::StartFailed) => "Session start failed".into(),
         Some(ApiErrorCode::PurgeFailed) => "Session purge failed".into(),
         Some(ApiErrorCode::AccountSwapUnavailable) => "Account swap refused, nothing changed. The target must be another account (a tool with its own `agent_config_dir`) of the same agent, the session needs a recorded Claude conversation and a launch that can carry it, and a terminal session needs `auto_resume_on_restart` on for the target profile".into(),
+        Some(ApiErrorCode::BackgroundProcesses) => {
+            "Restart refused, nothing stopped: the session runs background processes that were not confirmed".into()
+        }
         Some(ApiErrorCode::LifecycleLocked) => {
             "Session is busy with another operation; nothing changed, retry when it finishes".into()
         }
