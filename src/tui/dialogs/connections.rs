@@ -241,7 +241,7 @@ impl ConnectionsView {
 
     /// Enter on the Web dashboard row submits; the Daemon row has nothing to open. The Serve
     /// key that opened the hub submits from any row, except on a takeover, once it is a
-    /// separate press: [`SEPARATE_PRESS`] after the last one, or after any other key.
+    /// separate press: 700 ms after the last one, or after any other key.
     pub fn handle_key(&mut self, key: KeyEvent, strict: bool, now: Instant) -> DialogResult<()> {
         let rows = self.rows();
         if !self.offline_takeover() && bindings::is_bound(ActionId::Serve, strict, &key) {
