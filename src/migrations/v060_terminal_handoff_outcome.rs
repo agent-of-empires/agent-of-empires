@@ -15,21 +15,31 @@ fn run_in(app_dir: &Path) -> Result<()> {
     Ok(())
 }
 
+/// A linked `sessions.json` is read and rewritten at its target, as storage does, under the
+/// profile directory's storage lock.
 fn migrate_file(path: &Path) -> Result<()> {
-    let metadata = match std::fs::symlink_metadata(path) {
-        Ok(metadata) => metadata,
+    let linked = match std::fs::symlink_metadata(path) {
+        Ok(metadata) => metadata.file_type().is_symlink(),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
         Err(error) => return Err(error.into()),
     };
-    anyhow::ensure!(
-        metadata.file_type().is_file(),
-        "terminal handoff migration requires a regular sessions file: {}",
-        path.display()
-    );
+    let not_regular = || {
+        format!(
+            "terminal handoff migration requires a regular sessions file: {}",
+            path.display()
+        )
+    };
     let directory = path.parent().context("sessions file has no parent")?;
     let _lock =
         crate::session::acquire_storage_flock(directory, crate::session::STORAGE_LOCK_FILENAME)?;
-    let bytes = std::fs::read(path)?;
+    let file =
+        crate::session::anchored_fs::ResolvedDataFile::open(path).with_context(not_regular)?;
+    let Some((mut snapshot, _)) = file.open_read_snapshot().with_context(not_regular)? else {
+        anyhow::ensure!(!linked, "{}: its link has no target", not_regular());
+        return Ok(());
+    };
+    let mut bytes = Vec::new();
+    std::io::Read::read_to_end(&mut snapshot, &mut bytes)?;
     let mut rows: Value = match serde_json::from_slice(&bytes) {
         Ok(rows) => rows,
         Err(error) => {
@@ -84,7 +94,7 @@ fn migrate_file(path: &Path) -> Result<()> {
     }
     if recorded > 0 {
         crate::session::backup_before_migration(path)?;
-        crate::session::atomic_write(path, serde_json::to_vec_pretty(&rows)?.as_slice())?;
+        file.replace_preserving_permissions(serde_json::to_vec_pretty(&rows)?.as_slice())?;
         tracing::info!(target: "migrations.v060", path = %path.display(), recorded, "Recorded terminal handoff outcomes");
     }
     Ok(())
@@ -253,26 +263,52 @@ mod tests {
     }
 
     #[test]
-    fn a_symlinked_sessions_file_is_refused_and_kept() -> Result<()> {
-        let root = tempfile::tempdir()?;
-        let target = root.path().join("elsewhere.json");
-        let path = root.path().join("sessions.json");
+    fn a_linked_sessions_file_is_migrated_at_its_regular_target() -> Result<()> {
         let row = Instance::new("pending", "/tmp/repo");
         let intent = pending(&row, TerminalHandoffContext::Discard);
         let bytes = serde_json::to_vec(&json!([written_before(&row, &intent)?]))?;
-        std::fs::write(&target, &bytes)?;
-        std::os::unix::fs::symlink(&target, &path)?;
 
-        let error = migrate_file(&path).unwrap_err();
+        let root = tempfile::tempdir()?;
+        let target = root.path().join("dotfiles").join("sessions.json");
+        std::fs::create_dir(target.parent().unwrap())?;
+        std::fs::write(&target, &bytes)?;
+        let path = root.path().join("sessions.json");
+        std::os::unix::fs::symlink(&target, &path)?;
+        migrate_file(&path)?;
+        assert_eq!(std::fs::read_link(&path)?, target, "the link is kept");
+        let rows: Value = serde_json::from_slice(&std::fs::read(&target)?)?;
+        assert_eq!(rows[0]["terminal_handoff"]["outcome"], "fresh");
+        assert_eq!(crate::session::migration_backups(&path)?.len(), 1);
+        let lock = crate::session::STORAGE_LOCK_FILENAME;
         assert!(
-            error
-                .to_string()
-                .contains("requires a regular sessions file"),
-            "{error:#}"
+            root.path().join(lock).exists(),
+            "locked where storage locks"
         );
-        assert_eq!(std::fs::read_link(&path)?, target);
-        assert_eq!(std::fs::read(&target)?, bytes);
-        assert!(crate::session::migration_backups(&path)?.is_empty());
+        assert!(
+            !target.with_file_name(lock).exists(),
+            "not beside the target"
+        );
+
+        for (name, make_target) in [("a directory", true), ("a missing file", false)] {
+            let root = tempfile::tempdir()?;
+            let target = root.path().join("elsewhere");
+            if make_target {
+                std::fs::create_dir(&target)?;
+            }
+            let path = root.path().join("sessions.json");
+            std::os::unix::fs::symlink(&target, &path)?;
+            let error = migrate_file(&path).unwrap_err();
+            assert!(
+                format!("{error:#}").contains("requires a regular sessions file"),
+                "{name}: {error:#}"
+            );
+            assert_eq!(std::fs::read_link(&path)?, target, "{name}");
+            assert_eq!(target.exists(), make_target, "{name}");
+            assert!(
+                crate::session::migration_backups(&path)?.is_empty(),
+                "{name}"
+            );
+        }
         Ok(())
     }
 
