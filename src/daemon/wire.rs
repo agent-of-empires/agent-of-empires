@@ -487,9 +487,9 @@ pub struct RestartSessionBody {
     /// `Some` refuses a restart that would stop a background process not listed (#5762); absent
     /// skips the check. It is checked before the launch hooks and again before the pane stops; a
     /// 409 `background_processes` from the second check says `launch_hooks_ran: true`, and the
-    /// confirm then sets `skip_on_launch` so `on_launch` runs once. Only for a restart that changes
-    /// no setting (`profile`, `tool`, `command_override`, `extra_args`, `unsnooze`,
-    /// `discard_sandbox_container`): a refusal after the hooks must leave the row as it was.
+    /// confirm then sets `skip_on_launch` so `on_launch` runs once. Not with `profile`, `tool`,
+    /// `command_override`, `extra_args` or `discard_sandbox_container`: a refusal after the hooks
+    /// can't undo them.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub stop_processes: Option<Vec<ProcessIdentity>>,
     /// With `stop_processes`, restart even when the check can't tell the Agent from what it

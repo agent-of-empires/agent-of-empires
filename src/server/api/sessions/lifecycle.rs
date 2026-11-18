@@ -3492,7 +3492,6 @@ async fn prepare_agent_session_inner(
             || body.tool.is_some()
             || body.command_override.is_some()
             || body.extra_args.is_some()
-            || body.unsnooze
             || body.discard_sandbox_container
         {
             return api_error(

@@ -10041,6 +10041,8 @@ async fn an_update_restart_names_the_agents_background_shells_before_stopping_th
     };
     let mut live = inst.clone();
     live.command = agent.to_str().unwrap().to_owned();
+    // Snoozed outside Attention sort, the TUI's update restart also sends `unsnooze`.
+    live.snooze(60);
     let storage = Storage::new_unwatched("default").unwrap();
     storage
         .update(|rows, _| {
@@ -10059,6 +10061,7 @@ async fn an_update_restart_names_the_agents_background_shells_before_stopping_th
                 only_if_idle: true,
                 stop_processes: Some(stop),
                 skip_on_launch,
+                unsnooze: true,
                 ..Default::default()
             };
             let response = lifecycle::prepare_agent_session(
@@ -10102,6 +10105,8 @@ async fn an_update_restart_names_the_agents_background_shells_before_stopping_th
     assert_eq!(after.last_error, before.last_error);
     assert_eq!(after.last_accessed_at, before.last_accessed_at);
     assert_eq!(after.idle_entered_at, before.idle_entered_at);
+    assert!(before.snoozed_until.is_some());
+    assert_eq!(after.snoozed_until, before.snoozed_until);
     assert!(after.lifecycle_reservation.is_none());
 
     // Confirming that list with `skip_on_launch` restarts without running the hooks again.
@@ -10111,7 +10116,7 @@ async fn an_update_restart_names_the_agents_background_shells_before_stopping_th
 }
 
 #[tokio::test]
-async fn a_process_check_is_refused_on_a_restart_that_changes_a_setting() {
+async fn a_process_check_is_refused_with_a_setting_a_late_refusal_cannot_undo() {
     let mut inst = Instance::new("process-check", "/tmp/process-check");
     inst.id = "process-check".to_string();
     inst.status = Status::Idle;
@@ -10123,6 +10128,7 @@ async fn a_process_check_is_refused_on_a_restart_that_changes_a_setting() {
     let cases = [
         (
             "profile",
+            true,
             crate::daemon::RestartSessionBody {
                 profile: Some("other".into()),
                 ..checked()
@@ -10130,6 +10136,7 @@ async fn a_process_check_is_refused_on_a_restart_that_changes_a_setting() {
         ),
         (
             "tool",
+            true,
             crate::daemon::RestartSessionBody {
                 tool: Some("codex".into()),
                 ..checked()
@@ -10137,6 +10144,7 @@ async fn a_process_check_is_refused_on_a_restart_that_changes_a_setting() {
         ),
         (
             "command",
+            true,
             crate::daemon::RestartSessionBody {
                 command_override: Some("sh".into()),
                 ..checked()
@@ -10144,13 +10152,15 @@ async fn a_process_check_is_refused_on_a_restart_that_changes_a_setting() {
         ),
         (
             "extra args",
+            true,
             crate::daemon::RestartSessionBody {
                 extra_args: Some("-v".into()),
                 ..checked()
             },
         ),
         (
-            "unsnooze",
+            "unsnooze, restored from the admission snapshot",
+            false,
             crate::daemon::RestartSessionBody {
                 unsnooze: true,
                 ..checked()
@@ -10158,13 +10168,14 @@ async fn a_process_check_is_refused_on_a_restart_that_changes_a_setting() {
         ),
         (
             "container",
+            true,
             crate::daemon::RestartSessionBody {
                 discard_sandbox_container: true,
                 ..checked()
             },
         ),
     ];
-    for (setting, body) in cases {
+    for (setting, refused, body) in cases {
         let response = lifecycle::prepare_agent_session(
             state.clone(),
             "process-check".to_string(),
@@ -10173,7 +10184,12 @@ async fn a_process_check_is_refused_on_a_restart_that_changes_a_setting() {
             Some(Arc::new(body)),
         )
         .await;
-        assert_eq!(response.status(), StatusCode::BAD_REQUEST, "{setting}");
+        assert_eq!(
+            response.status() == StatusCode::BAD_REQUEST,
+            refused,
+            "{setting}: {}",
+            response.status()
+        );
     }
 }
 
