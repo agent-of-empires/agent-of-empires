@@ -3069,22 +3069,48 @@ finally:
     #[test]
     fn a_tail_pass_reads_a_bounded_amount_and_the_final_one_drains() {
         use std::io::Write as _;
-        let mut written = tempfile::NamedTempFile::new().unwrap();
         let total = 3 * TAIL_PASS_LIMIT + 7;
-        written.write_all(&vec![b'x'; total]).unwrap();
-        let pass = |limit| {
-            let mut forwarded = 0;
-            let mut forward = |_: OutputStream, bytes: &[u8]| forwarded += bytes.len();
-            OutputTail {
-                stdout: written.reopen().unwrap(),
-                stderr: tempfile::tempfile().unwrap(),
-                forward: &mut forward,
-            }
-            .forward_new(limit);
-            forwarded
+        let file = |byte| {
+            let mut file = tempfile::NamedTempFile::new().unwrap();
+            file.write_all(&vec![byte; total]).unwrap();
+            file
         };
-        assert_eq!(pass(Some(TAIL_PASS_LIMIT)), TAIL_PASS_LIMIT);
-        assert_eq!(pass(None), total, "the final pass drains to the end");
+        let (stdout, stderr) = (file(b'o'), file(b'e'));
+        let received = std::cell::RefCell::new(Vec::<(OutputStream, u8)>::new());
+        let mut forward = |stream, bytes: &[u8]| {
+            received
+                .borrow_mut()
+                .extend(bytes.iter().map(|&byte| (stream, byte)));
+        };
+        let mut tail = OutputTail {
+            stdout: stdout.reopen().unwrap(),
+            stderr: stderr.reopen().unwrap(),
+            forward: &mut forward,
+        };
+        // Bytes forwarded per stream since the last read; each stream carries only its own.
+        let take = || {
+            let bytes = std::mem::take(&mut *received.borrow_mut());
+            [(OutputStream::Stdout, b'o'), (OutputStream::Stderr, b'e')].map(|(stream, own)| {
+                let mine: Vec<u8> = bytes
+                    .iter()
+                    .filter(|(s, _)| *s == stream)
+                    .map(|&(_, b)| b)
+                    .collect();
+                assert!(
+                    mine.iter().all(|&b| b == own),
+                    "{stream:?} got another stream's bytes"
+                );
+                mine.len()
+            })
+        };
+        tail.forward_new(Some(TAIL_PASS_LIMIT));
+        assert_eq!(take(), [TAIL_PASS_LIMIT; 2], "a bounded pass per stream");
+        tail.forward_new(None);
+        assert_eq!(
+            take(),
+            [total - TAIL_PASS_LIMIT; 2],
+            "the final pass drains the rest, from where the bounded one stopped"
+        );
     }
 
     /// A cancelled run returns without draining the backlog its child left unread. Passes go on

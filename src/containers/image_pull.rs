@@ -625,7 +625,10 @@ mod tests {
         );
         assert!(matches!(state(&retried), PullState::Running(_)));
         retry_release_tx.send(()).unwrap();
-        retry.wait(&CancellationToken::new()).unwrap();
+        within("the released retry", move || {
+            retry.wait(&CancellationToken::new())
+        })
+        .unwrap();
         drop(first);
     }
 
