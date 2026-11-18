@@ -728,12 +728,14 @@ mod tests {
                 "auto_cleanup": false,
             },
             "updates": { "auto_update_plugins": true },
+            "session": { "plugin_staging_sandbox": false },
         }));
         let mut base = Config::default();
         base.worktree.enabled = false;
         base.worktree.path_template = "./wt/{branch}".to_string();
         base.worktree.bare_repo_path_template = "../{branch}".to_string();
         base.worktree.workspace_path_template = "../ws/{branch}".to_string();
+        base.session.plugin_staging_sandbox = true;
         let merged = merge_repo_config(base, &repo);
         assert!(!merged.worktree.enabled);
         assert_eq!(merged.worktree.path_template, "./wt/{branch}");
@@ -741,9 +743,11 @@ mod tests {
         assert_eq!(merged.worktree.workspace_path_template, "../ws/{branch}");
         assert!(!merged.worktree.auto_cleanup);
         assert!(!merged.updates.auto_update_plugins);
+        assert!(merged.session.plugin_staging_sandbox);
         assert_eq!(
             rejected(&repo),
             vec![
+                "session.plugin_staging_sandbox",
                 "updates.auto_update_plugins",
                 "worktree.bare_repo_path_template",
                 "worktree.enabled",

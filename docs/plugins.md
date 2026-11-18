@@ -164,37 +164,51 @@ that would replace a file already in the source tree, or that is a symlink,
 hardlink or special file, is rejected so the disclosed manifest and tree match
 what gets installed.
 
-Remote GitHub preparation uses a private filesystem with a **1 GiB** ceiling
-before consent. Preview and apply operations share exclusion, so concurrent
-previews cannot multiply this allowance. Clone data, downloaded archives and
-extracted files share the same volume. Streamed downloads and decompressed
-archive data also have byte limits; remote source trees and extracted assets
-allow at most 65,536 entries, including implicit directories. Archive metadata
-read ahead by the tar parser has a separate 1 MiB limit. Standard branches and
-tags clone shallow-first; other references may need more history.
+Remote GitHub preparation defaults to an ordinary staging directory, without
+requiring native sandbox tools. Downloads, expanded archives and the resulting
+remote source tree have **1 GiB** byte limits. Remote source trees and extracted
+assets allow at most 65,536 entries, including implicit directories. Archive
+metadata read ahead by the tar parser has a separate 1 MiB limit. Standard
+branches and tags clone shallow-first; other references may need more history.
 
-Linux uses RAM/swap-backed tmpfs, charged to the process's memory cgroup.
-Its data ceiling is reduced to at most one quarter of available RAM or remaining
-visible cgroup memory, whichever is lower, rounded down to whole pages.
-The inode budget reserves 1,024 entries beyond the source-entry ceiling when
-memory permits, and is reduced on memory-constrained hosts. These are snapshots,
-not memory reservations: concurrent pressure or Git allocations can still exhaust
-memory. The filesystem allowance is not a total process-memory limit.
+Default accounting is not a hard filesystem quota. Git clones and credential
+helpers can write before the resulting source tree is checked, and helpers can
+write outside staging. Reference checks and remote previews remain available on
+hosts without a native quota backend.
 
-An unavailable quota backend fails remote preparation rather than using an
-unbounded or periodically monitored directory. These limits can reject large
-plugins. Linux requires readable memory accounting, unprivileged user/mount/PID
-namespaces, `mount`, `unshare`, `nsenter` and Bubblewrap. macOS uses a fixed-size
-disk image through `hdiutil` and `sandbox-exec`. Restricted hosts that cannot
-provide these mechanisms refuse remote preparation and reference checks.
-Git preparation cannot use host Unix sockets; credential helpers that require
+To require a native filesystem bound for remote preparation and reference checks,
+enable **Strict plugin staging** in the machine-wide Session settings, or set:
+
+```toml
+[session]
+plugin_staging_sandbox = true
+```
+
+Strict mode shares a private filesystem with a **1 GiB** ceiling across clone
+data, downloaded archives and extracted files. Preview and apply operations share
+exclusion, so concurrent previews cannot multiply this allowance. Linux uses
+RAM/swap-backed tmpfs charged to the process's memory cgroup. Its data ceiling is
+reduced to at most one quarter of available RAM or remaining visible cgroup
+memory, whichever is lower, rounded down to whole pages. The inode budget reserves
+1,024 entries beyond the source-entry ceiling when memory permits.
+These are snapshots, not memory reservations: concurrent pressure or Git
+allocations can still exhaust memory. The allowance is not a total process-memory
+limit.
+
+With strict mode enabled, unavailable enforcement fails closed without switching
+to an ordinary directory. Linux requires readable memory accounting,
+unprivileged user/mount/PID namespaces, `mount`, `unshare`, `nsenter` and Bubblewrap.
+macOS uses a fixed-size disk image through `hdiutil` and `sandbox-exec`.
+Restricted hosts refuse remote preparation and reference checks in this mode.
+Strict Git preparation cannot use host Unix sockets; credential helpers requiring
 an SSH agent or desktop keyring may fail even when file-based credentials work.
 
 After consent, publication copies and verifies the prepared tree on the
 installation filesystem before replacing an existing plugin. This copy and
-approved build outputs are outside the pre-consent allowance. An uncertain
-mount or cleanup outcome requires manual recovery, not an unbounded retry.
-The `<app_dir>/.plugin-staging-active` journal records native staging ownership.
+approved build outputs are outside the preparation limits. In strict mode, an
+uncertain mount or cleanup outcome requires manual recovery, not an unbounded
+retry. The `<app_dir>/.plugin-staging-active` journal records native staging ownership.
+Disabling strict mode does not clear existing recovery evidence.
 Startup and worker admission can retire an abandoned pre-consent journal only
 after proving its recorded owners, PID namespace and native supervisor groups
 have exited and its original host mountpoint is unchanged. This does not erase

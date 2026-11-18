@@ -3275,6 +3275,7 @@ mod tests {
     )]
     async fn staging_volume_cleanup_failure_retains_marker_and_operation_lock() {
         let _home = isolate_app_dir();
+        update_config(|config| config.session.plugin_staging_sandbox = true).unwrap();
         let source = tempfile::tempdir().unwrap();
         let repo = source.path().join("acme/cleanup.git");
         std::fs::create_dir_all(&repo).unwrap();

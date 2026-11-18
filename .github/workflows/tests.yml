@@ -71,12 +71,16 @@ jobs:
         with:
           tool: cargo-nextest
       - name: Install runtime test prerequisites
-        run: sudo apt-get update && sudo apt-get install -y tmux bubblewrap iproute2 apparmor
+        run: sudo apt-get update && sudo apt-get install -y tmux
+      - name: Install isolated namespace test prerequisites
+        if: matrix.leg == 'core-rest' || matrix.leg == 'web-e2e'
+        run: sudo apt-get install -y bubblewrap iproute2 apparmor
       # RunsOn appends `. /etc/environment` to /etc/profile, so every login shell
       # resets PATH and aoe's login-shell launches lose the e2e stub dirs.
       - name: Keep inherited PATH in login shells
         run: sudo sed -i '/runs-on\/env/d' /etc/profile
       - name: Enable isolated namespace tests
+        if: matrix.leg == 'core-rest' || matrix.leg == 'web-e2e'
         run: |
           sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
           # The packaged profile denies capabilities to bwrap children, including ip.

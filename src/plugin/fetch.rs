@@ -39,12 +39,12 @@ struct Staging {
 }
 
 impl Staging {
-    fn create_local(plugins_root: &Path) -> Result<Self> {
+    fn create_directory(plugins_root: &Path) -> Result<Self> {
         std::fs::create_dir_all(plugins_root)?;
         let directory = tempfile::Builder::new()
             .prefix(".staging-")
             .tempdir_in(plugins_root)
-            .context("creating local plugin staging dir")?
+            .context("creating plugin staging dir")?
             .keep();
         Ok(Self {
             mount: directory.clone(),
@@ -126,6 +126,13 @@ impl Staging {
         }
     }
 
+    fn limit(&self, requested: u64) -> u64 {
+        self.volume
+            .as_ref()
+            .map_or(requested, crate::process::StagingVolume::limit)
+    }
+
+    #[cfg(test)]
     fn volume(&self) -> &crate::process::StagingVolume {
         self.volume.as_ref().expect("live staging volume")
     }
@@ -311,15 +318,17 @@ fn stage_with_limits(
     limit: u64,
     entry_limit: usize,
 ) -> Result<FetchedPlugin> {
+    let sandbox = crate::session::Config::load()?
+        .session
+        .plugin_staging_sandbox;
     let budget = super::execution::Budget::new();
     let mut staging = match &source {
-        PluginSource::Github { .. } => Staging::create(&plugins_root, limit)?,
-        PluginSource::Local(_) => Staging::create_local(&plugins_root)?,
+        PluginSource::Github { .. } if sandbox => Staging::create(&plugins_root, limit)?,
+        PluginSource::Github { .. } | PluginSource::Local(_) => {
+            Staging::create_directory(&plugins_root)?
+        }
     };
-    let limit = staging
-        .volume
-        .as_ref()
-        .map_or(limit, crate::process::StagingVolume::limit);
+    let limit = staging.limit(limit);
     let tree = staging.root().join("tree");
 
     let result = super::execution::catch_panic(|| {
@@ -479,7 +488,7 @@ impl GitFailed {
 
 fn configure_git(cmd: &mut Command) {
     // Authentication, certificates and URL rewrites belong to the user's trusted
-    // configuration. The volume confines any writes performed by its helpers.
+    // configuration. Only the opt-in native backend confines helper writes.
     // Do not let inherited repository selectors redirect this fresh checkout.
     for key in [
         "GIT_DIR",
@@ -521,7 +530,14 @@ fn configure_git(cmd: &mut Command) {
 }
 
 fn git_command(args: &[&str], cwd: &Path, staging: &Staging) -> Command {
-    let mut cmd = staging.volume().git_command();
+    let mut cmd = match &staging.volume {
+        Some(volume) => volume.git_command(),
+        None => {
+            let mut cmd = Command::new("git");
+            cmd.env("TMPDIR", &staging.mount);
+            cmd
+        }
+    };
     configure_git(&mut cmd);
     cmd.args(["-C"])
         .arg(cwd)
@@ -587,10 +603,19 @@ pub(super) fn ls_remote_with_operation(
     operation: Arc<crate::session::StorageFlock>,
 ) -> Result<String> {
     // Credential helpers and trusted transport configuration can write, even
-    // for a reference listing. Give them the same filesystem and exclusion.
+    // for a reference listing. Share preparation's backend and exclusion.
+    let sandbox = crate::session::Config::load()?
+        .session
+        .plugin_staging_sandbox;
     let operation = Some(operation);
-    let acquisition =
-        super::execution::catch_panic(|| Staging::create(&super::plugins_dir()?, STAGING_LIMIT));
+    let acquisition = super::execution::catch_panic(|| {
+        let plugins = super::plugins_dir()?;
+        if sandbox {
+            Staging::create(&plugins, STAGING_LIMIT)
+        } else {
+            Staging::create_directory(&plugins)
+        }
+    });
     let staging = match acquisition {
         Ok(staging) => staging,
         Err(error) => {
@@ -606,7 +631,7 @@ pub(super) fn ls_remote_with_operation(
             return Err(error);
         }
     };
-    let limit = staging.volume().limit();
+    let limit = staging.limit(STAGING_LIMIT);
     let result = super::execution::catch_panic(|| {
         let target = reference.unwrap_or("HEAD");
         let peeled = format!("{target}^{{}}");
@@ -672,7 +697,7 @@ fn git_clone_checkout(
     staging: &Staging,
     budget: super::execution::Budget,
 ) -> Result<String> {
-    // Git runs inside the volume's namespace. Never hand it the parent's /proc root.
+    // Native Git runs inside the volume's namespace; ordinary Git uses this path directly.
     let native_tree = staging.mount.join("tree");
     let mut clone = git_command(
         &[
@@ -1499,6 +1524,193 @@ fn ensure_executable(tree: &Path, rel: &Path) -> Result<()> {
 mod tests {
     use super::*;
 
+    fn path_without_native_tools(directory: &Path) -> crate::session::test_support::EnvGuard {
+        let guard = crate::session::test_support::EnvGuard::read_lock();
+        let inherited = std::env::var_os("PATH").expect("test PATH");
+        std::fs::create_dir(directory).unwrap();
+        for name in ["git", "sh"] {
+            let executable = std::env::split_paths(&inherited)
+                .map(|path| path.join(name))
+                .find(|path| path.is_file())
+                .unwrap_or_else(|| panic!("{name} missing from test PATH"));
+            std::os::unix::fs::symlink(executable.canonicalize().unwrap(), directory.join(name))
+                .unwrap();
+        }
+        guard.and_set("PATH", directory)
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn default_remote_staging_and_ref_checks_work_without_native_tools() {
+        use crate::git::test_support::run_git;
+        use crate::session::test_support::{isolate_app_dir, EnvGuard};
+        let _reload = crate::plugin::ReloadRegistryOnDrop;
+        let _home = isolate_app_dir();
+        assert!(
+            !crate::session::Config::load()
+                .unwrap()
+                .session
+                .plugin_staging_sandbox
+        );
+        let fixture = tempfile::tempdir().unwrap();
+        let repo = fixture.path().join("acme/stage.git");
+        write_publication_manifest(&repo);
+        std::fs::write(repo.join("payload"), b"remote snapshot").unwrap();
+        run_git(&repo, &["init", "-q"]);
+        run_git(&repo, &["add", "."]);
+        run_git(&repo, &["commit", "-qm", "fixture"]);
+        run_git(&repo, &["tag", "-a", "v1", "-m", "release"]);
+        let commit = run_git(&repo, &["rev-parse", "HEAD"]).trim().to_owned();
+        let clone_base = format!("file://{}", fixture.path().display());
+        let _configuration = EnvGuard::set(&[
+            ("AOE_GITHUB_CLONE_BASE", clone_base.as_str()),
+            ("GIT_CONFIG_GLOBAL", "/dev/null"),
+            ("GIT_CONFIG_NOSYSTEM", "1"),
+        ]);
+        let _path = path_without_native_tools(&fixture.path().join("path"));
+        let source = PluginSource::parse("gh:acme/stage@v1").unwrap();
+        let url = source.github_clone_url().unwrap();
+        assert_eq!(ls_remote(&url, None).unwrap(), commit);
+        assert_eq!(ls_remote(&url, Some("v1")).unwrap(), commit);
+        let operation = super::super::install::begin_operation().unwrap();
+        assert_eq!(
+            ls_remote_with_operation(&url, Some("v1"), operation.clone()).unwrap(),
+            commit
+        );
+        let mut fetched = fetch(&source, Some(operation)).await.unwrap();
+        assert_eq!(fetched.resolved_commit.as_deref(), Some(commit.as_str()));
+        let staging = fetched.staging.as_ref().unwrap();
+        let directory = staging.directory.clone();
+        assert!(staging.volume.is_none());
+        assert!(staging.marker.is_none());
+        assert!(!fetched.tree.join(".git").exists());
+        assert!(super::super::install::begin_operation().is_err());
+        std::fs::write(repo.join("payload"), b"changed source").unwrap();
+        let asset = directory.join("worker");
+        std::fs::write(&asset, b"worker").unwrap();
+        install_asset_into(&fetched.tree, "worker", Some("bin/worker"), &asset).unwrap();
+        fetched.publication_hash = complete_tree_hash(&fetched.tree).unwrap();
+        fetched.begin_publication().unwrap();
+        let destination = fixture.path().join("published");
+        fetched.copy_for_publication(&destination).unwrap();
+        assert_eq!(
+            std::fs::read(destination.join("payload")).unwrap(),
+            b"remote snapshot"
+        );
+        assert_eq!(
+            std::fs::read(destination.join("bin/worker")).unwrap(),
+            b"worker"
+        );
+        fetched.cleanup().await.unwrap();
+        assert!(!directory.exists());
+        for (bytes, entries, expected) in [
+            (1, STAGING_ENTRY_LIMIT, "plugin staging budget exceeded"),
+            (STAGING_LIMIT, 1, "plugin staging entry budget exceeded"),
+        ] {
+            let error = stage_with_limits(
+                source.clone(),
+                crate::plugin::plugins_dir().unwrap(),
+                Some(url.clone()),
+                bytes,
+                entries,
+            )
+            .err()
+            .expect("remote snapshot limit");
+            assert!(format!("{error:#}").contains(expected), "{error:#}");
+        }
+        let consent = super::super::install::preview_install("gh:acme/stage@v1", false)
+            .await
+            .unwrap();
+        super::super::install::apply_install(
+            "gh:acme/stage@v1",
+            &consent.fingerprint,
+            false,
+            super::super::install::OperationLog::Inherit,
+        )
+        .await
+        .unwrap();
+        let plugins = crate::plugin::plugins_dir().unwrap();
+        assert_eq!(
+            std::fs::read(plugins.join("acme.stage/payload")).unwrap(),
+            b"remote snapshot"
+        );
+        assert!(crate::session::Config::load()
+            .unwrap()
+            .plugins
+            .contains_key("acme.stage"));
+        assert!(std::fs::read_dir(&plugins).unwrap().all(|entry| !entry
+            .unwrap()
+            .file_name()
+            .to_string_lossy()
+            .starts_with(".staging-")));
+        assert!(!crate::session::get_app_dir()
+            .unwrap()
+            .join(super::super::install::STAGING_MARKER)
+            .exists());
+        assert!(super::super::install::begin_operation().is_ok());
+    }
+
+    #[test]
+    #[serial_test::serial]
+    #[cfg(target_os = "linux")]
+    fn explicit_strict_staging_refuses_missing_native_tools_without_fallback() {
+        use crate::git::test_support::run_git;
+        let _home = crate::session::test_support::isolate_app_dir();
+        crate::session::update_config(|config| config.session.plugin_staging_sandbox = true)
+            .unwrap();
+        let fixture = tempfile::tempdir().unwrap();
+        let repo = fixture.path().join("repository");
+        write_publication_manifest(&repo);
+        run_git(&repo, &["init", "-q"]);
+        run_git(&repo, &["add", "."]);
+        run_git(&repo, &["commit", "-qm", "fixture"]);
+        let _path = path_without_native_tools(&fixture.path().join("path"));
+        let url = format!("file://{}", repo.display());
+        let plugins = crate::plugin::plugins_dir().unwrap();
+        let error = stage(
+            PluginSource::parse("gh:acme/stage").unwrap(),
+            plugins.clone(),
+            Some(url.clone()),
+        )
+        .err()
+        .expect("strict preparation must not fall back to ordinary Git");
+        assert!(format!("{error:#}").contains("acquiring strict plugin staging filesystem"));
+        let error = ls_remote(&url, None).unwrap_err();
+        assert!(format!("{error:#}").contains("acquiring strict plugin staging filesystem"));
+        assert_eq!(std::fs::read_dir(plugins).unwrap().count(), 0);
+        assert!(!crate::session::get_app_dir()
+            .unwrap()
+            .join(super::super::install::STAGING_MARKER)
+            .exists());
+        assert!(super::super::install::begin_operation().is_ok());
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn staging_backend_selection_propagates_config_errors() {
+        let _home = crate::session::test_support::isolate_app_dir();
+        let fixture = tempfile::tempdir().unwrap();
+        let source = fixture.path().join("source");
+        write_publication_manifest(&source);
+        let plugins = crate::plugin::plugins_dir().unwrap();
+        let operation = super::super::install::begin_operation().unwrap();
+        std::fs::write(crate::session::config::config_path().unwrap(), "[session\n").unwrap();
+        let expected = format!("{:#}", crate::session::Config::load().unwrap_err());
+        for source in [
+            PluginSource::Local(source),
+            PluginSource::parse("gh:acme/stage").unwrap(),
+        ] {
+            let url = source.github_clone_url();
+            let error = stage(source, plugins.clone(), url)
+                .err()
+                .expect("invalid config");
+            assert_eq!(format!("{error:#}"), expected);
+        }
+        let error = ls_remote_with_operation("unused://", None, operation).unwrap_err();
+        assert_eq!(format!("{error:#}"), expected);
+        assert!(!plugins.exists() || std::fs::read_dir(plugins).unwrap().next().is_none());
+    }
+
     fn publication_fixture(tree: PathBuf) -> FetchedPlugin {
         let (manifest, manifest_bytes) = read_manifest(&tree).unwrap();
         FetchedPlugin {
@@ -1632,12 +1844,16 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::serial]
     #[cfg_attr(
         target_os = "linux",
         ignore = "requires private user/mount namespaces and bubblewrap"
     )]
     fn staging_volume_high_ratio_archive_hits_filesystem_limit_and_cleans() {
         use crate::git::test_support::run_git;
+        let _home = crate::session::test_support::isolate_app_dir();
+        crate::session::update_config(|config| config.session.plugin_staging_sandbox = true)
+            .unwrap();
         let fixture = tempfile::tempdir().unwrap();
         let source = fixture.path().join("source");
         write_publication_manifest(&source);
@@ -1800,6 +2016,8 @@ mod tests {
         use crate::git::test_support::run_git;
         use crate::session::test_support::{isolate_app_dir, EnvGuard};
         let _home = isolate_app_dir();
+        crate::session::update_config(|config| config.session.plugin_staging_sandbox = true)
+            .unwrap();
         let fixture = tempfile::tempdir().unwrap();
         let repo = fixture.path().join("repository");
         write_publication_manifest(&repo);
@@ -1947,6 +2165,8 @@ mod tests {
     #[serial_test::serial]
     async fn safe_acquisition_failure_keeps_live_marker_until_proven_cleanup() {
         let _home = crate::session::test_support::isolate_app_dir();
+        crate::session::update_config(|config| config.session.plugin_staging_sandbox = true)
+            .unwrap();
         let operation = super::super::install::begin_operation().unwrap();
         let root = crate::session::get_app_dir().unwrap();
         let mut gate = test_gate::install(&root, "staging-acquisition");
@@ -2192,6 +2412,7 @@ mod tests {
                 repositories.path().to_str().unwrap(),
             ),
         ]);
+        let _path = path_without_native_tools(&repositories.path().join("path"));
         let source = PluginSource::parse("gh:acme/bin@v1").unwrap();
         let plugins = crate::plugin::plugins_dir().unwrap();
         let (entered, waiting) = tokio::sync::oneshot::channel();
@@ -2569,6 +2790,8 @@ mod tests {
     #[serial_test::serial]
     fn local_staging_ignores_remote_limits_and_freezes_source() {
         let _home = crate::session::test_support::isolate_app_dir();
+        crate::session::update_config(|config| config.session.plugin_staging_sandbox = true)
+            .unwrap();
         let fixture = tempfile::tempdir().unwrap();
         let source = fixture.path().join("source");
         write_publication_manifest(&source);
