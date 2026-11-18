@@ -48,20 +48,19 @@ fn canonical_host(host: &str) -> String {
     }
 }
 
-/// The raw value plus each further percent-decoding of it, so a token spelled with escapes in
-/// the userinfo, path, query or fragment is still found.
+/// The raw value plus each further percent-decoding of it until it stops changing, so a token
+/// spelled with escapes at any depth in the userinfo, path, query or fragment is still found.
 fn decoded_forms(value: &str) -> Vec<String> {
     let mut forms = vec![value.to_owned()];
-    while forms.len() < 5 {
+    loop {
         let decoded = percent_encoding::percent_decode_str(forms.last().expect("non-empty"))
             .decode_utf8_lossy()
             .into_owned();
         if forms.last() == Some(&decoded) {
-            break;
+            return forms;
         }
         forms.push(decoded);
     }
-    forms
 }
 
 fn is_loopback_host(canonical: &str) -> bool {
@@ -366,6 +365,11 @@ mod tests {
             ("https://u:%61bcdef0123@p.example.test/mcp", "", true),
             ("https://p.example.test/mcp#%61bcdef0123", "", true),
             ("https://p.example.test/mcp?k=%2561bcdef0123", "", true),
+            (
+                "https://p.example.test/mcp?k=%2525252561bcdef0123",
+                "",
+                true,
+            ),
             ("https://p.example.test/mcp", "Bearer %61bcdef0123", true),
             (
                 "https://p.example.test/mcp?k=%61bcdef9999",
