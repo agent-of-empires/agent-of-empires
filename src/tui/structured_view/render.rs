@@ -736,13 +736,23 @@ fn render_transcript(
     let mut first = state.scroll_offset.get().min(max);
     // A projection that grew above the reader moved their row; put the content
     // they were reading back at the top of the pane.
-    if let Some(anchor) = state.take_scroll_anchor() {
+    if let Some((anchor, row)) = state.take_scroll_anchor() {
         if let Some(index) = anchor_offset(&text.lines, &anchor, first) {
-            first = index.min(max);
+            first = index.saturating_sub(row).min(max);
             state.scroll_offset.set(first);
         }
     }
-    state.note_top_line(text.lines.get(first as usize).map(line_text));
+    // A blank separator names no row, so the anchor is the first row with
+    // content, kept at the height it held when the projection changes.
+    let anchor_row = text
+        .lines
+        .iter()
+        .enumerate()
+        .skip(first as usize)
+        .take(text_area.height as usize)
+        .find(|(_, line)| !line_text(line).trim().is_empty())
+        .map(|(index, line)| (line_text(line), index.saturating_sub(first as usize) as u16));
+    state.note_top_line(anchor_row);
     let para = Paragraph::new(text).scroll((first, 0));
     frame.render_widget(para, text_area);
     TranscriptGeometry {
@@ -763,6 +773,10 @@ fn line_text(line: &Line<'static>) -> String {
 /// Row index of `anchor` closest to `hint`, so a blank or repeated row keeps
 /// the reader near where they were instead of jumping to the first match.
 fn anchor_offset(lines: &[Line<'static>], anchor: &str, hint: u16) -> Option<u16> {
+    // An empty anchor names no row: any match would be a different blank.
+    if anchor.trim().is_empty() {
+        return None;
+    }
     let mut best: Option<(u16, usize)> = None;
     for (index, line) in lines.iter().enumerate() {
         if index > u16::MAX as usize {
@@ -3148,6 +3162,59 @@ mod tests {
         assert_eq!(
             top_after, top_before,
             "the reader keeps the row they were on"
+        );
+    }
+
+    /// A separator at the top of the pane names no row, so anchoring on it used
+    /// to pick whichever blank sat nearest the old offset and move the reader.
+    #[test]
+    fn a_blank_top_row_keeps_the_reader_on_their_content() {
+        let chunk = |text: &str, id: &str| Event::AgentMessageChunk {
+            text: text.into(),
+            message_id: Some(id.into()),
+        };
+        let thought = |text: &str, id: &str| Event::AgentThoughtChunk {
+            text: text.into(),
+            message_id: Some(id.into()),
+        };
+        let mut state = test_state();
+        let mut events = vec![thought(
+            "first thought\nweighing the options\nchecking the second one\nsettling on one",
+            "t-a",
+        )];
+        for index in 0..12 {
+            events.push(chunk(
+                &format!("reply number {index}"),
+                &format!("m-{index}"),
+            ));
+        }
+        state.transcript.server_rows = server_rows(&events);
+
+        // Find an offset that puts a blank separator at the top of the pane, so
+        // the reader's own row is the first line of content below it.
+        let offset = (1..20u16)
+            .find(|offset| {
+                state.scroll_offset.set(*offset);
+                let rows = render_rows(&state, 60, 20, true);
+                let top = render_geometry(&state, 60, 20).text_area.y as usize;
+                rows[top].trim().is_empty() && !rows[top + 1].trim().is_empty()
+            })
+            .expect("fixture has a blank separator above a reply");
+        state.scroll_offset.set(offset);
+        let before = render_geometry(&state, 60, 20);
+        let rows_before = render_rows(&state, 60, 20, true);
+        let content_before = rows_before[(before.text_area.y + 1) as usize]
+            .trim()
+            .to_string();
+
+        state.anchor_scroll_to_top_line();
+        state.show_full_thinking = true;
+        let after = render_geometry(&state, 60, 20);
+        let rows_after = render_rows(&state, 60, 20, true);
+        assert_eq!(
+            rows_after[(after.text_area.y + 1) as usize].trim(),
+            content_before,
+            "the content under the separator stays where the reader had it"
         );
     }
 

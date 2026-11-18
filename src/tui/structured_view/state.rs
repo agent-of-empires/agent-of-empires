@@ -40,10 +40,13 @@ pub struct StructuredViewState {
     pub scroll_offset: Cell<u16>,
     /// Content of the row the last frame painted at the top of the transcript.
     /// Interior-mutable: the render borrows the state immutably.
-    top_line_text: RefCell<Option<String>>,
+    /// The topmost non-blank row of the last frame, with how many rows below the
+    /// pane's top it sat: a blank separator names no row, so anchoring on one
+    /// picks a blank that moved elsewhere.
+    top_line_text: RefCell<Option<(String, u16)>>,
     /// Row content to find again after the projection changes height above the
     /// reader, set by a thought toggle taken while they are scrolled back.
-    scroll_anchor: RefCell<Option<String>>,
+    scroll_anchor: RefCell<Option<(String, u16)>>,
     /// Nonce of the approval currently holding the modal action shelf. Identity
     /// is used instead of a list index so historical resolved rows can never
     /// make the highlighted request diverge from the request the keys resolve.
@@ -142,7 +145,7 @@ pub struct StructuredViewState {
 
 impl StructuredViewState {
     /// Remember the row the frame painted at the top of the transcript.
-    pub fn note_top_line(&self, text: Option<String>) {
+    pub fn note_top_line(&self, text: Option<(String, u16)>) {
         *self.top_line_text.borrow_mut() = text;
     }
 
@@ -153,7 +156,7 @@ impl StructuredViewState {
     }
 
     /// The row content the next frame should scroll back to, if any.
-    pub fn take_scroll_anchor(&self) -> Option<String> {
+    pub fn take_scroll_anchor(&self) -> Option<(String, u16)> {
         self.scroll_anchor.take()
     }
 }
