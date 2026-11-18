@@ -3087,12 +3087,17 @@ finally:
         assert_eq!(pass(None), total, "the final pass drains to the end");
     }
 
-    /// A cancelled run returns without draining the backlog its child left unread.
+    /// A cancelled run returns without draining the backlog its child left unread. Passes go on
+    /// only for the bounded kill grace, which can't reach most of a 64 MiB backlog.
     #[test]
     #[cfg(unix)]
     fn a_cancel_is_not_held_behind_the_unread_backlog() {
         let mut cmd = Command::new("sh");
-        cmd.args(["-c", "head -c 1048576 /dev/zero; exec sleep 600"]);
+        const BACKLOG: usize = 64 << 20;
+        cmd.args([
+            "-c",
+            &format!("head -c {BACKLOG} /dev/zero; exec sleep 600"),
+        ]);
         let cancel = CancellationToken::new();
         let mut forwarded = 0usize;
         let mut forward = |_: OutputStream, bytes: &[u8]| {
@@ -3110,8 +3115,8 @@ finally:
         .unwrap();
         assert!(result.is_none(), "cancelled");
         assert!(
-            forwarded <= 2 * TAIL_PASS_LIMIT,
-            "forwarded {forwarded} bytes after the cancel"
+            forwarded < BACKLOG / 2,
+            "forwarded {forwarded} of {BACKLOG} bytes: the backlog was drained"
         );
     }
 
