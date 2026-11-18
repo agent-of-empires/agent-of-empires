@@ -161,7 +161,9 @@ mod tests {
             assert_eq!(progress.snapshot(), expected, "step {i}");
         }
 
-        // A read between two lines doesn't change what the next read says.
+        // A read between lines changes nothing, so both give the same answer. A layer announced
+        // after the known set finished still latches Unpacking, because the phase never goes
+        // back; Docker announces every layer before any finishes (the transcript test below).
         let lines = || [layer("x", false), layer("x", true), layer("y", false)];
         let (mut polled, mut unpolled) = (Progress::default(), Progress::default());
         for update in lines() {
@@ -171,7 +173,9 @@ mod tests {
         for update in lines() {
             unpolled.apply(update);
         }
-        assert_eq!(polled.snapshot(), unpolled.snapshot());
+        let expected = snap(Some(Unpacking), Some(1), Some(2));
+        assert_eq!(polled.snapshot(), expected, "polled");
+        assert_eq!(unpolled.snapshot(), expected, "unpolled");
     }
 
     #[test]
@@ -215,9 +219,17 @@ mod tests {
         }
     }
 
+    const CANCEL: &str =
+        include_str!("../../tests/fixtures/pull-progress/docker-29.5.2-cancel.txt");
+    const RETRY: &str = include_str!("../../tests/fixtures/pull-progress/docker-29.5.2-retry.txt");
+
+    fn transcript(fixture: &str) -> impl Iterator<Item = &str> {
+        fixture.lines().filter(|line| !line.starts_with('#'))
+    }
+
     fn replay(fixture: &str, mut each: impl FnMut(&str, &mut Progress)) -> Progress {
         let mut progress = Progress::default();
-        for line in fixture.lines().filter(|line| !line.starts_with('#')) {
+        for line in transcript(fixture) {
             if let Some(update) = docker_layer(line) {
                 progress.apply(update);
             }
@@ -226,13 +238,38 @@ mod tests {
         progress
     }
 
+    /// The unpacking latch is safe only if no layer is announced after one has finished.
+    #[test]
+    fn docker_announces_every_layer_before_any_finishes() {
+        for (name, fixture) in [("cancel", CANCEL), ("retry", RETRY)] {
+            let mut announced = HashSet::new();
+            let mut first_done: Option<&str> = None;
+            for line in transcript(fixture) {
+                match docker_layer(line) {
+                    Some(LayerUpdate { id, done: false }) => {
+                        assert!(
+                            first_done.is_none(),
+                            "{name}: {line:?} announced after {first_done:?}"
+                        );
+                        announced.insert(id);
+                    }
+                    Some(LayerUpdate { id, done: true }) if announced.contains(&id) => {
+                        first_done.get_or_insert(line);
+                    }
+                    _ => {}
+                }
+            }
+            assert!(
+                !announced.is_empty() && first_done.is_some(),
+                "{name}: the transcript announces and finishes layers"
+            );
+        }
+    }
+
     #[test]
     fn docker_transcripts_count_layers_unpack_after_the_last_download_and_resume() {
         use PullPhase::*;
-        let cancel = replay(
-            include_str!("../../tests/fixtures/pull-progress/docker-29.5.2-cancel.txt"),
-            |_, _| {},
-        );
+        let cancel = replay(CANCEL, |_, _| {});
         let at_kill = cancel.snapshot();
         assert_eq!(
             (at_kill.phase, at_kill.layers_done, at_kill.layers_known),
@@ -242,19 +279,16 @@ mod tests {
 
         let mut first_done = None;
         let mut unpacking_lines = Vec::new();
-        let retry = replay(
-            include_str!("../../tests/fixtures/pull-progress/docker-29.5.2-retry.txt"),
-            |line, progress| {
-                let snapshot = progress.snapshot();
-                if first_done.is_none() && snapshot.layers_done > Some(0) {
-                    first_done = Some((line.to_string(), snapshot.layers_done));
-                    assert!(progress.done.is_superset(&cancel.done), "{line}");
-                }
-                if snapshot.phase == Some(Unpacking) {
-                    unpacking_lines.push(line.to_string());
-                }
-            },
-        );
+        let retry = replay(RETRY, |line, progress| {
+            let snapshot = progress.snapshot();
+            if first_done.is_none() && snapshot.layers_done > Some(0) {
+                first_done = Some((line.to_string(), snapshot.layers_done));
+                assert!(progress.done.is_superset(&cancel.done), "{line}");
+            }
+            if snapshot.phase == Some(Unpacking) {
+                unpacking_lines.push(line.to_string());
+            }
+        });
         let (line, done) = first_done.expect("the retry counts a layer");
         assert!(line.ends_with("Already exists"), "{line}");
         assert!(done >= at_kill.layers_done, "{line}");
