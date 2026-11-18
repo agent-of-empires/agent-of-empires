@@ -153,6 +153,33 @@ pub(crate) mod test_support {
     pub(super) fn executable() -> Option<std::path::PathBuf> {
         EXECUTABLE.with(|slot| slot.borrow().clone())
     }
+
+    /// Opens a FIFO's write end once its reader is there, failing at `deadline` instead of
+    /// blocking forever when the reader has gone.
+    #[cfg(unix)]
+    pub(crate) fn open_fifo_writer(
+        path: &std::path::Path,
+        deadline: std::time::Instant,
+    ) -> std::fs::File {
+        use std::os::unix::fs::OpenOptionsExt as _;
+        loop {
+            match std::fs::OpenOptions::new()
+                .write(true)
+                .custom_flags(libc::O_NONBLOCK)
+                .open(path)
+            {
+                Ok(file) => return file,
+                Err(err) if err.raw_os_error() == Some(libc::ENXIO) => {
+                    assert!(
+                        std::time::Instant::now() < deadline,
+                        "the FIFO's reader went away before it was released"
+                    );
+                    std::thread::sleep(std::time::Duration::from_millis(5));
+                }
+                Err(err) => panic!("opening {}: {err}", path.display()),
+            }
+        }
+    }
 }
 
 pub(crate) fn executable_for_native_launch() -> std::io::Result<std::path::PathBuf> {
@@ -833,16 +860,27 @@ struct OutputTail<'a> {
     forward: &'a mut dyn FnMut(OutputStream, &[u8]),
 }
 
+/// Bytes read per stream on one pass while the child runs, so a fast writer can't hold off the
+/// wait loop's deadline and cancel checks.
+const TAIL_PASS_LIMIT: usize = 64 * 1024;
+
 impl OutputTail<'_> {
-    /// Best effort: a failed read loses progress, not the captured output.
-    fn forward_new(&mut self) {
+    /// Best effort: a failed read loses progress, not the captured output. `limit` bounds each
+    /// stream's bytes; `None` drains to the current end.
+    fn forward_new(&mut self, limit: Option<usize>) {
         let mut buf = [0u8; 8192];
         for (stream, file) in [
             (OutputStream::Stdout, &mut self.stdout),
             (OutputStream::Stderr, &mut self.stderr),
         ] {
-            while let Ok(n @ 1..) = file.read(&mut buf) {
+            let mut left = limit.unwrap_or(usize::MAX);
+            while left > 0 {
+                let want = left.min(buf.len());
+                let Ok(n @ 1..) = file.read(&mut buf[..want]) else {
+                    break;
+                };
                 (self.forward)(stream, &buf[..n]);
+                left -= n;
             }
         }
     }
@@ -868,6 +906,9 @@ fn run_with_timeout_inner(
         }),
         None => None,
     };
+    if cancel.is_some_and(CancellationToken::is_cancelled) {
+        return Ok(None);
+    }
     let mut child = cmd.spawn()?;
 
     let waited = match tail.as_mut() {
@@ -880,13 +921,13 @@ fn run_with_timeout_inner(
             cancel,
             Instant::now,
             |pause| {
-                tail.forward_new();
+                tail.forward_new(Some(TAIL_PASS_LIMIT));
                 std::thread::sleep(pause);
             },
         )?,
     };
     if let Some(tail) = tail.as_mut() {
-        tail.forward_new();
+        tail.forward_new(None);
     }
     let Some(status) = waited else {
         return Ok(None);
@@ -3008,6 +3049,39 @@ finally:
     }
 
     #[test]
+    fn a_cancel_before_spawn_starts_nothing() {
+        let cancel = CancellationToken::new();
+        cancel.cancel();
+        // A missing program would fail to spawn, so `Ok(None)` shows no spawn was tried.
+        let mut cmd = Command::new("/nonexistent/aoe-cancelled-before-spawn");
+        assert!(matches!(
+            run_until_cancelled_process_group(&mut cmd, Duration::from_secs(5), &cancel),
+            Ok(None)
+        ));
+    }
+
+    #[test]
+    fn a_tail_pass_reads_a_bounded_amount_and_the_final_one_drains() {
+        use std::io::Write as _;
+        let mut written = tempfile::NamedTempFile::new().unwrap();
+        let total = 3 * TAIL_PASS_LIMIT + 7;
+        written.write_all(&vec![b'x'; total]).unwrap();
+        let pass = |limit| {
+            let mut forwarded = 0;
+            let mut forward = |_: OutputStream, bytes: &[u8]| forwarded += bytes.len();
+            OutputTail {
+                stdout: written.reopen().unwrap(),
+                stderr: tempfile::tempfile().unwrap(),
+                forward: &mut forward,
+            }
+            .forward_new(limit);
+            forwarded
+        };
+        assert_eq!(pass(Some(TAIL_PASS_LIMIT)), TAIL_PASS_LIMIT);
+        assert_eq!(pass(None), total, "the final pass drains to the end");
+    }
+
+    #[test]
     #[cfg(unix)]
     fn observed_output_arrives_while_the_child_still_runs() {
         use std::io::Write as _;
@@ -3056,10 +3130,7 @@ finally:
             "the child is still blocked on the gate"
         );
 
-        std::fs::OpenOptions::new()
-            .write(true)
-            .open(&gate)
-            .unwrap()
+        test_support::open_fifo_writer(&gate, Instant::now() + DEADLINE)
             .write_all(b"go\n")
             .unwrap();
         let output = done

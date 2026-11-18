@@ -1127,10 +1127,7 @@ mod tests {
         }
         assert_eq!(snapshot().phase, Some(PullPhase::Downloading));
 
-        std::fs::OpenOptions::new()
-            .write(true)
-            .open(&gate)
-            .unwrap()
+        crate::process::test_support::open_fifo_writer(&gate, deadline)
             .write_all(b"go\n")
             .unwrap();
         pulling.join().unwrap().unwrap();
