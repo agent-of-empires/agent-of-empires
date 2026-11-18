@@ -4932,8 +4932,8 @@ mod tests {
     }
 
     /// #5766: the Serve key that opened Connections opens the Web dashboard from any row, in
-    /// either mode. On the offline and outdated takeovers, where only r and q act, it does
-    /// nothing.
+    /// either mode, but a held key stays in Connections. On the offline and outdated takeovers,
+    /// where only r and q act, it does nothing.
     #[tokio::test]
     #[serial_test::serial]
     async fn the_serve_key_in_connections_opens_the_web_dashboard_except_on_a_takeover() {
@@ -4960,6 +4960,13 @@ mod tests {
             )
             .unwrap();
             app.home.strict_hotkeys = strict;
+            // A held key opens Connections, then never reaches the Serve screen, whose restart
+            // and reset use the same key.
+            for _ in 0..30 {
+                app.home.handle_key(key, None);
+            }
+            assert!(app.home.connections_view.is_some(), "strict={strict}: held");
+            assert!(app.home.serve_view.is_none(), "strict={strict}: held");
             // The Daemon row comes first and is selected, so Enter would do nothing here.
             app.home.connections_view =
                 Some(ConnectionsView::new(Some(A::ReadOnly), WebState::Off));
@@ -4989,7 +4996,11 @@ mod tests {
                 );
                 assert!(
                     matches!(
-                        ConnectionsView::offline(attention, None, false).handle_key(key, strict),
+                        ConnectionsView::offline(attention, None, false).handle_key(
+                            key,
+                            strict,
+                            std::time::Instant::now()
+                        ),
                         DialogResult::Continue
                     ),
                     "{case}: the takeover view ignores it"
