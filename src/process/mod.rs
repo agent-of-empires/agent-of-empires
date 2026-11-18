@@ -3132,15 +3132,17 @@ finally:
         .arg(&written);
         let cancel = CancellationToken::new();
         let deadline = Instant::now() + Duration::from_secs(10);
-        let (mut forwarded, mut at_cancel) = (0usize, None);
+        let (mut forwarded, mut at_cancel, mut gate_expired) = (0usize, None, false);
         let mut forward = |stream: OutputStream, bytes: &[u8]| {
-            // Hold the first pass until the child is done writing, so it reads `ready` in the
-            // same pass however the child was scheduled.
-            while !written.exists() {
-                assert!(
-                    Instant::now() < deadline,
-                    "the child never wrote its backlog"
-                );
+            // Hold the first callback until the child is done writing, so `ready` is read in that
+            // pass however the child was scheduled. On expiry, cancel rather than panic here, so
+            // the runner still kills and reaps the child.
+            while !gate_expired && !written.exists() {
+                if Instant::now() >= deadline {
+                    gate_expired = true;
+                    cancel.cancel();
+                    return;
+                }
                 std::thread::sleep(Duration::from_millis(5));
             }
             match stream {
@@ -3158,11 +3160,12 @@ finally:
             &mut forward,
         )
         .unwrap();
+        assert!(!gate_expired, "the child never wrote its backlog");
         assert!(result.is_none(), "cancelled");
-        assert_eq!(
-            at_cancel,
-            Some(TAIL_PASS_LIMIT),
-            "one bounded pass came first"
+        // At most one bounded pass came first; none if stdout was still empty at its read.
+        assert!(
+            at_cancel.is_some_and(|bytes| bytes <= TAIL_PASS_LIMIT),
+            "forwarded {at_cancel:?} before the cancel"
         );
         assert!(
             forwarded < BACKLOG / 2,
