@@ -218,7 +218,8 @@ fn is_shell(sample: &CommandSample) -> bool {
         || sample.argv.first().is_some_and(|arg0| name(arg0))
 }
 
-/// What `shell` runs: its first descendant that isn't another shell, or the shell's own line.
+/// What `shell` runs: its first descendant that isn't another shell, or else the command the
+/// shell was given.
 fn named_command(tree: &[CommandSample], shell: &CommandSample) -> Vec<String> {
     let mut level = vec![shell.identity.pid];
     while !level.is_empty() {
@@ -228,7 +229,48 @@ fn named_command(tree: &[CommandSample], shell: &CommandSample) -> Vec<String> {
         }
         level = children.iter().map(|child| child.identity.pid).collect();
     }
-    shell.argv.clone()
+    wrapped_command(&shell.argv).unwrap_or_else(|| shell.argv.clone())
+}
+
+/// The command inside Claude Code's Bash wrapper, `bash -c "source <snapshot> ... && eval
+/// '<command>' < /dev/null ..."`, split on whitespace for display.
+fn wrapped_command(argv: &[String]) -> Option<Vec<String>> {
+    if !argv.iter().any(|arg| arg == "-c") {
+        return None;
+    }
+    let script = argv.last()?.strip_prefix("source ")?;
+    let (_, quoted) = script.split_once("&& eval ")?;
+    let command = shell_word(quoted)?;
+    let words: Vec<String> = command.split_whitespace().map(str::to_owned).collect();
+    (!words.is_empty()).then_some(words)
+}
+
+/// The first shell word of `text`: adjacent single- and double-quoted parts joined, as the shell
+/// reads them. `None` for an unterminated quote.
+fn shell_word(text: &str) -> Option<String> {
+    let mut word = String::new();
+    let mut chars = text.chars();
+    loop {
+        match chars.next() {
+            None => return Some(word),
+            Some(c) if c.is_whitespace() => return Some(word),
+            Some('\'') => loop {
+                match chars.next()? {
+                    '\'' => break,
+                    c => word.push(c),
+                }
+            },
+            Some('"') => loop {
+                match chars.next()? {
+                    '"' => break,
+                    '\\' => word.push(chars.next()?),
+                    c => word.push(c),
+                }
+            },
+            Some('\\') => word.push(chars.next()?),
+            Some(c) => word.push(c),
+        }
+    }
 }
 
 /// The found processes the caller hasn't agreed to stop. A reused PID has a new start identity,
@@ -380,12 +422,7 @@ mod tests {
                     sample(20, 1, "/opt/claude/versions/2.1.0", &["claude"]),
                     dev_shell(20),
                 ],
-                Some(vec![&[
-                    "bash",
-                    "-c",
-                    "-l",
-                    "source /tmp/snap && eval 'npm run dev'",
-                ]]),
+                Some(vec![&["npm", "run", "dev"]]),
             ),
             (
                 "npm claude with an MCP server: nothing",
@@ -514,6 +551,62 @@ mod tests {
             });
             assert_eq!(named(census(&tree, launch, &resolve)), expected, "{name}");
         }
+    }
+
+    #[test]
+    fn a_wrapped_tool_command_is_named_by_what_it_evaluates() {
+        // Claude Code 2.1's Bash tool, captured from this machine's own `ps`.
+        let captured = "source /root/.claude/shell-snapshots/snapshot-bash-1-x.sh 2>/dev/null \
+            || true && shopt -u extglob 2>/dev/null || true && { \\builtin unalias -- 'which'; \
+            } >/dev/null 2>&1 || true && eval 'grep -c '\"'\"'a b'\"'\"' log' < /dev/null \
+            && pwd -P >| /tmp/claude-4d4e-cwd";
+        for (argv, named) in [
+            (
+                vec!["/bin/bash", "-c", captured],
+                // Joined with spaces, the words read as the command was typed.
+                Some(vec!["grep", "-c", "'a", "b'", "log"]),
+            ),
+            (
+                vec![
+                    "bash",
+                    "-c",
+                    "-l",
+                    "source /tmp/snap && eval 'npm run dev' < /dev/null",
+                ],
+                Some(vec!["npm", "run", "dev"]),
+            ),
+            (vec!["bash", "-c", "sleep 600"], None),
+            (vec!["bash", "script.sh"], None),
+            (
+                vec!["bash", "-c", "source /tmp/snap && eval 'unterminated"],
+                None,
+            ),
+            (vec!["bash", "-c", "source /tmp/snap && eval ''"], None),
+        ] {
+            let argv: Vec<String> = argv.iter().map(|arg| arg.to_string()).collect();
+            let named = named.map(|words| words.iter().map(|w| w.to_string()).collect::<Vec<_>>());
+            assert_eq!(wrapped_command(&argv), named, "{argv:?}");
+        }
+        let shell = sample(
+            30,
+            20,
+            "/usr/bin/bash",
+            &["bash", "-c", "-l", "source /s && eval 'make watch'"],
+        );
+        assert_eq!(
+            named_command(std::slice::from_ref(&shell), &shell),
+            ["make", "watch"]
+        );
+        let plain = sample(
+            31,
+            20,
+            "/usr/bin/bash",
+            &["bash", "-c", "while :; do :; done"],
+        );
+        assert_eq!(
+            named_command(std::slice::from_ref(&plain), &plain),
+            plain.argv
+        );
     }
 
     #[test]
