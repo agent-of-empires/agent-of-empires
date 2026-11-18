@@ -1421,3 +1421,30 @@ fn tool_admission_rejects_reserved_rows_and_uses_fresh_configuration() {
         "the cached command ran instead of durable configuration"
     );
 }
+
+/// Tab on a structured row takes the same activation as Enter, so the System
+/// Health takeover cannot stay painted over the view Tab just focused: the
+/// next key must reach the composer, not a panel still on screen.
+#[test]
+#[serial]
+fn tab_on_a_structured_row_dismisses_the_system_health_panel() {
+    let mut inst = Instance::new("acp", "/tmp/acp");
+    inst.view = crate::session::View::Structured;
+    let mut env = seeded_env(test_home(), &[inst.clone()], true);
+    env.view.select_session_by_id(&inst.id);
+    env.view.view_mode = ViewMode::Structured;
+    env.view.system_health_open = true;
+
+    let action = env
+        .view
+        .handle_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE), None);
+
+    assert!(
+        matches!(&action, Some(Action::OpenStructuredView(id)) if id == &inst.id),
+        "Tab on a structured row opens its view, got {action:?}"
+    );
+    assert!(
+        !env.view.system_health_open,
+        "the health takeover must not cover the composer the press focuses"
+    );
+}

@@ -3264,9 +3264,11 @@ impl HomeView {
                 }
                 let live_key = self.selected_session.as_deref().map(|id| self.live_key(id));
                 // Neither Tab meaning has a pane to reach in a structured view, so the
-                // press takes the session's native view, as Enter does.
+                // press takes the session's native view through the same activation as
+                // Enter: that dismisses System Health, which would otherwise leave the
+                // composer it focuses behind a panel the next key cannot reach.
                 if live_key == Some(None) {
-                    return self.start_live_send();
+                    return self.activate_selected_session();
                 }
                 if live_key == Some(Some(LiveKey::Enter)) {
                     if let Some(action) = self.tab_attach_action() {
@@ -6913,6 +6915,9 @@ impl HomeView {
         // is the native view: the chord attaches the way Enter does.
         if self.structured_view_selected(&id) {
             self.exit_live_send_if_active();
+            // The native view replaces whatever the preview showed, so the health
+            // panel must not stay painted over the composer it focuses.
+            self.system_health_open = false;
             return Some(Action::OpenStructuredView(id));
         }
         // A structured agent has no tmux target, but its auxiliary terminal/tool panes do.
@@ -6976,13 +6981,6 @@ impl HomeView {
     /// explicit view-switch call sites that invoke it.
     pub(super) fn maybe_auto_start_live_send(&mut self) -> Option<Action> {
         let id = self.selected_session.clone()?;
-        // The setting starts a relay, and a structured view has no pane to relay
-        // into: it must not open the view full-screen, and a relay left running
-        // from a pane view would keep stealing the keys this view shows.
-        if self.structured_view_selected(&id) {
-            self.exit_live_send_if_active();
-            return None;
-        }
         if !self.live_send_on_view_switch(&id) {
             return None;
         }
