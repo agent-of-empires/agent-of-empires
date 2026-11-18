@@ -3621,7 +3621,8 @@ mod tests {
         crate::session::get_profile_dir("test").unwrap();
         let mut rows = Vec::new();
         for title in ["first", "second"] {
-            let mut inst = Instance::new(title, &format!("/tmp/{title}"));
+            let cwd = std::env::temp_dir().join(title);
+            let mut inst = Instance::new(title, &cwd.to_string_lossy());
             inst.view = View::Structured;
             inst.source_profile = "test".into();
             rows.push(inst);
