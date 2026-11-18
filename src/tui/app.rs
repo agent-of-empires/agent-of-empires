@@ -155,6 +155,9 @@ pub struct App {
     )>,
     /// The row whose mount failed, so reselecting it doesn't retry every tick.
     structured_mount_failed: Option<String>,
+    /// Set when Enter asked for a row whose mount was already in flight: the
+    /// completion takes over the screen instead of a second connect replaying it.
+    structured_mount_activate: Option<String>,
     /// Cleared on failure so the user can retry.
     pending_install_version: Option<String>,
     /// The running binary keeps its old version until restart, so this stops
@@ -355,6 +358,7 @@ impl App {
             preview_mount_pending: None,
             structured_mount: None,
             structured_mount_failed: None,
+            structured_mount_activate: None,
             pending_view_switch: None,
             pending_smart_rename: None,
             dashboard_launch: None,
@@ -2445,6 +2449,17 @@ impl App {
                 .await;
             return Ok(());
         }
+        // A mount for this row is already connecting off the loop: a second
+        // connect here would block the loop and replay what it is about to
+        // install, so it hands the screen over when it lands.
+        if self
+            .structured_mount
+            .as_ref()
+            .is_some_and(|(target, _)| target == session_id)
+        {
+            self.structured_mount_activate = Some(session_id.to_owned());
+            return Ok(());
+        }
         match locate_daemon().await {
             Ok(endpoint) => {
                 self.connect_embedded_structured(endpoint, session_id).await;
@@ -2574,7 +2589,10 @@ impl App {
         if !another_row_pending {
             self.clear_preview_mount_pending();
         }
-        let wanted = self.home.selected_structured_session().as_deref() == Some(target.as_str());
+        // A completion is only wanted while the daemon sidebar is still the
+        // source: the row can survive going offline, and its mount must not.
+        let wanted = self.home.sidebar_source == crate::tui::session_feed::SidebarSource::Daemon
+            && self.home.selected_structured_session().as_deref() == Some(target.as_str());
         // The target may have mounted while this connected, whether Enter opened
         // it or it is a view the user has since left. Either way it already holds
         // a draft that a replacement would drop.
@@ -2587,10 +2605,15 @@ impl App {
             Ok(view) if wanted && !mounted => {
                 self.structured_mount_failed = None;
                 self.home.structured_preview = Some(view);
+                if self.structured_mount_activate.as_deref() == Some(target.as_str()) {
+                    self.structured_mount_activate = None;
+                    self.activate_embedded();
+                }
                 true
             }
             Ok(_) => true,
             Err(e) => {
+                self.structured_mount_activate = None;
                 if wanted {
                     self.structured_mount_failed = Some(target);
                     self.set_status(e);
@@ -2626,6 +2649,7 @@ impl App {
             .is_some_and(|(target, _)| selected.as_deref() != Some(target.as_str()))
         {
             self.structured_mount = None;
+            self.structured_mount_activate = None;
         }
         // A failure is remembered only for the row it belongs to, so the early
         // returns below cannot strand it on a row the user has come back to.
@@ -2681,6 +2705,9 @@ impl App {
         }
         if self.home.sidebar_source != crate::tui::session_feed::SidebarSource::Daemon {
             self.clear_preview_mount_pending();
+            self.structured_mount = None;
+            self.structured_mount_activate = None;
+            self.structured_mount_failed = None;
             return self.home.structured_preview.take().is_some();
         }
         if removed_retained {
@@ -3727,6 +3754,66 @@ mod tests {
         assert!(
             app.home.structured_preview_pending,
             "and its loading placeholder"
+        );
+    }
+
+    /// Enter on a row whose mount is already connecting must not start a second
+    /// blocking connect: it hands the row over when that mount lands.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn enter_hands_over_an_in_flight_mount_instead_of_reconnecting() {
+        use crate::tui::structured_view::embedded::EmbeddedView;
+        let (mut app, _guard, id) = app_on_a_structured_row();
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        app.structured_mount = Some((id.clone(), rx));
+
+        app.open_structured_view(&id).await.unwrap();
+
+        assert!(
+            app.structured_mount.is_some(),
+            "the in-flight mount stays the only connect"
+        );
+        assert_eq!(app.structured_mount_activate.as_deref(), Some(id.as_str()));
+
+        assert!(tx.send(Ok(EmbeddedView::for_test(&id))).is_ok());
+        assert!(app.poll_structured_mount());
+        assert!(app.structured_mount_activate.is_none());
+        assert!(
+            app.home
+                .structured_preview
+                .as_ref()
+                .is_some_and(|view| view.is_active()),
+            "the landed mount takes the screen Enter asked for"
+        );
+    }
+
+    /// The daemon connection can drop while its row stays selected, and a
+    /// completion from before the drop must not be installed on it.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn losing_the_daemon_sidebar_drops_the_pending_mount() {
+        use crate::tui::structured_view::embedded::EmbeddedView;
+        let (mut app, _guard, id) = app_on_a_structured_row();
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        app.structured_mount = Some((id.clone(), rx));
+        app.home.sidebar_source = crate::tui::session_feed::SidebarSource::Disconnected;
+
+        app.reconcile_structured_preview();
+
+        assert!(app.structured_mount.is_none(), "the mount is dropped");
+        assert!(tx.is_closed(), "the connect sees its receiver go away");
+
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        app.structured_mount = Some((id.clone(), rx));
+        assert!(tx.send(Ok(EmbeddedView::for_test(&id))).is_ok());
+        assert!(app.poll_structured_mount(), "the completion still redraws");
+        assert!(
+            app.home.structured_preview.is_none(),
+            "a connect from before the drop is not installed"
+        );
+        assert_eq!(
+            app.structured_mount_failed, None,
+            "and its failure is not cached against the row"
         );
     }
 
