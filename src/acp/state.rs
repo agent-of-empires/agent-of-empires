@@ -1012,7 +1012,9 @@ pub enum Event {
         comments: Vec<DiffComment>,
         assembled_markdown: String,
     },
-    /// A prompt arrived while another `session/prompt` was in flight.
+    /// A prompt that did not run, carried back for a retry: it arrived while
+    /// another `session/prompt` was in flight, or the agent answered it with
+    /// an error.
     PromptRejected {
         reason: String,
         text: String,

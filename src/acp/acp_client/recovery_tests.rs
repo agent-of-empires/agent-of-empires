@@ -645,13 +645,13 @@ async fn recovered_completion_orders_updates_and_applies_rate_limit_parking() {
 }
 
 /// The runner relays the agent's error answer to `session/prompt`: the turn
-/// surfaces it and returns the text, unless it answers a cancel, and the same
-/// connection runs the next prompt (#5662).
+/// surfaces it, returns the text and cancels any leftover agent turn, unless
+/// it answers a cancel. The same connection runs the next prompt (#5662).
 #[tokio::test]
 async fn rejected_prompt_over_the_runner_keeps_the_connection() {
     let _env = crate::session::test_support::EnvGuard::read_lock();
     for (cancel_first, want_reason, want_returned) in
-        [(false, "prompt_complete", true), (true, "cancelled", false)]
+        [(false, "prompt_rejected", true), (true, "cancelled", false)]
     {
         let mut runner = Runner::new();
         let mut client = runner.attach(false).await;
@@ -688,6 +688,10 @@ async fn rejected_prompt_over_the_runner_keeps_the_connection() {
         .unwrap();
         assert_eq!(reason, want_reason);
         assert_eq!((surfaced, returned), (want_returned, want_returned));
+        if want_returned {
+            // The rejection clears a turn the agent may still be running.
+            assert!(matches!(runner.frame().await, ControlBody::Cancel));
+        }
 
         client.send_prompt("again", &[]).await.unwrap();
         assert!(matches!(runner.frame().await, ControlBody::Prompt { .. }));

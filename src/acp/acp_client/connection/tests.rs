@@ -823,7 +823,7 @@ async fn rejected_prompt_keeps_the_connection_and_returns_the_text() {
     .await;
 
     let (seen, reason) = prompt_turn(&mut fake, "retry me").await;
-    assert_eq!(reason, "prompt_complete", "{seen:?}");
+    assert_eq!(reason, "prompt_rejected", "{seen:?}");
     assert!(
         seen.iter().any(|e| matches!(
             e,

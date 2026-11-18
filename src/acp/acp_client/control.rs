@@ -288,21 +288,20 @@ impl DaemonControlClient {
         }
     }
 
-    /// Registers the completion waiter before sending the `Prompt` frame.
+    /// Registers the completion waiter before sending the `Prompt` frame. A
+    /// waiter already pending is refused locally, without a frame.
     pub(super) async fn prompt(
         &self,
         request: serde_json::Value,
-    ) -> oneshot::Receiver<control_protocol::PromptOutcome> {
+    ) -> Result<oneshot::Receiver<control_protocol::PromptOutcome>, agent_client_protocol::Error>
+    {
         let (tx, rx) = oneshot::channel();
         {
             let mut completion = self.completion.lock().expect("completion mutex poisoned");
             if matches!(*completion, PromptCompletion::Pending { .. }) {
-                let _ = tx.send(control_protocol::PromptOutcome::Error {
-                    code: control_protocol::INTERNAL_ERROR as i32,
-                    message: "a local prompt is already awaiting completion".into(),
-                    data: None,
-                });
-                return rx;
+                return Err(acp_internal_error(
+                    "a local prompt is already awaiting completion".into(),
+                ));
             }
             *completion = PromptCompletion::Pending {
                 prompt_req_id: None,
@@ -315,7 +314,7 @@ impl DaemonControlClient {
             *self.completion.lock().expect("completion mutex poisoned") =
                 PromptCompletion::LocalIdle;
         }
-        rx
+        Ok(rx)
     }
 
     pub(super) async fn cancel(&self) {
@@ -975,7 +974,7 @@ mod tests {
         }
 
         async fn prompt(&mut self) -> oneshot::Receiver<PromptOutcome> {
-            let rx = self.client.prompt(serde_json::json!({})).await;
+            let rx = self.client.prompt(serde_json::json!({})).await.unwrap();
             assert!(matches!(
                 control_protocol::read_frame(&mut self.peer).await.unwrap(),
                 Some(ControlBody::Prompt { .. })
@@ -1112,14 +1111,11 @@ mod tests {
     async fn duplicate_local_prompt_preserves_first_waiter_and_sends_no_prompt() {
         let mut peer = PromptControlPeer::new().await;
         let completion = peer.prompt().await;
-        let mut duplicate = peer
+        let duplicate = peer
             .client
             .prompt(serde_json::json!({"duplicate": true}))
             .await;
-        assert!(matches!(
-            duplicate.try_recv().unwrap(),
-            PromptOutcome::Error { code, .. } if i64::from(code) == control_protocol::INTERNAL_ERROR
-        ));
+        assert!(duplicate.is_err());
         // Cancel arriving next proves the duplicate sent no Prompt frame.
         peer.client.cancel().await;
         assert!(matches!(
@@ -1398,7 +1394,7 @@ mod tests {
         let (client, crate_side) = connect(&control, "eof", Arc::new(TerminalClaim::new()), false)
             .await
             .unwrap();
-        let completion = client.prompt(serde_json::json!({})).await;
+        let completion = client.prompt(serde_json::json!({})).await.unwrap();
         fake.await.unwrap();
         assert!(tokio::time::timeout(Duration::from_secs(1), completion)
             .await
@@ -1458,6 +1454,8 @@ mod tests {
                                 },
                             }
                         }
+                        // Sent after a plain rejection (#5662).
+                        ControlBody::Cancel => continue,
                         frame => panic!("unexpected resumed-session request: {frame:?}"),
                     };
                     control_protocol::write_frame(&mut peer, &reply)
@@ -1492,15 +1490,7 @@ mod tests {
                             recovery.push("stopped");
                         }
                         // Any other rejection ends only the turn (#5662).
-                        Event::Stopped { reason } => {
-                            assert_eq!(reason, "prompt_complete");
-                            recovery.push("stopped");
-                            break;
-                        }
-                        Event::PromptRuntimeError { message: error } => {
-                            assert!(error.contains(message), "{error}");
-                            recovery.push("error");
-                        }
+                        Event::Stopped { .. } => break,
                         Event::AgentStartupError { message: error, .. } => {
                             panic!("the connection must not fail: {error}")
                         }
@@ -1510,7 +1500,7 @@ mod tests {
                 let want = if should_reset {
                     vec!["reset", "stopped"]
                 } else {
-                    vec!["error", "stopped"]
+                    vec![]
                 };
                 assert_eq!(recovery, want, "{message}");
                 let _ = client.shutdown().await;
@@ -2115,7 +2105,7 @@ mod tests {
                         assert_eq!(applied.load(AtomicOrdering::Relaxed), 1);
 
                         let (entered_rx, release_tx) = arm();
-                        let mut completion = client.prompt(serde_json::json!({})).await;
+                        let mut completion = client.prompt(serde_json::json!({})).await.unwrap();
                         entered_rx.await.unwrap();
                         // Wait for the reader to match the completion while the
                         // crate is still applying the update sent before it.

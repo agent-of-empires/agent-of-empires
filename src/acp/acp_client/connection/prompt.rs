@@ -24,8 +24,9 @@ use crate::acp::acp_client::errors::acp_internal_error;
 use crate::acp::acp_client::lifecycle::{LifecycleSignal, OffProtocolWorkKind};
 use crate::acp::acp_client::opencode::recover_opencode_prompt_error;
 use crate::acp::acp_client::rate_limit::{
-    captured_rate_limit_reset, classify_rate_limit_error, clear_captured_rejections,
-    is_unsupported_session_error, take_rate_limit_from_captured_rejection,
+    captured_rate_limit_reset, classify_rate_limit_error, classify_rate_limit_from_message,
+    clear_captured_rejections, is_unsupported_session_error,
+    take_rate_limit_from_captured_rejection,
 };
 use crate::acp::acp_client::reset::ResetSessionOutcome;
 use crate::acp::acp_client::steer::{first_text_block, SteerOutcome, SteerRequest};
@@ -309,7 +310,10 @@ impl Session {
         };
         match serde_json::to_value(request) {
             Ok(params) => {
-                let rx = control.prompt(params).await;
+                let rx = match control.prompt(params).await {
+                    Ok(rx) => rx,
+                    Err(e) => return Box::pin(async move { lost(Err(e)) }),
+                };
                 let control = Arc::clone(control);
                 Box::pin(async move {
                     match rx.await {
@@ -371,9 +375,10 @@ impl Session {
             Err(e) => e,
         };
         let label = &self.shared.session_label;
-        // A resumed id the agent dropped: reset context so the respawn opens
-        // a fresh session instead of terminating the runner (#3560).
-        if self.session_from_storage && is_unsupported_session_error(&e) {
+        // A dropped session only recovers through a respawn. A resumed id
+        // also resets context so the respawn opens a fresh session (#3560).
+        let dropped_session = is_unsupported_session_error(&e);
+        if self.session_from_storage && dropped_session {
             warn!(
                 target: "acp.protocol",
                 session = %label,
@@ -388,24 +393,28 @@ impl Session {
             self.shared
                 .context_reset_emitted
                 .store(true, Ordering::Relaxed);
+        }
+        if dropped_session || !rejected {
             return Err(e);
         }
         // The agent is still answering, so only this turn ends (#5662).
-        if rejected {
-            warn!(
-                target: "acp.protocol",
-                session = %label,
-                "agent rejected session/prompt; ending the turn and keeping the connection: {e}"
-            );
-            // An error answering our cancel ends the turn as cancelled.
-            if turn.flags.cancelling || turn.flags.orphan_cancel_sent {
-                turn.flags.prompt_cancelled = true;
-            } else {
-                turn.flags.rejection = Some(e.to_string());
-            }
+        warn!(
+            target: "acp.protocol",
+            session = %label,
+            "agent rejected session/prompt; ending the turn and keeping the connection: {e}"
+        );
+        // An error answering our cancel ends the turn as cancelled.
+        if turn.flags.cancelling || turn.flags.orphan_cancel_sent {
+            turn.flags.prompt_cancelled = true;
             return Ok(Flow::Break);
         }
-        Err(e)
+        turn.flags.rejection = Some(e.message);
+        // A turn the agent still runs from before a restart is the usual
+        // cause, and aoe already treats it as ended, so the retry needs it gone.
+        if let Err(error) = self.send_cancel().await {
+            debug!(target: "acp.protocol", %error, "cancel after a rejected prompt failed");
+        }
+        Ok(Flow::Break)
     }
 
     /// The adapter can end a limited turn normally, so a still-future rejected
@@ -417,10 +426,12 @@ impl Session {
         let shared = &self.shared;
         match result {
             Err(error) => {
-                return classify_rate_limit_error(
-                    error,
-                    captured_rate_limit_reset(&shared.rate_limit_rejections, chrono::Utc::now()),
-                )
+                let captured =
+                    captured_rate_limit_reset(&shared.rate_limit_rejections, chrono::Utc::now());
+                // A marker only in the text used to park through the
+                // connection error path, which a rejection no longer takes.
+                return classify_rate_limit_error(error, captured.clone())
+                    .or_else(|| classify_rate_limit_from_message(&error.to_string(), captured));
             }
             Ok(response) if matches!(response.stop_reason, StopReason::Cancelled) => return None,
             Ok(_) => {}
@@ -732,6 +743,7 @@ impl Session {
                 preceding.push(Event::PromptRuntimeError { message });
             }
         }
+        let rejected = turn.flags.rejection.is_some();
         if let Some(error) = turn.flags.rejection.take() {
             preceding.push(Event::PromptRuntimeError {
                 message: format!("the agent rejected the prompt: {error}"),
@@ -742,15 +754,20 @@ impl Session {
             });
         }
         let f = &mut turn.flags;
-        let reason = terminal_stop_reason(
-            f.rate_limit.is_some(),
-            f.force_stopped,
-            f.prompt_orphaned,
-            f.agent_unresponsive,
-            f.shutdown,
-            f.prompt_cancelled,
-            f.orphan_cancel_sent && finished,
-        );
+        // Not `prompt_complete`, which consumers read as a finished reply.
+        let reason = if rejected {
+            "prompt_rejected"
+        } else {
+            terminal_stop_reason(
+                f.rate_limit.is_some(),
+                f.force_stopped,
+                f.prompt_orphaned,
+                f.agent_unresponsive,
+                f.shutdown,
+                f.prompt_cancelled,
+                f.orphan_cancel_sent && finished,
+            )
+        };
         if let Some(info) = f.rate_limit.take() {
             preceding.push(Event::RateLimit { info });
         }
