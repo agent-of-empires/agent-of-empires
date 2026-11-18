@@ -2466,7 +2466,7 @@ mod tests {
 
     #[test]
     fn oneshot_argv_places_model_args_by_agent_convention() {
-        let cases: [(&str, Option<&str>, &[&str]); 8] = [
+        let cases: [(&str, Option<&str>, &[&str]); 9] = [
             (
                 "claude",
                 Some("picked-small"),
@@ -2526,6 +2526,11 @@ mod tests {
                 &["kimi", "-p", "name this", "-m", "moonshot-v1-8k"],
             ),
             (
+                "vibe",
+                Some("mistral-medium-3.5"),
+                &["vibe", "-p", "name this", "--model", "mistral-medium-3.5"],
+            ),
+            (
                 "opencode",
                 Some("anthropic/claude-haiku-4-5"),
                 &[
@@ -2541,7 +2546,7 @@ mod tests {
             let argv = argv_for(name, model);
             assert_eq!(argv.as_slice(), expected, "{name} {model:?}");
         }
-        for name in ["opencode", "kimi", "codex", "gemini", "copilot"] {
+        for name in ["opencode", "kimi", "codex", "gemini", "copilot", "vibe"] {
             let argv = argv_for(name, None);
             assert!(
                 !argv.iter().any(|arg| arg == "--model" || arg == "-m"),
