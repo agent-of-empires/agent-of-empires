@@ -21,6 +21,10 @@ pub(crate) struct LayerUpdate {
 /// Non-TTY `docker pull` prints `<12-hex id>: <status>` on stdout as each layer changes
 /// (`tests/fixtures/pull-progress`). Done means downloaded, so the unpacking phase covers the
 /// `Pull complete` lines that follow the last download. Unrecognised lines are `None`.
+///
+/// Docker's classic image store prints only `Already exists` for a cached layer, with no
+/// `Pulling fs layer` (moby v24 `distribution/xfer/download.go`), so there the counts cover
+/// only the layers the pull fetches.
 pub(crate) fn docker_layer(line: &str) -> Option<LayerUpdate> {
     let (id, status) = line.split_once(": ")?;
     if id.len() != 12 || !id.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f')) {
@@ -64,15 +68,17 @@ impl Progress {
         } else if self.known.contains(&id) {
             self.done.insert(id);
         }
-        self.phase = self.phase.max(Some(PullPhase::Downloading));
+        // Decided by the output, never by when a status read happens. Docker announces every
+        // layer before any finishes, so a done line that finishes the known set is the last.
+        let phase = if !self.known.is_empty() && self.done.len() == self.known.len() {
+            PullPhase::Unpacking
+        } else {
+            PullPhase::Downloading
+        };
+        self.phase = self.phase.max(Some(phase));
     }
 
-    /// Unpacking starts once every known layer is done. It is decided here, on read, so a
-    /// runtime's opening burst of layer lines lands before the check.
-    pub(crate) fn snapshot(&mut self) -> ProgressSnapshot {
-        if !self.known.is_empty() && self.done.len() == self.known.len() {
-            self.phase = Some(PullPhase::Unpacking);
-        }
+    pub(crate) fn snapshot(&self) -> ProgressSnapshot {
         let count = |set: &HashSet<String>| {
             (!self.known.is_empty()).then(|| u32::try_from(set.len()).unwrap_or(u32::MAX))
         };
@@ -155,12 +161,17 @@ mod tests {
             assert_eq!(progress.snapshot(), expected, "step {i}");
         }
 
-        // A runtime's opening burst of layer lines lands before the read decides the phase.
-        let mut burst = Progress::default();
-        burst.apply(layer("x", false));
-        burst.apply(layer("x", true));
-        burst.apply(layer("y", false));
-        assert_eq!(burst.snapshot().phase, Some(Downloading));
+        // A read between two lines doesn't change what the next read says.
+        let lines = || [layer("x", false), layer("x", true), layer("y", false)];
+        let (mut polled, mut unpolled) = (Progress::default(), Progress::default());
+        for update in lines() {
+            polled.apply(update);
+            polled.snapshot();
+        }
+        for update in lines() {
+            unpolled.apply(update);
+        }
+        assert_eq!(polled.snapshot(), unpolled.snapshot());
     }
 
     #[test]
@@ -218,7 +229,7 @@ mod tests {
     #[test]
     fn docker_transcripts_count_layers_unpack_after_the_last_download_and_resume() {
         use PullPhase::*;
-        let mut cancel = replay(
+        let cancel = replay(
             include_str!("../../tests/fixtures/pull-progress/docker-29.5.2-cancel.txt"),
             |_, _| {},
         );
@@ -231,7 +242,7 @@ mod tests {
 
         let mut first_done = None;
         let mut unpacking_lines = Vec::new();
-        let mut retry = replay(
+        let retry = replay(
             include_str!("../../tests/fixtures/pull-progress/docker-29.5.2-retry.txt"),
             |line, progress| {
                 let snapshot = progress.snapshot();
