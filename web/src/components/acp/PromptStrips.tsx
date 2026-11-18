@@ -23,7 +23,7 @@ function Strip({ tone, testId, children }: { tone: string; testId?: string; chil
   );
 }
 
-/** Prompts the daemon refused while another turn was in flight. */
+/** Prompts that did not run: the daemon refused them mid-turn, or the agent answered with an error. */
 export function RejectedPromptsStrip({
   rejected,
   onRetry,
@@ -31,7 +31,7 @@ export function RejectedPromptsStrip({
   disabled,
 }: {
   rejected: RejectedPrompt[];
-  onRetry: (text: string) => void;
+  onRetry: (prompt: RejectedPrompt) => void;
   onDismiss: (id: string) => void;
   /** Retry is gated while the worker restarts: sending would clear the restart
    *  state before the respawn has actually reconnected. */
@@ -57,11 +57,20 @@ export function RejectedPromptsStrip({
               <p className="max-h-48 overflow-y-auto whitespace-pre-wrap break-words text-xs text-amber-100">
                 {r.text}
               </p>
-              <p className="mt-0.5 text-[10px] text-amber-400/80">Agent was busy; prompt was not sent.</p>
+              {r.attachments?.length ? (
+                <p className="mt-0.5 truncate text-[10px] text-amber-300/90">
+                  {r.attachments.map((a) => a.name ?? a.kind).join(", ")}
+                </p>
+              ) : null}
+              <p className="mt-0.5 text-[10px] text-amber-400/80">
+                {r.reason === "prompt_failed"
+                  ? "The agent rejected the prompt."
+                  : "Agent was busy; prompt was not sent."}
+              </p>
             </div>
             <button
               type="button"
-              onClick={() => onRetry(r.text)}
+              onClick={() => onRetry(r)}
               disabled={disabled}
               className="inline-flex shrink-0 items-center gap-1 rounded-md border border-amber-700/60 bg-amber-900/30 px-2 py-1 text-[10px] font-mono uppercase tracking-wide text-amber-100 hover:bg-amber-900/60 disabled:cursor-not-allowed disabled:opacity-40 disabled:hover:bg-amber-900/30"
               aria-label="Retry rejected prompt"

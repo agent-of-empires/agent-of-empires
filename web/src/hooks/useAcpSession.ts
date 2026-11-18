@@ -10,6 +10,7 @@ import {
   type ElicitationResolution,
   type PromptAttachmentInput,
   type QueuedPrompt,
+  type RejectedPrompt,
 } from "../lib/acpTypes";
 import {
   cancelSubagent,
@@ -17,6 +18,7 @@ import {
   editServerQueuedPrompt,
   enqueueServerPrompt,
   listServerQueue,
+  loadStoredAttachment,
   removeServerQueuedPrompt,
   reportAcpInteraction,
   setSessionSnooze,
@@ -423,6 +425,21 @@ export function useAcpSession(
     [sessionId, archivedAtRef, snoozedUntilRef, dispatchPromptNow, enqueueServer, showServerQueued],
   );
 
+  /** Resends a refused prompt as it was sent, attachments included. */
+  const retryRejectedPrompt = useCallback(
+    async (prompt: RejectedPrompt) => {
+      const loaded = await Promise.all((prompt.attachments ?? []).map(loadStoredAttachment));
+      const attachments = loaded.filter((a): a is PromptAttachmentInput => a !== null);
+      // A partial resend would differ from what the user sent.
+      if (attachments.length < loaded.length) {
+        dispatch({ kind: "error", message: "Could not reload this prompt's attachments, so it was not resent." });
+        return;
+      }
+      await sendPrompt(prompt.text, attachments.length > 0 ? attachments : undefined);
+    },
+    [sendPrompt],
+  );
+
   // The daemon owns and drains the queue; re-list on connect, at each turn change, and when the
   // polled count changes (not whenever it differs: optimistic rows here differ until the next
   // poll). The first list per session waits for rows the server never confirmed to be re-sent,
@@ -616,6 +633,7 @@ export function useAcpSession(
     resolveApproval,
     resolveElicitation,
     sendPrompt,
+    retryRejectedPrompt,
     cancelPrompt,
     cancelSubagent: cancelSubagentById,
     forceEndTurn,

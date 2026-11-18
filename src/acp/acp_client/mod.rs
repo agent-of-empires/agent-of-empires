@@ -79,7 +79,7 @@ use tokio::sync::{mpsc, oneshot, Mutex};
 use tokio_util::compat::{TokioAsyncReadCompatExt, TokioAsyncWriteCompatExt};
 use tracing::Instrument;
 
-use self::commands::{ClientCmd, ConnectMode};
+use self::commands::{ClientCmd, ConnectMode, PromptInput};
 use self::connection::{run_connection_task, ConnectionParams, RunnerLink};
 use self::control::{connect_runner_control_v3, ShutdownControlOnDrop};
 use self::delete::ACP_SESSION_DELETE_TIMEOUT;
@@ -853,7 +853,10 @@ impl AcpClient {
             return Err(AcpError::NotRunning);
         }
         let mut blocks = Vec::with_capacity(1 + attachments.len());
-        blocks.push(ContentBlock::Text(TextContent::new(text)));
+        // An attachment-only prompt carries no empty text block.
+        if !text.is_empty() || attachments.is_empty() {
+            blocks.push(ContentBlock::Text(TextContent::new(text)));
+        }
         for att in attachments {
             let data = base64::engine::general_purpose::STANDARD.encode(&att.data);
             let mime = att.mime_type.clone();
@@ -870,7 +873,11 @@ impl AcpClient {
                 }
             });
         }
-        self.send_cmd(ClientCmd::Prompt(blocks)).await
+        self.send_cmd(ClientCmd::Prompt(PromptInput {
+            blocks,
+            attachments: attachments.iter().map(AttachmentBlob::to_ref).collect(),
+        }))
+        .await
     }
 
     /// Best-effort `session/cancel`; Ok even with no turn in flight.

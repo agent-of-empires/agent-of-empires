@@ -24,7 +24,7 @@ import type {
   ImportableSession,
   SettingsFieldDescriptor,
 } from "./types";
-import type { ConfigOptionDescriptor } from "./acpTypes";
+import type { AcpAttachment, ConfigOptionDescriptor, PromptAttachmentInput } from "./acpTypes";
 import { clearDeviceBindingSecret, getOrCreateDeviceBindingSecret } from "./deviceBinding";
 import { INLINE_ELEVATION_HEADER } from "./fetchInterceptor";
 
@@ -387,6 +387,25 @@ function fileToBase64(file: File): Promise<string> {
     };
     reader.readAsDataURL(file);
   });
+}
+
+function bytesToBase64(bytes: Uint8Array): string {
+  let binary = "";
+  // Chunked so a large attachment does not overflow the argument limit.
+  for (let i = 0; i < bytes.length; i += 0x8000) binary += String.fromCharCode(...bytes.subarray(i, i + 0x8000));
+  return btoa(binary);
+}
+
+/** Reads a sent prompt's stored attachment back as an upload, or null when it is gone. */
+export async function loadStoredAttachment(a: AcpAttachment): Promise<PromptAttachmentInput | null> {
+  try {
+    const res = await fetch(a.url);
+    if (!res.ok) return null;
+    const dataB64 = bytesToBase64(new Uint8Array(await res.arrayBuffer()));
+    return { kind: a.kind, mimeType: a.mimeType, ...(a.name ? { name: a.name } : {}), dataB64 };
+  } catch {
+    return null;
+  }
 }
 
 /**

@@ -833,6 +833,14 @@
       "components": ["web/src/hooks/useAcpSession.ts", "web/src/hooks/acpSession/reducer.ts"]
     },
     {
+      "id": "acp.rejected-prompt-retry",
+      "kind": "vitest",
+      "risk": "medium",
+      "specs": ["src/hooks/useAcpSession.test.ts", "src/lib/acpTypes.reducer.test.ts"],
+      "components": ["web/src/hooks/useAcpSession.ts", "web/src/components/acp/PromptStrips.tsx"],
+      "notes": "A prompt the agent rejects keeps its stored attachments; Retry reloads each one and resends text and attachments as sent, an attachment-only prompt included, and does not resend when an attachment cannot be reloaded."
+    },
+    {
       "id": "acp.server-queue",
       "kind": "vitest",
       "risk": "medium",

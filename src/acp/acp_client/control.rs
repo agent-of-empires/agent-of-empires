@@ -1409,13 +1409,16 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn attached_session_only_resets_for_missing_session_errors() {
+    async fn attached_session_prompt_errors_reset_tear_down_or_end_the_turn() {
         use crate::acp::acp_client::AcpClient;
         use crate::acp::state::AcpSessionId;
 
-        for (message, should_reset) in [
-            ("Unsupported ACP session", true),
-            ("Unsupported session mode", false),
+        // -32000 alone is not a login: some adapters use it for any failure.
+        for (message, code, want) in [
+            ("Unsupported ACP session", -32603, &["reset", "stopped"][..]),
+            ("Unsupported session mode", -32603, &["rejected"]),
+            ("Authentication required", -32000, &["startup_error"]),
+            ("model overloaded", -32000, &["rejected"]),
         ] {
             let tmp = tempfile::tempdir().unwrap();
             let socket = tmp.path().join("s.sock");
@@ -1448,7 +1451,7 @@ mod tests {
                             ControlBody::PromptCompleted {
                                 prompt_req_id: 1,
                                 outcome: PromptOutcome::Error {
-                                    code: -32603,
+                                    code,
                                     message: message.into(),
                                     data: None,
                                 },
@@ -1485,23 +1488,22 @@ mod tests {
                 while let Some(event) = client.next_event().await {
                     match event {
                         Event::SessionContextReset { .. } => recovery.push("reset"),
-                        Event::Stopped { reason } if should_reset => {
-                            assert_eq!(reason, "stored_session_rejected");
+                        Event::Stopped { reason } if reason == "stored_session_rejected" => {
                             recovery.push("stopped");
                         }
                         // Any other rejection ends only the turn (#5662).
-                        Event::Stopped { .. } => break,
+                        Event::Stopped { reason } if reason == "prompt_rejected" => {
+                            recovery.push("rejected");
+                            break;
+                        }
+                        Event::Stopped { reason } => panic!("{message}: stopped as {reason}"),
                         Event::AgentStartupError { message: error, .. } => {
-                            panic!("the connection must not fail: {error}")
+                            assert!(error.contains(message), "{error}");
+                            recovery.push("startup_error");
                         }
                         _ => {}
                     }
                 }
-                let want = if should_reset {
-                    vec!["reset", "stopped"]
-                } else {
-                    vec![]
-                };
                 assert_eq!(recovery, want, "{message}");
                 let _ = client.shutdown().await;
             };
