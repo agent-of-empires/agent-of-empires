@@ -70,9 +70,9 @@ pub struct ProgressSnapshot {
 
 impl Progress {
     pub(crate) fn apply(&mut self, LayerUpdate { id, done }: LayerUpdate) {
-        // Decided by the output, never by when a status read happens. Docker announces every
-        // layer before any finishes, so a done line that finishes the known set is the last; an
-        // announcement never moves the phase.
+        // Decided by the output, never by when a status read happens. This assumes Docker
+        // announces every layer before any finishes (see `docker_layer`), so a done line that
+        // finishes the known set is the last; an announcement never moves the phase.
         let phase = if !done {
             if self.done_unannounced.remove(&id) {
                 self.done.insert(id.clone());
@@ -249,7 +249,8 @@ mod tests {
 
         // A read between lines changes nothing, so both give the same answer. A layer announced
         // after the known set finished still latches Unpacking, because the phase never goes
-        // back; Docker announces every layer before any finishes (the transcript test below).
+        // back. The captured transcripts announce every layer before any finishes (the test
+        // below); that order is assumed, not guaranteed (see `docker_layer`).
         let lines = || [layer("x", false), layer("x", true), layer("y", false)];
         let (mut polled, mut unpolled) = (Progress::default(), Progress::default());
         for update in lines() {
