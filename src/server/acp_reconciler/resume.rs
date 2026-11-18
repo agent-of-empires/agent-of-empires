@@ -203,9 +203,9 @@ pub(super) async fn resume_one(state: Arc<AppState>, target: ResumeTarget) -> Re
         }
         Err(error) => {
             log_refused_admission(&id, "resume", &error);
-            // A durable stop fence is terminal; only a pending teardown clears.
+            // A stop is terminal; a temporary admission refusal is not a spawn attempt.
             return match error {
-                SupervisorError::TeardownPending(_) => ResumeOutcome::Retry,
+                SupervisorError::TeardownPending(_) => ResumeOutcome::AdmissionDeferred,
                 _ => ResumeOutcome::SpawnFinished,
             };
         }

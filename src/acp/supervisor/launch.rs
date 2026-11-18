@@ -119,12 +119,19 @@ impl<S: BroadcastSink> Supervisor<S> {
         // Hold the worker gate while claiming the matching durable stop token.
         let _workers = self.workers.lock().await;
         let request_state = lock_recover(&self.spawn_requests);
-        if (request_state.stop_fences.contains_key(session_id) && restart.is_none())
-            || cancellation
-                .as_ref()
-                .is_some_and(CancellationToken::is_cancelled)
+        if cancellation
+            .as_ref()
+            .is_some_and(CancellationToken::is_cancelled)
         {
             return Err(SupervisorError::SpawnCancelled(session_id.to_string()));
+        }
+        let admission_error = if restart.is_none() {
+            request_state.admission_error(session_id)
+        } else {
+            None
+        };
+        if let Some(error) = admission_error {
+            return Err(error);
         }
         drop(request_state);
         let restart_requests = lock_recover(&self.restart_requests);
@@ -174,13 +181,19 @@ impl<S: BroadcastSink> Supervisor<S> {
         // A stop may have installed its fence while durable admission was
         // being prepared. Abandon this exact Lease before any launch work.
         let request_state = lock_recover(&self.spawn_requests);
-        if (request_state.stop_fences.contains_key(session_id) && restart.is_none())
-            || cancellation
-                .as_ref()
-                .is_some_and(CancellationToken::is_cancelled)
+        let admission_error = if cancellation
+            .as_ref()
+            .is_some_and(CancellationToken::is_cancelled)
         {
+            Some(SupervisorError::SpawnCancelled(session_id.to_string()))
+        } else if restart.is_none() {
+            request_state.admission_error(session_id)
+        } else {
+            None
+        };
+        if let Some(error) = admission_error {
             table.abandon(&lease);
-            return Err(SupervisorError::SpawnCancelled(session_id.to_string()));
+            return Err(error);
         }
         drop(request_state);
         if kind != ResumeKind::Attach {

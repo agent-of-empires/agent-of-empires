@@ -110,11 +110,13 @@ async fn purge_session_artifacts_inner(
             cleanup_errors,
         });
     }
-    // Freeze the original worker before reservation, so a refused registry read cannot strand Purge.
-    let retirement = if instance.is_structured() {
-        Some(state.acp_supervisor.capture_retirement(id)?)
+    // A later admission must not replace the construction frozen for this purge.
+    let (_retirement_admission, retirement) = if instance.is_structured() {
+        let admission = state.acp_supervisor.fence_spawn_admission(id);
+        let retirement = state.acp_supervisor.capture_retirement(id)?;
+        (Some(admission), Some(retirement))
     } else {
-        None
+        (None, None)
     };
     let request = crate::session::deletion::DeletionRequest {
         session_id: id.to_owned(),
