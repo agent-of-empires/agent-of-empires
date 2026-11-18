@@ -793,9 +793,10 @@ pub(super) fn foreign_runner_group_absent(pid: u32) -> anyhow::Result<bool> {
     let ruid = unsafe { libc::getuid() };
     Ok((info.pbsi_uid != uid || info.pbsi_ruid != ruid) && !runner_group_executing(pid)?)
 }
+
 /// `samples` with each one's command line, executable and age. `ps` joins arguments with spaces,
-/// so they are split on whitespace here. A process that exited, or whose PID now names another
-/// process, is left out.
+/// so they are split on whitespace; `-ww` stops ps cutting them at the terminal width. A process
+/// that exited, or whose PID now names another process, is left out.
 pub(super) fn describe_processes(
     samples: Vec<super::PrimeProcessSample>,
 ) -> anyhow::Result<Vec<super::CommandSample>> {
@@ -804,7 +805,7 @@ pub(super) fn describe_processes(
     }
     let pids: Vec<String> = samples.iter().map(|s| s.identity.pid.to_string()).collect();
     let mut command = Command::new("ps");
-    command.args(["-o", "pid=,etime=,args=", "-p", &pids.join(",")]);
+    command.args(["-ww", "-o", "pid=,etime=,args=", "-p", &pids.join(",")]);
     let output = crate::session::capture::run_with_timeout_limit(
         command,
         std::time::Duration::from_secs(2),
