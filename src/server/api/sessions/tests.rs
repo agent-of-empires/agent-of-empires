@@ -9851,12 +9851,15 @@ async fn an_update_restart_names_the_agents_background_shells_before_stopping_th
     let project = tempfile::tempdir().unwrap();
     let agent = project.path().join("agent");
     let second = project.path().join("second");
+    let third = project.path().join("third");
     std::fs::write(
         &agent,
         format!(
             "#!/bin/sh\nbash -c 'sleep 600; :' &\nwhile [ ! -e {0} ]; do sleep 0.05; done\n\
-             bash -c 'sleep 700; :' &\nwait\n",
-            second.display()
+             bash -c 'sleep 700; :' &\nwhile [ ! -e {1} ]; do sleep 0.05; done\n\
+             bash -c 'sleep 800; :' &\nwait\n",
+            second.display(),
+            third.display()
         ),
     )
     .unwrap();
@@ -9975,6 +9978,7 @@ async fn an_update_restart_names_the_agents_background_shells_before_stopping_th
     let (status, first) = restart(&inst, vec![], false).await;
     assert_eq!(status, StatusCode::CONFLICT, "{first}");
     assert_eq!(first["error"], "background_processes");
+    assert_eq!(first["launch_hooks_ran"], false);
     assert_eq!(first["classified"], true);
     assert_eq!(first["total"], 1);
     assert_eq!(
@@ -10020,6 +10024,157 @@ async fn an_update_restart_names_the_agents_background_shells_before_stopping_th
     let (_, accepted) = restart(&shelved(&unrecorded), vec![], true).await;
     assert_eq!(accepted["error"], "session_archived", "{accepted}");
     assert_eq!(sleeping(2), 2, "nothing was stopped");
+
+    // A shell that starts while the launch hooks run, after the first check passed, is found by
+    // the recheck before the pane stops. The row goes back to how it was.
+    let runs = project.path().join("on-launch-runs");
+    crate::session::config::update_config(|global| {
+        global.hooks.on_launch = vec![format!("echo run >> '{}'", runs.display())];
+    })
+    .unwrap();
+    crate::session::config::update_app_state(|app| app.has_acknowledged_agent_hooks = true)
+        .unwrap();
+    let hook_runs = || {
+        std::fs::read_to_string(&runs)
+            .map(|text| text.lines().count())
+            .unwrap_or(0)
+    };
+    let mut live = inst.clone();
+    live.command = agent.to_str().unwrap().to_owned();
+    let storage = Storage::new_unwatched("default").unwrap();
+    storage
+        .update(|rows, _| {
+            *rows = vec![live.clone()];
+            Ok(())
+        })
+        .unwrap();
+    let state = crate::server::test_support::build_test_app_state(vec![live]);
+    crate::server::test_support::refresh_canonical_metadata_for_test(&state).await;
+    let before = storage.load().unwrap().remove(0);
+    let confirm = |stop: Vec<crate::daemon::ProcessIdentity>, skip_on_launch| {
+        let state = state.clone();
+        let id = id.clone();
+        async move {
+            let body = crate::daemon::RestartSessionBody {
+                only_if_idle: true,
+                stop_processes: Some(stop),
+                skip_on_launch,
+                ..Default::default()
+            };
+            let response = lifecycle::prepare_agent_session(
+                state,
+                id,
+                Ok(None),
+                lifecycle::AgentPreparation::Restart,
+                Some(Arc::new(body)),
+            )
+            .await;
+            let status = response.status();
+            let body = axum::body::to_bytes(response.into_body(), 64 * 1024)
+                .await
+                .unwrap();
+            (
+                status,
+                serde_json::from_slice::<serde_json::Value>(&body).unwrap_or_default(),
+            )
+        }
+    };
+    let (entered, release) =
+        lifecycle::launch_hook_gate::arm(&id, lifecycle::launch_hook_gate::Stage::BeforeHooks);
+    let late = tokio::spawn(confirm(identities(&refreshed), false));
+    entered.await.expect("the confirm passed the first check");
+    std::fs::write(&third, "").unwrap();
+    assert_eq!(sleeping(3), 3);
+    release.send(()).unwrap();
+    let (status, late) = late.await.unwrap();
+    assert_eq!(status, StatusCode::CONFLICT, "{late}");
+    assert_eq!(late["error"], "background_processes");
+    assert_eq!(late["launch_hooks_ran"], true);
+    assert_eq!(late["total"], 3);
+    assert_eq!(
+        hook_runs(),
+        1,
+        "the launch hooks ran once, before the recheck"
+    );
+    assert_eq!(sleeping(3), 3, "the recheck stopped nothing");
+    let after = storage.load().unwrap().remove(0);
+    assert_eq!(after.status, before.status);
+    assert_eq!(after.last_error, before.last_error);
+    assert_eq!(after.last_accessed_at, before.last_accessed_at);
+    assert_eq!(after.idle_entered_at, before.idle_entered_at);
+    assert!(after.lifecycle_reservation.is_none());
+
+    // Confirming that list with `skip_on_launch` restarts without running the hooks again.
+    let (status, confirmed) = confirm(identities(&late), true).await;
+    assert!(status.is_success(), "{status} {confirmed}");
+    assert_eq!(hook_runs(), 1, "on_launch ran once for the whole restart");
+}
+
+#[tokio::test]
+async fn a_process_check_is_refused_on_a_restart_that_changes_a_setting() {
+    let mut inst = Instance::new("process-check", "/tmp/process-check");
+    inst.id = "process-check".to_string();
+    inst.status = Status::Idle;
+    let state = crate::server::test_support::build_test_app_state(vec![inst]);
+    let checked = || crate::daemon::RestartSessionBody {
+        stop_processes: Some(vec![]),
+        ..Default::default()
+    };
+    let cases = [
+        (
+            "profile",
+            crate::daemon::RestartSessionBody {
+                profile: Some("other".into()),
+                ..checked()
+            },
+        ),
+        (
+            "tool",
+            crate::daemon::RestartSessionBody {
+                tool: Some("codex".into()),
+                ..checked()
+            },
+        ),
+        (
+            "command",
+            crate::daemon::RestartSessionBody {
+                command_override: Some("sh".into()),
+                ..checked()
+            },
+        ),
+        (
+            "extra args",
+            crate::daemon::RestartSessionBody {
+                extra_args: Some("-v".into()),
+                ..checked()
+            },
+        ),
+        (
+            "unsnooze",
+            crate::daemon::RestartSessionBody {
+                unsnooze: true,
+                ..checked()
+            },
+        ),
+        (
+            "container",
+            crate::daemon::RestartSessionBody {
+                discard_sandbox_container: true,
+                ..checked()
+            },
+        ),
+    ];
+    for (setting, body) in cases {
+        let response = lifecycle::prepare_agent_session(
+            state.clone(),
+            "process-check".to_string(),
+            Ok(None),
+            lifecycle::AgentPreparation::Restart,
+            Some(Arc::new(body)),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST, "{setting}");
+    }
 }
 
 #[tokio::test]

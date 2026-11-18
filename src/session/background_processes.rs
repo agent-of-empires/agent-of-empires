@@ -72,6 +72,67 @@ pub(crate) fn refusal(
     }
 }
 
+/// A restart's confirmation, checked again just before its pane is stopped, after the launch
+/// hooks ran without the locks.
+pub(crate) struct ProcessRecheck {
+    pub(crate) confirmed: Vec<PrimeProcessIdentity>,
+    pub(crate) stop_unclassified: bool,
+    pub(crate) admitted: AdmittedRestart,
+}
+
+/// The fields a restart's admission changes, as they were before it, so a late refusal can put
+/// them back. The admission takes a check only on a restart that changes no setting.
+#[derive(Debug, Clone)]
+pub(crate) struct AdmittedRestart {
+    status: crate::session::Status,
+    last_error: Option<String>,
+    last_error_check: Option<std::time::Instant>,
+    last_accessed_at: Option<chrono::DateTime<chrono::Utc>>,
+    archived_at: Option<chrono::DateTime<chrono::Utc>>,
+    snoozed_until: Option<chrono::DateTime<chrono::Utc>>,
+    idle_dormant_since: Option<chrono::DateTime<chrono::Utc>>,
+    idle_entered_at: Option<chrono::DateTime<chrono::Utc>>,
+}
+
+impl AdmittedRestart {
+    pub(crate) fn of(row: &Instance) -> Self {
+        Self {
+            status: row.status,
+            last_error: row.last_error.clone(),
+            last_error_check: row.last_error_check,
+            last_accessed_at: row.last_accessed_at,
+            archived_at: row.archived_at,
+            snoozed_until: row.snoozed_until,
+            idle_dormant_since: row.idle_dormant_since,
+            idle_entered_at: row.idle_entered_at,
+        }
+    }
+
+    pub(crate) fn restore(&self, row: &mut Instance) {
+        row.status = self.status;
+        row.last_error.clone_from(&self.last_error);
+        row.last_error_check = self.last_error_check;
+        row.last_accessed_at = self.last_accessed_at;
+        row.archived_at = self.archived_at;
+        row.snoozed_until = self.snoozed_until;
+        row.idle_dormant_since = self.idle_dormant_since;
+        row.idle_entered_at = self.idle_entered_at;
+    }
+}
+
+/// The recheck found what the first check didn't: the refusal's fields, with the reservation
+/// already released and the row restored.
+#[derive(Debug)]
+pub(crate) struct BackgroundProcessesAppeared(pub(crate) serde_json::Value);
+
+impl std::fmt::Display for BackgroundProcessesAppeared {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("background processes started after the restart's check")
+    }
+}
+
+impl std::error::Error for BackgroundProcessesAppeared {}
+
 /// How many processes a refusal names; the rest are counted.
 const NAMED: usize = 5;
 /// More background shells than this are reported as unclassified, so the refusal stays within

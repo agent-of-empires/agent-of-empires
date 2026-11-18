@@ -155,6 +155,7 @@ pub(crate) struct ResumeLaunchOptions {
     pub(crate) resume_policy: ResumeAttemptPolicy,
     pub(crate) restart: bool,
     pub(crate) conversation_carry: Option<ConversationCarry>,
+    pub(crate) processes: Option<crate::session::background_processes::ProcessRecheck>,
 }
 
 const RESUME_PROBE_MAX: std::time::Duration = std::time::Duration::from_millis(3000);
@@ -205,6 +206,7 @@ impl Instance {
                 resume_policy,
                 restart: true,
                 conversation_carry: None,
+                processes: None,
             },
         )
     }
@@ -229,6 +231,7 @@ impl Instance {
                 resume_policy: ResumeAttemptPolicy::HonorAutoResumeSetting,
                 restart: true,
                 conversation_carry,
+                processes: None,
             },
         )
     }
@@ -339,6 +342,7 @@ impl Instance {
                 resume_policy,
                 restart: false,
                 conversation_carry: None,
+                processes: None,
             },
         )
     }
@@ -545,7 +549,23 @@ impl Instance {
             resume_policy,
             restart,
             conversation_carry,
+            processes,
         } = options;
+        // Under the same locks as the pane stop below, which nothing before it touches.
+        if let Some(recheck) = processes {
+            use crate::session::background_processes::{pane_census, refusal};
+            if let Some(fields) = refusal(
+                pane_census(self),
+                &recheck.confirmed,
+                recheck.stop_unclassified,
+            ) {
+                self.withdraw_reserved_restart(storage, generation, &recheck.admitted)?;
+                return Err(
+                    crate::session::background_processes::BackgroundProcessesAppeared(fields)
+                        .into(),
+                );
+            }
+        }
         // Capture may refresh memory, but publication must compare against durable prior state.
         let prior = self.conversation_state();
         self.capture_resume_launch_target_in(CaptureStorage::Scoped(storage));
@@ -573,6 +593,38 @@ impl Instance {
             return Err(error);
         }
         result
+    }
+
+    /// Give back a restart's reservation without failing the row: its admitted fields return to
+    /// what they were, and the poller the restart stopped starts again.
+    fn withdraw_reserved_restart(
+        &mut self,
+        storage: &dyn crate::session::SessionStore,
+        generation: u64,
+        admitted: &crate::session::background_processes::AdmittedRestart,
+    ) -> Result<()> {
+        let released = storage.update(|instances, _groups| {
+            let Some(stored) = instances.iter_mut().find(|row| row.id == self.id) else {
+                return Ok(false);
+            };
+            if !stored
+                .release_lifecycle_reservation_if_owned(LifecycleOperation::Launch, generation)
+            {
+                return Ok(false);
+            }
+            admitted.restore(stored);
+            Ok(true)
+        })?;
+        anyhow::ensure!(
+            released,
+            crate::session::LifecycleReservationError::Superseded
+        );
+        self.release_lifecycle_reservation_if_owned(LifecycleOperation::Launch, generation);
+        admitted.restore(self);
+        if let Err(error) = self.maybe_start_poller_since_in(CaptureStorage::Scoped(storage)) {
+            tracing::warn!(target: "session.capture", session = %self.id, %error, "poller restart after a withdrawn restart failed");
+        }
+        Ok(())
     }
 
     /// Tear down the outgoing pane, carry the conversation, then build the
@@ -839,6 +891,63 @@ mod tests {
     use super::*;
 
     use crate::session::instance::launch_command::build_resume_flags;
+
+    /// A restart the background-process recheck refuses gives its reservation back without
+    /// failing the row: the admitted fields return and the poller it stopped runs again.
+    #[test]
+    #[serial_test::serial]
+    fn a_withdrawn_restart_leaves_the_row_and_its_poller_as_they_were() {
+        let _budget = crate::session::poller::test_support::IsolatedBudget::with_ceiling(1);
+        let temp = tempfile::tempdir().unwrap();
+        let _home = crate::session::test_support::isolate_app_dir_at(temp.path());
+        let storage = crate::session::storage::Storage::new_unwatched("withdrawn").unwrap();
+        let mut inst = Instance::new("withdrawn", "/tmp/withdrawn");
+        inst.source_profile = "withdrawn".to_string();
+        inst.status = Status::Idle;
+        inst.last_error = Some("an earlier failure".to_string());
+        storage
+            .update(|instances, _groups| {
+                instances.push(inst.clone());
+                Ok(())
+            })
+            .unwrap();
+        assert_eq!(inst.maybe_start_poller(), PollerStart::Started);
+        let before = storage.load().unwrap().remove(0);
+
+        let admitted = crate::session::background_processes::AdmittedRestart::of(&before);
+        inst.acquire_lifecycle_reservation(
+            &storage,
+            LifecycleOperation::Launch,
+            Some(Status::Starting),
+        )
+        .unwrap();
+        let generation = inst.lifecycle_generation;
+        storage
+            .update(|instances, _groups| {
+                let row = &mut instances[0];
+                row.touch_last_accessed();
+                row.last_error = None;
+                Ok(())
+            })
+            .unwrap();
+        inst.capture_poller.stop();
+
+        inst.withdraw_reserved_restart(&storage, generation, &admitted)
+            .unwrap();
+        let after = storage.load().unwrap().remove(0);
+        assert_eq!(after.status, before.status);
+        assert_eq!(after.last_error, before.last_error);
+        assert_eq!(after.last_accessed_at, before.last_accessed_at);
+        assert!(after.lifecycle_reservation.is_none());
+        assert_eq!(inst.status, before.status);
+        assert!(inst.capture_poller.is_running());
+        inst.capture_poller.stop();
+
+        // A reservation a peer has since taken is not given back.
+        assert!(inst
+            .withdraw_reserved_restart(&storage, generation, &admitted)
+            .is_err());
+    }
     use crate::session::instance::test_helpers::{install_aliases, seed_claude_transcript};
     use serial_test::serial;
     use tempfile::tempdir;
@@ -907,6 +1016,7 @@ mod tests {
                     resume_policy: ResumeAttemptPolicy::Allow,
                     restart: true,
                     conversation_carry: None,
+                    processes: None,
                 },
                 generation,
                 Ok(()),

@@ -484,8 +484,12 @@ pub struct RestartSessionBody {
     /// Refuse, before anything stops, unless `tool` is an account swap that keeps the conversation.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub require_account_carry: bool,
-    /// `Some` refuses, under the lifecycle locks, a restart that would stop a background process
-    /// not listed (#5762); absent skips the check.
+    /// `Some` refuses a restart that would stop a background process not listed (#5762); absent
+    /// skips the check. It is checked before the launch hooks and again before the pane stops; a
+    /// 409 `background_processes` from the second check says `launch_hooks_ran: true`, and the
+    /// confirm then sets `skip_on_launch` so `on_launch` runs once. Only for a restart that changes
+    /// no setting (`profile`, `tool`, `command_override`, `extra_args`, `unsnooze`,
+    /// `discard_sandbox_container`): a refusal after the hooks must leave the row as it was.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub stop_processes: Option<Vec<ProcessIdentity>>,
     /// With `stop_processes`, restart even when the check can't tell the Agent from what it
@@ -501,6 +505,9 @@ pub struct RestartForUpdateBody {
     pub stop_processes: Option<Vec<ProcessIdentity>>,
     #[serde(default)]
     pub stop_unclassified: bool,
+    /// Set on the confirm after a refusal with `launch_hooks_ran: true`.
+    #[serde(default)]
+    pub skip_on_launch: bool,
 }
 
 /// A process by its PID and start, so a reused PID isn't taken for the one confirmed.
