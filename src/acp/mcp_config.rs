@@ -48,19 +48,26 @@ fn canonical_host(host: &str) -> String {
     }
 }
 
-/// The raw value plus each further percent-decoding of it until it stops changing, so a token
-/// spelled with escapes at any depth in the userinfo, path, query or fragment is still found.
-fn decoded_forms(value: &str) -> Vec<String> {
-    let mut forms = vec![value.to_owned()];
-    loop {
-        let decoded = percent_encoding::percent_decode_str(forms.last().expect("non-empty"))
+const MAX_DECODE_ROUNDS: usize = 32;
+
+/// True if `value`, or any percent-decoding of it, contains a token, so a token spelled with
+/// escapes in the userinfo, path, query or fragment is still found. Fails closed: a value still
+/// changing after `MAX_DECODE_ROUNDS` counts as a hit.
+fn mentions_token(value: &str, tokens: &[String]) -> bool {
+    let mut current = value.to_owned();
+    for _ in 0..=MAX_DECODE_ROUNDS {
+        if tokens.iter().any(|token| current.contains(token.as_str())) {
+            return true;
+        }
+        let next = percent_encoding::percent_decode_str(&current)
             .decode_utf8_lossy()
             .into_owned();
-        if forms.last() == Some(&decoded) {
-            return forms;
+        if next == current {
+            return false;
         }
-        forms.push(decoded);
+        current = next;
     }
+    true
 }
 
 fn is_loopback_host(canonical: &str) -> bool {
@@ -86,11 +93,9 @@ pub fn drop_daemon_servers(
                 ProjectMcpTransport::Stdio { .. } => return true,
             };
             let credential_risk = daemon.tokens.as_ref().is_none_or(|tokens| {
-                std::iter::once(url).chain(headers.values()).any(|value| {
-                    decoded_forms(value)
-                        .iter()
-                        .any(|form| tokens.iter().any(|token| form.contains(token.as_str())))
-                })
+                std::iter::once(url)
+                    .chain(headers.values())
+                    .any(|value| mentions_token(value, tokens))
             });
             let host_is_daemon = reqwest::Url::parse(url).is_ok_and(|url| {
                 url.host_str().is_some_and(|host| {
