@@ -90,21 +90,30 @@ impl Progress {
     }
 }
 
+/// Longer than any progress line a parser reads; a longer line is dropped, not buffered.
+const MAX_LINE: usize = 4096;
+
 /// Splits one stream's chunks into lines. `\r` also ends a line, for runtimes that redraw.
 #[derive(Debug, Default)]
 pub(crate) struct LineBuffer {
     partial: Vec<u8>,
+    /// Set once a line passes [`MAX_LINE`]; its bytes are skipped through the next delimiter.
+    overflowed: bool,
 }
 
 impl LineBuffer {
     pub(crate) fn push(&mut self, bytes: &[u8], mut on_line: impl FnMut(&str)) {
         for &byte in bytes {
             if byte == b'\n' || byte == b'\r' {
-                if !self.partial.is_empty() {
+                if !self.partial.is_empty() && !self.overflowed {
                     on_line(&String::from_utf8_lossy(&self.partial));
-                    self.partial.clear();
                 }
-            } else {
+                self.partial.clear();
+                self.overflowed = false;
+            } else if self.partial.len() == MAX_LINE {
+                self.partial.clear();
+                self.overflowed = true;
+            } else if !self.overflowed {
                 self.partial.push(byte);
             }
         }
@@ -114,6 +123,25 @@ impl LineBuffer {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn an_oversized_line_is_dropped_through_its_delimiter_and_later_lines_still_arrive() {
+        let mut buffer = LineBuffer::default();
+        let mut lines = Vec::new();
+        // Split so the overflow and the delimiter arrive in different chunks.
+        let huge = vec![b'x'; 4 * MAX_LINE];
+        for chunk in huge.chunks(1000) {
+            buffer.push(chunk, |line| lines.push(line.to_string()));
+            assert!(
+                buffer.partial.len() <= MAX_LINE,
+                "the partial line is bounded"
+            );
+        }
+        buffer.push(b"tail of the long line\nabc: Pull complete\n", |line| {
+            lines.push(line.to_string())
+        });
+        assert_eq!(lines, ["abc: Pull complete"]);
+    }
 
     fn layer(id: &str, done: bool) -> LayerUpdate {
         LayerUpdate {

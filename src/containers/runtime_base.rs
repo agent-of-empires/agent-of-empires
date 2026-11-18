@@ -325,24 +325,32 @@ impl RuntimeBase {
         cmd.stdin(Stdio::null());
         let start = Instant::now();
         tracing::info!(target: "containers.image", runtime = %self.name, %image, "pulling image");
-        let (mut stdout_lines, mut stderr_lines) = (LineBuffer::default(), LineBuffer::default());
-        let mut on_output = |stream: crate::process::OutputStream, bytes: &[u8]| {
-            let lines = match stream {
-                crate::process::OutputStream::Stdout => &mut stdout_lines,
-                crate::process::OutputStream::Stderr => &mut stderr_lines,
-            };
-            lines.push(bytes, |line| {
-                if let Some(update) = self.pull_progress.and_then(|parse| parse(line)) {
-                    pull.report(update);
-                }
-            });
+        let ran = match self.pull_progress {
+            // A runtime with no parser is not observed, so its output isn't split into lines.
+            None => crate::process::run_until_cancelled_process_group(&mut cmd, timeout, cancel),
+            Some(parse) => {
+                let (mut stdout_lines, mut stderr_lines) =
+                    (LineBuffer::default(), LineBuffer::default());
+                let mut on_output = |stream: crate::process::OutputStream, bytes: &[u8]| {
+                    let lines = match stream {
+                        crate::process::OutputStream::Stdout => &mut stdout_lines,
+                        crate::process::OutputStream::Stderr => &mut stderr_lines,
+                    };
+                    lines.push(bytes, |line| {
+                        if let Some(update) = parse(line) {
+                            pull.report(update);
+                        }
+                    });
+                };
+                crate::process::run_until_cancelled_process_group_observed(
+                    &mut cmd,
+                    timeout,
+                    cancel,
+                    &mut on_output,
+                )
+            }
         };
-        let output = match crate::process::run_until_cancelled_process_group_observed(
-            &mut cmd,
-            timeout,
-            cancel,
-            &mut on_output,
-        )? {
+        let output = match ran? {
             Some(output) => output,
             None if cancel.is_cancelled() => {
                 tracing::info!(target: "containers.image", runtime = %self.name, %image, "image pull cancelled");
