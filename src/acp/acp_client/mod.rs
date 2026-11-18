@@ -162,7 +162,8 @@ struct SessionState {
 }
 
 impl SessionState {
-    /// Allowed fs roots are the cwd plus any additional directories.
+    /// Allowed fs roots are the cwd plus any additional directories. A root
+    /// that cannot be opened now stays unavailable; `spawn` rejects that case.
     fn pin_fs_roots(&self, cwd: &Path, additional_dirs: &[PathBuf]) -> &FsPolicy {
         self.fs_roots.get_or_init(|| {
             let mut roots = vec![cwd.to_path_buf()];
@@ -541,6 +542,10 @@ impl AcpClient {
             return Err(AcpError::ProjectPathMissing {
                 path: config.cwd.clone(),
             });
+        }
+        // A root missing at pin time would stay unavailable for the session.
+        if let Some(path) = config.additional_dirs.iter().find(|dir| !dir.exists()) {
+            return Err(AcpError::ProjectPathMissing { path: path.clone() });
         }
         let state = Arc::<SessionState>::default();
         state.pin_fs_roots(&config.cwd, &config.additional_dirs);
@@ -1287,6 +1292,18 @@ mod shutdown_tests {
 #[cfg(all(test, unix))]
 mod fs_roots_tests {
     use super::*;
+
+    #[tokio::test]
+    async fn spawn_rejects_a_missing_additional_dir() {
+        let temp = tempfile::tempdir().unwrap();
+        let missing = temp.path().join("gone");
+        let mut config = test_helpers::env_test_spawn_config(temp.path().to_path_buf());
+        config.additional_dirs = vec![missing.clone()];
+        match AcpClient::spawn(config, AcpSessionId("s".into())).await {
+            Err(AcpError::ProjectPathMissing { path }) => assert_eq!(path, missing),
+            other => panic!("expected ProjectPathMissing, got {:?}", other.err()),
+        }
+    }
 
     #[test]
     fn roots_pinned_before_a_swap_keep_resolving_to_the_original_directory() {
