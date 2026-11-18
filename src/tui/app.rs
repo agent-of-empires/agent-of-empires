@@ -2565,7 +2565,15 @@ impl App {
             }
             Err(TryRecvError::Closed) => Err("structured view: mount was cancelled".to_owned()),
         };
-        self.clear_preview_mount_pending();
+        // Leave another row's debounce and loading flag alone: a stale
+        // completion for this row must not restart them.
+        let another_row_pending = self
+            .preview_mount_pending
+            .as_ref()
+            .is_some_and(|(pending, _)| *pending != target);
+        if !another_row_pending {
+            self.clear_preview_mount_pending();
+        }
         let wanted = self.home.selected_structured_session().as_deref() == Some(target.as_str());
         // The target may have mounted while this connected, whether Enter opened
         // it or it is a view the user has since left. Either way it already holds
@@ -3690,6 +3698,35 @@ mod tests {
         assert!(
             !app.home.structured_preview_pending,
             "the placeholder must clear once the transcript is mounted"
+        );
+    }
+
+    /// A completion for a row the user already left must not clear the
+    /// debounce and loading flag of the row they are on now.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn a_stale_completion_leaves_the_new_rows_pending_mount_alone() {
+        use crate::tui::structured_view::embedded::EmbeddedView;
+        let (mut app, _guard, ids) = app_on_two_structured_rows();
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        app.structured_mount = Some((ids[0].clone(), rx));
+        app.home.selected_session = Some(ids[1].clone());
+        app.preview_mount_pending = Some((ids[1].clone(), std::time::Instant::now()));
+        app.home.structured_preview_pending = true;
+
+        assert!(tx.send(Ok(EmbeddedView::for_test(&ids[0]))).is_ok());
+        assert!(app.poll_structured_mount(), "the stale mount is consumed");
+
+        assert_eq!(
+            app.preview_mount_pending
+                .as_ref()
+                .map(|(pending, _)| pending.as_str()),
+            Some(ids[1].as_str()),
+            "the row now selected keeps its debounce"
+        );
+        assert!(
+            app.home.structured_preview_pending,
+            "and its loading placeholder"
         );
     }
 
