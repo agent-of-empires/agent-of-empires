@@ -4608,7 +4608,6 @@ mod tests {
                 );
                 std::thread::sleep(Duration::from_millis(10));
             }
-            REGISTRY.lock().unwrap().remove(guard.name());
         }
         assert!(
             !capture(&other_pane).contains("after-reuse"),
