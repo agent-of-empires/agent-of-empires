@@ -2699,17 +2699,8 @@ fn git_exec_surface_overlays(
             protect.push((dot_git, false));
         }
         for (path, is_dir) in protect {
-            if !path.exists() {
-                if is_dir {
-                    std::fs::create_dir_all(&path)
-                        .with_context(|| format!("creating {}", path.display()))?;
-                } else if path.file_name().is_some_and(|n| n == "config.worktree") {
-                    std::fs::File::create(&path)
-                        .with_context(|| format!("creating {}", path.display()))?;
-                } else {
-                    continue;
-                }
-            }
+            // Decide coverage first: a git dir no mount covers gets no overlay,
+            // so it must not be touched either.
             let Some((volume, root)) = project_volumes
                 .iter()
                 .map(|v| (v, canon(Path::new(&v.host_path))))
@@ -2718,6 +2709,25 @@ fn git_exec_surface_overlays(
             else {
                 continue;
             };
+            if is_dir {
+                std::fs::create_dir_all(&path)
+                    .with_context(|| format!("creating {}", path.display()))?;
+            } else if path.file_name().is_some_and(|n| n == "config.worktree") {
+                // Create-new: an existing file, or one a host git just wrote, is kept.
+                match std::fs::OpenOptions::new()
+                    .write(true)
+                    .create_new(true)
+                    .open(&path)
+                {
+                    Ok(_) => {}
+                    Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {}
+                    Err(e) => {
+                        return Err(e).with_context(|| format!("creating {}", path.display()))
+                    }
+                }
+            } else if !path.exists() {
+                continue;
+            }
             let container_path = Path::new(&volume.container_path)
                 .join(path.strip_prefix(&root).unwrap_or(Path::new("")))
                 .to_string_lossy()
@@ -3932,6 +3942,53 @@ mod tests {
         assert_eq!(
             volumes[0].container_path,
             format!("/workspace/{}", dir_name)
+        );
+    }
+
+    #[test]
+    fn git_exec_surface_overlays_only_touch_covered_git_dirs() {
+        let (_dir, main) = setup_regular_repo();
+        let worktree = main.with_file_name(format!(
+            "{}-wt",
+            main.file_name().unwrap().to_string_lossy()
+        ));
+        let status = std::process::Command::new("git")
+            .args(["worktree", "add", "-b", "wt", worktree.to_str().unwrap()])
+            .current_dir(&main)
+            .status()
+            .unwrap();
+        assert!(status.success());
+        std::fs::remove_dir_all(main.join(".git/hooks")).ok();
+        let admin = std::fs::read_dir(main.join(".git/worktrees"))
+            .unwrap()
+            .next()
+            .unwrap()
+            .unwrap()
+            .path();
+
+        // Only the worktree is mounted: its main repo's `.git` has no overlay,
+        // so nothing may be created there.
+        let volumes = vec![VolumeMount {
+            host_path: worktree.to_string_lossy().to_string(),
+            container_path: "/workspace/wt".into(),
+            read_only: false,
+        }];
+        git_exec_surface_overlays(&volumes, std::slice::from_ref(&worktree)).unwrap();
+        assert!(!main.join(".git/hooks").exists());
+        assert!(!main.join(".git/config.worktree").exists());
+        assert!(!admin.join("config.worktree").exists());
+
+        // A covered `config.worktree` that already exists keeps its content.
+        let volumes = vec![VolumeMount {
+            host_path: main.to_string_lossy().to_string(),
+            container_path: "/workspace/main".into(),
+            read_only: false,
+        }];
+        std::fs::write(main.join(".git/config.worktree"), "[core]\n").unwrap();
+        git_exec_surface_overlays(&volumes, &[]).unwrap();
+        assert_eq!(
+            std::fs::read_to_string(main.join(".git/config.worktree")).unwrap(),
+            "[core]\n"
         );
     }
 
