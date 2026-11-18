@@ -1427,13 +1427,24 @@ impl SessionService {
             })
             .and_then(|i| {
                 let turn = i.pending_initial_turn.as_ref()?;
-                let consumed = self
-                    .unpersisted_clears
-                    .lock()
-                    .expect("unpersisted_clears mutex poisoned")
-                    .contains(&(id.to_string(), turn.text.clone()));
-                (turn.error.is_none() && !consumed).then(|| (i.clone(), turn.text.clone()))
+                self.turn_is_deliverable(id, turn)
+                    .then(|| (i.clone(), turn.text.clone()))
             })
+    }
+
+    /// A pending turn that failed, or whose delivery was consumed but could not be
+    /// cleared on disk, must not be delivered again by either view's drain.
+    pub(crate) fn turn_is_deliverable(
+        &self,
+        id: &str,
+        turn: &crate::session::PendingInitialTurn,
+    ) -> bool {
+        turn.error.is_none()
+            && !self
+                .unpersisted_clears
+                .lock()
+                .expect("unpersisted_clears mutex poisoned")
+                .contains(&(id.to_string(), turn.text.clone()))
     }
 
     async fn report_undelivered_turn(
@@ -1510,24 +1521,27 @@ impl SessionService {
                 .iter()
                 .find(|i| i.id == id && i.launch_is_finalized() && i.terminal_handoff.is_none())
                 .and_then(|i| {
-                    i.pending_initial_turn.clone().map(|turn| {
-                        // Reconstruct the creator principal so plugin-created
-                        // pending turns keep plugin attribution and the plugin
-                        // mode-assertion path; user-created ones stay User.
-                        let caller = match &i.created_by_plugin {
-                            Some(plugin_id) => SessionCaller::Plugin {
-                                plugin_id: plugin_id.clone(),
-                            },
-                            None => SessionCaller::User,
-                        };
-                        (
-                            turn.text,
-                            turn.attachments,
-                            turn.synthesized,
-                            i.source_profile.clone(),
-                            caller,
-                        )
-                    })
+                    i.pending_initial_turn
+                        .clone()
+                        .filter(|turn| self.turn_is_deliverable(id, turn))
+                        .map(|turn| {
+                            // Reconstruct the creator principal so plugin-created
+                            // pending turns keep plugin attribution and the plugin
+                            // mode-assertion path; user-created ones stay User.
+                            let caller = match &i.created_by_plugin {
+                                Some(plugin_id) => SessionCaller::Plugin {
+                                    plugin_id: plugin_id.clone(),
+                                },
+                                None => SessionCaller::User,
+                            };
+                            (
+                                turn.text,
+                                turn.attachments,
+                                turn.synthesized,
+                                i.source_profile.clone(),
+                                caller,
+                            )
+                        })
                 })
         }) else {
             return;
@@ -3747,6 +3761,36 @@ mod tests {
             "drain must release its claim on the no-op paths"
         );
     }
+    /// A failed or consumed turn is not deliverable by either view's drain, so a
+    /// terminal-to-structured switch cannot replay it.
+    #[tokio::test]
+    async fn a_failed_or_consumed_turn_is_not_deliverable_after_a_view_switch() {
+        let mut inst = Instance::new("switched", "/tmp/aoe-switch-project");
+        inst.id = "sess-switch".to_string();
+        inst.view = crate::session::View::Structured;
+        let service = crate::server::test_support::build_test_app_state(vec![inst])
+            .session_service
+            .clone();
+        let turn = |text: &str, error: Option<&str>| crate::session::PendingInitialTurn {
+            text: text.to_string(),
+            attachments: Vec::new(),
+            synthesized: false,
+            error: error.map(str::to_string),
+        };
+
+        assert!(service.turn_is_deliverable("sess-switch", &turn("fresh", None)));
+        assert!(!service.turn_is_deliverable("sess-switch", &turn("failed", Some("not running"))));
+
+        service
+            .unpersisted_clears
+            .lock()
+            .unwrap()
+            .insert(("sess-switch".to_string(), "typed".to_string()));
+        assert!(!service.turn_is_deliverable("sess-switch", &turn("typed", None)));
+        assert!(service.turn_is_deliverable("sess-switch", &turn("other", None)));
+        assert!(service.turn_is_deliverable("sess-other", &turn("typed", None)));
+    }
+
     /// Declare `bridge` as a custom ACP agent that resets with `alias`.
     fn declare_custom_reset(alias: &str) {
         let config = crate::session::get_app_dir().unwrap().join("config.toml");

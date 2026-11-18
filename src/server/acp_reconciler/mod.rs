@@ -577,7 +577,12 @@ async fn drain_pending_initial_turns(state: &Arc<AppState>) {
         let instances = state.instances.read().await;
         instances
             .iter()
-            .filter(|i| i.pending_initial_turn.is_some() && is_resumable(i))
+            .filter(|i| {
+                is_resumable(i)
+                    && i.pending_initial_turn
+                        .as_ref()
+                        .is_some_and(|turn| state.session_service.turn_is_deliverable(&i.id, turn))
+            })
             .map(|i| i.id.clone())
             .collect()
     };
@@ -601,7 +606,7 @@ async fn drain_pending_initial_turns(state: &Arc<AppState>) {
                 !i.is_structured()
                     && i.pending_initial_turn
                         .as_ref()
-                        .is_some_and(|turn| turn.error.is_none())
+                        .is_some_and(|turn| state.session_service.turn_is_deliverable(&i.id, turn))
             })
             .map(|i| i.id.clone())
             .collect()
