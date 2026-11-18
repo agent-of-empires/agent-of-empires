@@ -1675,11 +1675,20 @@ fn drive_terminal_handoff(
                             TerminalHandoff::new(native, launch_id.clone(), launch_driver);
                         // The launch refuses the command's selector beside AoE's own conversation
                         // on every retry, so a switch owed from before that refusal ends here. The
-                        // launch adopts a live pane before that check, so a kept one doesn't end.
+                        // launch adopts a live pane before that check, so a kept one doesn't end,
+                        // and one tmux can't classify keeps the switch owed.
                         let ended = command_selector_conflicts(&row, false)
-                            && !row
-                                .tmux_session()
-                                .is_ok_and(|pane| pane.exists_live() && !pane.is_pane_dead());
+                            && match row.tmux_session() {
+                                Ok(pane) => match crate::tmux::utils::probe_pane(pane.name()) {
+                                    crate::tmux::utils::PaneProbe::Alive => false,
+                                    crate::tmux::utils::PaneProbe::Dead
+                                    | crate::tmux::utils::PaneProbe::Missing => true,
+                                    crate::tmux::utils::PaneProbe::Unknown => anyhow::bail!(
+                                        "tmux couldn't tell whether the kept pane is live"
+                                    ),
+                                },
+                                Err(_) => true,
+                            };
                         let result = if ended {
                             Ok(())
                         } else {
@@ -5376,6 +5385,31 @@ mod tests {
                 }
             }
             assert_eq!(before.command, "claude --resume old-id", "{}", held.title);
+            if *tried == Tried::KeptPane {
+                // A tmux too slow to answer can't say whether the kept pane lives: the switch
+                // stays owed rather than ending on the selector.
+                let timeout = crate::tmux::TmuxTimeoutGuard::arm(before.tmux_session()?.name());
+                let unknown = switch().await.into_response();
+                drop(timeout);
+                assert_eq!(unknown.status(), StatusCode::SERVICE_UNAVAILABLE);
+                assert_eq!(
+                    unknown
+                        .headers()
+                        .get(crate::daemon::ERROR_CODE_HEADER)
+                        .and_then(|v| v.to_str().ok()),
+                    Some("handoff_pending")
+                );
+                let still = stored(&held.id)?;
+                let intent = still.terminal_handoff.as_ref().expect("the switch is owed");
+                assert_eq!(
+                    (intent.stage, intent.launch_started, intent.launch.is_some()),
+                    (HandoffStage::TerminalLaunchOwed, true, true)
+                );
+                assert_eq!(
+                    crate::tmux::first_pane_id(still.tmux_session()?.name()),
+                    kept_pane
+                );
+            }
             let interrupted = switch().await.into_response();
             assert_eq!(interrupted.status(), StatusCode::SERVICE_UNAVAILABLE);
             let pending = stored(&held.id)?;
