@@ -544,7 +544,9 @@ fn run_explicit_recovery(
         }
     };
     crate::cli::serve::with_inactive_serve_state(transaction, Some(serve), |_| {
-        recovery::reconcile_repaired_components()
+        recovery::reconcile_repaired_components()?;
+        // Not in the helper: registered v046 calls it, and an upgrade must reach v060 in order.
+        v060_terminal_handoff_outcome::run()
     })?;
     legacy_scope_recovery::run_under_exclusion(transaction, serve)
 }

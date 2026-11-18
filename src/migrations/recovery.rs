@@ -5,7 +5,6 @@ pub(super) fn reconcile_repaired_components() -> Result<()> {
     super::v039_prime_control_path::run()?;
     super::v040_worker_ownership::run()?;
     super::v045_runner_scope_ownership::run()?;
-    super::v060_terminal_handoff_outcome::run()?;
     super::v046_reconcile_runtime_lineages::reconcile_sidebar_settings()
 }
 

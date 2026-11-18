@@ -318,6 +318,45 @@ mod tests {
 
     #[test]
     #[serial_test::serial]
+    fn an_upgrade_from_before_v046_records_the_outcome_after_v059() -> Result<()> {
+        let home = tempfile::tempdir()?;
+        let _home = crate::session::test_support::isolate_app_dir_at(home.path());
+        let app = crate::session::get_app_dir()?;
+        let storage = crate::session::Storage::new_unwatched("default")?;
+        let row = Instance::new("pending", "/tmp/repo");
+        let intent = pending(&row, TerminalHandoffContext::Discard);
+        let bytes = serde_json::to_vec(&json!([written_before(&row, &intent)?]))?;
+        std::fs::write(storage.sessions_path(), &bytes)?;
+        std::fs::write(app.join(".schema_version"), "45")?;
+        // Whether the handoff has its outcome as each migration finishes.
+        let finished = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let (seen, path) = (finished.clone(), storage.sessions_path().to_path_buf());
+        let reporter: crate::migrations::progress::Reporter = std::sync::Arc::new(move |event| {
+            if let crate::migrations::progress::Event::Finished { version, .. } = event {
+                let rows: Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+                let recorded = rows[0]["terminal_handoff"].get("outcome").is_some();
+                seen.lock().unwrap().push((version, recorded));
+            }
+        });
+
+        crate::migrations::run_migrations_with(Some(reporter))?;
+
+        let finished = finished.lock().unwrap().clone();
+        let expected: Vec<_> = crate::migrations::MIGRATIONS
+            .iter()
+            .map(|(version, ..)| *version)
+            .filter(|version| *version > 45)
+            .map(|version| (version, version >= 60))
+            .collect();
+        assert_eq!(finished, expected);
+        let loaded = storage.load()?;
+        let handoff = loaded[0].terminal_handoff.as_deref().expect("kept handoff");
+        assert_eq!(handoff.outcome, TerminalHandoffOutcome::Fresh);
+        Ok(())
+    }
+
+    #[test]
+    #[serial_test::serial]
     fn a_component_repaired_after_v060_gets_its_outcome_on_recovery() -> Result<()> {
         let home = tempfile::tempdir()?;
         let _home = crate::session::test_support::isolate_app_dir_at(home.path());
@@ -337,8 +376,9 @@ mod tests {
         let repaired = serde_json::to_vec(&json!([written_before(&row, &intent)?]))?;
         std::fs::write(storage.sessions_path(), &repaired)?;
         assert!(storage.load().is_err(), "the repaired row has no outcome");
+        crate::session::purge_owners::initialize(&app)?;
 
-        crate::migrations::recovery::reconcile_repaired_components()?;
+        crate::migrations::run_migrations_announced(None)?;
 
         let loaded = storage.load()?;
         let handoff = loaded[0].terminal_handoff.as_deref().expect("kept handoff");
