@@ -1487,13 +1487,22 @@ mod tests {
                 while let Some(event) = client.next_event().await {
                     match event {
                         Event::SessionContextReset { .. } => recovery.push("reset"),
-                        Event::Stopped { reason } => {
+                        Event::Stopped { reason } if should_reset => {
                             assert_eq!(reason, "stored_session_rejected");
                             recovery.push("stopped");
                         }
-                        Event::AgentStartupError { message: error, .. } => {
+                        // Any other rejection ends only the turn (#5662).
+                        Event::Stopped { reason } => {
+                            assert_eq!(reason, "prompt_complete");
+                            recovery.push("stopped");
+                            break;
+                        }
+                        Event::PromptRuntimeError { message: error } => {
                             assert!(error.contains(message), "{error}");
                             recovery.push("error");
+                        }
+                        Event::AgentStartupError { message: error, .. } => {
+                            panic!("the connection must not fail: {error}")
                         }
                         _ => {}
                     }
@@ -1501,7 +1510,7 @@ mod tests {
                 let want = if should_reset {
                     vec!["reset", "stopped"]
                 } else {
-                    vec!["error"]
+                    vec!["error", "stopped"]
                 };
                 assert_eq!(recovery, want, "{message}");
                 let _ = client.shutdown().await;

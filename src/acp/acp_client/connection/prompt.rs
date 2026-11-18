@@ -36,7 +36,7 @@ use crate::acp::acp_client::watchdog::{
 };
 
 type AcpResult<T> = Result<T, agent_client_protocol::Error>;
-type PromptFut = Pin<Box<dyn Future<Output = AcpResult<PromptResponse>> + Send>>;
+type PromptFut = Pin<Box<dyn Future<Output = PromptReply> + Send>>;
 type SteerFut =
     Pin<Box<dyn Future<Output = (Vec<ContentBlock>, AcpResult<serde_json::Value>)> + Send>>;
 
@@ -68,6 +68,13 @@ fn observe_select_win(command: bool) {
     });
 }
 
+/// `session/prompt`'s result. `rejected` marks an error the agent answered
+/// with, as opposed to a lost transport or runner.
+struct PromptReply {
+    result: AcpResult<PromptResponse>,
+    rejected: bool,
+}
+
 enum Flow {
     Continue,
     Break,
@@ -87,10 +94,14 @@ struct TurnFlags {
     cancelling: bool,
     /// What the adapter reported; `None` when no `PromptResponse` arrived.
     agent_stop_reason: Option<StopReason>,
+    /// The error the agent answered `session/prompt` with.
+    rejection: Option<String>,
 }
 
 struct Turn {
     epoch: u64,
+    /// Handed back on a rejection so the user can retry it.
+    prompt_text: String,
     flags: TurnFlags,
     watchdog: SilentOrphanWatchdog,
     cfg: SilentOrphanWatchdogConfig,
@@ -114,6 +125,12 @@ impl Turn {
         self.flags.cancelling = true;
         self.cancel_grace.as_mut().reset(deadline);
     }
+}
+
+/// The SDK's own error for a connection that ended before the response.
+fn is_lost_response(error: &agent_client_protocol::Error) -> bool {
+    agent_client_protocol::is_connection_terminated(error)
+        || agent_client_protocol::is_incoming_transport_closed(error)
 }
 
 /// Debug-only fault injection: suppress the prompt response once so the
@@ -193,6 +210,7 @@ impl Session {
         let orphan_check_period = silent_orphan_check_interval();
         let mut turn = Turn {
             epoch,
+            prompt_text: first_text_block(&blocks),
             flags: TurnFlags::default(),
             watchdog: SilentOrphanWatchdog::default(),
             cfg: SilentOrphanWatchdogConfig {
@@ -277,8 +295,17 @@ impl Session {
 
     async fn send_prompt(&self, blocks: Vec<ContentBlock>) -> PromptFut {
         let request = PromptRequest::new(self.acp_session_id.clone(), blocks);
+        let lost = |result| PromptReply {
+            result,
+            rejected: false,
+        };
         let Some(control) = self.control.as_ref() else {
-            return Box::pin(self.connection.send_request(request).block_task());
+            let sent = self.connection.send_request(request).block_task();
+            return Box::pin(async move {
+                let result = sent.await;
+                let rejected = result.as_ref().is_err_and(|e| !is_lost_response(e));
+                PromptReply { result, rejected }
+            });
         };
         match serde_json::to_value(request) {
             Ok(params) => {
@@ -286,21 +313,23 @@ impl Session {
                 let control = Arc::clone(control);
                 Box::pin(async move {
                     match rx.await {
-                        Ok(outcome) => prompt_outcome_to_response(outcome),
+                        Ok(outcome) => PromptReply {
+                            rejected: matches!(outcome, PromptOutcome::Error { .. }),
+                            result: prompt_outcome_to_response(outcome),
+                        },
                         // The runner may still own the turn, so it stays open
                         // for a reattach instead of ending here.
-                        Err(_) if control.lost() => {
-                            Err(acp_internal_error("runner control channel lost".into()))
-                        }
+                        Err(_) if control.lost() => lost(Err(acp_internal_error(
+                            "runner control channel lost".into(),
+                        ))),
                         // The dying connection surfaces the underlying failure.
-                        Err(_) => prompt_outcome_to_response(PromptOutcome::Aborted),
+                        Err(_) => lost(prompt_outcome_to_response(PromptOutcome::Aborted)),
                     }
                 })
             }
             Err(e) => {
-                Box::pin(
-                    async move { Err(acp_internal_error(format!("serialize prompt params: {e}"))) },
-                )
+                let result = Err(acp_internal_error(format!("serialize prompt params: {e}")));
+                Box::pin(async move { lost(result) })
             }
         }
     }
@@ -323,11 +352,11 @@ impl Session {
         }
     }
 
-    async fn on_prompt_result(
-        &mut self,
-        turn: &mut Turn,
-        res: AcpResult<PromptResponse>,
-    ) -> AcpResult<Flow> {
+    async fn on_prompt_result(&mut self, turn: &mut Turn, reply: PromptReply) -> AcpResult<Flow> {
+        let PromptReply {
+            result: res,
+            rejected,
+        } = reply;
         if let Ok(response) = &res {
             turn.flags.prompt_cancelled = matches!(response.stop_reason, StopReason::Cancelled);
             turn.flags.agent_stop_reason = Some(response.stop_reason);
@@ -359,6 +388,22 @@ impl Session {
             self.shared
                 .context_reset_emitted
                 .store(true, Ordering::Relaxed);
+            return Err(e);
+        }
+        // The agent is still answering, so only this turn ends (#5662).
+        if rejected {
+            warn!(
+                target: "acp.protocol",
+                session = %label,
+                "agent rejected session/prompt; ending the turn and keeping the connection: {e}"
+            );
+            // An error answering our cancel ends the turn as cancelled.
+            if turn.flags.cancelling || turn.flags.orphan_cancel_sent {
+                turn.flags.prompt_cancelled = true;
+            } else {
+                turn.flags.rejection = Some(e.to_string());
+            }
+            return Ok(Flow::Break);
         }
         Err(e)
     }
@@ -686,6 +731,15 @@ impl Session {
             {
                 preceding.push(Event::PromptRuntimeError { message });
             }
+        }
+        if let Some(error) = turn.flags.rejection.take() {
+            preceding.push(Event::PromptRuntimeError {
+                message: format!("the agent rejected the prompt: {error}"),
+            });
+            preceding.push(Event::PromptRejected {
+                reason: "prompt_failed".into(),
+                text: std::mem::take(&mut turn.prompt_text),
+            });
         }
         let f = &mut turn.flags;
         let reason = terminal_stop_reason(

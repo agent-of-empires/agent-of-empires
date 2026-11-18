@@ -643,3 +643,57 @@ async fn recovered_completion_orders_updates_and_applies_rate_limit_parking() {
         }
     }
 }
+
+/// The runner relays the agent's error answer to `session/prompt`: the turn
+/// surfaces it and returns the text, unless it answers a cancel, and the same
+/// connection runs the next prompt (#5662).
+#[tokio::test]
+async fn rejected_prompt_over_the_runner_keeps_the_connection() {
+    let _env = crate::session::test_support::EnvGuard::read_lock();
+    for (cancel_first, want_reason, want_returned) in
+        [(false, "prompt_complete", true), (true, "cancelled", false)]
+    {
+        let mut runner = Runner::new();
+        let mut client = runner.attach(false).await;
+        client.send_prompt("retry me", &[]).await.unwrap();
+        assert!(matches!(runner.frame().await, ControlBody::Prompt { .. }));
+        if cancel_first {
+            client.cancel_prompt().await.unwrap();
+            assert!(matches!(runner.frame().await, ControlBody::Cancel));
+        }
+        runner
+            .send(ControlBody::PromptCompleted {
+                prompt_req_id: 7,
+                outcome: PromptOutcome::Error {
+                    code: -32000,
+                    message: "a turn is already running".into(),
+                    data: None,
+                },
+            })
+            .await;
+        let (mut surfaced, mut returned) = (false, false);
+        let reason = timeout(Duration::from_secs(5), async {
+            loop {
+                match client.next_event().await.expect("connection remains open") {
+                    Event::PromptRuntimeError { message } => {
+                        surfaced = message.contains("a turn is already running");
+                    }
+                    Event::PromptRejected { text, .. } => returned = text == "retry me",
+                    Event::Stopped { reason } => return reason,
+                    _ => {}
+                }
+            }
+        })
+        .await
+        .unwrap();
+        assert_eq!(reason, want_reason);
+        assert_eq!((surfaced, returned), (want_returned, want_returned));
+
+        client.send_prompt("again", &[]).await.unwrap();
+        assert!(matches!(runner.frame().await, ControlBody::Prompt { .. }));
+        runner.complete("end_turn").await;
+        assert_eq!(stopped(&mut client).await, "prompt_complete");
+        assert!(client.control_loss().is_none());
+        client.shutdown().await.unwrap();
+    }
+}
