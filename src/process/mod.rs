@@ -3088,23 +3088,23 @@ finally:
     }
 
     /// A cancelled run returns without draining the backlog its child left unread. Passes go on
-    /// only for the bounded kill grace, which can't reach most of a 64 MiB backlog.
+    /// only for the bounded kill grace, which reaches a small part of the backlog; the old final
+    /// drain forwarded all of it.
     #[test]
     #[cfg(unix)]
     fn a_cancel_is_not_held_behind_the_unread_backlog() {
+        const BACKLOG: usize = 16 << 20;
         let mut cmd = Command::new("sh");
-        const BACKLOG: usize = 64 << 20;
+        // `ready` follows the whole backlog, so the cancel comes once it is all written.
         cmd.args([
             "-c",
-            &format!("head -c {BACKLOG} /dev/zero; exec sleep 600"),
+            &format!("head -c {BACKLOG} /dev/zero; echo ready >&2; exec sleep 600"),
         ]);
         let cancel = CancellationToken::new();
         let mut forwarded = 0usize;
-        let mut forward = |_: OutputStream, bytes: &[u8]| {
-            forwarded += bytes.len();
-            if forwarded >= TAIL_PASS_LIMIT {
-                cancel.cancel();
-            }
+        let mut forward = |stream: OutputStream, bytes: &[u8]| match stream {
+            OutputStream::Stdout => forwarded += bytes.len(),
+            OutputStream::Stderr => cancel.cancel(),
         };
         let result = run_until_cancelled_process_group_observed(
             &mut cmd,
