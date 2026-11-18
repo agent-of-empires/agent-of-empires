@@ -484,12 +484,65 @@ thread_local! {
     static TMUX_COMMAND_EXECUTIONS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
 }
 
+/// Sessions whose exact-target commands time out, one entry per live [`TmuxTimeoutGuard`].
+#[cfg(test)]
+static TIMED_OUT_SESSIONS: Mutex<Vec<String>> = Mutex::new(Vec::new());
+
+/// Test-only: every deadline-bounded tmux command aimed at the exact session `=name` (or one of
+/// its windows or panes) times out until the guard drops, as when the server is too slow to
+/// answer. Keyed by name, so a parallel test's commands run normally.
+#[cfg(test)]
+pub(crate) struct TmuxTimeoutGuard(String);
+
+#[cfg(test)]
+impl TmuxTimeoutGuard {
+    pub(crate) fn arm(session_name: &str) -> Self {
+        TIMED_OUT_SESSIONS
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .push(session_name.to_owned());
+        Self(session_name.to_owned())
+    }
+
+    fn times_out(cmd: &Command) -> bool {
+        let sessions = TIMED_OUT_SESSIONS.lock().unwrap_or_else(|e| e.into_inner());
+        cmd.get_args().any(|arg| {
+            let arg = arg.to_string_lossy();
+            arg.strip_prefix('=').is_some_and(|target| {
+                sessions.iter().any(|name| {
+                    target == name
+                        || target
+                            .strip_prefix(name.as_str())
+                            .is_some_and(|rest| rest.starts_with(':'))
+                })
+            })
+        })
+    }
+}
+
+#[cfg(test)]
+impl Drop for TmuxTimeoutGuard {
+    fn drop(&mut self) {
+        let mut sessions = TIMED_OUT_SESSIONS.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(at) = sessions.iter().position(|name| *name == self.0) {
+            sessions.remove(at);
+        }
+    }
+}
+
 fn run_tmux_command_with_timeout_inner(
     cmd: &mut Command,
     timeout: Duration,
 ) -> std::io::Result<Output> {
     #[cfg(test)]
     TMUX_COMMAND_EXECUTIONS.with(|count| count.set(count.get() + 1));
+    #[cfg(test)]
+    if TmuxTimeoutGuard::times_out(cmd) {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::TimedOut,
+            "tmux command timed out (test)",
+        ));
+    }
     cmd.stdin(Stdio::null());
     match crate::process::run_with_timeout(cmd, timeout)? {
         Some(output) => Ok(output),

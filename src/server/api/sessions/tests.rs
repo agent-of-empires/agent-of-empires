@@ -9830,12 +9830,21 @@ async fn restart_for_update_refuses_a_session_that_is_not_out_of_date() {
         let response = restart_for_update(
             axum::extract::State(state.clone()),
             axum::extract::Path(id.to_string()),
-            Ok(None),
+            axum::extract::Request::new(axum::body::Body::empty()),
         )
         .await
         .into_response();
         assert_eq!(response.status(), expected, "{id}");
     }
+    // A check sent without a Content-Type is refused, not taken for no check.
+    let response = restart_for_update(
+        axum::extract::State(state.clone()),
+        axum::extract::Path("fresh-agent".to_string()),
+        axum::extract::Request::new(axum::body::Body::from(r#"{"stop_processes":[]}"#)),
+    )
+    .await
+    .into_response();
+    assert_eq!(response.status(), StatusCode::UNSUPPORTED_MEDIA_TYPE);
 }
 
 /// #5762: a restart that asks for the check names the shells the Agent started and stops
@@ -9876,8 +9885,6 @@ async fn an_update_restart_names_the_agents_background_shells_before_stopping_th
     let mut unrecorded = inst.clone();
     unrecorded.launch_executable = None;
     unrecorded.launch_resolved_executable = None;
-    // The check runs before the shelved-row refusal, so an archived copy shows a restart got
-    // past it without launching anything.
     let shelved = |row: &Instance| {
         let mut row = row.clone();
         row.archive();
@@ -10008,21 +10015,23 @@ async fn an_update_restart_names_the_agents_background_shells_before_stopping_th
         ]
     );
 
-    // Confirming exactly what was found lets the restart past the check.
-    let (_, confirmed) = restart(&shelved(&inst), identities(&refreshed), false).await;
-    assert_eq!(confirmed["error"], "session_archived", "{confirmed}");
-    let (_, unconfirmed) = restart(&shelved(&inst), identities(&first), false).await;
-    assert_eq!(
-        unconfirmed["error"], "background_processes",
-        "{unconfirmed}"
-    );
+    // A pane tmux doesn't answer for might run anything, so even the right list is refused.
+    let timeout = crate::tmux::TmuxTimeoutGuard::arm(&pane);
+    let (status, unknown) = restart(&inst, identities(&refreshed), false).await;
+    drop(timeout);
+    assert_eq!(status, StatusCode::CONFLICT, "{unknown}");
+    assert_eq!(unknown["error"], "background_processes");
+    assert_eq!(unknown["classified"], false);
 
-    // Without a recorded launch the Agent can't be told apart: a generic refusal, until accepted.
+    // A shelved row says so before any process is listed.
+    let (_, archived) = restart(&shelved(&inst), vec![], false).await;
+    assert_eq!(archived["error"], "session_archived", "{archived}");
+
+    // Without a recorded launch the Agent can't be told apart: a generic refusal, until accepted
+    // (at the end, since that restart goes ahead).
     let (status, generic) = restart(&unrecorded, vec![], false).await;
     assert_eq!(status, StatusCode::CONFLICT, "{generic}");
     assert_eq!(generic["classified"], false);
-    let (_, accepted) = restart(&shelved(&unrecorded), vec![], true).await;
-    assert_eq!(accepted["error"], "session_archived", "{accepted}");
     assert_eq!(sleeping(2), 2, "nothing was stopped");
 
     // A shell that starts while the launch hooks run, after the first check passed, is found by
@@ -10084,8 +10093,18 @@ async fn an_update_restart_names_the_agents_background_shells_before_stopping_th
     };
     let (entered, release) =
         lifecycle::launch_hook_gate::arm(&id, lifecycle::launch_hook_gate::Stage::BeforeHooks);
-    let late = tokio::spawn(confirm(identities(&refreshed), false));
-    entered.await.expect("the confirm passed the first check");
+    let mut late = tokio::spawn(confirm(identities(&refreshed), false));
+    tokio::select! {
+        entered = tokio::time::timeout(std::time::Duration::from_secs(30), entered) => {
+            entered
+                .expect("the confirm reached the launch hooks")
+                .expect("the confirm passed the first check");
+        }
+        early = &mut late => {
+            lifecycle::launch_hook_gate::disarm(&id);
+            panic!("the confirm answered before the hooks: {:?}", early.unwrap());
+        }
+    }
     std::fs::write(&third, "").unwrap();
     assert_eq!(sleeping(3), 3);
     release.send(()).unwrap();
@@ -10113,6 +10132,74 @@ async fn an_update_restart_names_the_agents_background_shells_before_stopping_th
     let (status, confirmed) = confirm(identities(&late), true).await;
     assert!(status.is_success(), "{status} {confirmed}");
     assert_eq!(hook_runs(), 1, "on_launch ran once for the whole restart");
+
+    // Accepting an unclassified check lets the restart go ahead.
+    let mut unrecorded = unrecorded;
+    unrecorded.command = agent.to_str().unwrap().to_owned();
+    let (status, accepted) = restart(&unrecorded, vec![], true).await;
+    assert!(status.is_success(), "{status} {accepted}");
+}
+
+/// A checked restart that the 400 refuses never gets as far as a sandbox's `before_start` hook,
+/// which a sandbox that needs a login would otherwise run first.
+#[tokio::test]
+#[serial_test::serial]
+async fn a_refused_process_check_runs_no_sandbox_hook() -> anyhow::Result<()> {
+    let home = crate::session::test_support::isolate_app_dir();
+    crate::session::config::update_app_state(|state| state.has_acknowledged_agent_hooks = true)?;
+    let _unset = crate::session::test_support::EnvGuard::unset(&[
+        "ANTHROPIC_API_KEY",
+        "ANTHROPIC_AUTH_TOKEN",
+        "CLAUDE_CODE_OAUTH_TOKEN",
+        "CLAUDE_CODE_USE_BEDROCK",
+        "CLAUDE_CODE_USE_VERTEX",
+    ]);
+    crate::session::config::update_config(|c| {
+        c.sandbox.shared_credential = crate::session::config::SharedCredentialMode::SeparateLogin;
+    })?;
+    let credentials = home.path().join(".claude").join("sandbox-v2");
+    std::fs::create_dir_all(&credentials)?;
+    std::fs::write(credentials.join(".credentials.json"), "{}")?;
+    let project = tempfile::tempdir()?;
+    let ran = project.path().join("before-start-ran");
+    crate::session::config::update_config(|c| {
+        c.host_hooks.before_start = vec![format!("touch '{}'", ran.display())];
+    })?;
+    let mut row = Instance::new("checked-sandbox", project.path().to_str().unwrap());
+    row.source_profile = "default".into();
+    row.tool = "claude".into();
+    row.status = Status::Idle;
+    row.sandbox_info = Some(crate::session::SandboxInfo {
+        provider: None,
+        enabled: true,
+        container_id: None,
+        image: "ubuntu:latest".to_string(),
+        container_name: "checked-sandbox-test".to_string(),
+        extra_env: None,
+        custom_instruction: None,
+        before_start_env: Vec::new(),
+        before_start_hook_env: Vec::new(),
+        container_workdir: None,
+    });
+    crate::server::test_support::seed_instances_on_disk_for_test("default", vec![row.clone()]);
+    let state = crate::server::test_support::build_test_app_state(vec![row.clone()]);
+    crate::server::test_support::refresh_canonical_metadata_for_test(&state).await;
+    let body = crate::daemon::RestartSessionBody {
+        stop_processes: Some(vec![]),
+        extra_args: Some("--verbose".into()),
+        ..Default::default()
+    };
+    let response = lifecycle::prepare_agent_session(
+        state,
+        row.id.clone(),
+        Ok(None),
+        lifecycle::AgentPreparation::Restart,
+        Some(Arc::new(body)),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    assert!(!ran.exists(), "the hook ran for a refused request");
+    Ok(())
 }
 
 #[tokio::test]

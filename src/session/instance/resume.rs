@@ -943,10 +943,31 @@ mod tests {
         assert!(inst.capture_poller.is_running());
         inst.capture_poller.stop();
 
-        // A reservation a peer has since taken is not given back.
+        // A reservation a peer has since taken, and what it wrote, are left alone.
+        let mut peer = storage.load().unwrap().remove(0);
+        peer.acquire_lifecycle_reservation(
+            &storage,
+            LifecycleOperation::Launch,
+            Some(Status::Starting),
+        )
+        .unwrap();
+        assert_ne!(peer.lifecycle_generation, generation);
+        storage
+            .update(|instances, _groups| {
+                instances[0].snooze(30);
+                Ok(())
+            })
+            .unwrap();
         assert!(inst
             .withdraw_reserved_restart(&storage, generation, &admitted)
             .is_err());
+        let kept = storage.load().unwrap().remove(0);
+        assert!(kept
+            .lifecycle_reservation
+            .as_ref()
+            .is_some_and(|held| held.generation == peer.lifecycle_generation));
+        assert_eq!(kept.status, Status::Starting);
+        assert!(kept.snoozed_until.is_some(), "the peer's snooze stays");
     }
     use crate::session::instance::test_helpers::{install_aliases, seed_claude_transcript};
     use serial_test::serial;

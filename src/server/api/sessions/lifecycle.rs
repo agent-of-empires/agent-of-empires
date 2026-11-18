@@ -2147,17 +2147,14 @@ pub async fn recreate_container(
 pub async fn restart_for_update(
     State(state): State<Arc<AppState>>,
     Path(id): Path<String>,
-    body: Result<
-        Option<Json<crate::daemon::RestartForUpdateBody>>,
-        axum::extract::rejection::JsonRejection,
-    >,
+    request: axum::extract::Request,
 ) -> axum::response::Response {
     if let Some(resp) = cityhall_block_non_structured(&state, &id).await {
         return resp;
     }
-    let check = match body {
-        Ok(body) => body.map(|Json(body)| body).unwrap_or_default(),
-        Err(rejection) => return rejection.into_response(),
+    let check = match update_check(request).await {
+        Ok(check) => check,
+        Err(response) => return response,
     };
     let instance = {
         let instances = state.instances.read().await;
@@ -2209,6 +2206,36 @@ async fn background_processes_refusal(
         .unwrap_or(PaneCensus::Unclassified);
     let fields = refusal(census, &confirmed, body.stop_unclassified)?;
     Some(background_processes_response(fields, false))
+}
+
+/// The update restart's check. An empty body asks for none; any other body must be JSON, so a
+/// check sent without a `Content-Type` is refused instead of dropped.
+async fn update_check(
+    request: axum::extract::Request,
+) -> Result<crate::daemon::RestartForUpdateBody, axum::response::Response> {
+    use axum::extract::FromRequest as _;
+    let (parts, body) = request.into_parts();
+    let bytes = axum::body::to_bytes(body, 64 * 1024)
+        .await
+        .map_err(|_| StatusCode::PAYLOAD_TOO_LARGE.into_response())?;
+    if bytes.is_empty() {
+        return Ok(Default::default());
+    }
+    let request = axum::extract::Request::from_parts(parts, axum::body::Body::from(bytes));
+    Json::from_request(request, &())
+        .await
+        .map(|Json(check)| check)
+        .map_err(IntoResponse::into_response)
+}
+
+/// A background-process check with a setting a refusal after the hooks couldn't undo.
+fn check_with_unrestorable_setting(body: &crate::daemon::RestartSessionBody) -> bool {
+    body.stop_processes.is_some()
+        && (body.profile.is_some()
+            || body.tool.is_some()
+            || body.command_override.is_some()
+            || body.extra_args.is_some()
+            || body.discard_sandbox_container)
 }
 
 /// The 409 for a restart that found unconfirmed background processes. `launch_hooks_ran` says
@@ -2525,6 +2552,7 @@ async fn admit_restart_sandbox_login(
     if row.ensure_startable().is_err()
         || matches!(row.status, Status::Creating | Status::Deleting)
         || (body.only_if_idle && row.status != Status::Idle)
+        || (!row.is_structured() && check_with_unrestorable_setting(body))
         || (state.cityhall_mode && !row.is_structured())
         || *state.canonical_health.read().await != crate::daemon::RuntimeHealth::Healthy
     {
@@ -3483,26 +3511,15 @@ async fn prepare_agent_session_inner(
             "Session is busy or its agent is not out of date".to_string(),
         );
     }
-    // Structured workers are stopped by their reconciler, not here, so they skip the check.
-    if let Some(body) = restart
+    if restart
         .as_ref()
-        .filter(|body| body.stop_processes.is_some() && !instance.is_structured())
+        .is_some_and(|body| !instance.is_structured() && check_with_unrestorable_setting(body))
     {
-        if body.profile.is_some()
-            || body.tool.is_some()
-            || body.command_override.is_some()
-            || body.extra_args.is_some()
-            || body.discard_sandbox_container
-        {
-            return api_error(
-                StatusCode::BAD_REQUEST,
-                "validation_failed",
-                "stop_processes applies only to a restart that changes no setting".to_string(),
-            );
-        }
-        if let Some(response) = background_processes_refusal(&instance, body).await {
-            return response;
-        }
+        return api_error(
+            StatusCode::BAD_REQUEST,
+            "validation_failed",
+            "stop_processes applies only to a restart that changes no setting".to_string(),
+        );
     }
     // #4116: a shelved row refuses every start path with its own code, decided on
     // the row this request reloaded. It answers before the lifecycle reservation,
@@ -3512,6 +3529,15 @@ async fn prepare_agent_session_inner(
     // peer that shelves it while this request waits.
     if let Err(blocked) = instance.ensure_startable() {
         return crate::server::api::start_blocked_response(blocked);
+    }
+    // Structured workers are stopped by their reconciler, not here, so they skip the check.
+    if let Some(body) = restart
+        .as_ref()
+        .filter(|body| body.stop_processes.is_some() && !instance.is_structured())
+    {
+        if let Some(response) = background_processes_refusal(&instance, body).await {
+            return response;
+        }
     }
     let body = match body {
         Ok(body) => body.map(|Json(body)| body).unwrap_or_default(),
@@ -4288,6 +4314,14 @@ pub(super) mod launch_hook_gate {
         let (release_tx, release_rx) = tokio::sync::oneshot::channel();
         *GATE.lock().unwrap() = Some((id.to_owned(), stage, entered_tx, release_rx));
         (entered_rx, release_tx)
+    }
+
+    /// Clears a gate armed for `id` that no restart reached, so it can't hold a later one.
+    pub(in crate::server::api::sessions) fn disarm(id: &str) {
+        let mut gate = GATE.lock().unwrap_or_else(|e| e.into_inner());
+        if gate.as_ref().is_some_and(|(session, ..)| session == id) {
+            *gate = None;
+        }
     }
 
     pub(super) async fn pause(id: &str, stage: Stage) {
