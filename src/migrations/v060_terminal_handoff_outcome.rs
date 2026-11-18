@@ -55,12 +55,14 @@ fn migrate_file(path: &Path) -> Result<()> {
                 path.display()
             )
         })?;
-        if fields.contains_key("outcome") {
-            continue;
-        }
+        let recorded_already = fields.get("outcome").cloned();
         let outcome = (|| -> Result<Value> {
-            let outcome = serde_json::to_value(outcome_of(fields)?)?;
-            // Validate a copy, as v048 does, so a malformed handoff is refused, not rewritten.
+            let outcome = match recorded_already.clone() {
+                Some(outcome) => outcome,
+                None => serde_json::to_value(outcome_of(fields)?)?,
+            };
+            // Validate a copy of every handoff, as v048 does, so a malformed one is refused before
+            // any other row is rewritten.
             let mut copy = fields.clone();
             copy.insert("outcome".into(), outcome.clone());
             let intent: crate::session::TerminalHandoffIntent =
@@ -75,8 +77,10 @@ fn migrate_file(path: &Path) -> Result<()> {
                 path.display()
             )
         })?;
-        fields.insert("outcome".into(), outcome);
-        recorded += 1;
+        if recorded_already.is_none() {
+            fields.insert("outcome".into(), outcome);
+            recorded += 1;
+        }
     }
     if recorded > 0 {
         crate::session::backup_before_migration(path)?;
@@ -224,6 +228,22 @@ mod tests {
             let mut value = written_before(&row, &intent)?;
             corrupt(&mut value);
             let bytes = serde_json::to_vec(&json!([value]))?;
+            std::fs::write(&path, &bytes)?;
+            assert!(migrate_file(&path).is_err());
+            assert_eq!(std::fs::read(&path)?, bytes);
+            assert!(crate::session::migration_backups(&path)?.is_empty());
+        }
+        // A handoff that already has an outcome is validated too, beside one that needs it.
+        let recorded: [fn(&mut Value); 3] = [
+            |row| row["terminal_handoff"]["outcome"] = json!("sideways"),
+            |row| row["terminal_handoff"]["id"] = json!("not-a-uuid"),
+            |row| row["terminal_handoff"]["target_generation"] = json!(1),
+        ];
+        for corrupt in recorded {
+            let mut value = written_before(&row, &intent)?;
+            value["terminal_handoff"]["outcome"] = json!("fresh");
+            corrupt(&mut value);
+            let bytes = serde_json::to_vec(&json!([written_before(&row, &intent)?, value]))?;
             std::fs::write(&path, &bytes)?;
             assert!(migrate_file(&path).is_err());
             assert_eq!(std::fs::read(&path)?, bytes);
