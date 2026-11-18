@@ -1674,8 +1674,12 @@ fn drive_terminal_handoff(
                         let mut held =
                             TerminalHandoff::new(native, launch_id.clone(), launch_driver);
                         // The launch refuses the command's selector beside AoE's own conversation
-                        // on every retry, so a switch owed from before that refusal ends here.
-                        let ended = command_selector_conflicts(&row, false);
+                        // on every retry, so a switch owed from before that refusal ends here. The
+                        // launch adopts a live pane before that check, so a kept one doesn't end.
+                        let ended = command_selector_conflicts(&row, false)
+                            && !row
+                                .tmux_session()
+                                .is_ok_and(|pane| pane.exists_live() && !pane.is_pane_dead());
                         let result = if ended {
                             Ok(())
                         } else {
@@ -5110,7 +5114,8 @@ mod tests {
     }
 
     /// A switch owed with the command's own selector beside AoE's id ends, whether or not a launch
-    /// was already attempted, and a restart without the selector launches.
+    /// was already refused, and a restart without the selector launches. A pane an earlier attempt
+    /// kept is adopted instead.
     #[tokio::test]
     #[serial_test::serial]
     async fn an_owed_switch_the_command_selector_refuses_ends_and_a_restart_launches(
@@ -5157,7 +5162,6 @@ mod tests {
             row.command = "claude".into();
             row
         };
-        let kept = attempted("owed own selector, pane kept");
         #[derive(PartialEq)]
         enum Resume {
             Switch,
@@ -5179,7 +5183,11 @@ mod tests {
                 Tried::Refused,
                 Resume::Recovery,
             ),
-            (kept.clone(), Tried::KeptPane, Resume::Switch),
+            (
+                attempted("owed own selector, pane kept"),
+                Tried::KeptPane,
+                Resume::Switch,
+            ),
             (
                 owed("owed own selector, adoption fails"),
                 Tried::Never,
@@ -5378,6 +5386,21 @@ mod tests {
                     }),
                 ));
             }
+            if *tried == Tried::KeptPane {
+                // The kept pane was adopted, so the retried cleanup completes the switch.
+                assert_eq!(switch().await.into_response().status(), StatusCode::OK);
+                let adopted = stored(&held.id)?;
+                assert!(adopted.terminal_handoff.is_none());
+                assert_eq!(adopted.view, View::Terminal);
+                let pane = adopted.tmux_session()?;
+                assert!(pane.exists_live() && !pane.is_pane_dead());
+                assert_eq!(crate::tmux::first_pane_id(pane.name()), kept_pane);
+                let cached = find_instance(&state, &held.id).await.unwrap();
+                assert_ne!(cached.status, Status::Error);
+                assert!(cached.last_error.is_none());
+                assert!(!argv.exists(), "the adopted pane was not replaced");
+                continue;
+            }
             if *resume != Resume::Recovery {
                 // A retried switch drives the cleanup and still answers with the coded refusal.
                 let response = switch().await.into_response();
@@ -5463,12 +5486,6 @@ mod tests {
                 "claude --resume old-id",
                 "--resume old-id\n",
             ),
-            (
-                &kept,
-                Some("claude".to_string()),
-                "claude",
-                "--session-id sid-held\n",
-            ),
         ] {
             let _ = std::fs::remove_file(&argv);
             let response = crate::server::api::restart_session(
@@ -5492,14 +5509,6 @@ mod tests {
             assert_eq!(restarted.command, command, "{}", row.title);
             assert!(restarted.terminal_handoff.is_none());
         }
-        // The remedy replaces the pane the earlier attempt kept, rather than skipping on it.
-        let restarted = stored(&kept.id)?.tmux_session()?;
-        let replaced = crate::tmux::first_pane_id(restarted.name());
-        assert!(restarted.exists_live() && !restarted.is_pane_dead());
-        assert!(
-            replaced.is_some() && replaced != kept_pane,
-            "{kept_pane:?} -> {replaced:?}"
-        );
         let cleared = stored(&id_cleared.id)?;
         assert_eq!(cleared.agent_session_id, None, "the clear dropped AoE's id");
         Ok(())
