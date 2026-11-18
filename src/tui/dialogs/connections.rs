@@ -3,7 +3,7 @@
 
 use std::time::{Duration, Instant};
 
-use crossterm::event::{KeyCode, KeyEvent};
+use crossterm::event::{KeyCode, KeyEvent, KeyEventKind};
 use ratatui::prelude::*;
 use ratatui::widgets::*;
 
@@ -241,13 +241,15 @@ impl ConnectionsView {
 
     /// Enter on the Web dashboard row submits; the Daemon row has nothing to open. The Serve
     /// key that opened the hub submits from any row, except on a takeover, once it is a
-    /// separate press: 700 ms after the last one, or after any other key.
+    /// separate press: 700 ms after the last one, or after any other key. A key-repeat event
+    /// never counts.
     pub fn handle_key(&mut self, key: KeyEvent, strict: bool, now: Instant) -> DialogResult<()> {
         let rows = self.rows();
         if !self.offline_takeover() && bindings::is_bound(ActionId::Serve, strict, &key) {
-            let held = self
-                .last_serve
-                .is_some_and(|last| now.saturating_duration_since(last) < SEPARATE_PRESS);
+            let held = key.kind == KeyEventKind::Repeat
+                || self
+                    .last_serve
+                    .is_some_and(|last| now.saturating_duration_since(last) < SEPARATE_PRESS);
             if !held {
                 return DialogResult::Submit(());
             }
@@ -659,6 +661,8 @@ mod tests {
     fn the_second_serve_chord_opens_the_dashboard_only_as_a_separate_press() {
         let ms = Duration::from_millis;
         let down = KeyEvent::new(KeyCode::Down, KeyModifiers::NONE);
+        let repeat =
+            |key: KeyEvent| KeyEvent::new_with_kind(key.code, key.modifiers, KeyEventKind::Repeat);
         // A held key: the first repeat after a 500 ms OS delay, then one every 33 ms for 2 s.
         let held: Vec<Duration> = std::iter::once(ms(500))
             .chain((1..=60).map(|i| ms(500 + 33 * i)))
@@ -685,6 +689,13 @@ mod tests {
                     "another key between",
                     vec![(ms(50), down), (ms(100), serve)],
                     true,
+                ),
+                (
+                    "repeat events, however far apart",
+                    (1..=3)
+                        .map(|i| (SEPARATE_PRESS * 2 * i, repeat(serve)))
+                        .collect(),
+                    false,
                 ),
                 (
                     "a pause after a hold",
