@@ -268,6 +268,8 @@ export function WorkspaceSidebar(props: Props) {
       onArchiveToggle: triage.archiveToggle,
       onSnooze: triage.snooze,
       onUnreadToggle: triage.unreadToggle,
+      onIgnoreToggle: triage.ignoreToggle,
+      onReclaimOwnership: triage.reclaimOwnership,
       bulkApi: selection.rowBulkApi,
     }),
   };

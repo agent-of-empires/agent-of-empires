@@ -152,6 +152,14 @@ pub(super) fn build_router(state: Arc<AppState>) -> Router {
             "/api/sessions/{id}/favorite",
             patch(api::update_session_favorite).layer(read_only.clone()),
         )
+        .route(
+            "/api/sessions/{id}/ignored",
+            patch(api::update_session_ignored).layer(read_only.clone()),
+        )
+        .route(
+            "/api/sessions/{id}/reclaim-ownership",
+            post(api::reclaim_session_ownership).layer(read_only.clone()),
+        )
         .route("/api/sessions/{id}/color", patch(api::update_session_color))
         .route(
             "/api/sessions/{id}/archive",

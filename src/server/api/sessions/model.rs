@@ -109,6 +109,7 @@ pub(super) fn session_response_from_instance_with_plan(
         urgent: inst.is_urgent(),
         pinned_at: timestamp(row.pinned_at),
         archived_at: timestamp(row.archived_at),
+        ignored_at: timestamp(row.ignored_at),
         snoozed_until: timestamp(row.active_snoozed_until),
         trashed_at: timestamp(row.trashed_at),
         trash_lifecycle_id: inst.trash_lifecycle_id.clone(),

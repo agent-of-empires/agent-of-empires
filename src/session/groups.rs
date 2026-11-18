@@ -601,7 +601,12 @@ fn last_activity_group_key(
 /// Priority tier for the Attention sort. The per-status ranks live on
 /// [`crate::session::Status::attention_tier`].
 fn attention_tier(inst: &Instance) -> u8 {
-    if inst.is_archived() || inst.is_snoozed() || inst.is_trashed() || inst.pane_dead_observed {
+    if inst.is_archived()
+        || inst.is_ignored()
+        || inst.is_snoozed()
+        || inst.is_trashed()
+        || inst.pane_dead_observed
+    {
         // Tier 99 sinks: archived and snoozed (snoozed = temporary archive, wakes automatically
         // when timer expires).
         return 99;

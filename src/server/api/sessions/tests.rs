@@ -2638,6 +2638,115 @@ async fn engagement_unsinks_archived_and_snoozed_row_in_one_canonical_commit() -
     Ok(())
 }
 
+/// Ignoring a managed row keeps it live and present. The response and the
+/// persisted row carry the ignore marker and the manager link, and neither
+/// archive nor trash is set by the mutation.
+#[tokio::test]
+#[serial_test::serial]
+async fn ignore_session_keeps_the_row_live_and_reports_its_manager() -> anyhow::Result<()> {
+    use axum::body::to_bytes;
+    let _guard = crate::session::test_support::isolate_app_dir();
+    let mut row = Instance::new("managed ignore", "/tmp/managed-ignore");
+    row.source_profile = "receipt".into();
+    row.parent_session_id = Some("manager".into());
+    let id = row.id.clone();
+    let state = crate::server::test_support::build_test_app_state(vec![row.clone()]);
+    let storage = Storage::new("receipt", state.file_watch.clone())?;
+    storage.update(|rows, _| {
+        rows.push(row);
+        Ok(())
+    })?;
+    *state.canonical_metadata.write().await =
+        crate::server::reload::load_all_profiles(&state.file_watch)?.metadata;
+    state.runtime.publish(&state).await?;
+
+    let response = update_session_ignored(
+        State(state.clone()),
+        Path(id.clone()),
+        Ok(Json(UpdateIgnoredBody { ignored: true })),
+    )
+    .await
+    .into_response();
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = to_bytes(response.into_body(), usize::MAX).await?;
+    let json: serde_json::Value = serde_json::from_slice(&body)?;
+    assert!(json["ignored_at"].is_string(), "{json}");
+    assert_eq!(json["parent_session_id"], "manager");
+    assert!(
+        json["archived_at"].is_null(),
+        "ignore is not archive: {json}"
+    );
+    assert!(json["trashed_at"].is_null(), "ignore is not trash: {json}");
+
+    let stored = storage
+        .load()?
+        .into_iter()
+        .find(|row| row.id == id)
+        .expect("row persisted");
+    assert!(stored.is_ignored());
+    assert!(!stored.is_archived());
+    assert!(!stored.is_trashed());
+    assert_eq!(stored.parent_session_id.as_deref(), Some("manager"));
+    Ok(())
+}
+
+/// Taking ownership back clears the manager link and the ignore marker in one
+/// commit, while the row identity, conversation binding, and unrelated triage
+/// timestamps survive.
+#[tokio::test]
+#[serial_test::serial]
+async fn reclaim_ownership_clears_manager_and_ignore_in_one_commit() -> anyhow::Result<()> {
+    use axum::body::to_bytes;
+    let _guard = crate::session::test_support::isolate_app_dir();
+    let mut row = Instance::new("managed reclaim", "/tmp/managed-reclaim");
+    row.source_profile = "receipt".into();
+    row.parent_session_id = Some("manager".into());
+    row.agent_session_id = Some("native-conversation".into());
+    row.ignore();
+    row.pin();
+    row.ignore();
+    let id = row.id.clone();
+    let state = crate::server::test_support::build_test_app_state(vec![row.clone()]);
+    let storage = Storage::new("receipt", state.file_watch.clone())?;
+    storage.update(|rows, _| {
+        rows.push(row);
+        Ok(())
+    })?;
+    *state.canonical_metadata.write().await =
+        crate::server::reload::load_all_profiles(&state.file_watch)?.metadata;
+    state.runtime.publish(&state).await?;
+
+    let response = reclaim_session_ownership(
+        State(state.clone()),
+        Path(id.clone()),
+        Ok(Json(ReclaimOwnershipBody { reclaim: true })),
+    )
+    .await;
+    let response =
+        assert_response_status(response.into_response(), StatusCode::OK, "reclaim").await;
+    let body = to_bytes(response.into_body(), usize::MAX).await?;
+    let json: serde_json::Value = serde_json::from_slice(&body)?;
+    assert!(json["ignored_at"].is_null(), "{json}");
+    assert!(json["parent_session_id"].is_null(), "{json}");
+
+    let stored = storage
+        .load()?
+        .into_iter()
+        .find(|row| row.id == id)
+        .expect("row persisted");
+    assert!(!stored.is_ignored());
+    assert!(stored.parent_session_id.is_none());
+    assert_eq!(stored.id, id);
+    assert_eq!(
+        stored.agent_session_id.as_deref(),
+        Some("native-conversation")
+    );
+    assert!(stored.is_pinned(), "unrelated triage survives reclaim");
+    assert!(!stored.is_archived());
+    assert!(!stored.is_trashed());
+    Ok(())
+}
+
 /// A trashed row is shelved, not mid-lifecycle: `/access` used to answer a
 /// generic `lifecycle_busy`, which the dashboard cannot act on, while every
 /// other entry point returned the row's own code.

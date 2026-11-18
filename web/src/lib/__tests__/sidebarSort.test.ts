@@ -100,6 +100,7 @@ function repoGroup(workspaces: Workspace[]): RepoGroup {
 const TS = "2025-06-01T00:00:00Z";
 const archived = { archived_at: TS };
 const snoozed = { snoozed_until: "2099-01-01T00:00:00Z" };
+const ignored = { ignored_at: TS };
 const noTimestamp = { created_at: "bad", idle_entered_at: null, last_accessed_at: null };
 const ids = (list: Workspace[]) => list.map((w) => w.id);
 
@@ -149,7 +150,9 @@ describe("triage", () => {
     ["one pinned session", [{}, { id: "s2", pinned_at: TS }], { pinned: true, sunk: false, tier: 0 }],
     ["pinned beside archived", [{ pinned_at: TS }, { id: "s2", ...archived }], { pinned: true, sunk: false, tier: 0 }],
     ["archived and snoozed", [archived, { id: "s2", ...snoozed }], { pinned: false, sunk: true, tier: 2 }],
+    ["ignored", [ignored], { pinned: false, sunk: false, tier: 1 }],
     ["one live beside archived", [archived, { id: "s2" }], { pinned: false, sunk: false, tier: 1 }],
+    ["one live beside ignored", [ignored, { id: "s2" }], { pinned: false, sunk: false, tier: 1 }],
     ["empty", [], { pinned: false, sunk: false, tier: 1 }],
   ])("%s workspace", (_name, sessions, { pinned, sunk, tier }) => {
     const ws = workspace("w", sessions.map(session));

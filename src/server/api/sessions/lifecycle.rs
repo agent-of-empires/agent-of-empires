@@ -115,6 +115,125 @@ pub async fn update_session_favorite(
     crate::server::runtime::session_mutation_response(&state, &id, None::<()>).await
 }
 
+/// Ignore or unignore a session managed by another session. The row stays
+/// live and present; archive, snooze, and trash are untouched.
+pub async fn update_session_ignored(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<String>,
+    body: Result<Json<UpdateIgnoredBody>, axum::extract::rejection::JsonRejection>,
+) -> impl IntoResponse {
+    if state.read_only {
+        return crate::server::api::read_only_response();
+    }
+    let Json(body) = match body {
+        Ok(body) => body,
+        Err(rejection) => return rejection.into_response(),
+    };
+
+    let namespace = state.profile_namespace.read().await;
+    let lock = state.instance_lock(&id).await;
+    let guard = lock.lock().await;
+    if let Some(response) = cityhall_block_non_structured(&state, &id).await {
+        return response;
+    }
+    let profile = {
+        let instances = state.instances.read().await;
+        let Some(instance) = instances.iter().find(|instance| instance.id == id) else {
+            return crate::server::api::session_not_found();
+        };
+        instance.source_profile.clone()
+    };
+    let ignored = body.ignored;
+    let persist_id = id.clone();
+    let committed = commit_profile_update(
+        &state,
+        profile,
+        "ignore update",
+        move |instances| {
+            if let Some(instance) = instances
+                .iter_mut()
+                .find(|instance| instance.id == persist_id)
+            {
+                if ignored {
+                    instance.ignore();
+                } else {
+                    instance.unignore();
+                }
+            }
+        },
+        None,
+    )
+    .await;
+    if let Err(response) = committed {
+        return response;
+    }
+    tracing::info!(target: "session.sync", session = %id, field = "ignored", value = ignored, "session updated");
+    drop(guard);
+    drop(namespace);
+    crate::server::runtime::session_mutation_response(&state, &id, None::<()>).await
+}
+
+/// Take ownership of a managed session: clear its manager link and ignore
+/// marker while preserving the row, conversation, worktree, and every
+/// unrelated triage timestamp.
+pub async fn reclaim_session_ownership(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<String>,
+    body: Result<Json<ReclaimOwnershipBody>, axum::extract::rejection::JsonRejection>,
+) -> impl IntoResponse {
+    if state.read_only {
+        return crate::server::api::read_only_response();
+    }
+    let Json(body) = match body {
+        Ok(body) => body,
+        Err(rejection) => return rejection.into_response(),
+    };
+    if !body.reclaim {
+        return api_error(
+            StatusCode::BAD_REQUEST,
+            "validation_failed",
+            "reclaim must be true",
+        );
+    }
+
+    let namespace = state.profile_namespace.read().await;
+    let lock = state.instance_lock(&id).await;
+    let guard = lock.lock().await;
+    if let Some(response) = cityhall_block_non_structured(&state, &id).await {
+        return response;
+    }
+    let profile = {
+        let instances = state.instances.read().await;
+        let Some(instance) = instances.iter().find(|instance| instance.id == id) else {
+            return crate::server::api::session_not_found();
+        };
+        instance.source_profile.clone()
+    };
+    let persist_id = id.clone();
+    let committed = commit_profile_update(
+        &state,
+        profile,
+        "reclaim ownership",
+        move |instances| {
+            if let Some(instance) = instances
+                .iter_mut()
+                .find(|instance| instance.id == persist_id)
+            {
+                instance.reclaim_ownership();
+            }
+        },
+        None,
+    )
+    .await;
+    if let Err(response) = committed {
+        return response;
+    }
+    tracing::info!(target: "session.sync", session = %id, field = "ownership", value = "reclaimed", "session updated");
+    drop(guard);
+    drop(namespace);
+    crate::server::runtime::session_mutation_response(&state, &id, None::<()>).await
+}
+
 pub async fn update_session_color(
     State(state): State<Arc<AppState>>,
     Path(id): Path<String>,

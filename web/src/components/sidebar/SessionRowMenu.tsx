@@ -7,6 +7,7 @@ import {
   CircleDot,
   CircleStop,
   Container,
+  EyeOff,
   FolderPen,
   FolderPlus,
   Focus,
@@ -113,6 +114,8 @@ export interface SingleRowActions {
   archive: () => void;
   openSnooze: () => void;
   unsnooze: () => void;
+  ignore: (sessionId: string) => void;
+  reclaimOwnership: (sessionId: string) => void;
   unread: () => void;
   remove: () => void;
 }
@@ -305,6 +308,30 @@ export function SingleRowMenuItems({
         glyph: icon(Container),
         indent: true,
       }),
+    ],
+    [
+      item(
+        "ignore",
+        {
+          label: "Ignore managed session",
+          singleLabel: (s) => (s.ignored_at != null ? "Unignore session" : "Ignore managed session"),
+          detail: "Keeps it live without archive or trash",
+          testId: "sidebar-context-menu-ignore",
+          glyph: icon(EyeOff),
+        },
+        a.ignore,
+      ),
+      item(
+        "reclaimOwnership",
+        {
+          label: "Take ownership",
+          singleLabel: (s) => (s.parent_session_id ? "Take ownership back" : "Take ownership"),
+          detail: "Clears the managing session and ignore state",
+          testId: "sidebar-context-menu-reclaim-ownership",
+          glyph: icon(UserRoundCog),
+        },
+        a.reclaimOwnership,
+      ),
     ],
   ];
   return (

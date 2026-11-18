@@ -519,9 +519,9 @@ fn decorate_row(
         // is the textual cue, so this is a dim color with no italic modifier.
         icon = sunk_icon;
         style = Style::default().fg(theme.dimmed);
-    } else if in_attention && inst.is_snoozed() {
-        // Snooze decoration is Attention-only; elsewhere the row paints its real state
-        // and the timer keeps running.
+    } else if in_attention && (inst.is_snoozed() || inst.is_ignored()) {
+        // Snooze and ignore decoration is Attention-only; elsewhere the row paints its
+        // real state. Ignored rows stay present and live, unlike archive and trash.
         icon = sunk_icon;
         style = Style::default()
             .fg(theme.dimmed)
@@ -542,6 +542,8 @@ fn decorate_row(
         Cow::Owned(inst.title.clone())
     } else if in_attention && inst.is_snoozed() {
         Cow::Owned(format!("z {}", inst.title))
+    } else if in_attention && inst.is_ignored() {
+        Cow::Owned(format!("i {}", inst.title))
     } else if in_attention && inst.is_urgent() {
         Cow::Owned(format!("! {}", inst.title))
     } else {
@@ -2068,6 +2070,7 @@ impl HomeView {
                             let unread_resting = crate::session::unread_enabled()
                                 && inst.is_unread()
                                 && !inst.is_archived()
+                                && !inst.is_ignored()
                                 && !inst.is_snoozed()
                                 && matches!(inst.status, Status::Idle | Status::Unknown);
                             let color = if is_shown_dormant && !unread_resting {

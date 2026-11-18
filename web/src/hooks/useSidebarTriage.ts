@@ -1,6 +1,13 @@
 import { useCallback, useState } from "react";
 
-import { setSessionArchive, setSessionPin, setSessionSnooze, setSessionUnread } from "../lib/api";
+import {
+  reclaimSessionOwnership,
+  setSessionArchive,
+  setSessionIgnored,
+  setSessionPin,
+  setSessionSnooze,
+  setSessionUnread,
+} from "../lib/api";
 import { reportError } from "../lib/toastBus";
 import {
   makeOptimisticSnoozedUntil,
@@ -91,6 +98,18 @@ export function useSidebarTriage(workspaces: readonly Workspace[]) {
     [triage],
   );
 
+  const ignoreToggle = useCallback((sessionId: string, ignored: boolean) => {
+    void setSessionIgnored(sessionId, ignored).then((row) => {
+      if (row == null) reportError(ignored ? "Failed to ignore session" : "Failed to unignore session");
+    });
+  }, []);
+
+  const reclaimOwnership = useCallback((sessionId: string) => {
+    void reclaimSessionOwnership(sessionId).then((row) => {
+      if (row == null) reportError("Failed to take ownership");
+    });
+  }, []);
+
   const pinToggle = useCallback(
     (ws: Workspace, pinned: boolean) => {
       void pin(ws, pinned).then((r) => reportFailure(r, pinned ? "Failed to pin session" : "Failed to unpin session"));
@@ -151,6 +170,8 @@ export function useSidebarTriage(workspaces: readonly Workspace[]) {
     archiveToggle,
     snooze: snoozeOne,
     unreadToggle,
+    ignoreToggle,
+    reclaimOwnership,
     bulkPin,
     bulkArchive,
     bulkSnooze,

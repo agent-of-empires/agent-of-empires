@@ -489,6 +489,8 @@ const requestCases: RequestCase[] = [
     { respond: json(session), result: { ok: true, session } },
   ],
   ["PATCH /api/sessions/s1/snooze", () => api.setSessionSnooze("s1", 60), { body: { minutes: 60 } }],
+  ["PATCH /api/sessions/s1/ignored", () => api.setSessionIgnored("s1", true), { body: { ignored: true } }],
+  ["POST /api/sessions/s1/reclaim-ownership", () => api.reclaimSessionOwnership("s1"), { body: { reclaim: true } }],
   ["PATCH /api/sessions/s1/unread", () => api.setSessionUnread("s1", true), { body: { unread: true } }],
   [
     "POST /api/sessions/s1/projects",

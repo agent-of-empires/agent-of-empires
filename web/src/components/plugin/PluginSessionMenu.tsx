@@ -30,7 +30,13 @@ export interface SessionMenuRequest {
   onClose: (picked: string | null) => void;
 }
 
-type TriageHandlers = "onPinToggle" | "onArchiveToggle" | "onSnooze" | "onUnreadToggle";
+type TriageHandlers =
+  | "onPinToggle"
+  | "onArchiveToggle"
+  | "onSnooze"
+  | "onUnreadToggle"
+  | "onIgnoreToggle"
+  | "onReclaimOwnership";
 
 interface Props extends Omit<RowObservation, "onSessionMutation"> {
   request: SessionMenuRequest;
@@ -74,6 +80,8 @@ function ScopedMenu({ request, workspaces, readOnly, handlers, observedById, run
         onArchiveToggle: triage.archiveToggle,
         onSnooze: triage.snooze,
         onUnreadToggle: triage.unreadToggle,
+        onIgnoreToggle: triage.ignoreToggle,
+        onReclaimOwnership: triage.reclaimOwnership,
       }}
     />
   );
