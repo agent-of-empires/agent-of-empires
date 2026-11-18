@@ -1528,7 +1528,7 @@ mod tests {
         let guard = crate::session::test_support::EnvGuard::read_lock();
         let inherited = std::env::var_os("PATH").expect("test PATH");
         std::fs::create_dir(directory).unwrap();
-        for name in ["git", "sh"] {
+        for name in ["git", "sh", "ps"] {
             let executable = std::env::split_paths(&inherited)
                 .map(|path| path.join(name))
                 .find(|path| path.is_file())
