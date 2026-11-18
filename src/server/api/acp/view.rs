@@ -4236,6 +4236,19 @@ mod tests {
         row
     }
 
+    /// The fake agent's argv record once it reads `expected`, or as it stands at the deadline: the
+    /// file exists before its line is written.
+    async fn argv_record(path: &std::path::Path, expected: &str) -> String {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        loop {
+            let record = std::fs::read_to_string(path).unwrap_or_default();
+            if record == expected || std::time::Instant::now() >= deadline {
+                return record;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+    }
+
     /// A success body as JSON, or a refusal as `{error: <code header>, message: <text body>}`.
     /// Refusals must stay plain text: the current web client shows the body as it is.
     async fn response_json(response: Response) -> anyhow::Result<(StatusCode, serde_json::Value)> {
@@ -5317,11 +5330,11 @@ mod tests {
                     })
                     .await??;
                     set_command("claude --resume old-id")?;
-                    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
-                    while !argv.exists() {
-                        assert!(std::time::Instant::now() < deadline, "the kept pane ran");
-                        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
-                    }
+                    assert_eq!(
+                        argv_record(&argv, "--session-id sid-held\n").await,
+                        "--session-id sid-held\n",
+                        "the kept pane ran"
+                    );
                     // Pane ids are never reused within a tmux server; the PID lookup is not
                     // available in every environment.
                     kept_pane =
@@ -5500,11 +5513,12 @@ mod tests {
             let status = response.status();
             let body = axum::body::to_bytes(response.into_body(), 8192).await?;
             assert!(status.is_success(), "{}: {status}: {body:?}", row.title);
-            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
-            while !argv.exists() && std::time::Instant::now() < deadline {
-                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-            }
-            assert_eq!(std::fs::read_to_string(&argv)?, launched, "{}", row.title);
+            assert_eq!(
+                argv_record(&argv, launched).await,
+                launched,
+                "{}",
+                row.title
+            );
             let restarted = stored(&row.id)?;
             assert_eq!(restarted.command, command, "{}", row.title);
             assert!(restarted.terminal_handoff.is_none());
