@@ -2538,7 +2538,7 @@ impl App {
             // nobody unless it is cut short when the receiver goes away.
             let result = tokio::select! {
                 result = EmbeddedView::connect(endpoint, &mount_session) => {
-                    result.map_err(|e| e.to_string())
+                    result.map_err(|e| format!("structured view: {e}"))
                 }
                 _ = tx.closed() => return,
             };
@@ -2608,6 +2608,17 @@ impl App {
     /// the mount set changed.
     fn reconcile_structured_preview(&mut self) -> bool {
         self.home.enforce_trash_read_only();
+        // A mount whose row the selection has left would replay the whole
+        // transcript before `poll_structured_mount` discarded it, so drop the
+        // receiver and let the task's `tx.closed()` cut it short.
+        let selected = self.home.selected_structured_session();
+        if self
+            .structured_mount
+            .as_ref()
+            .is_some_and(|(target, _)| selected.as_deref() != Some(target.as_str()))
+        {
+            self.structured_mount = None;
+        }
         // A failure is remembered only for the row it belongs to, so the early
         // returns below cannot strand it on a row the user has come back to.
         let selecting_failed_row = self
@@ -3682,6 +3693,25 @@ mod tests {
         );
     }
 
+    /// Selecting another row cuts the connect short instead of letting it
+    /// replay a whole transcript the poll would then throw away.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn selecting_another_row_cancels_the_mount_in_flight() {
+        let (mut app, _guard, ids) = app_on_two_structured_rows();
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        app.structured_mount = Some((ids[0].clone(), rx));
+
+        app.home.selected_session = Some(ids[1].clone());
+        app.reconcile_structured_preview();
+
+        assert!(
+            app.structured_mount.is_none(),
+            "a mount for a row the selection left is dropped"
+        );
+        assert!(tx.is_closed(), "the connect sees its receiver go away");
+    }
+
     /// A connect that finishes after the user kept moving is dropped, not
     /// painted over the row they are on now.
     #[tokio::test]
@@ -3706,9 +3736,7 @@ mod tests {
         let (mut app, _guard, id) = app_on_a_structured_row();
         let (tx, rx) = tokio::sync::oneshot::channel();
         app.structured_mount = Some((id.clone(), rx));
-        assert!(tx
-            .send(Err("structured view: ws connect failed".to_owned()))
-            .is_ok());
+        assert!(tx.send(Err("ws connect failed".to_owned())).is_ok());
 
         assert!(app.poll_structured_mount(), "the error status is painted");
         assert_eq!(app.structured_mount_failed.as_deref(), Some(id.as_str()));
