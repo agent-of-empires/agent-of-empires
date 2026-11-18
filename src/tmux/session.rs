@@ -5119,15 +5119,38 @@ mod tests {
         );
     }
 
+    /// #5850: a tmux client without a UTF-8 locale prints every byte outside printable ASCII
+    /// as `_`. The locale reaches only a child test process, never this one's environment.
     #[test]
     #[serial_test::serial]
-    /// #5850: a tmux client without a UTF-8 locale prints the tab in the lookup's format as `_`.
-    fn the_pane_pid_resolves_without_a_utf8_locale() {
+    fn pane_queries_read_intact_without_a_utf8_locale() {
+        const CHILD: &str = "AOE_TEST_PANE_QUERY_LOCALE_CHILD";
         if !tmux_available() {
             eprintln!("Skipping test: tmux not available");
             return;
         }
-        let guard = TmuxTestSession::new("aoe_test_pane_pid_locale");
+        if std::env::var_os(CHILD).is_none() {
+            let child = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "tmux::session::tests::pane_queries_read_intact_without_a_utf8_locale",
+                    "--nocapture",
+                ])
+                .env(CHILD, "1")
+                .env("LANG", "C")
+                .env("LC_ALL", "C")
+                .env("LC_CTYPE", "C")
+                .output()
+                .unwrap();
+            let stdout = String::from_utf8_lossy(&child.stdout);
+            assert!(
+                child.status.success() && stdout.contains("1 passed"),
+                "{stdout}{}",
+                String::from_utf8_lossy(&child.stderr)
+            );
+            return;
+        }
+        let guard = TmuxTestSession::new("aoe_test_pane_query_locale");
         let session_name = guard.name().to_string();
         let mut args: Vec<String> = ["new-session", "-d", "-s", &session_name, "sleep 30"]
             .iter()
@@ -5141,23 +5164,15 @@ mod tests {
             .success());
         let pane = only_pane_id(&session_name);
         wait_for_pane_command(&pane, "sleep");
-        let expected = pane_field(&pane, "#{pane_pid}")
-            .parse::<u32>()
-            .expect("pane PID");
-
-        const LOCALE: [&str; 3] = ["LANG", "LC_ALL", "LC_CTYPE"];
-        let saved = LOCALE.map(|key| (key, std::env::var_os(key)));
-        for key in LOCALE {
-            std::env::set_var(key, "C");
+        let pid = pane_field(&pane, "#{pane_pid}");
+        let cases = [(
+            "pane PID",
+            crate::process::get_pane_pid(&session_name).map(|pid| pid.to_string()),
+            pid.as_str(),
+        )];
+        for (query, read, expected) in cases {
+            assert_eq!(read.as_deref(), Some(expected), "{query}");
         }
-        let resolved = crate::process::get_pane_pid(&session_name);
-        for (key, value) in saved {
-            match value {
-                Some(value) => std::env::set_var(key, value),
-                None => std::env::remove_var(key),
-            }
-        }
-        assert_eq!(resolved, Some(expected));
     }
 
     #[test]
