@@ -837,7 +837,15 @@ impl App {
                                 }
                             }
                             Some(Ok(Event::Resize(_, _))) => self.home.invalidate_rows(),
-                            None => break,
+                            Some(Err(error)) => {
+                                tracing::info!(target: "tui.input", "Terminal event stream error, exiting: {}", error);
+                                self.should_quit = true;
+                                break;
+                            }
+                            None => {
+                                self.should_quit = true;
+                                break;
+                            }
                             _ => continue,
                         }
                         self.draw(terminal)?;
@@ -1314,7 +1322,6 @@ impl App {
                         }
                         Some(Ok(_)) => {}
                         Some(Err(e)) => {
-                            // The tty is gone.
                             tracing::info!(target: "tui.input", "Terminal event stream error, exiting: {}", e);
                             self.should_quit = true;
                             break;

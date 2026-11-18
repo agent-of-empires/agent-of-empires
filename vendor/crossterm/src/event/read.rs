@@ -73,6 +73,7 @@ impl InternalEventReader {
                     }
                 }
                 Err(e) => {
+                    self.events.extend(self.skipped_events.drain(..));
                     if e.kind() == io::ErrorKind::Interrupted {
                         return Ok(false);
                     }
@@ -103,24 +104,23 @@ impl InternalEventReader {
         loop {
             while let Some(event) = self.events.pop_front() {
                 if filter.eval(&event) {
-                    while let Some(event) = skipped_events.pop_front() {
-                        self.events.push_back(event);
+                    while let Some(event) = skipped_events.pop_back() {
+                        self.events.push_front(event);
                     }
 
                     return Ok(event);
                 } else {
-                    // We can not directly write events back to `self.events`.
-                    // If we did, we would put our self's into an endless loop
-                    // that would enqueue -> dequeue -> enqueue etc.
-                    // This happens because `poll` in this function will always return true if there are events in it's.
-                    // And because we just put the non-fulfilling event there this is going to be the case.
-                    // Instead we can store them into the temporary buffer,
-                    // and then when the filter is fulfilled write all events back in order.
+                    // Keep skipped input aside until the filtered read completes.
                     skipped_events.push_back(event);
                 }
             }
 
-            let _ = self.poll(None, filter)?;
+            if let Err(error) = self.poll(None, filter) {
+                while let Some(event) = skipped_events.pop_back() {
+                    self.events.push_front(event);
+                }
+                return Err(error);
+            }
         }
     }
 }
@@ -219,15 +219,49 @@ mod tests {
     fn test_read_does_not_consume_skipped_event() {
         const SKIPPED_EVENT: InternalEvent = InternalEvent::Event(Event::Resize(10, 10));
         const CURSOR_EVENT: InternalEvent = InternalEvent::CursorPosition(10, 20);
+        const TAIL_EVENT: InternalEvent = InternalEvent::Event(Event::Resize(30, 40));
 
         let mut reader = InternalEventReader {
-            events: vec![SKIPPED_EVENT, CURSOR_EVENT].into(),
+            events: vec![SKIPPED_EVENT, CURSOR_EVENT, TAIL_EVENT].into(),
             source: None,
             skipped_events: Vec::with_capacity(32),
         };
 
         assert_eq!(reader.read(&CursorPositionFilter).unwrap(), CURSOR_EVENT);
         assert_eq!(reader.read(&InternalEventFilter).unwrap(), SKIPPED_EVENT);
+        assert_eq!(reader.read(&InternalEventFilter).unwrap(), TAIL_EVENT);
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn filtered_errors_preserve_queued_and_deferred_events() {
+        const INPUT: InternalEvent = InternalEvent::Event(Event::Resize(10, 10));
+        const RESPONSE: InternalEvent = InternalEvent::CursorPosition(10, 20);
+        for queued in [true, false] {
+            let source = if queued {
+                FakeSource::new(&[RESPONSE])
+            } else {
+                FakeSource::new(&[INPUT, RESPONSE])
+            };
+            let mut reader = InternalEventReader {
+                events: if queued { vec![INPUT].into() } else { VecDeque::new() },
+                source: Some(Box::new(source)),
+                skipped_events: Vec::with_capacity(32),
+            };
+            assert!(reader.read(&CursorPositionFilter).is_err());
+            assert_eq!(reader.read(&InternalEventFilter).unwrap(), INPUT);
+        }
+
+        let mut reader = InternalEventReader {
+            events: VecDeque::new(),
+            source: Some(Box::new(FakeSource {
+                events: vec![INPUT, RESPONSE].into(),
+                error: Some(io::ErrorKind::Interrupted.into()),
+            })),
+            skipped_events: Vec::with_capacity(32),
+        };
+        assert!(!reader.poll(None, &CursorPositionFilter).unwrap());
+        assert_eq!(reader.read(&InternalEventFilter).unwrap(), INPUT);
     }
 
     #[test]

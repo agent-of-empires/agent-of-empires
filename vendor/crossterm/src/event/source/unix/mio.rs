@@ -151,43 +151,34 @@ impl EventSource for UnixInternalEventSource {
                             self.tty_refresh_pending = true;
                             continue;
                         }
-                        loop {
-                            #[cfg(all(test, feature = "event-stream", not(any(feature = "libc", feature = "use-dev-tty"))))]
-                            {
-                                self.probe.read_attempts += 1;
-                                eprintln!("TTY READ ATTEMPT {}", self.probe.read_attempts);
+                        #[cfg(all(test, feature = "event-stream", not(any(feature = "libc", feature = "use-dev-tty"))))]
+                        {
+                            self.probe.read_attempts += 1;
+                            eprintln!("TTY READ ATTEMPT {}", self.probe.read_attempts);
+                        }
+                        let read_result = self.tty_fd.read(&mut self.tty_buffer);
+                        #[cfg(all(test, feature = "event-stream", not(any(feature = "libc", feature = "use-dev-tty"))))]
+                        self.probe.reads.push(match &read_result {
+                            Ok(count) => Ok(*count),
+                            Err(error) => Err(error.kind()),
+                        });
+                        match read_result {
+                            Ok(0) => return Err(io::Error::new(
+                                io::ErrorKind::UnexpectedEof, "Terminal input closed",
+                            )),
+                            Ok(read_count) => self.parser.advance(
+                                &self.tty_buffer[..read_count],
+                                read_count == TTY_BUFFER_SIZE,
+                            ),
+                            Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+                                self.tty_refresh_pending = false;
                             }
-                            let read_result = self.tty_fd.read(&mut self.tty_buffer);
-                            #[cfg(all(test, feature = "event-stream", not(any(feature = "libc", feature = "use-dev-tty"))))]
-                            self.probe.reads.push(match &read_result {
-                                Ok(count) => Ok(*count),
-                                Err(error) => Err(error.kind()),
-                            });
-                            match read_result {
-                                Ok(read_count) => {
-                                    if read_count > 0 {
-                                        self.parser.advance(
-                                            &self.tty_buffer[..read_count],
-                                            read_count == TTY_BUFFER_SIZE,
-                                        );
-                                    }
-                                }
-                                Err(e) => {
-                                    // No more data to read at the moment. We will receive another event
-                                    if e.kind() == io::ErrorKind::WouldBlock {
-                                        self.tty_refresh_pending = false;
-                                        break;
-                                    }
-                                    // once more data is available to read.
-                                    else if e.kind() == io::ErrorKind::Interrupted {
-                                        continue;
-                                    }
-                                }
-                            };
-
-                            if let Some(event) = self.parser.next() {
-                                return Ok(Some(event));
-                            }
+                            Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
+                            Err(error) => return Err(error),
+                        }
+                        // Incomplete input needs fresh readiness, not another blocking read.
+                        if let Some(event) = self.parser.next() {
+                            return Ok(Some(event));
                         }
                     }
                     SIGNAL_TOKEN => {
@@ -966,8 +957,58 @@ mod forced_batch_tests {
         assert_eq!(empty.source.probe.read_attempts, 0);
     }
 
+    fn run_incomplete_input(wake: bool) {
+        let mut pty = PrivateInput::with_mode(true, false);
+        if wake {
+            pty.prequeue_and_wake(b"\x1b[", ForcedOrder::TtyFirst, false);
+        } else {
+            pty.writer.write_all(b"\x1b[").unwrap();
+            pty.wait_pending(2);
+        }
+        let result = pty.call("incomplete CSI before completion", POLL_TIMEOUT);
+        if wake {
+            assert_interrupted(&result);
+        } else {
+            assert_eq!(result.unwrap(), None);
+        }
+        assert_eq!(pty.pending(), 0);
+        pty.writer.write_all(b"A").unwrap();
+        pty.wait_pending(1);
+        assert_eq!(
+            pty.call("complete the retained CSI", POLL_TIMEOUT).unwrap(),
+            Some(InternalEvent::Event(Event::Key(KeyEvent::new(
+                KeyCode::Up, KeyModifiers::NONE,
+            ))))
+        );
+    }
+
+    fn run_closed_input(socket: bool) {
+        let mut source = if socket {
+            let PrivateInput { writer, source, .. } = PrivateInput::with_socketpair();
+            drop(writer);
+            source
+        } else {
+            let PrivateInput { writer, alias, source } = PrivateInput::with_mode(true, false);
+            drop(source);
+            drop(alias);
+            // A PTY master with no open slaves yields a real EIO on Linux.
+            UnixInternalEventSource::from_file_descriptor(FileDesc::Owned(writer.into())).unwrap()
+        };
+        let error = source.try_read(Some(POLL_TIMEOUT)).unwrap_err();
+        if socket {
+            assert_eq!(error.kind(), io::ErrorKind::UnexpectedEof);
+        } else {
+            assert_eq!(error.raw_os_error(), Some(probe_libc::EIO));
+        }
+    }
+
     fn run_child_case(case: &str) {
         match case {
+            "incomplete-timeout" => run_incomplete_input(false),
+            "incomplete-wake" => run_incomplete_input(true),
+            "input-eof" => run_closed_input(true),
+            #[cfg(target_os = "linux")]
+            "input-eio" => run_closed_input(false),
             "blocking-live-finite" => run_live_stale(false, POLL_TIMEOUT),
             "blocking-stale-finite" => run_live_stale(true, POLL_TIMEOUT),
             "blocking-live-zero" => run_live_stale(false, Duration::ZERO),
@@ -998,6 +1039,12 @@ mod forced_batch_tests {
             }
         };
     }
+
+    owned_case!(input_incomplete_timeout_preserves_sequence, "incomplete-timeout");
+    owned_case!(input_incomplete_wake_preserves_sequence, "incomplete-wake");
+    owned_case!(input_eof_returns_error, "input-eof");
+    #[cfg(target_os = "linux")]
+    owned_case!(input_eio_returns_error, "input-eio");
 
     owned_case!(forced_batch_blocking_live_finite, "blocking-live-finite");
     owned_case!(forced_batch_blocking_stale_finite, "blocking-stale-finite");

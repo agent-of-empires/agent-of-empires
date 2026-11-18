@@ -117,18 +117,23 @@ The unchanged Unicode-width suite and `emoji-test.txt` remain under
 
 ### Terminal consumer changes
 
-Crossterm's runtime delta is the Unix Mio consumer, plus removal of unnecessary
-closure parentheses in `src/terminal/sys/unix.rs` (warning-only). Its regression
-tests exercise actual fetched readiness; existing upstream tests, parser, optional
-backends, and published feature choices remain intact. Saved controls retain their
-order. A TTY hint retained across a return cannot authorize a blocking read;
-readiness is reevaluated through the existing registration and poll. This does not
-eliminate every race with a concurrent competing input consumer.
+Crossterm's runtime delta covers the Unix Mio consumer, filtered-event
+conservation, EventStream error/waker delivery, and removal of unnecessary
+closure parentheses in `src/terminal/sys/unix.rs` (warning-only). Parser behavior,
+optional backends, and published feature choices remain intact. Saved controls
+retain their order. Each TTY readiness permits one read; incomplete input retains
+its parser bytes while polling the remaining deadline. EOF and hard read errors
+reach the stream once, then end that stream. Its worker wakes the latest task.
+Readiness is reevaluated through the existing registration and poll. This does
+not eliminate every race with a concurrent competing input consumer.
 
 A forced ordering of an actual fetched batch establishes a conditional consumer
 contract, not the original macOS event order. Blocking stale cases verify completed
 private-alias consumption, not end-to-end App handoff. Root terminal checks and
 native kqueue coverage remain required.
+The vendor helper requires incomplete CSI timeout/cancellation and later
+completion, socket EOF, Linux-only PTY-master EIO, skipped-event conservation,
+and latest-task error delivery in addition to the original batch controls.
 
 ### Updates and upstreaming
 

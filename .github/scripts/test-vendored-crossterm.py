@@ -13,7 +13,7 @@ import tomllib
 ROOT = Path(__file__).resolve().parents[2]
 FORK = ROOT / "vendor" / "crossterm"
 MANIFEST = FORK / "Cargo.toml"
-EXPECTED_TESTS = 18
+EXPECTED_TESTS = 21 + int(sys.platform.startswith("linux"))
 
 
 def main():
@@ -69,28 +69,30 @@ def main():
         production.update(identities)
     print(f"Verified {len(production)} host production pins and Rustix backend", flush=True)
 
-    command = [
-        "cargo", "test", "--manifest-path", str(MANIFEST), "--locked", "--lib",
-        "--features", "event-stream", "forced_batch_", "--",
-    ]
-    listed = subprocess.run(
-        command + ["--list"], check=True, text=True, stdout=subprocess.PIPE, cwd=ROOT,
-    ).stdout
-    tests = [
-        line for line in listed.splitlines()
-        if "::forced_batch_" in line and line.endswith(": test")
-    ]
-    if len(tests) != EXPECTED_TESTS or len(set(tests)) != EXPECTED_TESTS:
-        raise RuntimeError(f"expected {EXPECTED_TESTS} real-consumer tests, found {tests}")
-    result = subprocess.run(
-        command + ["--test-threads=1", "--nocapture"], text=True,
-        stdout=subprocess.PIPE, stderr=subprocess.STDOUT, cwd=ROOT,
-    )
-    print(result.stdout, end="", flush=True)
-    result.check_returncode()
-    summary = f"test result: ok. {EXPECTED_TESTS} passed; 0 failed; 0 ignored;"
-    if summary not in result.stdout:
-        raise RuntimeError("all real-consumer regressions must execute without skips")
+    for test_filter, expected_count in (
+        ("forced_batch_", EXPECTED_TESTS),
+        ("event::read::tests::", 16),
+        ("event::stream::tests::", 2),
+    ):
+        command = [
+            "cargo", "test", "--manifest-path", str(MANIFEST), "--locked", "--lib",
+            "--features", "event-stream", test_filter, "--",
+        ]
+        listed = subprocess.run(
+            command + ["--list"], check=True, text=True, stdout=subprocess.PIPE, cwd=ROOT,
+        ).stdout
+        tests = [line for line in listed.splitlines() if line.endswith(": test")]
+        if len(tests) != expected_count or len(set(tests)) != expected_count:
+            raise RuntimeError(f"expected {expected_count} {test_filter} tests, found {tests}")
+        result = subprocess.run(
+            command + ["--test-threads=1", "--nocapture"], text=True,
+            stdout=subprocess.PIPE, stderr=subprocess.STDOUT, cwd=ROOT,
+        )
+        print(result.stdout, end="", flush=True)
+        result.check_returncode()
+        summary = f"test result: ok. {expected_count} passed; 0 failed; 0 ignored;"
+        if summary not in result.stdout:
+            raise RuntimeError("all input regressions must execute without skips")
 
 
 if __name__ == "__main__":
