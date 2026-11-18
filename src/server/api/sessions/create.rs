@@ -1641,7 +1641,7 @@ pub(super) async fn run_create_task<T>(
 /// retry may run again once the image can be pulled.
 fn lost_shared_pull(e: &anyhow::Error) -> bool {
     use crate::containers::error::DockerError;
-    e.chain().any(|cause| {
+    create_cause(e).0.chain().any(|cause| {
         cause
             .downcast_ref::<crate::server::session_spawn::ImageUpdateFailed>()
             .is_some_and(|failed| failed.cancelled)
@@ -1818,6 +1818,16 @@ async fn created_session_response(
     crate::server::runtime::mutation_response(&snapshot.value.cursor, (status, Json(response)))
 }
 
+/// What a create failed on, seen through a failed on_create hook, which keeps its cause as a
+/// field, not a source, so `chain()` alone doesn't reach it. Container setup, and with it a
+/// missing image's pull, runs inside the hooks.
+fn create_cause(e: &anyhow::Error) -> (&anyhow::Error, Option<&CreateHookFailed>) {
+    let hook = e
+        .chain()
+        .find_map(|cause| cause.downcast_ref::<CreateHookFailed>());
+    (hook.map_or(e, |hook| &hook.cause), hook)
+}
+
 /// Expose typed creation failures without leaking raw output or internal paths.
 pub(super) fn public_create_session_error(e: &anyhow::Error) -> (&'static str, String) {
     if let Some(duplicate) = e.downcast_ref::<crate::server::session_spawn::CliDuplicateSession>() {
@@ -1827,12 +1837,8 @@ pub(super) fn public_create_session_error(e: &anyhow::Error) -> (&'static str, S
     use crate::session::builder::BuildRefusal;
     use crate::session::config::repo_config::HookFailed;
 
-    // A failed on_create hook keeps its cause, so its typed parts can still be found.
-    let create_hook = e
-        .chain()
-        .find_map(|cause| cause.downcast_ref::<CreateHookFailed>());
+    let (e, create_hook) = create_cause(e);
     let from_repo = create_hook.is_some_and(|hook| hook.from_repo);
-    let e = create_hook.map_or(e, |hook| &hook.cause);
     let runtime = || crate::containers::get_container_runtime().display_name();
     let unavailable = |why: String| ("sandbox_unavailable", why);
     for cause in e.chain() {

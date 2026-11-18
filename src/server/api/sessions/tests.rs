@@ -10982,8 +10982,20 @@ async fn a_create_whose_shared_pull_was_cancelled_is_not_replayed() {
             anyhow::Error::from(DockerError::PullCancelled("img".into())).context("ensure image"),
             false,
         ),
+        (
+            "missing image pull cancelled during container setup",
+            CreateHookFailed::new(DockerError::PullCancelled("img".into()).into(), None, false)
+                .into(),
+            false,
+        ),
         ("latest pull failed", failed(false).into(), true),
+        (
+            "a hook failure wrapping another error",
+            CreateHookFailed::new(anyhow::anyhow!("exit 7"), None, false).into(),
+            true,
+        ),
     ];
+    // Not recorded means a same-key retry runs the create again instead of replaying.
     for (case, error, replayed) in cases {
         let failures = crate::server::create_progress::CreateProgressRegistry::default();
         let progress = crate::server::create_progress::CreateProgress::default();
