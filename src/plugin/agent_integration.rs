@@ -2698,10 +2698,27 @@ command = "acme-omp-shim"
         assert!(
             error.contains("19.0.0") && error.contains("provider_versions"),
             "a reply on an unlisted provider version must name the version and the declaration: {error}"
+        ); // The provider wrote the version string: an escape sequence in it must
+           // not reach the status line as a terminal control.
+        report.provider_version = "19.0.0\u{1b}[2J".into();
+        dir_guard::write_atomic(dir.as_fd(), leaf, &serde_json::to_vec(&report).unwrap()).unwrap();
+        let escaped = respond(
+            &instance,
+            &report,
+            AgentIntegrationResponse::Approval {
+                choice: IntegrationApprovalChoice::Allow,
+            },
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(
+            escaped.contains("\\u{1b}") && !escaped.contains('\u{1b}'),
+            "a provider-written version must reach the error escaped: {escaped:?}"
         );
 
         report.provider_version = "18.11.1".into();
         dir_guard::write_atomic(dir.as_fd(), leaf, &serde_json::to_vec(&report).unwrap()).unwrap();
+
         assert_eq!(
             owned_status(&instance, false),
             Some((crate::session::Status::Waiting, true)),
