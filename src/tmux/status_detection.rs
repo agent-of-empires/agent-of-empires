@@ -989,6 +989,9 @@ run this command? (y/n)
             &[
                 "run command? (y/n)",
                 "Allow this tool to run?",
+                "Do you want to run this command?\n\u{276f} 1. Yes\n  \
+                    2. Yes, and approve `ls` for the rest of the running session\n  \
+                    3. No, and tell Copilot what to do differently (Esc)",
                 "pick an option\nenter to select",
                 "done\n>",
                 "done\ncopilot>",

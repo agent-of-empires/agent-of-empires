@@ -11,6 +11,8 @@ contains_any = [
   "run command?",
   "allow this tool",
   "approve for the rest",
+  "for the rest of the running session",
+  "tell copilot what to do differently",
   "enter to select",
   "esc to cancel",
 ]
