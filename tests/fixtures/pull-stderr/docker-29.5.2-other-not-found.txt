@@ -1,0 +1,6 @@
+# runtime: docker 29.5.2
+# command: docker pull alpine:aoe-capture-no-such-tag
+# captured: 2026-11-17 (date only; the time wasn't recorded)
+# exit and stderr follow
+Error response from daemon: failed to resolve reference "docker.io/library/alpine:aoe-capture-no-such-tag": docker.io/library/alpine:aoe-capture-no-such-tag: not found
+# exit: 1

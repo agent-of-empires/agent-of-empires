@@ -1,6 +1,7 @@
 pub mod container_interface;
 pub mod error;
 mod execution;
+pub mod image_pull;
 pub mod image_update;
 mod runtime;
 pub(crate) mod runtime_base;
