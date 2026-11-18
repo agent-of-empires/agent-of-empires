@@ -1,9 +1,10 @@
 id = "gemini"
 
 # The trust dialog's first choice row, inside its border, so neither quoted
-# prose nor a composer repeating the label can stand in for it.
+# prose nor a composer repeating the label can stand in for it. The quoted-prose
+# veto below uses the same predicate.
 [markers.trust_choice]
-line_regex = ['(?i)^\x{2502}\s*(?:\x{25CF}\s*)?1\.\s+trust folder\b']
+line_regex = ['(?i)^\s*\x{2502}\s*(?:\x{25CF}\s*)?(?:1\.\s+)?trust folder\b']
 
 [[rules]]
 extends = "interrupt_hint"
@@ -26,8 +27,8 @@ visible = true
 contains = ["do you trust the files in this folder?", "trust folder (", "don't trust"]
 not = [
   { region = "after(trust_choice)", line_regex = ['^\s*>(?:\s|$)'] },
-  # Quoted in the transcript: a composer is up and no bordered dialog row is.
-  { region = "whole_recent", line_regex = ['^\s*>(?:\s|$)'], not = [{ region = "whole_recent", line_regex = ['(?i)^\s*\x{2502}.*\btrust folder\b'] }] },
+  # Quoted in the transcript: a composer is up and no `trust_choice` row is.
+  { region = "whole_recent", line_regex = ['^\s*>(?:\s|$)'], not = [{ region = "whole_recent", line_regex = ['(?i)^\s*\x{2502}\s*(?:\x{25CF}\s*)?(?:1\.\s+)?trust folder\b'] }] },
 ]
 
 [[rules]]
