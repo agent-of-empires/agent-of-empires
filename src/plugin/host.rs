@@ -646,6 +646,10 @@ impl PluginHost {
             .get(plugin_id)
             .filter(|p| p.active())
             .ok_or_else(|| anyhow::anyhow!("plugin {plugin_id} is no longer active"))?;
+        if !plugin.builtin() {
+            super::install::check_recovery_evidence()
+                .context("external plugin worker launch fenced pending manual recovery")?;
+        }
         let granted: Vec<String> = plugin
             .manifest
             .capabilities
@@ -706,6 +710,13 @@ impl PluginHost {
             });
         }
 
+        if !plugin.builtin() {
+            if let Err(error) = super::install::check_recovery_evidence() {
+                let _ = std::fs::remove_file(&log_path);
+                return Err(error)
+                    .context("external plugin worker launch fenced pending manual recovery");
+            }
+        }
         let mut child = match cmd.spawn() {
             Ok(child) => child,
             Err(e) => {
@@ -1636,6 +1647,88 @@ command = ["sleep", "600"]
             );
         })
         .unwrap();
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn recovery_evidence_fences_external_worker_boot_and_restart() {
+        let _reload = crate::plugin::ReloadRegistryOnDrop;
+        let _home = crate::session::test_support::isolate_app_dir();
+        let id = "acme.fenced";
+        install_sleeper(id);
+        let before = crate::session::Config::load().unwrap().plugins;
+        let registry = crate::plugin::reload_registry();
+        let root = crate::session::get_app_dir().unwrap();
+        let marker = root.join(".plugin-recovery-required");
+        for persistence_fails in [false, true] {
+            if persistence_fails {
+                std::fs::create_dir(&marker).unwrap();
+                let recovery: anyhow::Result<()> = Err(super::super::execution::RecoveryRequired(
+                    "unsettled installation".into(),
+                )
+                .into());
+                super::super::install::log_recovery(&recovery);
+                std::fs::remove_dir(&marker).unwrap();
+                assert_eq!(
+                    std::fs::symlink_metadata(&marker).unwrap_err().kind(),
+                    std::io::ErrorKind::NotFound
+                );
+                assert!(super::super::install::begin_operation().is_err());
+            } else {
+                std::fs::write(&marker, "unsettled installation").unwrap();
+            }
+            let host = PluginHost::new(
+                &root,
+                "default",
+                None,
+                std::sync::Arc::new(crate::server::runtime::RuntimeWork::default()),
+            )
+            .unwrap();
+            for restart in [false, true] {
+                if restart {
+                    host.restart_worker(id, &registry).await;
+                } else {
+                    host.start(&registry).await;
+                }
+                wait_until("recovery-fenced supervisor", || async {
+                    !host.state.lock().await.running.contains_key(id)
+                })
+                .await;
+                assert!(worker_pid(&host, id).await.is_none());
+                assert_eq!(crate::session::Config::load().unwrap().plugins, before);
+                assert!(
+                    registry.get(id).unwrap().active(),
+                    "fence must not revoke persisted intent"
+                );
+            }
+            if !persistence_fails {
+                std::fs::remove_file(&marker).unwrap();
+                host.restart_worker(id, &registry).await;
+                wait_until("worker after explicit recovery", || async {
+                    worker_pid(&host, id).await.is_some()
+                })
+                .await;
+            }
+            host.shutdown().await;
+        }
+        drop(_home);
+        let _home = crate::session::test_support::isolate_app_dir();
+        install_sleeper(id);
+        let registry = crate::plugin::reload_registry();
+        let host = PluginHost::new(
+            &crate::session::get_app_dir().unwrap(),
+            "default",
+            None,
+            std::sync::Arc::new(crate::server::runtime::RuntimeWork::default()),
+        )
+        .unwrap();
+        host.start(&registry).await;
+        wait_until("worker in unrelated app root", || async {
+            worker_pid(&host, id).await.is_some()
+        })
+        .await;
+        host.shutdown().await;
     }
 
     /// An update replaces a plugin's tree under its live worker (#3552).

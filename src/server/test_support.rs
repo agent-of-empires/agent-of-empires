@@ -286,6 +286,7 @@ pub(crate) fn build_test_app_state_impl_with_event_store(
         idempotency_locks,
         create_progress: Default::default(),
         list_sessions_resolver_misses: std::sync::atomic::AtomicUsize::new(0),
+        session_cfg_store: Default::default(),
         smart_rename_inflight: std::sync::Mutex::new(std::collections::HashSet::new()),
         smart_rename_attempted: std::sync::Mutex::new(std::collections::HashSet::new()),
         smart_rename_semaphore: tokio::sync::Semaphore::new(
@@ -390,6 +391,38 @@ pub fn seed_instances_on_disk_for_test(profile: &str, insts: Vec<Instance>) {
             Ok(())
         })
         .expect("seed sessions.json");
+}
+
+/// Seeds the rows `state` holds into their profiles' stores and refreshes the canonical
+/// metadata: a launch opens the stored row, so a row that exists only in memory is a session
+/// whose source is unavailable. Rows with no profile run under `default`.
+pub async fn seed_native_rows_for_test(state: &Arc<AppState>) {
+    crate::session::purge_owners::initialize(&crate::session::get_app_dir().expect("app dir"))
+        .expect("purge owners");
+    let mut by_profile: std::collections::BTreeMap<String, Vec<Instance>> = Default::default();
+    for row in state.instances.read().await.iter() {
+        by_profile
+            .entry(row.source_profile.clone())
+            .or_default()
+            .push(row.clone());
+    }
+    for (profile, rows) in by_profile {
+        seed_instances_on_disk_for_test(&profile, rows);
+    }
+    refresh_canonical_metadata_for_test(state).await;
+}
+
+/// [`build_test_app_state`] for rows a launch opens from the store (see
+/// [`seed_native_rows_for_test`]); a row with no profile gets `default`.
+pub async fn build_native_test_app_state(mut rows: Vec<Instance>) -> Arc<AppState> {
+    for row in &mut rows {
+        if row.source_profile.is_empty() {
+            row.source_profile = "default".to_string();
+        }
+    }
+    let state = build_test_app_state(rows);
+    seed_native_rows_for_test(&state).await;
+    state
 }
 
 /// Make storage for `profile` fail on every write: a plain file where its directory belongs.
@@ -662,6 +695,29 @@ pub fn capture_log(f: impl FnOnce()) -> String {
     );
     let out = buf.lock().unwrap().clone();
     String::from_utf8(out).unwrap()
+}
+
+/// Serve the production router through the kernel-verified owner Unix acceptor.
+#[cfg(all(test, unix))]
+pub(crate) async fn serve_local_plugin_fixture(
+    state: Arc<AppState>,
+    path: &std::path::Path,
+    submissions: Arc<std::sync::atomic::AtomicUsize>,
+) -> tokio::task::JoinHandle<()> {
+    let app = build_router_for_test(state).layer(axum::middleware::from_fn(
+        move |request: axum::extract::Request, next: axum::middleware::Next| {
+            let submissions = submissions.clone();
+            async move {
+                if request.method() == axum::http::Method::POST
+                    && request.uri().path().ends_with("/update/apply")
+                {
+                    submissions.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                }
+                next.run(request).await
+            }
+        },
+    ));
+    serve_owner_router_for_test(path, app).await
 }
 
 /// A launcher whose agent rejects `initialize` for want of a login, as the connection task

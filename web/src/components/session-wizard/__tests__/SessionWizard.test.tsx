@@ -207,6 +207,17 @@ describe("SessionWizard structured view payload", () => {
     expect(payload()).toMatchObject({ tool: "claude", view });
   });
 
+  it.each([
+    ["terminal", "structured"],
+    ["off", "terminal"],
+  ])("keeps a prefilled Structured view over the %s default, unless it's off", async (setting, view) => {
+    vi.mocked(fetchSettings).mockResolvedValueOnce({ acp: { structured_view: setting } } as never);
+    renderWizard({ path: "/tmp/proj", tool: "claude", useStructuredView: true });
+    await launch();
+    await waitFor(() => expect(createSession).toHaveBeenCalled());
+    expect(payload()).toMatchObject({ tool: "claude", view });
+  });
+
   it("hides the View row when structured_view is off", async () => {
     vi.mocked(fetchSettings).mockResolvedValueOnce({ acp: { structured_view: "off" } } as never);
     renderWizard();

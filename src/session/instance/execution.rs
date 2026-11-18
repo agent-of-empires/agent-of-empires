@@ -3360,6 +3360,15 @@ impl ConversationState {
             && self.active == instance.active_execution
             && self.pi_session_path == instance.pi_session_path
     }
+
+    /// Whether a launch from this state resumes a conversation, as `Instance::conversation_target` decides.
+    pub(crate) fn resumes(&self) -> bool {
+        match self.intent {
+            ResumeIntent::Cleared => false,
+            ResumeIntent::Use(_) | ResumeIntent::Fork { .. } => true,
+            ResumeIntent::Default => self.session_id.is_some(),
+        }
+    }
 }
 
 impl Instance {

@@ -81,7 +81,11 @@ impl LoadedPlugin {
     }
 }
 
-fn grant_covers(grant: &CapabilityGrant, manifest: &PluginManifest, manifest_hash: &str) -> bool {
+pub(super) fn grant_covers(
+    grant: &CapabilityGrant,
+    manifest: &PluginManifest,
+    manifest_hash: &str,
+) -> bool {
     grant.manifest_hash == manifest_hash
         && manifest
             .capabilities

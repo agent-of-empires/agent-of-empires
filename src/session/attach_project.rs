@@ -1085,7 +1085,13 @@ pub(crate) fn resume_after_conversion(
                     )
                 };
                 match outcome {
-                    Ok(_) => {
+                    Ok(outcome) => {
+                        if let super::StartOutcome::Indeterminate { cause } = outcome {
+                            warnings.push(format!(
+                                "the session's restart in its new directory is unconfirmed: {}",
+                                cause.message()
+                            ));
+                        }
                         let id = session_id.to_string();
                         // Preserve a concurrent peer edit while merging the restart result.
                         if let Err(e) = storage.update(|instances, _groups| {
@@ -1095,7 +1101,7 @@ pub(crate) fn resume_after_conversion(
                             Ok(())
                         }) {
                             warnings.push(format!(
-                                "the session restarted but its record could not be updated ({e:#})"
+                                "the session's restart state could not be recorded ({e:#})"
                             ));
                         }
                     }

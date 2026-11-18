@@ -28,7 +28,10 @@ import { Composer } from "./Composer";
 import { ContextPrimerBanner } from "./ContextPrimerBanner";
 import { PlanStrip } from "./PlanStrip";
 import { ModeSwitchFailedNotice, QueuedPromptsStrip, RejectedPromptsStrip, SessionNoticesStrip } from "./PromptStrips";
+import type { NewSessionLike } from "./ContainerGoneBanner";
 import { SessionBanners } from "./SessionBanners";
+import { composerBlockedReason, containerGoneRemedy } from "./containerGone";
+import type { RecreateContainerBlock } from "../sidebar/sessionActionTargets";
 import { ConfigOptionSwitchFailedNotice } from "./SessionConfigControls";
 import { StartupErrorScreen } from "./StartupErrorScreen";
 import { SystemNotices } from "./SystemNotices";
@@ -70,6 +73,7 @@ interface Props {
   onStartSession?: () => void;
   archivedAt: string | null;
   snoozedUntil: string | null;
+  queuedCount?: number;
   /** Trashed sessions are read-only: no composer or queue strips. */
   trashedAt: string | null;
   /** Restore the trashed workspace; resolves false on failure. */
@@ -79,6 +83,8 @@ interface Props {
   isSandboxed?: boolean;
   /** The Session's title when the dashboard may recreate its container. */
   recreateContainerTitle?: string;
+  /** Why the dashboard can't recreate its container, or null when it can. */
+  recreateContainerBlock: RecreateContainerBlock | null;
   onOpenAgentsPane?: (agentId?: string) => void;
   /** The server is read-only, so the session cannot be interrupted. */
   serverReadOnly?: boolean;
@@ -88,6 +94,8 @@ interface Props {
   onOpenTerminal?: (mode: ShellMode) => void;
   /** Whether the server lets the dashboard restart the Agent. */
   canRestartAgent?: boolean;
+  /** Opens the wizard for a Session like this one; omitted on a read-only server. */
+  newSessionLike?: NewSessionLike;
 }
 
 const STARTER_PROMPTS = [
@@ -105,6 +113,7 @@ export function StructuredView(props: Props) {
     compactAliases,
     archivedAt,
     snoozedUntil,
+    queuedCount,
     onOpenFileRef,
     fileRefSession,
   } = props;
@@ -120,6 +129,7 @@ export function StructuredView(props: Props) {
               acpWorkerState={acpWorkerState}
               archivedAt={archivedAt}
               snoozedUntil={snoozedUntil}
+              queuedCount={queuedCount}
               showClearedTurns={showClearedTurns}
             >
               {(ctx) => (
@@ -290,6 +300,9 @@ function AcpChrome({
         canRestart={!!view.canRestartAgent}
         onRestarted={ctx.markRestartStarted}
         onRestartFailed={ctx.markRestartFailed}
+        recreateContainerTitle={view.recreateContainerTitle}
+        recreateContainerBlock={view.recreateContainerBlock}
+        newSession={view.newSessionLike}
       />
 
       <ThreadPrimitive.Root className="flex flex-1 flex-col min-h-0">
@@ -443,6 +456,11 @@ function ComposerDock({
   const compactAliases = useCompactAliases();
   // The Daemon's solo commands: they run as their own turn, never steered into one.
   const soloAliases = useMemo(() => [...clearAliases, ...compactAliases], [clearAliases, compactAliases]);
+  // A send would start the Session, which rebuilds the container without Recreate's warning.
+  const blockedReason =
+    state.startupError && state.startupCause?.kind === "container_missing"
+      ? composerBlockedReason(containerGoneRemedy(!!view.canRestartAgent, view.recreateContainerBlock))
+      : null;
   return (
     <>
       <UsageLimitSection
@@ -486,6 +504,7 @@ function ComposerDock({
         })}
         onStartAndSend={view.onStartSession}
         onStopTurn={ctx.stopTurn}
+        blockedReason={blockedReason}
         soloAliases={soloAliases}
         agent={agent}
       />
@@ -516,11 +535,13 @@ function ComposerDock({
         onDismiss={ctx.dismissPrimer}
       />
 
-      <CompactionReminderBanner
-        state={state}
-        onCompact={() => ctx.sendPrompt("/compact")}
-        onDismiss={ctx.dismissCompactionReminder}
-      />
+      {!blockedReason && (
+        <CompactionReminderBanner
+          state={state}
+          onCompact={() => ctx.sendPrompt("/compact")}
+          onDismiss={ctx.dismissCompactionReminder}
+        />
+      )}
 
       {collapsible && (
         <ChromeCollapseHandle
@@ -541,6 +562,7 @@ function ComposerDock({
           currentAgent={state.agent ?? acpAgent}
           currentProvider={acpProvider}
           waitingFor={startingAgent}
+          blockedReason={blockedReason}
           connecting={connecting}
           availableModes={state.availableModes}
           currentModeId={state.currentModeId}
