@@ -33,8 +33,9 @@ use crate::cli::runtime_read::dto::{
 use crate::session::Instance;
 use crate::session::{GroupTree, Storage};
 
-/// Wire version with physical profile aliases and listed membership.
-pub(crate) const PROTOCOL_VERSION: u16 = 4;
+/// Wire version with physical profile aliases, listed membership, and session
+/// ignore state.
+pub(crate) const PROTOCOL_VERSION: u16 = 5;
 /// Whole-connection budget shared by both transports and the read client.
 pub(crate) const CONNECTION_BUDGET: Duration = Duration::from_secs(15);
 /// Shared incoming and outgoing frame/message ceiling for both transports.
