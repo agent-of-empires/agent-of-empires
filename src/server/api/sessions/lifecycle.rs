@@ -2203,7 +2203,10 @@ async fn background_processes_refusal(
     let row = instance.clone();
     let census = tokio::task::spawn_blocking(move || pane_census(&row))
         .await
-        .unwrap_or(PaneCensus::Unclassified);
+        .unwrap_or_else(|error| {
+            tracing::warn!(target: "http.api.sessions", session = %instance.id, %error, "background-process census failed");
+            PaneCensus::Unclassified
+        });
     let fields = refusal(census, &confirmed, body.stop_unclassified)?;
     Some(background_processes_response(fields, false))
 }
