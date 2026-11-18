@@ -90,8 +90,21 @@ fn create_owner_only(path: &Path) -> std::io::Result<()> {
     match options.open(path) {
         Ok(_) => Ok(()),
         // Reopening a database already open in this process would drop its SQLite locks.
-        Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => Ok(()),
+        Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => create_dangling_target(path),
         Err(err) => Err(err),
+    }
+}
+
+/// `create_new` also reports `AlreadyExists` for a symlink whose target is missing; create that
+/// target owner-only so SQLite does not create it with the default mode.
+fn create_dangling_target(path: &Path) -> std::io::Result<()> {
+    match std::fs::metadata(path) {
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+            let link = std::fs::read_link(path)?;
+            create_owner_only(&path.parent().unwrap_or(Path::new("")).join(link))
+        }
+        Err(err) => Err(err),
+        Ok(_) => Ok(()),
     }
 }
 
@@ -808,6 +821,23 @@ mod tests {
         insert_event(&conn, &schema, "a", 1, "\"x\"", 1).unwrap();
         for suffix in ["", "-wal", "-shm"] {
             let path = dir.path().join(format!("e.db{suffix}"));
+            let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+            assert_eq!(mode, 0o600, "{}", path.display());
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn open_through_a_dangling_symlink_creates_the_target_owner_only() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let link = dir.path().join("e.db");
+        std::os::unix::fs::symlink("history.sqlite", &link).unwrap();
+        let schema = Schema::new("demo").unwrap();
+        let conn = open(&link, &schema).unwrap();
+        insert_event(&conn, &schema, "a", 1, "\"x\"", 1).unwrap();
+        for suffix in ["", "-wal", "-shm"] {
+            let path = dir.path().join(format!("history.sqlite{suffix}"));
             let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
             assert_eq!(mode, 0o600, "{}", path.display());
         }
