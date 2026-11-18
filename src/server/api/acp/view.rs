@@ -739,8 +739,12 @@ async fn terminal_plan(
         plan if instance.terminal_rebind_pending => plan,
         plan if instance.command_session_selector().is_some() => {
             // The launch refuses the selector beside AoE's own conversation, so refuse before
-            // retirement rather than leave the switch owed.
-            if command_selector_conflicts(instance, matches!(plan, TerminalPlan::Continues { .. }))
+            // retirement rather than leave the switch owed. A row that can't start owes no launch.
+            if instance.ensure_startable().is_ok()
+                && command_selector_conflicts(
+                    instance,
+                    matches!(plan, TerminalPlan::Continues { .. }),
+                )
             {
                 TerminalPlan::Blocked(TerminalSwitchReason::CommandSelectorConflict)
             } else {
@@ -4878,7 +4882,12 @@ mod tests {
         let mut cleared = selecting("own selector, AoE id cleared", None);
         cleared.agent_session_id = Some("sid-cleared".into());
         cleared.resume_intent = ResumeIntent::Cleared;
+        // An archived row starts no pane, so its selector never reaches a launch.
+        let mut archived = selecting("own selector, archived", None);
+        archived.agent_session_id = Some("sid-archived".into());
+        archived.archived_at = Some(chrono::Utc::now());
         let rows = vec![
+            archived.clone(),
             unbound.clone(),
             unborn.clone(),
             held.clone(),
@@ -4929,6 +4938,20 @@ mod tests {
             assert_eq!(checked["context"], "blocked", "{}: {checked}", row.title);
             assert_eq!(checked["reason"], "command_selector_conflict");
         }
+        let checked = acp_terminal_check(State(state.clone()), Path(archived.id.clone())).await;
+        assert_eq!(
+            response_json(checked).await?.1["context"],
+            "command_decides"
+        );
+        let (status, json) = response_json(switch(&archived, b"").await.into_response()).await?;
+        assert_eq!(status, StatusCode::OK, "{json}");
+        let switched = stored(&archived)?;
+        assert_eq!(switched.view, View::Terminal);
+        assert!(switched.terminal_handoff.is_none());
+        assert!(
+            !switched.tmux_session()?.exists_live(),
+            "an archived switch started a pane"
+        );
         // A choice is refused; without one the switch does what it did before.
         for (row, body, code) in [
             (
