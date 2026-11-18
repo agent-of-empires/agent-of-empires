@@ -768,11 +768,15 @@ fn is_funnel_link(url: &str) -> bool {
     link_host(url).is_some_and(|host| host.ends_with(".ts.net"))
 }
 
+fn is_restart_key(code: KeyCode) -> bool {
+    matches!(code, KeyCode::Char('r' | 'R'))
+}
+
 fn funnel_reset_applies(mode: ServeMode, transport: Option<TunnelTransport>) -> bool {
     mode == ServeMode::Tunnel && transport == Some(TunnelTransport::Tailscale)
 }
 
-/// A destructive action awaiting a second press of its key.
+/// A destructive action its key armed, awaiting Enter.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum PendingConfirm {
     NewPassphrase,
@@ -845,6 +849,11 @@ pub struct ServeView {
     state: ServeViewState,
     pending_passphrase: String,
     pending_confirm: Option<(PendingConfirm, Instant)>,
+    /// The error screen's Funnel reset, armed by R and awaiting Enter.
+    funnel_reset_armed: Option<Instant>,
+    /// The R that opened this screen from Connections may still be held, so R does nothing
+    /// until another key arrives.
+    restart_key_held: bool,
     show_help: bool,
     mouse: RefCell<ServeMouse>,
     copied: Option<(&'static str, Instant)>,
@@ -954,6 +963,8 @@ impl ServeView {
             state,
             pending_passphrase: String::new(),
             pending_confirm: None,
+            funnel_reset_armed: None,
+            restart_key_held: false,
             show_help: false,
             mouse: RefCell::default(),
             copied: None,
@@ -1041,7 +1052,16 @@ impl ServeView {
         mouse.hover.update(col, row, &rects)
     }
 
+    /// Opened from Connections by `key`: when it was R, its hold may carry over.
+    pub fn opened_by(&mut self, key: &KeyEvent) {
+        self.restart_key_held = is_restart_key(key.code);
+    }
+
     pub fn handle_key(&mut self, key: KeyEvent) -> ServeAction {
+        if self.restart_key_held && is_restart_key(key.code) {
+            return ServeAction::Continue;
+        }
+        self.restart_key_held = false;
         if matches!(key.code, KeyCode::Esc | KeyCode::Char('q')) && !self.show_help {
             self.pending = None;
             self.pending_confirm = None;
@@ -1126,7 +1146,20 @@ impl ServeView {
                 self.request_picker(selected);
                 true
             }
-            PendingJob::Restart { intent, .. } => {
+            PendingJob::Restart { intent, confirmed } => {
+                if code == KeyCode::Enter {
+                    if let (RestartIntent::Confirm(action), None) = (intent, confirmed) {
+                        let action = *action;
+                        if let Some(PendingWork {
+                            kind: PendingJob::Restart { confirmed, .. },
+                            ..
+                        }) = &mut self.pending
+                        {
+                            *confirmed = Some(action);
+                        }
+                        return true;
+                    }
+                }
                 let repeated = match intent {
                     RestartIntent::Confirm(PendingConfirm::Restart) => {
                         matches!(code, KeyCode::Char('r' | 'R'))
@@ -1451,23 +1484,23 @@ impl ServeView {
         if std::mem::take(&mut self.show_help) {
             return ServeAction::Continue;
         }
-        let confirmed = self
+        // Any key ends an armed confirm; only Enter carries it out, so a held key never does.
+        let armed = self
             .pending_confirm
             .take()
-            .filter(|(action, when)| {
-                let repeated = match action {
-                    PendingConfirm::NewPassphrase => matches!(code, KeyCode::Char('g' | 'G')),
-                    PendingConfirm::Restart => matches!(code, KeyCode::Char('r' | 'R')),
-                };
-                repeated && when.elapsed() <= CONFIRM_TTL
-            })
+            .filter(|(_, when)| when.elapsed() <= CONFIRM_TTL)
             .map(|(action, _)| action);
         let (mode, transport) = self.context();
+        let mut confirmed = None;
         let intent = match code {
+            KeyCode::Enter => {
+                confirmed = armed;
+                armed.map(RestartIntent::Confirm)
+            }
             KeyCode::Char('g' | 'G') if mode == ServeMode::Tunnel => {
                 Some(RestartIntent::Confirm(PendingConfirm::NewPassphrase))
             }
-            KeyCode::Char('r' | 'R') => Some(RestartIntent::Confirm(PendingConfirm::Restart)),
+            code if is_restart_key(code) => Some(RestartIntent::Confirm(PendingConfirm::Restart)),
             KeyCode::Char('?') => Some(RestartIntent::Help),
             KeyCode::Tab => {
                 if let ServeViewState::Active {
@@ -1517,11 +1550,16 @@ impl ServeView {
         };
         let reset = funnel_reset_applies(*mode, *transport);
         let failed = *transport;
+        let armed = self
+            .funnel_reset_armed
+            .take()
+            .is_some_and(|when| when.elapsed() <= CONFIRM_TTL);
         match code {
             KeyCode::Char('p' | 'P') if *mode == ServeMode::Tunnel => {
                 self.request_provider_retry(failed);
             }
-            KeyCode::Char('r' | 'R') if reset => self.request_funnel_reset(),
+            code if reset && is_restart_key(code) => self.funnel_reset_armed = Some(Instant::now()),
+            KeyCode::Enter if reset && armed => self.request_funnel_reset(),
             KeyCode::Enter | KeyCode::Char(' ') => return ServeAction::Close,
             _ => {}
         }
@@ -1617,6 +1655,13 @@ impl ServeView {
             .is_some_and(|(_, when)| when.elapsed() > CONFIRM_TTL)
         {
             self.pending_confirm = None;
+            changed = true;
+        }
+        if self
+            .funnel_reset_armed
+            .is_some_and(|when| when.elapsed() > CONFIRM_TTL)
+        {
+            self.funnel_reset_armed = None;
             changed = true;
         }
         if self

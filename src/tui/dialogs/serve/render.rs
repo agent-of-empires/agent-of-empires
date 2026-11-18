@@ -121,7 +121,7 @@ pub(super) fn render(view: &ServeView, frame: &mut Frame, area: Rect, theme: &Th
                 &mut mouse,
                 message,
                 view.control_error.as_deref(),
-                &error_recovery_keys(*mode, *transport),
+                &error_keys(*mode, *transport, view.funnel_reset_armed.is_some()),
             ),
         }
     }
@@ -592,7 +592,7 @@ fn render_active(
             mouse,
             "Daemon started but no URL available yet.",
             None,
-            &[],
+            &error_keys(ServeMode::Local, None, false),
         );
         return;
     };
@@ -786,14 +786,14 @@ fn render_active(
             );
             let (first, effect_text) = match action {
                 PendingConfirm::NewPassphrase => (
-                    "Press G again for a new passphrase.",
+                    "Press Enter for a new passphrase.",
                     "Every Device signs out.",
                 ),
                 PendingConfirm::Restart if effect.link == LinkChange::Replaced => {
-                    ("Press R again to restart.", "Agents keep running.")
+                    ("Press Enter to restart.", "Agents keep running.")
                 }
                 PendingConfirm::Restart => (
-                    "Press R again to restart.",
+                    "Press Enter to restart.",
                     match effect.logins {
                         Logins::Kept => "Devices stay signed in; agents keep running.",
                         Logins::Lost => "Every Device signs out; agents keep running.",
@@ -975,15 +975,30 @@ fn split_url_and_token(url: &str) -> (String, Option<&str>) {
 }
 
 /// The keys `error_key` handles for this failure, shown before the way out.
-fn error_recovery_keys(mode: ServeMode, transport: Option<TunnelTransport>) -> Vec<&'static str> {
-    let mut keys = Vec::new();
+struct ErrorKeys {
+    recovery: Vec<&'static str>,
+    rest: &'static [&'static str],
+}
+
+fn error_keys(mode: ServeMode, transport: Option<TunnelTransport>, reset_armed: bool) -> ErrorKeys {
+    // Armed, Enter resets, so no hint offers it as the way out, nor as a click target.
+    if reset_armed {
+        return ErrorKeys {
+            recovery: Vec::new(),
+            rest: &["Press Enter to turn off Funnel on its port. Any other key cancels."],
+        };
+    }
+    let mut recovery = Vec::new();
     if mode == ServeMode::Tunnel {
-        keys.push("[P] Pick provider");
+        recovery.push("[P] Pick provider");
     }
     if funnel_reset_applies(mode, transport) {
-        keys.push("[R] Turn off Funnel on its port");
+        recovery.push("[R] Turn off Funnel on its port");
     }
-    keys
+    ErrorKeys {
+        recovery,
+        rest: &["[S] Force stop", "[Enter] Back to sessions"],
+    }
 }
 
 fn render_error(
@@ -993,14 +1008,14 @@ fn render_error(
     mouse: &mut ServeMouse,
     message: &str,
     control_error: Option<&str>,
-    recovery: &[&str],
+    keys: &ErrorKeys,
 ) {
     let inner = render_page(frame, area, " Serve failed ", theme.error, theme.error);
-    let rest = ["[S] Force stop", "[Enter] Back to sessions"];
+    let (recovery, rest) = (keys.recovery.as_slice(), keys.rest);
     const GAP: &str = "    ";
     let one_line = recovery
         .iter()
-        .chain(&rest)
+        .chain(rest)
         .copied()
         .collect::<Vec<_>>()
         .join(GAP);
@@ -1733,8 +1748,8 @@ mod tests {
             view.running_persists = running;
             view.pending_confirm = Some((key, Instant::now()));
             let first = match key {
-                G => "Press G again for a new passphrase.",
-                R => "Press R again to restart.",
+                G => "Press Enter for a new passphrase.",
+                R => "Press Enter to restart.",
             };
             // 60 columns wraps the longest confirm onto a third footer row.
             for width in [60, 80, 120] {

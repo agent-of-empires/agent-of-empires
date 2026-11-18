@@ -2502,6 +2502,9 @@ impl HomeView {
                 DialogResult::Submit(()) => {
                     self.connections_view = None;
                     self.open_serve();
+                    if let Some(serve) = &mut self.serve_view {
+                        serve.opened_by(&key);
+                    }
                 }
             }
             return None;

@@ -11,6 +11,10 @@ fn key(code: char) -> KeyEvent {
     KeyEvent::from(KeyCode::Char(code))
 }
 
+fn enter() -> KeyEvent {
+    KeyEvent::from(KeyCode::Enter)
+}
+
 fn picker_state() -> ServeViewState {
     ServeViewState::ModePicker {
         selected: ServeMode::Tunnel,
@@ -399,7 +403,7 @@ fn requesting_a_new_passphrase_does_not_overwrite_saved_credentials() {
     view.target = Some(crate::cli::serve::tui_control_target().unwrap());
     view.handle_key(key('G'));
     wait_assessment(&mut view);
-    view.handle_key(key('G'));
+    view.handle_key(enter());
     wait_assessment(&mut view);
     assert!(view.take_launch().is_some());
     assert_ne!(view.pending_passphrase, "running daemon phrase");
@@ -434,14 +438,11 @@ fn restart_requires_an_uninterrupted_confirmation() {
         if expired {
             view.pending_confirm = Some((PendingConfirm::Restart, Instant::now() - CONFIRM_TTL));
         }
-        view.handle_key(key('R'));
+        view.handle_key(enter());
         wait_assessment(&mut view);
         if cancelled || expired {
             assert!(view.take_launch().is_none());
-            assert!(matches!(
-                view.pending_confirm,
-                Some((PendingConfirm::Restart, _))
-            ));
+            assert!(view.pending_confirm.is_none());
             assert!(matches!(view.state, ServeViewState::Active { .. }));
         } else {
             assert!(view.take_launch().is_some());
@@ -498,12 +499,12 @@ fn second_restart_key_reprobes_and_reconfirms_when_the_effect_changed() {
     wait_assessment(&mut view);
     assert_eq!(view.restart_probe.local_token, TokenWindow::Boundary);
     write_token(Duration::from_secs(24 * 60 * 60 + 60));
-    view.handle_key(key('R'));
+    view.handle_key(enter());
     wait_assessment(&mut view);
     assert_eq!(view.restart_probe.local_token, TokenWindow::Renews);
     assert!(view.take_launch().is_none());
     assert!(view.pending_confirm.is_some());
-    view.handle_key(key('R'));
+    view.handle_key(enter());
     wait_assessment(&mut view);
     assert!(view.take_launch().is_some());
 }
@@ -553,6 +554,9 @@ fn held_work_leaves_keys_clicks_ticks_and_render_usable() {
                 }
                 _ => {
                     view.handle_key(KeyEvent::from(code.unwrap()));
+                    if held == Held::Reset {
+                        view.handle_key(enter());
+                    }
                 }
             }
             exercise_rx.recv_timeout(Duration::from_secs(10)).unwrap();
@@ -820,7 +824,7 @@ fn a_key_during_second_restart_assessment_cancels_the_confirmation() {
     gate.entered(Held::Restart);
     gate.release(JobResult::Restart(RestartProbe::default()));
     wait_for(&mut view, |view| view.pending_confirm.is_some());
-    view.handle_key(key('R'));
+    view.handle_key(enter());
     gate.entered(Held::Restart);
     view.handle_key(key('x'));
     gate.release(JobResult::Restart(RestartProbe::default()));
@@ -847,7 +851,7 @@ fn a_timely_confirmation_survives_a_slow_second_assessment() {
         wait_for(&mut view, |view| view.pending_confirm.is_some());
         let confirmed_at = view.pending_confirm.unwrap().1;
 
-        view.handle_key(key(code));
+        view.handle_key(enter());
         gate.entered(Held::Restart);
         while let Some(remaining) = CONFIRM_TTL.checked_sub(confirmed_at.elapsed()) {
             std::thread::park_timeout(remaining + Duration::from_millis(1));
@@ -1065,6 +1069,9 @@ fn a_failed_stop_of_a_reopened_launch_loads_identity_before_recovery() {
         assert!(matches!(&view.state, ServeViewState::Error { message, .. }
             if message == "tailscale funnel failed"));
         view.handle_key(key(code));
+        if code == 'R' {
+            view.handle_key(enter());
+        }
         assert!(view.pending.is_some(), "{code} recovery did not start");
         gate.entered(held);
         gate.release(if code == 'P' {
@@ -1221,6 +1228,7 @@ fn a_superseded_queued_reset_never_executes() {
     let mut view = ServeView::with_state(error_state(), submitter);
     view.target = Some(crate::cli::serve::tui_control_target().unwrap());
     view.handle_key(key('R'));
+    view.handle_key(enter());
     assert!(
         view.pending
             .as_ref()
@@ -1254,6 +1262,7 @@ fn an_admitted_reset_finishes_once_after_close_and_reopen() {
     let mut view = ServeView::with_state(error_state(), jobs.submitter());
     view.target = Some(crate::cli::serve::tui_control_target().unwrap());
     view.handle_key(key('R'));
+    view.handle_key(enter());
     let process = fixture.entered();
     let descendant_pid = std::fs::read_to_string(fixture.root.path().join("descendant"))
         .unwrap()
@@ -1308,6 +1317,7 @@ fn a_reset_deadline_reaps_its_process_and_keeps_outcome_uncertain() {
     let mut view = ServeView::with_state(error_state(), jobs.submitter());
     view.target = Some(crate::cli::serve::tui_control_target().unwrap());
     view.handle_key(key('R'));
+    view.handle_key(enter());
     let process = fixture.entered();
     wait_for(&mut view, |view| view.pending.is_none());
     assert!(process.exited().unwrap());
@@ -2143,6 +2153,7 @@ fn runtime_owned_shutdown_does_not_hold_terminal_teardown_for_an_admitted_reset(
         let mut view = ServeView::with_state(error_state(), jobs.submitter());
         view.target = Some(crate::cli::serve::tui_control_target().unwrap());
         view.handle_key(key('R'));
+        view.handle_key(enter());
         let process = fixture.entered();
         drop(view);
         drop(entered_runtime);
@@ -2184,12 +2195,14 @@ fn funnel_reset_rediscovers_repaired_identity_without_replaying_the_mutation() {
     view.request(Job::ErrorContext, PendingJob::ErrorContext);
     wait_for(&mut view, |view| view.pending.is_none());
     view.handle_key(key('R'));
+    view.handle_key(enter());
     wait_for(&mut view, |view| view.pending.is_none());
     assert!(view.target.is_none());
     assert!(view.control_error.is_some());
     assert!(!fixture.root.path().join("calls").exists());
     std::fs::remove_dir(&pid).unwrap();
     view.handle_key(key('R'));
+    view.handle_key(enter());
     wait_for(&mut view, |_| fixture.root.path().join("entered").exists());
     let process = fixture.entered();
     for _ in 0..3 {
@@ -2423,7 +2436,7 @@ async fn restart_preserves_a_replacement_before_any_persisted_effect() {
                 original.exit();
                 successor.publish();
             }
-            view.handle_key(key(code));
+            view.handle_key(enter());
             gate.entered(Held::Restart);
             if replacement == "during-assessment" {
                 original.exit();
@@ -2504,7 +2517,11 @@ async fn restart_preserves_a_replacement_before_any_persisted_effect() {
                 "during-assessment" => 'S',
                 _ => 'R',
             };
-            match view.handle_key(key(recovery)) {
+            let mut action = view.handle_key(key(recovery));
+            if recovery == 'R' {
+                action = view.handle_key(enter());
+            }
+            match action {
                 ServeAction::Stop(request) => {
                     assert!(request.run(&mut jobs).await.is_err());
                 }
@@ -2659,7 +2676,11 @@ async fn launch_control_preserves_observed_absence_after_fresh_start_refusal() {
             view.finish_launch(Err(failure), context.observed_target);
         }
         wait_for(&mut view, |view| view.pending.is_none());
-        match view.handle_key(key(recovery)) {
+        let mut action = view.handle_key(key(recovery));
+        if recovery == 'R' {
+            action = view.handle_key(enter());
+        }
+        match action {
             ServeAction::Stop(request) => {
                 assert!(request.run(&mut jobs).await.is_err());
             }
@@ -2916,6 +2937,7 @@ fn funnel_reset_turns_off_only_the_configured_port() {
     let mut view = ServeView::with_state(error_state(), jobs.submitter());
     view.target = Some(crate::cli::serve::tui_control_target().unwrap());
     view.handle_key(key('R'));
+    view.handle_key(enter());
     let process = fixture.entered();
     fixture.release();
     wait_for(&mut view, |view| view.pending.is_none());
@@ -2929,4 +2951,189 @@ fn funnel_reset_turns_off_only_the_configured_port() {
     };
     assert!(message.contains("--https=8443 off"), "{message}");
     assert!(!message.contains("reset"), "{message}");
+}
+
+/// A held key as a terminal reports it: the press repeated, or key-repeat events after it.
+fn hold(key: KeyEvent, repeat_events: bool, count: usize) -> Vec<KeyEvent> {
+    let kind = if repeat_events {
+        crossterm::event::KeyEventKind::Repeat
+    } else {
+        crossterm::event::KeyEventKind::Press
+    };
+    vec![KeyEvent::new_with_kind(key.code, key.modifiers, kind); count]
+}
+
+fn reset_reply() -> JobResult {
+    JobResult::Reset {
+        port: Some(443),
+        result: Err("fixture reset outcome unknown".to_owned()),
+    }
+}
+
+/// The R that opens Connections, held through the hub's pause and into the Serve screen,
+/// never requests a restart or arms one, and never resets. Another key ends the hold.
+#[test]
+fn a_held_serve_key_from_connections_does_nothing_on_the_serve_screen() {
+    use crate::tui::dialogs::{ConnectionsView, DialogResult, WebState};
+    use crossterm::event::KeyModifiers;
+    let ms = Duration::from_millis;
+    for (strict, chord) in [
+        (
+            false,
+            KeyEvent::new(KeyCode::Char('R'), KeyModifiers::SHIFT),
+        ),
+        (
+            true,
+            KeyEvent::new(KeyCode::Char('r'), KeyModifiers::CONTROL),
+        ),
+    ] {
+        for repeat_events in [false, true] {
+            for error in [false, true] {
+                let case = format!("strict={strict} repeat_events={repeat_events} error={error}");
+                let mut jobs = ServeJobs::default();
+                let (submitter, gate) = gated(&mut jobs, Held::Restart);
+                let opened = Instant::now();
+                let mut hub = ConnectionsView::new(None, WebState::Off).opened_by_serve(opened);
+                // A pause past the hub's gap, as a long OS repeat delay gives, then the hold.
+                let burst = std::iter::once(chord).chain(hold(chord, repeat_events, 60));
+                let mut view: Option<ServeView> = None;
+                for (i, key) in burst.enumerate() {
+                    let now = opened + ms(800 + 33 * i as u64);
+                    match &mut view {
+                        None => {
+                            if let DialogResult::Submit(()) = hub.handle_key(key, strict, now) {
+                                let state = if error {
+                                    error_state()
+                                } else {
+                                    active_state(ServeMode::Local)
+                                };
+                                let mut opened = ServeView::with_state(state, submitter.clone());
+                                opened.opened_by(&key);
+                                view = Some(opened);
+                            }
+                        }
+                        Some(view) => assert!(
+                            matches!(view.handle_key(key), ServeAction::Continue),
+                            "{case}"
+                        ),
+                    }
+                }
+                let mut view = view.unwrap_or_else(|| panic!("{case}: Serve did not open"));
+                assert!(view.pending.is_none(), "{case}: a restart was requested");
+                assert!(view.pending_confirm.is_none(), "{case}");
+                assert!(view.funnel_reset_armed.is_none(), "{case}");
+
+                view.handle_key(key('x'));
+                view.handle_key(chord);
+                if error {
+                    assert!(view.funnel_reset_armed.is_some(), "{case}");
+                } else {
+                    gate.entered(Held::Restart);
+                    gate.release(JobResult::Restart(RestartProbe::default()));
+                    wait_for(&mut view, |view| view.pending_confirm.is_some());
+                }
+            }
+        }
+    }
+}
+
+/// R or G arms; only Enter confirms, including Enter pressed while the arming assessment
+/// runs. Any other key cancels, and the arming key, however long it is held, never confirms.
+#[test]
+#[serial_test::serial]
+fn a_restart_and_a_new_passphrase_confirm_only_with_enter() {
+    let _home = crate::session::test_support::isolate_app_dir();
+    let arm = |code: char, mode: ServeMode| {
+        let mut jobs = ServeJobs::default();
+        let (submitter, gate) = gated(&mut jobs, Held::Restart);
+        let mut view = ServeView::with_state(active_state(mode), submitter);
+        view.target = Some(crate::cli::serve::tui_control_target().unwrap());
+        view.handle_key(key(code));
+        gate.entered(Held::Restart);
+        (jobs, gate, view)
+    };
+    let probe = || JobResult::Restart(RestartProbe::default());
+
+    for (code, mode) in [('R', ServeMode::Local), ('G', ServeMode::Tunnel)] {
+        let (_jobs, gate, mut view) = arm(code, mode);
+        gate.release(probe());
+        wait_for(&mut view, |view| view.pending_confirm.is_some());
+        view.handle_key(enter());
+        gate.entered(Held::Restart);
+        gate.release(probe());
+        wait_assessment(&mut view);
+        assert!(view.take_launch().is_some(), "{code} then Enter");
+    }
+
+    let (_jobs, gate, mut view) = arm('R', ServeMode::Local);
+    gate.release(probe());
+    wait_for(&mut view, |view| view.pending_confirm.is_some());
+    view.handle_key(key('x'));
+    assert!(view.pending_confirm.is_none(), "another key cancels");
+    view.handle_key(enter());
+    assert!(view.pending.is_none(), "Enter with nothing armed");
+    assert!(view.take_launch().is_none());
+
+    let (_jobs, gate, mut view) = arm('R', ServeMode::Local);
+    view.handle_key(enter());
+    gate.release(probe());
+    wait_assessment(&mut view);
+    assert!(view.take_launch().is_some(), "Enter during the assessment");
+
+    for repeat_events in [false, true] {
+        let (_jobs, gate, mut view) = arm('R', ServeMode::Local);
+        for key in hold(key('R'), repeat_events, 5) {
+            view.handle_key(key);
+        }
+        gate.release(probe());
+        wait_for(&mut view, |view| view.pending_confirm.is_some());
+        for _ in 0..3 {
+            view.handle_key(hold(key('R'), repeat_events, 1)[0]);
+            gate.entered(Held::Restart);
+            gate.release(probe());
+            wait_for(&mut view, |view| view.pending_confirm.is_some());
+        }
+        assert!(
+            view.take_launch().is_none(),
+            "held R confirmed, repeat_events={repeat_events}"
+        );
+    }
+}
+
+/// On a Funnel error, R arms the reset and Enter carries it out; a held R never does, and
+/// Enter with nothing armed still closes.
+#[test]
+#[serial_test::serial]
+fn a_funnel_reset_confirms_only_with_enter() {
+    let _home = crate::session::test_support::isolate_app_dir();
+    for repeat_events in [false, true] {
+        let mut jobs = ServeJobs::default();
+        let (submitter, gate) = gated(&mut jobs, Held::Reset);
+        let mut view = ServeView::with_state(error_state(), submitter);
+        view.target = Some(crate::cli::serve::tui_control_target().unwrap());
+        for key in std::iter::once(key('R')).chain(hold(key('R'), repeat_events, 30)) {
+            assert!(matches!(view.handle_key(key), ServeAction::Continue));
+        }
+        assert!(
+            view.pending.is_none(),
+            "held R reset, repeat_events={repeat_events}"
+        );
+        assert!(view.funnel_reset_armed.is_some());
+        view.handle_key(enter());
+        assert!(view
+            .pending
+            .as_ref()
+            .is_some_and(|pending| matches!(pending.kind, PendingJob::Reset)));
+        gate.entered(Held::Reset);
+        gate.release(reset_reply());
+        wait_for(&mut view, |view| view.pending.is_none());
+    }
+
+    let mut jobs = ServeJobs::default();
+    let mut view = ServeView::with_state(error_state(), jobs.submitter());
+    view.handle_key(key('R'));
+    view.handle_key(key('x'));
+    assert!(view.funnel_reset_armed.is_none(), "another key cancels");
+    assert!(matches!(view.handle_key(enter()), ServeAction::Close));
+    assert!(view.pending.is_none());
 }
