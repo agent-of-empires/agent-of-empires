@@ -950,6 +950,7 @@ fn validate_session(session: &SessionRead) -> Result<(), &'static str> {
         session.trashed_at.as_deref(),
         session.active_snoozed_until.as_deref(),
         session.pinned_at.as_deref(),
+        session.ignored_at.as_deref(),
     ] {
         if value.is_some_and(|value| !valid_timestamp(value)) {
             return Err("schema_invalid");

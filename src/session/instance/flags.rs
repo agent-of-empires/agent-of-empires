@@ -420,7 +420,7 @@ impl Instance {
     /// clear the marker, and only explicit `unignore` or `reclaim_ownership`
     /// removes it otherwise.
     pub fn ignore(&mut self) {
-        self.ignored_at = Some(Utc::now());
+        self.ignored_at.get_or_insert_with(Utc::now);
         self.pinned_at = None;
     }
 
@@ -671,6 +671,9 @@ mod tests {
         inst.parent_session_id = Some("manager".into());
         inst.pin();
         inst.ignore();
+        let first = inst.ignored_at;
+        inst.ignore();
+        assert_eq!(inst.ignored_at, first, "re-ignoring keeps the timestamp");
         assert!(inst.is_ignored());
         assert!(!inst.is_archived());
         assert!(!inst.is_trashed());

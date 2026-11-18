@@ -59,7 +59,7 @@ _Avoid_: delete, hard delete
 Hiding a Session until a chosen time. Expired snoozes lift on their own.
 
 **Ignored**:
-A Session managed by another Session, hidden from attention without being Archived or Trashed. It stays live and present. Archive, Pin, Favorite, or Snooze cancels Ignore, and Archive takes precedence over it; Ignoring clears a Pin but changes no other state. Reclaiming ownership clears the manager link and Ignore together.
+A Session managed by another Session, hidden from attention without being Archived or Trashed. It stays live, stays in the list, and accepts direct input, which clears the marker. MCP `send_to` rejects it with an `ignored` error until it is unignored or reclaimed. Archive, Pin, Favorite, or Snooze cancels Ignore, and Archive takes precedence over it; Ignoring clears a Pin but changes no other state. Reclaiming ownership clears the manager link and Ignore together.
 _Avoid_: archived, snoozed, deleted
 
 **Managed session**:

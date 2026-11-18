@@ -116,8 +116,9 @@ pub async fn update_session_favorite(
 }
 
 /// Ignore or unignore a session managed by another session. The row stays
-/// live and present; archive, snooze, and trash are untouched. Ignoring an
-/// archived or trashed session is refused because those states outrank it.
+/// live and present; archive, snooze, and trash are untouched. Ignoring
+/// requires a manager and refuses an archived or trashed session because
+/// those states outrank it.
 pub async fn update_session_ignored(
     State(state): State<Arc<AppState>>,
     Path(id): Path<String>,
@@ -150,6 +151,15 @@ pub async fn update_session_ignored(
             } else {
                 crate::session::StartBlocked::Archived
             });
+        }
+        // Only a managed row can be ignored; otherwise the marker would outlive
+        // the manager link that gives it meaning.
+        if body.ignored && instance.parent_session_id.is_none() {
+            return crate::server::api::api_error(
+                axum::http::StatusCode::BAD_REQUEST,
+                "session_not_managed",
+                "Only a session managed by another session can be ignored",
+            );
         }
         instance.source_profile.clone()
     };

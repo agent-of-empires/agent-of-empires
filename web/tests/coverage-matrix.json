@@ -5520,7 +5520,8 @@
       "specs": [
         "src/lib/api.test.ts",
         "src/lib/__tests__/sidebarSort.test.ts",
-        "src/components/__tests__/SessionRowMenuOrder.test.tsx"
+        "src/components/__tests__/SessionRowMenuOrder.test.tsx",
+        "src/components/__tests__/SessionRowMenuActions.test.tsx"
       ],
       "components": [
         "web/src/lib/api.ts",

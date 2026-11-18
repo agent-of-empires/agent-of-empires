@@ -313,6 +313,7 @@ export function SingleRowMenuItems({
       item("ignore", {
         label: "Ignore managed session",
         singleLabel: (s) => (s.ignored_at != null ? "Unignore session" : "Ignore managed session"),
+        targetDetail: (s) => (s.ignored_at != null ? "ignored" : "not ignored"),
         detail: "Keeps it live without archive or trash",
         testId: "sidebar-context-menu-ignore",
         glyph: icon(EyeOff),
@@ -320,7 +321,7 @@ export function SingleRowMenuItems({
       item("reclaimOwnership", {
         label: "Take ownership",
         singleLabel: (s) => (s.parent_session_id ? "Take ownership back" : "Take ownership"),
-        detail: "Clears the managing session and ignore state",
+        detail: "Removes the manager link and clears Ignore",
         testId: "sidebar-context-menu-reclaim-ownership",
         glyph: icon(UserRoundCog),
       }),

@@ -2746,6 +2746,56 @@ async fn ignore_refuses_an_archived_or_trashed_session() -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Ignore needs a manager to own the row; without one the endpoint refuses it,
+/// while clearing a leftover marker stays allowed.
+#[tokio::test]
+#[serial_test::serial]
+async fn ignore_refuses_a_session_without_a_manager() -> anyhow::Result<()> {
+    use axum::body::to_bytes;
+    let _guard = crate::session::test_support::isolate_app_dir();
+    let mut row = Instance::new("unmanaged ignore", "/tmp/unmanaged-ignore");
+    row.source_profile = "receipt".into();
+    row.ignore();
+    let id = row.id.clone();
+    let state = crate::server::test_support::build_test_app_state(vec![row.clone()]);
+    let storage = Storage::new("receipt", state.file_watch.clone())?;
+    storage.update(|rows, _| {
+        rows.push(row);
+        Ok(())
+    })?;
+    *state.canonical_metadata.write().await =
+        crate::server::reload::load_all_profiles(&state.file_watch)?.metadata;
+    state.runtime.publish(&state).await?;
+
+    let response = update_session_ignored(
+        State(state.clone()),
+        Path(id.clone()),
+        Ok(Json(UpdateIgnoredBody { ignored: true })),
+    )
+    .await
+    .into_response();
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    let body = to_bytes(response.into_body(), usize::MAX).await?;
+    let json: serde_json::Value = serde_json::from_slice(&body)?;
+    assert_eq!(json["error"], "session_not_managed");
+
+    let response = update_session_ignored(
+        State(state.clone()),
+        Path(id.clone()),
+        Ok(Json(UpdateIgnoredBody { ignored: false })),
+    )
+    .await
+    .into_response();
+    assert_eq!(response.status(), StatusCode::OK);
+    let stored = storage
+        .load()?
+        .into_iter()
+        .find(|row| row.id == id)
+        .expect("row persisted");
+    assert!(!stored.is_ignored());
+    Ok(())
+}
+
 /// Taking ownership back clears the manager link and the ignore marker in one
 /// commit, while the row identity, conversation binding, and unrelated triage
 /// timestamps survive.

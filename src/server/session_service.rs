@@ -2954,6 +2954,7 @@ fn prompt_touch_rejection(
 
 /// Apply an accepted prompt gesture to the authoritative row before native commit.
 /// A wake lifts snooze/dormancy; other prompts advance recency monotonically.
+/// Both paths clear Ignore, since the user engaged with the row.
 ///
 /// Advancing `last_accessed_at` on disk is the signal `merge_user_action_diff`
 /// (`session/instance/merge.rs`) keys on to clear a park, which is right for a
@@ -2964,6 +2965,7 @@ pub(crate) fn apply_prompt_persist_to_disk(disk: &mut crate::session::Instance, 
     } else {
         let now = chrono::Utc::now();
         disk.last_accessed_at = disk.last_accessed_at.max(Some(now));
+        disk.ignored_at = None;
     }
 }
 
