@@ -68,10 +68,11 @@ fn warn_ambiguous(tool: &str, error: &anyhow::Error) {
     }
 }
 
-/// The last version reported per tool: the warning fires once per
-/// `(tool, version)` without letting a report-controlled string grow the set.
+/// The versions already reported per tool, so the warning fires once per
+/// `(tool, version)` while report-controlled strings stay bounded per tool.
+const UNSUPPORTED_WARNED_PER_TOOL: usize = 8;
 static UNSUPPORTED_WARNED: std::sync::LazyLock<
-    std::sync::Mutex<std::collections::HashMap<String, String>>,
+    std::sync::Mutex<std::collections::HashMap<String, Vec<String>>>,
 > = std::sync::LazyLock::new(|| std::sync::Mutex::new(std::collections::HashMap::new()));
 
 fn warn_unsupported_provider(tool: &str, version: &str, declared: &[String]) {
@@ -80,10 +81,11 @@ fn warn_unsupported_provider(tool: &str, version: &str, declared: &[String]) {
     let mut warned = UNSUPPORTED_WARNED
         .lock()
         .unwrap_or_else(|error| error.into_inner());
-    if warned.get(tool).is_some_and(|seen| seen == &version) {
+    let seen = warned.entry(tool.to_owned()).or_default();
+    if seen.contains(&version) || seen.len() >= UNSUPPORTED_WARNED_PER_TOOL {
         return;
     }
-    warned.insert(tool.to_owned(), version.clone());
+    seen.push(version.clone());
     tracing::warn!(target: "plugin.agents", %tool, %version, supported = %declared.join(" or "),
         "provider integration reports a version its declaration does not support; leaving status to pane detection");
 }
