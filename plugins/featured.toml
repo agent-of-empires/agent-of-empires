@@ -86,9 +86,11 @@ versions = {"0.1.1" = "sha256:b4174e233f643d6d565e75b6d88968d3e5f28f5c14e15008e2
 source = "gh:agent-of-empires/plugin-omp"
 versions = {"0.5.0" = "sha256:a2d718a00808b815ae6f3dcd7b05f6a81fdb6fedf642cb8883c42ef53889a962"}
 
-# Released and pinned at `v0.1.1`, so an install with no `@ref` resolves that
-# tag instead of a moving default branch. 0.1.0 stays listed so an install that
-# already has it still verifies; it published nothing on OpenCode 2.
+# `versions` is what a featured install is verified against, keyed by the
+# release tag it resolves to; it does not choose the tag. An install that names
+# no `@ref` selects the plugin's latest release, `v0.1.1`, which is the pin
+# below. 0.1.0 stays listed so an install already carrying it still verifies;
+# it published nothing on OpenCode 2.
 #
 # 0.1.1 declares `api_version = 21` with `session.integration` for the built-in
 # `opencode` tool and an `aoe_version` floor of `>=1.24.0`, so an older host

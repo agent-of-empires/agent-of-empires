@@ -944,6 +944,17 @@ fn read_report(instance_id: &str, tool: &str, plugin: &super::LoadedPlugin) -> R
         .iter()
         .find(|entry| entry.tool == tool)
         .context("provider integration declaration is unavailable")?;
+    if !integration.replies {
+        report.prompt = None;
+    }
+    sanitize_prompt(&mut report);
+    // Liveness first: an exited writer's report is stale whatever it names, so
+    // an incompatible version from it keeps the owned `Unknown` rather than
+    // handing the session back to pane rules.
+    ensure!(
+        crate::process::worker::is_pid_alive(report.writer_pid),
+        "integration writer exited"
+    );
     if integration
         .provider_compat(&report.provider_version)
         .is_err()
@@ -953,14 +964,6 @@ fn read_report(instance_id: &str, tool: &str, plugin: &super::LoadedPlugin) -> R
             declared: integration.provider_versions.clone(),
         });
     }
-    if !integration.replies {
-        report.prompt = None;
-    }
-    sanitize_prompt(&mut report);
-    ensure!(
-        crate::process::worker::is_pid_alive(report.writer_pid),
-        "integration writer exited"
-    );
     Ok(ReportRead::Snapshot(report))
 }
 
@@ -2716,7 +2719,22 @@ command = "acme-omp-shim"
             "a provider-written version must reach the error escaped: {escaped:?}"
         );
 
+        // A stale report from an exited writer is not evidence about the
+        // running provider, so it stays an owned Unknown.
+        let mut child = std::process::Command::new("true").spawn().unwrap();
+        let exited = child.id();
+        child.wait().unwrap();
+        report.provider_version = "19.0.0".into();
+        report.writer_pid = exited;
+        dir_guard::write_atomic(dir.as_fd(), leaf, &serde_json::to_vec(&report).unwrap()).unwrap();
+        assert_eq!(
+            owned_status(&instance, false),
+            Some((crate::session::Status::Unknown, false)),
+            "an incompatible report from an exited writer must not hand the session to pane rules"
+        );
+
         report.provider_version = "18.11.1".into();
+        report.writer_pid = std::process::id();
         dir_guard::write_atomic(dir.as_fd(), leaf, &serde_json::to_vec(&report).unwrap()).unwrap();
 
         assert_eq!(
