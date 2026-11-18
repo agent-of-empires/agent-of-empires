@@ -1847,10 +1847,16 @@ pub(super) fn public_create_session_error(e: &anyhow::Error) -> (&'static str, S
         if let Some(failed) =
             cause.downcast_ref::<crate::server::session_spawn::ImageUpdateFailed>()
         {
-            return (
-                "sandbox_image_update_failed",
-                format!("Couldn't pull the latest Sandbox image {}.", failed.image),
-            );
+            let message = if failed.cancelled {
+                format!(
+                    "Couldn't pull the latest Sandbox image {}: {}.",
+                    failed.image,
+                    crate::server::session_spawn::CANCELLED_UPDATE
+                )
+            } else {
+                format!("Couldn't pull the latest Sandbox image {}.", failed.image)
+            };
+            return ("sandbox_image_update_failed", message);
         }
         match cause.downcast_ref::<DockerError>() {
             Some(DockerError::NotInstalled) => return unavailable(not_installed(runtime())),

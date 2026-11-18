@@ -108,11 +108,16 @@ impl std::error::Error for SessionBuildPanicked {}
 /// A create's requested pull of the latest Sandbox image failed; `detail` is the
 /// runtime's sanitized stderr.
 #[derive(Debug, thiserror::Error)]
-#[error("Couldn't pull the latest Sandbox image {image}: {detail}")]
+#[error("Couldn't pull the latest Sandbox image {image}: {}", if *.cancelled { CANCELLED_UPDATE } else { .detail.as_str() })]
 pub(crate) struct ImageUpdateFailed {
     pub image: String,
+    /// The runtime's output; local owners only.
     pub detail: String,
+    /// The shared pull was cancelled for everyone, which every caller may be told.
+    pub cancelled: bool,
 }
+
+pub(crate) const CANCELLED_UPDATE: &str = "the update was cancelled";
 
 /// A CLI Terminal create with no `on_create` to run needs only an installed runtime; a pull needs it running.
 fn sandbox_readiness(
@@ -150,12 +155,16 @@ fn create_pull_error(error: crate::containers::error::DockerError) -> anyhow::Er
     use crate::containers::error::DockerError;
     match error {
         DockerError::Cancelled(_) => crate::server::session_service::CreationCancelled.into(),
-        DockerError::ImagePullFailed { image, detail, .. } => {
-            ImageUpdateFailed { image, detail }.into()
+        DockerError::ImagePullFailed { image, detail, .. } => ImageUpdateFailed {
+            image,
+            detail,
+            cancelled: false,
         }
+        .into(),
         DockerError::PullCancelled(image) => ImageUpdateFailed {
             image,
-            detail: "the image update was cancelled".into(),
+            detail: String::new(),
+            cancelled: true,
         }
         .into(),
         other => other.into(),
@@ -1225,7 +1234,7 @@ mod tests {
             .downcast_ref::<ImageUpdateFailed>()
             .expect("the create fails instead of reading as cancelled");
         assert_eq!(failed.image, "img");
-        assert_eq!(failed.detail, "the image update was cancelled");
+        assert!(failed.cancelled);
     }
 
     #[test]

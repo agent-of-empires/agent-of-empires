@@ -5830,10 +5830,24 @@ fn public_create_session_error_forwards_typed_causes_as_fixed_templates() {
             anyhow::Error::new(crate::server::session_spawn::ImageUpdateFailed {
                 image: "ghcr.io/acme/sandbox:1".into(),
                 detail: format!("denied: token {SECRET} at /root/.docker/config.json"),
+                cancelled: false,
             }),
             (
                 "sandbox_image_update_failed",
                 "Couldn't pull the latest Sandbox image ghcr.io/acme/sandbox:1.".into(),
+            ),
+        ),
+        (
+            "latest image pull cancelled for everyone",
+            anyhow::Error::new(crate::server::session_spawn::ImageUpdateFailed {
+                image: "ghcr.io/acme/sandbox:1".into(),
+                detail: String::new(),
+                cancelled: true,
+            }),
+            (
+                "sandbox_image_update_failed",
+                "Couldn't pull the latest Sandbox image ghcr.io/acme/sandbox:1: the update was cancelled."
+                    .into(),
             ),
         ),
         (
@@ -10372,6 +10386,7 @@ fn only_a_local_owner_sees_why_the_latest_image_pull_failed() {
     let error = anyhow::Error::new(crate::server::session_spawn::ImageUpdateFailed {
         image: "img:1".into(),
         detail: "manifest unknown".into(),
+        cancelled: false,
     });
     let stage = crate::server::create_progress::CreateStage::PullingImage;
     let public = create_failure(&error, stage, "ref").unwrap();
