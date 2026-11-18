@@ -20,7 +20,7 @@ pub(super) fn approval_plan_text(
     Some(plan.to_string())
 }
 
-/// `None` for text with no bullet lines.
+/// `None` for text with no list items.
 pub(super) fn plan_from_markdown(plan_text: &str) -> Option<Plan> {
     let steps = parse_plan_steps(plan_text);
     if steps.is_empty() {
@@ -33,93 +33,60 @@ pub(super) fn plan_from_markdown(plan_text: &str) -> Option<Plan> {
     })
 }
 
-/// Every line starting with a Markdown list marker (`-`, `*`, `+`, `1.`, `1)`)
-/// outside a fenced code block becomes a step.
+/// Each list item's first line becomes a step; code blocks never do.
 /// Sub-bullets flatten in, since `PlanEntry` has no nesting field.
 pub(super) fn parse_plan_steps(text: &str) -> Vec<PlanStep> {
-    use std::sync::OnceLock;
-    static BULLET: OnceLock<regex::Regex> = OnceLock::new();
-    let bullet = BULLET.get_or_init(|| {
-        regex::Regex::new(r"^\s*(?:[-*+]|\d+[.)])\s+(.+?)\s*$")
-            .expect("static plan-step regex must compile")
-    });
+    use pulldown_cmark::{Event, Parser, Tag, TagEnd};
 
-    let mut steps = Vec::new();
-    // Open fence: char, run length, and the column its container starts at.
-    let mut fence: Option<(char, usize, usize)> = None;
-    // Content column of the last list item, which may hold its own fences.
-    let mut item_col: Option<usize> = None;
-    for line in text.lines() {
-        let indent = line.len() - line.trim_start_matches(' ').len();
-        if let Some((ch, len, base)) = fence {
-            if fence_run(line, base)
-                .is_some_and(|(c, n, rest)| c == ch && n >= len && rest.trim().is_empty())
-            {
-                fence = None;
+    let mut titles = Vec::new();
+    // One entry per open list item: its title so far, or `None` once the
+    // first line has ended.
+    let mut items: Vec<Option<String>> = Vec::new();
+    for event in Parser::new(text) {
+        let current = items.last_mut();
+        match event {
+            Event::Start(Tag::Item) => items.push(Some(String::new())),
+            Event::End(TagEnd::Item) => {
+                if let Some(Some(title)) = items.pop() {
+                    titles.push(title);
+                }
             }
-            continue;
-        }
-        if !line.trim().is_empty() && item_col.is_some_and(|col| indent < col) {
-            item_col = None;
-        }
-        let base = item_col.unwrap_or(0);
-        if let Some((ch, len, _)) = fence_run(line, base) {
-            fence = Some((ch, len, base));
-            continue;
-        }
-        if let Some(caps) = bullet.captures(line) {
-            item_col = caps.get(1).map(|m| m.start());
-            let raw_title = caps.get(1).map(|m| m.as_str()).unwrap_or("");
-            let title = strip_markdown_emphasis(raw_title);
-            if title.is_empty() {
-                continue;
+            // `Vec<String>` parses as inline HTML; keep it as written.
+            Event::Text(t) | Event::InlineHtml(t) => {
+                if let Some(Some(title)) = current {
+                    title.push_str(&t);
+                }
             }
-            steps.push(PlanStep {
-                id: format!("step-{}", steps.len()),
-                title,
-                detail: None,
-                status: PlanStepStatus::Pending,
-            });
+            Event::Code(t) => {
+                if let Some(Some(title)) = current {
+                    title.push_str(&format!("`{t}`"));
+                }
+            }
+            // Inline markup keeps the line going; a break or any nested
+            // block (sub-list, code block, second paragraph) ends it.
+            Event::Start(
+                Tag::Paragraph | Tag::Emphasis | Tag::Strong | Tag::Link { .. } | Tag::Image { .. },
+            )
+            | Event::End(TagEnd::Emphasis | TagEnd::Strong | TagEnd::Link | TagEnd::Image) => {}
+            _ => {
+                if let Some(slot @ Some(_)) = current {
+                    titles.push(slot.take().unwrap_or_default());
+                }
+            }
         }
     }
-    steps
-}
-
-/// The fence char, run length and remainder of a CommonMark fence line in a
-/// container starting at column `base`. Four or more spaces past `base` make
-/// it indented code, not a fence.
-fn fence_run(line: &str, base: usize) -> Option<(char, usize, &str)> {
-    let trimmed = line.trim_start_matches(' ');
-    let indent = line.len() - trimmed.len();
-    if indent < base || indent - base > 3 {
-        return None;
-    }
-    let ch = trimmed.chars().next().filter(|c| matches!(c, '`' | '~'))?;
-    let len = trimmed.len() - trimmed.trim_start_matches(ch).len();
-    let rest = &trimmed[len..];
-    // A backtick fence's info string cannot contain a backtick.
-    (len >= 3 && !(ch == '`' && rest.contains('`'))).then_some((ch, len, rest))
-}
-
-/// Unwraps `**bold**`, `__bold__`, `*italic*` and `_italic_` so the PlanStrip
-/// renders no literal markers. Underscores anchor on word boundaries, leaving
-/// `snake_case` identifiers intact.
-pub(super) fn strip_markdown_emphasis(s: &str) -> String {
-    use std::sync::OnceLock;
-    static RE: OnceLock<regex::Regex> = OnceLock::new();
-    let re = RE.get_or_init(|| {
-        regex::Regex::new(r"\*\*(.+?)\*\*|\b__(.+?)__\b|\*([^*]+?)\*|\b_([^_]+?)_\b")
-            .expect("static emphasis-strip regex must compile")
-    });
-    re.replace_all(s.trim(), |caps: &regex::Captures<'_>| {
-        for i in 1..=4 {
-            if let Some(m) = caps.get(i) {
-                return m.as_str().to_string();
-            }
-        }
-        String::new()
-    })
-    .into_owned()
+    titles
+        .into_iter()
+        .map(|t| t.trim().to_string())
+        .filter(|t| !t.is_empty())
+        .enumerate()
+        .map(|(i, title)| PlanStep {
+            id: format!("step-{i}"),
+            title,
+            detail: None,
+            status: PlanStepStatus::Pending,
+        })
+        .collect()
 }
 
 pub(super) fn map_plan_status(
@@ -204,9 +171,7 @@ mod tests {
             assert!(matches!(s.status, PlanStepStatus::Pending));
         }
 
-        // CommonMark fences: a closer uses the opener's char, is at least as
-        // long, and has nothing but whitespace after. At most 3 spaces of
-        // indent past the container; more is indented code.
+        // Code blocks, fenced or indented, never yield steps.
         for (md, want) in [
             ("~~~\n~~~literal\n- hidden\n~~~  \n- after", &["after"][..]),
             ("````\n```\n- hidden\n````\n- after", &["after"]),
@@ -227,28 +192,47 @@ mod tests {
                 "1. step\n       ```\n   - sub\n- after",
                 &["step", "sub", "after"],
             ),
+            (
+                "- parent\n    - child\n\n    ```\n    - hidden\n    ```\n- after",
+                &["parent", "child", "after"],
+            ),
+            ("- step\n  ```\n  - hidden\n- after", &["step", "after"]),
+            (
+                "- step\n  ```\n  - hidden\n\nprose\n- after",
+                &["step", "after"],
+            ),
         ] {
             let titles: Vec<String> = parse_plan_steps(md).into_iter().map(|s| s.title).collect();
             assert_eq!(titles, want, "{md:?}");
         }
 
-        {
-            for (input, want) in [
-                ("**bold**", "bold"),
-                ("__bold__", "bold"),
-                ("*italic*", "italic"),
-                ("_italic_", "italic"),
-                ("mix of **bold** and *italic*", "mix of bold and italic"),
-                ("plain", "plain"),
-                ("rename _foo_ now", "rename foo now"),
-                ("foo_bar_baz", "foo_bar_baz"),
-                ("rename foo_bar_baz", "rename foo_bar_baz"),
-                ("call do_thing() then _stop_", "call do_thing() then stop"),
-                // `\b` is zero-width, so adjacent emphasis still unwraps.
-                ("_a_ _b_", "a b"),
-            ] {
-                assert_eq!(strip_markdown_emphasis(input), want, "input: {input}");
-            }
+        // Titles take the item's first line with Markdown emphasis removed.
+        for (input, want) in [
+            ("**bold**", "bold"),
+            ("__bold__", "bold"),
+            ("*italic*", "italic"),
+            ("_italic_", "italic"),
+            ("mix of **bold** and *italic*", "mix of bold and italic"),
+            ("plain", "plain"),
+            ("rename _foo_ now", "rename foo now"),
+            ("foo_bar_baz", "foo_bar_baz"),
+            ("rename foo_bar_baz", "rename foo_bar_baz"),
+            ("call do_thing() then _stop_", "call do_thing() then stop"),
+            ("_a_ _b_", "a b"),
+            ("Run `cargo test`", "Run `cargo test`"),
+            (
+                "Return Vec<String> from parse",
+                "Return Vec<String> from parse",
+            ),
+            ("Add ![badge](u) to README", "Add badge to README"),
+            ("first line\nlazy continuation", "first line"),
+            ("first paragraph\n\n  second paragraph", "first paragraph"),
+        ] {
+            let titles: Vec<String> = parse_plan_steps(&format!("- {input}"))
+                .into_iter()
+                .map(|s| s.title)
+                .collect();
+            assert_eq!(titles, [want], "input: {input:?}");
         }
     }
 }
