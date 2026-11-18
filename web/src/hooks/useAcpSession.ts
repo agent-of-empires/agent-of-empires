@@ -432,7 +432,11 @@ export function useAcpSession(
       const attachments = loaded.filter((a): a is PromptAttachmentInput => a !== null);
       // A partial resend would differ from what the user sent.
       if (attachments.length < loaded.length) {
-        dispatch({ kind: "error", message: "Could not reload this prompt's attachments, so it was not resent." });
+        dispatch({
+          kind: "error",
+          message:
+            "Could not reload this prompt's attachments, so it was not resent. Copy its text to send it without them.",
+        });
         return;
       }
       await sendPrompt(prompt.text, attachments.length > 0 ? attachments : undefined);

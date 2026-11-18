@@ -31,13 +31,27 @@ export function RejectedPromptsStrip({
   disabled,
 }: {
   rejected: RejectedPrompt[];
-  onRetry: (prompt: RejectedPrompt) => void;
+  onRetry: (prompt: RejectedPrompt) => Promise<void> | void;
   onDismiss: (id: string) => void;
   /** Retry is gated while the worker restarts: sending would clear the restart
    *  state before the respawn has actually reconnected. */
   disabled: boolean;
 }) {
+  // Retry reloads attachments first, so a second click would send it twice.
+  const [retrying, setRetrying] = useState<ReadonlySet<string>>(() => new Set());
   if (rejected.length === 0) return null;
+  const retry = async (prompt: RejectedPrompt) => {
+    setRetrying((ids) => new Set(ids).add(prompt.id));
+    try {
+      await onRetry(prompt);
+    } finally {
+      setRetrying((ids) => {
+        const next = new Set(ids);
+        next.delete(prompt.id);
+        return next;
+      });
+    }
+  };
   return (
     <Strip tone={AMBER_STRIP}>
       <div className="pb-1.5 text-[11px] uppercase tracking-wider text-amber-300">
@@ -70,8 +84,8 @@ export function RejectedPromptsStrip({
             </div>
             <button
               type="button"
-              onClick={() => onRetry(r)}
-              disabled={disabled}
+              onClick={() => void retry(r)}
+              disabled={disabled || retrying.has(r.id)}
               className="inline-flex shrink-0 items-center gap-1 rounded-md border border-amber-700/60 bg-amber-900/30 px-2 py-1 text-[10px] font-mono uppercase tracking-wide text-amber-100 hover:bg-amber-900/60 disabled:cursor-not-allowed disabled:opacity-40 disabled:hover:bg-amber-900/30"
               aria-label="Retry rejected prompt"
             >

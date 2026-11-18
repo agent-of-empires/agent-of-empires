@@ -841,8 +841,8 @@ impl AcpClient {
         cmd_tx.send(cmd).await.map_err(|_| AcpError::AgentExited)
     }
 
-    /// Attachments follow the text block. Callers gate kinds on the agent's
-    /// prompt capabilities (#1000).
+    /// Attachments follow the text block, which an attachment-only prompt
+    /// omits. Callers gate kinds on the agent's prompt capabilities (#1000).
     pub async fn send_prompt(
         &self,
         text: &str,
@@ -853,7 +853,6 @@ impl AcpClient {
             return Err(AcpError::NotRunning);
         }
         let mut blocks = Vec::with_capacity(1 + attachments.len());
-        // An attachment-only prompt carries no empty text block.
         if !text.is_empty() || attachments.is_empty() {
             blocks.push(ContentBlock::Text(TextContent::new(text)));
         }
