@@ -11,8 +11,11 @@ pub(crate) fn pane_census(instance: &Instance) -> PaneCensus {
     let Ok(session) = instance.tmux_session() else {
         return PaneCensus::Unclassified;
     };
-    if !session.exists() {
-        return PaneCensus::Background(Vec::new());
+    // A pane tmux can't classify might be running anything, so it isn't taken for an empty one.
+    match crate::tmux::utils::probe_pane(session.name()) {
+        crate::tmux::utils::PaneProbe::Missing => return PaneCensus::Background(Vec::new()),
+        crate::tmux::utils::PaneProbe::Unknown => return PaneCensus::Unclassified,
+        crate::tmux::utils::PaneProbe::Alive | crate::tmux::utils::PaneProbe::Dead => {}
     }
     let Some(tree) = session
         .get_pane_pid()
@@ -215,8 +218,11 @@ pub(crate) fn census(
     resolve: &dyn Fn(&str) -> Option<PathBuf>,
 ) -> PaneCensus {
     let matches = |sample: &CommandSample| {
-        // The program, or the script an interpreter runs: its first argument past any flags.
-        let script = sample.argv.iter().skip(1).find(|arg| !arg.starts_with('-'));
+        // The program, or the script an interpreter runs: its first argument past any flags. A
+        // shell given `-c` runs a command, not a script, so `bash -lc <agent>` isn't the Agent.
+        let mut args = sample.argv.iter().skip(1);
+        let script = args.find(|arg| !arg.starts_with('-') || runs_command(sample, arg));
+        let script = script.filter(|arg| !arg.starts_with('-'));
         sample.exe.as_deref().is_some_and(|exe| launch.matches(exe))
             || sample.argv.first().into_iter().chain(script).any(|arg| {
                 arg.contains('/') && resolve(arg).is_some_and(|path| launch.matches(&path))
@@ -265,6 +271,11 @@ pub(crate) fn census(
     )
 }
 
+/// Whether `flag` is a shell's `-c` (alone or among other short flags, as in `-lc`).
+fn runs_command(sample: &CommandSample, flag: &str) -> bool {
+    is_shell(sample) && flag.starts_with('-') && !flag.starts_with("--") && flag.contains('c')
+}
+
 fn is_shell(sample: &CommandSample) -> bool {
     let name = |path: &str| {
         let base = path.rsplit('/').next().unwrap_or(path);
@@ -279,8 +290,9 @@ fn is_shell(sample: &CommandSample) -> bool {
         || sample.argv.first().is_some_and(|arg0| name(arg0))
 }
 
-/// What `shell` runs: its first descendant that isn't another shell, or else the command the
-/// shell was given.
+/// What `shell` runs: its first descendant that isn't another shell, or else the program the
+/// shell was given. A `-c` script is never shown: it is one argument, so a secret inside it
+/// can't be blanked.
 fn named_command(tree: &[CommandSample], shell: &CommandSample) -> Vec<String> {
     let mut level = vec![shell.identity.pid];
     while !level.is_empty() {
@@ -290,11 +302,22 @@ fn named_command(tree: &[CommandSample], shell: &CommandSample) -> Vec<String> {
         }
         level = children.iter().map(|child| child.identity.pid).collect();
     }
-    wrapped_command(&shell.argv).unwrap_or_else(|| shell.argv.clone())
+    wrapped_command(&shell.argv).unwrap_or_else(|| {
+        let script_flag = shell
+            .argv
+            .iter()
+            .skip(1)
+            .position(|arg| runs_command(shell, arg));
+        match script_flag {
+            Some(at) => shell.argv[..at + 2].to_vec(),
+            None => shell.argv.clone(),
+        }
+    })
 }
 
-/// The command inside Claude Code's Bash wrapper, `bash -c "source <snapshot> ... && eval
-/// '<command>' < /dev/null ..."`, split on whitespace for display.
+/// The program inside Claude Code's Bash wrapper, `bash -c "source <snapshot> ... && eval
+/// '<command>' < /dev/null ..."`: its first word past any `NAME=value` and `env` prefix, and
+/// only when that word reads exactly as written, since nothing after it is shown.
 fn wrapped_command(argv: &[String]) -> Option<Vec<String>> {
     if !argv.iter().any(|arg| arg == "-c") {
         return None;
@@ -302,8 +325,28 @@ fn wrapped_command(argv: &[String]) -> Option<Vec<String>> {
     let script = argv.last()?.strip_prefix("source ")?;
     let (_, quoted) = script.split_once("&& eval ")?;
     let command = shell_word(quoted)?;
-    let words: Vec<String> = command.split_whitespace().map(str::to_owned).collect();
-    (!words.is_empty()).then_some(words)
+    let mut after_env = false;
+    for word in command.split_whitespace() {
+        if word.contains(['\'', '"', '`', '$', '\\', ';', '&', '|', '<', '>', '(', ')']) {
+            return None;
+        }
+        let assignment = word.split_once('=').is_some_and(|(name, _)| {
+            name.starts_with(|c: char| c.is_ascii_alphabetic() || c == '_')
+                && name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
+        });
+        if assignment {
+            continue;
+        }
+        if word == "env" && !after_env {
+            after_env = true;
+            continue;
+        }
+        if after_env && word.starts_with('-') {
+            return None;
+        }
+        return Some(vec![word.to_owned()]);
+    }
+    None
 }
 
 /// The first shell word of `text`: adjacent single- and double-quoted parts joined, as the shell
@@ -483,7 +526,36 @@ mod tests {
                     sample(20, 1, "/opt/claude/versions/2.1.0", &["claude"]),
                     dev_shell(20),
                 ],
+                Some(vec![&["npm"]]),
+            ),
+            (
+                "a login shell whose -c names the Agent is not the Agent",
+                &claude,
+                vec![
+                    sample(
+                        10,
+                        1,
+                        "/usr/bin/bash",
+                        &["bash", "-lc", "/opt/claude/versions/2.1.0"],
+                    ),
+                    sample(20, 10, "/opt/claude/versions/2.1.0", &["claude"]),
+                    sample(21, 10, "/usr/bin/cat", &["cat"]),
+                    dev_shell(20),
+                    npm.clone(),
+                ],
                 Some(vec![&["npm", "run", "dev"]]),
+            ),
+            (
+                // macOS reads arguments whole or not at all; without them nothing is named.
+                "an npm Agent whose arguments couldn't be read: unclassified",
+                &npm_claude,
+                vec![
+                    login.clone(),
+                    sample(20, 10, "/usr/bin/node", &[]),
+                    dev_shell(20),
+                    npm.clone(),
+                ],
+                None,
             ),
             (
                 "npm claude with an MCP server: nothing",
@@ -554,10 +626,7 @@ mod tests {
                         &["bash", "-c", "while :; do :; done"],
                     ),
                 ],
-                Some(vec![
-                    &["npm", "run", "dev"],
-                    &["bash", "-c", "while :; do :; done"],
-                ]),
+                Some(vec![&["npm", "run", "dev"], &["bash", "-c"]]),
             ),
             (
                 "a bundled helper and a nested copy don't move the Agent",
@@ -584,7 +653,7 @@ mod tests {
                     ),
                     sample(24, 20, "/bin/busybox", &["sh", "-c", "sleep 9"]),
                 ],
-                Some(vec![&["codex", "exec", "x"], &["sh", "-c", "sleep 9"]]),
+                Some(vec![&["codex", "exec", "x"], &["sh", "-c"]]),
             ),
             (
                 "no Agent process in the pane",
@@ -622,11 +691,7 @@ mod tests {
             } >/dev/null 2>&1 || true && eval 'grep -c '\"'\"'a b'\"'\"' log' < /dev/null \
             && pwd -P >| /tmp/claude-4d4e-cwd";
         for (argv, named) in [
-            (
-                vec!["/bin/bash", "-c", captured],
-                // Joined with spaces, the words read as the command was typed.
-                Some(vec!["grep", "-c", "'a", "b'", "log"]),
-            ),
+            (vec!["/bin/bash", "-c", captured], Some(vec!["grep"])),
             (
                 vec![
                     "bash",
@@ -634,7 +699,7 @@ mod tests {
                     "-l",
                     "source /tmp/snap && eval 'npm run dev' < /dev/null",
                 ],
-                Some(vec!["npm", "run", "dev"]),
+                Some(vec!["npm"]),
             ),
             (vec!["bash", "-c", "sleep 600"], None),
             (vec!["bash", "script.sh"], None),
@@ -643,6 +708,24 @@ mod tests {
                 None,
             ),
             (vec!["bash", "-c", "source /tmp/snap && eval ''"], None),
+            // The first word can carry a secret itself, so assignments go and an inexact word
+            // isn't shown.
+            (
+                vec!["bash", "-c", "source /s && eval 'TOKEN=abc cli --token x'"],
+                Some(vec!["cli"]),
+            ),
+            (
+                vec!["bash", "-c", "source /s && eval 'env API_KEY=x A=1 cli'"],
+                Some(vec!["cli"]),
+            ),
+            (vec!["bash", "-c", "source /s && eval 'env -i cli'"], None),
+            (
+                vec!["bash", "-c", "source /s && eval 'TOKEN=\"a b\" cli'"],
+                None,
+            ),
+            (vec!["bash", "-c", "source /s && eval '$(cat key) x'"], None),
+            (vec!["bash", "-c", "source /s && eval 'a\\ b'"], None),
+            (vec!["bash", "-c", "source /s && eval '\"cli\" x'"], None),
         ] {
             let argv: Vec<String> = argv.iter().map(|arg| arg.to_string()).collect();
             let named = named.map(|words| words.iter().map(|w| w.to_string()).collect::<Vec<_>>());
@@ -656,18 +739,34 @@ mod tests {
         );
         assert_eq!(
             named_command(std::slice::from_ref(&shell), &shell),
-            ["make", "watch"]
+            ["make"]
         );
-        let plain = sample(
-            31,
-            20,
-            "/usr/bin/bash",
-            &["bash", "-c", "while :; do :; done"],
-        );
-        assert_eq!(
-            named_command(std::slice::from_ref(&plain), &plain),
-            plain.argv
-        );
+        // A shell left at a builtin shows no script, however it was given.
+        for (argv, shown) in [
+            (
+                &["bash", "-c", "cli --token abc; read -r"][..],
+                &["bash", "-c"][..],
+            ),
+            (
+                &["bash", "-lc", "cli --token abc; read -r"],
+                &["bash", "-lc"],
+            ),
+            (
+                &["bash", "--norc", "-c", "x", "arg0", "--token", "y"],
+                &["bash", "--norc", "-c"],
+            ),
+            (
+                &["bash", "script.sh", "--token", "y"],
+                &["bash", "script.sh", "--token", "y"],
+            ),
+        ] {
+            let plain = sample(31, 20, "/usr/bin/bash", argv);
+            assert_eq!(
+                named_command(std::slice::from_ref(&plain), &plain),
+                shown,
+                "{argv:?}"
+            );
+        }
     }
 
     #[test]

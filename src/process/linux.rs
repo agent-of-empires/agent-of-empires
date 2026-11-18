@@ -1619,14 +1619,14 @@ fn process_tree_samples_with_root(
         if owned_root && pid == root.pid {
             continue;
         }
-        let stat = match fs::read_to_string(entry.path().join("stat")) {
+        // Bytes: the command name is whatever the process set, not necessarily UTF-8.
+        let stat = match fs::read(entry.path().join("stat")) {
             Ok(stat) => stat,
             Err(error) if process_disappeared(&error) => continue,
             Err(error) if pid == root.pid => return Err(error.into()),
             Err(_) => continue,
         };
-        let (_, tail) = stat.rsplit_once(") ").context("invalid process stat")?;
-        let mut fields = tail.split_ascii_whitespace();
+        let mut fields = stat_fields(&stat)?;
         let state = fields.next().context("missing process state")?;
         let parent = fields.next().context("missing process parent")?.parse()?;
         let start = fields.nth(17).context("missing process start identity")?;
@@ -2148,33 +2148,60 @@ mod tests {
         );
     }
 
+    /// A test child's whole process group, killed on drop however the test ends.
+    struct ChildGroup(Child);
+
+    impl Drop for ChildGroup {
+        fn drop(&mut self) {
+            unsafe { libc::kill(-(self.0.id() as i32), libc::SIGKILL) };
+            let _ = self.0.wait();
+        }
+    }
+
     #[test]
     fn a_process_tree_names_each_live_descendant_with_its_age() -> anyhow::Result<()> {
-        let mut child = Command::new("sh")
-            .args(["-c", "sleep 600 & wait"])
-            .spawn()?;
-        let root = child.id();
+        use std::os::unix::ffi::OsStrExt as _;
+        use std::os::unix::process::CommandExt as _;
+        // A command name that isn't UTF-8 still lists its process. A shell copy, since a
+        // multi-call coreutils `sleep` runs only under its own name.
+        let dir = tempfile::tempdir()?;
+        let shell = dir.path().join(std::ffi::OsStr::from_bytes(b"\xffsh"));
+        fs::copy(fs::canonicalize("/bin/sh")?, &shell)?;
+        let child = ChildGroup(
+            Command::new("sh")
+                .args(["-c", "\"$0\" -c 'sleep 600; :' & wait"])
+                .arg(&shell)
+                .process_group(0)
+                .spawn()?,
+        );
+        let root = child.0.id();
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
         let described = loop {
             let described = super::super::process_tree_commands(root)?;
-            if described.len() == 2 || std::time::Instant::now() > deadline {
+            if described.len() == 3 || std::time::Instant::now() > deadline {
                 break described;
             }
             std::thread::sleep(std::time::Duration::from_millis(20));
         };
-        child.kill()?;
-        child.wait()?;
+        let shown = String::from_utf8_lossy(shell.as_os_str().as_bytes()).into_owned();
         let argv: Vec<_> = described.iter().map(|sample| sample.argv.clone()).collect();
         assert_eq!(
             argv,
-            [vec!["sh", "-c", "sleep 600 & wait"], vec!["sleep", "600"]]
+            [
+                vec![
+                    "sh".to_owned(),
+                    "-c".into(),
+                    "\"$0\" -c 'sleep 600; :' & wait".into(),
+                    shown.clone()
+                ],
+                vec![shown, "-c".into(), "sleep 600; :".into()],
+                vec!["sleep".to_owned(), "600".into()],
+            ]
         );
         assert_eq!(described[1].parent, root);
+        assert_eq!(described[2].parent, described[1].identity.pid);
         assert!(described.iter().all(|sample| sample.elapsed_secs < 60));
-        assert!(described[1]
-            .exe
-            .as_ref()
-            .is_some_and(|exe| exe.ends_with("sleep")));
+        assert_eq!(described[1].exe.as_deref(), Some(shell.as_path()));
         Ok(())
     }
 
