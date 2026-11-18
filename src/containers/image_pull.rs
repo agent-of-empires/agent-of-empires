@@ -335,18 +335,17 @@ pub(crate) fn running_flight_id(key: &PullKey) -> Option<u64> {
 
 /// Cancels `key`'s running pull for every waiter and waits up to `backstop` for it to end.
 /// Returns that pull's state, not a retry's that started meanwhile; still `Running` if the
-/// backstop passed first. With no running pull it is just the current state.
+/// backstop passed first. With no running pull it is the state that lookup found, so a pull
+/// started just after reads as neither cancelled nor running.
 pub(crate) fn cancel(key: &PullKey, backstop: Duration) -> PullState {
-    let running = match lock(&FLIGHTS).get(key) {
+    let flight = match lock(&FLIGHTS).get(key) {
         Some(Entry::Running(flight)) => {
             lock(&flight.state).cancel_requested = true;
             flight.kill.cancel();
-            Some(flight.clone())
+            flight.clone()
         }
-        _ => None,
-    };
-    let Some(flight) = running else {
-        return state(key);
+        Some(Entry::Finished(state)) => return state.clone(),
+        None => return PullState::Idle,
     };
     let deadline = Instant::now() + backstop;
     let mut guard = lock(&flight.state);
