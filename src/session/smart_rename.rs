@@ -2528,7 +2528,15 @@ mod tests {
             (
                 "vibe",
                 Some("mistral-medium-3.5"),
-                &["vibe", "-p", "name this", "--model", "mistral-medium-3.5"],
+                &[
+                    "vibe",
+                    "-p",
+                    "name this",
+                    "--model",
+                    "mistral-medium-3.5",
+                    "--disabled-tools",
+                    "*",
+                ],
             ),
             (
                 "opencode",
@@ -2551,6 +2559,20 @@ mod tests {
             assert!(
                 !argv.iter().any(|arg| arg == "--model" || arg == "-m"),
                 "{name} has no built-in cheap alias: {argv:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn vibe_oneshots_disable_every_tool() {
+        let vibe = OneshotAgent::Builtin(agents::get_agent("vibe").unwrap());
+        let pinned = HashMap::from([("vibe".to_string(), "mistral-medium-3.5".to_string())]);
+        for models in [None, Some(&HashMap::new()), Some(&pinned)] {
+            let argv = vibe.argv("name this", models).expect("one-shot");
+            assert_eq!(
+                &argv[argv.len() - 2..],
+                ["--disabled-tools", "*"],
+                "{models:?}"
             );
         }
     }

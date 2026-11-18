@@ -1037,6 +1037,8 @@ impl AgentDef<'_> {
     pub fn oneshot_trailing_args(&self) -> &'static [&'static str] {
         match self.name {
             "copilot" => &["-s", "--allow-all-tools", "--no-ask-user"],
+            // Programmatic mode inherits the configured agent, which may edit files unasked.
+            "vibe" => &["--disabled-tools", "*"],
             _ => &[],
         }
     }
