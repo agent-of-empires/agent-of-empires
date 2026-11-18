@@ -2630,7 +2630,9 @@ pub(crate) fn preview_glob_volume_ignores(
 
     let glob_entries: Vec<&String> = volume_ignores
         .iter()
-        .filter(|e| has_glob_metachars(e))
+        .filter(|e| {
+            crate::session::validate_volume_ignore_format(e).is_ok() && has_glob_metachars(e)
+        })
         .collect();
     if glob_entries.is_empty() {
         return Ok(Vec::new());
@@ -6367,10 +6369,12 @@ volume_ignores_strategy = "named"
             "**/bin".to_string(),
             "**/missing".to_string(),
             "target".to_string(),
+            "../*".to_string(),
+            "a*:b".to_string(),
         ];
         let expansions = preview_glob_volume_ignores(project_path_str, None, &ignores).unwrap();
 
-        // Two glob entries (literal "target" excluded); order preserved.
+        // Two valid glob entries (literal "target" and rejected globs excluded); order preserved.
         assert_eq!(expansions.len(), 2);
         assert_eq!(expansions[0].pattern, "**/bin");
         let dir_name = project_dir.path().file_name().unwrap().to_string_lossy();
