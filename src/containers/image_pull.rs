@@ -250,8 +250,10 @@ impl Waiter {
             if let Some(outcome) = &state.outcome {
                 return match outcome {
                     Ok(()) => Ok(()),
-                    // Still joined: this caller didn't cancel, so it learns the pull was cancelled.
-                    Err(DockerError::Cancelled(_)) if self.joined && state.cancel_requested => {
+                    // A caller that cancelled too gets its own cancel; the others learn the pull was.
+                    Err(DockerError::Cancelled(_))
+                        if self.joined && state.cancel_requested && !cancel.is_cancelled() =>
+                    {
                         Err(DockerError::PullCancelled(self.image.clone()))
                     }
                     Err(error) => Err(reissue(error)),
@@ -322,16 +324,18 @@ pub(crate) fn state(key: &PullKey) -> PullState {
     }
 }
 
-/// The id of `key`'s running pull, to match against [`Waiter::flight_id`].
+/// The id of `key`'s running pull, to match against [`Waiter::flight_id`]. A killed pull has
+/// none: [`join_with`] won't join it, so a match would stand for a pull nobody can join.
 pub(crate) fn running_flight_id(key: &PullKey) -> Option<u64> {
     match lock(&FLIGHTS).get(key) {
-        Some(Entry::Running(flight)) => Some(flight.id),
+        Some(Entry::Running(flight)) if !flight.kill.is_cancelled() => Some(flight.id),
         _ => None,
     }
 }
 
 /// Cancels `key`'s running pull for every waiter and waits up to `backstop` for it to end.
-/// Returns the state then, which with no running pull is just the current one.
+/// Returns that pull's state, not a retry's that started meanwhile; still `Running` if the
+/// backstop passed first. With no running pull it is just the current state.
 pub(crate) fn cancel(key: &PullKey, backstop: Duration) -> PullState {
     let running = match lock(&FLIGHTS).get(key) {
         Some(Entry::Running(flight)) => {
@@ -341,22 +345,28 @@ pub(crate) fn cancel(key: &PullKey, backstop: Duration) -> PullState {
         }
         _ => None,
     };
-    if let Some(flight) = running {
-        let deadline = Instant::now() + backstop;
-        let mut guard = lock(&flight.state);
-        while guard.outcome.is_none() {
-            let left = deadline.saturating_duration_since(Instant::now());
-            if left.is_zero() {
-                break;
-            }
-            guard = flight
-                .finished
-                .wait_timeout(guard, left)
-                .unwrap_or_else(|e| e.into_inner())
-                .0;
+    let Some(flight) = running else {
+        return state(key);
+    };
+    let deadline = Instant::now() + backstop;
+    let mut guard = lock(&flight.state);
+    while guard.outcome.is_none() {
+        let left = deadline.saturating_duration_since(Instant::now());
+        if left.is_zero() {
+            break;
         }
+        guard = flight
+            .finished
+            .wait_timeout(guard, left)
+            .unwrap_or_else(|e| e.into_inner())
+            .0;
     }
-    state(key)
+    let ended = guard
+        .outcome
+        .as_ref()
+        .map(|outcome| finished_state(outcome, true).unwrap_or(PullState::Idle));
+    drop(guard);
+    ended.unwrap_or_else(|| PullState::Running(lock(&flight.progress).snapshot()))
 }
 
 /// How many callers are waiting on `key`'s running pull; 0 when none is running.
@@ -527,6 +537,7 @@ mod tests {
             Err(DockerError::Cancelled("pull".into()))
         });
         let second = join_with(cancelled.clone(), |_: &PullContext| Ok(()));
+        let own_cancel = join_with(cancelled.clone(), |_: &PullContext| Ok(()));
         started.recv_timeout(DEADLINE).expect("the pull starts");
         let waiting: Vec<_> = [first, second]
             .into_iter()
@@ -551,6 +562,15 @@ mod tests {
                 "a waiter that didn't cancel learns the pull was cancelled"
             );
         }
+        let cancelled_too = CancellationToken::new();
+        cancelled_too.cancel();
+        assert!(
+            matches!(
+                own_cancel.wait(&cancelled_too),
+                Err(DockerError::Cancelled(_))
+            ),
+            "a waiter that cancelled as well gets its own cancel"
+        );
         assert_eq!(
             cancel(&cancelled, DEADLINE),
             PullState::Cancelled,
@@ -560,6 +580,54 @@ mod tests {
             cancel(&key("Docker", "never-pulled"), DEADLINE),
             PullState::Idle
         );
+    }
+
+    #[test]
+    fn a_killed_pull_is_not_joinable_and_cancel_answers_for_it_not_a_retry() {
+        let retried = key("Docker", "cancel-then-retry");
+        let (killed_tx, killed) = mpsc::channel();
+        let (release_tx, release) = mpsc::channel::<()>();
+        let first = join_with(retried.clone(), move |pull: &PullContext| {
+            while !pull.kill.is_cancelled() {
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            killed_tx.send(()).unwrap();
+            let _ = release.recv();
+            Err(DockerError::Cancelled("pull".into()))
+        });
+        let first_id = first.flight_id();
+        assert_eq!(running_flight_id(&retried), Some(first_id));
+        let (answer_tx, answer) = mpsc::channel();
+        std::thread::spawn({
+            let retried = retried.clone();
+            move || answer_tx.send(cancel(&retried, DEADLINE))
+        });
+        killed
+            .recv_timeout(DEADLINE)
+            .expect("the cancel kills the pull");
+        assert!(matches!(state(&retried), PullState::Running(_)));
+        assert_eq!(
+            running_flight_id(&retried),
+            None,
+            "a killed pull can't be joined, so it has no id to match"
+        );
+
+        let (retry_release_tx, retry_release) = mpsc::channel::<()>();
+        let retry = join_with(retried.clone(), move |_: &PullContext| {
+            let _ = retry_release.recv();
+            Ok(())
+        });
+        assert_ne!(retry.flight_id(), first_id);
+        release_tx.send(()).unwrap();
+        assert_eq!(
+            answer.recv_timeout(DEADLINE).expect("the cancel returns"),
+            PullState::Cancelled,
+            "Cancel answers for the pull it cancelled, not the retry"
+        );
+        assert!(matches!(state(&retried), PullState::Running(_)));
+        retry_release_tx.send(()).unwrap();
+        retry.wait(&CancellationToken::new()).unwrap();
+        drop(first);
     }
 
     #[test]
