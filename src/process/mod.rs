@@ -3170,19 +3170,32 @@ finally:
                 });
             }
 
-            let start = Instant::now();
-            let result = if cancelled {
-                let cancel = CancellationToken::new();
-                cancel.cancel();
-                run_until_cancelled(&mut cmd, Duration::from_secs(60), &cancel).unwrap()
-            } else {
-                run_with_timeout(&mut cmd, Duration::from_millis(300)).unwrap()
+            let mut read_pid = move || {
+                let mut pid = [0; std::mem::size_of::<libc::pid_t>()];
+                pid_reader
+                    .read_exact(&mut pid)
+                    .expect("child must publish its PID before exec");
+                libc::pid_t::from_ne_bytes(pid) as u32
             };
-            let mut pid = [0; std::mem::size_of::<libc::pid_t>()];
-            pid_reader
-                .read_exact(&mut pid)
-                .expect("child must publish its PID before exec");
-            assert_child_reaped(libc::pid_t::from_ne_bytes(pid) as u32);
+            let start = Instant::now();
+            let (result, pid) = if cancelled {
+                // Cancelled once the child runs: a token cancelled before the spawn starts nothing.
+                let cancel = CancellationToken::new();
+                let canceller = std::thread::spawn({
+                    let cancel = cancel.clone();
+                    move || {
+                        let pid = read_pid();
+                        cancel.cancel();
+                        pid
+                    }
+                });
+                let result = run_until_cancelled(&mut cmd, Duration::from_secs(60), &cancel);
+                (result.unwrap(), canceller.join().unwrap())
+            } else {
+                let result = run_with_timeout(&mut cmd, Duration::from_millis(300)).unwrap();
+                (result, read_pid())
+            };
+            assert_child_reaped(pid);
             assert!(
                 result.is_none(),
                 "cancelled={cancelled}: child must be killed"
