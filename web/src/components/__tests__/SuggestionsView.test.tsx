@@ -182,9 +182,7 @@ describe("SuggestionsView", () => {
       const onPrepare = await openStarted();
       const row = (await screen.findByText("Fix lifecycle")).closest("li") as HTMLElement;
       expect(screen.queryByRole("button", { name: "Start" })).toBeNull();
-      expect(row.querySelector("p:nth-of-type(3)")?.textContent).toBe(
-        "GitHub · ⠋ Session running · Review RFC 4562 · started 3 min ago · aoe",
-      );
+      expect(row.querySelector("p:nth-of-type(2)")?.textContent).toBe("example/1 · ⠋ Running · started 3 min ago");
       fireEvent.click(screen.getByRole("button", { name: "Open" }));
       expect(onPrepare.onOpenSession).toHaveBeenCalledWith("sess-1");
     });
@@ -204,27 +202,13 @@ describe("SuggestionsView", () => {
     it("an archived Session says so and read-only keeps Open but offers no Dismiss", async () => {
       await openStarted({ ...started, archived: true });
       const row = (await screen.findByText("Fix lifecycle")).closest("li") as HTMLElement;
-      expect(row.textContent).toContain("Archived · Review RFC 4562");
+      expect(row.textContent).toContain("Archived · started");
       cleanup();
       await open(snapshot({ items: [{ ...item, started_session: started }] }), { readOnly: true });
       fireEvent.click(await screen.findByRole("button", { name: "More" }));
       expect(screen.queryByRole("menuitem", { name: "Dismiss" })).toBeNull();
       expect(screen.getByRole("button", { name: "Open" })).toBeTruthy();
     });
-  });
-
-  it("describes what Start does for the current start_without_review setting", async () => {
-    await open(snapshot());
-    expect(await screen.findByText(/Nothing runs until you press Launch/)).toBeTruthy();
-    cleanup();
-    const base = snapshot();
-    await open({ ...base, prefs: { ...base.prefs, start_without_review: true } });
-    expect(
-      await screen.findByText(
-        /Start creates the session from your template without review when the item has a template and a Project; otherwise it opens the wizard/,
-      ),
-    ).toBeTruthy();
-    expect(screen.queryByText(/Nothing runs until you press Launch/)).toBeNull();
   });
 
   it("Start without review creates the session from the prepared draft and skips the wizard", async () => {
@@ -372,15 +356,22 @@ describe("SuggestionsView", () => {
     expect(onPrepare).not.toHaveBeenCalled();
   });
 
-  it("renders one compact row: reference, title, then Source, reason and Project, with no preview or chip", async () => {
+  it("renders one compact row: title, short reference, reason once, with no preview, source name or link", async () => {
     await open(snapshot());
     const row = (await screen.findByText("Fix lifecycle")).closest("li") as HTMLElement;
     expect(row.textContent).not.toContain("UNTRUSTED BODY");
     expect(row.querySelector("a")).toBeNull();
-    expect(row.querySelector("p:nth-of-type(1)")?.textContent).toBe("example/1");
-    const meta = row.querySelector("p:nth-of-type(3)") as HTMLElement;
-    expect(meta.textContent).toBe("GitHub · Assigned to you · aoe");
+    expect(row.querySelector("p:nth-of-type(1)")?.textContent).toBe("Fix lifecycle");
+    const meta = row.querySelector("p:nth-of-type(2)") as HTMLElement;
+    expect(meta.textContent).toBe("example/1 · Assigned to you");
+    expect(meta.textContent).not.toContain("GitHub");
     expect(meta.firstElementChild?.className).toContain("font-mono");
+  });
+
+  it("shows #N in a repo group instead of owner/repo#N", async () => {
+    await open(snapshot({ items: [{ ...item, source_ref: "acme/web#12", mapping_key: "acme/web" }] }));
+    const row = (await screen.findByText("Fix lifecycle")).closest("li") as HTMLElement;
+    expect(row.querySelector("p:nth-of-type(2)")?.textContent).toBe("#12 · Assigned to you");
   });
 
   it("opens on the Dismissed filter when asked", async () => {
@@ -535,8 +526,6 @@ describe("SuggestionsView", () => {
       const [fresh, started] = (await screen.findAllByText(/click me/)).map((el) => el.closest("li") as HTMLElement);
       expect(fresh!.textContent).toContain("[click me](javascript:alert(1)) **bold**");
       expect(fresh!.textContent).toContain("<img src=x onerror=alert(1)> _em_ https://evil.test/x");
-      expect(fresh!.textContent).toContain("<b>proj</b>");
-      expect(started!.textContent).toContain("<script>1</script> [t](https://evil.test)");
       for (const row of [fresh!, started!]) {
         expect(row.querySelector("a, img, b, strong, em, script, h1")).toBeNull();
         expect(row.textContent).not.toContain("# heading");
@@ -574,13 +563,23 @@ describe("SuggestionsView", () => {
       };
     };
 
-    it("groups by resolved project with counts, unresolved last", async () => {
-      await open(two());
+    it("groups by repo with counts, no-repo last, and collapses from the header", async () => {
+      const base = two();
+      await open({
+        ...base,
+        items: [
+          { ...base.items[0]!, mapping_key: undefined },
+          { ...base.items[1]!, mapping_key: "acme/web" },
+          { ...base.items[2]!, mapping_key: "acme/web" },
+        ],
+      });
       const headings = await screen.findAllByRole("heading", { level: 2 });
-      expect(headings.map((h) => h.textContent)).toEqual(["api 2", "No project 1"]);
-      const api = screen.getByRole("region", { name: "Project api" });
-      expect(api.textContent).toContain("In api");
-      expect(api.textContent).toContain("Linear api");
+      expect(headings.map((h) => h.textContent)).toEqual(["web 2", "Other 1"]);
+      const web = screen.getByRole("region", { name: "Repo web" });
+      expect(web.textContent).toContain("In api");
+      fireEvent.click(within(web).getByRole("button", { name: /web/ }));
+      expect(screen.queryByText("In api")).toBeNull();
+      expect(screen.getByText("Loose")).toBeTruthy();
     });
 
     it("chips filter by provider and show the active counts", async () => {
@@ -591,7 +590,7 @@ describe("SuggestionsView", () => {
       expect(screen.getByText("Linear api")).toBeTruthy();
     });
 
-    it("drops a source chip when the provider tab changes, so the other list is not left empty", async () => {
+    it("drops a repo filter when the provider tab changes, so the other list is not left empty", async () => {
       const base = two();
       await open({
         ...base,
@@ -601,9 +600,8 @@ describe("SuggestionsView", () => {
         ],
       });
       await screen.findByText("GitHub item");
-      fireEvent.click(
-        within(screen.getByRole("group", { name: "Filter by source" })).getByRole("button", { name: "acme/ 1" }),
-      );
+      fireEvent.click(screen.getByRole("button", { name: "All repos" }));
+      fireEvent.click(screen.getAllByRole("button", { name: /^web/ })[0]!);
       expect(screen.queryByText("Linear item")).toBeNull();
       fireEvent.click(screen.getByRole("button", { name: "Linear 1" }));
       expect(screen.getByText("Linear item")).toBeTruthy();
@@ -718,7 +716,7 @@ describe("SuggestionsView", () => {
     fireEvent.click(await screen.findByRole("button", { name: "Dismissed 1" }));
     fetchSuggestions.mockResolvedValue(snapshot());
     fireEvent.click(await screen.findByRole("button", { name: "Restore" }));
-    fireEvent.click(await screen.findByRole("button", { name: /^All/ }));
+    fireEvent.click(await screen.findByRole("button", { name: "Dismissed 0" }));
     expect(await screen.findByText("Fix lifecycle")).toBeTruthy();
   });
 
@@ -786,13 +784,14 @@ describe("SuggestionsView", () => {
     );
     await screen.findByText("Web bug");
     const titles = () => ["Web bug", "Api bug", "Tool chore"].filter((t) => screen.queryByText(t));
-    const chips = screen.getByRole("group", { name: "Filter by source" });
+    fireEvent.click(screen.getByRole("button", { name: "All repos" }));
+    const menu = (name: RegExp) => screen.getByRole("button", { name });
 
-    fireEvent.click(within(chips).getByRole("button", { name: "acme/ 2" }));
+    fireEvent.click(menu(/^acme \(org\)/));
     expect(titles()).toEqual(["Web bug", "Api bug"]);
-    fireEvent.click(within(chips).getByRole("button", { name: "tool 1" }));
+    fireEvent.click(menu(/^tool/));
     expect(titles()).toEqual(["Web bug", "Api bug", "Tool chore"]);
-    fireEvent.click(within(chips).getByRole("button", { name: "acme/ 2" }));
+    fireEvent.click(menu(/^acme \(org\)/));
     expect(titles()).toEqual(["Tool chore"]);
 
     fireEvent.click(screen.getByRole("button", { name: "Clear filters" }));

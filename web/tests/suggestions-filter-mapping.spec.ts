@@ -46,11 +46,14 @@ test("search and source chips narrow unmapped suggestions", async ({ page }) => 
   const titles = page.locator("main").getByText(/^(Web bug|Api bug|Tool chore)$/);
   await expect(titles).toHaveCount(3);
 
-  const chips = page.getByRole("group", { name: "Filter by source" });
-  await chips.getByRole("button", { name: "acme/ 2" }).click();
+  await page.getByRole("button", { name: "All repos", exact: true }).click();
+  const menu = (name: RegExp) => page.getByRole("button", { name });
+  await menu(/^acme \(org\)/).click();
   await expect(titles).toHaveText(["Web bug", "Api bug"]);
-  await chips.getByRole("button", { name: "web 1" }).click();
-  await chips.getByRole("button", { name: "acme/ 2" }).click();
+  await menu(/^web 1/)
+    .first()
+    .click();
+  await menu(/^acme \(org\)/).click();
   await expect(titles).toHaveText(["Web bug"]);
 
   await page.getByRole("button", { name: "Clear filters" }).click();
@@ -78,7 +81,7 @@ test("the Map projects wizard proposes Projects and saves the checked ones", asy
     return route.fulfill({ json: { mappings: [] } });
   });
   await page.goto("/suggestions");
-  await page.getByRole("button", { name: "Map projects" }).click();
+  await page.getByRole("button", { name: "Link a Project" }).first().click();
 
   const wizard = page.getByRole("dialog", { name: "Map projects" });
   await expect(wizard.getByLabel("Map acme/web")).toBeChecked();
@@ -92,4 +95,23 @@ test("the Map projects wizard proposes Projects and saves the checked ones", asy
     { provider_id: "github", mapping_key: "acme/api", projects: ["/w/api"] },
     { provider_id: "github", mapping_key: "acme/web", projects: ["/w/site"] },
   ]);
+});
+
+test("a row is one line on desktop and two lines on a phone", async ({ page }) => {
+  const lines = async () => {
+    const row = page.locator("li", { hasText: "Web bug" });
+    const title = await row.getByText("Web bug", { exact: true }).boundingBox();
+    const meta = await row.getByText(/Assigned to you/).boundingBox();
+    return { title: title!, meta: meta! };
+  };
+  await page.setViewportSize({ width: 1100, height: 800 });
+  await page.goto("/suggestions");
+  await expect(page.getByText("Web bug", { exact: true })).toBeVisible();
+  const wide = await lines();
+  expect(wide.meta.y).toBeLessThan(wide.title.y + wide.title.height);
+
+  await page.setViewportSize({ width: 375, height: 800 });
+  await expect(page.getByText("Web bug", { exact: true })).toBeVisible();
+  const narrow = await lines();
+  expect(narrow.meta.y).toBeGreaterThanOrEqual(narrow.title.y + narrow.title.height - 1);
 });
