@@ -347,6 +347,275 @@ pub async fn patch_suggestion_prefs(
     }
 }
 
+/// The prefill of item `id`: `None` when it is no longer published.
+fn prefill_for(
+    host: &crate::plugin::host::PluginHost,
+    provider: &Provider,
+    id: &str,
+) -> anyhow::Result<Option<Result<serde_json::Value, PrepareRefusal>>> {
+    let (profile, found, preset) = host.with_suggestions_db(|conn, profile| {
+        let found = suggestions::find_item_with_mapping(conn, profile, provider, id)?;
+        let preset = match &found {
+            Some((found, _)) => suggestions::preset(conn, profile, &provider.id, &found.criterion)?,
+            None => None,
+        };
+        Ok::<_, anyhow::Error>((profile.to_string(), found, preset))
+    })?;
+    // Config and project resolution touch disk, so they run off the lock.
+    Ok(found.map(|(found, mapped)| {
+        suggestions::prepare(&profile, &found, preset.as_ref(), mapped.as_deref())
+    }))
+}
+
+fn refusal_response(refusal: PrepareRefusal) -> axum::response::Response {
+    match refusal {
+        PrepareRefusal::Stale => api_error(
+            StatusCode::BAD_REQUEST,
+            "stale",
+            "That suggestion is no longer open at its source",
+        ),
+        PrepareRefusal::PromptTooLong => api_error(
+            StatusCode::BAD_REQUEST,
+            "validation_failed",
+            format!(
+                "The expanded prompt exceeds {} bytes",
+                crate::session::MAX_INITIAL_PROMPT_BYTES
+            ),
+        ),
+        PrepareRefusal::Registry(error) => internal(error),
+    }
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct StartProject {
+    path: String,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct StartBody {
+    provider_id: String,
+    id: String,
+    /// Link the item's repo to this Project first, then start.
+    #[serde(default)]
+    project: Option<StartProject>,
+    #[serde(default)]
+    approve_hooks: bool,
+    /// The fingerprint of the `hooks_need_trust` answer being approved.
+    #[serde(default)]
+    review_fingerprint: Option<crate::daemon::CreationTrustFingerprint>,
+}
+
+fn start_failed(reason: impl Into<String>, hint: &str) -> axum::response::Response {
+    let reason = reason.into();
+    (
+        StatusCode::UNPROCESSABLE_ENTITY,
+        Json(json!({
+            "error": "start_failed",
+            "message": reason,
+            "reason": reason,
+            "hint": hint,
+            "retryable": true,
+        })),
+    )
+        .into_response()
+}
+
+/// Saves `path` as the Project of the item's repo. `Err` is a user-facing refusal.
+fn link_project(
+    host: &crate::plugin::host::PluginHost,
+    provider: &Provider,
+    id: &str,
+    path: &str,
+) -> anyhow::Result<Result<(), String>> {
+    let registered = crate::session::projects::load_merged(&host.suggestions_profile())?;
+    host.with_suggestions_db(|conn, profile| {
+        let Some((item, _)) = suggestions::find_item_with_mapping(conn, profile, provider, id)?
+        else {
+            return Ok(Err("That suggestion is no longer published".to_string()));
+        };
+        let Some(key) = item.mapping_key else {
+            return Ok(Err("This suggestion names no repo to link".to_string()));
+        };
+        let projects = match suggestions::normalize_mapping(&key, &[path.to_string()], &registered)
+        {
+            Ok(projects) => projects,
+            Err(message) => return Ok(Err(message)),
+        };
+        suggestions::put_mapping(conn, profile, &provider.id, &key, &projects)?;
+        Ok(Ok(()))
+    })
+}
+
+/// Turns the answer of the create into Start's contract.
+async fn start_outcome(response: axum::response::Response) -> axum::response::Response {
+    let status = response.status();
+    let bytes = axum::body::to_bytes(response.into_body(), 1 << 20)
+        .await
+        .unwrap_or_default();
+    let body: serde_json::Value = serde_json::from_slice(&bytes).unwrap_or_default();
+    let code = body["error"].as_str().unwrap_or_default();
+    if status == StatusCode::CREATED {
+        return (
+            StatusCode::CREATED,
+            Json(json!({ "session_id": body["id"], "title": body["title"] })),
+        )
+            .into_response();
+    }
+    if status == StatusCode::CONFLICT && matches!(code, "already_started" | "stale_suggestion") {
+        return (status, Json(body)).into_response();
+    }
+    let hint = match code {
+        "acp_adapter_missing" | "agent_not_allowed" => {
+            "Choose another agent in the preset, then try again."
+        }
+        _ => "Try again, or use Start with changes to see the full error.",
+    };
+    let reason = body["message"]
+        .as_str()
+        .map(String::from)
+        .unwrap_or_else(|| format!("The Session could not be created ({status})"));
+    start_failed(reason, hint)
+}
+
+pub async fn start_suggestion(
+    State(state): State<Arc<AppState>>,
+    body: Result<Json<StartBody>, axum::extract::rejection::JsonRejection>,
+) -> axum::response::Response {
+    if state.read_only {
+        return super::read_only_response();
+    }
+    let Json(body) = match body {
+        Ok(body) => body,
+        Err(rejection) => return rejection.into_response(),
+    };
+    // CityHall cannot save the link, so it starts only what is already linked.
+    if body.project.is_some() && state.cityhall_mode {
+        return super::cityhall_response();
+    }
+    let Some(host) = state.plugin_host.clone() else {
+        return unavailable();
+    };
+    let Some(provider) = find_provider(&body.provider_id) else {
+        return unknown_provider();
+    };
+    let StartBody {
+        provider_id,
+        id,
+        project,
+        approve_hooks,
+        review_fingerprint,
+    } = body;
+
+    let prefill = {
+        let (host, id) = (host.clone(), id.clone());
+        tokio::task::spawn_blocking(move || {
+            if let Some(project) = project {
+                if let Err(message) = link_project(&host, &provider, &id, &project.path)? {
+                    return Ok(Err(api_error(
+                        StatusCode::BAD_REQUEST,
+                        "validation_failed",
+                        message,
+                    )));
+                }
+            }
+            prefill_for(&host, &provider, &id).map(Ok)
+        })
+        .await
+    };
+    let prefill = match prefill {
+        Ok(Ok(Ok(Some(Ok(prefill))))) => prefill,
+        Ok(Ok(Ok(Some(Err(refusal))))) => return refusal_response(refusal),
+        Ok(Ok(Ok(None))) => return stale_item(),
+        Ok(Ok(Err(response))) => return response,
+        Ok(Err(error)) => return internal(error),
+        Err(error) => return internal(error),
+    };
+    let Some(path) = prefill["project"]["path"].as_str().map(String::from) else {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({
+                "error": "no_project",
+                "message": "This suggestion's repo is not linked to a Project",
+                "hint": "link_project",
+            })),
+        )
+            .into_response();
+    };
+
+    // The create gate still refuses unapproved hooks; this tells the caller what to approve.
+    let profile = state.served_profile().to_string();
+    let review_path = path.clone();
+    let review = tokio::task::spawn_blocking(move || {
+        super::sessions::review_start_trust(&profile, std::path::Path::new(&review_path))
+    })
+    .await;
+    let review = match review {
+        Ok(Ok(review)) => review,
+        Ok(Err(error)) => {
+            return start_failed(
+                error.to_string(),
+                "Check the Project's folder, then try again.",
+            )
+        }
+        Err(error) => return internal(error),
+    };
+    let (mut trust_hooks, mut trust_review) = (None, None);
+    if review.hooks_need_trust || review.mcp_need_trust {
+        if !approve_hooks {
+            return (
+                StatusCode::CONFLICT,
+                Json(json!({
+                    "error": "hooks_need_trust",
+                    "message": "Repository hooks require approval before this Session starts",
+                    "commands": {
+                        "on_create": review.merged_hooks.on_create,
+                        "on_launch": review.merged_hooks.on_launch,
+                        "on_destroy": review.merged_hooks.on_destroy,
+                    },
+                    "needs_mcp_trust": review.mcp_need_trust,
+                    "review_fingerprint": review.fingerprint,
+                })),
+            )
+                .into_response();
+        }
+        let Some(fingerprint) = review_fingerprint else {
+            return api_error(
+                StatusCode::BAD_REQUEST,
+                "validation_failed",
+                "approve_hooks needs the review_fingerprint of the hooks it approves",
+            );
+        };
+        (trust_hooks, trust_review) = (Some(true), Some(fingerprint));
+    }
+
+    let prompt = prefill["initial_prompt"]
+        .as_str()
+        .filter(|prompt| !prompt.is_empty());
+    let create = serde_json::from_value::<crate::daemon::CreateSessionBody>(json!({
+        "title": prefill["title"],
+        "path": path,
+        "tool": prefill["tool"],
+        "view": prefill["view"],
+        "yolo_mode": prefill["yolo"],
+        "worktree_enabled": prefill["worktree"],
+        "sandbox": prefill["sandbox"],
+        "initial_prompt": prompt,
+        "suggestion": { "provider_id": provider_id, "id": id },
+        "trust_hooks": trust_hooks,
+        "trust_review": trust_review,
+    }));
+    let create = match create {
+        Ok(create) => create,
+        Err(error) => return internal(error),
+    };
+    let reference = uuid::Uuid::new_v4().to_string();
+    let response =
+        super::sessions::create_session_with(state, false, &reference, false, create, None).await;
+    start_outcome(response).await
+}
+
 pub async fn prepare_suggestion(
     State(state): State<Arc<AppState>>,
     body: Result<Json<ItemRef>, axum::extract::rejection::JsonRejection>,
@@ -361,39 +630,10 @@ pub async fn prepare_suggestion(
     let Some(provider) = find_provider(&item.provider_id) else {
         return unknown_provider();
     };
-    let result = tokio::task::spawn_blocking(move || {
-        let (profile, found, preset) = host.with_suggestions_db(|conn, profile| {
-            let found = suggestions::find_item_with_mapping(conn, profile, &provider, &item.id)?;
-            let preset = match &found {
-                Some((found, _)) => {
-                    suggestions::preset(conn, profile, &provider.id, &found.criterion)?
-                }
-                None => None,
-            };
-            Ok::<_, anyhow::Error>((profile.to_string(), found, preset))
-        })?;
-        // Config and project resolution touch disk, so they run off the lock.
-        Ok::<_, anyhow::Error>(found.map(|(found, mapped)| {
-            suggestions::prepare(&profile, &found, preset.as_ref(), mapped.as_deref())
-        }))
-    })
-    .await;
+    let result = tokio::task::spawn_blocking(move || prefill_for(&host, &provider, &item.id)).await;
     match result {
         Ok(Ok(Some(Ok(prefill)))) => Json(prefill).into_response(),
-        Ok(Ok(Some(Err(PrepareRefusal::Stale)))) => api_error(
-            StatusCode::BAD_REQUEST,
-            "stale",
-            "That suggestion is no longer open at its source",
-        ),
-        Ok(Ok(Some(Err(PrepareRefusal::PromptTooLong)))) => api_error(
-            StatusCode::BAD_REQUEST,
-            "validation_failed",
-            format!(
-                "The expanded prompt exceeds {} bytes",
-                crate::session::MAX_INITIAL_PROMPT_BYTES
-            ),
-        ),
-        Ok(Ok(Some(Err(PrepareRefusal::Registry(error))))) => internal(error),
+        Ok(Ok(Some(Err(refusal)))) => refusal_response(refusal),
         Ok(Ok(None)) => stale_item(),
         Ok(Err(error)) => internal(error),
         Err(error) => internal(error),

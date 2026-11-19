@@ -11448,6 +11448,110 @@ async fn a_suggestion_has_one_primary_session() {
 }
 
 #[tokio::test]
+async fn start_creates_the_session_from_the_preset_and_links_it() {
+    use axum::response::IntoResponse;
+
+    let _home = crate::session::test_support::isolate_app_dir();
+    let _adapter = crate::session::test_support::stub_claude_adapter_on_agent_path();
+    crate::session::purge_owners::initialize(&crate::session::get_app_dir().unwrap()).unwrap();
+    crate::tmux::tool_retirement::initialize(&crate::session::get_app_dir().unwrap()).unwrap();
+    crate::session::config::update_app_state(|state| {
+        state.has_acknowledged_agent_hooks = true;
+    })
+    .expect("acknowledge the agent hook paths");
+    crate::session::config::update_config(|config| {
+        config.default_profile = "chosen-default".to_string();
+    })
+    .unwrap();
+    crate::session::Storage::new_unwatched("chosen-default").unwrap();
+    let (launcher, _launches) = crate::server::test_support::counting_failing_launcher();
+    let _registry = crate::server::api::suggestions_tests::register_provider();
+    let repo = tempfile::tempdir().unwrap();
+    crate::session::projects::add(
+        "default",
+        crate::session::projects::ProjectScope::Global,
+        crate::session::projects::Project::new(
+            "repo",
+            repo.path().to_string_lossy(),
+            crate::session::projects::ProjectScope::Global,
+        ),
+        false,
+    )
+    .unwrap();
+    let host = crate::plugin::host::PluginHost::new(
+        &crate::session::get_app_dir().unwrap().join("host"),
+        "default",
+        None,
+        Arc::new(crate::server::runtime::RuntimeWork::default()),
+    )
+    .unwrap();
+    crate::server::api::suggestions_tests::seed_item_on(&host, "42", Some("acme/web"), "42");
+    host.with_suggestions_db(|conn, profile| {
+        crate::plugin::suggestions::put_mapping(
+            conn,
+            profile,
+            "acme.gh",
+            "acme/web",
+            &[repo.path().to_string_lossy().into_owned()],
+        )
+    })
+    .unwrap();
+    let state = crate::server::test_support::build_test_app_state_impl(
+        Vec::new(),
+        Vec::new(),
+        Vec::new(),
+        None,
+        false,
+        |state| {
+            state.profile = std::sync::RwLock::new(crate::session::config::effective_profile(""));
+            state.plugin_host = Some(host);
+        },
+        |supervisor| supervisor.with_launcher(launcher),
+    );
+    crate::server::test_support::refresh_canonical_metadata_for_test(&state).await;
+    let start = || async {
+        let body: crate::server::api::StartBody =
+            serde_json::from_value(serde_json::json!({ "provider_id": "acme.gh", "id": "42" }))
+                .unwrap();
+        let response = crate::server::api::start_suggestion(
+            axum::extract::State(state.clone()),
+            Ok(axum::Json(body)),
+        )
+        .await
+        .into_response();
+        let status = response.status();
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        (
+            status,
+            serde_json::from_slice::<serde_json::Value>(&bytes).unwrap(),
+        )
+    };
+
+    let (status, started) = start().await;
+    assert_eq!(status, axum::http::StatusCode::CREATED, "{started}");
+    let instances = state.instances.read().await;
+    let session = instances
+        .iter()
+        .find(|i| i.id == started["session_id"])
+        .expect("created");
+    assert_eq!(session.tool, "claude");
+    assert_eq!(session.suggestion.as_ref().unwrap().id, "42");
+    // The plugin's own prompt, as the preset has none of its own.
+    assert_eq!(
+        session.pending_initial_turn.as_ref().unwrap().text,
+        "Fix #{number}"
+    );
+    drop(instances);
+
+    let (status, again) = start().await;
+    assert_eq!(status, axum::http::StatusCode::CONFLICT, "{again}");
+    assert_eq!(again["error"], "already_started");
+    assert_eq!(again["session_id"], started["session_id"]);
+}
+
+#[tokio::test]
 async fn create_rejects_a_suggestion_that_is_not_published() {
     let _home = crate::session::test_support::isolate_app_dir();
     let _registry = crate::server::api::suggestions_tests::register_provider();

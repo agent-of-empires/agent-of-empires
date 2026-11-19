@@ -535,6 +535,89 @@ async fn prepare_resolves_the_preset_prompt_and_stale_items() {
 
 #[tokio::test]
 #[serial_test::serial]
+async fn start_refuses_an_unlinked_repo_and_shows_hooks_before_approval() {
+    let f = fixture();
+    let start = |extra: Value| {
+        let mut body = json!({ "provider_id": PROVIDER, "id": "a" });
+        body.as_object_mut()
+            .unwrap()
+            .extend(extra.as_object().unwrap().clone());
+        body
+    };
+    f.seed_item("a", Some("acme/web"), "42");
+
+    let (status, code, body) = f
+        .call(Method::POST, "/api/suggestions/start", start(json!({})))
+        .await;
+    assert_eq!(
+        (status, code.as_str()),
+        (StatusCode::BAD_REQUEST, "no_project")
+    );
+    assert_eq!(body["hint"], "link_project");
+
+    // Start in...: a path that is not a registered Project saves nothing.
+    let (status, code, _) = f
+        .call(
+            Method::POST,
+            "/api/suggestions/start",
+            start(json!({ "project": { "path": "/not/registered" } })),
+        )
+        .await;
+    assert_eq!(
+        (status, code.as_str()),
+        (StatusCode::BAD_REQUEST, "validation_failed")
+    );
+    let (_, _, mappings) = f
+        .call(Method::GET, "/api/suggestions/mappings", Value::Null)
+        .await;
+    assert_eq!(mappings["mappings"], json!([]), "{mappings}");
+
+    // The repo's hooks must be reviewed first; nothing is created.
+    std::fs::create_dir_all(f.repo.join(".agent-of-empires")).unwrap();
+    std::fs::write(
+        f.repo.join(".agent-of-empires/config.toml"),
+        "[hooks]\non_create = [\"npm ci\"]\n",
+    )
+    .unwrap();
+    let repo = f.repo.to_string_lossy().into_owned();
+    let (status, code, body) = f
+        .call(
+            Method::POST,
+            "/api/suggestions/start",
+            start(json!({ "project": { "path": repo } })),
+        )
+        .await;
+    assert_eq!(
+        (status, code.as_str()),
+        (StatusCode::CONFLICT, "hooks_need_trust"),
+        "{body}"
+    );
+    assert_eq!(body["commands"]["on_create"], json!(["npm ci"]));
+    assert!(body["review_fingerprint"]["project_path"].is_string());
+    // The link was saved, so approving needs no project again.
+    let (_, _, mappings) = f
+        .call(Method::GET, "/api/suggestions/mappings", Value::Null)
+        .await;
+    assert_eq!(
+        mappings["mappings"][0]["mapping_key"], "acme/web",
+        "{mappings}"
+    );
+
+    let (status, code, _) = f
+        .call(
+            Method::POST,
+            "/api/suggestions/start",
+            start(json!({ "approve_hooks": true })),
+        )
+        .await;
+    assert_eq!(
+        (status, code.as_str()),
+        (StatusCode::BAD_REQUEST, "validation_failed")
+    );
+}
+
+#[tokio::test]
+#[serial_test::serial]
 async fn mappings_validate_list_and_delete_by_query() {
     let f = fixture();
     let repo = f.repo.to_string_lossy().into_owned();
