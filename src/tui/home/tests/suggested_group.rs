@@ -397,6 +397,28 @@ fn enter_in_the_full_view_on_an_unlinked_item_opens_the_dialog_to_pick_a_project
 
 #[test]
 #[serial]
+fn the_full_view_dismisses_with_z_and_in_strict_mode_only_with_capital_z() {
+    for (strict, dismiss, ignored) in [(false, 'z', 'Z'), (true, 'Z', 'z')] {
+        let (mut env, requests) = expanded_env(2);
+        env.view.strict_hotkeys = strict;
+        with_authenticated_local_project_registry(&mut env.view, |view| {
+            view.open_suggestions_view();
+            view.handle_key(key(KeyCode::Char(ignored)), None);
+            view.suggestions_feed.reload();
+        });
+        assert_eq!(next_request(&requests), "load", "{ignored} does nothing");
+        with_authenticated_local_project_registry(&mut env.view, |view| {
+            view.handle_key(key(KeyCode::Char(dismiss)), None);
+        });
+        poll_until(&mut env, |env| {
+            !env.view.suggestions_feed.is_busy_for_test()
+        });
+        assert_eq!(next_request(&requests), "dismiss gh/i0 true", "{dismiss}");
+    }
+}
+
+#[test]
+#[serial]
 fn a_failed_start_says_why_and_enter_tries_again() {
     let answer = StartAnswer::Failed("Docker isn't running. Start it, then try again.".into());
     let (mut env, requests) = expanded_env_answering(2, answer);
