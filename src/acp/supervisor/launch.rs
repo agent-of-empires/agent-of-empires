@@ -1473,6 +1473,7 @@ pub(super) async fn resolve_mcp_servers(
         session_env,
         native_config_override,
     } = host;
+    let sandboxed = paths.sandboxed;
     let sandbox_info = scope.sandbox_info.filter(|info| info.enabled).cloned();
     let projection_env = session_env.clone();
     let workspace_info = scope.workspace_info.cloned();
@@ -1485,6 +1486,7 @@ pub(super) async fn resolve_mcp_servers(
             McpPaths {
                 cwd: paths.cwd.clone(),
                 config_path: paths.config_path.clone(),
+                sandboxed,
             },
         );
         tokio::task::spawn_blocking(move || {
@@ -1522,6 +1524,18 @@ pub(super) async fn resolve_mcp_servers(
             return Vec::new();
         }
     };
+    // Read the accepted tokens after the definitions so they cover every token those hold.
+    // Dropped before the hook, which must never see a daemon token, and again after it, since
+    // the hook can add servers.
+    let daemon = if sandboxed {
+        Some(crate::acp::mcp_config::DaemonIdentity::current().await)
+    } else {
+        None
+    };
+    let resolved = match &daemon {
+        Some(daemon) => crate::acp::mcp_config::drop_daemon_servers(resolved, daemon),
+        None => resolved,
+    };
     let ctx = crate::acp::mcp_rewrite::McpRewriteContext {
         session_id: session_id.to_string(),
         agent: agent_key.to_string(),
@@ -1545,7 +1559,7 @@ pub(super) async fn resolve_mcp_servers(
     );
     // Only a definition the hook left untouched keeps its provenance; an added or redefined
     // one is project-local so it never receives session env values.
-    let resolved = defs
+    let resolved: Vec<ResolvedMcpServer> = defs
         .into_iter()
         .map(|def| ResolvedMcpServer {
             provenance: match originals.remove(&def.name) {
@@ -1556,6 +1570,10 @@ pub(super) async fn resolve_mcp_servers(
             shadowed: Vec::new(),
         })
         .collect();
+    let resolved = match &daemon {
+        Some(daemon) => crate::acp::mcp_config::drop_daemon_servers(resolved, daemon),
+        None => resolved,
+    };
     crate::acp::mcp_config::project_servers_to_acp(resolved, &projection_env)
 }
 
@@ -2915,11 +2933,74 @@ time.sleep(60)
         use crate::session::mcp::project_mcp::{ProjectMcpServer, ProjectMcpTransport};
         ProjectMcpServer {
             name: "rewritten".into(),
-            transport: ProjectMcpTransport::Http {
-                url: "http://gateway/mcp".into(),
-                headers: Default::default(),
+            transport: ProjectMcpTransport::Stdio {
+                command: "gateway".into(),
+                args: Vec::new(),
+                env: Default::default(),
             },
         }
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn a_sandboxed_session_never_gives_the_hook_or_keeps_a_daemon_server() {
+        use crate::acp::mcp_rewrite::test_support::{RecordingRewriter, SlotGuard};
+
+        let (_home, tmp) = isolate_home();
+        let _env = crate::session::test_support::EnvGuard::unset(&["CLAUDE_CONFIG_DIR"]);
+        std::fs::write(
+            tmp.path().join(".claude.json"),
+            r#"{ "mcpServers": {
+                "fs": { "command": "f" },
+                "daemon": { "type": "http", "url": "http://127.0.0.1:9000/mcp" }
+            } }"#,
+        )
+        .unwrap();
+        let readded = crate::session::mcp::project_mcp::ProjectMcpServer {
+            name: "readded".into(),
+            transport: crate::session::mcp::project_mcp::ProjectMcpTransport::Http {
+                url: "http://127.0.0.1:9000/mcp".into(),
+                headers: Default::default(),
+            },
+        };
+        let kept = crate::session::mcp::project_mcp::ProjectMcpServer {
+            name: "kept".into(),
+            transport: crate::session::mcp::project_mcp::ProjectMcpTransport::Stdio {
+                command: "k".into(),
+                args: Vec::new(),
+                env: Default::default(),
+            },
+        };
+        let rewriter = RecordingRewriter::returning(vec![kept, readded]);
+        let _slot = SlotGuard::install(rewriter.clone());
+        let servers = resolve_mcp_servers(
+            "claude",
+            "daemon-test",
+            None,
+            McpPaths {
+                cwd: tmp.path().to_path_buf(),
+                config_path: tmp.path().join("config.toml"),
+                sandboxed: true,
+            },
+            McpHostEnv::default(),
+            McpSandboxScope::default(),
+            "failed",
+        )
+        .await;
+
+        assert_eq!(
+            rewriter.input_names(),
+            [["fs".to_string()]],
+            "the hook must not see the daemon server"
+        );
+        let names: Vec<String> = serde_json::to_value(&servers)
+            .unwrap()
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|s| s["name"].as_str().unwrap().to_string())
+            .collect();
+        assert_eq!(names, ["kept"], "a server the hook adds is screened too");
     }
 
     #[tokio::test]
@@ -2934,7 +3015,7 @@ time.sleep(60)
             r#"{ "mcpServers": { "native": { "command": "n" } } }"#,
         )
         .unwrap();
-        let resolve = |sandbox_info| {
+        let resolve = |sandbox_info, sandboxed: bool| {
             resolve_mcp_servers(
                 "claude",
                 "hook-test",
@@ -2942,6 +3023,7 @@ time.sleep(60)
                 McpPaths {
                     cwd: tmp.path().to_path_buf(),
                     config_path: tmp.path().join("config.toml"),
+                    sandboxed,
                 },
                 McpHostEnv::default(),
                 McpSandboxScope {
@@ -2971,10 +3053,10 @@ time.sleep(60)
 
         let rewriter = RecordingRewriter::returning(Vec::new());
         let slot = SlotGuard::install(rewriter.clone());
-        let sandboxed = resolve(Some(&info)).await;
-        resolve(Some(&disabled)).await;
+        let sandboxed = resolve(Some(&info), true).await;
+        resolve(Some(&disabled), true).await;
         drop(slot);
-        let plain = resolve(None).await;
+        let plain = resolve(None, false).await;
 
         assert_eq!(
             rewriter.sandboxed_calls(),
@@ -3042,6 +3124,7 @@ time.sleep(60)
             McpPaths {
                 cwd: tmp.path().to_path_buf(),
                 config_path: tmp.path().join("config.toml"),
+                sandboxed: false,
             },
             McpHostEnv {
                 session_env: vec![("FAKE_TOKEN".into(), "fake-value".into())],

@@ -3038,9 +3038,10 @@ mod tests {
         let (_home, temp) = isolate_home();
         let rewriter = RecordingRewriter::returning(vec![ProjectMcpServer {
             name: "rewritten".into(),
-            transport: ProjectMcpTransport::Http {
-                url: "http://gateway/mcp".into(),
-                headers: Default::default(),
+            transport: ProjectMcpTransport::Stdio {
+                command: "gateway".into(),
+                args: Vec::new(),
+                env: Default::default(),
             },
         }]);
         let _slot = SlotGuard::install(rewriter.clone());
@@ -3075,7 +3076,7 @@ mod tests {
         );
         assert!(matches!(
             config.mcp_servers.as_slice(),
-            [McpServer::Http(server)] if server.name == "rewritten"
+            [McpServer::Stdio(server)] if server.name == "rewritten"
         ));
     }
 
