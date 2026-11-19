@@ -728,6 +728,29 @@ The outgoing worker must exit before its replacement is admitted.
 { "command_override": "my-agent", "extra_args": "--verbose", "unsnooze": true }
 ```
 
+**Background-process check** (Terminal view sessions; a structured session ignores it)
+
+| Field | Notes |
+| --- | --- |
+| `stop_processes` | A list of `{"pid", "start_id"}`, as a `background_processes` refusal names them. When present, even empty, it asks for the check: the restart is refused unless every background shell the Agent started in its pane is listed. Omitted, no check runs. It can't be combined with `profile`, `tool`, `command_override`, `extra_args` or `discard_sandbox_container` (`400 validation_failed`), since a refusal after the launch hooks couldn't undo them. |
+| `stop_unclassified` | With `stop_processes`, restart even when the check can't tell the Agent from what it started. |
+| `skip_on_launch` | Don't run the `on_launch` hooks. Set it on the confirm after a refusal with `launch_hooks_ran: true`, so the hooks run once. |
+
+The check runs before the launch hooks and again just before the pane is stopped. A non-empty body must be sent as `Content-Type: application/json`; otherwise the restart answers `415` instead of running without the check.
+
+| Status | Body | When |
+| --- | --- | --- |
+| `409` | `{"error": "background_processes", "message", "launch_hooks_ran", "classified", "total", "processes"}` | The check found a process `stop_processes` doesn't list, or couldn't classify the pane and `stop_unclassified` wasn't set. Nothing was stopped. |
+| `415` | axum's plain-text rejection | A non-empty body without a JSON `Content-Type`. |
+
+In a `background_processes` refusal:
+- `processes` lists each process as `{"pid", "start_id", "elapsed_secs"}`, and the first five also carry `argv`. `total` counts them all.
+- `argv` is shown only where its arguments are known exactly. Values of secret-looking flags and variables read `***`. A shell's `-c` script is never shown.
+- `classified: false`, with `total: 0` and no processes, means the check couldn't tell what the pane runs. That includes more than 24 background shells.
+- `launch_hooks_ran: true` means the refusal came from the second check, after the `on_launch` hooks had run. Confirm with `skip_on_launch: true`.
+
+To confirm, send the same restart with `stop_processes` set to the listed identities. A process started after the refusal is refused again; a reused PID has a new `start_id`.
+
 The response includes the session and an `outcome` containing
 `lifecycle_generation`, `profile`, and the prepared terminal `target` (`null` for
 structured sessions). The receipt cursor is carried in `aoe-runtime-epoch` and
@@ -736,6 +759,14 @@ attach only after applying a snapshot at or beyond that receipt in the same
 epoch, with matching lifecycle generation, profile, and live terminal identity.
 A successful terminal restart can still have canonical status `Starting`.
 Clients must not wait for `Idle` as an additional attachment grant.
+
+## POST /api/sessions/{id}/restart-for-update
+
+Restart a session whose agent binary was replaced after launch. Eligibility is checked again here, so a session that is busy or whose agent isn't out of date answers `409 not_eligible`. An empty body restarts without the background-process check. Otherwise the body is JSON with the [`/restart` check fields](#post-apisessionsidrestart) `stop_processes`, `stop_unclassified` and `skip_on_launch`, under the same `Content-Type` rule, and it answers the same `409 background_processes` and `415`.
+
+```json
+{ "stop_processes": [{ "pid": 4242, "start_id": "…" }] }
+```
 
 ## GET and PUT /api/sessions/{id}/file
 
