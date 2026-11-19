@@ -431,12 +431,32 @@ fn creation_trust_fingerprint(
     crate::session::config::repo_config::creation_trust_fingerprint(base, trust)
 }
 
+/// The redacted one-line summaries of the repo's MCP servers, for the trust dialog.
+fn mcp_summaries(
+    mcp: crate::session::config::repo_config::TrustSurface<
+        Vec<crate::session::mcp::project_mcp::ProjectMcpServer>,
+    >,
+) -> Vec<String> {
+    use crate::session::config::repo_config::TrustSurface;
+    match mcp {
+        TrustSurface::Trusted(servers)
+        | TrustSurface::NeedsTrust {
+            config: servers, ..
+        } => servers
+            .iter()
+            .map(|server| server.redacted_summary())
+            .collect(),
+        TrustSurface::Absent => Vec::new(),
+    }
+}
+
 /// What Start must show before it may create a Session in `path`.
 pub(crate) struct StartTrust {
     pub(crate) fingerprint: crate::daemon::CreationTrustFingerprint,
     pub(crate) merged_hooks: crate::session::HooksConfig,
     pub(crate) hooks_need_trust: bool,
     pub(crate) mcp_need_trust: bool,
+    pub(crate) mcp_summaries: Vec<String>,
 }
 
 /// The trust review of a plain (non-scratch) creation in `path`, as
@@ -455,10 +475,12 @@ pub(crate) fn review_start_trust(
         }
         TrustSurface::Absent => Default::default(),
     };
+    let (hooks_need_trust, mcp_need_trust) = (trust.hooks.needs_trust(), trust.mcp.needs_trust());
     Ok(StartTrust {
         fingerprint: creation_trust_fingerprint(&base, &trust),
-        hooks_need_trust: trust.hooks.needs_trust(),
-        mcp_need_trust: trust.mcp.needs_trust(),
+        hooks_need_trust,
+        mcp_need_trust,
+        mcp_summaries: mcp_summaries(trust.mcp),
         merged_hooks: repo_config::apply_repo_hook_overrides(base, &repo_hooks),
     })
 }
@@ -517,16 +539,7 @@ pub async fn review_creation_trust(
                 }
                 TrustSurface::Absent => Default::default(),
             };
-            let mcp_summaries = match trust.mcp {
-                TrustSurface::Trusted(servers)
-                | TrustSurface::NeedsTrust {
-                    config: servers, ..
-                } => servers
-                    .iter()
-                    .map(|server| server.redacted_summary())
-                    .collect(),
-                TrustSurface::Absent => Vec::new(),
-            };
+            let mcp_summaries = mcp_summaries(trust.mcp);
             let (suggested_title, worktree_path_id) =
                 if let Some(branch) = body.generated_worktree_branch {
                     anyhow::ensure!(

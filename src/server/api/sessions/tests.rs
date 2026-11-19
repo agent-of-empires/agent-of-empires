@@ -11003,6 +11003,107 @@ async fn start_creates_the_session_from_the_preset_and_links_it() {
     assert_eq!(again["session_id"], started["session_id"]);
 }
 
+/// Start shows the hooks and MCP servers it needs approved, starts once they are
+/// approved at the reviewed fingerprint, and refuses a stale approval.
+#[tokio::test]
+#[serial_test::serial]
+async fn start_approves_reviewed_hooks_and_refuses_a_changed_review() {
+    use axum::response::IntoResponse;
+    let (_guards, state) = suggestion_state().await;
+    let repo = tempfile::tempdir().unwrap();
+    let config = repo.path().join(".agent-of-empires/config.toml");
+    std::fs::create_dir_all(config.parent().unwrap()).unwrap();
+    std::fs::write(&config, "[hooks]\non_create = [\"true\"]\n").unwrap();
+    std::fs::write(
+        repo.path().join(".mcp.json"),
+        r#"{ "mcpServers": { "fs": { "command": "mcp-fs" } } }"#,
+    )
+    .unwrap();
+    crate::session::projects::add(
+        "default",
+        crate::session::projects::ProjectScope::Global,
+        crate::session::projects::Project::new(
+            "repo",
+            repo.path().to_string_lossy(),
+            crate::session::projects::ProjectScope::Global,
+        ),
+        false,
+    )
+    .unwrap();
+    let host = state.plugin_host.clone().unwrap();
+    crate::server::api::suggestions_tests::seed_item_on(&host, "42", Some("acme/web"), "42");
+    host.with_suggestions_db(|conn, profile| {
+        crate::plugin::suggestions::put_mapping(
+            conn,
+            profile,
+            "acme.gh",
+            "acme/web",
+            &[repo.path().to_string_lossy().into_owned()],
+        )
+    })
+    .unwrap();
+    let start = |extra: serde_json::Value| {
+        let state = state.clone();
+        async move {
+            let mut body = serde_json::json!({ "provider_id": "acme.gh", "id": "42" });
+            body.as_object_mut()
+                .unwrap()
+                .extend(extra.as_object().unwrap().clone());
+            let body: crate::server::api::StartBody = serde_json::from_value(body).unwrap();
+            let response = crate::server::api::start_suggestion(
+                axum::extract::State(state),
+                Ok(axum::Json(body)),
+            )
+            .await
+            .into_response();
+            let status = response.status();
+            let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+                .await
+                .unwrap();
+            (
+                status,
+                serde_json::from_slice::<serde_json::Value>(&bytes).unwrap(),
+            )
+        }
+    };
+
+    let (status, review) = start(serde_json::json!({})).await;
+    assert_eq!(status, axum::http::StatusCode::CONFLICT, "{review}");
+    assert_eq!(review["error"], "hooks_need_trust");
+    assert_eq!(review["commands"]["on_create"], serde_json::json!(["true"]));
+    assert_eq!(review["needs_mcp_trust"], true);
+    assert_eq!(
+        review["mcp_summaries"].as_array().unwrap().len(),
+        1,
+        "{review}"
+    );
+    assert!(review["mcp_summaries"][0].as_str().unwrap().contains("fs"));
+
+    // The repo's hooks change after the review: the old approval is refused.
+    std::fs::write(&config, "[hooks]\non_create = [\"true\", \"echo more\"]\n").unwrap();
+    let approve = |review: &serde_json::Value| {
+        serde_json::json!({
+            "approve_hooks": true,
+            "review_fingerprint": review["review_fingerprint"],
+        })
+    };
+    let (status, stale) = start(approve(&review)).await;
+    assert_eq!(status, axum::http::StatusCode::CONFLICT, "{stale}");
+    assert_eq!(stale["error"], "trust_changed");
+
+    // Reviewed again, approving starts the Session.
+    let (_, fresh) = start(serde_json::json!({})).await;
+    assert_eq!(fresh["error"], "hooks_need_trust", "{fresh}");
+    let (status, started) = start(approve(&fresh)).await;
+    assert_eq!(status, axum::http::StatusCode::CREATED, "{started}");
+    assert!(state
+        .instances
+        .read()
+        .await
+        .iter()
+        .any(|i| i.id == started["session_id"]));
+}
+
 #[tokio::test]
 async fn create_rejects_a_suggestion_that_is_not_published() {
     let _home = crate::session::test_support::isolate_app_dir();
