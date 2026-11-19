@@ -73,9 +73,9 @@ pub(crate) fn spec_hash(spec: &SuggestionsSpec) -> String {
         .fold(String::new(), |acc, b| acc + &format!("{b:02x}"))
 }
 
-/// Every suggestion table, including the legacy `suggestion_policy`, dropped
-/// when the recorded schema version differs.
-const TABLES: [&str; 13] = [
+/// Every suggestion table, including the legacy `suggestion_policy` and
+/// `suggestion_templates`, dropped when the recorded schema version differs.
+const TABLES: [&str; 14] = [
     "suggestion_providers",
     "suggestion_items",
     "suggestion_sources",
@@ -88,6 +88,7 @@ const TABLES: [&str; 13] = [
     "suggestion_preferences",
     "suggestion_provider_prefs",
     "suggestion_policy",
+    "suggestion_templates",
     "suggestion_links",
 ];
 
@@ -354,6 +355,7 @@ mod tests {
                  PRIMARY KEY (profile, provider_id, item_id)
              );
              CREATE TABLE suggestion_policy (profile TEXT PRIMARY KEY);
+             CREATE TABLE suggestion_templates (profile TEXT PRIMARY KEY);
              CREATE TABLE suggestion_schema (id INTEGER PRIMARY KEY, version INTEGER NOT NULL);
              INSERT INTO suggestion_schema VALUES (1, 0);",
         )
@@ -364,14 +366,15 @@ mod tests {
             .query_row("SELECT version FROM suggestion_schema", [], |r| r.get(0))
             .unwrap();
         assert_eq!(version, SCHEMA_VERSION);
-        let policy: i64 = conn
+        let legacy: i64 = conn
             .query_row(
-                "SELECT COUNT(*) FROM sqlite_master WHERE name = 'suggestion_policy'",
+                "SELECT COUNT(*) FROM sqlite_master
+                 WHERE name IN ('suggestion_policy', 'suggestion_templates')",
                 [],
                 |r| r.get(0),
             )
             .unwrap();
-        assert_eq!(policy, 0);
+        assert_eq!(legacy, 0);
         // A matching version keeps the data.
         init(&conn).unwrap();
         assert_eq!(ids(&snap(&conn, "p")), ["a"]);
