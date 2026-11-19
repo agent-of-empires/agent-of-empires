@@ -326,7 +326,7 @@ mod tests {
         let mut observe = super::super::fetch::test_gate::install(&root, "leader-exit-observe");
         let mut command = Command::new("sh");
         command.args(["-c",
-            "printf %s $$ > leader; while [ ! -f start ]; do sleep 0.01; done; sleep 300 & printf %s $! > late; while [ ! -f release ]; do sleep 0.01; done; exit 0"])
+            "printf %s $$ > leader; while [ ! -f start ]; do sleep 0.01; done; { sleep 300; : ; } & printf %s $! > late; while [ ! -f release ]; do sleep 0.01; done; exit 0"])
             .current_dir(&root)
             .stdin(std::process::Stdio::null())
             .stdout(std::process::Stdio::null())
@@ -369,9 +369,9 @@ mod tests {
         })
         .await
         .unwrap();
-        // The leader publishes the background job's pid between fork and exec, and the
-        // macOS process identity changes on exec, so capture only once the leader is
-        // gone: the run is still parked at the gate and has not settled the group yet.
+        // The background job is a subshell that never execs, so its macOS process
+        // identity is stable from fork; capture it once the leader is gone, while the
+        // run is still parked at the gate and has not settled the group yet.
         let (late_pid, late) = captured(&root.join("late")).await;
         assert!(
             !late.exited().unwrap(),
