@@ -1110,6 +1110,7 @@ fn reserve_handoff_in(
             }),
             launch_required: row.ensure_startable().is_ok(),
             launch_started: false,
+            selector_ended: false,
             launch: None,
         }));
         Ok(HandoffKey {
@@ -1736,9 +1737,7 @@ fn drive_terminal_handoff(
                             );
                             intent.stage = HandoffStage::ProjectionCleanupOwed;
                             if ended {
-                                // Means "this switch's launch went ahead", which an ending makes
-                                // false even after an earlier attempt set it.
-                                intent.launch_started = false;
+                                intent.selector_ended = true;
                                 row.status = Status::Error;
                             }
                             Ok(())
@@ -1775,8 +1774,8 @@ fn drive_terminal_handoff(
                             crate::session::LifecycleReservationError::Superseded
                         );
                         // Read from disk, so a cleanup resumed after a failure or a restart still
-                        // reports a launch that was owed but never started.
-                        let ended = recorded.launch_required && !recorded.launch_started;
+                        // reports the ending.
+                        let ended = recorded.selector_ended;
                         recorded.ensure_original_stopped(&cleanup_id)?;
                         let mut target = cleanup_state
                             .acp_supervisor
@@ -5135,6 +5134,91 @@ mod tests {
         Ok(())
     }
 
+    /// A switch whose Terminal pane is already live adopts it without a launch, so its cleanup
+    /// completes rather than reporting the command-selector ending.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn a_switch_that_adopts_a_live_pane_without_a_launch_completes() -> anyhow::Result<()> {
+        let _home = crate::session::test_support::isolate_app_dir();
+        let home = std::path::PathBuf::from(std::env::var_os("HOME").unwrap());
+        let _store = crate::session::test_support::EnvGuard::set(&[(
+            "CLAUDE_CONFIG_DIR",
+            home.join(".claude"),
+        )]);
+        let argv = home.join("claude-argv");
+        let _claude = crate::session::test_support::install_login_shell_path_command(
+            &home,
+            "claude",
+            &format!(
+                "#!/bin/sh\necho \"$@\" >> {}\nexec sleep 60\n",
+                argv.display()
+            ),
+        );
+        crate::session::config::update_app_state(|state| {
+            state.has_acknowledged_agent_hooks = true
+        })?;
+        let project = tempfile::tempdir()?;
+        let mut row = structured_claude_row(
+            "live pane, no receipt",
+            project.path().to_str().unwrap(),
+            None,
+        );
+        row.command = "claude".into();
+        row.agent_session_id = Some("sid-held".into());
+        let name = crate::tmux::Session::generate_name(&row.id, &row.title);
+        let _pane = crate::tmux::test_helpers::TmuxTestSession::from_name(name.clone());
+        let mut args: Vec<String> = ["new-session", "-d", "-s", &name, "sleep 600"]
+            .map(String::from)
+            .into();
+        crate::tmux::utils::append_pane_base_index_args(&mut args, &name);
+        assert!(crate::tmux::tmux_command().args(&args).status()?.success());
+        let live = crate::tmux::first_pane_id(&name);
+        assert!(live.is_some());
+        crate::server::test_support::seed_instances_on_disk_for_test("default", vec![row.clone()]);
+        let state = crate::server::test_support::build_test_app_state_impl_with_event_store(
+            vec![row.clone()],
+            Vec::new(),
+            Vec::new(),
+            None,
+            Some(Arc::new(crate::acp::event_store::EventStore::open(
+                &project.path().join("events.db"),
+                100,
+            )?)),
+            |_| {},
+            |supervisor| supervisor,
+        );
+        crate::server::test_support::refresh_canonical_metadata_for_test(&state).await;
+
+        let response = acp_disable(
+            State(state.clone()),
+            Path(row.id.clone()),
+            axum::body::Bytes::from_static(b""),
+        )
+        .await
+        .into_response();
+        let status = response.status();
+        let body = axum::body::to_bytes(response.into_body(), 8192).await?;
+        assert_eq!(status, StatusCode::OK, "{body:?}");
+        let stored = crate::session::Storage::open_unwatched("default")?
+            .load()?
+            .into_iter()
+            .find(|r| r.id == row.id)
+            .unwrap();
+        assert!(stored.terminal_handoff.is_none());
+        assert_eq!(stored.view, View::Terminal);
+        assert_ne!(stored.status, Status::Error);
+        assert_eq!(
+            crate::tmux::first_pane_id(&name),
+            live,
+            "the live pane was kept"
+        );
+        let cached = find_instance(&state, &row.id).await.unwrap();
+        assert_ne!(cached.status, Status::Error);
+        assert!(cached.last_error.is_none());
+        assert!(!argv.exists(), "nothing was launched");
+        Ok(())
+    }
+
     /// A switch owed with the command's own selector beside AoE's id ends, whether or not a launch
     /// was already refused, and a restart without the selector launches. A pane an earlier attempt
     /// kept is adopted instead.
@@ -5418,6 +5502,12 @@ mod tests {
                 .as_ref()
                 .expect("cleanup still owed");
             assert_eq!(intent.stage, HandoffStage::ProjectionCleanupOwed);
+            assert_eq!(
+                intent.selector_ended,
+                *tried != Tried::KeptPane,
+                "{}",
+                held.title
+            );
             assert_eq!(pending.view, View::Terminal);
             db.execute_batch("DROP TRIGGER refuse_handoff_delete")?;
             if *resume == Resume::SwitchAdoptionFails {

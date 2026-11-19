@@ -162,6 +162,7 @@ mod tests {
             terminal: None,
             launch_required: false,
             launch_started: false,
+            selector_ended: false,
             launch: None,
         };
         let mut pending = serde_json::to_value(&row)?;
