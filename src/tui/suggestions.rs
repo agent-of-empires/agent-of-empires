@@ -121,6 +121,24 @@ struct Prepared {
     initial_prompt: String,
     tool: String,
     project: Option<PreparedProject>,
+    #[serde(default)]
+    view: Option<String>,
+    #[serde(default)]
+    worktree: bool,
+    #[serde(default)]
+    sandbox: bool,
+    #[serde(default)]
+    yolo: bool,
+}
+
+/// The kind's preset rows the New Session dialog starts from.
+#[derive(Debug, Clone, Copy, Default)]
+pub(super) struct Preset {
+    /// `None` leaves the dialog's own default view.
+    pub structured: Option<bool>,
+    pub worktree: bool,
+    pub sandbox: bool,
+    pub yolo: bool,
 }
 
 /// A suggestion resolved to a registered project, ready for the dialog.
@@ -135,6 +153,7 @@ pub(super) struct Start {
     pub title: String,
     pub initial_prompt: String,
     pub tool: String,
+    pub preset: Preset,
     /// Links the created Session to the suggestion; `None` for "Start another".
     pub suggestion: Option<crate::session::SuggestionOrigin>,
 }
@@ -466,6 +485,12 @@ fn start_for(snapshot: Option<&Snapshot>, key: &ItemKey, prepared: Prepared) -> 
         title: plain_line(&prepared.title),
         initial_prompt: plain(&prepared.initial_prompt),
         tool: prepared.tool,
+        preset: Preset {
+            structured: prepared.view.as_deref().map(|v| v == "structured"),
+            worktree: prepared.worktree,
+            sandbox: prepared.sandbox,
+            yolo: prepared.yolo,
+        },
         suggestion: Some(crate::session::SuggestionOrigin {
             provider_id: key.0.clone(),
             id: key.1.clone(),
@@ -1466,6 +1491,10 @@ impl SuggestionsFeed {
                         project: Some(PreparedProject {
                             path: "/tmp".into(),
                         }),
+                        view: Some("terminal".into()),
+                        worktree: true,
+                        sandbox: false,
+                        yolo: true,
                     }))
                 }
                 Req::Start {
@@ -1854,6 +1883,10 @@ mod tests {
             initial_prompt: "final prompt".into(),
             tool: "claude".into(),
             project: project.map(|path| PreparedProject { path: path.into() }),
+            view: None,
+            worktree: false,
+            sandbox: false,
+            yolo: false,
         }
     }
 

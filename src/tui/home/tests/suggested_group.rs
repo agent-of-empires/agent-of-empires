@@ -188,6 +188,8 @@ fn enter_on_a_suggestion_with_no_linked_project_opens_the_prefilled_dialog() {
     assert_eq!(data.path, "/tmp");
     assert_eq!(data.title, "Prepared title");
     assert_eq!(data.initial_prompt.as_deref(), Some("Prepared prompt"));
+    assert!(data.worktree_enabled, "the preset's worktree row");
+    assert!(data.yolo_mode, "the preset's yolo row");
 }
 
 #[test]

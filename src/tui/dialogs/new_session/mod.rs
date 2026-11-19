@@ -724,6 +724,27 @@ impl NewSessionDialog {
         self.suggested_title = title;
     }
 
+    /// Applies a preset's rows, each only as far as this form allows. Call after `set_tool`.
+    pub fn set_preset(
+        &mut self,
+        structured: Option<bool>,
+        worktree: bool,
+        sandbox: bool,
+        yolo: bool,
+    ) {
+        if let Some(structured) = structured.filter(|_| self.structured_capable) {
+            self.set_structured(structured);
+        }
+        if !self.selected_tool_host_only() {
+            self.worktree_enabled = worktree;
+            if sandbox && self.docker_available {
+                self.set_sandbox_enabled(true);
+                self.sandbox_dirty = true;
+            }
+        }
+        self.yolo_mode = yolo || self.yolo_mode;
+    }
+
     /// Set the first turn a plugin proposed, edited with Ctrl+O.
     pub fn set_suggestion(&mut self, prompt: String, origin: PromptOrigin) {
         self.prompt = Input::new(prompt);

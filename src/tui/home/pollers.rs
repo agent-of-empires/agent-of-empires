@@ -206,6 +206,12 @@ impl HomeView {
             None => dialog.require_path(),
         }
         dialog.set_tool(&start.tool);
+        dialog.set_preset(
+            start.preset.structured,
+            start.preset.worktree,
+            start.preset.sandbox,
+            start.preset.yolo,
+        );
         dialog.set_title(start.title);
         dialog.set_suggestion(
             start.initial_prompt,
