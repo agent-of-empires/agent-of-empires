@@ -75,7 +75,7 @@ pub(crate) fn spec_hash(spec: &SuggestionsSpec) -> String {
 
 /// Every suggestion table, including the legacy `suggestion_policy`, dropped
 /// when the recorded schema version differs.
-const TABLES: [&str; 12] = [
+const TABLES: [&str; 13] = [
     "suggestion_providers",
     "suggestion_items",
     "suggestion_sources",
@@ -88,6 +88,7 @@ const TABLES: [&str; 12] = [
     "suggestion_preferences",
     "suggestion_provider_prefs",
     "suggestion_policy",
+    "suggestion_links",
 ];
 
 pub(crate) fn init(conn: &Connection) -> rusqlite::Result<()> {
@@ -184,6 +185,15 @@ pub(crate) fn init(conn: &Connection) -> rusqlite::Result<()> {
              refresh_minutes INTEGER NOT NULL DEFAULT 15,
              show_source_ref INTEGER NOT NULL DEFAULT 1
          );
+         CREATE TABLE IF NOT EXISTS suggestion_links (
+             profile     TEXT NOT NULL,
+             provider_id TEXT NOT NULL,
+             item_id     TEXT NOT NULL,
+             holder      TEXT NOT NULL,
+             pending     INTEGER NOT NULL,
+             claimed_at  INTEGER NOT NULL,
+             PRIMARY KEY (profile, provider_id, item_id)
+         );
          CREATE TABLE IF NOT EXISTS suggestion_provider_prefs (
              profile     TEXT NOT NULL,
              provider_id TEXT NOT NULL,
@@ -228,12 +238,14 @@ fn effective_enabled(
 }
 
 mod ingest;
+mod links;
 mod prefs;
 mod prepare;
 mod preset;
 mod store;
 
 pub(crate) use ingest::*;
+pub(crate) use links::*;
 pub(crate) use prefs::*;
 pub(crate) use prepare::*;
 pub(crate) use preset::*;

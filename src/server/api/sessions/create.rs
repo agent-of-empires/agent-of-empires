@@ -808,6 +808,124 @@ pub(super) async fn wait_until_left_starting(
     }
 }
 
+/// The primary link a create holds until it settles: `(origin, claim token)`.
+pub(super) type SuggestionLink = (crate::session::SuggestionOrigin, String);
+
+/// Claims the primary link of the suggestion a Session starts from. A second
+/// start of the same item is refused with 409 `already_started`.
+pub(super) async fn claim_suggestion_link(
+    state: &Arc<AppState>,
+    origin: Option<&crate::session::SuggestionOrigin>,
+) -> Result<Option<SuggestionLink>, axum::response::Response> {
+    use crate::plugin::suggestions::Claim;
+    let (Some(origin), Some(host)) = (origin, state.plugin_host.clone()) else {
+        return Ok(None);
+    };
+    let Some(profile) = origin.profile.clone() else {
+        return Ok(None);
+    };
+    let live: std::collections::HashSet<String> = state
+        .instances
+        .read()
+        .await
+        .iter()
+        .filter(|i| !i.is_trashed())
+        .map(|i| i.id.clone())
+        .collect();
+    let token = uuid::Uuid::new_v4().to_string();
+    let (item, claim_token) = (origin.clone(), token.clone());
+    let claimed = tokio::task::spawn_blocking(move || {
+        host.with_suggestions_db(|conn, _| {
+            crate::plugin::suggestions::claim_link(
+                conn,
+                &profile,
+                &item.provider_id,
+                &item.id,
+                &claim_token,
+                &live,
+                chrono::Utc::now().timestamp(),
+            )
+        })
+    })
+    .await;
+    match claimed {
+        Ok(Ok(Claim::Won)) => Ok(Some((origin.clone(), token))),
+        Ok(Ok(Claim::Session(session_id))) => Err((
+            StatusCode::CONFLICT,
+            Json(serde_json::json!({
+                "error": "already_started",
+                "message": "This suggestion already has a Session",
+                "session_id": session_id,
+            })),
+        )
+            .into_response()),
+        Ok(Ok(Claim::Starting)) => Err((
+            StatusCode::CONFLICT,
+            Json(serde_json::json!({
+                "error": "already_started",
+                "message": "This suggestion is already starting",
+                "session_id": null,
+            })),
+        )
+            .into_response()),
+        Ok(Err(error)) => Err(api_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "internal",
+            error.to_string(),
+        )),
+        Err(error) => Err(api_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "internal",
+            error.to_string(),
+        )),
+    }
+}
+
+/// Records the created Session on its claimed link, or frees the link when the
+/// create failed (`session_id` is `None`).
+pub(super) async fn settle_suggestion_link(
+    state: &Arc<AppState>,
+    link: Option<&SuggestionLink>,
+    session_id: Option<&str>,
+) {
+    let (Some((origin, token)), Some(host)) = (link, state.plugin_host.clone()) else {
+        return;
+    };
+    let Some(profile) = origin.profile.clone() else {
+        return;
+    };
+    let (origin, token, session_id) = (origin.clone(), token.clone(), session_id.map(String::from));
+    let settled = tokio::task::spawn_blocking(move || {
+        host.with_suggestions_db(|conn, _| match &session_id {
+            Some(id) => crate::plugin::suggestions::settle_link(
+                conn,
+                &profile,
+                &origin.provider_id,
+                &origin.id,
+                &token,
+                id,
+            ),
+            None => crate::plugin::suggestions::release_link(
+                conn,
+                &profile,
+                &origin.provider_id,
+                &origin.id,
+                &token,
+            ),
+        })
+    })
+    .await;
+    match settled {
+        Ok(Ok(())) => {}
+        Ok(Err(error)) => {
+            tracing::warn!(target: "plugin.suggestions", %error, "could not update a suggestion link");
+        }
+        Err(error) => {
+            tracing::warn!(target: "plugin.suggestions", %error, "suggestion link task failed");
+        }
+    }
+}
+
 pub async fn create_session(
     State(state): State<Arc<AppState>>,
     axum::extract::Query(query): axum::extract::Query<CreateSessionQuery>,
@@ -1561,6 +1679,13 @@ pub(crate) async fn create_session_with(
         progress: Some(Arc::clone(&progress)),
     };
 
+    // A suggestion has one primary Session: claim its link before provisioning
+    // anything, and free it again if the create fails.
+    let link = match claim_suggestion_link(&state, spec.suggestion.as_ref()).await {
+        Ok(link) => link,
+        Err(response) => return response,
+    };
+
     // Detached so a client that drops the connection mid-create (a backgrounded
     // mobile tab) cannot cancel it between persisting and publishing. The guard
     // and registration move with it, so a retry with the same key waits for
@@ -1596,6 +1721,7 @@ pub(crate) async fn create_session_with(
     match created {
         Ok((outcome, _created)) => {
             let instance = outcome.instance;
+            settle_suggestion_link(&state, link.as_ref(), Some(&instance.id)).await;
             if wait_ready && instance.status == Status::Starting {
                 let _ = wait_until_left_starting(&state, &instance.id, WAIT_READY_TIMEOUT).await;
             }
@@ -1604,6 +1730,7 @@ pub(crate) async fn create_session_with(
             created_session_response(&state, &instance.id, warnings, StatusCode::CREATED).await
         }
         Err(e) => {
+            settle_suggestion_link(&state, link.as_ref(), None).await;
             // A failed creation can still have committed and rolled back
             // durable state (a borrowed row the rollback released, a profile
             // adopted by a peer). `adopt_committed_profiles` only requests a
