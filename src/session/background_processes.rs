@@ -507,22 +507,23 @@ fn redacted(arg: &str, hide: &mut Hide) -> String {
     {
         return format!("{name}: {REDACTED}");
     }
-    // Before the word split below, so a value with spaces (`--token=alpha beta`) is hidden whole.
-    if let Some((name, _)) = arg
-        .split_once('=')
-        .filter(|(name, _)| !name.contains(char::is_whitespace) && secret_name(name))
-    {
-        return format!("{name}={REDACTED}");
-    }
     if arg.contains(char::is_whitespace) {
-        // A process that rewrites its title can report several words as one argument.
+        // Several words in one argument: a rewritten title, or a value with spaces. Where a
+        // secret's value ends is unknown, so nothing after a blanked word is shown.
         let mut words = Vec::new();
-        for word in arg.split_whitespace() {
-            if word.strip_suffix(':').is_some_and(secret_name) {
-                words.extend([word.to_owned(), REDACTED.to_owned()]);
-                break;
+        let mut rest = arg.split_whitespace().peekable();
+        while let Some(word) = rest.next() {
+            let shown = redacted(word, hide);
+            if shown == word {
+                words.push(shown);
+                continue;
             }
-            words.push(redacted(word, hide));
+            let hides_rest = shown.ends_with(REDACTED);
+            words.push(shown);
+            if !hides_rest && rest.peek().is_some() {
+                words.push(REDACTED.to_owned());
+            }
+            break;
         }
         return words.join(" ");
     }
@@ -1093,10 +1094,31 @@ mod tests {
                     "DATABASE_URL=mysql://u:***@h",
                 ],
             ),
-            // A process that rewrote its title reports its words as one argument.
             (
-                &["node server.js --token abc -H Authorization: Bearer x"],
-                &["node server.js --token *** -H Authorization: ***"],
+                &["curl", "--user=admin:top secret", "-uadmin:top secret"],
+                &["curl", "--user=admin:***", "-uadmin:***"],
+            ),
+            // A process that rewrote its title reports its words as one argument. Nothing after a
+            // blanked word is shown, since the value may hold spaces.
+            (
+                &["node server.js --token=alpha beta --verbose"],
+                &["node server.js --token=***"],
+            ),
+            (
+                &["node server.js --token alpha beta -H Authorization: Bearer x"],
+                &["node server.js --token ***"],
+            ),
+            (
+                &["worker -H Authorization: Bearer x"],
+                &["worker -H Authorization: ***"],
+            ),
+            (
+                &["sync postgres://u:pw@db/app --verbose"],
+                &["sync postgres://u:***@db/app ***"],
+            ),
+            (
+                &["node server.js --port 3000"],
+                &["node server.js --port 3000"],
             ),
             // Not secrets: a key-like word that isn't a flag, a path, `-p` (a port or a prompt), a
             // URL without a password, a `-u` that takes no pair.
