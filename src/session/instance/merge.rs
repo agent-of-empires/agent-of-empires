@@ -490,6 +490,7 @@ impl Instance {
         self.last_accessed_at = self.last_accessed_at.max(post.last_accessed_at);
 
         let archived_changed = pre.archived_at != post.archived_at;
+        let ignored_changed = pre.ignored_at != post.ignored_at;
         let favorited_changed = pre.favorited_at != post.favorited_at;
         let snoozed_changed = pre.snoozed_until != post.snoozed_until;
         let pinned_changed = pre.pinned_at != post.pinned_at;
@@ -513,6 +514,10 @@ impl Instance {
         // snooze(): snoozed=Some => ignored=None, pinned=None.
         if snoozed_changed && post.snoozed_until.is_some() {
             self.ignored_at = None;
+            self.pinned_at = None;
+        }
+        // ignore(): ignored=Some => pinned=None.
+        if ignored_changed && post.ignored_at.is_some() {
             self.pinned_at = None;
         }
         // pin(): pinned=Some => archived=None, ignored=None, snoozed=None.
@@ -1273,6 +1278,13 @@ mod tests {
                 |i| i.ignore(),
                 |_| {},
                 &[(ignored, true)],
+            ),
+            (
+                "tui ignore clears peer pin",
+                |_| {},
+                |i| i.ignore(),
+                |i| i.pin(),
+                &[(ignored, true), (pinned, false)],
             ),
             (
                 "tui pin beats peer ignore",

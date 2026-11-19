@@ -2056,6 +2056,47 @@ fn favorite_gutter_follows_pin_predicate() {
             text_attention
         );
     }
+
+    // Ignore prefix is Attention-only too.
+    {
+        use crate::session::config::SortOrder;
+
+        let mut env = create_test_env_with_sessions(1);
+        let id = env.view.instance_at(0).id.clone();
+        env.view.mutate_instance(&id, |inst| inst.ignore());
+
+        env.view.sort_order = SortOrder::Newest;
+        env.view.flat_items = env.view.build_flat_items();
+        let item_newest = env
+            .view
+            .flat_items
+            .iter()
+            .find(|i| matches!(i, Item::Session { id: sid, .. } if *sid == id))
+            .cloned()
+            .expect("session item present in Newest sort");
+        let text_newest = rendered_row_text(&env.view, &item_newest);
+        assert!(
+            !text_newest.contains("i "),
+            "ignore prefix must be hidden outside Attention sort; got: {:?}",
+            text_newest
+        );
+
+        env.view.sort_order = SortOrder::Attention;
+        env.view.flat_items = env.view.build_flat_items();
+        let item_attention = env
+            .view
+            .flat_items
+            .iter()
+            .find(|i| matches!(i, Item::Session { id: sid, .. } if *sid == id))
+            .cloned()
+            .expect("session item present in Attention sort");
+        let text_attention = rendered_row_text(&env.view, &item_attention);
+        assert!(
+            text_attention.contains("i "),
+            "ignore prefix must surface in Attention sort; got: {:?}",
+            text_attention
+        );
+    }
 }
 
 /// Archived sessions live under the synthetic "Archived" section pinned to
@@ -2481,14 +2522,23 @@ fn every_view_mode_paints_the_same_sunk_row_decoration() {
         ];
     });
 
-    // (label, archived, snoozed, expected title prefix, extra modifiers)
+    // (label, archived, snoozed, ignored, expected title prefix, extra modifiers)
     let cases = [
-        ("archived", true, false, "", Modifier::empty()),
+        ("archived", true, false, false, "", Modifier::empty()),
         (
             "snoozed",
             false,
             true,
+            false,
             "z ",
+            Modifier::ITALIC | Modifier::DIM,
+        ),
+        (
+            "ignored",
+            false,
+            false,
+            true,
+            "i ",
             Modifier::ITALIC | Modifier::DIM,
         ),
     ];
@@ -2506,6 +2556,7 @@ fn every_view_mode_paints_the_same_sunk_row_decoration() {
             inst.status = Status::Running;
             inst.archived_at = None;
             inst.snoozed_until = None;
+            inst.ignored_at = None;
         });
         let live = env
             .view
@@ -2517,7 +2568,7 @@ fn every_view_mode_paints_the_same_sunk_row_decoration() {
              the sink assertions below would be vacuous"
         );
 
-        for (label, archived, snoozed, prefix, extra) in cases {
+        for (label, archived, snoozed, ignored, prefix, extra) in cases {
             // Status stays Running so the live-glyph branch would fire in
             // every mode if the sink override were missing.
             env.view.mutate_instance(&id, |inst| {
@@ -2525,6 +2576,7 @@ fn every_view_mode_paints_the_same_sunk_row_decoration() {
                 inst.archived_at = archived.then(chrono::Utc::now);
                 inst.snoozed_until =
                     snoozed.then(|| chrono::Utc::now() + chrono::Duration::minutes(15));
+                inst.ignored_at = ignored.then(chrono::Utc::now);
             });
 
             let line = env
@@ -2564,6 +2616,7 @@ fn every_view_mode_paints_the_same_sunk_row_decoration() {
                 inst.status = status;
                 inst.archived_at = Some(chrono::Utc::now());
                 inst.snoozed_until = None;
+                inst.ignored_at = None;
             });
             let line = env
                 .view

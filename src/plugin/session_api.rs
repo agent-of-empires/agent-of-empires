@@ -732,6 +732,16 @@ async fn sessions_turn_send(
                     blocked.to_string(),
                 ));
             }
+            PromptTouch::Ignored => {
+                if marked_pending {
+                    clear_revival_pending(&deps.session_service, &req.session_id).await;
+                }
+                return Err(DispatchError::with_kind(
+                    codes::FAILED_PRECONDITION,
+                    "ignored",
+                    "The session is ignored because another session manages it",
+                ));
+            }
         };
         let dispatch = deps
             .session_service
@@ -972,6 +982,13 @@ async fn deliver_structured(
         PromptTouch::RevivalRefused => return Err(map_send_error(SendTurnError::RevivalRefused)),
         PromptTouch::WorkerNotReady => return Err(map_send_error(SendTurnError::WorkerNotReady)),
         PromptTouch::Blocked(blocked) => return Err(blocked_error(blocked)),
+        PromptTouch::Ignored => {
+            return Err(DispatchError::with_kind(
+                codes::FAILED_PRECONDITION,
+                "ignored",
+                "The session is ignored because another session manages it",
+            ))
+        }
     };
     let was_running = service.acp_supervisor.is_running(id).await;
     let dispatch = service

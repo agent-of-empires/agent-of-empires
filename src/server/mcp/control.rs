@@ -460,6 +460,7 @@ impl McpServer {
                 prompt_id: None,
                 queued_prompt_id: None,
                 no_revive: false,
+                refuse_if_ignored: true,
             };
             let submitted = submit_prompt(&self.state, &SessionCaller::User, &id, submission)
                 .await
@@ -869,6 +870,11 @@ fn prompt_refusal(id: &str, error: PromptSubmitError) -> CallToolResult {
             tool_error("busy", message)
         }
         PromptSubmitError::Blocked(blocked) => tool_error("invalid_request", blocked.to_string()),
+        PromptSubmitError::Ignored => tool_error(
+            "ignored",
+            "The session is ignored because another session manages it. A person must \
+             reclaim ownership or unignore it before MCP sends a prompt.",
+        ),
         // The prompt stays queued and goes out after the login; resending would queue it twice.
         PromptSubmitError::LoginRequired { blocked, queued_id } => tool_error(
             "send_failed",

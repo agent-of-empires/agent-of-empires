@@ -440,8 +440,8 @@ fn spinner_idle_fresh(
         .current_frame()
 }
 
-/// Structured view row icon for a session. Centralizes the archive/snooze override that
-/// kills the live spinner for sunk rows so the list reads as parked. Crate-visible so
+/// Structured view row icon for a session. Centralizes the archive/snooze/ignore override
+/// that kills the live spinner for sunk rows so the list reads as parked. Crate-visible so
 /// tests can pin the override without the full render pipeline.
 pub(crate) fn agent_row_icon(inst: &crate::session::Instance) -> &'static str {
     // A dormant (idle-reaped, resumable) structured worker gets its own glyph, taking
@@ -465,7 +465,7 @@ pub(crate) fn agent_row_icon(inst: &crate::session::Instance) -> &'static str {
     if matches!(inst.status, Status::Error | Status::Deleting) {
         return icon;
     }
-    if inst.is_archived() || inst.is_snoozed() || inst.is_trashed() {
+    if inst.is_archived() || inst.is_snoozed() || inst.is_ignored() || inst.is_trashed() {
         ICON_STOPPED
     } else {
         icon

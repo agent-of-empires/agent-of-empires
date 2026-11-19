@@ -2718,9 +2718,17 @@ async fn ignore_refuses_an_archived_or_trashed_session() -> anyhow::Result<()> {
         crate::server::reload::load_all_profiles(&state.file_watch)?.metadata;
     state.runtime.publish(&state).await?;
 
-    for (id, expected) in [
-        (archived_id.clone(), "session_archived"),
-        (trashed_id.clone(), "session_trashed"),
+    for (id, expected, message) in [
+        (
+            archived_id.clone(),
+            "session_archived",
+            "An archived session cannot be ignored; unarchive it first",
+        ),
+        (
+            trashed_id.clone(),
+            "session_trashed",
+            "A session in trash cannot be ignored; restore it first",
+        ),
     ] {
         let response = update_session_ignored(
             State(state.clone()),
@@ -2733,6 +2741,7 @@ async fn ignore_refuses_an_archived_or_trashed_session() -> anyhow::Result<()> {
         let body = to_bytes(response.into_body(), usize::MAX).await?;
         let json: serde_json::Value = serde_json::from_slice(&body)?;
         assert_eq!(json["error"], expected);
+        assert_eq!(json["message"], message, "{expected}");
     }
 
     let stored = storage.load()?;

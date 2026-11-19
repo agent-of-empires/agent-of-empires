@@ -1427,7 +1427,7 @@ mod tests {
     }
 
     #[test]
-    fn attention_tiers_archive_and_snooze() {
+    fn attention_tiers_archive_snooze_and_ignore() {
         let mut waiting = with_status("w", "", Status::Waiting);
         assert_eq!(attention_tier(&waiting), 0);
         waiting.archive();
@@ -1461,6 +1461,12 @@ mod tests {
         snoozed.snooze(30);
         snoozed.unsnooze();
         assert!(snoozed.snoozed_until.is_none());
+
+        let mut ignored = with_status("g", "", Status::Waiting);
+        ignored.ignore();
+        assert_eq!(attention_tier(&ignored), 99, "ignore sinks a live row");
+        ignored.unignore();
+        assert_eq!(attention_tier(&ignored), 0, "unignore releases the tier");
     }
 
     #[test]
@@ -1484,9 +1490,11 @@ mod tests {
         let mut archived = with_status("aw", "", Status::Waiting);
         archived.archive();
         let idle = with_status("i", "", Status::Idle);
-        let mut sessions = vec![&waiting, &errored, &archived, &idle];
+        let mut ignored = with_status("iw", "", Status::Waiting);
+        ignored.ignore();
+        let mut sessions = vec![&waiting, &errored, &archived, &ignored, &idle];
         sort_sessions(&mut sessions, SortOrder::Attention);
-        assert_eq!(titles(&sessions), ["w", "e", "i", "aw"]);
+        assert_eq!(titles(&sessions), ["w", "e", "i", "aw", "iw"]);
     }
 
     #[test]
@@ -1596,7 +1604,7 @@ mod tests {
     }
 
     #[test]
-    fn live_favorite_excludes_snoozed_archived_and_trashed() {
+    fn live_favorite_excludes_snoozed_ignored_archived_and_trashed() {
         let now = Utc::now();
         let mut fav = inst("fav", "work");
         fav.favorite();
@@ -1623,6 +1631,16 @@ mod tests {
         trashed.favorited_at = Some(now);
         trashed.trashed_at = Some(now);
         assert!(!is_live_favorite(&archived) && !is_live_favorite(&trashed));
+
+        let mut ignored = inst("ignored", "work");
+        ignored.favorite();
+        ignored.ignore();
+        assert!(ignored.is_favorited(), "ignore must not clear the star");
+        assert!(!is_live_favorite(&ignored));
+        assert!(
+            !has_live_favorite("work", std::slice::from_ref(&ignored)),
+            "an ignored favorite must not pin its group"
+        );
     }
 
     #[test]

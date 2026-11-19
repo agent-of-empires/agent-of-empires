@@ -115,6 +115,23 @@ pub async fn update_session_favorite(
     crate::server::runtime::session_mutation_response(&state, &id, None::<()>).await
 }
 
+/// 409 for ignore refusing a sunk row. The codes stay the ones clients already
+/// switch on; the message names ignore instead of a start.
+fn ignore_blocked_response(blocked: crate::session::StartBlocked) -> axum::response::Response {
+    use crate::daemon::ApiErrorCode;
+    let (code, message) = match blocked {
+        crate::session::StartBlocked::Archived => (
+            ApiErrorCode::SessionArchived,
+            "An archived session cannot be ignored; unarchive it first",
+        ),
+        crate::session::StartBlocked::Trashed => (
+            ApiErrorCode::SessionTrashed,
+            "A session in trash cannot be ignored; restore it first",
+        ),
+    };
+    crate::server::api::api_error_with_code_header(code, message)
+}
+
 /// Ignore or unignore a session managed by another session. The row stays
 /// live and present; archive, snooze, and trash are untouched. Ignoring
 /// requires a manager and refuses an archived or trashed session because
@@ -146,7 +163,7 @@ pub async fn update_session_ignored(
         // Archive and trash outrank ignore; ignoring a sunk row would persist a state
         // the rest of the dashboard reads as archived or trashed.
         if body.ignored && (instance.is_archived() || instance.is_trashed()) {
-            return crate::server::api::start_blocked_response(if instance.is_trashed() {
+            return ignore_blocked_response(if instance.is_trashed() {
                 crate::session::StartBlocked::Trashed
             } else {
                 crate::session::StartBlocked::Archived

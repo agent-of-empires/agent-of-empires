@@ -423,6 +423,10 @@ pub(crate) enum PromptTouch {
     RevivalRefused,
     /// The session is archived or trashed; refused before any mutation.
     Blocked(crate::session::StartBlocked),
+    /// The caller refuses ignored rows and this one is ignored; refused before
+    /// any mutation. Checked under the per-session lock, so an ignore that
+    /// committed after the caller's own read still wins.
+    Ignored,
     WorkerNotReady,
 }
 
@@ -852,6 +856,28 @@ impl SessionService {
     /// (#4081 review: a client-side liveness check before this call would
     /// race a concurrent archive, snooze, or wake).
     pub(crate) async fn touch_and_wake_on_prompt(&self, id: &str, no_revive: bool) -> PromptTouch {
+        self.touch_and_wake_on_prompt_with(id, no_revive, false)
+            .await
+    }
+
+    /// Like [`Self::touch_and_wake_on_prompt`], but refuses an ignored row under
+    /// the instance lock. MCP sends use this so a concurrent ignore is never
+    /// cleared by the send.
+    pub(crate) async fn touch_and_wake_on_prompt_refusing_ignored(
+        &self,
+        id: &str,
+        no_revive: bool,
+    ) -> PromptTouch {
+        self.touch_and_wake_on_prompt_with(id, no_revive, true)
+            .await
+    }
+
+    async fn touch_and_wake_on_prompt_with(
+        &self,
+        id: &str,
+        no_revive: bool,
+        refuse_if_ignored: bool,
+    ) -> PromptTouch {
         let Ok(state) = self.native_state() else {
             return PromptTouch::WorkerNotReady;
         };
@@ -859,13 +885,20 @@ impl SessionService {
         let service = state.session_service.clone();
         let id = id.to_owned();
         work.run("server.prompt_touch", async move {
-            service.touch_and_wake_on_prompt_inner(&id, no_revive).await
+            service
+                .touch_and_wake_on_prompt_inner(&id, no_revive, refuse_if_ignored)
+                .await
         })
         .await
         .unwrap_or(PromptTouch::WorkerNotReady)
     }
 
-    async fn touch_and_wake_on_prompt_inner(&self, id: &str, no_revive: bool) -> PromptTouch {
+    async fn touch_and_wake_on_prompt_inner(
+        &self,
+        id: &str,
+        no_revive: bool,
+        refuse_if_ignored: bool,
+    ) -> PromptTouch {
         let Ok(state) = self.native_state() else {
             return PromptTouch::WorkerNotReady;
         };
@@ -909,6 +942,9 @@ impl SessionService {
                         .into_iter()
                         .find(|row| row.id == worker_id)
                         .ok_or(crate::session::SessionGone)?;
+                    if refuse_if_ignored && row.is_ignored() {
+                        return Ok(Err(PromptTouch::Ignored));
+                    }
                     if let Some(outcome) = prompt_touch_rejection(
                         &row,
                         generation,
@@ -976,6 +1012,10 @@ impl SessionService {
             let committed = store.update(|rows, _| {
                 let row = rows.iter_mut().find(|row| row.id == worker_id)
                     .ok_or(crate::session::SessionGone)?;
+                if refuse_if_ignored && row.is_ignored() {
+                    refused = Some(PromptTouch::Ignored);
+                    anyhow::bail!(crate::session::LifecycleReservationError::Superseded);
+                }
                 if let Some(outcome) = prompt_touch_rejection(
                     row, generation, &title, provider.as_deref(), view, no_revive,
                 ) {
@@ -5094,6 +5134,7 @@ mod tests {
         for reason in [
             "archived",
             "trashed",
+            "ignored",
             "no_revive",
             "unfinished",
             "superseded",
@@ -5106,6 +5147,7 @@ mod tests {
             match reason {
                 "archived" => persisted.archive(),
                 "trashed" => persisted.trash(),
+                "ignored" => persisted.ignore(),
                 "unfinished" => persisted.status = crate::session::Status::Creating,
                 "superseded" => persisted.lifecycle_generation += 1,
                 _ => {}
@@ -5122,10 +5164,17 @@ mod tests {
             let memory_before = serde_json::to_value(&visible).unwrap();
             let disk_before = std::fs::read(storage.sessions_path()).unwrap();
             let mut status_rx = state.status_tx.subscribe();
-            let outcome = state
-                .session_service
-                .touch_and_wake_on_prompt(&visible.id, reason == "no_revive")
-                .await;
+            let outcome = if reason == "ignored" {
+                state
+                    .session_service
+                    .touch_and_wake_on_prompt_refusing_ignored(&visible.id, false)
+                    .await
+            } else {
+                state
+                    .session_service
+                    .touch_and_wake_on_prompt(&visible.id, reason == "no_revive")
+                    .await
+            };
             match reason {
                 "archived" => assert!(matches!(
                     outcome,
@@ -5135,6 +5184,7 @@ mod tests {
                     outcome,
                     PromptTouch::Blocked(crate::session::StartBlocked::Trashed)
                 )),
+                "ignored" => assert!(matches!(outcome, PromptTouch::Ignored)),
                 "no_revive" => assert!(matches!(outcome, PromptTouch::RevivalRefused)),
                 _ => assert!(matches!(outcome, PromptTouch::WorkerNotReady)),
             }
