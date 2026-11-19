@@ -1,4 +1,5 @@
 import { useEffect, useRef, useState, type ReactNode } from "react";
+import { FROM_OTHER_PEOPLE_NOTE, fromOtherPeople } from "../../lib/suggestionKinds";
 import { DndContext, PointerSensor, closestCenter, useSensor, useSensors, type DragEndEvent } from "@dnd-kit/core";
 import { SortableContext, arrayMove, useSortable, verticalListSortingStrategy } from "@dnd-kit/sortable";
 import { CSS } from "@dnd-kit/utilities";
@@ -333,6 +334,9 @@ export function SuggestionsSettings({
                       {source.label}
                     </div>
                     <div className="truncate text-xs text-text-dim">{summary}</div>
+                    {fromOtherPeople(source.criterion) && (
+                      <div className="text-xs text-text-dim">{FROM_OTHER_PEOPLE_NOTE}</div>
+                    )}
                   </div>
                   <button
                     type="button"
