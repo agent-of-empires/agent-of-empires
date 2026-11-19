@@ -151,9 +151,11 @@ fn a_typed_prompt_is_submitted_without_a_suggestion_and_has_no_source() {
 
     let mut dialog = single_tool_dialog();
     let screen = screen_of(&mut dialog, 100, 40);
-    assert!(screen.contains("Prompt: none"), "{screen}");
-    assert!(screen.contains("Ctrl+O add"), "{screen}");
-    assert!(!screen.contains("not checked by AoE"));
+    assert!(
+        !screen.contains("Prompt"),
+        "a blank session shows no prompt line: {screen}"
+    );
+    assert!(!screen.contains("Ctrl+O"), "{screen}");
 
     dialog.handle_key(ctrl_key(KeyCode::Char('o')));
     let screen = screen_of(&mut dialog, 100, 40);
