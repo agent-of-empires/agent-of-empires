@@ -1011,6 +1011,7 @@
       "components": [
         "web/src/components/SuggestionsView.tsx",
         "web/src/components/SuggestionRow.tsx",
+        "web/src/components/SuggestionHooksReview.tsx",
         "web/src/components/SuggestionItemActions.tsx",
         "web/src/components/SuggestionStartMenu.tsx",
         "web/src/components/SuggestionFilterMenu.tsx",
