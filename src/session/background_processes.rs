@@ -324,9 +324,13 @@ pub(crate) fn census(
     )
 }
 
-/// Whether `flag` is a shell's `-c` (alone or among other short flags, as in `-lc`).
+/// Whether `flag` is a shell's `-c` (alone or among other short flags, as in `-lc`), or fish's
+/// `--command`, with its script after it or attached (`--command=…`).
 fn runs_command(sample: &CommandSample, flag: &str) -> bool {
-    is_shell(sample) && flag.starts_with('-') && !flag.starts_with("--") && flag.contains('c')
+    is_shell(sample)
+        && ((flag.starts_with('-') && !flag.starts_with("--") && flag.contains('c'))
+            || flag == "--command"
+            || flag.starts_with("--command="))
 }
 
 fn is_shell(sample: &CommandSample) -> bool {
@@ -362,7 +366,16 @@ fn named_command(tree: &[CommandSample], shell: &CommandSample) -> Vec<String> {
             .skip(1)
             .position(|arg| runs_command(shell, arg));
         match script_flag {
-            Some(at) => shell.argv[..at + 2].to_vec(),
+            Some(at) => {
+                let mut shown = shell.argv[..at + 1].to_vec();
+                shown.push(
+                    shell.argv[at + 1]
+                        .split_once('=')
+                        .map_or(shell.argv[at + 1].as_str(), |(flag, _)| flag)
+                        .to_owned(),
+                );
+                shown
+            }
             None => shell.argv.clone(),
         }
     })
@@ -904,8 +917,20 @@ mod tests {
                 &["bash", "script.sh", "--token", "y"],
                 &["bash", "script.sh", "--token", "y"],
             ),
+            (
+                &["fish", "--command", "cli --token abc; read"],
+                &["fish", "--command"],
+            ),
+            (
+                &["fish", "--command=cli --token abc; read"],
+                &["fish", "--command"],
+            ),
+            (
+                &["fish", "--no-config", "--command=cli --token abc"],
+                &["fish", "--no-config", "--command"],
+            ),
         ] {
-            let plain = sample(31, 20, "/usr/bin/bash", argv);
+            let plain = sample(31, 20, &format!("/usr/bin/{}", argv[0]), argv);
             assert_eq!(
                 named_command(std::slice::from_ref(&plain), &plain),
                 shown,
