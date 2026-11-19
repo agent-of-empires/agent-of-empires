@@ -461,15 +461,21 @@ impl AnchoredDir {
 
     /// Follow ancestors, but never a symlink at the anchor leaf or below it.
     pub(crate) fn open(path: &Path) -> Result<Self> {
-        Self::open_with_root_links(path, false)
+        Self::open_with_root_links(path, false, false)
+    }
+
+    /// Like `open`, but on Linux a search-only root or parent yields an
+    /// `O_PATH` descriptor, which cannot be fsynced.
+    pub(crate) fn open_traversal(path: &Path) -> Result<Self> {
+        Self::open_with_root_links(path, false, true)
     }
 
     /// Follow a user-managed profile reference, retaining its pathname for revalidation.
     pub(crate) fn open_reference(path: &Path) -> Result<Self> {
-        Self::open_with_root_links(path, true)
+        Self::open_with_root_links(path, true, false)
     }
 
-    fn open_with_root_links(path: &Path, follow_root: bool) -> Result<Self> {
+    fn open_with_root_links(path: &Path, follow_root: bool, traversal: bool) -> Result<Self> {
         let root = path.to_path_buf();
         for component in path.components() {
             if !matches!(
@@ -482,10 +488,17 @@ impl AnchoredDir {
                 );
             }
         }
-        let resolving = OFlag::O_DIRECTORY | OFlag::O_CLOEXEC | OFlag::O_RDONLY;
+        let resolving = OFlag::O_DIRECTORY | OFlag::O_CLOEXEC;
+        let acquire = |flags: OFlag, open_fd: &dyn Fn(OFlag) -> nix::Result<OwnedFd>| {
+            if traversal {
+                open_dir_or_path(flags, open_fd)
+            } else {
+                open_fd(flags | OFlag::O_RDONLY)
+            }
+        };
         let (Some(parent), Some(leaf)) = (path.parent(), path.file_name()) else {
             // A bare root such as `/` or `.` has no leaf to guard.
-            let fd = open(path, resolving, Mode::empty())
+            let fd = acquire(resolving, &|flags| open(path, flags, Mode::empty()))
                 .with_context(|| format!("opening anchored root {}", root.display()))?;
             return Ok(Self { root, fd });
         };
@@ -494,18 +507,16 @@ impl AnchoredDir {
         } else {
             parent
         };
-        let parent_fd = open(parent, resolving, Mode::empty())
+        let parent_fd = acquire(resolving, &|flags| open(parent, flags, Mode::empty()))
             .with_context(|| format!("opening anchored root parent {}", parent.display()))?;
-        let fd = openat(
-            &parent_fd,
-            leaf,
-            if follow_root {
-                resolving
-            } else {
-                resolving | OFlag::O_NOFOLLOW
-            },
-            Mode::empty(),
-        )
+        let leaf_flags = if follow_root {
+            resolving
+        } else {
+            resolving | OFlag::O_NOFOLLOW
+        };
+        let fd = acquire(leaf_flags, &|flags| {
+            openat(&parent_fd, leaf, flags, Mode::empty())
+        })
         .with_context(|| format!("opening anchored root {}", root.display()))?;
         Ok(Self { root, fd })
     }
@@ -1297,9 +1308,16 @@ impl AnchoredDir {
 /// still works as a dirfd for `openat` and `mkdirat`.
 fn openat_dir<P: ?Sized + nix::NixPath>(dir: &OwnedFd, name: &P) -> nix::Result<OwnedFd> {
     let flags = OFlag::O_DIRECTORY | OFlag::O_NOFOLLOW | OFlag::O_CLOEXEC;
-    match openat(dir, name, flags | OFlag::O_RDONLY, Mode::empty()) {
+    open_dir_or_path(flags, &|flags| openat(dir, name, flags, Mode::empty()))
+}
+
+fn open_dir_or_path(
+    flags: OFlag,
+    open_fd: &dyn Fn(OFlag) -> nix::Result<OwnedFd>,
+) -> nix::Result<OwnedFd> {
+    match open_fd(flags | OFlag::O_RDONLY) {
         #[cfg(target_os = "linux")]
-        Err(Errno::EACCES) => openat(dir, name, flags | OFlag::O_PATH, Mode::empty()),
+        Err(Errno::EACCES) => open_fd(flags | OFlag::O_PATH),
         result => result,
     }
 }

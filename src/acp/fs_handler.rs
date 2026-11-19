@@ -92,7 +92,7 @@ impl FsPolicy {
             .iter()
             .map(|root| {
                 let canonical = root.canonicalize().unwrap_or_else(|_| root.clone());
-                let dir = AnchoredDir::open(&canonical).ok().map(Arc::new);
+                let dir = AnchoredDir::open_traversal(&canonical).ok().map(Arc::new);
                 PinnedRoot { canonical, dir }
             })
             .collect();
@@ -463,6 +463,35 @@ mod tests {
                 PathBuf::from(host),
                 "{container}"
             );
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn search_only_root_or_parent_is_readable() {
+        use std::os::unix::fs::PermissionsExt;
+
+        struct Restore(PathBuf);
+        impl Drop for Restore {
+            fn drop(&mut self) {
+                let _ = std::fs::set_permissions(&self.0, std::fs::Permissions::from_mode(0o700));
+            }
+        }
+
+        if nix::unistd::geteuid().is_root() {
+            return;
+        }
+        let temp = tempfile::tempdir().unwrap();
+        let parent = temp.path().join("parent");
+        let root = parent.join("root");
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(root.join("f.txt"), "hello").unwrap();
+        for search_only in [root.clone(), parent.clone()] {
+            let _restore = Restore(search_only.clone());
+            std::fs::set_permissions(&search_only, std::fs::Permissions::from_mode(0o100)).unwrap();
+            let policy = FsPolicy::new(vec![root.clone()]);
+            let text = handle_read(&policy, "s", &root.join("f.txt")).unwrap();
+            assert_eq!(text, "hello", "search-only {search_only:?}");
         }
     }
 }
