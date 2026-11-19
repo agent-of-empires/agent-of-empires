@@ -2675,6 +2675,21 @@ struct CreationEntry {
 #[error("Session creation cancelled")]
 pub(crate) struct CreationCancelled;
 
+impl CreationCancelled {
+    /// A create's setup that fails once `cancel` fired reads as cancelled, whatever the setup
+    /// reported: a cancelled shared pull, say, or the create's own cancel ending its wait.
+    pub(crate) fn or_error(
+        cancel: &tokio_util::sync::CancellationToken,
+        error: anyhow::Error,
+    ) -> anyhow::Error {
+        if cancel.is_cancelled() {
+            Self.into()
+        } else {
+            error
+        }
+    }
+}
+
 pub(super) struct CreationGuard {
     service: Arc<SessionService>,
     id: String,

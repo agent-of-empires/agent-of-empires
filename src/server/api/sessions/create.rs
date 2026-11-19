@@ -688,11 +688,7 @@ pub(crate) fn run_create_hooks(
         instance
             .ensure_container_with_hook_in(store, cancel, None, Instance::mint_before_start_env)
             .map_err(|error| {
-                if cancel.is_cancelled() {
-                    crate::server::session_service::CreationCancelled.into()
-                } else {
-                    error
-                }
+                crate::server::session_service::CreationCancelled::or_error(cancel, error)
             })?;
         let workdir = instance.hook_container_workdir(plan.on_create_from_repo);
         if let Some(sandbox) = instance.sandbox_info.as_ref() {
