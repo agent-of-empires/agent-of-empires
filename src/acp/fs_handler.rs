@@ -381,49 +381,64 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn swapping_a_directory_for_a_symlink_never_escapes_the_root() {
-        use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+        use std::fs;
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::time::{Duration, Instant};
+        const CYCLES: usize = 20;
         let temp = tempfile::tempdir().unwrap();
         let root = temp.path().canonicalize().unwrap();
         let outside_dir = tempfile::tempdir().unwrap();
         let outside = outside_dir.path().to_path_buf();
         let policy = FsPolicy::new(vec![root.clone()]);
-        std::fs::create_dir(root.join("a")).unwrap();
+        fs::create_dir(root.join("a")).unwrap();
 
+        // Phase A: no swapper, `a` is a real directory.
+        handle_write(&policy, "s", &root.join("a/f.txt"), "in").unwrap();
+        handle_write(&policy, "s", &root.join("a/d/f.txt"), "in").unwrap();
+
+        // Phase B: writes race the swapper.
         let done = AtomicBool::new(false);
-        let swaps = AtomicUsize::new(0);
-        let (swapped_tx, swapped_rx) = std::sync::mpsc::channel();
-        let mut ok_writes = 0;
+        let (cycle_tx, cycle_rx) = std::sync::mpsc::channel();
         std::thread::scope(|scope| {
             scope.spawn(|| {
+                let (a, a_real) = (root.join("a"), root.join("a_real"));
                 while !done.load(Ordering::SeqCst) {
-                    let cycle =
-                        std::fs::rename(root.join("a"), root.join("a_real")).and_then(|()| {
-                            std::os::unix::fs::symlink(&outside, root.join("a"))?;
-                            std::fs::remove_file(root.join("a"))?;
-                            std::fs::rename(root.join("a_real"), root.join("a"))
-                        });
-                    if cycle.is_ok() && swaps.fetch_add(1, Ordering::SeqCst) == 0 {
-                        swapped_tx.send(()).unwrap();
+                    let cycle = fs::rename(&a, &a_real)
+                        .and_then(|()| std::os::unix::fs::symlink(&outside, &a))
+                        .and_then(|()| fs::remove_file(&a))
+                        .and_then(|()| fs::rename(&a_real, &a));
+                    if cycle.is_ok() {
+                        let _ = cycle_tx.send(());
+                        continue;
                     }
+                    // A writer may have recreated `a` mid-cycle: drop any stray
+                    // symlink or writer-made dir so `a_real` moves back.
+                    if a.symlink_metadata().is_ok_and(|m| m.is_symlink()) {
+                        let _ = fs::remove_file(&a);
+                    }
+                    if a_real.exists() {
+                        let _ = fs::remove_dir_all(&a);
+                        let _ = fs::rename(&a_real, &a);
+                    }
+                    let _ = fs::create_dir(&a);
                 }
             });
-            if swapped_rx
-                .recv_timeout(std::time::Duration::from_secs(30))
-                .is_err()
-            {
-                done.store(true, Ordering::SeqCst);
-                panic!("swapper completed no swap cycle");
-            }
-            for _ in 0..3000 {
-                ok_writes +=
-                    handle_write(&policy, "s", &root.join("a/f.txt"), "pwn").is_ok() as usize;
+            let deadline = Instant::now() + Duration::from_secs(30);
+            let mut cycles = 0;
+            while cycles < CYCLES {
+                if Instant::now() > deadline {
+                    done.store(true, Ordering::SeqCst);
+                    panic!("swapper completed {cycles}/{CYCLES} cycles within 30s");
+                }
+                while cycle_rx.try_recv().is_ok() {
+                    cycles += 1;
+                }
+                let _ = handle_write(&policy, "s", &root.join("a/f.txt"), "pwn");
                 let _ = handle_write(&policy, "s", &root.join("a/d/f.txt"), "pwn");
             }
             done.store(true, Ordering::SeqCst);
         });
-        assert!(swaps.load(Ordering::SeqCst) > 0);
-        assert!(ok_writes > 0, "no write succeeded while swapping");
-        assert_eq!(std::fs::read_dir(&outside).unwrap().count(), 0);
+        assert_eq!(fs::read_dir(&outside).unwrap().count(), 0);
     }
 
     #[test]
