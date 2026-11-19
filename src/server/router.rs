@@ -319,6 +319,7 @@ pub(super) fn build_router(state: Arc<AppState>) -> Router {
                 .delete(api::delete_suggestion_preset),
         )
         .route("/api/suggestions/prepare", post(api::prepare_suggestion))
+        .route("/api/suggestions/start", post(api::start_suggestion))
         .route(
             "/api/suggestions/mappings",
             get(api::list_suggestion_mappings)

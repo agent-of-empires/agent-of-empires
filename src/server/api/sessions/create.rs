@@ -431,6 +431,38 @@ fn creation_trust_fingerprint(
     crate::session::config::repo_config::creation_trust_fingerprint(base, trust)
 }
 
+/// What Start must show before it may create a Session in `path`.
+pub(crate) struct StartTrust {
+    pub(crate) fingerprint: crate::daemon::CreationTrustFingerprint,
+    pub(crate) merged_hooks: crate::session::HooksConfig,
+    pub(crate) hooks_need_trust: bool,
+    pub(crate) mcp_need_trust: bool,
+}
+
+/// The trust review of a plain (non-scratch) creation in `path`, as
+/// `POST /api/sessions/review` computes it.
+pub(crate) fn review_start_trust(
+    profile: &str,
+    path: &std::path::Path,
+) -> anyhow::Result<StartTrust> {
+    use crate::session::config::repo_config::{self, TrustSurface};
+    anyhow::ensure!(path.is_dir(), "Project path does not exist");
+    let base = crate::session::resolve_config(profile)?.hooks;
+    let trust = read_creation_trust(path, false)?;
+    let repo_hooks = match &trust.hooks {
+        TrustSurface::Trusted(hooks) | TrustSurface::NeedsTrust { config: hooks, .. } => {
+            hooks.clone()
+        }
+        TrustSurface::Absent => Default::default(),
+    };
+    Ok(StartTrust {
+        fingerprint: creation_trust_fingerprint(&base, &trust),
+        hooks_need_trust: trust.hooks.needs_trust(),
+        mcp_need_trust: trust.mcp.needs_trust(),
+        merged_hooks: repo_config::apply_repo_hook_overrides(base, &repo_hooks),
+    })
+}
+
 pub async fn review_creation_trust(
     State(state): State<Arc<AppState>>,
     body: Result<

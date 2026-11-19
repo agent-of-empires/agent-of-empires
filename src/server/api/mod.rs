@@ -93,8 +93,8 @@ pub use suggestions::{
     delete_suggestion_mapping, delete_suggestion_preset, dismiss_suggestion,
     get_suggestion_presets, get_suggestions, list_suggestion_mappings, list_suggestion_projects,
     patch_suggestion_prefs, prepare_suggestion, put_suggestion_mapping, put_suggestion_preset,
-    refresh_suggestions, run_suggestion_checks, run_suggestion_fix, undismiss_suggestion,
-    update_suggestion_source,
+    refresh_suggestions, run_suggestion_checks, run_suggestion_fix, start_suggestion,
+    undismiss_suggestion, update_suggestion_source, StartBody,
 };
 
 pub use system::{
@@ -723,6 +723,7 @@ mod tests {
                 "refresh_suggestions",
                 "run_suggestion_checks",
                 "run_suggestion_fix",
+                "start_suggestion",
                 "undismiss_suggestion",
                 "update_suggestion_source",
             ],
@@ -1897,6 +1898,7 @@ mod tests {
             (Method::POST, "/api/suggestions/refresh"),
             (Method::POST, "/api/suggestions/checks/run"),
             (Method::POST, "/api/suggestions/fix"),
+            (Method::POST, "/api/suggestions/start"),
             (Method::POST, "/api/suggestions/dismiss"),
             (Method::POST, "/api/suggestions/undismiss"),
             (Method::PATCH, "/api/suggestions/sources"),
