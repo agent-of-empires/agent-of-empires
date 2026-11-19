@@ -375,6 +375,16 @@ mod tests {
                 "",
                 true,
             ),
+            (
+                &format!("https://p.example.test/mcp?k=%{}41", "25".repeat(40)),
+                "",
+                true,
+            ),
+            (
+                &format!("https://p.example.test/mcp?k=%{}41", "25".repeat(50_000)),
+                "",
+                true,
+            ),
             ("https://p.example.test/mcp", "Bearer %61bcdef0123", true),
             (
                 "https://p.example.test/mcp?k=%61bcdef9999",
