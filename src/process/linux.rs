@@ -2201,7 +2201,11 @@ mod tests {
         assert_eq!(described[1].parent, root);
         assert_eq!(described[2].parent, described[1].identity.pid);
         assert!(described.iter().all(|sample| sample.elapsed_secs < 60));
-        assert_eq!(described[1].exe.as_deref(), Some(shell.as_path()));
+        // The kernel resolves links in `exe`, and CI's TMPDIR is one.
+        assert_eq!(
+            described[1].exe.as_deref(),
+            Some(fs::canonicalize(&shell)?.as_path())
+        );
         Ok(())
     }
 
