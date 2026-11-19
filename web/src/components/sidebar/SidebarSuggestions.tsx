@@ -3,6 +3,7 @@ import { OFFLINE_TITLE } from "../../lib/connectionState";
 import { SidebarCompactContext } from "../../lib/sidebarCompact";
 import { suggestionKey, useSuggestions } from "../../hooks/useSuggestions";
 import type { WizardPrefill } from "../session-wizard/SessionWizard";
+import { SuggestionHooksReview } from "../SuggestionHooksReview";
 import { FoldChevron } from "../icons";
 import { usePersistedFlag } from "../usePersistedFlag";
 import { NAV_ITEM, ROWS, onSidebarArrowKey } from "./keyboardNav";
@@ -101,6 +102,7 @@ export function SidebarSuggestions({ readOnly = false, onPrepare, onViewAll, onO
           </>
         )}
       </div>
+      <SuggestionHooksReview ctrl={ctrl} />
     </div>
   );
 }

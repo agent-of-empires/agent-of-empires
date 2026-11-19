@@ -37,7 +37,6 @@ const snap = (items: SuggestionItem[], sidebar: boolean): SuggestionsSnapshot =>
     homepage: true,
     sidebar,
     refresh_minutes: 15,
-    start_without_review: false,
     show_source_ref: true,
     provider_order: [],
   },
@@ -118,6 +117,27 @@ describe("SidebarSuggestions", () => {
     expect(props.onViewAll).toHaveBeenCalled();
     fireEvent.click(rows[0]!);
     expect(startSuggestion).toHaveBeenCalledWith("github", "i1", {});
+  });
+
+  it("shows the hooks review when a start needs trust, and resumes with the approval", async () => {
+    startSuggestion
+      .mockResolvedValueOnce({
+        kind: "hooks_need_trust",
+        review: { commands: { on_create: ["npm ci"] }, review_fingerprint: "fp1" },
+      })
+      .mockResolvedValueOnce({ kind: "started", sessionId: "s1", title: "Item 1" });
+    fetchSuggestions.mockResolvedValue(snap(ITEMS, true));
+    renderIt();
+    fireEvent.click(await screen.findByTestId("sidebar-suggested-toggle"));
+    fireEvent.click(screen.getAllByTestId("sidebar-suggested-row")[0]!);
+    expect(await screen.findByText("npm ci")).toBeTruthy();
+    fireEvent.click(screen.getByRole("button", { name: "Approve and start" }));
+    await waitFor(() =>
+      expect(startSuggestion).toHaveBeenLastCalledWith("github", "i1", {
+        approve_hooks: true,
+        review_fingerprint: "fp1",
+      }),
+    );
   });
 
   it("hides started suggestions, and the group is absent with nothing open", async () => {

@@ -9,7 +9,7 @@ import { SuggestionFilterMenu, FilterMenuItem } from "./SuggestionFilterMenu";
 import { useAgentNames } from "../hooks/useAgentNames";
 import { useSuggestionPresets } from "../hooks/useSuggestionPresets";
 import { SuggestionItemActions } from "./SuggestionItemActions";
-import { HooksTrustDialog } from "./session-wizard/HooksTrustDialog";
+import { SuggestionHooksReview } from "./SuggestionHooksReview";
 import { SuggestionMappingWizard } from "./SuggestionMappingWizard";
 import { SuggestionsSetupHint } from "./SuggestionsSetupHint";
 import { SUGGESTION_NOTE_CLASS, SuggestionRow, SuggestionStatusNotes, UndoBar } from "./SuggestionRow";
@@ -457,18 +457,7 @@ export function SuggestionsView({
           </>
         )}
       </div>
-      {ctrl.hooksReview && (
-        <HooksTrustDialog
-          starting={ctrl.hooksReview.item.title}
-          onCreate={ctrl.hooksReview.review.commands.on_create ?? []}
-          onLaunch={ctrl.hooksReview.review.commands.on_launch ?? []}
-          onDestroy={ctrl.hooksReview.review.commands.on_destroy ?? []}
-          needsMcpTrust={ctrl.hooksReview.review.needs_mcp_trust === true}
-          mcpSummaries={[]}
-          onConfirm={ctrl.approveHooks}
-          onCancel={ctrl.cancelHooks}
-        />
-      )}
+      <SuggestionHooksReview ctrl={ctrl} />
       {mapping && snapshot && (
         <SuggestionMappingWizard
           items={items}
