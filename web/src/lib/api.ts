@@ -375,7 +375,7 @@ export async function ensureTerminal(
   }
 }
 
-function fileToBase64(file: File): Promise<string> {
+function fileToBase64(blob: Blob): Promise<string> {
   return new Promise((resolve, reject) => {
     const reader = new FileReader();
     reader.onerror = () => reject(reader.error ?? new Error("read failed"));
@@ -385,15 +385,8 @@ function fileToBase64(file: File): Promise<string> {
       const comma = result.indexOf(",");
       resolve(comma >= 0 ? result.slice(comma + 1) : result);
     };
-    reader.readAsDataURL(file);
+    reader.readAsDataURL(blob);
   });
-}
-
-function bytesToBase64(bytes: Uint8Array): string {
-  let binary = "";
-  // Chunked so a large attachment does not overflow the argument limit.
-  for (let i = 0; i < bytes.length; i += 0x8000) binary += String.fromCharCode(...bytes.subarray(i, i + 0x8000));
-  return btoa(binary);
 }
 
 /** Reads a sent prompt's stored attachment back as an upload, or null when it is gone. */
@@ -401,7 +394,7 @@ export async function loadStoredAttachment(a: AcpAttachment): Promise<PromptAtta
   try {
     const res = await fetch(a.url);
     if (!res.ok) return null;
-    const dataB64 = bytesToBase64(new Uint8Array(await res.arrayBuffer()));
+    const dataB64 = await fileToBase64(await res.blob());
     return { kind: a.kind, mimeType: a.mimeType, ...(a.name ? { name: a.name } : {}), dataB64 };
   } catch {
     return null;
