@@ -442,22 +442,14 @@ pub(crate) fn unacknowledged(
         .collect()
 }
 
-/// `argv` as it may leave the host: values of secret-looking flags and variables blanked,
-/// control characters replaced, each argument and the whole line capped.
+/// `argv` as it may leave the host: credentials blanked (see `redacted`), control characters
+/// replaced, each argument and the whole line capped.
 pub(crate) fn shown_argv(argv: &[String]) -> Vec<String> {
     let mut shown = Vec::new();
     let mut size = 2;
-    let mut hide_next = false;
+    let mut hide = Hide::Nothing;
     for arg in argv {
-        let arg = if std::mem::take(&mut hide_next) {
-            REDACTED.to_owned()
-        } else if let Some((name, _)) = arg.split_once('=').filter(|(name, _)| secret_name(name)) {
-            format!("{name}={REDACTED}")
-        } else {
-            hide_next = arg.starts_with('-') && secret_name(arg);
-            arg.clone()
-        };
-        let arg: String = arg
+        let arg: String = redacted(arg, &mut hide)
             .chars()
             .map(|c| if c.is_control() { '\u{fffd}' } else { c })
             .collect();
@@ -473,16 +465,116 @@ pub(crate) fn shown_argv(argv: &[String]) -> Vec<String> {
 
 const REDACTED: &str = "***";
 
-/// A flag (`--api-key`) or variable (`GITHUB_TOKEN`) whose value is a credential.
+/// What a flag hides of the argument after it.
+#[derive(Clone, Copy)]
+enum Hide {
+    Nothing,
+    /// The whole value of a secret flag (`--token abc`).
+    Value,
+    /// The password of a `user:password` value (`curl -u`).
+    Password,
+}
+
+/// `arg` with its credentials blanked: the value after a secret flag, of a secret variable or
+/// header (`Authorization: Bearer …`), and a URL's or `--user`'s password. `hide` carries a
+/// secret flag over to the argument after it.
+fn redacted(arg: &str, hide: &mut Hide) -> String {
+    match std::mem::replace(hide, Hide::Nothing) {
+        Hide::Value => return REDACTED.to_owned(),
+        Hide::Password => {
+            if let Some((user, _)) = arg.split_once(':') {
+                return format!("{user}:{REDACTED}");
+            }
+        }
+        Hide::Nothing => {}
+    }
+    if let Some((name, _)) = arg
+        .split_once(':')
+        .filter(|(name, _)| !name.contains(char::is_whitespace) && secret_name(name))
+    {
+        return format!("{name}: {REDACTED}");
+    }
+    if arg.contains(char::is_whitespace) {
+        // A process that rewrites its title can report several words as one argument.
+        let mut words = Vec::new();
+        for word in arg.split_whitespace() {
+            if word.strip_suffix(':').is_some_and(secret_name) {
+                words.extend([word.to_owned(), REDACTED.to_owned()]);
+                break;
+            }
+            words.push(redacted(word, hide));
+        }
+        return words.join(" ");
+    }
+    let arg = without_url_password(arg);
+    if let Some((name, _)) = arg.split_once('=').filter(|(name, _)| secret_name(name)) {
+        return format!("{name}={REDACTED}");
+    }
+    if arg.starts_with('-') && secret_name(&arg) {
+        *hide = Hide::Value;
+    } else if matches!(arg.as_str(), "-u" | "--user" | "--proxy-user") {
+        *hide = Hide::Password;
+    }
+    arg
+}
+
+/// `arg` with the password of any URL in it (`scheme://user:password@host`) blanked. A `@` later
+/// in the argument can only blank more than the password, never less.
+fn without_url_password(arg: &str) -> String {
+    let mut shown = String::new();
+    let mut rest = arg;
+    while let Some(at) = rest.find("://") {
+        let (head, tail) = rest.split_at(at + 3);
+        shown.push_str(head);
+        rest = tail;
+        if let Some((user, info)) = tail
+            .rsplit_once('@')
+            .and_then(|(info, _)| Some((info.split_once(':')?.0, info)))
+        {
+            shown.push_str(&format!("{user}:{REDACTED}"));
+            rest = &tail[info.len()..];
+        }
+    }
+    shown.push_str(rest);
+    shown
+}
+
+/// A flag (`--api-key`), variable (`GITHUB_TOKEN`) or header (`Authorization`) whose value is a
+/// credential.
 fn secret_name(name: &str) -> bool {
     let name = name
         .trim_start_matches('-')
         .to_ascii_lowercase()
         .replace('-', "_");
     const EXACT: &[&str] = &[
-        "token", "password", "passwd", "pass", "secret", "auth", "apikey",
+        "token",
+        "password",
+        "passwd",
+        "pass",
+        "passphrase",
+        "secret",
+        "auth",
+        "authorization",
+        "apikey",
+        "key",
+        "bearer",
+        "credential",
+        "credentials",
+        "cookie",
     ];
-    const SUFFIXES: &[&str] = &["_token", "_key", "_secret", "_password", "_passwd", "_auth"];
+    const SUFFIXES: &[&str] = &[
+        "_token",
+        "_key",
+        "_secret",
+        "_password",
+        "_passwd",
+        "_passphrase",
+        "_auth",
+        "_authorization",
+        "_credential",
+        "_credentials",
+        "_cookie",
+    ];
     EXACT.contains(&name.as_str()) || SUFFIXES.iter().any(|suffix| name.ends_with(suffix))
 }
 
@@ -921,11 +1013,49 @@ mod tests {
                 &["env", "GITHUB_TOKEN=x", "PASSWORD=y"],
                 &["env", "GITHUB_TOKEN=***", "PASSWORD=***"],
             ),
-            // Not secrets: a key-like word that isn't a flag, a path, `-p` (a port or a prompt).
+            (
+                &["gpg", "--passphrase", "p"],
+                &["gpg", "--passphrase", "***"],
+            ),
+            (&["cli", "--key", "k"], &["cli", "--key", "***"]),
+            (&["cli", "--bearer=b"], &["cli", "--bearer=***"]),
+            // A header, a `--user` password and a URL's password.
+            (
+                &["curl", "-H", "Authorization: Bearer abc", "-u", "admin:pw"],
+                &["curl", "-H", "Authorization: ***", "-u", "admin:***"],
+            ),
+            (
+                &["curl", "-H", "X-Api-Key:k"],
+                &["curl", "-H", "X-Api-Key: ***"],
+            ),
+            (
+                &[
+                    "psql",
+                    "postgres://user:pw@db/app",
+                    "DATABASE_URL=mysql://u:p@h",
+                ],
+                &[
+                    "psql",
+                    "postgres://user:***@db/app",
+                    "DATABASE_URL=mysql://u:***@h",
+                ],
+            ),
+            // A process that rewrote its title reports its words as one argument.
+            (
+                &["node server.js --token abc -H Authorization: Bearer x"],
+                &["node server.js --token *** -H Authorization: ***"],
+            ),
+            // Not secrets: a key-like word that isn't a flag, a path, `-p` (a port or a prompt), a
+            // URL without a password, a `-u` that takes no pair.
             (
                 &["cli", "token", "keys.json"],
                 &["cli", "token", "keys.json"],
             ),
+            (
+                &["curl", "https://example.com/a@b", "localhost:3000"],
+                &["curl", "https://example.com/a@b", "localhost:3000"],
+            ),
+            (&["python", "-u", "app.py"], &["python", "-u", "app.py"]),
             (
                 &["ssh", "-p", "22", "--keyfile=/k"],
                 &["ssh", "-p", "22", "--keyfile=/k"],
