@@ -294,34 +294,23 @@ pub(crate) fn snapshot(
     Ok(json!({ "providers": out_providers, "items": out_items, "prefs": prefs }))
 }
 
-/// The oldest live Session of `profile` started from each item, as snapshot
-/// JSON keyed by `(provider_id, id)`. Trashed Sessions do not count; a tie
-/// on `created_at` goes to the smaller id.
+/// The primary Session of each linked item, as snapshot JSON keyed by
+/// `(provider_id, id)`, for links whose Session is live. Trashed Sessions do not count.
 pub(crate) fn started_sessions<'a>(
+    links: &[(String, String, String)],
     instances: impl IntoIterator<Item = &'a Instance>,
-    profile: &str,
 ) -> HashMap<(String, String), Value> {
-    let mut oldest: HashMap<(&str, &str), &Instance> = HashMap::new();
-    for inst in instances {
-        let Some(origin) = &inst.suggestion else {
-            continue;
-        };
-        let origin_profile = origin.profile.as_deref().unwrap_or(&inst.source_profile);
-        if inst.is_trashed() || origin_profile != profile {
-            continue;
-        }
-        let slot = oldest
-            .entry((origin.provider_id.as_str(), origin.id.as_str()))
-            .or_insert(inst);
-        if (inst.created_at, &inst.id) < (slot.created_at, &slot.id) {
-            *slot = inst;
-        }
-    }
-    oldest
+    let live: HashMap<&str, &Instance> = instances
         .into_iter()
-        .map(|((provider_id, id), inst)| {
-            (
-                (provider_id.to_string(), id.to_string()),
+        .filter(|inst| !inst.is_trashed())
+        .map(|inst| (inst.id.as_str(), inst))
+        .collect();
+    links
+        .iter()
+        .filter_map(|(provider_id, id, session_id)| {
+            let inst = live.get(session_id.as_str())?;
+            Some((
+                (provider_id.clone(), id.clone()),
                 json!({
                     "id": inst.id,
                     "title": inst.title,
@@ -329,7 +318,7 @@ pub(crate) fn started_sessions<'a>(
                     "archived": inst.is_archived(),
                     "created_at": inst.created_at,
                 }),
-            )
+            ))
         })
         .collect()
 }
@@ -808,33 +797,32 @@ mod tests {
     }
 
     #[test]
-    fn started_session_is_the_oldest_live_one_of_the_profile() {
-        let linked = |id: &str, age: i64, profile: &str| {
+    fn started_session_is_the_linked_live_one() {
+        let session = |id: &str| {
             let mut i = Instance::new(id, "/tmp/x");
             i.id = id.to_string();
-            i.created_at = chrono::Utc::now() - chrono::Duration::seconds(age);
-            i.source_profile = profile.to_string();
-            i.suggestion = Some(crate::session::SuggestionOrigin {
-                provider_id: "acme.github".into(),
-                id: "a".into(),
-                profile: None,
-            });
             i
         };
-        let mut trashed = linked("trashed", 300, "p");
+        let mut trashed = session("trashed");
         trashed.trash();
-        let mut archived = linked("archived", 200, "p");
+        let mut archived = session("archived");
         archived.archived_at = Some(chrono::Utc::now());
-        let instances = [
-            linked("newest", 10, "p"),
-            archived,
-            trashed,
-            linked("other-profile", 400, "q"),
-            Instance::new("unlinked", "/tmp/x"),
+        let instances = [session("unlinked"), archived, trashed];
+        let link = |item: &str, session: &str| {
+            (
+                "acme.github".to_string(),
+                item.to_string(),
+                session.to_string(),
+            )
+        };
+        let links = [
+            link("a", "archived"),
+            link("b", "trashed"),
+            link("c", "gone"),
         ];
-        let key = ("acme.github".to_string(), "a".to_string());
-        let started = started_sessions(&instances, "p");
+        let started = started_sessions(&links, &instances);
         assert_eq!(started.len(), 1);
+        let key = ("acme.github".to_string(), "a".to_string());
         assert_eq!(started[&key]["id"], "archived");
         assert_eq!(started[&key]["archived"], true);
 
@@ -845,6 +833,5 @@ mod tests {
         attach_started(&mut snapshot, &started);
         assert_eq!(snapshot["items"][0]["started_session"]["id"], "archived");
         assert!(snapshot["items"][1].get("started_session").is_none());
-        assert!(started_sessions(&instances[2..3], "p").is_empty());
     }
 }
