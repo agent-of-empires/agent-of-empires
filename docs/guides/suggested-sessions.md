@@ -25,7 +25,7 @@ The full view lists every suggestion:
 - One status line per provider: "updated 2 min ago", "waiting for first results", "nothing new", "refreshing…", or "couldn't refresh, <error>". Items from a failing provider stay listed from the last fetch.
 - Items group under the registered Project they resolve to; items with none sit last under "No project".
 - **Refresh** asks every provider to look again.
-- **Map projects** opens the [mapping wizard](#mapping-wizard).
+- **Link a Project** on a repo group opens the [mapping wizard](#mapping-wizard).
 - The gear opens Settings › Suggestions.
 
 ### Starting one
@@ -76,7 +76,7 @@ Each kind of suggestion has a prompt template that replaces the plugin's draft p
 
 #### Mapping wizard
 
-**Map projects** on `/suggestions`, or **Map projects automatically…** under Project mapping, lists every source key in the current suggestions that has no mapping and proposes a Project for it:
+**Link a Project** on a repo group in `/suggestions`, or **Map projects automatically…** under Project mapping, lists every source key in the current suggestions that has no mapping and proposes a Project for it:
 
 1. A Project whose git `origin` is the key (`owner/repo`, ignoring case) is proposed and checked.
 2. Otherwise a Project whose name or folder equals the key's last part, ignoring case, `-` and `_`, is proposed unchecked.
