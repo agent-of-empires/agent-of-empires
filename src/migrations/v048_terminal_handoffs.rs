@@ -11,10 +11,9 @@ pub fn run() -> Result<()> {
 }
 
 fn migrate_file(path: &Path) -> Result<()> {
-    match std::fs::symlink_metadata(path) {
-        Ok(_) => {}
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
-        Err(error) => return Err(error.into()),
+    // Follows links, so a dangling link (missing leaf or directory) is skipped like v045.
+    if !path.try_exists()? {
+        return Ok(());
     }
     let parent = path.parent().context("sessions file has no parent")?;
     let _lock =
@@ -108,6 +107,7 @@ mod tests {
             ("ok", target.clone(), true),
             ("dir", root.path().join("dir"), false),
             ("missing", root.path().join("missing.json"), true),
+            ("no-dir", root.path().join("absent/missing.json"), true),
         ] {
             let link = root.path().join(format!("{name}-sessions.json"));
             std::os::unix::fs::symlink(&goal, &link)?;
