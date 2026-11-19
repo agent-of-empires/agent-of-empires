@@ -241,6 +241,7 @@ impl HomeView {
             pending_stop_auxiliary: None,
             pending_legacy_tool_preparation: None,
             pending_image_pull: None,
+            hidden_pull: None,
             confirm_checked: Vec::new(),
             pending_switch_view_session: None,
             structured_preview: None,

@@ -399,6 +399,8 @@ pub struct HomeView {
     pub(super) pending_stop_auxiliary: Option<(String, crate::daemon::StopAuxiliaryBody)>,
     pending_legacy_tool_preparation: Option<panes::PendingLegacyToolPreparation>,
     pub(super) pending_image_pull: Option<String>,
+    /// A running sandbox image pull whose line Ctrl+X hid; the key line keeps its progress.
+    pub(crate) hidden_pull: Option<crate::containers::pull_progress::ProgressSnapshot>,
     /// Checkbox keys the last submitted confirm dialog had checked.
     pub(super) confirm_checked: Vec<&'static str>,
     pub(super) pending_switch_view_session: Option<String>,

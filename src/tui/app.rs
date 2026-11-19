@@ -14,6 +14,7 @@ use std::time::Duration;
 
 use super::home::update_bar::{DrawnBar, UpdateBar};
 use super::home::{bindings, HomeView, TerminalMode};
+use super::image_pull::{self, Applied, CancelKey, PullReport, PullRequest, PullSource, PullWatch};
 use super::styles::Theme;
 use crate::containers::image_update::ImageUpdate;
 use crate::session::config::AppStateConfig;
@@ -82,6 +83,13 @@ impl UpdateStatus {
         }
     }
 
+    fn lasting(text: String, ttl: std::time::Duration) -> Self {
+        Self {
+            text,
+            expires_at: Some(std::time::Instant::now() + ttl),
+        }
+    }
+
     fn is_expired(&self) -> bool {
         match self.expires_at {
             Some(deadline) => std::time::Instant::now() >= deadline,
@@ -91,6 +99,30 @@ impl UpdateStatus {
 }
 
 pub type TuiBackend = crate::tui::hyperlink::HyperlinkBackend<std::io::Stdout>;
+
+/// Sends a pull request to the Daemon, or to this process's pull without one. Replaceable so
+/// tests can answer requests themselves.
+type PullRunner =
+    Box<dyn FnMut(PullRequest, String) -> tokio::sync::oneshot::Receiver<PullReport> + Send>;
+
+const CANCEL_PULL_PROMPT: &str =
+    "Press Ctrl+E again to cancel the download. To keep going, press any other key.";
+
+fn run_pull_request(
+    request: PullRequest,
+    image: String,
+) -> tokio::sync::oneshot::Receiver<PullReport> {
+    let runtime = Config::load_or_warn().sandbox.container_runtime;
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    tokio::spawn(async move {
+        let report = PullSource::locate()
+            .await
+            .run(runtime, &image, request)
+            .await;
+        let _ = tx.send(report);
+    });
+    rx
+}
 
 pub struct App {
     home: HomeView,
@@ -117,7 +149,11 @@ pub struct App {
     image_update_rx: Option<
         tokio::sync::oneshot::Receiver<anyhow::Result<crate::containers::image_update::ImageCheck>>,
     >,
-    image_pull_rx: Option<tokio::sync::oneshot::Receiver<anyhow::Result<()>>>,
+    pull: PullWatch,
+    /// The pull request in flight and where its answer arrives.
+    pull_rx: Option<(PullRequest, tokio::sync::oneshot::Receiver<PullReport>)>,
+    pull_runner: PullRunner,
+    next_pull_poll: std::time::Instant,
     /// Snoozed via Ctrl+x while the registry still resolves to this digest.
     dismissed_image_digest: Option<String>,
     /// The update bar's last drawn line: the only one its keys act on.
@@ -336,7 +372,10 @@ impl App {
             dismissed_update_version,
             image_update: None,
             image_update_rx: None,
-            image_pull_rx: None,
+            pull: PullWatch::default(),
+            pull_rx: None,
+            pull_runner: Box::new(run_pull_request),
+            next_pull_poll: std::time::Instant::now(),
             dismissed_image_digest,
             drawn_bar: None,
             // Crossterm's stream needs a live event reader, which tests lack.
@@ -1316,7 +1355,7 @@ impl App {
             if self.poll_update_check()
                 | self.poll_update_status()
                 | self.poll_image_update_check()
-                | self.poll_image_pull_status()
+                | self.poll_pull()
             {
                 self.needs_redraw = true;
                 needs_full_refresh = true;
@@ -1498,9 +1537,12 @@ impl App {
                 }
             }
 
-            // Spinners live in the sidebar, which live-send users aren't watching.
+            self.schedule_pull_poll(std::time::Instant::now());
+
+            // Spinners live in the sidebar and the pull line, which live-send users aren't
+            // watching.
             if last_spinner_redraw.elapsed() >= SPINNER_REDRAW_INTERVAL
-                && self.home.has_animated_sessions()
+                && (self.home.has_animated_sessions() || self.pull.running())
                 && self.home.live_send.is_none()
             {
                 last_spinner_redraw = std::time::Instant::now();
@@ -1598,12 +1640,13 @@ impl App {
         let live = self.home.store_move_status_line();
         let bar = UpdateBar::pick(
             self.update_status.as_ref().map(|s| s.text.as_str()),
-            None,
+            self.pull.line(),
             live.as_deref(),
             self.update_info.as_ref(),
             self.image_update.as_ref(),
-            self.image_pull_rx.is_some(),
+            self.pull.holds_line(),
         );
+        self.home.hidden_pull = self.pull.hidden_progress().copied();
         // Reset so a frame that skips the preview path reports zero.
         self.home.preview_timings = Default::default();
         self.home.render(frame, frame.area(), &self.theme, bar);
@@ -1723,8 +1766,10 @@ impl App {
             return false;
         };
         match drawn {
-            DrawnBar::Live | DrawnBar::Pull(_) => {}
-            // A pull keeps running and reports its outcome as a new status.
+            DrawnBar::Live => {}
+            DrawnBar::Pull(line) => {
+                self.pull.dismiss(line);
+            }
             DrawnBar::Status(text) => {
                 if self.update_status.as_ref().is_some_and(|s| &s.text == text) {
                     self.update_status = None;
@@ -1757,19 +1802,29 @@ impl App {
     }
 
     /// The Update key on a drawn sandbox image line: opens the pull prompt if that update is
-    /// still current and no pull runs, and otherwise spends the key. Any other drawn line
-    /// returns false, leaving the key to the home Update action.
+    /// still current and no pull is on the bar, and otherwise spends the key. On a failed or
+    /// cancelled pull it pulls again. Any other drawn line returns false, leaving the key to
+    /// the home Update action.
     fn pull_from_update_bar(&mut self) -> bool {
-        let Some(DrawnBar::ImageUpdate { digest }) = &self.drawn_bar else {
-            return false;
-        };
-        if let Some(update) = self
-            .image_update
-            .as_ref()
-            .filter(|update| &update.remote_digest == digest && self.image_pull_rx.is_none())
-        {
-            let image = update.image.clone();
-            self.home.prompt_pull_sandbox_image(image);
+        match &self.drawn_bar {
+            Some(DrawnBar::Pull(line)) => {
+                if !self.pull.retries(line) {
+                    return false;
+                }
+                let image = Config::load_or_warn().sandbox.default_image;
+                self.start_pull(image);
+            }
+            Some(DrawnBar::ImageUpdate { digest }) => {
+                if let Some(update) = self
+                    .image_update
+                    .as_ref()
+                    .filter(|update| &update.remote_digest == digest && !self.pull.holds_line())
+                {
+                    let image = update.image.clone();
+                    self.home.prompt_pull_sandbox_image(image);
+                }
+            }
+            _ => return false,
         }
         true
     }
@@ -1815,45 +1870,87 @@ impl App {
         }
     }
 
-    fn spawn_image_pull(&mut self, image: String) {
-        if self.image_pull_rx.is_some() {
-            return;
-        }
-        // Persistent: a pull outlives the transient window, and an expired toast
-        // would let the banner re-render mid-pull.
-        self.update_status = Some(UpdateStatus::persistent(format!("pulling {image}…")));
-        let (tx, rx) = tokio::sync::oneshot::channel();
-        self.image_pull_rx = Some(rx);
-        std::thread::spawn(move || {
-            let result = crate::containers::get_container_runtime()
-                .pull_image(&image)
-                .map_err(anyhow::Error::from);
-            let _ = tx.send(result);
-        });
+    fn start_pull(&mut self, image: String) {
+        self.pull.start();
+        self.request_pull(PullRequest::Start, image);
     }
 
-    fn poll_image_pull_status(&mut self) -> bool {
-        let Some(mut rx) = self.image_pull_rx.take() else {
+    /// A poll waits for the request in flight; a start or cancel replaces it.
+    fn request_pull(&mut self, request: PullRequest, image: String) {
+        if request == PullRequest::Poll && self.pull_rx.is_some() {
+            return;
+        }
+        self.pull_rx = Some((request, (self.pull_runner)(request, image)));
+    }
+
+    /// Reads the pull's state on its interval while this TUI watches one, or while update
+    /// checks are on and a sandbox is in use, as the startup image check runs.
+    fn schedule_pull_poll(&mut self, now: std::time::Instant) {
+        if now < self.next_pull_poll {
+            return;
+        }
+        self.next_pull_poll = now + image_pull::poll_interval(self.pull.running());
+        if !self.pull.holds_line()
+            && !(get_update_settings().update_check_mode.is_enabled() && self.sandbox_in_use())
+        {
+            return;
+        }
+        let image = Config::load_or_warn().sandbox.default_image;
+        self.request_pull(PullRequest::Poll, image);
+    }
+
+    fn poll_pull(&mut self) -> bool {
+        let Some((request, mut rx)) = self.pull_rx.take() else {
             return false;
         };
-        match rx.try_recv() {
-            Ok(Ok(())) => {
-                self.image_update = None;
-                self.set_status("sandbox image updated. New sessions will use it.");
-                true
-            }
-            Ok(Err(e)) => {
-                self.set_status(format!("image pull failed: {e}"));
-                true
-            }
+        let report = match rx.try_recv() {
+            Ok(report) => report,
             Err(tokio::sync::oneshot::error::TryRecvError::Empty) => {
-                self.image_pull_rx = Some(rx);
-                false
+                self.pull_rx = Some((request, rx));
+                return false;
             }
-            Err(tokio::sync::oneshot::error::TryRecvError::Closed) => {
-                self.set_status("image pull ended unexpectedly");
+            Err(tokio::sync::oneshot::error::TryRecvError::Closed) => PullReport::Unavailable,
+        };
+        match self.pull.apply(request, report) {
+            Applied::Unchanged => false,
+            Applied::Changed => true,
+            Applied::Updated => {
+                self.image_update = None;
                 true
             }
+            Applied::Unanswered(text) => {
+                self.set_status(text);
+                true
+            }
+        }
+    }
+
+    /// Ctrl+E on a running pull: the first press asks, a second within the prompt's 3 s
+    /// cancels.
+    fn cancel_pull_key(&mut self) {
+        match self.pull.cancel_key(std::time::Instant::now()) {
+            CancelKey::Ignored => {}
+            CancelKey::Confirm => {
+                self.update_status = Some(UpdateStatus::lasting(
+                    CANCEL_PULL_PROMPT.to_string(),
+                    image_pull::CANCEL_CONFIRM_TTL,
+                ));
+            }
+            CancelKey::Cancel => {
+                self.clear_cancel_pull_prompt();
+                let image = Config::load_or_warn().sandbox.default_image;
+                self.request_pull(PullRequest::Cancel, image);
+            }
+        }
+    }
+
+    fn clear_cancel_pull_prompt(&mut self) {
+        if self
+            .update_status
+            .as_ref()
+            .is_some_and(|s| s.text == CANCEL_PULL_PROMPT)
+        {
+            self.update_status = None;
         }
     }
 
@@ -2282,6 +2379,18 @@ impl App {
             }
             return Ok(());
         }
+        let cancels_pull = bindings::is_bound(
+            bindings::ActionId::CancelImagePull,
+            self.home.strict_hotkeys,
+            &key,
+        ) && !self.home.has_dialog()
+            && self.pull.running();
+        if cancels_pull {
+            self.cancel_pull_key();
+            return Ok(());
+        }
+        self.pull.other_key();
+        self.clear_cancel_pull_prompt();
         match (key.code, key.modifiers) {
             // Ctrl+C belongs to the agent in live-send.
             (KeyCode::Char('c'), KeyModifiers::CONTROL) if !self.home.is_live_send_capturing() => {
@@ -3006,11 +3115,11 @@ impl App {
                 self.set_status(text);
             }
             Action::SpawnImagePull(image) => {
-                if self.image_pull_rx.is_some() {
+                if self.pull.running() {
                     self.set_status("image pull already in progress");
                     return Ok(());
                 }
-                self.spawn_image_pull(image);
+                self.start_pull(image);
             }
             Action::SendMessage(id, message) => {
                 // Cold starts show "Reviving" feedback; warm sessions skip the
@@ -3503,6 +3612,8 @@ pub enum Action {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::containers::image_pull::PullState;
+    use crate::tui::home::update_bar::PullLine;
 
     fn key_app() -> (App, Terminal<TuiBackend>) {
         let app = App::new(
@@ -3542,6 +3653,14 @@ mod tests {
 
     const CTRL_X: KeyEvent = KeyEvent::new(KeyCode::Char('x'), KeyModifiers::CONTROL);
 
+    /// Delivers `report` as the answer to a pull `request` in flight.
+    fn answer_pull(app: &mut App, request: PullRequest, report: PullReport) {
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        app.pull_rx = Some((request, rx));
+        tx.send(report).unwrap();
+        app.poll_pull();
+    }
+
     /// One frame, as the event loop draws before each key; returns the screen text.
     fn draw(app: &mut App) -> String {
         let mut screen = Terminal::new(ratatui::backend::TestBackend::new(100, 30)).unwrap();
@@ -3564,36 +3683,139 @@ mod tests {
         let (mut app, mut terminal) = key_app();
         app.update_info = Some(app_update());
         app.image_update = Some(image_update());
-        app.update_status = Some(UpdateStatus::persistent(
-            "pulling the sandbox image…".into(),
-        ));
-        let (pull_done, pull_rx) = tokio::sync::oneshot::channel();
-        app.image_pull_rx = Some(pull_rx);
+        app.pull.start();
         let dismissed = || AppStateConfig::load().unwrap().dismissed_update_version;
 
         draw(&mut app);
         app.handle_key(CTRL_X, &mut terminal).await.unwrap();
-        assert!(app.update_status.is_none());
+        assert!(app.pull.line().is_none(), "the pull line stays on screen");
+        assert!(
+            app.pull.hidden_progress().is_some(),
+            "the hidden pull lost its progress"
+        );
         assert_eq!(app.update_info, Some(app_update()));
         assert_eq!(app.dismissed_update_version, None);
         assert_eq!(dismissed(), None);
 
-        pull_done.send(Ok(())).unwrap();
-        assert!(app.poll_image_pull_status());
-        assert!(app
-            .update_status
-            .as_ref()
-            .is_some_and(|s| s.text.starts_with("sandbox image updated")));
+        answer_pull(
+            &mut app,
+            PullRequest::Poll,
+            PullReport::State(PullState::Done),
+        );
+        assert_eq!(app.pull.line(), Some(&PullLine::Done));
+        assert_eq!(
+            app.image_update, None,
+            "a finished pull still offers the image"
+        );
 
         draw(&mut app);
         app.handle_key(CTRL_X, &mut terminal).await.unwrap();
-        assert!(app.update_status.is_none());
+        assert!(app.pull.line().is_none());
         assert_eq!(app.update_info, Some(app_update()));
 
         draw(&mut app);
         app.handle_key(CTRL_X, &mut terminal).await.unwrap();
         assert!(app.update_info.is_none());
         assert_eq!(dismissed(), Some("1.1.0".into()));
+    }
+
+    /// Records each pull request instead of sending it.
+    fn record_pull_requests(app: &mut App) -> std::sync::Arc<std::sync::Mutex<Vec<PullRequest>>> {
+        let log = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let sent = log.clone();
+        app.pull_runner = Box::new(move |request, _| {
+            sent.lock().unwrap().push(request);
+            tokio::sync::oneshot::channel().1
+        });
+        log
+    }
+
+    /// The pull line's keys in both modes: Ctrl+E asks, then cancels; the Update key retries
+    /// a cancelled pull; Done clears on the next key, which still acts; and with a dialog open,
+    /// as while Live send captures keys, Ctrl+E is not the pull's.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn the_pull_line_keys_cancel_retry_and_clear_in_both_modes() {
+        let _home = crate::session::test_support::isolate_app_dir();
+        crate::session::get_profile_dir("test").unwrap();
+        for strict in [false, true] {
+            let (mut app, mut terminal) = key_app();
+            app.home.strict_hotkeys = strict;
+            let sent = record_pull_requests(&mut app);
+            let ctrl_e = bindings::key_event(bindings::ActionId::CancelImagePull, strict).unwrap();
+            let update = bindings::key_event(bindings::ActionId::Update, strict).unwrap();
+            let help = bindings::key_event(bindings::ActionId::Help, strict).unwrap();
+            let prompt = |app: &App| {
+                app.update_status
+                    .as_ref()
+                    .is_some_and(|s| s.text == CANCEL_PULL_PROMPT)
+            };
+            app.pull.start();
+
+            app.handle_key(ctrl_e, &mut terminal).await.unwrap();
+            assert!(prompt(&app), "strict={strict}: the first Ctrl+E didn't ask");
+            app.handle_key(
+                KeyEvent::new(KeyCode::Down, KeyModifiers::NONE),
+                &mut terminal,
+            )
+            .await
+            .unwrap();
+            assert!(
+                !prompt(&app),
+                "strict={strict}: another key left the prompt"
+            );
+            app.handle_key(ctrl_e, &mut terminal).await.unwrap();
+            assert!(
+                sent.lock().unwrap().is_empty(),
+                "strict={strict}: one Ctrl+E cancelled"
+            );
+            app.handle_key(ctrl_e, &mut terminal).await.unwrap();
+            assert_eq!(
+                *sent.lock().unwrap(),
+                [PullRequest::Cancel],
+                "strict={strict}"
+            );
+            assert!(!prompt(&app));
+
+            answer_pull(
+                &mut app,
+                PullRequest::Cancel,
+                PullReport::State(PullState::Cancelled),
+            );
+            draw(&mut app);
+            app.handle_key(update, &mut terminal).await.unwrap();
+            assert_eq!(
+                *sent.lock().unwrap(),
+                [PullRequest::Cancel, PullRequest::Start],
+                "strict={strict}: the Update key didn't retry"
+            );
+            assert!(app.pull.running());
+
+            answer_pull(
+                &mut app,
+                PullRequest::Poll,
+                PullReport::State(PullState::Done),
+            );
+            draw(&mut app);
+            app.handle_key(help, &mut terminal).await.unwrap();
+            assert_eq!(
+                app.pull.line(),
+                None,
+                "strict={strict}: Done outlived a key"
+            );
+            assert!(
+                app.home.has_dialog(),
+                "strict={strict}: the key that cleared Done didn't act"
+            );
+
+            app.pull.start();
+            app.handle_key(ctrl_e, &mut terminal).await.unwrap();
+            assert!(
+                !prompt(&app),
+                "strict={strict}: Ctrl+E behind a dialog asked"
+            );
+            assert_eq!(sent.lock().unwrap().len(), 2, "strict={strict}");
+        }
     }
 
     /// A status that expires after it was drawn is still the line on screen until the next

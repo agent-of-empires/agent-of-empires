@@ -4776,6 +4776,20 @@ impl HomeView {
             index
         });
 
+        if let Some(snapshot) = &self.hidden_pull {
+            let spinner = spinners::dots()
+                .set_interval(Duration::from_millis(220))
+                .current_frame();
+            groups.push((
+                0,
+                None,
+                vec![Span::styled(
+                    super::update_bar::hidden_pull_badge(snapshot, spinner),
+                    Style::default().fg(theme.accent).bold(),
+                )],
+            ));
+        }
+
         // Pack shortcuts and optional Tips by priority within the runtime status boundary.
         // Widths and separators use display cells, matching the painted click rectangles.
         let mut widths: Vec<usize> = groups
