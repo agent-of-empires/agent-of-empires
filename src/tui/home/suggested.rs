@@ -301,6 +301,9 @@ impl HomeView {
                     )));
                 }
                 lines.push(Line::from(""));
+                if let Some(preset) = &entry.preset {
+                    lines.push(Line::from(Span::styled(preset.clone(), dim)));
+                }
                 lines.push(Line::from(Span::styled("Prompt", bold)));
                 let prompt: Vec<&str> = entry.prompt.lines().collect();
                 lines.extend(

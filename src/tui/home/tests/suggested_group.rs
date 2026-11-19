@@ -831,6 +831,34 @@ fn the_preview_key_line_names_the_source_from_120_columns() {
 
 #[test]
 #[serial]
+fn the_preview_shows_the_preset_and_the_prompt_enter_sends() {
+    let mut snap = snapshot(1, &[]);
+    snap["providers"][0]["sources"] = serde_json::json!([{
+        "criterion": "review",
+        "preset": { "agent": "claude", "view": "structured", "worktree": true,
+                    "sandbox": false, "yolo": true, "prompt": "Review PR {pr_number} now" }
+    }]);
+    snap["items"][0]["criterion"] = "review".into();
+    snap["items"][0]["variables"] = serde_json::json!({ "pr_number": "42" });
+    snap["items"][0]["start"] = serde_json::json!({
+        "agent": "claude", "view": "structured", "worktree": true, "sandbox": false
+    });
+    let (mut env, _requests) = expanded_env(1);
+    env.view.suggestions_feed.set_snapshot_for_test(snap);
+    env.view.rebuild_flat_items();
+    env.view.cursor += 1;
+    env.view.update_selected();
+    let text = preview_text(&mut env, 120);
+    assert!(
+        text.contains("Starts with Claude Code · Structured · worktree · yolo"),
+        "{text}"
+    );
+    assert!(text.contains("Review PR 42 now"), "{text}");
+    assert!(!text.contains("do it"), "{text}");
+}
+
+#[test]
+#[serial]
 fn the_wide_key_line_only_offers_open_when_the_suggestion_has_a_link() {
     let (mut env, _requests) = expanded_env(1);
     env.view.cursor += 1;
