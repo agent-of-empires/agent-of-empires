@@ -36,9 +36,11 @@ pub struct HostApiState {
     profile: String,
     ui: UiStore,
     settings_revision: std::sync::atomic::AtomicU64,
-    /// Providers asked to refresh, by request time (monotonic, and unix seconds to compare
-    /// with a provider's `updated_at`).
-    refreshing: Mutex<HashMap<String, (Instant, i64)>>,
+    /// Providers asked to refresh: when, and the provider's publish count at that moment.
+    refreshing: Mutex<HashMap<String, (Instant, u64)>>,
+    /// Publishes seen per provider. Counted, not timestamped: a publish in the same second
+    /// as a refresh request must still end it.
+    publishes: Mutex<HashMap<String, u64>>,
 }
 
 /// A worker that never answers stops counting as refreshing after this long.
@@ -71,17 +73,16 @@ impl HostApiState {
             ui: UiStore::new(),
             settings_revision: std::sync::atomic::AtomicU64::new(0),
             refreshing: Mutex::new(HashMap::new()),
+            publishes: Mutex::new(HashMap::new()),
         })
     }
 
     pub(crate) fn mark_refreshing(&self, provider_id: &str) {
+        let seen = self.publish_count(provider_id);
         self.refreshing
             .lock()
             .unwrap_or_else(|p| p.into_inner())
-            .insert(
-                provider_id.to_string(),
-                (Instant::now(), chrono::Utc::now().timestamp()),
-            );
+            .insert(provider_id.to_string(), (Instant::now(), seen));
     }
 
     pub(crate) fn clear_refreshing(&self, provider_id: &str) {
@@ -91,18 +92,28 @@ impl HostApiState {
             .remove(provider_id);
     }
 
-    /// Unix seconds each provider was last asked to refresh, within [`REFRESH_TTL`]. A provider
-    /// is still refreshing only if its `updated_at` is older than that.
-    pub(crate) fn refreshing_providers(&self) -> HashMap<String, i64> {
+    fn publish_count(&self, provider_id: &str) -> u64 {
+        let publishes = self.publishes.lock().unwrap_or_else(|p| p.into_inner());
+        publishes.get(provider_id).copied().unwrap_or(0)
+    }
+
+    fn record_publish(&self, provider_id: &str) {
+        let mut publishes = self.publishes.lock().unwrap_or_else(|p| p.into_inner());
+        *publishes.entry(provider_id.to_string()).or_insert(0) += 1;
+    }
+
+    /// Providers asked to refresh, within [`REFRESH_TTL`], that have not published since.
+    pub(crate) fn refreshing_providers(&self) -> HashSet<String> {
         self.refreshing_providers_at(Instant::now())
     }
 
-    fn refreshing_providers_at(&self, now: Instant) -> HashMap<String, i64> {
+    fn refreshing_providers_at(&self, now: Instant) -> HashSet<String> {
         let mut pending = self.refreshing.lock().unwrap_or_else(|p| p.into_inner());
         pending.retain(|_, (at, _)| now.saturating_duration_since(*at) < REFRESH_TTL);
         pending
             .iter()
-            .map(|(id, (_, unix))| (id.clone(), *unix))
+            .filter(|(id, (_, seen))| self.publish_count(id) == *seen)
+            .map(|(id, _)| id.clone())
             .collect()
     }
 
@@ -267,9 +278,13 @@ pub fn dispatch(
         "suggestions.set" => {
             ctx.require(CAP_WORKER)?;
             let spec = suggestions_spec(ctx)?;
-            state.with_suggestions_db_as(ctx, |conn, profile| {
+            let stored = state.with_suggestions_db_as(ctx, |conn, profile| {
                 suggestions::set(conn, profile, &ctx.plugin_id, &spec, params)
-            })
+            });
+            if stored.is_ok() {
+                state.record_publish(&ctx.plugin_id);
+            }
+            stored
         }
         "suggestions.error" => {
             ctx.require(CAP_WORKER)?;
@@ -1210,14 +1225,29 @@ mod tests {
         state.mark_refreshing("a");
         state.mark_refreshing("b");
         state.clear_refreshing("a");
-        let pending = state.refreshing_providers();
-        assert_eq!(pending.keys().collect::<Vec<_>>(), ["b"]);
-        assert!(pending["b"] >= chrono::Utc::now().timestamp() - 5);
+        assert_eq!(
+            state.refreshing_providers(),
+            HashSet::from(["b".to_string()])
+        );
         let later = Instant::now() + REFRESH_TTL + Duration::from_secs(1);
         assert!(
             state.refreshing_providers_at(later).is_empty(),
             "a silent worker expires"
         );
+    }
+
+    #[test]
+    fn a_publish_ends_a_refresh_even_in_the_same_second() {
+        let tmp = tempfile::tempdir().unwrap();
+        let state = state(tmp.path());
+        state.record_publish("a");
+        state.mark_refreshing("a");
+        assert!(
+            state.refreshing_providers().contains("a"),
+            "earlier publish"
+        );
+        state.record_publish("a");
+        assert!(state.refreshing_providers().is_empty(), "next publish");
     }
 
     #[test]
