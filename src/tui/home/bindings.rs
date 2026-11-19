@@ -107,6 +107,7 @@ pub enum ActionId {
     /// Dismiss the update, status or image banner for this session. `App` owns the
     /// banner state, so it executes this before the home view sees the key.
     DismissUpdateBanner,
+    CancelImagePull,
     /// Scroll the preview back or forward a page.
     PreviewScrollUp,
     PreviewScrollDown,
@@ -665,6 +666,17 @@ pub static BINDINGS: &[Binding] = &[
         help: Some(HelpMeta {
             section: HelpSection::Other,
             desc: "Dismiss update bar (this session)",
+        }),
+        palette: None,
+    },
+    Binding {
+        id: ActionId::CancelImagePull,
+        non_strict: &[ctrl('e')],
+        strict: &[ctrl('e')],
+        context: Context::AppOnly,
+        help: Some(HelpMeta {
+            section: HelpSection::Other,
+            desc: "Cancel sandbox image download",
         }),
         palette: None,
     },
@@ -1370,6 +1382,7 @@ pub fn palette_id(id: ActionId) -> &'static str {
         ActionId::RetryTrash => "retry-trash",
         ActionId::OpenCommandPalette => "command-palette",
         ActionId::DismissUpdateBanner => "dismiss-update-banner",
+        ActionId::CancelImagePull => "cancel-image-pull",
         ActionId::PreviewScrollUp => "preview-scroll-up",
         ActionId::PreviewScrollDown => "preview-scroll-down",
     }
@@ -1761,8 +1774,22 @@ mod tests {
             }
         }
         // App-owned: never resolves in Home (so plugins keep Ctrl+X), yet App still matches it.
-        for c in [ctx(), live] {
-            assert_eq!(resolve_action(&ctrl_key('x'), false, &c), None);
+        for c in [&ctx(), &live] {
+            assert_eq!(resolve_action(&ctrl_key('x'), false, c), None);
+        }
+        // Ctrl+E cancels a sandbox image pull in both modes, and nothing else claims it.
+        for strict in [false, true] {
+            for c in [&ctx(), &live] {
+                assert_eq!(resolve_action(&ctrl_key('e'), strict, c), None);
+            }
+            assert!(is_bound(ActionId::CancelImagePull, strict, &ctrl_key('e')));
+            assert_eq!(label(ActionId::CancelImagePull, strict), "Ctrl+E");
+            for b in BINDINGS
+                .iter()
+                .filter(|b| b.id != ActionId::CancelImagePull)
+            {
+                assert!(!is_bound(b.id, strict, &ctrl_key('e')), "{:?}", b.id);
+            }
         }
         assert!(is_bound(
             ActionId::DismissUpdateBanner,

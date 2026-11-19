@@ -624,6 +624,10 @@ mod tests {
             "only meaningful while a banner shows",
         ),
         (
+            ActionId::CancelImagePull,
+            "only meaningful while an image downloads",
+        ),
+        (
             ActionId::PreviewScrollUp,
             "live-send relay key, not a list action",
         ),

@@ -3436,6 +3436,7 @@ impl HomeView {
                     | ActionId::PreviewScrollUp
                     | ActionId::PreviewScrollDown
                     | ActionId::DismissUpdateBanner
+                    | ActionId::CancelImagePull
             )
         {
             return None;
@@ -3614,8 +3615,8 @@ impl HomeView {
                     self.preview_explicit_tail = self.preview_scroll_offset == 0;
                 }
             }
-            // `App` handles the chord before the home view sees it.
-            ActionId::DismissUpdateBanner => {}
+            // `App` handles these chords before the home view sees them.
+            ActionId::DismissUpdateBanner | ActionId::CancelImagePull => {}
         }
         None
     }
