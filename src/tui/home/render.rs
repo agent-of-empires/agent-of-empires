@@ -1097,6 +1097,9 @@ impl HomeView {
             if let Some(palette) = &mut self.command_palette {
                 palette.render(frame, area, theme);
             }
+            if let Some(dialog) = &mut self.confirm_dialog {
+                dialog.render(frame, area, theme);
+            }
             return;
         }
         if let Some(ref serve) = self.serve_view {

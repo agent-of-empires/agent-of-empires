@@ -2320,7 +2320,11 @@ impl HomeView {
                 return None;
             }
         }
-        if let (Some(view), None) = (&mut self.suggestions_view, &self.command_palette) {
+        if let (Some(view), None, None) = (
+            &mut self.suggestions_view,
+            &self.command_palette,
+            &self.confirm_dialog,
+        ) {
             let block = self.session_feed.mutation_block();
             match view.handle_key(key, block, &mut self.suggestions_feed) {
                 SuggestionsAction::Continue => {}

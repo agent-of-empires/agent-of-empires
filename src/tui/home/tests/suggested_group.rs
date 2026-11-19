@@ -314,6 +314,29 @@ fn a_failed_start_in_the_full_view_stays_on_its_row() {
 
 #[test]
 #[serial]
+fn the_hooks_review_opened_from_the_full_view_is_drawn_and_takes_the_keys() {
+    let answer = StartAnswer::NeedsTrust {
+        commands: vec!["on create: make setup".into()],
+        fingerprint: serde_json::json!({ "project_path": "/repo", "hooks": "abc" }),
+    };
+    let (mut env, requests) = expanded_env_answering(2, answer);
+    with_authenticated_local_project_registry(&mut env.view, |view| {
+        view.open_suggestions_view();
+        view.handle_key(key(KeyCode::Enter), None);
+    });
+    assert_eq!(next_request(&requests), "start gh/i0");
+    poll_until(&mut env, |env| env.view.confirm_dialog.is_some());
+    let text = render_home_to_string(&mut env.view, 120, 40);
+    assert!(text.contains("Review repository hooks"), "{text}");
+    env.view.handle_key(key(KeyCode::Char('y')), None);
+    assert_eq!(
+        next_request(&requests),
+        r#"start gh/i0 {"project_path":"/repo","hooks":"abc"}"#
+    );
+}
+
+#[test]
+#[serial]
 fn a_failed_start_says_why_and_enter_tries_again() {
     let answer = StartAnswer::Failed("Docker isn't running. Start it, then try again.".into());
     let (mut env, requests) = expanded_env_answering(2, answer);
