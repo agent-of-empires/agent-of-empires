@@ -2937,7 +2937,6 @@ function AppContent({
                   },
                   onStarted: handleSuggestionStarted,
                   onViewAll: () => requestNavigate("/suggestions"),
-                  onOpenSession: (id) => requestNavigate(`/session/${encodeURIComponent(id)}`),
                 }}
               />
             )}

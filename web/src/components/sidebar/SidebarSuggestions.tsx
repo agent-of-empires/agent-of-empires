@@ -16,11 +16,10 @@ interface Props {
   onPrepare: (prefill: WizardPrefill) => void;
   onStarted?: (session: SessionResponse) => void;
   onViewAll: () => void;
-  onOpenSession: (sessionId: string) => void;
 }
 
 /** The "Suggested" Group at the bottom of the session list, shown when the `sidebar` pref is on. */
-export function SidebarSuggestions({ readOnly = false, onPrepare, onStarted, onViewAll, onOpenSession }: Props) {
+export function SidebarSuggestions({ readOnly = false, onPrepare, onStarted, onViewAll }: Props) {
   const compact = useContext(SidebarCompactContext);
   const [expanded, toggleExpanded] = usePersistedFlag("aoe-sidebar-suggested-expanded", false);
   const { snapshot, busy, offline, failures, notice, start } = useSuggestions(
@@ -30,9 +29,9 @@ export function SidebarSuggestions({ readOnly = false, onPrepare, onStarted, onV
   );
 
   if (!snapshot?.prefs.sidebar) return null;
-  const active = snapshot.items.filter((item) => !item.dismissed);
+  // A started suggestion is a Session already listed under its Project.
+  const active = snapshot.items.filter((item) => !item.dismissed && !item.started_session);
   if (active.length === 0) return null;
-  const nameOf = (id: string) => snapshot.providers.find((p) => p.id === id)?.name ?? id;
   const unavailable = readOnly ? "Read-only: can't create Sessions" : offline ? OFFLINE_TITLE : undefined;
   const rowClass = `w-full text-left py-1.5 hover:bg-surface-800/40 cursor-pointer transition-colors disabled:opacity-50 disabled:cursor-not-allowed focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-brand-500 ${
     compact ? "px-2" : "pl-7 pr-3"
@@ -60,7 +59,6 @@ export function SidebarSuggestions({ readOnly = false, onPrepare, onStarted, onV
           <>
             {active.slice(0, MAX_ROWS).map((item) => {
               const key = suggestionKey(item);
-              const started = item.started_session;
               const failure = failures[key]?.message;
               return (
                 <button
@@ -69,9 +67,9 @@ export function SidebarSuggestions({ readOnly = false, onPrepare, onStarted, onV
                   data-testid="sidebar-suggested-row"
                   onKeyDown={onSidebarArrowKey}
                   {...{ [NAV_ITEM]: "" }}
-                  disabled={!started && (busy !== null || !!unavailable || item.stale)}
-                  title={started ? `Open ${started.title}` : (unavailable ?? item.title)}
-                  onClick={() => (started ? onOpenSession(started.id) : void start(item, failures[key]?.another))}
+                  disabled={busy !== null || !!unavailable || item.stale}
+                  title={unavailable ?? item.title}
+                  onClick={() => void start(item, failures[key]?.another)}
                   className={rowClass}
                 >
                   <span
@@ -82,11 +80,7 @@ export function SidebarSuggestions({ readOnly = false, onPrepare, onStarted, onV
                   <span className="block truncate text-[11px] text-text-muted">
                     {failure
                       ? `Couldn't start: ${failure}`
-                      : [
-                          nameOf(item.provider_id),
-                          snapshot.prefs.show_source_ref ? item.source_ref : null,
-                          started ? "started" : null,
-                        ]
+                      : [snapshot.prefs.show_source_ref ? item.source_ref : null, item.reason]
                           .filter(Boolean)
                           .join(" · ")}
                   </span>

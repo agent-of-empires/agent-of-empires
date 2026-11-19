@@ -110,9 +110,9 @@ describe("SidebarSuggestions", () => {
     fireEvent.click(toggle);
     const rows = screen.getAllByTestId("sidebar-suggested-row");
     expect(rows.map((r) => r.textContent)).toEqual([
-      "Item 1GitHub · ex/1",
-      "Item 2GitHub · ex/2",
-      "Item 3GitHub · ex/3",
+      "Item 1ex/1 · Assigned to you",
+      "Item 2ex/2 · Assigned to you",
+      "Item 3ex/3 · Assigned to you",
     ]);
     fireEvent.click(screen.getByTestId("sidebar-suggested-view-all"));
     expect(props.onViewAll).toHaveBeenCalled();
@@ -120,14 +120,22 @@ describe("SidebarSuggestions", () => {
     expect(prepareSuggestion).toHaveBeenCalledWith("github", "i1");
   });
 
-  it("opens the started Session instead of preparing, and is absent with nothing open", async () => {
+  it("hides started suggestions, and the group is absent with nothing open", async () => {
     const started = { id: "s9", title: "Fix", status: "Running" as const, archived: false, created_at: "" };
-    fetchSuggestions.mockResolvedValue(snap([mk(1, { started_session: started })], true));
-    const props = renderIt();
+    fetchSuggestions.mockResolvedValue(snap([mk(1, { started_session: started }), mk(2)], true));
+    renderIt();
     fireEvent.click(await screen.findByTestId("sidebar-suggested-toggle"));
-    fireEvent.click(screen.getByTestId("sidebar-suggested-row"));
-    expect(props.onOpenSession).toHaveBeenCalledWith("s9");
-    expect(prepareSuggestion).not.toHaveBeenCalled();
+    expect(screen.getAllByTestId("sidebar-suggested-row").map((r) => r.textContent)).toEqual([
+      "Item 2ex/2 · Assigned to you",
+    ]);
+    expect(screen.getByTestId("sidebar-suggested-toggle").textContent).toBe("Suggested (1)");
+    cleanup();
+    fetchSuggestions.mockClear();
+    fetchSuggestions.mockResolvedValue(snap([mk(1, { started_session: started })], true));
+    renderIt();
+    await waitFor(() => expect(fetchSuggestions).toHaveBeenCalledTimes(1));
+    await act(async () => {});
+    expect(screen.queryByTestId("sidebar-suggested-section")).toBeNull();
     cleanup();
 
     fetchSuggestions.mockResolvedValue(snap([mk(1, { dismissed: true })], true));
