@@ -396,13 +396,23 @@ pub(crate) mod test_support {
     /// Returns a fixed set and records each call's sandbox for assertions after the run.
     pub(crate) struct RecordingRewriter {
         pub(crate) sandboxes: Mutex<Vec<Option<McpSandbox>>>,
+        inputs: Mutex<Vec<Vec<String>>>,
         result: Vec<ProjectMcpServer>,
     }
 
     impl RecordingRewriter {
+        /// Server names each call received.
+        pub(crate) fn input_names(&self) -> Vec<Vec<String>> {
+            self.inputs
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .clone()
+        }
+
         pub(crate) fn returning(result: Vec<ProjectMcpServer>) -> Arc<Self> {
             Arc::new(Self {
                 sandboxes: Mutex::new(Vec::new()),
+                inputs: Mutex::new(Vec::new()),
                 result,
             })
         }
@@ -417,8 +427,12 @@ pub(crate) mod test_support {
         fn rewrite<'a>(
             &'a self,
             ctx: &'a McpRewriteContext,
-            _servers: Vec<ProjectMcpServer>,
+            servers: Vec<ProjectMcpServer>,
         ) -> RewriteFuture<'a> {
+            self.inputs
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .push(servers.iter().map(|s| s.name.clone()).collect());
             self.sandboxes
                 .lock()
                 .unwrap_or_else(|e| e.into_inner())
