@@ -1,5 +1,5 @@
-//! Resolves a suggestion to a session prefill: template expansion and project
-//! resolution.
+//! Resolves a suggestion to a session prefill: the kind's preset, prompt
+//! expansion and project resolution.
 
 use super::*;
 
@@ -188,8 +188,9 @@ pub(crate) fn find_item_with_mapping(
 }
 
 /// Wizard prefill for `item`, resolved through the normal config cascade of its
-/// project, or the saved profile settings when it names none. A `template`
-/// replaces the provider's prompt, expanded from the item's variables.
+/// project, or the saved profile settings when it names none. A stored
+/// `preset` replaces the config defaults, and its prompt the provider's, expanded
+/// from the item's variables.
 ///
 /// A mapping whose first path resolves supplies the project and the rest of
 /// its list as extras. Otherwise the provider's `project` hint applies; an
@@ -197,13 +198,13 @@ pub(crate) fn find_item_with_mapping(
 pub(crate) fn prepare(
     profile: &str,
     item: &Suggestion,
-    template: Option<&str>,
+    preset: Option<&Preset>,
     mapped: Option<&[String]>,
 ) -> Result<Value, PrepareRefusal> {
     if item.stale {
         return Err(PrepareRefusal::Stale);
     }
-    let prompt = match template {
+    let prompt = match preset.and_then(|p| p.prompt.as_deref()) {
         Some(t) => {
             let expanded = expand(t, &item.variables)
                 .map_err(|PromptTooLong| PrepareRefusal::PromptTooLong)?;
@@ -220,11 +221,32 @@ pub(crate) fn prepare(
     let registered = projects::load_merged(profile)
         .map_err(|error| PrepareRefusal::Registry(error.to_string()))?;
     let (project, extras) = resolve_projects(&registered, item.project.as_deref(), mapped);
-    let mut config = match &project {
+    let effective = preset
+        .cloned()
+        .unwrap_or_else(|| default_preset(&project_config(profile, project.as_ref())));
+    let describe = |p: &Project| json!({ "name": p.name, "path": p.path });
+    Ok(json!({
+        "title": item.draft.title,
+        "initial_prompt": prompt,
+        "customized": preset.is_some(),
+        "source_ref": item.source_ref,
+        "project": project.as_ref().map(describe),
+        "extra_projects": extras.iter().map(describe).collect::<Vec<_>>(),
+        "tool": effective.agent,
+        "view": effective.view,
+        "yolo": effective.yolo,
+        "sandbox": effective.sandbox,
+        "worktree": effective.worktree,
+    }))
+}
+
+/// The profile config as a Session in `project` would see it.
+fn project_config(profile: &str, project: Option<&Project>) -> crate::session::config::Config {
+    let mut config = match project {
         Some(p) => resolve_config_with_repo_or_warn(profile, Path::new(&p.path)),
         None => resolve_config_or_warn(profile),
     };
-    if let Some(p) = &project {
+    if let Some(p) = project {
         if let Some(enabled) = p.overrides.worktree_enabled {
             config.worktree.enabled = enabled;
         }
@@ -232,31 +254,7 @@ pub(crate) fn prepare(
             config.sandbox.enabled_by_default = enabled;
         }
     }
-    let describe = |p: &Project| json!({ "name": p.name, "path": p.path });
-    let tool = config
-        .session
-        .default_tool
-        .clone()
-        .unwrap_or_else(|| "claude".to_string());
-    // Same rule as the web wizard; the spawn fills model and effort from `acp_defaults`.
-    let structured = matches!(
-        config.acp.structured_view,
-        StructuredView::Auto | StructuredView::Structured
-    ) && crate::session::builder::structured::tool_acp_capable(&tool, &config);
-    Ok(json!({
-        "title": item.draft.title,
-        "initial_prompt": prompt,
-        "template_criterion": template.map(|_| &item.criterion),
-        "templated": template.is_some(),
-        "source_ref": item.source_ref,
-        "project": project.as_ref().map(describe),
-        "extra_projects": extras.iter().map(describe).collect::<Vec<_>>(),
-        "tool": tool,
-        "view": if structured { "structured" } else { "terminal" },
-        "yolo": config.session.yolo_mode_default,
-        "sandbox": config.sandbox.enabled_by_default,
-        "worktree": config.worktree.enabled,
-    }))
+    config
 }
 
 #[cfg(test)]
@@ -291,9 +289,33 @@ mod tests {
         }
         let out = prepared(None);
         assert_eq!(out["initial_prompt"], "Do work");
-        assert!(out["template_criterion"].is_null());
-        let templated = prepare("default", &item("a", "assigned"), Some(""), None).unwrap();
-        assert_eq!(templated["template_criterion"], "assigned");
+        assert_eq!(out["customized"], false);
+        let custom = Preset {
+            agent: "codex".into(),
+            view: PresetView::Terminal,
+            worktree: false,
+            sandbox: true,
+            yolo: true,
+            prompt: Some(String::new()),
+        };
+        let customized = prepare("default", &item("a", "assigned"), Some(&custom), None).unwrap();
+        assert_eq!(customized["customized"], true);
+        assert_eq!(
+            (
+                &customized["tool"],
+                &customized["view"],
+                &customized["worktree"],
+                &customized["sandbox"],
+                &customized["yolo"]
+            ),
+            (
+                &json!("codex"),
+                &json!("terminal"),
+                &json!(false),
+                &json!(true),
+                &json!(true)
+            )
+        );
         assert_eq!(out["source_ref"], "example/1");
         assert_eq!(out["extra_projects"], json!([]));
         assert_eq!(
@@ -400,8 +422,13 @@ mod tests {
     fn prepare_applies_the_template_in_place_of_the_draft_prompt() {
         let _home = crate::session::test_support::isolate_app_dir();
         let i = item("a", "assigned");
-        let prompt =
-            |template| prepare("default", &i, template, None).map(|v| v["initial_prompt"].clone());
+        let with = |template: Option<&str>| Preset {
+            prompt: template.map(String::from),
+            ..default_preset(&crate::session::config::Config::default())
+        };
+        let prompt = |template: Option<&str>| {
+            prepare("default", &i, Some(&with(template)), None).map(|v| v["initial_prompt"].clone())
+        };
         assert_eq!(prompt(None), Ok(json!("Do work")));
         assert_eq!(
             prompt(Some("Fix {repo} {nope}")),
@@ -409,10 +436,6 @@ mod tests {
         );
         assert_eq!(prompt(Some("")), Ok(json!("")));
         assert_eq!(prompt(Some(" \n\t")), Ok(json!("")));
-        let templated =
-            |template| prepare("default", &i, template, None).unwrap()["templated"].clone();
-        assert_eq!(templated(None), json!(false));
-        assert_eq!(templated(Some("Fix {repo}")), json!(true));
         // 12-byte value, template within the stored bound: expansion is not.
         let bomb = "{repo}".repeat(MAX_INITIAL_PROMPT_BYTES / "{repo}".len());
         assert!(bomb.len() <= MAX_INITIAL_PROMPT_BYTES);

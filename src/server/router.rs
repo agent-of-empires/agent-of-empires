@@ -313,10 +313,10 @@ pub(super) fn build_router(state: Arc<AppState>) -> Router {
         )
         .route("/api/suggestions/prefs", patch(api::patch_suggestion_prefs))
         .route(
-            "/api/suggestions/templates",
-            get(api::get_suggestion_templates)
-                .put(api::put_suggestion_template)
-                .delete(api::delete_suggestion_template),
+            "/api/suggestions/presets",
+            get(api::get_suggestion_presets)
+                .put(api::put_suggestion_preset)
+                .delete(api::delete_suggestion_preset),
         )
         .route("/api/suggestions/prepare", post(api::prepare_suggestion))
         .route(
