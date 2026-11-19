@@ -60,7 +60,7 @@ test("search and source chips narrow unmapped suggestions", async ({ page }) => 
   await expect(titles).toHaveText(["Tool chore"]);
 });
 
-test("the Map projects wizard proposes Projects and saves the checked ones", async ({ page }) => {
+test("Settings Linked repos: the wizard proposes Projects and saves the checked ones", async ({ page }) => {
   await page.route("**/api/suggestions/projects", (route) =>
     route.fulfill({
       json: {
@@ -79,8 +79,10 @@ test("the Map projects wizard proposes Projects and saves the checked ones", asy
     }
     return route.fulfill({ json: { mappings: [] } });
   });
-  await page.goto("/suggestions");
-  await page.getByRole("button", { name: "Link a Project" }).first().click();
+  await page.goto("/settings/suggestions");
+  await page.getByText("Advanced").click();
+  await page.getByRole("button", { name: "Edit" }).last().click();
+  await page.getByRole("button", { name: "Link repos automatically…" }).click();
 
   const wizard = page.getByRole("dialog", { name: "Link each repo to a Project" });
   await expect(wizard.getByLabel("Map acme/web")).toBeChecked();

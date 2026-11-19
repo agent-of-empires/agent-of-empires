@@ -638,7 +638,7 @@ describe("SuggestionsView", () => {
       expect((await screen.findByRole("list", { name: "Provider status" })).textContent).toContain(
         "GitHub: nothing new",
       );
-      expect(screen.getByRole("list", { name: "Provider status" }).textContent).toContain("Linear: updated 2 min ago");
+      expect(screen.getByRole("list", { name: "Provider status" }).textContent).toContain("Linear updated 2 min ago");
     });
 
     it("follows a refreshing provider until it answers", async () => {

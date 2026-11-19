@@ -83,7 +83,7 @@ The prompt is a template. `{name}` expands to the item's variable of that name; 
 
 #### Mapping wizard
 
-**Link a Project** on a repo group in `/suggestions`, or **Link repos automatically…** under Linked repos, lists every source key in the current suggestions that has no mapping and proposes a Project for it:
+**Link repos automatically…** under Linked repos, lists every source key in the current suggestions that has no mapping and proposes a Project for it:
 
 1. A Project whose git `origin` is the key (`owner/repo`, ignoring case) is proposed and checked.
 2. Otherwise a Project whose name or folder equals the key's last part, ignoring case, `-` and `_`, is proposed unchecked.
