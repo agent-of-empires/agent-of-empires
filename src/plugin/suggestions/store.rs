@@ -1,11 +1,11 @@
-//! Profile-scoped queries and writes: items, dismissals, templates, mappings,
+//! Profile-scoped queries and writes: items, dismissals, presets, mappings,
 //! checks and the snapshot read.
 
 use super::*;
 
 /// Drops what a provider's worker published, in every profile, so a
 /// reinstalled or changed plugin starts `pending`. Sources, dismissals,
-/// templates and mappings are user state and stay.
+/// presets and mappings are user state and stay.
 pub(crate) fn forget_publication(conn: &Connection, provider_id: &str) -> rusqlite::Result<()> {
     let tx = conn.unchecked_transaction()?;
     for table in [
@@ -98,66 +98,6 @@ pub(crate) fn set_source(
         params![profile, provider_id, criterion, enabled],
     )?;
     Ok(())
-}
-
-/// The user's prompt template for a criterion; no row means the provider's
-/// `draft.prompt`, while an empty template means an empty prompt.
-pub(crate) fn template(
-    conn: &Connection,
-    profile: &str,
-    provider_id: &str,
-    criterion: &str,
-) -> rusqlite::Result<Option<String>> {
-    conn.query_row(
-        "SELECT template FROM suggestion_templates
-         WHERE profile = ?1 AND provider_id = ?2 AND criterion = ?3",
-        params![profile, provider_id, criterion],
-        |row| row.get(0),
-    )
-    .optional()
-}
-
-pub(crate) fn set_template(
-    conn: &Connection,
-    profile: &str,
-    provider_id: &str,
-    criterion: &str,
-    template: &str,
-) -> rusqlite::Result<()> {
-    conn.execute(
-        "INSERT INTO suggestion_templates (profile, provider_id, criterion, template)
-         VALUES (?1, ?2, ?3, ?4)
-         ON CONFLICT (profile, provider_id, criterion) DO UPDATE SET template = ?4",
-        params![profile, provider_id, criterion, template],
-    )?;
-    Ok(())
-}
-
-pub(crate) fn delete_template(
-    conn: &Connection,
-    profile: &str,
-    provider_id: &str,
-    criterion: &str,
-) -> rusqlite::Result<()> {
-    conn.execute(
-        "DELETE FROM suggestion_templates
-         WHERE profile = ?1 AND provider_id = ?2 AND criterion = ?3",
-        params![profile, provider_id, criterion],
-    )?;
-    Ok(())
-}
-
-/// Every stored template of the profile as `(provider_id, criterion, template)`.
-pub(crate) fn templates(
-    conn: &Connection,
-    profile: &str,
-) -> rusqlite::Result<Vec<(String, String, String)>> {
-    conn.prepare(
-        "SELECT provider_id, criterion, template FROM suggestion_templates
-         WHERE profile = ?1 ORDER BY provider_id, criterion",
-    )?
-    .query_map([profile], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))?
-    .collect()
 }
 
 /// Stored items whose criterion is currently enabled.
@@ -636,9 +576,9 @@ mod tests {
                     "'Fix', 'suggestions.fix.k'",
                 ),
                 (
-                    "suggestion_templates",
-                    "criterion, template",
-                    "'assigned', 't'",
+                    "suggestion_presets",
+                    "criterion, preset_json",
+                    "'assigned', '{}'",
                 ),
                 (
                     "suggestion_mappings",
@@ -683,7 +623,7 @@ mod tests {
         for table in [
             "suggestion_sources",
             "suggestion_dismissals",
-            "suggestion_templates",
+            "suggestion_presets",
             "suggestion_mappings",
         ] {
             assert_eq!(count(table), 2, "{table}");
@@ -844,22 +784,6 @@ mod tests {
                 .len(),
             1
         );
-    }
-
-    #[test]
-    fn templates_are_stored_per_profile_and_criterion() {
-        let conn = store();
-        let get = |profile, criterion| template(&conn, profile, "acme.github", criterion).unwrap();
-        assert_eq!(get("p", "assigned"), None);
-        set_template(&conn, "p", "acme.github", "assigned", "first").unwrap();
-        set_template(&conn, "p", "acme.github", "assigned", "").unwrap();
-        set_template(&conn, "p", "acme.github", "quiet", "q").unwrap();
-        assert_eq!(get("p", "assigned").as_deref(), Some(""));
-        assert_eq!(get("other", "assigned"), None);
-        assert_eq!(templates(&conn, "p").unwrap().len(), 2);
-        delete_template(&conn, "p", "acme.github", "assigned").unwrap();
-        assert_eq!(get("p", "assigned"), None);
-        assert_eq!(get("p", "quiet").as_deref(), Some("q"));
     }
 
     #[test]

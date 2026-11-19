@@ -3,8 +3,8 @@
 //!
 //! Rows are keyed by `effective_profile`, resolved by the callers on publish and
 //! on read alike. A provider's display name and source metadata come from the
-//! manifest; only status, items, source overrides, dismissals and prompt
-//! templates are stored.
+//! manifest; only status, items, source overrides, dismissals and start
+//! presets are stored.
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 
 use aoe_plugin_api::suggestions::{MAX_KEY_BYTES, SUGGESTIONS_FIX_PREFIX};
@@ -60,7 +60,7 @@ pub(crate) fn providers() -> Vec<Provider> {
         .collect()
 }
 
-const SCHEMA_VERSION: i64 = 2;
+const SCHEMA_VERSION: i64 = 3;
 
 /// Identifies the manifest spec a publication was validated against. Reads show
 /// only items stamped with the provider's current spec, so a worker that
@@ -80,7 +80,7 @@ const TABLES: [&str; 12] = [
     "suggestion_items",
     "suggestion_sources",
     "suggestion_dismissals",
-    "suggestion_templates",
+    "suggestion_presets",
     "suggestion_mappings",
     "suggestion_fixes",
     "suggestion_stale",
@@ -143,11 +143,11 @@ pub(crate) fn init(conn: &Connection) -> rusqlite::Result<()> {
              item_id     TEXT NOT NULL,
              PRIMARY KEY (profile, provider_id, item_id)
          );
-         CREATE TABLE IF NOT EXISTS suggestion_templates (
+         CREATE TABLE IF NOT EXISTS suggestion_presets (
              profile     TEXT NOT NULL,
              provider_id TEXT NOT NULL,
              criterion   TEXT NOT NULL,
-             template    TEXT NOT NULL,
+             preset_json TEXT NOT NULL,
              PRIMARY KEY (profile, provider_id, criterion)
          );
          CREATE TABLE IF NOT EXISTS suggestion_mappings (
@@ -182,7 +182,6 @@ pub(crate) fn init(conn: &Connection) -> rusqlite::Result<()> {
              homepage        INTEGER NOT NULL DEFAULT 1,
              sidebar         INTEGER NOT NULL DEFAULT 0,
              refresh_minutes INTEGER NOT NULL DEFAULT 15,
-             start_without_review INTEGER NOT NULL DEFAULT 0,
              show_source_ref INTEGER NOT NULL DEFAULT 1
          );
          CREATE TABLE IF NOT EXISTS suggestion_provider_prefs (
@@ -231,11 +230,13 @@ fn effective_enabled(
 mod ingest;
 mod prefs;
 mod prepare;
+mod preset;
 mod store;
 
 pub(crate) use ingest::*;
 pub(crate) use prefs::*;
 pub(crate) use prepare::*;
+pub(crate) use preset::*;
 pub(crate) use store::*;
 
 #[cfg(test)]

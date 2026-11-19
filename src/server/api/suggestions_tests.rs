@@ -379,107 +379,90 @@ async fn sources_and_prefs() {
     assert_eq!(snapshot["prefs"]["refresh_minutes"], 30);
 }
 
-#[tokio::test]
-#[serial_test::serial]
-async fn templates_round_trip_and_validation() {
-    let f = fixture();
-    let query = format!("/api/suggestions/templates?provider_id={PROVIDER}&criterion=assigned");
-
-    let (status, _, body) = f.call(Method::GET, &query, Value::Null).await;
-    assert_eq!(status, StatusCode::OK);
-    assert_eq!(
-        (&body["default"], &body["template"]),
-        (&json!(true), &Value::Null)
-    );
-
-    let (status, _, body) = f
-        .call(
-            Method::PUT,
-            "/api/suggestions/templates",
-            json!({ "provider_id": PROVIDER, "criterion": "assigned", "template": "Look at {number}" }),
-        )
-        .await;
-    assert_eq!(status, StatusCode::OK);
-    assert_eq!(
-        body,
-        json!({ "provider_id": PROVIDER, "criterion": "assigned",
-                "template": "Look at {number}", "default": false })
-    );
-    let (_, _, body) = f.call(Method::GET, &query, Value::Null).await;
-    assert_eq!(body["template"], "Look at {number}");
-    let (_, _, body) = f
-        .call(Method::GET, "/api/suggestions/templates", Value::Null)
-        .await;
-    assert_eq!(
-        body,
-        json!({ "templates": [{ "provider_id": PROVIDER, "criterion": "assigned",
-                                "template": "Look at {number}" }] })
-    );
-
-    for (uri, status, code) in [
-        (
-            format!("/api/suggestions/templates?provider_id={PROVIDER}"),
-            StatusCode::BAD_REQUEST,
-            "validation_failed",
-        ),
-        (
-            format!("/api/suggestions/templates?provider_id={PROVIDER}&criterion=undeclared"),
-            StatusCode::BAD_REQUEST,
-            "validation_failed",
-        ),
-        (
-            "/api/suggestions/templates?provider_id=nobody&criterion=assigned".to_string(),
-            StatusCode::NOT_FOUND,
-            "unknown_provider",
-        ),
-    ] {
-        let (got, got_code, _) = f.call(Method::GET, &uri, Value::Null).await;
-        assert_eq!((got, got_code.as_str()), (status, code), "{uri}");
-    }
-    let (status, code, _) = f
-        .call(
-            Method::PUT,
-            "/api/suggestions/templates",
-            json!({ "provider_id": PROVIDER, "criterion": "undeclared", "template": "x" }),
-        )
-        .await;
-    assert_eq!(
-        (status, code.as_str()),
-        (StatusCode::BAD_REQUEST, "validation_failed")
-    );
-
-    let (status, code, _) = f
-        .call(
-            Method::PUT,
-            "/api/suggestions/templates",
-            json!({ "provider_id": PROVIDER, "criterion": "assigned",
-                    "template": "x".repeat(65 * 1024) }),
-        )
-        .await;
-    assert_eq!(
-        (status, code.as_str()),
-        (StatusCode::BAD_REQUEST, "validation_failed")
-    );
-
-    for _ in 0..2 {
-        let (status, _, body) = f.call(Method::DELETE, &query, Value::Null).await;
-        assert_eq!((status, body), (StatusCode::OK, json!({ "ok": true })));
-    }
-    let (status, _, _) = f
-        .call(
-            Method::DELETE,
-            &format!("/api/suggestions/templates?provider_id={PROVIDER}"),
-            Value::Null,
-        )
-        .await;
-    assert_eq!(status, StatusCode::BAD_REQUEST);
-    let (_, _, body) = f.call(Method::GET, &query, Value::Null).await;
-    assert_eq!(body["default"], true);
+fn preset_body(criterion: &str, agent: &str, prompt: Value) -> Value {
+    json!({ "provider_id": PROVIDER, "criterion": criterion, "preset": {
+        "agent": agent, "view": "terminal", "worktree": false, "sandbox": true,
+        "yolo": true, "prompt": prompt } })
 }
 
 #[tokio::test]
 #[serial_test::serial]
-async fn prepare_resolves_prompt_template_and_stale_items() {
+async fn presets_default_round_trip_reset_and_validate() {
+    let f = fixture();
+    let entry = |body: &Value| {
+        body["presets"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|p| p["criterion"] == "assigned")
+            .unwrap()
+            .clone()
+    };
+
+    let (status, _, body) = f
+        .call(Method::GET, "/api/suggestions/presets", Value::Null)
+        .await;
+    assert_eq!(status, StatusCode::OK);
+    let assigned = entry(&body);
+    assert_eq!(assigned["customized"], false);
+    assert_eq!(assigned["preset"], assigned["defaults"]);
+    assert_eq!(assigned["defaults"]["prompt"], Value::Null);
+
+    let (status, _, put) = f
+        .call(
+            Method::PUT,
+            "/api/suggestions/presets",
+            preset_body("assigned", "codex", json!("Look at {number}")),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{put}");
+    assert_eq!(put["customized"], true);
+    assert_eq!(put["preset"]["agent"], "codex");
+    let (_, _, body) = f
+        .call(Method::GET, "/api/suggestions/presets", Value::Null)
+        .await;
+    let assigned = entry(&body);
+    assert_eq!(assigned["preset"]["prompt"], "Look at {number}");
+    assert_ne!(assigned["preset"], assigned["defaults"]);
+
+    for (body, code) in [
+        (
+            preset_body("undeclared", "codex", json!("x")),
+            "validation_failed",
+        ),
+        (
+            preset_body("assigned", "no-such-agent", json!("x")),
+            "validation_failed",
+        ),
+        (
+            preset_body("assigned", "codex", json!("x".repeat(65 * 1024))),
+            "validation_failed",
+        ),
+    ] {
+        let (status, got, _) = f.call(Method::PUT, "/api/suggestions/presets", body).await;
+        assert_eq!((status, got.as_str()), (StatusCode::BAD_REQUEST, code));
+    }
+
+    let query = format!("/api/suggestions/presets?provider_id={PROVIDER}&criterion=assigned");
+    let (status, _, _) = f.call(Method::DELETE, &query, Value::Null).await;
+    assert_eq!(status, StatusCode::NO_CONTENT);
+    let (status, _, _) = f
+        .call(
+            Method::DELETE,
+            &format!("/api/suggestions/presets?provider_id={PROVIDER}"),
+            Value::Null,
+        )
+        .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    let (_, _, body) = f
+        .call(Method::GET, "/api/suggestions/presets", Value::Null)
+        .await;
+    assert_eq!(entry(&body)["customized"], false);
+}
+
+#[tokio::test]
+#[serial_test::serial]
+async fn prepare_resolves_the_preset_prompt_and_stale_items() {
     let f = fixture();
     f.seed_item("a", None, "42");
     let item = |provider: &str, id: &str| json!({ "provider_id": provider, "id": id });
@@ -493,15 +476,15 @@ async fn prepare_resolves_prompt_template_and_stale_items() {
         .await;
     assert_eq!(status, StatusCode::OK);
     assert_eq!(body["title"], "Fix #42");
-    // Only a template expands variables; the draft prompt is used as published.
+    // Only a preset prompt expands variables; the draft prompt is used as published.
     assert_eq!(body["initial_prompt"], "Fix #{number}");
     assert_eq!(body["source_ref"], "acme/web#42");
     assert_eq!(body["project"], Value::Null);
 
     f.call(
         Method::PUT,
-        "/api/suggestions/templates",
-        json!({ "provider_id": PROVIDER, "criterion": "assigned", "template": "Review {number}" }),
+        "/api/suggestions/presets",
+        preset_body("assigned", "claude", json!("Review {number}")),
     )
     .await;
     let (_, _, body) = f
@@ -517,8 +500,8 @@ async fn prepare_resolves_prompt_template_and_stale_items() {
     f.seed_item("big", None, &"n".repeat(2000));
     f.call(
         Method::PUT,
-        "/api/suggestions/templates",
-        json!({ "provider_id": PROVIDER, "criterion": "assigned", "template": "{number}".repeat(100) }),
+        "/api/suggestions/presets",
+        preset_body("assigned", "claude", json!("{number}".repeat(100))),
     )
     .await;
     let (status, code, _) = f

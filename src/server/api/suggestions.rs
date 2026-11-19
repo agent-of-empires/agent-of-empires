@@ -12,7 +12,7 @@ use serde::Deserialize;
 use serde_json::json;
 
 use super::{api_error, AppState};
-use crate::plugin::suggestions::{self, PrepareRefusal, Provider};
+use crate::plugin::suggestions::{self, PrepareRefusal, Preset, Provider};
 use axum::http::StatusCode;
 
 #[derive(Deserialize)]
@@ -32,23 +32,17 @@ pub struct SourceBody {
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
-pub struct TemplateKey {
+pub struct PresetKey {
     provider_id: String,
     criterion: String,
 }
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
-pub struct TemplateBody {
+pub struct PresetBody {
     provider_id: String,
     criterion: String,
-    template: String,
-}
-
-#[derive(Deserialize)]
-pub struct TemplateQuery {
-    provider_id: Option<String>,
-    criterion: Option<String>,
+    preset: Preset,
 }
 
 #[derive(Deserialize)]
@@ -368,19 +362,19 @@ pub async fn prepare_suggestion(
         return unknown_provider();
     };
     let result = tokio::task::spawn_blocking(move || {
-        let (profile, found, template) = host.with_suggestions_db(|conn, profile| {
+        let (profile, found, preset) = host.with_suggestions_db(|conn, profile| {
             let found = suggestions::find_item_with_mapping(conn, profile, &provider, &item.id)?;
-            let template = match &found {
+            let preset = match &found {
                 Some((found, _)) => {
-                    suggestions::template(conn, profile, &provider.id, &found.criterion)?
+                    suggestions::preset(conn, profile, &provider.id, &found.criterion)?
                 }
                 None => None,
             };
-            Ok::<_, anyhow::Error>((profile.to_string(), found, template))
+            Ok::<_, anyhow::Error>((profile.to_string(), found, preset))
         })?;
         // Config and project resolution touch disk, so they run off the lock.
         Ok::<_, anyhow::Error>(found.map(|(found, mapped)| {
-            suggestions::prepare(&profile, &found, template.as_deref(), mapped.as_deref())
+            suggestions::prepare(&profile, &found, preset.as_ref(), mapped.as_deref())
         }))
     })
     .await;
@@ -406,15 +400,6 @@ pub async fn prepare_suggestion(
     }
 }
 
-/// The provider, or the error response when it is unknown or does not
-/// declare `criterion`.
-fn declared_source(
-    provider_id: &str,
-    criterion: &str,
-) -> Result<Provider, axum::response::Response> {
-    check_declared(find_provider(provider_id), criterion)
-}
-
 fn check_declared(
     provider: Option<Provider>,
     criterion: &str,
@@ -437,78 +422,84 @@ fn check_declared(
 }
 
 /// What a PUT must satisfy before anything is stored.
-fn check_template_put(
+fn check_preset_put(
     provider: Option<Provider>,
     criterion: &str,
-    template: &str,
+    profile: &str,
+    preset: &Preset,
 ) -> Result<(), axum::response::Response> {
     check_declared(provider, criterion)?;
-    if template.len() > crate::session::MAX_INITIAL_PROMPT_BYTES {
-        return Err(api_error(
-            StatusCode::BAD_REQUEST,
-            "validation_failed",
-            format!(
-                "Template is limited to {} bytes",
-                crate::session::MAX_INITIAL_PROMPT_BYTES
-            ),
-        ));
+    let invalid =
+        |message: String| api_error(StatusCode::BAD_REQUEST, "validation_failed", message);
+    let known_agent = crate::agents::get_agent(&preset.agent).is_some()
+        || crate::session::config::profile_config::resolve_config_or_warn(profile)
+            .session
+            .custom_agents
+            .get(&preset.agent)
+            .is_some_and(|command| !command.trim().is_empty());
+    if !known_agent {
+        return Err(invalid(format!("Unknown agent {:?}", preset.agent)));
+    }
+    if preset
+        .prompt
+        .as_deref()
+        .is_some_and(|prompt| prompt.len() > crate::session::MAX_INITIAL_PROMPT_BYTES)
+    {
+        return Err(invalid(format!(
+            "Prompt is limited to {} bytes",
+            crate::session::MAX_INITIAL_PROMPT_BYTES
+        )));
     }
     Ok(())
 }
 
-fn template_json(
+fn preset_json(
     provider_id: &str,
     criterion: &str,
-    template: Option<String>,
+    stored: Option<Preset>,
+    defaults: &Preset,
 ) -> serde_json::Value {
     json!({
         "provider_id": provider_id,
         "criterion": criterion,
-        "default": template.is_none(),
-        "template": template,
+        "customized": stored.is_some(),
+        "preset": stored.as_ref().unwrap_or(defaults),
+        "defaults": defaults,
     })
 }
 
-pub async fn get_suggestion_templates(
-    State(state): State<Arc<AppState>>,
-    Query(query): Query<TemplateQuery>,
-) -> impl IntoResponse {
-    let key = match (query.provider_id, query.criterion) {
-        (None, None) => None,
-        (Some(provider_id), Some(criterion)) => {
-            if let Err(response) = declared_source(&provider_id, &criterion) {
-                return response;
-            }
-            Some((provider_id, criterion))
-        }
-        _ => {
-            return api_error(
-                StatusCode::BAD_REQUEST,
-                "validation_failed",
-                "Pass both provider_id and criterion, or neither",
-            )
-        }
-    };
+/// The preset of every declared kind, resolved against the new-Session defaults.
+pub async fn get_suggestion_presets(State(state): State<Arc<AppState>>) -> impl IntoResponse {
     let Some(host) = state.plugin_host.clone() else {
-        return match key {
-            None => Json(json!({ "templates": [] })).into_response(),
-            Some(_) => unavailable(),
-        };
+        return Json(json!({ "presets": [] })).into_response();
     };
     let result = tokio::task::spawn_blocking(move || {
-        host.with_suggestions_db(|conn, profile| match key {
-            Some((provider_id, criterion)) => {
-                suggestions::template(conn, profile, &provider_id, &criterion)
-                    .map(|t| template_json(&provider_id, &criterion, t))
-            }
-            None => suggestions::templates(conn, profile).map(|rows| {
-                json!({ "templates": rows.into_iter()
-                    .map(|(provider_id, criterion, template)| {
-                        json!({ "provider_id": provider_id, "criterion": criterion, "template": template })
-                    })
-                    .collect::<Vec<_>>() })
-            }),
-        })
+        let defaults = suggestions::default_preset(
+            &crate::session::config::profile_config::resolve_config_or_warn(
+                &host.suggestions_profile(),
+            ),
+        );
+        let mut stored: std::collections::HashMap<(String, String), Preset> = host
+            .with_suggestions_db(suggestions::presets)?
+            .into_iter()
+            .map(|(provider_id, criterion, preset)| ((provider_id, criterion), preset))
+            .collect();
+        let presets: Vec<_> = suggestions::providers()
+            .into_iter()
+            .flat_map(|provider| {
+                provider
+                    .spec
+                    .sources
+                    .iter()
+                    .map(|source| (provider.id.clone(), source.criterion.clone()))
+                    .collect::<Vec<_>>()
+            })
+            .map(|key| {
+                let preset = stored.remove(&key);
+                preset_json(&key.0, &key.1, preset, &defaults)
+            })
+            .collect();
+        Ok::<_, anyhow::Error>(json!({ "presets": presets }))
     })
     .await;
     match result {
@@ -518,9 +509,9 @@ pub async fn get_suggestion_templates(
     }
 }
 
-pub async fn put_suggestion_template(
+pub async fn put_suggestion_preset(
     State(state): State<Arc<AppState>>,
-    body: Result<Json<TemplateBody>, axum::extract::rejection::JsonRejection>,
+    body: Result<Json<PresetBody>, axum::extract::rejection::JsonRejection>,
 ) -> impl IntoResponse {
     if state.read_only {
         return super::read_only_response();
@@ -532,30 +523,35 @@ pub async fn put_suggestion_template(
     let Some(host) = state.plugin_host.clone() else {
         return unavailable();
     };
-    if let Err(response) = check_template_put(
+    if let Err(response) = check_preset_put(
         find_provider(&body.provider_id),
         &body.criterion,
-        &body.template,
+        &host.suggestions_profile(),
+        &body.preset,
     ) {
         return response;
     }
     let result = tokio::task::spawn_blocking(move || {
+        let defaults = suggestions::default_preset(
+            &crate::session::config::profile_config::resolve_config_or_warn(
+                &host.suggestions_profile(),
+            ),
+        );
         host.with_suggestions_db(|conn, profile| {
-            suggestions::set_template(
+            suggestions::set_preset(
                 conn,
                 profile,
                 &body.provider_id,
                 &body.criterion,
-                &body.template,
+                &body.preset,
             )
-            .map(|()| {
-                template_json(
-                    &body.provider_id,
-                    &body.criterion,
-                    Some(body.template.clone()),
-                )
-            })
-        })
+        })?;
+        Ok::<_, anyhow::Error>(preset_json(
+            &body.provider_id,
+            &body.criterion,
+            Some(body.preset),
+            &defaults,
+        ))
     })
     .await;
     match result {
@@ -565,9 +561,9 @@ pub async fn put_suggestion_template(
     }
 }
 
-pub async fn delete_suggestion_template(
+pub async fn delete_suggestion_preset(
     State(state): State<Arc<AppState>>,
-    query: Result<Query<TemplateKey>, axum::extract::rejection::QueryRejection>,
+    query: Result<Query<PresetKey>, axum::extract::rejection::QueryRejection>,
 ) -> impl IntoResponse {
     if state.read_only {
         return super::read_only_response();
@@ -579,16 +575,16 @@ pub async fn delete_suggestion_template(
     let Some(host) = state.plugin_host.clone() else {
         return unavailable();
     };
-    // No provider or criterion check: a listed template must stay deletable
+    // No provider or criterion check: a stored preset must stay resettable
     // after its plugin is disabled or drops the criterion.
     let result = tokio::task::spawn_blocking(move || {
         host.with_suggestions_db(|conn, profile| {
-            suggestions::delete_template(conn, profile, &key.provider_id, &key.criterion)
+            suggestions::delete_preset(conn, profile, &key.provider_id, &key.criterion)
         })
     })
     .await;
     match result {
-        Ok(Ok(())) => Json(json!({ "ok": true })).into_response(),
+        Ok(Ok(())) => StatusCode::NO_CONTENT.into_response(),
         Ok(Err(error)) => internal(error),
         Err(error) => internal(error),
     }
@@ -732,23 +728,51 @@ mod tests {
     }
 
     #[test]
-    fn template_put_is_bounded_and_needs_a_declared_source() {
+    fn preset_put_is_bounded_and_needs_a_declared_source_and_known_agent() {
         let max = crate::session::MAX_INITIAL_PROMPT_BYTES;
-        let status = |provider: Option<Provider>, criterion: &str, len: usize| {
-            check_template_put(provider, criterion, &"x".repeat(len))
+        let preset = |agent: &str, len: usize| Preset {
+            agent: agent.into(),
+            view: suggestions::PresetView::Structured,
+            worktree: true,
+            sandbox: false,
+            yolo: false,
+            prompt: Some("x".repeat(len)),
+        };
+        let status = |provider: Option<Provider>, criterion: &str, preset: &Preset| {
+            check_preset_put(provider, criterion, "default", preset)
                 .err()
                 .map(|r| r.status())
         };
-        assert_eq!(status(Some(provider()), "assigned", 0), None);
-        assert_eq!(status(Some(provider()), "assigned", max), None);
         assert_eq!(
-            status(Some(provider()), "assigned", max + 1),
-            Some(StatusCode::BAD_REQUEST)
+            status(Some(provider()), "assigned", &preset("claude", 0)),
+            None
         );
         assert_eq!(
-            status(Some(provider()), "undeclared", 1),
-            Some(StatusCode::BAD_REQUEST)
+            status(Some(provider()), "assigned", &preset("claude", max)),
+            None
         );
-        assert_eq!(status(None, "assigned", 1), Some(StatusCode::NOT_FOUND));
+        for (provider, criterion, preset, expected) in [
+            (
+                Some(provider()),
+                "assigned",
+                preset("claude", max + 1),
+                StatusCode::BAD_REQUEST,
+            ),
+            (
+                Some(provider()),
+                "undeclared",
+                preset("claude", 1),
+                StatusCode::BAD_REQUEST,
+            ),
+            (
+                Some(provider()),
+                "assigned",
+                preset("no-such-agent", 1),
+                StatusCode::BAD_REQUEST,
+            ),
+            (None, "assigned", preset("claude", 1), StatusCode::NOT_FOUND),
+        ] {
+            assert_eq!(status(provider, criterion, &preset), Some(expected));
+        }
     }
 }
