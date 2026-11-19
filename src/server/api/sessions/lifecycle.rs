@@ -4320,11 +4320,19 @@ pub(super) mod launch_hook_gate {
         (entered_rx, release_tx)
     }
 
-    /// Clears a gate armed for `id` that no restart reached, so it can't hold a later one.
-    pub(in crate::server::api::sessions) fn disarm(id: &str) {
-        let mut gate = GATE.lock().unwrap_or_else(|e| e.into_inner());
-        if gate.as_ref().is_some_and(|(session, ..)| session == id) {
-            *gate = None;
+    /// On drop, clears a gate armed for its session that no restart reached, so a test that
+    /// fails before the restart gets there can't hold a later one.
+    pub(in crate::server::api::sessions) struct Disarm(pub(in crate::server::api::sessions) String);
+
+    impl Drop for Disarm {
+        fn drop(&mut self) {
+            let mut gate = GATE.lock().unwrap_or_else(|e| e.into_inner());
+            if gate
+                .as_ref()
+                .is_some_and(|(session, ..)| *session == self.0)
+            {
+                *gate = None;
+            }
         }
     }
 

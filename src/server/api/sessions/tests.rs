@@ -10126,24 +10126,33 @@ async fn an_update_restart_names_the_agents_background_shells_before_stopping_th
             )
         }
     };
-    let (entered, release) =
-        lifecycle::launch_hook_gate::arm(&id, lifecycle::launch_hook_gate::Stage::BeforeHooks);
-    let mut late = tokio::spawn(confirm(identities(&refreshed), false));
-    tokio::select! {
-        entered = tokio::time::timeout(std::time::Duration::from_secs(30), entered) => {
-            entered
-                .expect("the confirm reached the launch hooks")
-                .expect("the confirm passed the first check");
+    // Sends a confirm and, once it has passed the first check and waits at the launch hooks,
+    // starts shell number `count`.
+    let confirm_during_hooks = |stop, skip_on_launch, start: &std::path::Path, count| {
+        let start = start.to_owned();
+        let id = id.clone();
+        async move {
+            let stage = lifecycle::launch_hook_gate::Stage::BeforeHooks;
+            let (entered, release) = lifecycle::launch_hook_gate::arm(&id, stage);
+            let _disarm = lifecycle::launch_hook_gate::Disarm(id.clone());
+            let mut late = tokio::spawn(confirm(stop, skip_on_launch));
+            tokio::select! {
+                entered = tokio::time::timeout(std::time::Duration::from_secs(30), entered) => {
+                    entered
+                        .expect("the confirm reached the launch hooks")
+                        .expect("the confirm passed the first check");
+                }
+                early = &mut late => {
+                    panic!("the confirm answered before the hooks: {:?}", early.unwrap());
+                }
+            }
+            std::fs::write(&start, "").unwrap();
+            assert_eq!(sleeping(count), count);
+            release.send(()).unwrap();
+            late.await.unwrap()
         }
-        early = &mut late => {
-            lifecycle::launch_hook_gate::disarm(&id);
-            panic!("the confirm answered before the hooks: {:?}", early.unwrap());
-        }
-    }
-    std::fs::write(&third, "").unwrap();
-    assert_eq!(sleeping(3), 3);
-    release.send(()).unwrap();
-    let (status, late) = late.await.unwrap();
+    };
+    let (status, late) = confirm_during_hooks(identities(&refreshed), false, &third, 3).await;
     assert_eq!(status, StatusCode::CONFLICT, "{late}");
     assert_eq!(late["error"], "background_processes");
     assert_eq!(late["launch_hooks_ran"], true);
