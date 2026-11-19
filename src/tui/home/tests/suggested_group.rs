@@ -661,7 +661,7 @@ fn the_group_shows_without_any_session() {
     let theme = crate::tui::styles::Theme::default();
     let mut terminal = ratatui::Terminal::new(ratatui::backend::TestBackend::new(120, 40)).unwrap();
     terminal
-        .draw(|f| env.view.render(f, f.area(), &theme, None, None, None))
+        .draw(|f| env.view.render(f, f.area(), &theme, None))
         .unwrap();
     let text: String = terminal
         .backend()
