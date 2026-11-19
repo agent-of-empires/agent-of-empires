@@ -24,6 +24,7 @@ const WORKTREE_SCHEMA = [
 
 vi.mock("../../lib/api", () => ({
   fetchSuggestions: vi.fn(() => Promise.resolve(null)),
+  fetchAgents: vi.fn(() => Promise.resolve(null)),
   fetchProfiles: vi.fn(() => Promise.resolve(PROFILES)),
   fetchPlugins: vi.fn(() => Promise.resolve(null)),
   fetchSettings: vi.fn(() => Promise.resolve({ worktree: {} })),
@@ -100,7 +101,7 @@ describe("SettingsView schema load", () => {
     it("renders when general settings fail to load", async () => {
       vi.mocked(api.fetchSettings).mockResolvedValue(null);
       renderView("suggestions");
-      expect(await screen.findByText("Show in sidebar")).toBeTruthy();
+      expect(await screen.findByText("Show in the sidebar")).toBeTruthy();
       expect(screen.queryByText("Loading settings...")).toBeNull();
     });
 
@@ -108,7 +109,7 @@ describe("SettingsView schema load", () => {
       vi.mocked(api.fetchSettings).mockResolvedValue({ worktree: {} });
       vi.mocked(api.getSettingsSchema).mockResolvedValue(null);
       renderView("suggestions");
-      expect(await screen.findByText("Show in sidebar")).toBeTruthy();
+      expect(await screen.findByText("Show in the sidebar")).toBeTruthy();
       await waitFor(() => expect(screen.getByText("Failed to load settings schema.")).toBeTruthy());
       expect(screen.getByRole("button", { name: "Retry" })).toBeTruthy();
     });

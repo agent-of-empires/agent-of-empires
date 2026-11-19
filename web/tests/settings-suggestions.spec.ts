@@ -8,6 +8,15 @@ const source = (criterion: string, label: string, enabled: boolean, variables: s
   description: "",
   enabled,
   variables,
+  customized: false,
+  preset: {
+    agent: "claude",
+    view: "structured",
+    worktree: true,
+    sandbox: false,
+    yolo: false,
+    prompt: "/aoe-review {pr-number}",
+  },
 });
 
 function store() {
@@ -16,7 +25,6 @@ function store() {
       homepage: true,
       sidebar: false,
       refresh_minutes: 15,
-      start_without_review: false,
       show_source_ref: true,
       provider_order: ["github", "linear"],
     },
@@ -84,9 +92,6 @@ async function setup(page: import("@playwright/test").Page) {
     }
     return r.fulfill({ json: { ok: true } });
   });
-  await page.route("**/api/suggestions/templates", (r) =>
-    r.fulfill({ json: r.request().method() === "GET" ? { templates: [] } : { ok: true } }),
-  );
   await page.route("**/api/suggestions/mappings", (r) =>
     r.fulfill({ json: r.request().method() === "GET" ? { mappings: [] } : { ok: true } }),
   );
@@ -99,11 +104,11 @@ async function setup(page: import("@playwright/test").Page) {
 test("Alt+ArrowDown reorders the focused provider and persists the order", async ({ page }) => {
   const bodies = await setup(page);
   await page.goto("/settings/suggestions");
-  const github = page.getByLabel("Provider GitHub");
+  const github = page.getByLabel("Source GitHub");
   await github.focus();
   await page.keyboard.press("Alt+ArrowDown");
   await expect.poll(() => bodies).toContainEqual({ provider_order: ["linear", "github"] });
-  await expect(page.getByLabel(/^Provider /).first()).toHaveAccessibleName("Provider Linear");
+  await expect(page.getByLabel(/^Source /).first()).toHaveAccessibleName("Source Linear");
 });
 
 test("375px shows an arrow button instead of the drag handle", async ({ page }) => {
@@ -115,13 +120,30 @@ test("375px shows an arrow button instead of the drag handle", async ({ page }) 
   await expect.poll(() => bodies).toContainEqual({ provider_order: ["linear", "github"] });
 });
 
-test("the Start without review switch persists through the prefs PATCH", async ({ page }) => {
-  const bodies = await setup(page);
+test("a kind's preset saves through PUT /presets", async ({ page }) => {
+  await setup(page);
+  const puts: unknown[] = [];
+  await page.route("**/api/suggestions/presets", (r) => {
+    puts.push(r.request().postDataJSON());
+    return r.fulfill({ json: { ok: true } });
+  });
+  await page.route(
+    (url) => url.pathname === "/api/agents",
+    (r) => r.fulfill({ json: [{ name: "claude", display_name: "Claude Code", kind: "builtin", installed: true }] }),
+  );
   await page.goto("/settings/suggestions");
-  const sw = page.getByRole("switch", { name: "Start without review" });
-  await expect(sw).toBeEnabled();
-  await sw.click();
-  await expect.poll(() => bodies).toContainEqual({ start_without_review: true });
+  await page.getByRole("button", { name: "Edit Review requests" }).click();
+  await page.getByRole("switch", { name: "Sandbox" }).click();
+  await page.getByRole("button", { name: "Save" }).click();
+  await expect
+    .poll(() => puts)
+    .toEqual([
+      expect.objectContaining({
+        provider_id: "github",
+        criterion: "review-requested",
+        preset: expect.objectContaining({ sandbox: true }),
+      }),
+    ]);
 });
 
 test("a provider's suggestion_ plugin settings save through the settings PATCH", async ({ page }) => {

@@ -1,5 +1,4 @@
 import { useContext } from "react";
-import type { SessionResponse } from "../../lib/types";
 import { OFFLINE_TITLE } from "../../lib/connectionState";
 import { SidebarCompactContext } from "../../lib/sidebarCompact";
 import { suggestionKey, useSuggestions } from "../../hooks/useSuggestions";
@@ -14,19 +13,16 @@ const MAX_ROWS = 3;
 interface Props {
   readOnly?: boolean;
   onPrepare: (prefill: WizardPrefill) => void;
-  onStarted?: (session: SessionResponse) => void;
   onViewAll: () => void;
+  onOpenSession: (sessionId: string) => void;
 }
 
 /** The "Suggested" Group at the bottom of the session list, shown when the `sidebar` pref is on. */
-export function SidebarSuggestions({ readOnly = false, onPrepare, onStarted, onViewAll }: Props) {
+export function SidebarSuggestions({ readOnly = false, onPrepare, onViewAll, onOpenSession }: Props) {
   const compact = useContext(SidebarCompactContext);
   const [expanded, toggleExpanded] = usePersistedFlag("aoe-sidebar-suggested-expanded", false);
-  const { snapshot, busy, offline, failures, notice, start } = useSuggestions(
-    onPrepare,
-    onStarted,
-    (s) => !s.prefs.sidebar,
-  );
+  const ctrl = useSuggestions(onPrepare, onOpenSession, (s) => !s.prefs.sidebar);
+  const { snapshot, busy, offline, failures, notice, start } = ctrl;
 
   if (!snapshot?.prefs.sidebar) return null;
   // A started suggestion is a Session already listed under its Project.
@@ -59,7 +55,7 @@ export function SidebarSuggestions({ readOnly = false, onPrepare, onStarted, onV
           <>
             {active.slice(0, MAX_ROWS).map((item) => {
               const key = suggestionKey(item);
-              const failure = failures[key]?.message;
+              const failure = failures[key];
               return (
                 <button
                   key={key}
@@ -67,9 +63,9 @@ export function SidebarSuggestions({ readOnly = false, onPrepare, onStarted, onV
                   data-testid="sidebar-suggested-row"
                   onKeyDown={onSidebarArrowKey}
                   {...{ [NAV_ITEM]: "" }}
-                  disabled={busy !== null || !!unavailable || item.stale}
+                  disabled={busy !== null || ctrl.starting.includes(key) || !!unavailable || item.stale}
                   title={unavailable ?? item.title}
-                  onClick={() => void start(item, failures[key]?.another)}
+                  onClick={() => void start(item)}
                   className={rowClass}
                 >
                   <span
@@ -79,7 +75,7 @@ export function SidebarSuggestions({ readOnly = false, onPrepare, onStarted, onV
                   </span>
                   <span className="block truncate text-[11px] text-text-muted">
                     {failure
-                      ? `Couldn't start: ${failure}`
+                      ? `Couldn't start: ${failure.reason}`
                       : [snapshot.prefs.show_source_ref ? item.source_ref : null, item.reason]
                           .filter(Boolean)
                           .join(" · ")}

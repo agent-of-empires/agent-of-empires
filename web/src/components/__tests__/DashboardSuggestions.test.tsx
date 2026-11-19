@@ -5,17 +5,21 @@ import { DashboardSuggestions } from "../DashboardSuggestions";
 import { setServerDown } from "../../lib/connectionState";
 import type { SuggestionItem, SuggestionsSnapshot } from "../../lib/types";
 
-const { fetchSuggestions, prepareSuggestion, refreshSuggestions, dismissSuggestion, wide } = vi.hoisted(() => ({
-  fetchSuggestions: vi.fn(),
-  prepareSuggestion: vi.fn(),
-  refreshSuggestions: vi.fn(),
-  dismissSuggestion: vi.fn(),
-  wide: { value: true },
-}));
+const { fetchSuggestions, prepareSuggestion, refreshSuggestions, dismissSuggestion, startSuggestion, wide } =
+  vi.hoisted(() => ({
+    startSuggestion: vi.fn(),
+    fetchSuggestions: vi.fn(),
+    prepareSuggestion: vi.fn(),
+    refreshSuggestions: vi.fn(),
+    dismissSuggestion: vi.fn(),
+    wide: { value: true },
+  }));
 
 const { updateSuggestionSource } = vi.hoisted(() => ({ updateSuggestionSource: vi.fn() }));
 
 vi.mock("../../lib/api", () => ({
+  startSuggestion,
+  fetchAgents: () => Promise.resolve(null),
   fetchSuggestions,
   prepareSuggestion,
   refreshSuggestions,
@@ -123,8 +127,15 @@ describe("DashboardSuggestions", () => {
     }
   });
 
-  it("Start prepares and opens the wizard prefill without creating anything", async () => {
+  it("Start runs the preset without opening the wizard; Start with changes prepares the prefill", async () => {
     fetchSuggestions.mockResolvedValue(snap([mk(1)]));
+    startSuggestion.mockResolvedValue({ kind: "started", sessionId: "s1", title: "T" });
+    const onPrepare = vi.fn();
+    renderIt({ onPrepare });
+    fireEvent.click(await screen.findByRole("button", { name: "Start" }));
+    await waitFor(() => expect(startSuggestion).toHaveBeenCalledWith("github", "i1", {}));
+    expect(onPrepare).not.toHaveBeenCalled();
+
     prepareSuggestion.mockResolvedValue({
       ok: true,
       data: {
@@ -138,9 +149,8 @@ describe("DashboardSuggestions", () => {
         worktree: true,
       },
     });
-    const onPrepare = vi.fn();
-    renderIt({ onPrepare });
-    fireEvent.click(await screen.findByRole("button", { name: "Start" }));
+    fireEvent.click(screen.getByRole("button", { name: "Start options" }));
+    fireEvent.click(screen.getByRole("menuitem", { name: /^Start with changes/ }));
     await waitFor(() => expect(onPrepare).toHaveBeenCalled());
     expect(prepareSuggestion).toHaveBeenCalledWith("github", "i1");
     expect(onPrepare.mock.calls[0][0]).toMatchObject({ path: "/p", initialPrompt: "do it", tool: "claude" });

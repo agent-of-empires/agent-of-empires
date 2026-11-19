@@ -1,7 +1,7 @@
 import { useCallback, useMemo, useRef, useState } from "react";
 import { usePluginUiEntries } from "../lib/pluginUiContext";
 import { pluginSortSpecs } from "../lib/pluginUi";
-import type { ProjectInfo, RepoGroup, SessionResponse, Workspace } from "../lib/types";
+import type { ProjectInfo, RepoGroup, Workspace } from "../lib/types";
 import type { WizardPrefill } from "./session-wizard/SessionWizard";
 import type { RuntimeCursor, SessionMutation } from "../lib/api";
 import type { TrashRecoveryTarget } from "../lib/trashActions";
@@ -111,8 +111,8 @@ interface Props {
   /** Enables the "Suggested" Group, which shows only while the `sidebar` suggestions pref is on. */
   suggestions?: {
     onPrepare: (prefill: WizardPrefill) => void;
-    onStarted: (session: SessionResponse) => void;
     onViewAll: () => void;
+    onOpenSession: (sessionId: string) => void;
   };
 }
 

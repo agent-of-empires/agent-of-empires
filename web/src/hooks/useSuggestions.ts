@@ -1,50 +1,48 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import {
   dismissSuggestion,
-  createSession,
-  fetchCreateBootId,
   fetchSuggestions,
   prepareSuggestion,
   refreshSuggestions,
+  startSuggestion,
+  type StartHooksReview,
+  type StartOptions,
   type SuggestionResult,
 } from "../lib/api";
 import { useServerDown } from "../lib/connectionState";
 import { onSuggestionsChanged } from "../lib/suggestionEvents";
-import {
-  newIdempotencyKey,
-  peekPendingCreate,
-  registerPendingCreate,
-  releasePendingCreate,
-  resolvePendingCreate,
-} from "../lib/pendingCreates";
-import { reportError } from "../lib/toastBus";
+import { toastBus } from "../lib/toastBus";
 import { STALE_NOTICE, toWizardPrefill } from "../lib/suggestionPrefill";
-import type { SessionResponse, SuggestionItem, SuggestionsSnapshot } from "../lib/types";
+import type { SuggestionItem, SuggestionsSnapshot } from "../lib/types";
 import type { WizardPrefill } from "../components/session-wizard/SessionWizard";
 
-/** A start that failed, kept on its row so a retry repeats the same kind of start. */
+/** A start that failed, kept on its row: what went wrong, what to do, and how to retry. */
 export interface StartFailure {
-  message: string;
-  another: boolean;
+  reason: string;
+  hint?: string;
+  /** Try again would not help, so only Start with changes is offered. */
+  retryable: boolean;
+}
+
+/** A Start paused on the repo's hooks, until the user approves or cancels. */
+export interface HooksReview {
+  item: SuggestionItem;
+  review: StartHooksReview;
+  options: StartOptions;
 }
 
 const REFRESH_POLL_MS = 2000;
 const UNDO_MS = 10_000;
-const PENDING_NOTICE = "A session is still being created. Wait for it to finish.";
-
 export const suggestionKey = (item: SuggestionItem) => `${item.provider_id}:${item.id}`;
-
-// Module-level so a direct start in flight is seen by every hook instance, not only this view.
-let directStartInFlight = false;
 
 /**
  * Snapshot plus the mutations both suggestion views share. Every mutation reloads the snapshot.
- * With "Start without review" on and a resolved, templated draft, `start` creates the session and
- * calls `onStarted`; anything unresolved or needing hook trust opens the wizard through `onPrepare`.
+ * `start` runs the kind's preset on the server and toasts the Session; `startWithChanges` opens
+ * the prefilled wizard instead.
  */
 export function useSuggestions(
   onPrepare: (prefill: WizardPrefill) => void,
-  onStarted?: (session: SessionResponse) => void,
+  onOpenSession?: (sessionId: string) => void,
   // A view that renders nothing for a snapshot has no reason to follow a refreshing provider.
   idleFor?: (snapshot: SuggestionsSnapshot) => boolean,
 ) {
@@ -56,6 +54,9 @@ export function useSuggestions(
   const [busy, setBusy] = useState<string | null>(null);
   const [notice, setNotice] = useState<string | null>(null);
   const [failures, setFailures] = useState<Record<string, StartFailure>>({});
+  // Rows being started; the others stay usable meanwhile.
+  const [starting, setStarting] = useState<string[]>([]);
+  const [hooksReview, setHooksReview] = useState<HooksReview | null>(null);
   // Bumped after every load, success or not, so the refresh poll re-arms itself.
   const [loadTick, setLoadTick] = useState(0);
   const mounted = useRef(true);
@@ -121,112 +122,117 @@ export function useSuggestions(
     if (mounted.current) setRefreshing(false);
   };
 
-  // `another` starts a further Session without claiming the suggestion's link.
-  const start = async (item: SuggestionItem, another = false) => {
+  const clearFailure = (key: string) => setFailures(({ [key]: _gone, ...rest }) => rest);
+
+  // One-click start with the kind's preset. A paused hooks review resumes through `approveHooks`.
+  const start = async (item: SuggestionItem, options: StartOptions = {}) => {
     const key = suggestionKey(item);
-    // A retry after a failed start is the row's "Open wizard", so it never starts unreviewed.
-    const afterFailure = key in failures;
+    setStarting((s) => (s.includes(key) ? s : [...s, key]));
+    setNotice(null);
+    const result = await startSuggestion(item.provider_id, item.id, options);
+    setStarting((s) => s.filter((k) => k !== key));
+    if (!mounted.current && result.kind !== "started") return;
+    switch (result.kind) {
+      case "started": {
+        if (mounted.current) {
+          clearFailure(key);
+          setHooksReview(null);
+        }
+        const name = result.title || item.title;
+        if (onOpenSession && toastBus.handler?.infoAction)
+          toastBus.handler.infoAction(`Started \u201c${name}\u201d`, "Open", () => onOpenSession(result.sessionId));
+        else toastBus.handler?.info(`Started \u201c${name}\u201d`);
+        break;
+      }
+      case "hooks_need_trust":
+      case "trust_changed":
+        setHooksReview({ item, review: result.review, options });
+        return;
+      case "failed":
+        setHooksReview(null);
+        setFailures((f) => ({
+          ...f,
+          [key]: { reason: result.reason, hint: result.hint, retryable: result.retryable },
+        }));
+        break;
+      case "no_project":
+        // Nothing to link to without a choice, so the wizard's project picker takes over.
+        await startWithChanges(item);
+        return;
+      case "stale":
+        setHooksReview(null);
+        setNotice(STALE_NOTICE);
+        break;
+      case "error":
+        setHooksReview(null);
+        setNotice(result.error);
+        break;
+      // Another start won the link: the reload turns the row into Open.
+      case "already_started":
+        setHooksReview(null);
+        break;
+    }
+    await load();
+  };
+
+  const approveHooks = async () => {
+    if (!hooksReview) return;
+    const { item, review, options } = hooksReview;
+    setHooksReview(null);
+    await start(item, { ...options, approve_hooks: true, review_fingerprint: review.review_fingerprint });
+  };
+
+  // Opens the New session dialog with the kind's preset filled in. `another` starts a further
+  // Session without claiming the suggestion's link.
+  const startWithChanges = async (item: SuggestionItem, another = false) => {
+    const key = suggestionKey(item);
     setBusy(key);
     setNotice(null);
     const result = await prepareSuggestion(item.provider_id, item.id);
     if (!mounted.current) return;
     if (result.ok) {
-      setFailures(({ [key]: _gone, ...rest }) => rest);
-      const label = snapshot?.providers.find((p) => p.id === item.provider_id)?.name ?? item.provider_id;
+      clearFailure(key);
+      const provider = snapshot?.providers.find((p) => p.id === item.provider_id);
+      const label = provider?.name ?? item.provider_id;
+      const kindLabel = provider?.sources.find((src) => src.criterion === item.criterion)?.label;
       const link = another ? undefined : { provider_id: item.provider_id, id: item.id };
-      const prefill = toWizardPrefill(
-        result.data,
-        { label, title: item.title, url: item.source_url },
-        item.provider_id,
-        link,
-      );
-      const draft = result.data;
-      // The pref is ignored when a host passes no `onStarted`. Only the user's own template
-      // runs unreviewed; the provider's draft prompt always goes through the wizard.
-      // "Start another" always opens the wizard, so it never starts unreviewed.
-      if (
-        onStarted &&
-        !another &&
-        !afterFailure &&
-        snapshot?.prefs.start_without_review &&
-        draft.project &&
-        draft.templated &&
-        draft.initial_prompt
-      ) {
-        const body = {
-          title: draft.title || undefined,
-          path: draft.project.path,
-          tool: draft.tool,
-          view: draft.view,
-          yolo_mode: draft.yolo,
-          sandbox: draft.sandbox,
-          worktree_enabled: draft.worktree,
-          create_new_branch: draft.worktree,
-          initial_prompt: draft.initial_prompt,
-          suggestion: link,
-          idempotency_key: newIdempotencyKey(),
-        };
-        // Claimed creates are invisible to peekPendingCreate, so starts in flight are tracked across hook instances here.
-        if (directStartInFlight) {
-          if (mounted.current) {
-            setNotice(PENDING_NOTICE);
-            setBusy(null);
-          }
-          return;
-        }
-        directStartInFlight = true;
-        try {
-          const origin = await fetchCreateBootId();
-          // Checked after the await and just before registering, so no other start slips in between.
-          if (peekPendingCreate()) {
-            if (mounted.current) {
-              setNotice(PENDING_NOTICE);
-              setBusy(null);
-            }
-            return;
-          }
-          registerPendingCreate({ body, tool: draft.tool, since: Date.now(), origin }, { claimed: true });
-          const created = await createSession(body);
-          // No definite answer: the app-level owner keeps reconciling under this key, and a
-          // re-click is refused until it does.
-          if (created.network || created.outcomeUnknown) releasePendingCreate(body.idempotency_key);
-          else resolvePendingCreate(body.idempotency_key);
-          if (created.ok && created.session) {
-            // Both views navigate away, so the snapshot is not reloaded.
-            onStarted(created.session);
-            if (mounted.current) setBusy(null);
-            return;
-          }
-          if (!mounted.current) {
-            // No row or wizard to show the reason on any more.
-            if (!created.ok && !created.network && !created.outcomeUnknown)
-              reportError(created.error ?? "Could not start the session.");
-            return;
-          }
-          if (created.network || created.outcomeUnknown) {
-            setNotice(created.error ?? "Could not start the session.");
-            setBusy(null);
-            return;
-          }
-          // A definitive refusal opens the prefilled wizard, so the draft can be corrected instead of resent as is.
-          if (!(created.hooksNeedTrust || created.trustChanged))
-            setNotice(created.error ?? "Could not start the session.");
-        } finally {
-          directStartInFlight = false;
-        }
-      }
       setBusy(null);
-      onPrepare(prefill);
+      onPrepare(
+        toWizardPrefill(
+          result.data,
+          { label, title: item.title, url: item.source_url, kindLabel },
+          { providerId: item.provider_id, criterion: item.criterion },
+          link,
+        ),
+      );
       return;
     }
     // A stale item is explained by the reload; any other failure stays on its row.
     if (result.stale) setNotice(STALE_NOTICE);
-    else setFailures((f) => ({ ...f, [key]: { message: result.error, another } }));
+    else setFailures((f) => ({ ...f, [key]: { reason: result.error, retryable: false } }));
     await load();
     if (mounted.current) setBusy(null);
   };
 
-  return { snapshot, loading, loadFailed, refreshing, busy, notice, failures, offline, load, act, refresh, start };
+  return {
+    snapshot,
+    loading,
+    loadFailed,
+    refreshing,
+    busy,
+    starting,
+    notice,
+    failures,
+    offline,
+    hooksReview,
+    load,
+    act,
+    refresh,
+    start,
+    startWithChanges,
+    approveHooks,
+    cancelHooks: () => setHooksReview(null),
+  };
 }
 
 /** Dismiss that can be undone for 10 s; `act` is the one from {@link useSuggestions}. */

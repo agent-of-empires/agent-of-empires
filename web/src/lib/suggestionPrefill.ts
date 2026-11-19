@@ -8,12 +8,12 @@ export const STALE_NOTICE = "That suggestion changed. Refreshing the list.";
 export function toWizardPrefill(
   p: SuggestionPrepared,
   source: NonNullable<WizardPrefill["source"]>,
-  providerId?: string,
+  kind?: { providerId: string; criterion: string },
   suggestion?: WizardPrefill["suggestion"],
 ): WizardPrefill {
   return {
     source,
-    template: p.template_criterion && providerId ? { providerId, criterion: p.template_criterion } : undefined,
+    template: kind,
     suggestion,
     title: p.title || undefined,
     path: p.project?.path,

@@ -26,7 +26,8 @@ interface Props {
   banner?: ReactNode;
   /** Both required to show the Suggested sessions section. */
   onPrepareSuggestion?: (prefill: WizardPrefill) => void;
-  onSuggestionStarted?: (session: SessionResponse) => void;
+  onEditSuggestionPreset?: (providerId: string, criterion: string) => void;
+  canLinkSuggestions?: boolean;
   onViewAllSuggestions?: () => void;
   /** The onboarding tour is running; the first-run hint stays out of it. */
   tourActive?: boolean;
@@ -44,7 +45,8 @@ export function Dashboard({
   canManageProjects = true,
   banner,
   onPrepareSuggestion,
-  onSuggestionStarted,
+  onEditSuggestionPreset,
+  canLinkSuggestions,
   onViewAllSuggestions,
   onOpenSuggestionsMarketplace,
   tourActive = false,
@@ -166,7 +168,8 @@ export function Dashboard({
           key={suggestionsEpoch}
           readOnly={readOnly}
           onPrepare={onPrepareSuggestion}
-          onStarted={onSuggestionStarted}
+          onEditPreset={onEditSuggestionPreset}
+          canLink={canLinkSuggestions}
           onViewAll={onViewAllSuggestions}
           onOpenSession={onSelectSession}
         />

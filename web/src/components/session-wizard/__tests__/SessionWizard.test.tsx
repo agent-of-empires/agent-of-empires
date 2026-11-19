@@ -2501,8 +2501,8 @@ describe("SessionWizard suggestion source", () => {
     expect(payload()).toMatchObject({ title: "Review RFC 4562" });
   });
 
-  it("offers Edit template only for a templated prompt", () => {
-    const onEditTemplate = vi.fn();
+  it("offers Edit preset only for a suggestion prefill", () => {
+    const onEditPreset = vi.fn();
     const template = { providerId: "gh", criterion: "review-requested" };
     const mount = (prefill: WizardPrefill) =>
       render(
@@ -2511,13 +2511,13 @@ describe("SessionWizard suggestion source", () => {
           onClose={vi.fn()}
           onCreated={vi.fn()}
           prefill={prefill}
-          onEditTemplate={onEditTemplate}
+          onEditPreset={onEditPreset}
         />,
       );
     mount({ path: "/tmp/proj", tool: "claude", initialPrompt: "/aoe-review", source, template });
     expect(screen.getByTestId("wizard-template").textContent).toContain("review-requested");
-    fireEvent.click(screen.getByRole("button", { name: "Edit template" }));
-    expect(onEditTemplate).toHaveBeenCalledWith(template);
+    fireEvent.click(screen.getByRole("button", { name: "Edit preset" }));
+    expect(onEditPreset).toHaveBeenCalledWith(template);
     cleanup();
     mount({ path: "/tmp/proj", tool: "claude", initialPrompt: "draft", source });
     expect(screen.queryByTestId("wizard-template")).toBeNull();
