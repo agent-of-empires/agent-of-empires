@@ -18,11 +18,10 @@ fn run_in(app_dir: &Path) -> Result<()> {
 /// A linked `sessions.json` is read and rewritten at its target, as storage does, under the
 /// profile directory's storage lock.
 fn migrate_file(path: &Path) -> Result<()> {
-    let linked = match std::fs::symlink_metadata(path) {
-        Ok(metadata) => metadata.file_type().is_symlink(),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
-        Err(error) => return Err(error.into()),
-    };
+    // Follows links, so a dangling link (missing leaf or directory) is skipped like v045.
+    if !path.try_exists()? {
+        return Ok(());
+    }
     let not_regular = || {
         format!(
             "terminal handoff migration requires a regular sessions file: {}",
@@ -35,7 +34,6 @@ fn migrate_file(path: &Path) -> Result<()> {
     let file =
         crate::session::anchored_fs::ResolvedDataFile::open(path).with_context(not_regular)?;
     let Some((mut snapshot, _)) = file.open_read_snapshot().with_context(not_regular)? else {
-        anyhow::ensure!(!linked, "{}: its link has no target", not_regular());
         return Ok(());
     };
     let mut bytes = Vec::new();
@@ -298,21 +296,28 @@ mod tests {
             "not beside the target"
         );
 
-        for (name, make_target) in [("a directory", true), ("a missing file", false)] {
+        // A link to a directory is refused; a dangling one has no rows, so it is skipped.
+        for (name, goal, refused) in [
+            ("a directory", "elsewhere", true),
+            ("a missing file", "missing.json", false),
+            ("a missing directory", "absent/missing.json", false),
+        ] {
             let root = tempfile::tempdir()?;
-            let target = root.path().join("elsewhere");
-            if make_target {
+            let target = root.path().join(goal);
+            if refused {
                 std::fs::create_dir(&target)?;
             }
             let path = root.path().join("sessions.json");
             std::os::unix::fs::symlink(&target, &path)?;
-            let error = migrate_file(&path).unwrap_err();
-            assert!(
-                format!("{error:#}").contains("requires a regular sessions file"),
-                "{name}: {error:#}"
-            );
+            match migrate_file(&path) {
+                Err(error) => assert!(
+                    refused && format!("{error:#}").contains("requires a regular sessions file"),
+                    "{name}: {error:#}"
+                ),
+                Ok(()) => assert!(!refused, "{name}: accepted"),
+            }
             assert_eq!(std::fs::read_link(&path)?, target, "{name}");
-            assert_eq!(target.exists(), make_target, "{name}");
+            assert_eq!(target.exists(), refused, "{name}");
             assert!(
                 crate::session::migration_backups(&path)?.is_empty(),
                 "{name}"
