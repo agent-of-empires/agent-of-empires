@@ -171,11 +171,13 @@ pub(super) enum StartAnswer {
     /// Repository hooks need approval first: the commands to show, and the
     /// fingerprint the approval must quote.
     NeedsTrust {
-        /// The hooks changed after the user reviewed them, so the review shows again.
-        changed: bool,
         commands: Vec<String>,
+        /// One-line summaries of the repository's MCP servers.
+        mcp_summaries: Vec<String>,
         fingerprint: serde_json::Value,
     },
+    /// The hooks changed after the review: ask again for a fresh one.
+    TrustChanged,
     /// The item's repo is linked to no Project, so the wizard has to ask for one.
     NoProject,
     Failed(String),
@@ -191,7 +193,8 @@ fn start_answer(status: u16, body: &serde_json::Value) -> StartAnswer {
         (409, "already_started") => {
             StartAnswer::AlreadyStarted(body["session_id"].as_str().map(str::to_owned))
         }
-        (409, code @ ("hooks_need_trust" | "trust_changed")) => {
+        (409, "trust_changed") => StartAnswer::TrustChanged,
+        (409, "hooks_need_trust") => {
             let mut commands = Vec::new();
             for (stage, label) in [
                 ("on_create", "on create"),
@@ -204,12 +207,19 @@ fn start_answer(status: u16, body: &serde_json::Value) -> StartAnswer {
                         .map(|c| plain_line(&format!("{label}: {c}"))),
                 );
             }
-            if body["needs_mcp_trust"].as_bool() == Some(true) {
+            let mcp_summaries: Vec<String> = body["mcp_summaries"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .filter_map(|m| m.as_str())
+                .map(plain_line)
+                .collect();
+            if mcp_summaries.is_empty() && body["needs_mcp_trust"].as_bool() == Some(true) {
                 commands.push("project MCP servers".to_owned());
             }
             StartAnswer::NeedsTrust {
-                changed: code == "trust_changed",
                 commands,
+                mcp_summaries,
                 fingerprint: body["review_fingerprint"].clone(),
             }
         }
@@ -1148,6 +1158,8 @@ pub(super) struct SuggestionsFeed {
     start_key: Option<ItemKey>,
     /// The hooks review on screen: its item, the fingerprint it shows and the origin it was issued for.
     held_trust: Option<(ItemKey, serde_json::Value, Option<Origin>)>,
+    /// The next hooks review follows a `trust_changed` answer.
+    hooks_changed: bool,
     prepare_target: PrepareTarget,
     /// Epoch of the most recently opened full view.
     view_epoch: u64,
@@ -1190,6 +1202,7 @@ impl SuggestionsFeed {
             prepare_key: None,
             start_key: None,
             held_trust: None,
+            hooks_changed: false,
             prepare_target: PrepareTarget::Home,
             view_epoch: 0,
             in_flight_user: false,
@@ -1567,6 +1580,16 @@ impl SuggestionsFeed {
     /// Remembers the hooks review shown for `key`, bound to the list on screen.
     pub(super) fn hold_trust(&mut self, key: ItemKey, fingerprint: serde_json::Value) {
         self.held_trust = Some((key, fingerprint, self.origin()));
+    }
+
+    /// Asks for a fresh review after the daemon found the hooks changed.
+    pub(super) fn restart_after_trust_change(&mut self, key: ItemKey) {
+        self.hooks_changed = true;
+        self.start(key);
+    }
+
+    pub(super) fn take_hooks_changed(&mut self) -> bool {
+        std::mem::take(&mut self.hooks_changed)
     }
 
     pub(super) fn has_held_trust(&self) -> bool {
@@ -2235,6 +2258,7 @@ mod tests {
             "error": "hooks_need_trust",
             "commands": { "on_create": ["make setup"], "on_launch": [], "on_destroy": [] },
             "needs_mcp_trust": true,
+            "mcp_summaries": ["github: npx server"],
             "review_fingerprint": { "project_path": "/repo", "hooks": "abc" },
         });
         let cases = [
@@ -2260,19 +2284,15 @@ mod tests {
                 409,
                 hooks,
                 StartAnswer::NeedsTrust {
-                    changed: false,
-                    commands: vec!["on create: make setup".into(), "project MCP servers".into()],
+                    commands: vec!["on create: make setup".into()],
+                    mcp_summaries: vec!["github: npx server".into()],
                     fingerprint: json!({ "project_path": "/repo", "hooks": "abc" }),
                 },
             ),
             (
                 409,
-                json!({ "error": "trust_changed", "commands": {}, "review_fingerprint": { "n": 2 } }),
-                StartAnswer::NeedsTrust {
-                    changed: true,
-                    commands: vec![],
-                    fingerprint: json!({ "n": 2 }),
-                },
+                json!({ "error": "trust_changed" }),
+                StartAnswer::TrustChanged,
             ),
             (
                 400,

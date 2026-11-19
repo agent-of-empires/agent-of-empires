@@ -131,11 +131,13 @@ impl HomeView {
             StartAnswer::AlreadyStarted(None) => {
                 say(self, "Already starting. Reload in a moment.".into(), false);
             }
+            StartAnswer::TrustChanged => self.suggestions_feed.restart_after_trust_change(key),
             StartAnswer::NeedsTrust {
-                changed,
                 commands,
+                mcp_summaries,
                 fingerprint,
             } => {
+                let changed = self.suggestions_feed.take_hooks_changed();
                 let mut message = String::from(if changed {
                     "The hooks changed since you reviewed them. This repository runs:\n\n"
                 } else {
@@ -143,6 +145,9 @@ impl HomeView {
                 });
                 for command in &commands {
                     message.push_str(&format!("  {command}\n"));
+                }
+                for summary in &mcp_summaries {
+                    message.push_str(&format!("  MCP server: {summary}\n"));
                 }
                 message.push_str("\nApprove them and start?");
                 self.confirm_dialog = Some(
