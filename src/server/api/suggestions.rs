@@ -698,14 +698,14 @@ fn check_declared(
 fn check_preset_put(
     provider: Option<Provider>,
     criterion: &str,
-    profile: &str,
+    config: &crate::session::config::Config,
     preset: &Preset,
 ) -> Result<(), axum::response::Response> {
     check_declared(provider, criterion)?;
     let invalid =
         |message: String| api_error(StatusCode::BAD_REQUEST, "validation_failed", message);
     let known_agent = crate::agents::get_agent(&preset.agent).is_some()
-        || crate::session::config::profile_config::resolve_config_or_warn(profile)
+        || config
             .session
             .custom_agents
             .get(&preset.agent)
@@ -796,20 +796,16 @@ pub async fn put_suggestion_preset(
     let Some(host) = state.plugin_host.clone() else {
         return unavailable();
     };
-    if let Err(response) = check_preset_put(
-        find_provider(&body.provider_id),
-        &body.criterion,
-        &host.suggestions_profile(),
-        &body.preset,
-    ) {
-        return response;
-    }
+    let provider = find_provider(&body.provider_id);
     let result = tokio::task::spawn_blocking(move || {
-        let defaults = suggestions::default_preset(
-            &crate::session::config::profile_config::resolve_config_or_warn(
-                &host.suggestions_profile(),
-            ),
+        // The profile config is a disk read: keep it off the executor.
+        let config = crate::session::config::profile_config::resolve_config_or_warn(
+            &host.suggestions_profile(),
         );
+        if let Err(response) = check_preset_put(provider, &body.criterion, &config, &body.preset) {
+            return Ok(Err(response));
+        }
+        let defaults = suggestions::default_preset(&config);
         host.with_suggestions_db(|conn, profile| {
             suggestions::set_preset(
                 conn,
@@ -819,16 +815,17 @@ pub async fn put_suggestion_preset(
                 &body.preset,
             )
         })?;
-        Ok::<_, anyhow::Error>(preset_json(
+        Ok::<_, anyhow::Error>(Ok(preset_json(
             &body.provider_id,
             &body.criterion,
             Some(body.preset),
             &defaults,
-        ))
+        )))
     })
     .await;
     match result {
-        Ok(Ok(body)) => Json(body).into_response(),
+        Ok(Ok(Ok(body))) => Json(body).into_response(),
+        Ok(Ok(Err(response))) => response,
         Ok(Err(error)) => internal(error),
         Err(error) => internal(error),
     }
@@ -1012,9 +1009,14 @@ mod tests {
             prompt: Some("x".repeat(len)),
         };
         let status = |provider: Option<Provider>, criterion: &str, preset: &Preset| {
-            check_preset_put(provider, criterion, "default", preset)
-                .err()
-                .map(|r| r.status())
+            check_preset_put(
+                provider,
+                criterion,
+                &crate::session::config::Config::default(),
+                preset,
+            )
+            .err()
+            .map(|r| r.status())
         };
         assert_eq!(
             status(Some(provider()), "assigned", &preset("claude", 0)),
