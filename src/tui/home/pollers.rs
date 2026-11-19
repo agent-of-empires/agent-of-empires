@@ -151,17 +151,10 @@ impl HomeView {
                 );
                 self.suggestions_feed.hold_trust(key, fingerprint);
             }
-            StartAnswer::NoProject => {
-                if self.suggestions_view.is_some() {
-                    say(
-                        self,
-                        "No project is linked yet. Press e to pick one.".into(),
-                        false,
-                    );
-                } else {
-                    self.suggestions_feed.prepare(key);
-                }
-            }
+            StartAnswer::NoProject => match &mut self.suggestions_view {
+                Some(view) => view.prepare(key, false, &mut self.suggestions_feed),
+                None => self.suggestions_feed.prepare(key),
+            },
             StartAnswer::Failed(reason) => match &mut self.suggestions_view {
                 Some(view) => view.set_failed(key, reason),
                 None => self.flash_status(format!("{reason} Enter tries again.")),

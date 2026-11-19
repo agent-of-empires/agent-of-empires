@@ -383,6 +383,20 @@ fn e_in_the_full_view_opens_the_prefilled_dialog_in_one_press() {
 
 #[test]
 #[serial]
+fn enter_in_the_full_view_on_an_unlinked_item_opens_the_dialog_to_pick_a_project() {
+    let (mut env, requests) = expanded_env_answering(2, StartAnswer::NoProject);
+    terminal_view_config();
+    with_authenticated_local_project_registry(&mut env.view, |view| {
+        view.open_suggestions_view();
+        view.handle_key(key(KeyCode::Enter), None);
+    });
+    poll_until(&mut env, |env| env.view.new_dialog.is_some());
+    assert_eq!(next_request(&requests), "start gh/i0");
+    assert_eq!(next_request(&requests), "prepare gh/i0");
+}
+
+#[test]
+#[serial]
 fn a_failed_start_says_why_and_enter_tries_again() {
     let answer = StartAnswer::Failed("Docker isn't running. Start it, then try again.".into());
     let (mut env, requests) = expanded_env_answering(2, answer);
