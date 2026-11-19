@@ -3818,6 +3818,83 @@ mod tests {
         }
     }
 
+    /// While the search bar takes keys, the bar's keys are the query's: Ctrl+E (go-to-end), the
+    /// Update key (`u`, or Ctrl+U, which clears) and Ctrl+X neither cancel, retry, acknowledge
+    /// nor prompt a pull.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn the_search_bar_keeps_the_keys_it_types_with() {
+        let _home = crate::session::test_support::isolate_app_dir();
+        crate::session::get_profile_dir("test").unwrap();
+        let char_key = |c| KeyEvent::new(KeyCode::Char(c), KeyModifiers::NONE);
+        for strict in [false, true] {
+            let (mut app, mut terminal) = key_app();
+            app.home.strict_hotkeys = strict;
+            let sent = record_pull_requests(&mut app);
+            let ctrl_e = bindings::key_event(bindings::ActionId::CancelImagePull, strict).unwrap();
+            let update = bindings::key_event(bindings::ActionId::Update, strict).unwrap();
+            let search = bindings::key_event(bindings::ActionId::SearchStart, strict).unwrap();
+            app.handle_key(search, &mut terminal).await.unwrap();
+            for c in ['a', 'b'] {
+                app.handle_key(char_key(c), &mut terminal).await.unwrap();
+            }
+            assert!(app.home.search_active, "strict={strict}");
+            let query = |app: &App| app.home.search_query.value().to_string();
+
+            app.pull.start();
+            app.handle_key(ctrl_e, &mut terminal).await.unwrap();
+            app.handle_key(ctrl_e, &mut terminal).await.unwrap();
+            assert!(
+                sent.lock().unwrap().is_empty(),
+                "strict={strict}: Ctrl+E cancelled"
+            );
+            assert!(
+                !app.update_status
+                    .as_ref()
+                    .is_some_and(|s| s.text == CANCEL_PULL_PROMPT),
+                "strict={strict}: Ctrl+E asked"
+            );
+            assert_eq!(query(&app), "ab", "strict={strict}");
+
+            // `u` types into the query; Ctrl+U clears it.
+            let typed = if strict { "" } else { "abu" };
+            answer_pull(
+                &mut app,
+                PullRequest::Cancel,
+                PullReport::State(PullState::Cancelled),
+            );
+            draw(&mut app);
+            app.handle_key(update, &mut terminal).await.unwrap();
+            assert!(
+                sent.lock().unwrap().is_empty(),
+                "strict={strict}: the Update key retried"
+            );
+            assert_eq!(query(&app), typed, "strict={strict}");
+
+            draw(&mut app);
+            app.handle_key(CTRL_X, &mut terminal).await.unwrap();
+            assert_eq!(
+                app.pull.line(),
+                Some(&PullLine::Cancelled),
+                "strict={strict}: Ctrl+X acknowledged the pull"
+            );
+            assert_eq!(query(&app), typed, "strict={strict}");
+
+            app.pull = PullWatch::default();
+            app.image_update = Some(image_update());
+            draw(&mut app);
+            assert!(
+                matches!(app.drawn_bar, Some(DrawnBar::ImageUpdate { .. })),
+                "strict={strict}: the image offer isn't drawn"
+            );
+            app.handle_key(update, &mut terminal).await.unwrap();
+            assert_eq!(
+                app.home.pending_image_pull, None,
+                "strict={strict}: the Update key prompted a pull"
+            );
+        }
+    }
+
     /// A status that expires after it was drawn is still the line on screen until the next
     /// draw, so Ctrl+X dismisses it and not the AoE update it hid.
     #[tokio::test]
