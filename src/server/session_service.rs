@@ -3712,6 +3712,7 @@ mod tests {
             import_acp_session_id: None,
             import_binding: None,
             fork_seed: None,
+            session_id: None,
             progress: None,
             cli: None,
         }

@@ -35,6 +35,7 @@ use crate::session::capture::{
     OmpCliCaptureOptions, OmpStoreKind, PrimeRootPublication,
 };
 mod accessors;
+pub(crate) use accessors::generate_id;
 mod capture_slot;
 mod container;
 #[cfg(test)]
