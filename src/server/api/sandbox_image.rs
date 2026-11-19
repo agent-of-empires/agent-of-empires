@@ -977,6 +977,10 @@ mod tests {
             )
         };
         let pull_of = |body: serde_json::Value| body["pull"].clone();
+        // The TUI reads these bodies back as `PullState`.
+        let decoded = |pull: serde_json::Value| {
+            serde_json::from_value::<image_pull::PullState>(pull).expect("a PullState")
+        };
         let status = || {
             let state = state.clone();
             async move {
@@ -1016,11 +1020,13 @@ mod tests {
         let (code, body) = json(cancel(state.clone()).await).await;
         assert_eq!(code, StatusCode::OK);
         assert_eq!(body["image"], IMAGE);
+        let pull = pull_of(body);
         assert_eq!(
-            pull_of(body),
+            pull,
             serde_json::json!({"state": "idle"}),
             "nothing to cancel"
         );
+        assert_eq!(decoded(pull), image_pull::PullState::Idle);
 
         let runtime = ContainerRuntime::from(ContainerRuntimeName::default());
         let pull_key = image_pull::PullKey {
@@ -1045,22 +1051,36 @@ mod tests {
                 "pull".into(),
             ))
         });
+        let pull = status().await;
         assert_eq!(
-            status().await,
+            pull,
             serde_json::json!({"state": "running"}),
             "no counts before a line parses"
+        );
+        assert_eq!(
+            decoded(pull),
+            image_pull::PullState::Running(Default::default())
         );
         release.send(()).unwrap();
         reported
             .recv_timeout(Duration::from_secs(10))
             .expect("the pull reports");
+        let pull = status().await;
         assert_eq!(
-            status().await,
+            pull,
             serde_json::json!({
                 "state": "running",
                 "phase": "downloading",
                 "layers_done": 1,
                 "layers_known": 2,
+            })
+        );
+        assert_eq!(
+            decoded(pull),
+            image_pull::PullState::Running(crate::containers::pull_progress::ProgressSnapshot {
+                phase: Some(crate::containers::pull_progress::PullPhase::Downloading),
+                layers_done: Some(1),
+                layers_known: Some(2),
             })
         );
 
@@ -1071,12 +1091,34 @@ mod tests {
             running.wait(&tokio_util::sync::CancellationToken::new()),
             Err(crate::containers::error::DockerError::PullCancelled(_))
         ));
-        assert_eq!(status().await, serde_json::json!({"state": "cancelled"}));
+        let pull = status().await;
+        assert_eq!(pull, serde_json::json!({"state": "cancelled"}));
+        assert_eq!(decoded(pull), image_pull::PullState::Cancelled);
         let (code, body) = json(cancel(state.clone()).await).await;
         assert_eq!(
             (code, pull_of(body)),
             (StatusCode::OK, serde_json::json!({"state": "cancelled"})),
             "a repeat answers the same"
+        );
+
+        let failed = image_pull::join_with(pull_key.clone(), |_| {
+            Err(crate::containers::error::DockerError::ImagePullFailed {
+                runtime: "docker",
+                image: IMAGE.into(),
+                detail: "dial tcp: lookup registry".into(),
+                reason: image_pull::PullFailureReason::Network,
+            })
+        });
+        assert!(failed
+            .wait(&tokio_util::sync::CancellationToken::new())
+            .is_err());
+        assert_eq!(
+            decoded(status().await),
+            image_pull::PullState::Failed {
+                reason: image_pull::PullFailureReason::Network,
+                message: image_pull::PullFailureReason::Network.user_text(),
+                error: format!("docker couldn't pull image {IMAGE}: dial tcp: lookup registry"),
+            }
         );
 
         crate::session::update_config(|c| c.sandbox.allow_image_pull = false).unwrap();

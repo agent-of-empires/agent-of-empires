@@ -6,7 +6,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, LazyLock, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use tokio_util::sync::CancellationToken;
 
 use super::error::{DockerError, Result};
@@ -17,7 +17,7 @@ const CANCEL_POLL: Duration = Duration::from_millis(50);
 
 /// Why a pull failed, read from the runtime's stderr. Only Docker's stderr has been captured
 /// (`tests/fixtures/pull-stderr`), so other runtimes' failures read as `Other` until they are.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum PullFailureReason {
     Timeout,
@@ -59,7 +59,7 @@ impl PullFailureReason {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "state", rename_all = "snake_case")]
 pub enum PullState {
     Idle,

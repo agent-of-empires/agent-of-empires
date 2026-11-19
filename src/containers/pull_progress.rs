@@ -2,9 +2,9 @@
 
 use std::collections::HashSet;
 
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum PullPhase {
     Downloading,
@@ -58,7 +58,7 @@ pub(crate) struct Progress {
 }
 
 /// What `image-status` reports for a running pull; counts are absent until a layer line parses.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 pub struct ProgressSnapshot {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub phase: Option<PullPhase>,
