@@ -117,7 +117,7 @@ describe("DashboardSuggestions", () => {
         prefs: { ...PREFS, show_source_ref: shown },
       });
       const { unmount } = renderIt();
-      expect((await screen.findByText("GitHub")).parentElement?.textContent).toBe("GitHub · Assigned to you · aoe");
+      expect((await screen.findByText(/Assigned to you/)).textContent).toBe("Assigned to you · aoe");
       expect(screen.queryByTestId("suggestion-source-ref")?.textContent ?? null).toBe(expected);
       unmount();
     }

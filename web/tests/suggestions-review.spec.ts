@@ -78,7 +78,7 @@ test("Start opens the wizard with the draft prompt and creates nothing until Lau
   await page.goto("/suggestions");
 
   await expect(page.getByRole("heading", { name: "Suggested sessions" })).toBeVisible();
-  await expect(page.getByText("GitHub · Assigned to you · aoe")).toBeVisible();
+  await expect(page.getByText(/Assigned to you/)).toBeVisible();
   await expect(page.getByText("UNTRUSTED PROVIDER BODY")).toHaveCount(0);
 
   await page.getByRole("button", { name: "Start" }).click();
@@ -119,7 +119,7 @@ test("dismissed items move to the dismissed list and can be restored", async ({ 
   await expect(page.getByText(item.title, { exact: true })).toHaveCount(0);
   await page.getByRole("button", { name: "Dismissed 1" }).click();
   await page.getByRole("button", { name: "Restore" }).click();
-  await page.getByRole("button", { name: /^All/ }).click();
+  await page.getByRole("button", { name: "Dismissed 0" }).click();
   await expect(page.getByText(item.title, { exact: true })).toBeVisible();
 });
 
@@ -285,7 +285,7 @@ test("a started suggestion offers Open, and Start another sends no suggestion re
   );
   await page.goto("/suggestions");
 
-  await expect(page.getByText(/Session running · Review RFC 4562 · started 3 min ago/)).toBeVisible();
+  await expect(page.getByText(/Running · started 3 min ago/)).toBeVisible();
   await expect(page.getByRole("button", { name: "Start", exact: true })).toHaveCount(0);
 
   await page.getByRole("button", { name: "More", exact: true }).click();

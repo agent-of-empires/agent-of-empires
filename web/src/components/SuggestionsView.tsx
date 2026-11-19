@@ -1,10 +1,11 @@
 import { useState } from "react";
-import { FolderGit2, RefreshCw, Search, Settings, X } from "lucide-react";
+import { ChevronDown, ChevronRight, RefreshCw, Search, Settings, X } from "lucide-react";
 import { OFFLINE_TITLE } from "../lib/connectionState";
 import { agoLabel } from "../lib/suggestionTime";
 import { chipId, filterSuggestions, keyChipGroups, type KeyChip } from "../lib/suggestionFilter";
 import type { SuggestionItem, SuggestionProvider } from "../lib/types";
 import { suggestionKey, useDismissUndo, useSuggestions } from "../hooks/useSuggestions";
+import { SuggestionFilterMenu, FilterMenuItem } from "./SuggestionFilterMenu";
 import { SuggestionMappingWizard } from "./SuggestionMappingWizard";
 import { SuggestionsSetupHint } from "./SuggestionsSetupHint";
 import {
@@ -48,18 +49,20 @@ function providerStatus(provider: SuggestionProvider, itemCount: number) {
   return { text: `${provider.name}: ${updated}`, tone: "text-text-secondary" };
 }
 
-/** Items by the Project they resolve to, in first-seen order with unresolved last. */
-function groupByProject(items: SuggestionItem[]) {
-  const groups = new Map<string, { name: string; items: SuggestionItem[] }>();
+/** The `#12` of a `owner/repo#12` reference, which the group header already names. */
+const shortRef = (ref: string) => (ref.includes("#") ? ref.slice(ref.lastIndexOf("#")) : ref);
+
+/** Items by repo (`mapping_key`) in first-seen order, items with no repo last. */
+function groupByRepo(items: SuggestionItem[]) {
+  const groups = new Map<string, { key: string; name: string; items: SuggestionItem[] }>();
   for (const item of items) {
-    const key = item.resolved_project?.path ?? "";
-    const group = groups.get(key) ?? { name: item.resolved_project?.name ?? "No project", items: [] };
+    const key = item.mapping_key ?? "";
+    const name = key === "" ? "Other" : key.slice(key.indexOf("/") + 1);
+    const group = groups.get(key) ?? { key, name, items: [] };
     group.items.push(item);
     groups.set(key, group);
   }
-  return [...groups.entries()]
-    .sort(([a], [b]) => Number(a === "") - Number(b === ""))
-    .map(([key, group]) => ({ key, ...group }));
+  return [...groups.values()].sort((a, b) => Number(a.key === "") - Number(b.key === ""));
 }
 
 export function SuggestionsView({
@@ -78,11 +81,14 @@ export function SuggestionsView({
   const [query, setQuery] = useState("");
   const [keyChips, setKeyChips] = useState<KeyChip[]>([]);
   const [mapping, setMapping] = useState(false);
+  const [kinds, setKinds] = useState<string[]>([]);
+  const [collapsed, setCollapsed] = useState<string[]>([]);
 
   // A source chip belongs to the list it was picked in, so it does not outlive a tab change.
   const changeFilter = (next: Filter) => {
     setFilter(next);
     setKeyChips([]);
+    setKinds([]);
   };
 
   const disabled = readOnly || offline;
@@ -99,8 +105,11 @@ export function SuggestionsView({
         ? items.filter((i) => i.dismissed)
         : active.filter((i) => i.provider_id === filter.provider);
   const chipGroups = keyChipGroups(listed);
-  const narrowed = query.trim() !== "" || keyChips.length > 0;
-  const visible = filterSuggestions(listed, query, keyChips);
+  const narrowed = query.trim() !== "" || keyChips.length > 0 || kinds.length > 0;
+  const kindId = (i: { provider_id: string; criterion: string }) => `${i.provider_id}:${i.criterion}`;
+  const visible = filterSuggestions(listed, query, keyChips).filter(
+    (i) => kinds.length === 0 || kinds.includes(kindId(i)),
+  );
   const toggleChip = (chip: KeyChip) =>
     setKeyChips((current) =>
       current.some((c) => chipId(c) === chipId(chip))
@@ -110,8 +119,30 @@ export function SuggestionsView({
   const chipSelected = (chip: KeyChip) => keyChips.some((c) => chipId(c) === chipId(chip));
   const providers = snapshot?.providers.filter((p) => p.enabled) ?? [];
   const anyRefreshing = refreshing || providers.some((p) => p.refreshing);
-  const groups = groupByProject(visible);
-  const headed = groups.some((g) => g.key !== "");
+  const groups = groupByRepo(visible);
+  const kindOptions = providers.flatMap((p) =>
+    p.sources
+      .map((src) => ({ id: kindId({ provider_id: p.id, criterion: src.criterion }), label: src.label }))
+      .filter((k) => listed.some((i) => kindId(i) === k.id)),
+  );
+  const toggleKind = (id: string) => setKinds((c) => (c.includes(id) ? c.filter((k) => k !== id) : [...c, id]));
+  const toggleCollapsed = (key: string) =>
+    setCollapsed((c) => (c.includes(key) ? c.filter((k) => k !== key) : [...c, key]));
+  const repoLabel =
+    keyChips.length === 0
+      ? "All repos"
+      : keyChips.length === 1
+        ? "key" in keyChips[0]!
+          ? keyChips[0].key.slice(keyChips[0].key.indexOf("/") + 1)
+          : `${keyChips[0]!.org}/`
+        : `${keyChips.length} repos`;
+  const kindLabel =
+    kinds.length === 0
+      ? "All kinds"
+      : kinds.length === 1
+        ? (kindOptions.find((k) => k.id === kinds[0])?.label ?? "1 kind")
+        : `${kinds.length} kinds`;
+
   const chip = (selected: boolean) =>
     `${CHIP} ${selected ? "border-brand-500 bg-brand-500/10 text-text-primary" : "border-surface-700 text-text-secondary hover:bg-surface-800"}`;
 
@@ -131,29 +162,27 @@ export function SuggestionsView({
   return (
     <main className="flex-1 min-h-0 overflow-y-auto bg-surface-900 text-text-primary">
       <div className="mx-auto max-w-4xl p-4 md:p-8">
-        <header className="flex items-start justify-between gap-4">
-          <div>
+        <header className="flex items-center justify-between gap-4">
+          <div className="min-w-0">
             <h1 className="text-lg font-semibold">Suggested sessions</h1>
-            <p className="mt-2 max-w-2xl text-sm text-text-secondary">
-              {snapshot?.prefs.start_without_review
-                ? "Start creates the session from your template without review when the item has a template and a Project; otherwise it opens the wizard."
-                : "Start opens the new session wizard with the draft prompt. Nothing runs until you press Launch."}
-            </p>
+            {snapshot && (
+              <ul aria-label="Provider status" className="mt-1 flex flex-wrap gap-x-3 font-mono text-xs text-text-dim">
+                <li>{active.length}</li>
+                {providers.map((provider) => {
+                  const { text, tone } = providerStatus(
+                    provider,
+                    items.filter((i) => i.provider_id === provider.id).length,
+                  );
+                  return (
+                    <li key={provider.id} className={tone}>
+                      {text}
+                    </li>
+                  );
+                })}
+              </ul>
+            )}
           </div>
           <div className="flex flex-none items-center gap-1">
-            {items.some((i) => i.mapping_key) && (
-              <button
-                type="button"
-                aria-label="Map projects"
-                onClick={() => setMapping(true)}
-                disabled={disabled}
-                title={unavailableTitle ?? "Map sources to Projects"}
-                className="inline-flex h-8 items-center gap-2 rounded-md border border-surface-700 px-2.5 text-sm text-text-secondary hover:bg-surface-800 disabled:opacity-50 md:px-3"
-              >
-                <FolderGit2 className="h-4 w-4" />
-                <span className="hidden md:inline">Map projects</span>
-              </button>
-            )}
             <button
               type="button"
               aria-label="Refresh"
@@ -189,125 +218,132 @@ export function SuggestionsView({
         )}
 
         {snapshot && (
-          <>
-            <div className="mt-4 flex gap-2 overflow-x-auto" role="group" aria-label="Filter suggestions">
-              <button
-                type="button"
-                aria-pressed={filter === "all"}
-                onClick={() => changeFilter("all")}
-                className={chip(filter === "all")}
-              >
-                All <span className="text-text-dim">{active.length}</span>
-              </button>
-              {providers.map((p) => {
-                const selected = typeof filter === "object" && filter.provider === p.id;
-                return (
-                  <button
-                    key={p.id}
-                    type="button"
-                    aria-pressed={selected}
-                    onClick={() => changeFilter({ provider: p.id })}
-                    className={chip(selected)}
+          <div className="mt-3 flex flex-col gap-2">
+            <div className="flex flex-wrap items-center gap-2">
+              <label className="relative min-w-[160px] flex-1">
+                <Search className="pointer-events-none absolute left-2.5 top-2 h-4 w-4 text-text-dim" />
+                <input
+                  type="search"
+                  aria-label="Search suggestions"
+                  placeholder="Search"
+                  value={query}
+                  onChange={(e) => setQuery(e.target.value)}
+                  className="h-8 w-full rounded-md border border-surface-700 bg-surface-800 pl-8 pr-2 text-sm text-text-primary placeholder:text-text-dim"
+                />
+              </label>
+              {chipGroups.length > 0 && (
+                <SuggestionFilterMenu label={repoLabel} active={keyChips.length > 0}>
+                  <FilterMenuItem
+                    selected={keyChips.length === 0}
+                    count={listed.length}
+                    onClick={() => setKeyChips([])}
                   >
-                    {p.name}{" "}
-                    <span className="text-text-dim">{active.filter((i) => i.provider_id === p.id).length}</span>
-                  </button>
-                );
-              })}
-              {(dismissedCount > 0 || showDismissed) && (
+                    All repos
+                  </FilterMenuItem>
+                  {chipGroups.flatMap((group) => {
+                    const keyItems = group.keys.map(({ key, label, count }) => (
+                      <FilterMenuItem
+                        key={`key:${key}`}
+                        selected={chipSelected({ key })}
+                        title={key}
+                        indent={group.org !== null}
+                        count={count}
+                        onClick={() => toggleChip({ key })}
+                      >
+                        {label}
+                      </FilterMenuItem>
+                    ));
+                    if (group.org === null) return keyItems;
+                    const org = { org: group.org };
+                    return [
+                      <FilterMenuItem
+                        key={`org:${group.org}`}
+                        selected={chipSelected(org)}
+                        title={`Everything under ${group.org}/`}
+                        count={group.count}
+                        onClick={() => toggleChip(org)}
+                      >
+                        {group.org} (org)
+                      </FilterMenuItem>,
+                      ...keyItems,
+                    ];
+                  })}
+                </SuggestionFilterMenu>
+              )}
+              {kindOptions.length > 1 && (
+                <SuggestionFilterMenu label={kindLabel} active={kinds.length > 0}>
+                  <FilterMenuItem selected={kinds.length === 0} count={listed.length} onClick={() => setKinds([])}>
+                    All kinds
+                  </FilterMenuItem>
+                  {kindOptions.map((k) => (
+                    <FilterMenuItem
+                      key={k.id}
+                      selected={kinds.includes(k.id)}
+                      count={listed.filter((i) => kindId(i) === k.id).length}
+                      onClick={() => toggleKind(k.id)}
+                    >
+                      {k.label}
+                    </FilterMenuItem>
+                  ))}
+                </SuggestionFilterMenu>
+              )}
+              {narrowed && (
                 <button
                   type="button"
-                  aria-pressed={showDismissed}
-                  onClick={() => changeFilter("dismissed")}
-                  className={chip(showDismissed)}
+                  onClick={() => {
+                    setQuery("");
+                    setKeyChips([]);
+                    setKinds([]);
+                  }}
+                  className="inline-flex h-8 flex-none items-center gap-1 rounded-md px-2.5 text-xs text-text-secondary hover:bg-surface-800"
                 >
-                  Dismissed <span className="text-text-dim">{dismissedCount}</span>
+                  <X className="h-3.5 w-3.5" />
+                  Clear filters
                 </button>
               )}
             </div>
-            {listed.length > 0 && (
-              <div className="mt-3 flex flex-col gap-2">
-                <div className="flex items-center gap-2">
-                  <label className="relative flex-1">
-                    <Search className="pointer-events-none absolute left-2.5 top-2 h-4 w-4 text-text-dim" />
-                    <input
-                      type="search"
-                      aria-label="Search suggestions"
-                      placeholder="Search title, reference, reason or source"
-                      value={query}
-                      onChange={(e) => setQuery(e.target.value)}
-                      className="h-8 w-full rounded-md border border-surface-700 bg-surface-800 pl-8 pr-2 text-sm text-text-primary placeholder:text-text-dim"
-                    />
-                  </label>
-                  {narrowed && (
+            {(providers.length > 1 || dismissedCount > 0 || showDismissed) && (
+              <div className="flex gap-2 overflow-x-auto" role="group" aria-label="Filter suggestions">
+                {providers.length > 1 && (
+                  <>
                     <button
                       type="button"
-                      onClick={() => {
-                        setQuery("");
-                        setKeyChips([]);
-                      }}
-                      className="inline-flex h-8 flex-none items-center gap-1 rounded-md px-2.5 text-xs text-text-secondary hover:bg-surface-800"
+                      aria-pressed={filter === "all"}
+                      onClick={() => changeFilter("all")}
+                      className={chip(filter === "all")}
                     >
-                      <X className="h-3.5 w-3.5" />
-                      Clear filters
+                      All <span className="text-text-dim">{active.length}</span>
                     </button>
-                  )}
-                </div>
-                {chipGroups.length > 0 && (
-                  <div className="flex flex-wrap gap-1.5" role="group" aria-label="Filter by source">
-                    {chipGroups.flatMap((group) => {
-                      const keyChipsOf = group.keys.map(({ key, label, count }) => (
+                    {providers.map((p) => {
+                      const selected = typeof filter === "object" && filter.provider === p.id;
+                      return (
                         <button
-                          key={`key:${key}`}
+                          key={p.id}
                           type="button"
-                          aria-pressed={chipSelected({ key })}
-                          title={key}
-                          onClick={() => toggleChip({ key })}
-                          className={chip(chipSelected({ key }))}
+                          aria-pressed={selected}
+                          onClick={() => changeFilter({ provider: p.id })}
+                          className={chip(selected)}
                         >
-                          <span className="font-mono">{label}</span> <span className="text-text-dim">{count}</span>
+                          {p.name}{" "}
+                          <span className="text-text-dim">{active.filter((i) => i.provider_id === p.id).length}</span>
                         </button>
-                      ));
-                      if (group.org === null) return keyChipsOf;
-                      const org = { org: group.org };
-                      return [
-                        <button
-                          key={`org:${group.org}`}
-                          type="button"
-                          aria-pressed={chipSelected(org)}
-                          title={`Everything under ${group.org}/`}
-                          onClick={() => toggleChip(org)}
-                          className={chip(chipSelected(org))}
-                        >
-                          <span className="font-mono">{group.org}/</span>{" "}
-                          <span className="text-text-dim">{group.count}</span>
-                        </button>,
-                        ...keyChipsOf,
-                      ];
+                      );
                     })}
-                  </div>
+                  </>
+                )}
+                {(dismissedCount > 0 || showDismissed) && (
+                  <button
+                    type="button"
+                    aria-pressed={showDismissed}
+                    onClick={() => changeFilter(showDismissed ? "all" : "dismissed")}
+                    className={chip(showDismissed)}
+                  >
+                    Dismissed <span className="text-text-dim">{dismissedCount}</span>
+                  </button>
                 )}
               </div>
             )}
-            <ul
-              aria-label="Provider status"
-              className="mt-3 flex flex-col gap-1 font-mono text-xs md:flex-row md:flex-wrap md:gap-x-[18px]"
-            >
-              {snapshot.providers
-                .filter((p) => p.enabled)
-                .map((provider) => {
-                  const { text, tone } = providerStatus(
-                    provider,
-                    items.filter((i) => i.provider_id === provider.id).length,
-                  );
-                  return (
-                    <li key={provider.id} className={tone}>
-                      {text}
-                    </li>
-                  );
-                })}
-            </ul>
-          </>
+          </div>
         )}
 
         {loading && !snapshot && (
@@ -317,55 +353,76 @@ export function SuggestionsView({
         )}
         {snapshot && (
           <>
-            {groups.map((group) => (
-              <section key={group.key} aria-label={headed ? `Project ${group.name}` : undefined}>
-                {headed && (
+            {groups.map((group) => {
+              const closed = collapsed.includes(group.key);
+              const unlinked = group.key !== "" && group.items.every((i) => !i.resolved_project);
+              return (
+                <section key={group.key} aria-label={`Repo ${group.name}`}>
                   <h2 className="mx-1 mb-1.5 mt-4 font-mono text-xs text-text-secondary">
-                    {group.name} <span className="text-text-dim">{group.items.length}</span>
+                    <button
+                      type="button"
+                      aria-expanded={!closed}
+                      title={group.key || undefined}
+                      onClick={() => toggleCollapsed(group.key)}
+                      className="inline-flex cursor-pointer items-center gap-1.5 hover:text-text-primary"
+                    >
+                      {closed ? <ChevronRight className="h-3.5 w-3.5" /> : <ChevronDown className="h-3.5 w-3.5" />}
+                      {group.name} <span className="text-text-dim">{group.items.length}</span>
+                      {unlinked && <span className="text-text-dim"> · no Project yet</span>}
+                    </button>
+                    {unlinked && !disabled && (
+                      <button
+                        type="button"
+                        onClick={() => setMapping(true)}
+                        className="ml-2 cursor-pointer font-sans text-brand-500 hover:underline"
+                      >
+                        Link a Project
+                      </button>
+                    )}
                   </h2>
-                )}
-                <ul className={`rounded-lg border border-surface-700/40 bg-surface-900 ${headed ? "" : "mt-4"}`}>
-                  {group.items.map((item) => {
-                    const key = suggestionKey(item);
-                    const providerName =
-                      snapshot.providers.find((p) => p.id === item.provider_id)?.name ?? item.provider_id;
-                    return (
-                      <SuggestionRow
-                        key={key}
-                        title={item.title}
-                        source={providerName}
-                        sourceRef={snapshot.prefs.show_source_ref ? item.source_ref : undefined}
-                        reason={item.reason}
-                        project={item.resolved_project?.name ?? item.project}
-                        session={item.started_session}
-                        stale={item.stale}
-                        failure={failures[key]?.message}
-                        actions={
-                          <SuggestionActions
-                            dismissed={item.dismissed}
-                            readOnly={readOnly}
-                            offline={offline}
-                            busy={busy !== null}
-                            onStart={() => void start(item, failures[key]?.another)}
+                  {!closed && (
+                    <ul className="rounded-lg border border-surface-700/40 bg-surface-900">
+                      {group.items.map((item) => {
+                        const key = suggestionKey(item);
+                        const providerName =
+                          snapshot.providers.find((p) => p.id === item.provider_id)?.name ?? item.provider_id;
+                        return (
+                          <SuggestionRow
+                            key={key}
+                            title={item.title}
+                            inlineRef={snapshot.prefs.show_source_ref ? shortRef(item.source_ref) : ""}
+                            reason={item.reason}
+                            session={item.started_session}
                             stale={item.stale}
-                            failed={key in failures}
-                            started={
-                              item.started_session && {
-                                onOpen: () => onOpenSession(item.started_session!.id),
-                                onStartAnother: () => void start(item, true),
-                                providerName,
-                                sourceUrl: item.source_url,
-                              }
+                            failure={failures[key]?.message}
+                            actions={
+                              <SuggestionActions
+                                dismissed={item.dismissed}
+                                readOnly={readOnly}
+                                offline={offline}
+                                busy={busy !== null}
+                                onStart={() => void start(item, failures[key]?.another)}
+                                stale={item.stale}
+                                failed={key in failures}
+                                started={
+                                  item.started_session && {
+                                    onOpen: () => onOpenSession(item.started_session!.id),
+                                    onStartAnother: () => void start(item, true),
+                                    providerName,
+                                    sourceUrl: item.source_url,
+                                  }
+                                }
+                                onToggleDismiss={() => void dismiss(item, !item.dismissed)}
+                              />
                             }
-                            onToggleDismiss={() => void dismiss(item, !item.dismissed)}
                           />
-                        }
-                      />
-                    );
-                  })}
-                </ul>
-              </section>
-            ))}
+                        );
+                      })}
+                    </ul>
+                  )}
+                </section>
+              );
+            })}
             <ul className="mt-4 rounded-lg border border-surface-700/40 bg-surface-900 empty:hidden">
               {visible.length === 0 && (
                 <li className={SUGGESTION_NOTE_CLASS}>

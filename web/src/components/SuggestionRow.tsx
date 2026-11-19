@@ -5,9 +5,13 @@ import type { StartedSession } from "../lib/types";
 import { agoLabel } from "../lib/suggestionTime";
 import { useOutsideDismiss } from "./useOutsideDismiss";
 
+/** Buttons look 32px; on a phone an invisible 44px area around them takes the tap. */
+const TAP =
+  "relative after:absolute after:left-1/2 after:top-1/2 after:h-11 after:w-11 after:-translate-x-1/2 after:-translate-y-1/2 after:content-[''] md:after:hidden";
+
 export const SUGGESTION_NOTE_CLASS = "border-t border-surface-700/40 px-3 py-2 text-xs text-text-dim first:border-t-0";
 
-/** The reason line of a started item: Session state, its title, how long ago it began. */
+/** The reason line of a started item: Session state first, then how long ago it began. */
 function StartedReason({ session }: { session: StartedSession }) {
   const status = session.archived ? null : session.status;
   return (
@@ -17,20 +21,18 @@ function StartedReason({ session }: { session: StartedSession }) {
           <span aria-hidden="true" className="font-mono">
             ⠋
           </span>{" "}
-          Session running
+          Running
         </span>
       ) : status === "Idle" ? (
         <span>
           <span aria-hidden="true" className="font-mono">
             ⠒
           </span>{" "}
-          Session idle
+          Idle
         </span>
       ) : (
-        <span>{status ? `Session ${status.toLowerCase()}` : "Archived"}</span>
+        <span>{status ?? "Archived"}</span>
       )}
-      {" · "}
-      {session.title}
       {" · "}started {agoLabel(Date.parse(session.created_at))}
     </>
   );
@@ -38,9 +40,10 @@ function StartedReason({ session }: { session: StartedSession }) {
 
 interface RowProps {
   title: string;
-  source: string;
   /** Shown above the title when non-empty. */
   sourceRef?: string;
+  /** One line on wide screens, with this short reference (`#12`) ahead of the reason. */
+  inlineRef?: string;
   reason: string;
   project?: string | null;
   /** Replaces the reason with the started Session's state. */
@@ -74,8 +77,8 @@ function SourceRef({ value }: { value: string }) {
 
 export function SuggestionRow({
   title,
-  source,
   sourceRef,
+  inlineRef,
   reason,
   project,
   session,
@@ -91,18 +94,28 @@ export function SuggestionRow({
     >
       <div className="min-w-0 flex-1">
         {sourceRef && <SourceRef value={sourceRef} />}
-        <p className={`truncate text-sm text-text-primary ${stale ? "opacity-[0.55]" : ""}`}>{title}</p>
-        <p className={`mt-0.5 truncate text-xs ${stale ? "text-text-dim" : "text-text-muted"}`}>
-          <span className={`font-mono font-medium text-text-secondary ${stale ? "opacity-[0.55]" : ""}`}>{source}</span>
-          {" · "}
-          {session ? <StartedReason session={session} /> : reason}
-          {project && (
-            <>
-              {" · "}
-              <span className="font-mono font-medium text-text-secondary">{project}</span>
-            </>
-          )}
-        </p>
+        <div className={inlineRef !== undefined ? "md:flex md:items-baseline md:gap-3" : ""}>
+          <p className={`truncate text-sm text-text-primary ${stale ? "opacity-[0.55]" : ""} md:min-w-0 md:flex-1`}>
+            {title}
+          </p>
+          <p
+            className={`mt-0.5 truncate text-xs md:mt-0 md:flex-none md:max-w-[45%] ${stale ? "text-text-dim" : "text-text-muted"}`}
+          >
+            {inlineRef && (
+              <>
+                <span className="font-mono text-text-secondary">{inlineRef}</span>
+                {" · "}
+              </>
+            )}
+            {session ? <StartedReason session={session} /> : reason}
+            {project && (
+              <>
+                {" · "}
+                <span className="font-mono font-medium text-text-secondary">{project}</span>
+              </>
+            )}
+          </p>
+        </div>
         {failure && <p className="mt-0.5 break-words text-xs text-status-error">Couldn&apos;t start: {failure}</p>}
       </div>
       <div className="flex flex-none gap-1">{actions}</div>
@@ -156,7 +169,7 @@ function MoreMenu({
         aria-haspopup="menu"
         aria-expanded={open}
         onClick={() => setOpen((v) => !v)}
-        className="inline-flex h-8 w-8 items-center justify-center rounded-md text-text-secondary hover:bg-surface-700/50"
+        className={`${TAP} inline-flex h-8 w-8 items-center justify-center rounded-md text-text-secondary hover:bg-surface-700/50`}
       >
         <MoreHorizontal className="h-4 w-4" />
       </button>
@@ -233,7 +246,7 @@ export function SuggestionActions({
         <button
           type="button"
           onClick={started.onOpen}
-          className="inline-flex h-8 items-center rounded-md bg-brand-600 px-3 text-xs font-medium text-text-on-brand hover:bg-brand-500"
+          className={`${TAP} inline-flex h-8 items-center rounded-md bg-brand-600 px-3 text-xs font-medium text-text-on-brand hover:bg-brand-500`}
         >
           Open
         </button>
@@ -256,7 +269,7 @@ export function SuggestionActions({
           onClick={onStart}
           disabled={disabled}
           title={readOnly ? "Read-only: can't create Sessions" : offline ? OFFLINE_TITLE : undefined}
-          className="inline-flex h-8 items-center rounded-md border border-surface-700 bg-surface-800 px-3 text-xs font-medium text-text-primary hover:bg-surface-700/50 disabled:opacity-50"
+          className={`${TAP} inline-flex h-8 items-center rounded-md border border-surface-700 bg-surface-800 px-3 text-xs font-medium text-text-primary hover:bg-surface-700/50 disabled:opacity-50`}
         >
           {failed ? "Open wizard" : "Start"}
         </button>
@@ -268,7 +281,7 @@ export function SuggestionActions({
           title={label}
           onClick={onToggleDismiss}
           disabled={disabled}
-          className="inline-flex h-8 w-8 items-center justify-center rounded-md text-text-secondary hover:bg-surface-700/50 disabled:opacity-50"
+          className={`${TAP} inline-flex h-8 w-8 items-center justify-center rounded-md text-text-secondary hover:bg-surface-700/50 disabled:opacity-50`}
         >
           {dismissed ? <Undo2 className="h-4 w-4" /> : <X className="h-4 w-4" />}
         </button>
