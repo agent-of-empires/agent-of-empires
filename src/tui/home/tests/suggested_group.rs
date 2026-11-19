@@ -265,7 +265,7 @@ fn a_start_the_daemon_says_is_already_started_becomes_open() {
 #[serial]
 fn hooks_that_need_trust_show_a_review_and_approving_starts_with_its_fingerprint() {
     let answer = StartAnswer::NeedsTrust {
-        changed: false,
+        mcp_summaries: vec![],
         commands: vec!["on create: make setup".into()],
         fingerprint: serde_json::json!({ "project_path": "/repo", "hooks": "abc" }),
     };
@@ -286,6 +286,46 @@ fn hooks_that_need_trust_show_a_review_and_approving_starts_with_its_fingerprint
         next_request(&requests),
         r#"start gh/i0 {"project_path":"/repo","hooks":"abc"}"#
     );
+}
+
+#[test]
+#[serial]
+fn the_hooks_review_lists_the_mcp_servers_the_daemon_summarised() {
+    let answer = StartAnswer::NeedsTrust {
+        commands: vec!["on create: make setup".into()],
+        mcp_summaries: vec!["github: npx @modelcontextprotocol/server-github".into()],
+        fingerprint: serde_json::json!({ "project_path": "/repo" }),
+    };
+    let (mut env, requests) = expanded_env_answering(2, answer);
+    with_authenticated_local_project_registry(&mut env.view, |view| {
+        view.open_suggestions_view();
+        view.handle_key(key(KeyCode::Enter), None);
+    });
+    assert_eq!(next_request(&requests), "start gh/i0");
+    poll_until(&mut env, |env| env.view.confirm_dialog.is_some());
+    let text = render_home_to_string(&mut env.view, 140, 40);
+    assert!(text.contains("MCP server: github"), "{text}");
+}
+
+#[test]
+#[serial]
+fn a_changed_trust_asks_the_daemon_for_a_fresh_review_without_approval() {
+    let (mut env, requests) = expanded_env_answering(2, StartAnswer::TrustChanged);
+    with_authenticated_local_project_registry(&mut env.view, |view| {
+        view.open_suggestions_view();
+        view.handle_key(key(KeyCode::Enter), None);
+    });
+    assert_eq!(next_request(&requests), "start gh/i0");
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let second = loop {
+        env.view.apply_suggestions_results();
+        if let Ok(request) = requests.try_recv() {
+            break request;
+        }
+        assert!(Instant::now() < deadline, "no second start");
+        std::thread::sleep(Duration::from_millis(5));
+    };
+    assert_eq!(second, "start gh/i0");
 }
 
 #[test]
@@ -319,7 +359,7 @@ fn a_failed_start_in_the_full_view_stays_on_its_row() {
 #[serial]
 fn the_hooks_review_opened_from_the_full_view_is_drawn_and_takes_the_keys() {
     let answer = StartAnswer::NeedsTrust {
-        changed: false,
+        mcp_summaries: vec![],
         commands: vec!["on create: make setup".into()],
         fingerprint: serde_json::json!({ "project_path": "/repo", "hooks": "abc" }),
     };
@@ -343,7 +383,7 @@ fn the_hooks_review_opened_from_the_full_view_is_drawn_and_takes_the_keys() {
 #[serial]
 fn a_profile_switch_closes_the_hooks_review_and_nothing_is_approved() {
     let answer = StartAnswer::NeedsTrust {
-        changed: false,
+        mcp_summaries: vec![],
         commands: vec!["on create: make setup".into()],
         fingerprint: serde_json::json!({ "project_path": "/repo" }),
     };
