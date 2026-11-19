@@ -469,6 +469,8 @@ mod tests {
             (&K::PortMappingList, json!(["3000:3000", "8080:80"]), true),
             (&K::PortMappingList, json!(["3000"]), false),
             (&K::PortMappingList, json!(["a:b"]), false),
+            (&K::PortMappingList, json!(["3000:65536"]), false),
+            (&K::PortMappingList, json!(["65535:65535"]), true),
             (&K::Cron, json!("0 9 * * 1-5"), true),
             (&K::Cron, json!("*/15 * * * *"), true),
             (&K::Cron, json!("0 0,12 1 */2 *"), true),

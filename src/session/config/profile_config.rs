@@ -290,13 +290,14 @@ pub fn validate_env_format(entry: &str) -> Result<(), String> {
     }
 }
 
-/// Validate a `host:container` port mapping (digits only on both sides).
+/// Validate a `host:container` port mapping (digits only on both sides, each a valid port).
 pub fn validate_port_mapping_format(mapping: &str) -> Result<(), String> {
     let re = regex::Regex::new(r"^\d+:\d+$").unwrap();
-    if re.is_match(mapping) {
+    let in_range = mapping.split(':').all(|port| port.parse::<u16>().is_ok());
+    if re.is_match(mapping) && in_range {
         Ok(())
     } else {
-        Err("Must be port:port (e.g. 3000:3000)".to_string())
+        Err("Must be port:port, ports up to 65535 (e.g. 3000:3000)".to_string())
     }
 }
 
