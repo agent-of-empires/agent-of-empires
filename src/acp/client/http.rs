@@ -143,6 +143,34 @@ pub enum HttpError {
     Daemon(#[from] crate::daemon::DaemonClientError),
 }
 
+/// `GET /api/sandbox/image-status`, the fields a client reads.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Deserialize)]
+pub struct SandboxImageStatus {
+    #[serde(flatten)]
+    pub state: SandboxImageAvailability,
+    pub dismissed: bool,
+    pub checks_enabled: bool,
+    pub sandbox_in_use: bool,
+    pub pull: crate::containers::image_pull::PullState,
+    /// Why this Daemon won't pull; `pull_command` is then what to run instead.
+    pub pull_blocked: Option<String>,
+    pub pull_command: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Deserialize)]
+#[serde(tag = "state", rename_all = "snake_case")]
+pub enum SandboxImageAvailability {
+    Available { remote_digest: String },
+    Current,
+    Unknown { reason: String },
+    CheckFailed { error: String },
+}
+
+#[derive(serde::Deserialize)]
+struct SandboxPullReply {
+    pull: crate::containers::image_pull::PullState,
+}
+
 impl From<reqwest::Error> for HttpError {
     fn from(_: reqwest::Error) -> Self {
         Self::Transport
@@ -469,6 +497,44 @@ impl HttpClient {
         let res = self.execute(self.http.get(&url)).await?;
         let res = check_global_status(res)?;
         Ok(crate::daemon::decode_json::<UiSnapshot>(res).await?)
+    }
+
+    /// `GET /api/sandbox/image-status` for the configured image. `fresh` skips the cached
+    /// registry check.
+    pub async fn sandbox_image_status(&self, fresh: bool) -> Result<SandboxImageStatus, HttpError> {
+        let url = format!("{}/api/sandbox/image-status", self.endpoint.base_url);
+        let res = self
+            .execute(self.http.get(&url).query(&[("fresh", fresh)]))
+            .await?;
+        let res = check_global_status(res)?;
+        Ok(crate::daemon::decode_json(res).await?)
+    }
+
+    /// `POST /api/sandbox/image-pull`: starts the configured image's pull, or joins it.
+    pub async fn sandbox_image_pull(
+        &self,
+    ) -> Result<crate::containers::image_pull::PullState, HttpError> {
+        self.sandbox_pull_request("/api/sandbox/image-pull").await
+    }
+
+    /// `POST /api/sandbox/image-pull/cancel`: the state the cancelled pull ended in.
+    pub async fn sandbox_image_cancel(
+        &self,
+    ) -> Result<crate::containers::image_pull::PullState, HttpError> {
+        self.sandbox_pull_request("/api/sandbox/image-pull/cancel")
+            .await
+    }
+
+    async fn sandbox_pull_request(
+        &self,
+        path: &str,
+    ) -> Result<crate::containers::image_pull::PullState, HttpError> {
+        let url = format!("{}{path}", self.endpoint.base_url);
+        let res = self.execute(self.http.post(&url)).await?;
+        let res = check_global_status(res)?;
+        Ok(crate::daemon::decode_json::<SandboxPullReply>(res)
+            .await?
+            .pull)
     }
 
     /// `GET /api/plugins/commands`. The daemon's active plugin commands with
@@ -2703,5 +2769,104 @@ mod tests {
             body,
             &serde_json::json!({"config_id": "reasoning_effort", "value": "high"})
         );
+    }
+
+    /// The three sandbox image calls against the real router. A stand-in flight is the pull,
+    /// so no runtime is run.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn sandbox_image_status_pull_and_cancel_round_trip() {
+        use crate::containers::image_pull::{self, PullState};
+        use crate::server::test_support;
+        const IMAGE: &str = "aoe-test/http-client-pull:latest";
+        let _app = crate::session::test_support::isolate_app_dir();
+        crate::session::update_config(|c| {
+            c.updates.update_check_mode = crate::session::config::UpdateCheckMode::Off;
+            c.sandbox.allow_image_pull = true;
+            c.sandbox.default_image = IMAGE.into();
+        })
+        .unwrap();
+        let serve = |state: std::sync::Arc<crate::server::AppState>| async move {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let base = format!("http://{}", listener.local_addr().unwrap());
+            let app = test_support::build_router_for_test(state.clone());
+            let shutdown = state.shutdown.clone();
+            let server = tokio::spawn(async move {
+                axum::serve(
+                    listener,
+                    app.into_make_service_with_connect_info::<std::net::SocketAddr>(),
+                )
+                .with_graceful_shutdown(shutdown.cancelled_owned())
+                .await
+                .unwrap();
+            });
+            (HttpClient::new(endpoint(&base, None)).unwrap(), server)
+        };
+
+        let state = test_support::build_test_app_state(Vec::new());
+        let (client, server) = serve(state.clone()).await;
+        let status = client.sandbox_image_status(false).await.unwrap();
+        assert_eq!(status.pull, PullState::Idle);
+        assert_eq!(status.pull_blocked, None);
+        assert!(
+            status.pull_command.contains(IMAGE),
+            "{}",
+            status.pull_command
+        );
+
+        let runtime = crate::containers::ContainerRuntime::from(
+            crate::session::ContainerRuntimeName::default(),
+        );
+        let key = image_pull::PullKey {
+            runtime: runtime.display_name(),
+            image: IMAGE.into(),
+        };
+        // Ends by itself at the deadline, so a broken cancel fails the test instead of leaving
+        // the router's waiter blocked through the runtime's shutdown.
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        let flight = image_pull::join_with(key, move |pull| {
+            while !pull.kill.is_cancelled() && std::time::Instant::now() < deadline {
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            Err(crate::containers::error::DockerError::Cancelled(
+                "pull".into(),
+            ))
+        });
+        assert_eq!(
+            client.sandbox_image_pull().await.unwrap(),
+            PullState::Running(Default::default())
+        );
+        assert!(matches!(
+            client.sandbox_image_status(false).await.unwrap().pull,
+            PullState::Running(_)
+        ));
+        assert_eq!(
+            client.sandbox_image_cancel().await.unwrap(),
+            PullState::Cancelled
+        );
+        assert!(flight
+            .wait(&tokio_util::sync::CancellationToken::new())
+            .is_err());
+        state.shutdown.cancel();
+        server.await.unwrap();
+
+        let read_only =
+            test_support::build_test_app_state_configured(Vec::new(), |s| s.read_only = true);
+        let (client, server) = serve(read_only.clone()).await;
+        assert_eq!(
+            client
+                .sandbox_image_status(false)
+                .await
+                .unwrap()
+                .pull_blocked
+                .as_deref(),
+            Some("read_only")
+        );
+        assert!(matches!(
+            client.sandbox_image_pull().await,
+            Err(HttpError::ReadOnly)
+        ));
+        read_only.shutdown.cancel();
+        server.await.unwrap();
     }
 }
