@@ -152,7 +152,7 @@ pub(super) enum StartAnswer {
     /// fingerprint the approval must quote.
     NeedsTrust {
         commands: Vec<String>,
-        fingerprint: String,
+        fingerprint: serde_json::Value,
     },
     /// The item's repo is linked to no Project, so the wizard has to ask for one.
     NoProject,
@@ -187,7 +187,7 @@ fn start_answer(status: u16, body: &serde_json::Value) -> StartAnswer {
             }
             StartAnswer::NeedsTrust {
                 commands,
-                fingerprint: field("review_fingerprint"),
+                fingerprint: body["review_fingerprint"].clone(),
             }
         }
         (400, "no_project") => StartAnswer::NoProject,
@@ -229,7 +229,7 @@ enum Req {
     Start {
         provider_id: String,
         id: String,
-        review_fingerprint: Option<String>,
+        review_fingerprint: Option<serde_json::Value>,
         origin: Option<Origin>,
     },
 }
@@ -375,7 +375,7 @@ async fn run(req: &Req) -> Res {
             let mut body = serde_json::json!({ "provider_id": provider_id, "id": id });
             if let Some(fingerprint) = review_fingerprint {
                 body["approve_hooks"] = true.into();
-                body["review_fingerprint"] = fingerprint.clone().into();
+                body["review_fingerprint"] = fingerprint.clone();
             }
             Res::Started(
                 client
@@ -1518,11 +1518,11 @@ impl SuggestionsFeed {
     }
 
     /// Starts again with the repo hooks the user approved, named by `fingerprint`.
-    pub(super) fn start_approved(&mut self, key: ItemKey, fingerprint: String) {
+    pub(super) fn start_approved(&mut self, key: ItemKey, fingerprint: serde_json::Value) {
         self.submit_start(key, Some(fingerprint));
     }
 
-    fn submit_start(&mut self, key: ItemKey, review_fingerprint: Option<String>) {
+    fn submit_start(&mut self, key: ItemKey, review_fingerprint: Option<serde_json::Value>) {
         let pending = (self.busy && self.start_key.as_ref() == Some(&key))
             || self.queued.iter().any(|req| {
                 matches!(req, Req::Start { provider_id, id, .. }
@@ -2179,7 +2179,7 @@ mod tests {
             "error": "hooks_need_trust",
             "commands": { "on_create": ["make setup"], "on_launch": [], "on_destroy": [] },
             "needs_mcp_trust": true,
-            "review_fingerprint": "fp",
+            "review_fingerprint": { "project_path": "/repo", "hooks": "abc" },
         });
         let cases = [
             (
@@ -2205,7 +2205,7 @@ mod tests {
                 hooks,
                 StartAnswer::NeedsTrust {
                     commands: vec!["on create: make setup".into(), "project MCP servers".into()],
-                    fingerprint: "fp".into(),
+                    fingerprint: json!({ "project_path": "/repo", "hooks": "abc" }),
                 },
             ),
             (

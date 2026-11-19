@@ -419,7 +419,7 @@ pub struct HomeView {
     pub(super) pending_force_remove_session: Option<(String, std::num::NonZeroU64)>,
     pub(super) pending_trash_session: Option<TrashDialogTarget>,
     /// The suggestion waiting on the hooks review dialog, with the fingerprint to approve.
-    pub(super) pending_suggestion_trust: Option<((String, String), String)>,
+    pub(super) pending_suggestion_trust: Option<((String, String), serde_json::Value)>,
     pub(super) pending_dialog_click_action: Option<crate::tui::app::Action>,
     pub(super) search_active: bool,
     pub(super) search_query: Input,

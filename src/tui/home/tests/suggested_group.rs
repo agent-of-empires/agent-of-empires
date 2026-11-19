@@ -264,7 +264,7 @@ fn a_start_the_daemon_says_is_already_started_becomes_open() {
 fn hooks_that_need_trust_show_a_review_and_approving_starts_with_its_fingerprint() {
     let answer = StartAnswer::NeedsTrust {
         commands: vec!["on create: make setup".into()],
-        fingerprint: "fp1".into(),
+        fingerprint: serde_json::json!({ "project_path": "/repo", "hooks": "abc" }),
     };
     let (mut env, requests) = expanded_env_answering(2, answer);
     env.view.cursor += 1;
@@ -279,7 +279,10 @@ fn hooks_that_need_trust_show_a_review_and_approving_starts_with_its_fingerprint
         "approve_suggestion_hooks"
     );
     env.view.handle_key(key(KeyCode::Char('y')), None);
-    assert_eq!(next_request(&requests), "start gh/i0 fp1");
+    assert_eq!(
+        next_request(&requests),
+        r#"start gh/i0 {"project_path":"/repo","hooks":"abc"}"#
+    );
 }
 
 #[test]
