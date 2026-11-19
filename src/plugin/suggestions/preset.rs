@@ -51,7 +51,8 @@ pub(crate) fn default_preset(config: &Config) -> Preset {
     }
 }
 
-/// The stored preset of a kind, or `None` while it follows the defaults.
+/// The stored preset of a kind, or `None` while it follows the defaults. An
+/// undecodable row is logged and treated as absent, as [`presets`] does.
 pub(crate) fn preset(
     conn: &Connection,
     profile: &str,
@@ -66,7 +67,18 @@ pub(crate) fn preset(
             |row| row.get(0),
         )
         .optional()?;
-    Ok(json.map(|j| serde_json::from_str(&j)).transpose()?)
+    Ok(json.and_then(|j| match serde_json::from_str(&j) {
+        Ok(preset) => Some(preset),
+        Err(e) => {
+            tracing::warn!(
+                target: "plugin.suggestions",
+                provider = %provider_id,
+                criterion = %criterion,
+                "ignoring undecodable stored preset: {e}"
+            );
+            None
+        }
+    }))
 }
 
 pub(crate) fn set_preset(
@@ -134,4 +146,23 @@ pub(crate) fn presets(
             },
         )
         .collect())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::fixtures::*;
+    use super::*;
+
+    #[test]
+    fn an_undecodable_stored_preset_reads_as_absent() {
+        let conn = store();
+        conn.execute(
+            "INSERT INTO suggestion_presets (profile, provider_id, criterion, preset_json)
+             VALUES ('p', 'acme.github', 'assigned', '{\"agent\": 7}')",
+            [],
+        )
+        .unwrap();
+        assert_eq!(preset(&conn, "p", "acme.github", "assigned").unwrap(), None);
+        assert!(presets(&conn, "p").unwrap().is_empty());
+    }
 }
