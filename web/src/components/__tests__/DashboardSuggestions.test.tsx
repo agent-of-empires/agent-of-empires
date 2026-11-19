@@ -65,6 +65,16 @@ const renderIt = (props: Partial<Parameters<typeof DashboardSuggestions>[0]> = {
   render(<DashboardSuggestions onPrepare={vi.fn()} onViewAll={vi.fn()} onOpenSession={vi.fn()} {...props} />);
 
 describe("DashboardSuggestions", () => {
+  it("shows a provider error instead of claiming there is nothing to suggest", async () => {
+    fetchSuggestions.mockResolvedValue({
+      ...snap([]),
+      providers: [{ id: "github", name: "GitHub", status: "error", error: "gh is not signed in", sources: [] }],
+    });
+    renderIt();
+    expect(await screen.findByText(/GitHub: couldn't refresh, gh is not signed in/)).toBeTruthy();
+    expect(screen.queryByText(/Nothing to suggest right now/)).toBeNull();
+  });
+
   it("caps rows (3 wide, 2 narrow) and counts all non-dismissed items in View all", async () => {
     fetchSuggestions.mockResolvedValue(snap([1, 2, 3, 4, 5].map((n) => mk(n)).concat(mk(6, { dismissed: true }))));
     const onViewAll = vi.fn();
