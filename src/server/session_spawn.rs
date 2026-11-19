@@ -709,6 +709,7 @@ pub(crate) async fn spawn_structured_session(
                         &mut instance,
                         &hook_plan,
                         store,
+                        &creation_guard.cancellation(),
                         Some(&creation_progress),
                     )
                     .map_err(|error| {
@@ -716,12 +717,10 @@ pub(crate) async fn spawn_structured_session(
                             .hooks
                             .as_ref()
                             .and_then(|hooks| hooks.origin_hint("on_create"));
-                        anyhow::Error::new(
-                            crate::server::api::sessions::CreateHookFailed::new(
-                                error,
-                                hint.as_deref(),
-                                hook_plan.on_create_from_repo,
-                            ),
+                        crate::server::api::sessions::CreateHookFailed::wrap(
+                            error,
+                            hint.as_deref(),
+                            hook_plan.on_create_from_repo,
                         )
                     })
                 })

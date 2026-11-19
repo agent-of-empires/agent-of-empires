@@ -25,6 +25,19 @@ impl CreateHookFailed {
             from_repo,
         }
     }
+
+    /// The error for a failed on_create run. A cancelled create stays a cancel, so it is
+    /// answered and kept out of the replay map as one.
+    pub(crate) fn wrap(
+        error: anyhow::Error,
+        origin_hint: Option<&str>,
+        from_repo: bool,
+    ) -> anyhow::Error {
+        if error.is::<crate::server::session_service::CreationCancelled>() {
+            return error;
+        }
+        Self::new(error, origin_hint, from_repo).into()
+    }
 }
 
 /// Hard cap on one `idempotency_key`'s length, so a request cannot persist an
@@ -660,6 +673,7 @@ pub(crate) fn run_create_hooks(
     instance: &mut Instance,
     plan: &CreateHookPlan,
     store: &dyn crate::session::SessionStore,
+    cancel: &tokio_util::sync::CancellationToken,
     progress: Option<&dyn Fn(crate::session::config::repo_config::HookProgress)>,
 ) -> anyhow::Result<()> {
     use crate::session::config::repo_config;
@@ -670,7 +684,16 @@ pub(crate) fn run_create_hooks(
 
     let hook_env = repo_config::lifecycle_env_vars(instance);
     if instance.sandbox_info.is_some() {
-        instance.ensure_container_in(store, None)?;
+        // The create's cancel reaches a missing image's pull, which may be shared.
+        instance
+            .ensure_container_with_hook_in(store, cancel, None, Instance::mint_before_start_env)
+            .map_err(|error| {
+                if cancel.is_cancelled() {
+                    crate::server::session_service::CreationCancelled.into()
+                } else {
+                    error
+                }
+            })?;
         let workdir = instance.hook_container_workdir(plan.on_create_from_repo);
         if let Some(sandbox) = instance.sandbox_info.as_ref() {
             repo_config::execute_hooks_in_container_streamed(
