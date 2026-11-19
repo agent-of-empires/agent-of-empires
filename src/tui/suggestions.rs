@@ -548,8 +548,6 @@ const UNDO_WINDOW: std::time::Duration = std::time::Duration::from_secs(10);
 pub(super) enum SuggestionsAction {
     Continue,
     Close,
-    /// The user confirmed a prepared suggestion.
-    Start(Box<Start>),
     /// Jump to the Session an item was started as.
     OpenSession(String),
 }
@@ -756,13 +754,6 @@ impl SuggestionsView {
                     store.start(key);
                     return SuggestionsAction::Continue;
                 }
-                if self.prepare_another == another
-                    && self.prepared.as_ref().is_some_and(|(k, _)| *k == key)
-                {
-                    if let Some((_, start)) = self.prepared.take() {
-                        return SuggestionsAction::Start(Box::new(start));
-                    }
-                }
                 self.begin();
                 self.failed = None;
                 self.preparing = Some(key.clone());
@@ -772,6 +763,11 @@ impl SuggestionsView {
             _ => {}
         }
         SuggestionsAction::Continue
+    }
+
+    /// The prefill a prepare resolved, for the caller to open the dialog with.
+    pub(super) fn take_prepared(&mut self) -> Option<Start> {
+        self.prepared.take().map(|(_, start)| start)
     }
 
     /// Takes what a store poll holds for this view. True when state changed.
@@ -803,12 +799,6 @@ impl SuggestionsView {
                 if self.prepare_another {
                     start.suggestion = None;
                 }
-                self.notice = Some(if start.path.is_some() {
-                    "Review the prompt below, then press e to start.".into()
-                } else {
-                    "No single project matched. Review the prompt, then press e and pick one."
-                        .into()
-                });
                 self.prepared = Some((key, start));
                 changed = true;
             }
@@ -1975,7 +1965,7 @@ mod tests {
     }
 
     #[test]
-    fn e_resolves_the_final_prompt_and_a_second_e_starts() {
+    fn e_resolves_the_final_prompt_for_the_dialog() {
         let worker = Worker::seeded_for_test("t", Res::Prepared(Ok(prepared(Some("/repo")))));
         let mut rig = view_with(vec![item("a", Some("repo"), false)], worker);
         assert!(matches!(
@@ -1983,11 +1973,7 @@ mod tests {
             SuggestionsAction::Continue
         ));
         assert!(poll_until_settled(&mut rig));
-        assert!(rig.view.prepared.is_some());
-        assert!(render_text(&rig).contains("final prompt"));
-        let SuggestionsAction::Start(start) = press(&mut rig, KeyCode::Char('e'), true) else {
-            panic!("expected a start");
-        };
+        let start = rig.view.take_prepared().expect("the prefill is ready");
         assert_eq!(start.path.as_deref(), Some("/repo"));
         assert_eq!(start.initial_prompt, "final prompt");
         assert!(rig.view.prepared.is_none());
@@ -1999,10 +1985,7 @@ mod tests {
         let mut rig = view_with(vec![item("a", None, false)], worker);
         press(&mut rig, KeyCode::Char('e'), true);
         assert!(poll_until_settled(&mut rig));
-        assert!(rig.view.prepared.is_some());
-        let SuggestionsAction::Start(start) = press(&mut rig, KeyCode::Char('e'), true) else {
-            panic!("expected a start");
-        };
+        let start = rig.view.take_prepared().expect("the prefill is ready");
         assert_eq!(start.path, None);
         assert_eq!(start.initial_prompt, "final prompt");
     }
@@ -2029,9 +2012,7 @@ mod tests {
 
         press(&mut rig, KeyCode::Char('N'), true);
         assert!(poll_until_settled(&mut rig));
-        let SuggestionsAction::Start(start) = press(&mut rig, KeyCode::Char('N'), true) else {
-            panic!("expected a start");
-        };
+        let start = rig.view.take_prepared().expect("the prefill is ready");
         assert!(start.suggestion.is_none());
     }
 
@@ -2041,9 +2022,7 @@ mod tests {
         let mut rig = view_with(vec![item("a", Some("repo"), false)], worker);
         press(&mut rig, KeyCode::Char('e'), true);
         assert!(poll_until_settled(&mut rig));
-        let SuggestionsAction::Start(start) = press(&mut rig, KeyCode::Char('e'), true) else {
-            panic!("expected a start");
-        };
+        let start = rig.view.take_prepared().expect("the prefill is ready");
         let origin = start.suggestion.unwrap();
         assert_eq!(
             (origin.provider_id.as_str(), origin.id.as_str()),
@@ -2645,16 +2624,11 @@ mod tests {
     fn keys_are_not_swallowed_while_a_background_load_is_in_flight() {
         let mut rig = view_with(vec![item("a", Some("repo"), false)], idle_worker());
         rig.store.busy = true;
-        let key = ("p".to_string(), "a".to_string());
-        let start = start_for(rig.store.snapshot.as_ref(), &key, prepared(Some("/repo")));
-        rig.view.prepared = Some((key, start));
-        assert!(matches!(
-            press(&mut rig, KeyCode::Char('e'), true),
-            SuggestionsAction::Start(_)
-        ));
+        press(&mut rig, KeyCode::Char('e'), true);
+        assert_eq!(rig.store.queued.len(), 1, "the prepare waits its turn");
 
         rig.store.reload();
-        assert_eq!(rig.store.queued.len(), 1, "the reload waits its turn");
+        assert_eq!(rig.store.queued.len(), 2, "the reload waits its turn");
     }
 
     #[test]
