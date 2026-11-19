@@ -342,7 +342,7 @@ impl McpServer {
     }
 
     /// Whether `status` ends a wait for `states`. Status lags the event log, so with `after_seq`
-    /// an `Idle` read before that turn ended is the previous turn's.
+    /// an `Idle` read before that turn ended is the previous turn's. A failed query is "not yet".
     fn settled(
         &self,
         id: &str,
@@ -358,7 +358,7 @@ impl McpServer {
                 .state
                 .acp_event_store
                 .turn_ended_after(id, seq)
-                .unwrap_or(true),
+                .unwrap_or(false),
             _ => true,
         }
     }
