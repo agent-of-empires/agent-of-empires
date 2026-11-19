@@ -2412,6 +2412,12 @@ Allow once the lock is released.
   \u{203a} 1. Yes
     2. No
 \u{2736} Herding\u{2026} (53s \u{b7} \u{2193} 7.0k tokens)",
+            "\
+ The tool's permission menu offers:
+ 1. Allow once
+ 2. Allow always
+ 3. Deny
+ \u{2733} Puttering\u{2026} (26s \u{b7} thinking more with high effort)",
         ];
         for content in cases {
             assert!(
