@@ -11362,6 +11362,92 @@ async fn create_persists_initial_prompt_as_pending_turn() {
 }
 
 #[tokio::test]
+async fn a_suggestion_has_one_primary_session() {
+    let _home = crate::session::test_support::isolate_app_dir();
+    let _adapter = crate::session::test_support::stub_claude_adapter_on_agent_path();
+    crate::session::purge_owners::initialize(&crate::session::get_app_dir().unwrap()).unwrap();
+    crate::tmux::tool_retirement::initialize(&crate::session::get_app_dir().unwrap()).unwrap();
+    crate::session::config::update_app_state(|state| {
+        state.has_acknowledged_agent_hooks = true;
+    })
+    .expect("acknowledge the agent hook paths");
+    crate::session::config::update_config(|config| {
+        config.default_profile = "chosen-default".to_string();
+    })
+    .unwrap();
+    crate::session::Storage::new_unwatched("chosen-default").unwrap();
+    let (launcher, _launches) = crate::server::test_support::counting_failing_launcher();
+    let _registry = crate::server::api::suggestions_tests::register_provider();
+    let host = crate::plugin::host::PluginHost::new(
+        &crate::session::get_app_dir().unwrap().join("host"),
+        "default",
+        None,
+        Arc::new(crate::server::runtime::RuntimeWork::default()),
+    )
+    .unwrap();
+    crate::server::api::suggestions_tests::seed_item_on(&host, "42", None, "42");
+    let state = crate::server::test_support::build_test_app_state_impl(
+        Vec::new(),
+        Vec::new(),
+        Vec::new(),
+        None,
+        false,
+        |state| {
+            state.profile = std::sync::RwLock::new(crate::session::config::effective_profile(""));
+            state.plugin_host = Some(host);
+        },
+        |supervisor| supervisor.with_launcher(launcher),
+    );
+    crate::server::test_support::refresh_canonical_metadata_for_test(&state).await;
+    let create = |title: &str, linked: bool, extra: serde_json::Value| {
+        let mut body = serde_json::json!({
+            "title": title, "path": "", "tool": "claude",
+            "scratch": true, "view": "structured",
+        });
+        if linked {
+            body["suggestion"] = serde_json::json!({ "provider_id": "acme.gh", "id": "42" });
+        }
+        if let serde_json::Value::Object(extra) = extra {
+            body.as_object_mut().unwrap().extend(extra);
+        }
+        post_create(&state, body)
+    };
+    let null = serde_json::Value::Null;
+
+    // A failed start frees the link: this one is refused after it claimed.
+    let (status, _) = create("fails", true, serde_json::json!({ "trust_hooks": true })).await;
+    assert!(status.is_client_error(), "{status}");
+    let (status, first) = create("first", true, null.clone()).await;
+    assert_eq!(status, axum::http::StatusCode::CREATED, "{first}");
+
+    // A second start loses, and learns who won.
+    let (status, lost) = create("second", true, null.clone()).await;
+    assert_eq!(status, axum::http::StatusCode::CONFLICT, "{lost}");
+    assert_eq!(lost["error"], "already_started");
+    assert_eq!(lost["session_id"], first["id"]);
+
+    // "Start another" carries no origin, so it takes no link.
+    let (status, another) = create("another", false, null.clone()).await;
+    assert_eq!(status, axum::http::StatusCode::CREATED, "{another}");
+
+    // Trash frees the link; archive keeps it.
+    {
+        let mut instances = state.instances.write().await;
+        let held = instances.iter_mut().find(|i| i.id == first["id"]).unwrap();
+        held.archived_at = Some(chrono::Utc::now());
+    }
+    let (status, _) = create("while archived", true, null.clone()).await;
+    assert_eq!(status, axum::http::StatusCode::CONFLICT);
+    {
+        let mut instances = state.instances.write().await;
+        let held = instances.iter_mut().find(|i| i.id == first["id"]).unwrap();
+        held.trashed_at = Some(chrono::Utc::now());
+    }
+    let (status, second) = create("after trash", true, null).await;
+    assert_eq!(status, axum::http::StatusCode::CREATED, "{second}");
+}
+
+#[tokio::test]
 async fn create_rejects_a_suggestion_that_is_not_published() {
     let _home = crate::session::test_support::isolate_app_dir();
     let _registry = crate::server::api::suggestions_tests::register_provider();
