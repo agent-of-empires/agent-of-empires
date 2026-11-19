@@ -1064,6 +1064,8 @@ run this command? (y/n)
                 "run this command? (y/n)",
                 "\u{25cf} 1. Allow once\n  2. Allow always",
                 "execute this action? [y/n]",
+                "Command to approve\n  ls -la\n\n\u{276f} Yes, allow\n  Yes, and always allow low\n  \
+                    No, cancel\n\n\u{2191}\u{2193} navigate \u{b7} Enter select \u{b7} Esc cancel",
                 "ready\ndroid>",
                 "done\n>",
             ],
@@ -1169,6 +1171,11 @@ path: /workspace/secrets.env
   Yes, allow always
   No, deny access",
                 "I'll read that file now.\n awaiting user approval.",
+                "\
+\u{2503} self needs approval for Bash
+\u{2503} \u{25cf} Bash(free -m)
+\u{2503}
+\u{2503} ctrl+k approve \u{b7} alt+j manage",
             ],
         );
         assert_all(

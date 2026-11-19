@@ -25,6 +25,15 @@ id = "approval_prompt"
 priority = 950
 contains_any = ["continue?", "proceed?", "execute?", "enter to select", "esc to cancel"]
 
+# The permission dialog's options, which name no prompt of their own.
+[[rules]]
+id = "permission_choice"
+state = "waiting"
+priority = 945
+region = "whole_recent"
+visible = true
+contains = ["yes, allow", "no, cancel"]
+
 [[rules]]
 extends = "input_prompt"
 id = "input_prompt"
