@@ -402,11 +402,11 @@ fn tui_restart_failure_retains_predecessor_credential_for_rotation_and_removal()
         let key = if rotate { "g" } else { "r" };
         h.send_keys_unfenced(key);
         h.wait_for(if rotate {
-            "Press G again for a new passphrase."
+            "Press Enter for a new passphrase."
         } else {
-            "Press R again to restart."
+            "Press Enter to restart."
         });
-        h.send_keys_unfenced(key);
+        h.send_keys_unfenced("Enter");
         h.wait_for_timeout("Dashboard start failed", Duration::from_secs(75));
         let retained: serde_json::Value =
             serde_json::from_slice(&std::fs::read(app.join("serve.rollback.launch")).unwrap())
