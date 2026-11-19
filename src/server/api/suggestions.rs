@@ -540,10 +540,6 @@ pub async fn start_suggestion(
         Ok(body) => body,
         Err(rejection) => return rejection.into_response(),
     };
-    // CityHall cannot save the link, so it starts only what is already linked.
-    if body.project.is_some() && state.cityhall_mode {
-        return super::cityhall_response();
-    }
     let Some(host) = state.plugin_host.clone() else {
         return unavailable();
     };
