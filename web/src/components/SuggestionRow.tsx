@@ -6,7 +6,7 @@ import { agoLabel } from "../lib/suggestionTime";
 import { MENU_ITEM, MenuPopover, StartInMenu, StartMenu, type StartMenuProps } from "./SuggestionStartMenu";
 
 /** Buttons look 32px; on a phone an invisible 44px area around them takes the tap. */
-const TAP =
+export const TAP =
   "relative after:absolute after:left-1/2 after:top-1/2 after:h-11 after:w-11 after:-translate-x-1/2 after:-translate-y-1/2 after:content-[''] md:after:hidden";
 
 export const SUGGESTION_NOTE_CLASS = "border-t border-surface-700/40 px-3 py-2 text-xs text-text-dim first:border-t-0";
