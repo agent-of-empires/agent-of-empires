@@ -747,7 +747,7 @@ In a `background_processes` refusal:
 - `processes` lists each process as `{"pid", "start_id", "elapsed_secs"}`, and the first five also carry `argv`. `total` counts them all.
 - `argv` is shown only where its arguments are known exactly. Values of secret-looking flags and variables read `***`. A shell's `-c` script is never shown.
 - `classified: false`, with `total: 0` and no processes, means the check couldn't tell what the pane runs. That includes more than 24 background shells.
-- `launch_hooks_ran: true` means the refusal came from the second check, after the `on_launch` hooks had run. Confirm with `skip_on_launch: true`.
+- `launch_hooks_ran: true` means the refusal came from the second check, after the `on_launch` hooks' turn: they ran, or this request skipped them because an earlier attempt ran them. Confirm with `skip_on_launch: true`, so they don't run again.
 
 To confirm, send the same restart with `stop_processes` set to the listed identities. A process started after the refusal is refused again; a reused PID has a new `start_id`.
 

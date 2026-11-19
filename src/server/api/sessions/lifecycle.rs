@@ -2242,7 +2242,8 @@ fn check_with_unrestorable_setting(body: &crate::daemon::RestartSessionBody) -> 
 }
 
 /// The 409 for a restart that found unconfirmed background processes. `launch_hooks_ran` says
-/// the refusal came from the recheck after the launch hooks, so the confirm skips `on_launch`.
+/// the refusal came from the recheck after the launch hooks' turn, so the confirm skips
+/// `on_launch`. A request that skipped them says so too: an earlier attempt ran them.
 fn background_processes_response(
     fields: serde_json::Value,
     launch_hooks_ran: bool,

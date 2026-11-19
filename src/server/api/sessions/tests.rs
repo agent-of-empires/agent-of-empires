@@ -9896,14 +9896,17 @@ async fn an_update_restart_names_the_agents_background_shells_before_stopping_th
     let agent = project.path().join("agent");
     let second = project.path().join("second");
     let third = project.path().join("third");
+    let fourth = project.path().join("fourth");
     std::fs::write(
         &agent,
         format!(
             "#!/bin/sh\nbash -c 'sleep 600; :' &\nwhile [ ! -e {0} ]; do sleep 0.05; done\n\
              bash -c 'sleep 700; :' &\nwhile [ ! -e {1} ]; do sleep 0.05; done\n\
-             bash -c 'sleep 800; :' &\nwait\n",
+             bash -c 'sleep 800; :' &\nwhile [ ! -e {2} ]; do sleep 0.05; done\n\
+             bash -c 'sleep 900; :' &\nwait\n",
             second.display(),
-            third.display()
+            third.display(),
+            fourth.display()
         ),
     )
     .unwrap();
@@ -10172,8 +10175,16 @@ async fn an_update_restart_names_the_agents_background_shells_before_stopping_th
     assert_eq!(after.snoozed_until, before.snoozed_until);
     assert!(after.lifecycle_reservation.is_none());
 
+    // A confirm that skips the hooks they already ran is refused the same way, and still says
+    // they ran, so the next confirm skips them too.
+    let (status, skipped) = confirm_during_hooks(identities(&late), true, &fourth, 4).await;
+    assert_eq!(status, StatusCode::CONFLICT, "{skipped}");
+    assert_eq!(skipped["launch_hooks_ran"], true);
+    assert_eq!(skipped["total"], 4);
+    assert_eq!(hook_runs(), 1);
+
     // Confirming that list with `skip_on_launch` restarts without running the hooks again.
-    let (status, confirmed) = confirm(identities(&late), true).await;
+    let (status, confirmed) = confirm(identities(&skipped), true).await;
     assert!(status.is_success(), "{status} {confirmed}");
     assert_eq!(hook_runs(), 1, "on_launch ran once for the whole restart");
 
