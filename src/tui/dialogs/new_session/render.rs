@@ -178,7 +178,9 @@ impl NewSessionDialog {
             constraints.push(Constraint::Length(2)); // Sandbox checkbox (summary only)
         }
         constraints.push(Constraint::Length(2)); // Group
-        constraints.push(Constraint::Length(1)); // Prompt line
+        if self.shows_prompt_line() {
+            constraints.push(Constraint::Length(1)); // Prompt line
+        }
 
         // Inner width is 76: dialog width less borders and margin. The hint
         // line reserves 2 rows so per-field hints wrap instead of truncating.
@@ -491,8 +493,10 @@ impl NewSessionDialog {
         self.focusable_rects.push((fields.group, area));
         ci += 1;
 
-        frame.render_widget(Paragraph::new(self.prompt_line(theme)), chunks[ci]);
-        ci += 1;
+        if self.shows_prompt_line() {
+            frame.render_widget(Paragraph::new(self.prompt_line(theme)), chunks[ci]);
+            ci += 1;
+        }
 
         // Hints/errors (last chunk)
         let hint_chunk = ci;
@@ -635,6 +639,11 @@ impl NewSessionDialog {
         if self.dir_picker.is_active() {
             self.dir_picker.render(frame, full_area, theme);
         }
+    }
+
+    /// A blank session has no first turn to name; Ctrl+O still opens the editor.
+    fn shows_prompt_line(&self) -> bool {
+        self.prompt_origin.is_some() || !self.prompt.value().trim().is_empty()
     }
 
     /// The one line above the footer: where the prompt came from, or what it is.
