@@ -60,7 +60,7 @@ pub(crate) fn providers() -> Vec<Provider> {
         .collect()
 }
 
-const SCHEMA_VERSION: i64 = 3;
+const SCHEMA_VERSION: i64 = 4;
 
 /// Identifies the manifest spec a publication was validated against. Reads show
 /// only items stamped with the provider's current spec, so a worker that
@@ -191,7 +191,6 @@ pub(crate) fn init(conn: &Connection) -> rusqlite::Result<()> {
              item_id     TEXT NOT NULL,
              holder      TEXT NOT NULL,
              pending     INTEGER NOT NULL,
-             claimed_at  INTEGER NOT NULL,
              PRIMARY KEY (profile, provider_id, item_id)
          );
          CREATE TABLE IF NOT EXISTS suggestion_provider_prefs (
