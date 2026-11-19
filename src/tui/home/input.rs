@@ -1426,9 +1426,7 @@ impl HomeView {
                 None
             }
             "approve_suggestion_hooks" => {
-                if let Some((key, fingerprint)) = self.pending_suggestion_trust.take() {
-                    self.suggestions_feed.start_approved(key, fingerprint);
-                }
+                self.suggestions_feed.approve_held_trust();
                 None
             }
             "stop_session" => self.pending_stop_session.take().map(Action::StopSession),

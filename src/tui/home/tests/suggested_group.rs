@@ -337,6 +337,33 @@ fn the_hooks_review_opened_from_the_full_view_is_drawn_and_takes_the_keys() {
 
 #[test]
 #[serial]
+fn a_profile_switch_closes_the_hooks_review_and_nothing_is_approved() {
+    let answer = StartAnswer::NeedsTrust {
+        commands: vec!["on create: make setup".into()],
+        fingerprint: serde_json::json!({ "project_path": "/repo" }),
+    };
+    let (mut env, requests) = expanded_env_answering(2, answer);
+    env.view.cursor += 1;
+    env.view.update_selected();
+    env.view.active_profile = Some("A".into());
+    env.view.apply_suggestions_results();
+    with_authenticated_local_project_registry(&mut env.view, |view| {
+        view.handle_key(key(KeyCode::Enter), None);
+    });
+    poll_until(&mut env, |env| env.view.confirm_dialog.is_some());
+    env.view.active_profile = Some("B".into());
+    env.view.apply_suggestions_results();
+    assert!(env.view.confirm_dialog.is_none(), "the review is gone");
+    env.view.handle_key(key(KeyCode::Char('y')), None);
+    let sent: Vec<String> = requests.try_iter().collect();
+    assert!(
+        sent.iter().all(|r| !r.contains("project_path")),
+        "no approval was sent: {sent:?}"
+    );
+}
+
+#[test]
+#[serial]
 fn a_failed_start_says_why_and_enter_tries_again() {
     let answer = StartAnswer::Failed("Docker isn't running. Start it, then try again.".into());
     let (mut env, requests) = expanded_env_answering(2, answer);
