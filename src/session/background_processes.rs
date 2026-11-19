@@ -308,7 +308,7 @@ pub(crate) fn census(
     loop {
         let mut children = tree.iter().filter(|s| s.parent == agent.identity.pid);
         match (children.next(), children.next()) {
-            (Some(only), None) if matches(only) => agent = only,
+            (Some(only), None) if !is_shell(only) && matches(only) => agent = only,
             _ => break,
         }
     }
@@ -785,6 +785,32 @@ mod tests {
                     sample(23, 22, "/usr/bin/tail", &["tail", "-f", "log"]),
                 ],
                 Some(vec![&["tail", "-f", "log"]]),
+            ),
+            (
+                "a shell running one of the package's scripts is a background shell",
+                &npm_claude,
+                vec![
+                    sample(
+                        20,
+                        1,
+                        "/usr/bin/node",
+                        &[
+                            "node",
+                            "/usr/lib/node_modules/@anthropic-ai/claude-code/cli.js",
+                        ],
+                    ),
+                    sample(
+                        21,
+                        20,
+                        "/usr/bin/bash",
+                        &[
+                            "bash",
+                            "/usr/lib/node_modules/@anthropic-ai/claude-code/scripts/task.sh",
+                        ],
+                    ),
+                    sample(22, 21, "/usr/bin/sleep", &["sleep", "600"]),
+                ],
+                Some(vec![&["sleep", "600"]]),
             ),
             (
                 "two background shells",
