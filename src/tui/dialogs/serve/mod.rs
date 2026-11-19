@@ -1058,6 +1058,11 @@ impl ServeView {
     }
 
     pub fn handle_key(&mut self, key: KeyEvent) -> ServeAction {
+        self.handle_key_at(key, Instant::now())
+    }
+
+    /// [`Self::handle_key`] at `now`, the clock the confirm window is read against.
+    fn handle_key_at(&mut self, key: KeyEvent, now: Instant) -> ServeAction {
         if self.restart_key_held && is_restart_key(key.code) {
             return ServeAction::Continue;
         }
@@ -1126,7 +1131,7 @@ impl ServeView {
                 KeyCode::Esc | KeyCode::Char('q') => ServeAction::Close,
                 _ => ServeAction::Continue,
             },
-            ServeViewState::Active { .. } => self.active_key(key.code),
+            ServeViewState::Active { .. } => self.active_key(key.code, now),
             ServeViewState::Error { .. } => self.error_key(key.code),
         }
     }
@@ -1474,7 +1479,7 @@ impl ServeView {
         }
     }
 
-    fn active_key(&mut self, code: KeyCode) -> ServeAction {
+    fn active_key(&mut self, code: KeyCode, now: Instant) -> ServeAction {
         if std::mem::take(&mut self.show_help) {
             return ServeAction::Continue;
         }
@@ -1482,7 +1487,7 @@ impl ServeView {
         let armed = self
             .pending_confirm
             .take()
-            .filter(|(_, when)| when.elapsed() <= CONFIRM_TTL)
+            .filter(|(_, when)| now.saturating_duration_since(*when) <= CONFIRM_TTL)
             .map(|(action, _)| action);
         let (mode, transport) = self.context();
         let mut confirmed = None;
@@ -1565,6 +1570,7 @@ impl ServeView {
         fresh: RestartProbe,
         intent: RestartIntent,
         confirmed: Option<PendingConfirm>,
+        now: Instant,
     ) {
         let ServeViewState::Active {
             mode,
@@ -1616,12 +1622,17 @@ impl ServeView {
         } else {
             self.restart_probe = fresh;
             // The prompt shows now, so its window starts now.
-            self.pending_confirm = Some((action, Instant::now()));
+            self.pending_confirm = Some((action, now));
         }
     }
 
     /// Drain one bounded result and expire UI clocks. No process or filesystem work.
     pub fn tick(&mut self) -> bool {
+        self.tick_at(Instant::now())
+    }
+
+    /// [`Self::tick`] at `now`, which arms and expires the confirm window.
+    fn tick_at(&mut self, now: Instant) -> bool {
         use std::sync::mpsc::TryRecvError;
         let mut changed = false;
         if let Some(pending) = &mut self.pending {
@@ -1629,7 +1640,7 @@ impl ServeView {
             match result {
                 Ok((attempt, result)) if attempt == pending.attempt => {
                     let pending = self.pending.take().expect("pending result");
-                    changed = self.apply_result(pending, result);
+                    changed = self.apply_result(pending, result, now);
                 }
                 Ok(_) => {}
                 Err(TryRecvError::Empty) => {}
@@ -1647,7 +1658,7 @@ impl ServeView {
         }
         if self
             .pending_confirm
-            .is_some_and(|(_, when)| when.elapsed() > CONFIRM_TTL)
+            .is_some_and(|(_, when)| now.saturating_duration_since(when) > CONFIRM_TTL)
         {
             self.pending_confirm = None;
             changed = true;
@@ -1809,7 +1820,7 @@ impl ServeView {
         changed
     }
 
-    fn apply_result(&mut self, pending: PendingWork, result: JobResult) -> bool {
+    fn apply_result(&mut self, pending: PendingWork, result: JobResult, now: Instant) -> bool {
         match (pending.kind, result) {
             (kind, JobResult::Failed(message)) => {
                 self.fail_pending(kind, pending.mode, pending.transport, message)
@@ -1918,7 +1929,7 @@ impl ServeView {
                 };
             }
             (PendingJob::Restart { intent, confirmed }, JobResult::Restart(fresh)) => {
-                self.apply_restart(fresh, intent, confirmed)
+                self.apply_restart(fresh, intent, confirmed, now)
             }
             (
                 PendingJob::LaunchContext(mut request),

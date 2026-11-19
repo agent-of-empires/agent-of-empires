@@ -71,6 +71,16 @@ fn starting() -> ServeViewState {
     }
 }
 
+/// [`wait_for`], with every tick read at `now`.
+fn wait_for_at(view: &mut ServeView, now: Instant, predicate: impl Fn(&ServeView) -> bool) {
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while !predicate(view) {
+        view.tick_at(now);
+        assert!(Instant::now() < deadline, "Serve transition did not finish");
+        std::thread::yield_now();
+    }
+}
+
 fn wait_for(view: &mut ServeView, predicate: impl Fn(&ServeView) -> bool) {
     let deadline = Instant::now() + Duration::from_secs(10);
     while !predicate(view) {
@@ -3037,8 +3047,9 @@ fn a_held_serve_key_from_connections_does_nothing_on_the_serve_screen() {
     }
 }
 
-/// R or G arms; only Enter confirms, including Enter pressed while the arming assessment
-/// runs. Any other key cancels, and the arming key, however long it is held, never confirms.
+/// R or G arms, and the prompt shows once the arming assessment lands. Only Enter within 3 s of
+/// the prompt confirms; Enter while an assessment runs does nothing. Any other key cancels, and
+/// the arming key, however long it is held, never confirms.
 #[test]
 #[serial_test::serial]
 fn a_restart_and_a_new_passphrase_confirm_only_with_enter() {
@@ -3111,27 +3122,32 @@ fn a_restart_and_a_new_passphrase_confirm_only_with_enter() {
         );
     }
 
-    // The window runs from the prompt, which shows when the assessment lands.
-    for (age, confirms) in [
-        (CONFIRM_TTL - Duration::from_millis(250), true),
+    // The window runs from the prompt, which shows when the assessment lands, so a check held
+    // past CONFIRM_TTL still leaves the full window. Each Enter is read at an explicit time.
+    let asked = Instant::now();
+    let landed = asked + CONFIRM_TTL + Duration::from_secs(1);
+    for (after_prompt, confirms) in [
+        (CONFIRM_TTL, true),
         (CONFIRM_TTL + Duration::from_millis(1), false),
     ] {
         let (_jobs, gate, mut view) = arm('R', ServeMode::Local);
         gate.release(probe());
-        wait_for(&mut view, |view| view.pending_confirm.is_some());
-        let (action, _) = view.pending_confirm.unwrap();
-        view.pending_confirm = Some((action, Instant::now() - age));
-        view.handle_key(enter());
+        wait_for_at(&mut view, landed, |view| view.pending_confirm.is_some());
+        assert_eq!(view.pending_confirm.map(|(_, at)| at), Some(landed));
+        view.handle_key_at(enter(), landed + after_prompt);
         if confirms {
             gate.entered(Held::Restart);
             gate.release(probe());
             wait_assessment(&mut view);
             assert!(
                 view.take_launch().is_some(),
-                "Enter {age:?} after the prompt"
+                "Enter {after_prompt:?} after a late prompt"
             );
         } else {
-            assert!(view.pending.is_none(), "Enter {age:?} after the prompt");
+            assert!(
+                view.pending.is_none(),
+                "Enter {after_prompt:?} after the prompt"
+            );
             assert!(view.take_launch().is_none());
         }
     }
