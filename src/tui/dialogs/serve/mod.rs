@@ -813,6 +813,8 @@ enum PendingJob {
     Restart {
         intent: RestartIntent,
         confirmed: Option<PendingConfirm>,
+        /// When the key that asked was pressed; an Enter later than `CONFIRM_TTL` cancels.
+        asked_at: Instant,
     },
     LaunchContext(ServeLaunchRequest),
     LaunchOutcome,
@@ -1146,8 +1148,12 @@ impl ServeView {
                 self.request_picker(selected);
                 true
             }
-            PendingJob::Restart { intent, confirmed } => {
-                if code == KeyCode::Enter {
+            PendingJob::Restart {
+                intent,
+                confirmed,
+                asked_at,
+            } => {
+                if code == KeyCode::Enter && asked_at.elapsed() <= CONFIRM_TTL {
                     if let (RestartIntent::Confirm(action), None) = (intent, confirmed) {
                         let action = *action;
                         if let Some(PendingWork {
@@ -1421,6 +1427,7 @@ impl ServeView {
 
     pub(crate) fn refuse_stop(&mut self) {
         self.pending = None;
+        self.funnel_reset_armed = None;
         self.stop_requested = false;
         let (mode, transport) = self.context();
         self.fail_work(
@@ -1433,6 +1440,7 @@ impl ServeView {
     pub(crate) fn begin_stop(&mut self) {
         self.pending = None;
         self.pending_confirm = None;
+        self.funnel_reset_armed = None;
         self.pending_launch = None;
         self.show_help = false;
         self.stop_requested = true;
@@ -1518,7 +1526,11 @@ impl ServeView {
         if let Some(intent) = intent {
             self.request(
                 Job::Restart(mode, transport),
-                PendingJob::Restart { intent, confirmed },
+                PendingJob::Restart {
+                    intent,
+                    confirmed,
+                    asked_at: Instant::now(),
+                },
             );
         }
         ServeAction::Continue
@@ -1922,9 +1934,12 @@ impl ServeView {
                     transport: pending.transport,
                 };
             }
-            (PendingJob::Restart { intent, confirmed }, JobResult::Restart(fresh)) => {
-                self.apply_restart(fresh, intent, confirmed)
-            }
+            (
+                PendingJob::Restart {
+                    intent, confirmed, ..
+                },
+                JobResult::Restart(fresh),
+            ) => self.apply_restart(fresh, intent, confirmed),
             (
                 PendingJob::LaunchContext(mut request),
                 JobResult::LaunchContext {

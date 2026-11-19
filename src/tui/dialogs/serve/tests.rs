@@ -926,6 +926,7 @@ fn every_pending_state_leaves_a_closed_worker() {
                 PendingJob::Restart {
                     intent: RestartIntent::Help,
                     confirmed: None,
+                    asked_at: Instant::now(),
                 },
             ),
             Held::LaunchContext => (
@@ -3080,6 +3081,38 @@ fn a_restart_and_a_new_passphrase_confirm_only_with_enter() {
     wait_assessment(&mut view);
     assert!(view.take_launch().is_some(), "Enter during the assessment");
 
+    // The arm lasts CONFIRM_TTL from the R, however slow either assessment is: an Enter in time
+    // confirms when its assessment lands late, and an Enter after it cancels.
+    let (_jobs_a, early_gate, mut early) = arm('R', ServeMode::Local);
+    early.handle_key(enter());
+    let (_jobs_b, second_gate, mut second) = arm('R', ServeMode::Local);
+    second_gate.release(probe());
+    wait_for(&mut second, |view| view.pending_confirm.is_some());
+    second.handle_key(enter());
+    second_gate.entered(Held::Restart);
+    let asked = Instant::now();
+    let (_jobs_c, late_gate, mut late) = arm('R', ServeMode::Local);
+    while let Some(remaining) = CONFIRM_TTL.checked_sub(asked.elapsed()) {
+        std::thread::sleep(remaining + Duration::from_millis(50));
+    }
+    early_gate.release(probe());
+    wait_assessment(&mut early);
+    assert!(
+        early.take_launch().is_some(),
+        "Enter in time, slow first assessment"
+    );
+    second_gate.release(probe());
+    wait_assessment(&mut second);
+    assert!(
+        second.take_launch().is_some(),
+        "Enter in time, slow second assessment"
+    );
+    late.handle_key(enter());
+    assert!(late.pending.is_none(), "an Enter after CONFIRM_TTL cancels");
+    late_gate.release(probe());
+    assert!(late.take_launch().is_none());
+    assert!(late.pending_confirm.is_none());
+
     for repeat_events in [false, true] {
         let (_jobs, gate, mut view) = arm('R', ServeMode::Local);
         for key in hold(key('R'), repeat_events, 5) {
@@ -3136,4 +3169,29 @@ fn a_funnel_reset_confirms_only_with_enter() {
     assert!(view.funnel_reset_armed.is_none(), "another key cancels");
     assert!(matches!(view.handle_key(enter()), ServeAction::Close));
     assert!(view.pending.is_none());
+
+    // Stop ends the arm, so a Stop that fails at once leaves Enter closing, not resetting.
+    for refused in [false, true] {
+        let mut jobs = ServeJobs::default();
+        let mut view = ServeView::with_state(error_state(), jobs.submitter());
+        if !refused {
+            view.target = Some(crate::cli::serve::tui_control_target().unwrap());
+        }
+        view.handle_key(key('R'));
+        if refused {
+            assert!(matches!(
+                view.handle_key(key('S')),
+                ServeAction::StopOwnedLaunch
+            ));
+            view.refuse_stop();
+        } else {
+            assert!(matches!(view.handle_key(key('S')), ServeAction::Stop(_)));
+            view.finish_stop(Err("stop failed".to_owned()));
+        }
+        assert!(
+            matches!(view.handle_key(enter()), ServeAction::Close),
+            "refused={refused}"
+        );
+        assert!(view.pending.is_none(), "refused={refused}");
+    }
 }
