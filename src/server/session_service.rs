@@ -1391,25 +1391,32 @@ impl SessionService {
         }
         let typed = text.clone();
         let mut target = current.clone();
+        let probed = (current.lifecycle_generation, current.title.clone());
         let native_state = self.native_state().ok();
         let delivered = tokio::task::spawn_blocking(move || -> anyhow::Result<bool> {
-            // The cached row can predate an archive or trash another process wrote
-            // to disk; the lifecycle lock and a reload decide ownership.
+            // The cached row can predate an archive, trash or relaunch another
+            // process wrote to disk. The lifecycle locks and a reload decide
+            // ownership, and stay held until the text is typed.
+            let mut _held = None;
             if let Some(state) = native_state {
                 let native = crate::server::session_store::NativeSessionStore::open(
                     state,
                     &target.source_profile,
                     None,
                 )?;
-                if let Err(error) = target.acquire_auxiliary_locks_in(&native) {
-                    tracing::debug!(
-                        target: "acp.supervisor",
-                        session = %target.id,
-                        "terminal initial turn held back: {error:#}"
-                    );
-                    return Ok(false);
+                match target.acquire_auxiliary_locks_in(&native) {
+                    Ok(locks) => _held = Some(locks),
+                    Err(error) => {
+                        tracing::debug!(
+                            target: "acp.supervisor",
+                            session = %target.id,
+                            "terminal initial turn held back: {error:#}"
+                        );
+                        return Ok(false);
+                    }
                 }
-                if target.is_snoozed()
+                if (target.lifecycle_generation, &target.title) != (probed.0, &probed.1)
+                    || target.is_snoozed()
                     || !target
                         .pending_initial_turn
                         .as_ref()
@@ -5332,6 +5339,38 @@ mod tests {
             .drain_terminal_initial_turn_within("sess-trash", std::time::Duration::from_secs(3))
             .await;
         assert!(pane_text(&pane).contains("after-restore"));
+    }
+
+    /// A relaunch another process wrote to disk after the launch was probed
+    /// (the cached row still holds the old generation) is not typed into.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn terminal_initial_turn_is_not_typed_after_a_disk_only_relaunch() {
+        if !crate::tmux::is_tmux_available() {
+            return;
+        }
+        let _app_dir = crate::session::test_support::isolate_app_dir();
+        let inst = terminal_turn_instance("sess-relaunch", "term-relaunch", "old-launch-text");
+        let mut relaunched = inst.clone();
+        relaunched.lifecycle_generation += 1;
+        crate::server::test_support::seed_instances_on_disk_for_test(
+            &inst.source_profile,
+            vec![relaunched],
+        );
+        let pane = start_terminal_pane(&inst, READY_AGENT_SCRIPT, false);
+        let state = crate::server::test_support::build_test_app_state(vec![inst.clone()]);
+        let service = state.session_service.clone();
+        crate::server::test_support::refresh_canonical_metadata_for_test(&state).await;
+
+        service
+            .drain_terminal_initial_turn_within("sess-relaunch", std::time::Duration::from_secs(3))
+            .await;
+
+        assert!(!pane_text(&pane).contains("old-launch-text"));
+        let turn = pending_turn(&service, "sess-relaunch")
+            .await
+            .expect("turn is kept");
+        assert!(turn.error.is_none());
     }
 
     /// #3687: a background drain spawned from a pre-deletion snapshot must not
