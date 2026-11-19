@@ -618,7 +618,8 @@ fn a_takeover_names_the_live_key_in_a_flash_or_the_footer() {
 }
 
 /// A takeover in a structured Session's Terminal pane, then the view toggle: in Structured
-/// view neither key enters live mode, so the footer keeps the status and names no key.
+/// view there is no pane to relay into, so both keys attach the native view and the footer
+/// names no key.
 #[test]
 #[serial]
 fn a_takeover_names_no_key_where_neither_key_takes_control() {
@@ -649,17 +650,15 @@ fn a_takeover_names_no_key_where_neither_key_takes_control() {
         );
         assert!(!footer.contains("take control"), "{mode:?}: {footer}");
         assert!(footer.contains("↵ Attach"), "{mode:?}: {footer}");
-        // Neither key takes control: Enter opens the structured view and Tab is refused.
-        let enter = env.view.handle_key(key(KeyCode::Enter), None);
-        assert!(
-            matches!(&enter, Some(Action::OpenStructuredView(opened)) if opened == &id),
-            "{mode:?}: {enter:?}"
-        );
-        let tab = env.view.handle_key(key(KeyCode::Tab), None);
-        assert!(
-            matches!(tab, Some(Action::SetTransientStatus(_))),
-            "{mode:?}: {tab:?}"
-        );
+        // Neither key takes control: both open the structured view, which is this
+        // session's live form.
+        for key_code in [KeyCode::Enter, KeyCode::Tab] {
+            let action = env.view.handle_key(key(key_code), None);
+            assert!(
+                matches!(&action, Some(Action::OpenStructuredView(opened)) if opened == &id),
+                "{mode:?} {key_code:?}: {action:?}"
+            );
+        }
     }
 }
 
