@@ -4896,6 +4896,26 @@ impl HomeView {
             super::bindings::label(ActionId::DismissUpdateBanner, self.strict_hotkeys);
         let text = match bar {
             UpdateBar::Status(s) => format!(" {s}  [{dismiss_key}] dismiss"),
+            UpdateBar::Pull(line) => {
+                use super::update_bar::PullTone;
+                let color = match line.tone() {
+                    PullTone::Brand => theme.accent,
+                    PullTone::Success => theme.running,
+                    PullTone::Error => theme.error,
+                    PullTone::Plain => theme.text,
+                };
+                let spinner = spinners::dots()
+                    .set_interval(Duration::from_millis(220))
+                    .current_frame();
+                let text = line.text(area.width, self.strict_hotkeys, spinner);
+                let bar = Paragraph::new(Line::from(Span::styled(
+                    text,
+                    Style::default().fg(color).bold(),
+                )))
+                .style(Style::default().bg(theme.selection));
+                frame.render_widget(bar, area);
+                return;
+            }
             UpdateBar::Live(s) => format!(" {s}"),
             // Reassure users (#2220) that updating never tears down running sessions.
             // Kept after the keys so the action hints stay visible on narrow terminals.

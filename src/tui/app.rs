@@ -1598,6 +1598,7 @@ impl App {
         let live = self.home.store_move_status_line();
         let bar = UpdateBar::pick(
             self.update_status.as_ref().map(|s| s.text.as_str()),
+            None,
             live.as_deref(),
             self.update_info.as_ref(),
             self.image_update.as_ref(),
@@ -1722,7 +1723,7 @@ impl App {
             return false;
         };
         match drawn {
-            DrawnBar::Live => {}
+            DrawnBar::Live | DrawnBar::Pull(_) => {}
             // A pull keeps running and reports its outcome as a new status.
             DrawnBar::Status(text) => {
                 if self.update_status.as_ref().is_some_and(|s| &s.text == text) {

@@ -254,8 +254,14 @@ fn update_bar_renders_sandbox_image_banner() {
         terminal
             .draw(|f| {
                 let area = f.area();
-                let bar =
-                    UpdateBar::pick(None, None, Some(&update_info), Some(&image_update), false);
+                let bar = UpdateBar::pick(
+                    None,
+                    None,
+                    None,
+                    Some(&update_info),
+                    Some(&image_update),
+                    false,
+                );
                 env.view.render(f, area, &theme, bar);
             })
             .unwrap();
