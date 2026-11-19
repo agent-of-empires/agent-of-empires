@@ -8479,8 +8479,7 @@ volume_ignores = ["target"]
     #[test]
     #[serial_test::serial]
     fn test_volume_ignores_colon_in_worktree_path_fails_launch() {
-        let temp_home = TempDir::new().unwrap();
-        let _home_guard = crate::session::test_support::isolate_home(temp_home.path());
+        let _home = IsolatedHome::new();
         let sandbox_info = crate::session::instance::SandboxInfo {
             provider: None,
             enabled: true,
