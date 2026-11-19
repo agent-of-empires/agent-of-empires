@@ -247,20 +247,24 @@ impl HomeView {
         let (title, lines): (String, Vec<Line>) = match self.flat_items.get(self.cursor) {
             Some(Item::Group { path, .. }) if crate::session::is_suggested_section_path(path) => {
                 let total = self.suggestions_feed.listed_count();
-                (
-                    format!("Suggested ({total})"),
-                    vec![
-                        Line::from(format!(
-                            "From {} suggestions.",
-                            join_names(&self.suggestions_feed.provider_names())
-                        )),
-                        Line::from(""),
-                        Line::from(Span::styled(
-                            "Enter to expand, then Enter on one to start a session.",
-                            dim,
-                        )),
-                    ],
-                )
+                let mut lines = vec![
+                    Line::from(format!(
+                        "From {} suggestions.",
+                        join_names(&self.suggestions_feed.provider_names())
+                    )),
+                    Line::from(""),
+                ];
+                for (name, error) in self.suggestions_feed.provider_failures() {
+                    lines.push(Line::from(Span::styled(
+                        format!("{name} couldn't refresh: {error}"),
+                        Style::default().fg(theme.error),
+                    )));
+                }
+                lines.push(Line::from(Span::styled(
+                    "Enter to expand, then Enter on one to start a session.",
+                    dim,
+                )));
+                (format!("Suggested ({total})"), lines)
             }
             Some(Item::SuggestionsViewAll { total, .. }) => (
                 format!("Suggested ({total})"),

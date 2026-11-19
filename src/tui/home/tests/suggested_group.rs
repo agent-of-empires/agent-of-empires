@@ -774,3 +774,23 @@ fn a_failed_open_in_the_full_view_is_shown_there() {
         .as_deref()
         .is_some_and(|e| e.contains("no longer exists")));
 }
+
+#[test]
+#[serial]
+fn a_provider_failing_before_its_first_item_still_shows_the_group_with_the_error() {
+    let mut env = create_test_env_with_sessions(1);
+    env.view
+        .suggestions_feed
+        .set_snapshot_for_test(serde_json::json!({
+            "providers": [{ "id": "gh", "name": "GitHub", "error": "token expired" }],
+            "items": []
+        }));
+    env.view.rebuild_flat_items();
+    select_suggested_header(&mut env);
+
+    let text = render_home_to_string(&mut env.view, 120, 40);
+    assert!(
+        text.contains("GitHub couldn't refresh: token expired"),
+        "{text}"
+    );
+}

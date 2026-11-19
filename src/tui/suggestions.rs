@@ -1235,6 +1235,20 @@ impl SuggestionsFeed {
             .collect()
     }
 
+    /// Enabled providers that failed their last refresh, as `(name, error)`.
+    pub(super) fn provider_failures(&self) -> Vec<(String, String)> {
+        self.snapshot
+            .iter()
+            .flat_map(|s| &s.providers)
+            .filter(|p| p.enabled)
+            .filter_map(|p| Some((plain(&p.name), plain(p.error.as_deref()?))))
+            .collect()
+    }
+
+    pub(super) fn has_provider_failure(&self) -> bool {
+        !self.provider_failures().is_empty()
+    }
+
     /// Enabled provider names in snapshot order, for the group preview.
     pub(super) fn provider_names(&self) -> Vec<String> {
         self.snapshot
