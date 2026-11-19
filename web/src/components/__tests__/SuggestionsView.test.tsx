@@ -96,6 +96,29 @@ describe("SuggestionsView", () => {
     fireEvent.click(screen.getByRole("menuitem", { name: new RegExp(`^${name}`) }));
   };
 
+  it("the ▾ menu takes focus, moves with the arrow keys, and Esc or a pick returns focus to the button", async () => {
+    prepareSuggestion.mockReturnValue(new Promise(() => {}));
+    await open(snapshot());
+    const trigger = await screen.findByRole("button", { name: "Start options" });
+    fireEvent.click(trigger);
+    const items = screen.getAllByRole("menuitem");
+    expect(document.activeElement).toBe(items[0]);
+    fireEvent.keyDown(items[0]!, { key: "ArrowDown" });
+    expect(document.activeElement).toBe(items[1]);
+    fireEvent.keyDown(items[1]!, { key: "ArrowUp" });
+    expect(document.activeElement).toBe(items[0]);
+    fireEvent.keyDown(items[0]!, { key: "End" });
+    expect(document.activeElement).toBe(items[items.length - 1]);
+    fireEvent.keyDown(document.activeElement!, { key: "Escape" });
+    expect(screen.queryByRole("menu")).toBeNull();
+    expect(document.activeElement).toBe(trigger);
+
+    fireEvent.click(trigger);
+    fireEvent.click(screen.getByRole("menuitem", { name: "Copy prompt" }));
+    expect(screen.queryByRole("menu")).toBeNull();
+    expect(document.activeElement).toBe(trigger);
+  });
+
   it("Start runs the kind's preset, toasts the Session with Open, and opens no wizard", async () => {
     startSuggestion.mockResolvedValue({ kind: "started", sessionId: "s1", title: "Fix lifecycle" });
     const infoAction = vi.fn();

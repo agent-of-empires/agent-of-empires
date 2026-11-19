@@ -1,31 +1,60 @@
-import { useRef, useState, type ReactNode } from "react";
+import { useCallback, useId, useRef, useState, type KeyboardEvent, type ReactNode } from "react";
 import { ChevronDown } from "lucide-react";
 import { fetchSuggestionProjects } from "../lib/api";
 import type { SuggestionProject } from "../lib/types";
 import { useOutsideDismiss } from "./useOutsideDismiss";
 
-const ITEM =
-  "block w-full px-3 py-2 text-left text-xs text-text-secondary hover:bg-surface-700 disabled:opacity-50 md:py-1.5";
-const CHEVRON_BUTTON =
+export const MENU_ITEM =
+  "flex min-h-11 w-full flex-col justify-center px-3 py-2 text-left text-xs text-text-secondary hover:bg-surface-700 focus-visible:bg-surface-700 focus-visible:outline-none disabled:opacity-50 md:min-h-0 md:py-1.5";
+export const CHEVRON_BUTTON =
   "relative inline-flex h-8 items-center justify-center gap-1 rounded-md border border-surface-700 bg-surface-800 text-text-primary hover:bg-surface-700/50 disabled:opacity-50 after:absolute after:left-1/2 after:top-1/2 after:h-11 after:w-11 after:-translate-x-1/2 after:-translate-y-1/2 after:content-[''] md:after:hidden";
 
-/** A popover on desktop and a bottom sheet on a phone. Focus stays on its button, and Esc closes it. */
-function Popover({
+const ENABLED_ITEMS = '[role="menuitem"]:not(:disabled)';
+
+/**
+ * A popover on desktop and a bottom sheet on a phone. Opening focuses the first item, arrow keys
+ * move between items, and closing by Esc or by picking returns focus to the trigger button.
+ */
+export function MenuPopover({
   label,
+  align = "right",
   trigger,
   children,
 }: {
   label: string;
+  align?: "left" | "right";
   trigger: (props: { open: boolean; toggle: () => void }) => ReactNode;
   children: (close: () => void) => ReactNode;
 }) {
   const [open, setOpen] = useState(false);
+  const id = useId();
   const box = useRef<HTMLDivElement>(null);
   useOutsideDismiss(open, [box], () => setOpen(false));
-  const close = () => setOpen(false);
+  const close = (refocus = true) => {
+    setOpen(false);
+    if (refocus) document.querySelector<HTMLElement>(`[data-menu="${id}"] [aria-haspopup]`)?.focus();
+  };
+  const focusFirst = useCallback((el: HTMLDivElement | null) => {
+    el?.querySelector<HTMLElement>(ENABLED_ITEMS)?.focus();
+  }, []);
+  const onMenuKey = (e: KeyboardEvent<HTMLDivElement>) => {
+    if (e.key === "Tab") return close(false);
+    const items = [...e.currentTarget.querySelectorAll<HTMLElement>(ENABLED_ITEMS)];
+    const at = items.indexOf(document.activeElement as HTMLElement);
+    const next: Record<string, number> = {
+      ArrowDown: (at + 1) % items.length,
+      ArrowUp: (at - 1 + items.length) % items.length,
+      Home: 0,
+      End: items.length - 1,
+    };
+    if (!(e.key in next)) return;
+    e.preventDefault();
+    items[next[e.key]!]?.focus();
+  };
   return (
     <div
       ref={box}
+      data-menu={id}
       className="relative"
       onKeyDown={(e) => {
         if (e.key === "Escape" && open) close();
@@ -36,9 +65,11 @@ function Popover({
         <>
           <div aria-hidden="true" className="fixed inset-0 z-30 bg-black/40 md:hidden" onClick={() => setOpen(false)} />
           <div
+            ref={focusFirst}
             role="menu"
             aria-label={label}
-            className="fixed inset-x-0 bottom-0 z-40 max-h-[70vh] overflow-y-auto rounded-t-xl border border-surface-700 bg-surface-800 py-2 shadow-lg md:absolute md:inset-x-auto md:bottom-auto md:right-0 md:mt-1 md:max-h-72 md:w-[270px] md:rounded-md md:py-1"
+            onKeyDown={onMenuKey}
+            className={`fixed inset-x-0 bottom-0 z-40 max-h-[70vh] overflow-y-auto rounded-t-xl border border-surface-700 bg-surface-800 py-2 shadow-lg md:absolute md:inset-x-auto md:bottom-auto ${align === "right" ? "md:right-0" : "md:left-0"} md:mt-1 md:max-h-72 md:w-[270px] md:rounded-md md:py-1`}
           >
             {children(close)}
           </div>
@@ -72,7 +103,7 @@ export function StartMenu({
   onEditPreset,
 }: StartMenuProps) {
   return (
-    <Popover
+    <MenuPopover
       label="Start options"
       trigger={({ open, toggle }) => (
         <button
@@ -106,7 +137,7 @@ export function StartMenu({
             type="button"
             role="menuitem"
             disabled={disabled}
-            className={ITEM}
+            className={MENU_ITEM}
             onClick={() => {
               close();
               onStartWithChanges();
@@ -118,7 +149,7 @@ export function StartMenu({
           <button
             type="button"
             role="menuitem"
-            className={ITEM}
+            className={MENU_ITEM}
             onClick={() => {
               close();
               onCopyPrompt();
@@ -132,7 +163,7 @@ export function StartMenu({
               href={sourceUrl}
               target="_blank"
               rel="noopener noreferrer"
-              className={ITEM}
+              className={MENU_ITEM}
               onClick={() => close()}
             >
               Open in {providerName} ↗
@@ -142,7 +173,7 @@ export function StartMenu({
             <button
               type="button"
               role="menuitem"
-              className={ITEM}
+              className={MENU_ITEM}
               onClick={() => {
                 close();
                 onEditPreset();
@@ -154,7 +185,7 @@ export function StartMenu({
           )}
         </>
       )}
-    </Popover>
+    </MenuPopover>
   );
 }
 
@@ -183,7 +214,7 @@ export function StartInMenu({
     });
   };
   return (
-    <Popover
+    <MenuPopover
       label="Start in a Project"
       trigger={({ open, toggle }) => (
         <StartInTrigger
@@ -211,7 +242,7 @@ export function StartInMenu({
               type="button"
               role="menuitem"
               title={p.path}
-              className={ITEM}
+              className={MENU_ITEM}
               onClick={() => {
                 close();
                 onPick(p.path);
@@ -222,7 +253,7 @@ export function StartInMenu({
           ))
         )
       }
-    </Popover>
+    </MenuPopover>
   );
 }
 
