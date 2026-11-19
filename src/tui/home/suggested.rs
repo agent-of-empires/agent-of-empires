@@ -112,13 +112,23 @@ impl HomeView {
         false
     }
 
-    /// Selects the Session a suggestion was started as, expanding the Archived
-    /// or Trash section when that is where it sits. False, with the reason
-    /// flashed, when it cannot be shown (including another profile's).
+    /// [`try_open_linked_session`](Self::try_open_linked_session) with the reason flashed.
     pub(super) fn open_linked_session(&mut self, id: &str) -> bool {
+        match self.try_open_linked_session(id) {
+            Ok(()) => true,
+            Err(reason) => {
+                self.flash_status(reason);
+                false
+            }
+        }
+    }
+
+    /// Selects the Session a suggestion was started as, expanding the Archived
+    /// or Trash section and the project or org subgroup it sits in. The reason
+    /// when it cannot be shown (including another profile's).
+    pub(super) fn try_open_linked_session(&mut self, id: &str) -> Result<(), String> {
         let Some(row) = self.session_feed.applied_session(id) else {
-            self.flash_status("That session no longer exists");
-            return false;
+            return Err("That session no longer exists".into());
         };
         let (profile, trashed, archived) = (
             row.profile.clone(),
@@ -126,32 +136,55 @@ impl HomeView {
             row.archived_at.is_some(),
         );
         if self.active_profile.as_deref().is_some_and(|p| p != profile) {
-            self.flash_status(format!(
+            return Err(format!(
                 "That session is in profile {profile}. Switch to it to open it"
             ));
-            return false;
         }
         let sections = (
             self.trashed_section_collapsed,
             self.archived_section_collapsed,
         );
+        let subgroups = (
+            self.project_group_collapsed.clone(),
+            self.org_group_collapsed.clone(),
+        );
         if trashed {
             self.trashed_section_collapsed = false;
         } else if archived {
             self.archived_section_collapsed = false;
+            self.expand_archived_subgroup(id);
         }
         self.rebuild_flat_items();
         self.jump_to_session_id(id);
-        let shown = self.selected_session.as_deref() == Some(id);
-        if !shown {
-            (
-                self.trashed_section_collapsed,
-                self.archived_section_collapsed,
-            ) = sections;
-            self.rebuild_flat_items();
-            self.flash_status("That session could not be shown");
+        if self.selected_session.as_deref() == Some(id) {
+            return Ok(());
         }
-        shown
+        (
+            self.trashed_section_collapsed,
+            self.archived_section_collapsed,
+        ) = sections;
+        (self.project_group_collapsed, self.org_group_collapsed) = subgroups;
+        self.rebuild_flat_items();
+        Err("That session could not be shown".into())
+    }
+
+    /// Expands the archived Project or Org subgroup holding session `id`.
+    fn expand_archived_subgroup(&mut self, id: &str) {
+        let Some(inst) = self.get_instance(id) else {
+            return;
+        };
+        match self.group_by {
+            GroupByMode::Project => {
+                let path =
+                    crate::session::archived_project_sub_path(&super::project_group_key(inst));
+                self.project_group_collapsed.insert(path, false);
+            }
+            GroupByMode::Org => {
+                let path = crate::session::archived_project_sub_path(&self.org_group_key(inst));
+                self.org_group_collapsed.insert(path, false);
+            }
+            _ => {}
+        }
     }
 
     /// Flashes why the daemon refuses mutations; true when it does.

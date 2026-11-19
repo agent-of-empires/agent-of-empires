@@ -737,3 +737,40 @@ fn open_on_an_unknown_session_says_so_and_keeps_the_full_view() {
         .contains("no longer exists"));
     assert!(env.view.suggestions_view.is_some());
 }
+
+#[test]
+#[serial]
+fn open_reaches_a_session_in_a_collapsed_archive_project_subgroup() {
+    use crate::session::config::GroupByMode;
+    let mut env = create_test_env_two_projects_mixed_attention();
+    env.view.group_by = GroupByMode::Project;
+    let target = env.view.instances().next().unwrap().id.clone();
+    let project = crate::tui::home::project_group_key(env.view.get_instance(&target).unwrap());
+    publish_canonical_rows(&mut env, &[(target.clone(), true)], 5);
+    env.view.archived_section_collapsed = true;
+    env.view
+        .project_group_collapsed
+        .insert(crate::session::archived_project_sub_path(&project), true);
+    env.view.rebuild_flat_items();
+
+    assert!(env.view.open_linked_session(&target));
+    assert_eq!(env.view.selected_session.as_deref(), Some(target.as_str()));
+    assert!(!env.view.archived_section_collapsed);
+}
+
+#[test]
+#[serial]
+fn a_failed_open_in_the_full_view_is_shown_there() {
+    let mut env = create_test_env_with_sessions(1);
+    let mut snap = snapshot(1, &[]);
+    snap["items"][0]["started_session"] = serde_json::json!({ "id": "gone", "status": "Idle" });
+    env.view.suggestions_feed.set_snapshot_for_test(snap);
+    env.view.open_suggestions_view();
+    env.view.handle_key(key(KeyCode::Enter), None);
+
+    let shown = env.view.suggestions_view.as_ref().expect("view stays open");
+    assert!(shown
+        .error
+        .as_deref()
+        .is_some_and(|e| e.contains("no longer exists")));
+}

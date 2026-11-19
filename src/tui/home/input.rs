@@ -2320,11 +2320,14 @@ impl HomeView {
                 SuggestionsAction::Continue => {}
                 SuggestionsAction::Close => self.suggestions_view = None,
                 SuggestionsAction::Start(start) => self.start_suggestion(*start),
-                SuggestionsAction::OpenSession(id) => {
-                    if self.open_linked_session(&id) {
-                        self.suggestions_view = None;
+                SuggestionsAction::OpenSession(id) => match self.try_open_linked_session(&id) {
+                    Ok(()) => self.suggestions_view = None,
+                    Err(reason) => {
+                        if let Some(view) = &mut self.suggestions_view {
+                            view.set_error(reason);
+                        }
                     }
-                }
+                },
             }
             return None;
         }
