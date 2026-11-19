@@ -61,6 +61,36 @@ struct Provider {
     updated_at: Option<i64>,
     #[serde(default)]
     refreshing: bool,
+    #[serde(default)]
+    sources: Vec<Source>,
+}
+
+/// A source's effective preset, as `GET /api/suggestions` resolves it.
+#[derive(Debug, Clone, Deserialize)]
+struct Source {
+    criterion: String,
+    #[serde(default)]
+    preset: Option<WirePreset>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct WirePreset {
+    #[serde(default)]
+    yolo: bool,
+    /// A template; `None` sends the plugin's own draft prompt.
+    #[serde(default)]
+    prompt: Option<String>,
+}
+
+/// What Start creates an item with, resolved against its Project.
+#[derive(Debug, Clone, Deserialize)]
+struct ItemStart {
+    agent: String,
+    view: String,
+    #[serde(default)]
+    worktree: bool,
+    #[serde(default)]
+    sandbox: bool,
 }
 
 fn enabled_by_default() -> bool {
@@ -92,6 +122,12 @@ struct Item {
     started_session: Option<Started>,
     #[serde(default)]
     resolved_project: Option<ResolvedProject>,
+    #[serde(default)]
+    criterion: String,
+    #[serde(default)]
+    variables: std::collections::BTreeMap<String, String>,
+    #[serde(default)]
+    start: Option<ItemStart>,
     /// The source closed or changed; the item cannot start.
     #[serde(default)]
     stale: bool,
@@ -1073,6 +1109,7 @@ impl SuggestionsView {
                     .map(|l| Line::from(l.to_owned())),
             );
             detail.push(Line::from(""));
+            let effective = store.effective_prompt(item);
             let final_prompt = self
                 .prepared
                 .as_ref()
@@ -1081,10 +1118,16 @@ impl SuggestionsView {
             let (header, prompt) = match final_prompt {
                 Some(prompt) => ("Prompt sent to the agent (untrusted source text):", prompt),
                 None => (
-                    "Provider draft prompt (e resolves the final prompt first):",
-                    item.draft.prompt.as_str(),
+                    "Prompt Enter sends (untrusted source text):",
+                    effective.as_str(),
                 ),
             };
+            if let Some(line) = store.preset_line(item) {
+                detail.push(Line::from(Span::styled(
+                    plain(&line),
+                    Style::default().fg(theme.accent),
+                )));
+            }
             detail.push(Line::from(Span::styled(
                 header,
                 Style::default().fg(theme.accent),
@@ -1122,6 +1165,8 @@ pub(super) struct Entry {
     pub provider: String,
     pub project: Option<String>,
     pub prompt: String,
+    /// "Starts with Claude Code · Structured · worktree"; `None` before the daemon reports it.
+    pub preset: Option<String>,
     pub provider_error: Option<String>,
     /// The item's `source_url` when it is an http(s) address; core validates
     /// it, this is a second check before anything is opened.
@@ -1432,6 +1477,51 @@ impl SuggestionsFeed {
             .collect()
     }
 
+    fn source_preset(&self, item: &Item) -> Option<&WirePreset> {
+        self.provider(&item.provider_id)?
+            .sources
+            .iter()
+            .find(|s| s.criterion == item.criterion)?
+            .preset
+            .as_ref()
+    }
+
+    /// The prompt Enter sends: the source's template expanded with the item's
+    /// variables, or the plugin's draft when the preset has no template.
+    fn effective_prompt(&self, item: &Item) -> String {
+        self.source_preset(item)
+            .and_then(|p| p.prompt.as_deref())
+            .and_then(|t| crate::plugin::suggestions::expand(t, &item.variables).ok())
+            .unwrap_or_else(|| item.draft.prompt.clone())
+    }
+
+    /// "Starts with Claude Code · Structured · worktree", from what Start will create.
+    fn preset_line(&self, item: &Item) -> Option<String> {
+        let start = item.start.as_ref()?;
+        let agent =
+            crate::acp::agent_registry::display_name_for(&start.agent).unwrap_or(&start.agent);
+        let mut parts = vec![
+            plain_line(agent),
+            if start.view == "structured" {
+                "Structured"
+            } else {
+                "Terminal"
+            }
+            .to_owned(),
+        ];
+        let yolo = self.source_preset(item).is_some_and(|p| p.yolo);
+        for (on, label) in [
+            (start.worktree, "worktree"),
+            (start.sandbox, "sandbox"),
+            (yolo, "yolo"),
+        ] {
+            if on {
+                parts.push(label.to_owned());
+            }
+        }
+        Some(format!("Starts with {}", parts.join(" · ")))
+    }
+
     pub(super) fn entry(&self, key: &ItemKey) -> Option<Entry> {
         let item = self.item(key)?;
         let provider = self.provider(&key.0)?;
@@ -1441,7 +1531,8 @@ impl SuggestionsFeed {
             reason: plain(&item.reason),
             provider: plain(&provider.name),
             project: item.project.as_deref().map(plain),
-            prompt: plain(&item.draft.prompt),
+            prompt: plain(&self.effective_prompt(item)),
+            preset: self.preset_line(item),
             provider_error: provider.error.as_deref().map(plain),
             source_url: crate::util::is_http_url(&item.source_url).then(|| item.source_url.clone()),
             started_session: item.started_session.as_ref().map(|s| s.id.clone()),
@@ -1815,6 +1906,9 @@ mod tests {
             },
             started_session: None,
             resolved_project: None,
+            criterion: String::new(),
+            variables: Default::default(),
+            start: None,
             stale: false,
         }
     }
@@ -1844,6 +1938,7 @@ mod tests {
                 enabled: true,
                 updated_at: Some(chrono::Utc::now().timestamp() - 120),
                 refreshing: false,
+                sources: vec![],
             }],
             items,
             prefs: Prefs::default(),
@@ -1943,6 +2038,7 @@ mod tests {
                 enabled: true,
                 updated_at: None,
                 refreshing: false,
+                sources: vec![],
             }],
             items: vec![it],
             prefs: Prefs::default(),
@@ -2695,7 +2791,7 @@ mod tests {
             "reason · repo",
             "GitHub · ref-a · https://example.test/x",
             "preview text",
-            "Provider draft prompt",
+            "Prompt Enter sends",
             "run \u{fffd}[31mrm -rf\u{fffd}[0m now",
         ] {
             assert!(text.contains(expected), "missing {expected:?}");
