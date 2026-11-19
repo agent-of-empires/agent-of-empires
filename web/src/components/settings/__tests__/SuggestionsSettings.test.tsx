@@ -87,7 +87,7 @@ const snapshot = (): SuggestionsSnapshot => ({
       title: "T",
       reason: "r",
       source_url: "",
-      source_ref: "x",
+      source_ref: "o/r#7",
       preview: "",
       criterion: "review-requested",
       mapping_key: "github.com/o/r",
@@ -225,7 +225,7 @@ describe("SuggestionsSettings", () => {
     await screen.findByText(/Edit \u00b7 Review requests/);
     expect((screen.getByLabelText("Agent") as HTMLSelectElement).value).toBe("claude");
     expect(screen.getByRole("radio", { name: "Structured" }).getAttribute("aria-checked")).toBe("true");
-    expect(screen.getByText("Preview: /aoe-review 4562")).toBeTruthy();
+    expect(screen.getByText("For #7: /aoe-review 4562")).toBeTruthy();
 
     fireEvent.change(screen.getByLabelText("Agent"), { target: { value: "codex" } });
     fireEvent.click(screen.getByRole("radio", { name: "Terminal" }));
@@ -250,10 +250,10 @@ describe("SuggestionsSettings", () => {
   it("a preset with no prompt uses the plugin's, and typing one replaces it", async () => {
     open({ presets: [{ ...PRESETS[0]!, preset: { ...PRESET, prompt: null } }, PRESETS[1]!] });
     fireEvent.click(await screen.findByRole("button", { name: "Edit Review requests" }));
-    expect(await screen.findByText("Preview: plugin prompt")).toBeTruthy();
+    expect(await screen.findByText("For #7: plugin prompt")).toBeTruthy();
     expect(screen.getByText(/Uses GitHub's own prompt until you type one/)).toBeTruthy();
     fireEvent.change(screen.getByLabelText("GitHub review-requested prompt"), { target: { value: "Mine" } });
-    expect(screen.getByRole("button", { name: "Use GitHub's prompt" })).toBeTruthy();
+    expect(screen.getByRole("button", { name: "Reset to GitHub's prompt" })).toBeTruthy();
     fireEvent.click(screen.getByRole("button", { name: "Save" }));
     await waitFor(() =>
       expect(api.putSuggestionPreset).toHaveBeenCalledWith(
@@ -271,7 +271,7 @@ describe("SuggestionsSettings", () => {
     expect(api.putSuggestionPreset).not.toHaveBeenCalled();
 
     fireEvent.click(await screen.findByRole("button", { name: "Edit CI failures" }));
-    const reset = await screen.findByRole("button", { name: /^Reset to/ });
+    const reset = await screen.findByRole("button", { name: "Reset to GitHub's settings" });
     fireEvent.click(reset);
     await waitFor(() => expect(api.resetSuggestionPreset).toHaveBeenCalledWith("gh", "ci-failed"));
   });

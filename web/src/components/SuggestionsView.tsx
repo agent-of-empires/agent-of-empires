@@ -6,6 +6,7 @@ import { chipId, filterSuggestions, keyChipGroups, type KeyChip } from "../lib/s
 import type { SuggestionItem, SuggestionProvider } from "../lib/types";
 import { suggestionKey, useDismissUndo, useSuggestions } from "../hooks/useSuggestions";
 import { SuggestionFilterMenu, FilterMenuItem } from "./SuggestionFilterMenu";
+import { shortRef } from "../lib/suggestionPlan";
 import { useAgentNames } from "../hooks/useAgentNames";
 import { useSuggestionPresets } from "../hooks/useSuggestionPresets";
 import { SuggestionItemActions } from "./SuggestionItemActions";
@@ -48,7 +49,6 @@ function providerStatus(provider: SuggestionProvider, itemCount: number) {
 }
 
 /** The `#12` of a `owner/repo#12` reference, which the group header already names. */
-const shortRef = (ref: string) => (ref.includes("#") ? ref.slice(ref.lastIndexOf("#")) : ref);
 
 /** Items by repo (`mapping_key`) in first-seen order, items with no repo last. */
 function groupByRepo(items: SuggestionItem[]) {
