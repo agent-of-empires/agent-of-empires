@@ -75,6 +75,7 @@ const snapshot = (): SuggestionsSnapshot => ({
           enabled: false,
           variables: ["branch"],
         },
+        { criterion: "new-issues", label: "New issues", description: "", enabled: true, variables: [] },
       ],
     },
     { id: "lin", name: "Linear", status: "error", error: "API key rejected.", enabled: true, sources: [] },
@@ -178,6 +179,8 @@ describe("SuggestionsSettings", () => {
   it("reorders sources by keyboard and writes the Advanced settings", async () => {
     const openFull = open();
     await screen.findByText("Updated 2 min ago");
+    // Only kinds whose text comes from other people carry the warning.
+    expect(screen.getAllByText(/^From other people\./)).toHaveLength(1);
 
     fireEvent.keyDown(screen.getByLabelText("Source GitHub"), { key: "ArrowDown", altKey: true });
     await waitFor(() => expect(api.updateSuggestionPrefs).toHaveBeenCalledWith({ provider_order: ["lin", "gh"] }));
