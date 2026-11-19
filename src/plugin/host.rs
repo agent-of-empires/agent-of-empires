@@ -237,7 +237,7 @@ impl PluginHost {
     }
 
     /// Providers with a refresh in flight.
-    pub(crate) fn refreshing_suggestions(&self) -> std::collections::HashMap<String, i64> {
+    pub(crate) fn refreshing_suggestions(&self) -> std::collections::HashSet<String> {
         self.api.refreshing_providers()
     }
 

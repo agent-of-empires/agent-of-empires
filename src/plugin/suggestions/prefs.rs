@@ -182,18 +182,15 @@ pub(crate) fn apply_prefs(
     Ok(Ok(refresh_changed))
 }
 
-/// Sets `refreshing` on every snapshot provider: asked to refresh (unix seconds in
-/// `requested`) and not reported since, so an earlier publish does not end it.
-pub(crate) fn attach_refreshing(snapshot: &mut Value, requested: &HashMap<String, i64>) {
+/// Sets `refreshing` on every snapshot provider: asked to refresh and not published since.
+pub(crate) fn attach_refreshing(snapshot: &mut Value, requested: &HashSet<String>) {
     let Some(providers) = snapshot["providers"].as_array_mut() else {
         return;
     };
     for provider in providers {
-        let updated = provider["updated_at"].as_i64();
         let is = provider["id"]
             .as_str()
-            .and_then(|id| requested.get(id))
-            .is_some_and(|&at| updated.is_none_or(|u| at > u));
+            .is_some_and(|id| requested.contains(id));
         provider["refreshing"] = json!(is);
     }
 }
@@ -305,20 +302,14 @@ mod tests {
     }
 
     #[test]
-    fn refreshing_marks_every_provider() {
+    fn refreshing_marks_requested_providers() {
         let mut snapshot = json!({ "providers": [
             { "id": "a" },
-            { "id": "b", "updated_at": 90 },
-            { "id": "c", "updated_at": 110 },
-            { "id": "d", "updated_at": 100 },
-            { "id": "e" },
+            { "id": "b", "updated_at": 100 },
         ]});
-        let requested = HashMap::from(["b", "c", "d", "e"].map(|id| (id.to_string(), 100)));
+        let requested = HashSet::from(["b".to_string()]);
         attach_refreshing(&mut snapshot, &requested);
-        let flags: Vec<bool> = (0..5)
-            .map(|i| snapshot["providers"][i]["refreshing"].as_bool().unwrap())
-            .collect();
-        // a never asked; b not heard since; c and d reported at or after the request; e never reported.
-        assert_eq!(flags, [false, true, false, false, true]);
+        assert_eq!(snapshot["providers"][0]["refreshing"], json!(false));
+        assert_eq!(snapshot["providers"][1]["refreshing"], json!(true));
     }
 }
