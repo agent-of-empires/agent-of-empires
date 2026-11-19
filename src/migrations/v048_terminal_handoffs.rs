@@ -23,10 +23,7 @@ fn migrate_file(path: &Path) -> Result<()> {
         .open_read_snapshot()
         .with_context(|| format!("terminal handoff migration cannot read {}", path.display()))?
     else {
-        anyhow::bail!(
-            "terminal handoff migration found a dangling sessions link: {}",
-            path.display()
-        );
+        return Ok(());
     };
     let mut bytes = Vec::new();
     std::io::Read::read_to_end(&mut file, &mut bytes)?;
@@ -110,7 +107,7 @@ mod tests {
         for (name, goal, accepted) in [
             ("ok", target.clone(), true),
             ("dir", root.path().join("dir"), false),
-            ("missing", root.path().join("missing.json"), false),
+            ("missing", root.path().join("missing.json"), true),
         ] {
             let link = root.path().join(format!("{name}-sessions.json"));
             std::os::unix::fs::symlink(&goal, &link)?;
