@@ -3350,6 +3350,14 @@ pub(crate) fn build_container_config(
         }
     }
 
+    // A ':' (from the project path) would make `-v` read the mask as a bind spec.
+    if let Some(path) = resolved_ignore_paths.iter().find(|p| p.contains(':')) {
+        anyhow::bail!(
+            "Cannot mask {path}: a ':' in the path would be read as a bind-mount spec. \
+             Rename the directory or remove the entry from sandbox.volume_ignores"
+        );
+    }
+
     // Drop duplicates (a glob can match the same dir under overlapping bases) and
     // filter conflicts with extra_volumes, which take precedence over
     // volume_ignores. Conflicts: exact match, ignore is a parent of an extra, or
@@ -3357,7 +3365,6 @@ pub(crate) fn build_container_config(
     let mut seen_ignore = std::collections::HashSet::new();
     let expanded_ignore_paths: Vec<String> = resolved_ignore_paths
         .into_iter()
-        .filter(|path| !path.contains(':'))
         .filter(|path| seen_ignore.insert(path.clone()))
         .filter(|path| {
             !extra_volume_container_paths.iter().any(|extra_path| {
@@ -3780,6 +3787,12 @@ mod tests {
     }
 
     fn setup_bare_repo_with_worktree() -> (TempDir, std::path::PathBuf, std::path::PathBuf) {
+        setup_bare_repo_with_named_worktree("main")
+    }
+
+    fn setup_bare_repo_with_named_worktree(
+        name: &str,
+    ) -> (TempDir, std::path::PathBuf, std::path::PathBuf) {
         let dir = TempDir::new().unwrap();
         let bare_path = dir.path().join(".bare");
 
@@ -3797,7 +3810,7 @@ mod tests {
         std::fs::write(dir.path().join(".git"), "gitdir: ./.bare\n").unwrap();
 
         // Create worktree
-        let worktree_path = dir.path().join("main");
+        let worktree_path = dir.path().join(name);
         let _ = std::process::Command::new("git")
             .args(["worktree", "add", worktree_path.to_str().unwrap(), "HEAD"])
             .current_dir(&bare_path)
@@ -8459,6 +8472,63 @@ volume_ignores = ["target"]
             expected_wt_target,
             config.anonymous_volumes
         );
+    }
+
+    /// A valid mask whose resolved path holds a ':' must fail the launch, not be
+    /// dropped silently; a colon-free worktree keeps the mask.
+    #[test]
+    #[serial_test::serial]
+    fn test_volume_ignores_colon_in_worktree_path_fails_launch() {
+        let temp_home = TempDir::new().unwrap();
+        let _home_guard = crate::session::test_support::isolate_home(temp_home.path());
+        let sandbox_info = crate::session::instance::SandboxInfo {
+            provider: None,
+            enabled: true,
+            container_id: None,
+            image: "test:latest".to_string(),
+            container_name: "test-container".to_string(),
+            extra_env: None,
+            custom_instruction: None,
+            before_start_env: Vec::new(),
+            before_start_hook_env: Vec::new(),
+            container_workdir: None,
+        };
+
+        for (name, expect_err) in [("wt:x", true), ("wt", false)] {
+            let (_dir, main_repo_path, worktree_path) = setup_bare_repo_with_named_worktree(name);
+            if !worktree_path.exists() {
+                return; // git worktree add failed, skip
+            }
+            let config_dir = main_repo_path.join(".agent-of-empires");
+            fs::create_dir_all(&config_dir).unwrap();
+            fs::write(
+                config_dir.join("config.toml"),
+                "[sandbox]\nvolume_ignores = [\"node_modules\"]\n",
+            )
+            .unwrap();
+
+            let result = build_container_config(
+                worktree_path.to_str().unwrap(),
+                &sandbox_info,
+                ContainerAgentSelection::new("claude", None),
+                SandboxYolo::default(),
+                "test-instance-id",
+                None,
+                "",
+            );
+            match (expect_err, result) {
+                (true, Err(e)) => assert!(e.to_string().contains("Cannot mask"), "{e}"),
+                (false, Ok(config)) => assert!(
+                    config
+                        .anonymous_volumes
+                        .iter()
+                        .any(|v| v.ends_with("/wt/node_modules")),
+                    "{:?}",
+                    config.anonymous_volumes
+                ),
+                (_, other) => panic!("{name}: unexpected result {:?}", other.map(|_| ())),
+            }
+        }
     }
 
     // --- positive native-state policy tests ---
