@@ -10771,6 +10771,15 @@ async fn a_dropped_suggestion_create_frees_its_link() {
         })
     };
     assert_eq!(linked(), 1, "claimed while provisioning");
+    let (status, starting) = post_create(&state, linked_body("second", None)).await;
+    assert_eq!(status, axum::http::StatusCode::CONFLICT, "{starting}");
+    assert_eq!(starting["error"], "already_started");
+    assert!(
+        starting["session_id"]
+            .as_str()
+            .is_some_and(|id| !id.is_empty()),
+        "the 409 names the Session being created: {starting}"
+    );
     release.notify_one();
     wait_for("the failed create to free its link", || linked() == 0).await;
     let (status, retry) = post_create(&state, linked_body("retry", None)).await;

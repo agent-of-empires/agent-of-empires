@@ -79,6 +79,7 @@ pub use groups::{
 };
 #[cfg(test)]
 pub(crate) use instance::before_start_slot_waiters;
+pub(crate) use instance::generate_id;
 #[cfg(test)]
 pub(crate) use instance::install_aliases;
 pub(crate) use instance::resume_profile_config;

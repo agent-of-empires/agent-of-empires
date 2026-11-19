@@ -840,7 +840,7 @@ pub(super) async fn wait_until_left_starting(
     }
 }
 
-/// The primary link a create holds until it settles: `(origin, claim token)`.
+/// The primary link a create holds until it settles: `(origin, Session id)`.
 pub(super) type SuggestionLink = (crate::session::SuggestionOrigin, String);
 
 /// Claims the primary link of the suggestion a Session starts from. A second
@@ -848,6 +848,7 @@ pub(super) type SuggestionLink = (crate::session::SuggestionOrigin, String);
 pub(super) async fn claim_suggestion_link(
     state: &Arc<AppState>,
     origin: Option<&crate::session::SuggestionOrigin>,
+    session_id: &str,
 ) -> Result<Option<SuggestionLink>, axum::response::Response> {
     use crate::plugin::suggestions::Claim;
     let (Some(origin), Some(host)) = (origin, state.plugin_host.clone()) else {
@@ -864,8 +865,7 @@ pub(super) async fn claim_suggestion_link(
         .filter(|i| !i.is_trashed())
         .map(|i| i.id.clone())
         .collect();
-    let token = uuid::Uuid::new_v4().to_string();
-    let (item, claim_token) = (origin.clone(), token.clone());
+    let (item, claim_id) = (origin.clone(), session_id.to_owned());
     let claimed = tokio::task::spawn_blocking(move || {
         host.with_suggestions_db(|conn, _| {
             crate::plugin::suggestions::claim_link(
@@ -873,7 +873,7 @@ pub(super) async fn claim_suggestion_link(
                 &profile,
                 &item.provider_id,
                 &item.id,
-                &claim_token,
+                &claim_id,
                 &live,
                 chrono::Utc::now().timestamp(),
             )
@@ -881,7 +881,7 @@ pub(super) async fn claim_suggestion_link(
     })
     .await;
     match claimed {
-        Ok(Ok(Claim::Won)) => Ok(Some((origin.clone(), token))),
+        Ok(Ok(Claim::Won)) => Ok(Some((origin.clone(), session_id.to_owned()))),
         Ok(Ok(Claim::Session(session_id))) => Err((
             StatusCode::CONFLICT,
             Json(serde_json::json!({
@@ -891,12 +891,12 @@ pub(super) async fn claim_suggestion_link(
             })),
         )
             .into_response()),
-        Ok(Ok(Claim::Starting)) => Err((
+        Ok(Ok(Claim::Starting(session_id))) => Err((
             StatusCode::CONFLICT,
             Json(serde_json::json!({
                 "error": "already_started",
                 "message": "This suggestion is already starting",
-                "session_id": null,
+                "session_id": session_id,
             })),
         )
             .into_response()),
@@ -913,37 +913,28 @@ pub(super) async fn claim_suggestion_link(
     }
 }
 
-/// Records the created Session on its claimed link, or frees the link when the
-/// create failed (`session_id` is `None`).
+/// Marks the claimed Session created, or frees the link when the create failed
+/// (`created` is false).
 pub(super) async fn settle_suggestion_link(
     state: &Arc<AppState>,
     link: Option<&SuggestionLink>,
-    session_id: Option<&str>,
+    created: bool,
 ) {
-    let (Some((origin, token)), Some(host)) = (link, state.plugin_host.clone()) else {
+    let (Some((origin, session_id)), Some(host)) = (link, state.plugin_host.clone()) else {
         return;
     };
     let Some(profile) = origin.profile.clone() else {
         return;
     };
-    let (origin, token, session_id) = (origin.clone(), token.clone(), session_id.map(String::from));
+    let (origin, session_id) = (origin.clone(), session_id.clone());
     let settled = tokio::task::spawn_blocking(move || {
-        host.with_suggestions_db(|conn, _| match &session_id {
-            Some(id) => crate::plugin::suggestions::settle_link(
-                conn,
-                &profile,
-                &origin.provider_id,
-                &origin.id,
-                &token,
-                id,
-            ),
-            None => crate::plugin::suggestions::release_link(
-                conn,
-                &profile,
-                &origin.provider_id,
-                &origin.id,
-                &token,
-            ),
+        host.with_suggestions_db(|conn, _| {
+            let settle = if created {
+                crate::plugin::suggestions::settle_link
+            } else {
+                crate::plugin::suggestions::release_link
+            };
+            settle(conn, &profile, &origin.provider_id, &origin.id, &session_id)
         })
     })
     .await;
@@ -1658,7 +1649,7 @@ pub(crate) async fn create_session_with(
         .as_ref()
         .map_or_else(Default::default, |r| Arc::clone(&r.progress));
 
-    let spec = crate::server::session_spawn::StructuredSessionSpec {
+    let mut spec = crate::server::session_spawn::StructuredSessionSpec {
         title: body.title,
         title_typed: body.title_typed,
         size: body.size,
@@ -1708,12 +1699,22 @@ pub(crate) async fn create_session_with(
         import_acp_session_id: body.import_acp_session_id,
         import_binding,
         fork_seed,
+        session_id: None,
         progress: Some(Arc::clone(&progress)),
     };
 
     // A suggestion has one primary Session: claim its link before provisioning
     // anything, and free it again if the create fails.
-    let link = match claim_suggestion_link(&state, spec.suggestion.as_ref()).await {
+    if spec.suggestion.is_some() {
+        spec.session_id = Some(crate::session::generate_id());
+    }
+    let link = match claim_suggestion_link(
+        &state,
+        spec.suggestion.as_ref(),
+        spec.session_id.as_deref().unwrap_or_default(),
+    )
+    .await
+    {
         Ok(link) => link,
         Err(response) => return response,
     };
@@ -1747,11 +1748,7 @@ pub(crate) async fn create_session_with(
         .await;
         // Settled here, not in the handler, so a client that dropped mid-create
         // cannot leave the claim pending.
-        let session_id = result
-            .as_ref()
-            .ok()
-            .map(|(outcome, _)| outcome.instance.id.as_str());
-        settle_suggestion_link(&task_state, link.as_ref(), session_id).await;
+        settle_suggestion_link(&task_state, link.as_ref(), result.is_ok()).await;
         result
     })
     .await

@@ -73,6 +73,8 @@ pub(crate) struct StructuredSessionSpec {
     pub import_acp_session_id: Option<String>,
     pub import_binding: Option<crate::session::ConversationBinding>,
     pub fork_seed: Option<crate::session::ForkSeed>,
+    /// Id the new Session takes, when the caller named it before creating.
+    pub session_id: Option<String>,
     /// Where the web wizard polls this create's stage and hook output.
     pub progress: Option<Arc<crate::server::create_progress::CreateProgress>>,
     pub cli: Option<crate::daemon::CliCreationOptions>,
@@ -223,6 +225,7 @@ pub(crate) async fn spawn_structured_session(
             import_acp_session_id,
             import_binding,
             fork_seed,
+            session_id,
             progress,
             cli,
         } = spec;
@@ -311,6 +314,7 @@ pub(crate) async fn spawn_structured_session(
             no_submodules: cli.as_ref().is_some_and(|options| options.no_submodules),
             tie_workdir_to_name: cli.is_some(),
             worktree_path_id: cli.as_ref().and_then(|options| options.worktree_path_id.clone()),
+            session_id,
         };
 
         let namespace = runtime.block_on(worker_state.profile_namespace.read());
@@ -1342,6 +1346,7 @@ mod tests {
             import_acp_session_id: None,
             import_binding: None,
             fork_seed: None,
+            session_id: None,
             progress: None,
             cli: None,
         };
@@ -1563,6 +1568,7 @@ mod tests {
                 import_acp_session_id: None,
                 import_binding: None,
                 fork_seed: None,
+                session_id: None,
                 progress: Some(Arc::clone(&progress)),
                 cli: Some(crate::daemon::CliCreationOptions {
                     parent: None,

@@ -545,6 +545,7 @@ async fn admit_and_create(
         import_acp_session_id: None,
         import_binding: None,
         fork_seed: None,
+        session_id: None,
         progress: None,
         cli: None,
     };

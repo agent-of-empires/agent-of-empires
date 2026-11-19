@@ -104,6 +104,8 @@ pub struct InstanceParams {
     pub no_submodules: bool,
     pub tie_workdir_to_name: bool,
     pub worktree_path_id: Option<String>,
+    /// Id to give the new instance instead of a fresh one.
+    pub session_id: Option<String>,
 }
 
 /// Result of building an instance, tracking what was created for cleanup purposes.
@@ -1071,6 +1073,9 @@ pub(crate) fn plan_instance(
     }
 
     let mut instance = Instance::new(&final_title, &final_path);
+    if let Some(id) = params.session_id.clone() {
+        instance.id = id;
+    }
     instance.first_launch_names_agent = params.title_typed;
     if params.scratch {
         let dir = super::scratch::scratch_path(&instance.id)?;
@@ -3169,6 +3174,7 @@ mod tests {
             no_submodules: false,
             tie_workdir_to_name: false,
             worktree_path_id: None,
+            session_id: None,
         }
     }
 
@@ -3483,6 +3489,7 @@ mod tests {
             no_submodules: false,
             tie_workdir_to_name: false,
             worktree_path_id: None,
+            session_id: None,
         };
         let inst = build_instance(params, &[], &[], "default")
             .unwrap()
@@ -3563,6 +3570,7 @@ mod tests {
             no_submodules: false,
             tie_workdir_to_name: false,
             worktree_path_id: None,
+            session_id: None,
         };
         let inst = build_instance(params, &[], &[], "default")
             .unwrap()

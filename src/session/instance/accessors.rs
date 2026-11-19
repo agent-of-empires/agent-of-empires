@@ -11,7 +11,7 @@ pub(crate) const UNBOUND_STORE_HINT: &str = "ACP does not prove a native convers
 #[error("Cannot create sub-session of a sub-session (single level only)")]
 pub struct NestedSubSession;
 
-fn generate_id() -> String {
+pub(crate) fn generate_id() -> String {
     Uuid::new_v4().to_string().replace("-", "")[..16].to_string()
 }
 
