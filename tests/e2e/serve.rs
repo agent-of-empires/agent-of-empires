@@ -2332,7 +2332,16 @@ fn cli_serve_daemon_starts_and_stops_cleanly() {
     let port = pick_free_port();
     let port_s = port.to_string();
 
-    let start = h.run_cli(&["serve", "--daemon", "--port", &port_s, "--no-auth"]);
+    let start = h.run_cli(&[
+        "serve",
+        "--daemon",
+        "--port",
+        &port_s,
+        "--no-auth",
+        "--behind-proxy",
+        "--allowed-host",
+        "127.0.0.1",
+    ]);
     assert!(
         start.status.success(),
         "aoe serve --daemon failed.\nstdout: {}\nstderr: {}",
@@ -2724,14 +2733,32 @@ fn cli_serve_restart_replays_launch_state() {
         .trim()
         .parse()
         .unwrap();
-    let invalid = h.run_cli(&["serve", "--daemon", "--host", "0.0.0.0", "--no-auth"]);
+    let invalid = h.run_cli(&[
+        "serve",
+        "--daemon",
+        "--host",
+        "0.0.0.0",
+        "--no-auth",
+        // Invalid on purpose: --behind-proxy without --allowed-host fails
+        // validate_behind_proxy_allowlist, before the running core is stopped.
+        "--behind-proxy",
+    ]);
     assert!(!invalid.status.success());
     assert!(
         pid_alive(core_pid),
         "invalid exposure stopped the running core"
     );
 
-    let provisional = h.run_cli(&["serve", "--daemon", "--port", &port_s, "--no-auth"]);
+    let provisional = h.run_cli(&[
+        "serve",
+        "--daemon",
+        "--port",
+        &port_s,
+        "--no-auth",
+        "--behind-proxy",
+        "--allowed-host",
+        "127.0.0.1",
+    ]);
     assert!(
         provisional.status.success(),
         "{}",
@@ -2759,7 +2786,16 @@ fn cli_serve_restart_replays_launch_state() {
         .parse()
         .unwrap();
 
-    let start = h.run_cli(&["serve", "--daemon", "--port", &port_s, "--no-auth"]);
+    let start = h.run_cli(&[
+        "serve",
+        "--daemon",
+        "--port",
+        &port_s,
+        "--no-auth",
+        "--behind-proxy",
+        "--allowed-host",
+        "127.0.0.1",
+    ]);
     assert!(
         start.status.success(),
         "initial --daemon failed.\nstdout: {}\nstderr: {}",
@@ -3227,7 +3263,16 @@ fn cli_serve_daemon_writes_marker_to_debug_log_not_serve_log() {
     let port = pick_free_port();
     let port_s = port.to_string();
 
-    let start = h.run_cli(&["serve", "--daemon", "--port", &port_s, "--no-auth"]);
+    let start = h.run_cli(&[
+        "serve",
+        "--daemon",
+        "--port",
+        &port_s,
+        "--no-auth",
+        "--behind-proxy",
+        "--allowed-host",
+        "127.0.0.1",
+    ]);
     assert!(start.status.success(), "aoe serve --daemon failed");
 
     assert!(
@@ -4103,6 +4148,9 @@ fn cli_serve_daemon_profile_reaches_the_served_layer() {
         "--port",
         &port_s,
         "--no-auth",
+        "--behind-proxy",
+        "--allowed-host",
+        "127.0.0.1",
     ]);
     assert!(
         start.status.success(),
