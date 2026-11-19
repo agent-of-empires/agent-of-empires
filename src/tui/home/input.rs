@@ -1425,6 +1425,12 @@ impl HomeView {
                 }
                 None
             }
+            "approve_suggestion_hooks" => {
+                if let Some((key, fingerprint)) = self.pending_suggestion_trust.take() {
+                    self.suggestions_feed.start_approved(key, fingerprint);
+                }
+                None
+            }
             "stop_session" => self.pending_stop_session.take().map(Action::StopSession),
             "resume_reveal" => {
                 if let Some(intent) = self.retained_reveal.take() {

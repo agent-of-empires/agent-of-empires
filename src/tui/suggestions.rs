@@ -139,6 +139,69 @@ pub(super) struct Start {
     pub suggestion: Option<crate::session::SuggestionOrigin>,
 }
 
+/// What `POST /api/suggestions/start` answered, as the TUI acts on it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) enum StartAnswer {
+    Started {
+        session_id: String,
+        title: String,
+    },
+    /// The item has a Session already; `None` while that Session is still being created.
+    AlreadyStarted(Option<String>),
+    /// Repository hooks need approval first: the commands to show, and the
+    /// fingerprint the approval must quote.
+    NeedsTrust {
+        commands: Vec<String>,
+        fingerprint: String,
+    },
+    /// The item's repo is linked to no Project, so the wizard has to ask for one.
+    NoProject,
+    Failed(String),
+}
+
+fn start_answer(status: u16, body: &serde_json::Value) -> StartAnswer {
+    let field = |key: &str| body[key].as_str().unwrap_or_default().to_owned();
+    match (status, body["error"].as_str().unwrap_or_default()) {
+        (200..=299, _) => StartAnswer::Started {
+            session_id: field("session_id"),
+            title: field("title"),
+        },
+        (409, "already_started") => {
+            StartAnswer::AlreadyStarted(body["session_id"].as_str().map(str::to_owned))
+        }
+        (409, "hooks_need_trust" | "trust_changed") => {
+            let mut commands = Vec::new();
+            for (stage, label) in [
+                ("on_create", "on create"),
+                ("on_launch", "on launch"),
+                ("on_destroy", "on destroy"),
+            ] {
+                let list = body["commands"][stage].as_array().into_iter().flatten();
+                commands.extend(
+                    list.filter_map(|c| c.as_str())
+                        .map(|c| plain_line(&format!("{label}: {c}"))),
+                );
+            }
+            if body["needs_mcp_trust"].as_bool() == Some(true) {
+                commands.push("project MCP servers".to_owned());
+            }
+            StartAnswer::NeedsTrust {
+                commands,
+                fingerprint: field("review_fingerprint"),
+            }
+        }
+        (400, "no_project") => StartAnswer::NoProject,
+        (_, "stale" | "stale_suggestion") => {
+            StartAnswer::Failed("That suggestion is no longer open. Reload with r.".into())
+        }
+        (422, "start_failed") => {
+            let hint = field("hint");
+            StartAnswer::Failed(plain_line(format!("{} {hint}", field("reason")).trim()))
+        }
+        _ => StartAnswer::Failed(plain_line(&field("message"))),
+    }
+}
+
 /// The daemon and profile a list was read from. A mutation is bound to it, so
 /// a replaced daemon or another profile never receives work meant for the list shown.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -162,12 +225,21 @@ enum Req {
         target: PrepareTarget,
         origin: Option<Origin>,
     },
+    /// Starts the item with its preset; `review_fingerprint` approves the repo hooks it names.
+    Start {
+        provider_id: String,
+        id: String,
+        review_fingerprint: Option<String>,
+        origin: Option<Origin>,
+    },
 }
 
 impl Req {
     fn origin(&self) -> Option<&Origin> {
         match self {
-            Req::Dismiss { origin, .. } | Req::Prepare { origin, .. } => origin.as_ref(),
+            Req::Dismiss { origin, .. }
+            | Req::Prepare { origin, .. }
+            | Req::Start { origin, .. } => origin.as_ref(),
             _ => None,
         }
     }
@@ -202,6 +274,7 @@ enum Res {
     DismissKept(String),
     Refreshed(Result<(), String>),
     Prepared(Result<Prepared, String>),
+    Started(Result<StartAnswer, String>),
 }
 
 #[cfg(not(test))]
@@ -211,7 +284,8 @@ impl Res {
             Res::Snapshot(Err(e))
             | Res::DismissKept(e)
             | Res::Refreshed(Err(e))
-            | Res::Prepared(Err(e)) => Some(e),
+            | Res::Prepared(Err(e))
+            | Res::Started(Err(e)) => Some(e),
             _ => None,
         }
     }
@@ -220,12 +294,14 @@ impl Res {
 enum ResKind {
     Snapshot,
     Prepare,
+    Start,
     Other,
 }
 
 fn failed(req: &Req, message: String) -> Res {
     match req {
         Req::Prepare { .. } => Res::Prepared(Err(message)),
+        Req::Start { .. } => Res::Started(Err(message)),
         Req::Refresh => Res::Refreshed(Err(message)),
         Req::Load | Req::Dismiss { .. } => Res::Snapshot(Err(message)),
     }
@@ -290,6 +366,25 @@ async fn run(req: &Req) -> Res {
             },
             Err(e) => Res::Snapshot(Err(text(e))),
         },
+        Req::Start {
+            provider_id,
+            id,
+            review_fingerprint,
+            ..
+        } => {
+            let mut body = serde_json::json!({ "provider_id": provider_id, "id": id });
+            if let Some(fingerprint) = review_fingerprint {
+                body["approve_hooks"] = true.into();
+                body["review_fingerprint"] = fingerprint.clone().into();
+            }
+            Res::Started(
+                client
+                    .start_suggestion(&body)
+                    .await
+                    .map(|(status, body)| start_answer(status, &body))
+                    .map_err(text),
+            )
+        }
         Req::Prepare {
             provider_id, id, ..
         } => Res::Prepared(
@@ -442,7 +537,7 @@ pub(super) struct SuggestionsView {
     order: Vec<ItemKey>,
     pub(super) error: Option<String>,
     notice: Option<String>,
-    /// The resolved prefill, shown before the second Enter confirms it.
+    /// The resolved prefill, shown before the second `e` confirms it.
     prepared: Option<(ItemKey, Start)>,
     epoch: u64,
     selected: usize,
@@ -453,7 +548,7 @@ pub(super) struct SuggestionsView {
     /// The in-flight `prepare` is for "Start another", which does not claim the link.
     prepare_another: bool,
     /// The last start that failed, shown on its row; Enter tries again.
-    failed: Option<(ItemKey, String)>,
+    pub(super) failed: Option<(ItemKey, String)>,
 }
 
 impl SuggestionsView {
@@ -479,6 +574,16 @@ impl SuggestionsView {
             prepare_another: false,
             failed: None,
         }
+    }
+
+    /// Shows a start the daemon answered with a failure on its row; Enter tries again.
+    pub(super) fn set_failed(&mut self, key: ItemKey, message: String) {
+        self.notice = None;
+        self.failed = Some((key, message));
+    }
+
+    pub(super) fn set_notice(&mut self, message: impl Into<String>) {
+        self.notice = Some(message.into());
     }
 
     pub(super) fn set_error(&mut self, message: impl Into<String>) {
@@ -598,7 +703,8 @@ impl SuggestionsView {
             KeyCode::Char('z' | 'Z') => {
                 self.error = block.map(|b| block_note(b).to_string());
             }
-            KeyCode::Enter | KeyCode::Char('N') => {
+            KeyCode::Enter | KeyCode::Char('e' | 'N') => {
+                let review = key.code != KeyCode::Enter;
                 let another = key.code == KeyCode::Char('N');
                 let Some(key) = self.selected_key() else {
                     return SuggestionsAction::Continue;
@@ -616,6 +722,13 @@ impl SuggestionsView {
                 }
                 if item.is_some_and(|i| i.stale) {
                     self.notice = Some(STALE_NOTE.to_string());
+                    return SuggestionsAction::Continue;
+                }
+                if !review {
+                    self.begin();
+                    self.failed = None;
+                    self.notice = Some("Starting…".into());
+                    store.start(key);
                     return SuggestionsAction::Continue;
                 }
                 if self.prepare_another == another
@@ -648,6 +761,7 @@ impl SuggestionsView {
             changed = true;
         }
         if let Some(error) = polled.error.take() {
+            self.notice = None;
             match self.preparing.take() {
                 Some(key) if polled.prepare_failed => self.failed = Some((key, error)),
                 Some(key) => {
@@ -665,9 +779,9 @@ impl SuggestionsView {
                     start.suggestion = None;
                 }
                 self.notice = Some(if start.path.is_some() {
-                    "Review the prompt below, then press Enter to start.".into()
+                    "Review the prompt below, then press e to start.".into()
                 } else {
-                    "No single project matched. Review the prompt, then press Enter and pick one."
+                    "No single project matched. Review the prompt, then press e and pick one."
                         .into()
                 });
                 self.prepared = Some((key, start));
@@ -754,7 +868,7 @@ impl SuggestionsView {
             )));
         }
         footer.push(Line::from(Span::styled(
-            "j/k select · Enter review/start/open · N new · z dismiss/restore · d dismissed · r refresh · PgUp/PgDn prompt · Esc back",
+            "j/k select · Enter start/open · e start with changes · N new · z dismiss/restore · d dismissed · r refresh · PgUp/PgDn prompt · Esc back",
             Style::default().fg(theme.dimmed),
         )));
         let width = (inner.width as usize).max(1);
@@ -919,7 +1033,7 @@ impl SuggestionsView {
             let (header, prompt) = match final_prompt {
                 Some(prompt) => ("Prompt sent to the agent (untrusted source text):", prompt),
                 None => (
-                    "Provider draft prompt (Enter resolves the final prompt first):",
+                    "Provider draft prompt (e resolves the final prompt first):",
                     item.draft.prompt.as_str(),
                 ),
             };
@@ -975,6 +1089,8 @@ pub(super) struct FeedPoll {
     pub refreshed: bool,
     /// A prepared suggestion, with the key and the surface it was requested for.
     pub start: Option<(ItemKey, Start, PrepareTarget)>,
+    /// What the daemon answered to a start, with the item it was for.
+    pub started: Option<(ItemKey, StartAnswer)>,
     /// Failure of a user-initiated request; background reloads only log.
     pub error: Option<String>,
     /// `error` belongs to a prepare, not to a reload, refresh or dismiss.
@@ -991,6 +1107,7 @@ pub(super) struct SuggestionsFeed {
     /// The other profile the daemon's suggestions belong to, while it differs.
     foreign_profile: Option<String>,
     prepare_key: Option<ItemKey>,
+    start_key: Option<ItemKey>,
     prepare_target: PrepareTarget,
     /// Epoch of the most recently opened full view.
     view_epoch: u64,
@@ -1031,6 +1148,7 @@ impl SuggestionsFeed {
             profile: None,
             foreign_profile: None,
             prepare_key: None,
+            start_key: None,
             prepare_target: PrepareTarget::Home,
             view_epoch: 0,
             in_flight_user: false,
@@ -1060,6 +1178,9 @@ impl SuggestionsFeed {
                 self.prepare_key = Some((provider_id.clone(), id.clone()));
                 self.prepare_target = *target;
             }
+            Req::Start {
+                provider_id, id, ..
+            } => self.start_key = Some((provider_id.clone(), id.clone())),
             Req::Dismiss {
                 provider_id,
                 id,
@@ -1300,6 +1421,20 @@ impl SuggestionsFeed {
         snapshot: serde_json::Value,
         sink: std::sync::mpsc::Sender<String>,
     ) -> Self {
+        let started = StartAnswer::Started {
+            session_id: "s-new".into(),
+            title: "Prepared title".into(),
+        };
+        Self::recording_start_for_test(snapshot, sink, started)
+    }
+
+    /// [`recording_for_test`](Self::recording_for_test) whose start answers `started`.
+    #[cfg(test)]
+    pub(super) fn recording_start_for_test(
+        snapshot: serde_json::Value,
+        sink: std::sync::mpsc::Sender<String>,
+        started: StartAnswer,
+    ) -> Self {
         let worker = Worker::spawn("test-suggestions-feed", move |req| {
             let parse = || serde_json::from_value(snapshot.clone()).map_err(text);
             match req {
@@ -1328,6 +1463,16 @@ impl SuggestionsFeed {
                             path: "/tmp".into(),
                         }),
                     }))
+                }
+                Req::Start {
+                    provider_id,
+                    id,
+                    review_fingerprint,
+                    ..
+                } => {
+                    let approved = review_fingerprint.map_or(String::new(), |f| format!(" {f}"));
+                    let _ = sink.send(format!("start {provider_id}/{id}{approved}"));
+                    Res::Started(Ok(started.clone()))
                 }
                 Req::Refresh => Res::Refreshed(Ok(())),
             }
@@ -1364,6 +1509,35 @@ impl SuggestionsFeed {
             id: key.1.clone(),
             dismissed,
             origin: self.origin(),
+        });
+    }
+
+    /// Starts the item with its preset, behind the request in flight.
+    pub(super) fn start(&mut self, key: ItemKey) {
+        self.submit_start(key, None);
+    }
+
+    /// Starts again with the repo hooks the user approved, named by `fingerprint`.
+    pub(super) fn start_approved(&mut self, key: ItemKey, fingerprint: String) {
+        self.submit_start(key, Some(fingerprint));
+    }
+
+    fn submit_start(&mut self, key: ItemKey, review_fingerprint: Option<String>) {
+        let pending = (self.busy && self.start_key.as_ref() == Some(&key))
+            || self.queued.iter().any(|req| {
+                matches!(req, Req::Start { provider_id, id, .. }
+                    if (provider_id, id) == (&key.0, &key.1))
+            });
+        // A second Enter while the first answer is pending must not start twice.
+        if pending {
+            return;
+        }
+        let origin = self.origin();
+        self.submit(Req::Start {
+            provider_id: key.0,
+            id: key.1,
+            review_fingerprint,
+            origin,
         });
     }
 
@@ -1409,6 +1583,7 @@ impl SuggestionsFeed {
             changed: self.expire_recent(),
             refreshed: false,
             start: None,
+            started: None,
             error: None,
             prepare_failed: false,
         };
@@ -1428,6 +1603,7 @@ impl SuggestionsFeed {
         let req_kind = match &res {
             Res::Snapshot(_) => ResKind::Snapshot,
             Res::Prepared(_) => ResKind::Prepare,
+            Res::Started(_) => ResKind::Start,
             _ => ResKind::Other,
         };
         match res {
@@ -1471,10 +1647,20 @@ impl SuggestionsFeed {
                     out.prepare_failed = true;
                 }
             }
-            Res::Snapshot(Err(e)) | Res::Refreshed(Err(e)) | Res::Prepared(Err(e)) => {
+            Res::Started(Ok(answer)) => match self.start_key.take() {
+                Some(key) => out.started = Some((key, answer)),
+                None => out.error = Some("Profile changed, suggestion not started".into()),
+            },
+            Res::Snapshot(Err(e))
+            | Res::Refreshed(Err(e))
+            | Res::Prepared(Err(e))
+            | Res::Started(Err(e)) => {
                 if matches!(req_kind, ResKind::Prepare) {
                     self.prepare_key = None;
                     out.prepare_failed = true;
+                }
+                if matches!(req_kind, ResKind::Start) {
+                    self.start_key = None;
                 }
                 if let (ResKind::Snapshot, Some((key, dismissed))) = (req_kind, in_flight_dismiss) {
                     // A failed dismiss or restore leaves the undo window as it was.
@@ -1735,17 +1921,17 @@ mod tests {
     }
 
     #[test]
-    fn enter_resolves_the_final_prompt_and_a_second_enter_starts() {
+    fn e_resolves_the_final_prompt_and_a_second_e_starts() {
         let worker = Worker::seeded_for_test("t", Res::Prepared(Ok(prepared(Some("/repo")))));
         let mut rig = view_with(vec![item("a", Some("repo"), false)], worker);
         assert!(matches!(
-            press(&mut rig, KeyCode::Enter, true),
+            press(&mut rig, KeyCode::Char('e'), true),
             SuggestionsAction::Continue
         ));
         assert!(poll_until_settled(&mut rig));
         assert!(rig.view.prepared.is_some());
         assert!(render_text(&rig).contains("final prompt"));
-        let SuggestionsAction::Start(start) = press(&mut rig, KeyCode::Enter, true) else {
+        let SuggestionsAction::Start(start) = press(&mut rig, KeyCode::Char('e'), true) else {
             panic!("expected a start");
         };
         assert_eq!(start.path.as_deref(), Some("/repo"));
@@ -1757,10 +1943,10 @@ mod tests {
     fn prepare_without_a_registered_project_still_starts_with_the_path_left_to_pick() {
         let worker = Worker::seeded_for_test("t", Res::Prepared(Ok(prepared(None))));
         let mut rig = view_with(vec![item("a", None, false)], worker);
-        press(&mut rig, KeyCode::Enter, true);
+        press(&mut rig, KeyCode::Char('e'), true);
         assert!(poll_until_settled(&mut rig));
         assert!(rig.view.prepared.is_some());
-        let SuggestionsAction::Start(start) = press(&mut rig, KeyCode::Enter, true) else {
+        let SuggestionsAction::Start(start) = press(&mut rig, KeyCode::Char('e'), true) else {
             panic!("expected a start");
         };
         assert_eq!(start.path, None);
@@ -1799,9 +1985,9 @@ mod tests {
     fn a_plain_start_carries_the_suggestion_reference() {
         let worker = Worker::seeded_for_test("t", Res::Prepared(Ok(prepared(Some("/repo")))));
         let mut rig = view_with(vec![item("a", Some("repo"), false)], worker);
-        press(&mut rig, KeyCode::Enter, true);
+        press(&mut rig, KeyCode::Char('e'), true);
         assert!(poll_until_settled(&mut rig));
-        let SuggestionsAction::Start(start) = press(&mut rig, KeyCode::Enter, true) else {
+        let SuggestionsAction::Start(start) = press(&mut rig, KeyCode::Char('e'), true) else {
             panic!("expected a start");
         };
         let origin = start.suggestion.unwrap();
@@ -1858,6 +2044,7 @@ mod tests {
             changed: true,
             refreshed: false,
             start: None,
+            started: None,
             error: None,
             prepare_failed: false,
         }
@@ -1931,6 +2118,7 @@ mod tests {
             changed: false,
             refreshed: false,
             start: None,
+            started: None,
             error: None,
             prepare_failed: false,
         };
@@ -1985,6 +2173,63 @@ mod tests {
     }
 
     #[test]
+    fn start_answers_follow_the_daemons_typed_outcomes() {
+        use serde_json::json;
+        let hooks = json!({
+            "error": "hooks_need_trust",
+            "commands": { "on_create": ["make setup"], "on_launch": [], "on_destroy": [] },
+            "needs_mcp_trust": true,
+            "review_fingerprint": "fp",
+        });
+        let cases = [
+            (
+                201,
+                json!({ "session_id": "s1", "title": "T" }),
+                StartAnswer::Started {
+                    session_id: "s1".into(),
+                    title: "T".into(),
+                },
+            ),
+            (
+                409,
+                json!({ "error": "already_started", "session_id": "s2" }),
+                StartAnswer::AlreadyStarted(Some("s2".into())),
+            ),
+            (
+                409,
+                json!({ "error": "already_started", "session_id": null }),
+                StartAnswer::AlreadyStarted(None),
+            ),
+            (
+                409,
+                hooks,
+                StartAnswer::NeedsTrust {
+                    commands: vec!["on create: make setup".into(), "project MCP servers".into()],
+                    fingerprint: "fp".into(),
+                },
+            ),
+            (
+                400,
+                json!({ "error": "no_project" }),
+                StartAnswer::NoProject,
+            ),
+            (
+                422,
+                json!({ "error": "start_failed", "reason": "Docker isn't running", "hint": "Start it." }),
+                StartAnswer::Failed("Docker isn't running Start it.".into()),
+            ),
+            (
+                400,
+                json!({ "error": "stale" }),
+                StartAnswer::Failed("That suggestion is no longer open. Reload with r.".into()),
+            ),
+        ];
+        for (status, body, expected) in cases {
+            assert_eq!(start_answer(status, &body), expected, "{body}");
+        }
+    }
+
+    #[test]
     fn provider_text_keeps_tabs_and_crlf_line_breaks() {
         assert_eq!(plain("fn a() {\r\n\tx\r\n}"), "fn a() {\n\tx\n}");
         assert_eq!(plain_line("a\tb\nc"), "a b\u{fffd}c");
@@ -2005,12 +2250,12 @@ mod tests {
     }
 
     #[test]
-    fn a_failed_start_stays_on_its_row_and_enter_tries_again() {
+    fn a_failed_prepare_stays_on_its_row() {
         let worker =
             Worker::seeded_for_test("t", Res::Prepared(Err("branch already exists".into())));
         let mut rig = view_with(vec![item("a", Some("repo"), false)], worker);
         rig.store.in_flight_user = true;
-        press(&mut rig, KeyCode::Enter, true);
+        press(&mut rig, KeyCode::Char('e'), true);
         assert!(poll_until_settled(&mut rig));
         assert!(
             rig.view.error.is_none(),
@@ -2029,7 +2274,7 @@ mod tests {
         });
         let mut rig = view_with(vec![item("a", Some("repo"), false)], worker);
         rig.store.reload();
-        press(&mut rig, KeyCode::Enter, true);
+        press(&mut rig, KeyCode::Char('e'), true);
         let mut error_seen = None;
         for _ in 0..200 {
             let mut polled = rig.store.poll();
@@ -2308,7 +2553,7 @@ mod tests {
     fn a_view_prepare_answered_after_the_view_closed_is_left_for_the_caller_to_drop() {
         let worker = Worker::seeded_for_test("t", Res::Prepared(Ok(prepared(Some("/repo")))));
         let mut rig = view_with(vec![item("a", Some("repo"), false)], worker);
-        press(&mut rig, KeyCode::Enter, true);
+        press(&mut rig, KeyCode::Char('e'), true);
         let mut view_closed = rig.store.poll();
         for _ in 0..200 {
             if view_closed.start.is_some() {
@@ -2327,7 +2572,7 @@ mod tests {
     fn a_view_prepare_does_not_land_in_a_reopened_view() {
         let worker = Worker::seeded_for_test("t", Res::Prepared(Ok(prepared(Some("/repo")))));
         let mut rig = view_with(vec![item("a", Some("repo"), false)], worker);
-        press(&mut rig, KeyCode::Enter, true);
+        press(&mut rig, KeyCode::Char('e'), true);
         rig.view = SuggestionsView::new(&mut rig.store);
         let mut polled = rig.store.poll();
         for _ in 0..200 {
@@ -2350,7 +2595,7 @@ mod tests {
         let start = start_for(rig.store.snapshot.as_ref(), &key, prepared(Some("/repo")));
         rig.view.prepared = Some((key, start));
         assert!(matches!(
-            press(&mut rig, KeyCode::Enter, true),
+            press(&mut rig, KeyCode::Char('e'), true),
             SuggestionsAction::Start(_)
         ));
 

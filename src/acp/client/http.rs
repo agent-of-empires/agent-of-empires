@@ -541,6 +541,24 @@ impl HttpClient {
         })
     }
 
+    /// `POST /api/suggestions/start`. The status and JSON body of the answer,
+    /// which carries the typed outcomes (409 and 422) a caller acts on.
+    pub async fn start_suggestion(
+        &self,
+        body: &serde_json::Value,
+    ) -> Result<(u16, serde_json::Value), HttpError> {
+        let url = format!("{}/api/suggestions/start", self.endpoint.base_url);
+        let res = self.execute(self.http.post(&url).json(body)).await?;
+        let status = res.status();
+        if status.is_success() || matches!(status.as_u16(), 400 | 409 | 422) {
+            let value = crate::daemon::decode_json::<serde_json::Value>(res)
+                .await
+                .unwrap_or_default();
+            return Ok((status.as_u16(), value));
+        }
+        Err(status_error(&res, None, false))
+    }
+
     /// `POST /api/plugins/commands/{fqid}/invoke`. Dispatch an action-less
     /// plugin command to its worker as a fire-and-forget notification (the TUI
     /// twin of the web palette's invoke). Global, like `plugin_ui_state`; the
@@ -2770,6 +2788,30 @@ mod tests {
             body,
             &serde_json::json!({"config_id": "reasoning_effort", "value": "high"})
         );
+    }
+
+    #[tokio::test]
+    async fn a_start_returns_the_typed_outcome_of_a_409_and_posts_the_approval() {
+        use axum::{http::StatusCode as Code, routing::post, Json, Router};
+        let app = Router::new().route(
+            "/api/suggestions/start",
+            post(|Json(body): Json<serde_json::Value>| async move {
+                (
+                    Code::CONFLICT,
+                    Json(serde_json::json!({ "error": "hooks_need_trust", "echo": body })),
+                )
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let client = HttpClient::new(endpoint(&base, None)).unwrap();
+        let body = serde_json::json!({ "provider_id": "gh", "id": "1", "approve_hooks": true });
+        let (status, answer) = client.start_suggestion(&body).await.unwrap();
+        assert_eq!(status, 409);
+        assert_eq!(answer["error"], "hooks_need_trust");
+        assert_eq!(answer["echo"], body);
+        server.abort();
     }
 
     #[tokio::test]

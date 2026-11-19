@@ -2,7 +2,7 @@
 
 use super::*;
 use crate::tui::dialogs::PromptOrigin;
-use crate::tui::suggestions::{PrepareTarget, Start, SuggestionsView};
+use crate::tui::suggestions::{PrepareTarget, Start, StartAnswer, SuggestionsView};
 
 impl HomeView {
     pub(super) const CANONICAL_RELOAD_RETRY_INTERVAL: std::time::Duration =
@@ -82,11 +82,72 @@ impl HomeView {
             }
             changed = true;
         }
+        if let Some((key, answer)) = polled.started {
+            self.apply_start_answer(key, answer);
+            changed = true;
+        }
         if let Some(error) = polled.error {
             self.flash_status(error);
             changed = true;
         }
         changed
+    }
+
+    /// Shows what the daemon answered to a start, on the surface that asked.
+    fn apply_start_answer(&mut self, key: (String, String), answer: StartAnswer) {
+        let say = |this: &mut Self, message: String, error: bool| match &mut this.suggestions_view {
+            Some(view) if error => view.set_error(message),
+            Some(view) => view.set_notice(message),
+            None => this.flash_status(message),
+        };
+        match answer {
+            StartAnswer::Started { session_id, title } => {
+                self.suggestions_feed.link_started(&key, &session_id);
+                say(self, format!("Started {title}"), false);
+            }
+            StartAnswer::AlreadyStarted(Some(session_id)) => {
+                self.suggestions_feed.link_started(&key, &session_id);
+                say(self, "Already started. Enter opens it.".into(), false);
+            }
+            StartAnswer::AlreadyStarted(None) => {
+                say(self, "Already starting. Reload in a moment.".into(), false);
+            }
+            StartAnswer::NeedsTrust {
+                commands,
+                fingerprint,
+            } => {
+                let mut message = String::from("This repository runs these commands:\n\n");
+                for command in &commands {
+                    message.push_str(&format!("  {command}\n"));
+                }
+                message.push_str("\nApprove them and start?");
+                self.confirm_dialog = Some(
+                    crate::tui::dialogs::ConfirmDialog::new(
+                        "Review repository hooks",
+                        &message,
+                        "approve_suggestion_hooks",
+                    )
+                    .neutral()
+                    .buttons("Approve and start", "Cancel"),
+                );
+                self.pending_suggestion_trust = Some((key, fingerprint));
+            }
+            StartAnswer::NoProject => {
+                if self.suggestions_view.is_some() {
+                    say(
+                        self,
+                        "No project is linked yet. Press e to pick one.".into(),
+                        false,
+                    );
+                } else {
+                    self.suggestions_feed.prepare(key);
+                }
+            }
+            StartAnswer::Failed(reason) => match &mut self.suggestions_view {
+                Some(view) => view.set_failed(key, reason),
+                None => self.flash_status(format!("{reason} Enter tries again.")),
+            },
+        }
     }
 
     pub(super) fn open_suggestions_view(&mut self) {
