@@ -8,6 +8,7 @@ import type {
   SuggestionProvider,
   SuggestionSource,
 } from "../../lib/types";
+import { shortRef } from "../../lib/suggestionPlan";
 import { expandTemplate } from "../../lib/suggestionTemplate";
 import { TemplateEditor } from "./TemplateEditor";
 import { SuggestionSwitch } from "./suggestionsShared";
@@ -203,11 +204,14 @@ export function SuggestionPresetEditor({ provider, source, entry, item, disabled
               onClick={() => set("prompt", null)}
               className="cursor-pointer text-brand-500 hover:underline disabled:opacity-50"
             >
-              Use {provider.name}&apos;s prompt
+              Reset to {provider.name}&apos;s prompt
             </button>
           )}
         </p>
-        <p className="mt-1 break-words font-mono text-xs text-text-muted">Preview: {preview}</p>
+        <p className="mt-1 break-words font-mono text-xs text-text-muted">
+          {item ? `For ${shortRef(item.source_ref)}: ` : "Preview: "}
+          {preview}
+        </p>
       </div>
       <div className="flex items-center gap-2">
         <button type="button" className={GHOST} disabled={off || !entry?.customized} onClick={() => void reset()}>

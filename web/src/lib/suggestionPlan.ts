@@ -17,3 +17,6 @@ export function startSummary(
     .filter(Boolean)
     .join(" · ");
 }
+
+/** "owner/repo#12" as "#12". */
+export const shortRef = (ref: string) => (ref.includes("#") ? ref.slice(ref.lastIndexOf("#")) : ref);
