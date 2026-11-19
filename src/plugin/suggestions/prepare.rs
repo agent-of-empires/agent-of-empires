@@ -240,6 +240,31 @@ pub(crate) fn prepare(
     }))
 }
 
+/// The preset fields whose default differs from `base` (the profile's) in at least
+/// one registered project: a per-kind editor cannot show one value for them.
+pub(crate) fn project_default_overrides(
+    profile: &str,
+    registered: &[Project],
+    base: &Preset,
+) -> Vec<&'static str> {
+    let mut varying = std::collections::BTreeSet::new();
+    for project in registered {
+        let own = default_preset(&project_config(profile, Some(project)));
+        for (field, differs) in [
+            ("agent", own.agent != base.agent),
+            ("view", own.view != base.view),
+            ("worktree", own.worktree != base.worktree),
+            ("sandbox", own.sandbox != base.sandbox),
+            ("yolo", own.yolo != base.yolo),
+        ] {
+            if differs {
+                varying.insert(field);
+            }
+        }
+    }
+    varying.into_iter().collect()
+}
+
 /// The profile config as a Session in `project` would see it.
 fn project_config(profile: &str, project: Option<&Project>) -> crate::session::config::Config {
     let mut config = match project {
@@ -261,6 +286,23 @@ fn project_config(profile: &str, project: Option<&Project>) -> crate::session::c
 mod tests {
     use super::fixtures::*;
     use super::*;
+
+    #[test]
+    #[serial_test::serial]
+    fn a_project_override_marks_the_preset_default_it_changes() {
+        let _home = crate::session::test_support::isolate_app_dir();
+        let scope = projects::ProjectScope::Global;
+        let mut sandboxed = Project::new("sandboxed", "/tmp/aoe-sandboxed", scope);
+        sandboxed.overrides.sandbox_enabled = Some(true);
+        let plain = Project::new("plain", "/tmp/aoe-plain", scope);
+        let base = default_preset(&resolve_config_or_warn("default"));
+        assert!(!base.sandbox);
+        assert_eq!(
+            project_default_overrides("default", &[plain.clone(), sandboxed], &base),
+            ["sandbox"]
+        );
+        assert!(project_default_overrides("default", &[plain], &base).is_empty());
+    }
 
     #[test]
     #[serial_test::serial]

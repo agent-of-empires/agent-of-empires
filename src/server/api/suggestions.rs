@@ -731,6 +731,7 @@ fn preset_json(
     criterion: &str,
     stored: Option<Preset>,
     defaults: &Preset,
+    overridden: &[&str],
 ) -> serde_json::Value {
     json!({
         "provider_id": provider_id,
@@ -738,6 +739,7 @@ fn preset_json(
         "customized": stored.is_some(),
         "preset": stored.as_ref().unwrap_or(defaults),
         "defaults": defaults,
+        "project_overrides": overridden,
     })
 }
 
@@ -747,10 +749,14 @@ pub async fn get_suggestion_presets(State(state): State<Arc<AppState>>) -> impl 
         return Json(json!({ "presets": [] })).into_response();
     };
     let result = tokio::task::spawn_blocking(move || {
+        let profile = host.suggestions_profile();
         let defaults = suggestions::default_preset(
-            &crate::session::config::profile_config::resolve_config_or_warn(
-                &host.suggestions_profile(),
-            ),
+            &crate::session::config::profile_config::resolve_config_or_warn(&profile),
+        );
+        let overridden = suggestions::project_default_overrides(
+            &profile,
+            &crate::session::projects::load_merged(&profile)?,
+            &defaults,
         );
         let mut stored: std::collections::HashMap<(String, String), Preset> = host
             .with_suggestions_db(suggestions::presets)?
@@ -769,7 +775,7 @@ pub async fn get_suggestion_presets(State(state): State<Arc<AppState>>) -> impl 
             })
             .map(|key| {
                 let preset = stored.remove(&key);
-                preset_json(&key.0, &key.1, preset, &defaults)
+                preset_json(&key.0, &key.1, preset, &defaults, &overridden)
             })
             .collect();
         Ok::<_, anyhow::Error>(json!({ "presets": presets }))
@@ -806,6 +812,11 @@ pub async fn put_suggestion_preset(
             return Ok(Err(response));
         }
         let defaults = suggestions::default_preset(&config);
+        let overridden = suggestions::project_default_overrides(
+            &host.suggestions_profile(),
+            &crate::session::projects::load_merged(&host.suggestions_profile())?,
+            &defaults,
+        );
         host.with_suggestions_db(|conn, profile| {
             suggestions::set_preset(
                 conn,
@@ -820,6 +831,7 @@ pub async fn put_suggestion_preset(
             &body.criterion,
             Some(body.preset),
             &defaults,
+            &overridden,
         )))
     })
     .await;
