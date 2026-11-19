@@ -201,6 +201,7 @@ describe("SuggestionsView", () => {
           url: "https://example.test/issues/1",
           kindLabel: "Assigned issues",
         },
+        template: { providerId: "github", criterion: "assigned" },
         title: "Fix lifecycle",
         path: "/work/aoe",
         initialTab: undefined,
