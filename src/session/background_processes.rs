@@ -463,6 +463,7 @@ pub(crate) fn shown_argv(argv: &[String]) -> Vec<String> {
     let mut hide = Hide::Nothing;
     for arg in argv {
         let arg: String = redacted(arg, &mut hide)
+            .0
             .chars()
             .map(|c| if c.is_control() { '\u{fffd}' } else { c })
             .collect();
@@ -488,15 +489,15 @@ enum Hide {
     Password,
 }
 
-/// `arg` with its credentials blanked: the value after a secret flag, of a secret variable or
-/// header (`Authorization: Bearer …`), and a URL's or `--user`'s password. `hide` carries a
-/// secret flag over to the argument after it.
-fn redacted(arg: &str, hide: &mut Hide) -> String {
+/// `arg` with its credentials blanked, and whether it held one: the value after a secret flag,
+/// of a secret variable or header (`Authorization: Bearer …`), and a URL's or `--user`'s
+/// password. `hide` carries a secret flag over to the argument after it.
+fn redacted(arg: &str, hide: &mut Hide) -> (String, bool) {
     match std::mem::replace(hide, Hide::Nothing) {
-        Hide::Value => return REDACTED.to_owned(),
+        Hide::Value => return (REDACTED.to_owned(), true),
         Hide::Password => {
             if let Some((user, _)) = arg.split_once(':') {
-                return format!("{user}:{REDACTED}");
+                return (format!("{user}:{REDACTED}"), true);
             }
         }
         Hide::Nothing => {}
@@ -505,51 +506,50 @@ fn redacted(arg: &str, hide: &mut Hide) -> String {
         .split_once(':')
         .filter(|(name, _)| !name.contains(char::is_whitespace) && secret_name(name))
     {
-        return format!("{name}: {REDACTED}");
+        return (format!("{name}: {REDACTED}"), true);
     }
     if arg.contains(char::is_whitespace) {
         // Several words in one argument: a rewritten title, or a value with spaces. Where a
-        // secret's value ends is unknown, so nothing after a blanked word is shown.
+        // secret's value ends is unknown, so nothing after a word that held one is shown.
         let mut words = Vec::new();
         let mut rest = arg.split_whitespace().peekable();
         while let Some(word) = rest.next() {
-            let shown = redacted(word, hide);
-            if shown == word {
-                words.push(shown);
-                continue;
-            }
+            let (shown, secret) = redacted(word, hide);
             let hides_rest = shown.ends_with(REDACTED);
             words.push(shown);
-            if !hides_rest && rest.peek().is_some() {
-                words.push(REDACTED.to_owned());
+            if secret {
+                if !hides_rest && rest.peek().is_some() {
+                    words.push(REDACTED.to_owned());
+                }
+                return (words.join(" "), true);
             }
-            break;
         }
-        return words.join(" ");
+        return (words.join(" "), false);
     }
-    let arg = without_url_password(arg);
+    let (arg, url_password) = without_url_password(arg);
     if let Some((name, _)) = arg.split_once('=').filter(|(name, _)| secret_name(name)) {
-        return format!("{name}={REDACTED}");
+        return (format!("{name}={REDACTED}"), true);
     }
     // A `user:password` value attached to its flag (`--user=admin:pw`, `-uadmin:pw`).
     if let Some((flag, user)) = ["--user=", "--proxy-user=", "-u"].iter().find_map(|flag| {
         let (user, _) = arg.strip_prefix(flag)?.split_once(':')?;
         Some((flag, user))
     }) {
-        return format!("{flag}{user}:{REDACTED}");
+        return (format!("{flag}{user}:{REDACTED}"), true);
     }
     if arg.starts_with('-') && secret_name(&arg) {
         *hide = Hide::Value;
     } else if matches!(arg.as_str(), "-u" | "--user" | "--proxy-user") {
         *hide = Hide::Password;
     }
-    arg
+    (arg, url_password)
 }
 
-/// `arg` with the password of any URL in it (`scheme://user:password@host`) blanked. A `@` later
-/// in the argument can only blank more than the password, never less.
-fn without_url_password(arg: &str) -> String {
+/// `arg` with the password of any URL in it (`scheme://user:password@host`) blanked, and whether
+/// it had one. A `@` later in the argument can only blank more than the password, never less.
+fn without_url_password(arg: &str) -> (String, bool) {
     let mut shown = String::new();
+    let mut found = false;
     let mut rest = arg;
     while let Some(at) = rest.find("://") {
         let (head, tail) = rest.split_at(at + 3);
@@ -561,10 +561,11 @@ fn without_url_password(arg: &str) -> String {
         {
             shown.push_str(&format!("{user}:{REDACTED}"));
             rest = &tail[info.len()..];
+            found = true;
         }
     }
     shown.push_str(rest);
-    shown
+    (shown, found)
 }
 
 /// A flag (`--api-key`), variable (`GITHUB_TOKEN`) or header (`Authorization`) whose value is a
@@ -1114,6 +1115,26 @@ mod tests {
             ),
             (
                 &["sync postgres://u:pw@db/app --verbose"],
+                &["sync postgres://u:***@db/app ***"],
+            ),
+            // A word that only reads like a blank isn't a credential: the rest is shown.
+            (
+                &["grep -c *** log --verbose"],
+                &["grep -c *** log --verbose"],
+            ),
+            // A value that already reads `***` is still a value: the rest stays hidden.
+            (&["cli", "--token=*** beta"], &["cli", "--token=***"]),
+            (
+                &["curl", "--user=admin:*** secret"],
+                &["curl", "--user=admin:***"],
+            ),
+            (&["curl", "-uadmin:*** secret"], &["curl", "-uadmin:***"]),
+            (
+                &["node app --token *** remaining"],
+                &["node app --token ***"],
+            ),
+            (
+                &["sync postgres://u:***@db/app secret"],
                 &["sync postgres://u:***@db/app ***"],
             ),
             (
