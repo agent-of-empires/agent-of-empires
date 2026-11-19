@@ -170,6 +170,65 @@ pub(crate) fn attach_projects(mappings: &Mappings, snapshot: &mut Value, registe
     }
 }
 
+/// Adds each source's effective `preset` and `customized`, and each item's `start`:
+/// what Start would create with. Run after [`attach_projects`], whose
+/// `resolved_project` it reads. Touches the filesystem, so call it without the
+/// store lock.
+pub(crate) fn attach_presets(
+    profile: &str,
+    stored: &[(String, String, Preset)],
+    registered: &[Project],
+    snapshot: &mut Value,
+) {
+    let stored_for = |provider_id: &str, criterion: &str| {
+        stored
+            .iter()
+            .find(|(p, c, _)| p == provider_id && c == criterion)
+            .map(|(_, _, preset)| preset)
+    };
+    let base = default_preset(&resolve_config_or_warn(profile));
+    for provider in snapshot["providers"].as_array_mut().into_iter().flatten() {
+        let provider_id = provider["id"].as_str().unwrap_or_default().to_string();
+        for source in provider["sources"].as_array_mut().into_iter().flatten() {
+            let own = stored_for(
+                &provider_id,
+                source["criterion"].as_str().unwrap_or_default(),
+            );
+            source["customized"] = json!(own.is_some());
+            source["preset"] = json!(own.unwrap_or(&base));
+        }
+    }
+    let mut by_project: HashMap<String, Preset> = HashMap::new();
+    for item in snapshot["items"].as_array_mut().into_iter().flatten() {
+        let project = item["resolved_project"].clone();
+        let own = stored_for(
+            item["provider_id"].as_str().unwrap_or_default(),
+            item["criterion"].as_str().unwrap_or_default(),
+        );
+        let effective = match (own, project["path"].as_str()) {
+            (Some(own), _) => own.clone(),
+            (None, Some(path)) => by_project
+                .entry(path.to_string())
+                .or_insert_with(|| {
+                    let project = registered.iter().find(|p| p.path == path);
+                    default_preset(&project_config(profile, project))
+                })
+                .clone(),
+            (None, None) => base.clone(),
+        };
+        let mut start = json!({
+            "agent": effective.agent,
+            "view": effective.view,
+            "worktree": effective.worktree,
+            "sandbox": effective.sandbox,
+        });
+        if !project.is_null() {
+            start["project"] = project;
+        }
+        item["start"] = start;
+    }
+}
+
 /// The live item plus the mapping its `mapping_key` names, if any.
 pub(crate) fn find_item_with_mapping(
     conn: &Connection,
