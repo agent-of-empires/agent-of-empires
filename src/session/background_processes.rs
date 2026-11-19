@@ -507,6 +507,13 @@ fn redacted(arg: &str, hide: &mut Hide) -> String {
     {
         return format!("{name}: {REDACTED}");
     }
+    // Before the word split below, so a value with spaces (`--token=alpha beta`) is hidden whole.
+    if let Some((name, _)) = arg
+        .split_once('=')
+        .filter(|(name, _)| !name.contains(char::is_whitespace) && secret_name(name))
+    {
+        return format!("{name}={REDACTED}");
+    }
     if arg.contains(char::is_whitespace) {
         // A process that rewrites its title can report several words as one argument.
         let mut words = Vec::new();
@@ -1021,6 +1028,11 @@ mod tests {
                 &["cli", "--token", "***", "next"],
             ),
             (&["cli", "--token=abc"], &["cli", "--token=***"]),
+            (&["cli", "--token=alpha beta"], &["cli", "--token=***"]),
+            (
+                &["env", "API_KEY=alpha beta", "node"],
+                &["env", "API_KEY=***", "node"],
+            ),
             (&["cli", "--password", "pw"], &["cli", "--password", "***"]),
             (
                 &["cli", "--api-key", "k", "--verbose"],
