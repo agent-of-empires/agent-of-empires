@@ -451,6 +451,7 @@ describe("SuggestionsView", () => {
       const onPrepare = await open(snapshot());
       fireEvent.click(await screen.findByRole("button", { name: "Start" }));
       expect(await screen.findByText(/Couldn't start: worktree branch already exists\./)).toBeTruthy();
+      expect(screen.queryByRole("button", { name: "Try again" })).toBeNull();
       expect(screen.queryByRole("alert")).toBeNull();
       expect(onPrepare).not.toHaveBeenCalled();
 

@@ -142,6 +142,8 @@ interface ActionsProps {
   stale?: boolean;
   /** The last start failed: Start becomes Try again, beside Start with changes. */
   failed?: boolean;
+  /** False when trying again would fail the same way: only Start with changes is offered. */
+  retryable?: boolean;
   /** This row's start is running. */
   starting?: boolean;
   /** The ▾ menu; absent on a dismissed row. */
@@ -249,6 +251,7 @@ export function SuggestionActions({
   started,
   stale = false,
   failed = false,
+  retryable = true,
   starting = false,
   menu,
   startIn,
@@ -287,7 +290,7 @@ export function SuggestionActions({
           onPick={startIn.onPick}
         />
       )}
-      {showStart && !(startIn && !failed && !starting) && (
+      {showStart && !(startIn && !failed && !starting) && !(failed && !retryable) && (
         <button
           type="button"
           onClick={onStart}
