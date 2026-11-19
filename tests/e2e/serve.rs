@@ -4371,7 +4371,7 @@ case "$*" in
     fi
     ;;
   "funnel --bg --yes "*)
-    printf '%s\n' '{"Web":{"fixture.tailnet.ts.net:443":{"Handlers":{"/":{"Proxy":"http://127.0.0.1:'"$4"'"}}}},"AllowFunnel":{"fixture.tailnet.ts.net:443":true}}' > "$AOE_TEST_FUNNEL_STATE"
+    printf '%s\n' '{"Web":{"fixture.tailnet.ts.net:443":{"Handlers":{"/":{"Proxy":"http://127.0.0.1:'"$5"'"}}}},"AllowFunnel":{"fixture.tailnet.ts.net:443":true}}' > "$AOE_TEST_FUNNEL_STATE"
     ;;
   "funnel "*off)
     printf '{}\n' > "$AOE_TEST_FUNNEL_STATE"
@@ -4518,7 +4518,7 @@ case "$*" in
     fi
     ;;
   "funnel --bg --yes "*)
-    printf '%s\n' '{"Web":{"fixture.tailnet.ts.net:443":{"Handlers":{"/":{"Proxy":"http://127.0.0.1:'"$4"'"}}}},"AllowFunnel":{"fixture.tailnet.ts.net:443":true}}' > "$AOE_TEST_FUNNEL_STATE"
+    printf '%s\n' '{"Web":{"fixture.tailnet.ts.net:443":{"Handlers":{"/":{"Proxy":"http://127.0.0.1:'"$5"'"}}}},"AllowFunnel":{"fixture.tailnet.ts.net:443":true}}' > "$AOE_TEST_FUNNEL_STATE"
     ;;
   "funnel "*off)
     printf '{}\n' > "$AOE_TEST_FUNNEL_STATE"
