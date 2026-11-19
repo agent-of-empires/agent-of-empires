@@ -181,13 +181,18 @@ async fn sensitive_routes_are_blocked() {
         ),
         (
             Method::PUT,
-            "/api/suggestions/templates",
-            r#"{"provider_id":"x","criterion":"c","template":"t"}"#,
+            "/api/suggestions/presets",
+            r#"{"provider_id":"x","criterion":"c","preset":{"agent":"claude","view":"structured","worktree":false,"sandbox":false,"yolo":false,"prompt":null}}"#,
         ),
         (
             Method::DELETE,
-            "/api/suggestions/templates",
-            r#"{"provider_id":"x","criterion":"c"}"#,
+            "/api/suggestions/presets?provider_id=x&criterion=c",
+            "",
+        ),
+        (
+            Method::POST,
+            "/api/suggestions/start",
+            r#"{"provider_id":"x","id":"y"}"#,
         ),
         (
             Method::POST,
@@ -413,7 +418,7 @@ async fn suggestion_reads_stay_reachable_in_cityhall() {
     let app = build_router_for_test(state);
     for uri in [
         "/api/suggestions",
-        "/api/suggestions/templates",
+        "/api/suggestions/presets",
         "/api/suggestions/mappings",
     ] {
         let resp = app
