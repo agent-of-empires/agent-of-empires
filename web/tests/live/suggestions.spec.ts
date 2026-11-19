@@ -67,7 +67,7 @@ const snapshot = async (serve: ServeHandle) => (await api(serve, "")).json();
 const waitForItems = (serve: ServeHandle) =>
   expect.poll(async () => (await snapshot(serve)).items?.length ?? 0, { timeout: 30_000 }).toBe(2);
 
-test("preferences, templates, mappings and dismissals round-trip through the server", async ({ spawnServe, page }) => {
+test("preferences, presets, mappings and dismissals round-trip through the server", async ({ spawnServe, page }) => {
   const serve = await spawnServe({ seedFn: seedProvider });
   await waitForItems(serve);
 
