@@ -103,15 +103,15 @@ Change any proposal with its select, then **Link N repos** stores every checked 
 |---|---|
 | `j` / `k` | Select |
 | Enter | Start with the preset. On a started item it opens the session |
-| `e` | Start with changes: the first press resolves the final prompt and shows it ("Review the prompt below, then press e to start."); the second opens the New session dialog |
+| `e` | Start with changes: opens the New session dialog prefilled from the kind's preset and the final prompt |
 | `N` | A new session for the item that does not take its link, so a started item can have another |
-| `z` | Dismiss or restore |
+| `z` | Dismiss or restore (`Z` in strict mode, as on Home) |
 | `d` | Toggle the dismissed list |
 | `r` | Ask providers to refresh, then reload the list. On a read-only dashboard it only reloads |
 | PgUp / PgDn | Scroll the prompt |
 | Esc | Back |
 
-If the repo has hooks nobody has approved, Enter shows them in a review dialog; approving starts the session and cancelling starts nothing. A start that fails shows "Couldn't start: <reason>" with what to do on its row, and Enter tries again. An item whose repo is linked to no Project opens the New session dialog to pick one. A stale item says "No longer open at the source. Dismiss it, or wait for the next refresh."
+If the repo has hooks nobody has approved, Enter shows them in a review dialog; approving starts the session and cancelling starts nothing. A hooks review that is out of date (the hooks changed after you read them) shows again. A start that fails shows "Couldn't start: <reason>" with what to do on its row, and Enter tries again. An item whose repo is linked to no Project opens the New session dialog to pick one, from Home and from the full view. A stale item says "No longer open at the source. Dismiss it, or wait for the next refresh."
 
 **New-session dialog.** The dialog has no Prompt row. The first turn is one line above the footer: "Prompt from GitHub, not checked by AoE" for a suggestion, or "Prompt: none". `Ctrl+O` opens it in a small editor, which also shows the item's source text; `Esc` closes it and keeps your edits. `Ctrl+P` still opens the focused row's picker. The prompt is sent once the agent is ready (typed into a terminal session, or sent as the first turn of a [structured-view](../structured-view.md) one).
 
