@@ -2,7 +2,7 @@ import { updateSuggestionSource } from "../lib/api";
 import { useAgentNames } from "../hooks/useAgentNames";
 import { useSuggestionPresets } from "../hooks/useSuggestionPresets";
 import { SuggestionItemActions } from "./SuggestionItemActions";
-import { HooksTrustDialog } from "./session-wizard/HooksTrustDialog";
+import { SuggestionHooksReview } from "./SuggestionHooksReview";
 import { suggestionKey, useDismissUndo, useSuggestions } from "../hooks/useSuggestions";
 import { useIsWideViewport } from "../hooks/useIsWideViewport";
 import { SUGGESTION_NOTE_CLASS, SuggestionRow, SuggestionStatusNotes, UndoBar } from "./SuggestionRow";
@@ -128,18 +128,7 @@ export function DashboardSuggestions({
           {alert}
         </p>
       )}
-      {ctrl.hooksReview && (
-        <HooksTrustDialog
-          starting={ctrl.hooksReview.item.title}
-          onCreate={ctrl.hooksReview.review.commands.on_create ?? []}
-          onLaunch={ctrl.hooksReview.review.commands.on_launch ?? []}
-          onDestroy={ctrl.hooksReview.review.commands.on_destroy ?? []}
-          needsMcpTrust={ctrl.hooksReview.review.needs_mcp_trust === true}
-          mcpSummaries={[]}
-          onConfirm={ctrl.approveHooks}
-          onCancel={ctrl.cancelHooks}
-        />
-      )}
+      <SuggestionHooksReview ctrl={ctrl} />
       {undo && (
         <UndoBar
           title={undo.title}
