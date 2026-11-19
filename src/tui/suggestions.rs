@@ -572,6 +572,8 @@ pub(super) struct SuggestionsView {
     prepare_another: bool,
     /// The last start that failed, shown on its row; Enter tries again.
     pub(super) failed: Option<(ItemKey, String)>,
+    /// Strict mode keys: dismiss is `Z`, not `z`.
+    pub(super) strict: bool,
 }
 
 impl SuggestionsView {
@@ -596,6 +598,7 @@ impl SuggestionsView {
             preparing: None,
             prepare_another: false,
             failed: None,
+            strict: false,
         }
     }
 
@@ -715,7 +718,7 @@ impl SuggestionsView {
                 }
                 store.reload();
             }
-            KeyCode::Char('z' | 'Z') if mutations_allowed => {
+            KeyCode::Char(c) if c == self.dismiss_key() && mutations_allowed => {
                 if let Some(item) = self.item_at(store, self.selected) {
                     let (key, dismissed) =
                         ((item.provider_id.clone(), item.id.clone()), !item.dismissed);
@@ -723,7 +726,7 @@ impl SuggestionsView {
                     store.dismiss(&key, dismissed);
                 }
             }
-            KeyCode::Char('z' | 'Z') => {
+            KeyCode::Char(c) if c == self.dismiss_key() => {
                 self.error = block.map(|b| block_note(b).to_string());
             }
             KeyCode::Enter | KeyCode::Char('e' | 'N') => {
@@ -759,6 +762,14 @@ impl SuggestionsView {
             _ => {}
         }
         SuggestionsAction::Continue
+    }
+
+    fn dismiss_key(&self) -> char {
+        if self.strict {
+            'Z'
+        } else {
+            'z'
+        }
     }
 
     /// Asks for `key`'s prefill; the dialog opens when it arrives.
@@ -888,7 +899,10 @@ impl SuggestionsView {
             )));
         }
         footer.push(Line::from(Span::styled(
-            "j/k select · Enter start/open · e start with changes · N new · z dismiss/restore · d dismissed · r refresh · PgUp/PgDn prompt · Esc back",
+            format!(
+                "j/k select · Enter start/open · e start with changes · N new · {} dismiss/restore · d dismissed · r refresh · PgUp/PgDn prompt · Esc back",
+                self.dismiss_key()
+            ),
             Style::default().fg(theme.dimmed),
         )));
         let width = (inner.width as usize).max(1);
