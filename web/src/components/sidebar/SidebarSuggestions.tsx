@@ -76,7 +76,7 @@ export function SidebarSuggestions({ readOnly = false, onPrepare, onViewAll, onO
                   </span>
                   <span className="block truncate text-[11px] text-text-muted">
                     {failure
-                      ? `Couldn't start: ${failure.reason}`
+                      ? `Couldn't start: ${failure.reason}${failure.hint ? `. ${failure.hint}` : ""}`
                       : [snapshot.prefs.show_source_ref ? item.source_ref : null, item.reason]
                           .filter(Boolean)
                           .join(" · ")}

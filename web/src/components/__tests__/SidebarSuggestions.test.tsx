@@ -140,6 +140,24 @@ describe("SidebarSuggestions", () => {
     );
   });
 
+  it("a failed start shows the reason and what to do", async () => {
+    startSuggestion.mockResolvedValueOnce({
+      kind: "failed",
+      reason: "Docker isn't running",
+      hint: "Start it, then try again.",
+      retryable: true,
+    });
+    fetchSuggestions.mockResolvedValue(snap(ITEMS, true));
+    renderIt();
+    fireEvent.click(await screen.findByTestId("sidebar-suggested-toggle"));
+    fireEvent.click(screen.getAllByTestId("sidebar-suggested-row")[0]!);
+    await waitFor(() =>
+      expect(screen.getAllByTestId("sidebar-suggested-row")[0]!.textContent).toBe(
+        "Item 1Couldn't start: Docker isn't running. Start it, then try again.",
+      ),
+    );
+  });
+
   it("hides started suggestions, and the group is absent with nothing open", async () => {
     const started = { id: "s9", title: "Fix", status: "Running" as const, archived: false, created_at: "" };
     fetchSuggestions.mockResolvedValue(snap([mk(1, { started_session: started }), mk(2)], true));
