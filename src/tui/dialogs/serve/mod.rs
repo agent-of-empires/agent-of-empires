@@ -772,6 +772,34 @@ fn is_restart_key(code: KeyCode) -> bool {
     matches!(code, KeyCode::Char('r' | 'R'))
 }
 
+/// A key that may still be held down from before a boundary. The TUI gets no release events,
+/// so a held key's repeats arrive as presses; it stays inert until a different key arrives.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum HeldKey {
+    /// The R that opened this screen from Connections.
+    Restart,
+    /// An Enter pressed during a restart check, or the Enter that confirmed one.
+    Enter,
+}
+
+impl HeldKey {
+    fn matches(self, code: KeyCode) -> bool {
+        match self {
+            Self::Restart => is_restart_key(code),
+            Self::Enter => code == KeyCode::Enter,
+        }
+    }
+}
+
+/// Why a landed check shows its effects without asking.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Unasked {
+    /// Enter was pressed during the first check.
+    EarlyEnter,
+    /// The check after a confirm found different effects.
+    Changed,
+}
+
 fn funnel_reset_applies(mode: ServeMode, transport: Option<TunnelTransport>) -> bool {
     mode == ServeMode::Tunnel && transport == Some(TunnelTransport::Tailscale)
 }
@@ -851,9 +879,9 @@ pub struct ServeView {
     pending_confirm: Option<(PendingConfirm, Instant)>,
     /// The error screen's Funnel reset, armed by R and awaiting Enter.
     funnel_reset_armed: Option<Instant>,
-    /// The R that opened this screen from Connections may still be held, so R does nothing
-    /// until another key arrives.
-    restart_key_held: bool,
+    held_key: Option<HeldKey>,
+    /// A landed check that shows its effects without asking, until the next key.
+    unasked: Option<(PendingConfirm, Unasked)>,
     show_help: bool,
     mouse: RefCell<ServeMouse>,
     copied: Option<(&'static str, Instant)>,
@@ -964,7 +992,8 @@ impl ServeView {
             pending_passphrase: String::new(),
             pending_confirm: None,
             funnel_reset_armed: None,
-            restart_key_held: false,
+            held_key: None,
+            unasked: None,
             show_help: false,
             mouse: RefCell::default(),
             copied: None,
@@ -1054,7 +1083,7 @@ impl ServeView {
 
     /// Opened from Connections by `key`: when it was R, its hold may carry over.
     pub fn opened_by(&mut self, key: &KeyEvent) {
-        self.restart_key_held = is_restart_key(key.code);
+        self.held_key = is_restart_key(key.code).then_some(HeldKey::Restart);
     }
 
     pub fn handle_key(&mut self, key: KeyEvent) -> ServeAction {
@@ -1063,10 +1092,11 @@ impl ServeView {
 
     /// [`Self::handle_key`] at `now`, the clock the confirm window is read against.
     fn handle_key_at(&mut self, key: KeyEvent, now: Instant) -> ServeAction {
-        if self.restart_key_held && is_restart_key(key.code) {
+        if self.held_key.is_some_and(|held| held.matches(key.code)) {
             return ServeAction::Continue;
         }
-        self.restart_key_held = false;
+        self.held_key = None;
+        self.unasked = None;
         if matches!(key.code, KeyCode::Esc | KeyCode::Char('q')) && !self.show_help {
             self.pending = None;
             self.pending_confirm = None;
@@ -1155,6 +1185,7 @@ impl ServeView {
             // cancels: a bounce can't undo a confirm.
             PendingJob::Restart { intent, .. } => {
                 if code == KeyCode::Enter && matches!(intent, RestartIntent::Confirm(_)) {
+                    self.held_key = Some(HeldKey::Enter);
                     return true;
                 }
                 let repeated = match intent {
@@ -1345,6 +1376,7 @@ impl ServeView {
     }
 
     fn prepare_launch(&mut self, request: ServeLaunchRequest) {
+        self.unasked = None;
         self.pending_confirm = None;
         self.show_help = false;
         self.launch_in_flight = true;
@@ -1430,6 +1462,7 @@ impl ServeView {
 
     pub(crate) fn begin_stop(&mut self) {
         self.pending = None;
+        self.unasked = None;
         self.pending_confirm = None;
         self.funnel_reset_armed = None;
         self.pending_launch = None;
@@ -1494,6 +1527,9 @@ impl ServeView {
         let intent = match code {
             KeyCode::Enter => {
                 confirmed = armed;
+                if armed.is_some() {
+                    self.held_key = Some(HeldKey::Enter);
+                }
                 armed.map(RestartIntent::Confirm)
             }
             KeyCode::Char('g' | 'G') if mode == ServeMode::Tunnel => {
@@ -1621,8 +1657,19 @@ impl ServeView {
             });
         } else {
             self.restart_probe = fresh;
-            // The prompt shows now, so its window starts now.
-            self.pending_confirm = Some((action, now));
+            if self.held_key == Some(HeldKey::Enter) {
+                // That Enter may still be held, so asking now could take its repeat as a
+                // confirm. An R or G ends the repeat and checks again.
+                let why = if repeated {
+                    Unasked::Changed
+                } else {
+                    Unasked::EarlyEnter
+                };
+                self.unasked = Some((action, why));
+            } else {
+                // The prompt shows now, so its window starts now.
+                self.pending_confirm = Some((action, now));
+            }
         }
     }
 
@@ -1779,6 +1826,7 @@ impl ServeView {
     }
 
     fn fail_work(&mut self, mode: ServeMode, transport: Option<TunnelTransport>, message: String) {
+        self.unasked = None;
         self.pending_confirm = None;
         self.pending_launch = None;
         self.launch_in_flight = false;

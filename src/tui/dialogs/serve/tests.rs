@@ -72,6 +72,7 @@ fn starting() -> ServeViewState {
 }
 
 /// [`wait_for`], with every tick read at `now`.
+#[track_caller]
 fn wait_for_at(view: &mut ServeView, now: Instant, predicate: impl Fn(&ServeView) -> bool) {
     let deadline = Instant::now() + Duration::from_secs(10);
     while !predicate(view) {
@@ -81,6 +82,7 @@ fn wait_for_at(view: &mut ServeView, now: Instant, predicate: impl Fn(&ServeView
     }
 }
 
+#[track_caller]
 fn wait_for(view: &mut ServeView, predicate: impl Fn(&ServeView) -> bool) {
     let deadline = Instant::now() + Duration::from_secs(10);
     while !predicate(view) {
@@ -90,15 +92,19 @@ fn wait_for(view: &mut ServeView, predicate: impl Fn(&ServeView) -> bool) {
     }
 }
 
+/// Whether a restart check, or the launch context a confirm reads, is still running.
+fn assessing(view: &ServeView) -> bool {
+    view.pending.as_ref().is_some_and(|pending| {
+        matches!(
+            pending.kind,
+            PendingJob::Restart { .. } | PendingJob::LaunchContext(_)
+        )
+    })
+}
+
+#[track_caller]
 fn wait_assessment(view: &mut ServeView) {
-    wait_for(view, |view| {
-        !view.pending.as_ref().is_some_and(|pending| {
-            matches!(
-                pending.kind,
-                PendingJob::Restart { .. } | PendingJob::LaunchContext(_)
-            )
-        })
-    });
+    wait_for(view, |view| !assessing(view));
 }
 
 fn snapshot() -> JobResult {
@@ -489,7 +495,7 @@ fn token_age_counts_only_under_token_auth() {
 
 #[test]
 #[serial_test::serial]
-fn second_restart_key_reprobes_and_reconfirms_when_the_effect_changed() {
+fn a_changed_recheck_shows_its_effects_and_asks_only_after_another_r() {
     let _home = crate::session::test_support::isolate_app_dir();
     let token = crate::session::get_app_dir().unwrap().join("serve.token");
     let mut jobs = ServeJobs::default();
@@ -512,11 +518,25 @@ fn second_restart_key_reprobes_and_reconfirms_when_the_effect_changed() {
     view.handle_key(enter());
     wait_assessment(&mut view);
     assert_eq!(view.restart_probe.local_token, TokenWindow::Renews);
+    assert!(view.take_launch().is_none(), "a changed re-check restarted");
+    // The confirming Enter may still be held, so the re-check doesn't ask again.
+    assert!(view.pending_confirm.is_none(), "a changed re-check asked");
+    assert_eq!(
+        view.unasked,
+        Some((PendingConfirm::Restart, Unasked::Changed))
+    );
+    view.handle_key(enter());
+    assert!(!assessing(&view), "Enter after a changed re-check");
     assert!(view.take_launch().is_none());
+    view.handle_key(key('R'));
+    wait_assessment(&mut view);
     assert!(view.pending_confirm.is_some());
     view.handle_key(enter());
     wait_assessment(&mut view);
-    assert!(view.take_launch().is_some());
+    assert!(
+        view.take_launch().is_some(),
+        "R, then Enter, after a changed re-check"
+    );
 }
 
 #[test]
@@ -3048,8 +3068,9 @@ fn a_held_serve_key_from_connections_does_nothing_on_the_serve_screen() {
 }
 
 /// R or G arms, and the prompt shows once the arming assessment lands. Only Enter within 3 s of
-/// the prompt confirms; Enter while an assessment runs does nothing. Any other key cancels, and
-/// the arming key, however long it is held, never confirms.
+/// the prompt confirms; Enter while an assessment runs does nothing, and no prompt follows an
+/// Enter until R or G checks again. Any other key cancels, and the arming key, however long it
+/// is held, never confirms.
 #[test]
 #[serial_test::serial]
 fn a_restart_and_a_new_passphrase_confirm_only_with_enter() {
@@ -3085,30 +3106,51 @@ fn a_restart_and_a_new_passphrase_confirm_only_with_enter() {
     assert!(view.pending.is_none(), "Enter with nothing armed");
     assert!(view.take_launch().is_none());
 
-    // Nothing asks during the check, so an Enter then does nothing, whether or not the landed
-    // effects match the empty starting probe; Enter once it asks restarts.
-    for landed in [
-        RestartProbe::default(),
-        RestartProbe {
-            port: Some(8080),
-            ..RestartProbe::default()
-        },
+    // An Enter during the first check may still be held when it lands, so the check shows its
+    // effects without asking and Enter does nothing; R or G checks again, and Enter on that
+    // prompt confirms. A second Enter during the confirm's re-check doesn't undo it.
+    for (code, mode, landed) in [
+        ('R', ServeMode::Local, RestartProbe::default()),
+        (
+            'R',
+            ServeMode::Local,
+            RestartProbe {
+                port: Some(8080),
+                ..RestartProbe::default()
+            },
+        ),
+        ('G', ServeMode::Tunnel, RestartProbe::default()),
     ] {
-        let (_jobs, gate, mut view) = arm('R', ServeMode::Local);
+        let action = if code == 'G' {
+            PendingConfirm::NewPassphrase
+        } else {
+            PendingConfirm::Restart
+        };
+        let (_jobs, gate, mut view) = arm(code, mode);
         view.handle_key(enter());
         assert!(
             view.pending.is_some(),
             "Enter during the check cancelled it"
         );
         gate.release(JobResult::Restart(landed.clone()));
-        wait_for(&mut view, |view| view.pending_confirm.is_some());
+        wait_assessment(&mut view);
         assert!(
-            view.take_launch().is_none(),
-            "Enter during the check, {landed:?}"
+            view.pending_confirm.is_none(),
+            "{code} asked after an early Enter"
         );
+        assert_eq!(view.unasked, Some((action, Unasked::EarlyEnter)));
+        view.handle_key(enter());
+        assert!(
+            !assessing(&view),
+            "{code}: an early Enter's repeat confirmed"
+        );
+        assert!(view.take_launch().is_none(), "{code}, {landed:?}");
+        view.handle_key(key(code));
+        gate.entered(Held::Restart);
+        gate.release(JobResult::Restart(landed.clone()));
+        wait_for(&mut view, |view| view.pending_confirm.is_some());
         view.handle_key(enter());
         gate.entered(Held::Restart);
-        // A second Enter (a bounce or double tap) during the re-check doesn't undo the confirm.
         view.handle_key(enter());
         assert!(
             view.pending.is_some(),
@@ -3118,7 +3160,7 @@ fn a_restart_and_a_new_passphrase_confirm_only_with_enter() {
         wait_assessment(&mut view);
         assert!(
             view.take_launch().is_some(),
-            "Enter once it asks, {landed:?}"
+            "{code} again, then Enter, {landed:?}"
         );
     }
 

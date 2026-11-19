@@ -9,7 +9,7 @@ use crossterm::event::{KeyCode, KeyEvent};
 
 use super::{
     funnel_reset_applies, Flash, LinkChange, Logins, PendingConfirm, RestartEffect, ServeMode,
-    ServeMouse, ServeView, ServeViewState, TransportStatus, TunnelTransport, FLASH_TTL,
+    ServeMouse, ServeView, ServeViewState, TransportStatus, TunnelTransport, Unasked, FLASH_TTL,
 };
 use crate::tui::components::hint_buttons::scan_spaced_hints;
 use crate::tui::components::hover::paint_hover_bg;
@@ -775,8 +775,12 @@ fn render_active(
         .border_style(Style::default().fg(theme.border));
     let footer_inner = footer_block.inner(footer);
     frame.render_widget(footer_block, footer);
-    let footer_text = match view.pending_confirm.map(|(action, _)| action) {
-        Some(action) => {
+    let asking = view
+        .pending_confirm
+        .map(|(action, _)| (action, None))
+        .or(view.unasked.map(|(action, why)| (action, Some(why))));
+    let footer_text = match asking {
+        Some((action, unasked)) => {
             let effect = RestartEffect::of(
                 *mode,
                 urls,
@@ -813,15 +817,30 @@ fn render_active(
             let funnel_back = (action == PendingConfirm::Restart && effect.retakes_funnel).then_some(
                 "The Funnel link comes back only if no other server holds it; otherwise the Daemon stops and says why.",
             );
+            let again = match action {
+                PendingConfirm::NewPassphrase => "Press G to check again.",
+                PendingConfirm::Restart => "Press R to check again.",
+            };
+            let (lead, first, cancels) = match unasked {
+                None => (None, first, Some("Any other key cancels.")),
+                Some(Unasked::EarlyEnter) => {
+                    (Some("Enter was pressed before this asked. "), again, None)
+                }
+                Some(Unasked::Changed) => (None, again, None),
+            };
             let rest = [effect_text]
                 .into_iter()
                 .chain(link)
                 .chain(funnel_back)
-                .chain(["Any other key cancels."]);
-            let mut spans = vec![Span::styled(
+                .chain(cancels);
+            let mut spans: Vec<_> = lead
+                .map(|lead| Span::styled(lead, dimmed))
+                .into_iter()
+                .collect();
+            spans.push(Span::styled(
                 first,
                 Style::default().fg(theme.waiting).bold(),
-            )];
+            ));
             spans.extend(rest.map(|s| Span::styled(format!(" {s}"), dimmed)));
             Text::from(Line::from(spans))
         }
@@ -1767,6 +1786,25 @@ mod tests {
                 let (x, y) = crate::tui::dialogs::test_render::find(&buf, "cancels.");
                 assert_eq!(buf[(x, y)].fg, theme.dimmed, "{case}");
             }
+
+            // A check that shows its effects without asking names the key that asks again.
+            let again = match key {
+                G => "Press G to check again.",
+                R => "Press R to check again.",
+            };
+            view.pending_confirm = None;
+            for (why, lead) in [
+                (Unasked::EarlyEnter, "Enter was pressed before this asked. "),
+                (Unasked::Changed, ""),
+            ] {
+                view.unasked = Some((key, why));
+                let buf = crate::tui::dialogs::test_render::draw(120, 24, |f, theme| {
+                    render(&view, f, f.area(), theme)
+                });
+                let footer = text_in(&buf, Rect::new(0, 21, 120, 3));
+                assert_eq!(footer, format!("{lead}{again} {effects}"), "{case} {why:?}");
+            }
+            view.unasked = None;
 
             if help_restart.is_empty() {
                 continue;
