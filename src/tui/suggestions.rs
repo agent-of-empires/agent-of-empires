@@ -951,12 +951,10 @@ impl SuggestionsView {
 
 /// How often the Home list reloads the suggestions snapshot.
 const FEED_RELOAD: std::time::Duration = std::time::Duration::from_secs(60);
-const SOURCE_LABEL_WIDTH: usize = 6;
 
 /// What the Home list shows for one suggestion; provider text is untrusted and
 /// already stripped of control characters.
 pub(super) struct Entry {
-    pub label: String,
     pub source_ref: String,
     pub title: String,
     pub reason: String,
@@ -1262,12 +1260,7 @@ impl SuggestionsFeed {
     pub(super) fn entry(&self, key: &ItemKey) -> Option<Entry> {
         let item = self.item(key)?;
         let provider = self.provider(&key.0)?;
-        let name = plain(&provider.name);
-        let first = name.split_whitespace().next().unwrap_or_default();
-        let label =
-            crate::tui::components::prefix_within_width(first, SOURCE_LABEL_WIDTH).to_owned();
         Some(Entry {
-            label,
             source_ref: self.source_ref(item).map(plain).unwrap_or_default(),
             title: plain(&item.title),
             reason: plain(&item.reason),

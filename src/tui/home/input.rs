@@ -7784,7 +7784,7 @@ impl HomeView {
                         .entry(&(provider_id.clone(), id.clone()))
                     {
                         Some(entry) => {
-                            format!("{} {} {}", entry.label, entry.source_ref, entry.title)
+                            format!("{} {} {}", entry.provider, entry.source_ref, entry.title)
                         }
                         None => continue,
                     }
@@ -7852,7 +7852,7 @@ impl HomeView {
                         .entry(&(provider_id.clone(), id.clone()))
                     {
                         Some(entry) => {
-                            format!("{} {} {}", entry.label, entry.source_ref, entry.title)
+                            format!("{} {} {}", entry.provider, entry.source_ref, entry.title)
                         }
                         None => continue,
                     }

@@ -7,7 +7,6 @@ use ratatui::widgets::{Block, BorderType, Borders, Padding, Paragraph, Wrap};
 use ratatui::Frame;
 
 use super::*;
-use crate::tui::components::rendered_width;
 use crate::tui::dialogs::{PaletteAction, PaletteCommand, PaletteGroup};
 use crate::tui::styles::Theme;
 
@@ -363,7 +362,7 @@ impl HomeView {
         true
     }
 
-    /// Muted `source ref ` prefix and the title of a suggestion row.
+    /// The title of a suggestion row and the muted ` source ref` after it.
     pub(super) fn suggestion_row_text(
         &self,
         provider_id: &str,
@@ -372,12 +371,11 @@ impl HomeView {
         let entry = self
             .suggestions_feed
             .entry(&(provider_id.to_owned(), id.to_owned()))?;
-        let pad = " ".repeat(6usize.saturating_sub(rendered_width(&entry.label)));
-        let prefix = if entry.source_ref.is_empty() {
-            format!("{}{pad} ", entry.label)
+        let suffix = if entry.source_ref.is_empty() {
+            String::new()
         } else {
-            format!("{}{pad} {} ", entry.label, entry.source_ref)
+            format!(" {}", entry.source_ref)
         };
-        Some((prefix, entry.title))
+        Some((entry.title, suffix))
     }
 }
