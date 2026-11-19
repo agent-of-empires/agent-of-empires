@@ -311,6 +311,7 @@ export type IntegrationLostReason =
 // One variant per Event::* in src/acp/state.rs, externally tagged.
 export type AcpEvent =
   | { PlanUpdated: { plan: Plan } }
+  | { PlanRemoved: { plan_id: string } }
   | {
       TodoListUpdated: {
         todos: Array<{ id: string; text: string; completed: boolean }>;

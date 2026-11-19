@@ -4755,7 +4755,8 @@
       "kind": "live-playwright",
       "risk": "high",
       "specs": ["tests/live/acp-stories/agent-status.spec.ts"],
-      "components": ["web/src/components/WorkspaceSidebar.tsx"]
+      "components": ["web/src/components/WorkspaceSidebar.tsx"],
+      "notes": "The row summarizes the latest plan and drops it after a matching plan_removed or a /clear."
     },
     {
       "id": "story.sidebar-queued-count",
@@ -5063,7 +5064,8 @@
       "kind": "live-playwright",
       "risk": "high",
       "specs": ["tests/live/acp-stories/agent-status.spec.ts"],
-      "components": ["web/src/components/acp/StructuredView.tsx", "web/src/components/acp/PlanStrip.tsx"]
+      "components": ["web/src/components/acp/StructuredView.tsx", "web/src/components/acp/PlanStrip.tsx"],
+      "notes": "Legacy plan and plan_update checklists render; a matching plan_removed or a /clear hides the strip."
     },
     {
       "id": "story.diff-viewer-shows-files",

@@ -738,6 +738,10 @@ pub enum Event {
     PlanUpdated {
         plan: Plan,
     },
+    /// The agent dropped plan `plan_id`; clears the strip only if it shows that plan.
+    PlanRemoved {
+        plan_id: String,
+    },
     TodoListUpdated {
         todos: Vec<Todo>,
     },
@@ -1135,6 +1139,15 @@ impl AcpState {
     pub fn apply_event(&mut self, seq: u64, event: Event) -> Result<u64, StateError> {
         match event {
             Event::PlanUpdated { plan } => self.current_plan = Some(plan),
+            Event::PlanRemoved { plan_id } => {
+                if self
+                    .current_plan
+                    .as_ref()
+                    .is_some_and(|plan| plan.plan_id == plan_id)
+                {
+                    self.current_plan = None;
+                }
+            }
             Event::TodoListUpdated { todos } => self.todos = todos,
             Event::ToolCallStarted { tool_call } => {
                 self.sidebar_phase = SidebarPhase::Active;
