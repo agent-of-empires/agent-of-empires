@@ -11565,19 +11565,26 @@ async fn a_suggestion_has_one_primary_session() {
     let (status, another) = create("another", false, null.clone()).await;
     assert_eq!(status, axum::http::StatusCode::CREATED, "{another}");
 
-    // Trash frees the link; archive keeps it.
-    {
-        let mut instances = state.instances.write().await;
-        let held = instances.iter_mut().find(|i| i.id == first["id"]).unwrap();
-        held.archived_at = Some(chrono::Utc::now());
-    }
+    // Trash frees the link; archive keeps it. Both go through the handlers, so the
+    // durable row changes too: an in-memory edit is replaced by the next publish.
+    let first_id = first["id"].as_str().unwrap().to_string();
+    let response = update_session_archive(
+        State(state.clone()),
+        Path(first_id.clone()),
+        Ok(Json(UpdateArchiveBody {
+            archived: true,
+            kill_pane: false,
+        })),
+    )
+    .await
+    .into_response();
+    assert_eq!(response.status(), axum::http::StatusCode::OK);
     let (status, _) = create("while archived", true, null.clone()).await;
     assert_eq!(status, axum::http::StatusCode::CONFLICT);
-    {
-        let mut instances = state.instances.write().await;
-        let held = instances.iter_mut().find(|i| i.id == first["id"]).unwrap();
-        held.trashed_at = Some(chrono::Utc::now());
-    }
+    let response = trash_session(State(state.clone()), Path(first_id), None)
+        .await
+        .into_response();
+    assert_eq!(response.status(), axum::http::StatusCode::OK);
     let (status, second) = create("after trash", true, null).await;
     assert_eq!(status, axum::http::StatusCode::CREATED, "{second}");
 }
