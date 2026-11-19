@@ -54,15 +54,15 @@ pub(crate) enum Claim {
 }
 
 /// Claims the primary link of an item for the Session `session_id`, named before it
-/// is created. A link is taken over when its Session is not in `live` (trashed or
-/// gone) or its claim is no longer in flight.
+/// is created. A link is taken over when its Session is not `is_live` (trashed or
+/// gone; asked inside the claim, so the answer is not older than the row) or its claim is no longer in flight.
 pub(crate) fn claim_link(
     conn: &Connection,
     profile: &str,
     provider_id: &str,
     item_id: &str,
     session_id: &str,
-    live: &HashSet<String>,
+    is_live: &dyn Fn(&str) -> bool,
 ) -> rusqlite::Result<Claim> {
     let tx = conn.unchecked_transaction()?;
     let key = params![profile, provider_id, item_id];
@@ -84,8 +84,7 @@ pub(crate) fn claim_link(
     let held = if pending {
         is_starting(&holder).then(|| Claim::Starting(holder.clone()))
     } else {
-        live.contains(&holder)
-            .then(|| Claim::Session(holder.clone()))
+        is_live(&holder).then(|| Claim::Session(holder.clone()))
     };
     if let Some(held) = held {
         return Ok(held);
@@ -139,8 +138,8 @@ mod tests {
     #[test]
     fn the_database_admits_one_primary_link_per_item() {
         let conn = store();
-        let none = HashSet::new();
-        let claim = |session: &str, live: &HashSet<String>| {
+        let none = |_: &str| false;
+        let claim = |session: &str, live: &dyn Fn(&str) -> bool| {
             claim_link(&conn, "p", "acme.github", "a", session, live).unwrap()
         };
         let first = mark_starting("s1");
@@ -148,7 +147,7 @@ mod tests {
         assert_eq!(claim("s2", &none), Claim::Starting("s1".into()));
         settle_link(&conn, "p", "acme.github", "a", "s1").unwrap();
         drop(first);
-        let live = HashSet::from(["s1".to_string()]);
+        let live = |id: &str| id == "s1";
         assert_eq!(claim("s3", &live), Claim::Session("s1".into()));
         // Another item and another profile are independent.
         assert_eq!(
@@ -173,9 +172,9 @@ mod tests {
     #[test]
     fn a_claim_stranded_by_a_crash_is_taken_over_and_a_slow_create_is_not() {
         let conn = store();
-        let none = HashSet::new();
-        let claim =
-            |session: &str| claim_link(&conn, "p", "acme.github", "a", session, &none).unwrap();
+        let claim = |session: &str| {
+            claim_link(&conn, "p", "acme.github", "a", session, &|_| false).unwrap()
+        };
         // A long create is still in flight, however long it has run.
         let slow = mark_starting("slow");
         assert_eq!(claim("slow"), Claim::Won);

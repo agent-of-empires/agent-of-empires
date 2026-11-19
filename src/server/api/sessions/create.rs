@@ -861,17 +861,13 @@ pub(super) async fn claim_suggestion_link(
     let Some(profile) = origin.profile.clone() else {
         return Ok(None);
     };
-    let live: std::collections::HashSet<String> = state
-        .instances
-        .read()
-        .await
-        .iter()
-        .filter(|i| !i.is_trashed())
-        .map(|i| i.id.clone())
-        .collect();
+    let instances = Arc::clone(&state.instances);
     let starting = crate::plugin::suggestions::mark_starting(session_id);
     let (item, claim_id) = (origin.clone(), session_id.to_owned());
     let claimed = tokio::task::spawn_blocking(move || {
+        // Liveness is read under the instances lock the claim holds, so a Session
+        // a concurrent start just recorded cannot be judged gone.
+        let rows = instances.blocking_read();
         host.with_suggestions_db(|conn, _| {
             crate::plugin::suggestions::claim_link(
                 conn,
@@ -879,7 +875,7 @@ pub(super) async fn claim_suggestion_link(
                 &item.provider_id,
                 &item.id,
                 &claim_id,
-                &live,
+                &|id| rows.iter().any(|i| i.id == id && !i.is_trashed()),
             )
         })
     })

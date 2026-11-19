@@ -10744,6 +10744,33 @@ fn linked_body(title: &str, key: Option<&str>) -> serde_json::Value {
     body
 }
 
+/// Starts racing on one suggestion leave exactly one primary Session.
+#[tokio::test]
+#[serial_test::serial]
+async fn concurrent_starts_of_one_suggestion_create_one_session() {
+    let (_guards, state) = suggestion_state().await;
+    let starts: Vec<_> = (0..8)
+        .map(|n| {
+            let state = state.clone();
+            tokio::spawn(async move {
+                post_create(&state, linked_body(&format!("racer {n}"), None)).await
+            })
+        })
+        .collect();
+    let mut created = 0;
+    for start in starts {
+        let (status, body) = start.await.unwrap();
+        match status {
+            axum::http::StatusCode::CREATED => created += 1,
+            axum::http::StatusCode::CONFLICT => assert_eq!(body["error"], "already_started"),
+            other => panic!("unexpected {other}: {body}"),
+        }
+    }
+    assert_eq!(created, 1, "one winner");
+    let rows = state.instances.read().await;
+    assert_eq!(rows.len(), 1, "one Session exists");
+}
+
 /// A client that drops mid-create must not leave the link claimed: the create
 /// task frees it when the create fails, so the next start is not told "starting".
 #[tokio::test]
