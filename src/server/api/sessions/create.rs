@@ -1730,7 +1730,7 @@ pub(crate) async fn create_session_with(
         let _idempotency_guard = _idempotency_guard;
         let _registration = registration;
         let _creation_profile = _creation_profile;
-        run_create_task(
+        let result = run_create_task(
             async {
                 #[cfg(test)]
                 panic_hook::fire(key.as_deref()).await;
@@ -1744,7 +1744,15 @@ pub(crate) async fn create_session_with(
             key.as_deref(),
             &task_reference,
         )
-        .await
+        .await;
+        // Settled here, not in the handler, so a client that dropped mid-create
+        // cannot leave the claim pending.
+        let session_id = result
+            .as_ref()
+            .ok()
+            .map(|(outcome, _)| outcome.instance.id.as_str());
+        settle_suggestion_link(&task_state, link.as_ref(), session_id).await;
+        result
     })
     .await
     // Only a runtime shutdown cancels the task; a panic is caught inside it.
@@ -1753,7 +1761,6 @@ pub(crate) async fn create_session_with(
     match created {
         Ok((outcome, _created)) => {
             let instance = outcome.instance;
-            settle_suggestion_link(&state, link.as_ref(), Some(&instance.id)).await;
             if wait_ready && instance.status == Status::Starting {
                 let _ = wait_until_left_starting(&state, &instance.id, WAIT_READY_TIMEOUT).await;
             }
@@ -1762,7 +1769,6 @@ pub(crate) async fn create_session_with(
             created_session_response(&state, &instance.id, warnings, StatusCode::CREATED).await
         }
         Err(e) => {
-            settle_suggestion_link(&state, link.as_ref(), None).await;
             // A failed creation can still have committed and rolled back
             // durable state (a borrowed row the rollback released, a profile
             // adopted by a peer). `adopt_committed_profiles` only requests a

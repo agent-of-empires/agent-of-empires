@@ -10684,6 +10684,99 @@ async fn create_persists_initial_prompt_as_pending_turn() {
     );
 }
 
+/// App state with a plugin host holding suggestion "42" of `acme.gh`, and the
+/// guards that keep its isolated app dir and provider registered.
+async fn suggestion_state() -> (
+    (
+        crate::session::test_support::AppDirGuard,
+        tempfile::TempDir,
+        crate::plugin::ReloadRegistryOnDrop,
+    ),
+    std::sync::Arc<AppState>,
+) {
+    let home = crate::session::test_support::isolate_app_dir();
+    let adapter = crate::session::test_support::stub_claude_adapter_on_agent_path();
+    crate::session::purge_owners::initialize(&crate::session::get_app_dir().unwrap()).unwrap();
+    crate::tmux::tool_retirement::initialize(&crate::session::get_app_dir().unwrap()).unwrap();
+    crate::session::config::update_app_state(|state| {
+        state.has_acknowledged_agent_hooks = true;
+    })
+    .expect("acknowledge the agent hook paths");
+    crate::session::config::update_config(|config| {
+        config.default_profile = "chosen-default".to_string();
+    })
+    .unwrap();
+    crate::session::Storage::new_unwatched("chosen-default").unwrap();
+    let (launcher, _launches) = crate::server::test_support::counting_failing_launcher();
+    let registry = crate::server::api::suggestions_tests::register_provider();
+    let host = crate::plugin::host::PluginHost::new(
+        &crate::session::get_app_dir().unwrap().join("host"),
+        "default",
+        None,
+        Arc::new(crate::server::runtime::RuntimeWork::default()),
+    )
+    .unwrap();
+    crate::server::api::suggestions_tests::seed_item_on(&host, "42", None, "42");
+    let state = crate::server::test_support::build_test_app_state_impl(
+        Vec::new(),
+        Vec::new(),
+        Vec::new(),
+        None,
+        false,
+        |state| {
+            state.profile = std::sync::RwLock::new(crate::session::config::effective_profile(""));
+            state.plugin_host = Some(host);
+        },
+        |supervisor| supervisor.with_launcher(launcher),
+    );
+    crate::server::test_support::refresh_canonical_metadata_for_test(&state).await;
+    ((home, adapter, registry), state)
+}
+
+fn linked_body(title: &str, key: Option<&str>) -> serde_json::Value {
+    let mut body = serde_json::json!({
+        "title": title, "path": "", "tool": "claude", "scratch": true, "view": "structured",
+        "suggestion": { "provider_id": "acme.gh", "id": "42" },
+    });
+    if let Some(key) = key {
+        body["idempotency_key"] = key.into();
+    }
+    body
+}
+
+/// A client that drops mid-create must not leave the link claimed: the create
+/// task frees it when the create fails, so the next start is not told "starting".
+#[tokio::test]
+#[serial_test::serial]
+async fn a_dropped_suggestion_create_frees_its_link() {
+    let (_guards, state) = suggestion_state().await;
+    let release = create::panic_hook::arm("drop-link");
+    let first = tokio::spawn({
+        let state = state.clone();
+        async move { post_create(&state, linked_body("dropped", Some("drop-link"))).await }
+    });
+    wait_for("the create to be registered", || {
+        state.create_progress.snapshot("drop-link", None).is_some()
+    })
+    .await;
+    first.abort();
+    assert!(first.await.unwrap_err().is_cancelled());
+    let host = state.plugin_host.clone().unwrap();
+    let linked = || {
+        host.with_suggestions_db(|conn, _| {
+            conn.query_row("SELECT COUNT(*) FROM suggestion_links", [], |r| {
+                r.get::<_, i64>(0)
+            })
+            .unwrap()
+        })
+    };
+    assert_eq!(linked(), 1, "claimed while provisioning");
+    release.notify_one();
+    wait_for("the failed create to free its link", || linked() == 0).await;
+    let (status, retry) = post_create(&state, linked_body("retry", None)).await;
+    assert_eq!(status, axum::http::StatusCode::CREATED, "{retry}");
+}
+
 #[tokio::test]
 async fn a_suggestion_has_one_primary_session() {
     let _home = crate::session::test_support::isolate_app_dir();
