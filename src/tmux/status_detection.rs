@@ -1018,6 +1018,7 @@ run this command? (y/n)
                 "file saved",
                 "random output text",
                 "need more? help is available; use tab next tab to switch",
+                "You can approve it for the rest of the running session, or tell Copilot what to do differently.",
             ],
         );
         assert_all(
