@@ -175,9 +175,8 @@ impl FsPolicy {
             }
         }
 
-        for root in &self.allowed_roots {
-            let root_canonical = root.canonicalize().unwrap_or_else(|_| root.clone());
-            if canonical.starts_with(&root_canonical) {
+        for pinned in &self.pinned {
+            if canonical.starts_with(&pinned.canonical) {
                 return Ok(canonical);
             }
         }
@@ -353,6 +352,28 @@ mod tests {
             "secret"
         );
         assert!(!outside.join("d").exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn resolve_inside_compares_against_the_pinned_root() {
+        let temp = tempfile::tempdir().unwrap();
+        let parent = temp.path().canonicalize().unwrap();
+        let (root, outside) = (parent.join("wt"), parent.join("outside"));
+        std::fs::create_dir(&root).unwrap();
+        std::fs::create_dir(&outside).unwrap();
+        std::fs::write(root.join("f.txt"), "in").unwrap();
+        std::fs::write(outside.join("f.txt"), "secret").unwrap();
+        let policy = FsPolicy::new(vec![root.clone()]);
+        assert!(policy.resolve_inside(&root.join("f.txt")).is_ok());
+
+        std::fs::rename(&root, parent.join("moved")).unwrap();
+        std::os::unix::fs::symlink(&outside, &root).unwrap();
+
+        assert!(matches!(
+            policy.resolve_inside(&root.join("f.txt")),
+            Err(FsError::OutsideRoots(_))
+        ));
     }
 
     /// Supplemental: a directory flipping to a symlink to an outside
