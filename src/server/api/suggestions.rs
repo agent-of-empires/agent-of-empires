@@ -448,8 +448,33 @@ fn link_project(
     })
 }
 
-/// Turns the answer of the create into Start's contract.
-async fn start_outcome(response: axum::response::Response) -> axum::response::Response {
+/// 409 asking the caller to approve what the repo's hooks and MCP servers will run.
+fn hooks_need_trust(review: &super::sessions::StartTrust) -> axum::response::Response {
+    (
+        StatusCode::CONFLICT,
+        Json(json!({
+            "error": "hooks_need_trust",
+            "message": "Repository hooks require approval before this Session starts",
+            "commands": {
+                "on_create": review.merged_hooks.on_create,
+                "on_launch": review.merged_hooks.on_launch,
+                "on_destroy": review.merged_hooks.on_destroy,
+            },
+            "needs_mcp_trust": review.mcp_need_trust,
+            "mcp_summaries": review.mcp_summaries,
+            "review_fingerprint": review.fingerprint,
+        })),
+    )
+        .into_response()
+}
+
+/// Turns the answer of the create into Start's contract. `profile` and `path`
+/// re-read the review when the repo's trust moved under the create.
+async fn start_outcome(
+    response: axum::response::Response,
+    profile: String,
+    path: String,
+) -> axum::response::Response {
     let status = response.status();
     let bytes = axum::body::to_bytes(response.into_body(), 1 << 20)
         .await
@@ -465,6 +490,27 @@ async fn start_outcome(response: axum::response::Response) -> axum::response::Re
     }
     if status == StatusCode::CONFLICT && matches!(code, "already_started" | "stale_suggestion") {
         return (status, Json(body)).into_response();
+    }
+    if code == "creation_trust_changed" {
+        return api_error(
+            StatusCode::CONFLICT,
+            "trust_changed",
+            "The repository's hooks changed after you reviewed them; review them again",
+        );
+    }
+    if code == "hooks_need_trust" {
+        let review = tokio::task::spawn_blocking(move || {
+            super::sessions::review_start_trust(&profile, std::path::Path::new(&path))
+        })
+        .await;
+        return match review {
+            Ok(Ok(review)) => hooks_need_trust(&review),
+            Ok(Err(error)) => start_failed(
+                error.to_string(),
+                "Check the Project's folder, then try again.",
+            ),
+            Err(error) => internal(error),
+        };
     }
     let hint = match code {
         "acp_adapter_missing" | "agent_not_allowed" => {
@@ -546,9 +592,9 @@ pub async fn start_suggestion(
 
     // The create gate still refuses unapproved hooks; this tells the caller what to approve.
     let profile = state.served_profile().to_string();
-    let review_path = path.clone();
+    let (review_profile, review_path) = (profile.clone(), path.clone());
     let review = tokio::task::spawn_blocking(move || {
-        super::sessions::review_start_trust(&profile, std::path::Path::new(&review_path))
+        super::sessions::review_start_trust(&review_profile, std::path::Path::new(&review_path))
     })
     .await;
     let review = match review {
@@ -564,21 +610,7 @@ pub async fn start_suggestion(
     let (mut trust_hooks, mut trust_review) = (None, None);
     if review.hooks_need_trust || review.mcp_need_trust {
         if !approve_hooks {
-            return (
-                StatusCode::CONFLICT,
-                Json(json!({
-                    "error": "hooks_need_trust",
-                    "message": "Repository hooks require approval before this Session starts",
-                    "commands": {
-                        "on_create": review.merged_hooks.on_create,
-                        "on_launch": review.merged_hooks.on_launch,
-                        "on_destroy": review.merged_hooks.on_destroy,
-                    },
-                    "needs_mcp_trust": review.mcp_need_trust,
-                    "review_fingerprint": review.fingerprint,
-                })),
-            )
-                .into_response();
+            return hooks_need_trust(&review);
         }
         let Some(fingerprint) = review_fingerprint else {
             return api_error(
@@ -613,7 +645,7 @@ pub async fn start_suggestion(
     let reference = uuid::Uuid::new_v4().to_string();
     let response =
         super::sessions::create_session_with(state, false, &reference, false, create, None).await;
-    start_outcome(response).await
+    start_outcome(response, profile, path).await
 }
 
 pub async fn prepare_suggestion(
