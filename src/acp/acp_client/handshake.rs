@@ -4,7 +4,7 @@ use agent_client_protocol::schema::ProtocolVersion;
 use agent_client_protocol::v1::schema::{
     ClientCapabilities, ClientSessionCapabilities, CompactionCapabilities, ElicitationCapabilities,
     ElicitationFormCapabilities, FileSystemCapabilities, Implementation, InitializeRequest,
-    NoticeCapabilities, SubagentCapabilities,
+    NoticeCapabilities, PlanCapabilities, SubagentCapabilities,
 };
 use std::sync::Arc;
 use tokio::sync::{oneshot, Mutex};
@@ -42,6 +42,9 @@ pub(super) fn build_initialize_request(profile: &AgentProfile) -> InitializeRequ
                 .notices(NoticeCapabilities::new())
                 .compaction(CompactionCapabilities::new()),
         )
+        // Without this the adapter sends only the legacy id-less `plan`, and
+        // never `plan_removed`, so `/clear` leaves the old checklist up.
+        .plan(PlanCapabilities::new())
         // Each subagent then arrives as a child session on this connection.
         .subagents(profile.supports_subagents.then(SubagentCapabilities::new));
     InitializeRequest::new(ProtocolVersion::V1)
@@ -159,8 +162,8 @@ mod tests {
         );
     }
 
-    /// The adapter silently falls back to untyped text unless these exact keys
-    /// are advertised (#4242 for notices). Every other test builds its own
+    /// The adapter silently falls back to its legacy shapes unless these exact
+    /// keys are advertised (#4242, #5532). Every other test builds its own
     /// update, so a drift here would kill the feature with the suite green.
     #[test]
     fn initialize_advertises_the_session_capabilities() {
@@ -168,11 +171,15 @@ mod tests {
             &crate::acp::agent_profiles::CLAUDE,
         ))
         .expect("serialize");
-        for key in ["notices", "compaction"] {
+        for pointer in [
+            "/clientCapabilities/session/notices",
+            "/clientCapabilities/session/compaction",
+            "/clientCapabilities/plan",
+        ] {
             assert_eq!(
-                wire.pointer(&format!("/clientCapabilities/session/{key}")),
+                wire.pointer(pointer),
                 Some(&serde_json::json!({})),
-                "session {key} capability missing from {wire}"
+                "{pointer} missing from {wire}"
             );
         }
     }

@@ -3,6 +3,7 @@
 use super::super::pending::{ApprovalResolutionMessage, PendingResolver, PendingResponder};
 use super::prompt::{SelectProbe, SELECT_PROBE};
 use super::*;
+use crate::acp::acp_client::commands::PromptInput;
 use crate::acp::acp_client::reset::ResetSessionOutcome;
 use crate::acp::approvals::ApprovalDecision;
 use crate::acp::fs_handler::FsPolicy;
@@ -161,9 +162,9 @@ async fn cancel_under_flood() {
         .expect("handshake completes")
         .expect("handshake ok");
     cmd_tx
-        .send(ClientCmd::Prompt(vec![ContentBlock::Text(
-            TextContent::new("hi"),
-        )]))
+        .send(ClientCmd::Prompt(PromptInput::from(vec![
+            ContentBlock::Text(TextContent::new("hi")),
+        ])))
         .await
         .unwrap();
 
@@ -604,9 +605,9 @@ async fn default_mode_reaches_the_live_mode_option_only_when_configured() {
             })
             .await;
         fake.cmd_tx
-            .send(ClientCmd::Prompt(vec![ContentBlock::Text(
-                TextContent::new("hi"),
-            )]))
+            .send(ClientCmd::Prompt(PromptInput::from(vec![
+                ContentBlock::Text(TextContent::new("hi")),
+            ])))
             .await
             .unwrap();
         tokio::time::timeout(Duration::from_secs(10), prompted_rx.recv())
@@ -733,9 +734,9 @@ async fn prompted_turn_ending_on_a_rejected_window_parks() {
         })
         .await;
         fake.cmd_tx
-            .send(ClientCmd::Prompt(vec![ContentBlock::Text(
-                TextContent::new("hi"),
-            )]))
+            .send(ClientCmd::Prompt(PromptInput::from(vec![
+                ContentBlock::Text(TextContent::new("hi")),
+            ])))
             .await
             .unwrap();
 
@@ -781,6 +782,78 @@ async fn prompted_turn_ending_on_a_rejected_window_parks() {
         fake.agent.abort();
         let _ = fake.agent.await;
     }
+}
+
+/// Sends one prompt and returns the events before its `Stopped`, and its reason.
+async fn prompt_turn(fake: &mut FakeConnection, text: &str) -> (Vec<Event>, String) {
+    fake.cmd_tx
+        .send(ClientCmd::Prompt(PromptInput::from(vec![
+            ContentBlock::Text(TextContent::new(text)),
+        ])))
+        .await
+        .unwrap();
+    let mut seen = Vec::new();
+    tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            match fake.event_rx.recv().await.expect("connection remains open") {
+                Event::Stopped { reason } => return (seen, reason),
+                event => seen.push(event),
+            }
+        }
+    })
+    .await
+    .expect("the turn must reach a terminal event")
+}
+
+/// An agent that answers `session/prompt` with an error ends only that turn:
+/// the error and the prompt text come back, and the connection takes the next
+/// prompt (#5662).
+#[tokio::test]
+async fn rejected_prompt_keeps_the_connection_and_returns_the_text() {
+    let prompts = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let counter = prompts.clone();
+    let mut fake = spawn_fake_connection("s-rejected", move |id| {
+        vec![if counter.fetch_add(1, Ordering::SeqCst) == 0 {
+            format!(
+                r#"{{"jsonrpc":"2.0","id":{id},"error":{{"code":-32603,"message":"a turn is already running"}}}}"#
+            )
+        } else {
+            format!(r#"{{"jsonrpc":"2.0","id":{id},"result":{{"stopReason":"end_turn"}}}}"#)
+        }]
+    })
+    .await;
+
+    let (seen, reason) = prompt_turn(&mut fake, "retry me").await;
+    assert_eq!(reason, "prompt_rejected", "{seen:?}");
+    assert!(
+        seen.iter().any(|e| matches!(
+            e,
+            Event::PromptRuntimeError { message } if message.contains("a turn is already running")
+        )),
+        "the agent's error must surface on the turn: {seen:?}"
+    );
+    assert!(
+        seen.iter().any(|e| matches!(
+            e,
+            Event::PromptRejected { text, .. } if text == "retry me"
+        )),
+        "the prompt text must come back for a retry: {seen:?}"
+    );
+
+    let (seen, reason) = prompt_turn(&mut fake, "again").await;
+    assert_eq!(reason, "prompt_complete");
+    assert!(
+        !seen.iter().any(|e| matches!(
+            e,
+            Event::PromptRuntimeError { .. } | Event::PromptRejected { .. }
+        )),
+        "{seen:?}"
+    );
+    assert_eq!(prompts.load(Ordering::SeqCst), 2);
+    assert!(!fake.connection.is_finished());
+    fake.connection.abort();
+    fake.agent.abort();
+    let _ = fake.agent.await;
 }
 
 /// A child cancel reaches the agent addressed to the child and only when the
@@ -1045,9 +1118,9 @@ async fn reset_waits_for_a_running_subagent() {
 
     // The agent reports the child idle before it ends the turn.
     cmd_tx
-        .send(ClientCmd::Prompt(vec![ContentBlock::Text(
-            TextContent::new("go"),
-        )]))
+        .send(ClientCmd::Prompt(PromptInput::from(vec![
+            ContentBlock::Text(TextContent::new("go")),
+        ])))
         .await
         .unwrap();
     tokio::time::timeout(Duration::from_secs(30), async {

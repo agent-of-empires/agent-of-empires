@@ -6,7 +6,9 @@ import { test, expect } from "../../helpers/liveTest";
 import {
   chunk,
   endTurn,
+  idleComposer,
   openStructuredView,
+  postPrompt,
   replayFrames,
   script,
   sessionIdByTitle,
@@ -130,6 +132,54 @@ test("plan session update renders in PlanStrip and the sidebar PlanProgressMini"
   await expect(page.getByRole("progressbar", { name: /Plan progress: 0 of 3 steps/i })).toBeVisible({
     timeout: 20_000,
   });
+});
+
+const planItems = (planId: string, ...titles: string[]) => ({
+  sessionUpdate: "plan_update",
+  plan: {
+    type: "items",
+    planId,
+    entries: titles.map((content) => ({ content, status: "pending", priority: "medium" })),
+  },
+});
+
+test("a removed plan and /clear drop the PlanStrip and the sidebar PlanProgressMini", async ({ page, spawnServe }) => {
+  // #5532: /clear is a driven reset the adapter never sees, so only AoE's own clear drops that plan.
+  const { serve, sessionId } = await startAcpSession(spawnServe, {
+    title: "story-plan-cleared",
+    fakeAcpScript: script(
+      endTurn(planItems("plan", "Write a fix", "Add tests"), chunk("Planned.")),
+      endTurn({ sessionUpdate: "plan_removed", planId: "plan" }, chunk("Checklist done.")),
+      endTurn(planItems("plan", "Start over"), chunk("Replanned.")),
+    ),
+  });
+  const strip = page.getByTestId("plan-strip");
+  const progress = page.getByRole("progressbar", { name: /Plan progress/i });
+  const send = async (text: string, reply?: string) => {
+    const box = idleComposer(page);
+    await box.fill(text);
+    await box.press("Enter");
+    if (reply) await expect(page.getByText(reply)).toBeVisible({ timeout: 15_000 });
+  };
+  const expectPlan = async (steps: number) => {
+    await expect(strip).toContainText(`0/${steps}`, { timeout: 15_000 });
+    await expect(progress).toHaveAccessibleName(new RegExp(`0 of ${steps} steps`), { timeout: 20_000 });
+  };
+  const expectNoPlan = async () => {
+    await expect(strip).toHaveCount(0, { timeout: 15_000 });
+    await expect(progress).toHaveCount(0, { timeout: 20_000 });
+  };
+
+  await openStructuredView(page, serve, sessionId);
+  await send("plan this work", "Planned.");
+  await expectPlan(2);
+  await send("finish the checklist", "Checklist done.");
+  await expectNoPlan();
+  await send("plan again", "Replanned.");
+  await expectPlan(1);
+  // The composer's slash menu would take the Enter.
+  expect((await postPrompt(serve.baseUrl, sessionId, "/clear")).status).toBe(202);
+  await expectNoPlan();
 });
 
 test("startup banner: native-binary branch + agent-log disclosure", async ({ page, spawnServe }) => {

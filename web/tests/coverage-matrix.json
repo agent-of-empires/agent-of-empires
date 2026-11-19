@@ -833,6 +833,23 @@
       "components": ["web/src/hooks/useAcpSession.ts", "web/src/hooks/acpSession/reducer.ts"]
     },
     {
+      "id": "acp.rejected-prompt-retry",
+      "kind": "vitest",
+      "risk": "medium",
+      "specs": [
+        "src/hooks/useAcpSession.test.ts",
+        "src/lib/acpTypes.reducer.test.ts",
+        "src/components/acp/RejectedPromptsStrip.test.tsx"
+      ],
+      "components": [
+        "web/src/hooks/useAcpSession.ts",
+        "web/src/lib/acpTypes.ts",
+        "web/src/lib/api.ts",
+        "web/src/components/acp/PromptStrips.tsx"
+      ],
+      "notes": "A prompt the agent rejects keeps its stored attachments; Retry reloads each one and resends text and attachments as sent, an attachment-only prompt included, and does not resend when an attachment cannot be reloaded. The strip names the attachments, says whether the agent rejected the prompt or was busy, and allows one Retry at a time per entry."
+    },
+    {
       "id": "acp.server-queue",
       "kind": "vitest",
       "risk": "medium",
@@ -4738,7 +4755,8 @@
       "kind": "live-playwright",
       "risk": "high",
       "specs": ["tests/live/acp-stories/agent-status.spec.ts"],
-      "components": ["web/src/components/WorkspaceSidebar.tsx"]
+      "components": ["web/src/components/WorkspaceSidebar.tsx"],
+      "notes": "The row summarizes the latest plan and drops it after a matching plan_removed or a /clear."
     },
     {
       "id": "story.sidebar-queued-count",
@@ -5046,7 +5064,8 @@
       "kind": "live-playwright",
       "risk": "high",
       "specs": ["tests/live/acp-stories/agent-status.spec.ts"],
-      "components": ["web/src/components/acp/StructuredView.tsx", "web/src/components/acp/PlanStrip.tsx"]
+      "components": ["web/src/components/acp/StructuredView.tsx", "web/src/components/acp/PlanStrip.tsx"],
+      "notes": "Legacy plan and plan_update checklists render; a matching plan_removed or a /clear hides the strip."
     },
     {
       "id": "story.diff-viewer-shows-files",
