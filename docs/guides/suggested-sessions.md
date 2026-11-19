@@ -95,7 +95,7 @@ Change any proposal with its select, then **Link N repos** stores every checked 
 
 > The TUI keys below are provisional until #4597 settles the key bindings.
 
-**Home.** A collapsed **Suggested (N)** group sits above Trash and is absent when there are no open suggestions. Enter expands it to 3 items and a "View all" row. On an item, Enter prepares it and opens the prefilled dialog, `z` (`Z` in strict mode) dismisses it, and `Ctrl+K` lists "Open in <provider>". `N` (`Ctrl+N`) starts a blank session.
+**Home.** A collapsed **Suggested (N)** group sits above Trash and is absent when there are no open suggestions, unless a provider failed: the group stays and its preview shows the error. Enter expands it to 3 items and a "View all" row. Rows show the title with the source reference after it. On an item, Enter prepares it and opens the prefilled dialog, `z` (`Z` in strict mode) dismisses it, and `Ctrl+K` lists "Open in <provider>". `N` (`Ctrl+N`) starts a blank session.
 
 **Full view.** `S` opens it (`Ctrl+S` in strict mode).
 
@@ -103,17 +103,16 @@ Change any proposal with its select, then **Link N repos** stores every checked 
 |---|---|
 | `j` / `k` | Select |
 | Enter | First press resolves the final prompt and shows it ("Review the prompt below, then press Enter to start."); the second opens the dialog. On a started item it opens the session |
-| `N` | Start another session for a started item |
-| `x` | Dismiss or restore |
+| `N` | Start a new session for a started item |
+| `z` | Dismiss or restore |
 | `d` | Toggle the dismissed list |
-| `r` | Ask providers to refresh |
-| `l` | Reload the list |
+| `r` | Ask providers to refresh, then reload the list. On a read-only dashboard it only reloads |
 | PgUp / PgDn | Scroll the prompt |
 | Esc | Back |
 
-`r` only asks for a refresh ("Refresh requested. Press l to reload the list."). An item with no matching registered Project cannot be started ("No registered project matches this suggestion"), and a stale one says "No longer open at the source. Dismiss it, or wait for the next refresh."
+An item with no matching registered Project cannot be started ("No registered project matches this suggestion"), and a stale one says "No longer open at the source. Dismiss it, or wait for the next refresh."
 
-**New-session dialog.** The dialog has a **Prompt** row for the first turn. A suggestion fills it, labelled with the provider and "not checked by AoE"; edit it freely. `Ctrl+P` on the row shows the item's source text. The prompt is sent once the agent is ready (typed into a terminal session, or sent as the first turn of a [structured-view](../structured-view.md) one).
+**New-session dialog.** The dialog has no Prompt row. The first turn is one line above the footer: "Prompt from GitHub, not checked by AoE" for a suggestion, or "Prompt: none". `Ctrl+O` opens it in a small editor, which also shows the item's source text; `Esc` closes it and keeps your edits. `Ctrl+P` still opens the focused row's picker. The prompt is sent once the agent is ready (typed into a terminal session, or sent as the first turn of a [structured-view](../structured-view.md) one).
 
 From the command line, `aoe add --prompt <text>` or `--prompt-file <path>` sets the same first turn. It is rejected for terminal sessions.
 
