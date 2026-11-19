@@ -1012,10 +1012,15 @@ pub enum Event {
         comments: Vec<DiffComment>,
         assembled_markdown: String,
     },
-    /// A prompt arrived while another `session/prompt` was in flight.
+    /// A prompt that did not run, carried back for a retry: it arrived while
+    /// another `session/prompt` was in flight, or the agent answered it with
+    /// an error.
     PromptRejected {
         reason: String,
         text: String,
+        /// Refs to the prompt's stored attachments, resent with `text`.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        attachments: Vec<PromptAttachmentRef>,
     },
     /// Native ACP session id admitted by a successful new, load, fork, or
     /// resume. The server listener persists it on `Instance.acp_session_id` so
@@ -2203,6 +2208,7 @@ mod tests {
             Event::PromptRejected {
                 reason: "agent_busy".into(),
                 text: "hi".into(),
+                attachments: Vec::new(),
             },
         ] {
             let s = applied([prompt("hi"), terminal.clone()]);
