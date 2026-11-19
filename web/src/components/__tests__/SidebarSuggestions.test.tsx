@@ -5,15 +5,15 @@ import { SidebarSuggestions } from "../sidebar/SidebarSuggestions";
 import { updateSuggestionPrefs } from "../../lib/api";
 import type { SuggestionItem, SuggestionsSnapshot } from "../../lib/types";
 
-const { fetchSuggestions, prepareSuggestion } = vi.hoisted(() => ({
+const { fetchSuggestions, startSuggestion } = vi.hoisted(() => ({
   fetchSuggestions: vi.fn(),
-  prepareSuggestion: vi.fn(),
+  startSuggestion: vi.fn(),
 }));
 
 vi.mock("../../lib/api", async (importOriginal) => ({
   ...(await importOriginal<typeof import("../../lib/api")>()),
   fetchSuggestions,
-  prepareSuggestion,
+  startSuggestion,
 }));
 
 const mk = (n: number, over: Partial<SuggestionItem> = {}): SuggestionItem => ({
@@ -100,7 +100,7 @@ describe("SidebarSuggestions", () => {
 
   it("starts collapsed, then lists up to 3 items and View all", async () => {
     const preparing = new Promise(() => {});
-    prepareSuggestion.mockReturnValue(preparing);
+    startSuggestion.mockReturnValue(preparing);
     fetchSuggestions.mockResolvedValue(snap(ITEMS, true));
     const props = renderIt();
     const toggle = await screen.findByTestId("sidebar-suggested-toggle");
@@ -117,7 +117,7 @@ describe("SidebarSuggestions", () => {
     fireEvent.click(screen.getByTestId("sidebar-suggested-view-all"));
     expect(props.onViewAll).toHaveBeenCalled();
     fireEvent.click(rows[0]!);
-    expect(prepareSuggestion).toHaveBeenCalledWith("github", "i1");
+    expect(startSuggestion).toHaveBeenCalledWith("github", "i1", {});
   });
 
   it("hides started suggestions, and the group is absent with nothing open", async () => {

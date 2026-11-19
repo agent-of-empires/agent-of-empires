@@ -618,6 +618,37 @@ export interface SuggestionSource {
   enabled: boolean;
   /** Placeholder names every item of this criterion carries. */
   variables: string[];
+  /** What Start runs for this kind; the Profile's new-Session defaults until the user edits it. */
+  preset?: SuggestionPreset;
+  customized?: boolean;
+}
+
+/** How a kind starts a Session. `prompt` is a template with `{variables}` filled from each item. */
+export interface SuggestionPreset {
+  agent: string;
+  view: "structured" | "terminal";
+  worktree: boolean;
+  sandbox: boolean;
+  yolo: boolean;
+  prompt: string;
+}
+
+export interface SuggestionPresetEntry {
+  provider_id: string;
+  criterion: string;
+  preset: SuggestionPreset;
+  customized: boolean;
+  defaults: SuggestionPreset;
+}
+
+/** What Start will use for one item, as the preset resolves for it. */
+export interface SuggestionStartPlan {
+  agent: string;
+  view: "structured" | "terminal";
+  worktree: boolean;
+  sandbox: boolean;
+  /** The linked Project's name, when the repo is linked. */
+  project?: string | null;
 }
 
 /** One setup check a provider reports. `detail` and `fix` are provider text and untrusted. */
@@ -660,18 +691,10 @@ export interface SuggestionPrefs {
   homepage: boolean;
   sidebar: boolean;
   refresh_minutes: number;
-  /** Start creates the session from the prepared draft instead of opening the wizard. */
-  start_without_review: boolean;
   /** Rows show each item's `source_ref`. */
   show_source_ref: boolean;
   /** Every provider id, in the order the user set. */
   provider_order: string[];
-}
-
-export interface SuggestionTemplate {
-  provider_id: string;
-  criterion: string;
-  template: string;
 }
 
 export interface SuggestionMapping {
@@ -708,6 +731,8 @@ export interface SuggestionItem {
   stale?: boolean;
   /** The registered Project the item resolves to; the provider's `project` is only a hint. */
   resolved_project?: { name: string; path: string } | null;
+  /** What Start will use, resolved from the item's kind. */
+  start?: SuggestionStartPlan;
 }
 
 export interface SuggestionsSnapshot {
@@ -719,10 +744,6 @@ export interface SuggestionsSnapshot {
 export interface SuggestionPrepared {
   title: string;
   initial_prompt: string;
-  /** The item's criterion when a stored template produced `initial_prompt`, else null. */
-  template_criterion: string | null;
-  /** The prompt is the user's saved template, not the provider's draft text. */
-  templated: boolean;
   source_ref: string;
   project: { name: string; path: string } | null;
   tool: string;

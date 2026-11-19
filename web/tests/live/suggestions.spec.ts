@@ -1,4 +1,4 @@
-// Suggested sessions against the real server: a worker publishes, and preferences, templates, mappings and
+// Suggested sessions against the real server: a worker publishes, and preferences, presets, mappings and
 // dismissals persist across reads. Read-only mode refuses writes and offers no Start or Dismiss.
 
 import { spawnSync } from "node:child_process";
@@ -75,22 +75,31 @@ test("preferences, templates, mappings and dismissals round-trip through the ser
   expect(prefs.status).toBe(200);
   expect((await snapshot(serve)).prefs.sidebar).toBe(true);
 
-  const put = await api(serve, "/templates", {
+  const before = (await (await api(serve, "/presets")).json()).presets.find(
+    (p: { provider_id: string; criterion: string }) => p.provider_id === "acme.sugg" && p.criterion === "assigned",
+  );
+  expect(before.customized).toBe(false);
+  const edited = { ...before.preset, prompt: "Work on {n}", yolo: !before.preset.yolo };
+  const put = await api(serve, "/presets", {
     method: "PUT",
-    body: JSON.stringify({ provider_id: "acme.sugg", criterion: "assigned", template: "Work on {n}" }),
+    body: JSON.stringify({ provider_id: "acme.sugg", criterion: "assigned", preset: edited }),
   });
-  expect(put.status).toBe(200);
-  const stored = await (await api(serve, "/templates?provider_id=acme.sugg&criterion=assigned")).json();
-  expect(stored.template).toBe("Work on {n}");
+  expect(put.status, await put.clone().text()).toBe(200);
+  const stored = (await (await api(serve, "/presets")).json()).presets.find(
+    (p: { provider_id: string; criterion: string }) => p.provider_id === "acme.sugg" && p.criterion === "assigned",
+  );
+  expect(stored.customized).toBe(true);
+  expect(stored.preset.prompt).toBe("Work on {n}");
   const reset = await api(
     serve,
-    `/templates?${new URLSearchParams({ provider_id: "acme.sugg", criterion: "assigned" })}`,
-    {
-      method: "DELETE",
-    },
+    `/presets?${new URLSearchParams({ provider_id: "acme.sugg", criterion: "assigned" })}`,
+    { method: "DELETE" },
   );
-  expect(reset.status).toBe(200);
-  expect((await (await api(serve, "/templates?provider_id=acme.sugg&criterion=assigned")).json()).template).toBeNull();
+  expect(reset.status).toBe(204);
+  const after = (await (await api(serve, "/presets")).json()).presets.find(
+    (p: { provider_id: string; criterion: string }) => p.provider_id === "acme.sugg" && p.criterion === "assigned",
+  );
+  expect(after.customized).toBe(false);
 
   const mapped = await api(serve, "/mappings", {
     method: "PUT",
@@ -125,7 +134,16 @@ test("read-only refuses every suggestions write", async ({ spawnServe }) => {
   const writes: [string, string, object][] = [
     ["PATCH", "/prefs", { sidebar: true }],
     ["PATCH", "/sources", { provider_id: "acme.sugg", criterion: "assigned", enabled: false }],
-    ["PUT", "/templates", { provider_id: "acme.sugg", criterion: "assigned", template: "x" }],
+    [
+      "PUT",
+      "/presets",
+      {
+        provider_id: "acme.sugg",
+        criterion: "assigned",
+        preset: { agent: "claude", view: "terminal", worktree: false, sandbox: false, yolo: false, prompt: "x" },
+      },
+    ],
+    ["POST", "/start", { provider_id: "acme.sugg", id: "issue-1" }],
     ["PUT", "/mappings", { provider_id: "acme.sugg", mapping_key: "acme/web", projects: [] }],
     ["POST", "/dismiss", { provider_id: "acme.sugg", id: "issue-1" }],
     ["POST", "/refresh", {}],

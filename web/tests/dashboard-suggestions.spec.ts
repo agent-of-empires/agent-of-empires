@@ -25,7 +25,6 @@ const prefs = {
   homepage: true,
   sidebar: false,
   refresh_minutes: 15,
-  start_without_review: false,
   show_source_ref: true,
   provider_order: ["github"],
 };
@@ -42,7 +41,7 @@ async function mockHome(page: import("@playwright/test").Page) {
 test("homepage shows 3 suggestions and View all opens the full view", async ({ page }) => {
   await mockHome(page);
   await page.goto("/");
-  await expect(page.getByRole("button", { name: "Start" })).toHaveCount(3);
+  await expect(page.getByRole("button", { name: "Start", exact: true })).toHaveCount(3);
   await expect(page.getByText("Review requested from you · agent-of-empires")).toBeVisible();
   await page.getByRole("link", { name: "View all (4)" }).click();
   await expect(page).toHaveURL(/\/suggestions$/);
@@ -52,7 +51,7 @@ test("narrow viewport shows 2 suggestions", async ({ page }) => {
   await page.setViewportSize({ width: 375, height: 812 });
   await mockHome(page);
   await page.goto("/");
-  await expect(page.getByRole("button", { name: "Start" })).toHaveCount(2);
+  await expect(page.getByRole("button", { name: "Start", exact: true })).toHaveCount(2);
 });
 
 test("a long source reference keeps its number in view on a narrow row", async ({ page }) => {

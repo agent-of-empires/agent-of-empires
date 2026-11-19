@@ -1,37 +1,39 @@
-import type { SessionResponse } from "../lib/types";
 import { updateSuggestionSource } from "../lib/api";
+import { useAgentNames } from "../hooks/useAgentNames";
+import { SuggestionItemActions } from "./SuggestionItemActions";
+import { HooksTrustDialog } from "./session-wizard/HooksTrustDialog";
 import { suggestionKey, useDismissUndo, useSuggestions } from "../hooks/useSuggestions";
 import { useIsWideViewport } from "../hooks/useIsWideViewport";
-import {
-  SUGGESTION_NOTE_CLASS,
-  SuggestionActions,
-  SuggestionRow,
-  SuggestionStatusNotes,
-  UndoBar,
-} from "./SuggestionRow";
+import { SUGGESTION_NOTE_CLASS, SuggestionRow, SuggestionStatusNotes, UndoBar } from "./SuggestionRow";
 import type { WizardPrefill } from "./session-wizard/SessionWizard";
 
 interface Props {
   readOnly?: boolean;
   onPrepare: (prefill: WizardPrefill) => void;
-  onStarted?: (session: SessionResponse) => void;
+  onEditPreset?: (providerId: string, criterion: string) => void;
+  canLink?: boolean;
   onViewAll: () => void;
   onOpenSession: (sessionId: string) => void;
 }
 
-export function DashboardSuggestions({ readOnly = false, onPrepare, onStarted, onViewAll, onOpenSession }: Props) {
+export function DashboardSuggestions({
+  readOnly = false,
+  onPrepare,
+  onEditPreset,
+  canLink = true,
+  onViewAll,
+  onOpenSession,
+}: Props) {
   const wide = useIsWideViewport();
-  const { snapshot, loadFailed, busy, refreshing, notice, failures, offline, act, refresh, start } = useSuggestions(
-    onPrepare,
-    onStarted,
-  );
+  const ctrl = useSuggestions(onPrepare, onOpenSession);
+  const { snapshot, loadFailed, busy, refreshing, notice, failures, offline, act, refresh } = ctrl;
+  const agentName = useAgentNames();
   const { undo, dismiss, clearUndo } = useDismissUndo(act);
 
   if (!snapshot || snapshot.providers.length === 0 || !snapshot.prefs.homepage) return null;
 
   const active = snapshot.items.filter((item) => !item.dismissed);
   const rows = active.slice(0, wide ? 3 : 2);
-  const nameOf = (id: string) => snapshot.providers.find((p) => p.id === id)?.name ?? id;
   const pending = snapshot.providers.filter((p) => p.status === "pending");
   const errored = snapshot.providers.filter((p) => p.status === "error");
   const kindOf = (item: { provider_id: string; criterion: string }) =>
@@ -72,24 +74,18 @@ export function DashboardSuggestions({ readOnly = false, onPrepare, onStarted, o
             project={item.resolved_project?.name ?? item.project}
             session={item.started_session}
             stale={item.stale}
-            failure={failures[suggestionKey(item)]?.message}
+            failure={failures[suggestionKey(item)]}
             actions={
-              <SuggestionActions
+              <SuggestionItemActions
+                item={item}
+                snapshot={snapshot}
+                ctrl={ctrl}
                 readOnly={readOnly}
-                offline={offline}
-                busy={busy !== null}
-                onStart={() => void start(item, failures[suggestionKey(item)]?.another)}
-                stale={item.stale}
-                failed={suggestionKey(item) in failures}
+                agentName={agentName}
+                onOpenSession={onOpenSession}
                 onToggleDismiss={() => void dismiss(item, true)}
-                started={
-                  item.started_session && {
-                    onOpen: () => onOpenSession(item.started_session!.id),
-                    onStartAnother: () => void start(item, true),
-                    providerName: nameOf(item.provider_id),
-                    sourceUrl: item.source_url,
-                  }
-                }
+                onEditPreset={onEditPreset}
+                canLink={canLink}
               />
             }
           />
@@ -128,6 +124,18 @@ export function DashboardSuggestions({ readOnly = false, onPrepare, onStarted, o
         <p role="alert" className="mt-2 px-1 text-xs text-status-error">
           {alert}
         </p>
+      )}
+      {ctrl.hooksReview && (
+        <HooksTrustDialog
+          starting={ctrl.hooksReview.item.title}
+          onCreate={ctrl.hooksReview.review.commands.on_create ?? []}
+          onLaunch={ctrl.hooksReview.review.commands.on_launch ?? []}
+          onDestroy={ctrl.hooksReview.review.commands.on_destroy ?? []}
+          needsMcpTrust={(ctrl.hooksReview.review.mcp_servers?.length ?? 0) > 0}
+          mcpSummaries={ctrl.hooksReview.review.mcp_servers ?? []}
+          onConfirm={ctrl.approveHooks}
+          onCancel={ctrl.cancelHooks}
+        />
       )}
       {undo && (
         <UndoBar

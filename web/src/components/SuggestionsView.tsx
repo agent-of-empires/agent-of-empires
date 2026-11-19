@@ -6,16 +6,12 @@ import { chipId, filterSuggestions, keyChipGroups, type KeyChip } from "../lib/s
 import type { SuggestionItem, SuggestionProvider } from "../lib/types";
 import { suggestionKey, useDismissUndo, useSuggestions } from "../hooks/useSuggestions";
 import { SuggestionFilterMenu, FilterMenuItem } from "./SuggestionFilterMenu";
+import { useAgentNames } from "../hooks/useAgentNames";
+import { SuggestionItemActions } from "./SuggestionItemActions";
+import { HooksTrustDialog } from "./session-wizard/HooksTrustDialog";
 import { SuggestionMappingWizard } from "./SuggestionMappingWizard";
 import { SuggestionsSetupHint } from "./SuggestionsSetupHint";
-import {
-  SUGGESTION_NOTE_CLASS,
-  SuggestionActions,
-  SuggestionRow,
-  SuggestionStatusNotes,
-  UndoBar,
-} from "./SuggestionRow";
-import type { SessionResponse } from "../lib/types";
+import { SUGGESTION_NOTE_CLASS, SuggestionRow, SuggestionStatusNotes, UndoBar } from "./SuggestionRow";
 import type { WizardPrefill } from "./session-wizard/SessionWizard";
 
 interface Props {
@@ -25,8 +21,10 @@ interface Props {
   onPrepare: (prefill: WizardPrefill) => void;
   onOpenSession: (sessionId: string) => void;
   onOpenSettings?: () => void;
-  /** Called when "Start without review" created the session directly. */
-  onStarted?: (session: SessionResponse) => void;
+  /** Opens Settings › Suggestions on a kind's preset. */
+  onEditPreset?: (providerId: string, criterion: string) => void;
+  /** False where the repo-to-Project link cannot be saved (CityHall client mode). */
+  canLink?: boolean;
   /** Set when the first-run hint can open the Marketplace (not read-only or CityHall). */
   onOpenMarketplace?: () => void;
 }
@@ -71,11 +69,13 @@ export function SuggestionsView({
   onPrepare,
   onOpenSession,
   onOpenSettings,
-  onStarted,
+  onEditPreset,
+  canLink = true,
   onOpenMarketplace,
 }: Props) {
-  const { snapshot, loading, loadFailed, refreshing, busy, notice, failures, offline, act, refresh, start, load } =
-    useSuggestions(onPrepare, onStarted);
+  const ctrl = useSuggestions(onPrepare, onOpenSession);
+  const { snapshot, loading, loadFailed, refreshing, busy, notice, failures, offline, act, refresh, load } = ctrl;
+  const agentName = useAgentNames();
   const { undo, dismiss } = useDismissUndo(act);
   const [filter, setFilter] = useState<Filter>(initialDismissed ? "dismissed" : "all");
   const [query, setQuery] = useState("");
@@ -384,8 +384,6 @@ export function SuggestionsView({
                     <ul className="rounded-lg border border-surface-700/40 bg-surface-900">
                       {group.items.map((item) => {
                         const key = suggestionKey(item);
-                        const providerName =
-                          snapshot.providers.find((p) => p.id === item.provider_id)?.name ?? item.provider_id;
                         return (
                           <SuggestionRow
                             key={key}
@@ -394,25 +392,18 @@ export function SuggestionsView({
                             reason={item.reason}
                             session={item.started_session}
                             stale={item.stale}
-                            failure={failures[key]?.message}
+                            failure={failures[key]}
                             actions={
-                              <SuggestionActions
-                                dismissed={item.dismissed}
+                              <SuggestionItemActions
+                                item={item}
+                                snapshot={snapshot}
+                                ctrl={ctrl}
                                 readOnly={readOnly}
-                                offline={offline}
-                                busy={busy !== null}
-                                onStart={() => void start(item, failures[key]?.another)}
-                                stale={item.stale}
-                                failed={key in failures}
-                                started={
-                                  item.started_session && {
-                                    onOpen: () => onOpenSession(item.started_session!.id),
-                                    onStartAnother: () => void start(item, true),
-                                    providerName,
-                                    sourceUrl: item.source_url,
-                                  }
-                                }
+                                agentName={agentName}
+                                onOpenSession={onOpenSession}
                                 onToggleDismiss={() => void dismiss(item, !item.dismissed)}
+                                onEditPreset={onEditPreset}
+                                canLink={canLink}
                               />
                             }
                           />
@@ -463,6 +454,18 @@ export function SuggestionsView({
           </>
         )}
       </div>
+      {ctrl.hooksReview && (
+        <HooksTrustDialog
+          starting={ctrl.hooksReview.item.title}
+          onCreate={ctrl.hooksReview.review.commands.on_create ?? []}
+          onLaunch={ctrl.hooksReview.review.commands.on_launch ?? []}
+          onDestroy={ctrl.hooksReview.review.commands.on_destroy ?? []}
+          needsMcpTrust={(ctrl.hooksReview.review.mcp_servers?.length ?? 0) > 0}
+          mcpSummaries={ctrl.hooksReview.review.mcp_servers ?? []}
+          onConfirm={ctrl.approveHooks}
+          onCancel={ctrl.cancelHooks}
+        />
+      )}
       {mapping && snapshot && (
         <SuggestionMappingWizard
           items={items}

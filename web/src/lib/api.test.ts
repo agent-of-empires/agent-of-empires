@@ -1352,13 +1352,69 @@ describe("createSession errors", () => {
     expect(await api.createSession(body)).toEqual({ ok: false, error: "Network error: offline", network: true });
   });
 
-  it("resets a template by query, without a DELETE body", async () => {
-    fetchSpy.mockResolvedValueOnce(new Response(JSON.stringify({ ok: true }), { status: 200 }));
-    expect(await api.resetSuggestionTemplate("acme.sugg", "assigned")).toEqual({ ok: true, data: { ok: true } });
+  it("resets a preset by query, without a DELETE body", async () => {
+    fetchSpy.mockResolvedValueOnce(new Response(null, { status: 204 }));
+    expect(await api.resetSuggestionPreset("acme.sugg", "assigned")).toEqual({ ok: true, data: undefined });
     const [url, init] = fetchSpy.mock.calls.at(-1)!;
-    expect(url).toBe("/api/suggestions/templates?provider_id=acme.sugg&criterion=assigned");
+    expect(url).toBe("/api/suggestions/presets?provider_id=acme.sugg&criterion=assigned");
     expect(init?.method).toBe("DELETE");
     expect(init?.body).toBeUndefined();
+  });
+
+  describe("startSuggestion", () => {
+    const reply = (status: number, body: object) =>
+      fetchSpy.mockResolvedValueOnce(new Response(JSON.stringify(body), { status }));
+
+    it("posts the item and options, and reads the 202 ack", async () => {
+      reply(202, { session_id: "s1", title: "Fix it" });
+      expect(await api.startSuggestion("acme.sugg", "i1", { project: { path: "/p" } })).toEqual({
+        kind: "started",
+        sessionId: "s1",
+        title: "Fix it",
+      });
+      const [url, init] = fetchSpy.mock.calls.at(-1)!;
+      expect(url).toBe("/api/suggestions/start");
+      expect(JSON.parse(init?.body as string)).toEqual({ provider_id: "acme.sugg", id: "i1", project: { path: "/p" } });
+    });
+
+    it.each([
+      [
+        "409 already_started",
+        409,
+        { error: "already_started", session_id: "s9" },
+        { kind: "already_started", sessionId: "s9" },
+      ],
+      [
+        "409 hooks_need_trust",
+        409,
+        { error: "hooks_need_trust", commands: { on_create: ["npm ci"] }, review_fingerprint: "fp" },
+        {
+          kind: "hooks_need_trust",
+          review: { error: "hooks_need_trust", commands: { on_create: ["npm ci"] }, review_fingerprint: "fp" },
+        },
+      ],
+      [
+        "422 start_failed",
+        422,
+        { error: "start_failed", reason: "Docker isn't running", hint: "Start it.", retryable: true },
+        { kind: "failed", reason: "Docker isn't running", hint: "Start it.", retryable: true },
+      ],
+      ["400 stale", 400, { error: "stale", message: "gone" }, { kind: "stale" }],
+      ["400 no_project", 400, { error: "no_project", hint: "link_project" }, { kind: "no_project" }],
+    ])("maps %s", async (_name, status, body, expected) => {
+      reply(status, body);
+      expect(await api.startSuggestion("acme.sugg", "i1")).toEqual(expected);
+    });
+
+    it("reports anything else as an error, including no answer", async () => {
+      reply(500, { error: "boom", message: "server broke" });
+      expect(await api.startSuggestion("acme.sugg", "i1")).toMatchObject({ kind: "error" });
+      offline();
+      expect(await api.startSuggestion("acme.sugg", "i1")).toMatchObject({
+        kind: "error",
+        error: "Network error: offline",
+      });
+    });
   });
 
   it("tells a 2xx with an unreadable body apart from a network error on suggestion requests", async () => {

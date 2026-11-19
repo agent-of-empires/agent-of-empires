@@ -1,21 +1,21 @@
 // @vitest-environment jsdom
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { act, cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
+import { cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { SuggestionsSettings } from "../SuggestionsSettings";
-import type { TemplateFocus } from "../SuggestionTemplates";
+import type { PresetFocus } from "../SuggestionPresetEditor";
 import { useSuggestionsSnapshot } from "../useSuggestionsSnapshot";
 import { expandTemplate } from "../../../lib/suggestionTemplate";
-import type { SettingsFieldDescriptor, SuggestionsSnapshot } from "../../../lib/types";
+import type { SettingsFieldDescriptor, SuggestionPreset, SuggestionsSnapshot } from "../../../lib/types";
 import { loadSettings, resetSettingsStore, saveField, useProfileSettings } from "../../../lib/settingsStore";
 
 const api = vi.hoisted(() => ({
   fetchSuggestions: vi.fn(),
+  fetchAgents: vi.fn(),
   runSuggestionFix: vi.fn(),
   updateSuggestionPrefs: vi.fn(),
   updateSuggestionSource: vi.fn(),
-  fetchSuggestionTemplates: vi.fn(),
-  putSuggestionTemplate: vi.fn(),
-  resetSuggestionTemplate: vi.fn(),
+  putSuggestionPreset: vi.fn(),
+  resetSuggestionPreset: vi.fn(),
   fetchSuggestionMappings: vi.fn(),
   putSuggestionMapping: vi.fn(),
   deleteSuggestionMapping: vi.fn(),
@@ -26,12 +26,19 @@ const api = vi.hoisted(() => ({
 vi.mock("../../../lib/api", () => api);
 
 const ok = { ok: true, data: undefined };
+const PRESET: SuggestionPreset = {
+  agent: "claude",
+  view: "structured",
+  worktree: true,
+  sandbox: false,
+  yolo: false,
+  prompt: "/aoe-review {pr-number}",
+};
 const snapshot = (): SuggestionsSnapshot => ({
   prefs: {
     homepage: true,
     sidebar: false,
     refresh_minutes: 15,
-    start_without_review: false,
     show_source_ref: true,
     provider_order: ["gh", "lin"],
   },
@@ -49,8 +56,18 @@ const snapshot = (): SuggestionsSnapshot => ({
           description: "Review requested",
           enabled: true,
           variables: ["pr-number", "repo", "org", "branch"],
+          preset: PRESET,
+          customized: false,
         },
-        { criterion: "ci-failed", label: "CI failures", description: "", enabled: false, variables: ["branch"] },
+        {
+          criterion: "ci-failed",
+          label: "CI failures",
+          description: "",
+          enabled: false,
+          variables: ["branch"],
+          preset: { ...PRESET, view: "terminal", prompt: "" },
+          customized: true,
+        },
       ],
     },
     { id: "lin", name: "Linear", status: "error", error: "API key rejected.", enabled: true, sources: [] },
@@ -76,11 +93,11 @@ const snapshot = (): SuggestionsSnapshot => ({
 function Harness({
   readOnly,
   onOpenSuggestions,
-  templateFocus,
+  presetFocus,
 }: {
   readOnly: boolean;
-  onOpenSuggestions: () => void;
-  templateFocus?: TemplateFocus;
+  onOpenSuggestions: (dismissed: boolean) => void;
+  presetFocus?: PresetFocus;
 }) {
   const { snapshot, failed, reload } = useSuggestionsSnapshot();
   return (
@@ -90,21 +107,24 @@ function Harness({
       reload={reload}
       readOnly={readOnly}
       onOpenSuggestions={onOpenSuggestions}
-      templateFocus={templateFocus}
+      presetFocus={presetFocus}
     />
   );
 }
 
-function open(props: { readOnly?: boolean; templateFocus?: TemplateFocus } = {}) {
+function open(props: { readOnly?: boolean; presetFocus?: PresetFocus } = {}) {
   api.fetchSuggestions.mockResolvedValue(snapshot());
-  api.fetchSuggestionTemplates.mockResolvedValue([]);
+  api.fetchAgents.mockResolvedValue([
+    { name: "claude", display_name: "Claude Code", kind: "builtin", installed: true },
+    { name: "codex", display_name: "Codex", kind: "builtin", installed: true },
+  ]);
   api.fetchSuggestionMappings.mockResolvedValue([]);
   api.fetchProjects.mockResolvedValue([{ name: "aoe", path: "/p/aoe", scope: "global", pinned: false }]);
   for (const f of [
     api.updateSuggestionPrefs,
     api.updateSuggestionSource,
-    api.putSuggestionTemplate,
-    api.resetSuggestionTemplate,
+    api.putSuggestionPreset,
+    api.resetSuggestionPreset,
     api.putSuggestionMapping,
     api.deleteSuggestionMapping,
   ]) {
@@ -115,7 +135,7 @@ function open(props: { readOnly?: boolean; templateFocus?: TemplateFocus } = {})
     <Harness
       readOnly={props.readOnly ?? false}
       onOpenSuggestions={onOpenSuggestions}
-      templateFocus={props.templateFocus}
+      presetFocus={props.presetFocus}
     />,
   );
   return onOpenSuggestions;
@@ -127,33 +147,38 @@ afterEach(() => {
 });
 
 describe("SuggestionsSettings", () => {
-  it("shows provider status and writes prefs, sources and order", async () => {
+  it("lists Sources and Kinds, and writes prefs, kinds and order", async () => {
     const openFull = open();
-    await screen.findByText("Plugin · updated 2 min ago");
+    await screen.findByText("Updated 2 min ago");
     expect(screen.getByText(/Couldn't refresh: API key rejected\./)).toBeTruthy();
-    expect(screen.getByText("1 hidden for this Profile.")).toBeTruthy();
+    expect(screen.getByText("Drag to set which source comes first, or Alt+↑/↓ on a focused row.")).toBeTruthy();
 
-    fireEvent.click(screen.getByRole("switch", { name: "Show in sidebar" }));
+    fireEvent.click(screen.getByRole("switch", { name: "Show in the sidebar" }));
     await waitFor(() => expect(api.updateSuggestionPrefs).toHaveBeenCalledWith({ sidebar: true }));
-    fireEvent.click(screen.getByRole("switch", { name: "Show source reference" }));
+    fireEvent.click(screen.getByRole("switch", { name: "Show where each one comes from" }));
     await waitFor(() => expect(api.updateSuggestionPrefs).toHaveBeenCalledWith({ show_source_ref: false }));
     fireEvent.click(screen.getByRole("switch", { name: "Show Linear suggestions" }));
     await waitFor(() => expect(api.updateSuggestionPrefs).toHaveBeenCalledWith({ provider_enabled: { lin: false } }));
-    fireEvent.change(screen.getByLabelText("Refresh every"), { target: { value: "60" } });
-    await waitFor(() => expect(api.updateSuggestionPrefs).toHaveBeenCalledWith({ refresh_minutes: 60 }));
 
-    fireEvent.click(screen.getByLabelText("GitHub: CI failures"));
+    const kinds = screen.getByRole("region", { name: "GitHub kinds" });
+    expect(within(kinds).getByText("Claude Code \u00b7 Structured view \u00b7 worktree")).toBeTruthy();
+    expect(within(kinds).getByText("Not suggested")).toBeTruthy();
+    fireEvent.click(within(kinds).getByRole("switch", { name: "Suggest CI failures" }));
     await waitFor(() => expect(api.updateSuggestionSource).toHaveBeenCalledWith("gh", "ci-failed", true));
 
-    fireEvent.keyDown(screen.getByLabelText("Provider GitHub"), { key: "ArrowDown", altKey: true });
+    fireEvent.keyDown(screen.getByLabelText("Source GitHub"), { key: "ArrowDown", altKey: true });
     await waitFor(() => expect(api.updateSuggestionPrefs).toHaveBeenCalledWith({ provider_order: ["lin", "gh"] }));
-    fireEvent.keyDown(screen.getByLabelText("Provider GitHub"), { key: "ArrowUp", altKey: true });
+    fireEvent.keyDown(screen.getByLabelText("Source GitHub"), { key: "ArrowUp", altKey: true });
     expect(api.updateSuggestionPrefs).not.toHaveBeenCalledWith({ provider_order: ["gh", "lin"] });
 
+    fireEvent.change(screen.getByLabelText("Check for new suggestions every"), { target: { value: "60" } });
+    await waitFor(() => expect(api.updateSuggestionPrefs).toHaveBeenCalledWith({ refresh_minutes: 60 }));
+    expect(screen.getByText("1 hidden.")).toBeTruthy();
     fireEvent.click(screen.getByRole("button", { name: "Show" }));
     expect(openFull).toHaveBeenCalledWith(true);
-    fireEvent.click(screen.getByRole("switch", { name: "Start without review" }));
-    await waitFor(() => expect(api.updateSuggestionPrefs).toHaveBeenCalledWith({ start_without_review: true }));
+    // The old per-kind checkboxes, prompt templates page and unreviewed start are gone.
+    expect(screen.queryByText(/Start without review/)).toBeNull();
+    expect(screen.queryByText(/Prompt templates/)).toBeNull();
   });
 
   it("shows the agent-usage note and runs the plugin's fix", async () => {
@@ -161,265 +186,144 @@ describe("SuggestionsSettings", () => {
     snap.providers[0].uses_agent = true;
     snap.providers[1].fix = { label: "Fix in Linear settings" };
     api.fetchSuggestions.mockResolvedValue(snap);
-    api.fetchSuggestionTemplates.mockResolvedValue([]);
-    api.fetchSuggestionMappings.mockResolvedValue([]);
-    api.fetchProjects.mockResolvedValue([]);
+    api.fetchAgents.mockResolvedValue([]);
     api.runSuggestionFix.mockResolvedValue(ok);
     render(<Harness readOnly={false} onOpenSuggestions={vi.fn()} />);
-    expect((await screen.findByText(/uses an Agent to read the codebase/)).textContent).toContain("Plugin");
-    expect(screen.getAllByText(/uses an Agent/)).toHaveLength(1);
+    expect((await screen.findByText(/Uses your Agent's usage/)).textContent).toContain("Updated");
+    expect(screen.getAllByText(/Uses your Agent's usage/)).toHaveLength(1);
     fireEvent.click(screen.getByRole("button", { name: "Fix in Linear settings" }));
     await waitFor(() => expect(api.runSuggestionFix).toHaveBeenCalledWith("lin"));
   });
 
   it("disables every control when read-only", async () => {
     open({ readOnly: true });
-    await screen.findByText("Plugin · updated 2 min ago");
+    await screen.findByText("Updated 2 min ago");
     for (const sw of screen.getAllByRole("switch")) expect((sw as HTMLButtonElement).disabled).toBe(true);
-    expect((screen.getByLabelText("Refresh every") as HTMLSelectElement).disabled).toBe(true);
+    expect((screen.getByLabelText("Check for new suggestions every") as HTMLSelectElement).disabled).toBe(true);
   });
 
-  it("edits a template: chip inserts at the cursor, blur saves, preview expands, reset deletes", async () => {
+  it("edits a kind's preset: the fields show it, the prompt previews, Save sends the whole preset", async () => {
     open();
-    fireEvent.click(await screen.findByRole("button", { name: "Edit" }));
-    const field = (await screen.findByLabelText("GitHub review-requested template")) as HTMLTextAreaElement;
-    expect(screen.getByText("Uses the plugin's own prompt.")).toBeTruthy();
-    expect(screen.getByText("Preview: plugin prompt")).toBeTruthy();
+    fireEvent.click(await screen.findByRole("button", { name: "Edit Review requests" }));
+    await screen.findByText(/Edit \u00b7 Review requests/);
+    expect((screen.getByLabelText("Agent") as HTMLSelectElement).value).toBe("claude");
+    expect(screen.getByRole("radio", { name: "Structured" }).getAttribute("aria-checked")).toBe("true");
+    expect(screen.getByText("Preview: /aoe-review 4562")).toBeTruthy();
 
-    fireEvent.change(field, { target: { value: "/aoe-review #" } });
-    field.setSelectionRange(13, 13);
-    const variable = screen.getByRole("button", { name: "{pr-number}" });
-    // Without the mouse-down guard the textarea would blur and save before the variable is inserted.
-    expect(fireEvent.mouseDown(variable)).toBe(false);
-    fireEvent.click(variable);
-    expect(field.value).toBe("/aoe-review #{pr-number}");
-    expect(screen.getByText("Preview: /aoe-review #4562")).toBeTruthy();
-
-    fireEvent.blur(field);
+    fireEvent.change(screen.getByLabelText("Agent"), { target: { value: "codex" } });
+    fireEvent.click(screen.getByRole("radio", { name: "Terminal" }));
+    fireEvent.click(screen.getByRole("switch", { name: "Sandbox" }));
+    fireEvent.click(screen.getByRole("switch", { name: "Yolo mode" }));
+    fireEvent.change(screen.getByLabelText("GitHub review-requested prompt"), { target: { value: "Review {repo}" } });
+    fireEvent.click(screen.getByRole("button", { name: "Save" }));
     await waitFor(() =>
-      expect(api.putSuggestionTemplate).toHaveBeenCalledWith("gh", "review-requested", "/aoe-review #{pr-number}"),
+      expect(api.putSuggestionPreset).toHaveBeenCalledWith("gh", "review-requested", {
+        agent: "codex",
+        view: "terminal",
+        worktree: true,
+        sandbox: true,
+        yolo: true,
+        prompt: "Review {repo}",
+      }),
     );
-
-    fireEvent.change(field, { target: { value: "x {nope}" } });
-    expect(screen.getByText("{nope}").className).toContain("underline");
-    expect(screen.getByText("Preview: x {nope}")).toBeTruthy();
-    fireEvent.change(field, { target: { value: "" } });
-    expect(screen.getByText("Preview: starts with an empty prompt, so you type the first message.")).toBeTruthy();
-
-    expect(screen.getByText("CI failures from GitHub won't be suggested.")).toBeTruthy();
+    // Back on the list once the save and reload land.
+    await screen.findByRole("button", { name: "Edit Review requests" });
   });
 
-  it("keeps typed text when saving fails and locks reorder while a patch is in flight", async () => {
+  it("Cancel leaves the preset alone, and Reset deletes a customized one", async () => {
     open();
-    let finish: (v: typeof ok) => void = () => {};
-    api.updateSuggestionPrefs.mockReturnValue(new Promise((resolve) => (finish = resolve)));
-    const github = await screen.findByLabelText("Provider GitHub");
-    fireEvent.keyDown(github, { key: "ArrowDown", altKey: true });
-    await waitFor(() => expect(api.updateSuggestionPrefs).toHaveBeenCalledTimes(1));
-    fireEvent.keyDown(github, { key: "ArrowDown", altKey: true });
-    expect(api.updateSuggestionPrefs).toHaveBeenCalledTimes(1);
-    finish(ok);
-    await waitFor(() => expect(screen.getByLabelText("Drag GitHub to reorder")).toHaveProperty("disabled", false));
-    cleanup();
+    fireEvent.click(await screen.findByRole("button", { name: "Edit Review requests" }));
+    fireEvent.click(await screen.findByRole("button", { name: "Cancel" }));
+    expect(api.putSuggestionPreset).not.toHaveBeenCalled();
 
-    open();
-    api.putSuggestionTemplate.mockResolvedValue({ ok: false, error: "too long", stale: false });
-    fireEvent.click(await screen.findByRole("button", { name: "Edit" }));
-    const field = (await screen.findByLabelText("GitHub review-requested template")) as HTMLTextAreaElement;
-    fireEvent.change(field, { target: { value: "typed" } });
-    fireEvent.blur(field);
-    expect((await screen.findByRole("alert")).textContent).toContain("too long");
-    expect(field.value).toBe("typed");
+    fireEvent.click(await screen.findByRole("button", { name: "Edit CI failures" }));
+    const reset = await screen.findByRole("button", { name: /^Reset to/ });
+    fireEvent.click(reset);
+    await waitFor(() => expect(api.resetSuggestionPreset).toHaveBeenCalledWith("gh", "ci-failed"));
   });
 
-  it("keeps an edit typed while a save or reset is in flight", async () => {
+  it("keeps the editor open and shows the error when saving fails", async () => {
     open();
-    let finish: (v: typeof ok) => void = () => {};
-    api.putSuggestionTemplate.mockReturnValueOnce(new Promise((resolve) => (finish = resolve)));
-    fireEvent.click(await screen.findByRole("button", { name: "Edit" }));
-    const field = (await screen.findByLabelText("GitHub review-requested template")) as HTMLTextAreaElement;
-    fireEvent.change(field, { target: { value: "A" } });
-    fireEvent.blur(field);
-    await waitFor(() => expect(api.putSuggestionTemplate).toHaveBeenCalledWith("gh", "review-requested", "A"));
-    fireEvent.change(field, { target: { value: "B" } });
-    const loads = api.fetchSuggestionTemplates.mock.calls.length;
-    finish(ok);
-    await waitFor(() => expect(api.fetchSuggestionTemplates.mock.calls.length).toBeGreaterThan(loads));
-    expect(field.value).toBe("B");
-    fireEvent.blur(field);
-    await waitFor(() => expect(api.putSuggestionTemplate).toHaveBeenLastCalledWith("gh", "review-requested", "B"));
-    cleanup();
-
-    open();
-    api.fetchSuggestionTemplates.mockResolvedValue([
-      { provider_id: "gh", criterion: "review-requested", template: "saved" },
-    ]);
-    api.resetSuggestionTemplate.mockReturnValueOnce(new Promise((resolve) => (finish = resolve)));
-    fireEvent.click(await screen.findByRole("button", { name: "Edit" }));
-    const again = (await screen.findByLabelText("GitHub review-requested template")) as HTMLTextAreaElement;
-    await waitFor(() => expect(again.value).toBe("saved"));
-    fireEvent.click(screen.getAllByRole("button", { name: "Reset to the plugin's default" })[0]!);
-    await waitFor(() => expect(api.resetSuggestionTemplate).toHaveBeenCalledTimes(1));
-    fireEvent.change(again, { target: { value: "typed during reset" } });
-    const resetLoads = api.fetchSuggestionTemplates.mock.calls.length;
-    finish(ok);
-    await waitFor(() => expect(api.fetchSuggestionTemplates.mock.calls.length).toBeGreaterThan(resetLoads));
-    expect(again.value).toBe("typed during reset");
+    api.putSuggestionPreset.mockResolvedValueOnce({ ok: false, error: "unknown agent", stale: false });
+    fireEvent.click(await screen.findByRole("button", { name: "Edit Review requests" }));
+    fireEvent.click(await screen.findByRole("button", { name: "Save" }));
+    expect((await screen.findByRole("alert")).textContent).toContain("unknown agent");
+    expect(screen.getByText(/Edit \u00b7 Review requests/)).toBeTruthy();
   });
 
-  it("says so when the reload after a change fails, and Retry reloads", async () => {
+  it("says so when the snapshot reload fails, and Retry reloads", async () => {
     open();
-    const sidebar = await screen.findByRole("switch", { name: "Show in sidebar" });
+    await screen.findByText("Updated 2 min ago");
     api.fetchSuggestions.mockResolvedValueOnce(null);
-    fireEvent.click(sidebar);
-    expect((await screen.findByRole("alert")).textContent).toContain("Could not reload suggestions");
-    api.fetchSuggestions.mockResolvedValue(snapshot());
+    fireEvent.click(screen.getByRole("switch", { name: "Show in the sidebar" }));
+    await screen.findByText(/Could not reload suggestions/);
     fireEvent.click(screen.getByRole("button", { name: "Retry" }));
-    await waitFor(() => expect(screen.queryByRole("alert")).toBeNull());
+    await waitFor(() => expect(screen.queryByText(/Could not reload suggestions/)).toBeNull());
   });
 
-  it("keeps a saved template's text visible when its reload fails", async () => {
-    open();
-    fireEvent.click(await screen.findByRole("button", { name: "Edit" }));
-    const field = (await screen.findByLabelText("GitHub review-requested template")) as HTMLTextAreaElement;
-    api.fetchSuggestionTemplates.mockResolvedValueOnce(null);
-    fireEvent.change(field, { target: { value: "new prompt" } });
-    fireEvent.blur(field);
-    await screen.findByText(/Could not load templates/);
-    expect(field.value).toBe("new prompt");
-  });
-
-  it("confirms a template save from the template fetch even when the mapping fetch fails", async () => {
-    open();
-    fireEvent.click(await screen.findByRole("button", { name: "Edit" }));
-    const field = (await screen.findByLabelText("GitHub review-requested template")) as HTMLTextAreaElement;
-    api.fetchSuggestionTemplates.mockResolvedValueOnce([
-      { provider_id: "gh", criterion: "review-requested", template: "new prompt" },
-    ]);
-    api.fetchSuggestionMappings.mockResolvedValueOnce(null);
-    fireEvent.change(field, { target: { value: "new prompt" } });
-    fireEvent.blur(field);
-    await screen.findByText(/Could not load mappings/);
-    // The draft is gone, so the field follows the stored value again.
-    api.fetchSuggestionTemplates.mockResolvedValue([
-      { provider_id: "gh", criterion: "review-requested", template: "server" },
-    ]);
-    fireEvent.click(screen.getByRole("button", { name: "Retry" }));
-    await waitFor(() => expect(field.value).toBe("server"));
-  });
-
-  it("clears the load error once Retry loads everything", async () => {
-    api.fetchSuggestionMappings.mockResolvedValueOnce(null);
-    open();
-    fireEvent.click(await screen.findByRole("button", { name: "Edit" }));
-    await screen.findByText(/Could not load mappings/);
-    fireEvent.click(screen.getByRole("button", { name: "Retry" }));
-    await waitFor(() => expect(screen.queryByText(/Could not load mappings/)).toBeNull());
-  });
-
-  it("sends template saves one at a time, in the order they were made", async () => {
-    open();
-    let finishA: (v: typeof ok) => void = () => {};
-    api.putSuggestionTemplate.mockReturnValueOnce(new Promise((resolve) => (finishA = resolve)));
-    fireEvent.click(await screen.findByRole("button", { name: "Edit" }));
-    const field = (await screen.findByLabelText("GitHub review-requested template")) as HTMLTextAreaElement;
-    fireEvent.change(field, { target: { value: "A" } });
-    fireEvent.blur(field);
-    await waitFor(() => expect(api.putSuggestionTemplate).toHaveBeenCalledTimes(1));
-    fireEvent.change(field, { target: { value: "B" } });
-    fireEvent.blur(field);
-    await act(async () => {});
-    expect(api.putSuggestionTemplate).toHaveBeenCalledTimes(1);
-    finishA(ok);
-    await waitFor(() => expect(api.putSuggestionTemplate).toHaveBeenCalledTimes(2));
-    expect(api.putSuggestionTemplate).toHaveBeenLastCalledWith("gh", "review-requested", "B");
-  });
-
-  it("locks the mapping controls until a mapping save and its reload finish", async () => {
-    open();
-    let finish: (v: typeof ok) => void = () => {};
-    api.putSuggestionMapping.mockReturnValueOnce(new Promise((resolve) => (finish = resolve)));
-    fireEvent.click(await screen.findByRole("button", { name: "Edit" }));
-    const select = (await screen.findByLabelText("Map github.com/o/r")) as HTMLSelectElement;
-    await waitFor(() => expect(select.disabled).toBe(false));
-    fireEvent.change(select, { target: { value: "/p/aoe" } });
-    await waitFor(() => expect(api.putSuggestionMapping).toHaveBeenCalledWith("gh", "github.com/o/r", ["/p/aoe"]));
-    expect(select.disabled).toBe(true);
-    finish(ok);
-    await waitFor(() => expect(select.disabled).toBe(false));
-  });
-
-  it("keeps the mapping controls locked while a newer load supersedes the mapping reload", async () => {
-    open();
-    fireEvent.click(await screen.findByRole("button", { name: "Edit" }));
-    const select = (await screen.findByLabelText("Map github.com/o/r")) as HTMLSelectElement;
-    await waitFor(() => expect(select.disabled).toBe(false));
-    const field = (await screen.findByLabelText("GitHub review-requested template")) as HTMLTextAreaElement;
-    let first: (v: unknown[]) => void = () => {};
-    let second: (v: unknown[]) => void = () => {};
-    api.fetchSuggestionMappings
-      .mockReturnValueOnce(new Promise((resolve) => (first = resolve)))
-      .mockReturnValueOnce(new Promise((resolve) => (second = resolve)));
-    fireEvent.change(select, { target: { value: "/p/aoe" } });
-    await waitFor(() => expect(api.fetchSuggestionMappings).toHaveBeenCalledTimes(2));
-    fireEvent.change(field, { target: { value: "t" } });
-    fireEvent.blur(field);
-    await waitFor(() => expect(api.fetchSuggestionMappings).toHaveBeenCalledTimes(3));
-    await act(async () => first([]));
-    expect(select.disabled).toBe(true);
-    await act(async () => second([]));
-    await waitFor(() => expect(select.disabled).toBe(false));
-  });
-
-  it("keeps the mapping controls locked after a failed reload until Retry succeeds", async () => {
-    open();
-    fireEvent.click(await screen.findByRole("button", { name: "Edit" }));
-    const select = (await screen.findByLabelText("Map github.com/o/r")) as HTMLSelectElement;
-    await waitFor(() => expect(select.disabled).toBe(false));
-    api.fetchSuggestionMappings.mockResolvedValueOnce(null);
-    fireEvent.change(select, { target: { value: "/p/aoe" } });
-    await waitFor(() => expect(api.putSuggestionMapping).toHaveBeenCalledTimes(1));
-    await screen.findByText(/Could not reload mappings/);
-    expect(select.disabled).toBe(true);
-    fireEvent.click(screen.getByRole("button", { name: "Retry" }));
-    await waitFor(() => expect(select.disabled).toBe(false));
-    expect(screen.queryByText(/Could not reload mappings/)).toBeNull();
-  });
-
-  it("opens straight on a focused template and returns to the suggestions view", async () => {
+  it("opens straight on a focused preset and returns to the suggestions view", async () => {
     const openFull = open({
-      templateFocus: { providerId: "gh", criterion: "review-requested", returnToSuggestions: true },
+      presetFocus: { providerId: "gh", criterion: "review-requested", returnToSuggestions: true },
     });
-    await screen.findByLabelText("GitHub review-requested template");
-    fireEvent.click(screen.getByRole("button", { name: /Suggested sessions/ }));
+    await screen.findByText(/Edit \u00b7 Review requests/);
+    fireEvent.click(screen.getByRole("button", { name: "Cancel" }));
     expect(openFull).toHaveBeenCalledWith(false);
   });
 
-  it("opens the templates view when a focus arrives after mount, once per focus", async () => {
+  it("opens the editor when a focus arrives after mount, once per focus", async () => {
     api.fetchSuggestions.mockResolvedValue(snapshot());
-    api.fetchSuggestionTemplates.mockResolvedValue([]);
-    api.fetchSuggestionMappings.mockResolvedValue([]);
-    api.fetchProjects.mockResolvedValue([]);
+    api.fetchAgents.mockResolvedValue([]);
     const focus = () => ({ providerId: "gh", criterion: "review-requested" });
     const view = render(<Harness readOnly={false} onOpenSuggestions={vi.fn()} />);
-    await screen.findByText("Plugin · updated 2 min ago");
-    view.rerender(<Harness readOnly={false} onOpenSuggestions={vi.fn()} templateFocus={focus()} />);
-    fireEvent.click(await screen.findByRole("button", { name: /Suggestions/ }));
-    await screen.findByText("Plugin · updated 2 min ago");
+    await screen.findByText("Updated 2 min ago");
+    view.rerender(<Harness readOnly={false} onOpenSuggestions={vi.fn()} presetFocus={focus()} />);
+    fireEvent.click(await screen.findByRole("button", { name: "Cancel" }));
+    await screen.findByText("Updated 2 min ago");
     // A fresh object with the same values (an App re-render) must not reopen it.
-    view.rerender(<Harness readOnly={false} onOpenSuggestions={vi.fn()} templateFocus={focus()} />);
-    expect(screen.queryByLabelText("GitHub review-requested template")).toBeNull();
+    view.rerender(<Harness readOnly={false} onOpenSuggestions={vi.fn()} presetFocus={focus()} />);
+    expect(screen.queryByText(/Edit \u00b7 Review requests/)).toBeNull();
   });
 
-  it("maps a source to a Project and clears it", async () => {
-    open();
-    fireEvent.click(await screen.findByRole("button", { name: "Edit" }));
-    const row = (await screen.findByText("github.com/o/r")).closest("li") as HTMLElement;
-    expect(within(row).getByText("no mapping: the wizard asks")).toBeTruthy();
-    const select = within(row).getByLabelText("Map github.com/o/r") as HTMLSelectElement;
-    await waitFor(() => expect(select.disabled).toBe(false));
-    fireEvent.change(select, { target: { value: "/p/aoe" } });
-    await waitFor(() => expect(api.putSuggestionMapping).toHaveBeenCalledWith("gh", "github.com/o/r", ["/p/aoe"]));
+  describe("Linked repos", () => {
+    const openLinked = async () => {
+      open();
+      fireEvent.click(await screen.findByText("Advanced"));
+      const row = screen.getByText("Linked repos").closest("div.flex") as HTMLElement;
+      fireEvent.click(within(row).getByRole("button", { name: "Edit" }));
+      return (await screen.findByLabelText("Link github.com/o/r")) as HTMLSelectElement;
+    };
+
+    it("links a repo to a Project", async () => {
+      const select = await openLinked();
+      expect(screen.getByText("no Project yet")).toBeTruthy();
+      await waitFor(() => expect(select.disabled).toBe(false));
+      fireEvent.change(select, { target: { value: "/p/aoe" } });
+      await waitFor(() => expect(api.putSuggestionMapping).toHaveBeenCalledWith("gh", "github.com/o/r", ["/p/aoe"]));
+    });
+
+    it("locks the controls until a save and its reload finish", async () => {
+      let finish: (v: typeof ok) => void = () => {};
+      const select = await openLinked();
+      api.putSuggestionMapping.mockReturnValueOnce(new Promise((resolve) => (finish = resolve)));
+      await waitFor(() => expect(select.disabled).toBe(false));
+      fireEvent.change(select, { target: { value: "/p/aoe" } });
+      await waitFor(() => expect(api.putSuggestionMapping).toHaveBeenCalled());
+      expect(select.disabled).toBe(true);
+      finish(ok);
+      await waitFor(() => expect(select.disabled).toBe(false));
+    });
+
+    it("keeps the controls locked after a failed reload until Retry succeeds", async () => {
+      const select = await openLinked();
+      await waitFor(() => expect(select.disabled).toBe(false));
+      api.fetchSuggestionMappings.mockResolvedValueOnce(null);
+      fireEvent.change(select, { target: { value: "/p/aoe" } });
+      await screen.findByText(/Could not reload linked repos/);
+      expect(select.disabled).toBe(true);
+      fireEvent.click(screen.getByRole("button", { name: "Retry" }));
+      await waitFor(() => expect(select.disabled).toBe(false));
+      expect(screen.queryByText(/Could not reload linked repos/)).toBeNull();
+    });
   });
 });
 

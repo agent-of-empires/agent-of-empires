@@ -1814,15 +1814,6 @@ function AppContent({
     }
   }, [navigate, activeSessionId]);
 
-  const handleSuggestionStarted = useCallback(
-    (session: SessionResponse) => {
-      injectSession(session);
-      navigate(`/session/${encodeURIComponent(session.id)}`);
-      if (window.innerWidth < 768) setSidebarOpen(false);
-    },
-    [injectSession, navigate],
-  );
-
   const handleClosePluginPage = useCallback(() => {
     // A deep link has no in-app history to pop.
     if (location.key !== "default") navigate(-1);
@@ -2396,7 +2387,12 @@ function AppContent({
             }}
             onOpenSession={(id) => requestNavigate(`/session/${encodeURIComponent(id)}`)}
             onOpenSettings={() => requestNavigate("/settings/suggestions")}
-            onStarted={handleSuggestionStarted}
+            canLink={!caps.nameOnlyWizard}
+            onEditPreset={(providerId, criterion) =>
+              requestNavigate(
+                `/settings/suggestions?${new URLSearchParams({ preset_provider: providerId, preset_criterion: criterion, from: "suggestions" })}`,
+              )
+            }
           />
         </div>
       );
@@ -2427,11 +2423,11 @@ function AppContent({
           }}
           profile={searchParams.get("profile")}
           onOpenSuggestions={(dismissed) => navigate(dismissed ? "/suggestions?dismissed=1" : "/suggestions")}
-          templateFocus={
-            searchParams.get("template_provider") && searchParams.get("template_criterion")
+          presetFocus={
+            searchParams.get("preset_provider") && searchParams.get("preset_criterion")
               ? {
-                  providerId: searchParams.get("template_provider")!,
-                  criterion: searchParams.get("template_criterion")!,
+                  providerId: searchParams.get("preset_provider")!,
+                  criterion: searchParams.get("preset_criterion")!,
                   returnToSuggestions: searchParams.get("from") === "suggestions",
                 }
               : undefined
@@ -2494,11 +2490,16 @@ function AppContent({
               />
             )
           }
+          canLinkSuggestions={!caps.nameOnlyWizard}
+          onEditSuggestionPreset={(providerId, criterion) =>
+            requestNavigate(
+              `/settings/suggestions?${new URLSearchParams({ preset_provider: providerId, preset_criterion: criterion, from: "suggestions" })}`,
+            )
+          }
           onPrepareSuggestion={(prefill) => {
             setWizardPrefill(prefill);
             setShowSessionWizard(true);
           }}
-          onSuggestionStarted={handleSuggestionStarted}
           onViewAllSuggestions={() => requestNavigate("/suggestions")}
           onOpenSuggestionsMarketplace={() => requestNavigate("/settings/plugins?marketplace=suggestions")}
           tourActive={tour.isTourActive}
@@ -2889,7 +2890,7 @@ function AppContent({
                     setWizardPrefill(prefill);
                     setShowSessionWizard(true);
                   },
-                  onStarted: handleSuggestionStarted,
+                  onOpenSession: (id) => requestNavigate(`/session/${encodeURIComponent(id)}`),
                   onViewAll: () => requestNavigate("/suggestions"),
                 }}
               />
@@ -2926,12 +2927,12 @@ function AppContent({
               }}
               prefill={wizardPrefill}
               nameOnly={caps.nameOnlyWizard}
-              onEditTemplate={({ providerId, criterion }) => {
+              onEditPreset={({ providerId, criterion }) => {
                 setShowSessionWizard(false);
                 setWizardPrefill(undefined);
                 const q = new URLSearchParams({
-                  template_provider: providerId,
-                  template_criterion: criterion,
+                  preset_provider: providerId,
+                  preset_criterion: criterion,
                   from: "suggestions",
                 });
                 navigate(`/settings/suggestions?${q}`);

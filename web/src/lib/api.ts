@@ -27,7 +27,8 @@ import type {
   SuggestionProject,
   SuggestionPrefs,
   SuggestionPrepared,
-  SuggestionTemplate,
+  SuggestionPreset,
+  SuggestionPresetEntry,
   SuggestionsSnapshot,
 } from "./types";
 import type { AcpAttachment, ConfigOptionDescriptor, PromptAttachmentInput } from "./acpTypes";
@@ -3664,20 +3665,95 @@ export type SuggestionPrefsPatch = Partial<Omit<SuggestionPrefs, "provider_order
 export const updateSuggestionPrefs = (patch: SuggestionPrefsPatch) =>
   suggestionMutation("/api/suggestions/prefs", "PATCH", patch);
 
-export async function fetchSuggestionTemplates(): Promise<SuggestionTemplate[] | null> {
-  const body = await fetchJson<{ templates: SuggestionTemplate[] }>("/api/suggestions/templates");
-  return body?.templates ?? null;
+export async function fetchSuggestionPresets(): Promise<SuggestionPresetEntry[] | null> {
+  const body = await fetchJson<{ presets: SuggestionPresetEntry[] }>("/api/suggestions/presets");
+  return body?.presets ?? null;
 }
 
-export const putSuggestionTemplate = (providerId: string, criterion: string, template: string) =>
-  suggestionRequest("/api/suggestions/templates", "PUT", { provider_id: providerId, criterion, template });
+export const putSuggestionPreset = (providerId: string, criterion: string, preset: SuggestionPreset) =>
+  suggestionMutation("/api/suggestions/presets", "PUT", { provider_id: providerId, criterion, preset });
 
-/** Drops the override, so the provider's own prompt applies again. */
-export const resetSuggestionTemplate = (providerId: string, criterion: string) =>
-  suggestionRequest(
-    `/api/suggestions/templates?${new URLSearchParams({ provider_id: providerId, criterion })}`,
+/** Drops the edits, so the kind follows the Profile's defaults and the provider's prompt again. */
+export const resetSuggestionPreset = (providerId: string, criterion: string) =>
+  suggestionMutation(
+    `/api/suggestions/presets?${new URLSearchParams({ provider_id: providerId, criterion })}`,
     "DELETE",
   );
+
+/** The repo's hooks, as `POST /start` returns them with a 409 `hooks_need_trust`. */
+export interface StartHooksReview {
+  commands: { on_create?: string[]; on_launch?: string[]; on_destroy?: string[] };
+  mcp_servers?: string[];
+  review_fingerprint: string;
+}
+
+export interface StartOptions {
+  /** Links the item's repo to this registered Project, then starts. */
+  project?: { path: string };
+  approve_hooks?: boolean;
+  review_fingerprint?: string;
+}
+
+export type StartResult =
+  | { kind: "started"; sessionId: string; title: string }
+  | { kind: "already_started"; sessionId: string }
+  | { kind: "hooks_need_trust"; review: StartHooksReview }
+  | { kind: "trust_changed"; review: StartHooksReview }
+  /** The server said no: `reason` is what went wrong, `hint` what to do. */
+  | { kind: "failed"; reason: string; hint?: string; retryable: boolean }
+  | { kind: "stale" }
+  /** The repo has no linked Project: pick one with "Start in…". */
+  | { kind: "no_project" }
+  | { kind: "error"; error: string };
+
+/** Starts a Session from a suggestion with its kind's preset. The server answers 202 and the Session streams in. */
+export async function startSuggestion(
+  providerId: string,
+  id: string,
+  options: StartOptions = {},
+): Promise<StartResult> {
+  let res: Response;
+  let text: string;
+  try {
+    res = await fetch("/api/suggestions/start", jsonInit("POST", { provider_id: providerId, id, ...options }));
+    text = await res.text();
+  } catch (error) {
+    return { kind: "error", error: `Network error: ${error instanceof Error ? error.message : "connection failed"}` };
+  }
+  let body: Record<string, unknown> = {};
+  try {
+    body = text ? (JSON.parse(text) as Record<string, unknown>) : {};
+  } catch {
+    // Handled below by status.
+  }
+  const str = (v: unknown) => (typeof v === "string" ? v : undefined);
+  if (res.ok) {
+    const sessionId = str(body.session_id);
+    if (!sessionId)
+      return { kind: "error", error: "Unexpected response from the server. Reload to see the current state." };
+    notifySuggestionsChanged();
+    return { kind: "started", sessionId, title: str(body.title) ?? "" };
+  }
+  const code = str(body.error);
+  if (res.status === 409 && code === "already_started") {
+    notifySuggestionsChanged();
+    return { kind: "already_started", sessionId: str(body.session_id) ?? "" };
+  }
+  if (res.status === 409 && (code === "hooks_need_trust" || code === "trust_changed")) {
+    return { kind: code, review: body as unknown as StartHooksReview };
+  }
+  if (res.status === 422 && code === "start_failed") {
+    return {
+      kind: "failed",
+      reason: str(body.reason) ?? str(body.message) ?? "The Session could not be started.",
+      hint: str(body.hint),
+      retryable: body.retryable !== false,
+    };
+  }
+  if (res.status === 400 && code === "stale") return { kind: "stale" };
+  if (res.status === 400 && code === "no_project") return { kind: "no_project" };
+  return { kind: "error", error: parseApiErrorText(text, res.status) };
+}
 
 export async function fetchSuggestionMappings(): Promise<SuggestionMapping[] | null> {
   const body = await fetchJson<{ mappings: SuggestionMapping[] }>("/api/suggestions/mappings");

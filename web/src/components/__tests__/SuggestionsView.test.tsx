@@ -6,39 +6,24 @@ import { setServerDown } from "../../lib/connectionState";
 import { toastBus } from "../../lib/toastBus";
 import type { SuggestionItem, SuggestionsSnapshot } from "../../lib/types";
 
-const {
-  fetchSuggestions,
-  prepareSuggestion,
-  refreshSuggestions,
-  dismissSuggestion,
-  createSession,
-  fetchCreateBootId,
-  pending,
-} = vi.hoisted(() => ({
-  createSession: vi.fn(),
-  fetchCreateBootId: vi.fn(),
-  fetchSuggestions: vi.fn(),
-  prepareSuggestion: vi.fn(),
-  refreshSuggestions: vi.fn(),
-  dismissSuggestion: vi.fn(),
-  pending: { peek: vi.fn(), register: vi.fn(), release: vi.fn(), resolve: vi.fn() },
-}));
+const { fetchSuggestions, prepareSuggestion, refreshSuggestions, dismissSuggestion, startSuggestion, fetchProjects } =
+  vi.hoisted(() => ({
+    fetchSuggestions: vi.fn(),
+    prepareSuggestion: vi.fn(),
+    refreshSuggestions: vi.fn(),
+    dismissSuggestion: vi.fn(),
+    startSuggestion: vi.fn(),
+    fetchProjects: vi.fn(),
+  }));
 
 vi.mock("../../lib/api", () => ({
+  fetchAgents: () => Promise.resolve(null),
+  startSuggestion,
   fetchSuggestions,
   prepareSuggestion,
   refreshSuggestions,
   dismissSuggestion,
-  createSession,
-  fetchCreateBootId,
-}));
-
-vi.mock("../../lib/pendingCreates", () => ({
-  newIdempotencyKey: () => "key-1",
-  peekPendingCreate: pending.peek,
-  registerPendingCreate: pending.register,
-  releasePendingCreate: pending.release,
-  resolvePendingCreate: pending.resolve,
+  fetchSuggestionProjects: fetchProjects,
 }));
 
 const item: SuggestionItem = {
@@ -72,7 +57,6 @@ const snapshot = (over: Partial<SuggestionsSnapshot> = {}): SuggestionsSnapshot 
     homepage: true,
     sidebar: false,
     refresh_minutes: 15,
-    start_without_review: false,
     show_source_ref: true,
     provider_order: ["github"],
   },
@@ -84,8 +68,7 @@ afterEach(() => {
   cleanup();
   setServerDown(false);
   vi.clearAllMocks();
-  pending.peek.mockReturnValue(null);
-  fetchCreateBootId.mockResolvedValue("boot-1");
+  toastBus.handler = null;
 });
 
 async function open(snap: SuggestionsSnapshot | null, props: { readOnly?: boolean; initialDismissed?: boolean } = {}) {
@@ -97,33 +80,93 @@ async function open(snap: SuggestionsSnapshot | null, props: { readOnly?: boolea
   return Object.assign(onPrepare, { onOpenSession });
 }
 
-const prepared = {
-  title: "Fix lifecycle",
-  initial_prompt: "Template prompt.",
-  templated: true,
-  source_ref: "example/1",
-  project: { name: "aoe", path: "/work/aoe" },
-  tool: "opencode",
-  view: "structured" as const,
-  yolo: true,
-  sandbox: false,
-  worktree: true,
-};
-
-async function startWithoutReview(data: Partial<typeof prepared> | { project: null }, created?: object) {
-  prepareSuggestion.mockResolvedValue({ ok: true, data: { ...prepared, ...data } });
-  if (created) createSession.mockResolvedValue(created);
-  const snap = snapshot();
-  fetchSuggestions.mockResolvedValue({ ...snap, prefs: { ...snap.prefs, start_without_review: true } });
-  const onPrepare = vi.fn();
-  const onStarted = vi.fn();
-  render(<SuggestionsView onPrepare={onPrepare} onStarted={onStarted} />);
-  fireEvent.click(await screen.findByRole("button", { name: "Start" }));
-  return { onPrepare, onStarted };
-}
-
 describe("SuggestionsView", () => {
-  it("Start prepares and hands the draft prompt to the wizard without creating anything", async () => {
+  const startMenu = async (name: string) => {
+    fireEvent.click(await screen.findByRole("button", { name: "Start options" }));
+    fireEvent.click(screen.getByRole("menuitem", { name: new RegExp(`^${name}`) }));
+  };
+
+  it("Start runs the kind's preset, toasts the Session with Open, and opens no wizard", async () => {
+    startSuggestion.mockResolvedValue({ kind: "started", sessionId: "s1", title: "Fix lifecycle" });
+    const infoAction = vi.fn();
+    toastBus.handler = { push: vi.fn(), error: vi.fn(), info: vi.fn(), openLink: vi.fn(), action: vi.fn(), infoAction };
+    const onPrepare = await open(snapshot());
+    fireEvent.click(await screen.findByRole("button", { name: "Start" }));
+    await waitFor(() => expect(infoAction).toHaveBeenCalled());
+    expect(startSuggestion).toHaveBeenCalledWith("github", "issue-1", {});
+    expect(infoAction.mock.calls[0]![0]).toBe("Started \u201cFix lifecycle\u201d");
+    infoAction.mock.calls[0]![2]();
+    expect(onPrepare.onOpenSession).toHaveBeenCalledWith("s1");
+    expect(onPrepare).not.toHaveBeenCalled();
+    expect(prepareSuggestion).not.toHaveBeenCalled();
+  });
+
+  it("other rows stay usable while one starts", async () => {
+    startSuggestion.mockReturnValue(new Promise(() => {}));
+    await open(snapshot({ items: [item, { ...item, id: "issue-2", title: "Second" }] }));
+    const starts = await screen.findAllByRole("button", { name: "Start" });
+    fireEvent.click(starts[0]!);
+    expect(await screen.findByRole("button", { name: "Starting…" })).toHaveProperty("disabled", true);
+    expect((screen.getByRole("button", { name: "Start" }) as HTMLButtonElement).disabled).toBe(false);
+  });
+
+  it("a repo with hooks pauses on the review, and Approve and start repeats the call with the fingerprint", async () => {
+    startSuggestion
+      .mockResolvedValueOnce({
+        kind: "hooks_need_trust",
+        review: {
+          commands: { on_create: ["npm ci"], on_launch: ["./scripts/dev-setup.sh"] },
+          review_fingerprint: "fp-1",
+        },
+      })
+      .mockResolvedValueOnce({ kind: "started", sessionId: "s1", title: "Fix lifecycle" });
+    await open(snapshot());
+    fireEvent.click(await screen.findByRole("button", { name: "Start" }));
+    expect(await screen.findByText("Review this repo's hooks")).toBeTruthy();
+    expect(screen.getByText("npm ci")).toBeTruthy();
+    expect(screen.getByText("./scripts/dev-setup.sh")).toBeTruthy();
+    expect(startSuggestion).toHaveBeenCalledTimes(1);
+    fireEvent.click(screen.getByRole("button", { name: "Approve and start" }));
+    await waitFor(() => expect(startSuggestion).toHaveBeenCalledTimes(2));
+    expect(startSuggestion).toHaveBeenLastCalledWith("github", "issue-1", {
+      approve_hooks: true,
+      review_fingerprint: "fp-1",
+    });
+    await waitFor(() => expect(screen.queryByText("Review this repo's hooks")).toBeNull());
+  });
+
+  it("Cancel on the hooks review starts nothing", async () => {
+    startSuggestion.mockResolvedValue({
+      kind: "hooks_need_trust",
+      review: { commands: { on_create: ["npm ci"] }, review_fingerprint: "fp-1" },
+    });
+    await open(snapshot());
+    fireEvent.click(await screen.findByRole("button", { name: "Start" }));
+    fireEvent.click(await screen.findByRole("button", { name: "Cancel" }));
+    expect(screen.queryByText("Review this repo's hooks")).toBeNull();
+    expect(startSuggestion).toHaveBeenCalledTimes(1);
+  });
+
+  it("a failed start says why, then what to do, and Try again repeats the same start", async () => {
+    startSuggestion.mockResolvedValueOnce({
+      kind: "failed",
+      reason: "Docker isn't running",
+      hint: "Start it, then try again.",
+      retryable: true,
+    });
+    const onPrepare = await open(snapshot());
+    fireEvent.click(await screen.findByRole("button", { name: "Start" }));
+    expect(await screen.findByText("Couldn't start: Docker isn't running. Start it, then try again.")).toBeTruthy();
+    expect(screen.queryByRole("button", { name: "Start" })).toBeNull();
+
+    startSuggestion.mockResolvedValueOnce({ kind: "started", sessionId: "s1", title: "x" });
+    fireEvent.click(screen.getByRole("button", { name: "Try again" }));
+    await waitFor(() => expect(startSuggestion).toHaveBeenCalledTimes(2));
+    await waitFor(() => expect(screen.queryByText(/Couldn't start/)).toBeNull());
+    expect(onPrepare).not.toHaveBeenCalled();
+  });
+
+  it("Start with changes opens the prefilled New session dialog and keeps the link", async () => {
     prepareSuggestion.mockResolvedValue({
       ok: true,
       data: {
@@ -139,12 +182,18 @@ describe("SuggestionsView", () => {
       },
     });
     const onPrepare = await open(snapshot());
-    fireEvent.click(await screen.findByRole("button", { name: "Start" }));
+    await startMenu("Start with changes");
     await waitFor(() =>
       expect(onPrepare).toHaveBeenCalledWith({
-        source: { label: "GitHub", title: "Fix lifecycle", url: "https://example.test/issues/1" },
+        source: {
+          label: "GitHub",
+          title: "Fix lifecycle",
+          url: "https://example.test/issues/1",
+          kindLabel: "Assigned issues",
+        },
         title: "Fix lifecycle",
         path: "/work/aoe",
+        initialTab: undefined,
         tool: "opencode",
         yoloMode: true,
         sandboxEnabled: false,
@@ -152,7 +201,70 @@ describe("SuggestionsView", () => {
         suggestion: { provider_id: "github", id: "issue-1" },
       }),
     );
-    expect(prepareSuggestion).toHaveBeenCalledWith("github", "issue-1");
+    expect(startSuggestion).not.toHaveBeenCalled();
+  });
+
+  it("a Start that loses the link to another start turns the row into Open", async () => {
+    startSuggestion.mockResolvedValue({ kind: "already_started", sessionId: "s9" });
+    await open(snapshot());
+    fetchSuggestions.mockResolvedValue(
+      snapshot({
+        items: [
+          {
+            ...item,
+            started_session: {
+              id: "s9",
+              title: "x",
+              status: "Running",
+              archived: false,
+              created_at: new Date().toISOString(),
+            },
+          },
+        ],
+      }),
+    );
+    fireEvent.click(await screen.findByRole("button", { name: "Start" }));
+    expect(await screen.findByRole("button", { name: "Open" })).toBeTruthy();
+  });
+
+  it("a repo with no Project offers Start in…, and picking one starts with that Project", async () => {
+    fetchProjects.mockResolvedValue([{ name: "website", path: "/w/site", origin: null }]);
+    startSuggestion.mockResolvedValue({ kind: "started", sessionId: "s1", title: "Fix lifecycle" });
+    await open(snapshot({ items: [{ ...item, mapping_key: "acme/web", resolved_project: null }] }));
+    expect(screen.queryByRole("button", { name: "Start" })).toBeNull();
+    fireEvent.click(await screen.findByRole("button", { name: /^Start in…/ }));
+    fireEvent.click(await screen.findByRole("menuitem", { name: "website" }));
+    await waitFor(() =>
+      expect(startSuggestion).toHaveBeenCalledWith("github", "issue-1", { project: { path: "/w/site" } }),
+    );
+  });
+
+  it("Start in… is off where the link cannot be saved", async () => {
+    fetchSuggestions.mockResolvedValue(
+      snapshot({ items: [{ ...item, mapping_key: "acme/web", resolved_project: null }] }),
+    );
+    render(<SuggestionsView canLink={false} onPrepare={vi.fn()} onOpenSession={vi.fn()} />);
+    expect(((await screen.findByRole("button", { name: /^Start in…/ })) as HTMLButtonElement).disabled).toBe(true);
+  });
+
+  it("the ▾ menu says what Start uses and offers the kind's preset", async () => {
+    const onEditPreset = vi.fn();
+    fetchSuggestions.mockResolvedValue(
+      snapshot({
+        items: [
+          {
+            ...item,
+            resolved_project: { name: "aoe", path: "/work/aoe" },
+            start: { agent: "claude", view: "structured", worktree: true, sandbox: false, project: "aoe" },
+          },
+        ],
+      }),
+    );
+    render(<SuggestionsView onPrepare={vi.fn()} onOpenSession={vi.fn()} onEditPreset={onEditPreset} />);
+    fireEvent.click(await screen.findByRole("button", { name: "Start options" }));
+    expect(screen.getByText("aoe · claude · Structured view · worktree")).toBeTruthy();
+    fireEvent.click(screen.getByRole("menuitem", { name: /Edit the Assigned issues preset/ }));
+    expect(onEditPreset).toHaveBeenCalledWith("github", "assigned");
   });
 
   describe("a started suggestion", () => {
@@ -209,151 +321,6 @@ describe("SuggestionsView", () => {
       expect(screen.queryByRole("menuitem", { name: "Dismiss" })).toBeNull();
       expect(screen.getByRole("button", { name: "Open" })).toBeTruthy();
     });
-  });
-
-  it("Start without review creates the session from the prepared draft and skips the wizard", async () => {
-    const session = { id: "s1" };
-    const { onPrepare, onStarted } = await startWithoutReview({}, { ok: true, session });
-    await waitFor(() => expect(onStarted).toHaveBeenCalledWith(session));
-    expect(createSession).toHaveBeenCalledWith({
-      title: "Fix lifecycle",
-      path: "/work/aoe",
-      tool: "opencode",
-      view: "structured",
-      yolo_mode: true,
-      sandbox: false,
-      worktree_enabled: true,
-      create_new_branch: true,
-      initial_prompt: "Template prompt.",
-      suggestion: { provider_id: "github", id: "issue-1" },
-      idempotency_key: "key-1",
-    });
-    expect(pending.register).toHaveBeenCalledWith(expect.objectContaining({ tool: "opencode", origin: "boot-1" }), {
-      claimed: true,
-    });
-    expect(pending.resolve).toHaveBeenCalledWith("key-1");
-    expect(onPrepare).not.toHaveBeenCalled();
-  });
-
-  it("Start without review falls back to the wizard when the draft is unresolved or hooks need trust", async () => {
-    for (const [data, created] of [
-      [{ project: null }, undefined],
-      [{ initial_prompt: "" }, undefined],
-      [{ templated: false }, undefined],
-      [{}, { ok: false, error: "hooks", hooksNeedTrust: {} }],
-      [{}, { ok: false, error: "changed", trustChanged: true }],
-    ] as const) {
-      cleanup();
-      vi.clearAllMocks();
-      const { onPrepare, onStarted } = await startWithoutReview(data, created);
-      await waitFor(() => expect(onPrepare).toHaveBeenCalled());
-      expect(onStarted).not.toHaveBeenCalled();
-      expect(createSession).toHaveBeenCalledTimes(created ? 1 : 0);
-      if (created) expect(pending.resolve).toHaveBeenCalledWith("key-1");
-    }
-  });
-
-  it("Start without review shows a notice and never reopens the wizard when the outcome is unknown", async () => {
-    for (const created of [
-      { ok: false, error: "No answer from the server (502)", network: true },
-      { ok: false, error: "Unknown outcome", outcomeUnknown: true },
-    ]) {
-      cleanup();
-      vi.clearAllMocks();
-      const { onPrepare, onStarted } = await startWithoutReview({}, created);
-      expect((await screen.findByRole("alert")).textContent).toBe(created.error);
-      expect(onPrepare).not.toHaveBeenCalled();
-      expect(onStarted).not.toHaveBeenCalled();
-      expect(pending.release).toHaveBeenCalledTimes(1);
-      expect(pending.resolve).not.toHaveBeenCalled();
-    }
-  });
-
-  it("Start without review opens the prefilled wizard, with the reason shown, after a definitive refusal", async () => {
-    const { onPrepare, onStarted } = await startWithoutReview({}, { ok: false, error: "Sandbox unavailable" });
-    await waitFor(() => expect(onPrepare).toHaveBeenCalledTimes(1));
-    expect(onPrepare).toHaveBeenCalledWith(expect.objectContaining({ initialPrompt: "Template prompt." }));
-    expect((await screen.findByRole("alert")).textContent).toBe("Sandbox unavailable");
-    expect(onStarted).not.toHaveBeenCalled();
-    expect(pending.resolve).toHaveBeenCalledWith("key-1");
-    expect(pending.release).not.toHaveBeenCalled();
-  });
-
-  it("Start without review refuses when another create registers while the boot id is being fetched", async () => {
-    let bootId: (id: string) => void = () => {};
-    fetchCreateBootId.mockReturnValue(new Promise((resolve) => (bootId = resolve)));
-    pending.peek.mockReturnValue(null);
-    const { onPrepare } = await startWithoutReview({});
-    await waitFor(() => expect(fetchCreateBootId).toHaveBeenCalled());
-    pending.peek.mockReturnValue({ body: { idempotency_key: "other" } });
-    bootId("boot-1");
-    expect((await screen.findByRole("alert")).textContent).toContain("still being created");
-    expect(createSession).not.toHaveBeenCalled();
-    expect(pending.register).not.toHaveBeenCalled();
-    expect(onPrepare).not.toHaveBeenCalled();
-  });
-
-  it("Open wizard after a failed start never starts unreviewed, even with Start without review on", async () => {
-    prepareSuggestion
-      .mockResolvedValueOnce({ ok: false, error: "no agent", stale: false })
-      .mockResolvedValueOnce({ ok: true, data: prepared });
-    const snap = snapshot();
-    fetchSuggestions.mockResolvedValue({ ...snap, prefs: { ...snap.prefs, start_without_review: true } });
-    const onPrepare = vi.fn();
-    render(<SuggestionsView onPrepare={onPrepare} onStarted={vi.fn()} />);
-    fireEvent.click(await screen.findByRole("button", { name: "Start" }));
-    await screen.findByText(/Couldn't start: no agent/);
-    fireEvent.click(screen.getByRole("button", { name: "Open wizard" }));
-    await waitFor(() => expect(onPrepare).toHaveBeenCalledTimes(1));
-    expect(createSession).not.toHaveBeenCalled();
-  });
-
-  it("Start without review refuses a second view's Start while the first create is in flight", async () => {
-    let finish: (v: object) => void = () => {};
-    createSession.mockReturnValue(new Promise((resolve) => (finish = resolve)));
-    prepareSuggestion.mockResolvedValue({ ok: true, data: prepared });
-    const snap = snapshot();
-    fetchSuggestions.mockResolvedValue({ ...snap, prefs: { ...snap.prefs, start_without_review: true } });
-    render(
-      <>
-        <SuggestionsView onPrepare={vi.fn()} onStarted={vi.fn()} />
-        <SuggestionsView onPrepare={vi.fn()} onStarted={vi.fn()} />
-      </>,
-    );
-    const starts = await screen.findAllByRole("button", { name: "Start" });
-    fireEvent.click(starts[0]!);
-    await waitFor(() => expect(createSession).toHaveBeenCalledTimes(1));
-    fireEvent.click(starts[1]!);
-    expect((await screen.findByRole("alert")).textContent).toContain("still being created");
-    expect(createSession).toHaveBeenCalledTimes(1);
-    await act(async () => finish({ ok: true, session: { id: "s1" } }));
-  });
-
-  it("Start without review toasts a definitive refusal when the view unmounted mid-create", async () => {
-    let finish: (v: object) => void = () => {};
-    createSession.mockReturnValue(new Promise((resolve) => (finish = resolve)));
-    const error = vi.fn();
-    toastBus.handler = { error } as never;
-    prepareSuggestion.mockResolvedValue({ ok: true, data: prepared });
-    const snap = snapshot();
-    fetchSuggestions.mockResolvedValue({ ...snap, prefs: { ...snap.prefs, start_without_review: true } });
-    const onPrepare = vi.fn();
-    const { unmount } = render(<SuggestionsView onPrepare={onPrepare} onStarted={vi.fn()} />);
-    fireEvent.click(await screen.findByRole("button", { name: "Start" }));
-    await waitFor(() => expect(createSession).toHaveBeenCalledTimes(1));
-    unmount();
-    await act(async () => finish({ ok: false, error: "Path is not a project" }));
-    expect(error).toHaveBeenCalledWith("Path is not a project");
-    expect(onPrepare).not.toHaveBeenCalled();
-    toastBus.handler = null;
-  });
-
-  it("Start without review refuses a re-click while an earlier create is unresolved", async () => {
-    pending.peek.mockReturnValue({ body: { idempotency_key: "old" } });
-    const { onPrepare } = await startWithoutReview({});
-    expect((await screen.findByRole("alert")).textContent).toContain("still being created");
-    expect(createSession).not.toHaveBeenCalled();
-    expect(onPrepare).not.toHaveBeenCalled();
   });
 
   it("renders one compact row: title, short reference, reason once, with no preview, source name or link", async () => {
@@ -459,13 +426,16 @@ describe("SuggestionsView", () => {
       expect(onPrepare.mock.calls[0]![0].suggestion).toBeUndefined();
     });
 
-    it("a failed start stays on its row with Open wizard as the only way to retry", async () => {
-      prepareSuggestion.mockResolvedValueOnce({ ok: false, error: "worktree branch already exists", stale: false });
+    it("Start with changes on a failed row opens the dialog and clears the failure", async () => {
+      startSuggestion.mockResolvedValueOnce({
+        kind: "failed",
+        reason: "worktree branch already exists",
+        retryable: false,
+      });
       const onPrepare = await open(snapshot());
       fireEvent.click(await screen.findByRole("button", { name: "Start" }));
-      expect(await screen.findByText(/Couldn't start: worktree branch already exists/)).toBeTruthy();
+      expect(await screen.findByText(/Couldn't start: worktree branch already exists\./)).toBeTruthy();
       expect(screen.queryByRole("alert")).toBeNull();
-      expect(screen.queryByRole("button", { name: "Start" })).toBeNull();
       expect(onPrepare).not.toHaveBeenCalled();
 
       prepareSuggestion.mockResolvedValueOnce({
@@ -481,7 +451,7 @@ describe("SuggestionsView", () => {
           worktree: true,
         },
       });
-      fireEvent.click(screen.getByRole("button", { name: "Open wizard" }));
+      fireEvent.click(screen.getByRole("button", { name: "Start with changes" }));
       await waitFor(() => expect(onPrepare).toHaveBeenCalledTimes(1));
       await waitFor(() => expect(screen.queryByText(/Couldn't start/)).toBeNull());
     });
@@ -654,7 +624,7 @@ describe("SuggestionsView", () => {
   });
 
   it("a stale item shows a notice and reloads instead of opening the wizard", async () => {
-    prepareSuggestion.mockResolvedValue({ ok: false, error: "gone", stale: true });
+    startSuggestion.mockResolvedValue({ kind: "stale" });
     const onPrepare = await open(snapshot());
     fireEvent.click(await screen.findByRole("button", { name: "Start" }));
     expect((await screen.findByRole("alert")).textContent).toContain("Refreshing the list");
@@ -735,7 +705,7 @@ describe("SuggestionsView", () => {
       },
     });
     const onPrepare = await open(snapshot());
-    fireEvent.click(await screen.findByRole("button", { name: "Start" }));
+    await startMenu("Start with changes");
     await waitFor(() => expect(onPrepare).toHaveBeenCalled());
     expect(onPrepare.mock.calls[0][0].initialPrompt).toBeUndefined();
   });
@@ -764,11 +734,11 @@ describe("SuggestionsView", () => {
     });
 
     it("start", async () => {
-      prepareSuggestion.mockResolvedValue(failure);
+      startSuggestion.mockResolvedValue({ kind: "failed", reason: "boom", retryable: true });
       const onPrepare = await open(snapshot());
       fireEvent.click(await screen.findByRole("button", { name: "Start" }));
-      expect(await screen.findByText("Couldn't start: boom")).toBeTruthy();
-      for (const name of ["Open wizard", "Dismiss"]) {
+      expect(await screen.findByText("Couldn't start: boom.")).toBeTruthy();
+      for (const name of ["Try again", "Dismiss"]) {
         await waitFor(() => expect((screen.getByRole("button", { name }) as HTMLButtonElement).disabled).toBe(false));
       }
       expect(onPrepare).not.toHaveBeenCalled();

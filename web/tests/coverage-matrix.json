@@ -1011,7 +1011,12 @@
       "components": [
         "web/src/components/SuggestionsView.tsx",
         "web/src/components/SuggestionRow.tsx",
+        "web/src/components/SuggestionItemActions.tsx",
+        "web/src/components/SuggestionStartMenu.tsx",
+        "web/src/components/SuggestionFilterMenu.tsx",
         "web/src/components/DashboardSuggestions.tsx",
+        "web/src/hooks/useSuggestions.ts",
+        "web/src/components/session-wizard/HooksTrustDialog.tsx",
         "web/src/components/SuggestionMappingWizard.tsx"
       ]
     },
@@ -1041,10 +1046,10 @@
       "specs": ["tests/live/suggestions.spec.ts"],
       "components": [
         "web/src/components/settings/SuggestionsSettings.tsx",
-        "web/src/components/settings/SuggestionTemplates.tsx",
+        "web/src/components/settings/SuggestionPresetEditor.tsx",
         "web/src/components/SuggestionsView.tsx"
       ],
-      "notes": "A real worker publishes; preferences, templates, mappings and dismissals round-trip through the server, and read-only refuses every write."
+      "notes": "A real worker publishes; preferences, presets, mappings and dismissals round-trip through the server, and read-only refuses every write."
     },
     {
       "id": "settings.suggestions",
@@ -1054,7 +1059,8 @@
       "components": [
         "web/src/components/settings/SuggestionsSettings.tsx",
         "web/src/components/settings/PluginSettingsSections.tsx",
-        "web/src/components/settings/SuggestionTemplates.tsx",
+        "web/src/components/settings/SuggestionPresetEditor.tsx",
+        "web/src/components/settings/SuggestionLinkedRepos.tsx",
         "web/src/components/settings/TemplateEditor.tsx",
         "web/src/components/settings/suggestionsShared.tsx",
         "web/src/components/settings/useSuggestionsSnapshot.ts",

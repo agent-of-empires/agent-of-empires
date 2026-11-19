@@ -11,6 +11,8 @@ export interface ToastApi {
   /** An error toast with one button, such as reopening what failed. It is dismissed once
    *  used, unless `onAction` returns false to keep it for later. */
   action: (message: string, label: string, onAction: () => boolean | void) => void;
+  /** An info toast with one button, such as Open on a started Session. It expires like any info toast. */
+  infoAction?: (message: string, label: string, onAction: () => void) => void;
 }
 
 interface ToastBus {
