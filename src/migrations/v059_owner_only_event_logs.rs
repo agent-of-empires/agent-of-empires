@@ -22,6 +22,30 @@ fn restrict_file(path: &std::path::Path) -> Result<usize> {
     Ok(1)
 }
 
+/// Follows symlink hops without requiring the final target to exist.
+#[cfg(unix)]
+fn link_target(path: &std::path::Path) -> Result<std::path::PathBuf> {
+    let mut current = path.to_path_buf();
+    for _ in 0..40 {
+        if !std::fs::symlink_metadata(&current)?
+            .file_type()
+            .is_symlink()
+        {
+            return Ok(current);
+        }
+        let link = std::fs::read_link(&current)?;
+        current = current
+            .parent()
+            .unwrap_or(std::path::Path::new(""))
+            .join(link);
+        if matches!(std::fs::symlink_metadata(&current), Err(e) if e.kind() == std::io::ErrorKind::NotFound)
+        {
+            return Ok(current);
+        }
+    }
+    anyhow::bail!("too many symlink hops resolving {}", path.display())
+}
+
 #[cfg(unix)]
 fn restrict(dir: &std::path::Path) -> Result<usize> {
     let mut changed = 0;
@@ -34,18 +58,14 @@ fn restrict(dir: &std::path::Path) -> Result<usize> {
         }
         let path = entry.path();
         changed += restrict_file(&path)?;
-        // SQLite names sidecars after the resolved path of a symlinked log.
-        match std::fs::canonicalize(&path) {
-            Ok(target) if target != path => {
-                for suffix in ["-wal", "-shm"] {
-                    let mut sidecar = target.clone().into_os_string();
-                    sidecar.push(suffix);
-                    changed += restrict_file(sidecar.as_ref())?;
-                }
+        // SQLite names sidecars after the link's target, which may be missing while they survive.
+        let target = link_target(&path)?;
+        if target != path {
+            for suffix in ["-wal", "-shm"] {
+                let mut sidecar = target.clone().into_os_string();
+                sidecar.push(suffix);
+                changed += restrict_file(sidecar.as_ref())?;
             }
-            Ok(_) => {}
-            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
-            Err(err) => return Err(err.into()),
         }
     }
     Ok(changed)
@@ -131,5 +151,17 @@ mod tests {
             let mode = std::fs::metadata(path).unwrap().permissions().mode() & 0o777;
             assert_eq!(mode, 0o600, "{}", path.display());
         }
+    }
+
+    #[test]
+    fn restricts_surviving_sidecars_of_a_missing_link_target() {
+        let dir = tempfile::tempdir().unwrap();
+        std::os::unix::fs::symlink("history.sqlite", dir.path().join("acp_events.db")).unwrap();
+        let wal = dir.path().join("history.sqlite-wal");
+        std::fs::write(&wal, b"x").unwrap();
+        std::fs::set_permissions(&wal, std::fs::Permissions::from_mode(0o644)).unwrap();
+        assert_eq!(super::restrict(dir.path()).unwrap(), 1);
+        let mode = std::fs::metadata(&wal).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600);
     }
 }
