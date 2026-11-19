@@ -250,6 +250,27 @@ async fn an_unreadable_project_registry_is_reported_not_hidden() {
 
 #[tokio::test]
 #[serial_test::serial]
+async fn prepare_reports_an_unreadable_project_registry() {
+    let f = fixture();
+    f.seed_item("a", None, "42");
+    std::fs::write(
+        crate::session::get_app_dir().unwrap().join("projects.json"),
+        "not json",
+    )
+    .unwrap();
+    let (status, code, body) = f
+        .call(
+            Method::POST,
+            "/api/suggestions/prepare",
+            json!({ "provider_id": PROVIDER, "id": "a" }),
+        )
+        .await;
+    assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR, "{body}");
+    assert_eq!(code, "internal");
+}
+
+#[tokio::test]
+#[serial_test::serial]
 async fn dismiss_and_undismiss() {
     let f = fixture();
     f.seed_item("a", None, "42");

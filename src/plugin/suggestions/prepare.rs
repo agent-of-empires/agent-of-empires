@@ -9,6 +9,8 @@ pub(crate) enum PrepareRefusal {
     PromptTooLong,
     /// The source closed or changed, so the item cannot start.
     Stale,
+    /// The project registry could not be read, so no project can be resolved.
+    Registry(String),
 }
 
 /// An expanded prompt would exceed [`MAX_INITIAL_PROMPT_BYTES`].
@@ -215,7 +217,8 @@ pub(crate) fn prepare(
         }
         None => item.draft.prompt.clone(),
     };
-    let registered = projects::load_merged(profile).unwrap_or_default();
+    let registered = projects::load_merged(profile)
+        .map_err(|error| PrepareRefusal::Registry(error.to_string()))?;
     let (project, extras) = resolve_projects(&registered, item.project.as_deref(), mapped);
     let mut config = match &project {
         Some(p) => resolve_config_with_repo_or_warn(profile, Path::new(&p.path)),

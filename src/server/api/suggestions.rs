@@ -399,6 +399,7 @@ pub async fn prepare_suggestion(
                 crate::session::MAX_INITIAL_PROMPT_BYTES
             ),
         ),
+        Ok(Ok(Some(Err(PrepareRefusal::Registry(error))))) => internal(error),
         Ok(Ok(None)) => stale_item(),
         Ok(Err(error)) => internal(error),
         Err(error) => internal(error),
