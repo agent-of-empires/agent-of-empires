@@ -95,22 +95,23 @@ Change any proposal with its select, then **Link N repos** stores every checked 
 
 > The TUI keys below are provisional until #4597 settles the key bindings.
 
-**Home.** A collapsed **Suggested (N)** group sits above Trash and is absent when there are no open suggestions, unless a provider failed: the group stays and its preview shows the error. Enter expands it to 3 items and a "View all" row. Rows show the title with the source reference after it. On an item, Enter prepares it and opens the prefilled dialog, `z` (`Z` in strict mode) dismisses it, and `Ctrl+K` lists "Open in <provider>". `N` (`Ctrl+N`) starts a blank session.
+**Home.** A collapsed **Suggested (N)** group sits above Trash and is absent when there are no open suggestions, unless a provider failed: the group stays and its preview shows the error. Enter expands it to 3 items and a "View all" row. Rows show the title with the source reference after it. On an item, Enter starts it with its kind's [preset](#presets) and the status line says "Started <title>"; the row then turns into Open. `z` (`Z` in strict mode) dismisses it, and `Ctrl+K` lists "Open in <provider>". `N` (`Ctrl+N`) opens the New session dialog prefilled from the item, without linking it.
 
 **Full view.** `S` opens it (`Ctrl+S` in strict mode).
 
 | Key | Action |
 |---|---|
 | `j` / `k` | Select |
-| Enter | First press resolves the final prompt and shows it ("Review the prompt below, then press Enter to start."); the second opens the dialog. On a started item it opens the session |
-| `N` | Start a new session for a started item |
+| Enter | Start with the preset. On a started item it opens the session |
+| `e` | Start with changes: the first press resolves the final prompt and shows it ("Review the prompt below, then press e to start."); the second opens the New session dialog |
+| `N` | A new session for the item that does not take its link, so a started item can have another |
 | `z` | Dismiss or restore |
 | `d` | Toggle the dismissed list |
 | `r` | Ask providers to refresh, then reload the list. On a read-only dashboard it only reloads |
 | PgUp / PgDn | Scroll the prompt |
 | Esc | Back |
 
-An item with no matching registered Project cannot be started ("No registered project matches this suggestion"), and a stale one says "No longer open at the source. Dismiss it, or wait for the next refresh."
+If the repo has hooks nobody has approved, Enter shows them in a review dialog; approving starts the session and cancelling starts nothing. A start that fails shows "Couldn't start: <reason>" with what to do on its row, and Enter tries again. An item whose repo is linked to no Project opens the New session dialog to pick one. A stale item says "No longer open at the source. Dismiss it, or wait for the next refresh."
 
 **New-session dialog.** The dialog has no Prompt row. The first turn is one line above the footer: "Prompt from GitHub, not checked by AoE" for a suggestion, or "Prompt: none". `Ctrl+O` opens it in a small editor, which also shows the item's source text; `Esc` closes it and keeps your edits. `Ctrl+P` still opens the focused row's picker. The prompt is sent once the agent is ready (typed into a terminal session, or sent as the first turn of a [structured-view](../structured-view.md) one).
 

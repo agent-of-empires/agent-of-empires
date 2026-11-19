@@ -2,7 +2,7 @@
 
 use super::*;
 use crate::session::Item;
-use crate::tui::suggestions::SuggestionsFeed;
+use crate::tui::suggestions::{StartAnswer, SuggestionsFeed};
 use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
@@ -117,9 +117,18 @@ fn suggestion_rows_have_no_session_or_group_selection() {
 }
 
 fn expanded_env(count: usize) -> (TestEnv, mpsc::Receiver<String>) {
+    let started = StartAnswer::Started {
+        session_id: "s-new".into(),
+        title: "Prepared title".into(),
+    };
+    expanded_env_answering(count, started)
+}
+
+fn expanded_env_answering(count: usize, started: StartAnswer) -> (TestEnv, mpsc::Receiver<String>) {
     let mut env = create_test_env_with_sessions(1);
     let (sink, requests) = mpsc::channel();
-    env.view.suggestions_feed = SuggestionsFeed::recording_for_test(snapshot(count, &[]), sink);
+    env.view.suggestions_feed =
+        SuggestionsFeed::recording_start_for_test(snapshot(count, &[]), sink, started);
     env.view
         .suggestions_feed
         .set_snapshot_for_test(snapshot(count, &[]));
@@ -154,17 +163,17 @@ fn terminal_view_config() {
 
 #[test]
 #[serial]
-fn enter_on_a_suggestion_opens_the_prefilled_dialog() {
-    // After expanded_env: it creates the isolated home this must land in.
-    let (mut env, requests) = expanded_env(2);
+fn enter_on_a_suggestion_with_no_linked_project_opens_the_prefilled_dialog() {
+    let (mut env, requests) = expanded_env_answering(2, StartAnswer::NoProject);
     terminal_view_config();
     env.view.cursor += 1;
     env.view.update_selected();
     with_authenticated_local_project_registry(&mut env.view, |view| {
         view.handle_key(key(KeyCode::Enter), None);
     });
-    assert_eq!(next_request(&requests), "prepare gh/i0");
     poll_until(&mut env, |env| env.view.new_dialog.is_some());
+    assert_eq!(next_request(&requests), "start gh/i0");
+    assert_eq!(next_request(&requests), "prepare gh/i0");
 
     let data = match env
         .view
@@ -179,6 +188,147 @@ fn enter_on_a_suggestion_opens_the_prefilled_dialog() {
     assert_eq!(data.path, "/tmp");
     assert_eq!(data.title, "Prepared title");
     assert_eq!(data.initial_prompt.as_deref(), Some("Prepared prompt"));
+}
+
+#[test]
+#[serial]
+fn enter_starts_a_suggestion_and_its_row_turns_into_open() {
+    let (mut env, requests) = expanded_env(2);
+    env.view.cursor += 1;
+    env.view.update_selected();
+    with_authenticated_local_project_registry(&mut env.view, |view| {
+        view.handle_key(key(KeyCode::Enter), None);
+    });
+    assert_eq!(next_request(&requests), "start gh/i0");
+    poll_until(&mut env, |env| {
+        env.view
+            .status_flash_text()
+            .is_some_and(|text| text.contains("Started Prepared title"))
+    });
+    assert_eq!(next_request(&requests), "load");
+    assert!(env.view.new_dialog.is_none(), "no wizard for a plain start");
+    let entry = env
+        .view
+        .suggestions_feed
+        .entry(&("gh".into(), "i0".into()))
+        .unwrap();
+    assert_eq!(entry.started_session.as_deref(), Some("s-new"));
+}
+
+#[test]
+#[serial]
+fn a_second_enter_does_not_start_twice() {
+    let (mut env, requests) = expanded_env(2);
+    env.view.cursor += 1;
+    env.view.update_selected();
+    with_authenticated_local_project_registry(&mut env.view, |view| {
+        view.handle_key(key(KeyCode::Enter), None);
+        view.handle_key(key(KeyCode::Enter), None);
+    });
+    assert_eq!(next_request(&requests), "start gh/i0");
+    poll_until(&mut env, |env| {
+        env.view
+            .status_flash_text()
+            .is_some_and(|text| text.contains("Started"))
+    });
+    // The reload after a start follows the first start; a duplicate would come before it.
+    assert_eq!(next_request(&requests), "load", "no duplicate start");
+}
+
+#[test]
+#[serial]
+fn a_start_the_daemon_says_is_already_started_becomes_open() {
+    let answer = StartAnswer::AlreadyStarted(Some("s-other".into()));
+    let (mut env, requests) = expanded_env_answering(2, answer);
+    env.view.cursor += 1;
+    env.view.update_selected();
+    with_authenticated_local_project_registry(&mut env.view, |view| {
+        view.handle_key(key(KeyCode::Enter), None);
+    });
+    assert_eq!(next_request(&requests), "start gh/i0");
+    poll_until(&mut env, |env| {
+        env.view
+            .status_flash_text()
+            .is_some_and(|text| text.contains("Already started"))
+    });
+    let entry = env
+        .view
+        .suggestions_feed
+        .entry(&("gh".into(), "i0".into()))
+        .unwrap();
+    assert_eq!(entry.started_session.as_deref(), Some("s-other"));
+}
+
+#[test]
+#[serial]
+fn hooks_that_need_trust_show_a_review_and_approving_starts_with_its_fingerprint() {
+    let answer = StartAnswer::NeedsTrust {
+        commands: vec!["on create: make setup".into()],
+        fingerprint: "fp1".into(),
+    };
+    let (mut env, requests) = expanded_env_answering(2, answer);
+    env.view.cursor += 1;
+    env.view.update_selected();
+    with_authenticated_local_project_registry(&mut env.view, |view| {
+        view.handle_key(key(KeyCode::Enter), None);
+    });
+    assert_eq!(next_request(&requests), "start gh/i0");
+    poll_until(&mut env, |env| env.view.confirm_dialog.is_some());
+    assert_eq!(
+        env.view.confirm_dialog.as_ref().unwrap().action(),
+        "approve_suggestion_hooks"
+    );
+    env.view.handle_key(key(KeyCode::Char('y')), None);
+    assert_eq!(next_request(&requests), "start gh/i0 fp1");
+}
+
+#[test]
+#[serial]
+fn a_failed_start_in_the_full_view_stays_on_its_row() {
+    let answer = StartAnswer::Failed("Docker isn't running. Start it, then try again.".into());
+    let (mut env, requests) = expanded_env_answering(2, answer);
+    with_authenticated_local_project_registry(&mut env.view, |view| {
+        view.open_suggestions_view();
+        view.handle_key(key(KeyCode::Enter), None);
+    });
+    assert_eq!(next_request(&requests), "start gh/i0");
+    poll_until(&mut env, |env| {
+        env.view
+            .suggestions_view
+            .as_ref()
+            .is_some_and(|view| view.failed.is_some())
+    });
+    let (_, message) = env
+        .view
+        .suggestions_view
+        .as_ref()
+        .unwrap()
+        .failed
+        .clone()
+        .unwrap();
+    assert!(message.contains("Docker isn't running"));
+}
+
+#[test]
+#[serial]
+fn a_failed_start_says_why_and_enter_tries_again() {
+    let answer = StartAnswer::Failed("Docker isn't running. Start it, then try again.".into());
+    let (mut env, requests) = expanded_env_answering(2, answer);
+    env.view.cursor += 1;
+    env.view.update_selected();
+    with_authenticated_local_project_registry(&mut env.view, |view| {
+        view.handle_key(key(KeyCode::Enter), None);
+    });
+    assert_eq!(next_request(&requests), "start gh/i0");
+    poll_until(&mut env, |env| {
+        env.view.status_flash_text().is_some_and(|text| {
+            text.contains("Docker isn't running") && text.contains("Enter tries again")
+        })
+    });
+    with_authenticated_local_project_registry(&mut env.view, |view| {
+        view.handle_key(key(KeyCode::Enter), None);
+    });
+    assert_eq!(next_request(&requests), "start gh/i0");
 }
 
 #[test]
@@ -210,7 +360,7 @@ fn a_prepare_answered_after_the_cursor_moved_is_dropped() {
     env.view.cursor += 1;
     env.view.update_selected();
     with_authenticated_local_project_registry(&mut env.view, |view| {
-        view.handle_key(key(KeyCode::Enter), None);
+        view.handle_key(key(KeyCode::Char('N')), None);
     });
     env.view.cursor -= 1;
     env.view.update_selected();
@@ -284,13 +434,13 @@ fn enter_on_an_unstarted_suggestion_is_refused_while_mutations_are_unavailable()
 
 #[test]
 #[serial]
-fn a_second_enter_does_not_queue_a_second_prepare() {
+fn a_second_n_does_not_queue_a_second_prepare() {
     let (mut env, requests) = expanded_env(2);
     env.view.cursor += 1;
     env.view.update_selected();
     with_authenticated_local_project_registry(&mut env.view, |view| {
-        view.handle_key(key(KeyCode::Enter), None);
-        view.handle_key(key(KeyCode::Enter), None);
+        view.handle_key(key(KeyCode::Char('N')), None);
+        view.handle_key(key(KeyCode::Char('N')), None);
     });
     assert_eq!(next_request(&requests), "prepare gh/i0");
     poll_until(&mut env, |env| env.view.new_dialog.is_some());
@@ -312,7 +462,7 @@ fn a_home_prepare_answered_after_the_full_view_opened_is_dropped() {
     env.view.cursor += 1;
     env.view.update_selected();
     with_authenticated_local_project_registry(&mut env.view, |view| {
-        view.handle_key(key(KeyCode::Enter), None);
+        view.handle_key(key(KeyCode::Char('N')), None);
         view.open_suggestions_view();
     });
     assert_eq!(next_request(&requests), "prepare gh/i0");
