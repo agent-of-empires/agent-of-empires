@@ -98,20 +98,15 @@ pub(super) const FIELD_HELP: &[FieldHelp] = &[
         name: "Group",
         description: "Optional grouping for organization (Ctrl+P to browse existing groups)",
     },
-    FieldHelp {
-        name: "Prompt",
-        description:
-            "Optional first turn, sent once the agent is ready (Ctrl+P views a suggestion's source)",
-    },
 ];
 
-/// Where a prefilled prompt came from, shown with the Prompt row.
+/// Where a prefilled prompt came from, shown above the form.
 #[derive(Clone)]
 pub struct PromptOrigin {
     pub provider: String,
     pub source_ref: String,
     pub reason: String,
-    /// Untrusted provider text behind the prompt, shown on Ctrl+P.
+    /// Untrusted provider text behind the prompt, shown in the Ctrl+O editor.
     pub source_text: Option<String>,
     /// Links the created Session to the suggestion; `None` for "Start another".
     pub suggestion: Option<crate::session::SuggestionOrigin>,
@@ -306,8 +301,8 @@ pub struct NewSessionDialog {
     /// First turn for the agent; `prompt_origin` is set only for a suggestion.
     prompt: Input,
     prompt_origin: Option<PromptOrigin>,
-    /// Overlay with `prompt_origin.source_text`, opened by Ctrl+P on the Prompt row.
-    pub(super) show_prompt_source: bool,
+    /// The prompt editor overlay, opened by Ctrl+O; it shows `prompt_origin.source_text` above the prompt.
+    pub(super) prompt_editor: bool,
     /// A suggestion left the path unresolved: submit waits for the user to pick one.
     path_required: bool,
     /// `(focused_field_index, rect)` per main-form field, repopulated every
@@ -499,7 +494,6 @@ pub(super) struct FieldIndices {
     pub worktree: usize,
     pub sandbox: usize,
     pub group: usize,
-    pub prompt: usize,
     /// One past the last focusable row, where Tab wraps.
     pub count: usize,
 }
@@ -520,7 +514,6 @@ impl FieldIndices {
             (before.worktree, self.worktree),
             (before.sandbox, self.sandbox),
             (before.group, self.group),
-            (before.prompt, self.prompt),
         ]
         .into_iter()
         .find(|(old, _)| *old == index)
@@ -692,7 +685,7 @@ impl NewSessionDialog {
             suggested_title: String::new(),
             prompt: Input::default(),
             prompt_origin: None,
-            show_prompt_source: false,
+            prompt_editor: false,
             path_required: false,
             focusable_rects: Vec::new(),
             sandbox_config_rects: Vec::new(),
@@ -731,7 +724,7 @@ impl NewSessionDialog {
         self.suggested_title = title;
     }
 
-    /// Show an editable Prompt row for text a plugin proposed.
+    /// Set the first turn a plugin proposed, edited with Ctrl+O.
     pub fn set_suggestion(&mut self, prompt: String, origin: PromptOrigin) {
         self.prompt = Input::new(prompt);
         self.prompt_origin = Some(origin);
@@ -1146,7 +1139,6 @@ impl NewSessionDialog {
             worktree: take(!is_host_only),
             sandbox: take(self.docker_available && !is_host_only),
             group: take(true),
-            prompt: take(true),
             count: next,
         }
     }
@@ -1326,7 +1318,7 @@ impl NewSessionDialog {
             suggested_title: String::new(),
             prompt: Input::default(),
             prompt_origin: None,
-            show_prompt_source: false,
+            prompt_editor: false,
             path_required: false,
             focusable_rects: Vec::new(),
             sandbox_config_rects: Vec::new(),
@@ -1416,7 +1408,7 @@ impl NewSessionDialog {
             suggested_title: String::new(),
             prompt: Input::default(),
             prompt_origin: None,
-            show_prompt_source: false,
+            prompt_editor: false,
             path_required: false,
             focusable_rects: Vec::new(),
             sandbox_config_rects: Vec::new(),
@@ -1445,8 +1437,8 @@ impl NewSessionDialog {
             self.show_help = false;
             return Some(DialogResult::Continue);
         }
-        if self.show_prompt_source {
-            self.show_prompt_source = false;
+        if self.prompt_editor {
+            self.prompt_editor = false;
             return Some(DialogResult::Continue);
         }
 
@@ -1635,11 +1627,19 @@ impl NewSessionDialog {
             return DialogResult::Continue;
         }
 
-        if self.show_prompt_source {
+        if self.prompt_editor {
             let toggle =
-                key.code == KeyCode::Char('p') && key.modifiers.contains(KeyModifiers::CONTROL);
-            if toggle || matches!(key.code, KeyCode::Esc | KeyCode::Enter) {
-                self.show_prompt_source = false;
+                key.code == KeyCode::Char('o') && key.modifiers.contains(KeyModifiers::CONTROL);
+            match key.code {
+                _ if toggle => self.prompt_editor = false,
+                KeyCode::Esc => self.prompt_editor = false,
+                KeyCode::Enter => {
+                    self.prompt
+                        .handle(tui_input::InputRequest::InsertChar('\n'));
+                }
+                _ => {
+                    self.prompt.handle_event(&crossterm::event::Event::Key(key));
+                }
             }
             return DialogResult::Continue;
         }
@@ -1738,10 +1738,11 @@ impl NewSessionDialog {
                 self.sandbox_focused_field = 0;
                 return DialogResult::Continue;
             }
-            if self.focused_field == fields.prompt && self.prompt_origin.is_some() {
-                self.show_prompt_source = true;
-                return DialogResult::Continue;
-            }
+        }
+
+        if key.code == KeyCode::Char('o') && key.modifiers.contains(KeyModifiers::CONTROL) {
+            self.prompt_editor = true;
+            return DialogResult::Continue;
         }
 
         if self.handle_path_shortcuts(key) {
@@ -2416,13 +2417,15 @@ impl NewSessionDialog {
             n if n == fields.title => &mut self.title,
             n if n == fields.path => &mut self.path,
             n if n == fields.group => &mut self.group,
-            n if n == fields.prompt => &mut self.prompt,
             _ => &mut self.title,
         }
     }
 
     pub fn handle_paste(&mut self, text: &str) {
-        if self.show_prompt_source {
+        if self.prompt_editor {
+            for ch in text.replace("\r\n", "\n").replace('\r', "\n").chars() {
+                self.prompt.handle(tui_input::InputRequest::InsertChar(ch));
+            }
             return;
         }
         let target: &mut Input = if let Some(ref mut input) = self.env_editing_input {
@@ -2441,12 +2444,6 @@ impl NewSessionDialog {
             &mut self.worktree_branch
         } else if self.sandbox_config_mode && self.sandbox_focused_field == 0 {
             &mut self.sandbox_image
-        } else if self.focused_field == self.field_indices().prompt {
-            // The prompt is the one multi-line input: keep newlines.
-            for ch in text.replace("\r\n", "\n").replace('\r', "\n").chars() {
-                self.prompt.handle(tui_input::InputRequest::InsertChar(ch));
-            }
-            return;
         } else {
             self.current_input_mut()
         };
