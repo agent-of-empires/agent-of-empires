@@ -826,7 +826,12 @@ fn render_active(
                 Some(Unasked::EarlyEnter) => {
                     (Some("Enter was pressed before this asked. "), again, None)
                 }
-                Some(Unasked::Changed) => (None, again, None),
+                // Only a restart re-checks its effects; a new passphrase always signs everyone out.
+                Some(Unasked::Changed) => (
+                    Some("What a restart would change is different now. "),
+                    again,
+                    None,
+                ),
             };
             let rest = [effect_text]
                 .into_iter()
@@ -1793,10 +1798,14 @@ mod tests {
                 R => "Press R to check again.",
             };
             view.pending_confirm = None;
-            for (why, lead) in [
-                (Unasked::EarlyEnter, "Enter was pressed before this asked. "),
-                (Unasked::Changed, ""),
-            ] {
+            let changed = (key == R).then_some((
+                Unasked::Changed,
+                "What a restart would change is different now. ",
+            ));
+            for (why, lead) in [(Unasked::EarlyEnter, "Enter was pressed before this asked. ")]
+                .into_iter()
+                .chain(changed)
+            {
                 view.unasked = Some((key, why));
                 let buf = crate::tui::dialogs::test_render::draw(120, 24, |f, theme| {
                     render(&view, f, f.area(), theme)
