@@ -1975,6 +1975,40 @@ describe("SessionWizard create failures", () => {
     expect(payload()).toMatchObject({ suggestion });
   });
 
+  it("Reopen keeps the suggestion link through a second background failure", async () => {
+    const suggestion = { provider_id: "github", id: "issue-1" };
+    const { restore } = await backgroundFailure(
+      failure("validation_failed", null, "Title is too long."),
+      "claude",
+      undefined,
+      {
+        suggestion,
+      },
+    );
+    const toastAction = vi.fn();
+    toastBus.handler = { push: vi.fn(), error: vi.fn(), info: vi.fn(), openLink: vi.fn(), action: toastAction };
+    let finish!: (r: unknown) => void;
+    createSession.mockReturnValueOnce(new Promise((r) => (finish = r)));
+    const onReopenFailure = vi.fn();
+    render(
+      <SessionWizard
+        servedProfile="default"
+        onClose={vi.fn()}
+        onCreated={vi.fn()}
+        onCreatedInBackground={vi.fn()}
+        onReopenFailure={onReopenFailure}
+        restore={restore}
+      />,
+    );
+    fireEvent.click(await screen.findByTestId("create-failure-try_again"));
+    fireEvent.click(await screen.findByText("Continue in background", undefined, { timeout: 3000 }));
+    await act(async () => finish(failure("validation_failed", null, "Title is too long.")));
+    await waitFor(() => expect(toastAction).toHaveBeenCalledOnce());
+    toastBus.handler = null;
+    toastAction.mock.calls[0]![2]();
+    expect(onReopenFailure.mock.calls[0]![0].suggestion).toEqual(suggestion);
+  });
+
   it("Reopen restores the form as sent, not an edit made while the create ran", async () => {
     const title = () => document.getElementById("wizard-title") as HTMLInputElement;
     const { restore } = await backgroundFailure(UNAVAILABLE, "claude", () => {

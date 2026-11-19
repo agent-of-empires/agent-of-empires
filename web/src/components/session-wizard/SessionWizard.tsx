@@ -775,7 +775,7 @@ export function SessionWizard({
             data: sent,
             failure,
             progress: lastProgressRef.current,
-            suggestion: prefill?.suggestion,
+            suggestion: body.suggestion,
           };
           const { title } = failureView(failure, { sandboxEnabled: restored.data.sandboxEnabled, runtimeDown: false });
           const reference = failure.reference ? ` Reference ${failure.reference.slice(0, 8)}… · in debug.log` : "";
