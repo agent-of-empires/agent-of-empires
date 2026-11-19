@@ -33,6 +33,7 @@ export function DashboardSuggestions({ readOnly = false, onPrepare, onStarted, o
   const rows = active.slice(0, wide ? 3 : 2);
   const nameOf = (id: string) => snapshot.providers.find((p) => p.id === id)?.name ?? id;
   const pending = snapshot.providers.filter((p) => p.status === "pending");
+  const errored = snapshot.providers.filter((p) => p.status === "error");
   const kindOf = (item: { provider_id: string; criterion: string }) =>
     snapshot.providers
       .find((p) => p.id === item.provider_id)
@@ -102,9 +103,14 @@ export function DashboardSuggestions({ readOnly = false, onPrepare, onStarted, o
             Getting your first suggestions from {pending.map((p) => p.name).join(", ")}…
           </li>
         )}
+        {errored.map((p) => (
+          <li key={p.id} className={`${SUGGESTION_NOTE_CLASS} text-status-error`}>
+            {p.name}: couldn&apos;t refresh, {p.error ?? "provider error"}
+          </li>
+        ))}
         {rows.length === 0 && pending.length === 0 && (
           <li className={SUGGESTION_NOTE_CLASS}>
-            Nothing to suggest right now.{" "}
+            {errored.length === 0 && "Nothing to suggest right now. "}
             {!readOnly && !offline && (
               <button
                 type="button"
