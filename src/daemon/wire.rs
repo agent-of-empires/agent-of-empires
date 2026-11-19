@@ -486,8 +486,9 @@ pub struct RestartSessionBody {
     pub require_account_carry: bool,
     /// `Some` refuses a restart that would stop a background process not listed (#5762); absent
     /// skips the check. It is checked before the launch hooks and again before the pane stops; a
-    /// 409 `background_processes` from the second check says `launch_hooks_ran: true`, and the
-    /// confirm then sets `skip_on_launch` so `on_launch` runs once. Not with `profile`, `tool`,
+    /// 409 `background_processes` says `launch_hooks_ran: true` once the hooks have run (the
+    /// second check, or a request with `skip_on_launch`), and the confirm then sets
+    /// `skip_on_launch` so `on_launch` runs once. Not with `profile`, `tool`,
     /// `command_override`, `extra_args` or `discard_sandbox_container`: a refusal after the hooks
     /// can't undo them.
     #[serde(default, skip_serializing_if = "Option::is_none")]

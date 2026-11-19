@@ -9897,16 +9897,19 @@ async fn an_update_restart_names_the_agents_background_shells_before_stopping_th
     let second = project.path().join("second");
     let third = project.path().join("third");
     let fourth = project.path().join("fourth");
+    let fifth = project.path().join("fifth");
     std::fs::write(
         &agent,
         format!(
             "#!/bin/sh\nbash -c 'sleep 600; :' &\nwhile [ ! -e {0} ]; do sleep 0.05; done\n\
              bash -c 'sleep 700; :' &\nwhile [ ! -e {1} ]; do sleep 0.05; done\n\
              bash -c 'sleep 800; :' &\nwhile [ ! -e {2} ]; do sleep 0.05; done\n\
-             bash -c 'sleep 900; :' &\nwait\n",
+             bash -c 'sleep 900; :' &\nwhile [ ! -e {3} ]; do sleep 0.05; done\n\
+             bash -c 'sleep 1000; :' &\nwait\n",
             second.display(),
             third.display(),
-            fourth.display()
+            fourth.display(),
+            fifth.display()
         ),
     )
     .unwrap();
@@ -10183,8 +10186,18 @@ async fn an_update_restart_names_the_agents_background_shells_before_stopping_th
     assert_eq!(skipped["total"], 4);
     assert_eq!(hook_runs(), 1);
 
+    // A shell that starts before the next confirm is refused at the first check, before the
+    // hooks' turn. The refusal still says they ran, so the confirm after it skips them too.
+    std::fs::write(&fifth, "").unwrap();
+    assert_eq!(sleeping(5), 5);
+    let (status, early) = confirm(identities(&skipped), true).await;
+    assert_eq!(status, StatusCode::CONFLICT, "{early}");
+    assert_eq!(early["launch_hooks_ran"], true);
+    assert_eq!(early["total"], 5);
+    assert_eq!(hook_runs(), 1);
+
     // Confirming that list with `skip_on_launch` restarts without running the hooks again.
-    let (status, confirmed) = confirm(identities(&skipped), true).await;
+    let (status, confirmed) = confirm(identities(&early), true).await;
     assert!(status.is_success(), "{status} {confirmed}");
     assert_eq!(hook_runs(), 1, "on_launch ran once for the whole restart");
 

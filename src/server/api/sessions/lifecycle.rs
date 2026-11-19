@@ -2205,7 +2205,8 @@ async fn background_processes_refusal(
             PaneCensus::Unclassified
         });
     let fields = refusal(census, &confirmed, body.stop_unclassified)?;
-    Some(background_processes_response(fields, false))
+    // A confirm that skips the hooks does so because an earlier attempt ran them.
+    Some(background_processes_response(fields, body.skip_on_launch))
 }
 
 /// A restart body: empty asks for the defaults; any other body must be JSON, so a
@@ -2242,8 +2243,8 @@ fn check_with_unrestorable_setting(body: &crate::daemon::RestartSessionBody) -> 
 }
 
 /// The 409 for a restart that found unconfirmed background processes. `launch_hooks_ran` says
-/// the refusal came from the recheck after the launch hooks' turn, so the confirm skips
-/// `on_launch`. A request that skipped them says so too: an earlier attempt ran them.
+/// the launch hooks have run for this restart, so the confirm skips `on_launch`: this request
+/// reached their turn, or skipped them because an earlier attempt ran them.
 fn background_processes_response(
     fields: serde_json::Value,
     launch_hooks_ran: bool,
