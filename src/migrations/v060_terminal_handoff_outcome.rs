@@ -52,6 +52,7 @@ fn migrate_file(path: &Path) -> Result<()> {
         return Ok(());
     };
     let mut recorded = 0;
+    let mut handoffs = 0;
     for (index, row) in rows.iter_mut().enumerate() {
         let Some(intent) = row
             .get_mut("terminal_handoff")
@@ -59,6 +60,7 @@ fn migrate_file(path: &Path) -> Result<()> {
         else {
             continue;
         };
+        handoffs += 1;
         let fields = intent.as_object_mut().with_context(|| {
             format!(
                 "invalid terminal handoff at session row {index} in {}",
@@ -96,6 +98,13 @@ fn migrate_file(path: &Path) -> Result<()> {
         crate::session::backup_before_migration(path)?;
         file.replace_preserving_permissions(serde_json::to_vec_pretty(&rows)?.as_slice())?;
         tracing::info!(target: "migrations.v060", path = %path.display(), recorded, "Recorded terminal handoff outcomes");
+    }
+    // The schema marker must not become durable before the rewrite, so the target's directory is
+    // synced, as storage does after a replace. A rerun after a failed sync finds the rewrite
+    // already visible and syncs it again.
+    if handoffs > 0 {
+        file.sync_parent()
+            .context("terminal handoff outcomes were written, but their directory sync failed")?;
     }
     Ok(())
 }
@@ -309,6 +318,49 @@ mod tests {
                 "{name}"
             );
         }
+        Ok(())
+    }
+
+    #[test]
+    fn a_linked_targets_directory_is_synced_before_the_migration_counts() -> Result<()> {
+        use crate::session::anchored_fs::FAIL_SYNC_ONCE;
+        let _reset = crate::session::anchored_fs::ResetExchangeHooks;
+        let row = Instance::new("pending", "/tmp/repo");
+        let intent = pending(&row, TerminalHandoffContext::Discard);
+        let root = tempfile::tempdir()?;
+        let target = root.path().join("dotfiles").join("sessions.json");
+        std::fs::create_dir(target.parent().unwrap())?;
+        std::fs::write(
+            &target,
+            serde_json::to_vec(&json!([written_before(&row, &intent)?]))?,
+        )?;
+        let path = root.path().join("sessions.json");
+        std::os::unix::fs::symlink(&target, &path)?;
+        let outcome = || -> Result<Value> {
+            let rows: Value = serde_json::from_slice(&std::fs::read(&target)?)?;
+            Ok(rows[0]["terminal_handoff"]["outcome"].clone())
+        };
+
+        // A failed sync of the target's directory fails the migration after the rewrite, and so
+        // does the rerun, which finds nothing left to record but still syncs.
+        for attempt in ["first run", "rerun"] {
+            FAIL_SYNC_ONCE.set(Some(target.parent().unwrap().to_path_buf()));
+            let error = migrate_file(&path).unwrap_err();
+            assert!(
+                format!("{error:#}").contains("directory sync failed"),
+                "{attempt}: {error:#}"
+            );
+            assert!(
+                FAIL_SYNC_ONCE.with_borrow(Option::is_none),
+                "{attempt}: synced"
+            );
+            assert_eq!(outcome()?, "fresh", "{attempt}");
+        }
+        // The link's own directory isn't the one synced.
+        FAIL_SYNC_ONCE.set(Some(root.path().to_path_buf()));
+        migrate_file(&path)?;
+        assert!(FAIL_SYNC_ONCE.with_borrow(Option::is_some));
+        assert_eq!(crate::session::migration_backups(&path)?.len(), 1);
         Ok(())
     }
 
