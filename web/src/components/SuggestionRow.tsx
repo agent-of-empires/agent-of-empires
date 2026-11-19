@@ -341,6 +341,7 @@ export function UndoBar({
           >
             Stop suggesting {stopLabel}
           </button>
+          <span className="flex-none text-text-dim">(back on in Settings › Suggestions)</span>
         </>
       )}
     </div>

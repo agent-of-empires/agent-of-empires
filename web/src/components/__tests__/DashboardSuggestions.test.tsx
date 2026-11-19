@@ -178,6 +178,7 @@ describe("DashboardSuggestions", () => {
     updateSuggestionSource.mockResolvedValue(ok);
     renderIt();
     fireEvent.click(await screen.findByRole("button", { name: "Dismiss" }));
+    expect(await screen.findByText("(back on in Settings › Suggestions)")).toBeTruthy();
     fireEvent.click(await screen.findByRole("button", { name: "Stop suggesting assigned issues" }));
     await waitFor(() => expect(updateSuggestionSource).toHaveBeenCalledWith("github", "assigned", false));
     await waitFor(() => expect(screen.queryByText(/Dismissed/)).toBeNull());
