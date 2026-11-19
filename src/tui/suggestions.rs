@@ -1016,7 +1016,7 @@ impl SuggestionsView {
                         plain(name),
                         Style::default().fg(theme.text).add_modifier(Modifier::BOLD),
                     ),
-                    Span::styled(format!(" {count}"), Style::default().fg(theme.dimmed)),
+                    Span::styled(format!(" ({count})"), Style::default().fg(theme.dimmed)),
                 ]));
             }
             let current = index == self.selected;
@@ -1035,19 +1035,16 @@ impl SuggestionsView {
             } else {
                 Style::default().fg(theme.text)
             };
+            let source_ref = store
+                .source_ref(item)
+                .map(|r| format!(" {r}"))
+                .unwrap_or_default();
             lines.push(Line::from(vec![
                 Span::styled(
-                    plain(&format!(
-                        "{marker}{} {}",
-                        store.provider_name(&item.provider_id),
-                        store
-                            .source_ref(item)
-                            .map(|r| format!("{r} "))
-                            .unwrap_or_default()
-                    )),
-                    Style::default().fg(theme.dimmed),
+                    plain(&format!("{marker}{}{state}", item.title)),
+                    title_style,
                 ),
-                Span::styled(plain(&format!("{}{state}", item.title)), title_style),
+                Span::styled(plain(&source_ref), Style::default().fg(theme.dimmed)),
             ]));
             let failure = self.failed.as_ref().filter(|(key, _)| *key == item_key);
             if let Some((_, message)) = failure {
@@ -2184,7 +2181,7 @@ mod tests {
             idle_worker(),
         );
         assert_eq!(ids(&rig), ["b1", "b2", "a1", "loose"]);
-        assert!(render_text(&rig).contains("web 2"));
+        assert!(render_text(&rig).contains("web (2)"));
         for _ in 0..3 {
             press(&mut rig, KeyCode::Char('j'), true);
         }
@@ -2194,7 +2191,7 @@ mod tests {
                 .unwrap_or_else(|| panic!("{needle} in {text}"))
         };
         assert!(
-            at("api 1") < at("No project 1"),
+            at("api (1)") < at("No project (1)"),
             "the window scrolled to the last group"
         );
         let flat = view_with(vec![item("x", None, false)], idle_worker());
@@ -2787,7 +2784,7 @@ mod tests {
         let rig = view_with(vec![hostile], idle_worker());
         let text = render_text(&rig);
         for expected in [
-            "GitHub ref-a a",
+            "a ref-a",
             "reason · repo",
             "GitHub · ref-a · https://example.test/x",
             "preview text",
@@ -2802,8 +2799,8 @@ mod tests {
     #[test]
     fn the_source_reference_follows_the_pref() {
         for (shown, row, detail, entry_ref) in [
-            (true, "GitHub ref-a a", "GitHub · ref-a · https://", "ref-a"),
-            (false, "GitHub a", "GitHub · https://", ""),
+            (true, "a ref-a", "GitHub · ref-a · https://", "ref-a"),
+            (false, "› a", "GitHub · https://", ""),
         ] {
             let mut rig = view_with(vec![item("a", None, false)], idle_worker());
             rig.store.snapshot.as_mut().unwrap().prefs.show_source_ref = shown;
