@@ -993,11 +993,7 @@ fn apply_prepared(
         },
         &prior,
     )?;
-    let cleared = if suggestions_changed {
-        forget_suggestion_publication(id)
-    } else {
-        Ok(())
-    };
+    let cleared = clear_suggestions_after_update(id, suggestions_changed);
     super::reload_registry();
     cleared?;
     tracing::info!(target: "plugin.install", plugin = %id, version = %prepared.fetched.manifest.version, "plugin updated");
@@ -1463,6 +1459,30 @@ fn remove_external(id: &str) -> Result<()> {
 /// unknown installed plugin counts as changed.
 fn suggestions_spec_changed(current: Option<&LoadedPlugin>, next: &PluginManifest) -> bool {
     current.is_none_or(|p| p.manifest.suggestions != next.suggestions)
+}
+
+/// Marker for a published-suggestions cleanup that has not finished, so the
+/// next update retries it even when its manifest no longer differs.
+fn cleanup_marker(plugin_id: &str) -> Result<std::path::PathBuf> {
+    Ok(crate::session::get_app_dir()?
+        .join("suggestions-cleanup-pending")
+        .join(plugin_id))
+}
+
+/// Clears the plugin's published suggestions when its spec changed or an
+/// earlier cleanup failed, and forgets the marker only once that succeeds.
+fn clear_suggestions_after_update(plugin_id: &str, spec_changed: bool) -> Result<()> {
+    let marker = cleanup_marker(plugin_id)?;
+    if !spec_changed && !marker.exists() {
+        return Ok(());
+    }
+    if let Some(dir) = marker.parent() {
+        std::fs::create_dir_all(dir)?;
+    }
+    std::fs::write(&marker, b"")?;
+    forget_suggestion_publication(plugin_id)?;
+    std::fs::remove_file(&marker)?;
+    Ok(())
 }
 
 /// Clears the plugin's published rows through the database file, for when no
@@ -2654,6 +2674,38 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         assert!(remove_external("acme.thing").is_err());
         assert!(dir.exists(), "a failed cleanup must not remove the plugin");
+    }
+
+    #[test]
+    #[serial]
+    fn a_failed_update_cleanup_is_retried_by_the_next_update() {
+        let _home = isolate_app_dir();
+        let db = crate::session::get_app_dir()
+            .unwrap()
+            .join(super::super::host_api::EVENTS_DB);
+        std::fs::write(&db, b"not a sqlite database, long enough to be read as one").unwrap();
+        assert!(clear_suggestions_after_update("acme.thing", true).is_err());
+        assert!(cleanup_marker("acme.thing").unwrap().exists());
+
+        std::fs::remove_file(&db).unwrap();
+        {
+            let conn = rusqlite::Connection::open(&db).unwrap();
+            super::super::suggestions::init(&conn).unwrap();
+            conn.execute(
+                "INSERT INTO suggestion_items (profile, provider_id, item_id, item_json)
+                 VALUES ('p', 'acme.thing', 'a', '{}')",
+                [],
+            )
+            .unwrap();
+        }
+        // The retry's manifest matches the installed one: only the marker asks for it.
+        clear_suggestions_after_update("acme.thing", false).unwrap();
+        let conn = rusqlite::Connection::open(&db).unwrap();
+        let left: i64 = conn
+            .query_row("SELECT COUNT(*) FROM suggestion_items", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(left, 0);
+        assert!(!cleanup_marker("acme.thing").unwrap().exists());
     }
 
     /// Uninstall removes only a configured external plugin's directory: a
