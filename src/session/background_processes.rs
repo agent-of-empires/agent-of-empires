@@ -823,6 +823,50 @@ mod tests {
     }
 
     #[test]
+    fn no_part_of_a_spaced_secret_leaves_the_host() {
+        let eval = r#"source /s && eval 'cli --token "alpha beta"' < /dev/null"#;
+        let exact = sample(31, 30, "/usr/bin/cli", &["cli", "--password", "alpha beta"]);
+        for (tree, shown) in [
+            (
+                vec![sample(30, 20, "/usr/bin/bash", &["bash", "-c", eval])],
+                &["cli"][..],
+            ),
+            (
+                vec![sample(
+                    30,
+                    20,
+                    "/usr/bin/bash",
+                    &["bash", "-c", r#"cli --password "alpha beta""#],
+                )],
+                &["bash", "-c"],
+            ),
+            (
+                vec![sample(
+                    30,
+                    20,
+                    "/usr/bin/bash",
+                    &["bash", "-lc", r#"cli --token "alpha beta"; read -r"#],
+                )],
+                &["bash", "-lc"],
+            ),
+            // Arguments read whole keep the value as one, so it is blanked whole.
+            (
+                vec![sample(30, 20, "/usr/bin/bash", &["bash", "-c", "x"]), exact],
+                &["cli", "--password", "***"],
+            ),
+        ] {
+            let named = shown_argv(&named_command(&tree, &tree[0]));
+            assert!(
+                !named
+                    .iter()
+                    .any(|arg| arg.contains("alpha") || arg.contains("beta")),
+                "{named:?}"
+            );
+            assert_eq!(named, shown);
+        }
+    }
+
+    #[test]
     fn a_confirmed_process_is_matched_by_its_start_not_its_pid() {
         let found = |pid, start: &str| BackgroundProcess {
             identity: PrimeProcessIdentity {
