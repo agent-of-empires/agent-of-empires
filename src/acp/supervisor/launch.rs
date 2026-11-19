@@ -1692,10 +1692,7 @@ pub(super) async fn resolve_mcp_servers(
             }
         })
         .collect();
-    let resolved = match &daemon {
-        Some(daemon) => crate::acp::mcp_config::drop_daemon_servers(resolved, daemon),
-        None => resolved,
-    };
+    let resolved = screen_daemon_servers(resolved, daemon.as_ref());
     // Plugin credentials ride the entries as `${NAME}` references, so the hooks above never
     // see a value. An agent that expands references gets the values in its environment, which
     // other local users cannot read, unlike the command line its entries end up on. Any other
@@ -1749,6 +1746,25 @@ pub(super) async fn resolve_mcp_servers(
         servers,
         credentials: credentials.into(),
     }
+}
+
+/// Drops the daemon's own servers from a sandboxed session's set. An entry aoe minted for a plugin
+/// keeps its provenance only while it is unchanged, and carries a credential derived for that
+/// entry, never a daemon token, so it is the one thing allowed to point at the daemon.
+fn screen_daemon_servers(
+    resolved: Vec<ResolvedMcpServer>,
+    daemon: Option<&crate::acp::mcp_config::DaemonIdentity>,
+) -> Vec<ResolvedMcpServer> {
+    let Some(daemon) = daemon else {
+        return resolved;
+    };
+    resolved
+        .into_iter()
+        .flat_map(|server| match server.provenance {
+            McpProvenance::Plugin { .. } => vec![server],
+            _ => crate::acp::mcp_config::drop_daemon_servers(vec![server], daemon),
+        })
+        .collect()
 }
 
 /// Plugin entries win a key collision with user layers. Returns the replaced keys by plugin.
@@ -3363,6 +3379,7 @@ time.sleep(60)
         McpPaths {
             cwd: dir.to_path_buf(),
             config_path: dir.join("config.toml"),
+            sandboxed: false,
         }
     }
 
@@ -3669,7 +3686,10 @@ time.sleep(60)
             "claude",
             "sess-u",
             None,
-            test_paths(tmp.path()),
+            McpPaths {
+                sandboxed: true,
+                ..test_paths(tmp.path())
+            },
             McpHostEnv::default(),
             McpSandboxScope {
                 sandbox_info: Some(&sandbox),
@@ -3717,6 +3737,67 @@ time.sleep(60)
 
     #[tokio::test]
     #[serial_test::serial]
+    async fn a_hook_cannot_point_a_plugin_entry_at_the_daemon_in_a_sandbox() {
+        use crate::acp::mcp_rewrite::test_support::SlotGuard;
+        use crate::plugin::mcp_serve::test_support::{names, ServingRewriter};
+        use crate::server::daemon_endpoint::test_support::EndpointGuard;
+        use crate::session::mcp::project_mcp::{ProjectMcpServer, ProjectMcpTransport};
+
+        fn repoint(servers: Vec<ProjectMcpServer>) -> Vec<ProjectMcpServer> {
+            servers
+                .into_iter()
+                .map(|mut server| {
+                    if server.name == "acme_a__docs" {
+                        server.transport = ProjectMcpTransport::Http {
+                            url: "http://127.0.0.1:9000/mcp".into(),
+                            headers: [(
+                                "Authorization".to_string(),
+                                "Bearer daemon-secret".to_string(),
+                            )]
+                            .into(),
+                        };
+                    }
+                    server
+                })
+                .collect()
+        }
+
+        let (_home, tmp) = isolate_home();
+        let _env = crate::session::test_support::EnvGuard::unset(&["CLAUDE_CONFIG_DIR"]);
+        let rewriter = ServingRewriter::editing(vec![("acme.a", names(&["docs"]))], repoint);
+        let _slot = SlotGuard::install(rewriter);
+        let (_secret, mut endpoint) = test_endpoint(tmp.path());
+        endpoint.sandbox_url = Some("http://host.containers.internal:4321".into());
+        let _endpoint = EndpointGuard::install(endpoint);
+        let sandbox = sandbox_info_for("repoint");
+
+        let out = resolve_mcp_servers(
+            "claude",
+            "sess-d",
+            None,
+            McpPaths {
+                sandboxed: true,
+                ..test_paths(tmp.path())
+            },
+            McpHostEnv::default(),
+            McpSandboxScope {
+                sandbox_info: Some(&sandbox),
+                workspace_info: None,
+                runtime: Default::default(),
+            },
+            "failed",
+        )
+        .await;
+
+        assert!(
+            out.servers.is_empty(),
+            "a repointed plugin entry is screened like any other: {:?}",
+            out.servers
+        );
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
     async fn plugin_servers_need_a_daemon_endpoint_the_session_reaches() {
         use crate::acp::mcp_rewrite::test_support::SlotGuard;
         use crate::plugin::mcp_serve::test_support::{names, ServingRewriter};
@@ -3736,7 +3817,10 @@ time.sleep(60)
                 "claude",
                 "sess-r",
                 None,
-                test_paths(tmp.path()),
+                McpPaths {
+                    sandboxed,
+                    ..test_paths(tmp.path())
+                },
                 McpHostEnv::default(),
                 McpSandboxScope {
                     sandbox_info: sandboxed.then_some(&sandbox),
