@@ -106,7 +106,7 @@ export interface WizardPrefill {
     /** The Start that just failed, so the dialog says why. */
     failure?: { reason: string; hint?: string };
   };
-  /** Set when a stored template produced `initialPrompt`. */
+  /** Set when a kind's preset produced `initialPrompt`. */
   template?: { providerId: string; criterion: string };
   /** Suggestion to link the created Session to. */
   suggestion?: { provider_id: string; id: string };

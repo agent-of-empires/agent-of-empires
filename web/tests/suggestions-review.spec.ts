@@ -56,7 +56,6 @@ test("Start with changes opens the wizard with the draft prompt and creates noth
       json: {
         title: item.draft.title,
         initial_prompt: item.draft.prompt,
-        templated: false,
         source_ref: item.source_ref,
         project: { name: "aoe", path: "/work/aoe" },
         tool: "claude",

@@ -197,7 +197,7 @@ interface Props {
   cityhall?: boolean;
   /** Opens the full Suggested sessions view, optionally on its Dismissed filter. */
   onOpenSuggestions?: (dismissed: boolean) => void;
-  /** Opens Settings > Suggestions on one template block. */
+  /** Opens Settings > Suggestions on one kind's preset editor. */
   presetFocus?: PresetFocus;
 }
 
