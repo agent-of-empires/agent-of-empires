@@ -977,6 +977,7 @@ impl PluginHost {
             ui_contributions,
             deep_link_pages,
             ui_generation,
+            suggestions_spec: plugin.manifest.suggestions.clone(),
         });
         serve_connection(
             &self.api,
@@ -1765,6 +1766,7 @@ mod tests {
             ui_contributions: std::collections::HashSet::new(),
             deep_link_pages: Default::default(),
             ui_generation: 0,
+            suggestions_spec: None,
         });
 
         // The worker: request a forbidden method, then publish the error code it
@@ -1836,6 +1838,7 @@ process.stdout.write(JSON.stringify({jsonrpc:"2.0",id:1,method:"session.meta.set
             ui_contributions: std::collections::HashSet::new(),
             deep_link_pages: Default::default(),
             ui_generation: 0,
+            suggestions_spec: None,
         });
 
         const WORKER: &str = r#"
