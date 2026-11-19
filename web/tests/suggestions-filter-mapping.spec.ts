@@ -114,3 +114,19 @@ test("a row is one line on desktop and two lines on a phone", async ({ page }) =
   const narrow = await lines();
   expect(narrow.meta.y).toBeGreaterThanOrEqual(narrow.title.y + narrow.title.height - 1);
 });
+
+test("the Start menu is a bottom sheet with 44px items on a phone", async ({ page }) => {
+  const linked = items.map((i) => ({ ...i, resolved_project: { name: "web", path: "/w/site" } }));
+  await page.route("**/api/suggestions", (route) =>
+    route.fulfill({ json: { providers: [provider], items: linked, prefs } }),
+  );
+  await page.setViewportSize({ width: 375, height: 800 });
+  await page.goto("/suggestions");
+  await page.locator("li", { hasText: "Web bug" }).getByRole("button", { name: "Start options" }).click();
+  const menuItems = page.getByRole("menu", { name: "Start options" }).getByRole("menuitem");
+  const count = await menuItems.count();
+  expect(count).toBeGreaterThan(0);
+  for (let i = 0; i < count; i++) {
+    expect((await menuItems.nth(i).boundingBox())!.height).toBeGreaterThanOrEqual(44);
+  }
+});

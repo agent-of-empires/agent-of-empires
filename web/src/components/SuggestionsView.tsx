@@ -12,7 +12,7 @@ import { SuggestionItemActions } from "./SuggestionItemActions";
 import { SuggestionHooksReview } from "./SuggestionHooksReview";
 import { SuggestionMappingWizard } from "./SuggestionMappingWizard";
 import { SuggestionsSetupHint } from "./SuggestionsSetupHint";
-import { SUGGESTION_NOTE_CLASS, SuggestionRow, SuggestionStatusNotes, UndoBar } from "./SuggestionRow";
+import { SUGGESTION_NOTE_CLASS, SuggestionRow, TAP, SuggestionStatusNotes, UndoBar } from "./SuggestionRow";
 import type { WizardPrefill } from "./session-wizard/SessionWizard";
 
 interface Props {
@@ -191,7 +191,7 @@ export function SuggestionsView({
               onClick={() => void refresh()}
               disabled={anyRefreshing || disabled}
               title={unavailableTitle}
-              className="inline-flex h-8 items-center gap-2 rounded-md border border-surface-700 px-2.5 text-sm text-text-secondary hover:bg-surface-800 disabled:opacity-50 md:px-3"
+              className={`${TAP} inline-flex h-8 items-center gap-2 rounded-md border border-surface-700 px-2.5 text-sm text-text-secondary hover:bg-surface-800 disabled:opacity-50 md:px-3`}
             >
               <RefreshCw className={`h-4 w-4 ${anyRefreshing ? "animate-spin" : ""}`} />
               <span className="hidden md:inline">{anyRefreshing ? "Refreshing…" : "Refresh"}</span>
@@ -202,7 +202,7 @@ export function SuggestionsView({
                 aria-label="Settings › Suggestions"
                 title="Settings › Suggestions"
                 onClick={onOpenSettings}
-                className="inline-flex h-8 w-8 items-center justify-center rounded-md text-text-secondary hover:bg-surface-800"
+                className={`${TAP} inline-flex h-8 w-8 items-center justify-center rounded-md text-text-secondary hover:bg-surface-800`}
               >
                 <Settings className="h-4 w-4" />
               </button>
