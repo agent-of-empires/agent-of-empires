@@ -1476,6 +1476,13 @@ describe("server queue", () => {
 describe("retryRejectedPrompt (#5662)", () => {
   const image = { id: "att-1", kind: "image" as const, mime_type: "image/png", name: "shot.png", size: 3 };
 
+  // Node 22's Response.blob() returns a Node Blob, which jsdom's FileReader rejects.
+  function blobResponse(bytes: Uint8Array): Response {
+    const res = new Response(bytes);
+    res.blob = () => Promise.resolve(new Blob([bytes]));
+    return res;
+  }
+
   async function rejectedThenRetry(text: string, blob: () => Response) {
     calls = installAcpFakes(({ url }) => (url.includes("/acp/attachments/") ? blob() : undefined));
     const { result } = await openSession("s-retry");
@@ -1494,7 +1501,7 @@ describe("retryRejectedPrompt (#5662)", () => {
     ["a captioned image", "look at this"],
     ["an attachment-only prompt", ""],
   ])("resends %s with its stored attachment", async (_label, text) => {
-    await rejectedThenRetry(text, () => new Response(new Uint8Array([112, 110, 103])));
+    await rejectedThenRetry(text, () => blobResponse(new Uint8Array([112, 110, 103])));
     expect(calls.some((c) => c.method === "GET" && c.url === "/api/sessions/s-retry/acp/attachments/att-1")).toBe(true);
     const sent = posts("/acp/prompt");
     expect(sent).toHaveLength(1);
