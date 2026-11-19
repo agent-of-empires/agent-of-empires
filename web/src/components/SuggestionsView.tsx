@@ -10,7 +10,6 @@ import { useAgentNames } from "../hooks/useAgentNames";
 import { useSuggestionPresets } from "../hooks/useSuggestionPresets";
 import { SuggestionItemActions } from "./SuggestionItemActions";
 import { SuggestionHooksReview } from "./SuggestionHooksReview";
-import { SuggestionMappingWizard } from "./SuggestionMappingWizard";
 import { SuggestionsSetupHint } from "./SuggestionsSetupHint";
 import { SUGGESTION_NOTE_CLASS, SuggestionRow, TAP, SuggestionStatusNotes, UndoBar } from "./SuggestionRow";
 import type { WizardPrefill } from "./session-wizard/SessionWizard";
@@ -45,7 +44,7 @@ function providerStatus(provider: SuggestionProvider, itemCount: number) {
     };
   if (itemCount === 0) return { text: `${provider.name}: nothing new`, tone: "text-text-dim" };
   const updated = provider.updated_at ? `updated ${agoLabel(provider.updated_at * 1000)}` : "updated";
-  return { text: `${provider.name}: ${updated}`, tone: "text-text-secondary" };
+  return { text: `${provider.name} ${updated}`, tone: "text-text-secondary" };
 }
 
 /** The `#12` of a `owner/repo#12` reference, which the group header already names. */
@@ -82,7 +81,6 @@ export function SuggestionsView({
   const [filter, setFilter] = useState<Filter>(initialDismissed ? "dismissed" : "all");
   const [query, setQuery] = useState("");
   const [keyChips, setKeyChips] = useState<KeyChip[]>([]);
-  const [mapping, setMapping] = useState(false);
   const [kinds, setKinds] = useState<string[]>([]);
   const [collapsed, setCollapsed] = useState<string[]>([]);
 
@@ -372,15 +370,6 @@ export function SuggestionsView({
                       {group.name} <span className="text-text-dim">{group.items.length}</span>
                       {unlinked && <span className="text-text-dim"> · no Project yet</span>}
                     </button>
-                    {unlinked && !disabled && (
-                      <button
-                        type="button"
-                        onClick={() => setMapping(true)}
-                        className="ml-2 cursor-pointer font-sans text-brand-500 hover:underline"
-                      >
-                        Link a Project
-                      </button>
-                    )}
                   </h2>
                   {!closed && (
                     <ul className="rounded-lg border border-surface-700/40 bg-surface-900">
@@ -458,14 +447,6 @@ export function SuggestionsView({
         )}
       </div>
       <SuggestionHooksReview ctrl={ctrl} />
-      {mapping && snapshot && (
-        <SuggestionMappingWizard
-          items={items}
-          providers={snapshot.providers}
-          disabled={disabled}
-          onClose={() => setMapping(false)}
-        />
-      )}
     </main>
   );
 }

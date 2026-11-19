@@ -330,6 +330,7 @@ describe("SuggestionsSettings", () => {
 
     it("links a repo to a Project", async () => {
       const select = await openLinked();
+      expect(screen.getByText("0 repos linked to Projects.")).toBeTruthy();
       expect(screen.getByText("no Project yet")).toBeTruthy();
       await waitFor(() => expect(select.disabled).toBe(false));
       fireEvent.change(select, { target: { value: "/p/aoe" } });

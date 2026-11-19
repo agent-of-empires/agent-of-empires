@@ -158,12 +158,18 @@ export function SuggestionLinkedRepos({ snapshot, disabled, onBack }: Props) {
     if (mounted.current) setSaving(false);
   };
 
+  const linked = mappings.filter((m) => m.projects.length > 0).length;
   return (
     <div className="space-y-4">
       <button type="button" onClick={onBack} className="cursor-pointer text-sm text-brand-500">
         &larr; Suggestions
       </button>
-      <h2 className="text-base font-semibold text-text-primary">Linked repos</h2>
+      <div>
+        <h2 className="text-base font-semibold text-text-primary">Linked repos</h2>
+        <p className="mt-1 text-xs text-text-dim">
+          {linked} {linked === 1 ? "repo" : "repos"} linked to Projects.
+        </p>
+      </div>
       {(error ?? loadError) && (
         <div
           role="alert"
