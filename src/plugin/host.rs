@@ -91,6 +91,8 @@ struct RunningWorker {
     manifest_hash: String,
     /// Lets teardown retire UI state from this worker generation only.
     ui_generation: Option<u64>,
+    /// Hash of the `[suggestions]` spec this worker launched with.
+    suggestions_hash: Option<String>,
     /// Bounded and separate from `inbound`, so a worker that stops reading stdin cannot grow
     /// daemon memory through session events. `None` unless the plugin opted in.
     events_inbound: Option<mpsc::Sender<String>>,
@@ -715,6 +717,7 @@ impl PluginHost {
                         inbound: None,
                         manifest_hash: String::new(),
                         ui_generation: None,
+                        suggestions_hash: None,
                         events_inbound: None,
                         lifecycle_events: false,
                         dropped_events: 0,
@@ -724,8 +727,20 @@ impl PluginHost {
             })
         };
         if let Some((stale, reservation)) = replaced {
+            let old_spec = stale.suggestions_hash.clone();
             self.teardown_workers(vec![(plugin_id.to_string(), stale)])
                 .await;
+            // The old worker is fenced now, so it cannot publish behind this clear:
+            // what it published under another spec must not outlive the swap.
+            let new_spec = registry.get(plugin_id).and_then(|p| {
+                p.manifest
+                    .suggestions
+                    .as_ref()
+                    .map(crate::plugin::suggestions::spec_hash)
+            });
+            if old_spec != new_spec {
+                self.forget_suggestions(plugin_id.to_string()).await;
+            }
             let mut table = self.state.lock().await;
             // A concurrent reconcile or restart may have claimed the slot since.
             if table
@@ -768,6 +783,7 @@ impl PluginHost {
                 inbound: None,
                 manifest_hash: String::new(),
                 ui_generation: None,
+                suggestions_hash: None,
                 events_inbound: None,
                 lifecycle_events: false,
                 dropped_events: 0,
@@ -1057,6 +1073,11 @@ impl PluginHost {
                     w.inbound = Some(inbound_tx.clone());
                     w.manifest_hash = manifest_hash.clone();
                     w.ui_generation = Some(ui_generation);
+                    w.suggestions_hash = plugin
+                        .manifest
+                        .suggestions
+                        .as_ref()
+                        .map(crate::plugin::suggestions::spec_hash);
                     w.events_inbound = status_tx;
                     w.lifecycle_events = session_lifecycle;
                     true
@@ -1465,6 +1486,7 @@ impl PluginHost {
                 inbound: None,
                 manifest_hash: String::new(),
                 ui_generation: None,
+                suggestions_hash: None,
                 events_inbound: event_capacity.map(|_| tx),
                 lifecycle_events,
                 dropped_events: 0,
@@ -1519,6 +1541,7 @@ impl PluginHost {
                 inbound: Some(tx),
                 manifest_hash: String::new(),
                 ui_generation: None,
+                suggestions_hash: None,
                 events_inbound: None,
                 lifecycle_events: false,
                 dropped_events: 0,
@@ -3085,6 +3108,126 @@ command = {command}
         waiter.abort();
         assert!(waiter.await.unwrap_err().is_cancelled());
         assert_eq!(host.pending.waiting(plugin_id), 0);
+        host.shutdown().await;
+    }
+
+    /// Replacing a worker clears what it published only when the new build
+    /// declares another `[suggestions]` spec, and only once the old worker is
+    /// stopped, so it cannot publish behind the clear.
+    #[cfg(unix)]
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn replacing_a_worker_clears_its_publication_only_when_the_spec_changed() {
+        use crate::session::{update_config, CapabilityGrant, PluginConfig};
+
+        let temp = tempfile::tempdir().unwrap();
+        let _reload = crate::plugin::ReloadRegistryOnDrop;
+        let _env = crate::session::test_support::EnvGuard::set(&[
+            ("XDG_CONFIG_HOME", temp.path().to_path_buf()),
+            ("HOME", temp.path().to_path_buf()),
+            ("USERPROFILE", temp.path().to_path_buf()),
+        ]);
+        let plugin_id = "acme.suggester";
+        let install = |version: &str, label: &str| {
+            let manifest = format!(
+                r#"
+id = "{plugin_id}"
+name = "Suggester"
+version = "{version}"
+api_version = 23
+capabilities = ["runtime.worker"]
+
+[runtime]
+kind = "command"
+system = true
+command = ["sleep", "600"]
+
+[suggestions]
+
+[[suggestions.sources]]
+criterion = "assigned"
+label = "{label}"
+variables = []
+"#
+            );
+            let dir = crate::plugin::plugins_dir().unwrap().join(plugin_id);
+            std::fs::create_dir_all(&dir).unwrap();
+            std::fs::write(dir.join("aoe-plugin.toml"), &manifest).unwrap();
+            update_config(|config| {
+                config.plugins.insert(
+                    plugin_id.to_string(),
+                    PluginConfig {
+                        grant: Some(CapabilityGrant {
+                            manifest_hash: aoe_plugin_api::PluginManifest::hash_bytes(
+                                manifest.as_bytes(),
+                            ),
+                            capabilities: vec!["runtime.worker".to_string()],
+                            granted_at: chrono::Utc::now(),
+                        }),
+                        ..PluginConfig::default()
+                    },
+                );
+            })
+            .unwrap();
+            crate::plugin::reload_registry()
+        };
+        let registry = install("1.0.0", "Assigned");
+        let host = PluginHost::new(
+            &temp.path().join("host"),
+            "default",
+            None,
+            std::sync::Arc::new(crate::server::runtime::RuntimeWork::default()),
+        )
+        .unwrap();
+        host.start(&registry).await;
+        wait_until("the worker", || async {
+            worker_pid(&host, plugin_id).await.is_some()
+        })
+        .await;
+        // What the old worker published after the installer cleared, before the swap.
+        host.api.with_suggestions_db(|conn, _| {
+            conn.execute(
+                "INSERT INTO suggestion_providers (profile, provider_id, updated_at) VALUES ('p', ?1, 0)",
+                [plugin_id],
+            )
+            .unwrap();
+        });
+        let published = || {
+            host.api.with_suggestions_db(|conn, _| {
+                conn.query_row(
+                    "SELECT COUNT(*) FROM suggestion_providers WHERE provider_id = ?1",
+                    [plugin_id],
+                    |row| row.get::<_, i64>(0),
+                )
+                .unwrap()
+            })
+        };
+
+        let first = worker_pid(&host, plugin_id).await.unwrap();
+        host.restart_worker(plugin_id, &install("1.0.1", "Assigned"))
+            .await;
+        wait_until("the replacement", || async {
+            worker_pid(&host, plugin_id)
+                .await
+                .is_some_and(|pid| pid != first)
+        })
+        .await;
+        assert_eq!(published(), 1, "the same spec keeps what was published");
+
+        let second = worker_pid(&host, plugin_id).await.unwrap();
+        host.restart_worker(plugin_id, &install("1.1.0", "Renamed"))
+            .await;
+        wait_until("the second replacement", || async {
+            worker_pid(&host, plugin_id)
+                .await
+                .is_some_and(|pid| pid != second)
+        })
+        .await;
+        assert_eq!(
+            published(),
+            0,
+            "another spec clears it behind the old worker"
+        );
         host.shutdown().await;
     }
 
