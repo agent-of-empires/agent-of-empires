@@ -813,8 +813,6 @@ enum PendingJob {
     Restart {
         intent: RestartIntent,
         confirmed: Option<PendingConfirm>,
-        /// When the key that asked was pressed; an Enter later than `CONFIRM_TTL` cancels.
-        asked_at: Instant,
     },
     LaunchContext(ServeLaunchRequest),
     LaunchOutcome,
@@ -1148,23 +1146,11 @@ impl ServeView {
                 self.request_picker(selected);
                 true
             }
-            PendingJob::Restart {
-                intent,
-                confirmed,
-                asked_at,
-            } => {
-                if code == KeyCode::Enter && asked_at.elapsed() <= CONFIRM_TTL {
-                    if let (RestartIntent::Confirm(action), None) = (intent, confirmed) {
-                        let action = *action;
-                        if let Some(PendingWork {
-                            kind: PendingJob::Restart { confirmed, .. },
-                            ..
-                        }) = &mut self.pending
-                        {
-                            *confirmed = Some(action);
-                        }
-                        return true;
-                    }
+            // Only an Enter on a prompt counts, so one during either check neither confirms nor
+            // cancels: a bounce can't undo a confirm.
+            PendingJob::Restart { intent, .. } => {
+                if code == KeyCode::Enter && matches!(intent, RestartIntent::Confirm(_)) {
+                    return true;
                 }
                 let repeated = match intent {
                     RestartIntent::Confirm(PendingConfirm::Restart) => {
@@ -1526,11 +1512,7 @@ impl ServeView {
         if let Some(intent) = intent {
             self.request(
                 Job::Restart(mode, transport),
-                PendingJob::Restart {
-                    intent,
-                    confirmed,
-                    asked_at: Instant::now(),
-                },
+                PendingJob::Restart { intent, confirmed },
             );
         }
         ServeAction::Continue
@@ -1633,6 +1615,7 @@ impl ServeView {
             });
         } else {
             self.restart_probe = fresh;
+            // The prompt shows now, so its window starts now.
             self.pending_confirm = Some((action, Instant::now()));
         }
     }
@@ -1934,12 +1917,9 @@ impl ServeView {
                     transport: pending.transport,
                 };
             }
-            (
-                PendingJob::Restart {
-                    intent, confirmed, ..
-                },
-                JobResult::Restart(fresh),
-            ) => self.apply_restart(fresh, intent, confirmed),
+            (PendingJob::Restart { intent, confirmed }, JobResult::Restart(fresh)) => {
+                self.apply_restart(fresh, intent, confirmed)
+            }
             (
                 PendingJob::LaunchContext(mut request),
                 JobResult::LaunchContext {

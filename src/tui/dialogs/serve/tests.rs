@@ -926,7 +926,6 @@ fn every_pending_state_leaves_a_closed_worker() {
                 PendingJob::Restart {
                     intent: RestartIntent::Help,
                     confirmed: None,
-                    asked_at: Instant::now(),
                 },
             ),
             Held::LaunchContext => (
@@ -3075,43 +3074,67 @@ fn a_restart_and_a_new_passphrase_confirm_only_with_enter() {
     assert!(view.pending.is_none(), "Enter with nothing armed");
     assert!(view.take_launch().is_none());
 
-    let (_jobs, gate, mut view) = arm('R', ServeMode::Local);
-    view.handle_key(enter());
-    gate.release(probe());
-    wait_assessment(&mut view);
-    assert!(view.take_launch().is_some(), "Enter during the assessment");
-
-    // The arm lasts CONFIRM_TTL from the R, however slow either assessment is: an Enter in time
-    // confirms when its assessment lands late, and an Enter after it cancels.
-    let (_jobs_a, early_gate, mut early) = arm('R', ServeMode::Local);
-    early.handle_key(enter());
-    let (_jobs_b, second_gate, mut second) = arm('R', ServeMode::Local);
-    second_gate.release(probe());
-    wait_for(&mut second, |view| view.pending_confirm.is_some());
-    second.handle_key(enter());
-    second_gate.entered(Held::Restart);
-    let asked = Instant::now();
-    let (_jobs_c, late_gate, mut late) = arm('R', ServeMode::Local);
-    while let Some(remaining) = CONFIRM_TTL.checked_sub(asked.elapsed()) {
-        std::thread::sleep(remaining + Duration::from_millis(50));
+    // Nothing asks during the check, so an Enter then does nothing, whether or not the landed
+    // effects match the empty starting probe; Enter once it asks restarts.
+    for landed in [
+        RestartProbe::default(),
+        RestartProbe {
+            port: Some(8080),
+            ..RestartProbe::default()
+        },
+    ] {
+        let (_jobs, gate, mut view) = arm('R', ServeMode::Local);
+        view.handle_key(enter());
+        assert!(
+            view.pending.is_some(),
+            "Enter during the check cancelled it"
+        );
+        gate.release(JobResult::Restart(landed.clone()));
+        wait_for(&mut view, |view| view.pending_confirm.is_some());
+        assert!(
+            view.take_launch().is_none(),
+            "Enter during the check, {landed:?}"
+        );
+        view.handle_key(enter());
+        gate.entered(Held::Restart);
+        // A second Enter (a bounce or double tap) during the re-check doesn't undo the confirm.
+        view.handle_key(enter());
+        assert!(
+            view.pending.is_some(),
+            "a second Enter cancelled the confirm"
+        );
+        gate.release(JobResult::Restart(landed.clone()));
+        wait_assessment(&mut view);
+        assert!(
+            view.take_launch().is_some(),
+            "Enter once it asks, {landed:?}"
+        );
     }
-    early_gate.release(probe());
-    wait_assessment(&mut early);
-    assert!(
-        early.take_launch().is_some(),
-        "Enter in time, slow first assessment"
-    );
-    second_gate.release(probe());
-    wait_assessment(&mut second);
-    assert!(
-        second.take_launch().is_some(),
-        "Enter in time, slow second assessment"
-    );
-    late.handle_key(enter());
-    assert!(late.pending.is_none(), "an Enter after CONFIRM_TTL cancels");
-    late_gate.release(probe());
-    assert!(late.take_launch().is_none());
-    assert!(late.pending_confirm.is_none());
+
+    // The window runs from the prompt, which shows when the assessment lands.
+    for (age, confirms) in [
+        (CONFIRM_TTL - Duration::from_millis(250), true),
+        (CONFIRM_TTL + Duration::from_millis(1), false),
+    ] {
+        let (_jobs, gate, mut view) = arm('R', ServeMode::Local);
+        gate.release(probe());
+        wait_for(&mut view, |view| view.pending_confirm.is_some());
+        let (action, _) = view.pending_confirm.unwrap();
+        view.pending_confirm = Some((action, Instant::now() - age));
+        view.handle_key(enter());
+        if confirms {
+            gate.entered(Held::Restart);
+            gate.release(probe());
+            wait_assessment(&mut view);
+            assert!(
+                view.take_launch().is_some(),
+                "Enter {age:?} after the prompt"
+            );
+        } else {
+            assert!(view.pending.is_none(), "Enter {age:?} after the prompt");
+            assert!(view.take_launch().is_none());
+        }
+    }
 
     for repeat_events in [false, true] {
         let (_jobs, gate, mut view) = arm('R', ServeMode::Local);
