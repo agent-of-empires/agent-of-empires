@@ -422,7 +422,7 @@ fn ago_label(secs: i64) -> String {
     }
 }
 
-/// How long a dismissed row stays listed so `x` can undo it.
+/// How long a dismissed row stays listed so `z` can undo it.
 const UNDO_WINDOW: std::time::Duration = std::time::Duration::from_secs(10);
 
 pub(super) enum SuggestionsAction {
@@ -580,15 +580,14 @@ impl SuggestionsView {
                 self.show_dismissed = !self.show_dismissed;
                 self.reorder(store, key);
             }
-            KeyCode::Char('l') => {
+            KeyCode::Char('r') => {
                 self.begin();
+                if mutations_allowed {
+                    store.refresh();
+                }
                 store.reload();
             }
-            KeyCode::Char('r') if mutations_allowed => {
-                self.begin();
-                store.refresh();
-            }
-            KeyCode::Char('x') if mutations_allowed => {
+            KeyCode::Char('z' | 'Z') if mutations_allowed => {
                 if let Some(item) = self.item_at(store, self.selected) {
                     let (key, dismissed) =
                         ((item.provider_id.clone(), item.id.clone()), !item.dismissed);
@@ -596,7 +595,7 @@ impl SuggestionsView {
                     store.dismiss(&key, dismissed);
                 }
             }
-            KeyCode::Char('r' | 'x') => {
+            KeyCode::Char('z' | 'Z') => {
                 self.error = block.map(|b| block_note(b).to_string());
             }
             KeyCode::Enter | KeyCode::Char('N') => {
@@ -645,7 +644,7 @@ impl SuggestionsView {
             changed = true;
         }
         if polled.refreshed {
-            self.notice = Some("Refresh requested. Press l to reload the list.".into());
+            self.notice = Some("Refresh requested.".into());
             changed = true;
         }
         if let Some(error) = polled.error.take() {
@@ -755,7 +754,7 @@ impl SuggestionsView {
             )));
         }
         footer.push(Line::from(Span::styled(
-            "j/k select · Enter review/start/open · N start another · x dismiss/restore · d dismissed · r refresh · l reload · PgUp/PgDn prompt · Esc back",
+            "j/k select · Enter review/start/open · N new · z dismiss/restore · d dismissed · r refresh · PgUp/PgDn prompt · Esc back",
             Style::default().fg(theme.dimmed),
         )));
         let width = (inner.width as usize).max(1);
@@ -826,7 +825,7 @@ impl SuggestionsView {
             let marker = if current { "› " } else { "  " };
             let state = match (item.dismissed, store.is_recent(&item_key)) {
                 (false, _) => "",
-                (true, true) => " [dismissed, x to undo]",
+                (true, true) => " [dismissed, z to undo]",
                 (true, false) => " [dismissed]",
             };
             let title_style = if item.dismissed || item.stale {
@@ -886,7 +885,7 @@ impl SuggestionsView {
         if lines.is_empty() {
             let message = match (&store.snapshot, store.busy) {
                 (None, true) => "Loading suggestions…",
-                (None, false) => "No suggestions loaded. Press l to reload.",
+                (None, false) => "No suggestions loaded. Press r to reload.",
                 (Some(_), _) => "Nothing to suggest right now.",
             };
             lines.push(Line::from(Span::styled(
@@ -1007,7 +1006,7 @@ pub(super) struct SuggestionsFeed {
     dismissing: Vec<ItemKey>,
     /// Restore requests not yet answered by a snapshot showing them.
     restoring: Vec<ItemKey>,
-    /// Items dismissed in the last [`UNDO_WINDOW`], kept listed so `x` or `z` undoes them.
+    /// Items dismissed in the last [`UNDO_WINDOW`], kept listed so `z` undoes them.
     recent: Vec<(ItemKey, std::time::Instant)>,
     loaded_at: Option<std::time::Instant>,
     load_attempt_at: Option<std::time::Instant>,
@@ -1730,8 +1729,7 @@ mod tests {
     #[test]
     fn mutating_keys_are_refused_when_read_only() {
         let mut rig = view_with(vec![item("a", None, false)], idle_worker());
-        press(&mut rig, KeyCode::Char('x'), false);
-        press(&mut rig, KeyCode::Char('r'), false);
+        press(&mut rig, KeyCode::Char('z'), false);
         assert!(!rig.store.busy);
         assert!(rig.view.error.is_some());
     }
@@ -1866,7 +1864,7 @@ mod tests {
     }
 
     #[test]
-    fn a_dismissed_item_stays_dimmed_for_ten_seconds_and_x_undoes_it() {
+    fn a_dismissed_item_stays_dimmed_for_ten_seconds_and_z_undoes_it() {
         let mut rig = view_with(vec![item("a", None, false)], idle_worker());
         let key = ("p".to_string(), "a".to_string());
         rig.store.dismissing.push(key.clone());
@@ -1874,7 +1872,7 @@ mod tests {
         rig.store.settle_dismissals();
         assert!(rig.view.apply(&rig.store, &mut changed()));
         assert_eq!(ids(&rig), ["a"], "kept while the undo window is open");
-        assert!(render_text(&rig).contains("[dismissed, x to undo]"));
+        assert!(render_text(&rig).contains("[dismissed, z to undo]"));
 
         let stale = std::time::Instant::now()
             .checked_sub(UNDO_WINDOW + std::time::Duration::from_secs(1))
@@ -2030,7 +2028,7 @@ mod tests {
             _ => unreachable!("no other request expected"),
         });
         let mut rig = view_with(vec![item("a", Some("repo"), false)], worker);
-        press(&mut rig, KeyCode::Char('l'), true);
+        rig.store.reload();
         press(&mut rig, KeyCode::Enter, true);
         let mut error_seen = None;
         for _ in 0..200 {
@@ -2234,7 +2232,7 @@ mod tests {
         let mut rig = view_with(vec![], worker);
         rig.store.refresh();
         assert!(poll_until_settled(&mut rig));
-        assert!(rig.view.notice.as_deref().unwrap().contains("Press l"));
+        assert_eq!(rig.view.notice.as_deref(), Some("Refresh requested."));
     }
 
     #[test]
@@ -2243,7 +2241,7 @@ mod tests {
             panic!("worker died")
         });
         let mut rig = view_with(vec![item("a", None, false)], worker);
-        press(&mut rig, KeyCode::Char('l'), true);
+        rig.store.reload();
         assert!(rig.store.busy);
         assert!(poll_until_settled(&mut rig));
         assert!(!rig.store.busy);
@@ -2275,7 +2273,7 @@ mod tests {
         let mut view = SuggestionsView::new(&mut store);
         assert_eq!(store.keys().len(), 1);
         view.handle_key(
-            KeyEvent::new(KeyCode::Char('x'), KeyModifiers::NONE),
+            KeyEvent::new(KeyCode::Char('z'), KeyModifiers::NONE),
             None,
             &mut store,
         );
@@ -2356,7 +2354,7 @@ mod tests {
             SuggestionsAction::Start(_)
         ));
 
-        press(&mut rig, KeyCode::Char('l'), true);
+        rig.store.reload();
         assert_eq!(rig.store.queued.len(), 1, "the reload waits its turn");
     }
 
@@ -2515,8 +2513,8 @@ mod tests {
         let snapshot = rig.store.snapshot.as_mut().unwrap();
         snapshot.daemon = Some("http://a".into());
         snapshot.profile = Some("A".into());
-        press(&mut rig, KeyCode::Char('l'), true);
-        press(&mut rig, KeyCode::Char('x'), true);
+        rig.store.reload();
+        press(&mut rig, KeyCode::Char('z'), true);
         assert!(poll_until_settled(&mut rig));
         assert!(rig.store.queued.is_empty());
         assert!(rig.store.dismissing.is_empty());
@@ -2538,5 +2536,38 @@ mod tests {
             profile: None,
         };
         assert!(origin_error(&unbound, "http://b", Some("B")).is_none());
+    }
+    #[test]
+    fn r_reloads_on_a_read_only_dashboard_and_refreshes_first_otherwise() {
+        let (sink, seen) = std::sync::mpsc::channel();
+        let worker = Worker::spawn("t", move |req| match req {
+            Req::Load => {
+                let _ = sink.send("load");
+                Res::Snapshot(Err("boom".into()))
+            }
+            Req::Refresh => {
+                let _ = sink.send("refresh");
+                Res::Refreshed(Ok(()))
+            }
+            _ => unreachable!("no other request expected"),
+        });
+        let mut rig = view_with(vec![item("a", None, false)], worker);
+        press(&mut rig, KeyCode::Char('r'), false);
+        assert!(poll_until_settled(&mut rig));
+        assert_eq!(seen.try_iter().collect::<Vec<_>>(), ["load"]);
+
+        press(&mut rig, KeyCode::Char('r'), true);
+        for _ in 0..2 {
+            assert!(poll_until_settled(&mut rig));
+        }
+        assert_eq!(seen.try_iter().collect::<Vec<_>>(), ["refresh", "load"]);
+    }
+
+    #[test]
+    fn x_and_l_no_longer_do_anything() {
+        let mut rig = view_with(vec![item("a", None, false)], idle_worker());
+        press(&mut rig, KeyCode::Char('x'), true);
+        press(&mut rig, KeyCode::Char('l'), true);
+        assert!(!rig.store.busy);
     }
 }
