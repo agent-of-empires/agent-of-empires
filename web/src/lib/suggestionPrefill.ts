@@ -20,6 +20,7 @@ export function toWizardPrefill(
     // No resolved project: open the picker, so the prompt never lands in the last-used repo.
     initialTab: p.project ? undefined : "recent",
     tool: p.tool,
+    useStructuredView: p.view ? p.view === "structured" : undefined,
     yoloMode: p.yolo,
     sandboxEnabled: p.sandbox,
     // A blank initial_prompt is rejected by POST /api/sessions, so send none.
