@@ -1,0 +1,5 @@
+# runtime: none; source-quoted, not a capture
+# source: Go's text for ENOSPC, which Docker and Podman (both Go) print for a full disk:
+# https://github.com/golang/go/blob/14f2cd7f8ec5f705d2a3da14cf3ed0f7a5c6744c/src/syscall/zerrors_linux_amd64.go#L1385
+# stderr follows
+no space left on device

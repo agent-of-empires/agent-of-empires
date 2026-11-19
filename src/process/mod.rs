@@ -897,8 +897,9 @@ fn collect_descendants_from_map(
 pub fn get_pane_pid(session_name: &str) -> Option<u32> {
     let pane = crate::tmux::first_pane_id(session_name)?;
     // The pane id must travel alone: `session:%id` reads as a window
-    // spec and falls back to the window's active pane (tmux 3.7c).
-    let output = crate::tmux::tmux_command()
+    // spec and falls back to the window's active pane (tmux 3.7c). A client
+    // without UTF-8 prints the tab as `_`, so the query passes `-u`.
+    let output = crate::tmux::tmux_query_command()
         .args([
             "display-message",
             "-t",

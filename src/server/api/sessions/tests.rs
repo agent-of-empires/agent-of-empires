@@ -5817,6 +5817,7 @@ fn public_create_session_error_forwards_typed_causes_as_fixed_templates() {
                 runtime: "Podman",
                 image: "ghcr.io/acme/sandbox:1".into(),
                 detail: format!("denied: token {SECRET} at /root/.docker/config.json"),
+                reason: crate::containers::image_pull::PullFailureReason::Other,
             })
             .context("ensure image"),
             (
@@ -5922,6 +5923,7 @@ fn public_create_session_error_forwards_typed_causes_as_fixed_templates() {
                 runtime: "Docker",
                 image: "x".repeat(2000),
                 detail: String::new(),
+                reason: crate::containers::image_pull::PullFailureReason::Other,
             }),
             "sandbox_image_pull_failed",
         ),

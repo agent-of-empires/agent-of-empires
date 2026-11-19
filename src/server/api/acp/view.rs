@@ -4099,6 +4099,7 @@ mod tests {
     /// A success body as JSON, or a refusal as `{error: <code header>, message: <text body>}`.
     /// Refusals must stay plain text: the current web client shows the body as it is.
     async fn response_json(response: Response) -> anyhow::Result<(StatusCode, serde_json::Value)> {
+        use anyhow::Context as _;
         let status = response.status();
         let code = response
             .headers()
@@ -4106,7 +4107,13 @@ mod tests {
             .map(|value| value.to_str().unwrap().to_string());
         let bytes = axum::body::to_bytes(response.into_body(), usize::MAX).await?;
         let Some(code) = code else {
-            return Ok((status, serde_json::from_slice(&bytes)?));
+            let json = serde_json::from_slice(&bytes).with_context(|| {
+                format!(
+                    "HTTP {status}: expected JSON response; body:\n{}",
+                    String::from_utf8_lossy(&bytes)
+                )
+            })?;
+            return Ok((status, json));
         };
         let message = String::from_utf8(bytes.to_vec())?;
         assert!(
@@ -4754,6 +4761,7 @@ mod tests {
             );
             let seq = state.acp_event_store.highest_seq_checked(&reserved.id)?;
             let (reserve_state, failing) = (state.clone(), state.clone());
+            let release_gate = state.profile_namespace.clone().write_owned().await;
             let error = tokio::task::spawn_blocking(move || {
                 crate::server::session_store::before_next_adoption_for_test(move || {
                     failing
@@ -4776,8 +4784,22 @@ mod tests {
             .await?
             .unwrap_err();
             assert!(error.is::<HandoffReserved>(), "{error:#}");
+            assert!(stored(&reserved)?.lifecycle_reservation.is_some());
+            let drain = state.runtime.work.drain();
+            tokio::pin!(drain);
+            assert!(
+                futures_util::poll!(&mut drain).is_pending(),
+                "native release must remain blocked by the namespace writer"
+            );
+            drop(release_gate);
+            drain.await;
+            assert!(stored(&reserved)?.lifecycle_reservation.is_none());
             crate::server::test_support::refresh_canonical_metadata_for_test(&state).await;
             crate::server::test_support::accept_runtime_read_cache_for_test(&state).await;
+            assert_eq!(
+                *state.canonical_health.read().await,
+                crate::daemon::RuntimeHealth::Healthy
+            );
         }
         let checked = acp_terminal_check(State(state.clone()), Path(reserved.id.clone())).await;
         assert_eq!(response_json(checked).await?.1["reason"], "handoff_pending");

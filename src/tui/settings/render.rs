@@ -2137,6 +2137,12 @@ mod status_message_tests {
     #[serial]
     fn every_scroll_offset_shows_the_unclipped_rows() {
         use super::super::CategoryRow;
+        // Over SSH the Sound tab draws a warning above its fields; this compares fields only.
+        let _ssh = crate::session::test_support::EnvGuard::unset(&[
+            "SSH_CONNECTION",
+            "SSH_CLIENT",
+            "SSH_TTY",
+        ]);
         let (_temp, _guard, mut view) = fresh_view();
         let tabs: Vec<usize> = (0..view.categories.len())
             .filter(|&i| {

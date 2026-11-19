@@ -14,6 +14,19 @@ pub struct AttachmentBlob {
     pub data: Vec<u8>,
 }
 
+impl AttachmentBlob {
+    /// The metadata-only ref events carry in place of the bytes.
+    pub fn to_ref(&self) -> crate::daemon::PromptAttachmentRef {
+        crate::daemon::PromptAttachmentRef {
+            id: self.id.clone(),
+            kind: self.kind,
+            mime_type: self.mime_type.clone(),
+            name: self.name.clone(),
+            size: self.data.len() as u64,
+        }
+    }
+}
+
 impl EventStore {
     /// Persist a blob keyed to its `UserPromptSent` seq, so retention and
     /// session delete drop it with that event.

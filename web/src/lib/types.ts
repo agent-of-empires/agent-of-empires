@@ -590,8 +590,14 @@ export interface SettingsFieldDescriptor {
   profile_overridable: boolean;
   validation: SettingsValidation;
   advanced: boolean;
+  /** One plain line for users; absent on fields without one and on plugin fields. */
+  summary?: string;
   /** Read only by the TUI; folded apart from the dashboard's own settings. */
   tui_only?: boolean;
+  /** Read only by the dashboard; sent only when set. */
+  web_only?: boolean;
+  /** Read once when an AoE process starts; sent only when set. */
+  restart?: boolean;
   /** Present only on plugin fields, which have no stored value until saved. */
   default?: unknown;
   /** Plugin field that can also be set per registered project. */

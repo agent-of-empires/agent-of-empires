@@ -97,7 +97,7 @@ impl HomeView {
         // agents (e.g. Codex) don't swallow the final Enter. Shells in
         // the paired terminal panes don't need the delay.
         let delay = match &target {
-            live_send::LiveSendTarget::Agent => crate::agents::send_keys_enter_delay(&inst.tool),
+            live_send::LiveSendTarget::Agent => inst.send_keys_enter_delay(),
             live_send::LiveSendTarget::Terminal
             | live_send::LiveSendTarget::ContainerTerminal
             | live_send::LiveSendTarget::Tool(_) => 0,

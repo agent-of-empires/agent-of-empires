@@ -116,7 +116,7 @@ In `--remote` mode the token rotates every four hours. Use `aoe url` for the liv
 |------|---------|-------------|
 | `--port` | 8080 | Port to listen on |
 | `--host` | 127.0.0.1 | Bind address; `0.0.0.0` for LAN/VPN access |
-| `--auth` | `token` | `token` (URL token), `passphrase` (login wall only), `none` (loopback only unless `--behind-proxy`). `--no-auth` is an alias for `none` |
+| `--auth` | `token` | `token` (URL token), `passphrase` (login wall only), `none` (requires `--behind-proxy`). `--no-auth` is an alias for `none` |
 | `--passphrase` | | Passphrase for the login wall, also read from `AOE_SERVE_PASSPHRASE`. Valid with `--auth=token` and `--auth=passphrase` |
 | `--behind-proxy` | off | An external proxy terminates TLS: sets `; Secure` cookies and trusts `X-Forwarded-For` and `X-Forwarded-Proto` only from loopback peers. Spawns no tunnel and requires at least one `--allowed-host` |
 | `--dangerously-allow-plaintext-remote` | off | Accept plain HTTP from non-loopback peers instead of answering `426`; see [Security](#security) |
@@ -128,7 +128,7 @@ In `--remote` mode the token rotates every four hours. Use `aoe url` for the liv
 | `--read-only` | off | View terminals but send no keystrokes |
 | `--daemon` / `--stop` | off | Fork to the background, or stop a running daemon |
 
-`--auth=passphrase` and `--auth=none` on a non-loopback bind require `--behind-proxy`. Passphrase mode requires `--passphrase` or `AOE_SERVE_PASSPHRASE`; combining a passphrase with `--auth=none` is refused. Public `--remote` tunnels require both token auth and a passphrase and refuse reduced-auth modes. See [Authentication](#authentication).
+`--auth=none` always requires `--behind-proxy`: a loopback TCP peer can be a sandbox container (Docker Desktop, OrbStack and Podman machine forward `host.docker.internal` to host `127.0.0.1`) or another local user, so it cannot be trusted as the owner. `--auth=passphrase` on a non-loopback bind requires `--behind-proxy`. Passphrase mode requires `--passphrase` or `AOE_SERVE_PASSPHRASE`; combining a passphrase with `--auth=none` is refused. Public `--remote` tunnels require both token auth and a passphrase and refuse reduced-auth modes. See [Authentication](#authentication).
 
 ### CityHall client mode
 
@@ -285,7 +285,7 @@ Both flags are repeatable and replayed across `aoe serve --restart`.
 ### Dangerous (blocked)
 
 - `aoe serve --host 0.0.0.0` on public WiFi without a VPN: unencrypted HTTP, which is why it is refused with `426` unless you pass `--dangerously-allow-plaintext-remote`.
-- `aoe serve --auth=none --host 0.0.0.0` (or `--no-auth --host 0.0.0.0`): refuses to start without `--behind-proxy`.
+- `aoe serve --auth=none` or `--no-auth` on any bind: refuses to start without `--behind-proxy`. The CLI needs no token over the owner-only Unix socket.
 - `aoe serve --auth=none --remote` or `--auth=passphrase --remote`: refuses to start.
 
 ## Installing as a PWA
