@@ -615,19 +615,16 @@ export interface SuggestionSource {
   enabled: boolean;
   /** Placeholder names every item of this criterion carries. */
   variables: string[];
-  /** What Start runs for this kind; the Profile's new-Session defaults until the user edits it. */
-  preset?: SuggestionPreset;
-  customized?: boolean;
 }
 
-/** How a kind starts a Session. `prompt` is a template with `{variables}` filled from each item. */
+/** How a kind starts a Session. `prompt` is a template with `{variables}` filled from each item; null uses the plugin's own prompt. */
 export interface SuggestionPreset {
   agent: string;
   view: "structured" | "terminal";
   worktree: boolean;
   sandbox: boolean;
   yolo: boolean;
-  prompt: string;
+  prompt: string | null;
 }
 
 export interface SuggestionPresetEntry {
@@ -636,16 +633,6 @@ export interface SuggestionPresetEntry {
   preset: SuggestionPreset;
   customized: boolean;
   defaults: SuggestionPreset;
-}
-
-/** What Start will use for one item, as the preset resolves for it. */
-export interface SuggestionStartPlan {
-  agent: string;
-  view: "structured" | "terminal";
-  worktree: boolean;
-  sandbox: boolean;
-  /** The linked Project's name, when the repo is linked. */
-  project?: string | null;
 }
 
 /** One setup check a provider reports. `detail` and `fix` are provider text and untrusted. */
@@ -728,8 +715,6 @@ export interface SuggestionItem {
   stale?: boolean;
   /** The registered Project the item resolves to; the provider's `project` is only a hint. */
   resolved_project?: { name: string; path: string } | null;
-  /** What Start will use, resolved from the item's kind. */
-  start?: SuggestionStartPlan;
 }
 
 export interface SuggestionsSnapshot {

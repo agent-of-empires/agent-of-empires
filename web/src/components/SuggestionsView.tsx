@@ -7,6 +7,7 @@ import type { SuggestionItem, SuggestionProvider } from "../lib/types";
 import { suggestionKey, useDismissUndo, useSuggestions } from "../hooks/useSuggestions";
 import { SuggestionFilterMenu, FilterMenuItem } from "./SuggestionFilterMenu";
 import { useAgentNames } from "../hooks/useAgentNames";
+import { useSuggestionPresets } from "../hooks/useSuggestionPresets";
 import { SuggestionItemActions } from "./SuggestionItemActions";
 import { HooksTrustDialog } from "./session-wizard/HooksTrustDialog";
 import { SuggestionMappingWizard } from "./SuggestionMappingWizard";
@@ -76,6 +77,7 @@ export function SuggestionsView({
   const ctrl = useSuggestions(onPrepare, onOpenSession);
   const { snapshot, loading, loadFailed, refreshing, busy, notice, failures, offline, act, refresh, load } = ctrl;
   const agentName = useAgentNames();
+  const presetOf = useSuggestionPresets();
   const { undo, dismiss } = useDismissUndo(act);
   const [filter, setFilter] = useState<Filter>(initialDismissed ? "dismissed" : "all");
   const [query, setQuery] = useState("");
@@ -400,6 +402,7 @@ export function SuggestionsView({
                                 ctrl={ctrl}
                                 readOnly={readOnly}
                                 agentName={agentName}
+                                presetOf={presetOf}
                                 onOpenSession={onOpenSession}
                                 onToggleDismiss={() => void dismiss(item, !item.dismissed)}
                                 onEditPreset={onEditPreset}
@@ -460,8 +463,8 @@ export function SuggestionsView({
           onCreate={ctrl.hooksReview.review.commands.on_create ?? []}
           onLaunch={ctrl.hooksReview.review.commands.on_launch ?? []}
           onDestroy={ctrl.hooksReview.review.commands.on_destroy ?? []}
-          needsMcpTrust={(ctrl.hooksReview.review.mcp_servers?.length ?? 0) > 0}
-          mcpSummaries={ctrl.hooksReview.review.mcp_servers ?? []}
+          needsMcpTrust={ctrl.hooksReview.review.needs_mcp_trust === true}
+          mcpSummaries={[]}
           onConfirm={ctrl.approveHooks}
           onCancel={ctrl.cancelHooks}
         />

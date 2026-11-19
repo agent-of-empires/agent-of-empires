@@ -4,6 +4,7 @@ import type {
   AgentInfo,
   SuggestionItem,
   SuggestionPreset,
+  SuggestionPresetEntry,
   SuggestionProvider,
   SuggestionSource,
 } from "../../lib/types";
@@ -38,6 +39,7 @@ function Row({ label, hint, children }: { label: string; hint?: string; children
 interface Props {
   provider: SuggestionProvider;
   source: SuggestionSource;
+  entry: SuggestionPresetEntry | undefined;
   /** A current item of this kind, for the prompt preview. */
   item: SuggestionItem | undefined;
   disabled: boolean;
@@ -47,8 +49,8 @@ interface Props {
 }
 
 /** What Start uses for every suggestion of one kind: the New session dialog's rows, in its order. */
-export function SuggestionPresetEditor({ provider, source, item, disabled, onBack, onSaved }: Props) {
-  const stored = source.preset;
+export function SuggestionPresetEditor({ provider, source, entry, item, disabled, onBack, onSaved }: Props) {
+  const stored = entry?.preset;
   const [draft, setDraft] = useState<SuggestionPreset | null>(stored ?? null);
   const [agents, setAgents] = useState<AgentInfo[]>([]);
   const [error, setError] = useState<string | null>(null);
@@ -100,9 +102,11 @@ export function SuggestionPresetEditor({ provider, source, item, disabled, onBac
     onBack();
   };
   const preview = item
-    ? draft.prompt === ""
-      ? "starts with an empty prompt, so you type the first message."
-      : expandTemplate(draft.prompt, item.variables ?? {})
+    ? draft.prompt === null
+      ? item.draft.prompt
+      : draft.prompt === ""
+        ? "starts with an empty prompt, so you type the first message."
+        : expandTemplate(draft.prompt, item.variables ?? {})
     : "no current suggestion to preview.";
   const off = disabled || busy;
 
@@ -183,17 +187,31 @@ export function SuggestionPresetEditor({ provider, source, item, disabled, onBac
         <div className="mb-1 text-sm text-text-primary">Prompt</div>
         <TemplateEditor
           label={`${provider.name} ${source.criterion} prompt`}
-          value={draft.prompt}
+          value={draft.prompt ?? ""}
           variables={source.variables}
           disabled={off}
           onChange={(v) => set("prompt", v)}
           onCommit={() => {}}
         />
-        <p className="mt-2 text-xs text-text-dim">Words in {"{braces}"} are filled in from each suggestion.</p>
+        <p className="mt-2 text-xs text-text-dim">
+          {draft.prompt === null
+            ? `Uses ${provider.name}'s own prompt until you type one. `
+            : "Words in {braces} are filled in from each suggestion. "}
+          {draft.prompt !== null && (
+            <button
+              type="button"
+              disabled={off}
+              onClick={() => set("prompt", null)}
+              className="cursor-pointer text-brand-500 hover:underline disabled:opacity-50"
+            >
+              Use {provider.name}&apos;s prompt
+            </button>
+          )}
+        </p>
         <p className="mt-1 break-words font-mono text-xs text-text-muted">Preview: {preview}</p>
       </div>
       <div className="flex items-center gap-2">
-        <button type="button" className={GHOST} disabled={off || !source.customized} onClick={() => void reset()}>
+        <button type="button" className={GHOST} disabled={off || !entry?.customized} onClick={() => void reset()}>
           Reset to {provider.name}&apos;s settings
         </button>
         <span className="flex-1" />

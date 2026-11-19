@@ -11,6 +11,7 @@ import { loadSettings, resetSettingsStore, saveField, useProfileSettings } from 
 const api = vi.hoisted(() => ({
   fetchSuggestions: vi.fn(),
   fetchAgents: vi.fn(),
+  fetchSuggestionPresets: vi.fn(),
   runSuggestionFix: vi.fn(),
   updateSuggestionPrefs: vi.fn(),
   updateSuggestionSource: vi.fn(),
@@ -34,6 +35,16 @@ const PRESET: SuggestionPreset = {
   yolo: false,
   prompt: "/aoe-review {pr-number}",
 };
+const PRESETS = [
+  { provider_id: "gh", criterion: "review-requested", customized: false, preset: PRESET, defaults: PRESET },
+  {
+    provider_id: "gh",
+    criterion: "ci-failed",
+    customized: true,
+    preset: { ...PRESET, view: "terminal", prompt: "" },
+    defaults: PRESET,
+  },
+];
 const snapshot = (): SuggestionsSnapshot => ({
   prefs: {
     homepage: true,
@@ -56,8 +67,6 @@ const snapshot = (): SuggestionsSnapshot => ({
           description: "Review requested",
           enabled: true,
           variables: ["pr-number", "repo", "org", "branch"],
-          preset: PRESET,
-          customized: false,
         },
         {
           criterion: "ci-failed",
@@ -65,8 +74,6 @@ const snapshot = (): SuggestionsSnapshot => ({
           description: "",
           enabled: false,
           variables: ["branch"],
-          preset: { ...PRESET, view: "terminal", prompt: "" },
-          customized: true,
         },
       ],
     },
@@ -112,8 +119,9 @@ function Harness({
   );
 }
 
-function open(props: { readOnly?: boolean; presetFocus?: PresetFocus } = {}) {
+function open(props: { readOnly?: boolean; presetFocus?: PresetFocus; presets?: typeof PRESETS } = {}) {
   api.fetchSuggestions.mockResolvedValue(snapshot());
+  api.fetchSuggestionPresets.mockResolvedValue(props.presets ?? PRESETS);
   api.fetchAgents.mockResolvedValue([
     { name: "claude", display_name: "Claude Code", kind: "builtin", installed: true },
     { name: "codex", display_name: "Codex", kind: "builtin", installed: true },
@@ -148,7 +156,7 @@ afterEach(() => {
 
 describe("SuggestionsSettings", () => {
   it("lists Sources and Kinds, and writes prefs, kinds and order", async () => {
-    const openFull = open();
+    open();
     await screen.findByText("Updated 2 min ago");
     expect(screen.getByText(/Couldn't refresh: API key rejected\./)).toBeTruthy();
     expect(screen.getByText("Drag to set which source comes first, or Alt+↑/↓ on a focused row.")).toBeTruthy();
@@ -165,6 +173,11 @@ describe("SuggestionsSettings", () => {
     expect(within(kinds).getByText("Not suggested")).toBeTruthy();
     fireEvent.click(within(kinds).getByRole("switch", { name: "Suggest CI failures" }));
     await waitFor(() => expect(api.updateSuggestionSource).toHaveBeenCalledWith("gh", "ci-failed", true));
+  });
+
+  it("reorders sources by keyboard and writes the Advanced settings", async () => {
+    const openFull = open();
+    await screen.findByText("Updated 2 min ago");
 
     fireEvent.keyDown(screen.getByLabelText("Source GitHub"), { key: "ArrowDown", altKey: true });
     await waitFor(() => expect(api.updateSuggestionPrefs).toHaveBeenCalledWith({ provider_order: ["lin", "gh"] }));
@@ -187,6 +200,7 @@ describe("SuggestionsSettings", () => {
     snap.providers[1].fix = { label: "Fix in Linear settings" };
     api.fetchSuggestions.mockResolvedValue(snap);
     api.fetchAgents.mockResolvedValue([]);
+    api.fetchSuggestionPresets.mockResolvedValue(PRESETS);
     api.runSuggestionFix.mockResolvedValue(ok);
     render(<Harness readOnly={false} onOpenSuggestions={vi.fn()} />);
     expect((await screen.findByText(/Uses your Agent's usage/)).textContent).toContain("Updated");
@@ -228,6 +242,23 @@ describe("SuggestionsSettings", () => {
     );
     // Back on the list once the save and reload land.
     await screen.findByRole("button", { name: "Edit Review requests" });
+  });
+
+  it("a preset with no prompt uses the plugin's, and typing one replaces it", async () => {
+    open({ presets: [{ ...PRESETS[0]!, preset: { ...PRESET, prompt: null } }, PRESETS[1]!] });
+    fireEvent.click(await screen.findByRole("button", { name: "Edit Review requests" }));
+    expect(await screen.findByText("Preview: plugin prompt")).toBeTruthy();
+    expect(screen.getByText(/Uses GitHub's own prompt until you type one/)).toBeTruthy();
+    fireEvent.change(screen.getByLabelText("GitHub review-requested prompt"), { target: { value: "Mine" } });
+    expect(screen.getByRole("button", { name: "Use GitHub's prompt" })).toBeTruthy();
+    fireEvent.click(screen.getByRole("button", { name: "Save" }));
+    await waitFor(() =>
+      expect(api.putSuggestionPreset).toHaveBeenCalledWith(
+        "gh",
+        "review-requested",
+        expect.objectContaining({ prompt: "Mine" }),
+      ),
+    );
   });
 
   it("Cancel leaves the preset alone, and Reset deletes a customized one", async () => {
@@ -272,6 +303,7 @@ describe("SuggestionsSettings", () => {
 
   it("opens the editor when a focus arrives after mount, once per focus", async () => {
     api.fetchSuggestions.mockResolvedValue(snapshot());
+    api.fetchSuggestionPresets.mockResolvedValue(PRESETS);
     api.fetchAgents.mockResolvedValue([]);
     const focus = () => ({ providerId: "gh", criterion: "review-requested" });
     const view = render(<Harness readOnly={false} onOpenSuggestions={vi.fn()} />);

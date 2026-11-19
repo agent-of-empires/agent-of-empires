@@ -1,5 +1,6 @@
 import { updateSuggestionSource } from "../lib/api";
 import { useAgentNames } from "../hooks/useAgentNames";
+import { useSuggestionPresets } from "../hooks/useSuggestionPresets";
 import { SuggestionItemActions } from "./SuggestionItemActions";
 import { HooksTrustDialog } from "./session-wizard/HooksTrustDialog";
 import { suggestionKey, useDismissUndo, useSuggestions } from "../hooks/useSuggestions";
@@ -28,6 +29,7 @@ export function DashboardSuggestions({
   const ctrl = useSuggestions(onPrepare, onOpenSession);
   const { snapshot, loadFailed, busy, refreshing, notice, failures, offline, act, refresh } = ctrl;
   const agentName = useAgentNames();
+  const presetOf = useSuggestionPresets();
   const { undo, dismiss, clearUndo } = useDismissUndo(act);
 
   if (!snapshot || snapshot.providers.length === 0 || !snapshot.prefs.homepage) return null;
@@ -82,6 +84,7 @@ export function DashboardSuggestions({
                 ctrl={ctrl}
                 readOnly={readOnly}
                 agentName={agentName}
+                presetOf={presetOf}
                 onOpenSession={onOpenSession}
                 onToggleDismiss={() => void dismiss(item, true)}
                 onEditPreset={onEditPreset}
@@ -131,8 +134,8 @@ export function DashboardSuggestions({
           onCreate={ctrl.hooksReview.review.commands.on_create ?? []}
           onLaunch={ctrl.hooksReview.review.commands.on_launch ?? []}
           onDestroy={ctrl.hooksReview.review.commands.on_destroy ?? []}
-          needsMcpTrust={(ctrl.hooksReview.review.mcp_servers?.length ?? 0) > 0}
-          mcpSummaries={ctrl.hooksReview.review.mcp_servers ?? []}
+          needsMcpTrust={ctrl.hooksReview.review.needs_mcp_trust === true}
+          mcpSummaries={[]}
           onConfirm={ctrl.approveHooks}
           onCancel={ctrl.cancelHooks}
         />

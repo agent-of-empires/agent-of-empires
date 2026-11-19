@@ -20,6 +20,7 @@ const { updateSuggestionSource } = vi.hoisted(() => ({ updateSuggestionSource: v
 vi.mock("../../lib/api", () => ({
   startSuggestion,
   fetchAgents: () => Promise.resolve(null),
+  fetchSuggestionPresets: () => Promise.resolve(null),
   fetchSuggestions,
   prepareSuggestion,
   refreshSuggestions,

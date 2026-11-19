@@ -2,7 +2,7 @@ import { prepareSuggestion } from "../lib/api";
 import { reportError, reportInfo } from "../lib/toastBus";
 import { startSummary } from "../lib/suggestionPlan";
 import { suggestionKey, type useSuggestions } from "../hooks/useSuggestions";
-import type { SuggestionItem, SuggestionsSnapshot } from "../lib/types";
+import type { SuggestionItem, SuggestionPresetEntry, SuggestionsSnapshot } from "../lib/types";
 import { SuggestionActions } from "./SuggestionRow";
 
 interface Props {
@@ -11,6 +11,7 @@ interface Props {
   ctrl: ReturnType<typeof useSuggestions>;
   readOnly: boolean;
   agentName: (id: string) => string;
+  presetOf: (providerId: string, criterion: string) => SuggestionPresetEntry | undefined;
   onOpenSession: (sessionId: string) => void;
   onToggleDismiss: () => void;
   /** Opens Settings › Suggestions on this kind's preset; absent where Settings is out of reach. */
@@ -26,6 +27,7 @@ export function SuggestionItemActions({
   ctrl,
   readOnly,
   agentName,
+  presetOf,
   onOpenSession,
   onToggleDismiss,
   onEditPreset,
@@ -35,7 +37,7 @@ export function SuggestionItemActions({
   const provider = snapshot.providers.find((p) => p.id === item.provider_id);
   const providerName = provider?.name ?? item.provider_id;
   const kindLabel = provider?.sources.find((s) => s.criterion === item.criterion)?.label;
-  const linked = !!(item.resolved_project ?? item.start?.project);
+  const linked = !!item.resolved_project;
   return (
     <SuggestionActions
       dismissed={item.dismissed}
@@ -60,7 +62,7 @@ export function SuggestionItemActions({
         item.dismissed
           ? undefined
           : {
-              uses: startSummary(item, agentName),
+              uses: startSummary(item, presetOf(item.provider_id, item.criterion)?.preset, agentName),
               providerName,
               sourceUrl: item.source_url,
               kindLabel,
