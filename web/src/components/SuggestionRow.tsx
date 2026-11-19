@@ -1,10 +1,9 @@
-import { useRef, useState, type ReactNode } from "react";
+import type { ReactNode } from "react";
 import { MoreHorizontal, Undo2, X } from "lucide-react";
 import { OFFLINE_TITLE } from "../lib/connectionState";
 import type { StartedSession } from "../lib/types";
 import { agoLabel } from "../lib/suggestionTime";
-import { StartInMenu, StartMenu, type StartMenuProps } from "./SuggestionStartMenu";
-import { useOutsideDismiss } from "./useOutsideDismiss";
+import { MENU_ITEM, MenuPopover, StartInMenu, StartMenu, type StartMenuProps } from "./SuggestionStartMenu";
 
 /** Buttons look 32px; on a phone an invisible 44px area around them takes the tap. */
 const TAP =
@@ -152,9 +151,6 @@ interface ActionsProps {
   startIn?: { onPick: (path: string) => void; disabled?: boolean; title?: string };
 }
 
-const MENU_ITEM_CLASS =
-  "block w-full px-3 py-1.5 text-left text-xs text-text-secondary hover:bg-surface-700 disabled:opacity-50";
-
 function MoreMenu({
   started,
   stale,
@@ -170,36 +166,34 @@ function MoreMenu({
   offline: boolean;
   onDismiss: () => void;
 }) {
-  const [open, setOpen] = useState(false);
-  const ref = useRef<HTMLDivElement>(null);
-  useOutsideDismiss(open, [ref], () => setOpen(false));
   const unavailable = readOnly ? "Read-only: can't create Sessions" : offline ? OFFLINE_TITLE : undefined;
   return (
-    <div ref={ref} className="relative">
-      <button
-        type="button"
-        aria-label="More"
-        title="More"
-        aria-haspopup="menu"
-        aria-expanded={open}
-        onClick={() => setOpen((v) => !v)}
-        className={`${TAP} inline-flex h-8 w-8 items-center justify-center rounded-md text-text-secondary hover:bg-surface-700/50`}
-      >
-        <MoreHorizontal className="h-4 w-4" />
-      </button>
-      {open && (
-        <div
-          role="menu"
-          className="absolute right-0 z-20 mt-1 w-[220px] rounded-md border border-surface-700 bg-surface-800 py-1 shadow-lg"
+    <MenuPopover
+      label="More"
+      trigger={({ open, toggle }) => (
+        <button
+          type="button"
+          aria-label="More"
+          title="More"
+          aria-haspopup="menu"
+          aria-expanded={open}
+          onClick={toggle}
+          className={`${TAP} inline-flex h-8 w-8 items-center justify-center rounded-md text-text-secondary hover:bg-surface-700/50`}
         >
+          <MoreHorizontal className="h-4 w-4" />
+        </button>
+      )}
+    >
+      {(close) => (
+        <>
           <button
             type="button"
             role="menuitem"
             disabled={disabled || stale}
             title={stale ? "No longer open at the source" : unavailable}
-            className={MENU_ITEM_CLASS}
+            className={MENU_ITEM}
             onClick={() => {
-              setOpen(false);
+              close();
               started.onStartAnother();
             }}
           >
@@ -211,8 +205,8 @@ function MoreMenu({
               href={started.sourceUrl}
               target="_blank"
               rel="noopener noreferrer"
-              className={MENU_ITEM_CLASS}
-              onClick={() => setOpen(false)}
+              className={MENU_ITEM}
+              onClick={() => close()}
             >
               Open in {started.providerName} ↗
             </a>
@@ -224,9 +218,9 @@ function MoreMenu({
                 type="button"
                 role="menuitem"
                 disabled={disabled}
-                className={MENU_ITEM_CLASS}
+                className={MENU_ITEM}
                 onClick={() => {
-                  setOpen(false);
+                  close();
                   onDismiss();
                 }}
               >
@@ -234,9 +228,9 @@ function MoreMenu({
               </button>
             </>
           )}
-        </div>
+        </>
       )}
-    </div>
+    </MenuPopover>
   );
 }
 
