@@ -1365,8 +1365,8 @@ describe("createSession errors", () => {
     const reply = (status: number, body: object) =>
       fetchSpy.mockResolvedValueOnce(new Response(JSON.stringify(body), { status }));
 
-    it("posts the item and options, and reads the 202 ack", async () => {
-      reply(202, { session_id: "s1", title: "Fix it" });
+    it("posts the item and options, and reads the 201 answer", async () => {
+      reply(201, { session_id: "s1", title: "Fix it" });
       expect(await api.startSuggestion("acme.sugg", "i1", { project: { path: "/p" } })).toEqual({
         kind: "started",
         sessionId: "s1",
@@ -1399,7 +1399,7 @@ describe("createSession errors", () => {
         { error: "start_failed", reason: "Docker isn't running", hint: "Start it.", retryable: true },
         { kind: "failed", reason: "Docker isn't running", hint: "Start it.", retryable: true },
       ],
-      ["400 stale", 400, { error: "stale", message: "gone" }, { kind: "stale" }],
+      ["409 stale_suggestion", 409, { error: "stale_suggestion", message: "gone" }, { kind: "stale" }],
       ["400 no_project", 400, { error: "no_project", hint: "link_project" }, { kind: "no_project" }],
     ])("maps %s", async (_name, status, body, expected) => {
       reply(status, body);

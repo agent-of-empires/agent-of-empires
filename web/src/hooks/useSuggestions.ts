@@ -145,7 +145,6 @@ export function useSuggestions(
         break;
       }
       case "hooks_need_trust":
-      case "trust_changed":
         setHooksReview({ item, review: result.review, options });
         return;
       case "failed":

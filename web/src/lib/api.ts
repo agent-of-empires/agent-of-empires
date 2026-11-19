@@ -3683,7 +3683,7 @@ export const resetSuggestionPreset = (providerId: string, criterion: string) =>
 /** The repo's hooks, as `POST /start` returns them with a 409 `hooks_need_trust`. */
 export interface StartHooksReview {
   commands: { on_create?: string[]; on_launch?: string[]; on_destroy?: string[] };
-  mcp_servers?: string[];
+  needs_mcp_trust?: boolean;
   review_fingerprint: string;
 }
 
@@ -3698,7 +3698,6 @@ export type StartResult =
   | { kind: "started"; sessionId: string; title: string }
   | { kind: "already_started"; sessionId: string }
   | { kind: "hooks_need_trust"; review: StartHooksReview }
-  | { kind: "trust_changed"; review: StartHooksReview }
   /** The server said no: `reason` is what went wrong, `hint` what to do. */
   | { kind: "failed"; reason: string; hint?: string; retryable: boolean }
   | { kind: "stale" }
@@ -3706,7 +3705,7 @@ export type StartResult =
   | { kind: "no_project" }
   | { kind: "error"; error: string };
 
-/** Starts a Session from a suggestion with its kind's preset. The server answers 202 and the Session streams in. */
+/** Starts a Session from a suggestion with its kind's preset; the server answers 201 once it exists. */
 export async function startSuggestion(
   providerId: string,
   id: string,
@@ -3739,9 +3738,10 @@ export async function startSuggestion(
     notifySuggestionsChanged();
     return { kind: "already_started", sessionId: str(body.session_id) ?? "" };
   }
-  if (res.status === 409 && (code === "hooks_need_trust" || code === "trust_changed")) {
+  if (res.status === 409 && code === "hooks_need_trust") {
     return { kind: code, review: body as unknown as StartHooksReview };
   }
+  if (res.status === 409 && code === "stale_suggestion") return { kind: "stale" };
   if (res.status === 422 && code === "start_failed") {
     return {
       kind: "failed",
@@ -3750,7 +3750,6 @@ export async function startSuggestion(
       retryable: body.retryable !== false,
     };
   }
-  if (res.status === 400 && code === "stale") return { kind: "stale" };
   if (res.status === 400 && code === "no_project") return { kind: "no_project" };
   return { kind: "error", error: parseApiErrorText(text, res.status) };
 }

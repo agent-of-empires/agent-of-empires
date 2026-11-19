@@ -8,15 +8,6 @@ const source = (criterion: string, label: string, enabled: boolean, variables: s
   description: "",
   enabled,
   variables,
-  customized: false,
-  preset: {
-    agent: "claude",
-    view: "structured",
-    worktree: true,
-    sandbox: false,
-    yolo: false,
-    prompt: "/aoe-review {pr-number}",
-  },
 });
 
 function store() {
@@ -123,7 +114,23 @@ test("375px shows an arrow button instead of the drag handle", async ({ page }) 
 test("a kind's preset saves through PUT /presets", async ({ page }) => {
   await setup(page);
   const puts: unknown[] = [];
+  const preset = {
+    agent: "claude",
+    view: "structured",
+    worktree: true,
+    sandbox: false,
+    yolo: false,
+    prompt: "/aoe-review {pr-number}",
+  };
   await page.route("**/api/suggestions/presets", (r) => {
+    if (r.request().method() === "GET")
+      return r.fulfill({
+        json: {
+          presets: [
+            { provider_id: "github", criterion: "review-requested", customized: false, preset, defaults: preset },
+          ],
+        },
+      });
     puts.push(r.request().postDataJSON());
     return r.fulfill({ json: { ok: true } });
   });

@@ -195,7 +195,7 @@ async function mockStart(page: import("@playwright/test").Page, reply: { status:
 
 test("Start runs the preset in one click: no wizard, a toast with Open", async ({ page }) => {
   const { startPosts, sessionPosts } = await mockStart(page, {
-    status: 202,
+    status: 201,
     json: { session_id: "started-1", title: item.title },
   });
   await page.goto("/suggestions");
@@ -224,7 +224,7 @@ test("a repo with hooks pauses Start on the review, and Approve and start sends 
   await expect(page.getByText("Review this repo's hooks")).toBeVisible();
   await expect(page.getByText("npm ci")).toBeVisible();
   await page.route("**/api/suggestions/start", (route) =>
-    route.fulfill({ status: 202, json: { session_id: "started-1", title: item.title } }),
+    route.fulfill({ status: 201, json: { session_id: "started-1", title: item.title } }),
   );
   await page.getByRole("button", { name: "Approve and start" }).click();
   await expect.poll(() => startPosts.length).toBe(1);

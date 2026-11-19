@@ -14,6 +14,7 @@ import type { SettingsFieldDescriptor, SuggestionProvider, SuggestionsSnapshot }
 import { OFFLINE_TITLE, useServerDown } from "../../lib/connectionState";
 import { agoLabel } from "../../lib/suggestionTime";
 import { useAgentNames } from "../../hooks/useAgentNames";
+import { useSuggestionPresets } from "../../hooks/useSuggestionPresets";
 import { SectionHeader, SuggestionSwitch } from "./suggestionsShared";
 import { SuggestionLinkedRepos } from "./SuggestionLinkedRepos";
 import { SuggestionPresetEditor, type PresetFocus } from "./SuggestionPresetEditor";
@@ -151,6 +152,7 @@ export function SuggestionsSettings({
     presetFocus ? { providerId: presetFocus.providerId, criterion: presetFocus.criterion } : null,
   );
   const agentName = useAgentNames();
+  const presetOf = useSuggestionPresets();
   const mounted = useRef(true);
   // Keyed on primitives: App rebuilds `presetFocus` every render, which must not reopen the view.
   const focusKey = presetFocus && `${presetFocus.providerId}/${presetFocus.criterion}`;
@@ -207,6 +209,7 @@ export function SuggestionsSettings({
         <SuggestionPresetEditor
           provider={provider}
           source={source}
+          entry={presetOf(provider.id, source.criterion)}
           item={snapshot.items.find((i) => i.provider_id === provider.id && i.criterion === source.criterion)}
           disabled={disabled}
           onBack={() => (presetFocus?.returnToSuggestions ? onOpenSuggestions?.(false) : setView(null))}
@@ -307,7 +310,7 @@ export function SuggestionsSettings({
           <SectionHeader>{`${provider.name} · Kinds`}</SectionHeader>
           <ul className="overflow-hidden rounded-lg border border-surface-700/40 bg-surface-900">
             {provider.sources.map((source) => {
-              const preset = source.preset;
+              const preset = presetOf(provider.id, source.criterion)?.preset;
               const summary = !source.enabled
                 ? "Not suggested"
                 : preset

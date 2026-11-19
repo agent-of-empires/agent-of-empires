@@ -6,15 +6,23 @@ import { setServerDown } from "../../lib/connectionState";
 import { toastBus } from "../../lib/toastBus";
 import type { SuggestionItem, SuggestionsSnapshot } from "../../lib/types";
 
-const { fetchSuggestions, prepareSuggestion, refreshSuggestions, dismissSuggestion, startSuggestion, fetchProjects } =
-  vi.hoisted(() => ({
-    fetchSuggestions: vi.fn(),
-    prepareSuggestion: vi.fn(),
-    refreshSuggestions: vi.fn(),
-    dismissSuggestion: vi.fn(),
-    startSuggestion: vi.fn(),
-    fetchProjects: vi.fn(),
-  }));
+const {
+  fetchSuggestions,
+  prepareSuggestion,
+  refreshSuggestions,
+  dismissSuggestion,
+  startSuggestion,
+  fetchProjects,
+  fetchPresets,
+} = vi.hoisted(() => ({
+  fetchSuggestions: vi.fn(),
+  prepareSuggestion: vi.fn(),
+  refreshSuggestions: vi.fn(),
+  dismissSuggestion: vi.fn(),
+  startSuggestion: vi.fn(),
+  fetchProjects: vi.fn(),
+  fetchPresets: vi.fn(),
+}));
 
 vi.mock("../../lib/api", () => ({
   fetchAgents: () => Promise.resolve(null),
@@ -24,6 +32,7 @@ vi.mock("../../lib/api", () => ({
   refreshSuggestions,
   dismissSuggestion,
   fetchSuggestionProjects: fetchProjects,
+  fetchSuggestionPresets: fetchPresets,
 }));
 
 const item: SuggestionItem = {
@@ -69,6 +78,7 @@ afterEach(() => {
   setServerDown(false);
   vi.clearAllMocks();
   toastBus.handler = null;
+  fetchPresets.mockResolvedValue([]);
 });
 
 async function open(snap: SuggestionsSnapshot | null, props: { readOnly?: boolean; initialDismissed?: boolean } = {}) {
@@ -255,12 +265,16 @@ describe("SuggestionsView", () => {
           {
             ...item,
             resolved_project: { name: "aoe", path: "/work/aoe" },
-            start: { agent: "claude", view: "structured", worktree: true, sandbox: false, project: "aoe" },
           },
         ],
       }),
     );
+    const preset = { agent: "claude", view: "structured", worktree: true, sandbox: false, yolo: false, prompt: null };
+    fetchPresets.mockResolvedValue([
+      { provider_id: "github", criterion: "assigned", customized: false, preset, defaults: preset },
+    ]);
     render(<SuggestionsView onPrepare={vi.fn()} onOpenSession={vi.fn()} onEditPreset={onEditPreset} />);
+    await waitFor(() => expect(fetchPresets).toHaveBeenCalled());
     fireEvent.click(await screen.findByRole("button", { name: "Start options" }));
     expect(screen.getByText("aoe · claude · Structured view · worktree")).toBeTruthy();
     fireEvent.click(screen.getByRole("menuitem", { name: /Edit the Assigned issues preset/ }));
