@@ -2191,7 +2191,7 @@ async fn restart_refusal_preserves_authoritative_launch_fields() -> anyhow::Resu
         let response = restart_session(
             State(state.clone()),
             Path(id.clone()),
-            Ok(Some(Json(crate::daemon::RestartSessionBody {
+            crate::server::test_support::json_request(&crate::daemon::RestartSessionBody {
                 profile: match refusal {
                     "profile_collision" => Some("target".into()),
                     "missing_profile" => Some("missing".into()),
@@ -2203,7 +2203,7 @@ async fn restart_refusal_preserves_authoritative_launch_fields() -> anyhow::Resu
                 extra_args: Some("--replacement".into()),
                 unsnooze: true,
                 ..Default::default()
-            }))),
+            }),
         )
         .await
         .into_response();
@@ -2294,10 +2294,10 @@ async fn running_restart_respawns_while_start_remains_idempotent() -> anyhow::Re
     let restarted = restart_session(
         State(state.clone()),
         Path(id.clone()),
-        Ok(Some(Json(crate::daemon::RestartSessionBody {
+        crate::server::test_support::json_request(&crate::daemon::RestartSessionBody {
             wake_message: Some(String::new()),
             ..Default::default()
-        }))),
+        }),
     )
     .await
     .into_response();
@@ -2384,10 +2384,10 @@ async fn restart_delivers_requested_wake_message_to_new_pane() -> anyhow::Result
     let response = restart_session(
         State(state.clone()),
         Path(id),
-        Ok(Some(Json(crate::daemon::RestartSessionBody {
+        crate::server::test_support::json_request(&crate::daemon::RestartSessionBody {
             wake_message: Some("wake-message-verified".into()),
             ..Default::default()
-        }))),
+        }),
     )
     .await
     .into_response();
@@ -9847,6 +9847,41 @@ async fn restart_for_update_refuses_a_session_that_is_not_out_of_date() {
     assert_eq!(response.status(), StatusCode::UNSUPPORTED_MEDIA_TYPE);
 }
 
+/// #5762: `/restart` takes the same check, so a check sent without a `Content-Type` is refused
+/// there too, before the session is looked up.
+#[tokio::test]
+async fn restart_refuses_a_check_sent_without_a_json_content_type() {
+    let state = crate::server::test_support::build_test_app_state(vec![]);
+    let check = crate::daemon::RestartSessionBody {
+        stop_processes: Some(Vec::new()),
+        ..Default::default()
+    };
+    for (name, request, expected) in [
+        (
+            "empty",
+            axum::extract::Request::new(axum::body::Body::empty()),
+            StatusCode::NOT_FOUND,
+        ),
+        (
+            "json",
+            crate::server::test_support::json_request(&check),
+            StatusCode::NOT_FOUND,
+        ),
+        (
+            "untyped",
+            axum::extract::Request::new(axum::body::Body::from(
+                serde_json::to_vec(&check).unwrap(),
+            )),
+            StatusCode::UNSUPPORTED_MEDIA_TYPE,
+        ),
+    ] {
+        let response = restart_session(State(state.clone()), Path("missing".to_string()), request)
+            .await
+            .into_response();
+        assert_eq!(response.status(), expected, "{name}");
+    }
+}
+
 /// #5762: a restart that asks for the check names the shells the Agent started and stops
 /// nothing until each one, by PID and start, is confirmed.
 #[tokio::test]
@@ -14500,11 +14535,11 @@ async fn restart_admission_decides_on_the_incoming_tool() -> anyhow::Result<()> 
             let response = restart_session(
                 State(state.clone()),
                 Path(row.id.clone()),
-                Ok(Some(Json(crate::daemon::RestartSessionBody {
+                crate::server::test_support::json_request(&crate::daemon::RestartSessionBody {
                     tool: Some(incoming.into()),
                     command_override: Some(incoming.into()),
                     ..Default::default()
-                }))),
+                }),
             )
             .await;
             let body: serde_json::Value =
@@ -14624,11 +14659,11 @@ async fn restart_admission_decides_an_account_swap_on_the_incoming_account() -> 
             let response = restart_session(
                 State(state.clone()),
                 Path(row.id.clone()),
-                Ok(Some(Json(crate::daemon::RestartSessionBody {
+                crate::server::test_support::json_request(&crate::daemon::RestartSessionBody {
                     tool: Some("claude-2".into()),
                     command_override: Some("claude".into()),
                     ..Default::default()
-                }))),
+                }),
             )
             .await;
             let body: serde_json::Value =

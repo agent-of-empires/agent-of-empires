@@ -2074,17 +2074,14 @@ pub async fn start_session(
 pub async fn restart_session(
     State(state): State<Arc<AppState>>,
     Path(id): Path<String>,
-    body: Result<
-        Option<Json<crate::daemon::RestartSessionBody>>,
-        axum::extract::rejection::JsonRejection,
-    >,
+    request: axum::extract::Request,
 ) -> axum::response::Response {
     if let Some(response) = crate::server::api::cityhall_block(&state) {
         return response;
     }
-    let body = match body {
-        Ok(body) => body.map(|Json(body)| body).unwrap_or_default(),
-        Err(error) => return error.into_response(),
+    let body: crate::daemon::RestartSessionBody = match json_or_default(request).await {
+        Ok(body) => body,
+        Err(response) => return response,
     };
     // The restart body sets the same spawn fields the create route accepts, so
     // it answers with the same gate and the same `400 validation_failed`.
@@ -2152,7 +2149,7 @@ pub async fn restart_for_update(
     if let Some(resp) = cityhall_block_non_structured(&state, &id).await {
         return resp;
     }
-    let check = match update_check(request).await {
+    let check: crate::daemon::RestartForUpdateBody = match json_or_default(request).await {
         Ok(check) => check,
         Err(response) => return response,
     };
@@ -2211,23 +2208,26 @@ async fn background_processes_refusal(
     Some(background_processes_response(fields, false))
 }
 
-/// The update restart's check. An empty body asks for none; any other body must be JSON, so a
-/// check sent without a `Content-Type` is refused instead of dropped.
-async fn update_check(
+/// A restart body: empty asks for the defaults; any other body must be JSON, so a
+/// background-process check sent without a `Content-Type` is refused instead of dropped.
+async fn json_or_default<T: serde::de::DeserializeOwned + Default>(
     request: axum::extract::Request,
-) -> Result<crate::daemon::RestartForUpdateBody, axum::response::Response> {
+) -> Result<T, axum::response::Response> {
     use axum::extract::FromRequest as _;
     let (parts, body) = request.into_parts();
-    let bytes = axum::body::to_bytes(body, 64 * 1024)
-        .await
-        .map_err(|_| StatusCode::PAYLOAD_TOO_LARGE.into_response())?;
+    let bytes = axum::body::Bytes::from_request(
+        axum::extract::Request::from_parts(parts.clone(), body),
+        &(),
+    )
+    .await
+    .map_err(IntoResponse::into_response)?;
     if bytes.is_empty() {
-        return Ok(Default::default());
+        return Ok(T::default());
     }
     let request = axum::extract::Request::from_parts(parts, axum::body::Body::from(bytes));
     Json::from_request(request, &())
         .await
-        .map(|Json(check)| check)
+        .map(|Json(body)| body)
         .map_err(IntoResponse::into_response)
 }
 
@@ -4596,7 +4596,12 @@ mod durable_stop_tests {
             let before = state.runtime.publish(&state).await?;
             let response = match target {
                 "restart" => {
-                    restart_session(State(state.clone()), Path(row.id.clone()), Ok(None)).await
+                    restart_session(
+                        State(state.clone()),
+                        Path(row.id.clone()),
+                        axum::extract::Request::new(axum::body::Body::empty()),
+                    )
+                    .await
                 }
                 "container-terminal" => super::super::ensure::ensure_container_terminal(
                     State(state.clone()),
@@ -4815,11 +4820,11 @@ mod durable_stop_tests {
             let response = restart_session(
                 State(state.clone()),
                 Path(row.id.clone()),
-                Ok(Some(Json(crate::daemon::RestartSessionBody {
+                crate::server::test_support::json_request(&crate::daemon::RestartSessionBody {
                     skip_on_launch: true,
                     wake_message: Some(String::new()),
                     ..Default::default()
-                }))),
+                }),
             )
             .await;
             let status = response.status();
@@ -4967,11 +4972,11 @@ mod durable_stop_tests {
         let response = restart_session(
             State(state.clone()),
             Path(row.id.clone()),
-            Ok(Some(Json(crate::daemon::RestartSessionBody {
+            crate::server::test_support::json_request(&crate::daemon::RestartSessionBody {
                 skip_on_launch: true,
                 wake_message: Some(String::new()),
                 ..Default::default()
-            }))),
+            }),
         )
         .await;
         let status = response.status();

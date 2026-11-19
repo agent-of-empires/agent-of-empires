@@ -160,6 +160,15 @@ pub fn build_test_app_state_ingress(
 
 /// Like [`build_test_app_state`] but every worker start goes through
 /// `launcher`, so a test decides how a start ends.
+/// A request carrying `body` as JSON, as a client sends it.
+#[cfg(test)]
+pub(crate) fn json_request(body: &impl serde::Serialize) -> axum::extract::Request {
+    axum::extract::Request::builder()
+        .header(axum::http::header::CONTENT_TYPE, "application/json")
+        .body(axum::body::Body::from(serde_json::to_vec(body).unwrap()))
+        .unwrap()
+}
+
 #[cfg(test)]
 pub(crate) fn build_test_app_state_with_launcher(
     prior: Vec<Instance>,
