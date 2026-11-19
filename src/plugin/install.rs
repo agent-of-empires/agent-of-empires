@@ -973,10 +973,12 @@ fn apply_prepared(
         prepared.fetched.manifest.version
     ));
     let prior = PriorMetadata::capture(id)?;
-    let suggestions_changed =
-        suggestions_spec_changed(super::registry().get(id), &prepared.fetched.manifest);
+    let cleanup = persist_suggestions_cleanup(
+        id,
+        suggestions_spec_changed(super::registry().get(id), &prepared.fetched.manifest),
+    )?;
     let granted = grant.is_some();
-    replace_and_build(
+    let replaced = replace_and_build(
         id,
         &prepared.fetched,
         &final_dir,
@@ -992,8 +994,15 @@ fn apply_prepared(
             )
         },
         &prior,
-    )?;
-    let cleared = clear_suggestions_after_update(id, suggestions_changed);
+    );
+    if let Err(error) = replaced {
+        // Rolled back: the old build and what it published still stand.
+        if cleanup == Cleanup::Persisted {
+            let _ = std::fs::remove_file(cleanup_marker(id)?);
+        }
+        return Err(error);
+    }
+    let cleared = run_suggestions_cleanup(id, &cleanup);
     super::reload_registry();
     cleared?;
     tracing::info!(target: "plugin.install", plugin = %id, version = %prepared.fetched.manifest.version, "plugin updated");
@@ -1469,19 +1478,43 @@ fn cleanup_marker(plugin_id: &str) -> Result<std::path::PathBuf> {
         .join(plugin_id))
 }
 
-/// Clears the plugin's published suggestions when its spec changed or an
-/// earlier cleanup failed, and forgets the marker only once that succeeds.
-fn clear_suggestions_after_update(plugin_id: &str, spec_changed: bool) -> Result<()> {
+/// Where an update stands on clearing the plugin's published suggestions.
+#[derive(Debug, PartialEq, Eq)]
+enum Cleanup {
+    /// Nothing to clear.
+    None,
+    /// An earlier cleanup is still pending.
+    Pending,
+    /// This update persisted the obligation; it is undone if the update fails.
+    Persisted,
+}
+
+/// Persists the obligation to clear the plugin's suggestions when its spec
+/// changes or an earlier cleanup is pending. Runs before the update commits, so
+/// an interruption or a write failure cannot lose it, and a failure here stops
+/// the update.
+fn persist_suggestions_cleanup(plugin_id: &str, spec_changed: bool) -> Result<Cleanup> {
     let marker = cleanup_marker(plugin_id)?;
-    if !spec_changed && !marker.exists() {
-        return Ok(());
+    if marker.exists() {
+        return Ok(Cleanup::Pending);
+    }
+    if !spec_changed {
+        return Ok(Cleanup::None);
     }
     if let Some(dir) = marker.parent() {
         std::fs::create_dir_all(dir)?;
     }
     std::fs::write(&marker, b"")?;
+    Ok(Cleanup::Persisted)
+}
+
+/// Runs a persisted cleanup and forgets the marker only once it succeeds.
+fn run_suggestions_cleanup(plugin_id: &str, cleanup: &Cleanup) -> Result<()> {
+    if *cleanup == Cleanup::None {
+        return Ok(());
+    }
     forget_suggestion_publication(plugin_id)?;
-    std::fs::remove_file(&marker)?;
+    std::fs::remove_file(cleanup_marker(plugin_id)?)?;
     Ok(())
 }
 
@@ -2684,7 +2717,9 @@ mod tests {
             .unwrap()
             .join(super::super::host_api::EVENTS_DB);
         std::fs::write(&db, b"not a sqlite database, long enough to be read as one").unwrap();
-        assert!(clear_suggestions_after_update("acme.thing", true).is_err());
+        let first = persist_suggestions_cleanup("acme.thing", true).unwrap();
+        assert_eq!(first, Cleanup::Persisted);
+        assert!(run_suggestions_cleanup("acme.thing", &first).is_err());
         assert!(cleanup_marker("acme.thing").unwrap().exists());
 
         std::fs::remove_file(&db).unwrap();
@@ -2699,13 +2734,36 @@ mod tests {
             .unwrap();
         }
         // The retry's manifest matches the installed one: only the marker asks for it.
-        clear_suggestions_after_update("acme.thing", false).unwrap();
+        let retry = persist_suggestions_cleanup("acme.thing", false).unwrap();
+        assert_eq!(retry, Cleanup::Pending);
+        run_suggestions_cleanup("acme.thing", &retry).unwrap();
         let conn = rusqlite::Connection::open(&db).unwrap();
         let left: i64 = conn
             .query_row("SELECT COUNT(*) FROM suggestion_items", [], |r| r.get(0))
             .unwrap();
         assert_eq!(left, 0);
         assert!(!cleanup_marker("acme.thing").unwrap().exists());
+        assert_eq!(
+            persist_suggestions_cleanup("acme.thing", false).unwrap(),
+            Cleanup::None
+        );
+    }
+
+    /// The obligation is written before the update commits, so a marker that
+    /// cannot be written refuses the update instead of losing the cleanup.
+    #[test]
+    #[serial]
+    fn an_obligation_that_cannot_be_persisted_stops_the_update() {
+        let _home = isolate_app_dir();
+        let marker = cleanup_marker("acme.thing").unwrap();
+        // A file where the marker directory belongs.
+        std::fs::write(marker.parent().unwrap(), b"in the way").unwrap();
+        assert!(persist_suggestions_cleanup("acme.thing", true).is_err());
+        assert_eq!(
+            persist_suggestions_cleanup("acme.thing", false).unwrap(),
+            Cleanup::None,
+            "an unchanged spec owes nothing"
+        );
     }
 
     /// Uninstall removes only a configured external plugin's directory: a
