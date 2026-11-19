@@ -182,10 +182,10 @@ describe("SuggestionsView", () => {
       data: {
         title: "Fix lifecycle",
         initial_prompt: "Review the issue.",
-        templated: false,
         source_ref: "example/1",
         project: { name: "aoe", path: "/work/aoe" },
         tool: "opencode",
+        view: "terminal",
         yolo: true,
         sandbox: false,
         worktree: true,
@@ -206,6 +206,7 @@ describe("SuggestionsView", () => {
         path: "/work/aoe",
         initialTab: undefined,
         tool: "opencode",
+        useStructuredView: false,
         yoloMode: true,
         sandboxEnabled: false,
         initialPrompt: "Review the issue.",
@@ -468,6 +469,10 @@ describe("SuggestionsView", () => {
       });
       fireEvent.click(screen.getByRole("button", { name: "Start with changes" }));
       await waitFor(() => expect(onPrepare).toHaveBeenCalledTimes(1));
+      expect(onPrepare.mock.calls[0]![0].source.failure).toEqual({
+        reason: "worktree branch already exists",
+        hint: undefined,
+      });
       await waitFor(() => expect(screen.queryByText(/Couldn't start/)).toBeNull());
     });
 

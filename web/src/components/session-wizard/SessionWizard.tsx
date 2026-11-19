@@ -98,7 +98,14 @@ export interface WizardPrefill {
   initialPrompt?: string;
   title?: string;
   /** Where a suggested session came from, shown as the "From" strip. */
-  source?: { label: string; title: string; url: string; kindLabel?: string };
+  source?: {
+    label: string;
+    title: string;
+    url: string;
+    kindLabel?: string;
+    /** The Start that just failed, so the dialog says why. */
+    failure?: { reason: string; hint?: string };
+  };
   /** Set when a stored template produced `initialPrompt`. */
   template?: { providerId: string; criterion: string };
   /** Suggestion to link the created Session to. */
@@ -267,6 +274,11 @@ function SourceStrip({ source }: { source: NonNullable<WizardPrefill["source"]> 
         <a href={source.url} target="_blank" rel="noreferrer" className="text-brand-500 hover:underline">
           Open &#8599;
         </a>
+      )}
+      {source.failure && (
+        <p data-testid="wizard-source-failure" className="w-full text-status-error">
+          Couldn&apos;t start: {source.failure.reason}.{source.failure.hint ? ` ${source.failure.hint}` : ""}
+        </p>
       )}
     </div>
   );

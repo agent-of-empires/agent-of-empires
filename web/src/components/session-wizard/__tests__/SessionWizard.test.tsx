@@ -2348,6 +2348,35 @@ describe("SessionWizard suggestion link", () => {
 });
 
 describe("SessionWizard suggestion source", () => {
+  it("says why the Start that led here failed", async () => {
+    renderWizard({
+      path: "/tmp/proj",
+      tool: "claude",
+      source: {
+        label: "GitHub",
+        title: "Fix",
+        url: "",
+        failure: { reason: "branch exists", hint: "Pick another branch name." },
+      },
+    });
+    expect((await screen.findByTestId("wizard-source-failure")).textContent).toBe(
+      "Couldn't start: branch exists. Pick another branch name.",
+    );
+  });
+
+  it("opens in the view the preset names", async () => {
+    const prepared = {
+      title: "t",
+      initial_prompt: "p",
+      project: null,
+      view: "terminal",
+    } as unknown as SuggestionPrepared;
+    expect(toWizardPrefill(prepared, { label: "G", title: "t", url: "" }).useStructuredView).toBe(false);
+    expect(
+      toWizardPrefill({ ...prepared, view: "structured" }, { label: "G", title: "t", url: "" }).useStructuredView,
+    ).toBe(true);
+  });
+
   const source = { label: "GitHub", title: "Fix lifecycle", url: "https://example.test/issues/1" };
 
   it("shows the From strip and seeds the title", async () => {

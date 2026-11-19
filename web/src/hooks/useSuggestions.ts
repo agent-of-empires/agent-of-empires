@@ -190,6 +190,7 @@ export function useSuggestions(
     const result = await prepareSuggestion(item.provider_id, item.id);
     if (!mounted.current) return;
     if (result.ok) {
+      const failure = failures[key];
       clearFailure(key);
       const provider = snapshot?.providers.find((p) => p.id === item.provider_id);
       const label = provider?.name ?? item.provider_id;
@@ -199,7 +200,13 @@ export function useSuggestions(
       onPrepare(
         toWizardPrefill(
           result.data,
-          { label, title: item.title, url: item.source_url, kindLabel },
+          {
+            label,
+            title: item.title,
+            url: item.source_url,
+            kindLabel,
+            failure: failure && { reason: failure.reason, hint: failure.hint },
+          },
           { providerId: item.provider_id, criterion: item.criterion },
           link,
         ),
