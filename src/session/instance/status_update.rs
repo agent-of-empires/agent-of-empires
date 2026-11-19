@@ -134,9 +134,33 @@ impl Instance {
     /// recorded.
     fn explain_error_from_pane(&mut self, session: &tmux::Session) {
         if self.last_error.is_none() {
+            self.last_error = self.refused_restart_error("The terminal ended.");
+        }
+        if self.last_error.is_none() {
             let pane_content = session.capture_pane(20).unwrap_or_default();
             self.last_error = Some(summarize_error_from_pane(&pane_content));
         }
+    }
+
+    /// Latch an Error for a pane tmux can't show: `message`, or when every launch of this row is
+    /// refused, `ended` and the remedy.
+    fn latch_missing_pane(&mut self, message: &str, ended: &str) {
+        if self.last_error.is_none() {
+            self.last_error = self.refused_restart_error(ended);
+        }
+        self.latch_tmux_error(message);
+    }
+
+    /// `ended`, what happened to the pane, then the fix a restart needs first, when every launch of
+    /// this row is refused. The remedy itself isn't stored, so after a reload or a daemon restart
+    /// this is how it comes back. Only asked while nothing explains the Error yet.
+    fn refused_restart_error(&self, ended: &str) -> Option<String> {
+        self.command_selector_refuses_launch().then(|| {
+            format!(
+                "{ended} Terminal view can't start this Session again: {}",
+                Self::command_selector_remedy(&self.id)
+            )
+        })
     }
 
     pub(super) fn update_status_with_metadata_inner(
@@ -215,7 +239,7 @@ impl Instance {
                     session.name()
                 );
                 self.unknown_since = None;
-                self.latch_tmux_error(TMUX_SESSION_GONE_ERROR);
+                self.latch_missing_pane(TMUX_SESSION_GONE_ERROR, "The tmux session is gone.");
                 return;
             }
             tmux::SessionExistence::Unknown => {
@@ -247,7 +271,10 @@ impl Instance {
                     window,
                     self.ever_confirmed_present
                 );
-                self.latch_tmux_error(TMUX_SERVER_UNREACHABLE_ERROR);
+                self.latch_missing_pane(
+                    TMUX_SERVER_UNREACHABLE_ERROR,
+                    "The tmux server could not be reached.",
+                );
                 return;
             }
             tmux::SessionExistence::Present => {
@@ -1296,6 +1323,93 @@ Esc to cancel \u{b7} Tab to amend \u{b7} ctrl+e to explain\n\
 
         assert_eq!(inst.status, Status::Error);
         assert_eq!(inst.last_error.as_deref(), Some("agent crashed"));
+    }
+
+    /// A Terminal row whose command picks its own conversation beside AoE's can never start again,
+    /// so a gone or ended pane says what happened to it and how to fix the command (#5829).
+    #[test]
+    #[serial_test::serial]
+    fn an_ended_pane_whose_restart_is_refused_names_the_remedy() {
+        let refused = |inst: &Instance, ended: &str| {
+            format!(
+                "{ended} Terminal view can't start this Session again: {}",
+                Instance::command_selector_remedy(&inst.id)
+            )
+        };
+        let conflicting = || {
+            let mut inst = Instance::new("selector", "/tmp/selector");
+            inst.tool = "claude".into();
+            inst.command = "claude --resume external".into();
+            inst.agent_session_id = Some("sid-aoe".into());
+            inst.status = Status::Running;
+            inst
+        };
+        let flag_removed = || {
+            let mut inst = conflicting();
+            inst.command = "claude".into();
+            inst
+        };
+        let id_cleared = || {
+            let mut inst = conflicting();
+            inst.resume_intent = ResumeIntent::Cleared;
+            inst
+        };
+
+        {
+            let _cache = force_session_absent();
+            let inst = conflicting();
+            let gone = refused(&inst, "The tmux session is gone.");
+            for (mut inst, expected) in [
+                (inst, gone.as_str()),
+                (flag_removed(), TMUX_SESSION_GONE_ERROR),
+                (id_cleared(), TMUX_SESSION_GONE_ERROR),
+            ] {
+                inst.update_status_with_metadata_inner(None, None);
+                assert_eq!(inst.status, Status::Error, "{}", inst.command);
+                assert_eq!(
+                    inst.last_error.as_deref(),
+                    Some(expected),
+                    "{}",
+                    inst.command
+                );
+            }
+        }
+
+        // No tmux server, as after the last pane ended, past the window that waits for one.
+        {
+            let guard = crate::tmux::SessionCacheGuard::capture();
+            guard.force_unreachable();
+            let mut inst = conflicting();
+            inst.unknown_since = Some(std::time::Instant::now() - Duration::from_secs(60));
+            inst.update_status_with_metadata_inner(None, None);
+            assert_eq!(inst.status, Status::Error);
+            let unreachable = refused(&inst, "The tmux server could not be reached.");
+            assert_eq!(inst.last_error.as_deref(), Some(unreachable.as_str()));
+        }
+
+        // An agent that crashed in its pane: the pane's end leads, then the remedy. A live pane
+        // explains nothing.
+        for dead in [true, false] {
+            let mut inst = conflicting();
+            write_hook_status(&inst.id, "running");
+            let name = tmux::Session::generate_name(&inst.id, &inst.title);
+            let guard = crate::tmux::SessionCacheGuard::capture();
+            guard.force_present(&[name.as_str()]);
+            let metadata = tmux::PaneMetadata {
+                pane_dead: dead,
+                ..agent_pane_metadata("claude", None)
+            };
+            inst.update_status_with_metadata_inner(Some(&metadata), None);
+            crate::hooks::cleanup_hook_status_dir(&inst.id);
+            if dead {
+                assert_eq!(inst.status, Status::Error);
+                let ended = refused(&inst, "The terminal ended.");
+                assert_eq!(inst.last_error.as_deref(), Some(ended.as_str()));
+            } else {
+                assert_ne!(inst.status, Status::Error);
+                assert_eq!(inst.last_error, None);
+            }
+        }
     }
 
     /// A turn's running and idle frames can share tmux's activity second.
