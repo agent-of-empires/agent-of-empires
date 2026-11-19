@@ -754,15 +754,20 @@ impl SuggestionsView {
                     store.start(key);
                     return SuggestionsAction::Continue;
                 }
-                self.begin();
-                self.failed = None;
-                self.preparing = Some(key.clone());
-                self.prepare_another = another;
-                store.prepare_in_view(key, self.epoch);
+                self.prepare(key, another, store);
             }
             _ => {}
         }
         SuggestionsAction::Continue
+    }
+
+    /// Asks for `key`'s prefill; the dialog opens when it arrives.
+    pub(super) fn prepare(&mut self, key: ItemKey, another: bool, store: &mut SuggestionsFeed) {
+        self.begin();
+        self.failed = None;
+        self.preparing = Some(key.clone());
+        self.prepare_another = another;
+        store.prepare_in_view(key, self.epoch);
     }
 
     /// The prefill a prepare resolved, for the caller to open the dialog with.
