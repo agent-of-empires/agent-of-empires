@@ -98,6 +98,19 @@ pub(crate) fn claim_link(
     Ok(Claim::Won)
 }
 
+/// `(provider_id, item_id, session_id)` of every created primary Session of `profile`.
+pub(crate) fn settled_links(
+    conn: &Connection,
+    profile: &str,
+) -> rusqlite::Result<Vec<(String, String, String)>> {
+    conn.prepare(
+        "SELECT provider_id, item_id, holder FROM suggestion_links
+         WHERE profile = ?1 AND pending = 0",
+    )?
+    .query_map([profile], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))?
+    .collect()
+}
+
 /// Marks the claim of `session_id` as a created Session.
 pub(crate) fn settle_link(
     conn: &Connection,

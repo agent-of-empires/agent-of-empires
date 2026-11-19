@@ -106,34 +106,35 @@ pub async fn get_suggestions(State(state): State<Arc<AppState>>) -> impl IntoRes
         .into_response();
     };
     let profile = host.suggestions_profile();
-    let started = {
-        let instances = state.instances.read().await;
-        // Same visibility as the CityHall session list: terminal sessions stay hidden.
-        suggestions::started_sessions(
-            instances
-                .iter()
-                .filter(|inst| !state.cityhall_mode || inst.is_structured()),
-            &profile,
-        )
-    };
     let refreshing = host.refreshing_suggestions();
     let result = tokio::task::spawn_blocking(move || {
         let providers = suggestions::providers();
         // Disk reads stay off the store lock.
         let registered = crate::session::projects::load_merged(&profile)?;
-        let (mut snapshot, mappings) = host.with_suggestions_db(|conn, profile| {
+        let (mut snapshot, mappings, links) = host.with_suggestions_db(|conn, profile| {
             Ok::<_, anyhow::Error>((
                 suggestions::snapshot(conn, profile, &providers)?,
                 suggestions::load_mappings(conn, profile)?,
+                suggestions::settled_links(conn, profile)?,
             ))
         })?;
         // Canonicalizing paths hits the filesystem: keep it off the store lock.
         suggestions::attach_projects(&mappings, &mut snapshot, &registered);
-        Ok::<_, anyhow::Error>(snapshot)
+        Ok::<_, anyhow::Error>((snapshot, links))
     })
     .await;
     match result {
-        Ok(Ok(mut snapshot)) => {
+        Ok(Ok((mut snapshot, links))) => {
+            let started = {
+                let instances = state.instances.read().await;
+                // Same visibility as the CityHall session list: terminal sessions stay hidden.
+                suggestions::started_sessions(
+                    &links,
+                    instances
+                        .iter()
+                        .filter(|inst| !state.cityhall_mode || inst.is_structured()),
+                )
+            };
             suggestions::attach_started(&mut snapshot, &started);
             suggestions::attach_refreshing(&mut snapshot, &refreshing);
             Json(snapshot).into_response()

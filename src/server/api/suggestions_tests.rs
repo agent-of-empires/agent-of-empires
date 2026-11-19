@@ -151,6 +151,15 @@ impl Fixture {
     }
 }
 
+/// Records `session_id` as the settled primary Session of item `id`.
+pub(crate) fn link_session_on(host: &PluginHost, id: &str, session_id: &str) {
+    host.with_suggestions_db(|conn, profile| {
+        crate::plugin::suggestions::claim_link(conn, profile, PROVIDER, id, session_id, &|_| false)
+            .unwrap();
+        crate::plugin::suggestions::settle_link(conn, profile, PROVIDER, id, session_id).unwrap();
+    });
+}
+
 /// Publish `id` the way a worker would, with no hint and no mapping key.
 pub(crate) fn seed_item_on(host: &PluginHost, id: &str, mapping_key: Option<&str>, number: &str) {
     let mut item = json!({
@@ -210,27 +219,48 @@ async fn snapshot_and_refresh() {
     }
 }
 
+/// `started_session` follows the link table joined to live Sessions, not a scan
+/// of Sessions that carry an origin; CityHall keeps terminal Sessions hidden.
 #[tokio::test]
 #[serial_test::serial]
-async fn cityhall_hides_terminal_sessions_from_started_session() {
+async fn started_session_comes_from_the_link_joined_to_live_sessions() {
+    let origin = || {
+        Some(crate::session::SuggestionOrigin {
+            provider_id: PROVIDER.into(),
+            id: "a".into(),
+            profile: None,
+        })
+    };
     let mut linked = crate::session::Instance::new("terminal", "/tmp/x");
     linked.source_profile = "default".into();
-    linked.suggestion = Some(crate::session::SuggestionOrigin {
-        provider_id: PROVIDER.into(),
-        id: "a".into(),
-        profile: None,
-    });
+    linked.suggestion = origin();
+    let mut trashed = linked.clone();
+    trashed.id = "trashed".into();
+    trashed.trash();
+    let started = |body: &Value| body["items"][0].get("started_session").cloned();
     for (cityhall, shown) in [(false, true), (true, false)] {
         let f = fixture_with(vec![linked.clone()], cityhall);
         f.seed_item("a", None, "42");
+        let (_, _, body) = f.call(Method::GET, "/api/suggestions", Value::Null).await;
+        assert_eq!(
+            started(&body),
+            None,
+            "an origin without a link is not started"
+        );
+        link_session_on(&f.host, "a", &linked.id);
         let (status, _, body) = f.call(Method::GET, "/api/suggestions", Value::Null).await;
         assert_eq!(status, StatusCode::OK);
-        assert_eq!(
-            body["items"][0].get("started_session").is_some(),
-            shown,
-            "cityhall={cityhall}"
-        );
+        assert_eq!(started(&body).is_some(), shown, "cityhall={cityhall}");
     }
+    // A link whose Session is gone or trashed shows nothing.
+    let f = fixture_with(vec![trashed], false);
+    f.seed_item("a", None, "42");
+    link_session_on(&f.host, "a", "trashed");
+    let (_, _, body) = f.call(Method::GET, "/api/suggestions", Value::Null).await;
+    assert_eq!(started(&body), None);
+    link_session_on(&f.host, "a", "gone");
+    let (_, _, body) = f.call(Method::GET, "/api/suggestions", Value::Null).await;
+    assert_eq!(started(&body), None);
 }
 
 #[tokio::test]
