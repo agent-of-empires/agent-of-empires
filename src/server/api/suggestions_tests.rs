@@ -597,20 +597,45 @@ async fn prepare_resolves_the_preset_prompt_and_stale_items() {
         (StatusCode::BAD_REQUEST, "validation_failed")
     );
 
-    for (body, status, code) in [
+    // An item its source closed is refused the same way as one no longer published.
+    f.seed_item("closed", None, "7");
+    f.host.with_suggestions_db(|conn, _| {
+        conn.execute(
+            "UPDATE suggestion_items SET item_json = json_set(item_json, '$.stale', json('true'))
+             WHERE item_id = 'closed'",
+            [],
+        )
+        .unwrap();
+    });
+    for (uri, body, status, code) in [
         (
+            "prepare",
             item(PROVIDER, "gone"),
             StatusCode::CONFLICT,
             "stale_suggestion",
         ),
         (
+            "prepare",
+            item(PROVIDER, "closed"),
+            StatusCode::CONFLICT,
+            "stale_suggestion",
+        ),
+        (
+            "start",
+            item(PROVIDER, "closed"),
+            StatusCode::CONFLICT,
+            "stale_suggestion",
+        ),
+        (
+            "prepare",
             item("nobody", "a"),
             StatusCode::NOT_FOUND,
             "unknown_provider",
         ),
     ] {
-        let (got, got_code, _) = f.call(Method::POST, "/api/suggestions/prepare", body).await;
-        assert_eq!((got, got_code.as_str()), (status, code));
+        let uri = format!("/api/suggestions/{uri}");
+        let (got, got_code, _) = f.call(Method::POST, &uri, body).await;
+        assert_eq!((got, got_code.as_str()), (status, code), "{uri}");
     }
 }
 

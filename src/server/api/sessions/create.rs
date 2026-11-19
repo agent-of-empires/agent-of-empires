@@ -1326,7 +1326,7 @@ pub(crate) async fn create_session_with(
                 return api_error(
                     StatusCode::CONFLICT,
                     "stale_suggestion",
-                    "Suggestion is no longer published; refresh and retry",
+                    "Suggestion is no longer open; refresh and retry",
                 );
             }
             Ok(Err(error)) => {
