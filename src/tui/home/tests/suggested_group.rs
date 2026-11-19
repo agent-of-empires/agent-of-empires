@@ -205,7 +205,7 @@ fn enter_starts_a_suggestion_and_its_row_turns_into_open() {
     poll_until(&mut env, |env| {
         env.view
             .status_flash_text()
-            .is_some_and(|text| text.contains("Started Prepared title"))
+            .is_some_and(|text| text.contains("Started Prepared title · Enter opens it"))
     });
     assert_eq!(next_request(&requests), "load");
     assert!(env.view.new_dialog.is_none(), "no wizard for a plain start");
@@ -265,6 +265,7 @@ fn a_start_the_daemon_says_is_already_started_becomes_open() {
 #[serial]
 fn hooks_that_need_trust_show_a_review_and_approving_starts_with_its_fingerprint() {
     let answer = StartAnswer::NeedsTrust {
+        changed: false,
         commands: vec!["on create: make setup".into()],
         fingerprint: serde_json::json!({ "project_path": "/repo", "hooks": "abc" }),
     };
@@ -318,6 +319,7 @@ fn a_failed_start_in_the_full_view_stays_on_its_row() {
 #[serial]
 fn the_hooks_review_opened_from_the_full_view_is_drawn_and_takes_the_keys() {
     let answer = StartAnswer::NeedsTrust {
+        changed: false,
         commands: vec!["on create: make setup".into()],
         fingerprint: serde_json::json!({ "project_path": "/repo", "hooks": "abc" }),
     };
@@ -341,6 +343,7 @@ fn the_hooks_review_opened_from_the_full_view_is_drawn_and_takes_the_keys() {
 #[serial]
 fn a_profile_switch_closes_the_hooks_review_and_nothing_is_approved() {
     let answer = StartAnswer::NeedsTrust {
+        changed: false,
         commands: vec!["on create: make setup".into()],
         fingerprint: serde_json::json!({ "project_path": "/repo" }),
     };

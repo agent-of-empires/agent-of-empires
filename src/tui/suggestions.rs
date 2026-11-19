@@ -1,7 +1,8 @@
 //! Suggested sessions browser. Items come from the daemon's suggestions API;
-//! starting one opens the regular new-session dialog prefilled from `prepare`.
-//! Provider text is untrusted: it is shown as plain text, control characters
-//! stripped, and the prompt is visible before Enter.
+//! Enter starts one with its kind's preset through `start`, and `e` opens the
+//! regular new-session dialog prefilled from `prepare`. Provider text is
+//! untrusted: it is shown as plain text, control characters stripped, and the
+//! prompt Enter will send is visible before it.
 
 use std::sync::mpsc::TryRecvError;
 
@@ -170,6 +171,8 @@ pub(super) enum StartAnswer {
     /// Repository hooks need approval first: the commands to show, and the
     /// fingerprint the approval must quote.
     NeedsTrust {
+        /// The hooks changed after the user reviewed them, so the review shows again.
+        changed: bool,
         commands: Vec<String>,
         fingerprint: serde_json::Value,
     },
@@ -188,7 +191,7 @@ fn start_answer(status: u16, body: &serde_json::Value) -> StartAnswer {
         (409, "already_started") => {
             StartAnswer::AlreadyStarted(body["session_id"].as_str().map(str::to_owned))
         }
-        (409, "hooks_need_trust" | "trust_changed") => {
+        (409, code @ ("hooks_need_trust" | "trust_changed")) => {
             let mut commands = Vec::new();
             for (stage, label) in [
                 ("on_create", "on create"),
@@ -205,6 +208,7 @@ fn start_answer(status: u16, body: &serde_json::Value) -> StartAnswer {
                 commands.push("project MCP servers".to_owned());
             }
             StartAnswer::NeedsTrust {
+                changed: code == "trust_changed",
                 commands,
                 fingerprint: body["review_fingerprint"].clone(),
             }
@@ -2256,8 +2260,18 @@ mod tests {
                 409,
                 hooks,
                 StartAnswer::NeedsTrust {
+                    changed: false,
                     commands: vec!["on create: make setup".into(), "project MCP servers".into()],
                     fingerprint: json!({ "project_path": "/repo", "hooks": "abc" }),
+                },
+            ),
+            (
+                409,
+                json!({ "error": "trust_changed", "commands": {}, "review_fingerprint": { "n": 2 } }),
+                StartAnswer::NeedsTrust {
+                    changed: true,
+                    commands: vec![],
+                    fingerprint: json!({ "n": 2 }),
                 },
             ),
             (

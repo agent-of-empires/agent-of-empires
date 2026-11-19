@@ -122,7 +122,7 @@ impl HomeView {
         match answer {
             StartAnswer::Started { session_id, title } => {
                 self.suggestions_feed.link_started(&key, &session_id);
-                say(self, format!("Started {title}"), false);
+                say(self, format!("Started {title} · Enter opens it"), false);
             }
             StartAnswer::AlreadyStarted(Some(session_id)) => {
                 self.suggestions_feed.link_started(&key, &session_id);
@@ -132,10 +132,15 @@ impl HomeView {
                 say(self, "Already starting. Reload in a moment.".into(), false);
             }
             StartAnswer::NeedsTrust {
+                changed,
                 commands,
                 fingerprint,
             } => {
-                let mut message = String::from("This repository runs these commands:\n\n");
+                let mut message = String::from(if changed {
+                    "The hooks changed since you reviewed them. This repository runs:\n\n"
+                } else {
+                    "This repository runs these commands:\n\n"
+                });
                 for command in &commands {
                     message.push_str(&format!("  {command}\n"));
                 }
