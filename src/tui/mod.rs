@@ -10,6 +10,7 @@ pub mod diff;
 pub(crate) mod home;
 mod host_title;
 pub mod hyperlink;
+mod image_pull;
 pub(crate) mod links;
 pub(crate) mod markdown;
 mod metrics_poller;
