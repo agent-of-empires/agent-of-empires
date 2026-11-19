@@ -2033,12 +2033,12 @@ impl HomeView {
             Item::Suggestion {
                 provider_id, id, ..
             } => {
-                let (prefix, title) = self
+                let (title, suffix) = self
                     .suggestion_row_text(provider_id, id)
-                    .unwrap_or_else(|| (String::new(), "(no longer available)".to_string()));
+                    .unwrap_or_else(|| ("(no longer available)".to_string(), String::new()));
                 (
                     " ",
-                    Cow::Owned(format!("{prefix}{title}")),
+                    Cow::Owned(format!("{title}{suffix}")),
                     Style::default().fg(theme.text),
                 )
             }
@@ -2208,17 +2208,17 @@ impl HomeView {
                 provider_id, id, ..
             } = item
             {
-                if let Some((prefix, _)) = self.suggestion_row_text(provider_id, id) {
+                if let Some((title, _)) = self.suggestion_row_text(provider_id, id) {
                     let shown = truncate_to_width(&text, room);
-                    let (muted, title) =
-                        shown.split_at(prefix_within_width(&shown, rendered_width(&prefix)).len());
+                    let (title, muted) =
+                        shown.split_at(prefix_within_width(&shown, rendered_width(&title)).len());
                     let muted_style = if is_selected {
                         text_style
                     } else {
                         Style::default().fg(theme.dimmed)
                     };
-                    line_spans.push(Span::styled(muted.to_string(), muted_style));
                     line_spans.push(Span::styled(title.to_string(), text_style));
+                    line_spans.push(Span::styled(muted.to_string(), muted_style));
                     return Line::from(line_spans);
                 }
             }

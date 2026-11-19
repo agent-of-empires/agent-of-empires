@@ -603,28 +603,6 @@ fn ctrl_k_on_an_empty_suggestions_list_does_nothing() {
 
 #[test]
 #[serial]
-fn the_provider_label_is_padded_and_cut_by_display_cells() {
-    let mut env = create_test_env_with_sessions(1);
-    // "#0" ref: label column of 6 cells, a space, the ref, a space.
-    for name in [
-        "GitHub",
-        "\u{7814}\u{7a76}",
-        "\u{7814}\u{7a76}\u{6240}\u{6240}",
-    ] {
-        let mut snap = snapshot(1, &[]);
-        snap["providers"][0]["name"] = name.into();
-        env.view.suggestions_feed.set_snapshot_for_test(snap);
-        let (prefix, _) = env.view.suggestion_row_text("gh", "i0").unwrap();
-        assert_eq!(
-            crate::tui::components::rendered_width(&prefix),
-            6 + 1 + 2 + 1,
-            "{name}: {prefix:?}"
-        );
-    }
-}
-
-#[test]
-#[serial]
 fn clicking_a_suggestion_row_leaves_live_send() {
     use crate::tui::home::live_send::{LiveSendState, LiveSendTarget};
     let (mut env, _requests) = expanded_env(1);
@@ -680,11 +658,11 @@ fn the_source_reference_shows_on_the_row_and_preview_unless_hidden() {
     let (mut env, _requests) = expanded_env(1);
     env.view.cursor += 1;
     env.view.update_selected();
-    for (prefs, prefix, meta) in [
-        (None, "GitHub #0 ", "GitHub · #0 · review requested"),
+    for (prefs, suffix, meta) in [
+        (None, " #0", "GitHub · #0 · review requested"),
         (
             Some(serde_json::json!({ "show_source_ref": false })),
-            "GitHub ",
+            "",
             "GitHub · review requested",
         ),
     ] {
@@ -694,7 +672,7 @@ fn the_source_reference_shows_on_the_row_and_preview_unless_hidden() {
         }
         env.view.suggestions_feed.set_snapshot_for_test(snap);
         let row = env.view.suggestion_row_text("gh", "i0").unwrap();
-        assert_eq!(row.0, prefix);
+        assert_eq!(row, ("Item 0".to_string(), suffix.to_string()));
         let text = preview_text(&mut env, 100);
         assert!(text.contains(meta), "{meta:?}: {text}");
     }
@@ -793,4 +771,13 @@ fn a_provider_failing_before_its_first_item_still_shows_the_group_with_the_error
         text.contains("GitHub couldn't refresh: token expired"),
         "{text}"
     );
+}
+
+#[test]
+#[serial]
+fn a_home_row_leads_with_the_title_not_the_source() {
+    let (mut env, _requests) = expanded_env(1);
+    let text = render_home_to_string(&mut env.view, 120, 40);
+    assert!(text.contains("Item 0 #0"), "{text}");
+    assert!(!text.contains("GitHub #0"), "{text}");
 }
