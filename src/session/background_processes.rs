@@ -530,6 +530,13 @@ fn redacted(arg: &str, hide: &mut Hide) -> String {
     if let Some((name, _)) = arg.split_once('=').filter(|(name, _)| secret_name(name)) {
         return format!("{name}={REDACTED}");
     }
+    // A `user:password` value attached to its flag (`--user=admin:pw`, `-uadmin:pw`).
+    if let Some((flag, user)) = ["--user=", "--proxy-user=", "-u"].iter().find_map(|flag| {
+        let (user, _) = arg.strip_prefix(flag)?.split_once(':')?;
+        Some((flag, user))
+    }) {
+        return format!("{flag}{user}:{REDACTED}");
+    }
     if arg.starts_with('-') && secret_name(&arg) {
         *hide = Hide::Value;
     } else if matches!(arg.as_str(), "-u" | "--user" | "--proxy-user") {
@@ -1060,6 +1067,15 @@ mod tests {
             (
                 &["curl", "-H", "Authorization: Bearer abc", "-u", "admin:pw"],
                 &["curl", "-H", "Authorization: ***", "-u", "admin:***"],
+            ),
+            (
+                &["curl", "--user=admin:pw", "-uadmin:pw", "--proxy-user=p:x"],
+                &[
+                    "curl",
+                    "--user=admin:***",
+                    "-uadmin:***",
+                    "--proxy-user=p:***",
+                ],
             ),
             (
                 &["curl", "-H", "X-Api-Key:k"],
