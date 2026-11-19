@@ -6,7 +6,7 @@ use serde::Serialize;
 
 /// Bump on any wire shape change, including additive optional fields. v14 excludes trashed
 /// sessions from every census, so v13 and v14 series must not be averaged together.
-pub const SCHEMA_VERSION: u32 = 14;
+pub const SCHEMA_VERSION: u32 = 15;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "lowercase")]
@@ -109,6 +109,11 @@ pub struct UsageSnapshot {
     pub distinct_sessions_by_model_bucket: BTreeMap<String, u32>,
 
     pub features: BTreeMap<String, bool>,
+    /// Closed-vocabulary layout and ordering preferences, see `features::active_prefs`.
+    pub prefs: BTreeMap<String, String>,
+    /// Accessory-feature uses since the last confirmed snapshot, keyed by the
+    /// `feature_use` registry. Every key is always present.
+    pub feature_uses: BTreeMap<String, u32>,
 
     pub usage_seen: BTreeMap<String, u32>,
 

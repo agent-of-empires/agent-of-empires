@@ -3,6 +3,7 @@
 
 pub mod aggregate;
 pub mod events;
+pub mod feature_use;
 pub mod features;
 pub mod form_factor;
 pub mod plugins;
@@ -298,6 +299,7 @@ pub fn build_usage_snapshot(
     let (plugins_by_source, plugins_active) = plugins::census(crate::plugin::registry().all());
     snapshot.plugins_by_source = plugins_by_source;
     snapshot.plugins_active = plugins_active;
+    snapshot.feature_uses = feature_use::snapshot();
     Some(snapshot)
 }
 
@@ -345,6 +347,8 @@ fn assemble_usage_snapshot(
         distinct_sessions_by_agent: BTreeMap::new(),
         distinct_sessions_by_model_bucket: BTreeMap::new(),
         features,
+        prefs: features::active_prefs(config),
+        feature_uses: BTreeMap::new(),
         usage_seen,
         web_clients_seen: BTreeMap::new(),
         structured_clients_seen: BTreeMap::new(),
@@ -599,6 +603,8 @@ mod tests {
             distinct_sessions_by_agent: BTreeMap::new(),
             distinct_sessions_by_model_bucket: BTreeMap::new(),
             features: BTreeMap::new(),
+            prefs: BTreeMap::new(),
+            feature_uses: BTreeMap::new(),
             usage_seen: usage_signals::zeroed(),
             web_clients_seen: BTreeMap::new(),
             structured_clients_seen: BTreeMap::new(),
@@ -743,6 +749,7 @@ mod tests {
         assert_eq!(snapshot.session_total, 1);
         assert_eq!(snapshot.session_creates_since_last_snapshot, 3);
         assert_eq!(snapshot.features, features::active_features(&config));
+        assert_eq!(snapshot.prefs, features::active_prefs(&config));
     }
 
     #[test]

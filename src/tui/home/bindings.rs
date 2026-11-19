@@ -113,6 +113,37 @@ pub enum ActionId {
 }
 
 impl ActionId {
+    /// The accessory feature this action counts as a use of. Sort and group-by
+    /// count at apply time, since their actions only open a picker.
+    pub fn feature_use(self) -> Option<crate::telemetry::feature_use::FeatureUse> {
+        use crate::telemetry::feature_use::FeatureUse as F;
+        Some(match self {
+            ActionId::NewFromSelection => F::NewFromSelection,
+            ActionId::SearchStart => F::Search,
+            ActionId::ToggleArchive => F::ArchiveToggle,
+            ActionId::ToggleFavorite => F::FavoriteToggle,
+            ActionId::MoveRowUp | ActionId::MoveRowDown => F::RowReorder,
+            ActionId::JumpPrevFinished | ActionId::JumpNextFinished => F::JumpFinished,
+            ActionId::ToggleSnooze => F::SnoozeToggle,
+            ActionId::ToggleUnread => F::UnreadToggle,
+            ActionId::ToggleContainer => F::ContainerTerminalToggle,
+            ActionId::TogglePreviewInfo => F::PreviewInfoToggle,
+            ActionId::ToggleDiagnostics => F::DiagnosticsToggle,
+            ActionId::ToggleHideStopped => F::HideStoppedToggle,
+            ActionId::OpenSystemHealth => F::SystemHealth,
+            ActionId::NextWaiting => F::AttentionJump,
+            ActionId::ToggleProjectPin => F::ProjectPinToggle,
+            ActionId::Tips => F::Tips,
+            ActionId::Fork => F::Fork,
+            ActionId::AutoName => F::AutoName,
+            ActionId::EmptyTrash => F::TrashEmpty,
+            ActionId::RestoreTrash => F::TrashRestore,
+            ActionId::ToggleSplitTerminal => F::SplitTerminalToggle,
+            ActionId::OpenCommandPalette => F::CommandPalette,
+            _ => return None,
+        })
+    }
+
     /// Whether acting on this variant needs a canonical session behind the
     /// cursor. The creating stub is a sidebar placeholder the daemon owns end
     /// to end: it has neither a runtime nor a published row, so these actions

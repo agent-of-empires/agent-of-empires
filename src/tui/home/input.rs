@@ -3437,6 +3437,9 @@ impl HomeView {
         {
             return None;
         }
+        if let Some(feature) = id.feature_use() {
+            crate::telemetry::feature_use::record(feature);
+        }
         match id {
             ActionId::Quit => return Some(Action::Quit),
             ActionId::ResolveIndeterminate => {
@@ -4964,6 +4967,9 @@ impl HomeView {
     }
 
     pub(super) fn apply_sort_order(&mut self, new_order: SortOrder) {
+        if new_order != self.sort_order {
+            crate::telemetry::feature_use::record(new_order.into());
+        }
         self.sort_order = new_order;
         if self.search_active && !self.search_query.value().is_empty() {
             self.refresh_flat_items();
@@ -4981,6 +4987,7 @@ impl HomeView {
     }
 
     pub(super) fn apply_group_by(&mut self, new_mode: GroupByMode) {
+        crate::telemetry::feature_use::record(new_mode.into());
         self.group_by = new_mode;
         self.rebuild_flat_items();
         self.reseat_cursor_after_rebuild();
@@ -5692,6 +5699,9 @@ impl HomeView {
         if self.is_creating_stub_selected() {
             self.flash_status("Still creating this session; it has no runtime yet");
             return;
+        }
+        if let Some(feature) = action.feature_use() {
+            crate::telemetry::feature_use::record(feature);
         }
         match action {
             ContextMenuAction::Rename => self.open_rename_for_selected(),

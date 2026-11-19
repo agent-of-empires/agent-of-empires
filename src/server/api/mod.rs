@@ -98,8 +98,9 @@ pub use system::{
     update_profile_settings, update_settings, update_theme,
 };
 pub use telemetry::{
-    get_telemetry_status, post_telemetry_seen, post_telemetry_structured_interaction,
-    reset_telemetry_id, set_telemetry_consent, TelemetryMutation,
+    get_telemetry_status, post_telemetry_feature_use, post_telemetry_seen,
+    post_telemetry_structured_interaction, reset_telemetry_id, set_telemetry_consent,
+    TelemetryMutation,
 };
 
 /// A clone of the live instance with this id.
@@ -679,6 +680,7 @@ mod tests {
             "telemetry.rs",
             include_str!("telemetry.rs"),
             &[
+                "post_telemetry_feature_use",
                 "post_telemetry_seen",
                 "post_telemetry_structured_interaction",
                 "reset_telemetry_id",

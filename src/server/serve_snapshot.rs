@@ -194,6 +194,7 @@ pub struct StructuredTelemetryCounters {
 /// build time) so a failed send retains the signals for the next snapshot.
 pub(super) struct ReportedServeSignals {
     usage_seen: std::collections::BTreeMap<String, u32>,
+    feature_uses: std::collections::BTreeMap<String, u32>,
     web_clients: FormFactorCounts,
     structured_clients: FormFactorCounts,
     session_creates: u32,
@@ -270,6 +271,7 @@ pub(super) async fn build_serve_snapshot(
     snapshot.distinct_sessions_by_model_bucket = aggregator.distinct_by_model();
     *state.telemetry_last_reported.lock().unwrap() = Some(ReportedServeSignals {
         usage_seen,
+        feature_uses: snapshot.feature_uses.clone(),
         web_clients,
         structured_clients,
         session_creates,
@@ -296,6 +298,7 @@ pub(super) fn clear_reported_serve_signals(
         return;
     }
     state.telemetry_usage_seen.decrement(&reported.usage_seen);
+    crate::telemetry::feature_use::clear_reported(&reported.feature_uses);
     state.telemetry_web_clients.decrement(&reported.web_clients);
     state
         .telemetry_structured_clients

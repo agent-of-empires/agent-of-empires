@@ -9,6 +9,7 @@ import {
   updateSessionGroup,
   type SessionMutation,
 } from "../../lib/api";
+import { reportFeatureUse } from "../../lib/featureUse";
 import { useUnreadIndicatorEnabled } from "../../lib/unreadIndicator";
 import { useSessionColorsEnabled } from "../../lib/sessionColors";
 import { enterFocusWindow, openFocusWindow, requestOpenSession } from "../../lib/sessionRoute";
@@ -226,6 +227,7 @@ function buildRowActions(
       requestSwitchAccount(s.id);
     }),
     fork: afterTarget("fork", async (s) => {
+      reportFeatureUse("fork");
       const result = await createSession({
         path: s.project_path,
         tool: s.tool,
@@ -237,16 +239,24 @@ function buildRowActions(
       else reportError(result.error ?? "Could not fork this session. Please try again.");
     }),
     autoName: afterTarget("autoName", async (s) => {
+      reportFeatureUse("auto_name");
       const result = await smartRenameSession(s.id);
       if (!result.ok) reportError(result.message ?? "Could not start auto-name. Please try again.");
     }),
     summarize: afterTarget("summarize", async (s) => {
+      reportFeatureUse("summarize");
       const result = await summarizeSession(s.id);
       if (result.ok) reportInfo("Summarizing the conversation so far…");
       else reportError(result.message ?? "Could not start the summary. Please try again.");
     }),
-    showOnly: afterTarget("showOnly", (s) => enterFocusWindow(s.id)),
-    openOwnWindow: afterTarget("openOwnWindow", (s) => openFocusWindow(s.id)),
+    showOnly: afterTarget("showOnly", (s) => {
+      reportFeatureUse("focus_mode");
+      enterFocusWindow(s.id);
+    }),
+    openOwnWindow: afterTarget("openOwnWindow", (s) => {
+      reportFeatureUse("focus_mode");
+      openFocusWindow(s.id);
+    }),
     stop: afterTarget("stop", (s) => props.onStop?.(s.id)),
     start: afterTarget("start", (s) => props.onStart?.(s.id)),
     restartUpdate: afterTarget("restartUpdate", (s) => props.onRestartForUpdate?.(s.id)),

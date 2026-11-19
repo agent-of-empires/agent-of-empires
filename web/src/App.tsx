@@ -117,6 +117,7 @@ import {
   fetchPlugins,
 } from "./lib/api";
 import type { DeleteSessionOptions, RuntimeCursor, ServerAbout, SettingsResponse } from "./lib/api";
+import { reportFeatureUse, type FeatureUse } from "./lib/featureUse";
 import { autoResumeSettingsHref } from "./lib/autoResumeSettingsHref";
 import { getClientCapabilities } from "./lib/clientCapabilities";
 import { onServerDownChange } from "./lib/connectionState";
@@ -359,6 +360,15 @@ function isInsideEditable(target: EventTarget | null): boolean {
 
 const noop = (): void => {};
 
+// "snooze" opens the picker, counted when a duration is picked; trash and restore are core.
+const SESSION_STATE_FEATURE: Partial<Record<SessionStateAction, FeatureUse>> = {
+  pin: "pin_toggle",
+  unpin: "pin_toggle",
+  archive: "archive_toggle",
+  unarchive: "archive_toggle",
+  unsnooze: "snooze_toggle",
+};
+
 /** Composes the authenticated dashboard and synchronizes its user-scoped UI state. */
 function AppContent({
   loginRequired,
@@ -554,6 +564,10 @@ function AppContent({
         : undefined,
     [activePluginSort, pluginUiEntries],
   );
+  const selectPluginSort = useCallback((ref: { pluginId: string; entryId: string }) => {
+    reportFeatureUse("sort_plugin");
+    setPluginSortRef(ref);
+  }, []);
   const selectSidebarSortMode = useCallback(
     (mode: SidebarSortMode) => {
       setPluginSortRef(null);
@@ -637,6 +651,7 @@ function AppContent({
   // poll firing mid-PUT can't revert the drag.
   const handleReorderWorkspaces = useCallback(
     (newOrder: string[]) => {
+      reportFeatureUse("row_reorder");
       setWorkspaceOrdering(newOrder);
       markLocalOrderingUpdate();
       void updateWorkspaceOrdering(newOrder);
@@ -789,6 +804,8 @@ function AppContent({
   };
   const togglePaneAny = useCallback(
     (kind: string) => {
+      if (kind === "files") reportFeatureUse("files_pane");
+      if (kind === "agents") reportFeatureUse("agents_pane");
       const defaultDock: DockLocation =
         pluginPaneById.get(kind)?.defaultDock ?? BUILTIN_PANES.find((p) => p.id === kind)?.defaultDock ?? "right";
       if (isPluginPaneId(kind)) togglePlugin(kind, defaultDock);
@@ -1923,6 +1940,7 @@ function AppContent({
   const attentionJump = useAttentionJump(sidebarGroups);
 
   const handleJumpToAttention = useCallback(() => {
+    reportFeatureUse("attention_jump");
     const next = nextAttentionSessionId(attentionJump.orderedIds, attentionJump.attention, activeSessionId);
     if (next) handleSelectSession(next);
   }, [attentionJump, activeSessionId, handleSelectSession]);
@@ -2023,6 +2041,8 @@ function AppContent({
         unsnooze: () => setSessionSnooze(id, null),
         trash: () => trashSession(id),
       };
+      const feature = SESSION_STATE_FEATURE[action];
+      if (feature) reportFeatureUse(feature);
       const result = await run[action]();
       if (result) applySession(result);
       else reportError(`Failed to ${action} session`);
@@ -2809,7 +2829,7 @@ function AppContent({
                 sortMode={sidebarSortMode}
                 onSortModeChange={selectSidebarSortMode}
                 pluginSortRef={pluginSortRef}
-                onPluginSortChange={setPluginSortRef}
+                onPluginSortChange={selectPluginSort}
                 axis={sidebarAxis}
                 onAxisChange={setSidebarAxis}
               />
@@ -2942,6 +2962,7 @@ function AppContent({
               title="Snooze session"
               onCancel={() => setSnoozeTargetId(null)}
               onPick={(minutes) => {
+                reportFeatureUse("snooze_toggle");
                 const id = snoozeTargetId;
                 setSnoozeTargetId(null);
                 void setSessionSnooze(id, minutes).then((result) => {

@@ -41,12 +41,17 @@ fn reported_session_creates() -> u32 {
     TUI_SESSION_CREATES.load(std::sync::atomic::Ordering::Relaxed)
 }
 
-/// Subtract exactly what a confirmed snapshot reported, so creates that landed
-/// during the send roll into the next snapshot.
-fn clear_reported_session_creates(reported: u32, outcome: crate::telemetry::SendOutcome) {
-    if reported == 0 || outcome != crate::telemetry::SendOutcome::Sent {
+/// Subtract exactly what a confirmed snapshot reported, so creates and feature
+/// uses that landed during the send roll into the next snapshot.
+fn clear_reported_tui_signals(
+    reported: u32,
+    feature_uses: &std::collections::BTreeMap<String, u32>,
+    outcome: crate::telemetry::SendOutcome,
+) {
+    if outcome != crate::telemetry::SendOutcome::Sent {
         return;
     }
+    crate::telemetry::feature_use::clear_reported(feature_uses);
     use std::sync::atomic::Ordering;
     // `try_update` needs Rust 1.99, newer than the MSRV and the Nix toolchain.
     #[allow(deprecated)]
@@ -1553,8 +1558,9 @@ impl App {
         // Bounded and deduped so a dead endpoint or an unchanged launch-then-quit costs nothing.
         if let Some(snapshot) = self.build_telemetry_snapshot() {
             let reported = snapshot.session_creates_since_last_snapshot;
+            let feature_uses = snapshot.feature_uses.clone();
             let outcome = crate::telemetry::flush_snapshot_if_changed(snapshot).await;
-            clear_reported_session_creates(reported, outcome);
+            clear_reported_tui_signals(reported, &feature_uses, outcome);
         }
 
         Ok(())
@@ -1579,13 +1585,14 @@ impl App {
     fn emit_telemetry_snapshot(&self) {
         if let Some(snapshot) = self.build_telemetry_snapshot() {
             let reported = snapshot.session_creates_since_last_snapshot;
+            let feature_uses = snapshot.feature_uses.clone();
             tokio::spawn(async move {
                 let outcome = if crate::telemetry::send_snapshot(snapshot).await {
                     crate::telemetry::SendOutcome::Sent
                 } else {
                     crate::telemetry::SendOutcome::Failed
                 };
-                clear_reported_session_creates(reported, outcome);
+                clear_reported_tui_signals(reported, &feature_uses, outcome);
             });
         }
     }
@@ -4610,7 +4617,7 @@ mod tests {
         let reported = reported_session_creates();
         assert_eq!(reported, 3);
         record_session_create();
-        clear_reported_session_creates(reported, SendOutcome::Sent);
+        clear_reported_tui_signals(reported, &Default::default(), SendOutcome::Sent);
         assert_eq!(
             TUI_SESSION_CREATES.load(Ordering::Relaxed),
             1,
@@ -4626,7 +4633,7 @@ mod tests {
             record_session_create();
             record_session_create();
             let reported = reported_session_creates();
-            clear_reported_session_creates(reported, outcome);
+            clear_reported_tui_signals(reported, &Default::default(), outcome);
             assert_eq!(
                 TUI_SESSION_CREATES.load(Ordering::Relaxed),
                 2,
@@ -4640,11 +4647,11 @@ mod tests {
     #[serial_test::serial(telemetry_creates)]
     fn create_counter_clear_is_noop_for_zero_and_saturates() {
         reset_creates(3);
-        clear_reported_session_creates(0, SendOutcome::Sent);
+        clear_reported_tui_signals(0, &Default::default(), SendOutcome::Sent);
         assert_eq!(TUI_SESSION_CREATES.load(Ordering::Relaxed), 3);
 
         reset_creates(2);
-        clear_reported_session_creates(5, SendOutcome::Sent);
+        clear_reported_tui_signals(5, &Default::default(), SendOutcome::Sent);
         assert_eq!(TUI_SESSION_CREATES.load(Ordering::Relaxed), 0);
     }
 

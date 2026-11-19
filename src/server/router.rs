@@ -427,6 +427,10 @@ pub(super) fn build_router(state: Arc<AppState>) -> Router {
         .route("/api/telemetry/reset-id", post(api::reset_telemetry_id))
         .route("/api/telemetry/seen", post(api::post_telemetry_seen))
         .route(
+            "/api/telemetry/feature-use",
+            post(api::post_telemetry_feature_use),
+        )
+        .route(
             "/api/telemetry/structured-interaction",
             post(api::post_telemetry_structured_interaction),
         )

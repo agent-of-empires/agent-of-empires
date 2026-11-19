@@ -25,10 +25,14 @@ impl Default for UsageSeenCounters {
 
 impl UsageSeenCounters {
     pub fn new() -> Self {
+        Self::with_names(USAGE_SIGNALS.iter().copied())
+    }
+
+    pub fn with_names(names: impl IntoIterator<Item = &'static str>) -> Self {
         Self {
-            counts: USAGE_SIGNALS
-                .iter()
-                .map(|&name| (name, AtomicU32::new(0)))
+            counts: names
+                .into_iter()
+                .map(|name| (name, AtomicU32::new(0)))
                 .collect(),
         }
     }
