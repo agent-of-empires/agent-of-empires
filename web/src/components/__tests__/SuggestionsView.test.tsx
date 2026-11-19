@@ -143,6 +143,53 @@ describe("SuggestionsView", () => {
     expect((screen.getByRole("button", { name: "Start" }) as HTMLButtonElement).disabled).toBe(false);
   });
 
+  it("lists the MCP servers in the hooks review, and a trust_changed answer asks again without approval", async () => {
+    startSuggestion
+      .mockResolvedValueOnce({
+        kind: "hooks_need_trust",
+        review: {
+          commands: { on_create: ["npm ci"] },
+          needs_mcp_trust: true,
+          mcp_summaries: ["docs: npx docs-mcp --token ***"],
+          review_fingerprint: "fp-1",
+        },
+      })
+      .mockResolvedValueOnce({ kind: "trust_changed" })
+      .mockResolvedValueOnce({
+        kind: "hooks_need_trust",
+        review: { commands: { on_create: ["npm ci", "make"] }, review_fingerprint: "fp-2" },
+      });
+    await open(snapshot());
+    fireEvent.click(await screen.findByRole("button", { name: "Start" }));
+    expect(await screen.findByText("docs: npx docs-mcp --token ***")).toBeTruthy();
+    fireEvent.click(screen.getByRole("button", { name: "Approve and start" }));
+    expect(await screen.findByText("make")).toBeTruthy();
+    expect(startSuggestion).toHaveBeenLastCalledWith("github", "issue-1", {});
+  });
+
+  it("the ▾ menu summarises what the server says Start will run for the item", async () => {
+    fetchSuggestions.mockResolvedValue(
+      snapshot({
+        items: [
+          {
+            ...item,
+            resolved_project: { name: "aoe", path: "/work/aoe" },
+            start: {
+              agent: "claude",
+              view: "terminal",
+              worktree: false,
+              sandbox: true,
+              project: { name: "aoe", path: "/work/aoe" },
+            },
+          },
+        ],
+      }),
+    );
+    render(<SuggestionsView onPrepare={vi.fn()} onOpenSession={vi.fn()} />);
+    fireEvent.click(await screen.findByRole("button", { name: "Start options" }));
+    expect(screen.getByText("aoe · claude · Terminal view · sandbox")).toBeTruthy();
+  });
+
   it("a repo with hooks pauses on the review, and Approve and start repeats the call with the fingerprint", async () => {
     startSuggestion
       .mockResolvedValueOnce({
