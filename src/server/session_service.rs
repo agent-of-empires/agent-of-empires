@@ -1390,8 +1390,34 @@ impl SessionService {
             return false;
         }
         let typed = text.clone();
-        let target = current.clone();
-        let delivered = tokio::task::spawn_blocking(move || -> anyhow::Result<()> {
+        let mut target = current.clone();
+        let native_state = self.native_state().ok();
+        let delivered = tokio::task::spawn_blocking(move || -> anyhow::Result<bool> {
+            // The cached row can predate an archive or trash another process wrote
+            // to disk; the lifecycle lock and a reload decide ownership.
+            if let Some(state) = native_state {
+                let native = crate::server::session_store::NativeSessionStore::open(
+                    state,
+                    &target.source_profile,
+                    None,
+                )?;
+                if let Err(error) = target.acquire_auxiliary_locks_in(&native) {
+                    tracing::debug!(
+                        target: "acp.supervisor",
+                        session = %target.id,
+                        "terminal initial turn held back: {error:#}"
+                    );
+                    return Ok(false);
+                }
+                if target.is_snoozed()
+                    || !target
+                        .pending_initial_turn
+                        .as_ref()
+                        .is_some_and(|turn| turn.error.is_none() && turn.text == typed)
+                {
+                    return Ok(false);
+                }
+            }
             anyhow::ensure!(
                 crate::server::api::sessions::ready_agent_session_for_automatic_input(&target)?
                     .is_some(),
@@ -1399,13 +1425,15 @@ impl SessionService {
             );
             target
                 .tmux_session()?
-                .send_keys_with_delay(&typed, target.send_keys_enter_delay())
+                .send_keys_with_delay(&typed, target.send_keys_enter_delay())?;
+            Ok(true)
         })
         .await
         .map_err(anyhow::Error::from)
         .and_then(|result| result);
         match delivered {
-            Ok(()) => self.clear_pending_initial_turn(id).await,
+            Ok(true) => self.clear_pending_initial_turn(id).await,
+            Ok(false) => {}
             Err(error) => self.report_undelivered_turn(&current, &text, &error).await,
         }
         false
@@ -1424,6 +1452,7 @@ impl SessionService {
                     && i.terminal_handoff.is_none()
                     && !i.is_archived()
                     && !i.is_snoozed()
+                    && !i.is_trashed()
             })
             .and_then(|i| {
                 let turn = i.pending_initial_turn.as_ref()?;
@@ -5220,6 +5249,89 @@ mod tests {
             let turn = pending_turn(&service, &id).await.expect("turn is kept");
             assert!(turn.error.is_none(), "{id}");
         }
+    }
+
+    /// An archive another process wrote to disk (`aoe archive --no-kill` keeps
+    /// the pane) is honored although the cached row is still active, and the
+    /// turn is delivered once the session is unarchived.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn terminal_initial_turn_honors_a_disk_only_archive() {
+        if !crate::tmux::is_tmux_available() {
+            return;
+        }
+        let _app_dir = crate::session::test_support::isolate_app_dir();
+        let inst = terminal_turn_instance("sess-disk-arch", "disk-arch", "after-unarchive");
+        let mut archived = inst.clone();
+        archived.archive();
+        crate::server::test_support::seed_instances_on_disk_for_test(
+            &inst.source_profile,
+            vec![archived],
+        );
+        let pane = start_terminal_pane(&inst, READY_AGENT_SCRIPT, false);
+        let state = crate::server::test_support::build_test_app_state(vec![inst.clone()]);
+        let service = state.session_service.clone();
+        crate::server::test_support::refresh_canonical_metadata_for_test(&state).await;
+
+        service
+            .drain_terminal_initial_turn_within("sess-disk-arch", std::time::Duration::from_secs(3))
+            .await;
+        assert!(!pane_text(&pane).contains("after-unarchive"));
+        let turn = pending_turn(&service, "sess-disk-arch")
+            .await
+            .expect("turn is kept");
+        assert!(turn.error.is_none());
+
+        crate::server::test_support::seed_instances_on_disk_for_test(
+            &inst.source_profile,
+            vec![inst.clone()],
+        );
+        service
+            .drain_terminal_initial_turn_within("sess-disk-arch", std::time::Duration::from_secs(3))
+            .await;
+        assert!(pane_text(&pane).contains("after-unarchive"));
+    }
+
+    /// A trashed session receives nothing and records no delivery error, so
+    /// restoring it delivers the turn.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn terminal_initial_turn_waits_out_trash_and_is_delivered_after_restore() {
+        if !crate::tmux::is_tmux_available() {
+            return;
+        }
+        let _app_dir = crate::session::test_support::isolate_app_dir();
+        let mut trashed = terminal_turn_instance("sess-trash", "term-trash", "after-restore");
+        trashed.trash();
+        crate::server::test_support::seed_instances_on_disk_for_test(
+            &trashed.source_profile,
+            vec![trashed.clone()],
+        );
+        let pane = start_terminal_pane(&trashed, READY_AGENT_SCRIPT, false);
+        let state = crate::server::test_support::build_test_app_state(vec![trashed.clone()]);
+        let service = state.session_service.clone();
+        crate::server::test_support::refresh_canonical_metadata_for_test(&state).await;
+
+        service
+            .drain_terminal_initial_turn_within("sess-trash", std::time::Duration::from_secs(3))
+            .await;
+        assert!(!pane_text(&pane).contains("after-restore"));
+        let turn = pending_turn(&service, "sess-trash")
+            .await
+            .expect("turn is kept");
+        assert!(turn.error.is_none());
+
+        let mut restored = trashed.clone();
+        restored.untrash();
+        crate::server::test_support::seed_instances_on_disk_for_test(
+            &restored.source_profile,
+            vec![restored.clone()],
+        );
+        service.instances.write().await[0] = restored;
+        service
+            .drain_terminal_initial_turn_within("sess-trash", std::time::Duration::from_secs(3))
+            .await;
+        assert!(pane_text(&pane).contains("after-restore"));
     }
 
     /// #3687: a background drain spawned from a pre-deletion snapshot must not
