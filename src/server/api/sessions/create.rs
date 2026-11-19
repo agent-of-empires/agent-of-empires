@@ -840,8 +840,12 @@ pub(super) async fn wait_until_left_starting(
     }
 }
 
-/// The primary link a create holds until it settles: `(origin, Session id)`.
-pub(super) type SuggestionLink = (crate::session::SuggestionOrigin, String);
+/// The primary link a create holds until it settles: `(origin, Session id, in-flight mark)`.
+pub(super) type SuggestionLink = (
+    crate::session::SuggestionOrigin,
+    String,
+    crate::plugin::suggestions::Starting,
+);
 
 /// Claims the primary link of the suggestion a Session starts from. A second
 /// start of the same item is refused with 409 `already_started`.
@@ -865,6 +869,7 @@ pub(super) async fn claim_suggestion_link(
         .filter(|i| !i.is_trashed())
         .map(|i| i.id.clone())
         .collect();
+    let starting = crate::plugin::suggestions::mark_starting(session_id);
     let (item, claim_id) = (origin.clone(), session_id.to_owned());
     let claimed = tokio::task::spawn_blocking(move || {
         host.with_suggestions_db(|conn, _| {
@@ -875,13 +880,12 @@ pub(super) async fn claim_suggestion_link(
                 &item.id,
                 &claim_id,
                 &live,
-                chrono::Utc::now().timestamp(),
             )
         })
     })
     .await;
     match claimed {
-        Ok(Ok(Claim::Won)) => Ok(Some((origin.clone(), session_id.to_owned()))),
+        Ok(Ok(Claim::Won)) => Ok(Some((origin.clone(), session_id.to_owned(), starting))),
         Ok(Ok(Claim::Session(session_id))) => Err((
             StatusCode::CONFLICT,
             Json(serde_json::json!({
@@ -920,7 +924,7 @@ pub(super) async fn settle_suggestion_link(
     link: Option<&SuggestionLink>,
     created: bool,
 ) {
-    let (Some((origin, session_id)), Some(host)) = (link, state.plugin_host.clone()) else {
+    let (Some((origin, session_id, _)), Some(host)) = (link, state.plugin_host.clone()) else {
         return;
     };
     let Some(profile) = origin.profile.clone() else {
