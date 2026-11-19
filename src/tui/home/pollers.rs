@@ -71,6 +71,14 @@ impl HomeView {
                 Some(view) => view.apply(&self.suggestions_feed, &mut polled),
                 None => false,
             };
+        if let Some(start) = self
+            .suggestions_view
+            .as_mut()
+            .and_then(SuggestionsView::take_prepared)
+        {
+            self.start_suggestion(start);
+            changed = true;
+        }
         if polled.changed {
             self.rebuild_flat_items_keeping_cursor();
             self.update_selected();

@@ -366,6 +366,23 @@ fn a_profile_switch_closes_the_hooks_review_and_nothing_is_approved() {
 
 #[test]
 #[serial]
+fn e_in_the_full_view_opens_the_prefilled_dialog_in_one_press() {
+    let (mut env, requests) = expanded_env(2);
+    terminal_view_config();
+    with_authenticated_local_project_registry(&mut env.view, |view| {
+        view.open_suggestions_view();
+        view.handle_key(key(KeyCode::Char('e')), None);
+    });
+    assert_eq!(next_request(&requests), "prepare gh/i0");
+    poll_until(&mut env, |env| env.view.new_dialog.is_some());
+    assert!(
+        env.view.suggestions_view.is_none(),
+        "the dialog replaces the view"
+    );
+}
+
+#[test]
+#[serial]
 fn a_failed_start_says_why_and_enter_tries_again() {
     let answer = StartAnswer::Failed("Docker isn't running. Start it, then try again.".into());
     let (mut env, requests) = expanded_env_answering(2, answer);

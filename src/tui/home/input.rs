@@ -2327,7 +2327,6 @@ impl HomeView {
             match view.handle_key(key, block, &mut self.suggestions_feed) {
                 SuggestionsAction::Continue => {}
                 SuggestionsAction::Close => self.suggestions_view = None,
-                SuggestionsAction::Start(start) => self.start_suggestion(*start),
                 SuggestionsAction::OpenSession(id) => match self.try_open_linked_session(&id) {
                     Ok(()) => self.suggestions_view = None,
                     Err(reason) => {
