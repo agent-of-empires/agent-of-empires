@@ -88,7 +88,7 @@ fn stale_item() -> axum::response::Response {
     api_error(
         StatusCode::CONFLICT,
         "stale_suggestion",
-        "Suggestion is no longer published; refresh and retry",
+        "Suggestion is no longer open; refresh and retry",
     )
 }
 
@@ -373,11 +373,7 @@ fn prefill_for(
 
 fn refusal_response(refusal: PrepareRefusal) -> axum::response::Response {
     match refusal {
-        PrepareRefusal::Stale => api_error(
-            StatusCode::BAD_REQUEST,
-            "stale",
-            "That suggestion is no longer open at its source",
-        ),
+        PrepareRefusal::Stale => stale_item(),
         PrepareRefusal::PromptTooLong => api_error(
             StatusCode::BAD_REQUEST,
             "validation_failed",
