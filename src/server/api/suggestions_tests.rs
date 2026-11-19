@@ -415,6 +415,57 @@ fn preset_body(criterion: &str, agent: &str, prompt: Value) -> Value {
         "yolo": true, "prompt": prompt } })
 }
 
+/// The snapshot carries each kind's preset and what Start uses for each item.
+#[tokio::test]
+#[serial_test::serial]
+async fn the_snapshot_shows_each_kinds_preset_and_what_start_uses() {
+    let f = fixture();
+    f.seed_item("a", Some("acme/web"), "42");
+    let snapshot = || async {
+        let (status, _, body) = f.call(Method::GET, "/api/suggestions", Value::Null).await;
+        assert_eq!(status, StatusCode::OK);
+        body
+    };
+    let body = snapshot().await;
+    let source = &body["providers"][0]["sources"][0];
+    assert_eq!(source["criterion"], "assigned");
+    assert_eq!(source["customized"], false);
+    let default_agent = source["preset"]["agent"].clone();
+    assert_eq!(body["items"][0]["start"]["agent"], default_agent);
+    assert!(
+        body["items"][0]["start"].get("project").is_none(),
+        "unlinked"
+    );
+
+    f.call(
+        Method::PUT,
+        "/api/suggestions/presets",
+        preset_body("assigned", "codex", Value::Null),
+    )
+    .await;
+    // Linked, the item names the Project Start would use.
+    let repo = f.repo.to_string_lossy().into_owned();
+    f.call(
+        Method::PUT,
+        "/api/suggestions/mappings",
+        json!({ "provider_id": PROVIDER, "mapping_key": "acme/web", "projects": [repo] }),
+    )
+    .await;
+    let body = snapshot().await;
+    let source = &body["providers"][0]["sources"][0];
+    assert_eq!(source["customized"], true);
+    assert_eq!(source["preset"]["agent"], "codex");
+    let start = &body["items"][0]["start"];
+    assert_eq!(start["agent"], "codex");
+    assert_eq!(
+        start["project"]["path"],
+        body["items"][0]["resolved_project"]["path"]
+    );
+    for field in ["view", "worktree", "sandbox"] {
+        assert!(!start[field].is_null(), "{field}");
+    }
+}
+
 #[tokio::test]
 #[serial_test::serial]
 async fn presets_default_round_trip_reset_and_validate() {
