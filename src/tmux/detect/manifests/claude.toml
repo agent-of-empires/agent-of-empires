@@ -18,10 +18,14 @@ priority = 980
 contains_any = ["do you want to", "would you like to proceed"]
 line_regex = ['^\s*\x{276F}\s*[1-9]\.']
 
+# Numbered rows only, so a draft behind the composer's `❯` is not a choice.
 [[rules]]
-extends = "approval_choice"
 id = "approval_choice"
+state = "waiting"
 priority = 980
+region = "whole_recent"
+visible = true
+line_regex = ['(?i)^\s*(?:[\x{25CF}\x{276F}]\s*)?[1-9]\.\s+(?:yes,\s+)?allow (?:once|always)\s*$']
 
 # The `AskUserQuestion` selection UI.
 [[rules]]

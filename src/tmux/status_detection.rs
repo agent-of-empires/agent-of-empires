@@ -2362,6 +2362,19 @@ Allow once the lock is released.
                 );
             }
         }
+        let droid_dialog = "Command to approve\n  ls -la\n\n\u{276f} Yes, allow\n  \
+            Yes, and always allow low\n  No, cancel\n\n\u{2191}\u{2193} navigate \u{b7} \
+            Enter select \u{b7} Esc cancel";
+        for (screen, want) in [
+            (droid_dialog, true),
+            ("Pick Yes, allow to run it, or No, cancel to stop.", false),
+        ] {
+            assert_eq!(
+                super::super::detect::rule_matches("droid", "permission_choice", screen, "", None),
+                want,
+                "{screen}"
+            );
+        }
         let prompt_above_dialog =
             format!(" > summarize the readme\n\n{GEMINI_FOLDER_TRUST_PROMPT}");
         let d = super::super::detect::detect(
@@ -2787,6 +2800,18 @@ enter to select · esc to cancel";
             detect_via_manifest("claude", &parked, "", stale),
             Status::Idle
         );
+
+        // A draft reading like a choice label is not Claude's numbered approval menu.
+        let draft = format!("✻ Cooked for 49s\n{box_}\n❯ Allow once\n{box_}");
+        assert!(!claude_rule_matches("approval_choice", &draft));
+        assert_eq!(
+            detect_via_manifest("claude", &draft, "", stale),
+            Status::Idle
+        );
+        assert!(claude_rule_matches(
+            "approval_choice",
+            "\u{276f} 1. Allow once\n  2. Allow always"
+        ));
 
         let interrupted = "\
 ⎿  Interrupted · What should Claude do instead?\n\

@@ -30,14 +30,18 @@ extends = "approval_choice"
 id = "approval_choice"
 priority = 950
 
-# The permission dialog's options, which name no prompt of their own.
+# The permission dialog's options, which name no prompt of their own. Each
+# label must start its own row.
 [[rules]]
 id = "permission_choice"
 state = "waiting"
 priority = 945
 region = "whole_recent"
 visible = true
-contains = ["yes, allow", "no, cancel"]
+line_regex = [
+  '(?i)^\s*(?:\x{276F}\s*)?yes, allow\b',
+  '(?i)^\s*(?:\x{276F}\s*)?no, cancel\b',
+]
 
 [[rules]]
 extends = "input_prompt"
