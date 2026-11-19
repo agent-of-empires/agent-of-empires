@@ -1108,6 +1108,8 @@ pub(super) struct SuggestionsFeed {
     foreign_profile: Option<String>,
     prepare_key: Option<ItemKey>,
     start_key: Option<ItemKey>,
+    /// The hooks review on screen: its item, the fingerprint it shows and the origin it was issued for.
+    held_trust: Option<(ItemKey, serde_json::Value, Option<Origin>)>,
     prepare_target: PrepareTarget,
     /// Epoch of the most recently opened full view.
     view_epoch: u64,
@@ -1149,6 +1151,7 @@ impl SuggestionsFeed {
             foreign_profile: None,
             prepare_key: None,
             start_key: None,
+            held_trust: None,
             prepare_target: PrepareTarget::Home,
             view_epoch: 0,
             in_flight_user: false,
@@ -1277,6 +1280,7 @@ impl SuggestionsFeed {
                 self.snapshot = None;
             }
             self.foreign_profile = None;
+            self.held_trust = None;
             self.loaded_at = None;
             self.load_attempt_at = None;
             // Adopting the first profile keeps a prepare in flight unless its snapshot was foreign.
@@ -1514,15 +1518,32 @@ impl SuggestionsFeed {
 
     /// Starts the item with its preset, behind the request in flight.
     pub(super) fn start(&mut self, key: ItemKey) {
-        self.submit_start(key, None);
+        let origin = self.origin();
+        self.submit_start(key, None, origin);
     }
 
-    /// Starts again with the repo hooks the user approved, named by `fingerprint`.
-    pub(super) fn start_approved(&mut self, key: ItemKey, fingerprint: serde_json::Value) {
-        self.submit_start(key, Some(fingerprint));
+    /// Remembers the hooks review shown for `key`, bound to the list on screen.
+    pub(super) fn hold_trust(&mut self, key: ItemKey, fingerprint: serde_json::Value) {
+        self.held_trust = Some((key, fingerprint, self.origin()));
     }
 
-    fn submit_start(&mut self, key: ItemKey, review_fingerprint: Option<serde_json::Value>) {
+    pub(super) fn has_held_trust(&self) -> bool {
+        self.held_trust.is_some()
+    }
+
+    /// Starts again with the hooks the user approved, to the daemon and profile the review came from.
+    pub(super) fn approve_held_trust(&mut self) {
+        if let Some((key, fingerprint, origin)) = self.held_trust.take() {
+            self.submit_start(key, Some(fingerprint), origin);
+        }
+    }
+
+    fn submit_start(
+        &mut self,
+        key: ItemKey,
+        review_fingerprint: Option<serde_json::Value>,
+        origin: Option<Origin>,
+    ) {
         let pending = (self.busy && self.start_key.as_ref() == Some(&key))
             || self.queued.iter().any(|req| {
                 matches!(req, Req::Start { provider_id, id, .. }
@@ -1532,7 +1553,6 @@ impl SuggestionsFeed {
         if pending {
             return;
         }
-        let origin = self.origin();
         self.submit(Req::Start {
             provider_id: key.0,
             id: key.1,
@@ -1632,6 +1652,7 @@ impl SuggestionsFeed {
                         .retain(|req| req.origin().is_none_or(|o| Some(o) == now.as_ref()));
                     self.dismissing.clear();
                     self.restoring.clear();
+                    self.held_trust = None;
                 }
                 self.settle_dismissals();
                 self.loaded_at = Some(std::time::Instant::now());

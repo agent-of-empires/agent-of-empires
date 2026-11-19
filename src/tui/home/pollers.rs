@@ -56,10 +56,21 @@ impl HomeView {
         self.suggestions_feed
             .tick(self.session_feed.latest_snapshot().is_some());
         let mut polled = self.suggestions_feed.poll();
-        let mut changed = match &mut self.suggestions_view {
-            Some(view) => view.apply(&self.suggestions_feed, &mut polled),
-            None => false,
-        };
+        let mut review_closed = false;
+        if self
+            .confirm_dialog
+            .as_ref()
+            .is_some_and(|d| d.action() == "approve_suggestion_hooks")
+            && !self.suggestions_feed.has_held_trust()
+        {
+            self.confirm_dialog = None;
+            review_closed = true;
+        }
+        let mut changed = review_closed
+            || match &mut self.suggestions_view {
+                Some(view) => view.apply(&self.suggestions_feed, &mut polled),
+                None => false,
+            };
         if polled.changed {
             self.rebuild_flat_items_keeping_cursor();
             self.update_selected();
@@ -130,7 +141,7 @@ impl HomeView {
                     .neutral()
                     .buttons("Approve and start", "Cancel"),
                 );
-                self.pending_suggestion_trust = Some((key, fingerprint));
+                self.suggestions_feed.hold_trust(key, fingerprint);
             }
             StartAnswer::NoProject => {
                 if self.suggestions_view.is_some() {
