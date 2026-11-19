@@ -48,6 +48,7 @@ export function SuggestionItemActions({
       onStart={() => void ctrl.start(item)}
       stale={item.stale}
       failed={key in ctrl.failures}
+      retryable={ctrl.failures[key]?.retryable !== false}
       onToggleDismiss={onToggleDismiss}
       startIn={
         !linked && item.mapping_key
