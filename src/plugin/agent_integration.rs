@@ -68,6 +68,28 @@ fn warn_ambiguous(tool: &str, error: &anyhow::Error) {
     }
 }
 
+/// The versions already reported per tool, so the warning fires once per
+/// `(tool, version)` while report-controlled strings stay bounded per tool.
+const UNSUPPORTED_WARNED_PER_TOOL: usize = 8;
+static UNSUPPORTED_WARNED: std::sync::LazyLock<
+    std::sync::Mutex<std::collections::HashMap<String, Vec<String>>>,
+> = std::sync::LazyLock::new(|| std::sync::Mutex::new(std::collections::HashMap::new()));
+
+fn warn_unsupported_provider(tool: &str, version: &str, declared: &[String]) {
+    // The provider wrote this string, so keep control characters out of the log.
+    let version = version.escape_default().to_string();
+    let mut warned = UNSUPPORTED_WARNED
+        .lock()
+        .unwrap_or_else(|error| error.into_inner());
+    let seen = warned.entry(tool.to_owned()).or_default();
+    if seen.contains(&version) || seen.len() >= UNSUPPORTED_WARNED_PER_TOOL {
+        return;
+    }
+    seen.push(version.clone());
+    tracing::warn!(target: "plugin.agents", %tool, %version, supported = %declared.join(" or "),
+        "provider integration reports a version its declaration does not support; leaving status to pane detection");
+}
+
 fn warn_reserved(plugin: &str, tool: &str, builtin: &str) {
     let mut warned = RESERVED_WARNED
         .lock()
@@ -724,7 +746,7 @@ pub fn snapshot(instance: &Instance) -> Option<AgentIntegrationSnapshot> {
     }
     let registry = super::registry();
     let plugin = provider(&registry, &instance.tool).ok()??;
-    read_report(&instance.id, &instance.tool, plugin)
+    read_snapshot(&instance.id, &instance.tool, plugin)
         .ok()
         .flatten()
 }
@@ -830,7 +852,21 @@ pub(crate) fn owned_status(
     let report = if pane_dead {
         None
     } else {
-        plugin.and_then(|plugin| read_report(&instance.id, tool, plugin).ok().flatten())
+        let read = plugin
+            .map(|plugin| read_report(&instance.id, tool, plugin))
+            .transpose()
+            .ok()
+            .flatten();
+        match read {
+            Some(ReportRead::Snapshot(report)) => Some(report),
+            // The provider is not the one the declaration describes, so its
+            // reports cannot be interpreted. Pane rules stay authoritative.
+            Some(ReportRead::UnsupportedVersion { version, declared }) => {
+                warn_unsupported_provider(tool, &version, &declared);
+                return None;
+            }
+            Some(ReportRead::Absent) | None => None,
+        }
     };
     session_status_override(true, pane_dead, report.as_ref().map(|report| report.status))
         .map(|status| (status, report.is_some()))
@@ -857,19 +893,42 @@ fn check_file(meta: &std::fs::Metadata) -> Result<()> {
     Ok(())
 }
 
-fn read_report(
+/// One read of an integration report.
+///
+/// "The running provider is not the one the declaration describes" is kept
+/// apart from "there is no usable report": the first leaves the session to
+/// pane detection, because the report cannot describe that provider, while the
+/// second is an owned `Unknown`.
+#[derive(Debug)]
+enum ReportRead {
+    Absent,
+    Snapshot(AgentIntegrationSnapshot),
+    UnsupportedVersion {
+        version: String,
+        declared: Vec<String>,
+    },
+}
+
+fn read_snapshot(
     instance_id: &str,
     tool: &str,
     plugin: &super::LoadedPlugin,
 ) -> Result<Option<AgentIntegrationSnapshot>> {
+    Ok(match read_report(instance_id, tool, plugin)? {
+        ReportRead::Snapshot(report) => Some(report),
+        ReportRead::Absent | ReportRead::UnsupportedVersion { .. } => None,
+    })
+}
+
+fn read_report(instance_id: &str, tool: &str, plugin: &super::LoadedPlugin) -> Result<ReportRead> {
     let Some(dir) = dir_guard::open_instance_dir_read_only(instance_id)? else {
-        return Ok(None);
+        return Ok(ReportRead::Absent);
     };
     let leaf = format!("integration-{}.json", plugin.id());
     let Some((meta, bytes)) =
         dir_guard::read_file_with_metadata_at(dir.as_fd(), &leaf, MAX_REPORT_BYTES + 1)?
     else {
-        return Ok(None);
+        return Ok(ReportRead::Absent);
     };
     check_file(&meta)?;
     ensure!(
@@ -885,18 +944,27 @@ fn read_report(
         .iter()
         .find(|entry| entry.tool == tool)
         .context("provider integration declaration is unavailable")?;
-    integration
-        .provider_compat(&report.provider_version)
-        .map_err(anyhow::Error::msg)?;
     if !integration.replies {
         report.prompt = None;
     }
     sanitize_prompt(&mut report);
+    // Liveness first: an exited writer's report is stale whatever it names, so
+    // an incompatible version from it keeps the owned `Unknown` rather than
+    // handing the session back to pane rules.
     ensure!(
         crate::process::worker::is_pid_alive(report.writer_pid),
         "integration writer exited"
     );
-    Ok(Some(report))
+    if integration
+        .provider_compat(&report.provider_version)
+        .is_err()
+    {
+        return Ok(ReportRead::UnsupportedVersion {
+            version: report.provider_version,
+            declared: integration.provider_versions.clone(),
+        });
+    }
+    Ok(ReportRead::Snapshot(report))
 }
 
 fn validate_report(r: &AgentIntegrationSnapshot, id: &str) -> Result<()> {
@@ -1067,8 +1135,16 @@ pub fn respond(
             _ => "the configuration is unreadable, so a custom program may now run this agent",
         }
     );
-    let current = read_report(&instance.id, &instance.tool, plugin)?
-        .context("provider integration report is unavailable")?;
+    let current = match read_report(&instance.id, &instance.tool, plugin)? {
+        ReportRead::Snapshot(report) => report,
+        ReportRead::UnsupportedVersion { version, declared } => bail!(
+            "provider version {} is outside the integration's provider_versions ({}); \
+             the session keeps pane detection",
+            version.escape_default(),
+            declared.join(", ")
+        ),
+        ReportRead::Absent => bail!("provider integration report is unavailable"),
+    };
     ensure!(
         same_prompt(expected, &current),
         "prompt changed; reopen the reply dialog"
@@ -2581,6 +2657,95 @@ command = "acme-omp-shim"
 
     #[test]
     #[serial_test::serial(hook_base)]
+    fn unsupported_provider_version_leaves_the_session_to_pane_rules() {
+        let (_base, _base_path, _hook_tmp) = crate::hooks::test_support::BaseGuard::ready();
+        let temp = tempfile::tempdir().unwrap();
+        let _reload = super::super::ReloadRegistryOnDrop;
+        let _env = crate::session::test_support::EnvGuard::set(&[
+            ("HOME", temp.path()),
+            ("XDG_CONFIG_HOME", temp.path()),
+            ("USERPROFILE", temp.path()),
+        ]);
+        let _featured = crate::session::test_support::EnvGuard::unset(&["AOE_FEATURED_INDEX_PATH"]);
+        install_test_integration("acme.integration-version", "version-agent");
+        super::super::reload_registry();
+
+        let mut instance = Instance::new("integration-version-test", "/tmp");
+        instance.tool = "version-agent".into();
+        instance.status = crate::session::Status::Running;
+        let dir = dir_guard::open_instance_dir(&instance.id).unwrap();
+        let leaf = "integration-acme.integration-version.json";
+
+        let mut report = snapshot();
+        report.instance_id = instance.id.clone();
+        report.provider_version = "19.0.0".into();
+        dir_guard::write_atomic(dir.as_fd(), leaf, &serde_json::to_vec(&report).unwrap()).unwrap();
+        assert_eq!(
+            owned_status(&instance, false),
+            None,
+            "an unsupported provider must keep pane detection instead of reading as an owned Unknown"
+        );
+        assert!(
+            super::snapshot(&instance).is_none(),
+            "no reply dialog may open for a provider version the declaration does not describe"
+        );
+        let error = respond(
+            &instance,
+            &report,
+            AgentIntegrationResponse::Approval {
+                choice: IntegrationApprovalChoice::Allow,
+            },
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(
+            error.contains("19.0.0") && error.contains("provider_versions"),
+            "a reply on an unlisted provider version must name the version and the declaration: {error}"
+        ); // The provider wrote the version string: an escape sequence in it must
+           // not reach the status line as a terminal control.
+        report.provider_version = "19.0.0\u{1b}[2J".into();
+        dir_guard::write_atomic(dir.as_fd(), leaf, &serde_json::to_vec(&report).unwrap()).unwrap();
+        let escaped = respond(
+            &instance,
+            &report,
+            AgentIntegrationResponse::Approval {
+                choice: IntegrationApprovalChoice::Allow,
+            },
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(
+            escaped.contains("\\u{1b}") && !escaped.contains('\u{1b}'),
+            "a provider-written version must reach the error escaped: {escaped:?}"
+        );
+
+        // A stale report from an exited writer is not evidence about the
+        // running provider, so it stays an owned Unknown.
+        let mut child = std::process::Command::new("true").spawn().unwrap();
+        let exited = child.id();
+        child.wait().unwrap();
+        report.provider_version = "19.0.0".into();
+        report.writer_pid = exited;
+        dir_guard::write_atomic(dir.as_fd(), leaf, &serde_json::to_vec(&report).unwrap()).unwrap();
+        assert_eq!(
+            owned_status(&instance, false),
+            Some((crate::session::Status::Unknown, false)),
+            "an incompatible report from an exited writer must not hand the session to pane rules"
+        );
+
+        report.provider_version = "18.11.1".into();
+        report.writer_pid = std::process::id();
+        dir_guard::write_atomic(dir.as_fd(), leaf, &serde_json::to_vec(&report).unwrap()).unwrap();
+
+        assert_eq!(
+            owned_status(&instance, false),
+            Some((crate::session::Status::Waiting, true)),
+            "a supported provider keeps its report"
+        );
+    }
+
+    #[test]
+    #[serial_test::serial(hook_base)]
     fn respond_writes_private_reply_and_delivers_declared_wake_key() {
         if !crate::tmux::test_helpers::tmux_available() {
             eprintln!("Skipping test: tmux not available");
@@ -2900,9 +3065,10 @@ command = "acme-omp-shim"
             manifest_hash: String::new(),
             granted: true,
         };
-        assert!(read_report("host-test", "test-agent", &plugin)
-            .unwrap()
-            .is_none());
+        assert!(matches!(
+            read_report("host-test", "test-agent", &plugin).unwrap(),
+            ReportRead::Absent
+        ));
         let dir = dir_guard::open_instance_dir("host-test").unwrap();
         let leaf = format!("integration-{}.json", plugin.id());
         for version in ["1.1.9", "1.2.0", "1.9.0", "2.0.0", "1.2.3-rc.1", "unknown"] {
@@ -2910,11 +3076,14 @@ command = "acme-omp-shim"
             report.provider_version = version.into();
             dir_guard::write_atomic(dir.as_fd(), &leaf, &serde_json::to_vec(&report).unwrap())
                 .unwrap();
-            let loaded = read_report("host-test", "test-agent", &plugin);
-            if !matches!(version, "1.2.0" | "1.9.0") {
-                assert!(loaded.is_err(), "{version}");
+            let loaded = read_report("host-test", "test-agent", &plugin).unwrap();
+            if matches!(version, "1.2.0" | "1.9.0") {
+                assert!(matches!(loaded, ReportRead::Snapshot(_)), "{version}");
             } else {
-                assert!(loaded.unwrap().is_some(), "{version}");
+                assert!(
+                    matches!(loaded, ReportRead::UnsupportedVersion { .. }),
+                    "{version} must stay a supported-version decision, not a malformed report"
+                );
             }
         }
         let mut fresh = snapshot();
@@ -2934,9 +3103,11 @@ command = "acme-omp-shim"
             }
             dir_guard::write_atomic(dir.as_fd(), &leaf, &serde_json::to_vec(&wire).unwrap())
                 .unwrap();
-            let loaded = read_report("host-test", "test-agent", &plugin)
-                .unwrap()
-                .unwrap();
+            let ReportRead::Snapshot(loaded) =
+                read_report("host-test", "test-agent", &plugin).unwrap()
+            else {
+                panic!("a supported version must produce a snapshot");
+            };
             assert_eq!(loaded.status, AgentIntegrationStatus::Waiting);
             assert_eq!(loaded.prompt.is_some(), replies && has_keys);
         }

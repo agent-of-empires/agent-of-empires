@@ -833,6 +833,23 @@
       "components": ["web/src/hooks/useAcpSession.ts", "web/src/hooks/acpSession/reducer.ts"]
     },
     {
+      "id": "acp.rejected-prompt-retry",
+      "kind": "vitest",
+      "risk": "medium",
+      "specs": [
+        "src/hooks/useAcpSession.test.ts",
+        "src/lib/acpTypes.reducer.test.ts",
+        "src/components/acp/RejectedPromptsStrip.test.tsx"
+      ],
+      "components": [
+        "web/src/hooks/useAcpSession.ts",
+        "web/src/lib/acpTypes.ts",
+        "web/src/lib/api.ts",
+        "web/src/components/acp/PromptStrips.tsx"
+      ],
+      "notes": "A prompt the agent rejects keeps its stored attachments; Retry reloads each one and resends text and attachments as sent, an attachment-only prompt included, and does not resend when an attachment cannot be reloaded. The strip names the attachments, says whether the agent rejected the prompt or was busy, and allows one Retry at a time per entry."
+    },
+    {
       "id": "acp.server-queue",
       "kind": "vitest",
       "risk": "medium",
@@ -984,8 +1001,12 @@
       "kind": "vitest",
       "risk": "medium",
       "specs": ["src/components/__tests__/SettingsView.folds.test.tsx"],
-      "components": ["web/src/components/SettingsView.tsx", "web/src/components/settings/FormFields.tsx"],
-      "notes": "The Updates tab shows the Daemon port (`serve.port`) under a Daemon heading; editing it saves `{ serve: { port } }` through the normal settings path. Global only; a new value applies after a stop and start. The same block renders the Funnel port select (`serve.funnel_port`) from the schema with no web code of its own."
+      "components": [
+        "web/src/components/SettingsView.tsx",
+        "web/src/components/settings/FormFields.tsx",
+        "web/src/components/settings/SchemaSection.tsx"
+      ],
+      "notes": "The Updates tab shows the Daemon port (`serve.port`) under a Daemon heading; editing it saves `{ serve: { port } }` through the normal settings path. Global only; a new value applies after a stop and start. The same block renders the Funnel port select (`serve.funnel_port`) from the schema with no web code of its own. Folder-ignore entries (`sandbox.volume_ignores`) are checked client-side from the schema's `volume_ignore_list` rule: an absolute path, a `:` or a `..` segment is rejected inline and not saved, while a relative entry such as node_modules saves as `{ sandbox: { volume_ignores } }`."
     },
     {
       "id": "settings.global-migration-and-persistence",
@@ -4738,7 +4759,8 @@
       "kind": "live-playwright",
       "risk": "high",
       "specs": ["tests/live/acp-stories/agent-status.spec.ts"],
-      "components": ["web/src/components/WorkspaceSidebar.tsx"]
+      "components": ["web/src/components/WorkspaceSidebar.tsx"],
+      "notes": "The row summarizes the latest plan and drops it after a matching plan_removed or a /clear."
     },
     {
       "id": "story.sidebar-queued-count",
@@ -5046,7 +5068,8 @@
       "kind": "live-playwright",
       "risk": "high",
       "specs": ["tests/live/acp-stories/agent-status.spec.ts"],
-      "components": ["web/src/components/acp/StructuredView.tsx", "web/src/components/acp/PlanStrip.tsx"]
+      "components": ["web/src/components/acp/StructuredView.tsx", "web/src/components/acp/PlanStrip.tsx"],
+      "notes": "Legacy plan and plan_update checklists render; a matching plan_removed or a /clear hides the strip."
     },
     {
       "id": "story.diff-viewer-shows-files",
@@ -6138,11 +6161,29 @@
     },
     {
       "id": "settings-restart-web-only-flags",
-      "kind": "deferred",
-      "issue": "https://github.com/agent-of-empires/agent-of-empires/issues/5302",
+      "kind": "vitest",
+      "risk": "medium",
+      "specs": [
+        "src/lib/settingRow.test.ts",
+        "src/components/settings/__tests__/SettingRow.test.tsx",
+        "src/components/setup/__tests__/SandboxStep.test.tsx"
+      ],
+      "components": [
+        "web/src/lib/settingRow.ts",
+        "web/src/components/settings/SettingRow.tsx",
+        "web/src/components/settings/SchemaSection.tsx",
+        "web/src/components/settings/FormFields.tsx",
+        "web/src/components/setup/steps/SandboxStep.tsx"
+      ],
+      "notes": "Each Settings row shows its label, tags (Needs restart, Web dashboard only, Terminal app only, Structured view only, Linux only), a lock on passphrase rows, the summary as its plain line (none without a summary, plugin rows included), and its section.field key with a copy button. The setup wizard hides the key. Every control is named by its row label. #5302."
+    },
+    {
+      "id": "settings.row-key-reveal",
+      "kind": "mocked-playwright",
       "risk": "low",
-      "reason": "Copy only: seven Settings labels lose \"(restart req.)\" and six summaries lose their restart sentence; the schema gains restart and web_only flags, which the row PR renders.",
-      "components": ["web/src/components/settings/SchemaSection.tsx"]
+      "specs": ["tests/settings-row.spec.ts"],
+      "components": ["web/src/components/settings/SettingRow.tsx"],
+      "notes": "With a mouse the key is invisible until hover or focus but keeps its line, so rows don't move; Tab reaches its copy button, which copies. At 375 it always shows. #5302."
     }
   ]
 }

@@ -24,7 +24,7 @@ import type {
   ImportableSession,
   SettingsFieldDescriptor,
 } from "./types";
-import type { ConfigOptionDescriptor } from "./acpTypes";
+import type { AcpAttachment, ConfigOptionDescriptor, PromptAttachmentInput } from "./acpTypes";
 import { clearDeviceBindingSecret, getOrCreateDeviceBindingSecret } from "./deviceBinding";
 import { INLINE_ELEVATION_HEADER } from "./fetchInterceptor";
 
@@ -375,7 +375,7 @@ export async function ensureTerminal(
   }
 }
 
-function fileToBase64(file: File): Promise<string> {
+function fileToBase64(blob: Blob): Promise<string> {
   return new Promise((resolve, reject) => {
     const reader = new FileReader();
     reader.onerror = () => reject(reader.error ?? new Error("read failed"));
@@ -385,8 +385,20 @@ function fileToBase64(file: File): Promise<string> {
       const comma = result.indexOf(",");
       resolve(comma >= 0 ? result.slice(comma + 1) : result);
     };
-    reader.readAsDataURL(file);
+    reader.readAsDataURL(blob);
   });
+}
+
+/** Reads a sent prompt's stored attachment back as an upload, or null when it is gone. */
+export async function loadStoredAttachment(a: AcpAttachment): Promise<PromptAttachmentInput | null> {
+  try {
+    const res = await fetch(a.url);
+    if (!res.ok) return null;
+    const dataB64 = await fileToBase64(await res.blob());
+    return { kind: a.kind, mimeType: a.mimeType, ...(a.name ? { name: a.name } : {}), dataB64 };
+  } catch {
+    return null;
+  }
 }
 
 /**
@@ -1148,8 +1160,8 @@ export function fetchPluginSessions(pluginId: string): Promise<{ sessions: Recor
 
 /** The host's aggregated UI-state snapshot. Returns an empty state (not null)
  *  shape on the server when no plugin host is running. */
-export function fetchPluginUiState(): Promise<PluginUiState | null> {
-  return fetchJson<PluginUiState>("/api/plugins/ui-state");
+export function fetchPluginUiState(init?: RequestInit): Promise<PluginUiState | null> {
+  return fetchJson<PluginUiState>("/api/plugins/ui-state", init);
 }
 
 /** Lets the next frame load of a page's `url` authenticate when device binding is on; the ticket rides an HttpOnly cookie. */

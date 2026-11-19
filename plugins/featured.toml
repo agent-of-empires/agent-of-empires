@@ -56,7 +56,7 @@ versions = {"1.0.0" = "sha256:1c4ed57deca62072ff0ebd061e4c849028f3a2ed25b35c25a4
 source = "gh:agent-of-empires/plugin-linear"
 versions = {"0.1.0" = "sha256:d83d52337a66bded91103cb88778cbbbee0f639e68b15d68d7981cd54c51a49f"}
 
-# Released and pinned at `v0.1.1`, so an install with no `@ref` resolves that
+# Released and pinned at `v0.1.2`, so an install with no `@ref` resolves that
 # tag instead of a moving default branch.
 #
 # plugin-freebuf 0.1.0 is intentionally unpinned: its build wrote `node_modules/`
@@ -66,9 +66,10 @@ versions = {"0.1.0" = "sha256:d83d52337a66bded91103cb88778cbbbee0f639e68b15d68d7
 # `.aoe-build/`.
 #
 # plugin-freebuf v0.1.1 @ 3514c04904aebde7473cf4a3f90f3975fe8a93c5
+# plugin-freebuf v0.1.2 @ 6bdb1285cc47fc888856983a6edba89ab1bc0dff
 [plugins."agent-of-empires.aoe-freebuf"]
 source = "gh:agent-of-empires/plugin-freebuf"
-versions = {"0.1.1" = "sha256:b4174e233f643d6d565e75b6d88968d3e5f28f5c14e15008e25f47475d94b743"}
+versions = {"0.1.1" = "sha256:b4174e233f643d6d565e75b6d88968d3e5f28f5c14e15008e25f47475d94b743", "0.1.2" = "sha256:db372d659a0bf23c64b036937ac7e875871bdf6b6af60471b8707ebfa06df4b5"}
 
 # Released and pinned at `v0.5.0`, so an install with no `@ref` resolves that
 # tag instead of a moving default branch.
@@ -84,3 +85,23 @@ versions = {"0.1.1" = "sha256:b4174e233f643d6d565e75b6d88968d3e5f28f5c14e15008e2
 [plugins."agent-of-empires.omp"]
 source = "gh:agent-of-empires/plugin-omp"
 versions = {"0.5.0" = "sha256:a2d718a00808b815ae6f3dcd7b05f6a81fdb6fedf642cb8883c42ef53889a962"}
+
+# `versions` is what a featured install is verified against, keyed by the
+# release tag it resolves to; it does not choose the tag. An install that names
+# no `@ref` selects the plugin's latest release, `v0.1.1`, which is the pin
+# below. 0.1.0 stays listed so an install already carrying it still verifies;
+# it published nothing on OpenCode 2.
+#
+# 0.1.1 declares `api_version = 21` with `session.integration` for the built-in
+# `opencode` tool and an `aoe_version` floor of `>=1.24.0`, so an older host
+# rejects the manifest in `PluginManifest::from_toml_str` and records a load
+# error while `opencode` keeps its bundled launch and pane detection. The
+# provider extension lives in the same repository but is installed inside
+# OpenCode, so install it first: once approved, this declaration owns status and
+# a session with no report reads as Unknown. Disabling or uninstalling the
+# plugin returns the session to pane detection.
+#
+# plugin-opencode v0.1.1 @ 84a4049
+[plugins."agent-of-empires.opencode"]
+source = "gh:agent-of-empires/plugin-opencode"
+versions = {"0.1.0" = "sha256:78526b6fae6810aaa8396b524af2209c23a5a390de6ac18412f045f24aaa274d", "0.1.1" = "sha256:1b3a12924f0835cc0f08d715206cabd51f726b90d1535f3047cddd59092821c2"}

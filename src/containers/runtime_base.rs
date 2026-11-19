@@ -2,6 +2,7 @@ use super::container_interface::{
     docker_env_args, ContainerConfig, RunFlag, TargetEnvFile, CGROUP_PARENT_LABEL,
 };
 use super::error::{sanitize_stderr, DockerError, Result};
+use super::image_pull::PullFailureReason;
 use std::collections::HashSet;
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
@@ -60,6 +61,7 @@ fn joins_user_slice(output: &str, rootless_marker: &str) -> bool {
         && words.any(|word| word.trim_matches(['[', ']']) == rootless_marker)
 }
 
+#[derive(Clone, Copy)]
 pub(crate) struct RuntimeBase {
     pub binary: &'static str,
     pub name: &'static str,
@@ -303,18 +305,25 @@ impl RuntimeBase {
         self.probe_succeeds(&["image", "inspect", image])
     }
 
-    pub fn pull_image(&self, image: &str) -> Result<()> {
-        self.pull_until_cancelled(image, &CancellationToken::new())
+    pub fn pull_until_cancelled(&self, image: &str, cancel: &CancellationToken) -> Result<()> {
+        self.pull_with_timeout(image, cancel, PULL_TIMEOUT)
     }
 
-    pub fn pull_until_cancelled(&self, image: &str, cancel: &CancellationToken) -> Result<()> {
+    fn pull_with_timeout(
+        &self,
+        image: &str,
+        cancel: &CancellationToken,
+        timeout: Duration,
+    ) -> Result<()> {
         let mut cmd = self.command();
         cmd.args(self.pull_prefix);
         cmd.arg(image);
         cmd.stdin(Stdio::null());
         let start = Instant::now();
         tracing::info!(target: "containers.image", runtime = %self.name, %image, "pulling image");
-        let output = match crate::process::run_until_cancelled(&mut cmd, PULL_TIMEOUT, cancel)? {
+        let output = match crate::process::run_until_cancelled_process_group(
+            &mut cmd, timeout, cancel,
+        )? {
             Some(output) => output,
             None if cancel.is_cancelled() => {
                 tracing::info!(target: "containers.image", runtime = %self.name, %image, "image pull cancelled");
@@ -327,13 +336,14 @@ impl RuntimeBase {
                     runtime = %self.name,
                     %image,
                     duration_ms = dur_ms,
-                    timeout_s = PULL_TIMEOUT.as_secs(),
+                    timeout_s = timeout.as_secs(),
                     "image pull timed out; killed",
                 );
                 return Err(DockerError::ImagePullFailed {
                     runtime: self.name,
                     image: image.to_string(),
-                    detail: format!("timed out after {}s", PULL_TIMEOUT.as_secs()),
+                    detail: format!("timed out after {}s", timeout.as_secs()),
+                    reason: PullFailureReason::Timeout,
                 });
             }
         };
@@ -353,6 +363,7 @@ impl RuntimeBase {
                 runtime: self.name,
                 image: image.to_string(),
                 detail: sanitize_stderr(&stderr),
+                reason: PullFailureReason::classify(&stderr),
             });
         }
 
@@ -364,16 +375,6 @@ impl RuntimeBase {
             "image pull completed"
         );
         Ok(())
-    }
-
-    pub fn ensure_image(&self, image: &str, cancel: &CancellationToken) -> Result<()> {
-        if self.image_exists_locally(image) {
-            tracing::info!(target: "containers.runtime", "Using local {} image '{}'", self.name, image);
-            return Ok(());
-        }
-
-        tracing::info!(target: "containers.runtime", "Pulling {} image '{}'", self.name, image);
-        self.pull_until_cancelled(image, cancel)
     }
 
     pub fn default_sandbox_image(&self) -> &'static str {
@@ -1054,6 +1055,61 @@ mod tests {
             &DOCKER.probe_output_with_timeout(&mut slow, Duration::from_millis(10)),
             Err(DockerError::IoError(error)) if error.kind() == std::io::ErrorKind::TimedOut
         ));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    #[serial_test::parallel]
+    fn a_pull_timeout_kills_a_runtime_that_ignores_sigterm_and_its_children() {
+        use std::os::unix::fs::PermissionsExt;
+        let _env = crate::session::test_support::EnvGuard::read_lock();
+        let dir = tempfile::tempdir().unwrap();
+        let (shell, child) = (dir.path().join("shell"), dir.path().join("child"));
+        let binary = dir.path().join("docker");
+        std::fs::write(
+            &binary,
+            format!(
+                "#!/bin/sh\ntrap '' TERM\necho $$ > '{}'\nsleep 300 &\necho $! > '{}'\nwait\n",
+                shell.display(),
+                child.display()
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(&binary, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let runtime = RuntimeBase {
+            binary: Box::leak(binary.to_string_lossy().into_owned().into_boxed_str()),
+            ..RuntimeBase::DOCKER
+        };
+
+        let result =
+            runtime.pull_with_timeout("img", &CancellationToken::new(), Duration::from_secs(1));
+        assert!(matches!(
+            result,
+            Err(DockerError::ImagePullFailed {
+                reason: PullFailureReason::Timeout,
+                ..
+            })
+        ));
+        // Dead or a zombie: this sandbox's PID 1 never reaps orphans.
+        let gone = |pid_file: &std::path::Path| {
+            let pid = std::fs::read_to_string(pid_file).unwrap();
+            std::fs::read_to_string(format!("/proc/{}/stat", pid.trim())).map_or(true, |stat| {
+                stat.rsplit(')')
+                    .next()
+                    .unwrap()
+                    .trim_start()
+                    .starts_with('Z')
+            })
+        };
+        assert!(gone(&shell), "the runtime process");
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !gone(&child) {
+            assert!(
+                Instant::now() < deadline,
+                "the runtime's child outlived the kill"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
     }
 
     fn create_args(base: &RuntimeBase, config: ContainerConfig) -> Vec<String> {

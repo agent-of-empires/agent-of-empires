@@ -67,6 +67,7 @@ mod v055_global_max_concurrent_workers;
 mod v056_launch_resolved_executable;
 mod v057_worker_launch_executable;
 mod v058_account_limits_window_shape;
+mod v059_owner_only_event_logs;
 mod v060_terminal_handoff_outcome;
 
 /// Fixtures shared by migrations that rewrite agent hook files.
@@ -309,6 +310,7 @@ const MIGRATIONS: &[Migration] = &[
         "account_limits_window_shape",
         v058_account_limits_window_shape::run,
     ),
+    (59, "owner_only_event_logs", v059_owner_only_event_logs::run),
     (
         60,
         "terminal_handoff_outcome",

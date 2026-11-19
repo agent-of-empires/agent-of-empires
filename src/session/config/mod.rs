@@ -3433,6 +3433,7 @@ pub struct SandboxConfig {
     #[setting(
         label = "Folders to leave out",
         widget = "list",
+        validate = "volume_ignore_list",
         web = "elevation:sandbox config affects host isolation",
         advanced,
         summary = "Paths inside the Project the container shouldn't see, like node_modules."

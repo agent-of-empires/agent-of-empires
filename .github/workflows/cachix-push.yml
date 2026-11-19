@@ -34,6 +34,8 @@ jobs:
   cachix:
     name: Build and push (${{ matrix.os }})
     runs-on: ${{ matrix.os }}
+    permissions:
+      contents: read
     strategy:
       fail-fast: false
       matrix:
