@@ -24,6 +24,9 @@ struct Snapshot {
     /// The profile the daemon publishes suggestions under.
     #[serde(default)]
     profile: Option<String>,
+    /// The daemon that served this snapshot; set by the loader, not the wire.
+    #[serde(skip)]
+    daemon: Option<String>,
     providers: Vec<Provider>,
     items: Vec<Item>,
     #[serde(default)]
@@ -136,6 +139,14 @@ pub(super) struct Start {
     pub suggestion: Option<crate::session::SuggestionOrigin>,
 }
 
+/// The daemon and profile a list was read from. A mutation is bound to it, so
+/// a replaced daemon or another profile never receives work meant for the list shown.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct Origin {
+    daemon: Option<String>,
+    profile: Option<String>,
+}
+
 enum Req {
     Load,
     Refresh,
@@ -143,12 +154,36 @@ enum Req {
         provider_id: String,
         id: String,
         dismissed: bool,
+        origin: Option<Origin>,
     },
     Prepare {
         provider_id: String,
         id: String,
         target: PrepareTarget,
+        origin: Option<Origin>,
     },
+}
+
+impl Req {
+    fn origin(&self) -> Option<&Origin> {
+        match self {
+            Req::Dismiss { origin, .. } | Req::Prepare { origin, .. } => origin.as_ref(),
+            _ => None,
+        }
+    }
+}
+
+/// Why a request bound to `origin` must not go to `daemon`, which publishes `published`.
+fn origin_error(origin: &Origin, daemon: &str, published: Option<&str>) -> Option<String> {
+    let moved = origin.daemon.as_deref().is_some_and(|d| d != daemon);
+    let switched = origin
+        .profile
+        .as_deref()
+        .zip(published)
+        .is_some_and(|(shown, now)| shown != now);
+    (moved || switched).then(|| {
+        "The daemon or profile changed since this list loaded. Reload and try again.".to_string()
+    })
 }
 
 /// Which surface asked for a prepare, so its answer goes back to that surface.
@@ -201,33 +236,55 @@ fn text(e: impl std::fmt::Display) -> String {
 }
 
 #[cfg(not(test))]
-async fn load(client: &HttpClient) -> Result<Snapshot, String> {
+async fn load(client: &HttpClient, daemon: &str) -> Result<Snapshot, String> {
     let value = client.suggestions().await.map_err(text)?;
-    serde_json::from_value(value).map_err(text)
+    let mut snapshot: Snapshot = serde_json::from_value(value).map_err(text)?;
+    snapshot.daemon = Some(daemon.to_owned());
+    Ok(snapshot)
+}
+
+/// Refuses a request bound to a daemon or profile other than the one answering.
+#[cfg(not(test))]
+async fn check_bound(
+    client: &HttpClient,
+    daemon: &str,
+    origin: Option<&Origin>,
+) -> Result<(), String> {
+    let Some(origin) = origin else { return Ok(()) };
+    let published = match &origin.profile {
+        Some(_) => load(client, daemon).await?.profile,
+        None => None,
+    };
+    origin_error(origin, daemon, published.as_deref()).map_or(Ok(()), Err)
 }
 
 #[cfg(not(test))]
 async fn run(req: &Req) -> Res {
-    let client = match locate_daemon()
-        .await
-        .map_err(text)
-        .and_then(|endpoint| HttpClient::new(endpoint).map_err(text))
-    {
+    let located = match locate_daemon().await.map_err(text) {
+        Ok(endpoint) => endpoint,
+        Err(message) => return failed(req, message),
+    };
+    let daemon = located.base_url.clone();
+    let client = match HttpClient::new(located).map_err(text) {
         Ok(client) => client,
         Err(message) => return failed(req, message),
     };
+    if let Err(message) = check_bound(&client, &daemon, req.origin()).await {
+        return failed(req, message);
+    }
     match req {
-        Req::Load => Res::Snapshot(load(&client).await),
+        Req::Load => Res::Snapshot(load(&client, &daemon).await),
         Req::Refresh => Res::Refreshed(client.refresh_suggestions().await.map_err(text)),
         Req::Dismiss {
             provider_id,
             id,
             dismissed,
+            ..
         } => match client
             .set_suggestion_dismissed(provider_id, id, *dismissed)
             .await
         {
-            Ok(()) => match load(&client).await {
+            Ok(()) => match load(&client, &daemon).await {
                 Ok(snapshot) => Res::Snapshot(Ok(snapshot)),
                 Err(e) => Res::DismissKept(e),
             },
@@ -1001,6 +1058,7 @@ impl SuggestionsFeed {
                 provider_id,
                 id,
                 target,
+                ..
             } => {
                 self.prepare_key = Some((provider_id.clone(), id.clone()));
                 self.prepare_target = *target;
@@ -1009,6 +1067,7 @@ impl SuggestionsFeed {
                 provider_id,
                 id,
                 dismissed,
+                ..
             } => self.in_flight_dismiss = Some(((provider_id.clone(), id.clone()), *dismissed)),
             _ => {}
         }
@@ -1022,6 +1081,14 @@ impl SuggestionsFeed {
         } else {
             self.send(req, true);
         }
+    }
+
+    /// Where the list on screen came from; `None` before the first load.
+    fn origin(&self) -> Option<Origin> {
+        self.snapshot.as_ref().map(|s| Origin {
+            daemon: s.daemon.clone(),
+            profile: s.profile.clone(),
+        })
     }
 
     fn item(&self, key: &ItemKey) -> Option<&Item> {
@@ -1238,6 +1305,7 @@ impl SuggestionsFeed {
                     provider_id,
                     id,
                     dismissed,
+                    ..
                 } => {
                     let _ = sink.send(format!("dismiss {provider_id}/{id} {dismissed}"));
                     Res::Snapshot(parse())
@@ -1289,6 +1357,7 @@ impl SuggestionsFeed {
             provider_id: key.0.clone(),
             id: key.1.clone(),
             dismissed,
+            origin: self.origin(),
         });
     }
 
@@ -1310,7 +1379,7 @@ impl SuggestionsFeed {
             self.busy && self.prepare_key.as_ref() == Some(key) && self.prepare_target == target;
         in_flight
             || self.queued.iter().any(|req| {
-                matches!(req, Req::Prepare { provider_id, id, target: t }
+                matches!(req, Req::Prepare { provider_id, id, target: t, .. }
                     if (provider_id, id) == (&key.0, &key.1) && *t == target)
             })
     }
@@ -1320,10 +1389,12 @@ impl SuggestionsFeed {
         if self.prepare_pending(&key, target) {
             return;
         }
+        let origin = self.origin();
         self.submit(Req::Prepare {
             provider_id: key.0,
             id: key.1,
             target,
+            origin,
         });
     }
 
@@ -1370,7 +1441,16 @@ impl SuggestionsFeed {
             }
             Res::Snapshot(Ok(snapshot)) => {
                 self.foreign_profile = None;
+                let before = self.origin();
                 self.snapshot = Some(snapshot);
+                if before.is_some() && before != self.origin() {
+                    // Work queued for the list that was replaced must not reach the new one.
+                    let now = self.origin();
+                    self.queued
+                        .retain(|req| req.origin().is_none_or(|o| Some(o) == now.as_ref()));
+                    self.dismissing.clear();
+                    self.restoring.clear();
+                }
                 self.settle_dismissals();
                 self.loaded_at = Some(std::time::Instant::now());
                 out.changed = true;
@@ -1477,6 +1557,7 @@ mod tests {
     fn view_with(items: Vec<Item>, worker: Worker<Req, Res>) -> Rig {
         let mut store = SuggestionsFeed::with_worker(worker);
         store.snapshot = Some(Snapshot {
+            daemon: None,
             profile: None,
             providers: vec![Provider {
                 id: "p".into(),
@@ -1571,6 +1652,7 @@ mod tests {
         it.reason = hostile("why\nmore");
         it.preview = hostile("body");
         let snapshot = Snapshot {
+            daemon: None,
             profile: None,
             providers: vec![Provider {
                 id: "p".into(),
@@ -1624,6 +1706,7 @@ mod tests {
         press(&mut rig, KeyCode::Char('j'), true);
         assert_eq!(rig.view.selected_key().unwrap().1, "b");
         rig.store.snapshot = Some(Snapshot {
+            daemon: None,
             profile: None,
             providers: vec![],
             items: vec![
@@ -1757,6 +1840,7 @@ mod tests {
 
     fn dismissed_snapshot(rig: &mut Rig, dismissed: bool) {
         rig.store.snapshot = Some(Snapshot {
+            daemon: None,
             profile: None,
             providers: vec![],
             items: vec![item("a", None, dismissed)],
@@ -1808,6 +1892,7 @@ mod tests {
         let key = |id: &str| ("p".to_string(), id.to_string());
         rig.store.dismissing = vec![key("a"), key("b")];
         let snapshot = |a: bool, b: bool| Snapshot {
+            daemon: None,
             profile: None,
             providers: vec![],
             items: vec![item("a", None, a), item("b", None, b)],
@@ -2344,6 +2429,7 @@ mod tests {
     #[test]
     fn a_snapshot_of_another_profile_is_not_shown_and_says_so() {
         let published = |profile: &str| Snapshot {
+            daemon: None,
             profile: Some(profile.into()),
             providers: vec![],
             items: vec![item("a", None, false)],
@@ -2398,5 +2484,52 @@ mod tests {
         rig.store.prepare_key = Some(("t".into(), "a".into()));
         rig.store.set_profile(Some("work".into()));
         assert!(rig.store.prepare_key.is_none());
+    }
+    #[test]
+    fn a_queued_dismiss_is_dropped_when_the_list_reloads_from_another_origin() {
+        let (sink, seen) = std::sync::mpsc::channel();
+        let worker = Worker::spawn("t", move |req| match req {
+            Req::Load => {
+                let _ = sink.send("load".to_string());
+                Res::Snapshot(Ok(Snapshot {
+                    daemon: Some("http://b".into()),
+                    profile: Some("B".into()),
+                    providers: Vec::new(),
+                    items: vec![item("a", None, false)],
+                    prefs: Prefs::default(),
+                }))
+            }
+            _ => {
+                let _ = sink.send("mutation".to_string());
+                Res::Refreshed(Ok(()))
+            }
+        });
+        let mut rig = view_with(vec![item("a", None, false)], worker);
+        let snapshot = rig.store.snapshot.as_mut().unwrap();
+        snapshot.daemon = Some("http://a".into());
+        snapshot.profile = Some("A".into());
+        press(&mut rig, KeyCode::Char('l'), true);
+        press(&mut rig, KeyCode::Char('x'), true);
+        assert!(poll_until_settled(&mut rig));
+        assert!(rig.store.queued.is_empty());
+        assert!(rig.store.dismissing.is_empty());
+        assert!(!rig.store.is_busy_for_test());
+        assert_eq!(seen.try_iter().collect::<Vec<_>>(), ["load"]);
+    }
+
+    #[test]
+    fn a_request_is_refused_by_another_daemon_or_profile_but_not_by_its_own() {
+        let origin = Origin {
+            daemon: Some("http://a".into()),
+            profile: Some("A".into()),
+        };
+        assert!(origin_error(&origin, "http://a", Some("A")).is_none());
+        assert!(origin_error(&origin, "http://b", Some("A")).is_some());
+        assert!(origin_error(&origin, "http://a", Some("B")).is_some());
+        let unbound = Origin {
+            daemon: None,
+            profile: None,
+        };
+        assert!(origin_error(&unbound, "http://b", Some("B")).is_none());
     }
 }
