@@ -285,6 +285,7 @@ impl HomeView {
             &self.suggestions_feed.keys(),
             self.suggestions_feed.listed_count(),
             self.suggested_section_collapsed,
+            self.suggestions_feed.has_provider_failure(),
         );
         append_trash_section(&mut items, &pool, self.trashed_section_collapsed);
         items
@@ -341,6 +342,7 @@ impl HomeView {
             &self.suggestions_feed.keys(),
             self.suggestions_feed.listed_count(),
             self.suggested_section_collapsed,
+            self.suggestions_feed.has_provider_failure(),
         );
         append_trash_section(&mut items, grouped, self.trashed_section_collapsed);
         items
@@ -466,6 +468,7 @@ impl HomeView {
             &self.suggestions_feed.keys(),
             self.suggestions_feed.listed_count(),
             self.suggested_section_collapsed,
+            self.suggestions_feed.has_provider_failure(),
         );
         append_trash_section(&mut items, &pool, self.trashed_section_collapsed);
         items
