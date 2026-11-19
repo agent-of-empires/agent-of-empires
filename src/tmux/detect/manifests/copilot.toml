@@ -15,6 +15,11 @@ contains_any = [
   "esc to cancel",
 ]
 
+[[rules]]
+extends = "approval_choice"
+id = "approval_choice"
+priority = 950
+
 # The permission dialog's choice rows, which name the tool mid-label.
 [[rules]]
 id = "permission_choice"

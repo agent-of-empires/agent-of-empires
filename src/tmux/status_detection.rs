@@ -2283,13 +2283,13 @@ Tips for getting started:
             (
                 "gemini",
                 GEMINI_APPROVAL_PROMPT,
-                "approval_prompt",
+                "approval_choice",
                 Status::Waiting,
             ),
             (
                 "gemini",
                 GEMINI_APPROVAL_AFTER_TRUST,
-                "approval_prompt",
+                "approval_choice",
                 Status::Waiting,
             ),
             ("gemini", GEMINI_AFTER_TRUST, "no_rule", Status::Idle),
@@ -2343,6 +2343,8 @@ Tips for getting started:
         let prose = "\
 The flag allows three retries, and the reviewer approved the plan.
 Writes are allowed once the lock is released.
+The policy will allow once the lock is released, and admins allow always.
+Allow once the lock is released.
 ";
         for agent in [
             "antigravity",
@@ -2353,10 +2355,12 @@ Writes are allowed once the lock is released.
             "gemini",
             "qwen",
         ] {
-            assert!(
-                !super::super::detect::rule_matches(agent, "approval_prompt", prose, "", None),
-                "{agent}"
-            );
+            for rule in ["approval_prompt", "approval_choice"] {
+                assert!(
+                    !super::super::detect::rule_matches(agent, rule, prose, "", None),
+                    "{agent} {rule}"
+                );
+            }
         }
         let prompt_above_dialog =
             format!(" > summarize the readme\n\n{GEMINI_FOLDER_TRUST_PROMPT}");

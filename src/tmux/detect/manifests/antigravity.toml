@@ -39,6 +39,11 @@ contains_any = [
 ]
 
 [[rules]]
+extends = "approval_choice"
+id = "approval_choice"
+priority = 970
+
+[[rules]]
 extends = "interrupt_hint"
 id = "interrupt_hint"
 priority = 960

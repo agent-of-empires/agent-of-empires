@@ -37,6 +37,11 @@ id = "approval_prompt"
 priority = 950
 contains_any = ["execute?", "enter to select", "esc to cancel"]
 
+[[rules]]
+extends = "approval_choice"
+id = "approval_choice"
+priority = 950
+
 # Only a bare `>`: Gemini renders ordinary prose behind the same glyph, so the
 # `> something` form the other agents accept would fire on transcript text.
 [[rules]]

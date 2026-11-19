@@ -18,6 +18,11 @@ priority = 980
 contains_any = ["do you want to", "would you like to proceed"]
 line_regex = ['^\s*\x{276F}\s*[1-9]\.']
 
+[[rules]]
+extends = "approval_choice"
+id = "approval_choice"
+priority = 980
+
 # The `AskUserQuestion` selection UI.
 [[rules]]
 id = "ask_user_question"
