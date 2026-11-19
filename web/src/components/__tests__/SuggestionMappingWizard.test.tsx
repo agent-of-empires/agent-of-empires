@@ -67,7 +67,7 @@ describe("SuggestionMappingWizard", () => {
     expect(lost.checked).toBe(true);
     fireEvent.change(screen.getByLabelText("Project for acme/web"), { target: { value: "/w/api" } });
 
-    fireEvent.click(screen.getByRole("button", { name: "Save 3 mappings" }));
+    fireEvent.click(screen.getByRole("button", { name: "Link 3 repos" }));
     await waitFor(() => expect(onClose).toHaveBeenCalled());
     expect(api.putSuggestionMapping.mock.calls).toEqual([
       ["gh", "acme/api", ["/w/api"]],
@@ -80,7 +80,7 @@ describe("SuggestionMappingWizard", () => {
   it("keeps the wizard open and reports a failed save", async () => {
     api.putSuggestionMapping.mockResolvedValue({ ok: false, error: "nope" });
     const { onClose, onSaved } = await open();
-    fireEvent.click(screen.getByRole("button", { name: "Save 1 mapping" }));
+    fireEvent.click(screen.getByRole("button", { name: "Link 1 repo" }));
     expect((await screen.findByRole("alert")).textContent).toContain("acme/web: nope");
     expect(onClose).not.toHaveBeenCalled();
     expect(onSaved).not.toHaveBeenCalled();
@@ -97,7 +97,7 @@ describe("SuggestionMappingWizard", () => {
       { provider_id: "gh", mapping_key: "acme/done", projects: ["/w/x"] },
       { provider_id: "gh", mapping_key: "acme/web", projects: ["/w/web"] },
     ]);
-    fireEvent.click(screen.getByRole("button", { name: "Save 2 mappings" }));
+    fireEvent.click(screen.getByRole("button", { name: "Link 2 repos" }));
     expect((await screen.findByRole("alert")).textContent).toContain("acme/api: nope");
     await waitFor(() => expect(screen.queryByLabelText("Map acme/web")).toBeNull());
     expect((screen.getByLabelText("Map acme/api") as HTMLInputElement).checked).toBe(true);
@@ -108,7 +108,7 @@ describe("SuggestionMappingWizard", () => {
     let finish: (v: unknown) => void = () => {};
     api.putSuggestionMapping.mockReturnValue(new Promise((resolve) => (finish = resolve)));
     const { onClose } = await open();
-    fireEvent.click(screen.getByRole("button", { name: "Save 1 mapping" }));
+    fireEvent.click(screen.getByRole("button", { name: "Link 1 repo" }));
     await waitFor(() => expect(api.putSuggestionMapping).toHaveBeenCalledTimes(1));
     fireEvent.keyDown(document, { key: "Escape" });
     fireEvent.click(screen.getByTestId("suggestion-mapping-wizard"));

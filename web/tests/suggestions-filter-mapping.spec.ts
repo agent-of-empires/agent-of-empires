@@ -83,12 +83,12 @@ test("the Map projects wizard proposes Projects and saves the checked ones", asy
   await page.goto("/suggestions");
   await page.getByRole("button", { name: "Link a Project" }).first().click();
 
-  const wizard = page.getByRole("dialog", { name: "Map projects" });
+  const wizard = page.getByRole("dialog", { name: "Link each repo to a Project" });
   await expect(wizard.getByLabel("Map acme/web")).toBeChecked();
   await expect(wizard.getByLabel("Map acme/api")).not.toBeChecked();
   await expect(wizard.getByLabel("Map other/tool")).toBeDisabled();
   await wizard.getByLabel("Map acme/api").check();
-  await wizard.getByRole("button", { name: "Save 2 mappings" }).click();
+  await wizard.getByRole("button", { name: "Link 2 repos" }).click();
 
   await expect(wizard).toHaveCount(0);
   expect(puts).toEqual([

@@ -133,7 +133,7 @@ export function SuggestionMappingWizard({ items, providers, disabled = false, on
   return (
     <Dialog
       id="suggestion-mapping-wizard"
-      title="Map projects"
+      title="Link each repo to a Project"
       panelClassName="w-[640px]"
       bodyClassName="max-h-[60vh] overflow-y-auto px-5 py-4"
       describedBy="suggestion-mapping-wizard-intro"
@@ -147,7 +147,7 @@ export function SuggestionMappingWizard({ items, providers, disabled = false, on
             disabled={busy || disabled || chosen.length === 0}
             className={`rounded-md px-3 py-1.5 text-sm font-medium disabled:opacity-50 ${BRAND_BUTTON}`}
           >
-            {busy ? "Saving…" : `Save ${chosen.length} ${chosen.length === 1 ? "mapping" : "mappings"}`}
+            {busy ? "Saving…" : `Link ${chosen.length} ${chosen.length === 1 ? "repo" : "repos"}`}
           </button>
         </>
       }
