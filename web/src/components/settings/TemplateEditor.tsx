@@ -27,10 +27,9 @@ interface Props {
   disabled: boolean;
   label: string;
   onChange: (value: string) => void;
-  onCommit: () => void;
 }
 
-export function TemplateEditor({ value, variables, disabled, label, onChange, onCommit }: Props) {
+export function TemplateEditor({ value, variables, disabled, label, onChange }: Props) {
   const area = useRef<HTMLTextAreaElement>(null);
   const caret = useRef<number | null>(null);
   const [showAll, setShowAll] = useState(false);
@@ -68,7 +67,6 @@ export function TemplateEditor({ value, variables, disabled, label, onChange, on
           disabled={disabled}
           spellCheck={false}
           onChange={(e) => onChange(e.target.value)}
-          onBlur={onCommit}
           className={`${text} absolute inset-0 h-full resize-none overflow-hidden bg-transparent text-transparent caret-text-primary outline-none`}
         />
       </div>

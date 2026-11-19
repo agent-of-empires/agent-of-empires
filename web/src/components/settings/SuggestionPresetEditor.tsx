@@ -191,7 +191,6 @@ export function SuggestionPresetEditor({ provider, source, entry, item, disabled
           variables={source.variables}
           disabled={off}
           onChange={(v) => set("prompt", v)}
-          onCommit={() => {}}
         />
         <p className="mt-2 text-xs text-text-dim">
           {draft.prompt === null
