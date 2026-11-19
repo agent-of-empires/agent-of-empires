@@ -3684,6 +3684,8 @@ export const resetSuggestionPreset = (providerId: string, criterion: string) =>
 export interface StartHooksReview {
   commands: { on_create?: string[]; on_launch?: string[]; on_destroy?: string[] };
   needs_mcp_trust?: boolean;
+  /** Redacted one-line summaries of the repo's MCP servers. */
+  mcp_summaries?: string[];
   review_fingerprint: string;
 }
 
@@ -3698,6 +3700,8 @@ export type StartResult =
   | { kind: "started"; sessionId: string; title: string }
   | { kind: "already_started"; sessionId: string }
   | { kind: "hooks_need_trust"; review: StartHooksReview }
+  /** The approved review no longer matches the repo: ask again, without approval. */
+  | { kind: "trust_changed" }
   /** The server said no: `reason` is what went wrong, `hint` what to do. */
   | { kind: "failed"; reason: string; hint?: string; retryable: boolean }
   | { kind: "stale" }
@@ -3741,6 +3745,7 @@ export async function startSuggestion(
   if (res.status === 409 && code === "hooks_need_trust") {
     return { kind: code, review: body as unknown as StartHooksReview };
   }
+  if (res.status === 409 && code === "trust_changed") return { kind: "trust_changed" };
   if (res.status === 409 && code === "stale_suggestion") return { kind: "stale" };
   if (res.status === 422 && code === "start_failed") {
     return {

@@ -13,7 +13,7 @@ export function SuggestionHooksReview({ ctrl }: { ctrl: ReturnType<typeof useSug
       onLaunch={review.commands.on_launch ?? []}
       onDestroy={review.commands.on_destroy ?? []}
       needsMcpTrust={review.needs_mcp_trust === true}
-      mcpSummaries={[]}
+      mcpSummaries={review.mcp_summaries ?? []}
       onConfirm={ctrl.approveHooks}
       onCancel={ctrl.cancelHooks}
     />

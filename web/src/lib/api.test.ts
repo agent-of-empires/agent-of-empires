@@ -1399,6 +1399,7 @@ describe("createSession errors", () => {
         { error: "start_failed", reason: "Docker isn't running", hint: "Start it.", retryable: true },
         { kind: "failed", reason: "Docker isn't running", hint: "Start it.", retryable: true },
       ],
+      ["409 trust_changed", 409, { error: "trust_changed" }, { kind: "trust_changed" }],
       ["409 stale_suggestion", 409, { error: "stale_suggestion", message: "gone" }, { kind: "stale" }],
       ["400 no_project", 400, { error: "no_project", hint: "link_project" }, { kind: "no_project" }],
     ])("maps %s", async (_name, status, body, expected) => {

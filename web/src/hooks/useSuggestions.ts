@@ -147,6 +147,11 @@ export function useSuggestions(
       case "hooks_need_trust":
         setHooksReview({ item, review: result.review, options });
         return;
+      case "trust_changed":
+        // Repeating without approval returns a fresh review.
+        setHooksReview(null);
+        await start(item, { ...options, approve_hooks: undefined, review_fingerprint: undefined });
+        return;
       case "failed":
         setHooksReview(null);
         setFailures((f) => ({
