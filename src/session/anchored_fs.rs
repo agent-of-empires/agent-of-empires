@@ -1266,14 +1266,13 @@ impl AnchoredDir {
         let Some(leaf) = components.pop() else {
             bail!("anchored file path has no leaf");
         };
-        let flags = OFlag::O_DIRECTORY | OFlag::O_NOFOLLOW | OFlag::O_CLOEXEC | OFlag::O_RDONLY;
-        let mut current = openat(&self.fd, ".", flags, Mode::empty())?;
+        let mut current = openat_dir(&self.fd, ".")?;
         for component in components {
             match mkdirat(&current, component.as_os_str(), Mode::S_IRWXU) {
                 Ok(()) | Err(Errno::EEXIST) => {}
                 Err(error) => return Err(error).context("creating anchored directory"),
             }
-            current = openat(&current, component.as_os_str(), flags, Mode::empty())
+            current = openat_dir(&current, component.as_os_str())
                 .context("opening anchored parent component")?;
         }
         Ok((current, leaf))
@@ -1284,22 +1283,24 @@ impl AnchoredDir {
         let Some(leaf) = components.pop() else {
             bail!("anchored file path has no leaf");
         };
-        let mut current = openat(
-            &self.fd,
-            ".",
-            OFlag::O_DIRECTORY | OFlag::O_NOFOLLOW | OFlag::O_CLOEXEC | OFlag::O_RDONLY,
-            Mode::empty(),
-        )?;
+        let mut current = openat_dir(&self.fd, ".")?;
         for component in components {
-            current = openat(
-                &current,
-                component.as_os_str(),
-                OFlag::O_DIRECTORY | OFlag::O_NOFOLLOW | OFlag::O_CLOEXEC | OFlag::O_RDONLY,
-                Mode::empty(),
-            )
-            .context("opening anchored parent component")?;
+            current = openat_dir(&current, component.as_os_str())
+                .context("opening anchored parent component")?;
         }
         Ok((current, leaf))
+    }
+}
+
+/// Open a directory without following a symlink. On Linux a search-only
+/// directory (mode 0o100) rejects `O_RDONLY`, so fall back to `O_PATH`, which
+/// still works as a dirfd for `openat` and `mkdirat`.
+fn openat_dir<P: ?Sized + nix::NixPath>(dir: &OwnedFd, name: &P) -> nix::Result<OwnedFd> {
+    let flags = OFlag::O_DIRECTORY | OFlag::O_NOFOLLOW | OFlag::O_CLOEXEC;
+    match openat(dir, name, flags | OFlag::O_RDONLY, Mode::empty()) {
+        #[cfg(target_os = "linux")]
+        Err(Errno::EACCES) => openat(dir, name, flags | OFlag::O_PATH, Mode::empty()),
+        result => result,
     }
 }
 
@@ -1329,6 +1330,26 @@ fn with_suffix(path: &Path, suffix: &str) -> PathBuf {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn open_file_descends_through_a_search_only_directory() {
+        use std::os::unix::fs::PermissionsExt;
+        if nix::unistd::geteuid().is_root() {
+            return; // Root bypasses the permissions exercised below.
+        }
+        let temporary = tempfile::tempdir().unwrap();
+        let dir = temporary.path().join("a");
+        std::fs::create_dir(&dir).unwrap();
+        std::fs::write(dir.join("f.txt"), b"hello").unwrap();
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o100)).unwrap();
+        let root = AnchoredDir::open(temporary.path()).unwrap();
+        let result = root.open_file(Path::new("a/f.txt"), false);
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let mut contents = String::new();
+        result.unwrap().read_to_string(&mut contents).unwrap();
+        assert_eq!(contents, "hello");
+    }
 
     #[test]
     fn data_file_stamp_requires_a_fresh_readable_open() {
