@@ -207,6 +207,8 @@ pub struct PluginRpcContext {
     /// Ids of the plugin's pages that declare `deep_link`.
     pub deep_link_pages: HashSet<String>,
     pub ui_generation: u64,
+    /// The `[suggestions]` spec of the manifest this worker was launched from.
+    pub suggestions_spec: Option<SuggestionsSpec>,
 }
 
 impl PluginRpcContext {
@@ -289,9 +291,13 @@ pub fn dispatch(
         "suggestions.error" => {
             ctx.require(CAP_WORKER)?;
             suggestions_spec(ctx)?;
-            state.with_suggestions_db_as(ctx, |conn, profile| {
+            let stored = state.with_suggestions_db_as(ctx, |conn, profile| {
                 suggestions::error(conn, profile, &ctx.plugin_id, params)
-            })
+            });
+            if stored.is_ok() {
+                state.record_publish(&ctx.plugin_id);
+            }
+            stored
         }
         "suggestions.checks.set" => {
             ctx.require(CAP_WORKER)?;
@@ -384,16 +390,27 @@ pub fn dispatch(
     }
 }
 
+/// The spec the worker launched with, refused once the installed manifest has moved on.
 fn suggestions_spec(ctx: &PluginRpcContext) -> Result<SuggestionsSpec, DispatchError> {
-    crate::plugin::registry()
+    let forbidden = || DispatchError {
+        code: codes::FORBIDDEN,
+        message: "plugin did not declare suggestions".into(),
+        data: None,
+    };
+    let launched = ctx.suggestions_spec.clone().ok_or_else(forbidden)?;
+    let current = crate::plugin::registry()
         .get(&ctx.plugin_id)
         .filter(|p| p.active())
         .and_then(|p| p.manifest.suggestions.clone())
-        .ok_or_else(|| DispatchError {
-            code: codes::FORBIDDEN,
-            message: "plugin did not declare suggestions".into(),
+        .ok_or_else(forbidden)?;
+    if suggestions::spec_hash(&current) != suggestions::spec_hash(&launched) {
+        return Err(DispatchError {
+            code: codes::FAILED_PRECONDITION,
+            message: "plugin manifest changed since this worker launched".into(),
             data: None,
-        })
+        });
+    }
+    Ok(launched)
 }
 
 fn projects_list(state: &HostApiState) -> Result<Value, DispatchError> {
@@ -1137,6 +1154,7 @@ mod tests {
             ui_contributions: HashSet::new(),
             deep_link_pages: Default::default(),
             ui_generation: 0,
+            suggestions_spec: None,
         }
     }
 
@@ -1250,6 +1268,91 @@ mod tests {
         assert!(state.refreshing_providers().is_empty(), "next publish");
     }
 
+    fn provider_ctx(generation: u64) -> PluginRpcContext {
+        PluginRpcContext {
+            ui_generation: generation,
+            suggestions_spec: crate::plugin::registry()
+                .get("acme.gh")
+                .and_then(|p| p.manifest.suggestions.clone()),
+            ..ctx_for("acme.gh", &[CAP_WORKER])
+        }
+    }
+
+    fn assigned_item() -> Value {
+        json!({ "items": [{
+            "id": "a", "title": "Fix it", "reason": "assigned",
+            "source_url": "https://example.com/1", "source_ref": "acme/web#1",
+            "preview": "body", "criterion": "assigned",
+            "variables": { "number": "1" },
+            "draft": { "title": "Fix", "prompt": "Fix #{number}" },
+        }]})
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn a_worker_launched_under_an_older_spec_cannot_publish_or_report() {
+        let _guard = crate::session::test_support::isolate_app_dir();
+        let _reload = crate::server::api::suggestions_tests::register_provider();
+        let tmp = tempfile::tempdir().unwrap();
+        let state = state(tmp.path());
+        let generation = state.begin_ui_generation("acme.gh");
+        let worker = provider_ctx(generation);
+        let accepted = dispatch(&state, &worker, "suggestions.set", &assigned_item()).unwrap();
+        assert_eq!(accepted["accepted"], 1);
+
+        // The installed manifest gains a source while the old worker keeps running.
+        let dir = crate::plugin::plugins_dir().unwrap().join("acme.gh");
+        let manifest = std::fs::read_to_string(dir.join("aoe-plugin.toml")).unwrap();
+        let changed = format!(
+            "{manifest}\n[[suggestions.sources]]\ncriterion = \"mentioned\"\nlabel = \"Mentioned\"\n"
+        );
+        std::fs::write(dir.join("aoe-plugin.toml"), &changed).unwrap();
+        crate::session::update_config(|config| {
+            let plugin = config.plugins.get_mut("acme.gh").unwrap();
+            plugin.grant.as_mut().unwrap().manifest_hash =
+                aoe_plugin_api::PluginManifest::hash_bytes(changed.as_bytes());
+        })
+        .unwrap();
+        crate::plugin::reload_registry();
+
+        for (method, params) in [
+            ("suggestions.set", assigned_item()),
+            ("suggestions.error", json!({ "message": "late" })),
+            ("suggestions.checks.set", json!({ "checks": [] })),
+            ("suggestions.sources", json!({})),
+        ] {
+            let err = dispatch(&state, &worker, method, &params).unwrap_err();
+            assert_eq!(err.code, codes::FAILED_PRECONDITION, "{method}");
+        }
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn an_error_report_ends_the_refresh() {
+        let _guard = crate::session::test_support::isolate_app_dir();
+        let _reload = crate::server::api::suggestions_tests::register_provider();
+        let tmp = tempfile::tempdir().unwrap();
+        let state = state(tmp.path());
+        let worker = provider_ctx(state.begin_ui_generation("acme.gh"));
+        state.mark_refreshing("acme.gh");
+        assert!(state.refreshing_providers().contains("acme.gh"));
+        dispatch(
+            &state,
+            &worker,
+            "suggestions.error",
+            &json!({ "message": "rate limited" }),
+        )
+        .unwrap();
+        assert!(state.refreshing_providers().is_empty());
+        let providers = crate::plugin::suggestions::providers();
+        let snapshot = state
+            .with_suggestions_db(|conn, profile| {
+                crate::plugin::suggestions::snapshot(conn, profile, &providers)
+            })
+            .unwrap();
+        assert_eq!(snapshot["providers"][0]["error"], "rate limited");
+    }
+
     #[test]
     fn ungranted_capability_is_forbidden() {
         let tmp = tempfile::tempdir().unwrap();
@@ -1303,6 +1406,7 @@ mod tests {
         let state = state(tmp.path());
         let worker = |generation| PluginRpcContext {
             ui_generation: generation,
+            suggestions_spec: None,
             ..ctx_for("acme.worker", &[CAP_WORKER])
         };
         let write = |ctx: &PluginRpcContext| {
@@ -1357,6 +1461,7 @@ mod tests {
             ui_contributions: HashSet::new(),
             deep_link_pages: Default::default(),
             ui_generation: 0,
+            suggestions_spec: None,
         }
     }
 
@@ -1749,6 +1854,7 @@ mod tests {
             ui_contributions: HashSet::new(),
             deep_link_pages: Default::default(),
             ui_generation: 0,
+            suggestions_spec: None,
         };
         assert_eq!(
             get(&other, "poll_interval_ms").unwrap()["value"],
@@ -1769,6 +1875,7 @@ mod tests {
             ui_contributions: contributions,
             deep_link_pages: Default::default(),
             ui_generation: state.begin_ui_generation("acme.worker"),
+            suggestions_spec: None,
         }
     }
 

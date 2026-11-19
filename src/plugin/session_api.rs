@@ -1290,6 +1290,7 @@ mod tests {
             ui_contributions: std::collections::HashSet::new(),
             deep_link_pages: Default::default(),
             ui_generation: 1,
+            suggestions_spec: None,
         }
     }
 
