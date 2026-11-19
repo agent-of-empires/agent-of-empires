@@ -1,6 +1,6 @@
 # Suggested sessions
 
-Suggested sessions are things worth starting a session for, such as a PR that wants your review or a failing check, published by installed plugins. AoE only lists them. Nothing runs until you start one, and starting always goes through a prefilled new-session dialog unless you turn on [Start without review](#start-without-review).
+Suggested sessions are things worth starting a session for, such as a PR that wants your review or a failing check, published by installed plugins. AoE only lists them. Nothing runs until you start one, and **Start** launches right away with the [preset](#presets) of the suggestion's kind.
 
 Each item has a title, a reason, the plugin that proposed it, and a draft prompt. Plugins decide what to publish; this page covers using them. Writing a provider is covered in the [plugin contract](../plugin-api.md#suggested-sessions).
 
@@ -18,29 +18,32 @@ To skip the sheet, install a provider with `aoe plugin install` ([Plugins](../pl
 
 The homepage shows up to 3 suggestions (2 on a narrow screen) under "Suggested sessions", with **View all (N)** linking to `/suggestions`. Turn the section off in Settings › Suggestions.
 
-The full view lists every suggestion:
+The full view lists every suggestion, one line per row, grouped by repo:
 
-- Filter chips: **All**, one per provider, and **Dismissed** once something is dismissed.
-- A search box matching the title, source reference, reason and source key, ignoring case, and one chip per source key with a count. Keys of the form `org/repo` are grouped: the `org/` chip shows everything under that org, a repo chip only that repository. Selected chips combine, they work whether or not a source is mapped to a Project, and **Clear filters** resets both.
-- One status line per provider: "updated 2 min ago", "waiting for first results", "nothing new", "refreshing…", or "couldn't refresh, <error>". Items from a failing provider stay listed from the last fetch.
-- Items group under the registered Project they resolve to; items with none sit last under "No project".
-- **Refresh** asks every provider to look again.
-- **Link a Project** on a repo group opens the [mapping wizard](#mapping-wizard).
-- The gear opens Settings › Suggestions.
+- Two header rows: the title with a status line (the count and each provider's "Updated 2 min ago", "Waiting for first results", "Nothing new", "Refreshing…" or "Couldn't refresh: <error>"), **Refresh** and the gear for Settings › Suggestions; then **Search**, **All repos ▾** and **All kinds ▾**. Items from a failing provider stay listed from the last fetch.
+- **Search** matches the title, source reference, reason and repo, ignoring case. **All repos ▾** lists the repos with counts. Keys of the form `org/repo` are grouped: the org row selects everything under that org, a repo row only that repository. **All kinds ▾** narrows to kinds such as Review requests. Selected rows combine, and **Clear filters** resets them.
+- Source chips (**All**, one per source) appear only with two or more sources, and **Dismissed** once something is dismissed.
+- Each repo group has a header with the count that collapses its rows. Rows show `#123` rather than `owner/repo#123`, then the reason once, such as "Review requested". A repo with no Project yet says so in its header.
+- On a phone each row takes two lines, and **Start**, **▾** and ✕ keep a 44px tap area. **▾** opens as a bottom sheet.
 
 ### Starting one
 
-**Start** opens the session wizard prefilled with the Project, tool, title and prompt. A strip above the form names the source and says "issue text not included". The source's own text is never added to the prompt for you. Review the **Prompt** row, then Launch.
+**Start** runs the suggestion's kind [preset](#presets) at once: agent, view, worktree, sandbox, Yolo mode and the prompt, in the Project the repo is linked to. There is no New session dialog and no prompt review. A toast names the Session ("Started “<title>”") with **Open**, and the other rows stay usable meanwhile.
 
-When a [template](#templates) produced the prompt, the wizard also shows "From template: <criterion>" with an **Edit template** link.
+If the repo defines [hooks](repo-config.md) you have not approved, Start pauses on **Review this repo's hooks**. **Approve and start** trusts them and starts in one step. Start cannot skip this review, and it asks again when the hooks change.
 
-If the item resolves to no registered Project, the wizard opens without one and you pick it. A [mapping](#projects) makes the choice automatic next time.
+**▾** next to Start shows what Start will use for this suggestion (Project, agent, view, worktree) and offers:
+
+- **Start with changes**: opens the New session dialog prefilled from the preset, for this one only. A strip above the form names the source and says "issue text not included"; the source's own text is never added to the prompt for you. The dialog also shows "From the <kind> preset" with an **Edit preset** link.
+- **Copy prompt**, **Open in <provider> ↗**, and **Edit the <kind> preset** (Settings › Suggestions).
+
+If the repo has no Project yet, **Start in… ▾** replaces Start. Picking a Project links the repo to it, then starts, so later suggestions from that repo start in one click. It is off on read-only dashboards and in CityHall mode, which cannot save the link.
 
 ### After starting
 
-The row stops offering Start. It shows "Session running", "Session idle" (or the session's other status, or "Archived") with its title and age, and an **Open** button. The **⋯** menu has **Start another Session…**, **Open in <provider> ↗** and **Dismiss**. Trashing the session removes the link; archiving keeps it.
+The row stops offering Start. It shows "⠋ Running · started 3 min ago" (or "Idle", the session's other status, or "Archived") and an **Open** button. The **⋯** menu has **Start another Session…**, **Open in <provider> ↗** and **Dismiss**. Trashing the session removes the link; archiving keeps it. Only one Session can claim a suggestion: a second Start on it opens the first.
 
-If a start fails, the row shows "Couldn't start: <reason>" and the button becomes **Open wizard**.
+If a start fails, the row shows "Couldn't start: <reason>" and what to do, such as "Docker isn't running. Start it, then try again." **Try again** repeats the same start, and **Start with changes** opens the New session dialog.
 
 ### Dismiss and restore
 
@@ -56,37 +59,37 @@ If a provider is switched off, its items are hidden and the view says "<provider
 
 | Setting | What it does |
 |---|---|
-| Show suggestions on the homepage | The homepage section. |
-| Show in sidebar | A collapsed **Suggested (N)** group at the bottom of the web session sidebar, above Trash, absent when there are no open suggestions. Expanded, it lists 3 items and **View all**; clicking an item starts it like **Start**, or opens its Session once started. Off by default. |
-| Show source reference | Shows where each suggestion comes from, such as `owner/repo#123`, above the title on web rows and before it on TUI rows. On by default. |
-| Providers | Drag to order (Alt+↑/↓ on a focused row, a move-up button on a phone). Each has an on/off switch and a **Show** checkbox per kind of suggestion. A provider that uses an agent says so, since it spends your agent usage. A provider error can carry a fix button from the plugin. |
-| *Provider* source settings | The provider plugin's own settings for its suggestions, such as the GitHub plugin's ignored organizations and repositories. The same settings, saved to the same place, also appear under Settings › Plugins. |
-| Refresh every | 5 min, 15 min, 30 min, 1 h or 2 h. A hint sent to plugins; they may refresh less often. |
-| Dismissed suggestions | **Show** opens the Dismissed filter. |
-| Prompt templates and Projects | **Edit**, see below. |
-| Start without review | See below. |
+| Show on the homepage | The homepage section. |
+| Show in the sidebar | A collapsed **Suggested (N)** group at the bottom of the web session sidebar, above Trash, absent when there are no open suggestions. Started suggestions are not listed, since the Session is already under its Project. Expanded, it lists 3 items and **View all**; clicking an item starts it like **Start**. Off by default. |
+| Show where each one comes from | Shows where each suggestion comes from, such as `owner/repo#123`, on web rows and before the title on TUI rows. On by default. |
+| Sources | Drag to set which source comes first (Alt+↑/↓ on a focused row, a move-up button on a phone). Each has an on/off switch. A source that uses an agent says so, since it spends your agent usage. A source error can carry a fix button from the plugin. |
+| *Source* · Kinds | One row per kind of suggestion, such as Review requests: what it starts with ("Claude Code · Structured view · worktree"), a switch to suggest it, and **Edit** for its [preset](#presets). |
+| *Source* source settings | The plugin's own settings for its suggestions, such as the GitHub plugin's ignored organizations and repositories. The same settings, saved to the same place, also appear under Settings › Plugins. |
+| Advanced › Check for new suggestions every | 5 min, 15 min, 30 min, 1 h or 2 h. A hint sent to plugins; they may refresh less often. |
+| Advanced › Linked repos | **Edit** opens [Projects](#projects). |
+| Advanced › Dismissed suggestions | **Show** opens the Dismissed filter. |
 
-### Templates
+### Presets
 
-Each kind of suggestion has a prompt template that replaces the plugin's draft prompt. `{name}` expands to the item's variable of that name; unknown names stay as typed. The editor lists the available variables and previews the result against a current item. **Reset to the plugin's default** removes your template. An empty template starts the session with no prompt, so you type the first message.
+Each kind of suggestion has a preset: what **Start** uses for every suggestion of that kind. **Edit** on a kind opens it with the same rows, in the same order, as the New session dialog: **Agent**, **View** (Structured or Terminal), **Worktree**, **Sandbox**, **Yolo mode** and **Prompt**. The Project is not part of a preset: it comes from the repo's link, so one preset works across repos.
+
+Until you edit it, a preset follows your new-session defaults (Yolo mode included) and the plugin's own prompt, so a later change to the defaults flows through. **Save** stores the whole preset for the current Profile. **Reset to <source>'s settings** removes your edits.
+
+The prompt is a template. `{name}` expands to the item's variable of that name; unknown names stay as typed. The editor lists the available variables and previews the result against a current item. An empty prompt starts the session with no prompt, so you type the first message. Kinds whose text comes from other people, such as Mentions and New issues, start the same way, so Start sends their text as the prompt. To read it first, use **▾ › Start with changes**.
 
 ### Projects
 
-**Project mapping** pins a source key (for example a repository) to one or more registered Projects. Unmapped keys show "no mapping: the wizard asks". Rules for how a Project is resolved are in the [API reference](../plugin-api.md#project-mappings).
+**Linked repos** pins a source key (for example a repository) to one or more registered Projects. **Start in…** makes the same link. Unlinked keys show "no Project yet". Rules for how a Project is resolved are in the [API reference](../plugin-api.md#project-mappings).
 
 #### Mapping wizard
 
-**Link a Project** on a repo group in `/suggestions`, or **Map projects automatically…** under Project mapping, lists every source key in the current suggestions that has no mapping and proposes a Project for it:
+**Link a Project** on a repo group in `/suggestions`, or **Link repos automatically…** under Linked repos, lists every source key in the current suggestions that has no mapping and proposes a Project for it:
 
 1. A Project whose git `origin` is the key (`owner/repo`, ignoring case) is proposed and checked.
 2. Otherwise a Project whose name or folder equals the key's last part, ignoring case, `-` and `_`, is proposed unchecked.
 3. Keys with no proposal are listed under "No match"; choosing a Project checks them.
 
-Change any proposal with its select, then **Save** stores every checked row as a mapping to that one Project. Saving is refused on read-only dashboards and in CityHall mode.
-
-### Start without review
-
-When on, **Start** creates the session straight from the template and mapping, skipping the wizard. This is web dashboard only, and only for an item whose template is non-empty and that resolves to a Project; anything else opens the wizard, as does a create the server refuses, with the reason shown. **Start another Session…** always opens the wizard.
+Change any proposal with its select, then **Link N repos** stores every checked row as a mapping to that one Project. Saving is refused on read-only dashboards and in CityHall mode.
 
 ## TUI
 
@@ -118,12 +121,12 @@ From the command line, `aoe add --prompt <text>` or `--prompt-file <path>` sets 
 
 A read-only dashboard lists suggestions but cannot change anything: "This dashboard is read-only. Start, Dismiss and Refresh are off." The same applies to the TUI view. Offline, suggestions stay visible from the last fetch ("Disconnected. Suggestions show from the last fetch; reconnect to start one.").
 
-In [CityHall mode](web-dashboard.md#cityhall-client-mode) the suggestion routes that change anything (refresh, dismiss, source and preference changes, template and mapping edits) are refused server-side, and plugin lifecycle is hidden, so setup and the Marketplace are unavailable. Reading suggestions stays allowed. The [API reference](../plugin-api.md#suggestions-api) lists the exact routes.
+In [CityHall mode](web-dashboard.md#cityhall-client-mode) the suggestion routes that change anything (start, refresh, dismiss, source and preference changes, preset and mapping edits) are refused server-side, and plugin lifecycle is hidden, so setup and the Marketplace are unavailable. Reading suggestions stays allowed. The [API reference](../plugin-api.md#suggestions-api) lists the exact routes.
 
 ## Troubleshooting
 
 - **Nothing appears, "waiting for first results".** The plugin has not published yet. Press Refresh; the first fetch usually takes under a minute.
 - **"couldn't refresh, <error>".** The plugin reported a failure and the last items are shown. If a fix button is offered, use it, then Refresh.
 - **Setup checks failing.** In the setup sheet, follow each failed check's fix text, then **Check again**.
-- **A kind of suggestion is missing.** Its **Show** checkbox, or the whole provider, may be off.
+- **A kind of suggestion is missing.** Its switch under Settings › Suggestions › Kinds, or the whole source, may be off.
 - **Start is greyed out.** Read-only or offline, see above.
