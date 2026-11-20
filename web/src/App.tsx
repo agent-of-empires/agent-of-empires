@@ -2418,7 +2418,7 @@ function AppContent({
             </button>
           </div>
           <SuggestionsView
-            readOnly={caps.readOnly}
+            readOnly={caps.readOnly || !caps.canManageSuggestions}
             onOpenMarketplace={
               caps.canManageProjects ? () => requestNavigate("/settings/plugins?marketplace=suggestions") : undefined
             }
@@ -2428,7 +2428,7 @@ function AppContent({
               setShowSessionWizard(true);
             }}
             onOpenSession={(id) => requestNavigate(`/session/${encodeURIComponent(id)}`)}
-            onOpenSettings={() => requestNavigate("/settings/suggestions")}
+            onOpenSettings={caps.canManageSuggestions ? () => requestNavigate("/settings/suggestions") : undefined}
             sessions={sessions}
             canLink={!caps.nameOnlyWizard}
             onEditPreset={(providerId, criterion) =>
@@ -2534,10 +2534,14 @@ function AppContent({
             )
           }
           canLinkSuggestions={!caps.nameOnlyWizard}
-          onEditSuggestionPreset={(providerId, criterion) =>
-            requestNavigate(
-              `/settings/suggestions?${new URLSearchParams({ preset_provider: providerId, preset_criterion: criterion, from: "suggestions" })}`,
-            )
+          canManageSuggestions={caps.canManageSuggestions}
+          onEditSuggestionPreset={
+            caps.canManageSuggestions
+              ? (providerId, criterion) =>
+                  requestNavigate(
+                    `/settings/suggestions?${new URLSearchParams({ preset_provider: providerId, preset_criterion: criterion, from: "suggestions" })}`,
+                  )
+              : undefined
           }
           onPrepareSuggestion={(prefill) => {
             setWizardPrefill(prefill);
@@ -2933,6 +2937,7 @@ function AppContent({
                 axis={sidebarAxis}
                 onAxisChange={setSidebarAxis}
                 suggestions={{
+                  readOnly: caps.readOnly || !caps.canManageSuggestions,
                   onPrepare: (prefill) => {
                     setWizardPrefill(prefill);
                     setShowSessionWizard(true);
@@ -2975,16 +2980,20 @@ function AppContent({
               }}
               prefill={wizardPrefill}
               nameOnly={caps.nameOnlyWizard}
-              onEditPreset={({ providerId, criterion }) => {
-                setShowSessionWizard(false);
-                setWizardPrefill(undefined);
-                const q = new URLSearchParams({
-                  preset_provider: providerId,
-                  preset_criterion: criterion,
-                  from: "suggestions",
-                });
-                navigate(`/settings/suggestions?${q}`);
-              }}
+              onEditPreset={
+                caps.canManageSuggestions
+                  ? ({ providerId, criterion }) => {
+                      setShowSessionWizard(false);
+                      setWizardPrefill(undefined);
+                      const q = new URLSearchParams({
+                        preset_provider: providerId,
+                        preset_criterion: criterion,
+                        from: "suggestions",
+                      });
+                      navigate(`/settings/suggestions?${q}`);
+                    }
+                  : undefined
+              }
             />
           )}
 

@@ -28,6 +28,8 @@ interface Props {
   onPrepareSuggestion?: (prefill: WizardPrefill) => void;
   onEditSuggestionPreset?: (providerId: string, criterion: string) => void;
   canLinkSuggestions?: boolean;
+  /** False in CityHall: suggestions are read-only there. Defaults to true. */
+  canManageSuggestions?: boolean;
   onViewAllSuggestions?: () => void;
   /** The onboarding tour is running; the first-run hint stays out of it. */
   tourActive?: boolean;
@@ -47,6 +49,7 @@ export function Dashboard({
   onPrepareSuggestion,
   onEditSuggestionPreset,
   canLinkSuggestions,
+  canManageSuggestions = true,
   onViewAllSuggestions,
   onOpenSuggestionsMarketplace,
   tourActive = false,
@@ -166,7 +169,7 @@ export function Dashboard({
       {onPrepareSuggestion && onViewAllSuggestions && (
         <DashboardSuggestions
           key={suggestionsEpoch}
-          readOnly={readOnly}
+          readOnly={readOnly || !canManageSuggestions}
           onPrepare={onPrepareSuggestion}
           onEditPreset={onEditSuggestionPreset}
           canLink={canLinkSuggestions}
