@@ -172,6 +172,7 @@ export function Dashboard({
           canLink={canLinkSuggestions}
           onViewAll={onViewAllSuggestions}
           onOpenSession={onSelectSession}
+          sessions={sessions}
         />
       )}
 

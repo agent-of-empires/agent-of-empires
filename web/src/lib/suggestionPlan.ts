@@ -1,4 +1,4 @@
-import type { SuggestionItem, SuggestionPreset } from "./types";
+import type { SessionResponse, StartedSession, SuggestionItem, SuggestionPreset } from "./types";
 
 /** "agent-of-empires · Claude Code · Structured view · worktree", what Start will run for the item. */
 export function startSummary(
@@ -21,3 +21,9 @@ export function startSummary(
 
 /** "owner/repo#12" as "#12". */
 export const shortRef = (ref: string) => (ref.includes("#") ? ref.slice(ref.lastIndexOf("#")) : ref);
+
+/** The snapshot's Session with its status from the live sessions poll, which the snapshot lags. */
+export function liveSession(started: StartedSession | undefined, sessions?: SessionResponse[]) {
+  const live = started && sessions?.find((s) => s.id === started.id);
+  return live ? { ...started, status: live.status } : started;
+}
