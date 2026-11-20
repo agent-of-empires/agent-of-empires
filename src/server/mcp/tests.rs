@@ -1570,6 +1570,29 @@ async fn wait_for_after_seq_waits_for_that_turn_and_returns_its_messages() {
     assert_eq!(done["has_more"], false);
 }
 
+/// A failed turn-end query is not a confirmed turn end: the wait times out instead.
+#[tokio::test]
+#[serial_test::serial]
+async fn wait_for_after_seq_does_not_settle_when_the_event_query_fails() {
+    let _guard = crate::session::test_support::isolate_app_dir();
+    let id = "mcp-wait-seq-query-fails";
+    let (app, state) = seeded_app(vec![structured_session(id)], false).await;
+    seed_events(&state, id, &[user_prompt("what is two plus two")]);
+    state
+        .acp_event_store
+        .hold_writer()
+        .execute_batch("DROP TABLE acp_events")
+        .expect("break the store");
+
+    let result = call(
+        &app,
+        "wait_for",
+        json!({"session_id": id, "after_seq": 1, "timeout_s": 0}),
+    )
+    .await;
+    assert_eq!(result["timed_out"], true, "{result}");
+}
+
 /// Approvals seeded through the event log are listed, by `wait_for` too, and each decision
 /// kind reaches the agent; a choice list takes only a named option, and an unknown nonce errors.
 #[tokio::test]

@@ -776,7 +776,7 @@ fn collapsed_sidebar_gives_preview_full_width() {
         terminal
             .draw(|f| {
                 let area = f.area();
-                env.view.render(f, area, &theme, None, None, None);
+                env.view.render(f, area, &theme, None);
             })
             .unwrap();
         env.view.preview_pane_area.width
@@ -822,7 +822,7 @@ fn sidebar_collapse_button_and_strip_toggle() {
         terminal
             .draw(|f| {
                 let area = f.area();
-                env.view.render(f, area, &theme, None, None, None);
+                env.view.render(f, area, &theme, None);
             })
             .unwrap();
     };

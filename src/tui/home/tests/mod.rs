@@ -431,7 +431,7 @@ fn render_geometry(view: &mut HomeView) {
     terminal
         .draw(|f| {
             let area = f.area();
-            view.render(f, area, &theme, None, None, None);
+            view.render(f, area, &theme, None);
         })
         .unwrap();
     view.acknowledge_confirmation(view.painted_confirmation);
@@ -930,7 +930,7 @@ fn render_home_to_string(view: &mut HomeView, width: u16, height: u16) -> String
     terminal
         .draw(|f| {
             let area = f.area();
-            view.render(f, area, &theme, None, None, None);
+            view.render(f, area, &theme, None);
         })
         .unwrap();
     view.acknowledge_confirmation(view.painted_confirmation);

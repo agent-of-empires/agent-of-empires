@@ -476,10 +476,11 @@ fn tab_enters_live_send_only_for_a_selected_session() {
 
 #[test]
 #[serial]
-fn tab_does_not_start_live_send_for_acp_session() {
-    // Acp sessions are not tmux-backed, so Tab must refuse with a visible "no tmux pane"
-    // toast (a silent no-op reads as a broken key) and never enqueue an EnterLiveSend that
-    // would fail downstream.
+fn tab_opens_the_structured_view_instead_of_live_send() {
+    // An ACP session has no pane to relay keystrokes into, so its live form is the
+    // native view: Tab attaches it and never enqueues an EnterLiveSend that would
+    // fail downstream. Enter reaches the same view through its own key path, which
+    // the default-attach-mode tests cover.
     let mut env = create_test_env_with_sessions(1);
     env.view.cursor = 0;
     env.view.update_selected();
@@ -500,11 +501,8 @@ fn tab_does_not_start_live_send_for_acp_session() {
         .view
         .handle_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE), None);
     assert!(
-        matches!(
-            &action,
-            Some(Action::SetTransientStatus(msg)) if msg.contains("no tmux pane")
-        ),
-        "Tab on a structured row must surface the no-tmux-pane toast, got {action:?}"
+        matches!(&action, Some(Action::OpenStructuredView(open)) if *open == id),
+        "Tab on a structured row must attach its view, got {action:?}"
     );
     assert!(env.view.live_send.is_none());
 }
@@ -1421,5 +1419,32 @@ fn tool_admission_rejects_reserved_rows_and_uses_fresh_configuration() {
     assert!(
         !stale_marker.exists(),
         "the cached command ran instead of durable configuration"
+    );
+}
+
+/// Tab on a structured row takes the same activation as Enter, so the System
+/// Health takeover cannot stay painted over the view Tab just focused: the
+/// next key must reach the composer, not a panel still on screen.
+#[test]
+#[serial]
+fn tab_on_a_structured_row_dismisses_the_system_health_panel() {
+    let mut inst = Instance::new("acp", "/tmp/acp");
+    inst.view = crate::session::View::Structured;
+    let mut env = seeded_env(test_home(), &[inst.clone()], true);
+    env.view.select_session_by_id(&inst.id);
+    env.view.view_mode = ViewMode::Structured;
+    env.view.system_health_open = true;
+
+    let action = env
+        .view
+        .handle_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE), None);
+
+    assert!(
+        matches!(&action, Some(Action::OpenStructuredView(id)) if id == &inst.id),
+        "Tab on a structured row opens its view, got {action:?}"
+    );
+    assert!(
+        !env.view.system_health_open,
+        "the health takeover must not cover the composer the press focuses"
     );
 }

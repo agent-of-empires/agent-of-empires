@@ -428,7 +428,7 @@ mod tests {
                 if cfg!(feature = "web") {
                     "Web dashboard"
                 } else {
-                    "Connections: API server"
+                    "API server"
                 },
                 "R",
                 "Ctrl+R",

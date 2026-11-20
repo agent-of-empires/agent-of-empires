@@ -167,7 +167,15 @@ fn run_dev(args: DevArgs) {
     let host = args.host.clone();
     let spawn_serve = || -> Child {
         Command::new(&bin)
-            .args(["serve", "--no-auth", "--port", &serve_port.to_string()])
+            .args([
+                "serve",
+                "--no-auth",
+                "--behind-proxy",
+                "--allowed-host",
+                "127.0.0.1",
+                "--port",
+                &serve_port.to_string(),
+            ])
             .stdin(Stdio::null())
             .process_group(0)
             .spawn()
