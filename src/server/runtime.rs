@@ -285,7 +285,9 @@ impl NativeRuntime {
             .mutation_epoch
             .load(std::sync::atomic::Ordering::SeqCst);
         let health = state.canonical_health.read().await.clone();
+        let project_started = std::time::Instant::now();
         let sessions = super::api::sessions::project_sessions(state).await;
+        let project_ms = project_started.elapsed().as_secs_f64() * 1000.0;
         let metadata = state.canonical_metadata.read().await;
         let workspace_ordering =
             super::api::sessions::compute_merged_ordering(&sessions, &metadata.workspace_ordering);
@@ -322,11 +324,13 @@ impl NativeRuntime {
         let previous = self.snapshots.borrow().clone();
         if let Some(previous) = &previous {
             if previous.mutation_epoch == mutation_epoch && previous.value.contents == contents {
+                tracing::debug!(target: "server.runtime", project_ms, changed = false, "projected");
                 self.hooks
                     .reconcile(&contents.sessions, &metadata.status_hooks);
                 return Ok(previous.clone());
             }
         }
+        tracing::debug!(target: "server.runtime", project_ms, changed = true, "projected");
         let revision = previous
             .as_ref()
             .map_or(Some(1), |previous| {
