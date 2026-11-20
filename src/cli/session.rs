@@ -1434,7 +1434,7 @@ async fn restart_session(profile: &str, args: SessionIdArgs) -> Result<()> {
         let tmux_session = crate::tmux::Session::new(&session_id, &title)?;
         tmux_session.wait_until_ready(
             std::time::Duration::from_secs(5),
-            crate::agents::ready_marker(&tool),
+            crate::agents::ready_markers(&tool),
         );
 
         match send_restart_wake(&working, &tmux_session, &wake_msg) {
