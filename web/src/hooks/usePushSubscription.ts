@@ -1,5 +1,5 @@
 import { useEffect, useSyncExternalStore } from "react";
-import { isIOS, isStandalone } from "../lib/platform";
+import { isIOS, isSecureOrigin, isStandalone } from "../lib/platform";
 import {
   classifyPushHealth,
   hasFreshGoneFailure,
@@ -27,14 +27,6 @@ export type PushState =
 
 const supportsPush = (): boolean =>
   typeof window !== "undefined" && "serviceWorker" in navigator && "PushManager" in window && "Notification" in window;
-
-// Push needs a secure context; plain http is allowed only on loopback.
-const isSecureOrigin = (): boolean => {
-  if (typeof window === "undefined") return false;
-  if (window.isSecureContext) return true;
-  const host = window.location.hostname;
-  return host === "localhost" || host === "127.0.0.1" || host === "[::1]";
-};
 
 const iosTab = () => isIOS() && !isStandalone();
 

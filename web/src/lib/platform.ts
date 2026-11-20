@@ -13,3 +13,23 @@ export const isStandalone = (): boolean => {
 /** A precise hovering pointer, taken as a sign of a physical keyboard. */
 export const hasFinePointer = (): boolean =>
   typeof window !== "undefined" && !!window.matchMedia?.("(hover: hover) and (pointer: fine)").matches;
+
+/** Push and install need a secure context; plain http counts only on loopback. */
+export const isSecureOrigin = (): boolean => {
+  if (typeof window === "undefined") return false;
+  if (window.isSecureContext) return true;
+  const host = window.location.hostname;
+  return host === "localhost" || host === "127.0.0.1" || host === "[::1]";
+};
+
+export type InstallHint = "ios" | "android" | "other";
+
+/**
+ * Which install steps a phone or tablet browser tab needs; null for an installed app, a desktop,
+ * or an insecure origin. An iPad with a trackpad has a fine pointer, so it counts as a desktop.
+ */
+export function installHint(): InstallHint | null {
+  if (isStandalone() || hasFinePointer() || !isSecureOrigin()) return null;
+  if (isIOS()) return "ios";
+  return /Android/.test(navigator.userAgent) ? "android" : "other";
+}
