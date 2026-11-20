@@ -18,19 +18,6 @@ priority = 980
 contains_any = ["do you want to", "would you like to proceed"]
 line_regex = ['^\s*\x{276F}\s*[1-9]\.']
 
-# A numbered allow row inside a menu carrying Claude's `❯` selection cursor, so
-# neither a composer draft nor a numbered list in output is a choice.
-[[rules]]
-id = "approval_choice"
-state = "waiting"
-priority = 980
-region = "whole_recent"
-visible = true
-line_regex = [
-  '(?i)^\s*(?:[\x{25CF}\x{276F}]\s*)?[1-9]\.\s+(?:yes,\s+)?allow (?:once|always)\s*$',
-  '^\s*\x{276F}\s*[1-9]\.',
-]
-
 # The `AskUserQuestion` selection UI.
 [[rules]]
 id = "ask_user_question"

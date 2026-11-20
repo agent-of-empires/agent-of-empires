@@ -2811,17 +2811,14 @@ enter to select · esc to cancel";
             Status::Idle
         );
 
-        // A draft reading like a choice label is not Claude's numbered approval menu.
-        let draft = format!("✻ Cooked for 49s\n{box_}\n❯ Allow once\n{box_}");
-        assert!(!claude_rule_matches("approval_choice", &draft));
-        assert_eq!(
-            detect_via_manifest("claude", &draft, "", stale),
-            Status::Idle
-        );
-        assert!(claude_rule_matches(
-            "approval_choice",
-            "\u{276f} 1. Allow once\n  2. Allow always"
-        ));
+        for line in ["❯ Allow once", "❯ 1. Allow once"] {
+            let draft = format!("✻ Cooked for 49s\n{box_}\n{line}\n{box_}");
+            assert_eq!(
+                detect_via_manifest("claude", &draft, "", stale),
+                Status::Idle,
+                "{line}"
+            );
+        }
 
         let interrupted = "\
 ⎿  Interrupted · What should Claude do instead?\n\
