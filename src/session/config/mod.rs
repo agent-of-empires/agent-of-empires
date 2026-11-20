@@ -1213,9 +1213,10 @@ pub struct SessionConfig {
     /// title instead of its info header. Narrower than this is also where a
     /// collapsed sidebar stops being available to `one_pane`. Values below 50
     /// are raised to 50, the narrowest side-by-side split that keeps the
-    /// preview's 40-column floor beside a minimal 10-column list. Values this
-    /// wide or wider only ever stack, which the arrangement handles like any
-    /// other narrow height.
+    /// preview's 40-column floor beside a minimal 10-column list. A value
+    /// greater than the terminal width puts every width below it, so the narrow
+    /// layout always applies, which the arrangement handles like any other
+    /// narrow height.
     #[serde(default = "default_narrow_breakpoint")]
     #[setting(
         label = "Narrow layout below this width",
