@@ -395,6 +395,7 @@ mod tests {
                 CommandSelectsConversation => {
                     ("command_selects_conversation", StatusCode::CONFLICT)
                 }
+                CommandSelectorConflict => ("command_selector_conflict", StatusCode::CONFLICT),
             };
             assert_eq!(reason.as_str(), wire);
             let code = ApiErrorCode::TerminalSwitchRefused(reason);
