@@ -336,29 +336,23 @@ fn a_changed_trust_asks_the_daemon_for_a_fresh_review_without_approval() {
 
 #[test]
 #[serial]
-fn a_failed_start_in_the_full_view_stays_on_its_row() {
-    let answer = StartAnswer::Failed("Docker isn't running. Start it, then try again.".into());
-    let (mut env, requests) = expanded_env_answering(2, answer);
+fn a_failed_start_in_the_full_view_shows_its_whole_reason() {
+    let reason = format!("Docker isn't running{}. Start it.", ", really".repeat(20));
+    let (mut env, requests) = expanded_env_answering(2, StartAnswer::Failed(reason));
     with_authenticated_local_project_registry(&mut env.view, |view| {
         view.open_suggestions_view();
         view.handle_key(key(KeyCode::Enter), None);
     });
     assert_eq!(next_request(&requests), "start gh/i0");
-    poll_until(&mut env, |env| {
-        env.view
-            .suggestions_view
-            .as_ref()
-            .is_some_and(|view| view.failed.is_some())
-    });
-    let (_, message) = env
-        .view
-        .suggestions_view
-        .as_ref()
-        .unwrap()
-        .failed
-        .clone()
-        .unwrap();
-    assert!(message.contains("Docker isn't running"));
+    poll_until(&mut env, |env| env.view.suggestions_feed.failed.is_some());
+    let text: String = render_home_to_string(&mut env.view, 100, 40)
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ");
+    assert!(
+        text.contains("really. Start it."),
+        "the end of the reason: {text}"
+    );
 }
 
 #[test]
@@ -506,10 +500,17 @@ fn a_failed_start_says_why_and_enter_tries_again() {
             text.contains("Docker isn't running") && text.contains("Enter tries again")
         })
     });
+    // The flash fades; the preview keeps the reason until the next try.
+    let preview = preview_text(&mut env, 100);
+    assert!(
+        preview.contains("Couldn't start: Docker isn't running"),
+        "{preview}"
+    );
     with_authenticated_local_project_registry(&mut env.view, |view| {
         view.handle_key(key(KeyCode::Enter), None);
     });
     assert_eq!(next_request(&requests), "start gh/i0");
+    assert!(!preview_text(&mut env, 100).contains("Couldn't start"));
 }
 
 #[test]

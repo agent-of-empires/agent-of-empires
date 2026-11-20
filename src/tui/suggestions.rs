@@ -636,8 +636,6 @@ pub(super) struct SuggestionsView {
     preparing: Option<ItemKey>,
     /// The in-flight `prepare` is for "Start another", which does not claim the link.
     prepare_another: bool,
-    /// The last start that failed, shown on its row; Enter tries again.
-    pub(super) failed: Option<(ItemKey, String)>,
     /// Strict mode keys: dismiss is `Z`, not `z`.
     pub(super) strict: bool,
 }
@@ -663,15 +661,19 @@ impl SuggestionsView {
             show_dismissed: false,
             preparing: None,
             prepare_another: false,
-            failed: None,
             strict: false,
         }
     }
 
     /// Shows a start the daemon answered with a failure on its row; Enter tries again.
-    pub(super) fn set_failed(&mut self, key: ItemKey, message: String) {
+    pub(super) fn set_failed(
+        &mut self,
+        store: &mut SuggestionsFeed,
+        key: ItemKey,
+        message: String,
+    ) {
         self.notice = None;
-        self.failed = Some((key, message));
+        store.failed = Some((key, message));
     }
 
     pub(super) fn set_notice(&mut self, message: impl Into<String>) {
@@ -815,7 +817,6 @@ impl SuggestionsView {
                 }
                 if !review {
                     self.begin();
-                    self.failed = None;
                     self.notice = Some("Starting…".into());
                     store.start(key);
                     return SuggestionsAction::Continue;
@@ -838,7 +839,7 @@ impl SuggestionsView {
     /// Asks for `key`'s prefill; the dialog opens when it arrives.
     pub(super) fn prepare(&mut self, key: ItemKey, another: bool, store: &mut SuggestionsFeed) {
         self.begin();
-        self.failed = None;
+        store.failed = None;
         self.preparing = Some(key.clone());
         self.prepare_another = another;
         store.prepare_in_view(key, self.epoch);
@@ -850,7 +851,7 @@ impl SuggestionsView {
     }
 
     /// Takes what a store poll holds for this view. True when state changed.
-    pub(super) fn apply(&mut self, store: &SuggestionsFeed, polled: &mut FeedPoll) -> bool {
+    pub(super) fn apply(&mut self, store: &mut SuggestionsFeed, polled: &mut FeedPoll) -> bool {
         let mut changed = false;
         if polled.changed {
             self.sync(store);
@@ -863,7 +864,7 @@ impl SuggestionsView {
         if let Some(error) = polled.error.take() {
             self.notice = None;
             match self.preparing.take() {
-                Some(key) if polled.prepare_failed => self.failed = Some((key, error)),
+                Some(key) if polled.prepare_failed => store.failed = Some((key, error)),
                 Some(key) => {
                     self.preparing = Some(key);
                     self.error = Some(error);
@@ -1060,7 +1061,7 @@ impl SuggestionsView {
                 ),
                 Span::styled(plain(&source_ref), Style::default().fg(theme.dimmed)),
             ]));
-            let failure = self.failed.as_ref().filter(|(key, _)| *key == item_key);
+            let failure = store.failed.as_ref().filter(|(key, _)| *key == item_key);
             if let Some((_, message)) = failure {
                 lines.push(Line::from(Span::styled(
                     plain(&format!(
@@ -1110,6 +1111,16 @@ impl SuggestionsView {
                 plain(&item.title),
                 Style::default().add_modifier(Modifier::BOLD),
             )));
+            if let Some((_, message)) = store
+                .failed
+                .as_ref()
+                .filter(|(key, _)| (&key.0, &key.1) == (&item.provider_id, &item.id))
+            {
+                detail.push(Line::from(Span::styled(
+                    plain(&format!("Couldn't start: {message} · Enter tries again")),
+                    Style::default().fg(theme.error),
+                )));
+            }
             let mut source = vec![store.provider_name(&item.provider_id)];
             source.extend(store.source_ref(item));
             source.push(&item.source_url);
@@ -1187,6 +1198,8 @@ pub(super) struct Entry {
     /// The id of the live Session the item was started as.
     pub started_session: Option<String>,
     pub dismissed: bool,
+    /// Why the last start failed, until the next try.
+    pub failed: Option<String>,
 }
 
 pub(super) struct FeedPoll {
@@ -1216,6 +1229,9 @@ pub(super) struct SuggestionsFeed {
     start_key: Option<ItemKey>,
     /// The hooks review on screen: its item, the fingerprint it shows and the origin it was issued for.
     held_trust: Option<(ItemKey, serde_json::Value, Option<Origin>)>,
+    /// The last start or prepare that failed, shown on its row on Home and in
+    /// the full view until the next try.
+    pub(super) failed: Option<(ItemKey, String)>,
     /// The next hooks review follows a `trust_changed` answer.
     hooks_changed: bool,
     prepare_target: PrepareTarget,
@@ -1260,6 +1276,7 @@ impl SuggestionsFeed {
             prepare_key: None,
             start_key: None,
             held_trust: None,
+            failed: None,
             hooks_changed: false,
             prepare_target: PrepareTarget::Home,
             view_epoch: 0,
@@ -1552,6 +1569,11 @@ impl SuggestionsFeed {
             source_url: crate::util::is_http_url(&item.source_url).then(|| item.source_url.clone()),
             started_session: item.started_session.as_ref().map(|s| s.id.clone()),
             dismissed: item.dismissed,
+            failed: self
+                .failed
+                .as_ref()
+                .filter(|(k, _)| k == key)
+                .map(|(_, m)| plain(m)),
         })
     }
 
@@ -1690,6 +1712,7 @@ impl SuggestionsFeed {
 
     /// Starts the item with its preset, behind the request in flight.
     pub(super) fn start(&mut self, key: ItemKey) {
+        self.failed = None;
         let origin = self.origin();
         self.submit_start(key, None, origin);
     }
@@ -2031,7 +2054,7 @@ mod tests {
     fn poll_until_settled(rig: &mut Rig) -> bool {
         for _ in 0..200 {
             let mut polled = rig.store.poll();
-            if rig.view.apply(&rig.store, &mut polled) {
+            if rig.view.apply(&mut rig.store, &mut polled) {
                 return true;
             }
             std::thread::sleep(std::time::Duration::from_millis(10));
@@ -2289,7 +2312,7 @@ mod tests {
         rig.store.dismissing.push(key.clone());
         dismissed_snapshot(&mut rig, true);
         rig.store.settle_dismissals();
-        assert!(rig.view.apply(&rig.store, &mut changed()));
+        assert!(rig.view.apply(&mut rig.store, &mut changed()));
         assert_eq!(ids(&rig), ["a"], "kept while the undo window is open");
         assert!(render_text(&rig).contains("[dismissed, z to undo]"));
 
@@ -2298,7 +2321,7 @@ mod tests {
             .expect("monotonic clock far enough from boot");
         rig.store.recent[0].1 = stale;
         assert!(rig.store.expire_recent());
-        assert!(rig.view.apply(&rig.store, &mut changed()));
+        assert!(rig.view.apply(&mut rig.store, &mut changed()));
         assert!(
             ids(&rig).is_empty(),
             "then only the dismissed list shows it"
@@ -2501,7 +2524,7 @@ mod tests {
             "the failure is on the row, not the footer"
         );
         assert!(render_text(&rig).contains("Couldn't start: branch already exists"));
-        assert!(rig.view.failed.is_some());
+        assert!(rig.store.failed.is_some());
     }
 
     #[test]
@@ -2517,7 +2540,7 @@ mod tests {
         let mut error_seen = None;
         for _ in 0..200 {
             let mut polled = rig.store.poll();
-            rig.view.apply(&rig.store, &mut polled);
+            rig.view.apply(&mut rig.store, &mut polled);
             error_seen = error_seen.or_else(|| rig.view.error.clone());
             if rig.view.prepared.is_some() {
                 break;
@@ -2526,7 +2549,7 @@ mod tests {
         }
         assert_eq!(error_seen.as_deref(), Some("reload boom"));
         assert!(
-            rig.view.failed.is_none(),
+            rig.store.failed.is_none(),
             "the reload error is not the row's"
         );
         assert!(rig.view.prepared.is_some(), "the prepare still completes");
@@ -2753,7 +2776,7 @@ mod tests {
         assert!(!rig.store.busy);
         assert!(rig.view.error.is_some());
         let mut polled = rig.store.poll();
-        assert!(!rig.view.apply(&rig.store, &mut polled));
+        assert!(!rig.view.apply(&mut rig.store, &mut polled));
     }
 
     #[test]
@@ -2844,7 +2867,7 @@ mod tests {
             polled = rig.store.poll();
         }
         assert!(polled.start.is_some());
-        rig.view.apply(&rig.store, &mut polled);
+        rig.view.apply(&mut rig.store, &mut polled);
         assert!(rig.view.prepared.is_none());
     }
 

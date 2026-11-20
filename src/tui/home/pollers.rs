@@ -75,7 +75,7 @@ impl HomeView {
         }
         let mut changed = review_closed
             || match &mut self.suggestions_view {
-                Some(view) => view.apply(&self.suggestions_feed, &mut polled),
+                Some(view) => view.apply(&mut self.suggestions_feed, &mut polled),
                 None => false,
             };
         if let Some(start) = self
@@ -183,8 +183,11 @@ impl HomeView {
                 None => self.suggestions_feed.prepare(key),
             },
             StartAnswer::Failed(reason) => match &mut self.suggestions_view {
-                Some(view) => view.set_failed(key, reason),
-                None => self.flash_status(format!("{reason} Enter tries again.")),
+                Some(view) => view.set_failed(&mut self.suggestions_feed, key, reason),
+                None => {
+                    self.flash_status(format!("{reason} Enter tries again."));
+                    self.suggestions_feed.failed = Some((key, reason));
+                }
             },
         }
     }
