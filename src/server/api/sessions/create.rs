@@ -875,13 +875,14 @@ pub(super) async fn claim_suggestion_link(
         return Ok(None);
     };
     let instances = Arc::clone(&state.instances);
+    let cityhall = state.cityhall_mode;
     let starting = crate::plugin::suggestions::mark_starting(session_id);
     let (item, claim_id) = (origin.clone(), session_id.to_owned());
     let claimed = tokio::task::spawn_blocking(move || {
         // Liveness is read under the instances lock the claim holds, so a Session
         // a concurrent start just recorded cannot be judged gone.
         let rows = instances.blocking_read();
-        host.with_suggestions_db(|conn, _| {
+        let claim = host.with_suggestions_db(|conn, _| {
             crate::plugin::suggestions::claim_link(
                 conn,
                 &profile,
@@ -890,29 +891,39 @@ pub(super) async fn claim_suggestion_link(
                 &claim_id,
                 &|id| rows.iter().any(|i| i.id == id && !i.is_trashed()),
             )
-        })
+        })?;
+        // The holder's id is named only to a caller that can see that Session, by
+        // the rule the Suggestions feed and the session list use. One still being
+        // created has no row to judge, so CityHall is not told its id.
+        let visible = match &claim {
+            Claim::Won => true,
+            Claim::Starting(_) => !cityhall,
+            Claim::Session(id) => rows
+                .iter()
+                .any(|i| i.id == *id && (!cityhall || i.is_structured())),
+        };
+        Ok::<_, rusqlite::Error>((claim, visible))
     })
     .await;
+    let conflict = |message: &str, holder: String, visible: bool| {
+        let mut body = serde_json::json!({ "error": "already_started", "message": message });
+        if visible {
+            body["session_id"] = holder.into();
+        }
+        (StatusCode::CONFLICT, Json(body)).into_response()
+    };
     match claimed {
-        Ok(Ok(Claim::Won)) => Ok(Some((origin.clone(), session_id.to_owned(), starting))),
-        Ok(Ok(Claim::Session(session_id))) => Err((
-            StatusCode::CONFLICT,
-            Json(serde_json::json!({
-                "error": "already_started",
-                "message": "This suggestion already has a Session",
-                "session_id": session_id,
-            })),
-        )
-            .into_response()),
-        Ok(Ok(Claim::Starting(session_id))) => Err((
-            StatusCode::CONFLICT,
-            Json(serde_json::json!({
-                "error": "already_started",
-                "message": "This suggestion is already starting",
-                "session_id": session_id,
-            })),
-        )
-            .into_response()),
+        Ok(Ok((Claim::Won, _))) => Ok(Some((origin.clone(), session_id.to_owned(), starting))),
+        Ok(Ok((Claim::Session(holder), visible))) => Err(conflict(
+            "This suggestion already has a Session",
+            holder,
+            visible,
+        )),
+        Ok(Ok((Claim::Starting(holder), visible))) => Err(conflict(
+            "This suggestion is already starting",
+            holder,
+            visible,
+        )),
         Ok(Err(error)) => Err(api_error(
             StatusCode::INTERNAL_SERVER_ERROR,
             "internal",

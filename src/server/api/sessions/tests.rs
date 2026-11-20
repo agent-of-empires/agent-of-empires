@@ -10698,6 +10698,19 @@ async fn suggestion_state() -> (
     ),
     std::sync::Arc<AppState>,
 ) {
+    suggestion_state_in(false).await
+}
+
+async fn suggestion_state_in(
+    cityhall: bool,
+) -> (
+    (
+        crate::session::test_support::AppDirGuard,
+        tempfile::TempDir,
+        crate::plugin::ReloadRegistryOnDrop,
+    ),
+    std::sync::Arc<AppState>,
+) {
     let home = crate::session::test_support::isolate_app_dir();
     let adapter = crate::session::test_support::stub_claude_adapter_on_agent_path();
     crate::session::purge_owners::initialize(&crate::session::get_app_dir().unwrap()).unwrap();
@@ -10730,6 +10743,7 @@ async fn suggestion_state() -> (
         |state| {
             state.profile = std::sync::RwLock::new(crate::session::config::effective_profile(""));
             state.plugin_host = Some(host);
+            state.cityhall_mode = cityhall;
         },
         |supervisor| supervisor.with_launcher(launcher),
     );
@@ -10815,6 +10829,62 @@ async fn a_dropped_suggestion_create_frees_its_link() {
     wait_for("the failed create to free its link", || linked() == 0).await;
     let (status, retry) = post_create(&state, linked_body("retry", None)).await;
     assert_eq!(status, axum::http::StatusCode::CREATED, "{retry}");
+}
+
+/// A 409 names the Session holding the link only to a caller that can see it:
+/// CityHall does not see terminal Sessions, nor one still being created.
+#[tokio::test]
+#[serial_test::serial]
+async fn a_conflict_names_the_holder_only_where_the_caller_can_see_it() {
+    for cityhall in [false, true] {
+        let (_guards, state) = suggestion_state_in(cityhall).await;
+        let mut holder = crate::session::Instance::new("terminal holder", "/tmp/x");
+        holder.source_profile = "default".into();
+        let holder_id = holder.id.clone();
+        state.instances.write().await.push(holder);
+        let host = state.plugin_host.clone().unwrap();
+        let link = |holder: &str, pending: bool| {
+            host.with_suggestions_db(|conn, _| {
+                conn.execute("DELETE FROM suggestion_links", []).unwrap();
+                conn.execute(
+                    "INSERT INTO suggestion_links (profile, provider_id, item_id, holder, pending)
+                     VALUES ('default', 'acme.gh', '42', ?1, ?2)",
+                    rusqlite::params![holder, pending],
+                )
+                .unwrap();
+            })
+        };
+        let origin = crate::session::SuggestionOrigin {
+            provider_id: "acme.gh".into(),
+            id: "42".into(),
+            profile: Some("default".into()),
+        };
+        let refused = || async {
+            let response = create::claim_suggestion_link(&state, Some(&origin), "new")
+                .await
+                .err()
+                .expect("the link is held");
+            assert_eq!(response.status(), axum::http::StatusCode::CONFLICT);
+            let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+                .await
+                .unwrap();
+            serde_json::from_slice::<serde_json::Value>(&bytes).unwrap()
+        };
+        link(&holder_id, false);
+        let settled = refused().await;
+        assert_eq!(settled["error"], "already_started");
+        assert_eq!(settled.get("session_id").is_some(), !cityhall, "{settled}");
+
+        let _starting = crate::plugin::suggestions::mark_starting("provisioning");
+        link("provisioning", true);
+        let starting = refused().await;
+        assert_eq!(starting["error"], "already_started");
+        assert_eq!(
+            starting.get("session_id").is_some(),
+            !cityhall,
+            "{starting}"
+        );
+    }
 }
 
 #[tokio::test]
