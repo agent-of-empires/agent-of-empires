@@ -608,6 +608,10 @@ fn ago_label(secs: i64) -> String {
     }
 }
 
+/// `initial_prompt_error_code` values from the daemon.
+const FOLDER_NOT_TRUSTED: &str = "agent_folder_not_trusted";
+const BYPASS_NOT_ACCEPTED: &str = "agent_bypass_not_accepted";
+
 /// How long a dismissed row stays listed so `z` can undo it.
 const UNDO_WINDOW: std::time::Duration = std::time::Duration::from_secs(10);
 
@@ -616,6 +620,10 @@ pub(super) enum SuggestionsAction {
     Close,
     /// Jump to the Session an item was started as.
     OpenSession(String),
+    /// Ask before turning on `pre_trust_agent_folders`.
+    TurnOnPreTrust,
+    /// Trash the item's Session, whose prompt was blocked, then start it again.
+    TryAgain(ItemKey, String),
 }
 
 type ItemKey = (String, String);
@@ -638,6 +646,8 @@ pub(super) struct SuggestionsView {
     prepare_another: bool,
     /// Strict mode keys: dismiss is `Z`, not `z`.
     pub(super) strict: bool,
+    /// `pre_trust_agent_folders` is on, so a Session blocked on folder trust can start again.
+    pub(super) pretrusted: bool,
 }
 
 impl SuggestionsView {
@@ -662,6 +672,7 @@ impl SuggestionsView {
             preparing: None,
             prepare_another: false,
             strict: false,
+            pretrusted: false,
         }
     }
 
@@ -783,6 +794,19 @@ impl SuggestionsView {
                 }
                 store.reload();
             }
+            KeyCode::Char('t') => {
+                let untrusted = self.item_at(store, self.selected).is_some_and(|i| {
+                    store
+                        .blocked_prompt(i)
+                        .is_some_and(|(_, code)| code.as_deref() == Some(FOLDER_NOT_TRUSTED))
+                });
+                if untrusted && !self.pretrusted {
+                    match block {
+                        Some(block) => self.error = Some(block_note(block).to_string()),
+                        None => return SuggestionsAction::TurnOnPreTrust,
+                    }
+                }
+            }
             KeyCode::Char(c) if c == self.dismiss_key() && mutations_allowed => {
                 if let Some(item) = self.item_at(store, self.selected) {
                     let (key, dismissed) =
@@ -805,6 +829,12 @@ impl SuggestionsView {
                     .and_then(|i| i.started_session.as_ref())
                     .filter(|_| !another)
                 {
+                    let untrusted = item
+                        .and_then(|i| store.blocked_prompt(i))
+                        .is_some_and(|(_, code)| code.as_deref() == Some(FOLDER_NOT_TRUSTED));
+                    if untrusted && self.pretrusted && block.is_none() {
+                        return SuggestionsAction::TryAgain(key, started.id.clone());
+                    }
                     return SuggestionsAction::OpenSession(started.id.clone());
                 }
                 if let Some(block) = block {
@@ -1071,6 +1101,21 @@ impl SuggestionsView {
                 )));
                 continue;
             }
+            if let Some((_, code)) = store.blocked_prompt(item) {
+                let next = match code.as_deref() {
+                    Some(FOLDER_NOT_TRUSTED) if self.pretrusted => "Enter tries again",
+                    Some(FOLDER_NOT_TRUSTED) => "t turn on pre-trust",
+                    Some(BYPASS_NOT_ACCEPTED) => {
+                        "accept Bypass Permissions once in the Session · Enter opens it"
+                    }
+                    _ => "Enter opens it",
+                };
+                lines.push(Line::from(Span::styled(
+                    format!("    Prompt not typed · {next}"),
+                    Style::default().fg(theme.error),
+                )));
+                continue;
+            }
             lines.push(Line::from(Span::styled(
                 plain(&format!(
                     "    {} · {}{}",
@@ -1118,6 +1163,12 @@ impl SuggestionsView {
             {
                 detail.push(Line::from(Span::styled(
                     plain(&format!("Couldn't start: {message} · Enter tries again")),
+                    Style::default().fg(theme.error),
+                )));
+            }
+            if let Some((message, _)) = store.blocked_prompt(item) {
+                detail.push(Line::from(Span::styled(
+                    plain(&format!("Prompt not typed: {message}")),
                     Style::default().fg(theme.error),
                 )));
             }
@@ -1232,6 +1283,9 @@ pub(super) struct SuggestionsFeed {
     /// The last start or prepare that failed, shown on its row on Home and in
     /// the full view until the next try.
     pub(super) failed: Option<(ItemKey, String)>,
+    /// Why a Session's first prompt was not typed, by Session id: the
+    /// daemon's plain message and its `initial_prompt_error_code`, if any.
+    pub(super) blocked_prompts: std::collections::HashMap<String, (String, Option<String>)>,
     /// The next hooks review follows a `trust_changed` answer.
     hooks_changed: bool,
     prepare_target: PrepareTarget,
@@ -1277,6 +1331,7 @@ impl SuggestionsFeed {
             start_key: None,
             held_trust: None,
             failed: None,
+            blocked_prompts: std::collections::HashMap::new(),
             hooks_changed: false,
             prepare_target: PrepareTarget::Home,
             view_epoch: 0,
@@ -1730,6 +1785,11 @@ impl SuggestionsFeed {
 
     pub(super) fn take_hooks_changed(&mut self) -> bool {
         std::mem::take(&mut self.hooks_changed)
+    }
+
+    /// Why the Session `item` was started as did not get its prompt.
+    fn blocked_prompt(&self, item: &Item) -> Option<&(String, Option<String>)> {
+        self.blocked_prompts.get(&item.started_session.as_ref()?.id)
     }
 
     pub(super) fn drop_held_trust(&mut self) {
@@ -2282,6 +2342,64 @@ mod tests {
             text.contains("f1 #38"),
             "the heading names the repo: {text}"
         );
+    }
+
+    fn blocked_rig(code: &str) -> Rig {
+        let mut started = item("a", None, false);
+        started.started_session = Some(Started {
+            id: "s1".into(),
+            status: "Idle".into(),
+            archived: false,
+        });
+        let mut rig = view_with(vec![started], idle_worker());
+        rig.store.blocked_prompts.insert(
+            "s1".into(),
+            (
+                "Claude Code is asking whether to trust this folder.".into(),
+                Some(code.into()),
+            ),
+        );
+        rig
+    }
+
+    #[test]
+    fn an_untrusted_folder_offers_pre_trust_then_try_again() {
+        let mut rig = blocked_rig("agent_folder_not_trusted");
+        let text = render_text(&rig);
+        assert!(text.contains("Prompt not typed"), "{text}");
+        assert!(text.contains("t turn on pre-trust"), "{text}");
+        assert!(
+            text.contains("asking whether to trust this folder"),
+            "{text}"
+        );
+        assert!(matches!(
+            press(&mut rig, KeyCode::Char('t'), false),
+            SuggestionsAction::Continue
+        ));
+        assert!(matches!(
+            press(&mut rig, KeyCode::Char('t'), true),
+            SuggestionsAction::TurnOnPreTrust
+        ));
+
+        rig.view.pretrusted = true;
+        assert!(render_text(&rig).contains("Enter tries again"));
+        let key = ("p".to_string(), "a".to_string());
+        assert!(matches!(
+            press(&mut rig, KeyCode::Enter, true),
+            SuggestionsAction::TryAgain(k, s) if k == key && s == "s1"
+        ));
+    }
+
+    #[test]
+    fn a_bypass_acceptance_says_to_open_the_session() {
+        let mut rig = blocked_rig("agent_bypass_not_accepted");
+        let text = render_text(&rig);
+        assert!(text.contains("accept Bypass Permissions"), "{text}");
+        assert!(!text.contains("pre-trust"), "{text}");
+        assert!(matches!(
+            press(&mut rig, KeyCode::Enter, true),
+            SuggestionsAction::OpenSession(s) if s == "s1"
+        ));
     }
 
     fn dismissed_snapshot(rig: &mut Rig, dismissed: bool) {
