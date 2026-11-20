@@ -275,6 +275,10 @@ retain their stores even when the session row no longer exists.
 
 A session still on the legacy shared store has no private store to reclaim; deleting it leaves the shared store for migration. The shared Claude credential file `sandbox-v2/.credentials.json` belongs to no session and is not reclaimed; remove it manually only after the last Claude sandbox is gone.
 
+## Host loopback services
+
+On Docker Desktop, OrbStack and Podman machine, a sandbox container reaches services bound to the host's `127.0.0.1` through `host.docker.internal` or `host.containers.internal`, and the host sees a loopback peer. Treat every host loopback listener as reachable by sandboxed code. For this reason `aoe serve --auth none` requires `--behind-proxy`; the default token auth and `--auth passphrase` stay safe against containers.
+
 ## Worktrees
 
 Git worktrees need the bare repo pattern so the container can reach the repo's git directory. See [Worktrees](worktrees.md#bare-repos).

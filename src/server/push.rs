@@ -921,7 +921,7 @@ pub async fn fire_wake_fired_push(
 /// subscribed before the startup producers run, so no hold's notice is missed.
 pub(crate) async fn spawn_login_required_consumer(
     state: std::sync::Arc<super::AppState>,
-    notices: tokio::sync::broadcast::Receiver<super::sandbox_login::LoginRequiredNotice>,
+    notices: tokio::sync::mpsc::UnboundedReceiver<super::sandbox_login::LoginRequiredNotice>,
 ) {
     if state.push.is_none() {
         return;

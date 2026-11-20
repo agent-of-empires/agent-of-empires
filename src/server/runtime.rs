@@ -550,6 +550,29 @@ pub(crate) async fn session_mutation_response<T: serde::Serialize>(
         #[serde(skip_serializing_if = "Option::is_none")]
         outcome: Option<T>,
     }
+    published_session_response(state, id, |session| {
+        Json(Body { session, outcome }).into_response()
+    })
+    .await
+}
+
+/// Return `202 Accepted` with the published session row and cursor headers.
+/// Flush only after releasing namespace, identity and publication guards.
+pub(crate) async fn accepted_session_mutation_response(
+    state: &Arc<AppState>,
+    id: &str,
+) -> Response {
+    published_session_response(state, id, |session| {
+        (axum::http::StatusCode::ACCEPTED, Json(session)).into_response()
+    })
+    .await
+}
+
+async fn published_session_response(
+    state: &Arc<AppState>,
+    id: &str,
+    respond: impl FnOnce(&crate::daemon::SessionResponse) -> Response,
+) -> Response {
     let snapshot = match state.runtime.publish(state).await {
         Ok(snapshot) => snapshot,
         Err(error) => {
@@ -566,13 +589,7 @@ pub(crate) async fn session_mutation_response<T: serde::Serialize>(
     else {
         return super::api::session_gone_after_persist();
     };
-    mutation_response(
-        &snapshot.value.cursor,
-        Json(Body {
-            session: row,
-            outcome,
-        }),
-    )
+    mutation_response(&snapshot.value.cursor, respond(row))
 }
 
 /// Whether `If-None-Match` names `etag`; weak comparison, so an intermediary's `W/` prefix does not matter.

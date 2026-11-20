@@ -39,7 +39,9 @@ test.describe("theme API", () => {
 });
 
 const DRACULA_SURFACE = "#282a36";
-const labelledSelect = (page: Page, label: RegExp) =>
+const labelledSelect = (page: Page, name: string) => page.getByRole("combobox", { name, exact: true });
+// A SelectField outside a settings row: its label isn't tied to the select, so walk from the label.
+const shellSelect = (page: Page, label: RegExp) =>
   page.locator("label", { hasText: label }).locator("..").locator("select");
 const getJson = (url: string, handle?: ServeHandle) =>
   fetch(url, { headers: handle ? authHeaders(handle) : {} }).then((r) => r.json());
@@ -208,7 +210,7 @@ test("theme picker repaints, persists across reload and serve restart (#1510)", 
   // The picker writes the global /api/theme endpoint and must dispatch its repaint only after the write.
   const settingsUrl = `${serve.baseUrl}/api/settings`;
   await page.goto(`${serve.baseUrl}/settings/theme`);
-  await pickDracula(labelledSelect(page, /^Theme$/));
+  await pickDracula(labelledSelect(page, "Theme"));
   await expect(async () => {
     expect((await getJson(settingsUrl))?.theme?.name).toBe("dracula");
   }).toPass({ timeout: 5_000 });
@@ -234,7 +236,7 @@ test.describe("passphrase mode", () => {
       });
     });
 
-    await pickDracula(labelledSelect(page, /^Theme$/));
+    await pickDracula(labelledSelect(page, "Theme"));
     await expect(async () => {
       expect((await getJson(settingsUrl, servePreauthed))?.theme?.name).toBe("dracula");
     }).toPass({ timeout: 5_000 });
@@ -368,7 +370,7 @@ test("global settings migrate from profiles and reject stale profile writes", as
   await page.goto(`${serve.baseUrl}/settings/session`);
   // Sidebar position is TUI-only, so it sits in the Terminal UI fold.
   await page.getByRole("button", { name: /Terminal UI/ }).click();
-  const position = labelledSelect(page, /^Sidebar position$/);
+  const position = labelledSelect(page, "Sidebar position");
   await expect(position).toHaveValue("left");
   const [saveResponse] = await Promise.all([
     page.waitForResponse(
@@ -452,9 +454,9 @@ test("Terminal UI toggles default on, save off, and persist across reload and re
 
 test("runtime logging overrides persist and clearing one preserves the other", async ({ serve, page }) => {
   await page.goto(`${serve.baseUrl}/settings/logging`);
-  const runtime = labelledSelect(page, /^runtime\.ws$/);
-  const ws = labelledSelect(page, /^server\.lifecycle$/);
-  const migration = labelledSelect(page, /^migrations\.v043$/);
+  const runtime = shellSelect(page, /^runtime\.ws$/);
+  const ws = shellSelect(page, /^server\.lifecycle$/);
+  const migration = shellSelect(page, /^migrations\.v043$/);
   await expect(runtime).toBeVisible();
   await runtime.selectOption("warn");
   const globalUrl = `${serve.baseUrl}/api/settings`;
@@ -488,11 +490,8 @@ test("systemd settings save machine-wide and refuse an invalid slice", async ({ 
     page.waitForResponse(
       (response) => response.url().startsWith(settingsUrl) && response.request().method() === "PATCH",
     );
-  const slice = page
-    .locator("label", { hasText: /^Slice$/ })
-    .locator("..")
-    .locator("input");
-  const toggle = (label: string) => page.getByText(label, { exact: true }).locator("../..").getByRole("switch");
+  const slice = page.getByRole("textbox", { name: "Slice", exact: true });
+  const toggle = (name: string) => page.getByRole("switch", { name, exact: true });
   // The harness seeds `enabled = false`, so the spec never turns real scopes on.
   const enabled = toggle("Run Sessions in systemd scopes");
   const survive = toggle("Keep Sessions running when the Daemon restarts");

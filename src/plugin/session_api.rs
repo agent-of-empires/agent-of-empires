@@ -1209,13 +1209,13 @@ fn map_send_error(e: SendTurnError) -> DispatchError {
             "worker_not_ready",
             format!("worker resume failed: {e}"),
         ),
-        SendTurnError::WorkerNotReady | SendTurnError::WorkerLostAfterPublish => {
-            DispatchError::with_kind(
-                codes::SERVICE_UNAVAILABLE,
-                "worker_not_ready",
-                "worker not ready; retry",
-            )
-        }
+        SendTurnError::WorkerNotReady
+        | SendTurnError::AgentChanged
+        | SendTurnError::WorkerLostAfterPublish => DispatchError::with_kind(
+            codes::SERVICE_UNAVAILABLE,
+            "worker_not_ready",
+            "worker not ready; retry",
+        ),
         // Unreachable: this plugin surface never sets `no_revive`.
         SendTurnError::RevivalRefused => DispatchError::with_kind(
             codes::FAILED_PRECONDITION,
@@ -2156,6 +2156,7 @@ mod tests {
                 Vec::new(),
                 false,
                 None,
+                None,
             )
             .await;
         drop(winner);
@@ -2607,6 +2608,7 @@ mod tests {
             &mut Default::default(),
             &mut Default::default(),
             &mut Default::default(),
+            &mut Default::default(),
         )
         .await;
     }
@@ -2833,6 +2835,7 @@ mod tests {
             .acp_supervisor
             .test_insert_worker_cmd_recording(id)
             .await;
+        let _live = crate::acp::supervisor::test_support::save_agent_record(id, "claude", true);
         service.acp_supervisor.test_publish_worker_attached(id);
         state.instances.write().await[0].status = Status::Idle;
         service.drain_queued_prompts_once(id).await;

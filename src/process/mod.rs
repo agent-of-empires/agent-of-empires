@@ -52,6 +52,19 @@ pub(crate) fn inherit_file_at_fd(
     }
 }
 
+/// Mount points visible to this process. Errors where the table is
+/// unavailable on Linux; other platforms have none to list and return empty.
+pub(crate) fn mount_points() -> std::io::Result<std::collections::HashSet<std::path::PathBuf>> {
+    #[cfg(target_os = "linux")]
+    {
+        linux::mount_points()
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        Ok(Default::default())
+    }
+}
+
 #[cfg(target_os = "linux")]
 use linux as platform;
 #[cfg(target_os = "macos")]
@@ -897,8 +910,9 @@ fn collect_descendants_from_map(
 pub fn get_pane_pid(session_name: &str) -> Option<u32> {
     let pane = crate::tmux::first_pane_id(session_name)?;
     // The pane id must travel alone: `session:%id` reads as a window
-    // spec and falls back to the window's active pane (tmux 3.7c).
-    let output = crate::tmux::tmux_command()
+    // spec and falls back to the window's active pane (tmux 3.7c). A client
+    // without UTF-8 prints the tab as `_`, so the query passes `-u`.
+    let output = crate::tmux::tmux_query_command()
         .args([
             "display-message",
             "-t",

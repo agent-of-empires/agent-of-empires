@@ -442,7 +442,7 @@ fn classify_live_panes(succeeded: bool, stdout: &[u8], stderr: &[u8]) -> bool {
 
 pub(crate) fn pane_current_command(session_name: &str) -> Option<String> {
     let first = first_pane_id(session_name)?;
-    crate::tmux::tmux_command()
+    crate::tmux::tmux_query_command()
         .args([
             "display-message",
             "-t",
@@ -466,7 +466,7 @@ pub(crate) fn pane_current_command(session_name: &str) -> Option<String> {
 /// read one way through the poller and another through `aoe session capture`.
 pub(crate) fn pane_title(session_name: &str) -> Option<String> {
     let target = format!("={session_name}:^");
-    crate::tmux::tmux_command()
+    crate::tmux::tmux_query_command()
         .args(["display-message", "-t", &target, "-p", "#{pane_title}"])
         .output()
         .ok()
@@ -488,7 +488,7 @@ pub(crate) fn pane_start_command_is_protected(session_name: &str) -> bool {
         return false;
     };
     let target = first;
-    crate::tmux::tmux_command()
+    crate::tmux::tmux_query_command()
         .args([
             "display-message",
             "-t",

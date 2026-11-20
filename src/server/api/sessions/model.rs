@@ -431,7 +431,7 @@ pub(crate) struct SessionCfgStore {
 struct StoredSessionCfg {
     /// Every file the resolve read, with the bytes it parsed.
     inputs: Vec<(std::path::PathBuf, Fingerprint)>,
-    config: (SessionConfig, StructuredView),
+    config: (SessionConfig, StructuredView, String),
 }
 
 /// One request's view of [`SessionCfgStore`], shared across the `list_sessions`
@@ -526,7 +526,11 @@ impl<'a> SessionCfgCache<'a> {
     }
 
     /// Resolve `(profile, project_path)`, reading from disk only when an input changed.
-    fn entry(&mut self, profile: &str, project_path: &str) -> &(SessionConfig, StructuredView) {
+    fn entry(
+        &mut self,
+        profile: &str,
+        project_path: &str,
+    ) -> &(SessionConfig, StructuredView, String) {
         // Resolving `""` would read the default profile's name from disk, past the fingerprints,
         // so key and resolve by the name itself.
         let profile = match profile {
@@ -568,7 +572,11 @@ impl<'a> SessionCfgCache<'a> {
                     key.clone(),
                     StoredSessionCfg {
                         inputs: inputs.into_inner(),
-                        config: (config.session, config.acp.structured_view),
+                        config: (
+                            config.session,
+                            config.acp.structured_view,
+                            config.acp.resolved_default_agent().to_string(),
+                        ),
                     },
                 );
             }
@@ -578,6 +586,15 @@ impl<'a> SessionCfgCache<'a> {
 
     pub(super) fn resolve(&mut self, profile: &str, project_path: &str) -> &SessionConfig {
         &self.entry(profile, project_path).0
+    }
+
+    pub(super) fn profile_config(
+        &mut self,
+        profile: &str,
+        project_path: &str,
+    ) -> (&SessionConfig, &str) {
+        let config = self.entry(profile, project_path);
+        (&config.0, &config.2)
     }
 
     pub(super) fn structured_view(&mut self, profile: &str, project_path: &str) -> StructuredView {

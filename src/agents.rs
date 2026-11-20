@@ -711,6 +711,7 @@ pub const AGENTS: &[AgentDef<'static>] = &[
         )
     },
     AgentDef {
+        oneshot_flag: Some("-p"),
         aliases: &["mistral-vibe"],
         detection: DetectionMethod::RunWithArg("vibe", "--version"),
         yolo: Some(YoloMode::CliFlag("--agent auto-approve")),
@@ -1036,13 +1037,15 @@ impl AgentDef<'_> {
     pub fn oneshot_trailing_args(&self) -> &'static [&'static str] {
         match self.name {
             "copilot" => &["-s", "--allow-all-tools", "--no-ask-user"],
+            // Programmatic mode inherits the configured agent, which may edit files unasked.
+            "vibe" => &["--disabled-tools", "*"],
             _ => &[],
         }
     }
 
     pub fn oneshot_model_flag(&self) -> Option<&str> {
         self.model_flag.or(match self.name {
-            "claude" | "copilot" | "prime-agent" => Some("--model"),
+            "claude" | "copilot" | "prime-agent" | "vibe" => Some("--model"),
             "codex" | "gemini" | "opencode" | "kimi" => Some("-m"),
             _ => None,
         })
@@ -1056,10 +1059,10 @@ impl AgentDef<'_> {
         }
     }
 
-    /// Value-binding `-p` (copilot, gemini, kimi) takes the prompt as its value, so model args
-    /// must trail the prompt.
+    /// Value-binding `-p` (copilot, gemini, kimi, vibe) takes the prompt as its value, so model
+    /// args must trail the prompt.
     pub fn oneshot_flag_binds_prompt(&self) -> bool {
-        matches!(self.name, "copilot" | "gemini" | "kimi")
+        matches!(self.name, "copilot" | "gemini" | "kimi" | "vibe")
     }
 
     /// Documented flag naming the agent's own session at launch. Gated by
@@ -1731,6 +1734,10 @@ fn is_safe_agent_name(name: &str) -> bool {
         && !name.contains('\\')
 }
 
+/// The built-in pause for `tool` between typing and Enter.
+///
+/// A declared integration paces through `Instance::send_keys_enter_delay`,
+/// which keeps this table as the fallback for every program it does not own.
 pub fn send_keys_enter_delay(tool: &str) -> u64 {
     get_agent(tool)
         .map(|a| a.send_keys_enter_delay_ms)

@@ -302,6 +302,7 @@ mod tests {
         respawn_history: std::collections::HashMap<String, Vec<std::time::Instant>>,
         parked: std::collections::HashSet<String>,
         capacity_deferred: std::collections::HashSet<String>,
+        stop_notified: std::collections::HashSet<String>,
     }
 
     impl ReconcilerTick {
@@ -319,6 +320,7 @@ mod tests {
                 &mut self.respawn_history,
                 &mut self.parked,
                 &mut self.capacity_deferred,
+                &mut self.stop_notified,
             )
             .await;
         }

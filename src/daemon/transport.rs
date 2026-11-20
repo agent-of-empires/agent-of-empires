@@ -998,9 +998,9 @@ mod tests {
     async fn body_helpers_share_deadlines_without_shortening_long_operations() {
         for unix in [true, false] {
             for (headers_ms, chunks, chunk_ms, timeout_ms, expires) in [
-                (0, 2, 0, 1000, false),
-                (70, 1, 60, 100, true),
-                (0, 10, 20, 100, true),
+                (0, 2, 0, 5000, false),
+                (350, 1, 300, 500, true),
+                (0, 10, 100, 500, true),
             ] {
                 for consumer in 0..3 {
                     let temp = tempfile::tempdir().unwrap();

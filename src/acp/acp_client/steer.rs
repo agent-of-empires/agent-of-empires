@@ -33,8 +33,6 @@ impl SteerRequest {
 }
 
 /// Text of the first text block, for the retry pill on a refused prompt.
-/// Attachments are not carried back into the pill; text is the retry hook
-/// and this is a rare edge.
 pub(super) fn first_text_block(blocks: &[ContentBlock]) -> String {
     blocks
         .iter()
@@ -213,7 +211,7 @@ done
                 .expect("timed out waiting for PromptRejected + Stopped")
                 .expect("event channel closed");
             match &ev {
-                Event::PromptRejected { reason, text } => {
+                Event::PromptRejected { reason, text, .. } => {
                     assert_eq!(reason, "agent_busy");
                     assert_eq!(
                         text, "also check the tests",

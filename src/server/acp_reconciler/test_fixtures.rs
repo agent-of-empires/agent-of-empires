@@ -61,6 +61,7 @@ pub(super) struct Tick {
     pub(super) respawn_history: HashMap<String, Vec<Instant>>,
     pub(super) parked: HashSet<String>,
     pub(super) capacity_deferred: HashSet<String>,
+    pub(super) stop_notified: HashSet<String>,
 }
 
 impl Tick {
@@ -79,6 +80,7 @@ impl Tick {
             &mut self.respawn_history,
             &mut self.parked,
             &mut self.capacity_deferred,
+            &mut self.stop_notified,
         )
         .await;
     }

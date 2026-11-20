@@ -1101,6 +1101,7 @@ pub async fn restore_session(
 /// title from the first prompt, even over one already chosen. Waits for the
 /// rename: `200` once the title is saved, `409` when nothing could be applied,
 /// `502` with the agent's reason on failure, `504` past the rename deadline.
+/// A terminal session's rename runs detached, so it answers `202` with the row.
 pub async fn force_smart_rename(
     State(state): State<Arc<AppState>>,
     Path(id): Path<String>,
@@ -1189,13 +1190,7 @@ pub async fn force_smart_rename(
                 true,
             ),
         );
-        return match state.runtime.publish(&state).await {
-            Ok(snapshot) => crate::server::runtime::mutation_response(
-                &snapshot.value.cursor,
-                StatusCode::ACCEPTED,
-            ),
-            Err(_) => StatusCode::SERVICE_UNAVAILABLE.into_response(),
-        };
+        return crate::server::runtime::accepted_session_mutation_response(&state, &id).await;
     }
 
     let Some((first_user_prompt, agent_prose)) = state
@@ -4066,6 +4061,7 @@ async fn prepare_agent_session_inner(
                 profile: profile.clone(),
             })
         };
+        let mut wake = None;
         if matches!(
             outcome,
             Some(
@@ -4077,16 +4073,22 @@ async fn prepare_agent_session_inner(
             let wake_message =
                 select_restart_wake_message(restart_origin, requested_wake_message, &profile);
             if !wake_message.is_empty() {
-                crate::session::restart::spawn_wake_worker(
-                    id.clone(),
-                    row.title.clone(),
-                    row.tool.clone(),
-                    wake_message,
-                    Some((profile.clone(), generation)),
-                );
+                wake = Some((wake_message, row.clone()));
             }
         }
         drop(rows);
+        if let Some((wake_message, wake_row)) = wake {
+            // The pace reads configuration, so it resolves outside the guard.
+            let delay = wake_row.send_keys_enter_delay();
+            crate::session::restart::spawn_wake_worker(
+                id.clone(),
+                wake_row.title.clone(),
+                wake_row.tool.clone(),
+                wake_message,
+                Some((profile.clone(), generation)),
+                delay,
+            );
+        }
         tracing::info!(target: "session.restart", session = %id, view = "terminal", reason, "session restarted");
         return crate::server::runtime::session_mutation_response(
             &state,
