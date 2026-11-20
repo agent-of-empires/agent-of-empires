@@ -712,7 +712,7 @@ async fn sessions_turn_send(
 
         let woke_idle_dormant = match deps
             .session_service
-            .touch_and_wake_on_prompt(&req.session_id, false)
+            .touch_and_wake_on_prompt_refusing_ignored(&req.session_id, false)
             .await
         {
             PromptTouch::Touched { idle_dormant } => idle_dormant,
@@ -952,7 +952,7 @@ async fn deliver_message(
         &req.session_id,
         req.message.clone(),
         true,
-        false,
+        true,
     )
     .await
     .map_err(|error| map_terminal_error(error.error))?;
@@ -978,7 +978,10 @@ async fn deliver_structured(
         .admit_prompt_submission(&caller, id)
         .await
         .map_err(|e| map_send_error(e.into()))?;
-    let woke_idle_dormant = match service.touch_and_wake_on_prompt(id, false).await {
+    let woke_idle_dormant = match service
+        .touch_and_wake_on_prompt_refusing_ignored(id, false)
+        .await
+    {
         PromptTouch::Touched { idle_dormant } => idle_dormant,
         PromptTouch::RevivalRefused => return Err(map_send_error(SendTurnError::RevivalRefused)),
         PromptTouch::WorkerNotReady => return Err(map_send_error(SendTurnError::WorkerNotReady)),
@@ -1760,9 +1763,13 @@ mod tests {
     async fn message_send_reports_missing_and_shelved_sessions_with_stable_kinds() {
         let _home = crate::session::test_support::isolate_app_dir();
         type Shelve = (&'static str, fn(&mut Instance));
-        let shelves: [Shelve; 2] = [
+        let shelves: [Shelve; 3] = [
             ("session_archived", Instance::archive),
             ("session_trashed", Instance::trash),
+            ("ignored", |row| {
+                row.parent_session_id = Some("manager".into());
+                row.ignore();
+            }),
         ];
         let mut prior = Vec::new();
         for (want, shelve) in shelves {
@@ -1777,13 +1784,15 @@ mod tests {
                 prior.push(inst);
             }
         }
-        let (deps, state, _dir) = test_deps(prior.clone());
+        let (deps, state, _dir) = test_deps_native(prior.clone()).await;
         let ctx = ctx_with(&["session.message"]);
         for inst in &prior {
             let want = if inst.is_archived() {
                 "session_archived"
-            } else {
+            } else if inst.is_trashed() {
                 "session_trashed"
+            } else {
+                "ignored"
             };
             let err = dispatch(
                 &deps,

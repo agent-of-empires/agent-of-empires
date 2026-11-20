@@ -421,18 +421,6 @@ impl McpServer {
 }
 
 impl McpServer {
-    /// Whether the row is ignored. Routine MCP reads and sends must not clear
-    /// that marker, so a send refuses rather than waking the session.
-    async fn is_ignored(&self, id: &str) -> bool {
-        self.state
-            .instances
-            .read()
-            .await
-            .iter()
-            .find(|instance| instance.id == id)
-            .is_some_and(Instance::is_ignored)
-    }
-
     async fn send_to(
         &self,
         id: String,
@@ -441,13 +429,6 @@ impl McpServer {
         let Some(structured) = self.view_of(&id).await.map(|v| v == View::Structured) else {
             return Err(Box::new(not_found(&id)));
         };
-        if self.is_ignored(&id).await {
-            return Err(Box::new(tool_error(
-                "ignored",
-                "The session is ignored because another session manages it. A person must \
-                 reclaim ownership or unignore it before MCP sends a prompt.",
-            )));
-        }
         if structured {
             if message.trim().is_empty() {
                 return Err(Box::new(tool_error(

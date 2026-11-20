@@ -94,6 +94,10 @@ async fn send_terminal_message_inner(
         .cloned()
         .ok_or(SendKeysError::NotFound)?;
     before.ensure_startable().map_err(SendKeysError::Blocked)?;
+    // Refuse before reviving; the locked disk check below covers a concurrent ignore.
+    if refuse_if_ignored && before.is_ignored() {
+        return Err(SendKeysError::Ignored);
+    }
     if before.is_structured() {
         return Err(SendKeysError::StructuredView);
     }
