@@ -50,7 +50,9 @@ export function SandboxImageBanner({ view }: { view: SandboxImageBannerView }) {
         <Bar
           tone="brand"
           lead={<Spinner />}
-          status={progress.phase === "unpacking" ? "Unpacking sandbox image…" : "Downloading sandbox image…"}
+          status={`${progress.phase === "unpacking" ? "Unpacking sandbox image…" : "Downloading sandbox image…"}${
+            view.cancelRefused !== null ? " Couldn't cancel." : ""
+          }`}
           onDismiss={view.onHide}
           dismissLabel="Hide sandbox image notice"
           fraction={progress.known ? (progress.done ?? 0) / progress.known : undefined}
@@ -66,6 +68,11 @@ export function SandboxImageBanner({ view }: { view: SandboxImageBannerView }) {
             >
               Cancel
             </button>
+          )}
+          {view.cancelRefused !== null && (
+            <Disclosure label="Details">
+              <pre className="whitespace-pre-wrap break-all font-mono">{view.cancelRefused}</pre>
+            </Disclosure>
           )}
         </Bar>
       );

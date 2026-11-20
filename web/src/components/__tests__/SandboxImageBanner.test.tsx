@@ -1,7 +1,7 @@
 // @vitest-environment jsdom
 // Sandbox image banner (#4591): which state shows for a Daemon status, and the pull flow.
 
-import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, onTestFinished, vi } from "vitest";
 import { act, cleanup, fireEvent, render, screen } from "@testing-library/react";
 
 import type { SandboxImagePull, SandboxImageStatus } from "../../lib/api";
@@ -46,7 +46,14 @@ function status(overrides: Partial<SandboxImageStatus> = {}): SandboxImageStatus
 }
 
 function Harness() {
-  const { view } = useSandboxImageBanner();
+  const { view, running } = useSandboxImageBanner();
+  if (running?.hidden) {
+    return (
+      <button type="button" onClick={running.onShow}>
+        Show pull
+      </button>
+    );
+  }
   return view ? <SandboxImageBanner view={view} /> : null;
 }
 
@@ -639,13 +646,50 @@ describe("SandboxImageBanner progress, cancel and hide (#5751)", () => {
     expect(banner()?.textContent).toBe(DOWNLOADING);
   });
 
-  it("keeps showing the pull when the Daemon refuses the cancel", async () => {
-    cancelSandboxImagePull.mockResolvedValueOnce({ ok: false });
+  it("says a refused Cancel couldn't cancel, with the Daemon's reason, until a click or the pull's end", async () => {
+    const refused = `${DOWNLOADING} Couldn't cancel.`;
+    const details = () => screen.queryByText("cancels are off here");
+    cancelSandboxImagePull.mockResolvedValue({ ok: false, message: "cancels are off here" });
+    onTestFinished(() =>
+      cancelSandboxImagePull.mockReset().mockResolvedValue({ ok: true, pull: { state: "cancelled" } }),
+    );
     await mount(running());
     fireEvent.click(screen.getByRole("button", { name: "Cancel" }));
     await pollAfter(0);
-    expect(banner()?.textContent).toBe(DOWNLOADING);
+    expect(banner()?.textContent).toBe(refused);
+    fireEvent.click(screen.getByRole("button", { name: "Details" }));
+    expect(details()?.closest("[hidden]")).toBeNull();
     expect((screen.getByRole("button", { name: "Cancel" }) as HTMLButtonElement).disabled).toBe(false);
+    // Polls that still show the pull running keep the notice readable.
+    await pollAfter(2000 * 3);
+    expect(banner()?.textContent).toBe(refused);
+
+    // Trying again clears it while the new request is out.
+    let answer!: (r: { ok: boolean; message?: string }) => void;
+    cancelSandboxImagePull.mockReturnValueOnce(new Promise((r) => (answer = r)));
+    fireEvent.click(screen.getByRole("button", { name: "Cancel" }));
+    expect(banner()?.textContent).toBe(DOWNLOADING);
+    expect(details()).toBeNull();
+    await act(async () => answer({ ok: false }));
+    // No message from the Daemon: the reply never arrived.
+    expect(banner()?.textContent).toBe(refused);
+    fireEvent.click(screen.getByRole("button", { name: "Details" }));
+    expect(screen.getByText("Couldn't reach the Daemon.")).toBeTruthy();
+
+    // × clears it, so showing the pull again brings back the plain banner.
+    fireEvent.click(screen.getByRole("button", { name: "Hide sandbox image notice" }));
+    fireEvent.click(screen.getByRole("button", { name: "Show pull" }));
+    expect(banner()?.textContent).toBe(DOWNLOADING);
+    fireEvent.click(screen.getByRole("button", { name: "Cancel" }));
+    await pollAfter(0);
+    expect(banner()?.textContent).toBe(refused);
+    // The pull ending clears it, so the next pull, started elsewhere, doesn't carry it.
+    fetchSandboxImageStatus.mockResolvedValue(status({ state: "current", pull: { state: "done" } }));
+    await pollAfter(2000);
+    expect(banner()?.textContent).toBe(UPDATED);
+    fetchSandboxImageStatus.mockResolvedValue(running());
+    await pollAfter(30_000);
+    expect(banner()?.textContent).toBe(DOWNLOADING);
   });
 
   it("offers no Cancel while the Daemon won't pull from the web", async () => {

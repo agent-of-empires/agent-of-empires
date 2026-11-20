@@ -93,3 +93,24 @@ test("the pull spinner stands still when the user prefers reduced motion (#5751)
   await page.emulateMedia({ reducedMotion: "no-preference" });
   expect(await spinner.evaluate((el) => getComputedStyle(el).animationName)).not.toBe("none");
 });
+
+test("at 375px a refused Cancel says so, and its Details fit on screen (#5751)", async ({ page }) => {
+  await page.setViewportSize({ width: 375, height: 800 });
+  await mockDaemon(page, { current: { state: "running", phase: "downloading", layers_done: 3, layers_known: 7 } });
+  await page.route("**/api/sandbox/image-pull/cancel", (r) =>
+    r.fulfill({
+      status: 403,
+      json: { error: "pull_disabled", message: "Pulling sandbox images from the web is off." },
+    }),
+  );
+  await page.goto("/");
+  const banner = page.getByTestId("sandbox-image-banner");
+  await banner.getByRole("button", { name: "Cancel" }).click();
+  await expect(banner.getByRole("status")).toHaveText("Downloading sandbox image… Couldn't cancel.");
+  await banner.getByRole("button", { name: "Details" }).click();
+  await expect(page.getByText("Pulling sandbox images from the web is off.")).toBeInViewport();
+  for (const name of ["Cancel", "Details", "Hide sandbox image notice"]) {
+    await expect(banner.getByRole("button", { name })).toBeInViewport();
+  }
+  expect(await noSideScroll(page)).toBeLessThanOrEqual(0);
+});

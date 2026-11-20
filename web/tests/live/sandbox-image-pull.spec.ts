@@ -14,8 +14,8 @@ const FIXTURE = resolve(
   "../../../tests/fixtures/pull-progress/docker-29.5.2-cancel.txt",
 );
 
-/** A `docker` whose pull of `image` prints the captured lines, then holds until it is killed. Other pulls,
- *  such as a migration's, fail at once. */
+/** A `docker` whose pull of `image` prints the captured lines, then holds until it is killed. Other pulls
+ *  fail at once, since a held one (migration v2 pulls alpine) stalls startup. */
 function fakeDocker(shimBin: string, home: string, image: string) {
   const lines = join(home, "pull-lines.txt");
   const output = readFileSync(FIXTURE, "utf8")

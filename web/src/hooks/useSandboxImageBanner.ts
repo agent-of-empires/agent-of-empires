@@ -33,8 +33,16 @@ export interface SandboxPullProgress {
 export type SandboxImageBannerView =
   | { kind: "available"; image: string; onUpdate: () => void; onDismiss: () => void }
   | { kind: "gated"; image: string; command: string; onDismiss: () => void }
-  /** `onCancel` is absent where the dashboard can't pull, and so can't cancel either. */
-  | { kind: "updating"; progress: SandboxPullProgress; onCancel?: () => void; cancelling: boolean; onHide: () => void }
+  /** `onCancel` is absent where the dashboard can't pull, and so can't cancel either. `cancelRefused` is
+   *  why the Daemon refused the last Cancel, for Details. */
+  | {
+      kind: "updating";
+      progress: SandboxPullProgress;
+      onCancel?: () => void;
+      cancelling: boolean;
+      cancelRefused: string | null;
+      onHide: () => void;
+    }
   | { kind: "done"; onDismiss: () => void }
   | { kind: "cancelled"; onUpdate: () => void; onDismiss: () => void }
   /** `error` is the runtime's output, or the Daemon's refusal, for Details. */
@@ -77,6 +85,9 @@ export function useSandboxImageBanner(): SandboxImageBannerState {
   // × on a running pull hides its banner until that pull ends; its outcome shows again.
   const [hidden, setHidden] = useState(false);
   const [cancelling, setCancelling] = useState(false);
+  // Why the Daemon refused the last Cancel; the pull keeps running. Kept until a click or the pull's end,
+  // not the next 2 s poll, so Details stays readable.
+  const [cancelRefused, setCancelRefused] = useState<string | null>(null);
   // Why the Daemon refused the last "Update now"; nothing was pulled.
   const [refusal, setRefusal] = useState<string | null>(null);
   // Set from "Update now" until a status answer confirms the pull, so polling stays fast even when
@@ -143,6 +154,7 @@ export function useSandboxImageBanner(): SandboxImageBannerState {
           setRefusal(null);
         } else if (!predatesPull) {
           setHidden(false);
+          setCancelRefused(null);
         }
         // The cap only limits what's shown: while the reply is out, keep watching for the pull.
         expectingPull.current = predatesPull || answer.pull.state === "running" || since !== null;
@@ -203,6 +215,7 @@ export function useSandboxImageBanner(): SandboxImageBannerState {
     setNoticeDismissed(false);
     setHidden(false);
     setRefusal(null);
+    setCancelRefused(null);
     expectingPull.current = true;
     pullConfirmed.current = false;
     replyPendingSince.current = Date.now();
@@ -235,8 +248,10 @@ export function useSandboxImageBanner(): SandboxImageBannerState {
 
   const cancel = useCallback(() => {
     setCancelling(true);
+    setCancelRefused(null);
     void cancelSandboxImagePull().then((reply) => {
       setCancelling(false);
+      if (!reply.ok) setCancelRefused(reply.message ?? "Couldn't reach the Daemon.");
       if (reply.pull) {
         const pull = reply.pull;
         // This page cancelled it, so the outcome is this page's to show.
@@ -251,7 +266,10 @@ export function useSandboxImageBanner(): SandboxImageBannerState {
   }, []);
 
   const show = useCallback(() => setHidden(false), []);
-  const hide = useCallback(() => setHidden(true), []);
+  const hide = useCallback(() => {
+    setHidden(true);
+    setCancelRefused(null);
+  }, []);
 
   const banner = ((): SandboxImageBannerState => {
     if (configUnreadable) {
@@ -281,7 +299,7 @@ export function useSandboxImageBanner(): SandboxImageBannerState {
       const progress = pullProgress(pull);
       const onCancel = status.pull_blocked ? undefined : cancel;
       return {
-        view: hidden ? null : { kind: "updating", progress, onCancel, cancelling, onHide: hide },
+        view: hidden ? null : { kind: "updating", progress, onCancel, cancelling, cancelRefused, onHide: hide },
         running: { progress, hidden, onShow: show },
       };
     }
