@@ -35,10 +35,17 @@ export function MenuPopover({
     if (refocus) document.querySelector<HTMLElement>(`[data-menu="${id}"] [aria-haspopup]`)?.focus();
   };
   const menu = useRef<HTMLDivElement>(null);
-  // Every render, since items can arrive after opening (Start in… loads its Projects then).
+  // Once per open, on the first render that has an item: Start in… loads its Projects after opening.
+  const focused = useRef(false);
   useEffect(() => {
     const el = menu.current;
-    if (el && !el.contains(document.activeElement)) el.querySelector<HTMLElement>(ENABLED_ITEMS)?.focus();
+    if (!el) focused.current = false;
+    if (!el || focused.current) return;
+    const first = el.querySelector<HTMLElement>(ENABLED_ITEMS);
+    if (first) {
+      first.focus();
+      focused.current = true;
+    }
   });
   const onMenuKey = (e: KeyboardEvent<HTMLDivElement>) => {
     if (e.key === "Tab") return close(false);
