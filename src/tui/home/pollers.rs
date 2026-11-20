@@ -57,13 +57,20 @@ impl HomeView {
             .tick(self.session_feed.latest_snapshot().is_some());
         let mut polled = self.suggestions_feed.poll();
         let mut review_closed = false;
-        if self
+        let reviewing = self
             .confirm_dialog
             .as_ref()
-            .is_some_and(|d| d.action() == "approve_suggestion_hooks")
-            && !self.suggestions_feed.has_held_trust()
-        {
+            .is_some_and(|d| d.action() == "approve_suggestion_hooks");
+        if reviewing && !self.suggestions_feed.has_held_trust() {
             self.confirm_dialog = None;
+            review_closed = true;
+        }
+        // The review was cancelled: nothing starts.
+        if !reviewing && self.suggestions_feed.has_held_trust() {
+            self.suggestions_feed.drop_held_trust();
+            if let Some(view) = &mut self.suggestions_view {
+                view.set_notice("Not started: the hooks were not approved.");
+            }
             review_closed = true;
         }
         let mut changed = review_closed
