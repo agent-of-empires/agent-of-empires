@@ -289,7 +289,8 @@ pub(super) fn build_router(state: Arc<AppState>) -> Router {
         .route("/api/app-state/tip-seen", post(api::mark_tip_seen))
         // Plugin management.
         .route("/api/plugins", get(api::list_plugins))
-        .route("/api/plugins/{id}/icon", get(api::serve_plugin_icon))
+        // A live login session needs no device binding here; see `auth::UnboundClaim`.
+        .route("/plugin-icons/{id}", get(api::serve_plugin_icon))
         .route(
             "/api/plugins/{id}/pages/{page_id}",
             get(api::serve_plugin_page),
@@ -510,6 +511,10 @@ pub(super) fn build_router(state: Arc<AppState>) -> Router {
         )
         .route("/api/sessions/{id}/acp/enable", post(api::acp_enable))
         .route("/api/sessions/{id}/acp/disable", post(api::acp_disable))
+        .route(
+            "/api/sessions/{id}/acp/terminal-check",
+            get(api::acp_terminal_check),
+        )
         .route(
             "/api/sessions/{id}/queue",
             post(api::queue_enqueue)

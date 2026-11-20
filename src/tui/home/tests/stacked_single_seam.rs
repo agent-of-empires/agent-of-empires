@@ -41,7 +41,7 @@ fn render_home(env: &mut TestEnv, width: u16, height: u16) -> ratatui::buffer::B
     terminal
         .draw(|f| {
             let area = f.area();
-            env.view.render(f, area, &theme, None, None, None);
+            env.view.render(f, area, &theme, None);
         })
         .unwrap();
     terminal.backend().buffer().clone()

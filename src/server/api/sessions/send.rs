@@ -302,10 +302,7 @@ async fn send_terminal_message_inner(
         Ok((native, instance, session)) => {
             tokio::task::spawn_blocking(move || -> anyhow::Result<bool> {
                 use crate::session::SessionStore;
-                session.send_keys_with_delay(
-                    &message,
-                    crate::agents::send_keys_enter_delay(&instance.tool),
-                )?;
+                session.send_keys_with_delay(&message, instance.send_keys_enter_delay())?;
                 let _lifecycle = native
                     .storage()
                     .acquire_instance_lifecycle_lock(&instance.id)?;

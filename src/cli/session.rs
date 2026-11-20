@@ -1429,7 +1429,7 @@ fn send_restart_wake(
         Some(profile_identity),
     )?;
     let tmux_session = working.agent_input_session(name, physical, true, Some(fence))?;
-    let delay = crate::agents::send_keys_enter_delay(&working.tool);
+    let delay = working.send_keys_enter_delay();
     tmux_session.send_keys_with_delay(wake_msg, delay)?;
     Ok(true)
 }

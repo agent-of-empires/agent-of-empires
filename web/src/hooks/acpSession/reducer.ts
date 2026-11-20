@@ -57,6 +57,8 @@ export type Action =
   | { kind: "settle_inflight_prompt"; id: string }
   | { kind: "rollback_optimistic_prompt"; id: string }
   | { kind: "error"; message: string; target?: NonNullable<AcpState["interactionError"]>["target"] }
+  // A launch the daemon refused and kept the prompt for: shown through the startup banner.
+  | { kind: "blocked_launch"; message: string }
   | { kind: "clear_error" }
   | { kind: "approval_resolved_locally"; nonce: string }
   | {
@@ -270,6 +272,8 @@ export function reducer(state: AcpState, action: Action): AcpState {
       return { ...state, lagged: false };
     case "error":
       return { ...state, interactionError: { message: action.message, target: action.target } };
+    case "blocked_launch":
+      return { ...state, startupError: action.message };
     case "clear_error":
       return state.interactionError
         ? { ...state, interactionError: null }
@@ -319,7 +323,8 @@ export function reducer(state: AcpState, action: Action): AcpState {
         ...state,
         optimisticRows: state.optimisticRows.concat(row),
         startupError: null,
-        // Keep the active Retry banner.
+        startupCause: null,
+        // A Retry still running keeps its line.
         retriedError: state.restartInFlight ? state.retriedError : null,
         restartFailure: null,
         inflightPromptIds: state.inflightPromptIds.includes(id)
@@ -384,7 +389,11 @@ export function reducer(state: AcpState, action: Action): AcpState {
         restartInFlight: true,
         restartStoppedSent: state.restartStoppedSent || action.stoppedSent,
         restartFailure: null,
-        ...(action.retriedError !== undefined && { startupError: null, retriedError: action.retriedError }),
+        ...(action.retriedError !== undefined && {
+          startupError: null,
+          startupCause: null,
+          retriedError: action.retriedError,
+        }),
       };
     case "restart_failed":
       if (action.epoch !== state.restartEpoch)

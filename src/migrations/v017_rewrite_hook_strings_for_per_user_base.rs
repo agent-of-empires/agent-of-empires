@@ -174,6 +174,15 @@ fn rewrite_one(target: &HookTarget) -> Result<()> {
 /// - Parent dir not empty after sweep: `rmdir` returns `ENOTEMPTY`, we leave
 ///   the dir for whichever co-tenant still has entries there to clean up.
 fn sweep_legacy_base_in(legacy: &Path) {
+    sweep_legacy_base_with(legacy, crate::process::mount_points());
+}
+
+/// Without the mount table a same-device bind mount cannot be told apart
+/// from a plain directory, so the sweep is skipped.
+fn sweep_legacy_base_with(
+    legacy: &Path,
+    mounts: std::io::Result<std::collections::HashSet<PathBuf>>,
+) {
     use nix::errno::Errno;
     use nix::fcntl::{open, AtFlags, OFlag};
     use nix::sys::stat::{fstat, fstatat, Mode};
@@ -232,6 +241,15 @@ fn sweep_legacy_base_in(legacy: &Path) {
     }
     drop(readdir);
 
+    let mounts = match mounts {
+        Ok(mounts) => mounts,
+        Err(e) => {
+            debug!(target: "migrations.v017",
+                "v017: skipped legacy {} sweep (mount table: {})", legacy.display(), e);
+            return;
+        }
+    };
+    let legacy_real = std::fs::canonicalize(legacy).unwrap_or_else(|_| legacy.to_path_buf());
     for name in child_names {
         let name_str = match name.to_str() {
             Ok(s) => s,
@@ -244,6 +262,14 @@ fn sweep_legacy_base_in(legacy: &Path) {
                 continue;
             }
         };
+        if is_mount_boundary(parent_st.st_dev, st.st_dev)
+            || mounts.contains(&legacy_real.join(name_str))
+        {
+            debug!(target: "migrations.v017",
+                "v017: legacy {}/{} is a mount point, skipping",
+                legacy.display(), name_str);
+            continue;
+        }
         if st.st_uid != euid {
             debug!(target: "migrations.v017",
                 "v017: legacy {}/{} owned by uid={}, skipping (multi-tenant)",
@@ -283,6 +309,13 @@ fn sweep_legacy_base_in(legacy: &Path) {
             "v017: legacy {} owner uid={} != euid={}, leaving parent",
             legacy.display(), parent_st.st_uid, euid);
     }
+}
+
+/// A sandbox bind-mounts a live host hook dir here, owned by our uid, so the
+/// sweep must not delete through it. Another device marks a mount; a bind
+/// mount on the same device is caught by the mount table instead.
+fn is_mount_boundary(parent_dev: nix::libc::dev_t, child_dev: nix::libc::dev_t) -> bool {
+    parent_dev != child_dev
 }
 
 /// Iterative owner-checked subtree removal under a verified parent fd.
@@ -675,6 +708,86 @@ mod tests {
             legacy.exists(),
             "legacy parent must remain while an alien-owned entry exists"
         );
+    }
+
+    #[test]
+    fn mount_boundary_is_a_device_mismatch_with_the_parent() {
+        for (parent_dev, child_dev, expected) in [(10, 10, false), (10, 11, true), (0, 1, true)] {
+            assert_eq!(
+                super::is_mount_boundary(parent_dev, child_dev),
+                expected,
+                "parent={parent_dev} child={child_dev}"
+            );
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn legacy_sweep_is_skipped_when_the_mount_inventory_is_unavailable() {
+        use std::os::unix::fs::PermissionsExt;
+        let tmp = TempDir::new().unwrap();
+        let legacy = tmp.path().join("legacy-aoe-hooks-nomounts");
+        fs::create_dir(&legacy).unwrap();
+        fs::set_permissions(&legacy, fs::Permissions::from_mode(0o700)).unwrap();
+        let inst = legacy.join("inst");
+        fs::create_dir(&inst).unwrap();
+        fs::write(inst.join("status"), b"running").unwrap();
+
+        super::sweep_legacy_base_with(
+            &legacy,
+            Err(std::io::Error::from(std::io::ErrorKind::NotFound)),
+        );
+
+        assert!(
+            inst.join("status").exists(),
+            "an unknown mount table must leave the legacy dir untouched"
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn legacy_sweep_keeps_a_same_device_child_listed_as_a_mount_point() {
+        use std::os::unix::fs::PermissionsExt;
+        let tmp = TempDir::new().unwrap();
+        let legacy = fs::canonicalize(tmp.path())
+            .unwrap()
+            .join("legacy-aoe-hooks-bind");
+        fs::create_dir(&legacy).unwrap();
+        fs::set_permissions(&legacy, fs::Permissions::from_mode(0o700)).unwrap();
+        let mounted = legacy.join("mounted");
+        let ordinary = legacy.join("ordinary");
+        for dir in [&mounted, &ordinary] {
+            fs::create_dir(dir).unwrap();
+            fs::write(dir.join("status"), b"running").unwrap();
+        }
+
+        super::sweep_legacy_base_with(&legacy, Ok(std::iter::once(mounted.clone()).collect()));
+
+        assert!(
+            mounted.join("status").exists(),
+            "a listed mount point must keep its files"
+        );
+        assert!(
+            !ordinary.exists(),
+            "an ordinary sibling must still be swept"
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn legacy_sweep_still_removes_same_device_children() {
+        use std::os::unix::fs::PermissionsExt;
+        let tmp = TempDir::new().unwrap();
+        let legacy = tmp.path().join("legacy-aoe-hooks-samedev");
+        fs::create_dir(&legacy).unwrap();
+        fs::set_permissions(&legacy, fs::Permissions::from_mode(0o700)).unwrap();
+        let inst = legacy.join("inst");
+        fs::create_dir(&inst).unwrap();
+        fs::write(inst.join("status"), b"idle").unwrap();
+
+        super::sweep_legacy_base_in(&legacy);
+
+        assert!(!legacy.exists(), "same-device children must still be swept");
     }
 
     #[test]

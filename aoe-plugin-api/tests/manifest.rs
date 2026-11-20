@@ -433,6 +433,49 @@ fn runtime_requires_worker_capability() {
 }
 
 #[test]
+fn send_keys_enter_delay_requires_api_22_and_caps_at_two_seconds() {
+    let declaration = "[[agent_integrations]]\ntool = \"example\"\ncommand = \"example\"\n\
+                       [agent_integrations.launch]\n\
+                       send_keys_enter_delay_ms = 150\n";
+
+    let parsed = parse(22, declaration);
+    assert_eq!(
+        parsed.agent_integrations[0]
+            .launch
+            .as_ref()
+            .and_then(|launch| launch.send_keys_enter_delay_ms),
+        Some(150)
+    );
+    assert_eq!(
+        PluginManifest::from_toml_str(&toml::to_string(&parsed).unwrap())
+            .expect("round-trips")
+            .agent_integrations[0]
+            .launch
+            .as_ref()
+            .and_then(|launch| launch.send_keys_enter_delay_ms),
+        Some(150)
+    );
+
+    let errors = invalid(21, declaration);
+    assert!(
+        errors
+            .iter()
+            .any(|error| error.contains("send_keys_enter_delay_ms requires api_version >= 22")),
+        "{errors:?}"
+    );
+
+    let errors = invalid(22, &declaration.replace("150", "2001"));
+    assert!(
+        errors
+            .iter()
+            .any(|error| error.contains("send_keys_enter_delay_ms must be at most 2000")),
+        "{errors:?}"
+    );
+
+    parse(22, &declaration.replace("150", "2000"));
+}
+
+#[test]
 fn session_id_capture_requires_api_22_and_a_worker_runtime() {
     let runtime = "capabilities = [\"runtime.worker\"]\n\
                    [runtime]\n\

@@ -4,12 +4,15 @@ import { Link } from "react-router-dom";
 import { type RespawnState, useRespawnSession } from "../../hooks/useRespawnSession";
 import type { AcpState, AuthStatus } from "../../lib/acpTypes";
 import { useAgentDisplayNames } from "../../lib/agentDisplayName";
-import { fetchAccountTargets, fetchAgents } from "../../lib/api";
+import { fetchAccountTargets, fetchAgents, switchSessionAccount } from "../../lib/api";
 import {
   clearPendingSwitchAccount,
   getPendingSwitchAccount,
+  getSwitchingAccount,
+  setSwitchingAccount,
   subscribePendingSwitchAccount,
 } from "../../lib/switchAccountTrigger";
+import { reportError } from "../../lib/toastBus";
 import { formatDurationSecondsShort } from "../sidebar/format";
 import { SwitchAccountModal } from "./SwitchAccountModal";
 import { SwitchAgentModal } from "./SwitchAgentModal";
@@ -122,7 +125,7 @@ export function UsageLimitBanner({
             </p>
           ) : null}
           {failoverTo && (
-            <p className="mt-1 text-xs text-text-secondary" data-testid="usage-limit-failover">
+            <p role="status" className="mt-1 text-xs text-text-secondary" data-testid="usage-limit-failover">
               Switching to {failoverTo}…
             </p>
           )}
@@ -273,6 +276,21 @@ export function UsageLimitSection({
     setAccountOpen(false);
     clearPendingSwitchAccount();
   };
+  // The restart runs in the background; this is its inline status, like a compaction's.
+  const switchingTo = useSyncExternalStore(
+    subscribePendingSwitchAccount,
+    () => getSwitchingAccount(sessionId),
+    () => null,
+  );
+  const switchAccount = (tool: string) => {
+    setSwitchingAccount(sessionId, tool);
+    void switchSessionAccount(sessionId, tool)
+      .then((result) => {
+        if (!result.ok) reportError(result.message ?? "Switching account failed.");
+      })
+      .finally(() => setSwitchingAccount(sessionId, null));
+  };
+  const switching = failoverTo ?? switchingTo ?? undefined;
   // Taken when the modal opens, so the switch's own Agent change doesn't reload it mid-handoff.
   const [handoff, setHandoff] = useState<{ from: string | null; eligible: string[] } | null>(null);
   return (
@@ -282,7 +300,7 @@ export function UsageLimitSection({
           agent={agent}
           rateLimit={rateLimit}
           autoResume={autoResume}
-          failoverTo={failoverTo}
+          failoverTo={switching}
           retriesExhausted={retriesExhausted}
           resumeState={resume.state}
           resumeError={resume.error}
@@ -294,13 +312,23 @@ export function UsageLimitSection({
           settingsHref={settingsHref}
         />
       )}
+      {!rateLimit && switching && (
+        <p
+          role="status"
+          data-testid="switch-account-status"
+          className="border-t border-surface-700/60 px-4 py-2 text-xs text-text-muted"
+        >
+          Switching to {switching}…
+        </p>
+      )}
       <SwitchAccountModal
         open={accountOpen || pendingAccount === sessionId}
         sessionId={sessionId}
         currentTool={currentTool}
         authStatus={authStatus}
         targets={accountOpen ? accountTargets : undefined}
-        failoverTo={failoverTo}
+        failoverTo={switching}
+        onSwitch={switchAccount}
         onClose={closeAccount}
       />
 
