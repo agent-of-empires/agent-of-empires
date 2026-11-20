@@ -11,6 +11,8 @@ export interface ClientCapabilities {
   canUseTerminal: boolean;
   canUseDiff: boolean;
   canManageProjects: boolean;
+  /** Start, Dismiss, Refresh and preset edits on suggestions; CityHall refuses them. */
+  canManageSuggestions: boolean;
   nameOnlyWizard: boolean;
 }
 
@@ -22,6 +24,7 @@ export function getClientCapabilities(serverAbout: ServerAbout | null | undefine
     canUseTerminal: !cityhall,
     canUseDiff: !cityhall,
     canManageProjects: !cityhall,
+    canManageSuggestions: !cityhall,
     nameOnlyWizard: cityhall,
   };
 }
