@@ -270,6 +270,7 @@ impl McpServer {
                     &session.id,
                     text.clone(),
                     false,
+                    false,
                 )
                 .await
                 {
@@ -485,8 +486,14 @@ impl McpServer {
             )));
         }
         // No revival: a restarted agent can open on a dialog the check above never saw.
-        if let Err(e) =
-            send_terminal_message(&self.state.session_service, &id, message.clone(), false).await
+        if let Err(e) = send_terminal_message(
+            &self.state.session_service,
+            &id,
+            message.clone(),
+            false,
+            true,
+        )
+        .await
         {
             return Err(Box::new(terminal_refusal(&id, e.error).await));
         }
@@ -936,6 +943,11 @@ async fn terminal_refusal(id: &str, error: SendKeysError) -> CallToolResult {
             "invalid_request",
             "The session no longer has a terminal agent",
         ),
+        SendKeysError::Ignored => tool_error(
+            "ignored",
+            "The session is ignored because another session manages it. A person must \
+             reclaim ownership or unignore it before MCP sends a prompt.",
+        ),
         SendKeysError::Blocked(blocked) => tool_error("invalid_request", blocked.to_string()),
         SendKeysError::Tmux(error) => {
             tracing::warn!(target: "http.api.sessions", session = %id, %error, "terminal send failed");
@@ -1117,6 +1129,7 @@ mod tests {
                 "busy",
             ),
             (SendKeysError::NotRunning, "not_running"),
+            (SendKeysError::Ignored, "ignored"),
             (SendKeysError::Gone, "not_found"),
         ];
         for (error, code) in cases {

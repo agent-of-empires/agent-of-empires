@@ -24,6 +24,7 @@ pub(crate) enum SendKeysError {
     NotRunning,
     Transient(Status),
     StructuredView,
+    Ignored,
     Blocked(crate::session::StartBlocked),
     Gone,
     Tmux(anyhow::Error),
@@ -45,14 +46,22 @@ pub(crate) async fn send_terminal_message(
     id: &str,
     message: String,
     revive: bool,
+    refuse_if_ignored: bool,
 ) -> Result<bool, TerminalSendError> {
     let mut committed_cursor = None;
-    send_terminal_message_inner(service, id, message, revive, &mut committed_cursor)
-        .await
-        .map_err(|error| TerminalSendError {
-            error,
-            committed_cursor: committed_cursor.map(Box::new),
-        })
+    send_terminal_message_inner(
+        service,
+        id,
+        message,
+        revive,
+        refuse_if_ignored,
+        &mut committed_cursor,
+    )
+    .await
+    .map_err(|error| TerminalSendError {
+        error,
+        committed_cursor: committed_cursor.map(Box::new),
+    })
 }
 
 async fn send_terminal_message_inner(
@@ -60,6 +69,7 @@ async fn send_terminal_message_inner(
     id: &str,
     message: String,
     revive: bool,
+    refuse_if_ignored: bool,
     committed_cursor: &mut Option<(axum::http::HeaderValue, axum::http::HeaderValue)>,
 ) -> Result<bool, SendKeysError> {
     let state = service.native_state().map_err(SendKeysError::Tmux)?;
@@ -164,6 +174,16 @@ async fn send_terminal_message_inner(
         let store: &dyn SessionStore = &native;
         let expected = (instance.lifecycle_generation, instance.title.clone());
         let _ownership = instance.acquire_auxiliary_locks_in(&native)?;
+        // The snapshot pre-check races a local CLI or another process; the row the
+        // send would touch is authoritative.
+        if refuse_if_ignored
+            && store
+                .load()?
+                .iter()
+                .any(|row| row.id == instance.id && row.is_ignored())
+        {
+            return Err(IgnoredSession.into());
+        }
         anyhow::ensure!(
             instance.lifecycle_generation == expected.0 && instance.title == expected.1,
             crate::session::LifecycleReservationError::Superseded
@@ -206,6 +226,8 @@ async fn send_terminal_message_inner(
     result.map_err(|error| {
         if let Some(blocked) = error.downcast_ref::<crate::session::StartBlocked>() {
             SendKeysError::Blocked(*blocked)
+        } else if error.is::<IgnoredSession>() {
+            SendKeysError::Ignored
         } else if error.is::<crate::session::SessionGone>() {
             SendKeysError::Gone
         } else if error.is::<TerminalNotRunning>() {
@@ -224,6 +246,10 @@ async fn send_terminal_message_inner(
 #[derive(Debug, thiserror::Error)]
 #[error("Terminal session is not running")]
 struct TerminalNotRunning;
+
+#[derive(Debug, thiserror::Error)]
+#[error("Session is ignored")]
+struct IgnoredSession;
 
 impl IntoResponse for TerminalSendError {
     fn into_response(self) -> axum::response::Response {
@@ -246,6 +272,11 @@ impl IntoResponse for TerminalSendError {
                 Json(serde_json::json!({"error": "acp_mode_unsupported"})),
             )
                 .into_response(),
+            SendKeysError::Ignored => crate::server::api::api_error(
+                StatusCode::CONFLICT,
+                "ignored",
+                "The session is ignored because another session manages it",
+            ),
             SendKeysError::Blocked(blocked) => crate::server::api::start_blocked_response(blocked),
             SendKeysError::Tmux(error) => {
                 tracing::warn!(target: "http.api.sessions", %error, "terminal send failed");
@@ -308,7 +339,7 @@ pub async fn send_message(
     }
 
     let revive = req.revive;
-    match send_terminal_message(&state.session_service, &id, req.message, revive).await {
+    match send_terminal_message(&state.session_service, &id, req.message, revive, false).await {
         Ok(_) => {
             tracing::info!(target: "session.lifecycle", session = %id, len, revive, "terminal message sent");
             match state.runtime.publish(&state).await {

@@ -952,6 +952,7 @@ async fn deliver_message(
         &req.session_id,
         req.message.clone(),
         true,
+        false,
     )
     .await
     .map_err(|error| map_terminal_error(error.error))?;
@@ -1196,6 +1197,11 @@ fn map_terminal_error(e: SendKeysError) -> DispatchError {
         SendKeysError::StructuredView => {
             DispatchError::internal("terminal send reached a structured session")
         }
+        SendKeysError::Ignored => DispatchError::with_kind(
+            codes::FAILED_PRECONDITION,
+            "ignored",
+            "the session is ignored because another session manages it",
+        ),
         SendKeysError::Tmux(error) => {
             tracing::warn!(target: "plugin.host", %error, "plugin terminal send failed");
             DispatchError::internal("terminal send failed")

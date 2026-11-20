@@ -160,43 +160,48 @@ pub async fn update_session_ignored(
         let Some(instance) = instances.iter().find(|instance| instance.id == id) else {
             return crate::server::api::session_not_found();
         };
-        // Archive and trash outrank ignore; ignoring a sunk row would persist a state
-        // the rest of the dashboard reads as archived or trashed.
-        if body.ignored && (instance.is_archived() || instance.is_trashed()) {
-            return ignore_blocked_response(if instance.is_trashed() {
-                crate::session::StartBlocked::Trashed
-            } else {
-                crate::session::StartBlocked::Archived
-            });
-        }
-        // Only a managed row can be ignored; otherwise the marker would outlive
-        // the manager link that gives it meaning.
-        if body.ignored && instance.parent_session_id.is_none() {
-            return crate::server::api::api_error(
-                axum::http::StatusCode::BAD_REQUEST,
-                "session_not_managed",
-                "Only a session managed by another session can be ignored",
-            );
-        }
         instance.source_profile.clone()
     };
     let ignored = body.ignored;
     let persist_id = id.clone();
-    let committed = commit_profile_update(
+    let committed = commit_profile_update_with_refusal(
         &state,
         profile,
         "ignore update",
         move |instances| {
-            if let Some(instance) = instances
+            let Some(instance) = instances
                 .iter_mut()
                 .find(|instance| instance.id == persist_id)
-            {
-                if ignored {
-                    instance.ignore();
-                } else {
-                    instance.unignore();
+            else {
+                return Err(crate::server::api::session_not_found());
+            };
+            if ignored {
+                // Archive and trash outrank ignore; ignoring a sunk row would persist a
+                // state the rest of the dashboard reads as archived or trashed.
+                if instance.is_trashed() {
+                    return Err(ignore_blocked_response(
+                        crate::session::StartBlocked::Trashed,
+                    ));
                 }
+                if instance.is_archived() {
+                    return Err(ignore_blocked_response(
+                        crate::session::StartBlocked::Archived,
+                    ));
+                }
+                // Only a managed row can be ignored; otherwise the marker would outlive
+                // the manager link that gives it meaning.
+                if instance.parent_session_id.is_none() {
+                    return Err(crate::server::api::api_error(
+                        axum::http::StatusCode::BAD_REQUEST,
+                        "session_not_managed",
+                        "Only a session managed by another session can be ignored",
+                    ));
+                }
+                instance.ignore();
+            } else {
+                instance.unignore();
             }
+            Ok(())
         },
         None,
     )

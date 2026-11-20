@@ -947,6 +947,27 @@ async fn mcp_send_and_read_leave_an_ignored_managed_session_alone() {
     assert_eq!(row.parent_session_id.as_deref(), Some("mcp-manager"));
 }
 
+/// A terminal send re-reads the canonical row under the instance lock: an ignore committed
+/// after the dashboard snapshot refuses before any keys are typed.
+#[tokio::test]
+#[serial_test::serial]
+async fn mcp_terminal_send_refuses_an_ignore_committed_after_the_snapshot() {
+    let _guard = crate::session::test_support::isolate_app_dir();
+    let mut live = Instance::new("mcp-ignored-pane", "/tmp/aoe-mcp-ignored-pane");
+    live.source_profile = "default".into();
+    let id = live.id.clone();
+    let (app, _state) = seeded_app(vec![live.clone()], false).await;
+
+    // A local CLI or another process marks the stored row ignored; the in-memory
+    // snapshot the pre-check reads still looks live.
+    let mut ignored = live;
+    ignored.ignore();
+    test_support::seed_instances_on_disk_for_test("default", vec![ignored]);
+
+    let refused = call_result(&app, "send", json!({"session_id": id, "message": "hello"})).await;
+    assert_eq!(error_code(&refused), Some("ignored"), "{refused}");
+}
+
 /// A structured transcript reads as text from a cursor, pages on from `next_since`, and comes
 /// back raw on request.
 #[tokio::test]

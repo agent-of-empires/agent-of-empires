@@ -2705,9 +2705,13 @@ async fn ignore_refuses_an_archived_or_trashed_session() -> anyhow::Result<()> {
     trashed.source_profile = "receipt".into();
     trashed.parent_session_id = Some("manager".into());
     trashed.trash();
+    let mut raced = Instance::new("raced ignore", "/tmp/raced-ignore");
+    raced.source_profile = "receipt".into();
+    raced.parent_session_id = Some("manager".into());
     let archived_id = archived.id.clone();
     let trashed_id = trashed.id.clone();
-    let rows = vec![archived, trashed];
+    let raced_id = raced.id.clone();
+    let rows = vec![archived, trashed, raced];
     let state = crate::server::test_support::build_test_app_state(rows.clone());
     let storage = Storage::new("receipt", state.file_watch.clone())?;
     storage.update(|stored, _| {
@@ -2752,6 +2756,37 @@ async fn ignore_refuses_an_archived_or_trashed_session() -> anyhow::Result<()> {
             .expect("row persisted");
         assert!(!row.is_ignored(), "{id}");
     }
+
+    // The snapshot can go stale between the handler's read and the commit: a
+    // local CLI archives the stored row while the dashboard still sees it live.
+    storage.update(|stored, _| {
+        let row = stored
+            .iter_mut()
+            .find(|row| row.id == raced_id)
+            .expect("raced row persisted");
+        row.archive();
+        Ok(())
+    })?;
+    let response = update_session_ignored(
+        State(state.clone()),
+        Path(raced_id.clone()),
+        Ok(Json(UpdateIgnoredBody { ignored: true })),
+    )
+    .await
+    .into_response();
+    assert_eq!(response.status(), StatusCode::CONFLICT, "stale snapshot");
+    let body = to_bytes(response.into_body(), usize::MAX).await?;
+    let json: serde_json::Value = serde_json::from_slice(&body)?;
+    assert_eq!(json["error"], "session_archived", "{json}");
+    let stored = storage.load()?;
+    let row = stored
+        .iter()
+        .find(|row| row.id == raced_id)
+        .expect("raced row persisted");
+    assert!(
+        !row.is_ignored(),
+        "stale snapshot must not mark the row ignored"
+    );
     Ok(())
 }
 
