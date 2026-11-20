@@ -1686,7 +1686,7 @@ time.sleep(60)
                 )
                 .await;
             if purging {
-                assert!(matches!(result, Err(SupervisorError::TeardownPending(_))));
+                assert!(matches!(result, Err(SupervisorError::PurgeInProgress(_))));
                 assert_eq!(supervisor.worker_state(id).await, AcpWorkerState::Absent);
             } else {
                 assert!(matches!(result, Ok(ResumeReservationOutcome::Reserved(_))));

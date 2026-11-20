@@ -92,7 +92,7 @@ impl SpawnRequestState {
             return None;
         }
         Some(if restarting || fence.stop_owners == 0 {
-            SupervisorError::TeardownPending(session_id.to_string())
+            SupervisorError::PurgeInProgress(session_id.to_string())
         } else {
             SupervisorError::SpawnCancelled(session_id.to_string())
         })
@@ -123,7 +123,10 @@ pub enum SupervisorError {
     /// A concurrent shutdown cancelled the resume; callers treat it as a soft success.
     #[error("resume of session {0:?} was cancelled by a concurrent shutdown")]
     SpawnCancelled(String),
-    /// Retirement or a temporary admission fence has not cleared yet.
+    /// A temporary purge fence prevents admission.
+    #[error("session {0:?} has a purge in progress")]
+    PurgeInProgress(String),
+    /// Retirement of the previous worker has not completed.
     #[error("session {0:?} is still stopping its previous structured view worker")]
     TeardownPending(String),
     /// The worker a caller observed is no longer the running one.
