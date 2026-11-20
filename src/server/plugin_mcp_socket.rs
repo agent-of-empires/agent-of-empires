@@ -435,6 +435,86 @@ mod linux {
         match crate::server::auth::socket_plugin_caller(&state, &mut request).await {
             Some(caller) => {
                 request.extensions_mut().insert(caller);
+        #[test]
+        fn the_forwarder_refuses_header_injection_and_keeps_serving() {
+            use std::io::{BufRead, BufReader, Read, Write};
+            use std::os::unix::net::UnixListener;
+
+            let dir = tempfile::tempdir().unwrap();
+            let script = dir.path().join(FORWARDER_FILE);
+            std::fs::write(&script, FORWARDER).unwrap();
+            let socket = dir.path().join("s.sock");
+            let listener = UnixListener::bind(&socket).unwrap();
+            let server = std::thread::spawn(move || {
+                let (stream, _) = listener.accept().unwrap();
+                let mut reader = BufReader::new(stream);
+                let mut head = String::new();
+                let mut length = 0usize;
+                loop {
+                    let mut line = String::new();
+                    reader.read_line(&mut line).unwrap();
+                    if let Some(n) = line.to_ascii_lowercase().strip_prefix("content-length:") {
+                        length = n.trim().parse().unwrap();
+                    }
+                    head.push_str(&line);
+                    if line == "\r\n" {
+                        break;
+                    }
+                }
+                let mut body = vec![0; length];
+                reader.read_exact(&mut body).unwrap();
+                let id = serde_json::from_slice::<Value>(&body).unwrap()["id"].clone();
+                let reply = serde_json::json!({"jsonrpc": "2.0", "id": id, "result": {}});
+                let reply = reply.to_string();
+                write!(
+                    reader.get_mut(),
+                    "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{reply}",
+                    reply.len()
+                )
+                .unwrap();
+                head
+            });
+
+            let mut child = match std::process::Command::new("node")
+                .arg(&script)
+                .args([socket.to_str().unwrap(), "plugin", "server"])
+                .stdin(std::process::Stdio::piped())
+                .stdout(std::process::Stdio::piped())
+                .spawn()
+            {
+                Ok(child) => child,
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => return,
+                Err(e) => panic!("spawn node: {e}"),
+            };
+            let mut stdin = child.stdin.take().unwrap();
+            let mut stdout = BufReader::new(child.stdout.take().unwrap());
+            let mut ask = |message: Value| -> Value {
+                writeln!(stdin, "{message}").unwrap();
+                let mut line = String::new();
+                stdout.read_line(&mut line).unwrap();
+                serde_json::from_str(&line)
+                    .unwrap_or_else(|_| panic!("the forwarder died or printed {line:?}"))
+            };
+            let meta = "io.modelcontextprotocol/protocolVersion";
+            for (id, params) in [
+                (
+                    1,
+                    serde_json::json!({"_meta": {meta: "2026-07-28\r\nx-evil: 1"}}),
+                ),
+                (2, serde_json::json!({"_meta": {meta: "2026-07-28"}})),
+            ] {
+                let reply = ask(serde_json::json!(
+                    {"jsonrpc": "2.0", "id": id, "method": "ping", "params": params}
+                ));
+                assert_eq!(reply["id"], id);
+                assert_eq!(reply.get("error").is_some(), id == 1, "{reply}");
+            }
+            drop(stdin);
+            let head = server.join().unwrap();
+            child.wait().unwrap();
+            assert!(!head.contains("x-evil"), "{head}");
+        }
+
                 next.run(request).await
             }
             None => (
