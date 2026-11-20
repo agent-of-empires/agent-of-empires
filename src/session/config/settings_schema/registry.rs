@@ -197,6 +197,7 @@ mod tests {
             .filter(|d| d.section == "systemd")
             .map(|d| d.field.as_str())
             .collect();
+        // The web tags every systemd row "Linux only" by section.
         assert_eq!(fields, cases.iter().map(|c| c.0).collect::<Vec<_>>());
         for (field, widget, validation, advanced) in cases {
             let d = descriptor("systemd", field).unwrap();
@@ -272,6 +273,105 @@ mod tests {
         assert_eq!(row["label"], "Sidebar position");
     }
 
+    fn paths_where(flag: impl Fn(&FieldDescriptor) -> bool) -> Vec<String> {
+        let mut paths: Vec<String> = schema_ref()
+            .iter()
+            .filter(|d| flag(d))
+            .map(|d| d.path())
+            .collect();
+        paths.sort();
+        paths
+    }
+
+    #[test]
+    fn restart_and_web_only_flags_mark_exactly_the_audited_fields() {
+        // Each restart field is read once per process (a startup snapshot or a
+        // OnceLock), so a saved change waits for the next start.
+        let restart = [
+            "acp.max_concurrent_workers",
+            "logging.file_path",
+            "logging.keep_count",
+            "logging.max_size_mib",
+            "logging.output",
+            "logging.rotation",
+            "logging.show_spans",
+            "session.session_id_poller_max_threads",
+            "systemd.enabled",
+            "systemd.memory_max",
+            "systemd.slice",
+            "systemd.survive_daemon_restart",
+            "systemd.tasks_max",
+            "tmux.socket_name",
+            "web.mcp_enabled",
+            "web.notifications_enabled",
+            "web.notify_on_error",
+            "web.notify_on_idle",
+            "web.notify_on_waiting",
+            "web.notify_on_wake_fire",
+        ];
+        assert_eq!(paths_where(|d| d.restart), restart);
+        assert_eq!(paths_where(|d| d.web_only), ["session.show_session_colors"]);
+        assert!(paths_where(|d| d.web_only && d.tui_only).is_empty());
+        for d in schema_ref() {
+            assert!(
+                !d.label.to_lowercase().contains("restart req"),
+                "{}: the Needs restart tag replaces the label suffix",
+                d.path()
+            );
+        }
+    }
+
+    #[test]
+    fn flags_are_served_only_when_set() {
+        let flagged = served_row("logging.output");
+        assert_eq!(flagged["restart"], true, "{flagged}");
+        assert_eq!(flagged["label"], "Write to");
+        assert_eq!(served_row("session.show_session_colors")["web_only"], true);
+        let plain = served_row("session.delete_to_trash");
+        let obj = plain.as_object().unwrap();
+        assert!(
+            !obj.contains_key("restart") && !obj.contains_key("web_only"),
+            "{plain}"
+        );
+    }
+
+    #[test]
+    fn acp_section_fields_are_all_structured_view_settings() {
+        // The web tags every acp row "Structured view only" by section. A field
+        // that also changes Terminal view belongs in another section, or the
+        // web rule needs an exception.
+        let fields: Vec<&str> = schema_ref()
+            .iter()
+            .filter(|d| d.section == "acp")
+            .map(|d| d.field.as_str())
+            .collect();
+        assert_eq!(
+            fields,
+            [
+                "structured_view",
+                "default_agent",
+                "restrict_agents",
+                "allowed_agents",
+                "max_concurrent_workers",
+                "replay_events",
+                "node_path",
+                "show_tool_durations",
+                "wrap_tool_output",
+                "compaction_reminder",
+                "compaction_reminder_percent",
+                "notice_display",
+                "notice_timeout_secs",
+                "silent_orphan_grace_secs",
+                "auto_stop_idle_secs",
+                "rate_limit_auto_resume",
+                "rate_limit_failover",
+                "rate_limit_failover_accounts",
+                "allow_agent_install",
+                "acp_defaults",
+            ]
+        );
+    }
+
     #[test]
     fn field_declared_repo_and_write_policies() {
         use super::super::{RepoPolicy, ValidationKind, WebWritePolicy};
@@ -299,6 +399,7 @@ mod tests {
         for (section, field, expected) in [
             ("sandbox", "extra_volumes", RepoPolicy::Deny),
             ("sandbox", "selinux_relabel", RepoPolicy::Deny),
+            ("sandbox", "shared_credential", RepoPolicy::Deny),
             ("worktree", "path_template", RepoPolicy::Deny),
             ("session", "default_tool", RepoPolicy::Deny),
             ("session", "agent_detect_as", RepoPolicy::Allow),

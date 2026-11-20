@@ -23,6 +23,10 @@ The dashboard shows the same thing inline, as a screen that names the Agent, the
 - **A sandboxed session, in any of these states:** **Recreate container** restarts the session on a new container from the current local image, after the same confirmation as **More > Recreate container** in its context menu. Anything outside the working directory and the mounted folders is lost. See [Sandbox](../guides/sandbox.md#available-images).
 - **Read-only and CityHall dashboards** show the command only. Restart the agent from the TUI.
 
+### A sandboxed session's container is gone
+
+When a sandboxed session's container was removed, its agent can't restart in it, so the session stops with a screen saying the container is gone. **Recreate container** builds a new one from the current local image, after the same confirmation as **More > Recreate container**, and the session starts again. **New Session in** _Project_ opens the new session dialog for the same Project, Agent and Group instead. Sending is blocked until then, because a send would start the session on a new container without that warning. Read-only and CityHall dashboards ask you to have the owner recreate it. Recreate isn't offered for an archived or trashed session, or one that's being created or deleted, so the screen says to unarchive it from the sidebar, restore it from Trash, or wait first.
+
 ### "Failed to start structured view agent" while the adapter is installed
 
 `aoe serve` captures the launching shell's `PATH` at startup. If the adapter lives under a node-version-manager directory (nvm, fnm, mise, asdf) and the node version on the daemon's `PATH` does not match, the spawn fails with `No such file or directory`. Restart `aoe serve` from a shell where `which claude-agent-acp` resolves, or symlink the binary into `/usr/local/bin` or `~/.local/bin`.

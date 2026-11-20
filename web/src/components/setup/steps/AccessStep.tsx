@@ -74,6 +74,7 @@ export function AccessStep({ status, about, schema, values, onSaveField }: Props
               values={values}
               onSaveField={onSaveField}
               onlyFields={["notify_on_waiting", "notify_on_idle", "notify_on_error"]}
+              hideKeys
             />
           </div>
         </div>

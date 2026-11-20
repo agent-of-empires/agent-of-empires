@@ -112,7 +112,7 @@ fn legacy_duplicate_stays_excluded_and_is_surfaced() {
     terminal
         .draw(|f| {
             let area = f.area();
-            view.render(f, area, &theme, None, None, None);
+            view.render(f, area, &theme, None);
         })
         .unwrap();
     let buf = terminal.backend().buffer();

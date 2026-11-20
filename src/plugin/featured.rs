@@ -86,4 +86,40 @@ versions = { "1.0" = "sha256:aaa", "1.1" = "sha256:bbb" }
         assert!(entry.verifies("sha256:bbb"));
         assert!(!entry.verifies("sha256:ccc"));
     }
+
+    /// The shipped index is a maintainer attestation, so the ids and the sources they
+    /// vouch for are asserted here: a copy-paste cannot silently vouch for the wrong repo.
+    #[test]
+    fn embedded_index_lists_the_expected_ids_and_sources() {
+        let index = FeaturedIndex::from_toml_str(EMBEDDED).expect("embedded index parses");
+        let expected = [
+            (
+                "agent-of-empires.github",
+                "gh:agent-of-empires/plugin-github",
+            ),
+            ("agent-of-empires.cron", "gh:agent-of-empires/plugin-cron"),
+            (
+                "agent-of-empires.kanban",
+                "gh:agent-of-empires/plugin-kanban",
+            ),
+            (
+                "agent-of-empires.linear",
+                "gh:agent-of-empires/plugin-linear",
+            ),
+            (
+                "agent-of-empires.aoe-freebuf",
+                "gh:agent-of-empires/plugin-freebuf",
+            ),
+            ("agent-of-empires.omp", "gh:agent-of-empires/plugin-omp"),
+        ];
+        for (id, source) in expected {
+            let entry = index.get(id).unwrap_or_else(|| panic!("{id} is listed"));
+            assert_eq!(entry.source, source, "{id} names its own repository");
+            assert!(!entry.versions.is_empty(), "{id} has no vetted release");
+            assert!(
+                entry.versions.values().all(|v| v.starts_with("sha256:")),
+                "{id} has a non-sha256 version value"
+            );
+        }
+    }
 }

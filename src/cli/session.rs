@@ -1412,7 +1412,7 @@ fn send_restart_wake(
         return Ok(false);
     }
     let _input_lock = working.lock_for_input()?;
-    let delay = crate::agents::send_keys_enter_delay(&working.tool);
+    let delay = working.send_keys_enter_delay();
     tmux_session.send_keys_with_delay(wake_msg, delay)?;
     Ok(true)
 }

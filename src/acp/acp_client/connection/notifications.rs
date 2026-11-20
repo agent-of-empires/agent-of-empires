@@ -72,6 +72,7 @@ pub(super) struct Shared {
     /// While set, the per-prompt watchdog owns idle detection.
     pub(super) prompt_in_flight: Arc<AtomicBool>,
     pub(super) local_prompt_settled: tokio::sync::Notify,
+    pub(super) runner_completion_pending: AtomicBool,
     /// Bumped before each prompt so stale lifecycle envelopes are discarded.
     pub(super) prompt_epoch: AtomicU64,
     lifecycle_tx: mpsc::Sender<LifecycleEnvelope>,
@@ -141,6 +142,7 @@ impl Shared {
             adopted_turn_active: AtomicBool::new(false),
             prompt_in_flight,
             local_prompt_settled: tokio::sync::Notify::new(),
+            runner_completion_pending: AtomicBool::new(false),
             prompt_epoch: AtomicU64::new(0),
             lifecycle_tx,
             between_prompt: BetweenPromptTracker::default(),
@@ -217,6 +219,9 @@ impl Shared {
             }
             let _ = event_tx.send(Event::Stopped { reason }).await;
         });
+        if self.runner_completion_pending.swap(false, Ordering::AcqRel) {
+            self.local_prompt_settled.notify_waiters();
+        }
         let _ = publication.await;
     }
 

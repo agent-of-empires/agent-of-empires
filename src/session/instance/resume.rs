@@ -507,6 +507,13 @@ impl Instance {
             return Ok(StartOutcome::Fresh);
         }
         storage.check_available()?;
+        if options.restart && self.is_sandboxed() {
+            // A `before_start` hook the sandbox login admission needs runs here, before the
+            // title lock and lifecycle flock are taken (hooks may call `aoe` on this session)
+            // and before anything is stopped or discarded: the checks below then decide on
+            // its real environment, and a hook failure is its own error with nothing touched.
+            self.resolve_before_start_for_restart(storage, true)?;
+        }
 
         let title_lock = crate::session::storage::acquire_session_title_lock(&self.id)
             .context("failed to acquire instance start title lock")?;
@@ -528,6 +535,7 @@ impl Instance {
                 };
             }
         };
+        let mut promoted_restart = false;
         if !options.restart {
             use crate::tmux::utils::PaneProbe;
             match revival.as_ref().map(|target| target.state) {
@@ -547,7 +555,10 @@ impl Instance {
                         },
                     });
                 }
-                Some(PaneProbe::Dead) => options.restart = true,
+                Some(PaneProbe::Dead) => {
+                    options.restart = true;
+                    promoted_restart = true;
+                }
                 Some(PaneProbe::Missing) | None => {}
             }
         }
@@ -562,6 +573,22 @@ impl Instance {
             LifecycleOperation::Launch,
             Some(Status::Starting),
         )?;
+        let (title_lock, lifecycle_lock) = if promoted_restart && self.is_sandboxed() {
+            // Refresh admission without replacing the captured physical restart target.
+            drop(lifecycle_lock);
+            drop(title_lock);
+            let preparation = self.resolve_before_start_for_restart(storage, false);
+            self.reacquire_launch_locks_after_hooks(storage, generation, preparation)?
+        } else {
+            (title_lock, lifecycle_lock)
+        };
+        if options.restart && self.is_sandboxed() {
+            // Strict admission runs after hook preparation, before poller or container teardown.
+            if let Err(error) = self.ensure_sandbox_launchable_strict(storage) {
+                self.fail_reserved_launch(storage, generation, &error, None, None);
+                return Err(error);
+            }
+        }
         if discard_sandbox_container {
             if let Err(error) = self.discard_stale_sandbox_container() {
                 self.fail_reserved_launch(storage, generation, &error, None, None);
@@ -609,7 +636,7 @@ impl Instance {
                 }
             };
         let hook_result =
-            self.run_pre_launch_hooks(skip_on_launch, storage, None, Some(generation));
+            self.run_agent_launch_hooks(skip_on_launch, storage, None, Some(generation));
         self.finish_reserved_launch(storage, size, options, reservation, hook_result)
     }
 
@@ -4130,6 +4157,165 @@ exec sleep 60
         inst.tool = "work-claude".to_string();
         inst.command = "claude".to_string();
         assert!(inst.should_probe_pinned_fresh_launch(Some("11111111-2222-3333-4444-555555555555")));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    #[serial]
+    fn implicit_sandbox_revival_resolves_login_before_touching_the_corpse() {
+        use crate::session::test_support::{
+            failing_container_runtime, sandbox_needing_login, unset_claude_auth_routes,
+        };
+        crate::tmux::test_helpers::require_tmux!();
+        for auth in [false, true] {
+            let root = tempdir().unwrap();
+            let _app = crate::session::test_support::isolate_app_dir_at(root.path());
+            let _env = isolate_resume_environment(root.path());
+            let _auth = unset_claude_auth_routes();
+            let (_runtime, calls) = failing_container_runtime(root.path());
+            let mut instance = Instance::new("implicit-sandbox", root.path().to_str().unwrap());
+            instance.source_profile = "implicit-sandbox".into();
+            sandbox_needing_login(root.path(), &mut instance);
+            let counter = root.path().join("before-start-runs");
+            let hook = format!(
+                "echo run >> {}; echo {}",
+                shell_escape(&counter.to_string_lossy()),
+                if auth {
+                    "ANTHROPIC_API_KEY=sk-test-hook"
+                } else {
+                    "FOO=bar"
+                },
+            );
+            crate::session::config::update_config(|config| {
+                config.host_hooks.before_start = vec![hook];
+            })
+            .unwrap();
+            let storage = crate::session::Storage::new_unwatched(&instance.source_profile).unwrap();
+            storage
+                .update(|rows, _| {
+                    rows.push(instance.clone());
+                    Ok(())
+                })
+                .unwrap();
+            let (_corpse, _) = observed_dead_resume_fixture(&instance);
+            let original = instance.capture_revival_target().unwrap().unwrap();
+            let result =
+                instance.start_with_resume_fallback(None, true, ResumeAttemptPolicy::Allow);
+            let error = result.expect_err("the isolated runtime cannot launch");
+            assert_eq!(
+                std::fs::read_to_string(&counter).unwrap_or_default(),
+                "run\n",
+                "implicit revival must resolve its login hook exactly once"
+            );
+            assert_eq!(
+                error.is::<crate::session::SandboxLoginRequired>(),
+                !auth,
+                "{error:#}"
+            );
+            assert_eq!(
+                !std::fs::read_to_string(&calls)
+                    .unwrap_or_default()
+                    .is_empty(),
+                auth,
+                "only the hook with an auth route may reach the runtime"
+            );
+            if !auth {
+                let retained = instance.capture_revival_target().unwrap().unwrap();
+                assert_eq!(retained.pane, original.pane);
+                assert_eq!(retained.state, crate::tmux::utils::PaneProbe::Dead);
+            }
+            assert!(storage
+                .load()
+                .unwrap()
+                .remove(0)
+                .lifecycle_reservation
+                .is_none());
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    #[serial]
+    fn conversion_reports_unconfirmed_restart_without_losing_its_runtime() {
+        use crate::session::instance::start::test_support::{FinalizeObserver, FinalizePhase};
+        use crate::tmux::test_helpers::{
+            only_pane_id, wait_for_pane_agent_command, TmuxTestSession,
+        };
+        crate::tmux::test_helpers::require_tmux!();
+        let root = tempdir().unwrap();
+        let _app = crate::session::test_support::isolate_app_dir_at(root.path());
+        let _env = isolate_resume_environment(root.path());
+        crate::session::config::update_config(|config| {
+            config.systemd.enabled = false;
+            config.session.agent_status_hooks = false;
+            config.session.smart_rename = false;
+        })
+        .unwrap();
+        let births = root.path().join("births");
+        let pid = root.path().join("agent.pid");
+        let _agent = install_fake_claude(root.path(), &format!(
+            "#!/bin/sh\ncase \"$1\" in --help|--version) exit 1 ;; esac\nprintf x >> {}\nprintf '%s\\n' \"$$\" > {}\nexec sleep 60\n",
+            shell_escape(&births.to_string_lossy()), shell_escape(&pid.to_string_lossy()),
+        ));
+        let mut instance = Instance::new("conversion-unconfirmed", root.path().to_str().unwrap());
+        instance.tool = "claude".into();
+        instance.command = "claude".into();
+        instance.source_profile = "conversion-unconfirmed".into();
+        seed_claude_transcript(&mut instance, "77777777-7777-4777-8777-777777777777");
+        let conversation = instance.conversation_state();
+        let storage = crate::session::Storage::new_unwatched(&instance.source_profile).unwrap();
+        storage
+            .update(|rows, _| {
+                rows.push(instance.clone());
+                Ok(())
+            })
+            .unwrap();
+        let name = instance.tmux_session().unwrap().name().to_owned();
+        let _pane = TmuxTestSession::from_name(&name);
+        let final_name = name.clone();
+        let profile = instance.source_profile.clone();
+        let id = instance.id.clone();
+        let _finalize = FinalizeObserver::install(instance.id.clone(), move |_, phase| {
+            if matches!(phase, FinalizePhase::After) {
+                wait_for_pane_agent_command(&only_pane_id(&final_name), &pid, "sleep");
+                crate::session::Storage::new_unwatched(&profile)
+                    .unwrap()
+                    .update(|rows, _| {
+                        rows.iter_mut().find(|row| row.id == id).unwrap().title =
+                            "peer title".into();
+                        Ok(())
+                    })
+                    .unwrap();
+            }
+        });
+        let _settings = ProbeSettings::install(Some(0), None);
+        let wakes = crate::session::restart::wake_dispatches_for_test();
+        let warnings = crate::session::attach_project::resume_after_conversion(
+            &storage,
+            &instance.id,
+            crate::session::attach_project::Quiesced {
+                pane_was_live: true,
+                ..Default::default()
+            },
+        );
+        assert!(
+            warnings.iter().any(
+                |warning| warning.contains(LaunchIndeterminateCause::CommandTimedOut.message())
+            ),
+            "conversion must report uncertain readiness: {warnings:?}"
+        );
+        let row = storage.load().unwrap().remove(0);
+        assert_eq!(row.title, "peer title");
+        assert_eq!(row.agent_session_id, conversation.session_id);
+        assert_eq!(row.agent_session_binding, conversation.binding);
+        assert!(row.lifecycle_reservation.is_none());
+        assert!(row.launch_resolved_executable.is_some());
+        assert_eq!(
+            crate::tmux::utils::probe_pane(&name),
+            crate::tmux::utils::PaneProbe::Alive
+        );
+        assert_eq!(std::fs::read(&births).unwrap(), b"x");
+        assert_eq!(crate::session::restart::wake_dispatches_for_test(), wakes);
     }
 
     fn observed_dead_resume_fixture(

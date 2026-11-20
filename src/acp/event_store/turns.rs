@@ -77,6 +77,14 @@ const UNRESOLVED_BACKGROUND_TASKS_SQL: &str =
        )
      ORDER BY started.seq ASC";
 
+const LATER_PLAN_DROP_SQL: &str = "SELECT EXISTS(
+     SELECT 1 FROM acp_events
+     WHERE session_id = ?1
+       AND seq > ?2
+       AND (discriminant IN ('SessionCleared', 'AgentSwitched')
+            OR (discriminant = 'PlanRemoved'
+                AND json_extract(event_json, '$.PlanRemoved.plan_id') = ?3)))";
+
 /// Each subagent's latest snapshot, where it is still working. An
 /// `AgentSwitched` drops the children announced before it. SQLite takes the
 /// bare `event_json` from the `MAX(seq)` row of each group.
@@ -124,13 +132,25 @@ fn workflow_agents(conn: &rusqlite::Connection, session_id: &str, run_id: &str) 
 }
 
 impl EventStore {
+    /// The plan the strip shows: `None` once a later clear, agent switch, or
+    /// matching removal dropped it, as `AcpState` folds them.
     pub fn latest_plan(&self, session_id: &str) -> Option<Plan> {
-        let (_, json) =
-            events::latest_by_discriminant(&self.conn(), &self.schema, session_id, "PlanUpdated")?;
-        match decode_logged(&json, session_id, "latest_plan")? {
-            Event::PlanUpdated { plan } => Some(plan),
-            _ => None,
-        }
+        let conn = self.conn();
+        let (seq, json) =
+            events::latest_by_discriminant(&conn, &self.schema, session_id, "PlanUpdated")?;
+        let Event::PlanUpdated { plan } = decode_logged(&json, session_id, "latest_plan")? else {
+            return None;
+        };
+        let dropped = logged(
+            conn.query_row(
+                LATER_PLAN_DROP_SQL,
+                params![session_id, seq as i64, plan.plan_id],
+                |row| row.get::<_, bool>(0),
+            ),
+            "latest_plan",
+            session_id,
+        )?;
+        (!dropped).then_some(plan)
     }
 
     /// Latest advertised `(image, audio, embedded_context)` prompt capabilities.
@@ -439,6 +459,24 @@ impl EventStore {
             },
         )
         .collect()
+    }
+
+    /// Whether a turn ended (`Stopped` or `AgentStartupError`) after `seq`. `None` when the
+    /// query failed.
+    pub fn turn_ended_after(&self, session_id: &str, seq: u64) -> Option<bool> {
+        logged(
+            self.conn().query_row(
+                "SELECT EXISTS (
+                     SELECT 1 FROM acp_events
+                     WHERE session_id = ?1
+                       AND seq > ?2
+                       AND discriminant IN ('Stopped', 'AgentStartupError'))",
+                params![session_id, seq as i64],
+                |row| row.get::<_, bool>(0),
+            ),
+            "turn_ended_after query",
+            session_id,
+        )
     }
 
     /// Nonces of `ElicitationRequested` events with no matching `ElicitationResolved`.

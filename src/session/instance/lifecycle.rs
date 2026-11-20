@@ -1687,7 +1687,7 @@ mod tests {
                     pane: None,
                     expected: instance.conversation_state(),
                 };
-                instance.launch_resolved_executable = Some(executable);
+                instance.launch_resolved_executable = Some(executable.canonicalize().unwrap());
                 storage
                     .update(|rows, _| {
                         rows[0].status = status;
@@ -1700,6 +1700,15 @@ mod tests {
                 let result =
                     instance.release_indeterminate_launch(&storage, generation, &probe, None);
                 let stored = storage.load().unwrap().remove(0);
+                assert_eq!(
+                    stored.launch_resolved_executable,
+                    Some(if superseded {
+                        root.path().join("prior-agent")
+                    } else {
+                        executable.canonicalize().unwrap()
+                    }),
+                    "only the owned generation may publish its resolved executable"
+                );
                 if superseded {
                     assert!(result.unwrap_err().is::<LifecycleReservationError>());
                     assert_eq!(stored.status, status);

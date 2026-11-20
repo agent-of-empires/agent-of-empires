@@ -330,7 +330,7 @@ pub(super) async fn run_connection_task<W, R>(
             let control = control.clone();
             let shared = shared.clone();
             move |_connection| async move {
-                if let Some(control) = control {
+                if let Some(control) = &control {
                     control.shutdown();
                 }
                 // EOF already failed pending SDK requests. Let the local owner
@@ -339,10 +339,13 @@ pub(super) async fn run_connection_task<W, R>(
                 let settled = shared.local_prompt_settled.notified();
                 tokio::pin!(settled);
                 settled.as_mut().enable();
-                if (shared.prompt_epoch.load(Ordering::Acquire) != 0
-                    && shared.prompt_in_flight.load(Ordering::Acquire))
-                    || shared.adopted_completion_tx.borrow().is_some()
-                {
+                let pending = if control.is_some() {
+                    shared.runner_completion_pending.load(Ordering::Acquire)
+                } else {
+                    shared.prompt_epoch.load(Ordering::Acquire) != 0
+                        && shared.prompt_in_flight.load(Ordering::Acquire)
+                };
+                if pending {
                     settled.await;
                 }
                 Err(acp_internal_error("agent transport closed".into()))
@@ -366,7 +369,12 @@ pub(super) async fn run_connection_task<W, R>(
                             }
                             SessionIngressNotification::PromptCompleted(marker) => {
                                 if let Some(control) = control.as_ref() {
-                                    if let Some(outcome) = control.deliver_prompt_completion(marker)
+                                    if let Some(outcome) =
+                                        control.deliver_prompt_completion(marker, || {
+                                            shared
+                                                .runner_completion_pending
+                                                .store(true, Ordering::Release);
+                                        })
                                     {
                                         shared.adopted_completion_tx.send_replace(Some(outcome));
                                     }

@@ -185,6 +185,24 @@ impl Drop for PersistedMutation {
 #[derive(Debug)]
 pub(crate) struct QueuePersistFailed;
 
+/// Cap on queue depth per session. The queue lives on the `Instance` and every mutation
+/// rewrites the whole profile session file, so depth costs disk I/O on each enqueue rather
+/// than just memory.
+pub(crate) const MAX_QUEUED_PROMPTS_PER_SESSION: usize = 100;
+
+/// Cap on a single queued prompt's text. Unlike `/acp/prompt`, which streams straight to the
+/// agent, this text is persisted and rewritten on every subsequent queue mutation, so
+/// 256 KiB bounds that rewrite.
+pub(crate) const MAX_QUEUED_TEXT_BYTES: usize = 256 * 1024;
+
+/// Whether a session's queue can take a prompt, see [`SessionService::check_queue_room`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum QueueRoom {
+    Available,
+    TextTooLarge,
+    Full,
+}
+
 /// Result of `SessionService::edit_queued_prompt`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum EditQueuedOutcome {
@@ -263,6 +281,8 @@ pub struct SessionService {
     /// The queue drain reads turn liveness from it so it agrees with prompt
     /// dispatch; see [`SessionService::fold_control_state`].
     pub acp_control_cache: Arc<crate::acp::control_cache::ControlStateCache>,
+    /// Sessions held until the sandbox login they need exists.
+    pub(crate) sandbox_login: Arc<crate::server::sandbox_login::SandboxLoginService>,
     /// In-flight plugin creates keyed by `(plugin_id, idempotency_key)`.
     /// Sync mutex: critical sections are tiny and never span an `await`.
     create_in_flight: std::sync::Mutex<HashMap<(String, String), CreateInFlight>>,
@@ -366,11 +386,19 @@ pub(crate) enum SendTurnError {
     /// coming; retryable, and nothing was published, so the transcript is
     /// not left with a prompt no agent ever received. See #1748 and #3172.
     WorkerNotReady,
+    /// Pre-publish: the ready worker runs a different agent from the one the turn was classified
+    /// for (a resume picked another agent). Nothing was published; retryable.
+    AgentChanged,
     /// Pre-publish: `no_revive` was set and delivering this turn would have
     /// required resuming a worker that is not currently running.
     RevivalRefused,
     /// Post-publish: the forward found the resumed worker gone.
     WorkerLostAfterPublish,
+    /// Pre-publish: resuming the worker needs the sandbox login first.
+    LoginRequired(crate::session::SandboxLoginRequired),
+    /// Pre-publish: the sandbox login admission ran a `host_hooks.before_start` hook and it
+    /// failed; the message is the hook's own error. The caller keeps the turn.
+    HookFailed(String),
     /// Post-publish: the forward to the agent failed.
     Send(crate::acp::supervisor::SupervisorError),
 }
@@ -431,7 +459,10 @@ impl std::fmt::Display for SendTurnError {
             Self::ModeApplication(e) => write!(f, "mode application failed: {e}"),
             Self::ResumeFailed(e) => write!(f, "worker resume failed: {e}"),
             Self::WorkerNotReady | Self::WorkerLostAfterPublish => write!(f, "worker not ready"),
+            Self::AgentChanged => write!(f, "the ready worker runs another agent"),
             Self::RevivalRefused => write!(f, "no_revive: reviving a stopped worker is required"),
+            Self::LoginRequired(blocked) => write!(f, "{blocked}"),
+            Self::HookFailed(message) => write!(f, "{message}"),
             Self::Send(e) => write!(f, "prompt forward failed: {e}"),
         }
     }
@@ -468,6 +499,7 @@ impl SessionService {
             acp_supervisor: acp.supervisor,
             acp_event_store: acp.event_store,
             acp_control_cache: acp.control_cache,
+            sandbox_login: Arc::default(),
             create_in_flight: std::sync::Mutex::new(HashMap::new()),
             pending_drains: std::sync::Mutex::new(std::collections::HashSet::new()),
             persist_locks: RwLock::new(HashMap::new()),
@@ -1000,6 +1032,18 @@ impl SessionService {
         id: &str,
         turn: SendTurnRequest<'_>,
     ) -> Result<Option<u64>, SendTurnError> {
+        self.send_classified_turn(caller, id, turn, None).await
+    }
+
+    /// [`Self::send_turn`], publishing with `classified_as` when the caller already cut the
+    /// turn for an agent, else with [`Self::agent_profile`] once the worker is ready.
+    async fn send_classified_turn(
+        self: &Arc<Self>,
+        caller: &SessionCaller,
+        id: &str,
+        turn: SendTurnRequest<'_>,
+        classified_as: Option<crate::acp::supervisor::Classified>,
+    ) -> Result<Option<u64>, SendTurnError> {
         let SendTurnRequest {
             resume_authority,
             text,
@@ -1038,10 +1082,88 @@ impl SessionService {
             return Err(SendTurnError::RevivalRefused);
         }
         if needs_resume {
+            let origin = match caller {
+                SessionCaller::User => crate::server::sandbox_login::LaunchOrigin::Interactive,
+                SessionCaller::Plugin { .. } | SessionCaller::PluginMessage { .. } => {
+                    crate::server::sandbox_login::LaunchOrigin::Unattended
+                }
+            };
+            // Refused here, before the detached resume, so the caller can keep the turn.
+            // A join error falls through to the same gate in the container ensure.
+            let row = self
+                .instances
+                .read()
+                .await
+                .iter()
+                .find(|i| i.id == id && i.is_sandboxed())
+                .cloned();
+            if let Some(mut row) = row {
+                // Resolves a `before_start` hook the cheap decision cannot see: once per
+                // session, whichever copy of the row asks, so the resume reuses the result.
+                // A daemon without a native state, or a store that cannot open, falls
+                // through to the same gate in the container ensure.
+                let native_state = self.native_state().ok();
+                let checked = tokio::task::spawn_blocking(move || -> anyhow::Result<()> {
+                    let Some(state) = native_state else {
+                        return Ok(());
+                    };
+                    let profile = row.source_profile.clone();
+                    let native = crate::server::session_store::NativeSessionStore::open(
+                        state, &profile, None,
+                    )?;
+                    row.ensure_sandbox_launchable(&native)
+                })
+                .await;
+                let gate = match checked {
+                    Ok(Ok(())) => Ok(()),
+                    Ok(Err(e)) => match e.downcast::<crate::session::SandboxLoginRequired>() {
+                        Ok(blocked) => Err(blocked),
+                        Err(e) => match e.downcast::<crate::session::BeforeStartHookError>() {
+                            // The hook's own failure, not a login refusal: the caller keeps
+                            // the turn and its pending turn.
+                            Ok(hook) => return Err(SendTurnError::HookFailed(hook.to_string())),
+                            // A runtime that cannot log in is refused by the launch itself,
+                            // and a store that cannot open by the container ensure.
+                            Err(_) => Ok(()),
+                        },
+                    },
+                    // A join error falls through to the same gate in the container ensure.
+                    Err(_) => Ok(()),
+                };
+                if let Err(blocked) = gate {
+                    // The held session resumes after the login under automatic authority,
+                    // which a stop token fences: admit the explicit revival now. The
+                    // reservation is dropped at once; a stop landing later still wins.
+                    if resume_authority
+                        == crate::process::worker_registry::ResumeAuthority::Explicit
+                    {
+                        if let Err(e) = self
+                            .acp_supervisor
+                            .begin_resume(
+                                id,
+                                crate::acp::supervisor::ResumeKind::Attach,
+                                resume_authority,
+                            )
+                            .await
+                        {
+                            return Err(SendTurnError::ResumeFailed(e));
+                        }
+                    }
+                    tracing::info!(target: "acp.supervisor", session = %id, "turn held for the sandbox login");
+                    // The held session is not respawned, so no startup error would explain the
+                    // queue: publish one, once per hold.
+                    if self.sandbox_login.hold(id, origin, &blocked) {
+                        self.acp_supervisor
+                            .publish_startup_error(id, blocked.to_string());
+                    }
+                    return Err(SendTurnError::LoginRequired(blocked));
+                }
+            }
             match crate::server::acp_reconciler::trigger_resume_background(
                 self,
                 id,
                 resume_authority,
+                origin,
             )
             .await
             {
@@ -1075,6 +1197,33 @@ impl SessionService {
         {
             return Err(SendTurnError::RevivalRefused);
         }
+        let mut receiver = None;
+        let profile = match classified_as {
+            // A turn cut for one agent must not reach a worker a resume started as another.
+            Some(cut) => {
+                let (client, receiving, epoch) = self
+                    .acp_supervisor
+                    .classified_receiver(id)
+                    .await
+                    .ok_or(SendTurnError::WorkerNotReady)?;
+                if receiving != cut.agent {
+                    tracing::info!(
+                        target: "acp.queue",
+                        session = %id,
+                        cut_for = %cut.agent,
+                        receiving = ?receiving,
+                        "the ready worker runs another agent; withholding the turn"
+                    );
+                    return Err(SendTurnError::AgentChanged);
+                }
+                receiver = Some((client, receiving, epoch));
+                Some(cut.profile)
+            }
+            None => self
+                .agent_profile(id, Some(text))
+                .await
+                .map(|classified| classified.profile),
+        };
         // Persist the admitted turn before forwarding it to the agent.
         let published = self
             .acp_supervisor
@@ -1085,18 +1234,57 @@ impl SessionService {
                 prompt_ids,
                 synthesized,
                 caller.message_origin().map(str::to_string),
+                profile,
             )
             .await;
-        let outcome = match published.disposition {
-            crate::acp::supervisor::PromptDisposition::Forward => {
-                self.acp_supervisor.send_prompt(id, text, attachments).await
-            }
-            crate::acp::supervisor::PromptDisposition::ResetContext => {
+        let receiver_ready = match &receiver {
+            Some((_, _, epoch)) => {
                 self.acp_supervisor
-                    .reset_session_context(id, text, acp_mode_id.as_deref(), yolo_mode)
+                    .classified_receiver_is_ready(id, *epoch)
                     .await
             }
+            None => true,
         };
+        let outcome = if !receiver_ready {
+            Err(crate::acp::supervisor::SupervisorError::SpawnCancelled(
+                id.into(),
+            ))
+        } else {
+            match published.disposition {
+                crate::acp::supervisor::PromptDisposition::Forward => match &receiver {
+                    Some((client, _, _)) => client
+                        .send_prompt(text, attachments)
+                        .await
+                        .map_err(Into::into),
+                    None => self.acp_supervisor.send_prompt(id, text, attachments).await,
+                },
+                crate::acp::supervisor::PromptDisposition::ResetContext => match &receiver {
+                    Some((client, agent, _)) => {
+                        self.acp_supervisor
+                            .reset_client_context(
+                                client,
+                                id,
+                                agent,
+                                text,
+                                acp_mode_id.as_deref(),
+                                yolo_mode,
+                            )
+                            .await
+                    }
+                    None => {
+                        self.acp_supervisor
+                            .reset_session_context(id, text, acp_mode_id.as_deref(), yolo_mode)
+                            .await
+                    }
+                },
+            }
+        };
+        if receiver.is_some() && outcome.is_err() {
+            if let Some(seq) = published.last_seq {
+                self.acp_supervisor
+                    .publish_stopped_if_seq(id, "delivery_failed", seq);
+            }
+        }
         match outcome {
             Ok(()) => Ok(published.seq),
             // Intentional override of the canonical UnknownSession 404.
@@ -1502,6 +1690,29 @@ impl SessionService {
         Some((result, persisted))
     }
 
+    /// Whether the session's queue can take `text` as prompt `prompt_id`. Every path that
+    /// appends to the queue asks first, so no path grows it past the bounds: the text cap
+    /// (persisted text is rewritten on every queue mutation) and the depth cap (every
+    /// mutation rewrites the whole session file). Re-enqueuing an existing id replaces its
+    /// row, so it never counts against a full queue. Race-free only under the session's
+    /// prompt-submission guard, which every caller holds across this check and the enqueue.
+    pub(crate) async fn check_queue_room(
+        &self,
+        id: &str,
+        prompt_id: &str,
+        text: &str,
+    ) -> QueueRoom {
+        if text.len() > MAX_QUEUED_TEXT_BYTES {
+            return QueueRoom::TextTooLarge;
+        }
+        let queue = self.queued_prompts_snapshot(id).await;
+        if queue.len() >= MAX_QUEUED_PROMPTS_PER_SESSION && !queue.iter().any(|q| q.id == prompt_id)
+        {
+            return QueueRoom::Full;
+        }
+        QueueRoom::Available
+    }
+
     /// Append a prompt to the session's server-owned queue and return the
     /// stored entry (with its assigned `seq`). Idempotent on `prompt_id`:
     /// re-enqueuing an existing id updates its text/attachments in place instead
@@ -1880,7 +2091,7 @@ impl SessionService {
             return;
         };
 
-        let (caller, agent_key, queue) = {
+        let (caller, queue) = {
             let instances = self.instances.read().await;
             let Some(inst) = instances.iter().find(|i| i.id == id) else {
                 return;
@@ -1910,8 +2121,7 @@ impl SessionService {
                 },
                 None => SessionCaller::User,
             };
-            let agent_key = inst.agent_name.clone().unwrap_or_else(|| inst.tool.clone());
-            (caller, agent_key, queue)
+            (caller, queue)
         };
 
         let control = self.fold_control_state(id).await;
@@ -1919,10 +2129,13 @@ impl SessionService {
             return;
         }
 
-        // Leading batch up to a clear or compact boundary.
-        let profile = crate::acp::agent_profiles::resolve(&agent_key);
-        let (sub, combined) = queue_drain_batch(&queue, profile);
-        if profile.is_clear_command(&combined) && control.has_active_background_agent() {
+        // Leading batch up to a clear or compact boundary. Publication reuses this profile, so a
+        // settings change during delivery cannot reclassify a row the batch already cut.
+        let Some(classified) = self.agent_profile(id, None).await else {
+            return;
+        };
+        let (sub, combined) = queue_drain_batch(&queue, classified.profile);
+        if classified.profile.is_clear_command(&combined) && control.has_active_background_agent() {
             return;
         }
         let caller = match &sub[0].origin_plugin {
@@ -1964,7 +2177,7 @@ impl SessionService {
 
         // Deliver as a fresh turn on the live worker.
         if let Err(e) = self
-            .send_turn(
+            .send_classified_turn(
                 &caller,
                 id,
                 SendTurnRequest {
@@ -1976,10 +2189,13 @@ impl SessionService {
                     synthesized: false,
                     no_revive: false,
                 },
+                Some(classified),
             )
             .await
         {
-            tracing::warn!(target: "acp.queue", session = %id, "queue drain delivery failed; will retry: {e}");
+            if !matches!(e, SendTurnError::AgentChanged) {
+                tracing::warn!(target: "acp.queue", session = %id, "queue drain delivery failed; will retry: {e}");
+            }
             return;
         }
         tracing::info!(
@@ -2230,11 +2446,48 @@ impl SessionService {
     }
 
     async fn is_solo_command(&self, id: &str, text: &str) -> bool {
-        let instances = self.instances.read().await;
-        instances.iter().find(|i| i.id == id).is_some_and(|inst| {
-            let agent_key = inst.agent_name.as_deref().unwrap_or(&inst.tool);
-            crate::acp::agent_profiles::resolve(agent_key).is_solo_command(text)
-        })
+        self.agent_profile(id, Some(text))
+            .await
+            .is_some_and(|classified| classified.profile.is_solo_command(text))
+    }
+
+    /// The agent and profile that classify the session's prompts: its worker's agent, else the
+    /// agent its next spawn picks. Queue boundaries, solo-command holds, publication and the advertised
+    /// aliases share this identity. Given `text` that cannot match a declared reset alias, a
+    /// worker's profile skips the configuration read. `None` for an unknown session.
+    pub(crate) async fn agent_profile(
+        &self,
+        id: &str,
+        text: Option<&str>,
+    ) -> Option<crate::acp::supervisor::Classified> {
+        use crate::acp::supervisor::{Classified, SessionAgent};
+        let (next, source_profile, project_path) = {
+            let instances = self.instances.read().await;
+            let inst = instances.iter().find(|i| i.id == id)?;
+            (
+                SessionAgent::Next {
+                    tool: inst.tool.clone(),
+                    explicit: inst.agent_name.clone(),
+                },
+                inst.source_profile.clone(),
+                std::path::PathBuf::from(&inst.project_path),
+            )
+        };
+        let agent = match self.acp_supervisor.worker_agent_key(id).await {
+            Some(key)
+                if text
+                    .is_some_and(|t| !crate::acp::agent_profiles::could_be_declared_alias(t)) =>
+            {
+                let profile = crate::acp::agent_profiles::resolve(&key);
+                return Some(Classified {
+                    agent: key,
+                    profile,
+                });
+            }
+            Some(key) => SessionAgent::Worker(key),
+            None => next,
+        };
+        Some(agent.classify(&source_profile, &project_path).await)
     }
 
     /// See [`crate::acp::dispatch::WorkerLiveness::rate_limit_parked`].
@@ -2719,6 +2972,7 @@ pub(crate) fn apply_prompt_persist_to_disk(disk: &mut crate::session::Instance, 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::acp::supervisor::test_support::save_agent_record;
 
     fn plugin_instance(plugin_id: &str, key: &str, payload_hash: &str) -> Instance {
         let mut inst = Instance::new("scheduled", "/tmp/aoe-2897-project");
@@ -3230,6 +3484,498 @@ mod tests {
             "drain must release its claim on the no-op paths"
         );
     }
+    /// Declare `bridge` as a custom ACP agent that resets with `alias`.
+    fn declare_custom_reset(alias: &str) {
+        let config = crate::session::get_app_dir().unwrap().join("config.toml");
+        std::fs::create_dir_all(config.parent().unwrap()).unwrap();
+        std::fs::write(
+            config,
+            format!(
+                "[session.agent_acp_cmd]\nbridge = \"bridge acp\"\n\n\
+                 [session.agent_clear_alias]\nbridge = \"{alias}\"\n"
+            ),
+        )
+        .unwrap();
+    }
+
+    fn structured_idle_row(id: &str, tool: &str) -> Instance {
+        let mut row = Instance::new(id, &format!("/tmp/aoe-{id}"));
+        row.id = id.into();
+        row.tool = tool.into();
+        row.view = crate::session::View::Structured;
+        row.status = crate::session::Status::Idle;
+        row
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn a_custom_reset_is_classified_by_the_agent_the_session_runs() {
+        let _home = crate::session::test_support::isolate_app_dir();
+        declare_custom_reset("/new");
+        // Stored as Claude, running the custom bridge: the worker decides.
+        let rows = vec![
+            structured_idle_row("runs-bridge", "claude"),
+            structured_idle_row("next-bridge", "bridge"),
+            {
+                let mut row = structured_idle_row("explicit-bridge", "claude");
+                row.agent_name = Some("bridge".into());
+                row
+            },
+            structured_idle_row("runs-claude", "claude"),
+            structured_idle_row("dead-bridge", "claude"),
+        ];
+        let service = crate::server::test_support::build_test_app_state(rows)
+            .session_service
+            .clone();
+        let _live = save_agent_record("runs-bridge", "bridge", true);
+        // An unclean death leaves the record behind; the next spawn picks Claude.
+        save_agent_record("dead-bridge", "bridge", false);
+        // (session, text, solo)
+        let cases = [
+            ("runs-bridge", "/new", true),
+            ("runs-bridge", "/clear", false),
+            ("runs-bridge", "/compact", false),
+            // No worker: the agent the next spawn picks.
+            ("next-bridge", "/new", true),
+            ("explicit-bridge", "/new", true),
+            ("explicit-bridge", "/clear", false),
+            ("runs-claude", "/clear", true),
+            ("runs-claude", "/new", false),
+            ("dead-bridge", "/clear", true),
+            ("dead-bridge", "/new", false),
+        ];
+        for (id, text, solo) in cases {
+            assert_eq!(service.is_solo_command(id, text).await, solo, "{id} {text}");
+        }
+        assert!(service.agent_profile("missing", None).await.is_none());
+        for id in ["runs-bridge", "dead-bridge"] {
+            crate::process::worker_registry::delete(id).ok();
+        }
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn the_queue_drain_keeps_a_custom_reset_as_its_own_turn() {
+        let _home = crate::session::test_support::isolate_app_dir();
+        declare_custom_reset("/new");
+        // (session, queued rows, worker commands, rows left queued)
+        let cases: [(&str, &[&str], &[&str], &[&str]); 2] = [
+            (
+                "text-first",
+                &["first", "/new", "after"],
+                &["prompt"],
+                &["/new", "after"],
+            ),
+            (
+                "reset-first",
+                &["/new", "after"],
+                &["reset_session"],
+                &["after"],
+            ),
+        ];
+        for (id, queued, commands, left) in cases {
+            let service =
+                crate::server::test_support::build_test_app_state(vec![structured_idle_row(
+                    id, "claude",
+                )])
+                .session_service
+                .clone();
+            let recorded = service
+                .acp_supervisor
+                .test_insert_worker_cmd_recording(id)
+                .await;
+            let _live = save_agent_record(id, "bridge", true);
+            for (n, text) in queued.iter().enumerate() {
+                service
+                    .enqueue_prompt(
+                        id,
+                        format!("q{n}"),
+                        text.to_string(),
+                        Vec::new(),
+                        None,
+                        None,
+                    )
+                    .await
+                    .unwrap();
+            }
+            service.drain_queued_prompts_once(id).await;
+            service.acp_supervisor.test_flush_worker_commands(id).await;
+            assert_eq!(*recorded.lock().unwrap(), commands, "{id}");
+            let retained: Vec<String> = service
+                .queued_prompts_snapshot(id)
+                .await
+                .into_iter()
+                .map(|row| row.text)
+                .collect();
+            assert_eq!(retained, left, "{id}");
+            crate::process::worker_registry::delete(id).ok();
+        }
+    }
+
+    /// Publication uses the profile the drain cut the batch with, not a fresh configuration
+    /// read, so a settings change during delivery cannot turn a cut row into a reset.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn a_carried_classification_decides_the_published_turn() {
+        let _home = crate::session::test_support::isolate_app_dir();
+        let id = "carried";
+        let service = crate::server::test_support::build_test_app_state(vec![structured_idle_row(
+            id, "claude",
+        )])
+        .session_service
+        .clone();
+        let recorded = service
+            .acp_supervisor
+            .test_insert_worker_cmd_recording(id)
+            .await;
+        let _live = save_agent_record(id, "bridge", true);
+        let cut_with = service.agent_profile(id, None).await.unwrap();
+        // The setting changes after the cut: `/new` now resets.
+        declare_custom_reset("/new");
+        service
+            .send_classified_turn(
+                &SessionCaller::User,
+                id,
+                SendTurnRequest {
+                    resume_authority: crate::process::worker_registry::ResumeAuthority::Automatic,
+                    text: "/new",
+                    attachments: &[],
+                    woke_idle_dormant: false,
+                    prompt_ids: Vec::new(),
+                    synthesized: false,
+                    no_revive: false,
+                },
+                Some(cut_with),
+            )
+            .await
+            .ok()
+            .expect("the turn is delivered");
+        service.acp_supervisor.test_flush_worker_commands(id).await;
+        assert_eq!(*recorded.lock().unwrap(), ["prompt"]);
+        crate::process::worker_registry::delete(id).ok();
+    }
+
+    /// The drain cuts a batch while the worker is still starting. When the worker that becomes
+    /// ready runs another agent, the batch is withheld and both rows stay queued; the next pass
+    /// cuts them for the agent that runs.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn a_batch_cut_before_readiness_is_recut_for_the_agent_that_starts() {
+        use std::time::Duration;
+        let _home = crate::session::test_support::isolate_app_dir();
+        // `bridge` resets with `/new`, so `[/clear, after]` is one batch for it.
+        declare_custom_reset("/new");
+        let id = "starts-as-claude";
+        let service = crate::server::test_support::build_test_app_state(vec![structured_idle_row(
+            id, "bridge",
+        )])
+        .session_service
+        .clone();
+        for (n, text) in ["/clear", "after"].iter().enumerate() {
+            service
+                .enqueue_prompt(
+                    id,
+                    format!("q{n}"),
+                    text.to_string(),
+                    Vec::new(),
+                    None,
+                    None,
+                )
+                .await
+                .unwrap();
+        }
+        let starting = service.acp_supervisor.test_hold_starting(id);
+        let mut waits = service.acp_supervisor.watch_worker_waits();
+        let drain = tokio::spawn({
+            let service = Arc::clone(&service);
+            async move { service.drain_queued_prompts_once(id).await }
+        });
+        assert_eq!(
+            tokio::time::timeout(Duration::from_secs(10), waits.recv())
+                .await
+                .expect("the drain waits for the starting worker")
+                .unwrap(),
+            id
+        );
+        // The worker that becomes ready runs Claude.
+        let _live = save_agent_record(id, "claude", true);
+        let recorded = service
+            .acp_supervisor
+            .test_land_worker_cmd_recording(id, &starting)
+            .await;
+        tokio::time::timeout(Duration::from_secs(10), drain)
+            .await
+            .expect("the drain finishes once the worker is ready")
+            .unwrap();
+        service.acp_supervisor.test_flush_worker_commands(id).await;
+        assert!(recorded.lock().unwrap().is_empty());
+        let queued = |service: Arc<SessionService>| async move {
+            service
+                .queued_prompts_snapshot(id)
+                .await
+                .into_iter()
+                .map(|row| row.text)
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(queued(Arc::clone(&service)).await, ["/clear", "after"]);
+
+        service.drain_queued_prompts_once(id).await;
+        service.acp_supervisor.test_flush_worker_commands(id).await;
+        assert_eq!(*recorded.lock().unwrap(), ["reset_session"]);
+        assert_eq!(queued(Arc::clone(&service)).await, ["after"]);
+        crate::process::worker_registry::delete(id).ok();
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn a_lost_ready_receiver_preserves_the_batch_for_a_replacement() {
+        use crate::acp::supervisor::test_support::AgentKeyGate;
+        use std::time::Duration;
+        for replacement_point in 0..3 {
+            let after_publication = replacement_point == 2;
+            let _home = crate::session::test_support::isolate_app_dir();
+            declare_custom_reset("/new");
+            let id = "lost-ready-receiver";
+            let service =
+                crate::server::test_support::build_test_app_state(vec![structured_idle_row(
+                    id, "bridge",
+                )])
+                .session_service
+                .clone();
+            for (n, text) in ["/clear", "after"].iter().enumerate() {
+                service
+                    .enqueue_prompt(
+                        id,
+                        format!("q{n}"),
+                        text.to_string(),
+                        Vec::new(),
+                        None,
+                        None,
+                    )
+                    .await
+                    .unwrap();
+            }
+            let starting = service.acp_supervisor.test_hold_starting(id);
+            let mut waits = service.acp_supervisor.watch_worker_waits();
+            let drain = tokio::spawn({
+                let service = Arc::clone(&service);
+                async move { service.drain_queued_prompts_once(id).await }
+            });
+            tokio::time::timeout(Duration::from_secs(10), waits.recv())
+                .await
+                .unwrap()
+                .unwrap();
+            let before_read = Arc::new(tokio::sync::Barrier::new(2));
+            let after_read = Arc::new(tokio::sync::Barrier::new(2));
+            if after_publication {
+                service
+                    .acp_supervisor
+                    .test_gate_prompt_publish(Arc::clone(&before_read));
+            } else {
+                service.acp_supervisor.test_gate_agent_key(AgentKeyGate {
+                    before_read: Arc::clone(&before_read),
+                    after_read: Arc::clone(&after_read),
+                });
+            }
+            let live = save_agent_record(id, "bridge", true);
+            service
+                .acp_supervisor
+                .test_land_worker_cmd_recording(id, &starting)
+                .await;
+            tokio::time::timeout(Duration::from_secs(10), before_read.wait())
+                .await
+                .unwrap();
+            // Remove the ready receiver before identity validation.
+            if replacement_point == 0 {
+                service.acp_supervisor.test_remove_worker(id).await;
+                drop(live);
+                crate::process::worker_registry::delete(id).unwrap();
+            }
+            if !after_publication {
+                tokio::time::timeout(Duration::from_secs(10), before_read.wait())
+                    .await
+                    .unwrap();
+                tokio::time::timeout(Duration::from_secs(10), after_read.wait())
+                    .await
+                    .unwrap();
+            }
+
+            // Replace after the identity read, without taking the submission lock.
+            service.acp_supervisor.test_remove_worker(id).await;
+            crate::process::worker_registry::delete(id).ok();
+            let recorded = service
+                .acp_supervisor
+                .test_insert_worker_cmd_recording(id)
+                .await;
+            let socket = crate::process::worker_registry::socket_path_for(id).unwrap();
+            std::fs::remove_file(crate::process::worker::control_socket_sibling(&socket)).ok();
+            let _replacement = save_agent_record(id, "claude", true);
+            let release = if after_publication {
+                &before_read
+            } else {
+                &after_read
+            };
+            tokio::time::timeout(Duration::from_secs(10), release.wait())
+                .await
+                .unwrap();
+            tokio::time::timeout(Duration::from_secs(10), drain)
+                .await
+                .unwrap()
+                .unwrap();
+            service.acp_supervisor.test_flush_worker_commands(id).await;
+            assert!(recorded.lock().unwrap().is_empty());
+            assert!(!service.fold_control_state(id).await.turn_active);
+            assert_eq!(service.queued_prompts_snapshot(id).await.len(), 2);
+            service.drain_queued_prompts_once(id).await;
+            service.acp_supervisor.test_flush_worker_commands(id).await;
+            assert_eq!(*recorded.lock().unwrap(), ["reset_session"]);
+            let rows = service.queued_prompts_snapshot(id).await;
+            assert_eq!(rows.len(), 1);
+            assert_eq!(rows[0].text, "after");
+            crate::process::worker_registry::delete(id).unwrap();
+        }
+    }
+
+    /// A forwarded clear publishes `SessionCleared` after its prompt, so a delivery failure
+    /// after publication must still close the turn it opened.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn a_forwarded_clear_that_fails_after_publication_closes_its_turn() {
+        use std::time::Duration;
+        let _home = crate::session::test_support::isolate_app_dir();
+        let id = "forwarded-clear";
+        let service = crate::server::test_support::build_test_app_state(vec![structured_idle_row(
+            id, "opencode",
+        )])
+        .session_service
+        .clone();
+        let recorded = service
+            .acp_supervisor
+            .test_insert_worker_cmd_recording(id)
+            .await;
+        let _live = save_agent_record(id, "opencode", true);
+        let published = Arc::new(tokio::sync::Barrier::new(2));
+        service
+            .acp_supervisor
+            .test_gate_prompt_publish(Arc::clone(&published));
+        let send = tokio::spawn({
+            let service = Arc::clone(&service);
+            async move {
+                service
+                    .send_classified_turn(
+                        &SessionCaller::User,
+                        id,
+                        SendTurnRequest {
+                            resume_authority:
+                                crate::process::worker_registry::ResumeAuthority::Automatic,
+                            text: "/new",
+                            attachments: &[],
+                            woke_idle_dormant: false,
+                            prompt_ids: Vec::new(),
+                            synthesized: false,
+                            no_revive: false,
+                        },
+                        Some(crate::acp::supervisor::Classified {
+                            agent: "opencode".into(),
+                            profile: &crate::acp::agent_profiles::OPENCODE,
+                        }),
+                    )
+                    .await
+            }
+        });
+        tokio::time::timeout(Duration::from_secs(10), published.wait())
+            .await
+            .unwrap();
+        // The receiver goes away after `UserPromptSent` and `SessionCleared` are stored.
+        service.acp_supervisor.test_remove_worker(id).await;
+        tokio::time::timeout(Duration::from_secs(10), published.wait())
+            .await
+            .unwrap();
+        let outcome = tokio::time::timeout(Duration::from_secs(10), send)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(matches!(outcome, Err(ref e) if e.published()));
+        assert!(recorded.lock().unwrap().is_empty());
+        assert!(!service.fold_control_state(id).await.turn_active);
+        crate::process::worker_registry::delete(id).ok();
+    }
+
+    /// A live runner whose record predates `agent_key` runs `claude`: it classifies the session's
+    /// prompts and receives the queue.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn a_live_worker_recorded_without_an_agent_key_runs_claude() {
+        let _home = crate::session::test_support::isolate_app_dir();
+        declare_custom_reset("/new");
+        let id = "unkeyed-runner";
+        let service = crate::server::test_support::build_test_app_state(vec![structured_idle_row(
+            id, "bridge",
+        )])
+        .session_service
+        .clone();
+        let recorded = service
+            .acp_supervisor
+            .test_insert_worker_cmd_recording(id)
+            .await;
+        let _live = save_agent_record(id, "", true);
+        let classified = service.agent_profile(id, Some("/new")).await.unwrap();
+        assert_eq!(classified.agent, "claude");
+        service
+            .enqueue_prompt(id, "q0".into(), "hello".into(), Vec::new(), None, None)
+            .await
+            .unwrap();
+        service.drain_queued_prompts_once(id).await;
+        service.acp_supervisor.test_flush_worker_commands(id).await;
+        assert_eq!(*recorded.lock().unwrap(), ["prompt"]);
+        assert!(service.queued_prompts_snapshot(id).await.is_empty());
+        crate::process::worker_registry::delete(id).ok();
+    }
+
+    /// A batch cut for one agent is withheld from a worker a resume started as another, so the
+    /// drain leaves its rows queued and cuts them again for the agent that now runs.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn a_turn_cut_for_one_agent_is_withheld_from_a_worker_running_another() {
+        let _home = crate::session::test_support::isolate_app_dir();
+        let id = "resumed-as-claude";
+        let service = crate::server::test_support::build_test_app_state(vec![structured_idle_row(
+            id, "claude",
+        )])
+        .session_service
+        .clone();
+        let recorded = service
+            .acp_supervisor
+            .test_insert_worker_cmd_recording(id)
+            .await;
+        let _live = save_agent_record(id, "claude", true);
+        let cut_for_bridge = crate::acp::supervisor::Classified {
+            agent: "bridge".into(),
+            profile: &crate::acp::agent_profiles::CUSTOM_NEW,
+        };
+        let outcome = service
+            .send_classified_turn(
+                &SessionCaller::User,
+                id,
+                SendTurnRequest {
+                    resume_authority: crate::process::worker_registry::ResumeAuthority::Automatic,
+                    text: "/clear\n\nafter",
+                    attachments: &[],
+                    woke_idle_dormant: false,
+                    prompt_ids: Vec::new(),
+                    synthesized: false,
+                    no_revive: false,
+                },
+                Some(cut_for_bridge),
+            )
+            .await;
+        assert!(matches!(outcome, Err(SendTurnError::AgentChanged)));
+        service.acp_supervisor.test_flush_worker_commands(id).await;
+        assert!(recorded.lock().unwrap().is_empty());
+        assert!(!service.fold_control_state(id).await.turn_active);
+        crate::process::worker_registry::delete(id).ok();
+    }
+
     #[tokio::test]
     #[serial_test::serial]
     async fn a_stopped_running_worker_keeps_queued_prompts_instead_of_delivering_them() {
@@ -3327,10 +4073,10 @@ mod tests {
                 "sess-mid-turn",
                 1,
                 &Event::UserPromptSent {
-                    merged_prompt_ids: Vec::new(),
                     text: "go".into(),
                     attachments: Vec::new(),
                     prompt_id: None,
+                    merged_prompt_ids: Vec::new(),
                     synthesized: false,
                     origin_plugin: None,
                 },
@@ -4880,5 +5626,205 @@ mod tests {
             service.admits_turn(&message, "missing").await,
             Err(TurnAdmissionError::SessionNotFound)
         );
+    }
+
+    /// A turn for a stopped sandbox that needs the login is refused before any
+    /// resume, and the session is held under the caller's origin.
+    #[cfg(unix)]
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn sandbox_login_queue_send_turn_refuses_before_resume() {
+        use crate::server::sandbox_login::LaunchOrigin;
+        let home = crate::session::test_support::isolate_app_dir();
+        let _auth = crate::session::test_support::unset_claude_auth_routes();
+        let (_runtime, calls) =
+            crate::session::test_support::failing_container_runtime(home.path());
+        let cases = [
+            (SessionCaller::User, LaunchOrigin::Interactive),
+            (
+                SessionCaller::PluginMessage {
+                    plugin_id: "cron".to_string(),
+                },
+                LaunchOrigin::Unattended,
+            ),
+        ];
+        for (n, (caller, origin)) in cases.into_iter().enumerate() {
+            let id = &format!("sess-login-turn-{n}");
+            let mut row = Instance::new("login", "/tmp/aoe-login-turn");
+            row.id = id.to_string();
+            row.view = crate::session::View::Structured;
+            crate::session::test_support::sandbox_needing_login(home.path(), &mut row);
+            let state = crate::server::test_support::build_native_test_app_state(vec![row]).await;
+            let service = &state.session_service;
+
+            let result = service
+                .send_turn(
+                    &caller,
+                    id,
+                    SendTurnRequest {
+                        resume_authority:
+                            crate::process::worker_registry::ResumeAuthority::Explicit,
+                        text: "hi",
+                        attachments: &[],
+                        woke_idle_dormant: false,
+                        prompt_ids: Vec::new(),
+                        synthesized: false,
+                        no_revive: false,
+                    },
+                )
+                .await;
+
+            assert!(
+                matches!(result, Err(SendTurnError::LoginRequired(_))),
+                "{caller:?}"
+            );
+            assert_eq!(service.sandbox_login.held_origin(id), Some(origin));
+            let published: Vec<String> = state
+                .acp_event_store
+                .replay_from(id, 0)
+                .into_iter()
+                .map(|(_, e)| match e {
+                    crate::acp::Event::AgentStartupError { message, .. } => message,
+                    other => format!("unexpected {other:?}"),
+                })
+                .collect();
+            assert_eq!(
+                published,
+                [crate::session::test_support::login_required("claude").to_string()],
+                "{caller:?}: no resume started, so only the login guidance was published"
+            );
+            assert_eq!(
+                service.acp_supervisor.worker_state(id).await,
+                crate::daemon::AcpWorkerState::Absent
+            );
+        }
+        assert_eq!(std::fs::read_to_string(&calls).unwrap_or_default(), "");
+    }
+
+    /// On Apple Container the helper cannot run, so a turn that needs the login is refused
+    /// by the launch, not held: no hold record (so no push and no kept-message episode),
+    /// the refusal is the session's startup error, and the container runtime is never reached.
+    #[cfg(unix)]
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn sandbox_login_apple_container_send_turn_is_refused_not_held() {
+        let home = crate::session::test_support::isolate_app_dir();
+        let _auth = crate::session::test_support::unset_claude_auth_routes();
+        let (_runtime, calls) =
+            crate::session::test_support::failing_container_runtime(home.path());
+        let id = "sess-login-apple";
+        let mut row = Instance::new("login", "/tmp/aoe-login-apple");
+        row.id = id.to_string();
+        row.view = crate::session::View::Structured;
+        crate::session::test_support::sandbox_needing_login(home.path(), &mut row);
+        crate::session::config::update_config(|c| {
+            c.sandbox.container_runtime =
+                crate::session::config::ContainerRuntimeName::AppleContainer;
+        })
+        .unwrap();
+        let state = crate::server::test_support::build_native_test_app_state(vec![row]).await;
+        let service = &state.session_service;
+
+        let result = service
+            .send_turn(
+                &SessionCaller::User,
+                id,
+                SendTurnRequest {
+                    resume_authority: crate::process::worker_registry::ResumeAuthority::Explicit,
+                    text: "hi",
+                    attachments: &[],
+                    woke_idle_dormant: false,
+                    prompt_ids: Vec::new(),
+                    synthesized: false,
+                    no_revive: false,
+                },
+            )
+            .await;
+
+        assert!(
+            !matches!(result, Ok(_) | Err(SendTurnError::LoginRequired(_))),
+            "the launch is refused"
+        );
+        assert!(!service.sandbox_login.is_held(id));
+        let refusal = crate::session::SandboxLoginUnsupported.to_string();
+        tokio::time::timeout(std::time::Duration::from_secs(10), async {
+            loop {
+                let published = state.acp_event_store.replay_from(id, 0).into_iter().any(
+                    |(_, e)| matches!(e, crate::acp::Event::AgentStartupError { message, .. } if message.contains(&refusal)),
+                );
+                if published {
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("the refusal is the session's startup error");
+        assert!(!service.sandbox_login.is_held(id), "still no hold");
+        assert_eq!(std::fs::read_to_string(&calls).unwrap_or_default(), "");
+    }
+
+    /// `host_seed` mode and a sandboxed session of an agent without a login resume as before: no hold, and the
+    /// launch reaches the container runtime.
+    #[cfg(unix)]
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn sandbox_login_queue_send_turn_resumes_outside_the_gate() {
+        for case in ["host_seed", "codex"] {
+            let home = crate::session::test_support::isolate_app_dir();
+            let (_runtime, calls) =
+                crate::session::test_support::failing_container_runtime(home.path());
+            let id = &format!("sess-login-free-{case}");
+            let mut row = Instance::new("login", "/tmp/aoe-login-free");
+            row.id = id.to_string();
+            row.view = crate::session::View::Structured;
+            crate::session::test_support::sandbox_needing_login(home.path(), &mut row);
+            if case == "host_seed" {
+                crate::session::config::update_config(|c| {
+                    c.sandbox.shared_credential =
+                        crate::session::config::SharedCredentialMode::HostSeed;
+                })
+                .unwrap();
+            } else {
+                row.tool = "codex".to_string();
+            }
+            let state = crate::server::test_support::build_native_test_app_state(vec![row]).await;
+            let service = &state.session_service;
+
+            let result = service
+                .send_turn(
+                    &SessionCaller::PluginMessage {
+                        plugin_id: "cron".to_string(),
+                    },
+                    id,
+                    SendTurnRequest {
+                        resume_authority:
+                            crate::process::worker_registry::ResumeAuthority::Explicit,
+                        text: "hi",
+                        attachments: &[],
+                        woke_idle_dormant: false,
+                        prompt_ids: Vec::new(),
+                        synthesized: false,
+                        no_revive: false,
+                    },
+                )
+                .await;
+
+            assert!(
+                !matches!(result, Ok(_) | Err(SendTurnError::LoginRequired(_))),
+                "{case}: the fake runtime fails the resume"
+            );
+            assert!(!service.sandbox_login.is_held(id), "{case}");
+            tokio::time::timeout(std::time::Duration::from_secs(10), async {
+                while std::fs::read_to_string(&calls)
+                    .unwrap_or_default()
+                    .is_empty()
+                {
+                    tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+                }
+            })
+            .await
+            .unwrap_or_else(|_| panic!("{case}: the resume reached the container runtime"));
+        }
     }
 }

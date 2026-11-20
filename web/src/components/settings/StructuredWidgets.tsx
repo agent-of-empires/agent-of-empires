@@ -5,6 +5,7 @@ import { resolvePluginOptions } from "../../lib/api";
 import type { SettingsObjectField, SettingsOptionSource } from "../../lib/types";
 import { validateCron } from "./cronValidation";
 import { ListField, NumberField, SelectField, TextField, ToggleField } from "./FormFields";
+import type { RowLabel } from "./rowLabel";
 
 type Option = { value: string; label: string };
 type Item = Record<string, unknown>;
@@ -39,6 +40,7 @@ function useResolvedOptions(section: string, source: SettingsOptionSource, depen
 interface OptionProps {
   label: string;
   description?: string;
+  row?: RowLabel;
   section: string;
   source: SettingsOptionSource;
   depends: string[];
@@ -59,6 +61,7 @@ function PluginOptionSelect({
     <SelectField
       label={props.label}
       description={props.description}
+      row={props.row}
       value={value}
       onChange={onChange}
       options={withPlaceholder}
@@ -100,11 +103,13 @@ function PluginOptionMultiSelect({
 export function CronField({
   label,
   description,
+  row,
   value,
   onChange,
 }: {
   label: string;
   description?: string;
+  row?: RowLabel;
   value: string;
   onChange: (v: string) => void;
 }) {
@@ -114,6 +119,7 @@ export function CronField({
       <TextField
         label={label}
         description={description}
+        row={row}
         value={value}
         onChange={onChange}
         mono
@@ -129,13 +135,14 @@ export function DynamicSelectField({
   dependsOn,
   sectionValues,
   ...props
-}: Omit<OptionProps, "depends"> & {
+}: Omit<OptionProps, "depends" | "label" | "description" | "row"> & {
+  row: RowLabel;
   dependsOn: string[];
   sectionValues: Record<string, unknown>;
   value: string;
   onChange: (v: string) => void;
 }) {
-  return <PluginOptionSelect {...props} depends={strings(sectionValues, dependsOn)} />;
+  return <PluginOptionSelect {...props} label="" depends={strings(sectionValues, dependsOn)} />;
 }
 
 function renderItemField(section: string, field: SettingsObjectField, item: Item, setField: (v: unknown) => void) {
@@ -218,8 +225,7 @@ function renderItemField(section: string, field: SettingsObjectField, item: Item
 
 /** Repeatable structured items. Each item keeps the id under `idField` generated on add. */
 export function ObjectListField({
-  label,
-  description,
+  row,
   section,
   idField,
   fields,
@@ -228,8 +234,7 @@ export function ObjectListField({
   items,
   onChange,
 }: {
-  label: string;
-  description?: string;
+  row: RowLabel;
   section: string;
   idField: string;
   fields: SettingsObjectField[];
@@ -285,11 +290,7 @@ export function ObjectListField({
   ];
 
   return (
-    <div className="space-y-2">
-      <div>
-        <div className="text-sm text-text-bright">{label}</div>
-        {description && <div className="text-xs text-text-dim">{description}</div>}
-      </div>
+    <div role="group" aria-labelledby={row.labelId} className="space-y-2">
       {working.map((item, index) => (
         <div
           key={String(item[idField] ?? index)}

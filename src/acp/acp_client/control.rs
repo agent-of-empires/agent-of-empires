@@ -245,6 +245,7 @@ impl DaemonControlClient {
     pub(super) fn deliver_prompt_completion(
         &self,
         _: PromptCompletedMarker,
+        delivered: impl FnOnce(),
     ) -> Option<control_protocol::PromptOutcome> {
         let completion = self.completion.lock().expect("completion mutex poisoned");
         let settled = self
@@ -254,12 +255,14 @@ impl DaemonControlClient {
             .pop_front();
         match settled {
             Some(CompletionDelivery::Local(tx, outcome)) => {
+                delivered();
                 let _ = tx.send(outcome);
                 None
             }
             Some(CompletionDelivery::Adopted(outcome))
                 if matches!(*completion, PromptCompletion::Adopted) =>
             {
+                delivered();
                 Some(outcome)
             }
             _ => None,
@@ -287,21 +290,20 @@ impl DaemonControlClient {
         }
     }
 
-    /// Registers the completion waiter before sending the `Prompt` frame.
+    /// Registers the completion waiter before sending the `Prompt` frame. A
+    /// waiter already pending is refused locally, without a frame.
     pub(super) async fn prompt(
         &self,
         request: serde_json::Value,
-    ) -> oneshot::Receiver<control_protocol::PromptOutcome> {
+    ) -> Result<oneshot::Receiver<control_protocol::PromptOutcome>, agent_client_protocol::Error>
+    {
         let (tx, rx) = oneshot::channel();
         {
             let mut completion = self.completion.lock().expect("completion mutex poisoned");
             if matches!(*completion, PromptCompletion::Pending { .. }) {
-                let _ = tx.send(control_protocol::PromptOutcome::Error {
-                    code: control_protocol::INTERNAL_ERROR as i32,
-                    message: "a local prompt is already awaiting completion".into(),
-                    data: None,
-                });
-                return rx;
+                return Err(acp_internal_error(
+                    "a local prompt is already awaiting completion".into(),
+                ));
             }
             *completion = PromptCompletion::Pending {
                 prompt_req_id: None,
@@ -314,7 +316,7 @@ impl DaemonControlClient {
             *self.completion.lock().expect("completion mutex poisoned") =
                 PromptCompletion::LocalIdle;
         }
-        rx
+        Ok(rx)
     }
 
     pub(super) async fn cancel(&self) {
@@ -1020,7 +1022,7 @@ mod tests {
         }
 
         async fn prompt(&mut self) -> oneshot::Receiver<PromptOutcome> {
-            let rx = self.client.prompt(serde_json::json!({})).await;
+            let rx = self.client.prompt(serde_json::json!({})).await.unwrap();
             assert!(matches!(
                 control_protocol::read_frame(&mut self.peer).await.unwrap(),
                 Some(ControlBody::Prompt { .. })
@@ -1059,7 +1061,7 @@ mod tests {
                 assert_eq!(notification["method"], "_aoe/prompt_completed");
                 let marker: PromptCompletedMarker =
                     serde_json::from_value(notification["params"].clone()).unwrap();
-                if let Some(outcome) = self.client.deliver_prompt_completion(marker) {
+                if let Some(outcome) = self.client.deliver_prompt_completion(marker, || {}) {
                     self.consumer().await.finish(outcome).await;
                 }
             }
@@ -1267,7 +1269,10 @@ mod tests {
         .unwrap();
         assert!(peer.terminal.failed());
         let old_turn = peer.terminal.current_turn();
-        commands.send(ClientCmd::Prompt(Vec::new())).await.unwrap();
+        commands
+            .send(ClientCmd::Prompt(Vec::new().into()))
+            .await
+            .unwrap();
         let (flushed, mut flush) = oneshot::channel();
         commands
             .send(ClientCmd::FlushForTest(flushed))
@@ -1349,14 +1354,11 @@ mod tests {
     async fn duplicate_local_prompt_preserves_first_waiter_and_sends_no_prompt() {
         let mut peer = PromptControlPeer::new().await;
         let completion = peer.prompt().await;
-        let mut duplicate = peer
+        let duplicate = peer
             .client
             .prompt(serde_json::json!({"duplicate": true}))
             .await;
-        assert!(matches!(
-            duplicate.try_recv().unwrap(),
-            PromptOutcome::Error { code, .. } if i64::from(code) == control_protocol::INTERNAL_ERROR
-        ));
+        assert!(duplicate.is_err());
         // Cancel arriving next proves the duplicate sent no Prompt frame.
         peer.client.cancel().await;
         assert!(matches!(
@@ -1476,7 +1478,7 @@ mod tests {
             &serde_json::json!(PromptCompletedMarker::default().method())
         );
         peer.client
-            .deliver_prompt_completion(PromptCompletedMarker::default());
+            .deliver_prompt_completion(PromptCompletedMarker::default(), || {});
         assert_eq!(completion.await.unwrap(), end("end_turn"));
     }
 
@@ -1635,7 +1637,7 @@ mod tests {
         let (client, crate_side) = connect(&control, "eof", Arc::new(TerminalClaim::new()), false)
             .await
             .unwrap();
-        let completion = client.prompt(serde_json::json!({})).await;
+        let completion = client.prompt(serde_json::json!({})).await.unwrap();
         fake.await.unwrap();
         assert!(tokio::time::timeout(Duration::from_secs(1), completion)
             .await
@@ -1650,13 +1652,16 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn attached_session_only_resets_for_missing_session_errors() {
+    async fn attached_session_prompt_errors_reset_tear_down_or_end_the_turn() {
         use crate::acp::acp_client::AcpClient;
         use crate::acp::state::AcpSessionId;
 
-        for (message, should_reset) in [
-            ("Unsupported ACP session", true),
-            ("Unsupported session mode", false),
+        // -32000 alone is not a login: some adapters use it for any failure.
+        for (message, code, want) in [
+            ("Unsupported ACP session", -32603, &["reset", "stopped"][..]),
+            ("Unsupported session mode", -32603, &["rejected"]),
+            ("Authentication required", -32000, &["startup_error"]),
+            ("model overloaded", -32000, &["rejected"]),
         ] {
             let tmp = tempfile::tempdir().unwrap();
             let socket = tmp.path().join("s.sock");
@@ -1689,12 +1694,14 @@ mod tests {
                             ControlBody::PromptCompleted {
                                 prompt_req_id: 1,
                                 outcome: PromptOutcome::Error {
-                                    code: -32603,
+                                    code,
                                     message: message.into(),
                                     data: None,
                                 },
                             }
                         }
+                        // Sent after a plain rejection (#5662).
+                        ControlBody::Cancel => continue,
                         frame => panic!("unexpected resumed-session request: {frame:?}"),
                     };
                     control_protocol::write_frame(&mut peer, &reply)
@@ -1724,35 +1731,23 @@ mod tests {
                 while let Some(event) = client.next_event().await {
                     match event {
                         Event::SessionContextReset { .. } => recovery.push("reset"),
-                        Event::Stopped { reason } => {
-                            assert_eq!(
-                                reason,
-                                if should_reset {
-                                    "stored_session_rejected"
-                                } else {
-                                    "prompt_failed"
-                                },
-                                "{message}"
-                            );
+                        Event::Stopped { reason } if reason == "stored_session_rejected" => {
                             recovery.push("stopped");
                             break;
                         }
-                        Event::AgentStartupError { message: error, .. } => {
-                            panic!("request failure must not become a startup error: {error}");
+                        // Any other rejection ends only the turn (#5662).
+                        Event::Stopped { reason } if reason == "prompt_rejected" => {
+                            recovery.push("rejected");
+                            break;
                         }
-                        Event::PromptRuntimeError { message: error, .. } => {
-                            assert!(!should_reset);
-                            assert_eq!(error, message);
-                            recovery.push("request_error");
+                        Event::Stopped { reason } => panic!("{message}: stopped as {reason}"),
+                        Event::AgentStartupError { message: error, .. } => {
+                            assert!(error.contains(message), "{error}");
+                            recovery.push("startup_error");
                         }
                         _ => {}
                     }
                 }
-                let want = if should_reset {
-                    vec!["reset", "stopped"]
-                } else {
-                    vec!["request_error", "stopped"]
-                };
                 assert_eq!(recovery, want, "{message}");
                 let _ = client.shutdown().await;
             };
@@ -2341,7 +2336,7 @@ mod tests {
                                     }
                                     SessionIngressNotification::PromptCompleted(marker) => {
                                         if let Some(outcome) =
-                                            control.deliver_prompt_completion(marker)
+                                            control.deliver_prompt_completion(marker, || {})
                                         {
                                             adopted_tx.send(outcome).unwrap();
                                         }
@@ -2393,7 +2388,7 @@ mod tests {
                         assert_eq!(applied.load(AtomicOrdering::Relaxed), 1);
 
                         let (entered_rx, release_tx) = arm();
-                        let mut completion = client.prompt(serde_json::json!({})).await;
+                        let mut completion = client.prompt(serde_json::json!({})).await.unwrap();
                         entered_rx.await.unwrap();
                         // Wait for the reader to match the completion while the
                         // crate is still applying the update sent before it.
@@ -2746,7 +2741,10 @@ mod tests {
             .await
             .unwrap();
             assert_eq!(peer.terminal.current_turn(), adopted_turn);
-            commands.send(ClientCmd::Prompt(Vec::new())).await.unwrap();
+            commands
+                .send(ClientCmd::Prompt(Vec::new().into()))
+                .await
+                .unwrap();
             let next = tokio::time::timeout(
                 Duration::from_secs(10),
                 control_protocol::read_frame(&mut peer.peer),
@@ -2816,7 +2814,10 @@ mod tests {
         let notification: serde_json::Value = serde_json::from_str(&line).unwrap();
         let marker: PromptCompletedMarker =
             serde_json::from_value(notification["params"].clone()).unwrap();
-        assert!(peer.client.deliver_prompt_completion(marker).is_none());
+        assert!(peer
+            .client
+            .deliver_prompt_completion(marker, || {})
+            .is_none());
         assert_eq!(local.try_recv(), Err(oneshot::error::TryRecvError::Empty));
         peer.assert_local_terminal_ownership();
         peer.drain().await;

@@ -31,6 +31,7 @@ mod status;
 mod store_move;
 #[cfg(test)]
 mod tests;
+pub(crate) mod update_bar;
 mod user_action;
 mod watchers;
 
@@ -310,6 +311,9 @@ pub struct HomeView {
     pub(super) pending_repo_trust_fingerprint: Option<crate::daemon::CreationTrustFingerprint>,
     /// Create without setup, carried through the trust prompt a resubmit reopened.
     pub(super) pending_repo_trust_skip_on_create: bool,
+    /// The setup-failed dialog whose resubmit reopened the trust prompt, so an answer the
+    /// daemon link refuses returns to it instead of losing the request.
+    pub(super) pending_repo_trust_recovery: Option<CreateHookFailedDialog>,
     pub(super) hooks_install_dialog: Option<HooksInstallDialog>,
     pub(super) pending_hooks_install_data: Option<NewSessionData>,
     pub(super) volume_ignores_glob_dialog: Option<ConfirmDialog>,
@@ -371,6 +375,8 @@ pub struct HomeView {
     pub(super) hover_cell: Option<(u16, u16)>,
     pub(super) status_flash: Option<overlays::StatusFlash>,
     pub(super) live_send_ctrl_c_flash_until: Option<std::time::Instant>,
+    /// Whether the last frame drew the update bar; a takeover view hides it.
+    pub(super) update_bar_drawn: bool,
     /// Session whose live control another window took, until the selection moves or live
     /// mode starts again.
     pub(super) live_takeover: Option<live_send::TakenLive>,

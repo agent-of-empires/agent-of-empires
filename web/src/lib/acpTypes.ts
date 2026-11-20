@@ -299,6 +299,9 @@ export type IncompatibleAgentDetail =
       reason: string;
     };
 
+/** Mirror of `StartupCause` in src/acp/state.rs; the event leaves it out when nothing was diagnosed. */
+export type StartupCause = { kind: "container_missing" };
+
 /** Mirror of `IntegrationLostReason` in src/acp/state.rs. */
 export type IntegrationLostReason =
   | { kind: "contract_violation"; detail: string }
@@ -320,6 +323,7 @@ export interface OperationErrorEvidence {
 // One variant per Event::* in src/acp/state.rs, externally tagged.
 export type AcpEvent =
   | { PlanUpdated: { plan: Plan } }
+  | { PlanRemoved: { plan_id: string } }
   | {
       TodoListUpdated: {
         todos: Array<{ id: string; text: string; completed: boolean }>;
@@ -442,7 +446,7 @@ export type AcpEvent =
   | { AgentThoughtChunk: { text: string; message_id?: string } }
   | { CancelRequested: { escalates_at: string } }
   | { Stopped: { reason: string } }
-  | { AgentStartupError: { message: string } }
+  | { AgentStartupError: { message: string; cause?: StartupCause } }
   | { PromptRuntimeError: { message: string; evidence?: OperationErrorEvidence | null } }
   | { IncompatibleAgent: { detail: IncompatibleAgentDetail } }
   | { IntegrationLost: { reason: IntegrationLostReason } }
@@ -488,7 +492,7 @@ export type AcpEvent =
       };
     }
   | { BackgroundTaskFinished: { task_id: string; ended_at?: string | null } }
-  | { PromptRejected: { reason: string; text: string } }
+  | { PromptRejected: { reason: string; text: string; attachments?: PromptAttachmentRefWire[] } }
   | { AgentSwitched: { from: string; to: string; reason: string } }
   | { ConversationSummary: { text: string; summarized_until_seq: number } };
 
@@ -644,6 +648,8 @@ export interface AcpState {
   oldestSeq: number;
   lagged: boolean;
   startupError: string | null;
+  /** Why `startupError` happened, when the Daemon said; set and cleared with it. */
+  startupCause: StartupCause | null;
   /** Adapter compatibility failure; replaces the session view with `StartupErrorScreen`. */
   incompatibleAgent: IncompatibleAgentDetail | null;
   lastError: string | null;
@@ -838,6 +844,8 @@ export interface RejectedPrompt {
   text: string;
   reason: string;
   rejectedAt: string;
+  /** Stored with the sent prompt; Retry reloads and resends them. */
+  attachments?: AcpAttachment[];
 }
 
 export interface QueuedPrompt {
@@ -932,20 +940,25 @@ export function webRendersServerRow(row: TranscriptRow): boolean {
   return row.kind !== "notice";
 }
 
+/** A sent prompt's attachment, served from the daemon's store. */
+export function storedAttachment(a: PromptAttachmentRefWire, sessionId: string): AcpAttachment {
+  return {
+    id: a.id,
+    kind: a.kind,
+    mimeType: a.mime_type,
+    name: a.name,
+    size: a.size,
+    url: `/api/sessions/${encodeURIComponent(sessionId)}/acp/attachments/${encodeURIComponent(a.id)}`,
+  };
+}
+
 export function transcriptRowToActivity(row: TranscriptRow, sessionId: string): ActivityRow {
   const tool: ToolCall | undefined = row.tool
     ? { ...row.tool, raw_name: row.tool.raw_name ?? row.tool.name }
     : undefined;
-  const attachments: AcpAttachment[] | undefined =
+  const attachments =
     row.attachments && row.attachments.length > 0
-      ? row.attachments.map((a) => ({
-          id: a.id,
-          kind: a.kind,
-          mimeType: a.mime_type,
-          name: a.name,
-          size: a.size,
-          url: `/api/sessions/${encodeURIComponent(sessionId)}/acp/attachments/${encodeURIComponent(a.id)}`,
-        }))
+      ? row.attachments.map((a) => storedAttachment(a, sessionId))
       : undefined;
   return {
     id: row.id,
@@ -1056,6 +1069,7 @@ export function emptyAcpState(): AcpState {
     oldestSeq: 0,
     lagged: false,
     startupError: null,
+    startupCause: null,
     incompatibleAgent: null,
     lastError: null,
     lastErrorEvidence: null,
@@ -1106,6 +1120,7 @@ function isSteeredContinuation(state: AcpState): boolean {
 
 function applyNewTurnResets(next: AcpState): void {
   next.startupError = null;
+  next.startupCause = null;
   if (!next.restartInFlight) next.retriedError = null;
   next.lastError = null;
   next.lastErrorEvidence = null;
@@ -1324,13 +1339,17 @@ export function applyEvent(state: AcpState, frame: AcpFrame): AcpState {
     next.startupError = `Agent integration lost: ${
       reason.kind === "contract_violation" ? reason.detail : reason.kind.replace("_", " ")
     }`;
+    next.startupCause = null;
     next.agentUnresponsive = false;
     closeTurn(next);
     return next;
   }
   if ("AgentStartupError" in event) {
     next.startupError = event.AgentStartupError.message;
-    const retried = state.restartInFlight ? state.retriedError : null;
+    next.startupCause =
+      event.AgentStartupError.cause?.kind === "container_missing" ? { kind: "container_missing" } : null;
+    // A diagnosed cause gets its own banner, which doesn't compare with a Retry's error.
+    const retried = state.restartInFlight && !next.startupCause ? state.retriedError : null;
     endRestart(next);
     next.retriedError = retried;
     next.agentUnresponsive = false;
@@ -1396,6 +1415,7 @@ export function applyEvent(state: AcpState, frame: AcpFrame): AcpState {
     next.sessionAssigned = true;
     endRestart(next);
     next.startupError = null;
+    next.startupCause = null;
     next.incompatibleAgent = null;
     next.workerStopped = false;
     next.workerRestarting = false;
@@ -1449,6 +1469,7 @@ export function applyEvent(state: AcpState, frame: AcpFrame): AcpState {
     next.sessionUsage = null;
     next.usageBaseline = null;
     next.startupError = null;
+    next.startupCause = null;
     next.lastError = null;
     next.lastErrorEvidence = null;
     next.interactionError = null;
@@ -1467,11 +1488,13 @@ export function applyEvent(state: AcpState, frame: AcpFrame): AcpState {
     return next;
   }
   if ("PromptRejected" in event) {
+    const attachments = event.PromptRejected.attachments?.map((a) => storedAttachment(a, frame.session_id));
     const entry: RejectedPrompt = {
       id: `rejected-${frame.seq}`,
       text: event.PromptRejected.text,
       reason: event.PromptRejected.reason,
       rejectedAt: new Date().toISOString(),
+      ...(attachments?.length ? { attachments } : {}),
     };
     const REJECTED_PROMPTS_CAP = 5;
     next.rejectedPrompts = [...next.rejectedPrompts, entry].slice(-REJECTED_PROMPTS_CAP);
