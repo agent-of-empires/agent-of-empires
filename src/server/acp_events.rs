@@ -150,6 +150,7 @@ pub(super) async fn acp_event_listener(state: Arc<AppState>) {
                     &state.instance_locks,
                     state.file_watch.clone(),
                     &state.status_tx,
+                    &state.retry_starting,
                 )
                 .await;
                 if recovered > 0 {
@@ -560,8 +561,11 @@ pub(super) async fn acp_event_listener(state: Arc<AppState>) {
             // between. A future refactor that makes `apply_status_intent`
             // assign `status` more than once has to revisit this.
             let old_status = inst.status;
-            if let Some((policy, projected)) = status_update.filter(|_| live_worker) {
+            if let Some((policy, projected)) = status_update.filter(|_| {
+                live_worker && !retired_before_retry(&state.retry_starting, inst, frame.seq)
+            }) {
                 apply_status_intent(inst, policy, projected, &state.status_tx);
+                settle_retry_starting(&state.retry_starting, inst, old_status);
             }
             canonical_changed |= old_status != inst.status;
             let unread_profile =
@@ -780,6 +784,119 @@ fn revival_pending_clears_on(status: Status) -> bool {
     )
 }
 
+/// Retry watermarks: session id to the latest event seq when the Retry wrote `Starting`.
+pub(crate) type RetryStarting = std::sync::Mutex<std::collections::HashMap<String, u64>>;
+
+/// Whether a status projected at `seq` predates a Retry's `Starting`, so it is the retired
+/// worker's and must not move the row.
+pub(crate) fn retired_before_retry(
+    retry_starting: &RetryStarting,
+    inst: &Instance,
+    seq: u64,
+) -> bool {
+    inst.status == Status::Starting
+        && retry_starting
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(&inst.id)
+            .is_some_and(|watermark| seq <= *watermark)
+}
+
+/// Forget a Retry's watermark once its row has left `Starting`.
+fn settle_retry_starting(retry_starting: &RetryStarting, inst: &Instance, old_status: Status) {
+    if old_status == Status::Starting && inst.status != Status::Starting {
+        retry_starting
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(&inst.id);
+    }
+}
+
+/// A Retry's `Starting`, held until the launch succeeds. Dropped armed (an error return, a
+/// panic or a cancelled handler), it restores the prior status unless a newer frame moved the row.
+pub(crate) struct RetryStartingGuard {
+    state: Arc<AppState>,
+    id: String,
+    prior: Status,
+    watermark: u64,
+    armed: bool,
+}
+
+impl RetryStartingGuard {
+    /// Moves an `Error` or `Stopped` row to `Starting`; `None` when the row was in neither.
+    pub(crate) async fn begin(state: &Arc<AppState>, id: &str) -> Option<Self> {
+        let mut instances = state.instances.write().await;
+        let inst = instances.iter_mut().find(|i| i.id == id)?;
+        let prior = inst.status;
+        apply_status_intent(
+            inst,
+            StatusPolicy::Launch,
+            Status::Starting,
+            &state.status_tx,
+        );
+        if prior == Status::Starting || inst.status != Status::Starting {
+            return None;
+        }
+        let watermark = state.acp_supervisor.latest_seq(id);
+        state
+            .retry_starting
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(id.to_string(), watermark);
+        Some(Self {
+            state: state.clone(),
+            id: id.to_string(),
+            prior,
+            watermark,
+            armed: true,
+        })
+    }
+
+    /// The launch succeeded: the new worker's own frames now move the row.
+    pub(crate) fn disarm(mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for RetryStartingGuard {
+    fn drop(&mut self) {
+        // Outside a runtime (Daemon shutdown) there is nothing to revert into; boot re-projects.
+        if !self.armed || tokio::runtime::Handle::try_current().is_err() {
+            return;
+        }
+        let state = self.state.clone();
+        let id = std::mem::take(&mut self.id);
+        let (prior, watermark) = (self.prior, self.watermark);
+        self.state
+            .runtime
+            .work
+            .spawn("server.acp.retry_starting_revert", async move {
+                revert_retry_starting(&state, &id, prior, watermark).await;
+            });
+    }
+}
+
+async fn revert_retry_starting(state: &AppState, id: &str, prior: Status, watermark: u64) {
+    let mut instances = state.instances.write().await;
+    {
+        let mut retry_starting = state
+            .retry_starting
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        // A newer frame settled the row, or a later Retry owns it now.
+        if retry_starting.get(id) != Some(&watermark) {
+            return;
+        }
+        retry_starting.remove(id);
+    }
+    if let Some(inst) = instances
+        .iter_mut()
+        .find(|i| i.id == id && i.status == Status::Starting)
+    {
+        apply_status_intent(inst, StatusPolicy::Authoritative, prior, &state.status_tx);
+    }
+}
+
 /// Fold a projected status into an `Instance` under `policy`. Pure mutation;
 /// callers hold the write lock. Sends a `StatusChange` on
 /// `status_tx` so push notifications and the dashboard see the
@@ -816,6 +933,14 @@ pub(crate) fn apply_status_intent(
         // fresh worker attaches. The listener drops a retired worker's identity
         // frame before it gets here, since it can trail the stop.
         StatusPolicy::Heal => {
+            if !matches!(
+                inst.status,
+                Status::Error | Status::Stopped | Status::Starting
+            ) {
+                return;
+            }
+        }
+        StatusPolicy::Launch => {
             if !matches!(inst.status, Status::Error | Status::Stopped) {
                 return;
             }
@@ -950,6 +1075,7 @@ pub(super) async fn recover_structured_unread_after_lag(
     instance_locks: &RwLock<std::collections::HashMap<String, Arc<tokio::sync::Mutex<()>>>>,
     file_watch: Arc<crate::file_watch::FileWatchService>,
     status_tx: &broadcast::Sender<StatusChange>,
+    retry_starting: &RetryStarting,
 ) -> usize {
     let ids: Vec<String> = instances
         .read()
@@ -961,9 +1087,11 @@ pub(super) async fn recover_structured_unread_after_lag(
     let unread_enabled = crate::session::unread_enabled();
     let mut marked = 0usize;
     for id in ids {
-        let Some(projected) = folded_sidebar_status(service, &id).await else {
+        let fold = service.fold_control_state(&id).await;
+        if fold.last_seq == 0 {
             continue;
-        };
+        }
+        let projected = fold.sidebar_status();
         // Same snapshot-around-apply as the live path, so "the transition that
         // was actually applied" means the same thing in both.
         let unread_profile = {
@@ -975,7 +1103,10 @@ pub(super) async fn recover_structured_unread_after_lag(
                 continue;
             }
             let old_status = inst.status;
-            apply_status_intent(inst, StatusPolicy::Authoritative, projected, status_tx);
+            if !retired_before_retry(retry_starting, inst, fold.last_seq) {
+                apply_status_intent(inst, StatusPolicy::Authoritative, projected, status_tx);
+                settle_retry_starting(retry_starting, inst, old_status);
+            }
             should_mark_acp_unread(inst, old_status, unread_enabled)
                 .then(|| inst.source_profile.clone())
         };
@@ -1123,8 +1254,10 @@ pub(crate) enum StatusPolicy {
     /// resolve: `Waiting`, `Stopped` or `Error`. Used only by background
     /// work events (#4001).
     Background,
-    /// Only takes effect from `Error` or `Stopped`: a fresh worker attached.
+    /// Only takes effect from `Error`, `Stopped` or a Retry's `Starting`: a fresh worker attached.
     Heal,
+    /// A Retry starting the Agent from `Error` or `Stopped`. Set by handlers, never by an event.
+    Launch,
 }
 
 /// The events that move the sidebar status, and how.
@@ -1492,6 +1625,7 @@ mod tests {
             &locks,
             crate::file_watch::FileWatchService::noop(),
             &status_tx,
+            &state.retry_starting,
         )
         .await;
 
@@ -1608,6 +1742,7 @@ mod tests {
                 &locks,
                 crate::file_watch::FileWatchService::noop(),
                 &status_tx,
+                &state.retry_starting,
             )
             .await;
 
@@ -2213,6 +2348,141 @@ mod tests {
         listener.abort();
         let _ = listener.await;
         assert_eq!(row.status, Status::Error);
+    }
+
+    /// #5671: a Retry's `Starting` ignores the retired worker's trailing frames and moves on the
+    /// new worker's first one. The trailing frame is sent first, so the new one's change proves
+    /// it was handled.
+    #[tokio::test]
+    async fn acp_event_listener_holds_a_retry_starting_against_the_retired_worker() {
+        use crate::acp::Event;
+        let temp = tempfile::tempdir().expect("tempdir");
+        let _app_dir = crate::session::test_support::isolate_app_dir_at(temp.path());
+        let assigned = Event::AcpSessionAssigned {
+            acp_session_id: "acp-new".into(),
+        };
+        // (new worker's first frame, the status it settles the row on)
+        let cases = [
+            (assigned, Status::Idle),
+            (Event::startup_error("adapter exited"), Status::Error),
+        ];
+        for (fresh, want) in cases {
+            let mut inst = Instance::new("acp-5671", "/tmp/acp");
+            inst.view = crate::session::View::Structured;
+            inst.status = Status::Error;
+            let id = inst.id.clone();
+            let state = test_support::build_test_app_state(vec![inst]);
+            state.acp_supervisor.hydrate_seqs([(id.clone(), 5)]);
+            let guard = RetryStartingGuard::begin(&state, &id)
+                .await
+                .expect("an Error row starts");
+            guard.disarm();
+            let mut changes = state.status_tx.subscribe();
+
+            let listener = tokio::spawn(acp_event_listener(state.clone()));
+            await_subscribed(&state).await;
+            let frame = |seq, event: Event, sidebar_status| AcpBroadcastFrame {
+                session_id: id.clone(),
+                seq,
+                event: Arc::new(event),
+                worker_generation: None,
+                sidebar_status,
+            };
+            let retired = Event::Stopped {
+                reason: "user_stopped".into(),
+            };
+            for frame in [
+                frame(5, retired, Some(Status::Stopped)),
+                frame(6, fresh, Some(want)),
+            ] {
+                state
+                    .acp_events_tx
+                    .send(frame)
+                    .expect("listener is subscribed");
+            }
+
+            let change = tokio::time::timeout(std::time::Duration::from_secs(10), changes.recv())
+                .await
+                .expect("the new worker's frame moves the row")
+                .expect("status channel open");
+            listener.abort();
+            let _ = listener.await;
+            assert_eq!(
+                (change.old, change.new),
+                (Status::Starting, want),
+                "{want:?}"
+            );
+            assert!(changes.try_recv().is_err(), "{want:?}: one change only");
+            assert!(state.retry_starting.lock().unwrap().is_empty(), "{want:?}");
+        }
+    }
+
+    /// #5671: lag recovery applies a fold projection, not a frame, so it checks the fold's last seq
+    /// against the Retry watermark: a fold the retired worker wrote leaves `Starting`, a newer
+    /// one moves it.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn recover_structured_unread_after_lag_holds_a_retry_starting() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let _app_dir = crate::session::test_support::isolate_app_dir_at(temp.path());
+        // (watermark, status after recovery); the retired worker's Stopped is at seq 1.
+        for (watermark, want) in [(1, Status::Starting), (0, Status::Idle)] {
+            let mut inst = Instance::new("acp-5671-lag", "/tmp/acp");
+            inst.view = crate::session::View::Structured;
+            inst.status = Status::Error;
+            let id = inst.id.clone();
+            let state = test_support::build_test_app_state(vec![inst]);
+            let stopped = crate::acp::Event::Stopped {
+                reason: "user_stopped".into(),
+            };
+            state
+                .acp_event_store
+                .record(&id, 1, &stopped)
+                .expect("record");
+            state.acp_supervisor.hydrate_seqs([(id.clone(), watermark)]);
+            RetryStartingGuard::begin(&state, &id)
+                .await
+                .expect("an Error row starts")
+                .disarm();
+
+            recover_structured_unread_after_lag(
+                &state.instances,
+                &state.session_service,
+                &state.instance_locks,
+                crate::file_watch::FileWatchService::noop(),
+                &state.status_tx,
+                &state.retry_starting,
+            )
+            .await;
+
+            assert_eq!(
+                state.instances.read().await[0].status,
+                want,
+                "watermark {watermark}"
+            );
+        }
+    }
+
+    /// #5671: a guard dropped after its runtime is gone (Daemon shutdown) must not panic.
+    #[test]
+    fn retry_starting_guard_drops_quietly_outside_a_runtime() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let (state, guard) = runtime.block_on(async {
+            let mut inst = stopped_structured_instance();
+            inst.status = Status::Error;
+            let id = inst.id.clone();
+            let state = test_support::build_test_app_state(vec![inst]);
+            let guard = RetryStartingGuard::begin(&state, &id)
+                .await
+                .expect("starts");
+            (state, guard)
+        });
+        drop(runtime);
+        drop(guard);
+        assert_eq!(state.retry_starting.lock().unwrap().len(), 1);
     }
 
     /// #4001: after a daemon restart the control cache is cold. A reattached
@@ -2854,14 +3124,22 @@ mod tests {
     /// and no transition stamps `last_accessed_at` (#3465).
     #[test]
     fn apply_status_intent_matrix() {
-        use Status::{Creating, Deleting, Error, Idle, Running, Stopped, Waiting};
-        use StatusPolicy::{Authoritative, Background, Heal};
+        use Status::{Creating, Deleting, Error, Idle, Running, Starting, Stopped, Waiting};
+        use StatusPolicy::{Authoritative, Background, Heal, Launch};
         let user_touch = chrono::Utc::now() - chrono::Duration::seconds(60);
         // (from, trashed, policy, target, want)
         let cases = [
             (Stopped, false, Heal, Idle, Idle),
             (Error, false, Heal, Idle, Idle),
             (Running, false, Heal, Idle, Running),
+            (Starting, false, Heal, Idle, Idle),
+            (Error, false, Launch, Starting, Starting),
+            (Stopped, false, Launch, Starting, Starting),
+            (Idle, false, Launch, Starting, Idle),
+            (Running, false, Launch, Starting, Running),
+            (Waiting, false, Launch, Starting, Waiting),
+            (Error, true, Launch, Starting, Error),
+            (Starting, false, Authoritative, Error, Error),
             (Idle, false, Authoritative, Running, Running),
             (Running, false, Authoritative, Idle, Idle),
             (Waiting, false, Authoritative, Running, Running),

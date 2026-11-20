@@ -501,6 +501,142 @@ mod tests {
         assert_eq!(state.instances.read().await[0].group_path, "moved");
     }
 
+    fn retry_request(
+    ) -> Result<Json<worker::SpawnAcpRequest>, axum::extract::rejection::JsonRejection> {
+        Ok(Json(worker::SpawnAcpRequest {
+            agent: Some("codex".into()),
+            model: None,
+            additional_dirs: Vec::new(),
+            provider_env: Vec::new(),
+        }))
+    }
+
+    async fn errored_retry_state(
+        project: &std::path::Path,
+        id: &str,
+    ) -> Arc<crate::server::state::AppState> {
+        use crate::server::test_support as support;
+        let mut inst = crate::session::Instance::new("acp-5671", project.to_str().unwrap());
+        inst.id = id.into();
+        inst.source_profile = "default".into();
+        inst.view = crate::session::View::Structured;
+        inst.status = crate::session::Status::Error;
+        support::seed_instances_on_disk_for_test("default", vec![inst.clone()]);
+        let (launcher, _launches) = support::counting_failing_launcher();
+        let state = support::build_test_app_state_with_launcher(vec![inst], launcher);
+        support::refresh_canonical_metadata_for_test(&state).await;
+        state
+    }
+
+    async fn next_change(
+        changes: &mut tokio::sync::broadcast::Receiver<crate::server::push::StatusChange>,
+    ) -> (crate::session::Status, crate::session::Status) {
+        let change = tokio::time::timeout(std::time::Duration::from_secs(10), changes.recv())
+            .await
+            .expect("a status change")
+            .expect("status channel open");
+        (change.old, change.new)
+    }
+
+    /// #5671: Retry on an Error row shows `Starting`, and a failed launch puts the row back.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn a_failed_retry_shows_starting_then_returns_to_error() {
+        use crate::session::Status::{Error, Starting};
+        let _app_dir = crate::session::test_support::isolate_app_dir();
+        let project = tempfile::tempdir().unwrap();
+        for endpoint in ["spawn", "restart"] {
+            let id = format!("sess-5671-{endpoint}");
+            let state = errored_retry_state(project.path(), &id).await;
+            let mut changes = state.status_tx.subscribe();
+            let response = if endpoint == "spawn" {
+                spawn_acp(State(state.clone()), Path(id.clone()), retry_request())
+                    .await
+                    .into_response()
+            } else {
+                restart_acp(State(state.clone()), Path(id.clone()), retry_request())
+                    .await
+                    .into_response()
+            };
+            assert!(
+                !response.status().is_success(),
+                "{endpoint}: {}",
+                response.status()
+            );
+            assert_eq!(
+                next_change(&mut changes).await,
+                (Error, Starting),
+                "{endpoint}"
+            );
+            assert_eq!(
+                next_change(&mut changes).await,
+                (Starting, Error),
+                "{endpoint}"
+            );
+            assert_eq!(state.instances.read().await[0].status, Error, "{endpoint}");
+            assert!(
+                state.retry_starting.lock().unwrap().is_empty(),
+                "{endpoint}"
+            );
+        }
+    }
+
+    /// #5671: a Retry dropped after it wrote `Starting` (the client went away mid-launch) still
+    /// puts the row back. Only spawn runs in the request future; restart runs as runtime work.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn a_dropped_retry_restores_the_prior_status() {
+        use crate::session::Status::{Error, Starting};
+        let _app_dir = crate::session::test_support::isolate_app_dir();
+        let project = tempfile::tempdir().unwrap();
+        let [ready, release, done] = ["ready", "release", "done"].map(|f| project.path().join(f));
+        let hook = format!(
+            ": > '{}'; while [ ! -e '{}' ]; do sleep 0.01; done; : > '{}'",
+            ready.display(),
+            release.display(),
+            done.display()
+        );
+        crate::session::config::update_config(|global| {
+            global.host_hooks.before_session = vec![hook];
+        })
+        .unwrap();
+        // Nothing awaits the dropped launch's hook, and the runtime joins its blocking thread at
+        // shutdown: release it on every exit path and wait until it has seen the release.
+        struct Release([std::path::PathBuf; 2]);
+        impl Drop for Release {
+            fn drop(&mut self) {
+                let [release, done] = &self.0;
+                let _ = std::fs::write(release, b"release");
+                let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+                while !done.exists() && std::time::Instant::now() < deadline {
+                    std::thread::sleep(std::time::Duration::from_millis(10));
+                }
+            }
+        }
+        let release = Release([release, done]);
+        let id = "sess-5671-drop".to_string();
+        let state = errored_retry_state(project.path(), &id).await;
+        let mut changes = state.status_tx.subscribe();
+        let mut launch = Box::pin(spawn_acp(State(state.clone()), Path(id), retry_request()));
+        let hook_running = tokio::time::timeout(std::time::Duration::from_secs(10), async {
+            while !ready.exists() {
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        });
+        tokio::select! {
+            response = &mut launch => panic!("launch ended before its hook: {}", response.into_response().status()),
+            waited = hook_running => waited.expect("before_session hook started"),
+        }
+        assert_eq!(next_change(&mut changes).await, (Error, Starting));
+
+        drop(launch);
+        let restored = next_change(&mut changes).await;
+        drop(release);
+        assert_eq!(restored, (Starting, Error));
+        assert_eq!(state.instances.read().await[0].status, Error);
+        assert!(state.retry_starting.lock().unwrap().is_empty());
+    }
+
     /// #4116: a peer archive committed while the `before_session` hook runs (after the handler's
     /// recheck) still refuses the launch, on both the spawn and the agent-switch endpoint.
     #[tokio::test]

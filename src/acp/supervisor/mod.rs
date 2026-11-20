@@ -644,6 +644,11 @@ impl<S: BroadcastSink> Supervisor<S> {
         }
     }
 
+    /// The last seq allocated for the session, 0 before any.
+    pub(crate) fn latest_seq(&self, session_id: &str) -> u64 {
+        *lock_recover(&session_seq(&self.next_seqs, session_id))
+    }
+
     /// The running epoch, for a caller that must stop only that epoch.
     pub(crate) fn running_lease(&self, session_id: &str) -> Option<Lease> {
         lock_recover(&self.lifecycle)

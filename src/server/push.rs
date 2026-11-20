@@ -514,6 +514,9 @@ struct DwellState {
     idle_since: Option<std::time::Instant>,
     /// When the session most recently entered Error.
     error_since: Option<std::time::Instant>,
+    /// Set while a Retry's `Starting` follows an `Error`: that error's `error_since`, `None`
+    /// once it notified. A return to Error resumes it rather than arming a new one.
+    error_before_start: Option<Option<std::time::Instant>>,
     /// Last time a push fired for this session (any event type). Used
     /// for a shared per-session cooldown: rapid-fire events like
     /// Error → brief Running → Error don't double-buzz.
@@ -589,13 +592,24 @@ fn handle_status_change(dwell: &mut HashMap<String, DwellState>, change: StatusC
     entry.title = change.instance_title;
     let now = std::time::Instant::now();
     // Exactly one `*_since` is set at a time.
+    let resumed_error = match (change.old, change.new) {
+        (Status::Error, Status::Starting) => {
+            entry.error_before_start = Some(entry.error_since);
+            None
+        }
+        (Status::Starting, Status::Error) => entry.error_before_start.take(),
+        _ => {
+            entry.error_before_start = None;
+            None
+        }
+    };
     entry.waiting_since = None;
     entry.idle_since = None;
     entry.error_since = None;
     match change.new {
         Status::Waiting => entry.waiting_since = Some(now),
         Status::Idle => entry.idle_since = Some(now),
-        Status::Error => entry.error_since = Some(now),
+        Status::Error => entry.error_since = resumed_error.unwrap_or(Some(now)),
         _ => {}
     }
     // Drop entries for transitions into Stopped/Deleting so the map doesn't grow forever in
@@ -1798,6 +1812,43 @@ mod tests {
             },
         );
         assert!(dwell.get(&id).unwrap().waiting_since.is_none());
+    }
+
+    /// #5671: a Retry that falls back to Error (refused, dropped or failed) resumes the earlier
+    /// error instead of arming a second "errored" push. A failed Retry from Stopped is new.
+    #[test]
+    fn a_retry_falling_back_to_error_does_not_notify_again() {
+        let change = |old, new| StatusChange {
+            instance_id: "sess-5671".into(),
+            instance_title: "retry".into(),
+            effective_profile: "default".into(),
+            old,
+            new,
+            at: Utc::now(),
+        };
+        let watch = crate::server::state::WebWatch::Nothing;
+        let later = std::time::Instant::now() + std::time::Duration::from_secs(3600);
+        // (statuses before the Retry, whether the error already notified, notifications due)
+        let cases = [
+            (vec![Status::Running, Status::Error], true, 0),
+            (vec![Status::Running, Status::Error], false, 1),
+            (vec![Status::Stopped], false, 1),
+        ];
+        for (before, notified, want) in cases {
+            let mut dwell: HashMap<String, DwellState> = HashMap::new();
+            for pair in before.windows(2) {
+                handle_status_change(&mut dwell, change(pair[0], pair[1]));
+            }
+            if notified {
+                assert_eq!(due_events(&mut dwell, &watch, later).len(), 1, "{before:?}");
+                dwell.get_mut("sess-5671").unwrap().last_notified = None;
+            }
+            let prior = *before.last().unwrap();
+            handle_status_change(&mut dwell, change(prior, Status::Starting));
+            handle_status_change(&mut dwell, change(Status::Starting, Status::Error));
+            let due = due_events(&mut dwell, &watch, later);
+            assert_eq!(due.len(), want, "{before:?} notified={notified}");
+        }
     }
 
     #[test]
