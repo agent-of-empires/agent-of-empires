@@ -1031,6 +1031,17 @@
       "notes": "The Suggested Group shows only while prefs.sidebar is on, and appears without a remount when the pref changes in Settings."
     },
     {
+      "id": "suggestions.cityhall-read-only",
+      "kind": "vitest",
+      "risk": "medium",
+      "specs": [
+        "src/components/__tests__/DashboardSetupHint.test.tsx",
+        "src/components/__tests__/SuggestionsView.test.tsx"
+      ],
+      "components": ["web/src/lib/clientCapabilities.ts", "web/src/components/Dashboard.tsx", "web/src/App.tsx"],
+      "notes": "CityHall refuses suggestion mutations, so canManageSuggestions renders the Suggestions page, Home section and sidebar Group read-only."
+    },
+    {
       "id": "suggestions.first-run-setup",
       "kind": "mocked-playwright",
       "risk": "medium",

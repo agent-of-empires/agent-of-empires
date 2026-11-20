@@ -110,6 +110,8 @@ interface Props {
   onAxisChange: (axis: SidebarAxis) => void;
   /** Enables the "Suggested" Group, which shows only while the `sidebar` suggestions pref is on. */
   suggestions?: {
+    /** Overrides the sidebar's `readOnly` for the Group. */
+    readOnly?: boolean;
     onPrepare: (prefill: WizardPrefill) => void;
     onViewAll: () => void;
     onOpenSession: (sessionId: string) => void;
