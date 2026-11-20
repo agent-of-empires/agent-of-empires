@@ -97,6 +97,19 @@ fn enabled_by_default() -> bool {
     true
 }
 
+impl Item {
+    /// `(key, name)` of the full view's group: the repo, named by its last
+    /// segment, else the resolved Project.
+    fn group(&self) -> Option<(&str, &str)> {
+        if let Some(repo) = self.mapping_key.as_deref() {
+            return Some((repo, repo.rsplit('/').next().unwrap_or(repo)));
+        }
+        self.resolved_project
+            .as_ref()
+            .map(|p| (p.path.as_str(), p.name.as_str()))
+    }
+}
+
 /// The registered Project an item resolves to.
 #[derive(Debug, Clone, Deserialize)]
 struct ResolvedProject {
@@ -122,6 +135,9 @@ struct Item {
     started_session: Option<Started>,
     #[serde(default)]
     resolved_project: Option<ResolvedProject>,
+    /// The repo the provider links to a Project, as `owner/repo` for GitHub.
+    #[serde(default)]
+    mapping_key: Option<String>,
     #[serde(default)]
     criterion: String,
     #[serde(default)]
@@ -682,21 +698,21 @@ impl SuggestionsView {
         self.order.get(self.selected).cloned()
     }
 
-    /// The Project path an item sits under; empty when unresolved.
+    /// The group an item sits under; empty when it names no repo and resolved to no Project.
     fn group_key<'a>(&self, store: &'a SuggestionsFeed, index: usize) -> &'a str {
         self.item_at(store, index)
-            .and_then(|i| i.resolved_project.as_ref())
-            .map_or("", |p| p.path.as_str())
+            .and_then(Item::group)
+            .map_or("", |(key, _)| key)
     }
 
-    /// Headings show only once some item resolved to a Project.
-    fn has_project_groups(&self, store: &SuggestionsFeed) -> bool {
+    /// Headings show only once some item has a group.
+    fn has_groups(&self, store: &SuggestionsFeed) -> bool {
         (0..self.order.len()).any(|i| !self.group_key(store, i).is_empty())
     }
 
-    /// Rebuilds `order`, grouped by resolved Project in first-seen order with
-    /// unresolved last (snapshot order holds within a group), keeping the
-    /// selection on `key` when it is still listed.
+    /// Rebuilds `order`, grouped by repo in first-seen order with ungrouped
+    /// last (snapshot order holds within a group), keeping the selection on
+    /// `key` when it is still listed.
     fn reorder(&mut self, store: &SuggestionsFeed, key: Option<ItemKey>) {
         let listed: Vec<&Item> = store
             .snapshot
@@ -705,20 +721,17 @@ impl SuggestionsView {
             .filter(|i| store.is_listed(i, self.show_dismissed))
             .collect();
         let mut seen: Vec<&str> = Vec::new();
-        for item in &listed {
-            if let Some(project) = &item.resolved_project {
-                if !seen.contains(&project.path.as_str()) {
-                    seen.push(&project.path);
-                }
+        for (group, _) in listed.iter().filter_map(|i| i.group()) {
+            if !seen.contains(&group) {
+                seen.push(group);
             }
         }
         let mut ranked: Vec<(usize, &Item)> = listed
             .into_iter()
             .map(|i| {
                 let rank = i
-                    .resolved_project
-                    .as_ref()
-                    .and_then(|p| seen.iter().position(|s| *s == p.path))
+                    .group()
+                    .and_then(|(g, _)| seen.iter().position(|s| *s == g))
                     .unwrap_or(usize::MAX);
                 (rank, i)
             })
@@ -977,7 +990,7 @@ impl SuggestionsView {
         };
 
         let height = list_area.height as usize;
-        let headed = self.has_project_groups(store);
+        let headed = self.has_groups(store);
         // A heading opens the window and every group in it.
         let heading_at = |first: usize, index: usize| {
             headed
@@ -1004,10 +1017,7 @@ impl SuggestionsView {
             let item_key = (item.provider_id.clone(), item.id.clone());
             if heading_at(start, index) {
                 let key = self.group_key(store, index);
-                let name = item
-                    .resolved_project
-                    .as_ref()
-                    .map_or("No project", |p| p.name.as_str());
+                let name = item.group().map_or("No project", |(_, name)| name);
                 let count = (0..self.order.len())
                     .filter(|&i| self.group_key(store, i) == key)
                     .count();
@@ -1035,9 +1045,13 @@ impl SuggestionsView {
             } else {
                 Style::default().fg(theme.text)
             };
+            // The heading names the repo, so "owner/repo#12" shows as "#12".
             let source_ref = store
                 .source_ref(item)
-                .map(|r| format!(" {r}"))
+                .map(|r| {
+                    let short = item.mapping_key.as_deref().and_then(|k| r.strip_prefix(k));
+                    format!(" {}", short.filter(|r| r.starts_with('#')).unwrap_or(r))
+                })
                 .unwrap_or_default();
             lines.push(Line::from(vec![
                 Span::styled(
@@ -1905,6 +1919,7 @@ mod tests {
             },
             started_session: None,
             resolved_project: None,
+            mapping_key: None,
             criterion: String::new(),
             variables: Default::default(),
             start: None,
@@ -2200,6 +2215,32 @@ mod tests {
         assert!(
             !render_text(&flat).contains("No project"),
             "no headings without a resolved project"
+        );
+    }
+
+    #[test]
+    fn an_unlinked_repo_gets_its_own_group_named_after_the_repo() {
+        let in_repo = |mut item: Item, key: &str| {
+            item.source_ref = format!("{key}#38");
+            item.mapping_key = Some(key.into());
+            item
+        };
+        let rig = view_with(
+            vec![
+                item("loose", None, false),
+                in_repo(item("f1", None, false), "acme/freebuf"),
+                in_repo(in_project(item("w1", None, false), "web"), "acme/web"),
+            ],
+            idle_worker(),
+        );
+        assert_eq!(ids(&rig), ["f1", "w1", "loose"]);
+        let text = render_text(&rig);
+        assert!(text.contains("freebuf (1)"), "{text}");
+        assert!(text.contains("web (1)"), "{text}");
+        assert!(text.contains("No project (1)"), "{text}");
+        assert!(
+            text.contains("f1 #38"),
+            "the heading names the repo: {text}"
         );
     }
 
