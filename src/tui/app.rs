@@ -14,7 +14,10 @@ use std::time::Duration;
 
 use super::home::update_bar::{DrawnBar, UpdateBar};
 use super::home::{bindings, HomeView, TerminalMode};
-use super::image_pull::{self, Applied, CancelKey, PullReport, PullRequest, PullSource, PullWatch};
+use super::image_pull::{
+    self, Applied, CancelKey, ImageOffer, PullAnswer, PullReport, PullRequest, PullSource,
+    PullWatch,
+};
 use super::styles::Theme;
 use crate::containers::image_update::ImageUpdate;
 use crate::session::config::AppStateConfig;
@@ -103,7 +106,7 @@ pub type TuiBackend = crate::tui::hyperlink::HyperlinkBackend<std::io::Stdout>;
 /// Sends a pull request to the Daemon, or to this process's pull without one. Replaceable so
 /// tests can answer requests themselves.
 type PullRunner =
-    Box<dyn FnMut(PullRequest, String) -> tokio::sync::oneshot::Receiver<PullReport> + Send>;
+    Box<dyn FnMut(PullRequest, String) -> tokio::sync::oneshot::Receiver<PullAnswer> + Send>;
 
 const CANCEL_PULL_PROMPT: &str =
     "Press Ctrl+E again to cancel the download. To keep going, press any other key.";
@@ -111,15 +114,15 @@ const CANCEL_PULL_PROMPT: &str =
 fn run_pull_request(
     request: PullRequest,
     image: String,
-) -> tokio::sync::oneshot::Receiver<PullReport> {
+) -> tokio::sync::oneshot::Receiver<PullAnswer> {
     let runtime = Config::load_or_warn().sandbox.container_runtime;
     let (tx, rx) = tokio::sync::oneshot::channel();
     tokio::spawn(async move {
-        let report = PullSource::locate()
+        let answer = PullSource::locate()
             .await
             .run(runtime, &image, request)
             .await;
-        let _ = tx.send(report);
+        let _ = tx.send(answer);
     });
     rx
 }
@@ -151,7 +154,9 @@ pub struct App {
     >,
     pull: PullWatch,
     /// The pull request in flight and where its answer arrives.
-    pull_rx: Option<(PullRequest, tokio::sync::oneshot::Receiver<PullReport>)>,
+    pull_rx: Option<(PullRequest, tokio::sync::oneshot::Receiver<PullAnswer>)>,
+    /// The update a pull this TUI watched just installed, so a stale offer of it stays away.
+    pulled_image_digest: Option<String>,
     pull_runner: PullRunner,
     next_pull_poll: std::time::Instant,
     /// Snoozed via Ctrl+x while the registry still resolves to this digest.
@@ -374,6 +379,7 @@ impl App {
             image_update_rx: None,
             pull: PullWatch::default(),
             pull_rx: None,
+            pulled_image_digest: None,
             pull_runner: Box::new(run_pull_request),
             next_pull_poll: std::time::Instant::now(),
             dismissed_image_digest,
@@ -1839,6 +1845,10 @@ impl App {
         let (tx, rx) = tokio::sync::oneshot::channel();
         self.image_update_rx = Some(rx);
         tokio::spawn(async move {
+            // With a Daemon, its image-status offers the update instead.
+            if !matches!(PullSource::locate().await, PullSource::Local) {
+                return;
+            }
             let result = crate::containers::image_update::check_image(runtime, &image).await;
             let _ = tx.send(result);
         });
@@ -1903,26 +1913,49 @@ impl App {
         let Some((request, mut rx)) = self.pull_rx.take() else {
             return false;
         };
-        let report = match rx.try_recv() {
-            Ok(report) => report,
+        let PullAnswer { report, offer } = match rx.try_recv() {
+            Ok(answer) => answer,
             Err(tokio::sync::oneshot::error::TryRecvError::Empty) => {
                 self.pull_rx = Some((request, rx));
                 return false;
             }
-            Err(tokio::sync::oneshot::error::TryRecvError::Closed) => PullReport::Unavailable,
+            Err(tokio::sync::oneshot::error::TryRecvError::Closed) => {
+                PullReport::Unavailable.into()
+            }
         };
-        match self.pull.apply(request, report) {
+        let changed = match self.pull.apply(request, report) {
             Applied::Unchanged => false,
             Applied::Changed => true,
             Applied::Updated => {
-                self.image_update = None;
+                self.pulled_image_digest = self.image_update.take().map(|u| u.remote_digest);
                 true
             }
             Applied::Unanswered(text) => {
                 self.set_status(text);
                 true
             }
+        };
+        offer.is_some_and(|offer| self.offer_image_update(offer)) || changed
+    }
+
+    /// A Daemon's offer replaces the update on the bar, so one dismissed or pulled from the web
+    /// leaves it too. The Daemon drops its cached status only after a pull's waiter ends, so a
+    /// poll just after Done can still offer the update that pull installed.
+    fn offer_image_update(&mut self, offer: ImageOffer) -> bool {
+        let update = match offer {
+            ImageOffer::Update(update)
+                if self.dismissed_image_digest.as_ref() != Some(&update.remote_digest)
+                    && self.pulled_image_digest.as_ref() != Some(&update.remote_digest) =>
+            {
+                Some(update)
+            }
+            _ => None,
+        };
+        if self.image_update == update {
+            return false;
         }
+        self.image_update = update;
+        true
     }
 
     /// Ctrl+E on a running pull: the first press asks, a second within the prompt's 3 s
@@ -3654,10 +3687,10 @@ mod tests {
     const CTRL_X: KeyEvent = KeyEvent::new(KeyCode::Char('x'), KeyModifiers::CONTROL);
 
     /// Delivers `report` as the answer to a pull `request` in flight.
-    fn answer_pull(app: &mut App, request: PullRequest, report: PullReport) {
+    fn answer_pull(app: &mut App, request: PullRequest, answer: impl Into<PullAnswer>) {
         let (tx, rx) = tokio::sync::oneshot::channel();
         app.pull_rx = Some((request, rx));
-        tx.send(report).unwrap();
+        tx.send(answer.into()).unwrap();
         app.poll_pull();
     }
 
@@ -3672,6 +3705,69 @@ mod tests {
             .iter()
             .map(|c| c.symbol())
             .collect()
+    }
+
+    /// With a Daemon, the update on the bar is the one its image-status offers. A poll that no
+    /// longer offers it (dismissed or pulled from the web) takes it off, and an answer that says
+    /// nothing, as without a Daemon, keeps it. After a watched pull is Done, a poll still
+    /// offering the update it installed doesn't bring it back, but a newer one shows.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn a_daemon_poll_sets_the_image_update_on_the_bar() {
+        let _home = crate::session::test_support::isolate_app_dir();
+        crate::session::get_profile_dir("test").unwrap();
+        let (mut app, _terminal) = key_app();
+        let answer = |pull, offer| PullAnswer {
+            report: PullReport::State(pull),
+            offer: Some(offer),
+        };
+        let offered =
+            |update: &ImageUpdate| answer(PullState::Idle, ImageOffer::Update(update.clone()));
+        let newer = ImageUpdate {
+            remote_digest: "sha256:def".into(),
+            ..image_update()
+        };
+
+        answer_pull(&mut app, PullRequest::Poll, offered(&image_update()));
+        assert_eq!(app.image_update, Some(image_update()), "a poll offers it");
+        draw(&mut app);
+        assert!(matches!(app.drawn_bar, Some(DrawnBar::ImageUpdate { .. })));
+        answer_pull(
+            &mut app,
+            PullRequest::Poll,
+            PullReport::State(PullState::Idle),
+        );
+        assert_eq!(
+            app.image_update,
+            Some(image_update()),
+            "an answer without an offer keeps it"
+        );
+        answer_pull(
+            &mut app,
+            PullRequest::Poll,
+            answer(PullState::Idle, ImageOffer::NoUpdate),
+        );
+        assert_eq!(app.image_update, None, "no longer offered");
+
+        app.dismissed_image_digest = Some(image_update().remote_digest);
+        answer_pull(&mut app, PullRequest::Poll, offered(&image_update()));
+        assert_eq!(
+            app.image_update, None,
+            "dismissed here before the Daemon read it"
+        );
+        app.dismissed_image_digest = None;
+
+        answer_pull(&mut app, PullRequest::Poll, offered(&image_update()));
+        app.pull.start();
+        answer_pull(
+            &mut app,
+            PullRequest::Poll,
+            answer(PullState::Done, ImageOffer::Update(image_update())),
+        );
+        assert_eq!(app.pull.line(), Some(&PullLine::Done));
+        assert_eq!(app.image_update, None, "the update just pulled came back");
+        answer_pull(&mut app, PullRequest::Poll, offered(&newer));
+        assert_eq!(app.image_update, Some(newer), "a newer update shows");
     }
 
     /// #5747: each Ctrl+X acts on the line on screen, never one hidden behind it.

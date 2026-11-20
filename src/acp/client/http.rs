@@ -146,6 +146,7 @@ pub enum HttpError {
 /// `GET /api/sandbox/image-status`, the fields a client reads.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Deserialize)]
 pub struct SandboxImageStatus {
+    pub image: String,
     #[serde(flatten)]
     pub state: SandboxImageAvailability,
     pub dismissed: bool,
@@ -2806,6 +2807,7 @@ mod tests {
         let state = test_support::build_test_app_state(Vec::new());
         let (client, server) = serve(state.clone()).await;
         let status = client.sandbox_image_status(false).await.unwrap();
+        assert_eq!(status.image, IMAGE);
         assert_eq!(status.pull, PullState::Idle);
         assert_eq!(status.pull_blocked, None);
         assert!(

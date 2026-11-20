@@ -3,8 +3,10 @@
 
 use std::time::{Duration, Instant};
 
+use crate::acp::client::http::{SandboxImageAvailability, SandboxImageStatus};
 use crate::acp::client::{DiscoveryError, HttpClient, HttpError, ManagerError};
 use crate::containers::image_pull::PullState;
+use crate::containers::image_update::ImageUpdate;
 use crate::containers::pull_progress::ProgressSnapshot;
 use crate::containers::ContainerRuntime;
 use crate::daemon::DaemonEndpoint;
@@ -30,6 +32,46 @@ pub(crate) enum PullReport {
     },
     /// No answer: the Daemon is unreachable or failed the request.
     Unavailable,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct PullAnswer {
+    pub(crate) report: PullReport,
+    /// Only a Daemon's poll says: with a Daemon, its offer replaces this TUI's own registry
+    /// check, so both clients offer the same update.
+    pub(crate) offer: Option<ImageOffer>,
+}
+
+impl From<PullReport> for PullAnswer {
+    fn from(report: PullReport) -> Self {
+        Self {
+            report,
+            offer: None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum ImageOffer {
+    Update(ImageUpdate),
+    /// Current, dismissed, unchecked, or no sandbox in use.
+    NoUpdate,
+}
+
+impl ImageOffer {
+    fn from_status(status: &SandboxImageStatus) -> Self {
+        match &status.state {
+            SandboxImageAvailability::Available { remote_digest }
+                if status.sandbox_in_use && !status.dismissed =>
+            {
+                Self::Update(ImageUpdate {
+                    image: status.image.clone(),
+                    remote_digest: remote_digest.clone(),
+                })
+            }
+            _ => Self::NoUpdate,
+        }
+    }
 }
 
 pub(crate) enum PullSource {
@@ -59,30 +101,37 @@ impl PullSource {
         runtime: ContainerRuntimeName,
         image: &str,
         request: PullRequest,
-    ) -> PullReport {
+    ) -> PullAnswer {
         match self {
             Self::Daemon(client) => daemon(client, request).await,
-            Self::Local => local(runtime, image.to_string(), request).await,
-            Self::Unavailable => PullReport::Unavailable,
+            Self::Local => local(runtime, image.to_string(), request).await.into(),
+            Self::Unavailable => PullReport::Unavailable.into(),
         }
     }
 }
 
-async fn daemon(client: &HttpClient, request: PullRequest) -> PullReport {
+async fn daemon(client: &HttpClient, request: PullRequest) -> PullAnswer {
     let answer = match request {
-        PullRequest::Poll => client.sandbox_image_status(false).await.map(|s| s.pull),
-        PullRequest::Start => client.sandbox_image_pull().await,
-        PullRequest::Cancel => client.sandbox_image_cancel().await,
+        PullRequest::Poll => client
+            .sandbox_image_status(false)
+            .await
+            .map(|status| (Some(ImageOffer::from_status(&status)), status.pull)),
+        PullRequest::Start => client.sandbox_image_pull().await.map(|pull| (None, pull)),
+        PullRequest::Cancel => client.sandbox_image_cancel().await.map(|pull| (None, pull)),
     };
     match answer {
-        Ok(pull) => PullReport::State(pull),
+        Ok((offer, pull)) => PullAnswer {
+            report: PullReport::State(pull),
+            offer,
+        },
         Err(error) if is_refusal(&error) => match client.sandbox_image_status(false).await {
             Ok(status) => PullReport::Gated {
                 command: status.pull_command,
-            },
-            Err(_) => PullReport::Unavailable,
+            }
+            .into(),
+            Err(_) => PullReport::Unavailable.into(),
         },
-        Err(_) => PullReport::Unavailable,
+        Err(_) => PullReport::Unavailable.into(),
     }
 }
 
@@ -516,6 +565,55 @@ mod tests {
         assert_eq!(watch.line(), None);
     }
 
+    /// A Daemon offers an update only when one is available, a sandbox is in use and nobody
+    /// dismissed it.
+    #[test]
+    fn a_daemon_offers_only_an_available_update_in_use_and_not_dismissed() {
+        let update = ImageUpdate {
+            image: IMAGE.into(),
+            remote_digest: "sha256:new".into(),
+        };
+        let available = SandboxImageAvailability::Available {
+            remote_digest: "sha256:new".into(),
+        };
+        let unknown = SandboxImageAvailability::Unknown {
+            reason: "checks_off".into(),
+        };
+        let failed = SandboxImageAvailability::CheckFailed {
+            error: "registry_unreachable".into(),
+        };
+        // (state, sandbox in use, dismissed, offer)
+        for (state, in_use, dismissed, offer) in [
+            (&available, true, false, ImageOffer::Update(update.clone())),
+            (&available, true, true, ImageOffer::NoUpdate),
+            (&available, false, false, ImageOffer::NoUpdate),
+            (
+                &SandboxImageAvailability::Current,
+                true,
+                false,
+                ImageOffer::NoUpdate,
+            ),
+            (&unknown, true, false, ImageOffer::NoUpdate),
+            (&failed, true, false, ImageOffer::NoUpdate),
+        ] {
+            let status = SandboxImageStatus {
+                image: IMAGE.into(),
+                state: state.clone(),
+                dismissed,
+                checks_enabled: true,
+                sandbox_in_use: in_use,
+                pull: PullState::Idle,
+                pull_blocked: None,
+                pull_command: String::new(),
+            };
+            assert_eq!(
+                ImageOffer::from_status(&status),
+                offer,
+                "{state:?} in_use={in_use} dismissed={dismissed}"
+            );
+        }
+    }
+
     fn key() -> PullKey {
         PullKey {
             runtime: ContainerRuntime::from(ContainerRuntimeName::default()).display_name(),
@@ -578,11 +676,12 @@ mod tests {
         let source = PullSource::Local;
         assert_eq!(
             source.run(runtime, IMAGE, PullRequest::Poll).await,
-            PullReport::State(PullState::Idle)
+            PullAnswer::from(PullReport::State(PullState::Idle)),
+            "no offer: without a Daemon, the startup check offers the update"
         );
         let flight = stand_in();
         assert!(matches!(
-            source.run(runtime, IMAGE, PullRequest::Start).await,
+            source.run(runtime, IMAGE, PullRequest::Start).await.report,
             PullReport::State(PullState::Running(_))
         ));
         assert_eq!(
@@ -591,7 +690,7 @@ mod tests {
             "the stand-in and Start's"
         );
         assert_eq!(
-            source.run(runtime, IMAGE, PullRequest::Cancel).await,
+            source.run(runtime, IMAGE, PullRequest::Cancel).await.report,
             PullReport::State(PullState::Cancelled)
         );
         assert!(flight
@@ -631,10 +730,15 @@ mod tests {
 
         assert_eq!(
             source.run(runtime, IMAGE, PullRequest::Poll).await,
-            PullReport::State(PullState::Idle)
+            PullAnswer {
+                report: PullReport::State(PullState::Idle),
+                offer: Some(ImageOffer::NoUpdate),
+            },
+            "checks are off, so the Daemon offers nothing"
         );
         for request in [PullRequest::Start, PullRequest::Cancel] {
-            let PullReport::Gated { command } = source.run(runtime, IMAGE, request).await else {
+            let PullReport::Gated { command } = source.run(runtime, IMAGE, request).await.report
+            else {
                 panic!("{request:?} should be gated");
             };
             assert!(command.contains(IMAGE), "{command}");
