@@ -76,6 +76,19 @@ impl HomeView {
     /// through the size-owning worker. Falls back to the terminal size for the
     /// rare entry with no prior preview frame, and to `None` if neither is
     /// available so tmux keeps its default.
+    /// Live send as entered, with no session or send worker behind it.
+    #[cfg(test)]
+    pub(in crate::tui) fn enter_live_send_for_test(&mut self) {
+        self.live_send = Some(live_send::LiveSendState {
+            session_id: "live-send-test".into(),
+            title: "live send".into(),
+            tmux_name: "aoe_test_live_send".into(),
+            target: live_send::LiveSendTarget::Agent,
+            exit_chords: live_send::parse_chord_list(live_send::DEFAULT_EXIT_CHORD),
+            leader: None,
+        });
+    }
+
     pub(in crate::tui) fn live_send_boot_size(&self) -> Option<(u16, u16)> {
         let pane = self.preview_pane_area;
         if pane.width > 0 && pane.height > 0 {

@@ -3911,6 +3911,20 @@ mod tests {
                 "strict={strict}: Ctrl+E behind a dialog asked"
             );
             assert_eq!(sent.lock().unwrap().len(), 2, "strict={strict}");
+
+            // Claude Code uses Ctrl+E, so while Live send takes keys it isn't a cancel.
+            // With no session behind it, each key also ends this Live send.
+            app.home.show_help = false;
+            for _ in 0..2 {
+                app.home.enter_live_send_for_test();
+                app.handle_key(ctrl_e, &mut terminal).await.unwrap();
+                assert!(!prompt(&app), "strict={strict}: Ctrl+E in Live send asked");
+            }
+            assert_eq!(
+                sent.lock().unwrap().len(),
+                2,
+                "strict={strict}: Ctrl+E in Live send cancelled"
+            );
         }
     }
 
