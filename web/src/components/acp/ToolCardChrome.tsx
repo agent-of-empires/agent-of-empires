@@ -326,6 +326,7 @@ export function HighlightedBlock({
   // a theme switch keeps the old palette until the re-highlight lands.
   // NUL-delimited (as the escape sequence: a raw NUL byte in source makes git
   // treat the file as binary) so field concatenations cannot collide.
+  const [result, setResult] = useState<{ key: string; html: string } | null>(null);
   const [showAll, setShowAll] = useState(false);
   const [wrapped, toggleWrap] = useWrapState();
   const shiki = useShikiTheme();
@@ -338,7 +339,6 @@ export function HighlightedBlock({
   const inputKey = `${effectiveLang ?? ""}\u0000${shown}`;
   // Shiki cannot highlight SGR escapes, so ANSI output renders styled spans instead.
   const ansi = hasAnsi(shown);
-  const [result, setResult] = useState<{ key: string; html: string } | null>(null);
   // A cache hit renders highlighted on first paint, so a remounted block never flashes plain text.
   const cached = useMemo(
     () =>

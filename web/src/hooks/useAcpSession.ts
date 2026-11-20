@@ -242,7 +242,8 @@ export function useAcpSession(
   // Separate from the `[state]` effect: its cleanup runs on every state change and would defeat the throttle.
   useEffect(
     () => () => {
-      // eslint-disable-next-line react-you-might-not-need-an-effect/no-event-handler -- cleanup on session switch or unmount
+      // Cleanup on session switch or unmount.
+      // eslint-disable-next-line react-you-might-not-need-an-effect/no-event-handler
       if (sessionId) flushPersist(sessionId);
     },
     [sessionId],
