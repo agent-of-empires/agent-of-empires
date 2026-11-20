@@ -256,6 +256,24 @@ describe("SuggestionsView", () => {
     expect(await screen.findByText("make")).toBeTruthy();
   });
 
+  it("a Start refused after the view unmounted still toasts why", async () => {
+    const error = vi.fn();
+    toastBus.handler = { error } as never;
+    for (const [answer, text] of [
+      [{ kind: "failed", reason: "Branch not found", retryable: false }, "Branch not found"],
+      [{ kind: "error", error: "Server error" }, "Server error"],
+    ] as const) {
+      let finish: (v: object) => void = () => {};
+      startSuggestion.mockReturnValueOnce(new Promise((r) => (finish = r)));
+      fetchSuggestions.mockResolvedValue(snapshot());
+      const { unmount } = render(<SuggestionsView onPrepare={vi.fn()} onOpenSession={vi.fn()} />);
+      fireEvent.click(await screen.findByRole("button", { name: "Start" }));
+      unmount();
+      await act(async () => finish(answer));
+      expect(error).toHaveBeenLastCalledWith(text);
+    }
+  });
+
   it("Cancel on the hooks review starts nothing", async () => {
     startSuggestion.mockResolvedValue({
       kind: "hooks_need_trust",
