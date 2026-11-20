@@ -165,6 +165,9 @@ jobs:
         # rather than passing as a green run with the guard gone.
         run: |
           echo "TMPDIR=${TMPDIR:-unset}"
+          cargo build --bin aoe
+          target_dir=$(cargo metadata --no-deps --format-version 1 | jq -er .target_directory)
+          export AOE_TEST_ACP_RUNNER_EXE="$target_dir/debug/aoe"
           cargo nextest run --no-fail-fast
       - name: Require scoped cancellation coverage
         if: matrix.leg == 'core-rest'
@@ -383,6 +386,8 @@ jobs:
         run: |
           # Owned-runner unit fixtures launch the matching normal binary, not a test harness.
           cargo build --features e2e-tests --bin aoe
+          target_dir=$(cargo metadata --no-deps --format-version 1 | jq -er .target_directory)
+          export AOE_TEST_ACP_RUNNER_EXE="$target_dir/debug/aoe"
           cargo nextest run --features e2e-tests --lib --bins --no-fail-fast
       - name: Cargo test (macOS, daemon-only CLI reads)
         run: cargo nextest run --features e2e-tests --test integration -E 'test(cli_read_daemon::)' --no-fail-fast
