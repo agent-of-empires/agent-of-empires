@@ -107,6 +107,7 @@ pub async fn get_suggestions(State(state): State<Arc<AppState>>) -> impl IntoRes
     };
     let profile = host.suggestions_profile();
     let refreshing = host.refreshing_suggestions();
+    let reported_profile = profile.clone();
     let result = tokio::task::spawn_blocking(move || {
         let providers = suggestions::providers();
         // Disk reads stay off the store lock.
@@ -140,6 +141,7 @@ pub async fn get_suggestions(State(state): State<Arc<AppState>>) -> impl IntoRes
             };
             suggestions::attach_started(&mut snapshot, &started);
             suggestions::attach_refreshing(&mut snapshot, &refreshing);
+            snapshot["profile"] = json!(reported_profile);
             Json(snapshot).into_response()
         }
         Ok(Err(error)) => internal(error),

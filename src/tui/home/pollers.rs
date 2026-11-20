@@ -1,6 +1,8 @@
 //! Typed runtime completion polling; durable lifecycle work belongs to the daemon.
 
 use super::*;
+use crate::tui::dialogs::PromptOrigin;
+use crate::tui::suggestions::{PrepareTarget, Start, StartAnswer, SuggestionsView};
 
 impl HomeView {
     pub(super) const CANONICAL_RELOAD_RETRY_INTERVAL: std::time::Duration =
@@ -45,5 +47,241 @@ impl HomeView {
                 false
             }
         }
+    }
+
+    /// Drains the suggestions worker. True when state changed.
+    pub fn apply_suggestions_results(&mut self) -> bool {
+        self.suggestions_feed
+            .set_profile(self.active_profile.clone());
+        self.suggestions_feed
+            .tick(self.session_feed.latest_snapshot().is_some());
+        let mut polled = self.suggestions_feed.poll();
+        let blocked: std::collections::HashMap<_, _> = self
+            .session_feed
+            .applied_snapshot()
+            .map(|snapshot| {
+                snapshot
+                    .contents
+                    .sessions
+                    .iter()
+                    .filter_map(|row| {
+                        let message = row.initial_prompt_error.clone()?;
+                        Some((
+                            row.id.clone(),
+                            (message, row.initial_prompt_error_code.clone()),
+                        ))
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+        let blocked_changed = blocked != self.suggestions_feed.blocked_prompts;
+        self.suggestions_feed.blocked_prompts = blocked;
+        let mut review_closed = false;
+        let reviewing = self
+            .confirm_dialog
+            .as_ref()
+            .is_some_and(|d| d.action() == "approve_suggestion_hooks");
+        if reviewing && !self.suggestions_feed.has_held_trust() {
+            self.confirm_dialog = None;
+            review_closed = true;
+        }
+        // The review was cancelled: nothing starts.
+        if !reviewing && self.suggestions_feed.has_held_trust() {
+            self.suggestions_feed.drop_held_trust();
+            if let Some(view) = &mut self.suggestions_view {
+                view.set_notice("Not started: the hooks were not approved.");
+            }
+            review_closed = true;
+        }
+        let mut changed = review_closed
+            || blocked_changed
+            || match &mut self.suggestions_view {
+                Some(view) => view.apply(&mut self.suggestions_feed, &mut polled),
+                None => false,
+            };
+        if let Some(start) = self
+            .suggestions_view
+            .as_mut()
+            .and_then(SuggestionsView::take_prepared)
+        {
+            self.start_suggestion(start);
+            changed = true;
+        }
+        if polled.changed {
+            self.rebuild_flat_items_keeping_cursor();
+            self.update_selected();
+            changed = true;
+        }
+        // A view prepare answered after the view closed has no one to start it.
+        if let Some((key, mut start, target @ (PrepareTarget::Home | PrepareTarget::HomeAnother))) =
+            polled.start
+        {
+            if let Some(view) = &mut self.suggestions_view {
+                // The full view owns suggestion starts now, so say why nothing opened.
+                view.set_error("Suggestion ready, press Start again in this list");
+            } else if self.cursor_suggestion().as_ref() == Some(&key) && self.new_dialog.is_none() {
+                if target == PrepareTarget::HomeAnother {
+                    start.suggestion = None;
+                }
+                self.start_suggestion(start);
+            } else {
+                self.flash_status("Selection changed, suggestion not started");
+            }
+            changed = true;
+        }
+        if let Some((key, answer)) = polled.started {
+            self.apply_start_answer(key, answer);
+            changed = true;
+        }
+        if let Some(error) = polled.error {
+            self.flash_status(error);
+            changed = true;
+        }
+        changed
+    }
+
+    /// Shows what the daemon answered to a start, on the surface that asked.
+    fn apply_start_answer(&mut self, key: (String, String), answer: StartAnswer) {
+        let say = |this: &mut Self, message: String, error: bool| match &mut this.suggestions_view {
+            Some(view) if error => view.set_error(message),
+            Some(view) => view.set_notice(message),
+            None => this.flash_status(message),
+        };
+        // Home lists a started suggestion as its Session, not as a row Enter could open.
+        let opens = if self.suggestions_view.is_some() {
+            " · Enter opens it"
+        } else {
+            ""
+        };
+        match answer {
+            StartAnswer::Started { session_id, title } => {
+                self.suggestions_feed.link_started(&key, &session_id);
+                self.rebuild_flat_items_keeping_cursor();
+                self.update_selected();
+                say(self, format!("Started {title}{opens}"), false);
+            }
+            StartAnswer::AlreadyStarted(Some(session_id)) => {
+                self.suggestions_feed.link_started(&key, &session_id);
+                self.rebuild_flat_items_keeping_cursor();
+                self.update_selected();
+                say(self, format!("Already started{opens}"), false);
+            }
+            StartAnswer::AlreadyStarted(None) => {
+                say(self, "Already starting. Reload in a moment.".into(), false);
+            }
+            StartAnswer::TrustChanged => self.suggestions_feed.restart_after_trust_change(key),
+            StartAnswer::NeedsTrust {
+                commands,
+                mcp_summaries,
+                fingerprint,
+            } => {
+                let changed = self.suggestions_feed.take_hooks_changed();
+                let mut message = String::from(if changed {
+                    "The hooks changed since you reviewed them. This repository runs:\n\n"
+                } else {
+                    "This repository runs these commands:\n\n"
+                });
+                for command in &commands {
+                    message.push_str(&format!("  {command}\n"));
+                }
+                for summary in &mcp_summaries {
+                    message.push_str(&format!("  MCP server: {summary}\n"));
+                }
+                message.push_str("\nApprove them and start?");
+                self.confirm_dialog = Some(
+                    crate::tui::dialogs::ConfirmDialog::new(
+                        "Review repository hooks",
+                        &message,
+                        "approve_suggestion_hooks",
+                    )
+                    .neutral()
+                    .buttons("Approve and start", "Cancel"),
+                );
+                self.suggestions_feed.hold_trust(key, fingerprint);
+            }
+            StartAnswer::NoProject => match &mut self.suggestions_view {
+                Some(view) => view.prepare(key, false, &mut self.suggestions_feed),
+                None => self.suggestions_feed.prepare(key),
+            },
+            StartAnswer::Failed(reason) => match &mut self.suggestions_view {
+                Some(view) => view.set_failed(&mut self.suggestions_feed, key, reason),
+                None => {
+                    self.flash_status(format!("{reason} Enter tries again."));
+                    self.suggestions_feed.failed = Some((key, reason));
+                }
+            },
+        }
+    }
+
+    pub(super) fn open_suggestions_view(&mut self) {
+        let mut view = SuggestionsView::new(&mut self.suggestions_feed);
+        view.strict = self.strict_hotkeys;
+        view.pretrusted =
+            crate::session::config::Config::load().is_ok_and(|c| c.session.pre_trust_agent_folders);
+        self.suggestions_view = Some(view);
+    }
+
+    /// Replaces the view with the regular new-session dialog, prefilled; when
+    /// the dialog cannot open the view stays and shows why.
+    pub(super) fn start_suggestion(&mut self, start: Start) {
+        match self.suggestion_dialog(start) {
+            Ok(dialog) => {
+                self.suggestions_view = None;
+                self.new_dialog = Some(dialog);
+            }
+            Err(message) => {
+                if let Some(view) = &mut self.suggestions_view {
+                    view.set_error(message);
+                } else {
+                    self.flash_status(message);
+                }
+            }
+        }
+    }
+
+    fn suggestion_dialog(&self, start: Start) -> Result<NewSessionDialog, &'static str> {
+        if self.creating_stub_id.is_some() {
+            return Err("A session is already being created");
+        }
+        if !self.available_tools.any_available() {
+            return Err("No agent is available. Set one up before starting a suggestion");
+        }
+        let profile = self.config_profile();
+        let profiles =
+            crate::session::list_profiles_for_display().unwrap_or_else(|_| vec![profile.clone()]);
+        let mut dialog = NewSessionDialog::new(
+            self.available_tools.clone(),
+            self.all_group_paths(),
+            &profile,
+            profiles,
+        );
+        // Path first: setting it re-resolves the defaults the rest builds on.
+        let path_known = start.path.is_some();
+        match start.path {
+            Some(path) => dialog.set_path(path),
+            None => dialog.require_path(),
+        }
+        dialog.set_tool(&start.tool);
+        dialog.set_preset(
+            start.preset.structured,
+            start.preset.worktree,
+            start.preset.sandbox,
+            start.preset.yolo,
+        );
+        dialog.set_title(start.title);
+        dialog.set_suggestion(
+            start.initial_prompt,
+            PromptOrigin {
+                provider: start.provider,
+                source_ref: start.source_ref,
+                reason: start.reason,
+                source_text: start.source_text,
+                suggestion: start.suggestion,
+            },
+        );
+        if path_known {
+            dialog.focus_title();
+        }
+        Ok(dialog)
     }
 }

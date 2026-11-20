@@ -3,6 +3,7 @@
 use ratatui::prelude::*;
 use ratatui::widgets::*;
 use tui_input::Input;
+use unicode_width::UnicodeWidthChar;
 
 use super::{NewSessionDialog, FIELD_HELP, HELP_DIALOG_WIDTH, WT_WORKSPACE_FIELD};
 use crate::tui::components::{
@@ -47,6 +48,65 @@ fn overlay_hover_rects(entries: &[(usize, Rect)], fields: &[(usize, Rect)]) -> V
         .map(|(_, r)| *r)
         .chain(fields.iter().map(|(_, r)| label_row(*r)))
         .collect()
+}
+
+const PROMPT_TEXT_WIDTH: usize = 68;
+const PROMPT_MAX_ROWS: usize = 4;
+
+/// Splits `text` into rows of at most `PROMPT_TEXT_WIDTH` display cells, as
+/// `(index of the row's first char, row text)`. A row that fills the width is
+/// followed by an empty one, which is where the cursor goes.
+pub(super) fn wrap_prompt(text: &str) -> Vec<(usize, String)> {
+    let mut rows = vec![(0, String::new())];
+    let mut cells = 0;
+    let mut count = 0;
+    for (index, ch) in text.chars().enumerate() {
+        let width = ch.width().unwrap_or(0);
+        if cells + width > PROMPT_TEXT_WIDTH {
+            rows.push((index, String::new()));
+            cells = 0;
+        }
+        if let Some((_, row)) = rows.last_mut() {
+            row.push(ch);
+        }
+        cells += width;
+        count = index + 1;
+    }
+    if cells == PROMPT_TEXT_WIDTH {
+        rows.push((count, String::new()));
+    }
+    rows
+}
+
+/// Provider text is untrusted: one cell per char, with newlines shown as `⏎`
+/// and other control or bidi characters replaced, so nothing can move the
+/// terminal or reorder the line.
+fn prompt_display(s: &str) -> String {
+    s.chars()
+        .map(|c| match c {
+            '\n' => '⏎',
+            c if c.is_control() => '\u{fffd}',
+            '\u{202a}'..='\u{202e}' | '\u{2066}'..='\u{2069}' => '\u{fffd}',
+            c => c,
+        })
+        .collect()
+}
+
+/// Hard-wraps `line` into rows of at most `cols` display cells. Zero-width
+/// chars stay on the current row so they never start one by themselves.
+pub(super) fn wrap_cells(line: &str, cols: usize) -> Vec<String> {
+    let mut rows = vec![String::new()];
+    let mut used = 0;
+    for c in line.chars() {
+        let w = UnicodeWidthChar::width(c).unwrap_or(0);
+        if used > 0 && used + w > cols {
+            rows.push(String::new());
+            used = 0;
+        }
+        rows.last_mut().expect("one row").push(c);
+        used += w;
+    }
+    rows
 }
 
 impl NewSessionDialog {
@@ -94,6 +154,9 @@ impl NewSessionDialog {
             };
 
         let mut constraints = Vec::new();
+        if self.prompt_origin.is_some() {
+            constraints.push(Constraint::Length(2)); // From line
+        }
         if has_profile_selection {
             constraints.push(Constraint::Length(profile_field_height)); // Profile
         }
@@ -114,7 +177,10 @@ impl NewSessionDialog {
         if has_sandbox {
             constraints.push(Constraint::Length(2)); // Sandbox checkbox (summary only)
         }
-        constraints.push(Constraint::Length(2)); // Group (always, at the bottom)
+        constraints.push(Constraint::Length(2)); // Group
+        if self.shows_prompt_line() {
+            constraints.push(Constraint::Length(1)); // Prompt line
+        }
 
         // Inner width is 76: dialog width less borders and margin. The hint
         // line reserves 2 rows so per-field hints wrap instead of truncating.
@@ -157,6 +223,16 @@ impl NewSessionDialog {
 
         let fields = self.field_indices();
 
+        if let Some(origin) = &self.prompt_origin {
+            let from = format!(
+                "From {} · {} · {}",
+                origin.provider, origin.source_ref, origin.reason
+            );
+            let line = Line::styled(prompt_display(&from), Style::default().fg(theme.dimmed));
+            frame.render_widget(Paragraph::new(line), chunks[ci]);
+            ci += 1;
+        }
+
         if has_profile_selection {
             let area = chunks[ci];
             self.render_profile_field(frame, area, theme);
@@ -177,12 +253,19 @@ impl NewSessionDialog {
         ci += 1;
 
         let area = chunks[ci];
+        let title_focused = self.focused_field == fields.title;
+        // A long prefilled title reads from its start until the field is focused.
+        let title = if title_focused {
+            self.title.clone()
+        } else {
+            self.title.clone().with_cursor(0)
+        };
         render_text_field(
             frame,
             area,
             "Title:",
-            &self.title,
-            self.focused_field == fields.title,
+            &title,
+            title_focused,
             Some("(random civ)"),
             theme,
         );
@@ -417,6 +500,11 @@ impl NewSessionDialog {
         self.focusable_rects.push((fields.group, area));
         ci += 1;
 
+        if self.shows_prompt_line() {
+            frame.render_widget(Paragraph::new(self.prompt_line(theme)), chunks[ci]);
+            ci += 1;
+        }
+
         // Hints/errors (last chunk)
         let hint_chunk = ci;
         if self.confirm_create_dir.is_some() {
@@ -539,6 +627,10 @@ impl NewSessionDialog {
             self.render_help_overlay(frame, full_area, theme);
         }
 
+        if self.prompt_editor {
+            self.render_prompt_editor(frame, full_area, theme);
+        }
+
         if self.group_picker.is_active() {
             self.group_picker.render(frame, full_area, theme);
         }
@@ -554,6 +646,43 @@ impl NewSessionDialog {
         if self.dir_picker.is_active() {
             self.dir_picker.render(frame, full_area, theme);
         }
+    }
+
+    /// A blank session has no first turn to name; Ctrl+O still opens the editor.
+    fn shows_prompt_line(&self) -> bool {
+        self.prompt_origin.is_some() || !self.prompt.value().trim().is_empty()
+    }
+
+    /// The one line above the footer: where the prompt came from, or what it is.
+    fn prompt_line(&self, theme: &Theme) -> Line<'static> {
+        let dim = Style::default().fg(theme.dimmed);
+        let key = Style::default().fg(theme.hint);
+        let value = self.prompt.value();
+        let (text, verb) = match (&self.prompt_origin, value.trim().is_empty()) {
+            (Some(origin), false) => (
+                format!("Prompt from {}, not checked by AoE", origin.provider),
+                " view or edit",
+            ),
+            (None, false) => {
+                let first = value.lines().next().unwrap_or_default();
+                let more = if value.contains('\n') {
+                    " \u{2026}"
+                } else {
+                    ""
+                };
+                (format!("Prompt: {first}{more}"), " edit")
+            }
+            (_, true) => ("Prompt: none".to_string(), " add"),
+        };
+        Line::from(vec![
+            Span::styled(
+                crate::tui::components::truncate_to_width(&prompt_display(&text), 56),
+                dim,
+            ),
+            Span::styled(" \u{b7} ", dim),
+            Span::styled("Ctrl+O", key),
+            Span::styled(verb, dim),
+        ])
     }
 
     fn render_profile_field(&self, frame: &mut Frame, area: Rect, theme: &Theme) {
@@ -1268,7 +1397,8 @@ impl NewSessionDialog {
             + if has_profile_selection { 3 } else { 0 }
             + if has_tool_selection { 3 } else { 0 }
             + if has_sandbox { 3 } else { 0 }
-            + if show_sandbox_options_help { 12 } else { 0 };
+            + if show_sandbox_options_help { 12 } else { 0 }
+            + 3;
 
         let block = crate::tui::dialogs::toned_dialog_block(
             " New Session Help ",
@@ -1319,5 +1449,106 @@ impl NewSessionDialog {
         ]));
 
         frame.render_widget(Paragraph::new(lines), inner);
+    }
+
+    /// The Ctrl+O editor: the provider text behind a suggestion's prompt, when
+    /// there is one, above the editable prompt. Both are hard-wrapped by cell
+    /// width so the row count is exact; source rows past the area fold into a count.
+    fn render_prompt_editor(&self, frame: &mut Frame, area: Rect, theme: &Theme) {
+        let width = HELP_DIALOG_WIDTH.min(area.width);
+        let cols = usize::from(width.saturating_sub(2)).max(1);
+        let source: Vec<String> = match &self.prompt_origin {
+            Some(origin) => match origin.source_text.as_deref() {
+                Some(text) => text
+                    .lines()
+                    .flat_map(|line| wrap_cells(&prompt_display(line), cols))
+                    .collect(),
+                None => vec!["No source text.".to_string()],
+            },
+            None => Vec::new(),
+        };
+        let wrapped = wrap_prompt(&prompt_display(self.prompt.value()));
+        let prompt_rows = wrapped.len().clamp(1, PROMPT_MAX_ROWS * 2);
+        // Prompt header and rows, the close hint, the two border rows, and for
+        // a source its header, rows and a blank line.
+        let fixed = 1 + prompt_rows + 1 + 2 + if source.is_empty() { 0 } else { 2 };
+        let max_source = usize::from(area.height)
+            .saturating_sub(fixed)
+            .min(source.len());
+        let source_rows = if source.len() > max_source {
+            max_source.saturating_sub(1)
+        } else {
+            max_source
+        };
+        let hidden = source.len() - source_rows;
+        let source_height = if source.is_empty() {
+            0
+        } else {
+            2 + source_rows + usize::from(hidden > 0)
+        };
+        let height = (fixed - if source.is_empty() { 0 } else { 2 } + source_height) as u16;
+
+        let block = crate::tui::dialogs::toned_dialog_block(" Prompt ", theme.border, theme.title);
+        let (_, inner) =
+            crate::tui::dialogs::render_dialog_frame(frame, area, width, height, block);
+
+        let mut lines: Vec<Line> = Vec::new();
+        if let Some(origin) = &self.prompt_origin {
+            lines.push(Line::styled(
+                prompt_display(&format!("From {}, not checked by AoE", origin.provider)),
+                Style::default().fg(theme.dimmed),
+            ));
+            lines.extend(
+                source
+                    .iter()
+                    .take(source_rows)
+                    .map(|row| Line::styled(row.clone(), Style::default().fg(theme.text))),
+            );
+            if hidden > 0 {
+                lines.push(Line::styled(
+                    format!("\u{2026} {hidden} more lines"),
+                    Style::default().fg(theme.dimmed),
+                ));
+            }
+            lines.push(Line::from(""));
+        }
+        let prompt_top = lines.len() as u16 + 1;
+        lines.push(Line::styled(
+            "Prompt",
+            Style::default().fg(theme.accent).underlined(),
+        ));
+        let cursor = self.prompt.cursor();
+        let cursor_row = wrapped
+            .iter()
+            .rposition(|(first, _)| *first <= cursor)
+            .unwrap_or(0);
+        let start = (cursor_row + 1).saturating_sub(prompt_rows);
+        for row in start..start + prompt_rows {
+            let text = wrapped.get(row).map_or("", |(_, text)| text.as_str());
+            lines.push(Line::styled(
+                text.to_owned(),
+                Style::default().fg(theme.text),
+            ));
+        }
+        lines.push(Line::from(vec![
+            Span::styled("Esc", Style::default().fg(theme.hint)),
+            Span::styled(" or ", Style::default().fg(theme.dimmed)),
+            Span::styled("Ctrl+O", Style::default().fg(theme.hint)),
+            Span::styled(" to close, ", Style::default().fg(theme.dimmed)),
+            Span::styled("Enter", Style::default().fg(theme.hint)),
+            Span::styled(" adds a line", Style::default().fg(theme.dimmed)),
+        ]));
+        frame.render_widget(Paragraph::new(lines), inner);
+
+        let (first, text) = &wrapped[cursor_row];
+        let col: usize = text
+            .chars()
+            .take(cursor - first)
+            .map(|c| c.width().unwrap_or(0))
+            .sum();
+        frame.set_cursor_position(Position::new(
+            inner.x + (col as u16).min(inner.width.saturating_sub(1)),
+            inner.y + prompt_top + (cursor_row - start) as u16,
+        ));
     }
 }

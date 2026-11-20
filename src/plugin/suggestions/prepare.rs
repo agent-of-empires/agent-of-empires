@@ -22,7 +22,10 @@ pub(crate) struct PromptTooLong;
 /// names and stray braces, stays as typed, and substituted values are never
 /// scanned again: they are untrusted text. Returns [`PromptTooLong`] once the
 /// output would exceed [`MAX_INITIAL_PROMPT_BYTES`].
-fn expand(template: &str, variables: &BTreeMap<String, String>) -> Result<String, PromptTooLong> {
+pub(crate) fn expand(
+    template: &str,
+    variables: &BTreeMap<String, String>,
+) -> Result<String, PromptTooLong> {
     fn push(out: &mut String, text: &str) -> Result<(), PromptTooLong> {
         if out.len() + text.len() > MAX_INITIAL_PROMPT_BYTES {
             return Err(PromptTooLong);

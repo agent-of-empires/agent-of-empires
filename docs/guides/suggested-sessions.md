@@ -95,25 +95,25 @@ Change any proposal with its select, then **Link N repos** stores every checked 
 
 > The TUI keys below are provisional until #4597 settles the key bindings.
 
-**Home.** A collapsed **Suggested (N)** group sits above Trash and is absent when there are no open suggestions. Enter expands it to 3 items and a "View all" row. On an item, Enter prepares it and opens the prefilled dialog, `z` (`Z` in strict mode) dismisses it, and `Ctrl+K` lists "Open in <provider>". `N` (`Ctrl+N`) starts a blank session.
+**Home.** A collapsed **Suggested (N)** group sits above Trash and is absent when there are no open suggestions, unless a provider failed: the group stays and its preview shows the error. Enter expands it to 3 items and a "View all" row. Rows show the title with the source reference after it, and the preview names what Enter starts ("Starts with Claude Code · Structured · worktree") with the prompt it will send. On an item, Enter starts it with its kind's [preset](#presets) and the status line says "Started <title>"; the row then leaves the group, since the Session is listed under its Project. `z` (`Z` in strict mode) dismisses it, and `Ctrl+K` lists "Open in <provider>". `N` (`Ctrl+N`) opens the New session dialog prefilled from the item, without linking it.
 
 **Full view.** `S` opens it (`Ctrl+S` in strict mode).
 
 | Key | Action |
 |---|---|
 | `j` / `k` | Select |
-| Enter | First press resolves the final prompt and shows it ("Review the prompt below, then press Enter to start."); the second opens the dialog. On a started item it opens the session |
-| `N` | Start another session for a started item |
-| `x` | Dismiss or restore |
+| Enter | Start with the preset. On a started item it opens the session |
+| `e` | Start with changes: opens the New session dialog prefilled from the kind's preset and the final prompt |
+| `N` | A new session for the item that does not take its link, so a started item can have another |
+| `z` | Dismiss or restore (`Z` in strict mode, as on Home) |
 | `d` | Toggle the dismissed list |
-| `r` | Ask providers to refresh |
-| `l` | Reload the list |
+| `r` | Ask providers to refresh, then reload the list. On a read-only dashboard it only reloads |
 | PgUp / PgDn | Scroll the prompt |
 | Esc | Back |
 
-`r` only asks for a refresh ("Refresh requested. Press l to reload the list."). An item with no matching registered Project cannot be started ("No registered project matches this suggestion"), and a stale one says "No longer open at the source. Dismiss it, or wait for the next refresh."
+If the repo has hooks nobody has approved, Enter shows them, with a one-line summary of each MCP server, in a review dialog; approving starts the session and cancelling starts nothing. A hooks review that is out of date (the hooks changed after you read them) shows again. A start that fails shows "Couldn't start: <reason>" with what to do on its row and in the preview until the next try, and Enter tries again. An item whose repo is linked to no Project opens the New session dialog to pick one, from Home and from the full view. A stale item says "No longer open at the source. Dismiss it, or wait for the next refresh." When a started Claude Code Session did not get its prompt, its row says "Prompt not typed" and the detail pane gives the reason. If Claude Code is asking whether to trust the folder, `t` turns on pre-trust (`pre_trust_agent_folders`, after saying that the repo's own Claude Code settings then run too), and Enter then moves the blocked Session to Trash and starts the suggestion again. If it is asking to accept Bypass Permissions, open the Session once and accept it.
 
-**New-session dialog.** The dialog has a **Prompt** row for the first turn. A suggestion fills it, labelled with the provider and "not checked by AoE"; edit it freely. `Ctrl+P` on the row shows the item's source text. The prompt is sent once the agent is ready (typed into a terminal session, or sent as the first turn of a [structured-view](../structured-view.md) one).
+**New-session dialog.** The dialog has no Prompt row. The first turn is one line above the footer: "Prompt from GitHub, not checked by AoE" for a suggestion, or "Prompt: none". `Ctrl+O` opens it in a small editor, which also shows the item's source text; `Esc` closes it and keeps your edits. `Ctrl+P` still opens the focused row's picker. The prompt is sent once the agent is ready (typed into a terminal session, or sent as the first turn of a [structured-view](../structured-view.md) one).
 
 From the command line, `aoe add --prompt <text>` or `--prompt-file <path>` sets the same first turn. It is rejected for terminal sessions.
 
