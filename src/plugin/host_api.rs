@@ -65,7 +65,6 @@ impl HostApiState {
         )
         .context("create plugin_storage table")?;
         suggestions::init(&conn).context("create suggestion tables")?;
-        suggestions::clear_pending_links(&conn).context("clear stranded suggestion claims")?;
         Ok(Self {
             events: Mutex::new(conn),
             schema,

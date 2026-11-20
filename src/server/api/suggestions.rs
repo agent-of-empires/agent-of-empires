@@ -116,7 +116,7 @@ pub async fn get_suggestions(State(state): State<Arc<AppState>>) -> impl IntoRes
                 Ok::<_, anyhow::Error>((
                     suggestions::snapshot(conn, profile, &providers)?,
                     suggestions::load_mappings(conn, profile)?,
-                    suggestions::settled_links(conn, profile)?,
+                    suggestions::links(conn, profile)?,
                     suggestions::presets(conn, profile)?,
                 ))
             })?;

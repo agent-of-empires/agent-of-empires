@@ -10679,9 +10679,7 @@ async fn create_persists_initial_prompt_as_pending_turn() {
     assert_eq!(origin.profile.as_deref(), Some("default"));
     let host = state.plugin_host.clone().unwrap();
     let links = host
-        .with_suggestions_db(|conn, profile| {
-            crate::plugin::suggestions::settled_links(conn, profile)
-        })
+        .with_suggestions_db(crate::plugin::suggestions::links)
         .unwrap();
     let started = crate::plugin::suggestions::started_sessions(&links, instances.iter());
     assert_eq!(
