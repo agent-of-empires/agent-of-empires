@@ -391,7 +391,7 @@ export function SuggestionsView({
                             note={
                               <StartedPromptNote
                                 session={liveSession(item.started_session, sessions)}
-                                onTryAgain={() => void ctrl.retryBlocked(item)}
+                                onTryAgain={() => ctrl.retryBlocked(item)}
                                 disabled={disabled}
                               />
                             }

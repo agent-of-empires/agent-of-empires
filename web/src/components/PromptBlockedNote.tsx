@@ -23,15 +23,28 @@ export function PromptBlockedNote({
   message,
   onTryAgain,
   disabled = false,
+  live = "alert",
 }: {
   label: string;
   code?: string | null;
   message: string;
   /** Starts a fresh Session; without it the note says how to go on in this one. */
-  onTryAgain?: () => void;
+  onTryAgain?: () => Promise<unknown> | void;
   disabled?: boolean;
+  /** Rows re-render on every poll, so they announce politely. */
+  live?: "alert" | "status";
 }) {
   const [step, setStep] = useState<"idle" | "confirm" | "saving" | "on" | "failed">("idle");
+  const [retrying, setRetrying] = useState(false);
+  const tryAgain = async () => {
+    if (retrying || !onTryAgain) return;
+    setRetrying(true);
+    try {
+      await onTryAgain();
+    } finally {
+      setRetrying(false);
+    }
+  };
   const turnOn = async () => {
     setStep("saving");
     const outcome = await updateSettings({ session: { pre_trust_agent_folders: true } });
@@ -40,7 +53,7 @@ export function PromptBlockedNote({
   const actions = code === FOLDER && !disabled;
   return (
     <div className="text-xs text-status-warning">
-      <p role="alert" className="break-words">
+      <p role={live} className="break-words">
         {label}: {(code && PLAIN[code]) || message}
       </p>
       {actions && (step === "idle" || step === "failed") && (
@@ -54,8 +67,8 @@ export function PromptBlockedNote({
       {actions && (step === "confirm" || step === "saving") && (
         <p className="text-text-secondary">
           Claude Code will trust each folder AoE starts it in. That also runs the repo&apos;s own .claude/settings.json
-          hooks.{" "}
-          <button type="button" className={LINK} disabled={step === "saving"} onClick={() => void turnOn()}>
+          hooks. {/* Focus follows the step, since the button that had it is gone. */}
+          <button type="button" className={LINK} disabled={step === "saving"} onClick={() => void turnOn()} autoFocus>
             Turn on
           </button>{" "}
           <button type="button" className={LINK} disabled={step === "saving"} onClick={() => setStep("idle")}>
@@ -68,7 +81,7 @@ export function PromptBlockedNote({
         (onTryAgain ? (
           <p className="text-text-secondary">
             Pre-trust is on.{" "}
-            <button type="button" className={LINK} onClick={onTryAgain}>
+            <button type="button" className={LINK} disabled={retrying} onClick={() => void tryAgain()} autoFocus>
               Try again
             </button>{" "}
             moves this Session to Trash and starts a new one.
@@ -89,7 +102,7 @@ export function StartedPromptNote({
   disabled,
 }: {
   session?: StartedSession;
-  onTryAgain: () => void;
+  onTryAgain: () => Promise<unknown>;
   disabled: boolean;
 }) {
   if (!session?.initial_prompt_error) return null;
@@ -101,6 +114,7 @@ export function StartedPromptNote({
         message={session.initial_prompt_error}
         onTryAgain={onTryAgain}
         disabled={disabled}
+        live="status"
       />
     </div>
   );

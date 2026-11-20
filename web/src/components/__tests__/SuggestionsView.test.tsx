@@ -421,7 +421,7 @@ describe("SuggestionsView", () => {
         ],
       });
       const row = (await screen.findByText("Fix lifecycle")).closest("li") as HTMLElement;
-      expect(within(row).getByRole("alert").textContent).toBe(
+      expect(within(row).getByRole("status").textContent).toBe(
         "Prompt not sent: Claude Code is asking whether to trust this folder, so the prompt was not typed.",
       );
       fireEvent.click(within(row).getByRole("button", { name: "Turn on pre-trust" }));
@@ -430,6 +430,27 @@ describe("SuggestionsView", () => {
       await waitFor(() => expect(startSuggestion).toHaveBeenCalledWith("github", "issue-1", {}));
       expect(trashSession).toHaveBeenCalledWith("sess-1");
       expect(trashSession.mock.invocationCallOrder[0]).toBeLessThan(startSuggestion.mock.invocationCallOrder[0]!);
+    });
+
+    it("Try again does not start when the blocked Session cannot go to Trash", async () => {
+      updateSettings.mockResolvedValue("committed");
+      trashSession.mockResolvedValue(null);
+      await open(snapshot({ items: [{ ...item, started_session: started }] }), {
+        sessions: [
+          {
+            id: "sess-1",
+            status: "Idle",
+            initial_prompt_error: "blocked",
+            initial_prompt_error_code: "agent_folder_not_trusted",
+          } as SessionResponse,
+        ],
+      });
+      const row = (await screen.findByText("Fix lifecycle")).closest("li") as HTMLElement;
+      fireEvent.click(within(row).getByRole("button", { name: "Turn on pre-trust" }));
+      fireEvent.click(within(row).getByRole("button", { name: "Turn on" }));
+      fireEvent.click(await within(row).findByRole("button", { name: "Try again" }));
+      expect(await screen.findByText("Couldn't move that Session to Trash.")).toBeTruthy();
+      expect(startSuggestion).not.toHaveBeenCalled();
     });
 
     it("Start another opens the wizard without linking the new Session", async () => {
