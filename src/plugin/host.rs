@@ -53,6 +53,8 @@ struct RunningWorker {
     inbound: Option<mpsc::UnboundedSender<String>>,
     /// Lets teardown retire UI state from this worker generation only.
     ui_generation: Option<u64>,
+    /// Hash of the `[suggestions]` spec this worker launched with.
+    suggestions_hash: Option<String>,
     /// Bounded and separate from `inbound`, so a worker that stops reading stdin cannot grow
     /// daemon memory through session events. `None` unless the plugin opted in.
     events_inbound: Option<mpsc::Sender<String>>,
@@ -142,7 +144,7 @@ impl PluginHost {
             .with_context(|| format!("prepare {}", workers_dir.display()))?;
         worker_logs::prune_legacy(&workers_dir);
         let api = HostApiState::open(
-            &app_dir.join("plugin_events.db"),
+            &app_dir.join(crate::plugin::host_api::EVENTS_DB),
             profile,
             EVENT_RETENTION_PER_TOPIC,
         )?;
@@ -159,6 +161,138 @@ impl PluginHost {
             session_rpc,
             work,
         }))
+    }
+
+    /// The profile workers publish suggestions under; takes no lock.
+    pub(crate) fn suggestions_profile(&self) -> String {
+        self.api.suggestions_profile()
+    }
+
+    /// Run `f` on the suggestions store, keyed by the profile workers publish under.
+    pub(crate) fn with_suggestions_db<T>(
+        &self,
+        f: impl FnOnce(&rusqlite::Connection, &str) -> T,
+    ) -> T {
+        self.api.with_suggestions_db(f)
+    }
+
+    /// `with_suggestions_db` off the async executor: the store lock can wait
+    /// behind a busy database, which must not stall other tasks.
+    async fn with_suggestions_db_blocking<T: Send + 'static>(
+        &self,
+        f: impl FnOnce(&rusqlite::Connection, &str) -> T + Send + 'static,
+    ) -> anyhow::Result<T> {
+        let api = self.api.clone();
+        Ok(tokio::task::spawn_blocking(move || api.with_suggestions_db(f)).await?)
+    }
+
+    /// Ask the worker of `provider_id`, or of every suggestions provider, to
+    /// publish again, passing the user's `refresh_minutes` hint. Returns how
+    /// many workers were notified.
+    pub async fn refresh_suggestions(&self, provider_id: Option<&str>) -> usize {
+        self.refresh_providers(provider_id, Self::provider_ids())
+            .await
+    }
+
+    fn provider_ids() -> Vec<String> {
+        crate::plugin::suggestions::providers()
+            .into_iter()
+            .map(|p| p.id)
+            .collect()
+    }
+
+    async fn refresh_providers(&self, provider_id: Option<&str>, ids: Vec<String>) -> usize {
+        let minutes = self
+            .with_suggestions_db_blocking(crate::plugin::suggestions::refresh_minutes)
+            .await
+            .and_then(|minutes| Ok(minutes?))
+            .unwrap_or_else(|error| {
+                tracing::warn!(target: "plugin.host", error = %error, "suggestions: refresh_minutes unreadable");
+                crate::plugin::suggestions::DEFAULT_REFRESH_MINUTES
+            });
+        self.notify_providers(
+            aoe_plugin_api::suggestions::SUGGESTIONS_REFRESH,
+            serde_json::json!({ "refresh_minutes": minutes }),
+            provider_id,
+            ids,
+        )
+        .await
+    }
+
+    /// Send the fix method the provider stored with its current error to that
+    /// worker. `None` when the provider has no fix; otherwise whether a live
+    /// worker was notified.
+    pub async fn run_suggestion_fix(&self, provider_id: &str) -> anyhow::Result<Option<bool>> {
+        let provider = provider_id.to_string();
+        let method = self
+            .with_suggestions_db_blocking(move |conn, profile| {
+                crate::plugin::suggestions::fix_method(conn, profile, &provider)
+            })
+            .await??;
+        let Some(method) = method else {
+            return Ok(None);
+        };
+        Ok(Some(
+            self.notify_worker(provider_id, &method, serde_json::json!({}))
+                .await,
+        ))
+    }
+
+    /// Providers with a refresh in flight.
+    pub(crate) fn refreshing_suggestions(&self) -> std::collections::HashSet<String> {
+        self.api.refreshing_providers()
+    }
+
+    /// Ask every suggestions worker to report its setup checks again.
+    /// Returns how many workers were notified.
+    pub async fn run_suggestion_checks(&self) -> usize {
+        self.notify_providers(
+            aoe_plugin_api::suggestions::SUGGESTIONS_CHECKS_RUN,
+            serde_json::json!({}),
+            None,
+            Self::provider_ids(),
+        )
+        .await
+    }
+
+    async fn notify_providers(
+        &self,
+        method: &str,
+        params: Value,
+        provider_id: Option<&str>,
+        ids: Vec<String>,
+    ) -> usize {
+        // An unreadable switch store notifies nobody rather than a provider the user turned off.
+        let disabled = match self
+            .with_suggestions_db_blocking(crate::plugin::suggestions::disabled_providers)
+            .await
+            .and_then(|disabled| Ok(disabled?))
+        {
+            Ok(disabled) => disabled,
+            Err(error) => {
+                tracing::warn!(
+                    "suggestions: provider switches unreadable, skipping {method}: {error}"
+                );
+                return 0;
+            }
+        };
+        let mut sent = 0;
+        for id in ids {
+            if provider_id.is_some_and(|only| only != id) || disabled.contains(&id) {
+                continue;
+            }
+            let refresh = method == aoe_plugin_api::suggestions::SUGGESTIONS_REFRESH;
+            // Marked first, so a report that races the notification still clears it.
+            if refresh {
+                self.api.mark_refreshing(&id);
+            }
+            let notified = self.notify_worker(&id, method, params.clone()).await;
+            if refresh && !notified {
+                self.api.clear_refreshing(&id);
+            }
+            sent += usize::from(notified);
+        }
+        sent
     }
 
     /// The aggregated UI-state snapshot for the web to render. Read
@@ -425,7 +559,62 @@ impl PluginHost {
             drained
         };
 
+        let uninstalled: Vec<String> = to_teardown
+            .iter()
+            .map(|(id, _)| id.clone())
+            .filter(|id| registry.get(id).is_none())
+            .collect();
         self.teardown_workers(to_teardown).await;
+        for id in uninstalled {
+            self.forget_suggestions(id).await;
+        }
+    }
+
+    /// Clear what a plugin gone from the registry published. Runs after its
+    /// worker is stopped, so the worker cannot publish again behind the clear.
+    async fn forget_suggestions(&self, plugin_id: String) -> bool {
+        let api = self.api.clone();
+        let id = plugin_id.clone();
+        let cleared = tokio::task::spawn_blocking(move || {
+            api.with_suggestions_db(|conn, _| {
+                crate::plugin::suggestions::forget_publication(conn, &id)
+            })
+        })
+        .await;
+        match cleared {
+            Ok(Ok(())) => true,
+            Ok(Err(e)) => {
+                tracing::warn!(
+                    target: "plugin.host", plugin = %plugin_id,
+                    "could not clear published suggestions: {e}"
+                );
+                false
+            }
+            Err(e) => {
+                tracing::warn!(
+                    target: "plugin.host", plugin = %plugin_id,
+                    "clearing published suggestions did not finish: {e}"
+                );
+                false
+            }
+        }
+    }
+
+    /// Clears what an update owes behind a retired worker, and ends the
+    /// installer's obligation only once that clear has succeeded.
+    async fn settle_owed_cleanup(&self, plugin_id: &str, spec_changed: bool) {
+        let owed = crate::plugin::install::suggestions_cleanup_owed(plugin_id);
+        if !(spec_changed || owed) {
+            return;
+        }
+        if self.forget_suggestions(plugin_id.to_string()).await && owed {
+            if let Err(e) = crate::plugin::install::finish_suggestions_cleanup(plugin_id) {
+                tracing::warn!(
+                    target: "plugin.host", plugin = %plugin_id,
+                    "could not end the suggestions cleanup obligation: {e}"
+                );
+            }
+        }
     }
 
     /// Replace one plugin's worker so it runs the build now on disk, clearing its
@@ -448,6 +637,7 @@ impl PluginHost {
                         task: tokio::spawn(async {}),
                         inbound: None,
                         ui_generation: None,
+                        suggestions_hash: None,
                         events_inbound: None,
                         lifecycle_events: false,
                         dropped_events: 0,
@@ -456,8 +646,24 @@ impl PluginHost {
                 (stale, reservation)
             })
         };
+        let new_spec = registry.get(plugin_id).and_then(|p| {
+            p.manifest
+                .suggestions
+                .as_ref()
+                .map(crate::plugin::suggestions::spec_hash)
+        });
+        if replaced.is_none() {
+            // No worker runs, so nothing can publish behind a clear an update owes.
+            self.settle_owed_cleanup(plugin_id, false).await;
+        }
         if let Some((stale, reservation)) = replaced {
+            let old_spec = stale.suggestions_hash.clone();
             self.teardown_workers(vec![(plugin_id.to_string(), stale)])
+                .await;
+            // The old worker is fenced now, so it cannot publish behind this clear:
+            // what it published under another spec, or that an update still owes
+            // a clear for, must not outlive the swap.
+            self.settle_owed_cleanup(plugin_id, old_spec != new_spec)
                 .await;
             let mut table = self.state.lock().await;
             // A concurrent reconcile or restart may have claimed the slot since.
@@ -500,6 +706,7 @@ impl PluginHost {
                 task,
                 inbound: None,
                 ui_generation: None,
+                suggestions_hash: None,
                 events_inbound: None,
                 lifecycle_events: false,
                 dropped_events: 0,
@@ -783,6 +990,11 @@ impl PluginHost {
                     w.pid = pid;
                     w.inbound = Some(inbound_tx.clone());
                     w.ui_generation = Some(ui_generation);
+                    w.suggestions_hash = plugin
+                        .manifest
+                        .suggestions
+                        .as_ref()
+                        .map(crate::plugin::suggestions::spec_hash);
                     w.events_inbound = status_tx;
                     w.lifecycle_events = session_lifecycle;
                     true
@@ -813,6 +1025,7 @@ impl PluginHost {
             ui_contributions,
             deep_link_pages,
             ui_generation,
+            suggestions_spec: plugin.manifest.suggestions.clone(),
         });
         serve_connection(
             &self.api,
@@ -1076,8 +1289,35 @@ impl PluginHost {
                 task: tokio::spawn(async {}),
                 inbound: None,
                 ui_generation: None,
+                suggestions_hash: None,
                 events_inbound: event_capacity.map(|_| tx),
                 lifecycle_events,
+                dropped_events: 0,
+            },
+        );
+        rx
+    }
+
+    /// A worker that records every line the host writes to its stdin.
+    pub(crate) async fn register_inbound_test_worker(
+        &self,
+        plugin_id: &str,
+    ) -> mpsc::UnboundedReceiver<String> {
+        let (tx, rx) = mpsc::unbounded_channel();
+        let mut table = self.state.lock().await;
+        let supervisor_id = table.next_supervisor_id;
+        table.next_supervisor_id += 1;
+        table.running.insert(
+            plugin_id.to_string(),
+            RunningWorker {
+                supervisor_id,
+                pid: 0,
+                task: tokio::spawn(async {}),
+                inbound: Some(tx),
+                ui_generation: None,
+                suggestions_hash: None,
+                events_inbound: None,
+                lifecycle_events: false,
                 dropped_events: 0,
             },
         );
@@ -1210,6 +1450,70 @@ mod tests {
         );
     }
 
+    const STALL_DEADLINE: Duration = Duration::from_secs(10);
+
+    /// Runs `op` while a thread holds the suggestions lock and checks the
+    /// runtime keeps firing timers meanwhile. The lock is released only after
+    /// the timers have run, or at the deadline, which fails a stalled executor.
+    async fn assert_executor_runs_while_locked<F: std::future::Future>(
+        host: &Arc<PluginHost>,
+        op: F,
+    ) {
+        let (locked_tx, locked_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+        let holder = host.clone();
+        let thread = std::thread::spawn(move || {
+            holder.with_suggestions_db(|_, _| {
+                locked_tx.send(()).unwrap();
+                let _ = release_rx.recv_timeout(STALL_DEADLINE);
+            });
+        });
+        locked_rx.recv().unwrap();
+
+        let mut op = std::pin::pin!(op);
+        let ticker = async {
+            for _ in 0..5 {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        };
+        let ticked_first = tokio::time::timeout(STALL_DEADLINE, async {
+            tokio::select! {
+                _ = &mut op => false,
+                _ = ticker => true,
+            }
+        })
+        .await;
+        release_tx.send(()).unwrap();
+        thread.join().unwrap();
+        assert_eq!(
+            ticked_first,
+            Ok(true),
+            "the operation blocked the executor, or finished without the lock"
+        );
+        tokio::time::timeout(STALL_DEADLINE, op)
+            .await
+            .expect("the operation finishes once the lock is released");
+    }
+
+    #[tokio::test]
+    async fn suggestion_store_reads_do_not_block_the_async_executor() {
+        let tmp = tempfile::tempdir().unwrap();
+        let host = PluginHost::new(
+            tmp.path(),
+            "default",
+            None,
+            Arc::new(crate::server::runtime::RuntimeWork::default()),
+        )
+        .unwrap();
+
+        assert_executor_runs_while_locked(&host, host.refresh_suggestions(None)).await;
+        assert_executor_runs_while_locked(&host, host.run_suggestion_checks()).await;
+        assert_executor_runs_while_locked(&host, async {
+            host.run_suggestion_fix("acme.github").await.unwrap();
+        })
+        .await;
+    }
+
     #[tokio::test]
     async fn emit_session_lifecycle_changed_reaches_lifecycle_workers_of_the_host_profile() {
         let tmp = tempfile::tempdir().unwrap();
@@ -1241,6 +1545,48 @@ mod tests {
         assert!(msg.get("id").is_none(), "must be a notification");
         assert_eq!(msg["params"]["kind"], json!("archived"));
         assert!(status_only.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn refresh_carries_the_stored_interval_and_only_an_interval_change_asks_for_one() {
+        let tmp = tempfile::tempdir().unwrap();
+        let host = PluginHost::new(
+            tmp.path(),
+            "default",
+            None,
+            Arc::new(crate::server::runtime::RuntimeWork::default()),
+        )
+        .unwrap();
+        let mut worker = host.register_inbound_test_worker("acme.github").await;
+        let ids = || vec!["acme.github".to_string()];
+        let patch = |value: Value| -> crate::plugin::suggestions::PrefsPatch {
+            serde_json::from_value(value).unwrap()
+        };
+        let apply = |value: Value| {
+            let known = ids();
+            host.with_suggestions_db(|conn, profile| {
+                crate::plugin::suggestions::apply_prefs(conn, profile, &known, &patch(value))
+            })
+            .unwrap()
+            .unwrap()
+        };
+
+        // A PATCH that leaves the interval alone asks for no refresh.
+        assert!(!apply(json!({ "homepage": false })));
+        assert!(worker.try_recv().is_err());
+
+        assert!(apply(json!({ "refresh_minutes": 60 })));
+        assert_eq!(host.refresh_providers(None, ids()).await, 1);
+        let line = worker.try_recv().expect("worker gets a refresh");
+        let msg: Value = serde_json::from_str(line.trim_end()).unwrap();
+        assert_eq!(msg["method"], json!("suggestions.refresh"));
+        assert!(msg.get("id").is_none(), "must be a notification");
+        assert_eq!(msg["params"], json!({ "refresh_minutes": 60 }));
+        assert!(line.contains("\"refresh_minutes\":60"));
+
+        // The same value again changes nothing.
+        assert!(!apply(json!({ "refresh_minutes": 60 })));
+        assert!(worker.try_recv().is_err());
     }
 
     #[tokio::test]
@@ -1470,6 +1816,7 @@ mod tests {
             ui_contributions: std::collections::HashSet::new(),
             deep_link_pages: Default::default(),
             ui_generation: 0,
+            suggestions_spec: None,
         });
 
         // The worker: request a forbidden method, then publish the error code it
@@ -1541,6 +1888,7 @@ process.stdout.write(JSON.stringify({jsonrpc:"2.0",id:1,method:"session.meta.set
             ui_contributions: std::collections::HashSet::new(),
             deep_link_pages: Default::default(),
             ui_generation: 0,
+            suggestions_spec: None,
         });
 
         const WORKER: &str = r#"
@@ -1791,6 +2139,220 @@ command = ["sleep", "600"]
         })
         .await;
 
+        host.shutdown().await;
+    }
+
+    /// Replacing a worker clears what it published only when the new build
+    /// declares another `[suggestions]` spec, and only once the old worker is
+    /// stopped, so it cannot publish behind the clear.
+    #[cfg(unix)]
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn replacing_a_worker_clears_its_publication_only_when_the_spec_changed() {
+        use crate::session::{update_config, CapabilityGrant, PluginConfig};
+
+        let temp = tempfile::tempdir().unwrap();
+        let _reload = crate::plugin::ReloadRegistryOnDrop;
+        let _env = crate::session::test_support::EnvGuard::set(&[
+            ("XDG_CONFIG_HOME", temp.path().to_path_buf()),
+            ("HOME", temp.path().to_path_buf()),
+            ("USERPROFILE", temp.path().to_path_buf()),
+        ]);
+        let plugin_id = "acme.suggester";
+        let install = |version: &str, label: &str| {
+            let manifest = format!(
+                r#"
+id = "{plugin_id}"
+name = "Suggester"
+version = "{version}"
+api_version = 23
+capabilities = ["runtime.worker"]
+
+[runtime]
+kind = "command"
+system = true
+command = ["sleep", "600"]
+
+[suggestions]
+
+[[suggestions.sources]]
+criterion = "assigned"
+label = "{label}"
+variables = []
+"#
+            );
+            let dir = crate::plugin::plugins_dir().unwrap().join(plugin_id);
+            std::fs::create_dir_all(&dir).unwrap();
+            std::fs::write(dir.join("aoe-plugin.toml"), &manifest).unwrap();
+            update_config(|config| {
+                config.plugins.insert(
+                    plugin_id.to_string(),
+                    PluginConfig {
+                        grant: Some(CapabilityGrant {
+                            manifest_hash: aoe_plugin_api::PluginManifest::hash_bytes(
+                                manifest.as_bytes(),
+                            ),
+                            capabilities: vec!["runtime.worker".to_string()],
+                            granted_at: chrono::Utc::now(),
+                        }),
+                        ..PluginConfig::default()
+                    },
+                );
+            })
+            .unwrap();
+            crate::plugin::reload_registry()
+        };
+        let registry = install("1.0.0", "Assigned");
+        let host = PluginHost::new(
+            &temp.path().join("host"),
+            "default",
+            None,
+            std::sync::Arc::new(crate::server::runtime::RuntimeWork::default()),
+        )
+        .unwrap();
+        host.start(&registry).await;
+        wait_until("the worker", || async {
+            worker_pid(&host, plugin_id).await.is_some()
+        })
+        .await;
+        // What the old worker published after the installer cleared, before the swap.
+        host.api.with_suggestions_db(|conn, _| {
+            conn.execute(
+                "INSERT INTO suggestion_providers (profile, provider_id, updated_at) VALUES ('p', ?1, 0)",
+                [plugin_id],
+            )
+            .unwrap();
+        });
+        let published = || {
+            host.api.with_suggestions_db(|conn, _| {
+                conn.query_row(
+                    "SELECT COUNT(*) FROM suggestion_providers WHERE provider_id = ?1",
+                    [plugin_id],
+                    |row| row.get::<_, i64>(0),
+                )
+                .unwrap()
+            })
+        };
+
+        let first = worker_pid(&host, plugin_id).await.unwrap();
+        host.restart_worker(plugin_id, &install("1.0.1", "Assigned"))
+            .await;
+        wait_until("the replacement", || async {
+            worker_pid(&host, plugin_id)
+                .await
+                .is_some_and(|pid| pid != first)
+        })
+        .await;
+        assert_eq!(published(), 1, "the same spec keeps what was published");
+
+        let second = worker_pid(&host, plugin_id).await.unwrap();
+        host.restart_worker(plugin_id, &install("1.1.0", "Renamed"))
+            .await;
+        wait_until("the second replacement", || async {
+            worker_pid(&host, plugin_id)
+                .await
+                .is_some_and(|pid| pid != second)
+        })
+        .await;
+        assert_eq!(
+            published(),
+            0,
+            "another spec clears it behind the old worker"
+        );
+
+        // An update that owes a clear keeps its marker through the installer's
+        // own clear; the same spec is cleared behind the retired worker, which
+        // then ends the obligation.
+        crate::plugin::install::persist_suggestions_cleanup(plugin_id, true).unwrap();
+        host.api.with_suggestions_db(|conn, _| {
+            conn.execute(
+                "INSERT INTO suggestion_providers (profile, provider_id, updated_at) VALUES ('p', ?1, 0)",
+                [plugin_id],
+            )
+            .unwrap();
+        });
+        let third = worker_pid(&host, plugin_id).await.unwrap();
+        host.restart_worker(plugin_id, &install("1.1.1", "Renamed"))
+            .await;
+        wait_until("the third replacement", || async {
+            worker_pid(&host, plugin_id)
+                .await
+                .is_some_and(|pid| pid != third)
+        })
+        .await;
+        assert_eq!(published(), 0, "an owed clear runs for an unchanged spec");
+        assert!(
+            !crate::plugin::install::suggestions_cleanup_owed(plugin_id),
+            "and ends the obligation"
+        );
+        host.shutdown().await;
+    }
+
+    /// A plugin that is gone from the registry has its published suggestions
+    /// cleared once its worker stops; a merely disabled one keeps them.
+    #[cfg(unix)]
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn reconcile_clears_suggestions_of_an_uninstalled_plugin_only() {
+        use crate::session::update_config;
+
+        let temp = tempfile::tempdir().unwrap();
+        let _reload = crate::plugin::ReloadRegistryOnDrop;
+        let _env = crate::session::test_support::EnvGuard::set(&[
+            ("XDG_CONFIG_HOME", temp.path().to_path_buf()),
+            ("HOME", temp.path().to_path_buf()),
+            ("USERPROFILE", temp.path().to_path_buf()),
+        ]);
+        let plugin_id = "acme.sleeper";
+        install_sleeper(plugin_id);
+        let registry = crate::plugin::reload_registry();
+        let host = PluginHost::new(
+            &temp.path().join("host"),
+            "default",
+            None,
+            std::sync::Arc::new(crate::server::runtime::RuntimeWork::default()),
+        )
+        .unwrap();
+        host.start(&registry).await;
+        wait_until("the worker", || async {
+            worker_pid(&host, plugin_id).await.is_some()
+        })
+        .await;
+        let published = || {
+            host.api.with_suggestions_db(|conn, _| {
+                conn.query_row(
+                    "SELECT COUNT(*) FROM suggestion_providers WHERE provider_id = ?1",
+                    [plugin_id],
+                    |row| row.get::<_, i64>(0),
+                )
+                .unwrap()
+            })
+        };
+        host.api.with_suggestions_db(|conn, _| {
+            conn.execute(
+                "INSERT INTO suggestion_providers (profile, provider_id, updated_at) VALUES ('p', ?1, 0)",
+                [plugin_id],
+            )
+            .unwrap();
+        });
+
+        update_config(|config| config.plugins.get_mut(plugin_id).unwrap().enabled = false).unwrap();
+        host.reconcile(&crate::plugin::reload_registry()).await;
+        assert!(host.state.lock().await.running.is_empty());
+        assert_eq!(published(), 1);
+
+        update_config(|config| config.plugins.get_mut(plugin_id).unwrap().enabled = true).unwrap();
+        host.reconcile(&crate::plugin::reload_registry()).await;
+        wait_until("the worker again", || async {
+            worker_pid(&host, plugin_id).await.is_some()
+        })
+        .await;
+
+        update_config(|config| config.plugins.remove(plugin_id)).unwrap();
+        std::fs::remove_dir_all(crate::plugin::plugins_dir().unwrap().join(plugin_id)).unwrap();
+        host.reconcile(&crate::plugin::reload_registry()).await;
+        assert!(host.state.lock().await.running.is_empty());
+        assert_eq!(published(), 0);
         host.shutdown().await;
     }
 

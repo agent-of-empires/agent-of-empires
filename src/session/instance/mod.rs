@@ -35,6 +35,7 @@ use crate::session::capture::{
     OmpCliCaptureOptions, OmpStoreKind, PrimeRootPublication,
 };
 mod accessors;
+pub(crate) use accessors::generate_id;
 mod capture_slot;
 mod container;
 #[cfg(test)]
@@ -158,8 +159,8 @@ pub(crate) enum TerminalContextResume {
 pub use types::{
     AuxiliaryObservation, AuxiliaryTarget, LegacyToolAdoption, LegacyToolIdentity,
     LegacyToolObservation, PaneObservation, PanePresence, PluginCreateIdempotency, SandboxInfo,
-    TerminalInfo, TmuxServerIdentity, View, WorkspaceInfo, WorkspaceRepo, WorktreeInfo,
-    MAX_INITIAL_PROMPT_BYTES,
+    SuggestionOrigin, TerminalInfo, TmuxServerIdentity, View, WorkspaceInfo, WorkspaceRepo,
+    WorktreeInfo, MAX_INITIAL_PROMPT_BYTES,
 };
 pub(crate) use types::{
     PrimeAgentCapturePlan, PriorToolSession, ResumeIntent, SandboxPin, SandboxStoreTransitionPath,
@@ -645,6 +646,12 @@ pub struct Instance {
     /// releases the key. Additive: absent in older rows, no migration.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub plugin_create_idempotency: Option<PluginCreateIdempotency>,
+
+    /// Suggestion this session was started from. Additive: absent in older
+    /// rows, so no migration is needed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub suggestion: Option<SuggestionOrigin>,
+
     /// Set by a plugin's `sessions.turn.send` right before waking a resting session, under the
     /// same `instances` write lock that decides to revive it, so the plugin active-session cap
     /// treats it as occupying a slot immediately rather than waiting for a status to land.

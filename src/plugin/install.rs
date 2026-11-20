@@ -17,7 +17,7 @@ use super::changelog::UpdateChangelog;
 use super::featured::FeaturedIndex;
 use super::fetch::{self, FetchedPlugin};
 use super::lockfile::{LockedPlugin, Lockfile};
-use super::registry::ValidationState;
+use super::registry::{LoadedPlugin, ValidationState};
 use super::source::PluginSource;
 use super::NodeEnv;
 
@@ -973,8 +973,12 @@ fn apply_prepared(
         prepared.fetched.manifest.version
     ));
     let prior = PriorMetadata::capture(id)?;
+    let cleanup = persist_suggestions_cleanup(
+        id,
+        suggestions_spec_changed(super::registry().get(id), &prepared.fetched.manifest),
+    )?;
     let granted = grant.is_some();
-    replace_and_build(
+    let replaced = replace_and_build(
         id,
         &prepared.fetched,
         &final_dir,
@@ -990,8 +994,20 @@ fn apply_prepared(
             )
         },
         &prior,
-    )?;
+    );
+    if let Err(error) = replaced {
+        // Rolled back: the old build and what it published still stand.
+        if cleanup == Cleanup::Persisted {
+            let _ = std::fs::remove_file(cleanup_marker(id)?);
+        }
+        return Err(error);
+    }
+    // With a daemon running, its worker is retired after this and the daemon
+    // clears again behind it, then drops the marker. Without one, this is the last clear.
+    let retired = crate::acp::client::discovery::discover_local().is_err();
+    let cleared = run_suggestions_cleanup(id, &cleanup, retired);
     super::reload_registry();
+    cleared?;
     tracing::info!(target: "plugin.install", plugin = %id, version = %prepared.fetched.manifest.version, "plugin updated");
 
     if prepared.caps_changed && !granted {
@@ -1435,6 +1451,9 @@ fn is_installed_external(id: &str) -> Result<bool> {
 
 /// Drop the plugin's directory, config entry and lock entry.
 fn remove_external(id: &str) -> Result<()> {
+    // First, so a failed cleanup leaves the plugin installed rather than
+    // removed with live published rows.
+    forget_suggestion_publication(id)?;
     let dir = super::plugins_dir()?.join(id);
     if dir.exists() {
         std::fs::remove_dir_all(&dir).with_context(|| format!("removing {}", dir.display()))?;
@@ -1446,6 +1465,98 @@ fn remove_external(id: &str) -> Result<()> {
     }
     super::reload_registry();
     Ok(())
+}
+
+/// Whether an update replaces the installed `[suggestions]` block; an
+/// unknown installed plugin counts as changed.
+fn suggestions_spec_changed(current: Option<&LoadedPlugin>, next: &PluginManifest) -> bool {
+    current.is_none_or(|p| p.manifest.suggestions != next.suggestions)
+}
+
+/// Marker for a published-suggestions cleanup that has not finished, so the
+/// next update retries it even when its manifest no longer differs.
+fn cleanup_marker(plugin_id: &str) -> Result<std::path::PathBuf> {
+    Ok(crate::session::get_app_dir()?
+        .join("suggestions-cleanup-pending")
+        .join(plugin_id))
+}
+
+/// Where an update stands on clearing the plugin's published suggestions.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum Cleanup {
+    /// Nothing to clear.
+    None,
+    /// An earlier cleanup is still pending.
+    Pending,
+    /// This update persisted the obligation; it is undone if the update fails.
+    Persisted,
+}
+
+/// Persists the obligation to clear the plugin's suggestions when its spec
+/// changes or an earlier cleanup is pending. Runs before the update commits, so
+/// an interruption or a write failure cannot lose it, and a failure here stops
+/// the update.
+pub(crate) fn persist_suggestions_cleanup(plugin_id: &str, spec_changed: bool) -> Result<Cleanup> {
+    let marker = cleanup_marker(plugin_id)?;
+    if marker.exists() {
+        return Ok(Cleanup::Pending);
+    }
+    if !spec_changed {
+        return Ok(Cleanup::None);
+    }
+    if let Some(dir) = marker.parent() {
+        std::fs::create_dir_all(dir)?;
+    }
+    std::fs::write(&marker, b"")?;
+    Ok(Cleanup::Persisted)
+}
+
+/// Runs a persisted cleanup. The marker stays until a clear has succeeded
+/// with the old worker retired: `worker_retired` is false while a running daemon
+/// has yet to stop it, and that daemon then ends the obligation itself.
+fn run_suggestions_cleanup(plugin_id: &str, cleanup: &Cleanup, worker_retired: bool) -> Result<()> {
+    if *cleanup == Cleanup::None {
+        return Ok(());
+    }
+    forget_suggestion_publication(plugin_id)?;
+    if worker_retired {
+        finish_suggestions_cleanup(plugin_id)?;
+    }
+    Ok(())
+}
+
+/// Whether a cleanup of the plugin's published suggestions is still owed.
+pub(crate) fn suggestions_cleanup_owed(plugin_id: &str) -> bool {
+    cleanup_marker(plugin_id).is_ok_and(|marker| marker.exists())
+}
+
+/// Ends the obligation once a clear has succeeded behind a retired worker.
+pub(crate) fn finish_suggestions_cleanup(plugin_id: &str) -> Result<()> {
+    match std::fs::remove_file(cleanup_marker(plugin_id)?) {
+        Err(e) if e.kind() != std::io::ErrorKind::NotFound => Err(e.into()),
+        _ => Ok(()),
+    }
+}
+
+/// Clears the plugin's published rows through the database file, for when no
+/// daemon is involved: it waits on the daemon's write lock. A failure is
+/// returned so an update or uninstall is not reported as complete while stale
+/// rows remain. A running daemon clears them again itself once it stops the
+/// worker of a plugin that is gone from the registry.
+fn forget_suggestion_publication(plugin_id: &str) -> Result<()> {
+    let path = crate::session::get_app_dir()?.join(super::host_api::EVENTS_DB);
+    if !path.exists() {
+        return Ok(());
+    }
+    let conn =
+        rusqlite::Connection::open_with_flags(&path, rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE)
+            .with_context(|| format!("opening {}", path.display()))?;
+    conn.busy_timeout(std::time::Duration::from_secs(5))?;
+    // The schema owner creates tables an events DB from before this feature
+    // lacks, so only a real failure reaches the cleanup error.
+    super::suggestions::init(&conn)
+        .and_then(|()| super::suggestions::forget_publication(&conn, plugin_id))
+        .with_context(|| format!("could not clear the published suggestions of {plugin_id}"))
 }
 
 pub fn uninstall_logged(id: &str, log: &OperationLog) -> Result<()> {
@@ -2480,6 +2591,205 @@ mod tests {
         let mut changed = base.clone();
         changed.replies = true;
         assert!(agent_integrations_changed(Some(previous), &[changed]));
+    }
+
+    #[test]
+    fn suggestions_spec_changed_compares_the_installed_block() {
+        let manifest = |sources: &str| {
+            PluginManifest::from_toml_str(&format!(
+                "id = \"acme.thing\"\nname = \"Thing\"\nversion = \"1.0.0\"\napi_version = 23\ncapabilities = [\"runtime.worker\"]\n\
+                 [runtime]\nkind = \"command\"\nsystem = true\ncommand = [\"true\"]\n{sources}"
+            ))
+            .unwrap()
+        };
+        let block = |criterion: &str| {
+            format!(
+                "[suggestions]\n[[suggestions.sources]]\ncriterion = \"{criterion}\"\nlabel = \"L\"\n"
+            )
+        };
+        let installed = LoadedPlugin {
+            manifest: manifest(&block("assigned")),
+            enabled: true,
+            trust: aoe_plugin_api::TrustLevel::Community,
+            validation: ValidationState::Local,
+            source: None,
+            dir: None,
+            manifest_hash: String::new(),
+            granted: true,
+        };
+        assert!(suggestions_spec_changed(
+            Some(&installed),
+            &manifest(&block("quiet"))
+        ));
+        assert!(!suggestions_spec_changed(
+            Some(&installed),
+            &manifest(&block("assigned"))
+        ));
+        assert!(suggestions_spec_changed(
+            None,
+            &manifest(&block("assigned"))
+        ));
+    }
+
+    /// A separate process clears a provider's published rows through the
+    /// database file, and does not create the file when no daemon ever has.
+    #[test]
+    #[serial]
+    fn forgetting_suggestions_reaches_the_daemons_database_file() {
+        let _home = isolate_app_dir();
+        let db = crate::session::get_app_dir()
+            .unwrap()
+            .join(super::super::host_api::EVENTS_DB);
+        forget_suggestion_publication("acme.thing").unwrap();
+        assert!(!db.exists());
+
+        let host = super::super::host_api::HostApiState::open(&db, "default", 100).unwrap();
+        let count = |table: &str| -> i64 {
+            host.with_suggestions_db(|conn, _| {
+                conn.query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |r| r.get(0))
+                    .unwrap()
+            })
+        };
+        host.with_suggestions_db(|conn, _| {
+            for (table, columns) in [
+                ("suggestion_providers", "updated_at"),
+                ("suggestion_items", "item_id, item_json"),
+                ("suggestion_sources", "criterion, enabled"),
+                ("suggestion_dismissals", "item_id"),
+            ] {
+                let values = match table {
+                    "suggestion_providers" => "0",
+                    "suggestion_items" => "'a', '{}'",
+                    "suggestion_sources" => "'c', 1",
+                    _ => "'a'",
+                };
+                conn.execute(
+                    &format!(
+                        "INSERT INTO {table} (profile, provider_id, {columns}) VALUES ('p', 'acme.thing', {values})"
+                    ),
+                    [],
+                )
+                .unwrap();
+            }
+        });
+
+        forget_suggestion_publication("acme.thing").unwrap();
+
+        assert_eq!(count("suggestion_providers"), 0);
+        assert_eq!(count("suggestion_items"), 0);
+        assert_eq!(count("suggestion_sources"), 1);
+        assert_eq!(count("suggestion_dismissals"), 1);
+    }
+
+    /// An events DB from before the suggestions feature has no suggestion
+    /// tables: uninstall still succeeds.
+    #[test]
+    #[serial]
+    fn uninstalling_with_a_pre_feature_events_db_succeeds() {
+        let _home = isolate_app_dir();
+        let db = crate::session::get_app_dir()
+            .unwrap()
+            .join(super::super::host_api::EVENTS_DB);
+        let conn = rusqlite::Connection::open(&db).unwrap();
+        conn.execute_batch("CREATE TABLE events (id INTEGER PRIMARY KEY);")
+            .unwrap();
+        drop(conn);
+        update_config(|config| {
+            config.plugins.insert(
+                "acme.thing".to_string(),
+                PluginConfig {
+                    source: Some("gh:acme/thing".to_string()),
+                    ..PluginConfig::default()
+                },
+            );
+        })
+        .unwrap();
+        let dir = super::super::plugins_dir().unwrap().join("acme.thing");
+        std::fs::create_dir_all(&dir).unwrap();
+        uninstall("acme.thing").unwrap();
+        assert!(!dir.exists());
+        assert!(!Config::load().unwrap().plugins.contains_key("acme.thing"));
+    }
+
+    /// A failed cleanup is an error, not a logged warning, and it keeps the
+    /// plugin installed.
+    #[test]
+    #[serial]
+    fn a_failed_publication_cleanup_is_reported() {
+        let _home = isolate_app_dir();
+        let db = crate::session::get_app_dir()
+            .unwrap()
+            .join(super::super::host_api::EVENTS_DB);
+        std::fs::write(&db, b"not a sqlite database, long enough to be read as one").unwrap();
+        let err = forget_suggestion_publication("acme.thing").unwrap_err();
+        assert!(format!("{err:#}").contains("acme.thing"), "{err:#}");
+        let dir = super::super::plugins_dir().unwrap().join("acme.thing");
+        std::fs::create_dir_all(&dir).unwrap();
+        assert!(remove_external("acme.thing").is_err());
+        assert!(dir.exists(), "a failed cleanup must not remove the plugin");
+    }
+
+    #[test]
+    #[serial]
+    fn a_failed_update_cleanup_is_retried_by_the_next_update() {
+        let _home = isolate_app_dir();
+        let db = crate::session::get_app_dir()
+            .unwrap()
+            .join(super::super::host_api::EVENTS_DB);
+        std::fs::write(&db, b"not a sqlite database, long enough to be read as one").unwrap();
+        let first = persist_suggestions_cleanup("acme.thing", true).unwrap();
+        assert_eq!(first, Cleanup::Persisted);
+        assert!(run_suggestions_cleanup("acme.thing", &first, true).is_err());
+        assert!(cleanup_marker("acme.thing").unwrap().exists());
+
+        std::fs::remove_file(&db).unwrap();
+        {
+            let conn = rusqlite::Connection::open(&db).unwrap();
+            super::super::suggestions::init(&conn).unwrap();
+            conn.execute(
+                "INSERT INTO suggestion_items (profile, provider_id, item_id, item_json)
+                 VALUES ('p', 'acme.thing', 'a', '{}')",
+                [],
+            )
+            .unwrap();
+        }
+        // The retry's manifest matches the installed one: only the marker asks for it.
+        let retry = persist_suggestions_cleanup("acme.thing", false).unwrap();
+        assert_eq!(retry, Cleanup::Pending);
+        // A running daemon has not retired the old worker yet: it owns the last clear.
+        run_suggestions_cleanup("acme.thing", &retry, false).unwrap();
+        assert!(
+            cleanup_marker("acme.thing").unwrap().exists(),
+            "the marker outlives a clear the old worker could still undo"
+        );
+        run_suggestions_cleanup("acme.thing", &retry, true).unwrap();
+        let conn = rusqlite::Connection::open(&db).unwrap();
+        let left: i64 = conn
+            .query_row("SELECT COUNT(*) FROM suggestion_items", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(left, 0);
+        assert!(!cleanup_marker("acme.thing").unwrap().exists());
+        assert_eq!(
+            persist_suggestions_cleanup("acme.thing", false).unwrap(),
+            Cleanup::None
+        );
+    }
+
+    /// The obligation is written before the update commits, so a marker that
+    /// cannot be written refuses the update instead of losing the cleanup.
+    #[test]
+    #[serial]
+    fn an_obligation_that_cannot_be_persisted_stops_the_update() {
+        let _home = isolate_app_dir();
+        let marker = cleanup_marker("acme.thing").unwrap();
+        // A file where the marker directory belongs.
+        std::fs::write(marker.parent().unwrap(), b"in the way").unwrap();
+        assert!(persist_suggestions_cleanup("acme.thing", true).is_err());
+        assert_eq!(
+            persist_suggestions_cleanup("acme.thing", false).unwrap(),
+            Cleanup::None,
+            "an unchanged spec owes nothing"
+        );
     }
 
     /// Uninstall removes only a configured external plugin's directory: a
