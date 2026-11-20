@@ -9,18 +9,23 @@
 
 use crate::session::config::NarrowLayout;
 
-/// Below this width the home view stacks (list above preview) instead of
-/// side-by-side, and the preview drops its info header for the session title +
-/// status icon in the block title.
-///
-/// 80 is the conventional narrow-terminal boundary: at the default list_width
-/// of 35 a side-by-side preview there is 45 cols, and a full-width stacked one
-/// reads better. Phone widths live in this range.
+/// Default width below which the home view stacks (list above preview) instead
+/// of side-by-side, and the preview drops its info header for the session title
+/// and status icon in the block title. `SessionConfig::narrow_breakpoint`
+/// overrides it; 80 is the conventional narrow-terminal boundary, where at the
+/// default list_width of 35 a side-by-side preview is 45 cols and a full-width
+/// stacked one reads better. Phone widths live in this range.
 pub const STACKED_BREAKPOINT: u16 = 80;
 
 /// Minimum width the preview pane needs to render a tmux capture
 /// without hash-soup wrapping. Used as the side-by-side preview floor.
 pub const PREVIEW_MIN_WIDTH: u16 = 40;
+
+/// Narrowest breakpoint with a usable side-by-side layout: a 10-column list
+/// beside the [`PREVIEW_MIN_WIDTH`] preview floor. Configured breakpoints below
+/// it are raised to it, so a tiny or zero setting cannot put side-by-side into
+/// a width its preview cannot render in.
+pub const MIN_STACKED_BREAKPOINT: u16 = PREVIEW_MIN_WIDTH + 10;
 
 /// Width of the collapsed-sidebar strip: a bordered column wide enough
 /// for the `»` expand glyph plus its two border columns. Everything else
@@ -52,6 +57,19 @@ pub const DIALOG_MIN_WIDTH: u16 = 26;
 /// Cap on dialog width so it doesn't sprawl across wide desktops.
 pub const DIALOG_MAX_WIDTH: u16 = 80;
 
+/// The breakpoint a configured `SessionConfig::narrow_breakpoint` actually
+/// applies, clamped up to [`MIN_STACKED_BREAKPOINT`].
+pub fn effective_stacked_breakpoint(configured: u16) -> u16 {
+    configured.max(MIN_STACKED_BREAKPOINT)
+}
+
+/// Whether `viewport_width` takes the narrow layout for a configured
+/// `SessionConfig::narrow_breakpoint`. The comparison is strict, so a viewport
+/// exactly at the breakpoint stays side by side.
+pub fn is_narrow(viewport_width: u16, configured_breakpoint: u16) -> bool {
+    viewport_width < effective_stacked_breakpoint(configured_breakpoint)
+}
+
 /// Compute send-message dialog width: the full viewport below
 /// [`DIALOG_MIN_WIDTH`], otherwise [`DIALOG_TARGET_PCT`] of it clamped to
 /// `[DIALOG_MIN_WIDTH, DIALOG_MAX_WIDTH]`.
@@ -76,7 +94,7 @@ pub enum NarrowArrangement {
     Split(u16),
 }
 
-/// Arrange a narrow (below [`STACKED_BREAKPOINT`]) home view for `layout`.
+/// Arrange a narrow (see [`is_narrow`]) home view for `layout`.
 /// `preview_active` says the preview is the pane being worked in: live-send is
 /// relaying keys, a transcript is being read, or a System Health takeover is
 /// showing.
@@ -129,6 +147,26 @@ mod tests {
         for (height, want) in [(10, 2), (15, 5), (30, 10), (60, STACKED_LIST_HEIGHT_MAX)] {
             assert_eq!(stacked_list_height(height, None), want, "{height}");
         }
+    }
+
+    #[test]
+    fn configured_breakpoint_moves_the_narrow_boundary() {
+        // Default boundary: 79 is narrow, 80 is not.
+        assert!(is_narrow(79, STACKED_BREAKPOINT));
+        assert!(!is_narrow(80, STACKED_BREAKPOINT));
+        // A configured 100 moves it: 99 is narrow, 100 is side by side.
+        assert!(is_narrow(99, 100));
+        assert!(!is_narrow(100, 100));
+        // Tiny and zero settings clamp to the usable floor.
+        for configured in [0, 1, MIN_STACKED_BREAKPOINT - 1] {
+            assert_eq!(
+                effective_stacked_breakpoint(configured),
+                MIN_STACKED_BREAKPOINT,
+                "{configured}"
+            );
+        }
+        assert!(is_narrow(MIN_STACKED_BREAKPOINT - 1, 0));
+        assert!(!is_narrow(MIN_STACKED_BREAKPOINT, 0));
     }
 
     #[test]
