@@ -162,6 +162,7 @@ impl HomeView {
             pending_repo_trust_data: None,
             pending_repo_trust_fingerprint: None,
             pending_repo_trust_skip_on_create: false,
+            pending_repo_trust_recovery: None,
             hooks_install_dialog: None,
             pending_hooks_install_data: None,
             volume_ignores_glob_dialog: None,
@@ -218,6 +219,7 @@ impl HomeView {
             hover_cell: None,
             status_flash: None,
             live_send_ctrl_c_flash_until: None,
+            update_bar_drawn: false,
             live_takeover: None,
             sidebar_collapsed: user_config
                 .as_ref()

@@ -8,7 +8,10 @@ use serde_json::Value;
 use crate::agents::ResolvedHookEvent;
 
 use super::command::{hook_command, hook_command_session_id, is_aoe_hook_command};
-use super::config_io::{log_installed, log_removed, log_unchanged, with_config_lock, write_file};
+use super::config_io::{
+    log_installed, log_removed, log_unchanged, with_config_lock, with_config_lock_policy,
+    SymlinkPolicy,
+};
 use super::hermes_yaml;
 use super::HookInstallTarget;
 
@@ -40,12 +43,9 @@ pub fn install_hermes_hooks_with_events(
     if events.is_empty() && !config_path.exists() {
         return Ok(());
     }
-    with_config_lock(config_path, "yaml.lock", || {
-        let content = if config_path.exists() {
-            std::fs::read_to_string(config_path)?
-        } else {
-            String::new()
-        };
+    let policy = SymlinkPolicy::for_target(target);
+    with_config_lock_policy(config_path, "yaml.lock", policy, || {
+        let content = policy.read(config_path)?.unwrap_or_default();
         let edited = hermes_yaml::edit(&content, |hooks| {
             for event in events {
                 let commands = event_commands(event, target);
@@ -74,8 +74,10 @@ pub fn install_hermes_hooks_with_events(
             .ok_or_else(|| anyhow::anyhow!("config path has no parent"))?;
         let (allowlist_path, allowlist) = render_hermes_allowlist(config_dir, target, events)?;
         // Rendering keeps `approved_at` and is deterministic, so bytes compare.
-        let allowlist_changed =
-            !allowlist_path.exists() || std::fs::read(&allowlist_path)? != allowlist.as_bytes();
+        let allowlist_changed = match policy.read(&allowlist_path)? {
+            Some(current) => current != allowlist,
+            None => true,
+        };
 
         let yaml_changed = edited.is_some();
         if !yaml_changed && !allowlist_changed {
@@ -83,10 +85,10 @@ pub fn install_hermes_hooks_with_events(
             return Ok(());
         }
         if let Some(yaml) = &edited {
-            write_file(config_path, yaml.as_bytes())?;
+            policy.write(config_path, yaml.as_bytes())?;
         }
         if allowlist_changed {
-            write_file(&allowlist_path, allowlist.as_bytes())?;
+            policy.write(&allowlist_path, allowlist.as_bytes())?;
         }
         log_installed(config_path);
         Ok(())
@@ -142,11 +144,10 @@ fn render_hermes_allowlist(
     let allowlist_path = config_dir.join(HERMES_ALLOWLIST_FILE);
     let now = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
 
-    let mut data: Value = if allowlist_path.exists() {
-        serde_json::from_str(&std::fs::read_to_string(&allowlist_path)?)
-            .with_context(|| format!("Failed to parse {}", allowlist_path.display()))?
-    } else {
-        serde_json::json!({"approvals": []})
+    let mut data: Value = match SymlinkPolicy::for_target(target).read(&allowlist_path)? {
+        Some(content) => serde_json::from_str(&content)
+            .with_context(|| format!("Failed to parse {}", allowlist_path.display()))?,
+        None => serde_json::json!({"approvals": []}),
     };
     let approvals = data
         .as_object_mut()

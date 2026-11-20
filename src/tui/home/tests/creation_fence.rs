@@ -860,7 +860,31 @@ fn a_resubmit_reviews_trust_again_once_the_hooks_change() {
                 .as_ref()
                 .map(|d| d.title.as_str());
             assert_eq!(kept, Some("Hooked"), "{change}");
+            // An answer refused before it is sent returns to the setup-failed dialog,
+            // with the request, its new review and the Create-without-setup choice.
+            view.session_feed.set_mutation_permission_for_test(false);
             view.handle_key(key(KeyCode::Char('y')), None);
+            let (_, now) = creation_trust_review(&data()).unwrap();
+            let kept = view.create_hook_failed.as_ref().map(|(_, r)| {
+                (
+                    r.data.title.clone(),
+                    r.trust_review.clone(),
+                    r.skip_on_create,
+                )
+            });
+            assert_eq!(
+                kept,
+                Some((
+                    "Hooked".to_string(),
+                    Some(now),
+                    key_code == KeyCode::Char('s')
+                )),
+                "{change}"
+            );
+            view.handle_key(key(KeyCode::Esc), None);
+            view.session_feed.set_mutation_permission_for_test(true);
+            view.handle_key(key(key_code), None);
+            assert!(view.create_hook_failed.is_none(), "{change}");
         }
         let second = fail(CommandFailure::Rejected("done".into()));
         let (_, now) = creation_trust_review(&data()).unwrap();

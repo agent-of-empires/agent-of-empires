@@ -68,6 +68,7 @@ theme.
 
 - Preserve dashboard density and the status glyph system.
 - Keep runtime status separate from shortcuts; Tips yield to critical hints and compact to their icon when space is tight.
+- Show the model in use in the structured view status line beside usage and toggles, read from the session's `Model` config option so it follows a model switch instead of a fixed label.
 - Use rounded block borders.
 - Keep one character of horizontal padding in the list and preview panels.
 - Adjacent list and preview panels share one separator, never a double border.

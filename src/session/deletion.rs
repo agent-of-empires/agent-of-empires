@@ -694,6 +694,7 @@ impl<S: SessionStore + 'static> PurgeTransaction<S> {
                         .take()
                         .expect("reserved purge has captured ownership"),
                 )?);
+                crate::session::forget_before_start_resolution(&instances[index].id);
                 commit = Some((CompletionGate::Proceed, Some(instances.remove(index))));
             } else {
                 commit = Some((gate, Some(instances[index].clone())));
@@ -861,6 +862,7 @@ impl<S: SessionStore + 'static> PurgeTransaction<S> {
                 self.store().storage().profile(),
             );
             if matches!(gate, CompletionGate::Proceed) {
+                crate::session::forget_before_start_resolution(&instances[index].id);
                 instances.remove(index);
                 commit = Some((CompletionGate::Proceed, None));
             } else {

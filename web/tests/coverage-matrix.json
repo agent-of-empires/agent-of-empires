@@ -107,7 +107,7 @@
         "web/src/components/settings/PluginUpdateConsentModal.tsx",
         "web/src/components/settings/agentIntegrationDetails.ts"
       ],
-      "notes": "Install and update consent expose agent launch, detection and reply declarations as text with control and format characters made visible."
+      "notes": "Install and update consent expose agent launch, detection and reply declarations as text with control and format characters made visible, including the declared Enter delay so a timing-only change is visible."
     },
     {
       "id": "settings.plugin-agent-consent-browser",
@@ -892,6 +892,30 @@
       "components": ["web/src/hooks/useAcpSession.ts", "web/src/lib/api.ts"]
     },
     {
+      "id": "acp.login-required-queued-prompt",
+      "kind": "vitest",
+      "risk": "medium",
+      "specs": ["src/hooks/useAcpSession.test.ts"],
+      "components": ["web/src/hooks/useAcpSession.ts", "web/src/hooks/acpSession/reducer.ts"]
+    },
+    {
+      "id": "acp.rejected-prompt-retry",
+      "kind": "vitest",
+      "risk": "medium",
+      "specs": [
+        "src/hooks/useAcpSession.test.ts",
+        "src/lib/acpTypes.reducer.test.ts",
+        "src/components/acp/RejectedPromptsStrip.test.tsx"
+      ],
+      "components": [
+        "web/src/hooks/useAcpSession.ts",
+        "web/src/lib/acpTypes.ts",
+        "web/src/lib/api.ts",
+        "web/src/components/acp/PromptStrips.tsx"
+      ],
+      "notes": "A prompt the agent rejects keeps its stored attachments; Retry reloads each one and resends text and attachments as sent, an attachment-only prompt included, and does not resend when an attachment cannot be reloaded. The strip names the attachments, says whether the agent rejected the prompt or was busy, and allows one Retry at a time per entry."
+    },
+    {
       "id": "acp.server-queue",
       "kind": "vitest",
       "risk": "medium",
@@ -1043,8 +1067,12 @@
       "kind": "vitest",
       "risk": "medium",
       "specs": ["src/components/__tests__/SettingsView.folds.test.tsx"],
-      "components": ["web/src/components/SettingsView.tsx", "web/src/components/settings/FormFields.tsx"],
-      "notes": "The Updates tab shows the Daemon port (`serve.port`) under a Daemon heading; editing it saves `{ serve: { port } }` through the normal settings path. Global only; a new value applies after a stop and start. The same block renders the Funnel port select (`serve.funnel_port`) from the schema with no web code of its own."
+      "components": [
+        "web/src/components/SettingsView.tsx",
+        "web/src/components/settings/FormFields.tsx",
+        "web/src/components/settings/SchemaSection.tsx"
+      ],
+      "notes": "The Updates tab shows the Daemon port (`serve.port`) under a Daemon heading; editing it saves `{ serve: { port } }` through the normal settings path. Global only; a new value applies after a stop and start. The same block renders the Funnel port select (`serve.funnel_port`) from the schema with no web code of its own. Folder-ignore entries (`sandbox.volume_ignores`) are checked client-side from the schema's `volume_ignore_list` rule: an absolute path, a `:` or a `..` segment is rejected inline and not saved, while a relative entry such as node_modules saves as `{ sandbox: { volume_ignores } }`."
     },
     {
       "id": "settings.global-migration-and-persistence",
@@ -1062,6 +1090,13 @@
         "src/hooks/__tests__/useSettingsCommands.test.tsx"
       ],
       "components": ["web/src/components/SettingsView.tsx", "web/src/hooks/useSettingsCommands.ts"]
+    },
+    {
+      "id": "settings.shared-credential",
+      "kind": "vitest",
+      "risk": "medium",
+      "specs": ["src/components/settings/__tests__/SharedCredentialSetting.test.tsx"],
+      "components": ["web/src/components/SettingsView.tsx", "web/src/components/settings/FormFields.tsx"]
     },
     {
       "id": "settings.session-auto-stop-idle",
@@ -3310,6 +3345,14 @@
       ]
     },
     {
+      "id": "settings.persistent-terminals",
+      "kind": "vitest",
+      "risk": "low",
+      "description": "Kept terminals stay attached across session switches, so each keeps its scroll position.",
+      "specs": ["src/components/__tests__/TerminalSessionStack.test.tsx"],
+      "components": ["web/src/components/TerminalSessionStack.tsx"]
+    },
+    {
       "id": "settings.persistent-structured-views",
       "kind": "vitest",
       "risk": "low",
@@ -3434,7 +3477,7 @@
       "id": "acp.background-agents",
       "kind": "vitest",
       "risk": "medium",
-      "notes": "Shells and sub-agents filter by kind and group Running and Recent. Child details share thread-card rows; Claude Workflow runs group by run and phase. Current-snapshot/replay coverage keeps a current run live when covered historical events reuse its task id, while retaining completed historical runs for inspection.",
+      "notes": "Shells and sub-agents filter by kind and group Running and Recent. Child details share thread-card rows; Claude Workflow runs group by run and phase. Current-snapshot/replay coverage keeps a current run live when covered historical events reuse its task id, while retaining completed historical runs for inspection. A Workflow call stays a workflow card when a permission start retitles it, and reads \"Preparing workflow script\" until the call returns.",
       "specs": [
         "src/components/acp/__tests__/BackgroundAgentsPanel.test.tsx",
         "src/lib/acpTypes.reducer.test.ts",
@@ -3957,6 +4000,20 @@
       ]
     },
     {
+      "id": "acp.custom-agent-reset-alias",
+      "kind": "live-playwright",
+      "risk": "high",
+      "specs": ["tests/live/acp-session-history.spec.ts"],
+      "components": [
+        "src/acp/agent_profiles.rs",
+        "src/acp/supervisor/",
+        "src/server/api/sessions/list.rs",
+        "src/server/session_service.rs",
+        "src/session/config/mod.rs"
+      ],
+      "notes": "A custom ACP agent's `session.agent_clear_alias` drives the same fresh `session/new` as the Claude `/clear` and Codex `/new` stories, which this reuses. Rust tests cover what is specific to a custom agent: the queue drain keeps the reset as its own turn and leaves later rows queued (`the_queue_drain_keeps_a_custom_reset_as_its_own_turn`); the solo hold, drain, publication and session list use the agent the worker runs, else the one its next spawn picks (`a_custom_reset_is_classified_by_the_agent_the_session_runs`, `list_sessions_advertises_the_running_agents_reset_command`); publication keeps the classification the drain cut with (`a_carried_classification_decides_the_published_turn`); a built-in agent, including a registry agent without a profile, ignores its entry."
+    },
+    {
       "id": "acp.idle-dormant-wake",
       "kind": "vitest",
       "risk": "high",
@@ -4386,6 +4443,59 @@
       "notes": "Auth-required startup errors name the agent's own sign-in step from signInSteps.ts: Claude gets claude auth login and ANTHROPIC_API_KEY, Codex gets codex login (codex login --device-auth in a Container) and OPENAI_API_KEY, other agents get generic sign-in copy with no Claude or Codex commands. A sandboxed Session with install off runs the command inside the container and points new Sessions at the dashboard's \"Sandbox image update available\" banner, which offers Update now to pull it or shows the command to run, never at the TUI."
     },
     {
+      "id": "acp.container-gone-banner",
+      "kind": "mocked-playwright",
+      "risk": "high",
+      "specs": [
+        "tests/container-gone.spec.ts",
+        "src/components/acp/__tests__/ContainerGoneBanner.test.tsx",
+        "src/hooks/acpSession/reducer.test.ts",
+        "src/hooks/acpSession/stateCache.test.ts",
+        "src/components/session-wizard/__tests__/SessionWizard.test.tsx",
+        "src/components/acp/Composer.test.tsx",
+        "src/components/acp/QueuedPromptsStrip.test.tsx"
+      ],
+      "components": [
+        "web/src/components/acp/ContainerGoneBanner.tsx",
+        "web/src/components/acp/Composer.tsx",
+        "web/src/components/acp/PromptStrips.tsx",
+        "web/src/components/acp/StructuredView.tsx",
+        "web/src/components/acp/SessionBanners.tsx",
+        "web/src/components/sidebar/RecreateContainerDialog.tsx",
+        "web/src/components/session-wizard/SessionWizard.tsx",
+        "web/src/components/MobileMainPane.tsx",
+        "web/src/App.tsx"
+      ],
+      "notes": "An AgentStartupError with cause container_missing shows this banner instead of the generic one: no Retry or Use Terminal view, Recreate container (primary, full width at 375px) and New Session in the Project, named as its sidebar header (alias, else folder name). The composer is disabled with \"Recreate the container to send messages.\" as its placeholder, since a send would start the Session and rebuild the container without the warning; a queued row's Start and send is disabled with the same reason, and the compaction reminder's Compact now isn't offered; an untyped startup error leaves all three as on main. Recreate confirms through the Session menu's dialog and, once the Daemon accepts it, hands over to the startup line as a Retry does. New Session opens the wizard with the Project, Agent, Group and Structured view (kept over a Terminal view profile default, not over off), title empty, sandbox and yolo from the defaults. The cause is set and cleared wherever the startup error is, a later untyped error replaces it, and it persists with the cached state."
+    },
+    {
+      "id": "acp.container-gone-read-only",
+      "kind": "mocked-playwright",
+      "risk": "medium",
+      "specs": ["tests/container-gone.spec.ts", "src/components/acp/__tests__/ContainerGoneBanner.test.tsx"],
+      "components": ["web/src/components/acp/ContainerGoneBanner.tsx"],
+      "notes": "Where the server refuses a restart (read-only and CityHall), the banner keeps the heading and says \"This Session's sandbox container is gone. Ask the owner to recreate the container.\" whatever the Session's state, offers no actions, and the composer's placeholder says the same; Details still shows the server's message."
+    },
+    {
+      "id": "acp.container-gone-recreate-unavailable",
+      "kind": "mocked-playwright",
+      "risk": "medium",
+      "issue": "https://github.com/agent-of-empires/agent-of-empires/issues/5729",
+      "specs": [
+        "tests/container-gone.spec.ts",
+        "src/components/acp/__tests__/ContainerGoneBanner.test.tsx",
+        "src/components/__tests__/SessionRowSiblingTargets.test.tsx"
+      ],
+      "components": [
+        "web/src/components/acp/ContainerGoneBanner.tsx",
+        "web/src/components/acp/SessionBanners.tsx",
+        "web/src/components/acp/StructuredView.tsx",
+        "web/src/components/MobileMainPane.tsx",
+        "web/src/App.tsx"
+      ],
+      "notes": "#5729: the banner line, the read-only line and the composer's reason come from one remedy over recreateContainerBlock, the predicate behind the Session menu's Recreate container. Recreate is offered only when that predicate allows it; an archived Session says to unarchive it from the sidebar, a trashed one to restore it from Trash (with a Restore button where the view has one), and one being created or deleted to wait, with the composer saying the same where it's shown. Archived and trashed Sessions have no composer."
+    },
+    {
       "id": "acp.startup-error-banner-actions",
       "kind": "mocked-playwright",
       "risk": "medium",
@@ -4728,7 +4838,8 @@
       "kind": "live-playwright",
       "risk": "high",
       "specs": ["tests/live/acp-stories/agent-status.spec.ts"],
-      "components": ["web/src/components/WorkspaceSidebar.tsx"]
+      "components": ["web/src/components/WorkspaceSidebar.tsx"],
+      "notes": "The row summarizes the latest plan and drops it after a matching plan_removed or a /clear."
     },
     {
       "id": "story.sidebar-queued-count",
@@ -4741,8 +4852,21 @@
       "id": "sidebar.queued-count-hook",
       "kind": "vitest",
       "risk": "medium",
-      "specs": ["src/hooks/__tests__/useAcpQueueCount.test.tsx"],
-      "components": ["web/src/components/WorkspaceSidebar.tsx"]
+      "specs": ["src/hooks/__tests__/useAcpQueueCount.test.tsx", "src/hooks/useAcpSession.test.ts"],
+      "components": ["web/src/components/WorkspaceSidebar.tsx"],
+      "notes": "The count is the open session's live queue while it holds one, else the server's queued_count; a stored count or a failed queue list never wins, and a changed polled count re-lists."
+    },
+    {
+      "id": "sidebar.queued-chip-reason",
+      "kind": "mocked-playwright",
+      "risk": "medium",
+      "specs": [
+        "tests/sidebar-queued-chip-reason.spec.ts",
+        "src/components/sidebar/sessionQueuedReason.test.ts",
+        "src/components/__tests__/SessionRowTriage.test.tsx",
+        "src/hooks/__tests__/useSessionsPolling.test.tsx"
+      ],
+      "components": ["web/src/components/sidebar/RowBadges.tsx"]
     },
     {
       "id": "story.sidebar-rate-limit",
@@ -5023,7 +5147,8 @@
       "kind": "live-playwright",
       "risk": "high",
       "specs": ["tests/live/acp-stories/agent-status.spec.ts"],
-      "components": ["web/src/components/acp/StructuredView.tsx", "web/src/components/acp/PlanStrip.tsx"]
+      "components": ["web/src/components/acp/StructuredView.tsx", "web/src/components/acp/PlanStrip.tsx"],
+      "notes": "Legacy plan and plan_update checklists render; a matching plan_removed or a /clear hides the strip."
     },
     {
       "id": "story.diff-viewer-shows-files",
@@ -5866,7 +5991,7 @@
       "id": "settings.plugins",
       "kind": "vitest",
       "risk": "high",
-      "description": "Plugin cards show validation, including a warning-styled dev badge.",
+      "description": "Plugin cards show validation, including a warning-styled dev badge. Failed jobs retain their bounded tail and display the actual full-log path on the Daemon host.",
       "specs": [
         "src/components/settings/__tests__/PluginsSettings.test.tsx",
         "src/components/settings/__tests__/PluginIdentityIcon.test.tsx"
@@ -6105,6 +6230,55 @@
         "web/src/components/profiles/ProfilesSection.tsx",
         "web/src/components/sidebar/SessionRowMenu.tsx"
       ]
+    },
+    {
+      "id": "terminal-switch-refusal-text",
+      "kind": "deferred",
+      "issue": "https://github.com/agent-of-empires/agent-of-empires/issues/5651",
+      "risk": "low",
+      "reason": "Copy-only: a refused switch to Terminal view still toasts the server's plain-text message, now reworded; the server pins the text in acp::view tests. The web dialog in the next #5651 PR brings the tested flow.",
+      "components": ["web/src/lib/api.ts", "web/src/App.tsx"]
+    },
+    {
+      "id": "settings-restart-web-only-flags",
+      "kind": "vitest",
+      "risk": "medium",
+      "specs": [
+        "src/lib/settingRow.test.ts",
+        "src/components/settings/__tests__/SettingRow.test.tsx",
+        "src/components/setup/__tests__/SandboxStep.test.tsx"
+      ],
+      "components": [
+        "web/src/lib/settingRow.ts",
+        "web/src/components/settings/SettingRow.tsx",
+        "web/src/components/settings/SchemaSection.tsx",
+        "web/src/components/settings/FormFields.tsx",
+        "web/src/components/setup/steps/SandboxStep.tsx"
+      ],
+      "notes": "Each Settings row shows its label, tags (Needs restart, Web dashboard only, Terminal app only, Structured view only, Linux only), a lock on passphrase rows, the summary as its plain line (none without a summary, plugin rows included), and its section.field key with a copy button. The setup wizard hides the key. Every control is named by its row label. #5302."
+    },
+    {
+      "id": "settings.row-key-reveal",
+      "kind": "mocked-playwright",
+      "risk": "low",
+      "specs": ["tests/settings-row.spec.ts"],
+      "components": ["web/src/components/settings/SettingRow.tsx"],
+      "notes": "With a mouse the key is invisible until hover or focus but keeps its line, so rows don't move; Tab reaches its copy button, which copies. At 375 it always shows. #5302."
+    },
+    {
+      "id": "terminal-switch-command-selector-conflict",
+      "kind": "live-playwright",
+      "risk": "medium",
+      "specs": ["tests/live/acp-session-history.spec.ts"],
+      "components": ["web/src/lib/api.ts", "web/src/App.tsx", "web/src/components/SwitchViewDialog.tsx"]
+    },
+    {
+      "id": "terminal-switch-command-selector-owed-ending",
+      "kind": "deferred",
+      "issue": "https://github.com/agent-of-empires/agent-of-empires/issues/5651",
+      "risk": "low",
+      "reason": "A handoff owed from before the up-front refusal now ends in Terminal view with Error and the remedy instead of retrying, including when its cleanup resumes after a failure or restart. A live run can't produce that state: it needs a reservation made by a daemon without the refusal. Handler tests in acp::view cover the ending, the resumed cleanup and both remedies; the web flow that shows it comes with the #5651 switch dialog.",
+      "components": ["web/src/lib/api.ts", "web/src/App.tsx"]
     }
   ]
 }

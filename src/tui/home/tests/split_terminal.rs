@@ -338,7 +338,7 @@ fn passive_split_follows_captured_cursor_without_discarding_history_or_clear_fra
         terminal
             .draw(|frame| {
                 let area = frame.area();
-                env.view.render(frame, area, &theme, None, None, None);
+                env.view.render(frame, area, &theme, None);
             })
             .unwrap();
         let buffer = terminal.backend().buffer();

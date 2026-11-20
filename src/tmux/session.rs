@@ -1745,7 +1745,7 @@ impl Session {
             return Ok(physical.identity.pane_id.clone());
         }
         #[cfg(unix)]
-        if let Some(id) = crate::tmux::vt::channel_pane_id(&self.name) {
+        if let Some(id) = crate::tmux::vt::channel_pane_id(&self.name, deadline) {
             return Ok(id);
         }
         super::utils::first_pane_id_with_deadline(&self.name, deadline)
@@ -5732,6 +5732,97 @@ mod tests {
         );
     }
 
+    /// #5850: a tmux client without a UTF-8 locale prints every byte outside printable ASCII
+    /// as `_`. The locale reaches only a child test process, never this one's environment.
+    #[test]
+    #[serial_test::serial]
+    fn pane_queries_read_intact_without_a_utf8_locale() {
+        const CHILD: &str = "AOE_TEST_PANE_QUERY_LOCALE_CHILD";
+        if !tmux_available() {
+            eprintln!("Skipping test: tmux not available");
+            return;
+        }
+        if std::env::var_os(CHILD).is_none() {
+            let child = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "tmux::session::tests::pane_queries_read_intact_without_a_utf8_locale",
+                    "--nocapture",
+                ])
+                .env(CHILD, "1")
+                .env("LANG", "C")
+                .env("LC_ALL", "C")
+                .env("LC_CTYPE", "C")
+                // tmux treats a set TMUX as UTF-8 before it reads the locale.
+                .env_remove("TMUX")
+                .output()
+                .unwrap();
+            let stdout = String::from_utf8_lossy(&child.stdout);
+            assert!(
+                child.status.success() && stdout.contains("1 passed"),
+                "{stdout}{}",
+                String::from_utf8_lossy(&child.stderr)
+            );
+            return;
+        }
+        let guard = TmuxTestSession::new("aoe_test_pane_query_locale");
+        let session_name = guard.name().to_string();
+        let mut args: Vec<String> = ["new-session", "-d", "-s", &session_name, "sleep 30"]
+            .iter()
+            .map(|arg| arg.to_string())
+            .collect();
+        append_pane_base_index_args(&mut args, &session_name);
+        assert!(crate::tmux::tmux_command()
+            .args(&args)
+            .status()
+            .expect("tmux new-session")
+            .success());
+        let pane = only_pane_id(&session_name);
+        wait_for_pane_command(&pane, "sleep");
+        let title = "π ⠋ working";
+        assert!(crate::tmux::tmux_query_command()
+            .args(["select-pane", "-t", &pane, "-T", title])
+            .status()
+            .expect("set pane title")
+            .success());
+        let pid = pane_field(&pane, "#{pane_pid}");
+        let deadline = crate::tmux::TmuxCommandDeadline::new();
+        let server_pid = pane_field(&pane, "#{pid}");
+        let cases = [
+            (
+                "pane PID",
+                crate::process::get_pane_pid(&session_name).map(|pid| pid.to_string()),
+                pid.as_str(),
+            ),
+            (
+                "pane title",
+                crate::tmux::utils::pane_title(&session_name),
+                title,
+            ),
+            (
+                "server PID",
+                crate::tmux::vt::server_pid(&pane, &deadline),
+                server_pid.as_str(),
+            ),
+            (
+                "session pane membership",
+                Some(
+                    crate::tmux::vt::session_holds_pane(
+                        &session_name,
+                        &server_pid,
+                        &pane,
+                        &deadline,
+                    )
+                    .to_string(),
+                ),
+                "true",
+            ),
+        ];
+        for (query, read, expected) in cases {
+            assert_eq!(read.as_deref(), Some(expected), "{query}");
+        }
+    }
+
     #[test]
     #[serial_test::serial]
     /// Regression test for #488: when a user creates a split pane and makes it
@@ -5755,7 +5846,7 @@ mod tests {
             "80",
             "-y",
             "24",
-            "sleep 30",
+            "exec sleep 30",
         ]
         .iter()
         .map(|arg| arg.to_string())

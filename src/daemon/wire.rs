@@ -5,6 +5,74 @@ use serde::{Deserialize, Serialize};
 
 use crate::session::{Instance, SessionScope};
 
+#[derive(Serialize, Deserialize)]
+pub struct InstallPreviewBody {
+    pub source: String,
+    #[serde(default)]
+    pub dev: bool,
+}
+
+#[derive(Serialize, Deserialize)]
+pub struct StartInstallBody {
+    pub source: String,
+    #[serde(default)]
+    pub dev: bool,
+    pub expected_fingerprint: String,
+}
+
+#[derive(Serialize, Deserialize)]
+pub struct ApplyUpdateBody {
+    #[serde(default)]
+    pub expected_fingerprint: Option<String>,
+}
+
+#[derive(Clone, Copy, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PluginJobKind {
+    Install,
+    Update,
+    Uninstall,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(tag = "state", rename_all = "snake_case")]
+pub enum PluginJobStatus {
+    Running,
+    Succeeded,
+    Failed { error: String },
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct PluginJob {
+    pub id: String,
+    pub kind: PluginJobKind,
+    pub target: String,
+    pub status: PluginJobStatus,
+    pub started_at: i64,
+    pub finished_at: Option<i64>,
+}
+
+#[derive(Serialize, Deserialize)]
+pub struct PluginJobAccepted {
+    pub job_id: String,
+}
+
+#[derive(Serialize, Deserialize)]
+pub struct PluginJobLog {
+    #[serde(default)]
+    pub path: String,
+    pub exists: bool,
+    pub tail: String,
+    pub lines_returned: usize,
+    pub truncated: bool,
+}
+
+#[derive(Serialize, Deserialize)]
+pub struct PluginJobResponse {
+    pub job: PluginJob,
+    pub log: PluginJobLog,
+}
+
 /// One repository's branch base in a creation request.
 #[derive(Serialize, Deserialize)]
 pub struct RepoBaseInput {
@@ -1318,9 +1386,7 @@ pub struct SessionResponse {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub warnings: Vec<String>,
     /// Latest plan snapshot summarised for the sidebar. Present only on
-    /// structured view sessions whose agent has emitted a Plan (directly via
-    /// ACP `SessionUpdate::Plan` or indirectly via the ExitPlanMode
-    /// bridge in `acp_client::map_update_to_events`). See #1061.
+    /// structured view sessions whose agent has emitted a plan. See #1061.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub plan_summary: Option<PlanSummary>,
     /// Absolute RFC3339 timestamp at which the structured view session's

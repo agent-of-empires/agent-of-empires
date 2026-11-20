@@ -727,7 +727,7 @@ last_seen_version = "{}"
 
     /// Start `aoe serve --daemon --no-auth` on a free port and wait for it to bind.
     pub fn start_daemon(&self) -> u16 {
-        self.start_daemon_with(&["--no-auth"])
+        self.start_daemon_with(&["--no-auth", "--behind-proxy", "--allowed-host", "127.0.0.1"])
     }
 
     /// `start_daemon` with different auth or proxy flags.

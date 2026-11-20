@@ -1818,26 +1818,9 @@ impl HomeView {
             if let Some(result) = dialog.handle_click(col, row) {
                 match result {
                     DialogResult::Continue => {}
-                    DialogResult::Cancel => {
-                        self.repo_trust_dialog = None;
-                        self.pending_repo_trust_data = None;
-                        self.pending_repo_trust_fingerprint = None;
-                        self.pending_repo_trust_skip_on_create = false;
-                    }
+                    DialogResult::Cancel => self.cancel_repo_trust(),
                     DialogResult::Submit(action) => {
-                        self.repo_trust_dialog = None;
-                        let fingerprint = self.pending_repo_trust_fingerprint.take();
-                        let skip = std::mem::take(&mut self.pending_repo_trust_skip_on_create);
-                        if let Some(data) = self.pending_repo_trust_data.take() {
-                            let decision = match action {
-                                RepoTrustAction::Trust { .. } => {
-                                    RepoTrustDecision::Approve(fingerprint)
-                                }
-                                RepoTrustAction::Skip { .. } => RepoTrustDecision::Refuse,
-                            };
-                            let emit = self.create_session_with_hooks(data, decision, skip);
-                            self.pending_dialog_click_action = emit;
-                        }
+                        self.pending_dialog_click_action = self.submit_repo_trust(action);
                     }
                 }
             }
@@ -2513,12 +2496,15 @@ impl HomeView {
         }
 
         if let Some(view) = &mut self.connections_view {
-            match view.handle_key(key) {
+            match view.handle_key(key, self.strict_hotkeys, std::time::Instant::now()) {
                 DialogResult::Continue => {}
                 DialogResult::Cancel => self.connections_view = None,
                 DialogResult::Submit(()) => {
                     self.connections_view = None;
                     self.open_serve();
+                    if let Some(serve) = &mut self.serve_view {
+                        serve.opened_by(&key);
+                    }
                 }
             }
             return None;
@@ -2655,26 +2641,8 @@ impl HomeView {
         if let Some(dialog) = &mut self.repo_trust_dialog {
             match dialog.handle_key(key) {
                 DialogResult::Continue => {}
-                DialogResult::Cancel => {
-                    self.repo_trust_dialog = None;
-                    self.pending_repo_trust_data = None;
-                    self.pending_repo_trust_fingerprint = None;
-                    self.pending_repo_trust_skip_on_create = false;
-                }
-                DialogResult::Submit(action) => {
-                    self.repo_trust_dialog = None;
-                    let fingerprint = self.pending_repo_trust_fingerprint.take();
-                    let skip = std::mem::take(&mut self.pending_repo_trust_skip_on_create);
-                    if let Some(data) = self.pending_repo_trust_data.take() {
-                        let decision = match action {
-                            RepoTrustAction::Trust { .. } => {
-                                RepoTrustDecision::Approve(fingerprint)
-                            }
-                            RepoTrustAction::Skip { .. } => RepoTrustDecision::Refuse,
-                        };
-                        return self.create_session_with_hooks(data, decision, skip);
-                    }
-                }
+                DialogResult::Cancel => self.cancel_repo_trust(),
+                DialogResult::Submit(action) => return self.submit_repo_trust(action),
             }
             return None;
         }
@@ -3298,13 +3266,12 @@ impl HomeView {
                     return None;
                 }
                 let live_key = self.selected_session.as_deref().map(|id| self.live_key(id));
-                // A structured session has no tmux pane to attach or live-send into, so
-                // both Tab meanings are vacuous; say so instead of ignoring the press.
+                // Neither Tab meaning has a pane to reach in a structured view, so the
+                // press takes the session's native view through the same activation as
+                // Enter: that dismisses System Health, which would otherwise leave the
+                // composer it focuses behind a panel the next key cannot reach.
                 if live_key == Some(None) {
-                    return Some(Action::SetTransientStatus(
-                        "Structured sessions have no tmux pane; press Enter to open the structured view."
-                            .to_string(),
-                    ));
+                    return self.activate_selected_session();
                 }
                 if live_key == Some(Some(LiveKey::Enter)) {
                     if let Some(action) = self.tab_attach_action() {
@@ -4292,10 +4259,10 @@ impl HomeView {
     /// R: the Connections hub. Its Web dashboard row reaches [`Self::open_serve`].
     fn open_connections(&mut self) {
         let web = self.connections_web_state(None);
-        self.connections_view = Some(crate::tui::dialogs::ConnectionsView::new(
-            self.daemon_attention(),
-            web,
-        ));
+        self.connections_view = Some(
+            crate::tui::dialogs::ConnectionsView::new(self.daemon_attention(), web)
+                .opened_by_serve(std::time::Instant::now()),
+        );
     }
 
     /// The hub's Web dashboard row. `known` keeps a transport already read, so a refresh
@@ -6429,6 +6396,19 @@ impl HomeView {
                         self.exit_live_send_and_restore_sizing(&state);
                     }
                     None
+                } else if self.structured_view_selected(&id) {
+                    // The live form of a structured row is its native view, which
+                    // only Enter or the live-send chord opens: a click selects it.
+                    // A relay aimed at another session ends, so keystrokes follow
+                    // the selection instead of reaching the row left behind.
+                    if self
+                        .live_send
+                        .as_ref()
+                        .is_some_and(|state| state.session_id != id)
+                    {
+                        self.exit_live_send_if_active();
+                    }
+                    None
                 } else {
                     self.start_live_send()
                 }
@@ -6923,7 +6903,8 @@ impl HomeView {
     ///
     /// Still a no-op on group headers, empty lists and Creating rows, and on a session
     /// that is already the live-send target, so clicking the same row twice does not
-    /// re-run ensure_pane_ready or drop the live worker.
+    /// re-run ensure_pane_ready or drop the live worker. A structured session in
+    /// Structured view has no pane to relay into, so this opens its view instead.
     pub(super) fn start_live_send(&mut self) -> Option<Action> {
         let id = self.selected_session.clone()?;
         if self.live_send.as_ref().is_some_and(|s| s.session_id == id) {
@@ -6936,6 +6917,15 @@ impl HomeView {
         if matches!(inst.status, Status::Creating | Status::Deleting) {
             return None;
         }
+        // A structured agent has no pane to relay keystrokes into, so its live form
+        // is the native view: the chord attaches the way Enter does.
+        if self.structured_view_selected(&id) {
+            self.exit_live_send_if_active();
+            // The native view replaces whatever the preview showed, so the health
+            // panel must not stay painted over the composer it focuses.
+            self.system_health_open = false;
+            return Some(Action::OpenStructuredView(id));
+        }
         // A structured agent has no tmux target, but its auxiliary terminal/tool panes do.
         self.live_key(&id)?;
         // Pick the target from the pane being previewed: Structured view to the agent
@@ -6947,6 +6937,15 @@ impl HomeView {
             ViewMode::Tool(name) => live_send::LiveSendTarget::Tool(name.clone()),
         };
         Some(Action::EnterLiveSend(id))
+    }
+
+    /// Whether `id` is a structured session with the native structured view on
+    /// screen, where live send has no pane to relay into.
+    fn structured_view_selected(&self, id: &str) -> bool {
+        matches!(self.view_mode, ViewMode::Structured)
+            && self
+                .get_instance(id)
+                .is_some_and(|inst| inst.is_structured())
     }
 
     /// The paired terminal live send reaches for `inst`: the container shell when a
@@ -7358,7 +7357,8 @@ impl HomeView {
 
     /// The key that enters live mode on this Session's row, shared by Tab, `start_live_send`
     /// and the takeover footer. None for a structured Session in Structured view, which has
-    /// no tmux pane there; its Terminal and Tool panes go live.
+    /// no pane there: `start_live_send` attaches its native view instead. Its Terminal and
+    /// Tool panes still go live.
     pub(super) fn live_key(&self, id: &str) -> Option<LiveKey> {
         if matches!(self.view_mode, ViewMode::Structured)
             && self
@@ -7852,6 +7852,7 @@ impl HomeView {
         skip_on_create: bool,
     ) -> Option<Action> {
         use crate::session::TrustSurface;
+        self.pending_repo_trust_recovery = None;
         // A fingerprint we cannot build can only refuse.
         let (trust, fingerprint) = match creation_trust_review(&data) {
             Ok(review) => review,
@@ -7921,6 +7922,42 @@ impl HomeView {
         self.pending_repo_trust_data = Some(data);
         self.pending_repo_trust_fingerprint = Some(fingerprint);
         self.pending_repo_trust_skip_on_create = skip_on_create;
+        None
+    }
+
+    pub(super) fn cancel_repo_trust(&mut self) {
+        self.repo_trust_dialog = None;
+        self.pending_repo_trust_data = None;
+        self.pending_repo_trust_fingerprint = None;
+        self.pending_repo_trust_skip_on_create = false;
+        self.pending_repo_trust_recovery = None;
+    }
+
+    /// Applies the answer to the open trust prompt. A prompt a setup-failed resubmit reopened
+    /// returns to that dialog when the send is refused.
+    pub(super) fn submit_repo_trust(&mut self, action: RepoTrustAction) -> Option<Action> {
+        self.repo_trust_dialog = None;
+        let fingerprint = self.pending_repo_trust_fingerprint.take();
+        let skip_on_create = std::mem::take(&mut self.pending_repo_trust_skip_on_create);
+        let recovery = self.pending_repo_trust_recovery.take();
+        let data = self.pending_repo_trust_data.take()?;
+        let decision = match action {
+            RepoTrustAction::Trust { .. } => RepoTrustDecision::Approve(fingerprint),
+            RepoTrustAction::Skip { .. } => RepoTrustDecision::Refuse,
+        };
+        let Some(dialog) = recovery else {
+            return self.create_session_with_hooks(data, decision, skip_on_create);
+        };
+        let (trust_hooks, trust_review) = decision.into_request();
+        let request = super::CreationRequest {
+            data,
+            trust_hooks,
+            trust_review,
+            skip_on_create,
+        };
+        if let Err(request) = self.submit_creation(request) {
+            self.create_hook_failed = Some((dialog, *request));
+        }
         None
     }
 

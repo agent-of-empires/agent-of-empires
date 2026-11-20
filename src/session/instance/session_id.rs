@@ -729,6 +729,21 @@ impl Instance {
         }
     }
 
+    /// The native session selector in this row's own command or arguments. An unmanaged
+    /// launch then runs it instead of injecting AoE's own (see `apply_session_flags_in`).
+    /// A selector fails `validate_managed_arguments`, so such a launch is never managed.
+    pub(crate) fn command_session_selector(&self) -> Option<String> {
+        let mut words = parse_launch_command(&self.get_launch_command())?.words;
+        words.extend(shell_words::split(&self.extra_args).ok()?);
+        // The same agent an unmanaged launch checks (`build_launch_command_in`).
+        match self.declared_agent() {
+            Some(declared) => declared
+                .with_definition(|agent| self.existing_session_selector(&words, Some(agent)))
+                .flatten(),
+            None => self.existing_session_selector(&words, self.default_selector_agent()),
+        }
+    }
+
     fn existing_session_selector(
         &self,
         words: &[String],
@@ -835,15 +850,15 @@ impl Instance {
             .then(|| self.existing_session_selector(&parsed_command.words, agent))
             .flatten()
         {
-            let aoe_has_state = self.agent_session_id.is_some()
-                || matches!(
-                    self.resume_intent,
-                    ResumeIntent::Use(_) | ResumeIntent::Fork { .. }
-                );
-            if aoe_has_state {
+            if self.conversation_state().resumes() {
                 anyhow::bail!(
                     "{context} command already contains native session selector {selector}; remove it or clear the AoE-managed resume state before launching"
                 );
+            }
+            // The early return skips acquisition, which applies a clear.
+            if matches!(self.resume_intent, ResumeIntent::Cleared) {
+                self.set_agent_conversation(None, None, None);
+                self.resume_probe_failed_sid = None;
             }
             tracing::info!(target: "session.store", %context, %selector,
                 "command supplies its own native session selector; skipping AoE session injection");
@@ -2308,6 +2323,29 @@ work-opencode = "opencode"
                 );
                 assert!(error.contains("clear the AoE-managed resume state"));
             }
+            // A cleared id isn't AoE's conversation: the command runs as written and the clear
+            // still applies, since the selector skips acquisition.
+            let mut cleared = tool_instance("claude", "/tmp/x");
+            cleared.agent_session_id = Some(sid.to_string());
+            cleared.resume_intent = ResumeIntent::Cleared;
+            let mut actual = command.to_string();
+            assert!(!cleared
+                .apply_session_flags(
+                    &mut actual,
+                    None,
+                    None,
+                    &super::execution::AgentLaunchContext::host(
+                        cleared.default_selector_agent(),
+                        cleared
+                            .default_selector_agent()
+                            .and_then(|agent| cleared.host_agent_command(agent, None))
+                            .as_ref()
+                    ),
+                    &mut cleared.conversation_state()
+                )
+                .unwrap());
+            assert_eq!(actual, command);
+            assert!(cleared.agent_session_id.is_none(), "{command}");
         }
     }
 

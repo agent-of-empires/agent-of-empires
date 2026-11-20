@@ -15,15 +15,15 @@ use tracing::{debug, info, trace, warn};
 use super::command_loop::Session;
 use super::notifications::now_ms;
 use super::CANCEL_ESCALATION_GRACE;
-use crate::acp::acp_client::commands::ClientCmd;
+use crate::acp::acp_client::commands::{ClientCmd, PromptInput};
 use crate::acp::acp_client::control::{prompt_outcome_to_response, ControlPromptResult};
 use crate::acp::acp_client::delete::handle_delete_session_cmd;
 use crate::acp::acp_client::errors::{acp_internal_error, prompt_runtime_error, AcpError};
 use crate::acp::acp_client::lifecycle::{LifecycleSignal, OffProtocolWorkKind};
 use crate::acp::acp_client::opencode::recover_opencode_prompt_error;
 use crate::acp::acp_client::rate_limit::{
-    captured_rate_limit_reset, classify_rate_limit_error, clear_captured_rejections,
-    take_rate_limit_from_captured_rejection,
+    captured_rate_limit_reset, classify_rate_limit_error, classify_rate_limit_from_message,
+    clear_captured_rejections, take_rate_limit_from_captured_rejection,
 };
 use crate::acp::acp_client::reset::ResetSessionOutcome;
 use crate::acp::acp_client::session_identity::{ordered_native_request, OrderedRequestResult};
@@ -33,12 +33,12 @@ use crate::acp::acp_client::watchdog::{
     terminal_stop_reason, SilentOrphanWatchdog, SilentOrphanWatchdogConfig,
     OFF_PROTOCOL_WORK_GRACE_FLOOR,
 };
+use crate::daemon::PromptAttachmentRef;
 
 type AcpResult<T> = Result<T, agent_client_protocol::Error>;
 type PromptFut = Pin<Box<dyn Future<Output = PromptResult> + Send>>;
-type SteerFut = Pin<
-    Box<dyn Future<Output = (Vec<ContentBlock>, OrderedRequestResult<serde_json::Value>)> + Send>,
->;
+type SteerFut =
+    Pin<Box<dyn Future<Output = (PromptInput, OrderedRequestResult<serde_json::Value>)> + Send>>;
 type PromptResult = OrderedRequestResult<PromptResponse>;
 
 struct LocalPromptScope(std::sync::Arc<super::notifications::Shared>);
@@ -100,10 +100,15 @@ struct TurnFlags {
     result_observed: bool,
     /// What the adapter reported; `None` when no `PromptResponse` arrived.
     agent_stop_reason: Option<StopReason>,
+    /// The error the agent answered `session/prompt` with.
+    rejection: Option<agent_client_protocol::Error>,
 }
 
 struct Turn {
     epoch: u64,
+    /// Handed back on a rejection so the user can retry it.
+    prompt_text: String,
+    prompt_attachments: Vec<PromptAttachmentRef>,
     flags: TurnFlags,
     preceding: Vec<Event>,
     watchdog: SilentOrphanWatchdog,
@@ -115,7 +120,7 @@ struct Turn {
     /// At most one steer is outstanding so racing steers cannot reorder the
     /// user's messages; later ones wait in the backlog.
     steer_fut: Option<SteerFut>,
-    steer_backlog: VecDeque<Vec<ContentBlock>>,
+    steer_backlog: VecDeque<PromptInput>,
 }
 
 impl Turn {
@@ -153,7 +158,11 @@ fn simulate_orphan(session_label: &str) -> bool {
 impl Session {
     /// Runs one operation. A connection-loss event is itself terminal; it does
     /// not manufacture a second `Stopped` or a peer prompt failure.
-    pub(super) async fn run_prompt(&mut self, blocks: Vec<ContentBlock>) -> AcpResult<bool> {
+    pub(super) async fn run_prompt(&mut self, prompt: PromptInput) -> AcpResult<bool> {
+        let PromptInput {
+            blocks,
+            attachments,
+        } = prompt;
         let shared = self.shared.clone();
         let publication = shared.state.publication.lock().await;
         let epoch = {
@@ -221,6 +230,8 @@ impl Session {
         let mut turn = Turn {
             epoch,
             preceding: Vec::new(),
+            prompt_text: first_text_block(&blocks),
+            prompt_attachments: attachments,
             flags: TurnFlags::default(),
             watchdog: SilentOrphanWatchdog::default(),
             cfg: SilentOrphanWatchdogConfig {
@@ -292,10 +303,10 @@ impl Session {
                 {
                     self.on_orphan_check(&mut turn).await
                 }
-                (blocks, res) = async {
+                (prompt, res) = async {
                     turn.steer_fut.as_mut().expect("guarded by the arm condition").await
                 }, if turn.steer_fut.is_some() => {
-                    self.on_steer_result(&mut turn, blocks, res).await;
+                    self.on_steer_result(&mut turn, prompt, res).await;
                     Flow::Continue
                 }
             };
@@ -416,6 +427,17 @@ impl Session {
             Ok(_) => return Ok(Flow::Break),
             Err(error) => error,
         };
+        if correlated {
+            if turn.flags.cancelling || turn.flags.orphan_cancel_sent {
+                turn.flags.prompt_cancelled = true;
+            } else {
+                turn.flags.rejection = Some(error);
+                if let Err(error) = self.send_cancel().await {
+                    debug!(target: "acp.protocol", %error, "cancel after a rejected prompt failed");
+                }
+            }
+            return Ok(Flow::Break);
+        }
         warn!(target: "acp.protocol", session = %self.shared.session_label, ?error, "prompt operation failed; preserving connection and conversation");
         let mut diagnostic = prompt_runtime_error(
             &error,
@@ -444,11 +466,16 @@ impl Session {
         let shared = &self.shared;
         match result {
             Err(error) => {
-                return classify_rate_limit_error(
-                    error,
-                    captured_rate_limit_reset(&shared.rate_limit_rejections, chrono::Utc::now())
-                        .as_ref(),
-                )
+                let captured =
+                    captured_rate_limit_reset(&shared.rate_limit_rejections, chrono::Utc::now());
+                return classify_rate_limit_error(error, captured.as_ref()).or_else(|| {
+                    classify_rate_limit_from_message(&error.message, captured.as_ref()).map(
+                        |mut info| {
+                            info.status = super::super::errors::public_error_message(error);
+                            info
+                        },
+                    )
+                });
             }
             Ok(response) if matches!(response.stop_reason, StopReason::Cancelled) => return None,
             Ok(_) => {}
@@ -485,11 +512,12 @@ impl Session {
         deadline
     }
 
-    async fn reject_busy(&self, text: String) {
+    async fn reject_busy(&self, text: String, attachments: Vec<PromptAttachmentRef>) {
         self.shared
             .emit(Event::PromptRejected {
                 reason: "agent_busy".into(),
                 text,
+                attachments,
             })
             .await;
     }
@@ -550,7 +578,7 @@ impl Session {
                     .resume_task_tailing(&self.acp_session_id.0, task_ids)
                     .await
             }
-            Some(ClientCmd::Prompt(blocks)) => return Ok(self.on_follow_up(turn, blocks).await),
+            Some(ClientCmd::Prompt(prompt)) => return Ok(self.on_follow_up(turn, prompt).await),
             Some(ClientCmd::ResetSession {
                 text, respond_to, ..
             }) => {
@@ -559,7 +587,7 @@ impl Session {
                     target: "acp.protocol",
                     "conversation reset requested during in-flight prompt; refusing"
                 );
-                self.reject_busy(text).await;
+                self.reject_busy(text, Vec::new()).await;
                 let _ = respond_to.send(ResetSessionOutcome::Failed {
                     message: "a turn is in flight; stop it before clearing the conversation".into(),
                 });
@@ -589,7 +617,7 @@ impl Session {
         Ok(Flow::Continue)
     }
 
-    async fn on_follow_up(&mut self, turn: &mut Turn, blocks: Vec<ContentBlock>) -> Flow {
+    async fn on_follow_up(&mut self, turn: &mut Turn, prompt: PromptInput) -> Flow {
         let label = self.shared.session_label.clone();
         // A follow-up while cancelling means the user force-ended and
         // re-typed: the agent is wedged. Reject first so nothing is lost.
@@ -599,7 +627,7 @@ impl Session {
                 session = %label,
                 "follow-up prompt arrived while cancel pending; escalating to runner restart"
             );
-            self.reject_busy(first_text_block(&blocks)).await;
+            self.reject_busy(prompt.text(), prompt.attachments).await;
             turn.flags.agent_unresponsive = true;
             turn.flags.shutdown = true;
             return Flow::Break;
@@ -609,33 +637,33 @@ impl Session {
         let compacting =
             turn.watchdog.off_protocol_work_seen() == Some(OffProtocolWorkKind::Compaction);
         if self.steering_capable && !compacting {
-            self.steer_or_backlog(turn, blocks);
+            self.steer_or_backlog(turn, prompt);
         } else {
             warn!(
                 target: "acp.protocol",
                 compacting,
                 "received Prompt while one is in flight and it cannot be steered into; rejecting"
             );
-            self.reject_busy(first_text_block(&blocks)).await;
+            self.reject_busy(prompt.text(), prompt.attachments).await;
         }
         Flow::Continue
     }
 
-    fn steer_or_backlog(&self, turn: &mut Turn, blocks: Vec<ContentBlock>) {
+    fn steer_or_backlog(&self, turn: &mut Turn, prompt: PromptInput) {
         if turn.steer_fut.is_some() {
-            turn.steer_backlog.push_back(blocks);
+            turn.steer_backlog.push_back(prompt);
             return;
         }
         info!(
             target: "acp.protocol",
             session = %self.shared.session_label,
             "sending _session/steering during in-flight prompt ({} content blocks)",
-            blocks.len()
+            prompt.blocks.len()
         );
         let request = ordered_native_request(
             &self.connection,
             &self.shared.connection_state,
-            SteerRequest::new(self.acp_session_id.clone(), blocks.clone()),
+            SteerRequest::new(self.acp_session_id.clone(), prompt.blocks.clone()),
         );
         turn.steer_fut = Some(Box::pin(async move {
             let result = match request {
@@ -645,7 +673,7 @@ impl Session {
                 }
                 Err(error) => OrderedRequestResult::Refused(acp_internal_error(error.to_string())),
             };
-            (blocks, result)
+            (prompt, result)
         }));
     }
 
@@ -714,7 +742,7 @@ impl Session {
     async fn on_steer_result(
         &mut self,
         turn: &mut Turn,
-        blocks: Vec<ContentBlock>,
+        prompt: PromptInput,
         res: OrderedRequestResult<serde_json::Value>,
     ) {
         turn.steer_fut = None;
@@ -746,7 +774,7 @@ impl Session {
                     session = %label,
                     "_session/steering raced the turn's end; re-dispatching as a normal prompt"
                 );
-                self.pending_prompts.push_back(blocks);
+                self.pending_prompts.push_back(prompt);
                 self.pending_prompts.extend(turn.steer_backlog.drain(..));
             }
             Ok(outcome @ (SteerOutcome::StartedNewTurn | SteerOutcome::Unknown)) => {
@@ -765,7 +793,7 @@ impl Session {
                     error = %e,
                     "_session/steering failed; falling back to agent_busy rejection"
                 );
-                self.reject_busy(first_text_block(&blocks)).await;
+                self.reject_busy(prompt.text(), prompt.attachments).await;
             }
         }
         if let Some(next) = turn.steer_backlog.pop_front() {
@@ -788,6 +816,7 @@ impl Session {
         let w = &turn.watchdog;
         let finished = w.cost_seen() && w.off_protocol_work_seen().is_none();
         if !turn.flags.prompt_failed
+            && turn.flags.rejection.is_none()
             && shared.profile.key == "opencode"
             && finished
             && !w.saw_progress()
@@ -806,8 +835,22 @@ impl Session {
                 turn.flags.prompt_failed = true;
             }
         }
+        let rejected = turn.flags.rejection.is_some();
+        if let Some(error) = turn.flags.rejection.take() {
+            preceding.push(prompt_runtime_error(
+                &error,
+                crate::session::ErrorEvidenceSource::LocalPromptResult,
+            ));
+            preceding.push(Event::PromptRejected {
+                reason: "prompt_failed".into(),
+                text: std::mem::take(&mut turn.prompt_text),
+                attachments: std::mem::take(&mut turn.prompt_attachments),
+            });
+        }
         let f = &mut turn.flags;
-        let reason = if f.rate_limit.is_none() && f.prompt_failed {
+        let reason = if rejected {
+            "prompt_rejected"
+        } else if f.rate_limit.is_none() && f.prompt_failed {
             "prompt_failed"
         } else {
             terminal_stop_reason(
@@ -824,13 +867,14 @@ impl Session {
             preceding.push(Event::RateLimit { info });
         }
         let terminal_at = now_ms();
-        let claimed = if reason == "prompt_failed" || reason == "rate_limited" {
+        let failed = matches!(reason, "prompt_failed" | "prompt_rejected" | "rate_limited");
+        let claimed = if failed {
             shared.terminal_claim.claim_failed()
         } else {
             shared.terminal_claim.claim()
         };
         if claimed {
-            if reason == "prompt_failed" || reason == "rate_limited" {
+            if failed {
                 shared.between_prompt.deactivate();
             }
             if f.result_observed {
@@ -850,8 +894,8 @@ impl Session {
             .lock()
             .expect("last prompt mutex poisoned")
             .1 = now_ms();
-        shared.prompt_in_flight.store(false, Ordering::Relaxed);
         *shared.cancel_deadline.lock().unwrap() = None;
+        shared.prompt_in_flight.store(false, Ordering::Release);
         if shared.subagent_activity_at.load(Ordering::Relaxed) >= terminal_at
             || shared.subagent_working(now_ms())
         {

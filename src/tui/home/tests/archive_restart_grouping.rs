@@ -2643,7 +2643,7 @@ fn paint_never_forks_tmux_even_with_empty_absent_or_expired_caches() {
                 let backend = TestBackend::new(120, 40);
                 let mut terminal = Terminal::new(backend).unwrap();
                 terminal
-                    .draw(|f| env.view.render(f, f.area(), &theme, None, None, None))
+                    .draw(|f| env.view.render(f, f.area(), &theme, None))
                     .unwrap();
             }
             let forks = crate::tmux::fork_probe::take();

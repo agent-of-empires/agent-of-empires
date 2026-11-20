@@ -1,6 +1,8 @@
-import { useEffect, useRef, useState, type KeyboardEvent as ReactKeyboardEvent } from "react";
-import { fetchAccountTargets, switchSessionAccount } from "../../lib/api";
+import { useEffect, useEffectEvent, useRef, useState, type KeyboardEvent as ReactKeyboardEvent } from "react";
+import { useIsCoarsePointer } from "../../hooks/useIsCoarsePointer";
+import { fetchAccountTargets } from "../../lib/api";
 import type { AuthStatus } from "../../lib/acpTypes";
+import { dispatchFocusTerminal } from "../../lib/terminalFocus";
 
 interface Props {
   open: boolean;
@@ -13,10 +15,12 @@ interface Props {
   targets?: readonly string[];
   /** The account an automatic failover is moving to; confirming is blocked meanwhile. */
   failoverTo?: string;
+  /** Starts the switch; the dialog closes at once and the caller shows progress and errors. */
+  onSwitch: (tool: string) => void;
   onClose: () => void;
 }
 
-/** Restarts the session as another account of the same agent, keeping the conversation. */
+/** Picks another account of the same agent to continue the conversation on. */
 export function SwitchAccountModal({ open, ...rest }: Props) {
   // Mounted per opening, so each one starts with fresh state.
   return open ? <SwitchAccountDialog {...rest} /> : null;
@@ -28,12 +32,11 @@ function SwitchAccountDialog({
   authStatus,
   targets: given,
   failoverTo,
+  onSwitch,
   onClose,
 }: Omit<Props, "open">) {
   const [loaded, setLoaded] = useState<string[] | null | undefined>(undefined);
   const [choice, setChoice] = useState<string | null>(null);
-  const [submitting, setSubmitting] = useState(false);
-  const [error, setError] = useState<string | null>(null);
   const confirmRef = useRef<HTMLButtonElement>(null);
   const cancelRef = useRef<HTMLButtonElement>(null);
   const dialogRef = useRef<HTMLDivElement>(null);
@@ -54,15 +57,21 @@ function SwitchAccountDialog({
 
   useEffect(() => {
     const onKey = (e: KeyboardEvent) => {
-      if (e.key === "Escape" && !submitting) onClose();
+      if (e.key === "Escape") onClose();
     };
     document.addEventListener("keydown", onKey);
     return () => document.removeEventListener("keydown", onKey);
-  }, [submitting, onClose]);
+  }, [onClose]);
 
+  const isCoarse = useIsCoarsePointer();
+  // Confirming hides the banner button that opened this, so focus falls back to the composer; not on touch, where it opens the keyboard.
+  const restoreFocus = useEffectEvent((previous: HTMLElement | null) => {
+    if (previous?.isConnected) previous.focus();
+    else if (!isCoarse) dispatchFocusTerminal("composer");
+  });
   useEffect(() => {
     const previous = document.activeElement as HTMLElement | null;
-    return () => previous?.focus?.();
+    return () => restoreFocus(previous);
   }, []);
 
   // Confirm is disabled until the names load, so focus Cancel meanwhile and move on once it can take it.
@@ -75,10 +84,6 @@ function SwitchAccountDialog({
   // Tab and Shift+Tab wrap instead of reaching the page behind the dialog.
   const trapTab = (e: ReactKeyboardEvent) => {
     if (e.key !== "Tab") return;
-    if (submitting) {
-      e.preventDefault();
-      return;
-    }
     // The radio group is one tab stop, its checked radio, so that is the first stop, not the first radio.
     const items = Array.from(
       dialogRef.current?.querySelectorAll<HTMLElement>("button:not([disabled]), input:not([disabled])") ?? [],
@@ -92,19 +97,10 @@ function SwitchAccountDialog({
     }
   };
 
-  const confirm = async () => {
+  const confirm = () => {
     if (!selected || failoverTo) return;
-    setSubmitting(true);
-    setError(null);
-    // Submitting disables every control, which would drop focus to the page behind, so park it here.
-    dialogRef.current?.focus();
-    const result = await switchSessionAccount(sessionId, selected);
-    setSubmitting(false);
-    if (result.ok) onClose();
-    else {
-      setError(result.message ?? "Switching account failed.");
-      requestAnimationFrame(() => confirmRef.current?.focus());
-    }
+    onSwitch(selected);
+    onClose();
   };
 
   const identity = [authStatus?.label, authStatus?.account?.plan].filter((d): d is string => !!d);
@@ -121,7 +117,7 @@ function SwitchAccountDialog({
       data-testid="switch-account-modal"
       className="fixed inset-0 z-50 flex items-center justify-center bg-black/60 px-4"
       onClick={(e) => {
-        if (e.target === e.currentTarget && !submitting) onClose();
+        if (e.target === e.currentTarget) onClose();
       }}
     >
       <div className="w-full max-w-lg rounded-lg border border-surface-700 bg-surface-900 p-5 text-text-primary shadow-xl">
@@ -161,7 +157,6 @@ function SwitchAccountDialog({
                     value={name}
                     checked={selected === name}
                     onChange={() => setChoice(name)}
-                    disabled={submitting}
                   />
                   {name}
                 </label>
@@ -176,19 +171,12 @@ function SwitchAccountDialog({
           </div>
         )}
 
-        {error && (
-          <div className="mt-3 text-xs text-status-error" role="alert" data-testid="switch-account-error">
-            {error}
-          </div>
-        )}
-
         <div className="mt-5 flex justify-end gap-2">
           <button
             ref={cancelRef}
             type="button"
             onClick={onClose}
-            disabled={submitting}
-            className="rounded border border-surface-700 px-3 py-1 text-xs font-medium hover:bg-surface-800 disabled:cursor-not-allowed disabled:opacity-60"
+            className="rounded border border-surface-700 px-3 py-1 text-xs font-medium hover:bg-surface-800"
           >
             Cancel
           </button>
@@ -196,11 +184,11 @@ function SwitchAccountDialog({
             ref={confirmRef}
             type="button"
             data-testid="switch-account-confirm"
-            onClick={() => void confirm()}
-            disabled={!selected || submitting || !!failoverTo}
+            onClick={confirm}
+            disabled={!selected || !!failoverTo}
             className="rounded border border-brand-700 bg-brand-900/40 px-3 py-1 text-xs font-medium text-brand-100 hover:bg-brand-900/60 disabled:cursor-not-allowed disabled:opacity-60"
           >
-            {submitting ? "Switching..." : `Switch to ${selected ?? ""}`}
+            {`Switch to ${selected ?? ""}`}
           </button>
         </div>
       </div>

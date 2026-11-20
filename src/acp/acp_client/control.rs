@@ -555,7 +555,8 @@ impl DaemonControlClient {
         }
     }
 
-    /// Registers the completion waiter before sending the `Prompt` frame.
+    /// Registers the completion waiter before sending the `Prompt` frame. A
+    /// waiter already pending is refused locally, without a frame.
     pub(super) async fn prompt(
         &self,
         request: serde_json::Value,
@@ -1956,7 +1957,10 @@ mod tests {
         .unwrap();
         assert!(peer.terminal.failed());
         let old_turn = peer.terminal.current_turn();
-        commands.send(ClientCmd::Prompt(Vec::new())).await.unwrap();
+        commands
+            .send(ClientCmd::Prompt(Vec::new().into()))
+            .await
+            .unwrap();
         let (flushed, mut flush) = oneshot::channel();
         commands
             .send(ClientCmd::FlushForTest(flushed))
@@ -2472,6 +2476,8 @@ mod tests {
                                 },
                             }
                         }
+                        // Sent after a plain rejection (#5662).
+                        ControlBody::Cancel => continue,
                         frame => panic!("unexpected resumed-session request: {frame:?}"),
                     };
                     control_protocol::write_frame(&mut peer, &reply)
@@ -2499,7 +2505,7 @@ mod tests {
                 .await
                 .unwrap();
                 for (text, expected_reason) in [
-                    ("continue", "prompt_failed"),
+                    ("continue", "prompt_rejected"),
                     ("explicit next request", "prompt_complete"),
                 ] {
                     client.send_prompt(text, &[]).await.unwrap();
@@ -2521,7 +2527,7 @@ mod tests {
                                 panic!("peer data is not an EOF observation")
                             }
                             Event::PromptRuntimeError { message: error, .. } => {
-                                assert_eq!(expected_reason, "prompt_failed");
+                                assert_eq!(expected_reason, "prompt_rejected");
                                 assert_eq!(error, message);
                                 diagnostics += 1;
                             }
@@ -2529,7 +2535,7 @@ mod tests {
                                 assert_eq!(reason, expected_reason);
                                 assert_eq!(
                                     diagnostics,
-                                    usize::from(expected_reason == "prompt_failed")
+                                    usize::from(expected_reason == "prompt_rejected")
                                 );
                                 break;
                             }
@@ -3590,7 +3596,10 @@ mod tests {
             .await
             .unwrap();
             assert_eq!(peer.terminal.current_turn(), adopted_turn);
-            commands.send(ClientCmd::Prompt(Vec::new())).await.unwrap();
+            commands
+                .send(ClientCmd::Prompt(Vec::new().into()))
+                .await
+                .unwrap();
             let next = tokio::time::timeout(
                 Duration::from_secs(10),
                 control_protocol::read_frame(&mut peer.peer),

@@ -230,10 +230,11 @@ pub(crate) fn tmux_command() -> Command {
 /// non-`ECONNREFUSED` connect failure, and glibc localizes `strerror` by
 /// `LC_MESSAGES`, so on a non-English host the `(No such file or directory)`
 /// ENOENT marker for an absent socket (#3337) would not match. `LC_ALL` is
-/// removed so it cannot override that. Global `-u` forces UTF-8 session names
-/// even when the caller has `LC_CTYPE=C` or when `LC_ALL` was the only UTF-8
-/// locale source. Used by the status-query callers (which classify via
-/// [`tmux_no_server_running`]) and by `kill_session_if_present`. NOT folded into
+/// removed so it cannot override that. Global `-u` keeps format output intact
+/// (separators, session names, pane titles) even when the caller has
+/// `LC_CTYPE=C` or when `LC_ALL` was the only UTF-8 locale source, since tmux
+/// prints anything outside printable ASCII as `_` to a non-UTF-8 client. Used
+/// for every query whose output aoe parses, and by `kill_session_if_present`. NOT folded into
 /// [`tmux_command`]: the interactive attach/switch-client/capture-pane paths must
 /// keep the user's locale for UTF-8 and status-bar rendering, and `-u` would
 /// assert UTF-8 to a terminal that may not be.
@@ -508,12 +509,65 @@ thread_local! {
     static TMUX_COMMAND_EXECUTIONS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
 }
 
+/// Sessions whose exact-target commands time out, one entry per live [`TmuxTimeoutGuard`].
+#[cfg(test)]
+static TIMED_OUT_SESSIONS: Mutex<Vec<String>> = Mutex::new(Vec::new());
+
+/// Test-only: every deadline-bounded tmux command aimed at the exact session `=name` (or one of
+/// its windows or panes) times out until the guard drops, as when the server is too slow to
+/// answer. Keyed by name, so a parallel test's commands run normally.
+#[cfg(test)]
+pub(crate) struct TmuxTimeoutGuard(String);
+
+#[cfg(test)]
+impl TmuxTimeoutGuard {
+    pub(crate) fn arm(session_name: &str) -> Self {
+        TIMED_OUT_SESSIONS
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .push(session_name.to_owned());
+        Self(session_name.to_owned())
+    }
+
+    fn times_out(cmd: &Command) -> bool {
+        let sessions = TIMED_OUT_SESSIONS.lock().unwrap_or_else(|e| e.into_inner());
+        cmd.get_args().any(|arg| {
+            let arg = arg.to_string_lossy();
+            arg.strip_prefix('=').is_some_and(|target| {
+                sessions.iter().any(|name| {
+                    target == name
+                        || target
+                            .strip_prefix(name.as_str())
+                            .is_some_and(|rest| rest.starts_with(':'))
+                })
+            })
+        })
+    }
+}
+
+#[cfg(test)]
+impl Drop for TmuxTimeoutGuard {
+    fn drop(&mut self) {
+        let mut sessions = TIMED_OUT_SESSIONS.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(at) = sessions.iter().position(|name| *name == self.0) {
+            sessions.remove(at);
+        }
+    }
+}
+
 fn run_tmux_command_with_timeout_inner(
     cmd: &mut Command,
     timeout: Duration,
 ) -> std::io::Result<Output> {
     #[cfg(test)]
     TMUX_COMMAND_EXECUTIONS.with(|count| count.set(count.get() + 1));
+    #[cfg(test)]
+    if TmuxTimeoutGuard::times_out(cmd) {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::TimedOut,
+            "tmux command timed out (test)",
+        ));
+    }
     cmd.stdin(Stdio::null());
     match crate::process::run_with_timeout(cmd, timeout)? {
         Some(output) => Ok(output),
@@ -3675,9 +3729,9 @@ mod tests {
         );
     }
 
-    // Unrelated tests can launch tools without holding EnvGuard's process-wide lock.
+    // Isolate process-wide probe and socket state from unrelated tests.
     #[cfg(unix)]
-    fn run_probe_test_in_subprocess() -> bool {
+    pub(super) fn run_probe_test_in_subprocess() -> bool {
         const CHILD_ENV: &str = "AOE_AGENT_PROBE_TEST_CHILD";
         let thread = std::thread::current();
         let test = thread.name().expect("named test thread");

@@ -84,6 +84,9 @@ fn park_message(project_path: &str) -> String {
     }
 }
 
+/// Banner for a session whose queued prompts wait behind a durable stop.
+const STOP_FENCE_MESSAGE: &str = "Structured view worker was stopped (aoe acp stop); queued prompts wait until the session is started again.";
+
 #[derive(Debug, Clone)]
 pub struct ResumeDeferral {
     entry: DeferredResume,
@@ -275,6 +278,7 @@ pub async fn reconcile_acp_workers(
     respawn_history: &mut HashMap<String, Vec<Instant>>,
     parked: &mut HashSet<String>,
     resume_deferred: &mut HashMap<String, ResumeDeferral>,
+    stop_notified: &mut HashSet<String>,
 ) {
     let supervisor = &state.acp_supervisor;
     supervisor.settle_fork_rejections().await;
@@ -385,6 +389,8 @@ pub async fn reconcile_acp_workers(
     parked.retain(|id| live.contains(id));
     respawn_history.retain(|id, _| live.contains(id));
     resume_deferred.retain(|id, _| live.contains(id));
+    stop_notified
+        .retain(|id| live.contains(id) && crate::process::worker_registry::stop_requested(id));
 
     // Must precede scheduling: capacity counts registry entries, so dead
     // entries would block legitimate spawns.
@@ -392,6 +398,37 @@ pub async fn reconcile_acp_workers(
     readopt_orphan_runners(state, attempted).await;
     drain_pending_initial_turns(state).await;
     drain_queued_prompts(state).await;
+
+    let login = &state.session_service.sandbox_login;
+    for id in release_logged_in(state, login.held_ids()).await {
+        if with_queued_prompts.contains(&id) {
+            let Some(park) = query_store(
+                &state.acp_event_store,
+                &id,
+                "login queue release",
+                |store, id| store.rate_limit_park(id),
+            )
+            .await
+            else {
+                continue;
+            };
+            if let Some(park) = park {
+                let Some(submission) = state.session_service.try_prompt_submission(&id).await
+                else {
+                    continue;
+                };
+                rate_limit::schedule_quota_release(
+                    state.clone(),
+                    id.clone(),
+                    submission,
+                    rate_limit::QuotaResume::LoginQueue { park_seq: park.seq },
+                );
+                continue;
+            }
+        }
+        login.release(&id);
+        forget_session_budget(&id, attempted, parked, respawn_history, resume_deferred);
+    }
 
     let mut tasks = Vec::new();
     for mut target in targets {
@@ -463,6 +500,30 @@ pub async fn reconcile_acp_workers(
                 }
             }
         }
+        // A stop fences automatic resumes, but is not a crash-loop park.
+        if crate::process::worker_registry::stop_requested(&id) {
+            if with_queued_prompts.contains(&id)
+                && !stop_notified.contains(&id)
+                && crate::server::api::publish_startup_error_if_current(
+                    state,
+                    &id,
+                    &target.source_profile,
+                    target.lifecycle_generation,
+                    STOP_FENCE_MESSAGE.to_string(),
+                )
+                .await
+            {
+                // Logged once per notice; a refused publication retries next tick.
+                tracing::info!(
+                    target: "acp.supervisor",
+                    session = %id,
+                    "holding queued prompts: the worker was stopped and waits for an explicit start"
+                );
+                stop_notified.insert(id.clone());
+            }
+            attempted.insert(id);
+            continue;
+        }
         if let Some(park) = query_store(
             &state.acp_event_store,
             &id,
@@ -472,7 +533,11 @@ pub async fn reconcile_acp_workers(
         .await
         .flatten()
         {
-            if park.cap_reached && with_queued_prompts.contains(&id) {
+            if park.cap_reached
+                && with_queued_prompts.contains(&id)
+                && !login.is_held(&id)
+                && !parked.contains(&id)
+            {
                 rate_limit::schedule_capped_queue(state, &id, park.seq).await;
             }
             attempted.insert(id.clone());
@@ -504,6 +569,11 @@ pub async fn reconcile_acp_workers(
             AcpWorkerState::Absent => {}
         }
         if parked.contains(&id) {
+            attempted.insert(id);
+            continue;
+        }
+        // Waiting on the sandbox login spends no respawn budget.
+        if login.is_held(&id) {
             attempted.insert(id);
             continue;
         }
@@ -646,6 +716,54 @@ pub async fn reconcile_acp_workers(
             }
         }
     }
+}
+
+/// Held ids whose launch would now pass the login gate, or whose row is gone or
+/// triaged (archived, snoozed, trashed) and so no longer waits on a launch.
+async fn release_logged_in(state: &Arc<AppState>, held: Vec<String>) -> Vec<String> {
+    if held.is_empty() {
+        return Vec::new();
+    }
+    let rows: Vec<(String, Option<Instance>)> = {
+        let instances = state.instances.read().await;
+        held.into_iter()
+            .map(|id| {
+                let row = instances
+                    .iter()
+                    .find(|i| i.id == id && is_untriaged_structured(i))
+                    .cloned();
+                (id, row)
+            })
+            .collect()
+    };
+    // The release check reads only what the session already holds (its fresh hook
+    // resolution, never a hook run per tick): a held session whose `before_start` hook starts
+    // emitting a key is released by the next send or launch attempt, which re-resolves the
+    // hook, not by this tick.
+    let release_state = Arc::clone(state);
+    tokio::task::spawn_blocking(move || {
+        rows.into_iter()
+            .filter(|(_, row)| {
+                row.as_ref().is_none_or(|i| {
+                    // A store that cannot be read keeps the session held.
+                    let config = crate::server::session_store::NativeSessionStore::open(
+                        release_state.clone(),
+                        &i.source_profile,
+                        None,
+                    )
+                    .and_then(|native| {
+                        use crate::session::SessionStore;
+                        (&native as &dyn SessionStore)
+                            .launch_configuration(std::path::Path::new(&i.project_path))
+                    });
+                    config.is_ok_and(|config| i.ensure_sandbox_login_with(&config).is_ok())
+                })
+            })
+            .map(|(id, _)| id)
+            .collect()
+    })
+    .await
+    .unwrap_or_default()
 }
 
 /// Spawns the pending-initial-turn drain (#2897) for sessions with a live worker.
@@ -1430,6 +1548,8 @@ mod tests {
                 .acp_supervisor
                 .test_insert_worker_cmd_recording(name)
                 .await;
+            let _live =
+                crate::acp::supervisor::test_support::save_agent_record(name, "claude", true);
             let sink = ChannelSink::new(
                 state.acp_events_tx.clone(),
                 Arc::clone(&state.acp_event_store),
@@ -1500,6 +1620,429 @@ mod tests {
                 assert!(commands.lock().unwrap().contains(&"reset_session"));
             }
         }
+    }
+
+    /// A sandboxed row in `separate_login` mode with a `{}` shared credential,
+    /// re-armed by a startup failure before every tick, after enough ticks to
+    /// spend the respawn budget.
+    #[cfg(unix)]
+    async fn held_for_login(id: &str, tick: &mut Tick) -> HeldForLogin {
+        let home = crate::session::test_support::isolate_app_dir();
+        let (runtime, calls) = crate::session::test_support::failing_container_runtime(home.path());
+        let project = tempfile::TempDir::new().unwrap();
+        let mut inst = test_fixtures::structured_instance(id, &project.path().to_string_lossy());
+        let shared = crate::session::test_support::sandbox_needing_login(home.path(), &mut inst);
+        let state = crate::server::test_support::build_native_test_app_state(vec![inst]).await;
+        let login = &state.session_service.sandbox_login;
+        let mut notices = login.subscribe();
+
+        for _ in 0..RECONCILER_MAX_RESPAWNS_IN_WINDOW + 2 {
+            state.acp_supervisor.note_startup_failure(id);
+            tick.run(&state).await;
+        }
+
+        let login_message = crate::session::test_support::login_required("claude").to_string();
+        let login_errors = state
+            .acp_event_store
+            .replay_from(id, 0)
+            .into_iter()
+            .filter(|(_, e)| {
+                matches!(e, crate::acp::Event::AgentStartupError { message, .. } if *message == login_message)
+            })
+            .count();
+        assert_eq!(login_errors, 1, "one launch reached the gate");
+        assert_eq!(
+            test_fixtures::startup_errors(&state, id),
+            1,
+            "no park message"
+        );
+        assert!(!tick.parked.contains(id));
+        assert!(login.is_held(id));
+        assert_eq!(
+            login.held_origin(id),
+            Some(crate::server::sandbox_login::LaunchOrigin::Unattended)
+        );
+        assert!(notices.try_recv().is_ok(), "one notice");
+        assert!(notices.try_recv().is_err(), "only one notice");
+        assert_eq!(
+            std::fs::read_to_string(&calls).unwrap_or_default(),
+            "",
+            "the gate runs before any runtime call"
+        );
+        HeldForLogin {
+            state,
+            calls,
+            shared,
+            _project: project,
+            _runtime: runtime,
+            _home: home,
+        }
+    }
+
+    /// Fields drop in order: the PATH guard before the app dir guard that owns the env lock.
+    #[cfg(unix)]
+    struct HeldForLogin {
+        state: Arc<AppState>,
+        calls: std::path::PathBuf,
+        shared: std::path::PathBuf,
+        _project: tempfile::TempDir,
+        _runtime: crate::session::test_support::EnvGuard,
+        _home: crate::session::test_support::AppDirGuard,
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn sandbox_login_hold_skips_respawn_and_budget() {
+        let id = "s-login-hold";
+        let mut tick = Tick::default();
+        let held = held_for_login(id, &mut tick).await;
+
+        // An archived row no longer waits on a launch, so it leaves the held set.
+        held.state.instances.write().await[0].archived_at = Some(chrono::Utc::now());
+        tick.run(&held.state).await;
+        assert!(!held.state.session_service.sandbox_login.is_held(id));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn sandbox_login_hold_releases_after_credential_appears() {
+        let id = "s-login-release";
+        let mut tick = Tick::default();
+        let held = held_for_login(id, &mut tick).await;
+        let (state, calls) = (&held.state, &held.calls);
+
+        crate::session::test_support::write_fake_shared_credential(&held.shared);
+        tick.run(state).await;
+
+        assert!(!state.session_service.sandbox_login.is_held(id));
+        assert_eq!(tick.respawn_history.get(id).map(Vec::len), Some(1));
+        let errors: Vec<String> = state
+            .acp_event_store
+            .replay_from(id, 0)
+            .into_iter()
+            .filter_map(|(_, e)| match e {
+                crate::acp::Event::AgentStartupError { message, .. } => Some(message),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(errors.len(), 2, "{errors:?}");
+        assert!(
+            errors[1].starts_with("sandbox container ensure failed:"),
+            "the launch passed the gate: {errors:?}"
+        );
+        assert!(
+            !std::fs::read_to_string(calls)
+                .unwrap_or_default()
+                .is_empty(),
+            "the launch reached the container runtime"
+        );
+    }
+
+    /// A turn refused for the login on a session parked on a rate limit (not at its cap,
+    /// auto-resume off) is delivered after the login: the release resumes past the park.
+    #[cfg(unix)]
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn sandbox_login_hold_release_resumes_a_parked_session_with_a_kept_turn() {
+        use crate::server::session_service::{SendTurnError, SendTurnRequest, SessionCaller};
+        let id = "s-login-parked";
+        let home = crate::session::test_support::isolate_app_dir();
+        let (_runtime, calls) =
+            crate::session::test_support::failing_container_runtime(home.path());
+        let project = tempfile::TempDir::new().unwrap();
+        let mut inst = test_fixtures::structured_instance(id, &project.path().to_string_lossy());
+        let shared = crate::session::test_support::sandbox_needing_login(home.path(), &mut inst);
+        let state = crate::server::test_support::build_native_test_app_state(vec![inst]).await;
+        let store = &state.acp_event_store;
+        store
+            .record(
+                id,
+                1,
+                &crate::acp::Event::RateLimit {
+                    info: crate::acp::state::RateLimitInfo {
+                        status: "limited".into(),
+                        resets_at: Some(chrono::Utc::now() + chrono::Duration::days(3)),
+                        kind: "usage".into(),
+                    },
+                },
+            )
+            .unwrap();
+        store
+            .record(
+                id,
+                2,
+                &crate::acp::Event::Stopped {
+                    reason: "rate_limited".into(),
+                },
+            )
+            .unwrap();
+        state.acp_supervisor.hydrate_seqs([(id.to_string(), 2)]);
+        assert!(store.rate_limit_park(id).is_some_and(|p| !p.cap_reached));
+
+        // What a plugin message does: refused for the login, then kept in the queue.
+        let service = &state.session_service;
+        let caller = SessionCaller::PluginMessage {
+            plugin_id: "cron".to_string(),
+        };
+        let refused = service
+            .send_turn(
+                &caller,
+                id,
+                SendTurnRequest {
+                    resume_authority: crate::process::worker_registry::ResumeAuthority::Explicit,
+                    text: "PR #7 was merged",
+                    attachments: &[],
+                    woke_idle_dormant: false,
+                    prompt_ids: Vec::new(),
+                    synthesized: false,
+                    no_revive: false,
+                },
+            )
+            .await;
+        assert!(matches!(refused, Err(SendTurnError::LoginRequired(_))));
+        service
+            .enqueue_prompt(
+                id,
+                "kept".into(),
+                "PR #7 was merged".into(),
+                Vec::new(),
+                None,
+                Some("cron".into()),
+            )
+            .await
+            .unwrap();
+
+        let mut tick = Tick::default();
+        tick.run(&state).await;
+        assert!(service.sandbox_login.is_held(id));
+        crate::session::test_support::write_fake_shared_credential(&shared);
+        tick.run(&state).await;
+        let submission = service.prompt_submission_for_session(id).await.unwrap();
+        drop(submission);
+        assert!(
+            service.sandbox_login.is_held(id),
+            "the failed launch keeps the login release retryable"
+        );
+        assert!(
+            !std::fs::read_to_string(&calls)
+                .unwrap_or_default()
+                .is_empty(),
+            "the release resumed the parked session"
+        );
+
+        // The fake runtime cannot start the worker; a recording fake stands in for it.
+        let _cmds = state
+            .acp_supervisor
+            .test_insert_classified_worker(id, "claude")
+            .await;
+        let _live = crate::acp::supervisor::test_support::save_agent_record(id, "claude", true);
+        let context = {
+            let rows = state.instances.read().await;
+            let row = &rows[0];
+            let store =
+                Arc::new(crate::session::Storage::open_reference(&row.source_profile).unwrap());
+            let scope = crate::acp::state::NativeObservationScope::capture(row, &store).unwrap();
+            let context = scope.context;
+            state
+                .acp_supervisor
+                .current_lease(id)
+                .unwrap()
+                .set_admission(Some(crate::acp::supervisor::LaunchAdmission {
+                    store,
+                    generation: row.lifecycle_generation,
+                    namespace: Some(state.profile_namespace.clone()),
+                    native_scope: Some(scope),
+                }));
+            context
+        };
+        state
+            .acp_supervisor
+            .test_publish_worker_attached_in(id, Some(context));
+        state.acp_supervisor.test_observe_native_ready(id).await;
+        state.instances.write().await[0].status = crate::session::Status::Idle;
+        tick.run(&state).await;
+        let submission = service.prompt_submission_for_session(id).await.unwrap();
+        drop(submission);
+        assert!(
+            service.queued_prompts_snapshot(id).await.is_empty(),
+            "{:?}",
+            store.replay_from(id, 0)
+        );
+        let delivered: Vec<String> = store
+            .replay_from(id, 0)
+            .into_iter()
+            .filter_map(|(_, e)| match e {
+                crate::acp::Event::UserPromptSent { text, .. } => Some(text),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(delivered, ["PR #7 was merged"]);
+    }
+
+    /// What `aoe acp stop` leaves once the worker is gone: the durable stop token, no record.
+    #[cfg(unix)]
+    fn settle_a_stop(id: &str) {
+        use crate::process::worker_registry as registry;
+        let record = registry::WorkerRecord::new(
+            id.into(),
+            std::process::id(),
+            registry::socket_path_for(id).unwrap(),
+            "agent".into(),
+            "agent".into(),
+            "/tmp".into(),
+            None,
+            Vec::new(),
+            Vec::new(),
+            None,
+            None,
+        );
+        registry::save(&record).unwrap();
+        registry::request_stop(&record).unwrap();
+        registry::retire_selected(&record).unwrap();
+        assert!(registry::stop_requested(id));
+        assert!(registry::load(id).unwrap().is_none());
+    }
+
+    /// A plugin message to a stopped, login-less sandbox: refused for the login and
+    /// kept in the queue, as the plugin API does.
+    #[cfg(unix)]
+    async fn plugin_message_kept_for_login(
+        service: &Arc<crate::server::session_service::SessionService>,
+        id: &str,
+    ) {
+        use crate::server::session_service::{SendTurnError, SendTurnRequest, SessionCaller};
+        let caller = SessionCaller::PluginMessage {
+            plugin_id: "cron".to_string(),
+        };
+        let refused = service
+            .send_turn(
+                &caller,
+                id,
+                SendTurnRequest {
+                    resume_authority: crate::process::worker_registry::ResumeAuthority::Explicit,
+                    text: "PR #7 was merged",
+                    attachments: &[],
+                    woke_idle_dormant: false,
+                    prompt_ids: Vec::new(),
+                    synthesized: false,
+                    no_revive: false,
+                },
+            )
+            .await;
+        assert!(matches!(refused, Err(SendTurnError::LoginRequired(_))));
+        service
+            .enqueue_prompt(
+                id,
+                "kept".into(),
+                "PR #7 was merged".into(),
+                Vec::new(),
+                None,
+                Some("cron".into()),
+            )
+            .await
+            .unwrap();
+    }
+
+    /// The explicit revival a plugin message asks for crosses the stop fence before the hold,
+    /// so the automatic resume after the login is admitted and delivers the message once.
+    #[cfg(unix)]
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn sandbox_login_hold_keeps_the_explicit_revival_across_a_settled_stop() {
+        let id = "s-login-stopped";
+        let home = crate::session::test_support::isolate_app_dir();
+        let (_runtime, calls) =
+            crate::session::test_support::failing_container_runtime(home.path());
+        let project = tempfile::TempDir::new().unwrap();
+        let mut inst = test_fixtures::structured_instance(id, &project.path().to_string_lossy());
+        let shared = crate::session::test_support::sandbox_needing_login(home.path(), &mut inst);
+        let state = crate::server::test_support::build_native_test_app_state(vec![inst]).await;
+        let service = &state.session_service;
+
+        settle_a_stop(id);
+        plugin_message_kept_for_login(service, id).await;
+        assert!(
+            !crate::process::worker_registry::stop_requested(id),
+            "the explicit revival consumed the stop token it observed"
+        );
+
+        let mut tick = Tick::default();
+        tick.run(&state).await;
+        assert!(service.sandbox_login.is_held(id));
+        crate::session::test_support::write_fake_shared_credential(&shared);
+        tick.run(&state).await;
+        assert!(!service.sandbox_login.is_held(id));
+        assert!(
+            !std::fs::read_to_string(&calls)
+                .unwrap_or_default()
+                .is_empty(),
+            "the release resumed the stopped session"
+        );
+
+        let _cmds = state
+            .acp_supervisor
+            .test_insert_classified_worker(id, "claude")
+            .await;
+        let context = {
+            let rows = state.instances.read().await;
+            let row = &rows[0];
+            let storage = crate::session::Storage::open_reference(&row.source_profile).unwrap();
+            crate::acp::state::NativeObservationScope::capture(row, &storage)
+                .unwrap()
+                .context
+        };
+        state
+            .acp_supervisor
+            .test_publish_worker_attached_in(id, Some(context));
+        state.acp_supervisor.test_observe_native_ready(id).await;
+        state.instances.write().await[0].status = crate::session::Status::Idle;
+        service.drain_queued_prompts_once(id).await;
+        assert!(service.queued_prompts_snapshot(id).await.is_empty());
+        service.drain_queued_prompts_once(id).await;
+        let delivered: Vec<String> = state
+            .acp_event_store
+            .replay_from(id, 0)
+            .into_iter()
+            .filter_map(|(_, e)| match e {
+                crate::acp::Event::UserPromptSent { text, .. } => Some(text),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(delivered, ["PR #7 was merged"]);
+    }
+
+    /// A stop that lands after the explicit revival was admitted still fences the resume.
+    #[cfg(unix)]
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn sandbox_login_hold_respects_a_newer_stop() {
+        let id = "s-login-newer-stop";
+        let home = crate::session::test_support::isolate_app_dir();
+        let (_runtime, calls) =
+            crate::session::test_support::failing_container_runtime(home.path());
+        let project = tempfile::TempDir::new().unwrap();
+        let mut inst = test_fixtures::structured_instance(id, &project.path().to_string_lossy());
+        let shared = crate::session::test_support::sandbox_needing_login(home.path(), &mut inst);
+        let state = crate::server::test_support::build_native_test_app_state(vec![inst]).await;
+        let service = &state.session_service;
+
+        settle_a_stop(id);
+        plugin_message_kept_for_login(service, id).await;
+        settle_a_stop(id);
+
+        let mut tick = Tick::default();
+        crate::session::test_support::write_fake_shared_credential(&shared);
+        tick.run(&state).await;
+        assert!(!service.sandbox_login.is_held(id));
+        assert_eq!(
+            std::fs::read_to_string(&calls).unwrap_or_default(),
+            "",
+            "the newer stop fenced the resume"
+        );
+        assert!(crate::process::worker_registry::stop_requested(id));
+        assert_eq!(service.queued_prompts_snapshot(id).await.len(), 1);
     }
 
     /// Wake-on-drain: a dormant session with a queue must be woken, or its
@@ -1666,5 +2209,131 @@ mod tests {
         assert!(tick.parked.is_empty());
         let observed = worker_registry::stop_intent(id).unwrap();
         worker_registry::admit_resume(id, ResumeAuthority::Explicit, &observed).unwrap();
+    }
+
+    /// A stop holds the queue without spending crash-loop budget or suppressing
+    /// retries after an explicit start clears the fence.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn durable_user_stop_with_a_queue_does_not_crash_loop() {
+        use crate::process::worker_registry::{self, WorkerRecord};
+        use crate::session::Status;
+
+        for status in [Status::Idle, Status::Error] {
+            let id = "sess-stopped-queued";
+            let (_home, state, project) = test_fixtures::test_state(id);
+            {
+                let mut instances = state.instances.write().await;
+                instances[0].status = status;
+                instances[0]
+                    .queued_prompts
+                    .push(test_fixtures::queued_prompt());
+            }
+            let record = WorkerRecord::new(
+                id.into(),
+                std::process::id(),
+                worker_registry::socket_path_for(id).unwrap(),
+                "aoe-agent".into(),
+                "aoe-agent".into(),
+                project.path().to_path_buf(),
+                None,
+                vec![],
+                vec![],
+                None,
+                None,
+            );
+            worker_registry::save(&record).unwrap();
+            worker_registry::request_stop(&record).unwrap();
+            worker_registry::retire_selected(&record).unwrap();
+
+            let mut tick = test_fixtures::Tick::default();
+            *state.canonical_health.write().await = crate::daemon::RuntimeHealth::Degraded {
+                code: crate::daemon::ReloadFailureCode::Metadata,
+                profiles: vec!["default".into()],
+            };
+            for _ in 0..2 {
+                tick.run(&state).await;
+            }
+            assert_eq!(count_messages(&state, id, STOP_FENCE_MESSAGE), 0);
+            assert!(!tick.stop_notified.contains(id));
+            assert!(tick.parked.is_empty());
+            assert!(tick.respawn_history.get(id).is_none_or(Vec::is_empty));
+
+            *state.canonical_health.write().await = crate::daemon::RuntimeHealth::Healthy;
+            for _ in 0..=2 * RECONCILER_MAX_RESPAWNS_IN_WINDOW {
+                tick.run(&state).await;
+            }
+
+            assert!(
+                tick.respawn_history.get(id).is_none_or(Vec::is_empty),
+                "{status:?}: a fenced session must not charge the budget"
+            );
+            assert_eq!(
+                test_fixtures::startup_errors(&state, id),
+                1,
+                "{status:?}: one banner for the stop, no crash-loop park"
+            );
+            assert_eq!(
+                count_messages(&state, id, STOP_FENCE_MESSAGE),
+                1,
+                "{status:?}: the banner names the stop"
+            );
+            assert!(tick.parked.is_empty());
+
+            // Fresh reconciler state models a daemon restart with the same fence.
+            let mut tick = test_fixtures::Tick::default();
+            for _ in 0..=2 * RECONCILER_MAX_RESPAWNS_IN_WINDOW {
+                tick.run(&state).await;
+            }
+            assert!(
+                worker_registry::stop_requested(id),
+                "{status:?}: the fence survives the restart"
+            );
+            assert!(
+                tick.respawn_history.get(id).is_none_or(Vec::is_empty),
+                "{status:?}: a restart must not charge the budget either"
+            );
+            assert_eq!(
+                test_fixtures::startup_errors(&state, id),
+                2,
+                "{status:?}: one more banner after the restart, no crash-loop park"
+            );
+            assert_eq!(
+                count_messages(&state, id, STOP_FENCE_MESSAGE),
+                2,
+                "{status:?}: each process shows the stop banner once"
+            );
+
+            // Admission clears the fence; even a failed launch must not leave
+            // the queue held by the old stop notice.
+            let observed = worker_registry::stop_intent(id).unwrap();
+            worker_registry::admit_resume(
+                id,
+                worker_registry::ResumeAuthority::Explicit,
+                &observed,
+            )
+            .unwrap();
+            tick.run(&state).await;
+            assert_eq!(
+                tick.respawn_history.get(id).map_or(0, Vec::len),
+                1,
+                "{status:?}: the explicit start is a real attempt"
+            );
+            assert_eq!(test_fixtures::startup_errors(&state, id), 3, "{status:?}");
+            assert!(!tick.stop_notified.contains(id));
+            tick.run(&state).await;
+            assert_eq!(tick.respawn_history.get(id).map_or(0, Vec::len), 2);
+        }
+    }
+
+    fn count_messages(state: &AppState, id: &str, text: &str) -> usize {
+        state
+            .acp_event_store
+            .replay_from(id, 0)
+            .into_iter()
+            .filter(|(_, e)| {
+                matches!(e, crate::acp::Event::AgentStartupError { message, .. } if message == text)
+            })
+            .count()
     }
 }

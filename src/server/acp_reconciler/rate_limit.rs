@@ -214,6 +214,7 @@ pub(crate) enum QuotaResume {
     Manual,
     Automatic { park_seq: u64 },
     QueuedAtCap { park_seq: u64 },
+    LoginQueue { park_seq: u64 },
 }
 
 pub(crate) async fn resume_rate_limited(
@@ -238,6 +239,7 @@ pub(crate) async fn resume_rate_limited(
         QuotaResume::QueuedAtCap { park_seq } if park.seq != park_seq || !park.cap_reached => {
             return Ok(())
         }
+        QuotaResume::LoginQueue { park_seq } if park.seq != park_seq => return Ok(()),
         _ => {}
     }
     let profile = {
@@ -353,7 +355,19 @@ pub(crate) async fn resume_rate_limited(
         return Ok(());
     }
     let delivery = QuotaDelivery { park_seq: park.seq };
-    let outcome = if matches!(kind, QuotaResume::QueuedAtCap { .. }) {
+    let outcome = if matches!(kind, QuotaResume::LoginQueue { .. }) {
+        if state
+            .instances
+            .read()
+            .await
+            .iter()
+            .any(|row| row.id == id && row.pending_initial_turn.is_some())
+        {
+            ContinuationOutcome::Stands
+        } else {
+            ContinuationOutcome::SupersededByQueue
+        }
+    } else if matches!(kind, QuotaResume::QueuedAtCap { .. }) {
         if state
             .session_service
             .queued_prompts_snapshot(id)
@@ -420,7 +434,7 @@ pub(super) async fn schedule_capped_queue(state: &Arc<AppState>, id: &str, park_
     true
 }
 
-fn schedule_quota_release(
+pub(super) fn schedule_quota_release(
     state: Arc<AppState>,
     id: String,
     submission: tokio::sync::OwnedMutexGuard<()>,
@@ -430,9 +444,12 @@ fn schedule_quota_release(
         "acp.quota_release",
         crate::task_util::PanicPolicy::Log,
         async move {
+            let login_release = matches!(kind, QuotaResume::LoginQueue { .. });
             if let Err(error) = resume_rate_limited(&state, &id, submission, kind).await {
                 tracing::warn!(target: "acp.supervisor", session = %id, %error,
                     "quota continuation remains held");
+            } else if login_release {
+                state.session_service.sandbox_login.release(&id);
             }
         },
     );
@@ -473,6 +490,11 @@ pub(crate) async fn reap_rate_limit_resumes(
     for row in eligible {
         let id = row.id.clone();
         let has_queued_prompts = !row.queued_prompts.is_empty();
+        if state.session_service.sandbox_login.is_held(&id)
+            || crate::process::worker_registry::stop_requested(&id)
+        {
+            continue;
+        }
         let skip = |reason: &str| {
             tracing::trace!(target: "acp.supervisor", session = %id, "rate-limit auto-resume: skipped, {reason}");
         };
@@ -758,7 +780,7 @@ mod tests {
         crate::server::test_support::refresh_canonical_metadata_for_test(state).await;
         let commands = state
             .acp_supervisor
-            .test_insert_worker_cmd_recording(id)
+            .test_insert_classified_worker(id, &row.tool)
             .await;
         let scope = crate::acp::state::NativeObservationScope::capture(&row, &storage).unwrap();
         state
@@ -875,6 +897,7 @@ mod tests {
                     .push(queued_prompt());
             }
             ready_worker(&state, id).await;
+            let _live = crate::acp::supervisor::test_support::save_agent_record(id, "claude", true);
             let frontier = state.acp_event_store.highest_seq(id);
 
             let mut tick = Tick::default();
@@ -889,7 +912,12 @@ mod tests {
 
             tick.run(&state).await;
             settle_delivery(&state, id).await;
-            assert_eq!(startup_errors(&state, id), 0, "has_queue={has_queue}");
+            assert_eq!(
+                startup_errors(&state, id),
+                0,
+                "has_queue={has_queue}: {:?}",
+                state.acp_event_store.replay_from(id, frontier)
+            );
             assert_eq!(
                 delivered_prompts(&state, id, frontier).len(),
                 usize::from(has_queue)

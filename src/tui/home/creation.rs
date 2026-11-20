@@ -195,6 +195,7 @@ impl HomeView {
                 }
                 Ok(_) => {
                     let _ = self.review_creation_trust(request.data, request.skip_on_create);
+                    self.pending_repo_trust_recovery = Some(dialog);
                     return;
                 }
                 // The daemon judges a review this process cannot rebuild.

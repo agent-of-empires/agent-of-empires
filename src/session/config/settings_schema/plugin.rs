@@ -185,6 +185,8 @@ pub fn plugin_field_descriptors(
                 validation,
                 advanced: s.advanced,
                 tui_only: false,
+                web_only: false,
+                restart: false,
                 default: s
                     .default
                     .as_ref()

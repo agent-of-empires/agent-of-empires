@@ -924,7 +924,10 @@ fn no_current_target_proves_absent(
                 && std::str::from_utf8(&inventory.stdout).is_ok_and(|rows| {
                     rows.split_terminator('\n').all(|row| {
                         row.split_once(' ').is_some_and(|(id, session)| {
-                            name.map_or(id != target, |name| session != name)
+                            id.strip_prefix('$').is_some_and(|digits| {
+                                !digits.is_empty() && digits.bytes().all(|b| b.is_ascii_digit())
+                            }) && !session.is_empty()
+                                && name.map_or(id != target, |name| session != name)
                         })
                     })
                 })
@@ -1115,7 +1118,7 @@ fn classify_live_panes(succeeded: bool, stdout: &[u8], stderr: &[u8]) -> bool {
 
 pub(crate) fn pane_current_command(session_name: &str) -> Option<String> {
     let first = first_pane_id(session_name)?;
-    crate::tmux::tmux_command()
+    crate::tmux::tmux_query_command()
         .args([
             "display-message",
             "-t",
@@ -1139,7 +1142,7 @@ pub(crate) fn pane_current_command(session_name: &str) -> Option<String> {
 /// read one way through the poller and another through `aoe session capture`.
 pub(crate) fn pane_title(session_name: &str) -> Option<String> {
     let target = format!("={session_name}:^");
-    crate::tmux::tmux_command()
+    crate::tmux::tmux_query_command()
         .args(["display-message", "-t", &target, "-p", "#{pane_title}"])
         .output()
         .ok()
@@ -1161,7 +1164,7 @@ pub(crate) fn pane_start_command_is_protected(session_name: &str) -> bool {
         return false;
     };
     let target = first;
-    crate::tmux::tmux_command()
+    crate::tmux::tmux_query_command()
         .args([
             "display-message",
             "-t",
@@ -2279,11 +2282,11 @@ mod tests {
             let root = tempfile::tempdir().unwrap();
             let binary = root.path().join("tmux");
             let listing = match case {
-                "present" => r"printf 'proof|target\n'",
-                "whitespace" => r"printf ' proof|target \n'",
+                "present" => r"printf '$1 proof|target\n'",
+                "whitespace" => r"printf '$1  proof|target \n'",
                 "nonzero" => "exit 2",
                 "invalid-utf8" => r"printf '\377\n'",
-                "prefix" => r"printf 'proof|target-other\n'",
+                "prefix" => r"printf '$1 proof|target-other\n'",
                 _ => "exit 3",
             };
             let remove = if case == "exec-error" {

@@ -34,6 +34,7 @@ pub(crate) mod purge_owners;
 pub(crate) mod recovery;
 pub mod rename_transaction;
 pub mod restart;
+pub(crate) mod sandbox_login;
 pub mod sandbox_store_reclaim;
 pub mod scope;
 pub mod scratch;
@@ -77,8 +78,9 @@ pub use groups::{
     TRASH_SECTION_PATH,
 };
 #[cfg(test)]
+pub(crate) use instance::before_start_slot_waiters;
+#[cfg(test)]
 pub(crate) use instance::install_aliases;
-pub(crate) use instance::resolved_agent_for;
 pub(crate) use instance::resume_profile_config;
 #[cfg(all(test, unix))]
 pub(crate) use instance::test_helpers::frozen_test_helper;
@@ -92,6 +94,9 @@ pub(crate) use instance::{
     HostHookApprovalRequired, PassiveStatusPatch, ResumeIntent, SidWrite, ToolLaunchUnavailable,
 };
 pub(crate) use instance::{
+    forget_before_start_resolution, BeforeStartHook, BeforeStartHookError, Releasing,
+};
+pub(crate) use instance::{
     host_hook_agent, host_hook_disclosure, host_hook_disclosure_config_with_repo,
     host_hook_post_install_notes,
 };
@@ -101,11 +106,12 @@ pub use instance::{
     ExecutionLocation, Instance, LaunchIndeterminateCause, LaunchSidOutcome, LegacyToolAdoption,
     LegacyToolIdentity, LegacyToolObservation, LifecycleOperation, LifecycleReservation,
     LifecycleReservationError, ManagedResumeCause, PaneObservation, PanePresence,
-    PendingInitialTurn, PluginCreateIdempotency, PollerStart, SandboxInfo, SessionBucket,
-    SessionGone, StartBlocked, StartOutcome, Status, TerminalInfo, TmuxServerIdentity, View,
-    WorkspaceInfo, WorkspaceRepo, WorktreeInfo, SESSION_COLORS, TMUX_SERVER_UNREACHABLE_ERROR,
-    TMUX_SESSION_GONE_ERROR,
+    PendingInitialTurn, PluginCreateIdempotency, PollerStart, SandboxInfo, SandboxLoginRequired,
+    SandboxLoginUnsupported, SessionBucket, SessionGone, StartBlocked, StartOutcome, Status,
+    TerminalInfo, TmuxServerIdentity, View, WorkspaceInfo, WorkspaceRepo, WorktreeInfo,
+    SESSION_COLORS, TMUX_SERVER_UNREACHABLE_ERROR, TMUX_SESSION_GONE_ERROR,
 };
+pub(crate) use instance::{resolved_agent_for, UNBOUND_STORE_HINT};
 pub(crate) use instance::{
     ConversationState, LaunchFinalizationPending, LaunchReservation, ManagedResumeRefused,
     NativeInputError, NativeInputFence, ResumeAttemptPolicy, ResumeLaunchOptions,
@@ -196,7 +202,7 @@ pub use config::profile_config::{
     save_profile_config, update_profile_config, validate_capability_format,
     validate_check_interval, validate_env_format, validate_memory_limit, validate_network_format,
     validate_port_mapping_format, validate_security_opt_format, validate_systemd_slice,
-    validate_volume_format, ProfileConfig,
+    validate_volume_format, validate_volume_ignore_format, ProfileConfig,
 };
 pub use config::repo_config::{
     check_repo_trust, execute_hooks, execute_hooks_in_container, load_repo_config,

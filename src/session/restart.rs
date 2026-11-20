@@ -90,7 +90,8 @@ pub fn perform_restart(request: RestartRequest) -> RestartResult {
             .as_ref()
             .filter(|source| source.verify_bound_profile().is_ok())
             .and_then(|source| source.bound_profile_identity().ok());
-        spawn_wake_worker(&instance, wake_message, profile_identity);
+        let delay = instance.send_keys_enter_delay();
+        spawn_wake_worker(&instance, wake_message, profile_identity, delay);
     }
 
     RestartResult {
@@ -127,6 +128,7 @@ pub(crate) fn spawn_wake_worker(
     instance: &Instance,
     wake_message: String,
     profile_identity: Option<(u64, u64)>,
+    delay: u64,
 ) {
     #[cfg(test)]
     WAKE_DISPATCHES.with(|count| count.set(count.get() + 1));
@@ -168,12 +170,9 @@ pub(crate) fn spawn_wake_worker(
                 std::time::Duration::from_secs(5),
                 crate::agents::ready_marker(&tool),
             );
-            let delivered = session.admit_agent_input(expects_shell).and_then(|()| {
-                session.send_keys_with_delay(
-                    &wake_message,
-                    crate::agents::send_keys_enter_delay(&tool),
-                )
-            });
+            let delivered = session
+                .admit_agent_input(expects_shell)
+                .and_then(|()| session.send_keys_with_delay(&wake_message, delay));
             if let Err(error) = delivered {
                 tracing::warn!(target: "session.restart", %error,
                     "restart wake was not confirmed; no retry performed");

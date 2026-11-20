@@ -12,6 +12,7 @@ use crate::acp::supervisor::{
     ResumeReservationOutcome, SpawnRequest, Supervisor, SupervisorError,
 };
 use crate::process::worker_registry;
+use crate::server::sandbox_login::LaunchOrigin;
 use crate::server::session_service::SessionService;
 use crate::session::Instance;
 
@@ -224,6 +225,20 @@ async fn admit(
     }
 }
 
+/// A refused admission ends the attempt without a spawn, so it is the only
+/// record of why a counted attempt did nothing. A concurrent shutdown or a
+/// pending teardown is routine; anything else is logged where it is seen.
+fn log_refused_admission(id: &str, what: &str, error: &SupervisorError) {
+    match error {
+        SupervisorError::SpawnCancelled(_) | SupervisorError::TeardownPending(_) => {
+            tracing::debug!(target: "acp.supervisor", session = %id, "{what} not admitted: {error}");
+        }
+        _ => {
+            tracing::warn!(target: "acp.supervisor", session = %id, "{what} not admitted: {error}");
+        }
+    }
+}
+
 pub(super) async fn resume_one(state: Arc<AppState>, mut target: ResumeTarget) -> ResumeOutcome {
     let id = target.id.clone();
     let in_flight_turn = target.in_flight_turn;
@@ -284,7 +299,7 @@ pub(super) async fn resume_one(state: Arc<AppState>, mut target: ResumeTarget) -
             }
         }
         Err(error) => {
-            tracing::debug!(target: "acp.supervisor", session = %id, "resume not admitted: {error}");
+            log_refused_admission(&id, "resume", &error);
             // A durable stop fence is terminal; only a pending teardown clears.
             return match error {
                 SupervisorError::TeardownPending(_) => ResumeOutcome::Retry,
@@ -393,7 +408,7 @@ pub(super) async fn resume_one(state: Arc<AppState>, mut target: ResumeTarget) -
                         }
                     }
                     Err(error) => {
-                        tracing::debug!(target: "acp.supervisor", session = %id, "fallback spawn not admitted: {error}");
+                        log_refused_admission(&id, "fallback spawn", &error);
                         return ResumeOutcome::SpawnFinished;
                     }
                 };
@@ -449,7 +464,9 @@ pub(super) async fn resume_one(state: Arc<AppState>, mut target: ResumeTarget) -
         in_flight_turn || target.agent_turn_open,
     );
     requeue_interrupted_monitor(&state, &id).await;
-    let req = match build_spawn_request(&state.session_service, &target).await {
+    let req = match build_spawn_request(&state.session_service, &target, LaunchOrigin::Unattended)
+        .await
+    {
         Ok(req) => req,
         Err(PrepFailure::Reported) => return ResumeOutcome::SpawnFinished,
         Err(PrepFailure::Raced) => return ResumeOutcome::Retry,
@@ -524,9 +541,11 @@ enum PrepFailure {
 }
 
 /// Builds a fresh-spawn request; on sandbox failure publishes a startup error and returns `Err`.
+/// A launch refused for the sandbox login also holds the session under `origin`.
 async fn build_spawn_request(
     service: &Arc<SessionService>,
     target: &ResumeTarget,
+    origin: LaunchOrigin,
 ) -> Result<SpawnRequest, PrepFailure> {
     let state = service.native_state().map_err(|_| PrepFailure::Raced)?;
     let exclusion = crate::acp::sandbox::LaunchExclusion::acquire(state.clone(), &target.id, false)
@@ -587,6 +606,16 @@ async fn build_spawn_request(
             &config_path,
         )
         .await;
+    let sandbox_continuation = if instance.is_sandboxed()
+        && seed_history_replay
+        && target.stored_acp_session_id.as_deref().is_some_and(|id| {
+            instance.agent_session_id.as_deref() == Some(id)
+                && crate::agents::acp_transcript_cli_resumable(&target.tool, &agent)
+        }) {
+        crate::acp::supervisor::SandboxContinuation::ImportTerminal
+    } else {
+        crate::acp::supervisor::SandboxContinuation::Persisted
+    };
     let (native, exclusion) = crate::server::session_store::NativeSessionStore::open_for_launch(
         state.clone(),
         &instance,
@@ -603,6 +632,12 @@ async fn build_spawn_request(
     {
         Ok(info) => info,
         Err(e) => {
+            if let Some(blocked) = e.downcast_ref::<crate::session::SandboxLoginRequired>() {
+                tracing::warn!(target: "acp.supervisor", session = %target.id, "resume launch held: {blocked}");
+                service.sandbox_login.hold(&target.id, origin, blocked);
+                supervisor.publish_startup_error(&target.id, blocked.to_string());
+                return Err(PrepFailure::Reported);
+            }
             let message = format!("sandbox container ensure failed: {e}");
             tracing::warn!(target: "acp.supervisor", session = %target.id, "reconciler container ensure failed: {message}");
             let published = crate::server::api::publish_startup_error_if_current(
@@ -644,7 +679,7 @@ async fn build_spawn_request(
         model_config: acp_model_config,
         stored_acp_session_id: target.stored_acp_session_id.clone(),
         fork_from,
-        sandbox_continuation: crate::acp::supervisor::SandboxContinuation::Persisted,
+        sandbox_continuation,
         sandbox_info,
         source_profile: Some(target.source_profile.clone()),
         yolo_mode: target.yolo_mode,
@@ -743,7 +778,12 @@ pub(super) async fn ensure_rate_limit_worker(
                 }
             }
         } else {
-            match trigger_resume_background(&state.session_service, id, authority).await? {
+            let origin = if authority == worker_registry::ResumeAuthority::Explicit {
+                crate::server::sandbox_login::LaunchOrigin::Interactive
+            } else {
+                crate::server::sandbox_login::LaunchOrigin::Unattended
+            };
+            match trigger_resume_background(&state.session_service, id, authority, origin).await? {
                 ResumeTrigger::NotFound => {
                     return Err(SupervisorError::UnknownSession(id.to_owned()))
                 }
@@ -778,6 +818,7 @@ pub(crate) async fn trigger_resume_background(
     service: &Arc<SessionService>,
     id: &str,
     authority: crate::process::worker_registry::ResumeAuthority,
+    origin: LaunchOrigin,
 ) -> Result<ResumeTrigger, SupervisorError> {
     if service
         .instances
@@ -829,7 +870,7 @@ pub(crate) async fn trigger_resume_background(
                     .acp_supervisor
                     .synthesize_stopped_for_orphan(&target.id, "orphaned_at_restart");
             }
-            let Ok(req) = build_spawn_request(&service, &target).await else {
+            let Ok(req) = build_spawn_request(&service, &target, origin).await else {
                 return;
             };
             let agent = req.agent.clone();
@@ -926,7 +967,7 @@ mod tests {
         // The snapshot predates a worktree rename (#2260).
         let mut target = ResumeTarget::from_instance(&moved);
         target.project_path = "/tmp/aoe-2260-before-rename".to_string();
-        let req = build_spawn_request(&state.session_service, &target)
+        let req = build_spawn_request(&state.session_service, &target, LaunchOrigin::Unattended)
             .await
             .unwrap();
         assert_eq!(req.cwd, PathBuf::from("/tmp/aoe-2260-after-rename"));
@@ -935,6 +976,7 @@ mod tests {
         let req = build_spawn_request(
             &state.session_service,
             &ResumeTarget::from_instance(&unpinned),
+            LaunchOrigin::Unattended,
         )
         .await
         .unwrap();
@@ -952,7 +994,7 @@ mod tests {
             .find(|i| i.id == "sess-moved")
             .expect("fixture")
             .agent_model = Some("claude-opus-5".to_string());
-        let req = build_spawn_request(&state.session_service, &target)
+        let req = build_spawn_request(&state.session_service, &target, LaunchOrigin::Unattended)
             .await
             .unwrap();
         assert_eq!(req.model.as_deref(), Some("claude-opus-5"));
@@ -1001,9 +1043,10 @@ mod tests {
             let instances = state.instances.read().await;
             ResumeTarget::from_instance(&instances[0])
         };
-        let request = build_spawn_request(&state.session_service, &target)
-            .await
-            .unwrap();
+        let request =
+            build_spawn_request(&state.session_service, &target, LaunchOrigin::Unattended)
+                .await
+                .unwrap();
 
         assert_eq!(
             request
@@ -1134,6 +1177,7 @@ mod tests {
                 &state.session_service,
                 id,
                 crate::process::worker_registry::ResumeAuthority::Explicit,
+                LaunchOrigin::Interactive,
             )
             .await
             .expect("resume is admitted");
@@ -1170,7 +1214,13 @@ mod tests {
         let authority = crate::process::worker_registry::ResumeAuthority::Explicit;
 
         state.acp_event_store.test_set_unavailable(true);
-        let deferred = trigger_resume_background(&state.session_service, id, authority).await;
+        let deferred = trigger_resume_background(
+            &state.session_service,
+            id,
+            authority,
+            LaunchOrigin::Interactive,
+        )
+        .await;
         assert!(matches!(
             deferred,
             Err(SupervisorError::EventStoreUnavailable(_))
@@ -1181,9 +1231,14 @@ mod tests {
         );
 
         state.acp_event_store.test_set_unavailable(false);
-        let trigger = trigger_resume_background(&state.session_service, id, authority)
-            .await
-            .expect("the retry is admitted");
+        let trigger = trigger_resume_background(
+            &state.session_service,
+            id,
+            authority,
+            LaunchOrigin::Interactive,
+        )
+        .await
+        .expect("the retry is admitted");
         assert!(matches!(trigger, ResumeTrigger::Started));
         let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
         while state.acp_event_store.has_open_turn(id) != Some(false) {

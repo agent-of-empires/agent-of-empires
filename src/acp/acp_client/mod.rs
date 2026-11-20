@@ -53,7 +53,7 @@ pub use resolve_command::{
     is_bare_command, on_agent_path, resolve_agent_command, ResolvedAgentCommand, Unresolved,
 };
 pub(crate) use runner::wrap_in_scope;
-pub use session_sandbox::SessionSandbox;
+pub use session_sandbox::{effective_launch_env, SessionSandbox};
 pub(crate) use spawn::host_environment_denyreason;
 pub use spawn::SpawnConfig;
 
@@ -79,7 +79,7 @@ use tokio::sync::{mpsc, oneshot, Mutex};
 use tokio_util::compat::{TokioAsyncReadCompatExt, TokioAsyncWriteCompatExt};
 use tracing::Instrument;
 
-use self::commands::{ClientCmd, ConnectMode};
+use self::commands::{ClientCmd, ConnectMode, PromptInput};
 use self::connection::{run_connection_task, ConnectionParams, ConnectionState, RunnerLink};
 use self::control::{connect_runner_control_v5, wait_runner_registration, ShutdownControlOnDrop};
 use self::delete::ACP_SESSION_DELETE_TIMEOUT;
@@ -976,8 +976,8 @@ impl AcpClient {
         Ok(())
     }
 
-    /// Attachments follow the text block. Callers gate kinds on the agent's
-    /// prompt capabilities (#1000).
+    /// Attachments follow the text block, which an attachment-only prompt
+    /// omits. Callers gate kinds on the agent's prompt capabilities (#1000).
     pub async fn send_prompt(
         &self,
         text: &str,
@@ -989,7 +989,9 @@ impl AcpClient {
             return Err(AcpError::NotRunning);
         }
         let mut blocks = Vec::with_capacity(1 + attachments.len());
-        blocks.push(ContentBlock::Text(TextContent::new(text)));
+        if !text.is_empty() || attachments.is_empty() {
+            blocks.push(ContentBlock::Text(TextContent::new(text)));
+        }
         for att in attachments {
             let data = base64::engine::general_purpose::STANDARD.encode(&att.data);
             let mime = att.mime_type.clone();
@@ -1006,7 +1008,11 @@ impl AcpClient {
                 }
             });
         }
-        self.send_cmd(ClientCmd::Prompt(blocks)).await
+        self.send_cmd(ClientCmd::Prompt(PromptInput {
+            blocks,
+            attachments: attachments.iter().map(AttachmentBlob::to_ref).collect(),
+        }))
+        .await
     }
 
     /// Best-effort `session/cancel`; Ok even with no turn in flight.
@@ -1116,6 +1122,34 @@ impl AcpClient {
                 option_id,
             })
             .map_err(|_| AcpError::AgentExited)
+    }
+
+    /// Parks an approval as a permission request does, and yields what it was answered with:
+    /// the decision and named option, or `None` for a cancel.
+    #[cfg(test)]
+    pub(crate) async fn test_park_approval(
+        &self,
+        nonce: Nonce,
+    ) -> oneshot::Receiver<Option<(ApprovalDecision, Option<String>)>> {
+        let (resolve_tx, resolve_rx) = oneshot::channel();
+        self.pending_responders.lock().await.insert(
+            nonce,
+            pending::PendingResponder {
+                resolver: PendingResolver::Approval(resolve_tx),
+            },
+        );
+        let (answer_tx, answer_rx) = oneshot::channel();
+        tokio::spawn(async move {
+            let answer = match resolve_rx.await {
+                Ok(ApprovalResolutionMessage::Decision {
+                    decision,
+                    option_id,
+                }) => Some((decision, option_id)),
+                _ => None,
+            };
+            let _ = answer_tx.send(answer);
+        });
+        answer_rx
     }
 
     pub async fn cancel_permission(&self, nonce: Nonce) -> Result<(), AcpError> {

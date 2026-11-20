@@ -313,6 +313,12 @@ impl Instance {
         {
             self.status = status;
             self.detection.pending = None;
+            // The cached capture predates this status, so reusing it would keep
+            // the owned verdict once the provider stops reporting (an
+            // unsupported version, for example) and pane rules take over again.
+            self.detection.activity = None;
+            self.detection.captured_at = None;
+            self.detection.observation_key = None;
             self.detection.rule = Some(if reported {
                 crate::plugin::agent_integration::OWNED_RULE
             } else {
