@@ -210,8 +210,13 @@ mod linux {
             &inspected,
             &dir,
             || shares_kernel(&container),
-            || user_can_open(&container),
-            || has_node(&container),
+            || {
+                probe(
+                    &container,
+                    &format!("test -x {CONTAINER_DIR} && test -w {CONTAINER_DIR}/{SOCKET_FILE}"),
+                )
+            },
+            || probe(&container, "command -v node"),
         )
     }
 
@@ -261,41 +266,11 @@ mod linux {
         }
     }
 
-    /// Whether the user a command in the container runs as can traverse the mounted
-    /// directory and write the socket, as the agent's tools will. `None` when that cannot be
-    /// checked (no `sh`, a stopped container, a timeout).
-    fn user_can_open(container: &crate::containers::DockerContainer) -> Option<bool> {
-        let cmd = [
-            "sh".to_string(),
-            "-c".to_string(),
-            format!("test -x {CONTAINER_DIR} && test -w {CONTAINER_DIR}/{SOCKET_FILE}"),
-        ];
-        let argv = container.build_exec_argv("", &cmd);
-        let (program, args) = argv.split_first()?;
-        let mut command = std::process::Command::new(program);
-        command
-            .args(args)
-            .stdin(std::process::Stdio::null())
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null());
-        let out = crate::process::run_with_timeout(&mut command, std::time::Duration::from_secs(5))
-            .ok()
-            .flatten()?;
-        match out.status.code() {
-            Some(0) => Some(true),
-            Some(1) => Some(false),
-            _ => None,
-        }
-    }
-
-    /// Whether the container's default user has a `node` on its `PATH`. `None` when that
-    /// cannot be checked (no `sh`, a stopped container, a timeout).
-    fn has_node(container: &crate::containers::DockerContainer) -> Option<bool> {
-        let cmd = [
-            "sh".to_string(),
-            "-c".to_string(),
-            "command -v node".to_string(),
-        ];
+    /// Runs `script` in the container as its default user: `Some(true)` on exit 0,
+    /// `Some(false)` on exit 1, `None` when that cannot be checked (no `sh`, a stopped
+    /// container, a timeout).
+    fn probe(container: &crate::containers::DockerContainer, script: &str) -> Option<bool> {
+        let cmd = ["sh".to_string(), "-c".to_string(), script.to_string()];
         let argv = container.build_exec_argv("", &cmd);
         let (program, args) = argv.split_first()?;
         let mut command = std::process::Command::new(program);
@@ -435,6 +410,31 @@ mod linux {
         match crate::server::auth::socket_plugin_caller(&state, &mut request).await {
             Some(caller) => {
                 request.extensions_mut().insert(caller);
+                next.run(request).await
+            }
+            None => (
+                StatusCode::UNAUTHORIZED,
+                axum::Json(serde_json::json!({
+                    "error": "unauthorized",
+                    "message": "Invalid or missing plugin MCP credential"
+                })),
+            )
+                .into_response(),
+        }
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+        use crate::server::session_credential::McpSessionSecret;
+        use crate::server::test_helpers::vecs;
+        use crate::server::test_support;
+        use crate::session::Instance;
+        use serde_json::Value;
+        use tower::ServiceExt;
+
+        const TOKEN: &str = "socket-test-token";
+
         #[test]
         fn the_forwarder_refuses_header_injection_and_keeps_serving() {
             use std::io::{BufRead, BufReader, Read, Write};
@@ -514,31 +514,6 @@ mod linux {
             child.wait().unwrap();
             assert!(!head.contains("x-evil"), "{head}");
         }
-
-                next.run(request).await
-            }
-            None => (
-                StatusCode::UNAUTHORIZED,
-                axum::Json(serde_json::json!({
-                    "error": "unauthorized",
-                    "message": "Invalid or missing plugin MCP credential"
-                })),
-            )
-                .into_response(),
-        }
-    }
-
-    #[cfg(test)]
-    mod tests {
-        use super::*;
-        use crate::server::session_credential::McpSessionSecret;
-        use crate::server::test_helpers::vecs;
-        use crate::server::test_support;
-        use crate::session::Instance;
-        use serde_json::Value;
-        use tower::ServiceExt;
-
-        const TOKEN: &str = "socket-test-token";
 
         /// `/mcp` stays off: the socket serves plugins regardless of `web.mcp_enabled`.
         fn state(prior: Vec<Instance>, cityhall: bool) -> (Arc<AppState>, Arc<McpSessionSecret>) {
