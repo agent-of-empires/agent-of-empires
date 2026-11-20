@@ -6,10 +6,12 @@ use tokio::net::UnixListener;
 use tokio::time::{timeout, Instant};
 
 struct Runner {
-    temp: tempfile::TempDir,
     frames: mpsc::UnboundedReceiver<ControlBody>,
     send: mpsc::Sender<Option<ControlBody>>,
     task: tokio::task::JoinHandle<()>,
+    actor: crate::acp::supervisor::test_support::RetainedControlPeer,
+    _home: crate::session::test_support::AppDirGuard,
+    temp: tempfile::TempDir,
 }
 
 impl Drop for Runner {
@@ -19,12 +21,21 @@ impl Drop for Runner {
 }
 
 impl Runner {
-    fn new() -> Self {
+    async fn new() -> Self {
         let temp = tempfile::tempdir().unwrap();
+        let home = crate::session::test_support::isolate_app_dir_at(&temp.path().join("app"));
         let listener = UnixListener::bind(crate::process::worker::control_socket_sibling(
             &temp.path().join("runner.sock"),
         ))
         .unwrap();
+        let actor = crate::acp::supervisor::test_support::RetainedControlPeer::new(
+            "recovery",
+            temp.path(),
+            7,
+            "native",
+            crate::process::worker::control_socket_sibling(&temp.path().join("runner.sock")),
+        )
+        .await;
         let (send, mut receive) = mpsc::channel::<Option<ControlBody>>(256);
         let (frames_tx, frames) = mpsc::unbounded_channel();
         let task = tokio::spawn(async move {
@@ -62,6 +73,7 @@ impl Runner {
                         ControlBody::ResumeSession => Some(ControlBody::SessionReady {
                             acp_session_id: "native".into(),
                             result: serde_json::json!({}),
+                            native_channel: control_protocol::NativeChannelAvailability::Available,
                         }),
                         ControlBody::Prompt { .. } => {
                             Some(ControlBody::PromptStarted { prompt_req_id: 7 })
@@ -82,16 +94,19 @@ impl Runner {
             frames,
             send,
             task,
+            actor,
+            _home: home,
         }
     }
 
     async fn attach(&self, in_flight: bool) -> AcpClient {
         let mut client = AcpClient::attach(
-            self.temp.path().join("runner.sock"),
+            self.actor.record.socket_path.clone(),
             self.temp.path().into(),
             vec![],
             "native".into(),
             in_flight,
+            false,
             AcpSessionId("recovery".into()),
             None,
             "test-agent".into(),
@@ -194,8 +209,13 @@ async fn assigned(client: &mut AcpClient) {
     timeout(Duration::from_secs(5), async {
         loop {
             match client.next_event().await.unwrap() {
-                Event::AcpSessionAssigned { acp_session_id } => {
+                Event::AcpSessionAssigned {
+                    acp_session_id,
+                    connection_ready,
+                    ..
+                } => {
                     assert_eq!(acp_session_id, "native");
+                    assert!(connection_ready);
                     return;
                 }
                 Event::AgentStartupError { message, .. } => panic!("{message}"),
@@ -222,9 +242,10 @@ async fn stopped(client: &mut AcpClient) -> String {
 }
 
 #[tokio::test]
+#[serial_test::serial]
 async fn terminal_callbacks_keep_their_ids_after_control_recovery() {
     let _env = crate::session::test_support::EnvGuard::read_lock();
-    let mut runner = Runner::new();
+    let mut runner = Runner::new().await;
     let mut first = runner.attach(false).await;
     let terminal = runner
         .call(
@@ -258,9 +279,10 @@ async fn terminal_callbacks_keep_their_ids_after_control_recovery() {
 }
 
 #[tokio::test]
+#[serial_test::serial]
 async fn completed_turn_keeps_its_terminal_claim_when_eof_snapshots_it_active() {
     let _env = crate::session::test_support::EnvGuard::read_lock();
-    let mut runner = Runner::new();
+    let mut runner = Runner::new().await;
     let mut first = runner.attach(false).await;
     first.send_prompt("run", &[]).await.unwrap();
     assert!(matches!(runner.frame().await, ControlBody::Prompt { .. }));
@@ -291,17 +313,34 @@ async fn completed_turn_keeps_its_terminal_claim_when_eof_snapshots_it_active() 
 }
 
 #[tokio::test]
+#[serial_test::serial]
 async fn terminal_publication_survives_eof_while_the_event_channel_is_full() {
     let _env = crate::session::test_support::EnvGuard::read_lock();
-    for (local, limited) in [(true, false), (false, false), (true, true), (false, true)] {
-        let mut runner = Runner::new();
+    for (local, limited, cancel) in [
+        (true, false, false),
+        (false, false, false),
+        (true, true, false),
+        (false, true, false),
+        (false, true, true),
+    ] {
+        let mut runner = Runner::new().await;
         let mut first = runner.attach(!local).await;
         if local {
             first.send_prompt("run", &[]).await.unwrap();
             assert!(matches!(runner.frame().await, ControlBody::Prompt { .. }));
         }
+        let state = Arc::clone(&first.reattach.as_ref().unwrap().state);
+        if cancel {
+            first.cancel_prompt().await.unwrap();
+            assert!(matches!(runner.frame().await, ControlBody::Cancel));
+            while !matches!(
+                first.next_event().await,
+                Some(Event::CancelRequested { .. })
+            ) {}
+        }
         let capacity = first.inbound.as_ref().unwrap().max_capacity();
-        for index in 0..capacity {
+        let queued = capacity + if cancel { 2 } else { 0 };
+        for index in 0..queued {
             runner
                 .send(ControlBody::Notify {
                     method: "session/update".into(),
@@ -340,17 +379,28 @@ async fn terminal_publication_survives_eof_while_the_event_channel_is_full() {
         })
         .await
         .unwrap();
+        if cancel {
+            assert!(
+                !claim.failed(),
+                "the completion marker has not reached the dispatcher"
+            );
+            let turn = claim.current_turn();
+            tokio::time::pause();
+            tokio::time::advance(Duration::from_secs(30)).await;
+            tokio::time::resume();
+            timeout(Duration::from_secs(5), async {
+                while state.cancel_deadline.lock().unwrap().is_some() {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .unwrap();
+            assert_eq!(claim.current_turn(), turn);
+        }
         assert_eq!(first.inbound.as_ref().unwrap().len(), capacity);
         runner.send.send(None).await.unwrap();
         timeout(Duration::from_secs(5), async {
-            while !first
-                .connection_task
-                .lock()
-                .unwrap()
-                .as_ref()
-                .unwrap()
-                .is_finished()
-            {
+            while first.control_loss().is_none() {
                 tokio::task::yield_now().await;
             }
         })
@@ -363,6 +413,9 @@ async fn terminal_publication_survives_eof_while_the_event_channel_is_full() {
             ..first.control_loss().unwrap()
         };
         assert!(!first.claim_lost_turn(loss));
+        if cancel {
+            assert!(first.control_loss().unwrap().turn_in_flight);
+        }
         let mut terminals = 0;
         let mut rate_limits = 0;
         timeout(Duration::from_secs(5), async {
@@ -373,6 +426,11 @@ async fn terminal_publication_survives_eof_while_the_event_channel_is_full() {
         })
         .await
         .unwrap();
+        let task = first.connection_task.lock().unwrap().take().unwrap();
+        timeout(Duration::from_secs(5), task)
+            .await
+            .unwrap()
+            .unwrap();
         let mut next = runner.recover(&first, true).await;
         runner.complete("end_turn").await;
         runner
@@ -395,9 +453,10 @@ async fn terminal_publication_survives_eof_while_the_event_channel_is_full() {
 }
 
 #[tokio::test]
+#[serial_test::serial]
 async fn unfinished_lost_turn_is_claimed_once_by_the_fallback() {
     let _env = crate::session::test_support::EnvGuard::read_lock();
-    let mut runner = Runner::new();
+    let mut runner = Runner::new().await;
     let mut first = runner.attach(false).await;
     first.send_prompt("run", &[]).await.unwrap();
     assert!(matches!(runner.frame().await, ControlBody::Prompt { .. }));
@@ -408,9 +467,10 @@ async fn unfinished_lost_turn_is_claimed_once_by_the_fallback() {
 }
 
 #[tokio::test]
+#[serial_test::serial]
 async fn cancelling_turn_recovers_with_only_the_original_grace_remaining() {
     let _env = crate::session::test_support::EnvGuard::read_lock();
-    let mut runner = Runner::new();
+    let mut runner = Runner::new().await;
     let mut first = runner.attach(false).await;
     first.send_prompt("run", &[]).await.unwrap();
     assert!(matches!(runner.frame().await, ControlBody::Prompt { .. }));
@@ -458,6 +518,7 @@ async fn cancelling_turn_recovers_with_only_the_original_grace_remaining() {
 /// A control loss while the first cancel is still being sent keeps its
 /// escalation: the recovered turn ends at the original deadline.
 #[tokio::test]
+#[serial_test::serial]
 async fn cancel_armed_before_its_send_survives_control_loss_mid_send() {
     #[derive(Debug, Clone, Copy)]
     enum Cancel {
@@ -473,7 +534,7 @@ async fn cancel_armed_before_its_send_survives_control_loss_mid_send() {
             ]),
             Cancel::Local | Cancel::Adopted => crate::session::test_support::EnvGuard::read_lock(),
         };
-        let mut runner = Runner::new();
+        let mut runner = Runner::new().await;
         let mut first = runner.attach(matches!(case, Cancel::Adopted)).await;
         let state = Arc::clone(&first.reattach.as_ref().unwrap().state);
         let gate = state.cancel_send_gate.write().await;
@@ -530,9 +591,10 @@ async fn cancel_armed_before_its_send_survives_control_loss_mid_send() {
 }
 
 #[tokio::test]
+#[serial_test::serial]
 async fn silent_initial_adoption_releases_its_watchdog_on_control_loss() {
     let _env = crate::session::test_support::EnvGuard::read_lock();
-    let runner = Runner::new();
+    let runner = Runner::new().await;
     let mut first = runner.attach(true).await;
     runner.disconnect(&mut first).await;
     let mut next = runner.recover(&first, true).await;
@@ -542,6 +604,7 @@ async fn silent_initial_adoption_releases_its_watchdog_on_control_loss() {
 }
 
 #[tokio::test]
+#[serial_test::serial]
 async fn recovered_completion_orders_updates_and_applies_rate_limit_parking() {
     let _env = crate::session::test_support::EnvGuard::read_lock();
     for (report, stop_reason, reset_after, parked) in [
@@ -551,7 +614,7 @@ async fn recovered_completion_orders_updates_and_applies_rate_limit_parking() {
         ("rejected", "end_turn", -60, false),
         ("rejected", "error", 3600, true),
     ] {
-        let mut runner = Runner::new();
+        let mut runner = Runner::new().await;
         let mut first = runner.attach(false).await;
         first.send_prompt("run", &[]).await.unwrap();
         assert!(matches!(runner.frame().await, ControlBody::Prompt { .. }));
@@ -629,17 +692,23 @@ async fn recovered_completion_orders_updates_and_applies_rate_limit_parking() {
                 .collect::<Vec<_>>()
         );
         assert_eq!(limited, parked);
+        runner
+            .call(
+                "terminal/release",
+                serde_json::json!({"terminalId": "unused"}),
+            )
+            .await;
+        assert!(next.connection_ready());
+        next.test_flush_commands().await;
+        next.shutdown().await.unwrap();
         if parked {
             assert!(
                 timeout(Duration::from_secs(2), next.next_event())
                     .await
                     .unwrap()
                     .is_none(),
-                "parking must end the event stream"
+                "explicit shutdown must end the event stream"
             );
-        } else {
-            next.test_flush_commands().await;
-            next.shutdown().await.unwrap();
         }
     }
 }
@@ -676,7 +745,7 @@ async fn rejected_prompt_over_the_runner_keeps_the_connection() {
         } else {
             &[]
         };
-        let mut runner = Runner::new();
+        let mut runner = Runner::new().await;
         let mut client = runner.attach(false).await;
         client.send_prompt(text, attachments).await.unwrap();
         match runner.frame().await {
@@ -707,7 +776,7 @@ async fn rejected_prompt_over_the_runner_keeps_the_connection() {
         let reason = timeout(Duration::from_secs(5), async {
             loop {
                 match client.next_event().await.expect("connection remains open") {
-                    Event::PromptRuntimeError { message } => {
+                    Event::PromptRuntimeError { message, .. } => {
                         surfaced = message.contains("a turn is already running");
                     }
                     Event::PromptRejected {

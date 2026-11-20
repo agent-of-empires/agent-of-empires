@@ -145,6 +145,7 @@ export function StartupErrorBanner({
   sessionId,
   message,
   acpWorkerState,
+  canRecover,
   sentStopped = false,
   retriedError = null,
   restartEpoch = 0,
@@ -155,6 +156,8 @@ export function StartupErrorBanner({
   sessionId: string;
   message: string;
   acpWorkerState: AcpWorkerState;
+  /** Parent policy and current Native uncertainty gate actions, not Details or logs. */
+  canRecover: boolean;
   /** A restart stopped the sent message and it hasn't been sent again. */
   sentStopped?: boolean;
   /** The error a Retry was for, when this error ended that Retry. */
@@ -212,7 +215,7 @@ export function StartupErrorBanner({
     label: retryState === "retrying" ? "Retrying…" : "Retry",
     onClick: () => void retry(),
     testId: "startup-error-banner-retry",
-    disabled: busy,
+    disabled: busy || !canRecover,
   };
   const installAction: RecoveryAction = {
     label:
@@ -223,10 +226,17 @@ export function StartupErrorBanner({
           : "Install and retry",
     onClick: () => void install.install(),
     testId: "startup-error-banner-install",
-    disabled: busy,
+    disabled: busy || !canRecover,
   };
   const switchAction: RecoveryAction[] = onSwitchToTerminal
-    ? [{ label: "Use Terminal view", onClick: onSwitchToTerminal, testId: "startup-error-banner-terminal" }]
+    ? [
+        {
+          label: "Use Terminal view",
+          onClick: onSwitchToTerminal,
+          testId: "startup-error-banner-terminal",
+          disabled: !canRecover,
+        },
+      ]
     : [];
 
   const cause = startupErrorCause(message);

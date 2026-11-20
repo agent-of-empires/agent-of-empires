@@ -442,10 +442,13 @@ impl McpServer {
                 queued_prompt_id: None,
                 no_revive: false,
             };
-            let submitted = submit_prompt(&self.state, &SessionCaller::User, &id, submission)
-                .await
-                .map_err(|e| Box::new(prompt_refusal(&id, e)))?;
-            return Ok(send_outcome(submitted));
+            let submitted =
+                match submit_prompt(&self.state, &SessionCaller::User, &id, submission).await {
+                    Ok(submitted) => submitted,
+                    Err(error) => return Err(Box::new(prompt_refusal(&id, error).await)),
+                };
+            return send_outcome(submitted)
+                .map_err(|unavailability| Box::new(native_unavailable(unavailability)));
         }
         let Some(message) = terminal_text(message) else {
             return Err(Box::new(tool_error(
@@ -808,10 +811,15 @@ fn refusal(status: StatusCode, body: &[u8]) -> CallToolResult {
     }
 }
 
-fn send_outcome(submitted: PromptSubmitted) -> SendOutcome {
+fn send_outcome(
+    submitted: PromptSubmitted,
+) -> Result<SendOutcome, crate::acp::state::AcpConnectionUnavailability> {
     let (disposition, reason) = match submitted.dispatch {
         PromptDispatch::Sent => (Disposition::Sent, None),
         PromptDispatch::Steered => (Disposition::Steered, None),
+        PromptDispatch::Unavailable { unavailability } => {
+            return Err(unavailability);
+        }
         PromptDispatch::Queued { reason } => (
             Disposition::Queued,
             serde_json::to_value(reason)
@@ -819,16 +827,33 @@ fn send_outcome(submitted: PromptSubmitted) -> SendOutcome {
                 .and_then(|v| v.as_str().map(str::to_string)),
         ),
     };
-    SendOutcome {
+    Ok(SendOutcome {
         disposition,
         reason,
         queued_id: submitted.queued_id,
         seq: submitted.seq,
-    }
+    })
 }
 
-fn prompt_refusal(id: &str, error: PromptSubmitError) -> CallToolResult {
+fn native_unavailable(
+    unavailability: crate::acp::state::AcpConnectionUnavailability,
+) -> CallToolResult {
+    CallToolResult::structured_error(json!({
+        "code": "native_unavailable",
+        "message": "Native input is unavailable; read_output before resending",
+        "unavailability": unavailability,
+    }))
+}
+
+async fn prompt_refusal(id: &str, error: PromptSubmitError) -> CallToolResult {
     match error {
+        PromptSubmitError::AdmissionRefused(response) => {
+            let status = response.status();
+            match axum::body::to_bytes(response.into_body(), usize::MAX).await {
+                Ok(bytes) => refusal(status, &bytes),
+                Err(error) => tool_error("internal", error.to_string()),
+            }
+        }
         PromptSubmitError::SessionNotFound
         | PromptSubmitError::Turn(SendTurnError::SessionNotFound) => not_found(id),
         PromptSubmitError::WorkerNotReady
@@ -841,6 +866,10 @@ fn prompt_refusal(id: &str, error: PromptSubmitError) -> CallToolResult {
             "send_failed",
             "The agent stopped after the prompt was recorded; read_output before resending it",
         ),
+        PromptSubmitError::Turn(SendTurnError::Unavailable(unavailability))
+        | PromptSubmitError::Turn(SendTurnError::UnavailableAfterPublish(unavailability)) => {
+            native_unavailable(unavailability)
+        }
         PromptSubmitError::Turn(SendTurnError::ResumeFailed(e)) => tool_error(
             "busy",
             format!("The session's agent could not be resumed: {e}"),
@@ -1098,6 +1127,11 @@ mod tests {
             let result = terminal_refusal("s", error).await;
             assert_eq!(result.structured_content.unwrap()["code"], code);
         }
+        let unavailable = crate::acp::state::AcpConnectionUnavailability {
+            source: crate::acp::state::AcpConnectionSource::Sdk,
+            cause: crate::acp::state::AcpConnectionCause::IncomingEnded,
+            phase: crate::acp::state::AcpConnectionPhase::Established,
+        };
         let prompt_cases = [
             (
                 PromptSubmitError::Enqueue(StatusCode::TOO_MANY_REQUESTS, "queue is full".into()),
@@ -1109,10 +1143,45 @@ mod tests {
                 PromptSubmitError::Turn(SendTurnError::WorkerLostAfterPublish),
                 "send_failed",
             ),
+            (
+                PromptSubmitError::Turn(SendTurnError::Unavailable(unavailable)),
+                "native_unavailable",
+            ),
+            (
+                PromptSubmitError::Turn(SendTurnError::UnavailableAfterPublish(unavailable)),
+                "native_unavailable",
+            ),
         ];
         for (error, code) in prompt_cases {
-            let result = prompt_refusal("s", error);
-            assert_eq!(result.structured_content.unwrap()["code"], code);
+            let result = prompt_refusal("s", error).await;
+            let content = result.structured_content.unwrap();
+            assert_eq!(content["code"], code);
+            if code == "native_unavailable" {
+                assert_eq!(content["unavailability"], json!(unavailable));
+                assert!(content["message"]
+                    .as_str()
+                    .unwrap()
+                    .contains("read_output before resending"));
+            }
         }
+        let result = prompt_refusal(
+            "s",
+            PromptSubmitError::AdmissionRefused(
+                (
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    axum::Json(json!({
+                        "error": "worker_capacity",
+                        "message": "No worker capacity",
+                    })),
+                )
+                    .into_response(),
+            ),
+        )
+        .await;
+        let content = result.structured_content.unwrap();
+        assert_eq!(content["code"], "busy");
+        assert_eq!(content["http_error"], "worker_capacity");
+        assert_eq!(content["http_status"], 503);
+        assert_eq!(content["message"], "No worker capacity");
     }
 }

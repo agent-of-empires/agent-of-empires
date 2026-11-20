@@ -6,6 +6,8 @@ import {
   applyReducedState,
   deriveTurnActive,
   emptyAcpState,
+  nativeInputAvailable,
+  revokeNativeAuthority,
   mergePrependedActivity,
   mergeServerRows,
   patchServerRow,
@@ -34,6 +36,7 @@ export type Action =
       unchanged: string[];
       seq?: number;
     }
+  | { kind: "native_authority_pending" }
   | {
       kind: "frames";
       frames: AcpFrame[];
@@ -56,7 +59,7 @@ export type Action =
   | { kind: "prompt_send_rejected"; id: string }
   | { kind: "settle_inflight_prompt"; id: string }
   | { kind: "rollback_optimistic_prompt"; id: string }
-  | { kind: "error"; message: string }
+  | { kind: "error"; message: string; target?: NonNullable<AcpState["interactionError"]>["target"] }
   // A launch the daemon refused and kept the prompt for: shown through the startup banner.
   | { kind: "blocked_launch"; message: string }
   | { kind: "clear_error" }
@@ -74,11 +77,17 @@ export type Action =
       id: string;
       text: string;
       attachments?: PromptAttachmentInput[];
+      preserveExisting?: boolean;
     }
   | { kind: "dequeue_prompt"; id: string }
   | { kind: "edit_queued_prompt"; id: string; text: string }
   | { kind: "clear_queue" }
-  | { kind: "hydrate_server_queue"; rows: ServerQueuedPrompt[] }
+  | {
+      kind: "hydrate_server_queue";
+      rows: ServerQueuedPrompt[];
+      queueAtRead: QueuedPrompt[];
+      migrationConfirmed?: ReadonlySet<string>;
+    }
   | { kind: "confirm_queued_prompt"; id: string }
   | { kind: "dismiss_primer" }
   /** `retriedError` marks a Retry from the startup error banner, which replaces the banner with the startup line. */
@@ -223,6 +232,8 @@ export function reducer(state: AcpState, action: Action): AcpState {
       return applyEvent(state, action.frame);
     case "reduced_state":
       return applyReducedState(state, action.state, action.unchanged, action.seq);
+    case "native_authority_pending":
+      return revokeNativeAuthority(state);
     case "frames": {
       // Frames feed control state; the transcript comes from the server-folded rows.
       let next = action.frames.reduce(applyEvent, state);
@@ -262,8 +273,6 @@ export function reducer(state: AcpState, action: Action): AcpState {
         currentModeId: state.currentModeId ?? hs.currentModeId,
         availableCommands: state.availableCommands.length > 0 ? state.availableCommands : hs.availableCommands,
         configOptions: state.configOptions.length > 0 ? state.configOptions : hs.configOptions,
-        // The assignment can sit only in the prefix, and a forwarded `/new` clears the stored id.
-        sessionAssigned: state.sessionAssigned || hs.sessionAssigned,
       };
     }
     case "lagged":
@@ -271,18 +280,29 @@ export function reducer(state: AcpState, action: Action): AcpState {
     case "lagged_resolved":
       return { ...state, lagged: false };
     case "error":
-      return { ...state, lastError: action.message };
+      return { ...state, interactionError: { message: action.message, target: action.target } };
     case "blocked_launch":
-      return { ...state, startupError: action.message };
+      return { ...state, startupError: action.message, startupCause: null };
     case "clear_error":
-      return { ...state, lastError: null };
+      return state.interactionError
+        ? { ...state, interactionError: null }
+        : {
+            ...state,
+            lastError: null,
+            lastErrorEvidence: null,
+            startupError: null,
+            startupCause: null,
+            integrationLost: null,
+          };
     case "approval_resolved_locally": {
       // Don't wait for the broadcast, which the seq dedupe can swallow (#1821).
       const pendingApprovals = state.pendingApprovals.filter((a) => a.nonce !== action.nonce);
-      const removed = pendingApprovals.length !== state.pendingApprovals.length;
       return {
         ...state,
-        lastError: removed ? null : state.lastError,
+        interactionError:
+          state.interactionError?.target?.kind === "approval" && state.interactionError.target.nonce === action.nonce
+            ? null
+            : state.interactionError,
         pendingApprovals,
         locallyResolved: [...state.locallyResolved, action.nonce],
       };
@@ -290,12 +310,14 @@ export function reducer(state: AcpState, action: Action): AcpState {
     case "elicitation_resolved_locally": {
       const card = state.pendingElicitations.find((e) => e.nonce === action.nonce);
       const pendingElicitations = state.pendingElicitations.filter((e) => e.nonce !== action.nonce);
-      const removed = pendingElicitations.length !== state.pendingElicitations.length;
       const answers =
         card && action.resolution.action === "accept" ? summarizeAnswers(card, action.resolution.answers) : [];
       return {
         ...state,
-        lastError: removed ? null : state.lastError,
+        interactionError:
+          state.interactionError?.target?.kind === "elicitation" && state.interactionError.target.nonce === action.nonce
+            ? null
+            : state.interactionError,
         pendingElicitations,
         locallyResolved: [...state.locallyResolved, action.nonce],
         optimisticRows: appendElicitationAnswerRow(state.optimisticRows, action.nonce, answers),
@@ -316,17 +338,13 @@ export function reducer(state: AcpState, action: Action): AcpState {
       return {
         ...state,
         optimisticRows: state.optimisticRows.concat(row),
-        startupError: null,
-        startupCause: null,
-        // A Retry still running keeps its line.
         retriedError: state.restartInFlight ? state.retriedError : null,
-        lastError: null,
         restartFailure: null,
         inflightPromptIds: state.inflightPromptIds.includes(id)
           ? state.inflightPromptIds
           : state.inflightPromptIds.concat(id),
         promptSeq: state.promptSeq + 1,
-        turnActive: true,
+        turnActive: nativeInputAvailable(state) || state.serverTurnActive,
       };
     }
     case "prompt_send_rejected":
@@ -337,9 +355,10 @@ export function reducer(state: AcpState, action: Action): AcpState {
     case "rollback_optimistic_prompt":
       return rollbackOptimisticPrompt(state, action.id);
     case "enqueue_prompt": {
+      const existing = state.queuedPrompts.find((q) => q.id === action.id);
       // A late POST response can land after hydration already added the row: keep its server text and
       // order, but restore the local bytes hydration could only see as metadata.
-      if (state.queuedPrompts.some((q) => q.id === action.id)) {
+      if (existing && action.preserveExisting) {
         const attachments = action.attachments;
         return attachments && attachments.length > 0
           ? mapQueued(state, action.id, (q) => ({ ...q, attachments }))
@@ -348,13 +367,21 @@ export function reducer(state: AcpState, action: Action): AcpState {
       const entry: QueuedPrompt = {
         id: action.id,
         text: action.text,
-        queuedAt: new Date().toISOString(),
+        queuedAt: existing?.queuedAt ?? new Date().toISOString(),
         pending: true,
+        ...(existing?.attachments ? { attachments: existing.attachments } : {}),
         ...(action.attachments && action.attachments.length > 0 ? { attachments: action.attachments } : {}),
       };
-      return { ...state, queuedPrompts: state.queuedPrompts.concat(entry) };
+      return {
+        ...state,
+        queuedPrompts: existing
+          ? state.queuedPrompts.map((q) => (q.id === action.id ? entry : q))
+          : state.queuedPrompts.concat(entry),
+      };
     }
     case "dequeue_prompt":
+      // Even an already-removed row gets a new queue snapshot: the final
+      // acknowledgement must fence reads begun during optimistic delivery.
       return {
         ...state,
         queuedPrompts: state.queuedPrompts.filter((q) => q.id !== action.id),
@@ -364,7 +391,26 @@ export function reducer(state: AcpState, action: Action): AcpState {
     case "clear_queue":
       return { ...state, queuedPrompts: [] };
     case "hydrate_server_queue":
-      return hydrateServerQueue(state, action.rows);
+      // Confirmations can batch with a GET that started after the POSTs.
+      // Edits, removals and inserts still invalidate that GET.
+      return state.queuedPrompts === action.queueAtRead ||
+        (action.migrationConfirmed?.size &&
+          state.queuedPrompts.length === action.queueAtRead.length &&
+          state.queuedPrompts.some((row, index) => row !== action.queueAtRead[index]) &&
+          state.queuedPrompts.every((row, index) => {
+            const previous = action.queueAtRead[index]!;
+            return (
+              row === previous ||
+              (action.migrationConfirmed?.has(row.id) &&
+                previous.pending &&
+                !row.pending &&
+                row.id === previous.id &&
+                row.text === previous.text &&
+                row.attachments === previous.attachments)
+            );
+          }))
+        ? hydrateServerQueue(state, action.rows)
+        : state;
     case "confirm_queued_prompt":
       return mapQueued(state, action.id, (q) => ({ ...q, pending: false }));
     case "dismiss_primer":

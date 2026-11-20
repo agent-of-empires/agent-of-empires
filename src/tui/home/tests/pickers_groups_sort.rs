@@ -192,7 +192,7 @@ pub(super) async fn settle_row_command(
     };
     let (method, path, body) = wire(&captured.id, &captured.request);
     let (status, headers, value) =
-        request_at_epoch_with_headers(state, method, &path, body, epoch).await;
+        request_with_headers_at_epoch(state, method, &path, body, epoch).await;
     if !status.is_success() {
         assert!(
             status.is_client_error(),

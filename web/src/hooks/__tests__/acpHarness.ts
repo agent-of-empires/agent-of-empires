@@ -4,6 +4,7 @@ import { act } from "@testing-library/react";
 import { createElement, type ReactNode } from "react";
 import { vi } from "vitest";
 import { AgentProfileProvider } from "../../lib/agentProfileContext";
+export { currentControlSnapshot } from "../../../tests/helpers/acpControlSnapshot";
 
 export class FakeWebSocket {
   static CONNECTING = 0;

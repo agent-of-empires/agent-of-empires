@@ -13,6 +13,7 @@ async function openFailedSession(page: Page) {
   const mock = await mockAcpSession(page, {
     title: "story-startup-error",
     initialEvents: [{ AgentStartupError: { message: MESSAGE } }],
+    nativeAvailable: false,
   });
   const disables: string[] = [];
   await page.route("**/api/sessions/*/acp/disable", (r) => {
@@ -38,7 +39,7 @@ async function openFailedSession(page: Page) {
   return { banner, disables };
 }
 
-test("Use Terminal view confirms through the switch-view dialog, in keyboard order", async ({ page }) => {
+test("Use Terminal view confirms through the switch-view dialog, in keyboard order", async ({ page }, testInfo) => {
   const { banner, disables } = await openFailedSession(page);
 
   await banner.getByRole("button", { name: "Copy" }).focus();
@@ -54,6 +55,9 @@ test("Use Terminal view confirms through the switch-view dialog, in keyboard ord
   await expect(dialog).toContainText("Switch this session back to a tmux terminal?");
   // The banner only opens the confirmation; the switch waits for it.
   expect(disables).toEqual([]);
+  const capture = testInfo.outputPath("runtime-startup-refusal-terminal-confirmation.png");
+  await page.screenshot({ path: capture, fullPage: true, animations: "disabled" });
+  await testInfo.attach("runtime-startup-refusal-terminal-confirmation", { path: capture, contentType: "image/png" });
   await dialog.getByRole("button", { name: "Cancel" }).click();
   await expect(dialog).toBeHidden();
   expect(disables).toEqual([]);
@@ -93,6 +97,8 @@ test.describe("Retry", () => {
     const mock = await mockAcpSession(page, {
       title: "story-startup-error-retry",
       acpSessionId: "acp-1",
+      workerState: "absent",
+      nativeAvailable: false,
       initialEvents: [{ AgentStartupError: { message: MESSAGE } }],
     });
     for (const path of ["spawn", "restart"])
@@ -116,7 +122,8 @@ test.describe("Retry", () => {
 
   test("shows the startup line in place of the banner, then the transcript once the Agent starts", async ({ page }) => {
     const { mock, banner, line } = await retryFailedSession(page);
-    mock.pushEvents([{ AcpSessionAssigned: { acp_session_id: "acp-2" } }]);
+    mock.pushEvents([{ AcpSessionAssigned: { acp_session_id: "acp-2", connection_ready: true } }]);
+    mock.setNativeState({ ready: true });
     await expect(line).toHaveCount(0);
     await expect(banner).toHaveCount(0);
     await expect(page.getByText(HINT)).toBeVisible();

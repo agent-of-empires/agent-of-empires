@@ -60,7 +60,7 @@ pub(super) struct Tick {
     pub(super) attempted: HashSet<String>,
     pub(super) respawn_history: HashMap<String, Vec<Instant>>,
     pub(super) parked: HashSet<String>,
-    pub(super) capacity_deferred: HashSet<String>,
+    pub(super) resume_deferred: HashMap<String, super::ResumeDeferral>,
     pub(super) stop_notified: HashSet<String>,
 }
 
@@ -79,7 +79,7 @@ impl Tick {
             &mut cadence,
             &mut self.respawn_history,
             &mut self.parked,
-            &mut self.capacity_deferred,
+            &mut self.resume_deferred,
             &mut self.stop_notified,
         )
         .await;

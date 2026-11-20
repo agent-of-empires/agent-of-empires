@@ -4,6 +4,8 @@
 import { expect, type Page } from "@playwright/test";
 import { clickSidebarSession, openMobileSidebar } from "./sidebar";
 import { sessionResponse } from "./sessions";
+import { emptyAcpState } from "../../src/lib/acpTypes";
+import { currentControlSnapshot } from "./acpControlSnapshot";
 
 const BOOT_PATHS = [
   "settings",
@@ -18,9 +20,8 @@ const BOOT_PATHS = [
 ];
 const OBJECT_PATHS = new Set(["settings", "docker/status", "about", "system/update-status"]);
 
-/** Boot stubs plus one running structured-view session. Sockets are accepted
- *  but silent, so the session reads as connected; a spec that needs frames
- *  re-routes them afterwards (later registrations win). */
+/** Boot stubs plus one running structured-view session with an explicit current
+ *  native receipt. Specs that replace the socket supply their own receipts. */
 export async function mockStructuredSessionApis(page: Page, opts: { id: string; title: string; projectPath?: string }) {
   await page.route("**/api/login/status*", (r) => r.fulfill({ json: { required: false, authenticated: true } }));
   for (const path of BOOT_PATHS) {
@@ -50,7 +51,9 @@ export async function mockStructuredSessionApis(page: Page, opts: { id: string; 
   await page.route("**/api/sessions/*/ensure", (r) => r.fulfill({ json: { ok: true } }));
   await page.route("**/api/sessions/*/acp/**", (r) => r.fulfill({ json: {} }));
   await page.routeWebSocket(/\/sessions\/[^/]+\/ws(\?|$)/, () => {});
-  await page.routeWebSocket(/\/sessions\/[^/]+\/acp\/ws/, () => {});
+  await page.routeWebSocket(/\/sessions\/[^/]+\/acp\/ws/, (route) => {
+    route.send(JSON.stringify(currentControlSnapshot(emptyAcpState(), { ready: true })));
+  });
 }
 
 /** Open the session from the mobile sidebar and wait for the structured view. */

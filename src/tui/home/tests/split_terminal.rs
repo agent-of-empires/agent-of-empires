@@ -23,6 +23,7 @@ fn split_env(structured: bool, running: bool) -> (TestEnv, String, String) {
                 },
                 tmux_session: running.then(|| term.clone()),
                 legacy_tool: None,
+                physical: None,
             },
         }];
     });

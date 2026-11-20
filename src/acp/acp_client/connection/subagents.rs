@@ -547,6 +547,9 @@ mod tests {
             None,
             ingress.clone(),
             None,
+            Arc::default(),
+            None,
+            Arc::default(),
         );
         (ingress, shared, events)
     }
@@ -628,6 +631,9 @@ mod tests {
             None,
             ingress.clone(),
             None,
+            Arc::default(),
+            None,
+            Arc::default(),
         );
         shared.prompt_epoch.store(1, Ordering::Relaxed);
         shared
@@ -872,6 +878,9 @@ mod tests {
             None,
             ingress.clone(),
             None,
+            Arc::default(),
+            None,
+            Arc::default(),
         );
         let update = |capabilities: serde_json::Value| {
             serde_json::json!({
@@ -996,6 +1005,9 @@ mod tests {
                 None,
                 ingress.clone(),
                 None,
+                Arc::default(),
+                None,
+                Arc::default(),
             );
             shared.prompt_epoch.store(1, Ordering::Relaxed);
             feed(
@@ -1143,6 +1155,9 @@ mod tests {
                 None,
                 ingress.clone(),
                 None,
+                Arc::default(),
+                None,
+                Arc::default(),
             ));
             shared.prompt_epoch.store(1, Ordering::Relaxed);
             for frame in setup {
