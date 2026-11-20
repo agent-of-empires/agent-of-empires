@@ -2393,6 +2393,22 @@ describe("SessionWizard suggestion source", () => {
     expect(payload()).toMatchObject({ worktree_enabled: true });
   });
 
+  it("drops the preset's worktree when the profile changes", async () => {
+    vi.mocked(fetchProfiles).mockResolvedValue([
+      { name: "default", is_default: true },
+      { name: "work", is_default: false },
+    ] as never);
+    vi.mocked(fetchSettings).mockResolvedValue({ worktree: { enabled: false } } as never);
+    renderWizard({ path: "/tmp/proj", tool: "claude", useWorktree: true });
+    await waitFor(() => expect(fetchSettings).toHaveBeenCalled());
+    fireEvent.click(screen.getByText("Profile"));
+    fireEvent.click(await screen.findByRole("radio", { name: /work/ }));
+    await waitFor(() => expect(fetchSettings).toHaveBeenCalledWith("work"));
+    await waitFor(() =>
+      expect(screen.getByRole("switch", { name: "Create a worktree" }).getAttribute("aria-checked")).toBe("false"),
+    );
+  });
+
   const source = { label: "GitHub", title: "Fix lifecycle", url: "https://example.test/issues/1" };
 
   it("shows the From strip and seeds the title", async () => {
