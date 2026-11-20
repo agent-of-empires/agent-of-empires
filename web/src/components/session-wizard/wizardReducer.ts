@@ -352,6 +352,7 @@ function reduce(state: WizardState, action: Action): WizardState {
         state.data.importAcpSessionId || state.data.scratch || state.data.pathIsGitRepo === false
           ? false
           : (state.data.projectWorktreeOverride ?? action.worktreeEnabled);
+      const keepWorktree = !!action.skipIfDirty && state.data.worktreeDirty;
       const structuredViewOffered = action.structuredViewOffered ?? state.data.structuredViewOffered;
       const useStructuredView = seededStructuredView(state.data, action, structuredViewOffered);
       const resolvedSandbox = state.data.importAcpSessionId
@@ -381,7 +382,8 @@ function reduce(state: WizardState, action: Action): WizardState {
           yoloMode: action.yoloMode,
           sandboxEnabled: resolvedSandbox,
           profileSandboxDefault: action.sandboxEnabled,
-          useWorktree: resolvedUseWorktree(),
+          // A prefilled or typed choice survives the first load; a profile reset drops it.
+          useWorktree: keepWorktree ? state.data.useWorktree : resolvedUseWorktree(),
           profileWorktreeDefault: action.worktreeEnabled,
           useWorkspace: action.workspaceByDefault,
           workspaceDirty: false,
@@ -392,7 +394,7 @@ function reduce(state: WizardState, action: Action): WizardState {
           useStructuredView,
           structuredViewOffered,
           profileDirty: false,
-          worktreeDirty: false,
+          worktreeDirty: keepWorktree,
           sandboxDirty: false,
         },
       };

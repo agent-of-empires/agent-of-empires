@@ -280,6 +280,7 @@ describe("SuggestionsView", () => {
         initialTab: undefined,
         tool: "opencode",
         useStructuredView: false,
+        useWorktree: true,
         yoloMode: true,
         sandboxEnabled: false,
         initialPrompt: "Review the issue.",

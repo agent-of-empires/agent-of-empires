@@ -95,6 +95,8 @@ export interface WizardPrefill {
   worktreeEnabled?: boolean;
   /** Kept over the profile's view default, as a direct edit would be. */
   useStructuredView?: boolean;
+  /** A preset's worktree choice, kept over project and profile defaults like a direct edit. */
+  useWorktree?: boolean;
   initialPrompt?: string;
   title?: string;
   /** Where a suggested session came from, shown as the "From" strip. */
@@ -144,6 +146,8 @@ function initialWizardData(prefill: WizardPrefill | undefined, nameOnly: boolean
       useStructuredView: prefill.useStructuredView,
       structuredViewDirty: true,
     }),
+    ...(prefill.useWorktree !== undefined &&
+      !prefill.scratch && { useWorktree: prefill.useWorktree, worktreeDirty: true }),
   };
 }
 

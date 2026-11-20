@@ -2377,6 +2377,22 @@ describe("SessionWizard suggestion source", () => {
     ).toBe(true);
   });
 
+  it("keeps the preset's worktree over the profile default", async () => {
+    const prepared = {
+      title: "t",
+      initial_prompt: "p",
+      project: null,
+      worktree: true,
+    } as unknown as SuggestionPrepared;
+    expect(toWizardPrefill(prepared, { label: "G", title: "t", url: "" }).useWorktree).toBe(true);
+    vi.mocked(fetchSettings).mockResolvedValue({ worktree: { enabled: false } } as never);
+    renderWizard({ path: "/tmp/proj", tool: "claude", useWorktree: true });
+    await waitFor(() => expect(fetchSettings).toHaveBeenCalled());
+    await launch();
+    await waitFor(() => expect(createSession).toHaveBeenCalled());
+    expect(payload()).toMatchObject({ worktree_enabled: true });
+  });
+
   const source = { label: "GitHub", title: "Fix lifecycle", url: "https://example.test/issues/1" };
 
   it("shows the From strip and seeds the title", async () => {
