@@ -98,6 +98,7 @@ test.describe("Retry", () => {
       title: "story-startup-error-retry",
       acpSessionId: "acp-1",
       initialEvents: [{ AgentStartupError: { message: MESSAGE } }],
+      nativeAvailable: false,
     });
     for (const path of ["spawn", "restart"])
       await page.route(`**/api/sessions/*/acp/${path}`, (r) => r.fulfill({ json: {} }));
@@ -121,6 +122,7 @@ test.describe("Retry", () => {
   test("shows the startup line in place of the banner, then the transcript once the Agent starts", async ({ page }) => {
     const { mock, banner, line } = await retryFailedSession(page);
     mock.pushEvents([{ AcpSessionAssigned: { acp_session_id: "acp-2" } }]);
+    mock.setNativeState({ ready: true });
     await expect(line).toHaveCount(0);
     await expect(banner).toHaveCount(0);
     await expect(page.getByText(HINT)).toBeVisible();
