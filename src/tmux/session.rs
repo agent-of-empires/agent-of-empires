@@ -872,7 +872,7 @@ impl Session {
         let mut last: Option<String> = None;
         while std::time::Instant::now() < deadline {
             std::thread::sleep(poll_interval);
-            let Ok(now) = self.capture_pane(5) else {
+            let Ok(now) = self.capture_pane(0) else {
                 continue;
             };
             #[cfg(test)]

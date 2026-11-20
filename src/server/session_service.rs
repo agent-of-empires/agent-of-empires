@@ -1430,6 +1430,10 @@ impl SessionService {
                     .is_some(),
                 "the agent is no longer running"
             );
+            // The waits ran before these guards; what is on screen now decides.
+            if !pane_accepts_automatic_input(&target)? {
+                return Ok(false);
+            }
             target
                 .tmux_session()?
                 .send_keys_with_delay(&typed, target.send_keys_enter_delay())?;
@@ -2896,6 +2900,20 @@ impl std::fmt::Display for TerminalPromptBlocker {
 }
 
 impl std::error::Error for TerminalPromptBlocker {}
+
+/// Whether the visible screen, not its scrollback, shows the agent's input box. A first-run dialog
+/// is an error carrying its [`TerminalPromptBlocker`]; any other screen without
+/// a ready marker, such as a stale one that has since scrolled away, is `false`.
+fn pane_accepts_automatic_input(instance: &Instance) -> anyhow::Result<bool> {
+    let screen = crate::tmux::utils::strip_ansi(&instance.tmux_session()?.capture_pane(0)?);
+    if let Some(blocker) = TerminalPromptBlocker::detect(&instance.tool, &screen) {
+        return Err(blocker.into());
+    }
+    let screen = screen.to_lowercase();
+    Ok(crate::agents::ready_markers(&instance.tool)
+        .iter()
+        .any(|marker| screen.contains(marker)))
+}
 
 /// Blocks until the terminal session's agent process is up (alive pane, not a
 /// bare shell) and its ready marker is showing. An agent without a ready marker
@@ -4976,6 +4994,54 @@ mod tests {
             assert_eq!(turn.error_code.as_deref(), Some(code), "{case}");
             assert!(turn.error.is_some_and(|e| e.contains(hint)), "{case}");
         }
+    }
+
+    /// The screen is read again under the final guards: a ready marker that has
+    /// since gone, or a dialog that has since appeared, receives no input.
+    #[test]
+    #[serial_test::serial]
+    fn the_final_send_rechecks_the_visible_pane() {
+        if !crate::tmux::is_tmux_available() {
+            return;
+        }
+        let _app_dir = crate::session::test_support::isolate_app_dir();
+        let dir = tempfile::tempdir().unwrap();
+        let (trust, go) = (dir.path().join("trust"), dir.path().join("go"));
+        std::fs::write(&trust, TRUST_DIALOG_CAPTURE).unwrap();
+        let mut inst = terminal_turn_instance("sess-final", "term-final", "unused");
+        inst.tool = "claude".into();
+        let pane = start_terminal_pane(
+            &inst,
+            &format!(
+                "echo 'bypass permissions on (shift+tab to cycle)'; \
+                 until [ -f '{go}' ]; do sleep 0.05; done; clear; cat '{trust}'; \
+                 sleep 1; clear; echo loading; exec cat",
+                go = go.display(),
+                trust = trust.display()
+            ),
+            false,
+        );
+        let wait_for = |want: &dyn Fn(&str) -> bool| {
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+            while !want(&pane_text(&pane)) {
+                assert!(std::time::Instant::now() < deadline, "{}", pane_text(&pane));
+                std::thread::sleep(std::time::Duration::from_millis(50));
+            }
+        };
+
+        wait_for(&|screen| screen.contains("shift+tab to cycle"));
+        assert!(pane_accepts_automatic_input(&inst).unwrap());
+
+        std::fs::write(&go, b"").unwrap();
+        wait_for(&|screen| screen.contains("Yes, I trust this folder"));
+        let error = pane_accepts_automatic_input(&inst).unwrap_err();
+        assert_eq!(
+            error.downcast_ref::<TerminalPromptBlocker>(),
+            Some(&TerminalPromptBlocker::FolderNotTrusted)
+        );
+
+        wait_for(&|screen| screen.contains("loading"));
+        assert!(!pane_accepts_automatic_input(&inst).unwrap());
     }
 
     /// A Claude session is typed into once its input box shows the mode line,
