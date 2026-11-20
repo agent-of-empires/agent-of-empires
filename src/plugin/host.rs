@@ -2601,6 +2601,50 @@ command = {command}
         host.shutdown().await;
     }
 
+    /// A reply that names the request but lacks the JSON-RPC 2.0 envelope must fail the call,
+    /// so a caller's failure path runs instead of applying its result.
+    #[cfg(unix)]
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn a_reply_without_the_jsonrpc_version_fails_the_request() {
+        let temp = tempfile::tempdir().unwrap();
+        let _reload = crate::plugin::ReloadRegistryOnDrop;
+        let _env = crate::session::test_support::EnvGuard::set(&[
+            ("XDG_CONFIG_HOME", temp.path().to_path_buf()),
+            ("HOME", temp.path().to_path_buf()),
+            ("USERPROFILE", temp.path().to_path_buf()),
+        ]);
+        let plugin_id = "acme.sloppy";
+        install_worker(
+            plugin_id,
+            r#"["sh", "-c", "read line; echo '{\"id\":\"h-1\",\"result\":{\"drop\":\"*\"}}'; sleep 30"]"#,
+        );
+        let registry = crate::plugin::reload_registry();
+        let host = PluginHost::new(
+            &temp.path().join("host"),
+            "default",
+            None,
+            Arc::new(crate::server::runtime::RuntimeWork::default()),
+        )
+        .unwrap();
+        host.start(&registry).await;
+        let hash = registry.get(plugin_id).unwrap().manifest_hash.clone();
+
+        let started = Instant::now();
+        let err = host
+            .request_worker(
+                worker_ref(plugin_id, &hash),
+                "mcp.rewrite",
+                json!({}),
+                Duration::from_secs(20),
+            )
+            .await
+            .unwrap_err();
+        assert!(matches!(err, WorkerRequestError::Rejected), "{err}");
+        assert!(started.elapsed() < Duration::from_secs(10));
+        host.shutdown().await;
+    }
+
     #[cfg(unix)]
     #[tokio::test]
     #[serial_test::serial]
