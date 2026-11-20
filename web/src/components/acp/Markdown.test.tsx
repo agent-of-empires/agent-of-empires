@@ -16,6 +16,7 @@ vi.mock("../../hooks/useShikiTheme", () => ({
 }));
 
 vi.mock("../../lib/snippetHighlighter", () => ({
+  peekHighlight: () => undefined,
   highlightSnippet: vi.fn().mockResolvedValue("<pre><code>highlighted</code></pre>"),
 }));
 
