@@ -2345,6 +2345,10 @@ The flag allows three retries, and the reviewer approved the plan.
 Writes are allowed once the lock is released.
 The policy will allow once the lock is released, and admins allow always.
 Allow once the lock is released.
+Allow once
+\u{203a} Allow always
+> Allow once
+\u{276f} Allow always
 ";
         for agent in [
             "antigravity",

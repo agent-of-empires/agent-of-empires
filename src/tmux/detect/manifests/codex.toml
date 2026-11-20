@@ -139,7 +139,7 @@ not = [
   { line = { regex = ['(?i)^\s*(?:•\s*)?[\x{2800}-\x{28FF}]?\s*(working|thinking|processing|generating)[\s.:\x{2026}]'], not_regex = ['(?i)^\s*\S+(?:\W+\w+){0,4}\W+(completed?|done|finished|successful|successfully|success)\b'] } },
   { line_regex = ['(?i)^\s*[\x{276F}\x{203A}]\s*[1-9]\.'] },
   { contains_any = ["(y/n)", "[y/n]", "continue?", "proceed?", "execute?", "run command?", "enter to select", "esc to cancel"] },
-  { line_regex = ['(?i)^[\s\x{2502}]*(?:[\x{25CF}\x{276F}\x{203A}>]\s*)?(?:[1-9]\.\s+)?(?:yes,\s+)?allow (?:once|always)\s*\x{2502}?\s*$'] },
+  { line_regex = ['(?i)^[\s\x{2502}]*(?:[\x{25CF}\x{276F}\x{203A}>]\s*)?[1-9]\.\s+(?:yes,\s+)?allow (?:once|always)\s*\x{2502}?\s*$'] },
   # Two cursor prompts below the banner means the session moved on twice.
   { line_regex = ['(?i)^\s*[\x{276F}\x{203A}]\s*\S'], min_lines = 2 },
 ]
@@ -157,7 +157,7 @@ not = [
   { line_regex = ['(?i)^\s*(?:•\s*)?(?:esc|ctrl\+c) to interrupt\s*$'] },
   { line_regex = ['(?i)^\s*[\x{276F}\x{203A}]\s*[1-9]\.'] },
   { contains_any = ["(y/n)", "[y/n]", "continue?", "proceed?", "execute?", "run command?", "enter to select", "esc to cancel"] },
-  { line_regex = ['(?i)^[\s\x{2502}]*(?:[\x{25CF}\x{276F}\x{203A}>]\s*)?(?:[1-9]\.\s+)?(?:yes,\s+)?allow (?:once|always)\s*\x{2502}?\s*$'] },
+  { line_regex = ['(?i)^[\s\x{2502}]*(?:[\x{25CF}\x{276F}\x{203A}>]\s*)?[1-9]\.\s+(?:yes,\s+)?allow (?:once|always)\s*\x{2502}?\s*$'] },
   # Nothing but the model footer may follow the prompt: fresh output under it
   # means the turn moved on rather than parked.
   { region = "after(cursor_prompt)", line = { regex = ['\S'], not_regex = ['(?i)^\s*(gpt-|o3|o4)\S*\s.*\s\u{b7}\s'] } },
@@ -174,7 +174,7 @@ not = [
   { line_regex = ['(?i)^\s*(?:•\s*)?(?:esc|ctrl\+c) to interrupt\s*$'] },
   { line_regex = ['(?i)^\s*[\x{276F}\x{203A}]\s*[1-9]\.'] },
   { contains_any = ["(y/n)", "[y/n]", "continue?", "proceed?", "execute?", "run command?", "enter to select", "esc to cancel"] },
-  { line_regex = ['(?i)^[\s\x{2502}]*(?:[\x{25CF}\x{276F}\x{203A}>]\s*)?(?:[1-9]\.\s+)?(?:yes,\s+)?allow (?:once|always)\s*\x{2502}?\s*$'] },
+  { line_regex = ['(?i)^[\s\x{2502}]*(?:[\x{25CF}\x{276F}\x{203A}>]\s*)?[1-9]\.\s+(?:yes,\s+)?allow (?:once|always)\s*\x{2502}?\s*$'] },
   # Nothing but the model footer may follow the prompt: fresh output under it
   # means the turn moved on rather than parked.
   { region = "after(cursor_prompt)", line = { regex = ['\S'], not_regex = ['(?i)^\s*(gpt-|o3|o4)\S*\s.*\s\u{b7}\s'] } },
