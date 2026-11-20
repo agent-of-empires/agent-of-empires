@@ -23,6 +23,9 @@ use crate::plugin::ui_state::UiSnapshot;
 
 /// The daemon revives, waits for readiness and delivers before it answers a terminal send.
 const SEND_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(120);
+/// `POST /api/suggestions/start` answers after the create, which can take
+/// minutes for a sandbox; `POST /api/sessions` waits as long.
+const START_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30 * 60);
 const PLUGIN_PREVIEW_TIMEOUT: std::time::Duration =
     crate::plugin::EXECUTION_BUDGET.saturating_add(std::time::Duration::from_secs(10 * 60));
 
@@ -548,7 +551,9 @@ impl HttpClient {
         body: &serde_json::Value,
     ) -> Result<(u16, serde_json::Value), HttpError> {
         let url = format!("{}/api/suggestions/start", self.endpoint.base_url);
-        let res = self.execute(self.http.post(&url).json(body)).await?;
+        let res = self
+            .execute(self.http.post(&url).json(body).timeout(START_TIMEOUT))
+            .await?;
         let status = res.status();
         if status.is_success() || matches!(status.as_u16(), 400 | 409 | 422) {
             let value = crate::daemon::decode_json::<serde_json::Value>(res)
@@ -2303,6 +2308,36 @@ mod tests {
             ));
             assert!(!error.to_string().contains("secret-provider-credential"));
         }
+    }
+
+    #[tokio::test]
+    async fn a_suggestion_start_outlives_the_general_http_budget() {
+        use axum::{routing::post, Json, Router};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        // A sandboxed create answers only once its container is up.
+        let app = Router::new().route(
+            "/api/suggestions/start",
+            post(|| async {
+                tokio::time::sleep(Duration::from_millis(400)).await;
+                (
+                    StatusCode::CREATED,
+                    Json(serde_json::json!({ "session_id": "s1", "title": "t" })),
+                )
+            }),
+        );
+        let server = tokio::spawn(async move { axum::serve(listener, app).await });
+        let mut client =
+            HttpClient::new(endpoint(&format!("http://{address}"), Some("token"))).unwrap();
+        client.http = reqwest::Client::builder()
+            .no_proxy()
+            .timeout(Duration::from_millis(200))
+            .build()
+            .unwrap();
+        let started = client.start_suggestion(&serde_json::json!({})).await;
+        server.abort();
+        assert_eq!(started.unwrap().0, 201);
     }
 
     #[tokio::test]
