@@ -27,6 +27,7 @@ import { safeGetItem, safeRemoveItem, safeSetItem } from "../lib/safeStorage";
 import { isSessionActive } from "../lib/session";
 import { publishLivePane } from "../lib/liveControl";
 import { LiveControlStrip } from "./LiveControlStrip";
+import { PromptBlockedNote } from "./PromptBlockedNote";
 
 interface Props {
   readOnly: boolean;
@@ -534,12 +535,14 @@ export function LiveTerminalView({ session, readOnly, active = true, surface = "
             </span>
           )}
           {session.initial_prompt_error && (
-            <span
-              role="alert"
-              className="text-xs text-status-warning bg-surface-900/90 border border-surface-700/60 rounded-full px-4 py-2 max-w-md break-words text-center"
-            >
-              Initial prompt not sent: {session.initial_prompt_error}
-            </span>
+            <div className="pointer-events-auto bg-surface-900/90 border border-surface-700/60 rounded-2xl px-4 py-2 max-w-md text-center">
+              <PromptBlockedNote
+                label="Initial prompt not sent"
+                code={session.initial_prompt_error_code}
+                message={session.initial_prompt_error}
+                disabled={readOnly}
+              />
+            </div>
           )}
         </div>
       )}

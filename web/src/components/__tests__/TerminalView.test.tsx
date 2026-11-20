@@ -23,6 +23,7 @@ vi.mock("../../lib/api", () => ({
   ensureSession: (id: string, signal?: AbortSignal) => ensureSession(id, signal),
   ensureTerminal: (id: string, index?: number, container?: boolean) => ensureTerminal(id, index, container),
   isStartRefusal: (code?: string) => code === "session_archived" || code === "session_trashed",
+  updateSettings: vi.fn(),
 }));
 
 // The full hook is exercised by useTerminal.lifecycle.test.ts and the Playwright suites.
@@ -134,6 +135,23 @@ describe("TerminalView early-return states", () => {
     await waitFor(() => {
       expect(screen.getByRole("alert").textContent).toBe("Initial prompt not sent: the agent was not ready within 60s");
     });
+  });
+
+  it("offers pre-trust when Claude Code waits on folder trust", async () => {
+    render(
+      <TerminalView
+        readOnly={false}
+        session={makeSession({
+          initial_prompt_error:
+            "Claude Code is asking whether to trust this folder, so the prompt was not typed. Turn on…",
+          initial_prompt_error_code: "agent_folder_not_trusted",
+        })}
+      />,
+    );
+    expect((await screen.findByRole("alert")).textContent).toBe(
+      "Initial prompt not sent: Claude Code is asking whether to trust this folder, so the prompt was not typed.",
+    );
+    expect(screen.getByRole("button", { name: "Turn on pre-trust" })).toBeTruthy();
   });
 
   it("re-runs ensureSession when Retry is clicked", async () => {

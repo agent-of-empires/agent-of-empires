@@ -12,6 +12,7 @@ import { useSuggestionPresets } from "../hooks/useSuggestionPresets";
 import { SuggestionItemActions } from "./SuggestionItemActions";
 import { SuggestionHooksReview } from "./SuggestionHooksReview";
 import { SuggestionsSetupHint } from "./SuggestionsSetupHint";
+import { StartedPromptNote } from "./PromptBlockedNote";
 import { SUGGESTION_NOTE_CLASS, SuggestionRow, TAP, SuggestionStatusNotes, UndoBar } from "./SuggestionRow";
 import type { WizardPrefill } from "./session-wizard/SessionWizard";
 
@@ -387,6 +388,13 @@ export function SuggestionsView({
                             session={liveSession(item.started_session, sessions)}
                             stale={item.stale}
                             failure={failures[key]}
+                            note={
+                              <StartedPromptNote
+                                session={liveSession(item.started_session, sessions)}
+                                onTryAgain={() => void ctrl.retryBlocked(item)}
+                                disabled={disabled}
+                              />
+                            }
                             actions={
                               <SuggestionItemActions
                                 item={item}

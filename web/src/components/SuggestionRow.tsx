@@ -52,6 +52,8 @@ interface RowProps {
   stale?: boolean;
   /** A start that failed: the reason, then what to do. The row stays startable. */
   failure?: { reason: string; hint?: string };
+  /** Under the reason line, e.g. why a started Session's prompt was not typed. */
+  note?: ReactNode;
   actions: ReactNode;
 }
 
@@ -84,6 +86,7 @@ export function SuggestionRow({
   session,
   stale,
   failure,
+  note,
   actions,
 }: RowProps) {
   return (
@@ -122,6 +125,7 @@ export function SuggestionRow({
             {failure.hint ? ` ${failure.hint}` : ""}
           </p>
         )}
+        {note}
       </div>
       <div className="flex flex-none gap-1">{actions}</div>
     </li>

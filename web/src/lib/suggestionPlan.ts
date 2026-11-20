@@ -22,8 +22,15 @@ export function startSummary(
 /** "owner/repo#12" as "#12". */
 export const shortRef = (ref: string) => (ref.includes("#") ? ref.slice(ref.lastIndexOf("#")) : ref);
 
-/** The snapshot's Session with its status from the live sessions poll, which the snapshot lags. */
+/** The snapshot's Session with its status and prompt error from the live sessions poll, which the snapshot lags. */
 export function liveSession(started: StartedSession | undefined, sessions?: SessionResponse[]) {
   const live = started && sessions?.find((s) => s.id === started.id);
-  return live ? { ...started, status: live.status } : started;
+  return live
+    ? {
+        ...started,
+        status: live.status,
+        initial_prompt_error: live.initial_prompt_error,
+        initial_prompt_error_code: live.initial_prompt_error_code,
+      }
+    : started;
 }

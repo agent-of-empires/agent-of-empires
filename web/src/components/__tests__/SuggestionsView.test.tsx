@@ -14,6 +14,8 @@ const {
   startSuggestion,
   fetchProjects,
   fetchPresets,
+  trashSession,
+  updateSettings,
 } = vi.hoisted(() => ({
   fetchSuggestions: vi.fn(),
   prepareSuggestion: vi.fn(),
@@ -22,6 +24,8 @@ const {
   startSuggestion: vi.fn(),
   fetchProjects: vi.fn(),
   fetchPresets: vi.fn(),
+  trashSession: vi.fn(),
+  updateSettings: vi.fn(),
 }));
 
 vi.mock("../../lib/api", () => ({
@@ -33,6 +37,8 @@ vi.mock("../../lib/api", () => ({
   dismissSuggestion,
   fetchSuggestionProjects: fetchProjects,
   fetchSuggestionPresets: fetchPresets,
+  trashSession,
+  updateSettings,
 }));
 
 const item: SuggestionItem = {
@@ -397,6 +403,33 @@ describe("SuggestionsView", () => {
       });
       const row = (await screen.findByText("Fix lifecycle")).closest("li") as HTMLElement;
       expect(row.querySelector("p:nth-of-type(2)")?.textContent).toBe("example/1 · ⠒ Idle · started 3 min ago");
+    });
+
+    it("a prompt blocked by folder trust: Turn on pre-trust, then Try again trashes that Session and starts anew", async () => {
+      updateSettings.mockResolvedValue("committed");
+      trashSession.mockResolvedValue({});
+      startSuggestion.mockResolvedValue({ kind: "started", sessionId: "s2", title: "Fix lifecycle" });
+      await open(snapshot({ items: [{ ...item, started_session: started }] }), {
+        sessions: [
+          {
+            id: "sess-1",
+            status: "Idle",
+            initial_prompt_error:
+              "Claude Code is asking whether to trust this folder, so the prompt was not typed. Turn on…",
+            initial_prompt_error_code: "agent_folder_not_trusted",
+          } as SessionResponse,
+        ],
+      });
+      const row = (await screen.findByText("Fix lifecycle")).closest("li") as HTMLElement;
+      expect(within(row).getByRole("alert").textContent).toBe(
+        "Prompt not sent: Claude Code is asking whether to trust this folder, so the prompt was not typed.",
+      );
+      fireEvent.click(within(row).getByRole("button", { name: "Turn on pre-trust" }));
+      fireEvent.click(within(row).getByRole("button", { name: "Turn on" }));
+      fireEvent.click(await within(row).findByRole("button", { name: "Try again" }));
+      await waitFor(() => expect(startSuggestion).toHaveBeenCalledWith("github", "issue-1", {}));
+      expect(trashSession).toHaveBeenCalledWith("sess-1");
+      expect(trashSession.mock.invocationCallOrder[0]).toBeLessThan(startSuggestion.mock.invocationCallOrder[0]!);
     });
 
     it("Start another opens the wizard without linking the new Session", async () => {
