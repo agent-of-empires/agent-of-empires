@@ -22,16 +22,21 @@ fn restrict_file(path: &std::path::Path) -> Result<usize> {
     Ok(1)
 }
 
-/// Follows symlink hops without requiring the final target to exist.
+/// Follows symlink hops without requiring the final target to exist. Like Linux, it follows 40
+/// links and refuses a 41st.
 #[cfg(unix)]
 fn link_target(path: &std::path::Path) -> Result<std::path::PathBuf> {
+    const MAX_LINKS: usize = 40;
     let mut current = path.to_path_buf();
-    for _ in 0..40 {
+    for hops in 0..=MAX_LINKS {
         if !std::fs::symlink_metadata(&current)?
             .file_type()
             .is_symlink()
         {
             return Ok(current);
+        }
+        if hops == MAX_LINKS {
+            break;
         }
         let link = std::fs::read_link(&current)?;
         current = current
@@ -151,6 +156,55 @@ mod tests {
             let mode = std::fs::metadata(path).unwrap().permissions().mode() & 0o777;
             assert_eq!(mode, 0o600, "{}", path.display());
         }
+    }
+
+    #[test]
+    fn a_target_forty_links_away_is_restricted_and_a_forty_first_link_is_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("history.sqlite");
+        let files =
+            ["", "-wal", "-shm"].map(|suffix| dir.path().join(format!("history.sqlite{suffix}")));
+        for file in &files {
+            std::fs::write(file, b"x").unwrap();
+            std::fs::set_permissions(file, std::fs::Permissions::from_mode(0o644)).unwrap();
+        }
+        let modes = || {
+            files
+                .iter()
+                .map(|file| std::fs::metadata(file).unwrap().permissions().mode() & 0o777)
+                .collect::<Vec<_>>()
+        };
+        // `acp_events.db` is the first of `links` links, the last of which names `target`.
+        let link = dir.path().join("acp_events.db");
+        let chain = |links: usize| {
+            let hop = |n: usize| match n {
+                1 => link.clone(),
+                n => dir.path().join(format!("hop-{n}")),
+            };
+            for n in 1..=41 {
+                let _ = std::fs::remove_file(hop(n));
+            }
+            for n in 1..=links {
+                let next = if n == links {
+                    target.clone()
+                } else {
+                    hop(n + 1)
+                };
+                std::os::unix::fs::symlink(next, hop(n)).unwrap();
+            }
+        };
+
+        // The kernel refuses the 41st link too, so the refusal comes before any change.
+        chain(41);
+        assert!(super::link_target(&link).is_err());
+        assert!(super::restrict(dir.path()).is_err());
+        assert_eq!(modes(), [0o644; 3], "nothing restricted");
+
+        // The 40th link's target is accepted, and a rerun after the repair completes.
+        chain(40);
+        assert_eq!(super::link_target(&link).unwrap(), target);
+        assert_eq!(super::restrict(dir.path()).unwrap(), 3);
+        assert_eq!(modes(), [0o600; 3], "the database and both sidecars");
     }
 
     #[test]
