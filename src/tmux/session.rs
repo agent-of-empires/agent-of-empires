@@ -850,33 +850,52 @@ impl Session {
         Ok(capture_output(output.status.success(), &output.stdout))
     }
 
-    /// Wait for a known marker, or for two stable captures when no marker exists.
+    /// Wait for any known marker, or for two stable captures when no marker exists.
     /// The polling budget bounds readiness checks, not each native subprocess.
-    pub fn wait_until_ready(&self, max_wait: std::time::Duration, ready_marker: Option<&str>) {
+    /// Returns false when the budget ran out first.
+    pub fn wait_until_ready(&self, max_wait: std::time::Duration, ready_markers: &[&str]) -> bool {
+        self.wait_until_ready_unless(max_wait, ready_markers, |_| None::<()>)
+            .unwrap_or(false)
+    }
+
+    /// [`Self::wait_until_ready`] that also stops at once with `Err` when
+    /// `blocked` recognizes the plain-text screen as a dialog.
+    pub fn wait_until_ready_unless<B>(
+        &self,
+        max_wait: std::time::Duration,
+        ready_markers: &[&str],
+        blocked: impl Fn(&str) -> Option<B>,
+    ) -> Result<bool, B> {
         let poll_interval = std::time::Duration::from_millis(200);
         let deadline = std::time::Instant::now() + max_wait;
-        let ready_marker = ready_marker.map(str::to_lowercase);
+        let ready_markers: Vec<String> = ready_markers.iter().map(|m| m.to_lowercase()).collect();
         let mut last: Option<String> = None;
         while std::time::Instant::now() < deadline {
             std::thread::sleep(poll_interval);
-            let Ok(now) = self.capture_pane(5) else {
+            let Ok(now) = self.capture_pane(0) else {
                 continue;
             };
             #[cfg(test)]
             tests::observe_ready_capture(&now);
-            if let Some(marker) = ready_marker.as_deref() {
-                if now.to_lowercase().contains(marker) {
-                    return;
+            let screen = crate::tmux::utils::strip_ansi(&now);
+            if let Some(blocker) = blocked(&screen) {
+                return Err(blocker);
+            }
+            if !ready_markers.is_empty() {
+                let screen = screen.to_lowercase();
+                if ready_markers.iter().any(|m| screen.contains(m)) {
+                    return Ok(true);
                 }
                 continue;
             }
             if now.trim().len() > 20 {
                 if last.as_deref() == Some(now.as_str()) {
-                    return;
+                    return Ok(true);
                 }
                 last = Some(now);
             }
         }
+        Ok(false)
     }
 
     /// Capture the whole first window, panes composited, for the passive
@@ -3095,7 +3114,7 @@ mod tests {
                         resume: resume_rx,
                     });
                     Session::from_name(name)
-                        .wait_until_ready(std::time::Duration::from_secs(60), Some("ask anything"));
+                        .wait_until_ready(std::time::Duration::from_secs(60), &["ask anything"]);
                 });
                 let _release_on_unwind = ReleaseOnDrop(&release);
                 let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);

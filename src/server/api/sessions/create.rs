@@ -854,6 +854,29 @@ pub(crate) async fn create_session_with(
         }
     }
 
+    if body
+        .initial_prompt
+        .as_deref()
+        .is_some_and(|prompt| prompt.trim().is_empty())
+    {
+        return api_error(
+            StatusCode::BAD_REQUEST,
+            "validation_failed",
+            "initial_prompt must not be blank",
+        );
+    }
+    if body
+        .initial_prompt
+        .as_deref()
+        .is_some_and(|prompt| prompt.len() > crate::session::MAX_INITIAL_PROMPT_BYTES)
+    {
+        return api_error(
+            StatusCode::BAD_REQUEST,
+            "validation_failed",
+            "initial_prompt exceeds 64 KiB",
+        );
+    }
+
     // Idempotency first: a known key is answered from its result, replayed failure or
     // restart fence before any validation that reads mutable state (profiles, agents,
     // projects), which could otherwise turn a retry of an unknown outcome into a verdict.
@@ -1406,6 +1429,7 @@ pub(crate) async fn create_session_with(
         );
     }
 
+    let initial_turn = initial_turn.or(body.initial_prompt.take());
     let profile = body.profile.unwrap_or(default_profile);
     // `body.profile` is the caller's authority when it names one; otherwise
     // the served profile resolved above, which is also what the validation

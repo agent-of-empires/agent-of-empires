@@ -1943,6 +1943,8 @@ mod tests {
             text: "queued before the park".to_string(),
             attachments: Vec::new(),
             synthesized: true,
+            error: None,
+            error_code: None,
         };
         parked.pending_initial_turn = Some(seeded.clone());
         let (deps, state, _dir) = test_deps(vec![parked]);
@@ -3039,6 +3041,8 @@ mod tests {
                 text: "run the nightly task".to_string(),
                 attachments: Vec::new(),
                 synthesized: false,
+                error: None,
+                error_code: None,
             });
             crate::session::test_support::sandbox_needing_login(home.path(), &mut row);
             let (deps, state, _dir) = test_deps_native(vec![row]).await;
