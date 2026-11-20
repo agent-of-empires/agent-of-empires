@@ -1,12 +1,19 @@
 //! The Connections hub behind R: this computer's Web dashboard, plus its Daemon whenever the
 //! Daemon needs attention. While the Daemon is offline it is also the home screen's takeover.
 
-use crossterm::event::{KeyCode, KeyEvent};
+use std::time::{Duration, Instant};
+
+use crossterm::event::{KeyCode, KeyEvent, KeyEventKind};
 use ratatui::prelude::*;
 use ratatui::widgets::*;
 
 use super::DialogResult;
+use crate::tui::home::bindings::{self, ActionId};
 use crate::tui::styles::Theme;
+
+/// How long after a Serve chord the next one still counts as the same press. Above the common
+/// OS key-repeat delays (225 to 660 ms), so a held key's first repeat falls inside it.
+const SEPARATE_PRESS: Duration = Duration::from_millis(700);
 
 /// Why the Daemon row is listed. A healthy Daemon has no row.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -154,6 +161,9 @@ pub struct ConnectionsView {
     web: WebState,
     selected: usize,
     row_rects: Vec<(Row, Rect)>,
+    /// The last Serve chord while no other key has arrived, starting with the one that opened
+    /// the hub; a held key keeps renewing it.
+    last_serve: Option<Instant>,
 }
 
 impl ConnectionsView {
@@ -165,6 +175,7 @@ impl ConnectionsView {
             web,
             selected: 0,
             row_rects: Vec::new(),
+            last_serve: None,
         };
         // A failed launch opens on its row, so Enter shows why at once.
         if view.web == WebState::Failed {
@@ -188,6 +199,14 @@ impl ConnectionsView {
         Self {
             reason: reason.map(str::to_owned),
             ..Self::new(Some(attention), web)
+        }
+    }
+
+    /// Opened by the Serve chord at `now`, which a second press must be separate from.
+    pub fn opened_by_serve(self, now: Instant) -> Self {
+        Self {
+            last_serve: Some(now),
+            ..self
         }
     }
 
@@ -220,9 +239,24 @@ impl ConnectionsView {
         self.daemon.is_some_and(DaemonAttention::is_takeover)
     }
 
-    /// Enter on the Web dashboard row submits; the Daemon row has nothing to open.
-    pub fn handle_key(&mut self, key: KeyEvent) -> DialogResult<()> {
+    /// Enter on the Web dashboard row submits; the Daemon row has nothing to open. The Serve
+    /// key that opened the hub submits from any row, except on a takeover, once it is a
+    /// separate press: 700 ms after the last one, or after any other key. A key-repeat event
+    /// never counts.
+    pub fn handle_key(&mut self, key: KeyEvent, strict: bool, now: Instant) -> DialogResult<()> {
         let rows = self.rows();
+        if !self.offline_takeover() && bindings::is_bound(ActionId::Serve, strict, &key) {
+            let held = key.kind == KeyEventKind::Repeat
+                || self
+                    .last_serve
+                    .is_some_and(|last| now.saturating_duration_since(last) < SEPARATE_PRESS);
+            if !held {
+                return DialogResult::Submit(());
+            }
+            self.last_serve = Some(now);
+            return DialogResult::Continue;
+        }
+        self.last_serve = None;
         match key.code {
             KeyCode::Esc | KeyCode::Char('q') => DialogResult::Cancel,
             KeyCode::Up => {
@@ -621,10 +655,75 @@ mod tests {
         }
     }
 
+    /// #5832: the second Serve chord must be a separate press, in either mode. Times are
+    /// offsets from the chord that opened the hub.
+    #[test]
+    fn the_second_serve_chord_opens_the_dashboard_only_as_a_separate_press() {
+        let ms = Duration::from_millis;
+        let down = KeyEvent::new(KeyCode::Down, KeyModifiers::NONE);
+        let repeat =
+            |key: KeyEvent| KeyEvent::new_with_kind(key.code, key.modifiers, KeyEventKind::Repeat);
+        // A held key: the first repeat after a 500 ms OS delay, then one every 33 ms for 2 s.
+        let held: Vec<Duration> = std::iter::once(ms(500))
+            .chain((1..=60).map(|i| ms(500 + 33 * i)))
+            .collect();
+        for (strict, serve) in [
+            (
+                false,
+                KeyEvent::new(KeyCode::Char('R'), KeyModifiers::SHIFT),
+            ),
+            (
+                true,
+                KeyEvent::new(KeyCode::Char('r'), KeyModifiers::CONTROL),
+            ),
+        ] {
+            let cases: Vec<(&str, Vec<(Duration, KeyEvent)>, bool)> = vec![
+                ("inside the gap", vec![(ms(150), serve)], false),
+                ("after the gap", vec![(SEPARATE_PRESS, serve)], true),
+                (
+                    "a held key",
+                    held.iter().map(|&at| (at, serve)).collect(),
+                    false,
+                ),
+                (
+                    "another key between",
+                    vec![(ms(50), down), (ms(100), serve)],
+                    true,
+                ),
+                (
+                    "repeat events, however far apart",
+                    (1..=3)
+                        .map(|i| (SEPARATE_PRESS * 2 * i, repeat(serve)))
+                        .collect(),
+                    false,
+                ),
+                (
+                    "a pause after a hold",
+                    vec![(ms(500), serve), (ms(500) + SEPARATE_PRESS, serve)],
+                    true,
+                ),
+            ];
+            for (case, keys, opens) in cases {
+                let opened = Instant::now();
+                let mut view = ConnectionsView::new(Some(DaemonAttention::ReadOnly), WebState::Off)
+                    .opened_by_serve(opened);
+                let submitted = keys
+                    .iter()
+                    .map(|&(at, key)| view.handle_key(key, strict, opened + at))
+                    .any(|result| matches!(result, DialogResult::Submit(())));
+                assert_eq!(submitted, opens, "strict={strict}: {case}");
+            }
+        }
+    }
+
     #[test]
     fn enter_opens_only_the_web_dashboard_row() {
         let press = |view: &mut ConnectionsView, code| {
-            view.handle_key(KeyEvent::new(code, KeyModifiers::NONE))
+            view.handle_key(
+                KeyEvent::new(code, KeyModifiers::NONE),
+                false,
+                Instant::now(),
+            )
         };
         let mut view = ConnectionsView::new(None, WebState::Off);
         assert!(matches!(

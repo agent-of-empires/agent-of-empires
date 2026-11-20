@@ -38,7 +38,7 @@ export function PlanStrip({ plan }: { plan: Plan | null }) {
   const allDone = completed === totalSteps;
 
   return (
-    <div className="border-b border-surface-800 bg-surface-900/95 backdrop-blur">
+    <div data-testid="plan-strip" className="border-b border-surface-800 bg-surface-900/95 backdrop-blur">
       <button
         type="button"
         className="flex w-full items-center gap-3 px-4 py-2 text-left text-sm hover:bg-surface-800/40"

@@ -13,8 +13,8 @@ pub struct AgentProfile {
     /// Slash commands that compact the conversation.
     pub compact_aliases: &'static [&'static str],
     pub clear_requires_driven_reset: bool,
-    /// When true, the server synthesises a `PlanUpdated` event from a
-    /// `kind: switch_mode` tool call (Claude's ExitPlanMode shape).
+    /// When true, a `switch_mode` approval carries its `raw_input.plan`
+    /// markdown for the plan viewer (Claude's ExitPlanMode shape).
     pub supports_exit_plan_mode: bool,
     /// When true, the server synthesises a `WakeupScheduled` event from
     /// a tool call titled `"ScheduleWakeup"`.

@@ -78,7 +78,7 @@ The web composer sends attachments alongside the prompt when the active agent ad
 
 The paperclip is disabled with a tooltip when the agent accepts no attachments, and the picker offers only the kinds it does accept. `claude-agent-acp` advertises images and embedded resources; others vary. The server re-checks the capability and enforces size, count, and MIME limits, so an unsupported attachment comes back as an error rather than reaching the agent.
 
-Attachments persist with the transcript and queue alongside the prompt text, so sending one mid-turn parks the whole message until the session resumes. A full page reload drops a queued row carrying an attachment (reattach and resend). Audio and embedded resources are stored and sent but render as a labelled chip.
+Attachments persist with the transcript and queue alongside the prompt text, so sending one mid-turn parks the whole message until the session resumes. Audio and embedded resources are stored and sent but render as a labelled chip.
 
 ### Queued prompts
 
@@ -90,7 +90,7 @@ The composer keeps messages the session cannot accept yet:
 2. **Inactive session.** While the WebSocket is reconnecting or the worker is stopped, submissions are still accepted and parked, and drain once both are back.
 3. **Idle-dormant session.** The POST itself is the wake path: the server respawns the worker, holds the request until it is ready, then delivers it.
 
-Web queue entries persist in per-origin local storage, so a reload keeps them across the reconnect window; there is no server-side durability. The TUI queue is in-memory only and does not survive leaving the view.
+The daemon owns the queue, so any client reads the same entries and they survive a page reload, a reconnect, and leaving the view. Queued attachment bytes become eligible for periodic cleanup 24 hours after queueing; a drain batch is dropped unsent only when it has neither text nor remaining attachments, otherwise it is sent without the cleaned-up ones.
 
 Click a queued row to edit it inline, or, with the composer empty and the caret at the start, press `↑` to pull the most recent queued prompt back in; `↑` and `↓` walk the queue and restore your draft once you step past the newest. A banner (TUI: the composer border title) reads **Editing queued message N of M** while you recall, `Esc` abandons the edit, and sending updates that entry in place rather than queueing a duplicate.
 

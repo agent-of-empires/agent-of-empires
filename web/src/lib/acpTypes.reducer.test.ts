@@ -258,6 +258,25 @@ describe("applyEvent / PromptRejected (#1196)", () => {
     expect(state.turnActive).toBe(false);
   });
 
+  it("keeps the rejected prompt's stored attachments for Retry (#5662)", () => {
+    const attachments = [{ id: "a 1", kind: "image" as const, mime_type: "image/png", name: "shot.png", size: 3 }];
+    const state = applyEvent(emptyAcpState(), {
+      session_id: "s/1",
+      seq: 4,
+      event: { PromptRejected: { reason: "prompt_failed", text: "", attachments } },
+    });
+    expect(state.rejectedPrompts[0]!.attachments).toEqual([
+      {
+        id: "a 1",
+        kind: "image",
+        mimeType: "image/png",
+        name: "shot.png",
+        size: 3,
+        url: "/api/sessions/s%2F1/acp/attachments/a%201",
+      },
+    ]);
+  });
+
   it("caps the rejected-prompts FIFO at 5 entries", () => {
     let state = emptyAcpState();
     for (let i = 0; i < 7; i++) state = ev(state, i + 1, rejected(`p${i}`));

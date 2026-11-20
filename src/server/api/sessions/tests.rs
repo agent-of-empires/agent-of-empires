@@ -4335,6 +4335,40 @@ async fn force_smart_rename_preflight_skips_name_gate_and_sees_only_user_overrid
     }
 }
 
+// #5784: the TUI decodes the 202 body as the session row.
+#[tokio::test]
+#[serial_test::serial]
+async fn force_smart_rename_answers_a_terminal_session_with_its_row() {
+    use axum::body::to_bytes;
+
+    let tmp_home = tempfile::tempdir().expect("tempdir HOME");
+    let project = tempfile::tempdir().expect("tempdir project");
+    let _home = crate::session::test_support::isolate_app_dir_at(tmp_home.path());
+    let mut inst = Instance::new("Vikings", project.path().to_str().unwrap());
+    inst.tool = "claude".to_string();
+    inst.source_profile = "default".to_string();
+    let id = inst.id.clone();
+
+    let state = crate::server::test_support::build_test_app_state(vec![inst]);
+    let resp = force_smart_rename(
+        axum::extract::State(state.clone()),
+        axum::extract::Path(id.clone()),
+    )
+    .await
+    .into_response();
+    state.runtime.work.drain().await;
+    assert_eq!(resp.status(), StatusCode::ACCEPTED);
+    assert!(resp
+        .headers()
+        .contains_key(crate::daemon::RUNTIME_REVISION_HEADER));
+    assert!(resp
+        .headers()
+        .contains_key(crate::daemon::RUNTIME_EPOCH_HEADER));
+    let body = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+    let row: crate::daemon::SessionResponse = serde_json::from_slice(&body).unwrap();
+    assert_eq!(row.id, id);
+}
+
 // Regression witness for #2603: the ACP-capability and smart-rename overlays
 // share ONE per-request `SessionConfig` cache keyed by (profile, project_path),
 // so three instances covering two unique pairs must trigger exactly two

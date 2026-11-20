@@ -511,7 +511,7 @@ function ComposerDock({
 
       <RejectedPromptsStrip
         rejected={state.rejectedPrompts}
-        onRetry={ctx.sendPrompt}
+        onRetry={ctx.retryRejectedPrompt}
         onDismiss={ctx.dismissRejectedPrompt}
         disabled={state.workerRestarting || state.workerStopped || Boolean(state.startupError)}
       />

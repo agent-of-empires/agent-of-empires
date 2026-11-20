@@ -643,3 +643,100 @@ async fn recovered_completion_orders_updates_and_applies_rate_limit_parking() {
         }
     }
 }
+
+/// The runner relays the agent's error answer to `session/prompt`: the turn
+/// surfaces it, returns the prompt as sent (text and attachment refs) and
+/// cancels any leftover agent turn, unless it answers a cancel. The same
+/// connection runs the next prompt (#5662).
+#[tokio::test]
+async fn rejected_prompt_over_the_runner_keeps_the_connection() {
+    let _env = crate::session::test_support::EnvGuard::read_lock();
+    let image = AttachmentBlob {
+        id: "att-1".into(),
+        kind: PromptAttachmentKind::Image,
+        mime_type: "image/png".into(),
+        name: Some("shot.png".into()),
+        data: b"png".to_vec(),
+    };
+    let image_block = serde_json::json!({"type": "image", "data": "cG5n", "mimeType": "image/png"});
+    let text_block = |text: &str| serde_json::json!({"type": "text", "text": text});
+    for (text, with_image, cancel_first, want_blocks) in [
+        ("retry me", false, false, vec![text_block("retry me")]),
+        (
+            "look at this",
+            true,
+            false,
+            vec![text_block("look at this"), image_block.clone()],
+        ),
+        ("", true, false, vec![image_block.clone()]),
+        ("retry me", false, true, vec![text_block("retry me")]),
+    ] {
+        let attachments: &[AttachmentBlob] = if with_image {
+            std::slice::from_ref(&image)
+        } else {
+            &[]
+        };
+        let mut runner = Runner::new();
+        let mut client = runner.attach(false).await;
+        client.send_prompt(text, attachments).await.unwrap();
+        match runner.frame().await {
+            ControlBody::Prompt { request } => {
+                assert_eq!(
+                    request["prompt"],
+                    serde_json::json!(want_blocks),
+                    "{text:?}"
+                );
+            }
+            other => panic!("expected the prompt: {other:?}"),
+        }
+        if cancel_first {
+            client.cancel_prompt().await.unwrap();
+            assert!(matches!(runner.frame().await, ControlBody::Cancel));
+        }
+        runner
+            .send(ControlBody::PromptCompleted {
+                prompt_req_id: 7,
+                outcome: PromptOutcome::Error {
+                    code: -32603,
+                    message: "a turn is already running".into(),
+                    data: None,
+                },
+            })
+            .await;
+        let (mut surfaced, mut returned) = (false, None);
+        let reason = timeout(Duration::from_secs(5), async {
+            loop {
+                match client.next_event().await.expect("connection remains open") {
+                    Event::PromptRuntimeError { message } => {
+                        surfaced = message.contains("a turn is already running");
+                    }
+                    Event::PromptRejected {
+                        text, attachments, ..
+                    } => returned = Some((text, attachments)),
+                    Event::Stopped { reason } => return reason,
+                    _ => {}
+                }
+            }
+        })
+        .await
+        .unwrap();
+        if cancel_first {
+            assert_eq!(reason, "cancelled");
+            assert!(!surfaced && returned.is_none());
+        } else {
+            assert_eq!(reason, "prompt_rejected");
+            assert!(surfaced);
+            let refs: Vec<_> = attachments.iter().map(AttachmentBlob::to_ref).collect();
+            assert_eq!(returned, Some((text.to_string(), refs)), "{text:?}");
+            // The rejection clears a turn the agent may still be running.
+            assert!(matches!(runner.frame().await, ControlBody::Cancel));
+        }
+
+        client.send_prompt("again", &[]).await.unwrap();
+        assert!(matches!(runner.frame().await, ControlBody::Prompt { .. }));
+        runner.complete("end_turn").await;
+        assert_eq!(stopped(&mut client).await, "prompt_complete");
+        assert!(client.control_loss().is_none());
+        client.shutdown().await.unwrap();
+    }
+}

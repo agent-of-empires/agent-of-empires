@@ -137,7 +137,16 @@ fn structured_fork_mints_distinct_child_id_and_preserves_parent() {
     // Start the daemon.
     let port = pick_free_port();
     let port_s = port.to_string();
-    let start = h.run_cli(&["serve", "--daemon", "--port", &port_s, "--no-auth"]);
+    let start = h.run_cli(&[
+        "serve",
+        "--daemon",
+        "--port",
+        &port_s,
+        "--no-auth",
+        "--behind-proxy",
+        "--allowed-host",
+        "127.0.0.1",
+    ]);
     assert!(
         start.status.success(),
         "aoe serve --daemon failed.\nstdout: {}\nstderr: {}",
@@ -339,7 +348,16 @@ fn structured_fork_failure_clears_fork_pending_and_fails_cleanly() {
 
     let port = pick_free_port();
     let port_s = port.to_string();
-    let start = h.run_cli(&["serve", "--daemon", "--port", &port_s, "--no-auth"]);
+    let start = h.run_cli(&[
+        "serve",
+        "--daemon",
+        "--port",
+        &port_s,
+        "--no-auth",
+        "--behind-proxy",
+        "--allowed-host",
+        "127.0.0.1",
+    ]);
     assert!(start.status.success(), "aoe serve --daemon failed");
     assert!(
         wait_for_port(port, Duration::from_secs(10)),
@@ -457,7 +475,16 @@ fn create_handler_rejects_bad_fork_requests_with_400() {
 
     let port = pick_free_port();
     let port_s = port.to_string();
-    let start = h.run_cli(&["serve", "--daemon", "--port", &port_s, "--no-auth"]);
+    let start = h.run_cli(&[
+        "serve",
+        "--daemon",
+        "--port",
+        &port_s,
+        "--no-auth",
+        "--behind-proxy",
+        "--allowed-host",
+        "127.0.0.1",
+    ]);
     assert!(start.status.success(), "aoe serve --daemon failed");
     assert!(
         wait_for_port(port, Duration::from_secs(10)),

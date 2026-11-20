@@ -947,9 +947,9 @@ pub static BINDINGS: &[Binding] = &[
         help: Some(HelpMeta {
             section: HelpSection::Other,
             desc: if cfg!(feature = "web") {
-                "Connections: Web dashboard (browser / phone)"
+                "Connections; twice for the Web dashboard"
             } else {
-                "Connections: API server (LAN / Tunnel)"
+                "Connections; twice for the API server"
             },
         }),
         palette: Some(PaletteMeta {

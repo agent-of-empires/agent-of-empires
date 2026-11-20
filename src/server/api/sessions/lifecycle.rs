@@ -1101,6 +1101,7 @@ pub async fn restore_session(
 /// title from the first prompt, even over one already chosen. Waits for the
 /// rename: `200` once the title is saved, `409` when nothing could be applied,
 /// `502` with the agent's reason on failure, `504` past the rename deadline.
+/// A terminal session's rename runs detached, so it answers `202` with the row.
 pub async fn force_smart_rename(
     State(state): State<Arc<AppState>>,
     Path(id): Path<String>,
@@ -1189,13 +1190,7 @@ pub async fn force_smart_rename(
                 true,
             ),
         );
-        return match state.runtime.publish(&state).await {
-            Ok(snapshot) => crate::server::runtime::mutation_response(
-                &snapshot.value.cursor,
-                StatusCode::ACCEPTED,
-            ),
-            Err(_) => StatusCode::SERVICE_UNAVAILABLE.into_response(),
-        };
+        return crate::server::runtime::accepted_session_mutation_response(&state, &id).await;
     }
 
     let Some((first_user_prompt, agent_prose)) = state

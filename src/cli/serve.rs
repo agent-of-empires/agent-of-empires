@@ -55,12 +55,12 @@ pub struct ServeArgs {
 
     /// Authentication mode: `token` (default, random URL token),
     /// `passphrase` (no token URL, passphrase login wall only),
-    /// or `none` (no auth at all, loopback-only unless --behind-proxy).
+    /// or `none` (no auth at all, requires --behind-proxy).
     /// Mutually exclusive with --no-auth (which aliases --auth=none).
     #[arg(long, value_enum, conflicts_with = "no_auth")]
     pub auth: Option<AuthMode>,
 
-    /// Disable authentication (only allowed with localhost binding).
+    /// Disable authentication (requires --behind-proxy).
     /// Alias for --auth=none.
     #[arg(long)]
     pub no_auth: bool,
@@ -392,6 +392,18 @@ fn validate_auth_combination(
              both token auth and a passphrase. If you have an external reverse\n\
              proxy, use --behind-proxy instead of --remote.",
             auth_mode.as_cli_str()
+        );
+    }
+
+    // A TCP loopback peer may be a sandbox container or another local user,
+    // so only an operator-declared proxy can vouch for unauthenticated callers.
+    if matches!(auth_mode, AuthMode::None) && !behind_proxy {
+        bail!(
+            "Refusing to start with --auth=none without --behind-proxy.\n\
+             Any process that can reach the TCP port, including sandbox containers\n\
+             on Docker Desktop, OrbStack or Podman machine, would get full control.\n\
+             Use the default token auth or --auth=passphrase. CLI access over the\n\
+             owner-only Unix socket needs no token."
         );
     }
 
@@ -1450,14 +1462,17 @@ async fn validate_launch_args(profile: &str, args: &ServeArgs) -> Result<AuthMod
     } else {
         resolve_auth_mode(args.auth, args.no_auth)
     };
-    validate_auth_combination(
-        auth_mode,
-        args.passphrase.is_some(),
-        host_is_localhost(&args.host),
-        args.behind_proxy,
-        args.remote,
-        &args.host,
-    )?;
+    // Core-only serves the owner-only Unix socket and has no TCP listener to guard.
+    if !args.core_only {
+        validate_auth_combination(
+            auth_mode,
+            args.passphrase.is_some(),
+            host_is_localhost(&args.host),
+            args.behind_proxy,
+            args.remote,
+            &args.host,
+        )?;
+    }
     validate_behind_proxy_allowlist(args.behind_proxy, args.remote, &args.allowed_host)?;
     validate_allowed_hosts(&args.allowed_host)?;
     validate_allowed_origins(&args.allowed_origin)?;
@@ -3327,11 +3342,15 @@ mod tests {
     }
 
     #[test]
-    fn validate_none_loopback_ok() {
-        // Regression: --no-auth (== --auth=none) on loopback must still
-        // start, matching the legacy --no-auth behavior.
+    fn validate_none_needs_behind_proxy_even_on_loopback() {
+        // A loopback peer is not proof of a host process: Docker Desktop,
+        // OrbStack and Podman machine forward container traffic to host
+        // 127.0.0.1, so TCP no-auth would hand owner authority to sandboxes.
+        let err = validate_auth_combination(AuthMode::None, false, true, false, false, "127.0.0.1")
+            .unwrap_err();
+        assert!(err.to_string().contains("--behind-proxy"));
         assert!(
-            validate_auth_combination(AuthMode::None, false, true, false, false, "127.0.0.1")
+            validate_auth_combination(AuthMode::None, false, true, true, false, "127.0.0.1")
                 .is_ok()
         );
     }
