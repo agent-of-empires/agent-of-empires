@@ -5,6 +5,7 @@ import {
   prepareSuggestion,
   refreshSuggestions,
   startSuggestion,
+  trashSession,
   type StartHooksReview,
   type StartOptions,
   type SuggestionResult,
@@ -179,6 +180,15 @@ export function useSuggestions(
     await load();
   };
 
+  // The suggestion stays linked to a live Session, so the blocked one goes to Trash before a fresh Start.
+  const retryBlocked = async (item: SuggestionItem) => {
+    if (item.started_session && !(await trashSession(item.started_session.id))) {
+      setNotice("Couldn't move that Session to Trash.");
+      return;
+    }
+    await start(item);
+  };
+
   const approveHooks = async () => {
     if (!hooksReview) return;
     const { item, review, options } = hooksReview;
@@ -242,6 +252,7 @@ export function useSuggestions(
     start,
     startWithChanges,
     approveHooks,
+    retryBlocked,
     cancelHooks: () => setHooksReview(null),
   };
 }

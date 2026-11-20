@@ -1,5 +1,6 @@
 import type { SessionResponse } from "../lib/types";
 import { liveSession } from "../lib/suggestionPlan";
+import { StartedPromptNote } from "./PromptBlockedNote";
 import { updateSuggestionSource } from "../lib/api";
 import { useAgentNames } from "../hooks/useAgentNames";
 import { useSuggestionPresets } from "../hooks/useSuggestionPresets";
@@ -82,6 +83,13 @@ export function DashboardSuggestions({
             session={liveSession(item.started_session, sessions)}
             stale={item.stale}
             failure={failures[suggestionKey(item)]}
+            note={
+              <StartedPromptNote
+                session={liveSession(item.started_session, sessions)}
+                onTryAgain={() => void ctrl.retryBlocked(item)}
+                disabled={readOnly || offline}
+              />
+            }
             actions={
               <SuggestionItemActions
                 item={item}

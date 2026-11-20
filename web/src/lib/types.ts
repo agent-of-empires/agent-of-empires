@@ -30,6 +30,8 @@ export interface SessionResponse {
   last_error: string | null;
   /** Why the initial prompt was not typed into this terminal session. */
   initial_prompt_error?: string | null;
+  /** `agent_folder_not_trusted`, `agent_bypass_not_accepted`, or absent for other causes. */
+  initial_prompt_error_code?: string;
   branch: string | null;
   main_repo_path: string | null;
   /** Base branch of an AoE-created worktree; null for pre-existing or default branches. */
@@ -669,6 +671,9 @@ export interface StartedSession {
   status: SessionStatus;
   archived: boolean;
   created_at: string;
+  /** From the live sessions poll, not the snapshot. */
+  initial_prompt_error?: string | null;
+  initial_prompt_error_code?: string;
 }
 
 export interface SuggestionPrefs {
