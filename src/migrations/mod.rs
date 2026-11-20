@@ -68,6 +68,7 @@ mod v056_launch_resolved_executable;
 mod v057_worker_launch_executable;
 mod v058_account_limits_window_shape;
 mod v059_owner_only_event_logs;
+mod v060_plugin_staging_evidence;
 
 /// Fixtures shared by migrations that rewrite agent hook files.
 #[cfg(test)]
@@ -108,7 +109,7 @@ use anyhow::{Context, Result};
 use std::fs;
 use tracing::{debug, info};
 
-const CURRENT_VERSION: u32 = 59;
+const CURRENT_VERSION: u32 = 60;
 const VERSION_FILE: &str = ".schema_version";
 
 /// Version, log name, and the one-time transformation to run.
@@ -310,6 +311,11 @@ const MIGRATIONS: &[Migration] = &[
         v058_account_limits_window_shape::run,
     ),
     (59, "owner_only_event_logs", v059_owner_only_event_logs::run),
+    (
+        60,
+        "plugin_staging_evidence",
+        v060_plugin_staging_evidence::run,
+    ),
 ];
 
 /// The data-schema version this build targets, i.e. the version every install
