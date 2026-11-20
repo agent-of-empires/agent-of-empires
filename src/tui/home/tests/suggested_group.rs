@@ -194,7 +194,7 @@ fn enter_on_a_suggestion_with_no_linked_project_opens_the_prefilled_dialog() {
 
 #[test]
 #[serial]
-fn enter_starts_a_suggestion_and_its_row_turns_into_open() {
+fn enter_starts_a_suggestion_and_its_row_leaves_the_group() {
     let (mut env, requests) = expanded_env(2);
     env.view.cursor += 1;
     env.view.update_selected();
@@ -205,7 +205,7 @@ fn enter_starts_a_suggestion_and_its_row_turns_into_open() {
     poll_until(&mut env, |env| {
         env.view
             .status_flash_text()
-            .is_some_and(|text| text.contains("Started Prepared title · Enter opens it"))
+            .is_some_and(|text| text == "Started Prepared title")
     });
     assert_eq!(next_request(&requests), "load");
     assert!(env.view.new_dialog.is_none(), "no wizard for a plain start");
@@ -215,6 +215,12 @@ fn enter_starts_a_suggestion_and_its_row_turns_into_open() {
         .entry(&("gh".into(), "i0".into()))
         .unwrap();
     assert_eq!(entry.started_session.as_deref(), Some("s-new"));
+    assert!(
+        !suggested_rows(&env)
+            .iter()
+            .any(|row| matches!(row, Item::Suggestion { id, .. } if id == "i0")),
+        "the Session is listed under its Project instead"
+    );
 }
 
 #[test]
@@ -484,24 +490,29 @@ fn a_failed_start_says_why_and_enter_tries_again() {
 
 #[test]
 #[serial]
-fn enter_on_a_started_suggestion_opens_its_session_instead_of_preparing() {
-    let mut env = create_test_env_with_sessions(2);
-    let target = env.view.instances().last().unwrap().id.clone();
-    let mut snap = snapshot(1, &[]);
-    snap["items"][0]["started_session"] = serde_json::json!({ "id": target, "status": "Idle" });
-    let (sink, requests) = mpsc::channel();
-    env.view.suggestions_feed = SuggestionsFeed::recording_for_test(snap.clone(), sink);
+fn a_started_suggestion_is_not_listed_in_the_group() {
+    let mut env = create_test_env_with_sessions(1);
+    let mut snap = snapshot(2, &[]);
+    snap["items"][0]["started_session"] = serde_json::json!({ "id": "s1", "status": "Idle" });
     env.view.suggestions_feed.set_snapshot_for_test(snap);
     env.view.rebuild_flat_items();
     select_suggested_header(&mut env);
     env.view.handle_key(key(KeyCode::Enter), None);
+
+    let rows = suggested_rows(&env);
+    assert!(matches!(rows[1], Item::Suggestion { id, .. } if id == "i1"));
+    assert!(matches!(rows[2], Item::SuggestionsViewAll { total: 2, .. }));
+}
+
+#[test]
+#[serial]
+fn the_footer_offers_n_new_on_a_suggestion() {
+    let (mut env, _requests) = expanded_env(1);
     env.view.cursor += 1;
     env.view.update_selected();
-    env.view.handle_key(key(KeyCode::Enter), None);
-
-    assert_eq!(env.view.selected_session.as_deref(), Some(target.as_str()));
-    assert!(requests.try_recv().is_err(), "no prepare request");
-    assert!(env.view.new_dialog.is_none());
+    let text = render_home_to_string(&mut env.view, 160, 40);
+    assert!(text.contains("N New"), "{text}");
+    assert!(!text.contains("Another"), "{text}");
 }
 
 #[test]

@@ -1436,7 +1436,8 @@ impl SuggestionsFeed {
     }
 
     /// `(provider_id, id)` of every suggestion of a listed provider that is
-    /// open and undismissed, or dismissed within the undo window, in snapshot order.
+    /// open, not started and undismissed, or dismissed within the undo window,
+    /// in snapshot order. A started one is listed as its Session.
     pub(super) fn keys(&self) -> Vec<ItemKey> {
         self.snapshot
             .iter()
@@ -1444,6 +1445,7 @@ impl SuggestionsFeed {
             .filter(|i| {
                 (!i.dismissed || self.is_recent(&(i.provider_id.clone(), i.id.clone())))
                     && !i.stale
+                    && i.started_session.is_none()
                     && self.provider(&i.provider_id).is_some()
             })
             .map(|i| (i.provider_id.clone(), i.id.clone()))

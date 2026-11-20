@@ -119,14 +119,24 @@ impl HomeView {
             Some(view) => view.set_notice(message),
             None => this.flash_status(message),
         };
+        // Home lists a started suggestion as its Session, not as a row Enter could open.
+        let opens = if self.suggestions_view.is_some() {
+            " · Enter opens it"
+        } else {
+            ""
+        };
         match answer {
             StartAnswer::Started { session_id, title } => {
                 self.suggestions_feed.link_started(&key, &session_id);
-                say(self, format!("Started {title} · Enter opens it"), false);
+                self.rebuild_flat_items_keeping_cursor();
+                self.update_selected();
+                say(self, format!("Started {title}{opens}"), false);
             }
             StartAnswer::AlreadyStarted(Some(session_id)) => {
                 self.suggestions_feed.link_started(&key, &session_id);
-                say(self, "Already started. Enter opens it.".into(), false);
+                self.rebuild_flat_items_keeping_cursor();
+                self.update_selected();
+                say(self, format!("Already started{opens}"), false);
             }
             StartAnswer::AlreadyStarted(None) => {
                 say(self, "Already starting. Reload in a moment.".into(), false);

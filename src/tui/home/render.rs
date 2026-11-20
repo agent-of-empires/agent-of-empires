@@ -4731,7 +4731,7 @@ impl HomeView {
             let new_uses_shift = committed_search && !strict;
             let (click, key, label) = if on_suggestion {
                 let (click, key) = bound(ActionId::NewFromSelection);
-                (click, key, "Another")
+                (click, key, "New")
             } else if new_uses_shift {
                 (kc('N'), "N".to_string(), "New")
             } else {
