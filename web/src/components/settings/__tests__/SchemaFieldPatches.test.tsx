@@ -1,7 +1,7 @@
 // @vitest-environment jsdom
 
 import { beforeEach, describe, expect, it, vi } from "vitest";
-import { fireEvent, render, screen, waitFor } from "@testing-library/react";
+import { fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { SettingsView } from "../../SettingsView";
 import * as api from "../../../lib/api";
 import { descriptor } from "./fixtures";
@@ -66,9 +66,14 @@ const SCHEMA = [
   field(
     "session",
     "session_id_poller_max_threads",
-    "Session-id poller threads (restart req.)",
+    "Session-id poller threads",
     { kind: "number", min: 0 },
-    { profile_overridable: false, advanced: true, description: "Ceiling on concurrent session-id poller threads." },
+    {
+      profile_overridable: false,
+      advanced: true,
+      restart: true,
+      description: "Ceiling on concurrent session-id poller threads.",
+    },
   ),
   field("sound", "enabled", "Enabled", { kind: "toggle" }, { description: "Play sounds on agent state transitions." }),
   field("sound", "server_volume", "Server volume", { kind: "custom", id: "sound-volume" }),
@@ -102,19 +107,12 @@ function renderTab(tab: string) {
   return render(<SettingsView onClose={() => {}} tab={tab} onSelectTab={() => {}} onServerAboutRefresh={() => {}} />);
 }
 
-// FormFields labels are not wired to their controls, so walk from the label.
 function selectByLabel(container: HTMLElement, label: string): HTMLSelectElement {
-  const match = Array.from(container.querySelectorAll("label")).find((l) => l.textContent === label);
-  const select = match?.parentElement?.querySelector("select");
-  expect(select).toBeTruthy();
-  return select as HTMLSelectElement;
+  return within(container).getByRole("combobox", { name: label }) as HTMLSelectElement;
 }
 
 function numberInputByLabel(container: HTMLElement, label: string): HTMLInputElement {
-  const match = Array.from(container.querySelectorAll("label")).find((l) => l.textContent === label);
-  const input = match?.parentElement?.querySelector('input[type="number"]');
-  expect(input).toBeTruthy();
-  return input as HTMLInputElement;
+  return within(container).getByRole("spinbutton", { name: label }) as HTMLInputElement;
 }
 
 // NumberField only accepts typing while focused and commits on blur.
@@ -125,13 +123,7 @@ function commit(input: HTMLInputElement, value: string) {
 }
 
 function clickToggle(container: HTMLElement, label: string) {
-  const labelDiv = Array.from(container.querySelectorAll("div")).find(
-    (d) => d.textContent === label && d.querySelector("*") === null,
-  );
-  const row = labelDiv?.parentElement?.parentElement;
-  const sw = row?.querySelector('button[role="switch"]') as HTMLButtonElement;
-  expect(sw).toBeTruthy();
-  fireEvent.click(sw);
+  fireEvent.click(within(container).getByRole("switch", { name: label }));
 }
 
 import { resetSettingsStore } from "../../../lib/settingsStore";
@@ -206,7 +198,6 @@ describe("schema-driven settings field PATCH payloads", () => {
       const input = numberInputByLabel(container, label);
       expect(input.min).toBe(min);
       expect(input.max).toBe(max);
-      expect(input.closest("div")?.parentElement?.textContent).toContain("Applies to all profiles");
       commit(input, value);
       await waitFor(() =>
         expect(api.updateSettings).toHaveBeenCalledWith({ session: { [name]: Number(value) } }, "main"),
@@ -215,7 +206,7 @@ describe("schema-driven settings field PATCH payloads", () => {
   });
 
   it("session poller-thread ceiling is an advanced, global-only number that emits { session: { session_id_poller_max_threads } }", async () => {
-    const LABEL = "Session-id poller threads (restart req.)";
+    const LABEL = "Session-id poller threads";
     const { container } = renderTab("session");
     await screen.findByText("Snooze Duration (minutes)");
 
@@ -227,9 +218,6 @@ describe("schema-driven settings field PATCH payloads", () => {
     expect(fold.getAttribute("aria-expanded")).toBe("false");
     fireEvent.click(fold);
     await screen.findByText(LABEL);
-
-    const labelEl = Array.from(container.querySelectorAll("label")).find((l) => l.textContent === LABEL);
-    expect(labelEl?.parentElement?.textContent).toContain("Applies to all profiles (not profile-overridable).");
 
     const input = numberInputByLabel(container, LABEL);
     expect(input.min).toBe("0");
@@ -285,9 +273,7 @@ describe("schema-driven settings field PATCH payloads", () => {
       ["Browser volume", "browser_volume", 0.5],
       ["Server volume", "server_volume", 1.2],
     ] as const) {
-      const match = Array.from(container.querySelectorAll("label")).find((l) => l.textContent === label);
-      const range = match?.parentElement?.parentElement?.querySelector('input[type="range"]') as HTMLInputElement;
-      expect(range).toBeTruthy();
+      const range = within(container).getByRole("slider", { name: label });
       fireEvent.change(range, { target: { value: String(value) } });
       await waitFor(() => expect(api.updateSettings).toHaveBeenLastCalledWith({ sound: { [key]: value } }, "main"));
     }

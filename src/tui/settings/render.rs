@@ -1,12 +1,13 @@
 //! Rendering for the settings view
 
 use ratatui::{
-    layout::{Constraint, Direction, Layout, Rect},
+    buffer::Buffer,
+    layout::{Constraint, Direction, Layout, Position, Rect},
     style::{Modifier, Style},
     text::{Line, Span},
     widgets::{
         Block, BorderType, Borders, Clear, List, ListItem, Padding, Paragraph, Scrollbar,
-        ScrollbarOrientation, ScrollbarState,
+        ScrollbarOrientation, ScrollbarState, Widget,
     },
     Frame,
 };
@@ -20,7 +21,7 @@ use super::{
     SettingsView,
 };
 use crate::tui::components::hover::{paint_hover_bg, HoverState};
-use crate::tui::components::{set_input_cursor_position, truncate_to_width};
+use crate::tui::components::{input_cursor_position, set_input_cursor_position, truncate_to_width};
 use crate::tui::styles::Theme;
 
 fn is_ssh_session() -> bool {
@@ -607,22 +608,39 @@ impl SettingsView {
                 break;
             }
 
+            // Draw the field whole off-screen, then copy the rows the viewport shows: a field
+            // clipped at the top would otherwise start too low and spill into the next one.
             let visible_y = field_top.saturating_sub(scroll_offset);
+            let hidden = scroll_offset.saturating_sub(field_top);
             let is_selected = i == self.selected_field && is_focused;
             let field_area = Rect {
                 x: inner.x,
                 y: inner.y + visible_y + warning_offset,
                 width: inner.width,
-                height: field_h.min(fields_viewport_height.saturating_sub(visible_y)),
+                height: (field_h - hidden).min(fields_viewport_height - visible_y),
             };
-
-            if let Some(mut hits) =
-                self.render_field(frame, field_area, field, i, is_selected, theme)
-            {
-                // The value area can overhang a field clipped by the viewport.
-                let bottom = field_area.bottom();
-                hits.rows.retain(|(_, r)| r.y < bottom);
-                hits.actions.retain(|(_, r)| r.y < bottom);
+            let mut canvas = FieldCanvas::new(frame.buffer_mut(), field_area, hidden, field_h);
+            let whole = canvas.area();
+            let hits = self.render_field(&mut canvas, whole, field, i, is_selected, theme);
+            let to_screen = canvas.copy_into(frame.buffer_mut());
+            if let Some(position) = canvas.cursor.and_then(&to_screen) {
+                frame.set_cursor_position(position);
+            }
+            if let Some(mut hits) = hits {
+                fn shift<T>(
+                    rects: &mut Vec<(T, Rect)>,
+                    to_screen: impl Fn(Position) -> Option<Position>,
+                ) {
+                    rects.retain_mut(|(_, r)| match to_screen(r.as_position()) {
+                        Some(p) => {
+                            r.y = p.y;
+                            true
+                        }
+                        None => false,
+                    })
+                }
+                shift(&mut hits.rows, &to_screen);
+                shift(&mut hits.actions, &to_screen);
                 list_hits = Some(hits);
             }
             // Dividers are non-interactive, as keyboard navigation reflects.
@@ -699,7 +717,7 @@ impl SettingsView {
 
     fn render_field(
         &self,
-        frame: &mut Frame,
+        canvas: &mut FieldCanvas,
         area: Rect,
         field: &super::SettingField,
         index: usize,
@@ -717,27 +735,20 @@ impl SettingsView {
                 ),
                 Span::styled(" ──", Style::default().fg(theme.border)),
             ]);
-            frame.render_widget(Paragraph::new(heading), area);
+            canvas.render_widget(Paragraph::new(heading), area);
             if !field.description.is_empty() {
                 let wrapped = wrap_description_lines(&field.description, area.width);
-                // `area` is clipped when the header sits at the bottom of the
-                // viewport, so an unclamped subtitle paints over the border.
-                let subtitle_height = (wrapped.len() as u16).min(area.height.saturating_sub(1));
-                if subtitle_height > 0 {
-                    let subtitle_area = Rect {
-                        x: area.x,
-                        y: area.y + 1,
-                        width: area.width,
-                        height: subtitle_height,
-                    };
-                    let lines: Vec<Line> = wrapped
-                        .into_iter()
-                        .map(|line| {
-                            Line::from(Span::styled(line, Style::default().fg(theme.dimmed)))
-                        })
-                        .collect();
-                    frame.render_widget(Paragraph::new(lines), subtitle_area);
-                }
+                let subtitle_area = Rect {
+                    x: area.x,
+                    y: area.y + 1,
+                    width: area.width,
+                    height: wrapped.len() as u16,
+                };
+                let lines: Vec<Line> = wrapped
+                    .into_iter()
+                    .map(|line| Line::from(Span::styled(line, Style::default().fg(theme.dimmed))))
+                    .collect();
+                canvas.render_widget(Paragraph::new(lines), subtitle_area);
             }
             return None;
         }
@@ -763,49 +774,48 @@ impl SettingsView {
             Span::raw("")
         };
 
-        let label = Line::from(vec![
+        let mut spans = vec![
             Span::styled(field.label.clone(), label_style),
             override_indicator,
-        ]);
+        ];
+        spans.extend(
+            field
+                .tags()
+                .into_iter()
+                .map(|tag| Span::styled(format!(" · {tag}"), Style::default().fg(theme.dimmed))),
+        );
+        let label = Line::from(spans);
 
-        frame.render_widget(Paragraph::new(label), area);
+        canvas.render_widget(Paragraph::new(label), area);
 
-        // `area` is the field's visible slice: bound description and value to
-        // it so neither bleeds over the border or into the footer.
         let wrapped_desc = wrap_description_lines(&field.description, area.width);
         let desc_height = wrapped_desc.len() as u16;
-        let desc_visible = desc_height.min(area.height.saturating_sub(1));
-        if desc_visible > 0 {
-            let description_area = Rect {
-                x: area.x,
-                y: area.y + 1,
-                width: area.width,
-                height: desc_visible,
-            };
-            let desc_lines: Vec<Line> = wrapped_desc
-                .into_iter()
-                .map(|line| Line::from(Span::styled(line, Style::default().fg(theme.dimmed))))
-                .collect();
-            frame.render_widget(Paragraph::new(desc_lines), description_area);
-        }
+        let description_area = Rect {
+            x: area.x,
+            y: area.y + 1,
+            width: area.width,
+            height: desc_height,
+        };
+        let desc_lines: Vec<Line> = wrapped_desc
+            .into_iter()
+            .map(|line| Line::from(Span::styled(line, Style::default().fg(theme.dimmed))))
+            .collect();
+        canvas.render_widget(Paragraph::new(desc_lines), description_area);
 
         // Inner renderers paint at `value_area.y + 1`, so shift by the wrapped
-        // description height. The value sits at row `desc_height + 1`, so it is
-        // skipped when the clipped slice leaves no room for it.
-        if desc_height.saturating_add(1) >= area.height {
-            return None;
-        }
+        // description height.
         let value_area = Rect {
             y: area.y + desc_height,
+            height: area.height - desc_height,
             ..area
         };
 
         match &field.value {
             FieldValue::Bool(value) => {
-                self.render_bool_field(frame, value_area, *value, is_selected, theme);
+                self.render_bool_field(canvas, value_area, *value, is_selected, theme);
             }
             FieldValue::Text(value) => {
-                self.render_text_field(frame, value_area, value, index, is_selected, theme);
+                self.render_text_field(canvas, value_area, value, index, is_selected, theme);
             }
             FieldValue::OptionalText(value) => {
                 let display = match value.as_deref() {
@@ -824,16 +834,30 @@ impl SettingsView {
                     Some(text) => text.to_string(),
                     None => String::new(),
                 };
-                self.render_text_field(frame, value_area, &display, index, is_selected, theme);
+                self.render_text_field(canvas, value_area, &display, index, is_selected, theme);
             }
             FieldValue::Number(value) => {
-                self.render_number_field(frame, value_area, *value, index, is_selected, theme);
+                self.render_number_field(canvas, value_area, *value, index, is_selected, theme);
             }
             FieldValue::Select { selected, options } => {
-                self.render_select_field(frame, value_area, *selected, options, is_selected, theme);
+                self.render_select_field(
+                    canvas,
+                    value_area,
+                    *selected,
+                    options,
+                    is_selected,
+                    theme,
+                );
             }
             FieldValue::List(items) => {
-                return self.render_list_field(frame, value_area, items, index, is_selected, theme);
+                return self.render_list_field(
+                    canvas,
+                    value_area,
+                    items,
+                    index,
+                    is_selected,
+                    theme,
+                );
             }
             FieldValue::SectionHeader => {
                 // Handled by the early return at the top of `render_field`.
@@ -844,7 +868,7 @@ impl SettingsView {
 
     fn render_bool_field(
         &self,
-        frame: &mut Frame,
+        canvas: &mut FieldCanvas,
         area: Rect,
         value: bool,
         is_selected: bool,
@@ -869,12 +893,12 @@ impl SettingsView {
             checkbox,
             if value { "Enabled" } else { "Disabled" }
         );
-        frame.render_widget(Paragraph::new(text).style(style), value_area);
+        canvas.render_widget(Paragraph::new(text).style(style), value_area);
     }
 
     fn render_text_field(
         &self,
-        frame: &mut Frame,
+        canvas: &mut FieldCanvas,
         area: Rect,
         value: &str,
         index: usize,
@@ -892,7 +916,7 @@ impl SettingsView {
 
         if is_editing {
             let input = self.editing_input.as_ref().unwrap();
-            self.render_input_with_cursor(frame, value_area, input, theme);
+            self.render_input_with_cursor(canvas, value_area, input, theme);
         } else {
             let style = if is_selected {
                 Style::default().fg(theme.accent)
@@ -906,7 +930,7 @@ impl SettingsView {
                 value.to_string()
             };
 
-            frame.render_widget(Paragraph::new(display).style(style), value_area);
+            canvas.render_widget(Paragraph::new(display).style(style), value_area);
         }
     }
 
@@ -935,21 +959,21 @@ impl SettingsView {
 
     fn render_input_with_cursor(
         &self,
-        frame: &mut Frame,
+        canvas: &mut FieldCanvas,
         area: Rect,
         input: &Input,
         theme: &Theme,
     ) {
         let spans = Self::build_cursor_spans(input.value(), input.cursor(), theme);
-        frame.render_widget(Paragraph::new(Line::from(spans)), area);
+        canvas.render_widget(Paragraph::new(Line::from(spans)), area);
         if self.editing_cursor_visible() {
-            set_input_cursor_position(frame, area, 0, input);
+            canvas.cursor = input_cursor_position(area, 0, input);
         }
     }
 
     fn render_list_item_with_cursor(
         &self,
-        frame: &mut Frame,
+        canvas: &mut FieldCanvas,
         area: Rect,
         prefix: &str,
         input: &Input,
@@ -962,9 +986,9 @@ impl SettingsView {
             input.cursor(),
             theme,
         ));
-        frame.render_widget(Paragraph::new(Line::from(spans)), area);
+        canvas.render_widget(Paragraph::new(Line::from(spans)), area);
         if self.editing_cursor_visible() {
-            set_input_cursor_position(frame, area, prefix.width(), input);
+            canvas.cursor = input_cursor_position(area, prefix.width(), input);
         }
     }
 
@@ -974,7 +998,7 @@ impl SettingsView {
 
     fn render_number_field(
         &self,
-        frame: &mut Frame,
+        canvas: &mut FieldCanvas,
         area: Rect,
         value: u64,
         index: usize,
@@ -992,7 +1016,7 @@ impl SettingsView {
 
         if is_editing {
             let input = self.editing_input.as_ref().unwrap();
-            self.render_input_with_cursor(frame, value_area, input, theme);
+            self.render_input_with_cursor(canvas, value_area, input, theme);
         } else {
             let style = if is_selected {
                 Style::default().fg(theme.accent)
@@ -1000,13 +1024,13 @@ impl SettingsView {
                 Style::default().fg(theme.dimmed)
             };
 
-            frame.render_widget(Paragraph::new(value.to_string()).style(style), value_area);
+            canvas.render_widget(Paragraph::new(value.to_string()).style(style), value_area);
         }
     }
 
     fn render_select_field(
         &self,
-        frame: &mut Frame,
+        canvas: &mut FieldCanvas,
         area: Rect,
         selected: usize,
         options: &[String],
@@ -1028,7 +1052,7 @@ impl SettingsView {
 
         let display = options.get(selected).map(|s| s.as_str()).unwrap_or("?");
         let arrows = if is_selected { " < >" } else { "" };
-        frame.render_widget(
+        canvas.render_widget(
             Paragraph::new(format!("{}{}", display, arrows)).style(style),
             value_area,
         );
@@ -1037,7 +1061,7 @@ impl SettingsView {
     /// Returns the editor's hit rects while this list is expanded.
     fn render_list_field(
         &self,
-        frame: &mut Frame,
+        canvas: &mut FieldCanvas,
         area: Rect,
         items: &[String],
         index: usize,
@@ -1066,7 +1090,7 @@ impl SettingsView {
                 format!("[{} items]", items.len())
             };
 
-            frame.render_widget(Paragraph::new(text).style(style), value_area);
+            canvas.render_widget(Paragraph::new(text).style(style), value_area);
             None
         } else {
             // Expanded view - show all items
@@ -1098,43 +1122,35 @@ impl SettingsView {
                 }
                 spans.push(Span::styled(label, dimmed));
                 let width = label.len() as u16;
-                if x + width <= header_area.right() && header_area.height > 0 {
+                if x + width <= header_area.right() {
                     hits.actions
                         .push((code, Rect::new(x, header_area.y, width, 1)));
                 }
                 x += width;
             }
-            frame.render_widget(Paragraph::new(Line::from(spans)), header_area);
+            canvas.render_widget(Paragraph::new(Line::from(spans)), header_area);
             // An empty expanded list used to render nothing under the
             // header, leaving the user staring at blank rows with no cue
             // that `a` starts an entry (issue #2932).
             if items.is_empty() && !list_state.adding_new {
-                let hint_y = area.y + 2;
-                if hint_y < area.y + area.height {
-                    let hint_area = Rect {
-                        x: area.x + 2,
-                        y: hint_y,
-                        width: area.width.saturating_sub(2),
-                        height: 1,
-                    };
-                    frame.render_widget(
-                        Paragraph::new("(no items, press a to add one)")
-                            .style(Style::default().fg(theme.dimmed)),
-                        hint_area,
-                    );
-                }
+                let hint_area = Rect {
+                    x: area.x + 2,
+                    y: area.y + 2,
+                    width: area.width.saturating_sub(2),
+                    height: 1,
+                };
+                canvas.render_widget(
+                    Paragraph::new("(no items, press a to add one)")
+                        .style(Style::default().fg(theme.dimmed)),
+                    hint_area,
+                );
             }
 
             // Render items
             for (i, item) in items.iter().enumerate() {
-                let item_y = area.y + 2 + i as u16;
-                if item_y >= area.y + area.height {
-                    break;
-                }
-
                 let item_area = Rect {
                     x: area.x + 2,
-                    y: item_y,
+                    y: area.y + 2 + i as u16,
                     width: area.width.saturating_sub(2),
                     height: 1,
                 };
@@ -1160,28 +1176,26 @@ impl SettingsView {
                     .as_ref()
                     .filter(|_| i == list_state.selected_index && !list_state.adding_new)
                 {
-                    self.render_list_item_with_cursor(frame, item_area, prefix, input, theme);
+                    self.render_list_item_with_cursor(canvas, item_area, prefix, input, theme);
                 } else {
                     let display = format!("{}{}", prefix, item);
-                    frame.render_widget(Paragraph::new(display).style(style), item_area);
+                    canvas.render_widget(Paragraph::new(display).style(style), item_area);
                 }
             }
 
             // Show add prompt if adding new
-            if list_state.adding_new {
-                let add_y = area.y + 2 + items.len() as u16;
-                if add_y < area.y + area.height {
-                    let add_area = Rect {
-                        x: area.x + 2,
-                        y: add_y,
-                        width: area.width.saturating_sub(2),
-                        height: 1,
-                    };
-
-                    if let Some(input) = &list_state.editing_item {
-                        self.render_list_item_with_cursor(frame, add_area, "> ", input, theme);
-                    }
-                }
+            if let Some(input) = list_state
+                .editing_item
+                .as_ref()
+                .filter(|_| list_state.adding_new)
+            {
+                let add_area = Rect {
+                    x: area.x + 2,
+                    y: area.y + 2 + items.len() as u16,
+                    width: area.width.saturating_sub(2),
+                    height: 1,
+                };
+                self.render_list_item_with_cursor(canvas, add_area, "> ", input, theme);
             }
             Some(hits)
         }
@@ -1449,6 +1463,58 @@ impl SettingsView {
     }
 }
 
+/// One field drawn at full height off-screen; `render_fields` copies the rows the viewport shows.
+struct FieldCanvas {
+    buf: Buffer,
+    /// Hidden rows above the viewport.
+    hidden: u16,
+    /// Where the visible rows land on screen.
+    target: Rect,
+    cursor: Option<Position>,
+}
+
+impl FieldCanvas {
+    /// The rows that will be copied start out as the screen's, so the copy only changes what the
+    /// field draws.
+    fn new(screen: &Buffer, target: Rect, hidden: u16, height: u16) -> Self {
+        let mut buf = Buffer::empty(Rect::new(target.x, 0, target.width, height));
+        for row in 0..target.height {
+            for x in target.left()..target.right() {
+                buf[(x, hidden + row)] = screen[(x, target.y + row)].clone();
+            }
+        }
+        Self {
+            buf,
+            hidden,
+            target,
+            cursor: None,
+        }
+    }
+
+    fn area(&self) -> Rect {
+        self.buf.area
+    }
+
+    fn render_widget(&mut self, widget: impl Widget, area: Rect) {
+        widget.render(area, &mut self.buf);
+    }
+
+    /// Copies the visible rows and returns the map from a canvas position to the screen, `None`
+    /// for a row that isn't shown.
+    fn copy_into(&self, screen: &mut Buffer) -> impl Fn(Position) -> Option<Position> {
+        for row in 0..self.target.height {
+            for x in self.target.left()..self.target.right() {
+                screen[(x, self.target.y + row)] = self.buf[(x, self.hidden + row)].clone();
+            }
+        }
+        let (hidden, target) = (self.hidden, self.target);
+        move |p: Position| {
+            let row = p.y.checked_sub(hidden).filter(|row| *row < target.height)?;
+            Some(Position::new(p.x, target.y + row))
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::{wrap_description_height, wrap_description_lines};
@@ -1587,6 +1653,57 @@ mod status_message_tests {
             has_override: false,
             inherited_display: None,
         }
+    }
+
+    /// Schema flags render as tags on the label line, and a plain row has none.
+    #[test]
+    #[serial]
+    fn schema_flags_render_as_tags_after_the_label() {
+        let (_temp, _guard, mut view) = fresh_view();
+        let theme = load_theme("empire");
+        let schema_field = |label: &str, restart: bool, web_only: bool| SettingField {
+            kind: FieldKind::Schema {
+                section: "logging".to_string(),
+                field: label.to_lowercase(),
+                widget: WidgetKind::Toggle,
+                validation: ValidationKind::None,
+                profile_overridable: false,
+                restart,
+                web_only,
+            },
+            ..bool_field(label, "")
+        };
+        view.fields = vec![
+            schema_field("Restarted", true, false),
+            schema_field("Webbed", false, true),
+            schema_field("Plain", false, false),
+        ];
+        view.fields_scroll_offset = 0;
+
+        let area = Rect::new(0, 0, 60, 20);
+        let mut terminal = Terminal::new(TestBackend::new(60, 20)).unwrap();
+        terminal
+            .draw(|f| view.render_fields(f, area, &theme, true, None))
+            .unwrap();
+        let buf = terminal.backend().buffer().clone();
+        let line_of = |label: &str| {
+            (0..buf.area().height)
+                .map(|y| row_text(&buf, y))
+                .find(|row| row.contains(label))
+                .unwrap_or_else(|| panic!("no row for {label}:\n{}", buffer_text(&buf)))
+        };
+
+        let restarted = line_of("Restarted");
+        assert!(
+            restarted.contains("Restarted · Needs restart"),
+            "{restarted}"
+        );
+        assert!(!restarted.contains("Web dashboard only"), "{restarted}");
+        let webbed = line_of("Webbed");
+        assert!(webbed.contains("Webbed · Web dashboard only"), "{webbed}");
+        assert!(!webbed.contains("Needs restart"), "{webbed}");
+        let plain = line_of("Plain");
+        assert!(!plain.contains('·'), "{plain}");
     }
 
     /// A field clipped to a partial row at the bottom of the panel must not
@@ -1974,6 +2091,8 @@ mod status_message_tests {
                 widget: WidgetKind::OptionalText { mono: false },
                 validation: ValidationKind::MemoryLimit,
                 profile_overridable: true,
+                restart: false,
+                web_only: false,
             },
             label: "Memory Limit".to_string(),
             description: "Memory ceiling for sandbox containers.".to_string(),
@@ -1992,5 +2111,161 @@ mod status_message_tests {
             msg.starts_with("Memory Limit: "),
             "error should be prefixed with the field label, got {msg:?}"
         );
+    }
+
+    fn paint_fields(view: &mut super::super::SettingsView, width: u16, height: u16) -> Buffer {
+        let theme = load_theme("empire");
+        let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
+        view.field_rects.clear();
+        terminal
+            .draw(|f| view.render_fields(f, Rect::new(0, 0, width, height), &theme, true, None))
+            .unwrap();
+        terminal.backend().buffer().clone()
+    }
+
+    fn content_height(view: &super::super::SettingsView) -> u16 {
+        let rows: u16 = (0..view.fields.len())
+            .map(|i| view.field_height(&view.fields[i], i))
+            .sum();
+        rows + view.fields.len().saturating_sub(1) as u16
+    }
+
+    /// #5760: a field cut by the viewport shows exactly its own rows. On every tab, at every
+    /// scroll offset, the panel equals an unclipped render shifted by that offset, so no field's
+    /// text can land on another's rows. The 9-row panel clips some fields at both ends.
+    #[test]
+    #[serial]
+    fn every_scroll_offset_shows_the_unclipped_rows() {
+        use super::super::CategoryRow;
+        // Over SSH the Sound tab draws a warning above its fields; this compares fields only.
+        let _ssh = crate::session::test_support::EnvGuard::unset(&[
+            "SSH_CONNECTION",
+            "SSH_CLIENT",
+            "SSH_TTY",
+        ]);
+        let (_temp, _guard, mut view) = fresh_view();
+        let tabs: Vec<usize> = (0..view.categories.len())
+            .filter(|&i| {
+                matches!(view.categories[i], CategoryRow::Tab(c) if c != SettingsCategory::Plugins)
+            })
+            .collect();
+        let mut both_ends = Vec::new();
+        // Panel widths of an 80- and a 120-column terminal (the categories take 20).
+        for (width, height) in [(60u16, 30u16), (100, 30), (60, 9)] {
+            for &tab in &tabs {
+                view.selected_category = tab;
+                view.rebuild_fields();
+                view.fields_scroll_offset = 0;
+                let tall = paint_fields(&mut view, width, 400);
+                let content = content_height(&view);
+                assert!(
+                    content <= view.fields_viewport_height,
+                    "the reference must not scroll"
+                );
+                paint_fields(&mut view, width, height);
+                let viewport = view.fields_viewport_height;
+                let tab_name = format!("{:?} at {width}x{height}", view.categories[tab]);
+                if (0..view.fields.len()).any(|i| view.field_height(&view.fields[i], i) > viewport)
+                {
+                    both_ends.push(tab_name.clone());
+                }
+                for offset in 0..=content.saturating_sub(viewport) {
+                    view.fields_scroll_offset = offset;
+                    let buf = paint_fields(&mut view, width, height);
+                    for row in 0..viewport {
+                        let y = 1 + row;
+                        let same = (1..width - 1).all(|x| buf[(x, y)] == tall[(x, y + offset)]);
+                        assert!(
+                            same,
+                            "{tab_name}, offset {offset}, row {row}:\n got  {:?}\n want {:?}",
+                            row_text(&buf, y),
+                            row_text(&tall, y + offset)
+                        );
+                    }
+                    for (a, (_, ra)) in view.field_rects.iter().enumerate() {
+                        assert!(
+                            ra.y >= 1 && ra.bottom() <= 1 + viewport,
+                            "{tab_name}, offset {offset}: {ra:?}"
+                        );
+                        for (_, rb) in &view.field_rects[a + 1..] {
+                            assert!(
+                                !ra.intersects(*rb),
+                                "{tab_name}, offset {offset}: {ra:?} {rb:?}"
+                            );
+                        }
+                    }
+                }
+            }
+        }
+        assert!(
+            !both_ends.is_empty(),
+            "no tab has a field taller than the viewport"
+        );
+    }
+
+    /// An expanded list cut at the top keeps its click targets on the rows that show them.
+    #[test]
+    #[serial]
+    fn top_clipped_list_hits_match_their_rows() {
+        use super::super::ListEditState;
+        let (_temp, _guard, mut view) = fresh_view();
+        let (tab, index) = (0..view.categories.len())
+            .find_map(|tab| {
+                view.selected_category = tab;
+                view.rebuild_fields();
+                let index = view
+                    .fields
+                    .iter()
+                    .position(|f| matches!(f.value, FieldValue::List(_)))?;
+                Some((tab, index))
+            })
+            .expect("a tab with a list field");
+        view.selected_category = tab;
+        view.rebuild_fields();
+        let items = ["alpha-item", "bravo-item", "charlie-item"];
+        view.fields[index].value = FieldValue::List(items.iter().map(|s| s.to_string()).collect());
+        view.selected_field = index;
+        view.list_edit_state = Some(ListEditState {
+            selected_index: 0,
+            editing_item: None,
+            adding_new: false,
+        });
+        paint_fields(&mut view, 60, 30);
+        let top: u16 = (0..index)
+            .map(|i| view.field_height(&view.fields[i], i) + 1)
+            .sum();
+        let field_h = view.field_height(&view.fields[index], index);
+        // Field rows: label, description, the actions header, then one row per item.
+        let header_row = 1 + view.description_height(&view.fields[index].description);
+        for hidden in 0..field_h {
+            view.fields_scroll_offset = top + hidden;
+            let buf = paint_fields(&mut view, 60, 30);
+            let hits = &view.list_edit_hits;
+            let shown: Vec<usize> = (0..items.len())
+                .filter(|i| header_row + 1 + *i as u16 >= hidden)
+                .collect();
+            let got: Vec<usize> = hits.rows.iter().map(|(i, _)| *i).collect();
+            assert_eq!(got, shown, "hidden {hidden}");
+            for (i, rect) in &hits.rows {
+                let row = row_text(&buf, rect.y);
+                assert!(
+                    row.contains(items[*i]),
+                    "hidden {hidden}: item {i} at row {} reads {row:?}",
+                    rect.y
+                );
+            }
+            assert_eq!(
+                hits.actions.is_empty(),
+                header_row < hidden,
+                "hidden {hidden}"
+            );
+            for (_, rect) in &hits.actions {
+                assert!(
+                    row_text(&buf, rect.y).contains("(a)dd"),
+                    "hidden {hidden}: actions row {}",
+                    rect.y
+                );
+            }
+        }
     }
 }

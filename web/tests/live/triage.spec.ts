@@ -1,7 +1,7 @@
 // Sidebar triage against a real server (#1581): pin, archive, snooze, and bulk archive.
 
 import { spawnSync } from "node:child_process";
-import type { Page } from "@playwright/test";
+import type { Locator, Page } from "@playwright/test";
 import { test, expect, type ServeHandle } from "../helpers/liveTest";
 import { listSessions, seedSessionViaAoeAdd } from "../helpers/aoeServe";
 
@@ -14,8 +14,23 @@ async function openWithSession(page: Page, spawnServe: () => Promise<ServeHandle
   return { serve, sessionId: session!.id, row };
 }
 
+const contextMenu = (page: Page) => page.locator("[data-testid='sidebar-context-menu']");
 const menuItem = (page: Page, name: string) => page.locator(`[data-testid='sidebar-context-menu-${name}']`);
 const field = (serve: ServeHandle, key: string) => async () => (await listSessions(serve.baseUrl))[0]?.[key] ?? null;
+
+/** Right-click `target` once any previous menu has finished closing, and wait for the new one. */
+async function openMenu(page: Page, target: Locator) {
+  await expect(contextMenu(page)).toBeHidden();
+  await target.click({ button: "right" });
+  await expect(contextMenu(page)).toBeVisible();
+}
+
+async function closeMenu(page: Page) {
+  // The menu handles Escape only while focus is inside it.
+  await contextMenu(page).locator("button:visible").first().focus();
+  await page.keyboard.press("Escape");
+  await expect(contextMenu(page)).toBeHidden();
+}
 
 /** Click a menu item and return the PATCH body sent to `/api/sessions/:id/<endpoint>`. */
 async function patchVia(page: Page, sessionId: string, endpoint: string, click: () => Promise<void>) {
@@ -38,12 +53,14 @@ test("pin → unpin survives reload; snooze presets, a 1h pick, and unsnooze rou
     () => spawnServe({ seedFn: seedSessionViaAoeAdd({ title }) }),
     title,
   );
-  await row.click({ button: "right" });
+  await openMenu(page, row);
   expect(await patchVia(page, sessionId, "pin", () => menuItem(page, "pin").click())).toEqual({ pinned: true });
+  // Pin toggles in place and leaves the menu open over the row.
+  await closeMenu(page);
   await expect(row.locator("[aria-label='Pinned']")).toBeVisible({ timeout: 5_000 });
 
   // Archiving or snoozing a pinned session clears the pin server-side, so the menu offers both.
-  await row.click({ button: "right" });
+  await openMenu(page, row);
   await expect(menuItem(page, "pin")).toHaveAttribute("aria-pressed", "true");
   await expect(menuItem(page, "archive")).toHaveCount(1);
   await expect(menuItem(page, "snooze")).toHaveCount(1);
@@ -51,12 +68,13 @@ test("pin → unpin survives reload; snooze presets, a 1h pick, and unsnooze rou
 
   await page.reload();
   await expect(row.locator("[aria-label='Pinned']")).toBeVisible({ timeout: 10_000 });
-  await row.click({ button: "right" });
+  await openMenu(page, row);
   expect(await patchVia(page, sessionId, "pin", () => menuItem(page, "pin").click())).toEqual({ pinned: false });
+  await closeMenu(page);
   await expect.poll(field(serve, "pinned_at"), { timeout: 5_000 }).toBeNull();
 
   // Snooze: the TUI preset list, a 1h pick, and an unsnooze round trip.
-  await row.click({ button: "right" });
+  await openMenu(page, row);
   await menuItem(page, "snooze").click();
   const modal = page.locator("[data-testid='snooze-modal']");
   await expect(modal).toBeVisible();
@@ -86,13 +104,13 @@ test("pin → unpin survives reload; snooze presets, a 1h pick, and unsnooze rou
   await expect(snoozedRow).toContainText(title);
   await expect(snoozedRow.locator("[aria-label='Snoozed']")).toBeVisible();
   // A snoozed row offers only Unsnooze.
-  await snoozedRow.click({ button: "right" });
+  await openMenu(page, snoozedRow);
   await expect(menuItem(page, "unsnooze")).toBeVisible();
   await expect(menuItem(page, "pin")).toHaveCount(0);
   await expect(menuItem(page, "archive")).toHaveCount(0);
-  await page.mouse.click(5, 5);
+  await closeMenu(page);
 
-  await snoozedRow.click({ button: "right" });
+  await openMenu(page, snoozedRow);
   expect(await patchVia(page, sessionId, "snooze", () => menuItem(page, "unsnooze").click())).toEqual({
     minutes: null,
   });
@@ -110,7 +128,7 @@ test("archive sinks the row into the collapsible footer and persists", async ({ 
   const sunkRow = sunkSection.locator("[data-testid='sidebar-session-row']");
   const toggle = sunkSection.locator("[data-testid='sidebar-sunk-toggle']");
 
-  await row.click({ button: "right" });
+  await openMenu(page, row);
   expect(await patchVia(page, sessionId, "archive", () => menuItem(page, "archive").click())).toEqual({
     archived: true,
     kill_pane: true,
@@ -139,7 +157,7 @@ test("archive sinks the row into the collapsible footer and persists", async ({ 
   await expect(sunkRow).toContainText(title);
   await expect(sunkRow.locator("[aria-label='Archived']")).toBeVisible();
   // An archived row offers only Unarchive.
-  await sunkRow.click({ button: "right" });
+  await openMenu(page, sunkRow);
   await expect(menuItem(page, "archive")).toContainText("Unarchive");
   await expect(menuItem(page, "pin")).toHaveCount(0);
   await expect(menuItem(page, "snooze")).toHaveCount(0);
@@ -150,7 +168,7 @@ test("archive sinks the row into the collapsible footer and persists", async ({ 
   // The expanded state may be restored from localStorage, so read it rather than toggling blindly.
   if ((await toggle.getAttribute("aria-expanded")) !== "true") await toggle.click();
   await expect(sunkRow).toContainText(title, { timeout: 10_000 });
-  await sunkRow.click({ button: "right" });
+  await openMenu(page, sunkRow);
   expect(await patchVia(page, sessionId, "archive", () => menuItem(page, "archive").click())).toEqual({
     archived: false,
     kill_pane: true,
@@ -178,8 +196,8 @@ test("selecting two rows and bulk-archiving persists both", async ({ page, spawn
   const selected = page.locator("[data-testid='sidebar-session-row'][data-selected]");
   await expect(selected).toHaveCount(2);
 
-  await rows.nth(0).click({ button: "right" });
-  await expect(page.locator("[data-testid='sidebar-context-menu']")).toContainText("2 selected");
+  await openMenu(page, rows.nth(0));
+  await expect(contextMenu(page)).toContainText("2 selected");
   await menuItem(page, "bulk-archive").click();
   await expect
     .poll(async () => (await listSessions(serve.baseUrl)).filter((s) => s.archived_at).length, { timeout: 10_000 })

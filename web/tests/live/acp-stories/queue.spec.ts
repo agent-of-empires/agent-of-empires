@@ -122,7 +122,7 @@ test("sidebar row shows the queued-prompt count badge", async ({ page, spawnServ
     expect(response.status()).toBe(202);
     expect(await response.json()).toMatchObject({ disposition: "queued" });
   }
-  // Only confirmed rows are persisted; check the local projection before the hard navigation.
+  // After the hard navigation the chip's count comes from the Daemon's session list.
   await expect(page.getByText("Queued (2)", { exact: true })).toBeVisible();
 
   await page.goto(serve.baseUrl);

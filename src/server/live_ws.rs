@@ -816,7 +816,7 @@ pub async fn live_terminal_ws(
     match target {
         Some(inst) => {
             let tmux_name = crate::tmux::Session::resolve_name(&inst.id, &inst.title);
-            let enter_delay_ms = crate::agents::send_keys_enter_delay(&inst.tool);
+            let enter_delay_ms = inst.send_keys_enter_delay();
             let input_name = tmux_name.clone();
             let input = tokio::task::spawn_blocking(move || {
                 let physical = inst.agent_pane.physical.clone();

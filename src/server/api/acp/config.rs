@@ -303,6 +303,7 @@ mod tests {
         parked: std::collections::HashSet<String>,
         resume_deferred:
             std::collections::HashMap<String, crate::server::acp_reconciler::ResumeDeferral>,
+        stop_notified: std::collections::HashSet<String>,
     }
 
     impl ReconcilerTick {
@@ -320,6 +321,7 @@ mod tests {
                 &mut self.respawn_history,
                 &mut self.parked,
                 &mut self.resume_deferred,
+                &mut self.stop_notified,
             )
             .await;
         }

@@ -109,6 +109,9 @@ pub fn validate_value(kind: &ValidationKind, value: &Value) -> Result<(), Valida
         ValidationKind::PortMappingList => {
             validate_string_list(value, crate::session::validate_port_mapping_format)
         }
+        ValidationKind::VolumeIgnoreList => {
+            validate_string_list(value, crate::session::validate_volume_ignore_format)
+        }
         ValidationKind::CapabilityList => {
             validate_string_list(value, crate::session::validate_capability_format)
         }
@@ -391,6 +394,16 @@ mod tests {
             (&K::NonEmptyString, json!("x"), true),
             // str: any string incl. empty, but never a number/object.
             (&K::StringValue, json!(""), true),
+            (
+                &K::VolumeIgnoreList,
+                json!(["node_modules", "**/bin", "a/b"]),
+                true,
+            ),
+            (&K::VolumeIgnoreList, json!(["../../:/host"]), false),
+            (&K::VolumeIgnoreList, json!(["a/../b"]), false),
+            (&K::VolumeIgnoreList, json!(["/etc"]), false),
+            (&K::VolumeIgnoreList, json!(["x:rw"]), false),
+            (&K::VolumeIgnoreList, json!([""]), false),
             (&K::StringValue, json!(1), false),
             (&K::StringValue, json!({}), false),
             (&K::BoolValue, json!(true), true),
@@ -456,6 +469,8 @@ mod tests {
             (&K::PortMappingList, json!(["3000:3000", "8080:80"]), true),
             (&K::PortMappingList, json!(["3000"]), false),
             (&K::PortMappingList, json!(["a:b"]), false),
+            (&K::PortMappingList, json!(["3000:65536"]), false),
+            (&K::PortMappingList, json!(["65535:65535"]), true),
             (&K::Cron, json!("0 9 * * 1-5"), true),
             (&K::Cron, json!("*/15 * * * *"), true),
             (&K::Cron, json!("0 0,12 1 */2 *"), true),

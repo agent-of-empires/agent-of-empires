@@ -2710,6 +2710,65 @@ impl SessionFeed {
     pub(crate) fn set_cityhall_for_test(&self, cityhall: bool) {
         self.cityhall.store(cityhall, Ordering::SeqCst);
     }
+
+    /// Puts a store move on screen for an applied Session. Hold the receiver to keep the lane open.
+    #[cfg(test)]
+    pub(crate) fn show_sandbox_progress_for_test(&mut self, activity: &str) -> impl Sized {
+        let row = serde_json::from_value(serde_json::json!({
+            "id": "moving", "title": "moving-title", "profile": "test", "lifecycle_generation": 1,
+            "created_at": "2026-01-01T00:00:00Z", "status": "Idle",
+        }))
+        .unwrap();
+        self.applied = Some(Arc::new(RuntimeSnapshot {
+            cursor: RuntimeCursor {
+                epoch: "test".into(),
+                revision: 1,
+            },
+            contents: crate::daemon::RuntimeContents {
+                health: crate::daemon::RuntimeHealth::Healthy,
+                capabilities: crate::daemon::RuntimeCapabilities {
+                    mutations: true,
+                    native_interaction: true,
+                },
+                default_profile: "test".into(),
+                sessions: vec![row],
+                profiles: vec![],
+                workspace_ordering: vec![],
+                global_projects: vec![],
+            },
+        }));
+        let (commands, requests) = tokio::sync::mpsc::channel(COMMAND_CAPACITY);
+        self.commands = Some(commands);
+        set_grant(&self.native_grant, true);
+        self.pending.insert(
+            "moving".into(),
+            PendingCommand {
+                grant: self.native_grant.clone(),
+                lease: 0,
+                result: tokio::sync::oneshot::channel().1,
+                reply: None,
+                terminal: None,
+                marks_unread: false,
+                is_engagement: false,
+                deferred_native: None,
+                diff_save: None,
+            },
+        );
+        self.sandbox_progress
+            .send_replace(vec![crate::daemon::SandboxProgress {
+                operation_id: "move".into(),
+                session_id: "moving".into(),
+                profile: "test".into(),
+                activity: activity.into(),
+            }]);
+        requests
+    }
+
+    /// The Daemon's report that the store move finished: no progress left.
+    #[cfg(test)]
+    pub(crate) fn finish_sandbox_progress_for_test(&self) {
+        self.sandbox_progress.send_replace(Vec::new());
+    }
 }
 
 impl Default for SessionFeed {

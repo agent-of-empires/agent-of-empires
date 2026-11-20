@@ -7,11 +7,13 @@ import type {
   Workspace,
 } from "../../lib/types";
 import { useHasDraftForSessions } from "../../lib/acpDrafts";
-import { useQueuedCountForSessions } from "../../hooks/useAcpQueueCount";
+import { useQueuedCounts } from "../../hooks/useAcpQueueCount";
+import { useAgentDisplayNames } from "../../lib/agentDisplayName";
 import { summarizeRateLimits } from "../../lib/rateLimitSummary";
 import { computeSessionRowTag, useSessionRowTagMode } from "../../lib/sessionRowTag";
 import { FoldChevron } from "../icons";
 import { PluginRowLine } from "../plugin/PluginSlots";
+import { workspaceQueuedReason } from "./sessionQueuedReason";
 import { formatDurationSecondsShort, formatSnoozeRemainingShort } from "./format";
 import type { RowModel } from "./rowModel";
 
@@ -110,6 +112,22 @@ function RateLimitBadge({ sessions }: { sessions: SessionResponse[] }) {
   );
 }
 
+// Its own component so only rows with queued messages load the Agent names.
+function QueuedChip({ sessions, counts, total }: { sessions: SessionResponse[]; counts: number[]; total: number }) {
+  const agentName = useAgentDisplayNames();
+  const why = workspaceQueuedReason(sessions, counts, agentName);
+  const suffix = why ? ` · ${why}` : "";
+  return (
+    <Chip
+      title={`${total} queued message${total === 1 ? "" : "s"}${suffix}`}
+      label={`${total} queued${suffix}`}
+      className={`${CHIP} border-sky-700/40 bg-sky-950/30 font-mono font-medium tabular-nums text-sky-300`}
+    >
+      {total}
+    </Chip>
+  );
+}
+
 /** Badges after the row label; hidden in the compact rail. */
 export function RowTrailingBadges({ workspace, model }: { workspace: Workspace; model: RowModel }) {
   const { firstSession: first, effectiveArchived, effectiveSnoozedUntil } = model;
@@ -117,7 +135,8 @@ export function RowTrailingBadges({ workspace, model }: { workspace: Workspace; 
   const baseBranch = first?.base_branch ?? null;
   const sessionIds = useMemo(() => workspace.sessions.map((s) => s.id), [workspace.sessions]);
   const hasDraft = useHasDraftForSessions(sessionIds);
-  const queuedCount = useQueuedCountForSessions(sessionIds);
+  const queuedCounts = useQueuedCounts(workspace.sessions);
+  const queuedCount = queuedCounts.reduce((total, n) => total + n, 0);
   const worker = first?.view === "structured" ? first.acp_worker_state : undefined;
   return (
     <>
@@ -139,15 +158,7 @@ export function RowTrailingBadges({ workspace, model }: { workspace: Workspace; 
           <Pencil className="h-3 w-3 text-amber-400/90" />
         </span>
       )}
-      {queuedCount > 0 && (
-        <Chip
-          title={`${queuedCount} queued message${queuedCount === 1 ? "" : "s"}`}
-          label={`${queuedCount} queued`}
-          className={`${CHIP} border-sky-700/40 bg-sky-950/30 font-mono font-medium tabular-nums text-sky-300`}
-        >
-          {queuedCount}
-        </Chip>
-      )}
+      {queuedCount > 0 && <QueuedChip sessions={workspace.sessions} counts={queuedCounts} total={queuedCount} />}
       <RateLimitBadge sessions={workspace.sessions} />
       {workspace.sessions.some((s) => s.created_without_setup) && (
         // Visually hidden text, not aria-label: a generic span can't be named.

@@ -3,9 +3,8 @@
 
 use crate::acp::state::Event;
 use agent_client_protocol::v1::schema::{
-    CancelNotification, ContentBlock, McpServer, NewSessionRequest, NewSessionResponse,
-    SessionConfigId, SessionConfigOption, SessionConfigValueId, SessionId,
-    SetSessionConfigOptionRequest,
+    CancelNotification, McpServer, NewSessionRequest, NewSessionResponse, SessionConfigId,
+    SessionConfigOption, SessionConfigValueId, SessionId, SetSessionConfigOptionRequest,
 };
 use agent_client_protocol::v1::ConnectionTo;
 use agent_client_protocol::Agent;
@@ -20,7 +19,7 @@ use super::notifications::{now_ms, Shared};
 use crate::acp::acp_client::between_prompt::{
     between_prompt_stop_reason, BETWEEN_PROMPT_IDLE_CHECK_INTERVAL,
 };
-use crate::acp::acp_client::commands::ClientCmd;
+use crate::acp::acp_client::commands::{ClientCmd, PromptInput};
 use crate::acp::acp_client::config_options::{
     config_option_failure_event, config_options_event, dispatch_set_config_option,
     dispatch_set_mode, mode_config_id, model_config_values, model_option, modes_available_event,
@@ -60,7 +59,7 @@ pub(super) struct Session {
     pub(super) lifecycle_rx: mpsc::Receiver<LifecycleEnvelope>,
     /// Steers the adapter handed back unconsumed, run as ordinary turns.
     /// Kept here rather than re-sent on the bounded channel this task drains.
-    pub(super) pending_prompts: VecDeque<Vec<ContentBlock>>,
+    pub(super) pending_prompts: VecDeque<PromptInput>,
 }
 
 impl Session {
@@ -275,8 +274,8 @@ impl Session {
                 continue;
             }
             match cmd {
-                Some(ClientCmd::Prompt(blocks)) => {
-                    if self.run_prompt(blocks).await? {
+                Some(ClientCmd::Prompt(prompt)) => {
+                    if self.run_prompt(prompt).await? {
                         break;
                     }
                 }
@@ -466,6 +465,7 @@ impl Session {
                 .emit(Event::PromptRejected {
                     reason: "agent_busy".into(),
                     text,
+                    attachments: Vec::new(),
                 })
                 .await;
             let _ = respond_to.send(ResetSessionOutcome::Failed {
@@ -489,6 +489,7 @@ impl Session {
                 .emit(Event::PromptRejected {
                     reason: "agent_busy".into(),
                     text,
+                    attachments: Vec::new(),
                 })
                 .await;
             let _ = respond_to.send(ResetSessionOutcome::Failed {

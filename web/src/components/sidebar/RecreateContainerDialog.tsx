@@ -9,10 +9,13 @@ export function RecreateContainerDialog({
   sessionId,
   sessionTitle,
   onClose,
+  onRecreated,
 }: {
   sessionId: string;
   sessionTitle: string;
   onClose: () => void;
+  /** The Daemon accepted the recreate and is restarting the Agent. */
+  onRecreated?: () => void;
 }) {
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
@@ -28,6 +31,7 @@ export function RecreateContainerDialog({
     setBusy(false);
     if (result.ok) {
       reportInfo(`Restarting ${sessionTitle} on a new container…`);
+      onRecreated?.();
       onClose();
     } else {
       setError(result.message ?? "please try again.");

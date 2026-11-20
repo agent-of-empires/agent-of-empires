@@ -20,7 +20,13 @@ import {
 } from "../../lib/acpDrafts";
 import { MAX_ATTACHMENTS } from "./composerInput";
 import { isVisiblyBusy } from "../../lib/acpTypes";
-import type { AcpState, ApprovalDecision, ElicitationResolution, PromptAttachmentInput } from "../../lib/acpTypes";
+import type {
+  AcpState,
+  ApprovalDecision,
+  ElicitationResolution,
+  PromptAttachmentInput,
+  RejectedPrompt,
+} from "../../lib/acpTypes";
 import { useAgentProfile } from "../../lib/agentProfileContext";
 import { canOfferEarlier, earlierAction } from "../../lib/historyScroll";
 import { activityToThreadMessages, clearFoldGeneration } from "./activityMessages";
@@ -35,6 +41,8 @@ interface Props {
   /** Snoozed sessions auto-wake on send; archived ones refuse it. */
   archivedAt?: string | null;
   snoozedUntil?: string | null;
+  /** The session list's `queued_count`, so a queue changed elsewhere is re-listed. */
+  queuedCount?: number;
   /** Render rows before the latest `/clear` instead of folding them. */
   showClearedTurns?: boolean;
   children: (ctx: AcpContext) => ReactNode;
@@ -55,6 +63,7 @@ export interface AcpContext {
   resolveApproval: (nonce: string, decision: ApprovalDecision, optionId?: string) => Promise<void>;
   resolveElicitation: (nonce: string, resolution: ElicitationResolution) => Promise<void>;
   sendPrompt: (text: string, attachments?: PromptAttachmentInput[]) => Promise<void>;
+  retryRejectedPrompt: (prompt: RejectedPrompt) => Promise<void>;
   /** The composer's Stop, escalating a cancel the Agent ignores. */
   stopTurn: () => void;
   canForceEndTurn: boolean;
@@ -152,10 +161,11 @@ export function AcpRuntime({
   acpWorkerState = "running",
   archivedAt = null,
   snoozedUntil = null,
+  queuedCount,
   showClearedTurns = false,
   children,
 }: Props) {
-  const acp = useAcpSession(sessionId, acpWorkerState, archivedAt, snoozedUntil);
+  const acp = useAcpSession(sessionId, acpWorkerState, archivedAt, snoozedUntil, queuedCount);
   const agentProfile = useAgentProfile();
   const { pendingAttachments, setPendingAttachments, pendingAttachmentsRef } = usePendingAttachments(sessionId);
   const { onCancel, canForceEndTurn } = useCancelEscalation(
@@ -245,6 +255,7 @@ export function AcpRuntime({
         resolveApproval: acp.resolveApproval,
         resolveElicitation: acp.resolveElicitation,
         sendPrompt: acp.sendPrompt,
+        retryRejectedPrompt: acp.retryRejectedPrompt,
         stopTurn: () => void onCancel(),
         canForceEndTurn,
         pendingAttachments,

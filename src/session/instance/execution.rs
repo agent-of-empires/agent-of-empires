@@ -3396,6 +3396,15 @@ impl ConversationState {
                     &row.active_execution,
                 )
     }
+
+    /// Whether a launch from this state resumes a conversation, as `Instance::conversation_target` decides.
+    pub(crate) fn resumes(&self) -> bool {
+        match self.intent {
+            ResumeIntent::Cleared => false,
+            ResumeIntent::Use(_) | ResumeIntent::Fork { .. } => true,
+            ResumeIntent::Default => self.session_id.is_some(),
+        }
+    }
 }
 
 impl Instance {

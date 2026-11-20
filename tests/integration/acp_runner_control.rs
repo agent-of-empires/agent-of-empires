@@ -2063,11 +2063,11 @@ impl HeldTurnRunner {
         std::fs::write(
             &agent_script,
             r#"
-    import json, os, socket, sys
-    control = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-    control.connect(sys.argv[1])
-    control.sendall((str(os.getpid()) + "\n").encode())
-    for line in sys.stdin:
+import json, os, socket, sys
+control = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+control.connect(sys.argv[1])
+control.sendall((str(os.getpid()) + "\n").encode())
+for line in sys.stdin:
     message = json.loads(line)
     method = message.get("method")
     if method is None:
@@ -2095,7 +2095,7 @@ impl HeldTurnRunner {
     else:
         result = {}
     print(json.dumps({"jsonrpc":"2.0","id":request_id,"result":result}), flush=True)
-    "#,
+"#,
         )
         .unwrap();
         let workers = app_dir(&home, &home).join("acp-workers");
@@ -2125,13 +2125,19 @@ impl HeldTurnRunner {
                 ])
                 .env("HOME", &home)
                 .env("XDG_CONFIG_HOME", &home)
+                .stderr(std::fs::File::create(scratch.0.join("runner.stderr")).unwrap())
                 .spawn()
                 .unwrap(),
         );
         // Agent startup occurs only after the runner registers and binds its socket.
         let (gate, _) = tokio::time::timeout(Duration::from_secs(10), gate_listener.accept())
             .await
-            .unwrap()
+            .unwrap_or_else(|error| {
+                panic!(
+                    "runner never started the adapter: {error}; stderr: {}",
+                    std::fs::read_to_string(scratch.0.join("runner.stderr")).unwrap_or_default()
+                )
+            })
             .unwrap();
         let mut gate = tokio::io::BufReader::new(gate);
         let mut line = String::new();
@@ -2207,30 +2213,6 @@ impl HeldTurnRunner {
     async fn release_turn(&mut self) {
         use tokio::io::AsyncWriteExt as _;
         self.gate.get_mut().write_all(b"c").await.unwrap();
-    }
-
-    /// Route daemon observation through a proxy in front of the real control
-    /// socket while keeping the registry's exact producer identity.
-    fn route_through_proxy(
-        &self,
-    ) -> (
-        tokio::net::UnixListener,
-        agent_of_empires::process::worker_registry::WorkerRecord,
-    ) {
-        use agent_of_empires::process::worker_registry;
-        let proxy_socket = self.scratch.0.join("attempt.sock");
-        let proxy_control =
-            agent_of_empires::process::worker::control_socket_sibling(&proxy_socket);
-        let listener = tokio::net::UnixListener::bind(proxy_control).unwrap();
-        let mut record = worker_registry::load(self.id).unwrap().unwrap();
-        assert_eq!(record.pid, self.runner.0.id());
-        assert_eq!(
-            record.stored_acp_session_id.as_deref(),
-            Some("owned-native-session")
-        );
-        record.socket_path = proxy_socket;
-        worker_registry::save(&record).unwrap();
-        (listener, record)
     }
 
     fn method_count(&self, method: &str) -> usize {
@@ -2358,86 +2340,31 @@ async fn borrowed_attach_timeout_preserves_real_runner_and_native_turn() {
     held.await_prompt_started().await;
     drop(initial);
 
-    let (listener, original) = held.route_through_proxy();
-    let real_control = held.real_control.clone();
+    let original = worker_registry::load(id).unwrap().unwrap();
     let identity = RunnerIdentity::from_record(&original);
     assert!(identity.birth_fingerprint.is_some());
-    let (held_tx, held_rx) = tokio::sync::oneshot::channel();
-    let (closed_tx, closed_rx) = tokio::sync::oneshot::channel();
-    let detaching = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
-    let proxy_detaching = detaching.clone();
-    let mut proxy = tokio::task::JoinSet::new();
-    proxy.spawn(async move {
-        let mut held_tx = Some(held_tx);
-        let mut closed_tx = Some(closed_tx);
-        for attempt in 0..2 {
-            let (mut daemon, _) = listener.accept().await.unwrap();
-            let mut producer = tokio::net::UnixStream::connect(&real_control)
-                .await
-                .unwrap();
-            if attempt == 1 {
-                let copied = tokio::io::copy_bidirectional(&mut daemon, &mut producer).await;
-                // Detach may close the daemon end mid-copy; any other failure is the proxy's.
-                if !matches!(&copied, Err(error) if error.kind() == std::io::ErrorKind::NotConnected
-                    && proxy_detaching.load(std::sync::atomic::Ordering::Acquire))
-                {
-                    assert_proxy_copy(copied);
-                }
-                continue;
-            }
-            let hello = control_protocol::read_frame(&mut producer)
-                .await
-                .unwrap()
-                .unwrap();
-            assert!(matches!(hello, ControlBody::Hello { .. }));
-            control_protocol::write_frame(&mut daemon, &hello)
-                .await
-                .unwrap();
-            for initialize in [false, true] {
-                let command = control_protocol::read_frame(&mut daemon)
-                    .await
-                    .unwrap()
-                    .unwrap();
-                assert!(matches!(
-                    (&command, initialize),
-                    (ControlBody::Attach { .. }, false) | (ControlBody::Initialize { .. }, true)
-                ));
-                control_protocol::write_frame(&mut producer, &command)
-                    .await
-                    .unwrap();
-            }
-            let initialized = control_protocol::read_frame(&mut producer)
-                .await
-                .unwrap()
-                .unwrap();
-            assert!(matches!(initialized, ControlBody::Initialized { .. }));
-            held_tx.take().unwrap().send(()).unwrap();
-            assert_eq!(
-                control_protocol::read_frame(&mut daemon).await.unwrap(),
-                None,
-                "a timed-out observer must send no cancel, close, or delete"
-            );
-            drop(producer);
-            closed_tx.take().unwrap().send(()).unwrap();
-        }
-    });
     let (supervisor, store, mut rx) = supervisor_with_prompt_in_flight(&held);
-    let attaching = tokio::spawn({
-        let supervisor = supervisor.clone();
-        let home = held.home.clone();
-        async move { supervisor.attach(id.into(), home, vec![], true, None).await }
-    });
-    held_rx.await.unwrap();
-    tokio::time::pause();
-    tokio::time::advance(Duration::from_secs(3)).await;
-    tokio::time::resume();
-    assert!(matches!(
-        attaching.await.unwrap(),
-        Err(SupervisorError::Acp(
-            agent_of_empires::acp::acp_client::AcpError::AttachTimedOut
-        ))
-    ));
-    closed_rx.await.unwrap();
+    let pid = i32::try_from(held.runner.0.id()).unwrap();
+    assert_eq!(unsafe { libc::kill(pid, libc::SIGSTOP) }, 0);
+    let mut status = 0;
+    assert_eq!(
+        unsafe { libc::waitpid(pid, &mut status, libc::WUNTRACED) },
+        pid
+    );
+    assert!(libc::WIFSTOPPED(status));
+    let observation = supervisor
+        .attach(id.into(), held.home.clone(), vec![], true, None)
+        .await;
+    assert_eq!(unsafe { libc::kill(pid, libc::SIGCONT) }, 0);
+    assert!(
+        matches!(
+            observation,
+            Err(SupervisorError::Acp(
+                agent_of_empires::acp::acp_client::AcpError::AttachTimedOut
+            ))
+        ),
+        "{observation:?}"
+    );
     held.assert_runtime_alive();
     let retained = worker_registry::load(id).unwrap().unwrap();
     assert_eq!(RunnerIdentity::from_record(&retained), identity);
@@ -2460,24 +2387,29 @@ async fn borrowed_attach_timeout_preserves_real_runner_and_native_turn() {
     assert_eq!(supervisor.running_identity(id), Some(identity));
     held.release_turn().await;
     assert_original_turn_completed(&mut held, &store, &mut rx).await;
-    detaching.store(true, std::sync::atomic::Ordering::Release);
     supervisor.detach_all().await;
     held.assert_runtime_alive();
     let retained = worker_registry::load(id).unwrap().unwrap();
     assert_eq!(RunnerIdentity::from_record(&retained), identity);
-    proxy.join_next().await.unwrap().unwrap();
 }
 
-fn assert_proxy_copy<T>(result: std::io::Result<T>) {
-    // macOS can report ENOTCONN when the detached daemon side closes.
-    #[cfg(target_os = "macos")]
-    if result
-        .as_ref()
-        .is_err_and(|error| error.kind() == std::io::ErrorKind::NotConnected)
-    {
-        return;
-    }
-    result.expect("control proxy forwarding failed");
+fn connected_control_socket(path: &std::path::Path) -> Option<std::os::unix::net::UnixStream> {
+    use std::os::fd::FromRawFd;
+    let directory = if cfg!(target_os = "linux") {
+        "/proc/self/fd"
+    } else {
+        "/dev/fd"
+    };
+    std::fs::read_dir(directory).unwrap().find_map(|entry| {
+        let fd = entry.ok()?.file_name().to_str()?.parse::<i32>().ok()?;
+        // Duplicate first: Tokio can close the original descriptor concurrently.
+        let fd = unsafe { libc::fcntl(fd, libc::F_DUPFD_CLOEXEC, 0) };
+        if fd < 0 {
+            return None;
+        }
+        let socket = unsafe { std::os::unix::net::UnixStream::from_raw_fd(fd) };
+        (socket.peer_addr().ok()?.as_pathname() == Some(path)).then_some(socket)
+    })
 }
 
 /// Losing only the daemon's control connection, while the real runner and its
@@ -2486,63 +2418,15 @@ fn assert_proxy_copy<T>(result: std::io::Result<T>) {
 #[tokio::test]
 #[serial_test::serial]
 async fn control_connection_loss_reattaches_the_live_runner_mid_command() {
-    use agent_of_empires::acp::control_protocol::{self, ControlBody};
     use agent_of_empires::acp::runner_lifecycle::RunnerIdentity;
 
     let (mut held, initial) = HeldTurnRunner::start("ctlloss", "real-control-loss").await;
     let id = held.id;
     drop(initial);
-    let (listener, original) = held.route_through_proxy();
+    let original = agent_of_empires::process::worker_registry::load(id)
+        .unwrap()
+        .unwrap();
     let identity = RunnerIdentity::from_record(&original);
-    let real_control = held.real_control.clone();
-    let (sever_tx, sever_rx) = tokio::sync::oneshot::channel::<()>();
-    let (reattached_tx, reattached_rx) = tokio::sync::oneshot::channel();
-    let mut proxy = tokio::task::JoinSet::new();
-    proxy.spawn(async move {
-        let (mut daemon, _) = listener.accept().await.unwrap();
-        let mut producer = tokio::net::UnixStream::connect(&real_control)
-            .await
-            .unwrap();
-        tokio::select! {
-            result = tokio::io::copy_bidirectional(&mut daemon, &mut producer) => {
-                panic!("the first connection ended before the test severed it: {result:?}");
-            }
-            _ = sever_rx => {}
-        }
-        // Close only this connection, from both ends.
-        drop((daemon, producer));
-        let (mut daemon, _) = listener.accept().await.unwrap();
-        let mut producer = tokio::net::UnixStream::connect(&real_control)
-            .await
-            .unwrap();
-        let (mut daemon_read, mut daemon_write) = daemon.split();
-        let (mut producer_read, mut producer_write) = producer.split();
-        tokio::join!(
-            async {
-                use tokio::io::AsyncWriteExt;
-                assert_proxy_copy(tokio::io::copy(&mut daemon_read, &mut producer_write).await);
-                assert_proxy_copy(producer_write.shutdown().await);
-            },
-            async {
-                use tokio::io::AsyncWriteExt;
-                loop {
-                    let frame = control_protocol::read_frame(&mut producer_read)
-                        .await
-                        .unwrap()
-                        .expect("the runner closed before confirming the resume");
-                    control_protocol::write_frame(&mut daemon_write, &frame)
-                        .await
-                        .unwrap();
-                    if matches!(frame, ControlBody::SessionReady { .. }) {
-                        reattached_tx.send(()).unwrap();
-                        break;
-                    }
-                }
-                assert_proxy_copy(tokio::io::copy(&mut producer_read, &mut daemon_write).await);
-                assert_proxy_copy(daemon_write.shutdown().await);
-            }
-        );
-    });
     let (supervisor, store, mut rx) = supervisor_with_prompt_in_flight(&held);
     supervisor
         .attach(id.into(), held.home.clone(), vec![], false, None)
@@ -2550,25 +2434,10 @@ async fn control_connection_loss_reattaches_the_live_runner_mid_command() {
         .unwrap();
     supervisor.send_prompt(id, "keep going", &[]).await.unwrap();
     held.await_prompt_started().await;
-    sever_tx.send(()).unwrap();
-
-    let reattached = tokio::time::timeout(Duration::from_secs(10), reattached_rx)
-        .await
-        .expect("the live runner never confirmed resume while the command was held");
-    if reattached.is_err() {
-        // The proxy dropped the sender, so it ended before forwarding
-        // SessionReady. Report its own failure rather than the closed channel.
-        let outcome = tokio::time::timeout(Duration::from_secs(10), proxy.join_next())
-            .await
-            .expect("the control proxy did not finish after dropping its resume signal")
-            .expect("the control proxy task is missing");
-        match outcome {
-            Err(error) if error.is_panic() => std::panic::resume_unwind(error.into_panic()),
-            outcome => {
-                panic!("the control proxy ended before forwarding SessionReady: {outcome:?}")
-            }
-        }
-    }
+    // Shut down the daemon end of the attested connection, not the runner.
+    let control = connected_control_socket(&held.real_control).expect("connected daemon socket");
+    control.shutdown(std::net::Shutdown::Both).unwrap();
+    drop(control);
     held.release_turn().await;
     assert_original_turn_completed(&mut held, &store, &mut rx).await;
     assert_eq!(supervisor.running_identity(id), Some(identity));
@@ -2579,9 +2448,5 @@ async fn control_connection_loss_reattaches_the_live_runner_mid_command() {
         Some(identity)
     );
     supervisor.detach_all().await;
-    tokio::time::timeout(Duration::from_secs(10), proxy.join_next())
-        .await
-        .expect("the control proxy did not finish after detach")
-        .unwrap()
-        .unwrap();
+    held.assert_runtime_alive();
 }

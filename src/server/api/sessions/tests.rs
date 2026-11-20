@@ -4473,6 +4473,40 @@ async fn force_smart_rename_preflight_skips_name_gate_and_sees_only_user_overrid
     }
 }
 
+// #5784: the TUI decodes the 202 body as the session row.
+#[tokio::test]
+#[serial_test::serial]
+async fn force_smart_rename_answers_a_terminal_session_with_its_row() {
+    use axum::body::to_bytes;
+
+    let tmp_home = tempfile::tempdir().expect("tempdir HOME");
+    let project = tempfile::tempdir().expect("tempdir project");
+    let _home = crate::session::test_support::isolate_app_dir_at(tmp_home.path());
+    let mut inst = Instance::new("Vikings", project.path().to_str().unwrap());
+    inst.tool = "claude".to_string();
+    inst.source_profile = "default".to_string();
+    let id = inst.id.clone();
+
+    let state = crate::server::test_support::build_test_app_state(vec![inst]);
+    let resp = force_smart_rename(
+        axum::extract::State(state.clone()),
+        axum::extract::Path(id.clone()),
+    )
+    .await
+    .into_response();
+    state.runtime.work.drain().await;
+    assert_eq!(resp.status(), StatusCode::ACCEPTED);
+    assert!(resp
+        .headers()
+        .contains_key(crate::daemon::RUNTIME_REVISION_HEADER));
+    assert!(resp
+        .headers()
+        .contains_key(crate::daemon::RUNTIME_EPOCH_HEADER));
+    let body = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+    let row: crate::daemon::SessionResponse = serde_json::from_slice(&body).unwrap();
+    assert_eq!(row.id, id);
+}
+
 // Regression witness for #2603: the ACP-capability and smart-rename overlays
 // share ONE per-request `SessionConfig` cache keyed by (profile, project_path),
 // so three instances covering two unique pairs must trigger exactly two
@@ -4544,7 +4578,8 @@ fn session_cfg_cache_discovers_a_repeated_main_checkout_once() {
     let path = repo.path().to_str().unwrap();
 
     let misses = AtomicUsize::new(0);
-    let mut cache = super::model::SessionCfgCache::new(&misses);
+    let mut store = super::SessionCfgStore::default();
+    let mut cache = super::model::SessionCfgCache::new(&mut store, &misses);
     for _ in 0..3 {
         cache.resolve("default", path);
         cache.structured_view("default", path);
@@ -4552,6 +4587,199 @@ fn session_cfg_cache_discovers_a_repeated_main_checkout_once() {
 
     assert_eq!(cache.discoveries, 1);
     assert_eq!(misses.load(Ordering::Relaxed), 1);
+}
+
+// Regression witness for #5665: the store outlives a request, so an unchanged
+// config is neither rediscovered nor re-resolved, while any input edit, even one
+// that keeps the file's size, resolves again on the next request.
+#[test]
+#[serial_test::serial]
+fn session_cfg_store_reresolves_only_after_an_input_edit() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    let tmp_home = tempfile::tempdir().expect("tempdir HOME");
+    let _home = crate::session::test_support::isolate_app_dir_at(tmp_home.path());
+    let global = crate::session::get_app_dir()
+        .expect("app dir")
+        .join("config.toml");
+    let repo = tempfile::tempdir().expect("tempdir repo");
+    run_git(repo.path(), &["init", "-q"]);
+    let repo_config = repo.path().join(".agent-of-empires/config.toml");
+    std::fs::create_dir_all(repo_config.parent().unwrap()).unwrap();
+    let legacy_config = repo.path().join(".aoe/config.toml");
+    std::fs::create_dir_all(legacy_config.parent().unwrap()).unwrap();
+    let path = repo.path().to_str().unwrap();
+
+    let mut store = super::SessionCfgStore::default();
+    use crate::session::config::StructuredView::{Auto, Off};
+    let detect = |name: &str| format!("[session.agent_detect_as]\n{name} = \"claude\"\n");
+    // Misses, discoveries, then the resolved values, so a stale entry fails too.
+    let mut request_at = |at: &str, edit: &dyn Fn()| {
+        edit();
+        let misses = AtomicUsize::new(0);
+        let mut cache = super::model::SessionCfgCache::new(&mut store, &misses);
+        let mut aliases: Vec<String> = cache
+            .resolve("default", at)
+            .agent_detect_as
+            .keys()
+            .cloned()
+            .collect();
+        aliases.sort();
+        let view = cache.structured_view("default", at);
+        (
+            misses.load(Ordering::Relaxed),
+            cache.discoveries,
+            aliases.join(","),
+            view,
+        )
+    };
+
+    assert_eq!(
+        request_at(path, &|| {}),
+        (1, 1, String::new(), Auto),
+        "first request"
+    );
+    assert_eq!(
+        request_at(path, &|| {}),
+        (0, 0, String::new(), Auto),
+        "unchanged inputs"
+    );
+    let repo_dir = repo_config.parent().unwrap();
+    let app_dir = global.parent().unwrap();
+    let copy_dir = tempfile::tempdir().expect("tempdir config copy");
+    let cases: [(&str, &dyn Fn(), &str, _); 8] = [
+        (
+            "legacy repo config created",
+            &|| std::fs::write(&legacy_config, detect("ll")).unwrap(),
+            "ll",
+            Auto,
+        ),
+        // The loader picks a dangling primary over the legacy file, and the legacy file again once it goes.
+        (
+            "dangling primary link created",
+            &|| std::os::unix::fs::symlink("/nonexistent", &repo_config).unwrap(),
+            "",
+            Auto,
+        ),
+        (
+            "dangling primary link removed",
+            &|| std::fs::remove_file(&repo_config).unwrap(),
+            "ll",
+            Auto,
+        ),
+        (
+            "repo config created",
+            &|| std::fs::write(&repo_config, detect("aa")).unwrap(),
+            "aa",
+            Auto,
+        ),
+        (
+            "same-size repo config edit",
+            &|| std::fs::write(&repo_config, detect("bb")).unwrap(),
+            "bb",
+            Auto,
+        ),
+        (
+            "global config edit",
+            &|| std::fs::write(&global, "[acp]\nstructured_view = \"off\"\n").unwrap(),
+            "bb",
+            Off,
+        ),
+        // A repo config directory linked to the app dir is the global config, so it is skipped.
+        (
+            "repo config dir linked to the app dir",
+            &|| {
+                std::fs::remove_dir_all(repo_dir).unwrap();
+                std::os::unix::fs::symlink(app_dir, repo_dir).unwrap();
+            },
+            "",
+            Off,
+        ),
+        (
+            "link retargeted to an identical copy",
+            &|| {
+                std::fs::copy(&global, copy_dir.path().join("config.toml")).unwrap();
+                std::fs::remove_file(repo_dir).unwrap();
+                std::os::unix::fs::symlink(copy_dir.path(), repo_dir).unwrap();
+            },
+            "",
+            Off,
+        ),
+    ];
+    for (case, edit, aliases, view) in cases {
+        assert_eq!(
+            request_at(path, edit),
+            (1, 0, aliases.to_string(), view),
+            "{case}"
+        );
+    }
+    run_git(
+        repo.path(),
+        &["config", "core.worktree", copy_dir.path().to_str().unwrap()],
+    );
+    assert_eq!(
+        request_at(path, &|| {}),
+        (1, 1, String::new(), Off),
+        "core.worktree edit"
+    );
+
+    // A linked worktree's main repo follows a retargeted link in its gitdir path.
+    let layout = tempfile::tempdir().expect("tempdir worktree layout");
+    for (repo, alias) in [("a", "aa"), ("b", "bb")] {
+        let root = layout.path().join(repo);
+        std::fs::create_dir_all(root.join(".git/worktrees/w")).unwrap();
+        std::fs::create_dir_all(root.join(".agent-of-empires")).unwrap();
+        std::fs::write(root.join(".agent-of-empires/config.toml"), detect(alias)).unwrap();
+    }
+    let current = layout.path().join("current");
+    let worktree = layout.path().join("w");
+    std::fs::create_dir(&worktree).unwrap();
+    std::fs::write(
+        worktree.join(".git"),
+        format!("gitdir: {}/.git/worktrees/w\n", current.display()),
+    )
+    .unwrap();
+    let worktree = worktree.to_str().unwrap();
+    let link = |repo: &str| {
+        let _ = std::fs::remove_file(&current);
+        std::os::unix::fs::symlink(layout.path().join(repo), &current).unwrap();
+    };
+    for (repo, alias) in [("a", "aa"), ("b", "bb")] {
+        let (misses, _, aliases, _) = request_at(worktree, &|| link(repo));
+        assert_eq!((misses, aliases.as_str()), (1, alias), "worktree of {repo}");
+    }
+
+    // An empty profile shares the entry of the default profile it names.
+    let misses = AtomicUsize::new(0);
+    let mut cache = super::model::SessionCfgCache::new(&mut store, &misses);
+    cache.resolve("", path);
+    cache.resolve(&crate::session::config::effective_profile(""), path);
+    assert_eq!(misses.load(Ordering::Relaxed), 1, "empty profile");
+
+    // A `.git` file pointing nowhere skips discovery; a failed discovery is retried, not cached.
+    let broken_cases: [(&str, fn(&std::path::Path), usize); 2] = [
+        (
+            "gitfile pointing nowhere",
+            |dir| std::fs::write(dir.join(".git"), "gitdir: /nonexistent\n").unwrap(),
+            0,
+        ),
+        (
+            "unopenable .git dir",
+            |dir| std::fs::create_dir(dir.join(".git")).unwrap(),
+            1,
+        ),
+    ];
+    for (case, setup, discoveries) in broken_cases {
+        let broken = tempfile::tempdir().expect("tempdir broken repo");
+        setup(broken.path());
+        let broken = broken.path().to_str().unwrap();
+        for _ in 0..2 {
+            let misses = AtomicUsize::new(0);
+            let mut cache = super::model::SessionCfgCache::new(&mut store, &misses);
+            cache.resolve("default", broken);
+            assert_eq!(cache.discoveries, discoveries, "{case}");
+        }
+    }
 }
 
 // Repo roots that differ only in non-UTF-8 bytes must not share a config. APFS rejects such names.
@@ -4590,7 +4818,8 @@ fn session_cfg_cache_keeps_non_utf8_repo_roots_apart() {
         .collect();
 
     let misses = AtomicUsize::new(0);
-    let mut cache = super::model::SessionCfgCache::new(&misses);
+    let mut store = super::SessionCfgStore::default();
+    let mut cache = super::model::SessionCfgCache::new(&mut store, &misses);
     for path in &paths {
         cache.resolve("default", path);
     }
@@ -4734,6 +4963,79 @@ async fn list_sessions_judges_custom_agent_capability_by_the_agent_name() {
         .map(|s| (s.id.as_str(), s.acp_capable))
         .collect();
     assert_eq!(capable, [("named-agent", true), ("tool-only", false)]);
+}
+
+/// The list advertises the solo commands of the agent that classifies the session's prompts:
+/// its worker's agent, else the one its next spawn picks.
+#[tokio::test]
+#[serial_test::serial]
+async fn list_sessions_advertises_the_running_agents_reset_command() {
+    let _home = crate::session::test_support::isolate_app_dir();
+    crate::session::config::update_config(|c| {
+        c.session
+            .agent_acp_cmd
+            .insert("bridge".into(), "bridge acp".into());
+        c.session
+            .agent_clear_alias
+            .insert("bridge".into(), "/new".into());
+        c.acp.default_agent = "bridge".into();
+        c.session
+            .agent_acp_cmd
+            .insert("cursor".into(), "cursor-bridge acp".into());
+        c.session
+            .agent_clear_alias
+            .insert("cursor".into(), "/clear".into());
+    })
+    .unwrap();
+    let mk = |id: &str, tool: &str, structured: bool| {
+        let mut inst = Instance::new(id, &format!("/tmp/{id}"));
+        inst.id = id.to_string();
+        inst.tool = tool.to_string();
+        if structured {
+            inst.view = crate::session::View::Structured;
+        }
+        inst
+    };
+    let state = crate::server::test_support::build_test_app_state(vec![
+        mk("next-bridge", "bridge", true),
+        mk("default-bridge", "unknown", true),
+        mk("runs-bridge", "claude", true),
+        mk("dead-bridge", "claude", true),
+        mk("claude", "claude", true),
+        mk("cursor", "cursor", true),
+        mk("terminal-bridge", "bridge", false),
+    ]);
+    let _live =
+        crate::acp::supervisor::test_support::save_agent_record("runs-bridge", "bridge", true);
+    crate::acp::supervisor::test_support::save_agent_record("dead-bridge", "bridge", false);
+
+    let advertised: Vec<_> = project_sessions(&state, &Default::default(), &Default::default())
+        .await
+        .into_iter()
+        .map(|s| (s.id, s.clear_aliases, s.compact_aliases))
+        .collect();
+    let row = |id: &str, clear: &[&str], compact: &[&str]| {
+        (
+            id.to_string(),
+            clear.iter().map(|s| s.to_string()).collect::<Vec<_>>(),
+            compact.iter().map(|s| s.to_string()).collect::<Vec<_>>(),
+        )
+    };
+    assert_eq!(
+        advertised,
+        [
+            row("next-bridge", &["/new"], &[]),
+            row("default-bridge", &["/new"], &[]),
+            row("runs-bridge", &["/new"], &[]),
+            row("dead-bridge", &["/clear"], &["/compact"]),
+            row("claude", &["/clear"], &["/compact"]),
+            row("cursor", &[], &[]),
+            row("terminal-bridge", &[], &[]),
+        ]
+    );
+    for id in ["runs-bridge", "dead-bridge"] {
+        crate::process::worker_registry::delete(id).ok();
+    }
 }
 
 #[tokio::test]
@@ -5687,6 +5989,7 @@ fn public_create_session_error_forwards_typed_causes_as_fixed_templates() {
                 runtime: "Podman",
                 image: "ghcr.io/acme/sandbox:1".into(),
                 detail: format!("denied: token {SECRET} at /root/.docker/config.json"),
+                reason: crate::containers::image_pull::PullFailureReason::Other,
             })
             .context("ensure image"),
             (
@@ -5792,6 +6095,7 @@ fn public_create_session_error_forwards_typed_causes_as_fixed_templates() {
                 runtime: "Docker",
                 image: "x".repeat(2000),
                 detail: String::new(),
+                reason: crate::containers::image_pull::PullFailureReason::Other,
             }),
             "sandbox_image_pull_failed",
         ),
@@ -8777,6 +9081,95 @@ async fn start_paths_refuse_archived_and_trashed_sessions() {
     }
 }
 
+#[cfg(unix)]
+#[tokio::test]
+#[serial_test::serial]
+async fn sandbox_login_gate_tmux_start_ensure_and_send_are_409() {
+    use axum::body::to_bytes;
+    if !crate::tmux::tmux_command()
+        .arg("-V")
+        .output()
+        .is_ok_and(|output| output.status.success())
+    {
+        return;
+    }
+    let home = crate::session::test_support::isolate_app_dir();
+    let (_runtime, calls) = crate::session::test_support::failing_container_runtime(home.path());
+    crate::session::config::update_app_state(|s| s.has_acknowledged_agent_hooks = true).unwrap();
+    crate::session::config::update_config(|c| {
+        c.sandbox.shared_credential = crate::session::config::SharedCredentialMode::SeparateLogin;
+    })
+    .unwrap();
+    let root = home.path().join(".claude").join("sandbox-v2");
+    std::fs::create_dir_all(&root).unwrap();
+    std::fs::write(root.join(".credentials.json"), "{}").unwrap();
+    let message = crate::session::test_support::login_required("claude").to_string();
+
+    for which in ["start", "ensure", "send"] {
+        let mut inst = make_test_instance();
+        inst.title = format!("login-gate-{which}");
+        inst.project_path = home.path().to_string_lossy().into_owned();
+        inst.source_profile = "default".to_string();
+        inst.status = Status::Stopped;
+        inst.sandbox_info = Some(crate::session::SandboxInfo {
+            provider: None,
+            enabled: true,
+            container_id: None,
+            image: "test:latest".to_string(),
+            container_name: format!("aoe-login-gate-{which}"),
+            extra_env: None,
+            custom_instruction: None,
+            before_start_env: Vec::new(),
+            before_start_hook_env: Vec::new(),
+            container_workdir: None,
+        });
+        let id = inst.id.clone();
+        crate::server::test_support::seed_instances_on_disk_for_test("default", vec![inst.clone()]);
+        let session = inst.tmux_session().unwrap();
+        let state = crate::server::test_support::build_test_app_state(vec![inst]);
+        crate::server::test_support::refresh_canonical_metadata_for_test(&state).await;
+        let response = match which {
+            "start" => start_session(State(state.clone()), Path(id.clone()), Ok(None))
+                .await
+                .into_response(),
+            "ensure" => ensure_session(State(state.clone()), Path(id.clone()), Ok(None))
+                .await
+                .into_response(),
+            // A terminal session has no queue: the send fails with the error text.
+            _ => send_message(
+                State(state.clone()),
+                Path(id.clone()),
+                Ok(Json(SendMessageRequest {
+                    message: "hello".into(),
+                    revive: true,
+                })),
+            )
+            .await
+            .into_response(),
+        };
+        let spawned = session.exists();
+        let _ = session.kill();
+        assert_eq!(response.status(), StatusCode::CONFLICT, "{which}");
+        let body: serde_json::Value =
+            serde_json::from_slice(&to_bytes(response.into_body(), 1024).await.unwrap()).unwrap();
+        assert_eq!(
+            body,
+            serde_json::json!({"error": "sandbox_login_required", "message": message, "tool": "claude"}),
+            "{which}"
+        );
+        assert!(!spawned, "{which}");
+        let after = crate::session::Storage::open_unwatched("default")
+            .unwrap()
+            .load()
+            .unwrap()
+            .remove(0);
+        // The refusal is the response above; the stored row only records that the launch
+        // did not start (a failed launch persists no error text).
+        assert_eq!(after.status, Status::Error, "{which}");
+    }
+    assert_eq!(std::fs::read_to_string(&calls).unwrap_or_default(), "");
+}
+
 /// #4116: a peer (e.g. `aoe session archive`) can shelve the stored row after the daemon's
 /// memory check. Structured start and prompt-wake recheck that row inside their write, refuse,
 /// and leave `archived_at` in place.
@@ -9504,6 +9897,21 @@ fn plan_summary_counts_done_and_picks_the_first_non_done_step() {
 #[serial_test::serial]
 async fn rename_session_quiesces_structured_worker_only_on_profile_move() -> anyhow::Result<()> {
     let _home = crate::session::test_support::isolate_app_dir();
+    crate::session::config::update_config(|c| {
+        c.session
+            .agent_acp_cmd
+            .insert("bridge".into(), "bridge acp".into());
+    })?;
+    for (profile, alias) in [("rename-source", "/clear"), ("rename-target", "/new")] {
+        let dir = crate::session::get_app_dir()?
+            .join("profiles")
+            .join(profile);
+        std::fs::create_dir_all(&dir)?;
+        std::fs::write(
+            dir.join("config.toml"),
+            format!("[session.agent_clear_alias]\nbridge = \"{alias}\"\n"),
+        )?;
+    }
     let cases = [
         ("profile-move", Some("rename-target"), false),
         ("title-only", None, true),
@@ -9511,6 +9919,7 @@ async fn rename_session_quiesces_structured_worker_only_on_profile_move() -> any
     for (id, profile, worker_survives) in cases {
         let mut inst = Instance::new("Before", &format!("/tmp/{id}"));
         inst.id = id.into();
+        inst.tool = "bridge".into();
         inst.source_profile = "rename-source".into();
         inst.status = Status::Idle;
         inst.view = crate::session::View::Structured;
@@ -9524,6 +9933,11 @@ async fn rename_session_quiesces_structured_worker_only_on_profile_move() -> any
         crate::server::test_support::refresh_canonical_metadata_for_test(&state).await;
         state.acp_supervisor.test_insert_worker(id).await;
 
+        assert_eq!(
+            project_sessions(&state, &Default::default(), &Default::default()).await[0]
+                .clear_aliases,
+            ["/clear"]
+        );
         let response = rename_session(
             State(state.clone()),
             Path(id.to_string()),
@@ -9542,6 +9956,39 @@ async fn rename_session_quiesces_structured_worker_only_on_profile_move() -> any
             worker_survives,
             "{id}"
         );
+        if profile.is_some() {
+            let commands = state
+                .acp_supervisor
+                .test_insert_classified_worker(id, "bridge")
+                .await;
+            assert_eq!(
+                project_sessions(&state, &Default::default(), &Default::default()).await[0]
+                    .clear_aliases,
+                ["/new"]
+            );
+            state
+                .session_service
+                .send_turn(
+                    &crate::server::session_service::SessionCaller::User,
+                    id,
+                    crate::server::session_service::SendTurnRequest {
+                        resume_reservation: None,
+                        resume_authority:
+                            crate::process::worker_registry::ResumeAuthority::Automatic,
+                        text: "/new",
+                        attachments: &[],
+                        woke_idle_dormant: false,
+                        prompt_ids: Vec::new(),
+                        synthesized: false,
+                        no_revive: false,
+                    },
+                )
+                .await
+                .unwrap_or_else(|e| panic!("{e}"));
+            state.acp_supervisor.test_flush_worker_commands(id).await;
+            assert_eq!(*commands.lock().unwrap(), ["reset_session"]);
+            crate::process::worker_registry::delete(id)?;
+        }
     }
     Ok(())
 }
@@ -14501,6 +14948,402 @@ async fn cli_refused_parent_leaves_no_worktree_branch_or_session() {
             "{parent}: {refused}"
         );
     }
+}
+
+/// The sandbox login admission of a recreate (and of any restart) runs before the old agent is
+/// stopped and before its container is discarded, hook resolution included: a session that
+/// needs a login is refused with 409, a failing `before_start` hook with 502, and the runtime
+/// is never asked to remove anything; a hook or key that supplies the login lets it through.
+#[tokio::test]
+#[serial_test::serial]
+async fn recreate_container_checks_the_sandbox_login_before_discarding_anything(
+) -> anyhow::Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+    let home = crate::session::test_support::isolate_app_dir();
+    crate::session::config::update_app_state(|state| {
+        state.has_acknowledged_agent_hooks = true;
+    })?;
+    let _unset = crate::session::test_support::EnvGuard::unset(&[
+        "ANTHROPIC_API_KEY",
+        "ANTHROPIC_AUTH_TOKEN",
+        "CLAUDE_CODE_OAUTH_TOKEN",
+        "CLAUDE_CODE_USE_BEDROCK",
+        "CLAUDE_CODE_USE_VERTEX",
+    ]);
+    crate::session::config::update_config(|c| {
+        c.sandbox.shared_credential = crate::session::config::SharedCredentialMode::SeparateLogin;
+    })?;
+    let root = home.path().join(".claude").join("sandbox-v2");
+    std::fs::create_dir_all(&root)?;
+    std::fs::write(root.join(".credentials.json"), "{}")?;
+    let bin = tempfile::tempdir()?;
+    let calls = bin.path().join("runtime-calls");
+    for binary in ["docker", "podman", "container"] {
+        let script = bin.path().join(binary);
+        std::fs::write(
+            &script,
+            format!(
+                "#!/bin/sh\nprintf '%s\\n' \"$*\" >> '{}'\n\
+                 if [ \"$1\" = rm ]; then exit 0; fi\n\
+                 case \"$*\" in \"image inspect\"*) exit 0;; *inspect*) echo 'Error: No such container (container not found)' >&2; exit 1;; esac\n\
+                 echo 'permission denied' >&2\nexit 1\n",
+                calls.display()
+            ),
+        )?;
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755))?;
+    }
+    let _path = crate::session::test_support::path_prepended(bin.path());
+    let project = tempfile::tempdir()?;
+    let message = crate::session::test_support::login_required("claude").to_string();
+
+    // (hook, expected status, expected error code); no code means admitted.
+    let hooks: [(Option<&str>, StatusCode, Option<&str>); 4] = [
+        (None, StatusCode::CONFLICT, Some("sandbox_login_required")),
+        (
+            Some("echo FOO=bar"),
+            StatusCode::CONFLICT,
+            Some("sandbox_login_required"),
+        ),
+        (
+            Some("echo token=sekret >&2; exit 3"),
+            StatusCode::BAD_GATEWAY,
+            Some("before_start_hook_failed"),
+        ),
+        (Some("echo ANTHROPIC_API_KEY=sk-hook"), StatusCode::OK, None),
+    ];
+    for structured in [false, true] {
+        for (hook, expected, code) in hooks {
+            let case = format!("structured={structured} hook={hook:?}");
+            let _ = std::fs::remove_file(&calls);
+            crate::session::config::update_config(|c| {
+                c.host_hooks.before_start = hook.map(str::to_string).into_iter().collect();
+            })?;
+            let mut row = Instance::new("recreate-login", project.path().to_str().unwrap());
+            row.source_profile = "default".into();
+            row.tool = "claude".into();
+            row.status = Status::Stopped;
+            if structured {
+                row.view = crate::session::View::Structured;
+                row.agent_name = Some("claude".into());
+                row.mark_idle_dormant();
+            }
+            row.sandbox_info = Some(crate::session::SandboxInfo {
+                provider: None,
+                enabled: true,
+                container_id: None,
+                image: "ubuntu:latest".to_string(),
+                container_name: "recreate-login-test".to_string(),
+                extra_env: None,
+                custom_instruction: None,
+                before_start_env: Vec::new(),
+                before_start_hook_env: Vec::new(),
+                container_workdir: None,
+            });
+            crate::server::test_support::seed_instances_on_disk_for_test(
+                "default",
+                vec![row.clone()],
+            );
+            let state = crate::server::test_support::build_test_app_state(vec![row.clone()]);
+            crate::server::test_support::refresh_canonical_metadata_for_test(&state).await;
+
+            let response = recreate_container(State(state.clone()), Path(row.id.clone())).await;
+            let status = response.status();
+            let body: serde_json::Value =
+                serde_json::from_slice(&axum::body::to_bytes(response.into_body(), 8192).await?)
+                    .unwrap_or_default();
+            let log = std::fs::read_to_string(&calls).unwrap_or_default();
+            let removed = log.lines().any(|line| line.starts_with("rm "));
+            match code {
+                Some(code) => {
+                    assert_eq!(status, expected, "{case}: {body}");
+                    assert_eq!(body["error"], code, "{case}");
+                    if code == "sandbox_login_required" {
+                        assert_eq!(body["message"], message, "{case}");
+                    } else {
+                        assert_eq!(body["message"], "the before_start hook failed", "{case}");
+                    }
+                    assert!(!removed, "{case}: the container was discarded:\n{log}");
+                    let stored = crate::session::Storage::open_unwatched("default")?.load()?;
+                    assert_eq!(stored[0].status, Status::Stopped, "{case}");
+                    assert!(
+                        !stored[0].has_fresh_lifecycle_reservation(chrono::Utc::now()),
+                        "{case}: nothing was reserved"
+                    );
+                }
+                None => {
+                    // The fake runtime fails the create, so the relaunch itself fails, but
+                    // only after the old container was removed.
+                    assert!(!status.is_success(), "{case}: {status} {body}");
+                    assert_ne!(body["error"], "sandbox_login_required", "{case}");
+                    assert!(removed, "{case}: no removal:\n{log}");
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+/// The cheaper refusals of a restart answer first: an archived session gets its own code and
+/// the `before_start` hook is never run for it.
+#[tokio::test]
+#[serial_test::serial]
+async fn restart_of_a_shelved_sandbox_session_runs_no_before_start_hook() -> anyhow::Result<()> {
+    let home = crate::session::test_support::isolate_app_dir();
+    crate::session::config::update_config(|c| {
+        c.sandbox.shared_credential = crate::session::config::SharedCredentialMode::SeparateLogin;
+    })?;
+    let root = home.path().join(".claude").join("sandbox-v2");
+    std::fs::create_dir_all(&root)?;
+    std::fs::write(root.join(".credentials.json"), "{}")?;
+    let counter = home.path().join("hook-runs");
+    let hook = format!(
+        "echo run >> {}",
+        crate::session::environment::shell_escape(&counter.to_string_lossy())
+    );
+    crate::session::config::update_config(|c| c.host_hooks.before_start = vec![hook])?;
+    let project = tempfile::tempdir()?;
+    let mut row = Instance::new("shelved", project.path().to_str().unwrap());
+    row.source_profile = "default".into();
+    row.tool = "claude".into();
+    row.status = Status::Stopped;
+    row.sandbox_info = Some(crate::session::SandboxInfo {
+        provider: None,
+        enabled: true,
+        container_id: None,
+        image: "ubuntu:latest".to_string(),
+        container_name: "shelved-test".to_string(),
+        extra_env: None,
+        custom_instruction: None,
+        before_start_env: Vec::new(),
+        before_start_hook_env: Vec::new(),
+        container_workdir: None,
+    });
+    row.archive();
+    crate::server::test_support::seed_instances_on_disk_for_test("default", vec![row.clone()]);
+    let state = crate::server::test_support::build_test_app_state(vec![row.clone()]);
+    crate::server::test_support::refresh_canonical_metadata_for_test(&state).await;
+
+    let response = recreate_container(State(state.clone()), Path(row.id.clone())).await;
+    assert_eq!(response.status(), StatusCode::CONFLICT);
+    let body: serde_json::Value =
+        serde_json::from_slice(&axum::body::to_bytes(response.into_body(), 8192).await?)?;
+    assert_eq!(body["error"], "session_archived");
+    assert!(!counter.exists(), "the hook ran for a shelved session");
+    Ok(())
+}
+
+/// A restart that changes the tool is admitted on the launch it makes, not on the row it
+/// leaves: the hook runs for the incoming tool, and a restart into a tool without a sandbox
+/// login is not held by the outgoing tool's login.
+#[tokio::test]
+#[serial_test::serial]
+async fn restart_admission_decides_on_the_incoming_tool() -> anyhow::Result<()> {
+    let home = crate::session::test_support::isolate_app_dir();
+    crate::session::config::update_app_state(|state| {
+        state.has_acknowledged_agent_hooks = true;
+    })?;
+    let _unset = crate::session::test_support::EnvGuard::unset(&[
+        "ANTHROPIC_API_KEY",
+        "ANTHROPIC_AUTH_TOKEN",
+        "CLAUDE_CODE_OAUTH_TOKEN",
+        "CLAUDE_CODE_USE_BEDROCK",
+        "CLAUDE_CODE_USE_VERTEX",
+    ]);
+    crate::session::config::update_config(|c| {
+        c.sandbox.shared_credential = crate::session::config::SharedCredentialMode::SeparateLogin;
+    })?;
+    let root = home.path().join(".claude").join("sandbox-v2");
+    std::fs::create_dir_all(&root)?;
+    std::fs::write(root.join(".credentials.json"), "{}")?;
+    let project = tempfile::tempdir()?;
+
+    // (outgoing tool, incoming tool, hook, refused)
+    let cases = [
+        ("codex", "claude", "echo ANTHROPIC_API_KEY=sk-hook", false),
+        ("codex", "claude", "echo FOO=bar", true),
+        ("claude", "codex", "echo FOO=bar", false),
+    ];
+    for structured in [false, true] {
+        for (outgoing, incoming, hook, refused) in cases {
+            let case = format!("structured={structured} {outgoing}->{incoming} {hook}");
+            crate::session::config::update_config(|c| {
+                c.host_hooks.before_start = vec![hook.to_string()];
+            })?;
+            let mut row = Instance::new("restart-tool", project.path().to_str().unwrap());
+            row.source_profile = "default".into();
+            row.tool = outgoing.into();
+            row.status = Status::Stopped;
+            if structured {
+                row.view = crate::session::View::Structured;
+                row.agent_name = Some(outgoing.into());
+                row.mark_idle_dormant();
+            }
+            row.sandbox_info = Some(crate::session::SandboxInfo {
+                provider: None,
+                enabled: true,
+                container_id: None,
+                image: "ubuntu:latest".to_string(),
+                container_name: "restart-tool-test".to_string(),
+                extra_env: None,
+                custom_instruction: None,
+                before_start_env: Vec::new(),
+                before_start_hook_env: Vec::new(),
+                container_workdir: None,
+            });
+            crate::server::test_support::seed_instances_on_disk_for_test(
+                "default",
+                vec![row.clone()],
+            );
+            let state = crate::server::test_support::build_test_app_state(vec![row.clone()]);
+            crate::server::test_support::refresh_canonical_metadata_for_test(&state).await;
+
+            let response = restart_session(
+                State(state.clone()),
+                Path(row.id.clone()),
+                Ok(Some(Json(crate::daemon::RestartSessionBody {
+                    tool: Some(incoming.into()),
+                    command_override: Some(incoming.into()),
+                    ..Default::default()
+                }))),
+            )
+            .await;
+            let body: serde_json::Value =
+                serde_json::from_slice(&axum::body::to_bytes(response.into_body(), 8192).await?)
+                    .unwrap_or_default();
+            assert_eq!(
+                body["error"] == "sandbox_login_required",
+                refused,
+                "{case}: {body}"
+            );
+            assert_ne!(body["error"], "before_start_hook_failed", "{case}: {body}");
+            crate::session::forget_before_start_resolution(&row.id);
+        }
+    }
+    Ok(())
+}
+
+/// The pre-lock admission of a restart applies the tool the way the restart does. Another
+/// account of the same agent keeps the conversation (`swap_account`); any other tool parks it
+/// (`swap_tool`). A regression that always parked would drop the carried session id before the
+/// login admission. The admitted or refused outcome is the same on both branches, so this
+/// asserts the branch taken, on a host row: the branch is `classify`'s, not the sandbox's.
+#[test]
+#[serial_test::serial]
+fn restart_admission_keeps_the_conversation_of_an_account_swap() {
+    let _home = crate::session::test_support::isolate_app_dir();
+    let _registry =
+        crate::session::install_aliases("default", &[("claude-2", "claude"), ("codex-2", "codex")]);
+    let project = tempfile::tempdir().unwrap();
+    let row = || {
+        let mut row = Instance::new("account-swap", project.path().to_str().unwrap());
+        row.source_profile = "default".into();
+        row.tool = "claude".into();
+        row.agent_session_id = Some("session-1".into());
+        row
+    };
+
+    // Another account of the same agent: the session id stays, nothing is parked.
+    let mut account = row();
+    lifecycle::apply_restart_settings(&mut account, None, Some("claude-2"), None);
+    assert_eq!(account.tool, "claude-2");
+    assert_eq!(account.agent_session_id.as_deref(), Some("session-1"));
+    assert!(account.prior_tool_session_ids.is_empty());
+
+    // Another agent: the session id is parked under the outgoing tool.
+    let mut other = row();
+    lifecycle::apply_restart_settings(&mut other, None, Some("codex-2"), None);
+    assert_eq!(other.tool, "codex-2");
+    assert_eq!(other.agent_session_id, None);
+    assert!(other.prior_tool_session_ids.contains_key("claude"));
+}
+
+/// The restart into another account of the same agent is admitted on that launch: hook-only
+/// authentication admits it, a hook without any refuses it, as the restart itself decides.
+#[tokio::test]
+#[serial_test::serial]
+async fn restart_admission_decides_an_account_swap_on_the_incoming_account() -> anyhow::Result<()> {
+    let home = crate::session::test_support::isolate_app_dir();
+    let _registry = crate::session::install_aliases("default", &[("claude-2", "claude")]);
+    crate::session::config::update_app_state(|state| {
+        state.has_acknowledged_agent_hooks = true;
+    })?;
+    let _unset = crate::session::test_support::EnvGuard::unset(&[
+        "ANTHROPIC_API_KEY",
+        "ANTHROPIC_AUTH_TOKEN",
+        "CLAUDE_CODE_OAUTH_TOKEN",
+        "CLAUDE_CODE_USE_BEDROCK",
+        "CLAUDE_CODE_USE_VERTEX",
+    ]);
+    crate::session::config::update_config(|c| {
+        c.sandbox.shared_credential = crate::session::config::SharedCredentialMode::SeparateLogin;
+    })?;
+    let root = home.path().join(".claude").join("sandbox-v2");
+    std::fs::create_dir_all(&root)?;
+    std::fs::write(root.join(".credentials.json"), "{}")?;
+    let project = tempfile::tempdir()?;
+
+    // (hook, refused)
+    let cases = [
+        ("echo ANTHROPIC_API_KEY=sk-hook", false),
+        ("echo FOO=bar", true),
+    ];
+    for structured in [false, true] {
+        for (hook, refused) in cases {
+            let case = format!("structured={structured} claude->claude-2 {hook}");
+            crate::session::config::update_config(|c| {
+                c.host_hooks.before_start = vec![hook.to_string()];
+            })?;
+            let mut row = Instance::new("restart-account", project.path().to_str().unwrap());
+            row.source_profile = "default".into();
+            row.tool = "claude".into();
+            row.status = Status::Stopped;
+            if structured {
+                row.view = crate::session::View::Structured;
+                row.agent_name = Some("claude".into());
+                row.mark_idle_dormant();
+            }
+            row.sandbox_info = Some(crate::session::SandboxInfo {
+                provider: None,
+                enabled: true,
+                container_id: None,
+                image: "ubuntu:latest".to_string(),
+                container_name: "restart-account-test".to_string(),
+                extra_env: None,
+                custom_instruction: None,
+                before_start_env: Vec::new(),
+                before_start_hook_env: Vec::new(),
+                container_workdir: None,
+            });
+            crate::server::test_support::seed_instances_on_disk_for_test(
+                "default",
+                vec![row.clone()],
+            );
+            let state = crate::server::test_support::build_test_app_state(vec![row.clone()]);
+            crate::server::test_support::refresh_canonical_metadata_for_test(&state).await;
+
+            let response = restart_session(
+                State(state.clone()),
+                Path(row.id.clone()),
+                Ok(Some(Json(crate::daemon::RestartSessionBody {
+                    tool: Some("claude-2".into()),
+                    command_override: Some("claude".into()),
+                    ..Default::default()
+                }))),
+            )
+            .await;
+            let body: serde_json::Value =
+                serde_json::from_slice(&axum::body::to_bytes(response.into_body(), 8192).await?)
+                    .unwrap_or_default();
+            assert_eq!(
+                body["error"] == "sandbox_login_required",
+                refused,
+                "{case}: {body}"
+            );
+            assert_ne!(body["error"], "before_start_hook_failed", "{case}: {body}");
+            crate::session::forget_before_start_resolution(&row.id);
+        }
+    }
+    Ok(())
 }
 
 fn account_swap_body(tool: Option<&str>) -> crate::daemon::RestartSessionBody {

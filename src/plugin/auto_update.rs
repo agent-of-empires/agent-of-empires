@@ -7,10 +7,6 @@
 //! skipped and left for a manual `aoe plugin update`, so a background sweep never
 //! grants new capabilities or runs a changed build step unattended, and never
 //! deactivates a working plugin.
-//!
-//! ponytail: no cross-process lock around the sweep; it runs once at startup and
-//! the pre-existing install/update path is itself unguarded. Add an on-disk
-//! plugin-op lock if concurrent CLI/daemon mutation becomes a real problem.
 
 use std::future::Future;
 use std::pin::Pin;

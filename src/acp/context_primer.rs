@@ -200,7 +200,7 @@ fn fold_turns(events: &[(u64, Event)], before_seq: Option<u64>) -> Folded {
                 turns.extend(current.take());
                 ended_non_success = reason == "rate_limited"
                     || reason == RATE_LIMIT_EXHAUSTED_RETRIES_REASON
-                    || reason == "prompt_failed";
+                    || matches!(reason.as_str(), "prompt_failed" | "prompt_rejected");
             }
             Event::AgentStartupError { .. } | Event::AcpConnectionUnavailable { .. } => {
                 turns.extend(current.take());

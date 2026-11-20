@@ -1236,6 +1236,10 @@ pub enum Event {
     PlanUpdated {
         plan: Plan,
     },
+    /// The agent dropped plan `plan_id`; clears the strip only if it shows that plan.
+    PlanRemoved {
+        plan_id: String,
+    },
     TodoListUpdated {
         todos: Vec<Todo>,
     },
@@ -1525,10 +1529,15 @@ pub enum Event {
         comments: Vec<DiffComment>,
         assembled_markdown: String,
     },
-    /// A prompt arrived while another `session/prompt` was in flight.
+    /// A prompt that did not run, carried back for a retry: it arrived while
+    /// another `session/prompt` was in flight, or the agent answered it with
+    /// an error.
     PromptRejected {
         reason: String,
         text: String,
+        /// Refs to the prompt's stored attachments, resent with `text`.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        attachments: Vec<PromptAttachmentRef>,
     },
     /// Native ACP session id admitted by a successful new, load, fork, or
     /// resume. The server listener persists it on `Instance.acp_session_id` so
@@ -1701,6 +1710,15 @@ impl AcpState {
         }
         match event {
             Event::PlanUpdated { plan } => self.current_plan = Some(plan),
+            Event::PlanRemoved { plan_id } => {
+                if self
+                    .current_plan
+                    .as_ref()
+                    .is_some_and(|plan| plan.plan_id == plan_id)
+                {
+                    self.current_plan = None;
+                }
+            }
             Event::TodoListUpdated { todos } => self.todos = todos,
             Event::ToolCallStarted { tool_call } => {
                 if !matches!(
@@ -2217,13 +2235,14 @@ impl AcpState {
         self.turn_active = false;
         // A lost integration is an error until a new connection restores it.
         if self.integration_lost.is_none() {
-            self.sidebar_phase = if reason == "prompt_failed" || reason == "aborted" {
-                SidebarPhase::PromptFailed
-            } else if reason == "session_reset_failed" {
-                SidebarPhase::Error
-            } else {
-                SidebarPhase::Idle
-            };
+            self.sidebar_phase =
+                if matches!(reason, "prompt_failed" | "prompt_rejected" | "aborted") {
+                    SidebarPhase::PromptFailed
+                } else if reason == "session_reset_failed" {
+                    SidebarPhase::Error
+                } else {
+                    SidebarPhase::Idle
+                };
         }
         self.cancelling = false;
         self.compacting = false;
@@ -3298,6 +3317,7 @@ mod tests {
             Event::PromptRejected {
                 reason: "agent_busy".into(),
                 text: "hi".into(),
+                attachments: Vec::new(),
             },
         ] {
             let s = applied([prompt("hi"), terminal.clone()]);
