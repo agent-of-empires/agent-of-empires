@@ -57,7 +57,8 @@ export function useSuggestions(
   const [failures, setFailures] = useState<Record<string, StartFailure>>({});
   // Rows being started; the others stay usable meanwhile.
   const [starting, setStarting] = useState<string[]>([]);
-  const [hooksReview, setHooksReview] = useState<HooksReview | null>(null);
+  // One review at a time; another row's review waits its turn.
+  const [reviews, setReviews] = useState<HooksReview[]>([]);
   // Bumped after every load, success or not, so the refresh poll re-arms itself.
   const [loadTick, setLoadTick] = useState(0);
   const mounted = useRef(true);
@@ -124,6 +125,7 @@ export function useSuggestions(
   };
 
   const clearFailure = (key: string) => setFailures(({ [key]: _gone, ...rest }) => rest);
+  const dropReview = (key: string) => setReviews((q) => q.filter((r) => suggestionKey(r.item) !== key));
 
   // One-click start with the kind's preset. A paused hooks review resumes through `approveHooks`.
   const start = async (item: SuggestionItem, options: StartOptions = {}) => {
@@ -137,7 +139,7 @@ export function useSuggestions(
       case "started": {
         if (mounted.current) {
           clearFailure(key);
-          setHooksReview(null);
+          dropReview(key);
         }
         const name = result.title || item.title;
         if (onOpenSession && toastBus.handler?.infoAction)
@@ -145,16 +147,22 @@ export function useSuggestions(
         else toastBus.handler?.info(`Started \u201c${name}\u201d`);
         break;
       }
-      case "hooks_need_trust":
-        setHooksReview({ item, review: result.review, options });
+      case "hooks_need_trust": {
+        const next = { item, review: result.review, options };
+        setReviews((q) =>
+          q.some((r) => suggestionKey(r.item) === key)
+            ? q.map((r) => (suggestionKey(r.item) === key ? next : r))
+            : [...q, next],
+        );
         return;
+      }
       case "trust_changed":
         // Repeating without approval returns a fresh review.
-        setHooksReview(null);
+        dropReview(key);
         await start(item, { ...options, approve_hooks: undefined, review_fingerprint: undefined });
         return;
       case "failed":
-        setHooksReview(null);
+        dropReview(key);
         setFailures((f) => ({
           ...f,
           [key]: { reason: result.reason, hint: result.hint, retryable: result.retryable },
@@ -165,16 +173,16 @@ export function useSuggestions(
         await startWithChanges(item);
         return;
       case "stale":
-        setHooksReview(null);
+        dropReview(key);
         setNotice(STALE_NOTICE);
         break;
       case "error":
-        setHooksReview(null);
+        dropReview(key);
         setNotice(result.error);
         break;
       // Another start won the link: the reload turns the row into Open.
       case "already_started":
-        setHooksReview(null);
+        dropReview(key);
         break;
     }
     await load();
@@ -189,10 +197,11 @@ export function useSuggestions(
     await start(item);
   };
 
+  const hooksReview = reviews[0] ?? null;
   const approveHooks = async () => {
     if (!hooksReview) return;
     const { item, review, options } = hooksReview;
-    setHooksReview(null);
+    dropReview(suggestionKey(item));
     await start(item, { ...options, approve_hooks: true, review_fingerprint: review.review_fingerprint });
   };
 
@@ -253,7 +262,7 @@ export function useSuggestions(
     startWithChanges,
     approveHooks,
     retryBlocked,
-    cancelHooks: () => setHooksReview(null),
+    cancelHooks: () => setReviews((q) => q.slice(1)),
   };
 }
 

@@ -224,6 +224,38 @@ describe("SuggestionsView", () => {
     await waitFor(() => expect(screen.queryByText("Review this repo's hooks")).toBeNull());
   });
 
+  it("hooks reviews stay bound to their own row when Starts overlap", async () => {
+    const review = (cmd: string, fp: string) => ({
+      kind: "hooks_need_trust",
+      review: { commands: { on_create: [cmd] }, review_fingerprint: fp },
+    });
+    startSuggestion
+      .mockResolvedValueOnce(review("npm ci", "fp-a"))
+      .mockResolvedValueOnce({ kind: "failed", reason: "boom", retryable: true })
+      .mockResolvedValueOnce(review("make", "fp-b"))
+      .mockReturnValue(new Promise(() => {}));
+    await open(snapshot({ items: [item, { ...item, id: "issue-2", title: "Second" }] }));
+    const [startA, startB] = await screen.findAllByRole("button", { name: "Start" });
+    fireEvent.click(startA!);
+    expect(await screen.findByText("npm ci")).toBeTruthy();
+    // Another row's failure leaves A's review open.
+    fireEvent.click(startB!);
+    await waitFor(() => expect(startSuggestion).toHaveBeenCalledTimes(2));
+    await screen.findByText(/boom/);
+    expect(screen.getByText("npm ci")).toBeTruthy();
+    // Another row's review waits behind A's instead of replacing it.
+    fireEvent.click(screen.getByRole("button", { name: "Try again" }));
+    await waitFor(() => expect(startSuggestion).toHaveBeenCalledTimes(3));
+    expect(screen.getByText("npm ci")).toBeTruthy();
+    expect(screen.queryByText("make")).toBeNull();
+    fireEvent.click(screen.getByRole("button", { name: "Approve and start" }));
+    expect(startSuggestion).toHaveBeenLastCalledWith("github", "issue-1", {
+      approve_hooks: true,
+      review_fingerprint: "fp-a",
+    });
+    expect(await screen.findByText("make")).toBeTruthy();
+  });
+
   it("Cancel on the hooks review starts nothing", async () => {
     startSuggestion.mockResolvedValue({
       kind: "hooks_need_trust",
