@@ -94,6 +94,13 @@ impl PendingRequests {
         (id, rx)
     }
 
+    /// Runs `send` only while `id` is still registered. Retirement takes the same lock, so a
+    /// frame is either queued before the worker is retired or not at all.
+    pub fn send_while_registered(&self, id: &str, send: impl FnOnce() -> bool) -> bool {
+        let state = self.state();
+        state.entries.contains_key(id) && send()
+    }
+
     /// Only the plugin that owns the request can answer it.
     pub fn resolve(&self, plugin_id: &str, reply: WorkerReply) -> bool {
         let mut state = self.state();

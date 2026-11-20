@@ -285,16 +285,18 @@ impl PluginHost {
             serde_json::json!({ "jsonrpc": "2.0", "id": id, "method": method, "params": params })
                 .to_string()
                 + "\n";
-        // Teardown and exit clear the slot before failing entries, so a request registered
-        // after that sweep sees the missing worker here instead of waiting for the timeout.
-        // Checking the channel and queueing under one lock keeps a replaced worker from being
-        // handed the call.
+        // The frame is queued only while the channel is this worker's and the registration is
+        // live. EOF retires the registration before the channel is cleared, so a request that
+        // lost that race is never handed to the dead worker.
         let queued = {
             let table = self.state.lock().await;
             table.running.get(plugin_id).is_some_and(|w| {
-                w.inbound
-                    .as_ref()
-                    .is_some_and(|tx| tx.same_channel(&inbound) && tx.send(line).is_ok())
+                w.inbound.as_ref().is_some_and(|tx| {
+                    tx.same_channel(&inbound)
+                        && self
+                            .pending
+                            .send_while_registered(&id, || tx.send(line).is_ok())
+                })
             })
         };
         if !queued {
@@ -2280,6 +2282,38 @@ rl.on('line', (line) => {
             plugin_id,
             manifest_hash,
         }
+    }
+
+    /// At EOF the generation is retired while its stdin channel is still published. A request
+    /// arriving then must fail without a frame ever being queued for the dead worker.
+    #[tokio::test]
+    async fn a_request_after_retirement_queues_no_frame() {
+        let tmp = tempfile::tempdir().unwrap();
+        let host = PluginHost::new(
+            tmp.path(),
+            "default",
+            None,
+            Arc::new(crate::server::runtime::RuntimeWork::default()),
+        )
+        .unwrap();
+        let mut stdin = host.register_test_inbound("acme.hook", "sha256:v1").await;
+        let generation = host.state.lock().await.running["acme.hook"].supervisor_id;
+        host.pending.fail_worker("acme.hook", generation);
+
+        let err = host
+            .request_worker(
+                worker_ref("acme.hook", "sha256:v1"),
+                "mcp.rewrite",
+                json!({}),
+                Duration::from_secs(5),
+            )
+            .await
+            .unwrap_err();
+        assert!(matches!(err, WorkerRequestError::WorkerGone), "{err}");
+        assert!(
+            stdin.try_recv().is_err(),
+            "a frame was queued for a retired worker"
+        );
     }
 
     /// A request chosen under one manifest is not delivered to a worker launched from
