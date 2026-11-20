@@ -5,6 +5,7 @@ import { SortableContext, arrayMove, useSortable, verticalListSortingStrategy } 
 import { CSS } from "@dnd-kit/utilities";
 import { ArrowUp, GripVertical } from "lucide-react";
 import {
+  fetchSuggestionMappings,
   runSuggestionFix,
   updateSuggestionPrefs,
   updateSuggestionSource,
@@ -155,6 +156,19 @@ export function SuggestionsSettings({
   const agentName = useAgentNames();
   const presetOf = useSuggestionPresets();
   const mounted = useRef(true);
+  const [linkedCount, setLinkedCount] = useState<number | null>(null);
+  // Re-read on returning from Linked repos, where links change.
+  const onList = view === null;
+  useEffect(() => {
+    if (!onList) return;
+    let live = true;
+    void fetchSuggestionMappings().then((m) => {
+      if (live && m) setLinkedCount(m.filter((x) => x.projects.length > 0).length);
+    });
+    return () => {
+      live = false;
+    };
+  }, [onList]);
   // Keyed on primitives: App rebuilds `presetFocus` every render, which must not reopen the view.
   const focusKey = presetFocus && `${presetFocus.providerId}/${presetFocus.criterion}`;
   const [seenFocus, setSeenFocus] = useState(focusKey);
@@ -397,7 +411,14 @@ export function SuggestionsSettings({
               ))}
             </select>
           </Row>
-          <Row title="Linked repos" description="Which Project each repo starts in.">
+          <Row
+            title="Linked repos"
+            description={
+              linkedCount === null
+                ? "Which Project each repo starts in."
+                : `${linkedCount} ${linkedCount === 1 ? "repo" : "repos"} linked to Projects.`
+            }
+          >
             <button type="button" className={BUTTON} onClick={() => setView("linked")}>
               Edit
             </button>

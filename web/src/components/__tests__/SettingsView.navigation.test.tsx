@@ -24,6 +24,7 @@ vi.mock("../../lib/api", () => ({
   fetchSuggestions: vi.fn(() => Promise.resolve(null)),
   fetchAgents: vi.fn(() => Promise.resolve(null)),
   fetchSuggestionPresets: vi.fn(() => Promise.resolve(null)),
+  fetchSuggestionMappings: vi.fn(() => Promise.resolve(null)),
   fetchProfiles: vi.fn(() => Promise.resolve([{ name: "main", is_default: true }])),
   fetchSettings: vi.fn(() => Promise.resolve({ sandbox: {}, updates: {} })),
   getSettingsSchema: vi.fn(() => Promise.resolve(SCHEMA)),
