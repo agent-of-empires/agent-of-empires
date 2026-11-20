@@ -8,7 +8,17 @@ const TAB_STOP_WIDTH: usize = 4;
 
 /// Parse Markdown into styled ratatui lines.
 pub(crate) fn render(text: &str) -> Vec<Line<'static>> {
-    MarkdownBuilder::render(text)
+    use super::rich_text::{infallible, Memory, MemoryLines};
+    let source = Memory;
+    let mut output = MemoryLines::default();
+    let mut builder = infallible(MarkdownBuilder::new(&source, &mut output));
+    let options =
+        pulldown_cmark::Options::ENABLE_STRIKETHROUGH | pulldown_cmark::Options::ENABLE_TABLES;
+    for event in pulldown_cmark::Parser::new_ext(text, options) {
+        infallible(builder.handle(event, String::from));
+    }
+    infallible(builder.finish());
+    output.lines
 }
 
 /// Parse Markdown and wrap it to the available terminal width.
@@ -20,229 +30,275 @@ pub(crate) fn render_wrapped(text: &str, width: u16) -> Vec<Line<'static>> {
     wrapped
 }
 
-/// Accumulates `pulldown-cmark` events into themed ratatui lines.
-/// Inline emphasis pushes/pops modifiers on `mod_stack`, whose union is the
-/// active style. Block elements are separated by a single blank line at top
-/// level; code-block content is emitted line-by-line, never the fences.
-#[derive(Default)]
-struct MarkdownBuilder {
-    lines: Vec<Line<'static>>,
-    current: Vec<Span<'static>>,
-    mod_stack: Vec<Modifier>,
-    /// One entry per open list; `Some(n)` is the next ordinal of an
-    /// ordered list, `None` an unordered list.
-    list_stack: Vec<Option<u64>>,
+use super::rich_text::{ListStack, Sink, Source, Table, TablePart};
+
+/// Markdown grammar and styling shared by in-memory and retained projections.
+pub(crate) struct MarkdownBuilder<'a, S: Source, K: Sink<S::Text, Error = S::Error>> {
+    source: &'a S,
+    sink: &'a mut K,
+    lists: S::Lists,
+    table: S::Table,
+    table_open: bool,
+    table_cells: u64,
+    modifiers: [u64; 3],
     in_code_block: bool,
-    /// Destination of the innermost open link, appended dimmed in parens after
-    /// the link text. `None` when the URL matches the visible text.
-    link_dest: Option<String>,
-    /// Visible text accumulated inside the open link, for the
-    /// autolink-repeat check.
-    link_text: String,
-    /// Open-table state: cells of the in-progress row; rows are flushed
-    /// pipe-separated (the TUI has no column layout pass).
-    table_row: Option<Vec<String>>,
+    link_dest: Option<S::Text>,
+    link_matches: bool,
+    link_bytes: u64,
+    lines: u64,
+    pending_blanks: u64,
+    current: bool,
 }
 
-impl MarkdownBuilder {
-    fn render(text: &str) -> Vec<Line<'static>> {
-        let mut builder = MarkdownBuilder::default();
-        let options =
-            pulldown_cmark::Options::ENABLE_STRIKETHROUGH | pulldown_cmark::Options::ENABLE_TABLES;
-        for event in pulldown_cmark::Parser::new_ext(text, options) {
-            builder.handle(event);
-        }
-        builder.finish()
+impl<'a, S: Source, K: Sink<S::Text, Error = S::Error>> MarkdownBuilder<'a, S, K> {
+    pub fn new(source: &'a S, sink: &'a mut K) -> Result<Self, S::Error> {
+        Ok(Self {
+            source,
+            sink,
+            lists: source.lists()?,
+            table: source.table()?,
+            table_open: false,
+            table_cells: 0,
+            modifiers: [0; 3],
+            in_code_block: false,
+            link_dest: None,
+            link_matches: true,
+            link_bytes: 0,
+            lines: 0,
+            pending_blanks: 0,
+            current: false,
+        })
     }
-
     fn active_modifier(&self) -> Modifier {
-        self.mod_stack
-            .iter()
-            .fold(Modifier::empty(), |acc, m| acc | *m)
-    }
-
-    fn push_span(&mut self, content: &str, extra: Modifier) {
-        let style = Style::default().add_modifier(self.active_modifier() | extra);
-        self.current.push(Span::styled(content.to_string(), style));
-    }
-
-    /// Flush the in-progress line, dropping it if it has no spans.
-    fn flush(&mut self) {
-        let spans = std::mem::take(&mut self.current);
-        if !spans.is_empty() {
-            self.lines.push(Line::from(spans));
+        let mut active = Modifier::empty();
+        for (count, modifier) in
+            self.modifiers
+                .iter()
+                .zip([Modifier::BOLD, Modifier::ITALIC, Modifier::CROSSED_OUT])
+        {
+            if *count != 0 {
+                active |= modifier;
+            }
         }
+        active
     }
-
-    /// Flush a code line, preserving blank lines inside the block.
-    fn flush_code_line(&mut self) {
-        let spans = std::mem::take(&mut self.current);
-        self.lines.push(Line::from(spans));
+    fn span(&mut self, text: S::Text, extra: Modifier) -> Result<(), S::Error> {
+        self.sink.text(
+            text,
+            Style::default().add_modifier(self.active_modifier() | extra),
+        )?;
+        self.current = true;
+        Ok(())
     }
-
-    /// Insert a blank separator before a new top-level block.
+    fn flush(&mut self) -> Result<(), S::Error> {
+        if self.current {
+            self.sink
+                .blank_lines(std::mem::take(&mut self.pending_blanks))?;
+            self.sink.end_line()?;
+            self.lines += 1;
+            self.current = false;
+        }
+        Ok(())
+    }
+    fn flush_code_line(&mut self) -> Result<(), S::Error> {
+        if self.current {
+            self.flush()?;
+        } else {
+            self.lines += 1;
+            self.pending_blanks += 1;
+        }
+        Ok(())
+    }
     fn block_break(&mut self) {
-        if self.list_stack.is_empty() && !self.lines.is_empty() {
-            self.lines.push(Line::default());
+        if self.lists.len() == 0 && self.lines != 0 {
+            self.lines += 1;
+            self.pending_blanks += 1;
         }
     }
-
-    fn handle(&mut self, event: pulldown_cmark::Event) {
+    fn track_link(&mut self, text: &S::Text) -> Result<(), S::Error> {
+        if let Some(destination) = &self.link_dest {
+            if self.link_matches {
+                self.link_matches =
+                    self.source
+                        .prefix_matches(destination, self.link_bytes, text)?;
+            }
+            self.link_bytes += self.source.len(text);
+        }
+        Ok(())
+    }
+    pub fn handle<T, C, A, L>(
+        &mut self,
+        event: pulldown_cmark::Event<T, C, A, L>,
+        convert: impl FnOnce(T) -> S::Text,
+    ) -> Result<(), S::Error> {
         use pulldown_cmark::{Event, Tag, TagEnd};
         match event {
             Event::Start(Tag::Heading { .. }) => {
                 self.block_break();
-                self.mod_stack.push(Modifier::BOLD);
+                self.modifiers[0] += 1;
             }
             Event::End(TagEnd::Heading(_)) => {
-                self.flush();
-                self.mod_stack.pop();
+                self.flush()?;
+                self.modifiers[0] -= 1;
             }
             Event::Start(Tag::Paragraph) => self.block_break(),
-            Event::End(TagEnd::Paragraph) => self.flush(),
-            Event::Start(Tag::Strong) => self.mod_stack.push(Modifier::BOLD),
-            Event::Start(Tag::Emphasis) => self.mod_stack.push(Modifier::ITALIC),
-            Event::Start(Tag::Strikethrough) => self.mod_stack.push(Modifier::CROSSED_OUT),
-            Event::End(TagEnd::Strong | TagEnd::Emphasis | TagEnd::Strikethrough) => {
-                self.mod_stack.pop();
-            }
+            Event::End(TagEnd::Paragraph) => self.flush()?,
+            Event::Start(Tag::Strong) => self.modifiers[0] += 1,
+            Event::Start(Tag::Emphasis) => self.modifiers[1] += 1,
+            Event::Start(Tag::Strikethrough) => self.modifiers[2] += 1,
+            Event::End(TagEnd::Strong) => self.modifiers[0] -= 1,
+            Event::End(TagEnd::Emphasis) => self.modifiers[1] -= 1,
+            Event::End(TagEnd::Strikethrough) => self.modifiers[2] -= 1,
             Event::Start(Tag::CodeBlock(_)) => {
                 self.block_break();
                 self.in_code_block = true;
             }
             Event::End(TagEnd::CodeBlock) => {
-                self.flush();
+                self.flush()?;
                 self.in_code_block = false;
             }
-            Event::Start(Tag::List(first)) => self.list_stack.push(first),
-            Event::End(TagEnd::List(_)) => {
-                self.list_stack.pop();
-            }
+            Event::Start(Tag::List(first)) => self.lists.push(first)?,
+            Event::End(TagEnd::List(_)) => self.lists.pop()?,
             Event::Start(Tag::Link { dest_url, .. }) => {
-                self.link_dest = Some(dest_url.to_string());
-                self.link_text.clear();
+                self.link_dest = Some(convert(dest_url));
+                self.link_matches = true;
+                self.link_bytes = 0;
             }
             Event::End(TagEnd::Link) => {
-                // Append the URL (dimmed, in parens) unless it repeats the
-                // visible text, as an autolink or `[url](url)` would.
-                if let Some(dest) = self.link_dest.take() {
-                    let text = std::mem::take(&mut self.link_text);
-                    if dest != text && !dest.is_empty() {
-                        self.push_span(&format!(" ({dest})"), Modifier::DIM);
+                if let Some(destination) = self.link_dest.take() {
+                    if self.source.len(&destination) != 0
+                        && (!self.link_matches || self.link_bytes != self.source.len(&destination))
+                    {
+                        let style =
+                            Style::default().add_modifier(self.active_modifier() | Modifier::DIM);
+                        self.sink.literal(" (", style)?;
+                        self.sink.text(destination, style)?;
+                        self.sink.literal(")", style)?;
+                        self.current = true;
                     }
                 }
             }
             Event::Start(Tag::Table(_)) => self.block_break(),
             Event::End(TagEnd::Table) => {
-                self.table_row = None;
+                self.table_open = false;
+                self.table.clear()?;
             }
-            Event::Start(Tag::TableHead) => {
-                self.table_row = Some(Vec::new());
+            Event::Start(Tag::TableHead | Tag::TableRow) => {
+                self.table.clear()?;
+                self.table_open = true;
+                self.table_cells = 0;
             }
-            Event::End(TagEnd::TableHead) => {
-                self.flush_table_row(Modifier::BOLD);
-            }
-            Event::Start(Tag::TableRow) => {
-                self.table_row = Some(Vec::new());
-            }
-            Event::End(TagEnd::TableRow) => {
-                self.flush_table_row(Modifier::empty());
-            }
+            Event::End(TagEnd::TableHead) => self.flush_table_row(Modifier::BOLD)?,
+            Event::End(TagEnd::TableRow) => self.flush_table_row(Modifier::empty())?,
             Event::Start(Tag::TableCell) => {
-                if let Some(row) = self.table_row.as_mut() {
-                    row.push(String::new());
+                if self.table_open {
+                    if self.table_cells != 0 {
+                        self.table.push(TablePart::Separator)?;
+                    }
+                    self.table_cells += 1;
                 }
             }
-            Event::End(TagEnd::TableCell) => {}
             Event::Start(Tag::Item) => {
-                self.flush();
-                let depth = self.list_stack.len().saturating_sub(1);
-                let indent = "  ".repeat(depth);
-                let marker = match self.list_stack.last_mut() {
-                    Some(Some(n)) => {
-                        let m = format!("{n}. ");
-                        *n += 1;
-                        m
+                self.flush()?;
+                let depth = self.lists.len().saturating_sub(1);
+                self.sink.spaces(depth * 2, Style::default())?;
+                match self.lists.last()? {
+                    Some(Some(number)) => {
+                        self.sink.number(number, Style::default())?;
+                        self.sink.literal(". ", Style::default())?;
+                        self.lists.set_last(Some(number + 1))?;
                     }
-                    _ => "• ".to_string(),
-                };
-                self.current.push(Span::raw(format!("{indent}{marker}")));
+                    _ => self.sink.literal("• ", Style::default())?,
+                }
+                self.current = true;
             }
-            Event::End(TagEnd::Item) => self.flush(),
+            Event::End(TagEnd::Item) => self.flush()?,
             Event::Text(text) => {
-                if let Some(row) = self.table_row.as_mut() {
-                    if let Some(cell) = row.last_mut() {
-                        cell.push_str(&text);
+                let text = convert(text);
+                if self.table_open {
+                    if self.table_cells != 0 {
+                        self.table.push(TablePart::Text(text))?;
                     }
                 } else if self.in_code_block {
-                    self.push_code_text(&text);
+                    self.push_code_text(text)?;
                 } else {
-                    if self.link_dest.is_some() {
-                        self.link_text.push_str(&text);
-                    }
-                    self.push_span(&text, Modifier::empty());
+                    self.track_link(&text)?;
+                    self.span(text, Modifier::empty())?;
                 }
             }
             Event::Code(text) => {
-                if let Some(row) = self.table_row.as_mut() {
-                    if let Some(cell) = row.last_mut() {
-                        cell.push_str(&text);
+                let text = convert(text);
+                if self.table_open {
+                    if self.table_cells != 0 {
+                        self.table.push(TablePart::Text(text))?;
                     }
                 } else {
-                    if self.link_dest.is_some() {
-                        self.link_text.push_str(&text);
-                    }
-                    self.push_span(&text, Modifier::DIM);
+                    self.track_link(&text)?;
+                    self.span(text, Modifier::DIM)?;
                 }
             }
-            // A soft break renders as a real line break, matching how Claude
-            // Code prints agent output: a reply formatted one item per line must
-            // not collapse into one wrapped paragraph.
-            Event::SoftBreak if !self.in_code_block => self.flush(),
-            Event::HardBreak => self.flush(),
+            Event::SoftBreak if !self.in_code_block => self.flush()?,
+            Event::HardBreak => self.flush()?,
             Event::Rule => {
                 self.block_break();
-                self.lines.push(Line::from("───"));
+                self.sink.standalone_literal(
+                    "───",
+                    Style::default(),
+                    std::mem::take(&mut self.pending_blanks),
+                )?;
+                self.lines += 1;
             }
             _ => {}
         }
+        Ok(())
     }
-
-    /// Flush the in-progress table row as one pipe-separated line. The pass is
-    /// single-sweep, so cells are not column-aligned; the head row is bolded.
-    fn flush_table_row(&mut self, extra: Modifier) {
-        let Some(cells) = self.table_row.take() else {
-            return;
-        };
-        if cells.is_empty() {
-            return;
+    fn flush_table_row(&mut self, extra: Modifier) -> Result<(), S::Error> {
+        if !self.table_open {
+            return Ok(());
+        }
+        self.table_open = false;
+        if self.table_cells == 0 {
+            self.table.clear()?;
+            return Ok(());
         }
         let style = Style::default().add_modifier(self.active_modifier() | extra);
-        self.lines
-            .push(Line::from(Span::styled(cells.join(" │ "), style)));
+        let bytes = self.table.byte_len();
+        self.sink.standalone_line(
+            self.table.drain(),
+            bytes,
+            style,
+            std::mem::take(&mut self.pending_blanks),
+        )?;
+        self.lines += 1;
+        Ok(())
     }
-
-    /// Split code-block text on newlines, flushing one styled line per
-    /// row so multi-line blocks render distinctly without fence markers.
-    fn push_code_text(&mut self, text: &str) {
+    fn push_code_text(&mut self, text: S::Text) -> Result<(), S::Error> {
         let style = Style::default().add_modifier(Modifier::DIM);
-        let mut parts = text.split('\n').peekable();
-        while let Some(part) = parts.next() {
-            if !part.is_empty() {
-                self.current.push(Span::styled(part.to_string(), style));
+        let length = self.source.len(&text);
+        let mut start = 0;
+        while let Some(end) = self.source.find(&text, b'\n', start)? {
+            if start != end {
+                self.sink
+                    .text(self.source.slice(&text, start..end)?, style)?;
+                self.current = true;
             }
-            if parts.peek().is_some() {
-                self.flush_code_line();
-            }
+            self.flush_code_line()?;
+            start = end + 1;
         }
+        if start < length {
+            let text = if start == 0 {
+                text
+            } else {
+                self.source.slice(&text, start..length)?
+            };
+            self.sink.text(text, style)?;
+            self.current = true;
+        }
+        Ok(())
     }
-
-    fn finish(mut self) -> Vec<Line<'static>> {
-        self.flush();
-        while self.lines.last().is_some_and(|line| line.spans.is_empty()) {
-            self.lines.pop();
-        }
-        self.lines
+    pub fn finish(mut self) -> Result<u64, S::Error> {
+        self.flush()?;
+        Ok(self.lines - self.pending_blanks)
     }
 }
 

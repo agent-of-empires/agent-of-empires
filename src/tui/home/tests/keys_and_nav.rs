@@ -666,6 +666,7 @@ fn second_stop_key_press_confirms_the_stop() {
             assert!(env.view.confirm_dialog.is_some(), "strict={strict}");
             let expected =
                 (env.view.view_mode == ViewMode::Structured).then_some(Action::StopSession(id));
+            render_geometry(&mut env.view);
             assert_eq!(
                 env.view.handle_key(key(KeyCode::Char(stop_key)), None),
                 expected
@@ -1013,6 +1014,7 @@ fn test_quit_confirm_dont_ask_again_persists_opt_out() {
     // Focus and tick "don't warn me again", then confirm.
     env.view.handle_key(key(KeyCode::Down), None);
     env.view.handle_key(key(KeyCode::Char(' ')), None);
+    render_geometry(&mut env.view);
     let action = env.view.handle_key(key(KeyCode::Char('y')), None);
 
     assert_eq!(action, Some(Action::Quit));
@@ -1032,6 +1034,7 @@ fn test_quit_confirm_without_opt_out_keeps_flag() {
 
     env.view.show_quit_confirm();
     // Confirm without ticking the checkbox.
+    render_geometry(&mut env.view);
     let action = env.view.handle_key(key(KeyCode::Char('y')), None);
 
     assert_eq!(action, Some(Action::Quit));

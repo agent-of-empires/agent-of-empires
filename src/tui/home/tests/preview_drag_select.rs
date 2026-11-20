@@ -695,3 +695,52 @@ fn full_render_pipeline_captures_copy_text_after_finalize() {
         assert_eq!(copied, "alpha");
     }
 }
+
+#[test]
+#[serial]
+fn retained_release_uses_only_the_last_painted_window_without_another_scroll() {
+    for arrived_before_release in [false, true] {
+        let mut env = create_test_env_with_sessions(1);
+        let id = env.view.selected_session.clone().unwrap();
+        env.view.mutate_instance(&id, Instance::trash);
+        let pane = Rect::new(40, 0, 20, 3);
+        stage_pane(&mut env, pane, 10, 100);
+        assert!(env.view.handle_drag_start(40, 0));
+        assert!(env.view.handle_drag_move(45, 2));
+        let old_extent = env.view.preview_selection.unwrap().extent;
+        // An asynchronous scroll request alone must not count as painted geometry.
+        env.view.retained_scroll_offset = 60;
+        if arrived_before_release {
+            stage_pane(&mut env, pane, 20, 100);
+        }
+        let requested = env.view.retained_scroll_offset;
+        assert!(env.view.handle_drag_end());
+        let selection = env.view.preview_selection.unwrap();
+        assert!(selection.finalized);
+        assert_eq!(
+            selection.extent,
+            if arrived_before_release {
+                (5, 77)
+            } else {
+                old_extent
+            }
+        );
+        assert_eq!(
+            env.view.retained_scroll_offset, requested,
+            "release must not scroll again"
+        );
+        assert!(env.view.preview_drag_pos.is_none());
+        stage_pane(&mut env, pane, 30, 100);
+        assert!(
+            !env.view.tick_preview_autoscroll(),
+            "late arrival cannot extend a released gesture"
+        );
+        assert_eq!(env.view.preview_selection.unwrap().extent, selection.extent);
+        let rectangles = selection.screen_flow_rects(PreviewTextView {
+            pane,
+            first_line: 20,
+            total_lines: 100,
+        });
+        assert_eq!(rectangles.is_empty(), !arrived_before_release);
+    }
+}

@@ -15,6 +15,43 @@ pub(in crate::tui) struct StatusFlash {
 }
 
 impl HomeView {
+    /// Preserve pre-input authority only for this event; changed options or focus
+    /// need a new actual frame before a subsequent event can submit.
+    pub(super) fn begin_confirmation_input(&mut self) -> Option<ConfirmationToken> {
+        let presented = self
+            .presented_confirmation
+            .filter(|token| token.input == self.confirmation_input_revision);
+        if self.confirm_dialog.is_some()
+            || self.unified_delete_dialog.is_some()
+            || self.group_delete_options_dialog.is_some()
+        {
+            self.confirmation_input_revision = self
+                .confirmation_input_revision
+                .checked_add(1)
+                .expect("confirmation input revision overflow");
+            self.presented_confirmation = None;
+        }
+        presented
+    }
+
+    pub(in crate::tui) fn acknowledge_confirmation(&mut self, painted: Option<ConfirmationToken>) {
+        self.presented_confirmation = painted.filter(|token| {
+            token.input == self.confirmation_input_revision
+                && (self
+                    .confirm_dialog
+                    .as_ref()
+                    .is_some_and(|dialog| dialog.presentation_id() == token.dialog)
+                    || self
+                        .unified_delete_dialog
+                        .as_ref()
+                        .is_some_and(|pending| pending.dialog.presentation_id() == token.dialog)
+                    || self
+                        .group_delete_options_dialog
+                        .as_ref()
+                        .is_some_and(|dialog| dialog.presentation_id() == token.dialog))
+        });
+    }
+
     /// Expire the settings view's transient "Settings saved" toast when its
     /// window passes, so it fades even while the keyboard is idle. Returns true
     /// when a redraw is needed. No-op when the settings overlay isn't open.
@@ -268,8 +305,8 @@ impl HomeView {
         let status = match opened {
             Ok(()) => format!("opened {url}"),
             Err(e) => {
-                crate::tui::clipboard::copy_to_clipboard(url);
-                format!("{e}; copied {url}")
+                let copy = crate::tui::clipboard::copy_to_clipboard(url);
+                format!("{e}; {copy}")
             }
         };
         self.flash_status(status);
@@ -282,8 +319,8 @@ impl HomeView {
         let Some((copied, flash)) = opener_failure_feedback(&failed) else {
             return false;
         };
-        crate::tui::clipboard::copy_to_clipboard(&copied);
-        self.flash_status(flash);
+        let copy = crate::tui::clipboard::copy_to_clipboard(&copied);
+        self.flash_status(format!("{flash}; {copy}"));
         true
     }
 
@@ -302,6 +339,16 @@ impl HomeView {
         });
         failed
     }
+
+    pub(in crate::tui) fn clipboard_feedback(&mut self, message: String) {
+        if let Some(view) = self.serve_view.as_mut() {
+            view.clipboard_feedback(message.clone());
+        }
+        if let Some(view) = self.diff_view.as_mut() {
+            view.success_message = Some(message.clone());
+        }
+        self.flash_status(message);
+    }
 }
 
 /// Clipboard text and flash for failed openers; several are grouped so no URL is lost.
@@ -310,19 +357,12 @@ pub(super) fn opener_failure_feedback(
 ) -> Option<(String, String)> {
     match failed {
         [] => None,
-        [(url, status)] => Some((
-            url.clone(),
-            format!("nothing opened it ({status}); copied {url}"),
-        )),
+        [(url, status)] => Some((url.clone(), format!("nothing opened it ({status}); {url}"))),
         _ => {
             let urls: Vec<&str> = failed.iter().map(|(url, _)| url.as_str()).collect();
             Some((
                 urls.join("\n"),
-                format!(
-                    "nothing opened {} links; copied {}",
-                    urls.len(),
-                    urls.join(" ")
-                ),
+                format!("nothing opened {} links: {}", urls.len(), urls.join(" ")),
             ))
         }
     }

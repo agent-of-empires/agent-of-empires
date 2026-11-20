@@ -21,3 +21,57 @@ writer outright. The version here wraps ratatui's `CrosstermBackend` and
 resolves a cell's target through a side map keyed by position, because aoe's
 grid comes from `vt100`, which does not model hyperlinks per cell. The
 surrounding backend, the map, and the tests are original.
+
+## pulldown-cmark 0.13.6
+
+- Project: <https://github.com/raphlinus/pulldown-cmark>
+- License: MIT, full text in [`licenses/pulldown-cmark-MIT.txt`](licenses/pulldown-cmark-MIT.txt)
+- Used in: `vendor/pulldown-cmark`
+
+Modifications: shared memory-backed and disk-backed input, parser storage,
+reference dictionaries, and text normalization preserve the parser's grammar.
+The disk backend shares the application's SQLite dependency.
+
+The disk-backed Unicode folding table derives from Sean McArthur's
+`unicase` work. Its full MIT copyright and permission notice is shipped in
+[`licenses/unicase-MIT.txt`](licenses/unicase-MIT.txt).
+
+## unicode-width 0.2.2
+
+- Project: <https://github.com/unicode-rs/unicode-width>
+- License: MIT or Apache-2.0, used under MIT; full text in
+  [`licenses/unicode-width-MIT.txt`](licenses/unicode-width-MIT.txt)
+- Copyright: [`licenses/unicode-width-COPYRIGHT.txt`](licenses/unicode-width-COPYRIGHT.txt)
+- Used in: `vendor/unicode-width`
+
+Modifications: expose the existing reverse width calculation as an incremental
+accumulator shared by contiguous strings and disk-backed grapheme clusters.
+
+The unchanged upstream Unicode 17.0 emoji test data in
+`vendor/unicode-width/tests/emoji-test.txt` is copyright © 2025 Unicode, Inc.,
+under [Unicode License V3](https://www.unicode.org/license.txt). Its complete
+copyright and permission notice is shipped in
+[`licenses/Unicode-3.0.txt`](licenses/Unicode-3.0.txt).
+
+## ansi-to-tui 8.0.1
+
+- Project: <https://github.com/ratatui/ansi-to-tui>
+- License: MIT, full text in [`licenses/ansi-to-tui-MIT.txt`](licenses/ansi-to-tui-MIT.txt)
+- Used in: `src/tui/rich_text/ansi.rs`
+
+Modifications: the escape grammar and style transitions operate on contiguous
+or paged byte sources and emit through the shared rich-text sink.
+
+## Crossterm
+
+- Project: <https://github.com/crossterm-rs/crossterm>
+- Version: 0.29.0, vendored in `vendor/crossterm`
+- License: MIT, full copyright and permission notice in
+  [`licenses/crossterm-MIT.txt`](licenses/crossterm-MIT.txt)
+
+The Unix Mio consumer retains fetched control events across early returns and
+refreshes TTY readiness before polling again instead of reading a saved hint.
+The upstream parser and other backends are unchanged.
+
+Fork provenance, update ownership, supported distribution, and required release
+checks are documented in [Vendored dependencies](docs/development/releases.md#vendored-dependencies).

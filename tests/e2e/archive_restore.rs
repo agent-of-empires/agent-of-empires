@@ -879,7 +879,9 @@ fn trash_retained_transcript_is_read_only() {
         .unwrap() as u16
         + 1;
     h.send_mouse_click(0, 7, row);
-    h.wait_for("UNFINISHED-OUTPUT-END");
+    // Identity changes replay this fixture; viewport-only waits stay short.
+    let replay_timeout = Duration::from_secs(60);
+    h.wait_for_timeout("UNFINISHED-OUTPUT-END", replay_timeout);
     h.send_keys("S-PageUp");
     h.wait_for_absent("UNFINISHED-OUTPUT-END", Duration::from_secs(5));
     h.assert_screen_contains("Trash · read-only");
@@ -959,7 +961,7 @@ fn trash_retained_transcript_is_read_only() {
         )
         .unwrap();
     drop(events);
-    h.wait_for("LATE-RETAINED-OUTPUT");
+    h.wait_for_timeout("LATE-RETAINED-OUTPUT", replay_timeout);
     h.assert_screen_contains("Esc: sessions");
     let screen = h.capture_screen();
     let (y, line) = screen
@@ -998,7 +1000,7 @@ fn trash_retained_transcript_is_read_only() {
             },
         )
         .unwrap();
-    h.wait_for("CONCURRENT-TEARDOWN-SUMMARY");
+    h.wait_for_timeout("CONCURRENT-TEARDOWN-SUMMARY", replay_timeout);
     h.assert_screen_not_contains("◼");
     events
         .record(
@@ -1010,7 +1012,7 @@ fn trash_retained_transcript_is_read_only() {
         )
         .unwrap();
     drop(events);
-    h.wait_for_absent("completion unavailable", Duration::from_secs(45));
+    h.wait_for_absent("completion unavailable", replay_timeout);
     h.assert_screen_contains("CONCURRENT-TEARDOWN-SUMMARY");
     h.assert_screen_contains("Esc: sessions");
     h.send_keys("Home");
@@ -1194,7 +1196,7 @@ fn trash_retained_transcript_is_read_only() {
         .unwrap() as u16
         + 1;
     h.send_mouse_click(0, 7, row);
-    h.wait_for("CONCURRENT-TEARDOWN-SUMMARY");
+    h.wait_for_timeout("CONCURRENT-TEARDOWN-SUMMARY", replay_timeout);
     h.run_cli_ok(&["rm", &id, "--purge"]);
     h.wait_for_absent("TrashRetained", Duration::from_secs(5));
     h.wait_for_absent("CONCURRENT-TEARDOWN-SUMMARY", Duration::from_secs(5));

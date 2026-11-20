@@ -27,6 +27,7 @@ pub struct GroupDeleteOptions {
 }
 
 pub struct GroupDeleteOptionsDialog {
+    presentation_id: u64,
     group_path: String,
     session_count: usize,
     has_managed_worktrees: bool,
@@ -54,6 +55,7 @@ impl GroupDeleteOptionsDialog {
             GroupDeleteAction::MoveToDefault
         };
         Self {
+            presentation_id: crate::tui::terminal_output::next_interaction_revision(),
             group_path,
             session_count,
             has_managed_worktrees,
@@ -66,6 +68,10 @@ impl GroupDeleteOptionsDialog {
             focusable_rects: Vec::new(),
             hover: HoverState::default(),
         }
+    }
+
+    pub(in crate::tui) fn presentation_id(&self) -> u64 {
+        self.presentation_id
     }
 
     pub fn handle_click(&mut self, col: u16, row: u16) -> Option<DialogResult<GroupDeleteOptions>> {

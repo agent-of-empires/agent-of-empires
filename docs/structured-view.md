@@ -164,7 +164,9 @@ regardless of the session's current view or click preference.
 
 Scroll with the mouse wheel. Without reader focus, use **Earlier/Later** in the
 footer or **Shift+PageUp/PageDown**. Press **Enter** to focus the reader and use
-**Up/Down**, **PageUp/PageDown**, and **Home/End**. Drag over text to copy it.
+**Up/Down**, **PageUp/PageDown**, and **Home/End**. Drag over text to copy it,
+including a selection scrolled out of view. Press **y** in the focused reader
+to copy the complete rendered transcript without loading it into memory.
 **Esc** returns to the session list. Restore and permanent deletion remain
 separate management actions shown in the footer.
 
@@ -179,17 +181,42 @@ placeholders.
 Unfinished text snapshots remain readable even when their start or completion
 event is unavailable. They are labeled **completion unavailable**, not marked
 successful or stopped. Wrapping and copy preserve painted Unicode graphemes.
+Thoughts are shown in full rather than the active view's one-line preview.
+
+Large histories are processed off the UI thread and stored in temporary files.
+Only visible text and fixed-size caches stay in memory; an unusually large
+visible grapheme still needs its full bytes. A first visit at a new width may
+show preparation in progress. Scrolling and copy can revisit evicted windows;
+there is no transcript-size cutoff. Desktop clipboard helpers receive complete
+exports without an application size cap. OSC 52 skips copies above 1 MiB
+(1,048,576 raw bytes), with explicit feedback. Larger copies require a desktop
+helper. An OSC 52 write confirms emission, not clipboard acceptance; terminals
+may impose lower limits.
+
+Clipboard feedback distinguishes queued requests, completed desktop copies and
+OSC 52 emission. Queuing never means the text was copied. Copy while history is
+loading is refused with retry feedback. A source change cancels an outdated
+prepared copy.
+
+Retained tabs display at four-column stops and copy as original tabs. Distinct
+tool invocations remain distinct when an agent reuses a tool ID; replacement
+snapshots update only their invocation. Failed reads retry with bounded backoff
+while preserving the last readable window.
 
 The reader refreshes available content automatically, including replacements or
 backfills that leave sequence bounds unchanged, and preserves focus and scroll
-position. Read failures keep the last loaded content visible with an error.
-Content, size, or theme changes clear the previous text selection.
+position. Read failures keep the last readable window visible with an error,
+including failures while preparing replacement content. Dragging selects only
+painted retained rows. Content, wrapping width, or theme changes clear the
+previous selection.
+Missing ranges do not trigger repeated transcript reloads while retained content
+is unchanged.
 
 Retained reads use one complete history snapshot. If stored history changes,
 including an append, the reader rejects mixed content and retries while keeping
 the last readable view. An incomplete but unchanged history does not repeatedly
 reload. See [retained history internals](development/internals/structured-view.md#retained-history-consistency)
-for the storage and migration contract.
+for storage, clipboard ownership, and terminal transport invariants.
 
 Dialogs close when their target session changes or disappears. Trash context
 menus reject actions if their original session, profile, lifecycle generation,
@@ -204,9 +231,13 @@ The TUI command palette exposes Restore and Retry Trash using
 the same lifecycle-gated actions as the context menu. Opening Trash confirmation
 captures its runtime epoch; a daemon replacement invalidates the confirmation.
 Trash remains read-only without discarding untargeted pending composer paste.
-Web recovery lists unfinished members of mixed live/Trash workspaces separately.
-It never retries or restores a live sibling. Restore receipts keep their native
-revision so a late older Retry cannot replace the restored row.
+Web recovery is workspace-scoped. While any workspace member has unfinished
+Trash, Restore and Delete are hidden for the whole workspace, including settled
+Trash siblings; they return only when all pending members settle. Retry targets
+unfinished Trash members, never live siblings. This management-menu restriction
+is separate from passive web transcript opening.
+Restore receipts keep their native revision so a late older Retry cannot replace
+the restored row.
 
 If Retry cannot verify the checkout, keep the record in Trash and inspect its
 retained history read-only. There is no record-only removal action. A fresh
