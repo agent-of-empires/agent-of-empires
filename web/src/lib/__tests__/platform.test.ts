@@ -11,6 +11,7 @@ afterEach(() => {
   delete (window.navigator as unknown as { standalone?: boolean }).standalone;
   delete (window as unknown as { matchMedia?: unknown }).matchMedia;
   delete (window as { isSecureContext?: boolean }).isSecureContext;
+  delete (navigator as { maxTouchPoints?: number }).maxTouchPoints;
   Object.defineProperty(window, "location", { configurable: true, value: realLocation });
 });
 
@@ -58,15 +59,33 @@ describe("isStandalone", () => {
 const IPHONE = "Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) AppleWebKit/605.1.15";
 const IPAD = "Mozilla/5.0 (iPad; CPU OS 17_0 like Mac OS X) AppleWebKit/605.1.15";
 const ANDROID = "Mozilla/5.0 (Linux; Android 14; Pixel 8) AppleWebKit/537.36 Chrome/126.0 Mobile Safari/537.36";
+const MAC = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 Version/17.0 Safari/605.1.15";
 const FIREFOX_TOUCH = "Mozilla/5.0 (X11; Linux x86_64; rv:128.0) Gecko/20100101 Firefox/128.0";
 
 describe("installHint", () => {
   it.each([
-    { name: "an iPhone Safari tab", ua: IPHONE, standalone: false, finePointer: false, secure: true, want: "ios" },
-    { name: "the installed iPhone app", ua: IPHONE, standalone: true, finePointer: false, secure: true, want: null },
+    {
+      name: "an iPhone Safari tab",
+      ua: IPHONE,
+      touch: 5,
+      standalone: false,
+      finePointer: false,
+      secure: true,
+      want: "ios",
+    },
+    {
+      name: "the installed iPhone app",
+      ua: IPHONE,
+      touch: 5,
+      standalone: true,
+      finePointer: false,
+      secure: true,
+      want: null,
+    },
     {
       name: "an Android Chrome tab",
       ua: ANDROID,
+      touch: 5,
       standalone: false,
       finePointer: false,
       secure: true,
@@ -75,17 +94,45 @@ describe("installHint", () => {
     {
       name: "another touch browser",
       ua: FIREFOX_TOUCH,
+      touch: 5,
       standalone: false,
       finePointer: false,
       secure: true,
       want: "other",
     },
-    { name: "a desktop", ua: FIREFOX_TOUCH, standalone: false, finePointer: true, secure: true, want: null },
-    // Treated as a desktop on purpose: it can follow the replay line like one.
-    { name: "an iPad with a trackpad", ua: IPAD, standalone: false, finePointer: true, secure: true, want: null },
-    { name: "plain HTTP on a LAN", ua: ANDROID, standalone: false, finePointer: false, secure: false, want: null },
-  ])("is $want for $name", ({ ua, standalone, finePointer, secure, want }) => {
+    { name: "a desktop", ua: FIREFOX_TOUCH, touch: 0, standalone: false, finePointer: true, secure: true, want: null },
+    // Push on an iPad needs the installed app too, whatever the pointer.
+    {
+      name: "an iPad with a trackpad",
+      ua: IPAD,
+      touch: 5,
+      standalone: false,
+      finePointer: true,
+      secure: true,
+      want: "ios",
+    },
+    {
+      name: "an iPad in desktop mode",
+      ua: MAC,
+      touch: 5,
+      standalone: false,
+      finePointer: false,
+      secure: true,
+      want: "ios",
+    },
+    { name: "a Mac", ua: MAC, touch: 0, standalone: false, finePointer: true, secure: true, want: null },
+    {
+      name: "plain HTTP on a LAN",
+      ua: ANDROID,
+      touch: 5,
+      standalone: false,
+      finePointer: false,
+      secure: false,
+      want: null,
+    },
+  ])("is $want for $name", ({ ua, touch, standalone, finePointer, secure, want }) => {
     setUserAgent(ua);
+    Object.defineProperty(navigator, "maxTouchPoints", { configurable: true, value: touch });
     Object.defineProperty(window, "matchMedia", {
       configurable: true,
       value: (q: string) =>

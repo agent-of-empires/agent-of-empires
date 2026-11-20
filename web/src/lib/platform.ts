@@ -24,12 +24,18 @@ export const isSecureOrigin = (): boolean => {
 
 export type InstallHint = "ios" | "android" | "other";
 
+/** iPadOS in desktop mode reports a Mac userAgent; a real Mac has no touch points. */
+const isIPadDesktopMode = (): boolean =>
+  typeof navigator !== "undefined" && /Macintosh/.test(navigator.userAgent) && navigator.maxTouchPoints > 1;
+
 /**
  * Which install steps a phone or tablet browser tab needs; null for an installed app, a desktop,
- * or an insecure origin. An iPad with a trackpad has a fine pointer, so it counts as a desktop.
+ * or an insecure origin. An iPad gets the iOS steps even with a trackpad, since push there also
+ * needs the installed app.
  */
 export function installHint(): InstallHint | null {
-  if (isStandalone() || hasFinePointer() || !isSecureOrigin()) return null;
-  if (isIOS()) return "ios";
+  if (isStandalone() || !isSecureOrigin()) return null;
+  if (isIOS() || isIPadDesktopMode()) return "ios";
+  if (hasFinePointer()) return null;
   return /Android/.test(navigator.userAgent) ? "android" : "other";
 }
