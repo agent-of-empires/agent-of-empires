@@ -91,6 +91,10 @@ pub(super) fn session_response_from_instance_with_plan(
             .pending_initial_turn
             .as_ref()
             .and_then(|turn| turn.error.clone()),
+        initial_prompt_error_code: inst
+            .pending_initial_turn
+            .as_ref()
+            .and_then(|turn| turn.error_code.clone()),
         branch: row.worktree.map(|w| w.branch.clone()),
         main_repo_path: row.worktree.map(|w| w.main_repo_path.clone()),
         base_branch: row.worktree.and_then(|w| w.base_branch.clone()),

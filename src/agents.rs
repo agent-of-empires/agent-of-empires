@@ -1838,6 +1838,19 @@ pub fn oneshot_capable_names() -> Vec<&'static str> {
 mod tests {
     use super::*;
 
+    /// A real Claude Code 2.1.326 footer as `capture-pane -e` returns it: every
+    /// word carries its own color escape, so a raw substring match misses it.
+    #[test]
+    fn claude_ready_markers_match_a_colored_footer_once_escapes_are_stripped() {
+        let capture = "\x1b[39m  \x1b[38;5;211m\u{23f5}\u{23f5}\x1b[39m \x1b[38;5;211mbypass\x1b[39m \x1b[38;5;211mpermissions\x1b[39m \x1b[38;5;211mon\x1b[38;5;246m (shift+tab\x1b[39m \x1b[38;5;246mto\x1b[39m \x1b[38;5;246mcycle)\x1b[39m \x1b[38;5;246m\u{b7}\x1b[39m \x1b[38;5;246mPR\x1b[39m\n";
+        let shows = |screen: &str| {
+            let screen = screen.to_lowercase();
+            ready_markers("claude").iter().any(|m| screen.contains(m))
+        };
+        assert!(!shows(capture));
+        assert!(shows(&crate::tmux::utils::strip_ansi(capture)));
+    }
+
     /// A Terminal-view Claude session is only typed into once its input box is
     /// up, which shows a mode line that differs by permission mode, and never
     /// at the first-run trust dialog.

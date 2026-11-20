@@ -846,6 +846,7 @@ mod workspace_ordering_tests {
             dormant: false,
             idle_dormant_since: None,
             initial_prompt_error: None,
+            initial_prompt_error_code: None,
             pane_dead_observed: false,
             yolo_mode: false,
             sort_index: None,

@@ -1043,6 +1043,10 @@ pub struct SessionResponse {
     /// Why the initial prompt was not typed into a terminal session.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub initial_prompt_error: Option<String>,
+    /// Machine-readable `initial_prompt_error` cause when one applies:
+    /// `agent_folder_not_trusted` or `agent_bypass_not_accepted`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub initial_prompt_error_code: Option<String>,
     pub branch: Option<String>,
     pub main_repo_path: Option<String>,
     /// Base branch the worktree was created from when AoE managed the

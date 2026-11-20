@@ -678,7 +678,13 @@ waits up to 60 seconds for that marker, then types it. A shell, a
 command-override session or an agent without a ready marker is refused
 immediately and surfaces `initial_prompt_error`. On timeout nothing is typed;
 a send error can leave partial input in the pane. Either way the session row
-carries `initial_prompt_error`. A failed terminal prompt is not retried, unless
+carries `initial_prompt_error`. Claude Code's first-run folder-trust dialog and
+its one-time Bypass Permissions screen stop the wait within about a second;
+nothing is typed and neither screen is ever accepted for the user. The row
+then also carries `initial_prompt_error_code`: `agent_folder_not_trusted`
+(turn on `session.pre_trust_agent_folders`, or trust the folder once) or
+`agent_bypass_not_accepted` (open the session once and accept it). The code is
+absent for every other failure, which has only the message. A failed terminal prompt is not retried, unless
 persisting the error fails: the error then lives only in memory and a daemon
 restart retries the prompt. A consumed turn whose clear cannot be persisted is suppressed until a daemon restart, which can retype it. A crash between delivery and bookkeeping can
 deliver it twice. A blank or over-64 KiB (65536 bytes) value returns `400`.
