@@ -193,6 +193,7 @@ mod tests {
             outcome: crate::session::TerminalHandoffOutcome::Fresh,
             launch_required: false,
             launch_started: false,
+            selector_ended: false,
             launch: None,
         };
         let mut pending = serde_json::to_value(&row)?;

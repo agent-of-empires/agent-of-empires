@@ -2496,12 +2496,15 @@ impl HomeView {
         }
 
         if let Some(view) = &mut self.connections_view {
-            match view.handle_key(key) {
+            match view.handle_key(key, self.strict_hotkeys, std::time::Instant::now()) {
                 DialogResult::Continue => {}
                 DialogResult::Cancel => self.connections_view = None,
                 DialogResult::Submit(()) => {
                     self.connections_view = None;
                     self.open_serve();
+                    if let Some(serve) = &mut self.serve_view {
+                        serve.opened_by(&key);
+                    }
                 }
             }
             return None;
@@ -4256,10 +4259,10 @@ impl HomeView {
     /// R: the Connections hub. Its Web dashboard row reaches [`Self::open_serve`].
     fn open_connections(&mut self) {
         let web = self.connections_web_state(None);
-        self.connections_view = Some(crate::tui::dialogs::ConnectionsView::new(
-            self.daemon_attention(),
-            web,
-        ));
+        self.connections_view = Some(
+            crate::tui::dialogs::ConnectionsView::new(self.daemon_attention(), web)
+                .opened_by_serve(std::time::Instant::now()),
+        );
     }
 
     /// The hub's Web dashboard row. `known` keeps a transport already read, so a refresh
