@@ -108,13 +108,20 @@ impl std::error::Error for SessionBuildPanicked {}
 /// A create's requested pull of the latest Sandbox image failed; `detail` is the
 /// runtime's sanitized stderr.
 #[derive(Debug, thiserror::Error)]
-#[error("Couldn't pull the latest Sandbox image {image}: {}", if *.cancelled { CANCELLED_UPDATE } else { .detail.as_str() })]
+#[error("Couldn't pull the latest Sandbox image {image}: {}", match .failure { UpdateFailure::Cancelled => CANCELLED_UPDATE, UpdateFailure::Pull(_) => .detail.as_str() })]
 pub(crate) struct ImageUpdateFailed {
     pub image: String,
     /// The runtime's output; local owners only.
     pub detail: String,
-    /// The shared pull was cancelled for everyone, which every caller may be told.
-    pub cancelled: bool,
+    pub failure: UpdateFailure,
+}
+
+/// Why a create's pull of the latest image failed; every caller may be told either.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum UpdateFailure {
+    Pull(crate::containers::image_pull::PullFailureReason),
+    /// The shared pull was cancelled for everyone.
+    Cancelled,
 }
 
 pub(crate) const CANCELLED_UPDATE: &str = "the update was cancelled";
@@ -155,16 +162,21 @@ fn create_pull_error(error: crate::containers::error::DockerError) -> anyhow::Er
     use crate::containers::error::DockerError;
     match error {
         DockerError::Cancelled(_) => crate::server::session_service::CreationCancelled.into(),
-        DockerError::ImagePullFailed { image, detail, .. } => ImageUpdateFailed {
+        DockerError::ImagePullFailed {
             image,
             detail,
-            cancelled: false,
+            reason,
+            ..
+        } => ImageUpdateFailed {
+            image,
+            detail,
+            failure: UpdateFailure::Pull(reason),
         }
         .into(),
         DockerError::PullCancelled(image) => ImageUpdateFailed {
             image,
             detail: String::new(),
-            cancelled: true,
+            failure: UpdateFailure::Cancelled,
         }
         .into(),
         other => other.into(),
@@ -1235,7 +1247,7 @@ mod tests {
             .downcast_ref::<ImageUpdateFailed>()
             .expect("the create fails instead of reading as cancelled");
         assert_eq!(failed.image, "img");
-        assert!(failed.cancelled);
+        assert_eq!(failed.failure, UpdateFailure::Cancelled);
     }
 
     #[test]
@@ -1623,7 +1635,7 @@ mod tests {
                 "failed pull",
                 Some("echo created"),
                 false,
-                Some("echo 'manifest unknown' >&2; exit 1"),
+                Some("echo 'write /var/lib/docker/tmp: no space left on device' >&2; exit 1"),
             ),
             ("cancelled pull", Some("echo created"), false, Some("block")),
             // Exits 0 inside the cancel's grace, so the pull itself reports success.
@@ -1922,9 +1934,20 @@ mod tests {
                         let failed = error
                             .downcast_ref::<ImageUpdateFailed>()
                             .expect("typed pull failure");
+                        // A classified reason, not the `Other` a dropped one would read as.
                         assert_eq!(
-                            (failed.image.as_str(), failed.detail.as_str()),
-                            ("test-image", "manifest unknown")
+                            (
+                                failed.image.as_str(),
+                                failed.detail.as_str(),
+                                failed.failure
+                            ),
+                            (
+                                "test-image",
+                                "write /var/lib/docker/tmp: no space left on device",
+                                UpdateFailure::Pull(
+                                    crate::containers::image_pull::PullFailureReason::DiskSpace
+                                )
+                            )
                         );
                     }
                     "pull finishes as it is cancelled" => {

@@ -560,7 +560,9 @@ profile's `sandbox.default_image`. Any other `sandbox_image` is refused with
 These refusals come before anything is provisioned. While the pull runs, the
 create-progress `stage` is `pulling_image`. A failed pull ends the creation with
 `400 sandbox_image_update_failed`, and the session and its resources are rolled
-back. Only the local owner sees the runtime's output in its message; a replay
+back. Its message says why the pull failed, as the dashboard's sandbox image
+banner does.
+Only the local owner sees the runtime's output in its message; a replay
 of the cached failure does not include it. CityHall creations ignore the field.
 
 With CLI intent, `extra_args` uses shell-style word grouping and each decoded

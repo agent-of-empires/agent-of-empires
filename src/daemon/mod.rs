@@ -1551,8 +1551,8 @@ mod tests {
                 "running_hooks",
             ),
             (
-                r#"{"error":"sandbox_image_update_failed","message":"Couldn't pull the latest Sandbox image img:1.","stage":"pulling_image","reference":"creation-ref"}"#,
-                "Couldn't pull the latest Sandbox image img:1.",
+                r#"{"error":"sandbox_image_update_failed","message":"Couldn't download the sandbox image: not enough disk space.","stage":"pulling_image","reference":"creation-ref"}"#,
+                "Couldn't download the sandbox image: not enough disk space.",
                 "pulling_image",
             ),
         ] {

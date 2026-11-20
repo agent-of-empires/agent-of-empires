@@ -1663,7 +1663,9 @@ fn lost_shared_pull(e: &anyhow::Error) -> bool {
     create_cause(e).0.chain().any(|cause| {
         cause
             .downcast_ref::<crate::server::session_spawn::ImageUpdateFailed>()
-            .is_some_and(|failed| failed.cancelled)
+            .is_some_and(|failed| {
+                failed.failure == crate::server::session_spawn::UpdateFailure::Cancelled
+            })
             || matches!(
                 cause.downcast_ref::<DockerError>(),
                 Some(DockerError::PullCancelled(_))
@@ -1887,14 +1889,14 @@ pub(super) fn public_create_session_error(e: &anyhow::Error) -> (&'static str, S
         if let Some(failed) =
             cause.downcast_ref::<crate::server::session_spawn::ImageUpdateFailed>()
         {
-            let message = if failed.cancelled {
-                format!(
+            // The banner's wording for the same pull failure; the runtime's output is added for local owners.
+            let message = match failed.failure {
+                crate::server::session_spawn::UpdateFailure::Cancelled => format!(
                     "Couldn't pull the latest Sandbox image {}: {}.",
                     failed.image,
                     crate::server::session_spawn::CANCELLED_UPDATE
-                )
-            } else {
-                format!("Couldn't pull the latest Sandbox image {}.", failed.image)
+                ),
+                crate::server::session_spawn::UpdateFailure::Pull(reason) => reason.user_text(),
             };
             return ("sandbox_image_update_failed", message);
         }
