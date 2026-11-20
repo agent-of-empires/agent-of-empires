@@ -619,7 +619,6 @@ impl App {
     }
 
     fn admit_terminal_handoff(&mut self) -> Result<Option<super::terminal_output::Suspension>> {
-        self.pending_presentation = None;
         self.home.invalidate_presentation();
         self.host_title.invalidate();
         let mut suspension = match super::terminal_output::suspend() {
@@ -632,6 +631,8 @@ impl App {
             }
             Err(error) => return Err(error).context("admit terminal handoff"),
         };
+        self.pending_presentation = None;
+        self.drawn_bar = None;
         if !suspension
             .begin_handoff()
             .context("prepare terminal handoff")?
@@ -2439,18 +2440,19 @@ impl App {
                 return Ok(());
             }
             // No `needs_redraw`: its full clear flashes the screen.
+            // Clipboard output can finish a pending frame before draw collects its receipt.
             _ if bindings::is_bound(
                 bindings::ActionId::DismissUpdateBanner,
                 self.home.strict_hotkeys,
                 &key,
             ) && !self.home.has_dialog()
-                && self.dismiss_update_bar() =>
+                && (self.pending_presentation.is_some() || self.dismiss_update_bar()) =>
             {
                 return Ok(());
             }
             _ if bindings::is_bound(bindings::ActionId::Update, self.home.strict_hotkeys, &key)
                 && !self.home.has_dialog()
-                && self.pull_from_update_bar() =>
+                && (self.pending_presentation.is_some() || self.pull_from_update_bar()) =>
             {
                 return Ok(());
             }
@@ -4400,6 +4402,8 @@ mod tests {
         app.update_status.as_mut().unwrap().expires_at = Some(std::time::Instant::now());
         block_terminal(&mut control);
         app.draw(&mut terminal).unwrap();
+        assert!(app.pending_presentation.is_some());
+        assert!(app.admit_terminal_handoff().unwrap().is_none());
         assert!(app.pending_presentation.is_some());
         app.handle_key(CTRL_X, &mut terminal).await.unwrap();
         assert_eq!(app.update_info, Some(app_update()));
