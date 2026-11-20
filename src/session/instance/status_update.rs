@@ -25,6 +25,21 @@ fn ended_sentence(diagnostic: Option<&str>) -> String {
     }
 }
 
+/// Capture by the tick's batched pane id when it has one, else resolve the pane.
+fn capture_for_status(
+    session: &tmux::Session,
+    metadata: Option<&tmux::PaneMetadata>,
+    lines: usize,
+) -> String {
+    match metadata
+        .map(|m| m.pane_id.as_str())
+        .filter(|id| !id.is_empty())
+    {
+        Some(pane_id) => session.capture_pane_at(pane_id, lines),
+        None => session.capture_pane(lines).unwrap_or_default(),
+    }
+}
+
 /// Whether this poll can reuse the last verdict instead of capturing the pane.
 fn skip_capture(
     activity: Option<i64>,
@@ -142,11 +157,16 @@ impl Instance {
 
     /// Explain a pane failure from what the pane last printed, keeping any explanation already
     /// recorded. A pane that `ended` also names the remedy its restart needs, after what it printed.
-    fn explain_error_from_pane(&mut self, session: &tmux::Session, ended: bool) {
+    fn explain_error_from_pane(
+        &mut self,
+        session: &tmux::Session,
+        metadata: Option<&tmux::PaneMetadata>,
+        ended: bool,
+    ) {
         let pane_content = self
             .last_error
             .is_none()
-            .then(|| session.capture_pane(20).unwrap_or_default());
+            .then(|| capture_for_status(session, metadata, 20));
         if ended {
             self.name_refused_restart(None, pane_content.as_deref().and_then(pane_error_line));
         }
@@ -450,7 +470,7 @@ impl Instance {
             });
             if self.status == Status::Error {
                 if is_dead {
-                    self.explain_error_from_pane(&session, true);
+                    self.explain_error_from_pane(&session, metadata, true);
                 } else if self.last_error.is_none() {
                     self.last_error.set(summarize_error_from_pane(
                         &session.capture_pane(20).unwrap_or_default(),
@@ -487,7 +507,7 @@ impl Instance {
         // reported hooks at all: a hookless agent's pane is allowed to end.
         if is_dead && hook.is_some() {
             self.status = Status::Error;
-            self.explain_error_from_pane(&session, true);
+            self.explain_error_from_pane(&session, metadata, true);
             return;
         }
 
@@ -519,7 +539,7 @@ impl Instance {
                 self.status = hook.status;
                 // An Error keeps its explanation, as the manifest path does.
                 if hook.status == Status::Error {
-                    self.explain_error_from_pane(&session, false);
+                    self.explain_error_from_pane(&session, metadata, false);
                 } else {
                     self.last_error.clear();
                 }
@@ -530,7 +550,7 @@ impl Instance {
                 self.title, hook_tool, hook.age);
         }
 
-        let pane_content = session.capture_pane(50).unwrap_or_default();
+        let pane_content = capture_for_status(&session, metadata, 50);
         let detected = if pane_tool == "prime-agent" {
             if is_dead {
                 Status::Error
@@ -747,9 +767,7 @@ impl Instance {
 
         // Stamped before the capture, never after.
         let captured_at = Timestamp::now().as_unix_secs();
-        let pane_content = session
-            .capture_pane(policy.scope.lines())
-            .unwrap_or_default();
+        let pane_content = capture_for_status(session, metadata, policy.scope.lines());
         let clean = tmux::utils::strip_ansi(&pane_content);
         let detection = plan.detect(&clean, &observation);
 
@@ -1347,6 +1365,42 @@ Esc to cancel \u{b7} Tab to amend \u{b7} ctrl+e to explain\n\
             Status::Waiting,
             "Claude blocked on an approval prompt must reconcile Running -> Waiting (#1913)"
         );
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn capture_by_known_pane_id_skips_the_pane_lookup_forks() {
+        let _home = crate::session::test_support::isolate_app_dir();
+        if !tmux_available() {
+            eprintln!("skipping: tmux not available");
+            return;
+        }
+        let name = tmux::Session::generate_name("aoe_test_5788_cap", "pane id capture");
+        let _guard = spawn_pane(&name, "echo pane-id-marker; sleep 300");
+        assert!(wait_for_pane(&name, "pane-id-marker"));
+        crate::tmux::refresh_session_cache();
+        let session = tmux::Session::from_name(&name);
+        let mut metadata = agent_pane_metadata("sleep", None);
+        metadata.pane_id = tmux::first_pane_id(&name).expect("first pane id");
+
+        let forks = |metadata: Option<&tmux::PaneMetadata>, session: &tmux::Session| {
+            let _ = crate::tmux::fork_probe::take();
+            let _probe = crate::tmux::fork_probe::arm();
+            let out = capture_for_status(session, metadata, 20);
+            (out, crate::tmux::fork_probe::take())
+        };
+
+        let (out, count) = forks(Some(&metadata), &session);
+        assert!(out.contains("pane-id-marker"), "{out:?}");
+        assert_eq!(count, 1, "only capture-pane may fork when the id is known");
+
+        let (out, count) = forks(None, &session);
+        assert!(out.contains("pane-id-marker"), "{out:?}");
+        assert!(count > 1, "the fallback still resolves the pane first");
+
+        metadata.pane_id = "%999999".into();
+        let (out, _) = forks(Some(&metadata), &session);
+        assert_eq!(out, "", "a failed capture-pane reads as an empty pane");
     }
 
     /// Pane metadata for a live agent pane: not dead, running the agent itself, so neither the

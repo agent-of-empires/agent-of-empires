@@ -860,6 +860,15 @@ impl Session {
         Ok(capture_output(output.status.success(), &output.stdout))
     }
 
+    /// Capture a pane the caller already resolved, skipping the existence and pane-id probes.
+    /// A failed `capture-pane` reads as an empty pane, like [`Self::capture_pane`].
+    pub(crate) fn capture_pane_at(&self, pane_id: &str, lines: usize) -> String {
+        self.capture_target(pane_id, lines)
+            .ok()
+            .flatten()
+            .unwrap_or_default()
+    }
+
     /// Wait for any known marker, or for two stable captures when no marker exists.
     /// The polling budget bounds readiness checks, not each native subprocess.
     /// Returns false when the budget ran out first.
