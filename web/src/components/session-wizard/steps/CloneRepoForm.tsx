@@ -1,7 +1,13 @@
-import { useState } from "react";
+import { useState, type Ref } from "react";
 import { cloneRepo } from "../../../lib/api";
 
-export function CloneRepoForm({ onCloned }: { onCloned: (path: string) => void }) {
+export function CloneRepoForm({
+  onCloned,
+  inputRef,
+}: {
+  onCloned: (path: string) => void;
+  inputRef?: Ref<HTMLInputElement>;
+}) {
   const [cloneUrl, setCloneUrl] = useState("");
   const [cloneDestination, setCloneDestination] = useState("");
   const [shallowClone, setShallowClone] = useState(false);
@@ -37,6 +43,7 @@ export function CloneRepoForm({ onCloned }: { onCloned: (path: string) => void }
           Repository URL
         </label>
         <input
+          ref={inputRef}
           id="clone-url"
           type="text"
           value={cloneUrl}
@@ -50,7 +57,6 @@ export function CloneRepoForm({ onCloned }: { onCloned: (path: string) => void }
           placeholder="https://github.com/user/repo.git"
           className="w-full px-3 py-2.5 text-sm bg-surface-900 border border-surface-700/40 rounded-md text-text-primary placeholder:text-text-dim focus:outline-none focus:border-brand-600 font-mono"
           disabled={cloning}
-          autoFocus
         />
       </div>
 

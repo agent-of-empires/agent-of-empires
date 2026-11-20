@@ -1101,6 +1101,7 @@ pub async fn restore_session(
 /// title from the first prompt, even over one already chosen. Waits for the
 /// rename: `200` once the title is saved, `409` when nothing could be applied,
 /// `502` with the agent's reason on failure, `504` past the rename deadline.
+/// A terminal session's rename runs detached, so it answers `202` with the row.
 pub async fn force_smart_rename(
     State(state): State<Arc<AppState>>,
     Path(id): Path<String>,
@@ -1189,13 +1190,7 @@ pub async fn force_smart_rename(
                 true,
             ),
         );
-        return match state.runtime.publish(&state).await {
-            Ok(snapshot) => crate::server::runtime::mutation_response(
-                &snapshot.value.cursor,
-                StatusCode::ACCEPTED,
-            ),
-            Err(_) => StatusCode::SERVICE_UNAVAILABLE.into_response(),
-        };
+        return crate::server::runtime::accepted_session_mutation_response(&state, &id).await;
     }
 
     let Some((first_user_prompt, agent_prose)) = state
@@ -1402,6 +1397,17 @@ pub(crate) fn lifecycle_rejection(
         })
     {
         return Some(crate::server::api::start_blocked_response(blocked));
+    }
+    if let Some(login) = error.downcast_ref::<crate::session::SandboxLoginRequired>() {
+        return Some(crate::server::api::sandbox_login_required_response(login));
+    }
+    if let Some(unsupported) = error.downcast_ref::<crate::session::SandboxLoginUnsupported>() {
+        return Some(crate::server::api::sandbox_login_unsupported_response(
+            unsupported,
+        ));
+    }
+    if let Some(hook) = error.downcast_ref::<crate::session::BeforeStartHookError>() {
+        return Some(crate::server::api::before_start_hook_failed_response(hook));
     }
     // A row a peer purged between the memory check and this write: the caller
     // is talking to a session that no longer exists, not to a busy one.
@@ -2375,6 +2381,137 @@ fn admit_restart(
     Ok(())
 }
 
+/// Whether a restart into `tool` (under `target`, when it moves profile) swaps the account of
+/// the same agent and so keeps the row's conversation and provider, as the restart itself
+/// decides.
+fn keeps_account(row: &Instance, target: Option<&str>, tool: Option<&str>) -> bool {
+    let Some(tool) = tool.filter(|tool| *tool != row.tool) else {
+        return false;
+    };
+    matches!(
+        crate::session::conversation_carry::classify(
+            row,
+            target.unwrap_or(&row.source_profile),
+            tool
+        ),
+        crate::session::conversation_carry::ToolSwap::KeepConversation(_)
+    )
+}
+
+/// The restart's profile, tool and command over `row`, as the restart itself applies them:
+/// an account of the same agent keeps the conversation (`swap_account`), any other tool
+/// parks it (`swap_tool`). The launch the pre-lock admission decides on.
+pub(super) fn apply_restart_settings(
+    row: &mut Instance,
+    target: Option<&str>,
+    tool: Option<&str>,
+    command: Option<&str>,
+) {
+    let account_swap = keeps_account(row, target, tool);
+    if let Some(target) = target {
+        row.source_profile = target.to_owned();
+    }
+    if let Some(tool) = tool.filter(|tool| *tool != row.tool) {
+        if account_swap {
+            row.swap_account(tool);
+        } else {
+            row.swap_tool(tool);
+        }
+    }
+    if let Some(command) = command {
+        row.command = command.to_owned();
+    }
+}
+
+/// The sandbox login admission of a restart, before it takes any lock or stops or discards
+/// anything: a refusal leaves the running agent and its container as they are. It resolves a
+/// `before_start` hook the cheap decision cannot see, here and not under the locks (a hook may
+/// call `aoe` on this session), and the strict re-checks under the locks then find the result.
+/// `None` admits the restart, or leaves a refusal it cannot decide (a store that will not
+/// open) to the restart's own steps.
+async fn admit_restart_sandbox_login(
+    state: &Arc<AppState>,
+    id: &str,
+    body: &crate::daemon::RestartSessionBody,
+) -> Option<axum::response::Response> {
+    let mut row = state
+        .instances
+        .read()
+        .await
+        .iter()
+        .find(|row| row.id == id && row.is_sandboxed())
+        .cloned()?;
+    // A restart a cheaper check refuses never runs the hook: those checks answer first.
+    if row.ensure_startable().is_err()
+        || matches!(row.status, Status::Creating | Status::Deleting)
+        || (body.only_if_idle && row.status != Status::Idle)
+        || (state.cityhall_mode && !row.is_structured())
+        || *state.canonical_health.read().await != crate::daemon::RuntimeHealth::Healthy
+    {
+        return None;
+    }
+    let target = body
+        .profile
+        .as_deref()
+        .filter(|target| *target != row.source_profile)
+        .map(str::to_owned);
+    if let Some(target) = &target {
+        if !state
+            .canonical_metadata
+            .read()
+            .await
+            .profiles
+            .iter()
+            .any(|profile| profile.name == *target)
+        {
+            return None;
+        }
+    }
+    let (tool, command) = (body.tool.clone(), body.command_override.clone());
+    let native_state = state.clone();
+    let checked = tokio::task::spawn_blocking(move || -> anyhow::Result<()> {
+        use crate::session::SessionStore;
+        let id = row.id.clone();
+        let open = |profile: &str| {
+            let store = crate::server::session_store::NativeSessionStore::open(
+                native_state.clone(),
+                profile,
+                Some(id.clone()),
+            )?;
+            store.configuration(Some(profile))?;
+            anyhow::Ok(store)
+        };
+        // The persisted row first, then the restart's settings over it: a reload after them
+        // would undo them, and the hook and the gate decide on the launch the restart makes.
+        let source = open(&row.source_profile)?;
+        if let Err(error) = row.reconcile_from_store(&source) {
+            return match error.downcast_ref::<crate::session::LifecycleReservationError>() {
+                // The row is gone: the restart itself answers.
+                Some(crate::session::LifecycleReservationError::Superseded) => Ok(()),
+                _ => Err(error),
+            };
+        }
+        apply_restart_settings(
+            &mut row,
+            target.as_deref(),
+            tool.as_deref(),
+            command.as_deref(),
+        );
+        let launch_store = match &target {
+            Some(target) => open(target)?,
+            None => source,
+        };
+        row.resolve_before_start_for_restart(&launch_store, false)?;
+        row.ensure_sandbox_launchable_strict(&launch_store)
+    })
+    .await;
+    match checked {
+        Ok(Ok(())) => None,
+        Ok(Err(error)) => lifecycle_rejection(state, &error),
+        Err(_) => Some(StatusCode::INTERNAL_SERVER_ERROR.into_response()),
+    }
+}
+
 fn reserve_structured_restart(
     state: Arc<AppState>,
     instance: &Instance,
@@ -2415,7 +2552,39 @@ fn reserve_structured_restart(
             .map_err(LifecycleTargetError::Blocked)?;
         return Err(LifecycleTargetError::Busy.into());
     }
-    admit_restart(&mut probe, body, false)?;
+    let account_swap = keeps_account(
+        &probe,
+        body.profile
+            .as_deref()
+            .filter(|target| *target != instance.source_profile),
+        body.tool.as_deref(),
+    );
+    admit_restart(&mut probe, body, account_swap)?;
+    if probe.is_sandboxed() {
+        // Strictly, under the locks, before the caller stops the worker; the target
+        // profile's store when the restart moves the session.
+        let target_native = body
+            .profile
+            .as_deref()
+            .filter(|target| *target != instance.source_profile)
+            .map(|target| {
+                crate::server::session_store::NativeSessionStore::open(
+                    state.clone(),
+                    target,
+                    Some(instance.id.clone()),
+                )
+            })
+            .transpose()?;
+        let mut gated = probe.clone();
+        if let Some(target) = &target_native {
+            gated.source_profile = target.storage().profile().to_owned();
+        }
+        gated.ensure_sandbox_launchable_strict(
+            target_native
+                .as_ref()
+                .map_or(&native as &dyn SessionStore, |target| target),
+        )?;
+    }
     if let Some(target) = body
         .profile
         .as_deref()
@@ -3142,6 +3311,14 @@ async fn prepare_agent_session_inner(
     if state.read_only {
         return crate::server::api::read_only_response();
     }
+    if let Some(body) = restart
+        .as_deref()
+        .filter(|_| matches!(restart_origin, RestartOrigin::Explicit))
+    {
+        if let Some(response) = admit_restart_sandbox_login(&state, &id, body).await {
+            return response;
+        }
+    }
     #[cfg(test)]
     launch_hook_gate::pause(&id, launch_hook_gate::Stage::BeforeLocks).await;
     let namespace = state.profile_namespace.read().await;
@@ -3458,6 +3635,18 @@ async fn prepare_agent_session_inner(
                 probe.source_profile = target.into();
             }
             admit_restart(&mut probe, body, account_swap)?;
+            if probe.is_sandboxed() && !instance.is_structured() {
+                // Strictly, on what the session holds under these locks (the hook was resolved
+                // before them), and before anything below stops the agent or discards its
+                // container. A structured session was checked before its worker was stopped.
+                probe.ensure_sandbox_launchable_strict(
+                    target_native
+                        .as_ref()
+                        .map_or(&native as &dyn crate::session::SessionStore, |target| {
+                            target
+                        }),
+                )?;
+            }
             if let Some(target_native) = &target_native {
                 let rows = target_native.storage().load()?;
                 if rows.iter().any(|row| row.id == outgoing.id)
@@ -3624,7 +3813,7 @@ async fn prepare_agent_session_inner(
                         crate::session::recovery::recovery_hook_timeout(),
                     )
                 });
-                let hooks = started.run_pre_launch_hooks(
+                let hooks = started.run_agent_launch_hooks(
                     restart.as_ref().is_some_and(|body| body.skip_on_launch),
                     &native,
                     None,
@@ -3872,6 +4061,7 @@ async fn prepare_agent_session_inner(
                 profile: profile.clone(),
             })
         };
+        let mut wake = None;
         if matches!(
             outcome,
             Some(
@@ -3883,16 +4073,22 @@ async fn prepare_agent_session_inner(
             let wake_message =
                 select_restart_wake_message(restart_origin, requested_wake_message, &profile);
             if !wake_message.is_empty() {
-                crate::session::restart::spawn_wake_worker(
-                    id.clone(),
-                    row.title.clone(),
-                    row.tool.clone(),
-                    wake_message,
-                    Some((profile.clone(), generation)),
-                );
+                wake = Some((wake_message, row.clone()));
             }
         }
         drop(rows);
+        if let Some((wake_message, wake_row)) = wake {
+            // The pace reads configuration, so it resolves outside the guard.
+            let delay = wake_row.send_keys_enter_delay();
+            crate::session::restart::spawn_wake_worker(
+                id.clone(),
+                wake_row.title.clone(),
+                wake_row.tool.clone(),
+                wake_message,
+                Some((profile.clone(), generation)),
+                delay,
+            );
+        }
         tracing::info!(target: "session.restart", session = %id, view = "terminal", reason, "session restarted");
         return crate::server::runtime::session_mutation_response(
             &state,

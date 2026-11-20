@@ -163,10 +163,8 @@ pub struct StatusRule {
     pub regex: Option<String>,
 }
 
-/// Configuration for one plugin: whether it is enabled, its install source and
-/// capability grant (external plugins only), plus its schema-free persisted
-/// settings.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+/// Persisted plugin intent, external installation identity, and schema-free settings.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct PluginConfig {
     /// Whether the plugin is active. A disabled plugin contributes nothing to
     /// any surface.
@@ -206,12 +204,8 @@ pub struct PluginConfig {
     pub dev: bool,
 }
 
-/// A user's approval of an external plugin's requested capabilities, pinned to
-/// the exact manifest it was approved against. When the installed manifest hash
-/// later differs (an update that changed the capability set), the grant no
-/// longer applies and the plugin's runtime contributions stay inactive until
-/// re-approved.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+/// Approved capabilities pinned to an exact external manifest hash.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct CapabilityGrant {
     /// `sha256:<hex>` of the manifest bytes this grant was approved against.
     pub manifest_hash: String,
@@ -298,12 +292,12 @@ pub struct LoggingConfig {
     pub targets: std::collections::BTreeMap<String, String>,
 
     /// Where tracing lands: file (default) or stdout. TUI / daemon child /
-    /// runner coerce to file regardless. Restart aoe for changes to take
-    /// effect.
+    /// runner coerce to file regardless.
     #[serde(default)]
     #[setting(
-        label = "Write to (restart req.)",
+        label = "Write to",
         widget = "select",
+        restart,
         options = "file:file,stdout:stdout",
         global_only,
         advanced,
@@ -312,11 +306,12 @@ pub struct LoggingConfig {
     pub output: SinkKind,
 
     /// Log file location. Relative paths resolve under the app data dir;
-    /// absolute paths are used verbatim. Restart aoe for changes.
+    /// absolute paths are used verbatim.
     #[serde(default = "default_file_path")]
     #[setting(
-        label = "File (restart req.)",
+        label = "File",
         widget = "text",
+        restart,
         global_only,
         advanced,
         summary = "A name goes in AoE's app data folder; a full path is used as is."
@@ -324,11 +319,12 @@ pub struct LoggingConfig {
     pub file_path: String,
 
     /// size rotates when the live file crosses the threshold; never disables
-    /// rotation. Restart aoe for changes.
+    /// rotation.
     #[serde(default)]
     #[setting(
-        label = "Rotation (restart req.)",
+        label = "Rotation",
         widget = "select",
+        restart,
         options = "size:size,never:never",
         global_only,
         advanced
@@ -338,8 +334,9 @@ pub struct LoggingConfig {
     /// Rotation threshold in MiB. Ignored when rotation = never.
     #[serde(default = "default_max_size_mib")]
     #[setting(
-        label = "Max size MiB (restart req.)",
+        label = "Max size MiB",
         widget = "number",
+        restart,
         min = 0,
         global_only,
         advanced
@@ -349,8 +346,9 @@ pub struct LoggingConfig {
     /// How many rotated files to retain (.1 through .keep_count).
     #[serde(default = "default_keep_count")]
     #[setting(
-        label = "Keep (restart req.)",
+        label = "Keep",
         widget = "number",
+        restart,
         min = 0,
         global_only,
         advanced,
@@ -365,8 +363,9 @@ pub struct LoggingConfig {
     /// polling endpoints. Off by default keeps the log readable.
     #[serde(default = "default_show_spans")]
     #[setting(
-        label = "Show where each line came from (restart req.)",
+        label = "Show where each line came from",
         widget = "toggle",
+        restart,
         global_only,
         advanced,
         summary = "Adds context to each line. Makes the log longer."
@@ -494,16 +493,17 @@ pub struct AcpConfig {
     )]
     pub allowed_agents: Vec<String>,
     /// Hard cap on simultaneously running acp agent subprocesses;
-    /// additional sessions queue. Takes effect when the Daemon starts.
+    /// additional sessions queue.
     #[serde(default = "default_max_workers")]
     #[setting(
         label = "Most Agents running at once",
         widget = "number",
+        restart,
         min = 1,
         validate = "range:1",
         global_only,
         advanced,
-        summary = "How many Structured view Sessions can have their Agent running at the same time. Lower it to save memory. Applies after the Daemon restarts."
+        summary = "How many Structured view Sessions can have their Agent running at the same time. Lower it to save memory."
     )]
     pub max_concurrent_workers: u32,
     /// Per-session retention cap on acp events. 0 = unlimited (default);
@@ -1528,6 +1528,21 @@ pub struct SessionConfig {
     )]
     pub agent_acp_cmd: HashMap<String, String>,
 
+    /// Conversation-reset slash command for a custom ACP agent, `"/clear"` or
+    /// `"/new"` (e.g. "my-claude" = "/clear"). A custom agent has no built-in
+    /// profile, so without an entry its reset command reaches the model as an
+    /// ordinary prompt. With one, aoe drives a fresh `session/new` for it as it
+    /// does for a built-in agent. Applies only to an agent with its own `agent_acp_cmd`.
+    /// Repo-denied like `agent_acp_cmd`.
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    #[setting(
+        label = "Agent Clear Alias",
+        widget = "list",
+        web = "local_only:declares which slash command resets a custom agent's conversation",
+        category = "Agents"
+    )]
+    pub agent_clear_alias: HashMap<String, String>,
+
     /// Config directory read by the session's agent instead of its built-in
     /// default. Host sessions use the directory directly. Sandboxed sessions
     /// use a per-session `sandbox-v2/<instance id>` child of it, which AoE
@@ -1586,12 +1601,12 @@ pub struct SessionConfig {
     /// session id live; with more live sessions than this, the overflow's
     /// ids stop refreshing until another session stops. Process-wide:
     /// applied once at startup from the effective config of the profile the
-    /// process was launched with, so a change takes effect on the next
-    /// start. 0 keeps the default (50).
+    /// process was launched with. 0 keeps the default (50).
     #[serde(default = "default_session_id_poller_max_threads")]
     #[setting(
-        label = "Conversation lookup threads (restart req.)",
+        label = "Conversation lookup threads",
         widget = "number",
+        restart,
         min = 0,
         global_only,
         advanced,
@@ -1888,11 +1903,10 @@ pub struct SessionConfig {
     pub unread_indicator: bool,
 
     /// Show per-session color labels: the colored dot on sidebar rows and the
-    /// `Color` section in the session context menu. Web dashboard only; the TUI
-    /// does not render session colors. Turning this off hides them without
-    /// forbidding anything, `aoe session color` and the REST endpoint keep
-    /// working and stored values are preserved, so flipping back reveals them
-    /// again.
+    /// `Color` section in the session context menu. Turning this off hides
+    /// them without forbidding anything, `aoe session color` and the REST
+    /// endpoint keep working and stored values are preserved, so flipping back
+    /// reveals them again.
     ///
     /// `global_only`: the dashboard resolves one settings object for the whole
     /// client, not one per workspace, and the sidebar mixes sessions from
@@ -1902,6 +1916,7 @@ pub struct SessionConfig {
     #[setting(
         label = "Session colors",
         widget = "toggle",
+        web_only,
         category = "Interaction",
         global_only,
         summary = "A colored dot on each row, and Color in the Session menu."
@@ -2316,6 +2331,7 @@ impl Default for SessionConfig {
             agent_detect_as: HashMap::new(),
             agent_execution_as: HashMap::new(),
             agent_acp_cmd: HashMap::new(),
+            agent_clear_alias: HashMap::new(),
             agent_config_dir: HashMap::new(),
             strict_hotkeys: false,
             snooze_duration_minutes: 30,
@@ -2480,6 +2496,21 @@ impl SessionConfig {
         }
     }
 
+    /// The reset profile `agent_clear_alias` declares for `agent`. Only a custom agent launched
+    /// through its own valid `agent_acp_cmd` takes one; an agent inheriting a built-in adapter
+    /// through `agent_detect_as` runs as that built-in.
+    pub fn clear_alias_profile(
+        &self,
+        agent: &str,
+    ) -> Option<&'static crate::acp::agent_profiles::AgentProfile> {
+        if crate::acp::agent_profiles::is_builtin(agent) {
+            return None;
+        }
+        let cmd = self.agent_acp_cmd.get(agent)?;
+        crate::acp::AgentSpec::from_acp_cmd(agent, cmd).ok()?;
+        crate::acp::agent_profiles::alias_profile(self.agent_clear_alias.get(agent)?)
+    }
+
     /// Log warnings for misconfigured custom agent entries.
     /// Called after config load to surface TOML editing mistakes.
     pub fn warn_custom_agent_issues(&self) {
@@ -2515,6 +2546,24 @@ impl SessionConfig {
                     name,
                     target,
                     crate::agents::agent_names().join(", ")
+                );
+            }
+        }
+        for (name, alias) in &self.agent_clear_alias {
+            if name.is_empty() || crate::acp::agent_profiles::alias_profile(alias).is_none() {
+                tracing::warn!(target: "session.store",
+                    "agent_clear_alias: '{}' = '{}' is ignored; use an agent name and \"/clear\" or \"/new\"",
+                    name, alias
+                );
+            } else if crate::acp::agent_profiles::is_builtin(name) {
+                tracing::warn!(target: "session.store",
+                    "agent_clear_alias: '{}' is a built-in agent with its own reset command; the entry is ignored",
+                    name
+                );
+            } else if !self.agent_acp_cmd.contains_key(name) {
+                tracing::warn!(target: "session.store",
+                    "agent_clear_alias: '{}' has no agent_acp_cmd entry, so it runs as another agent; the entry is ignored",
+                    name
                 );
             }
         }
@@ -2629,8 +2678,9 @@ pub struct WebConfig {
     #[setting(
         label = "Notifications for every browser",
         widget = "toggle",
+        restart,
         global_only,
-        summary = "Off stops notifications in every browser and hides the Turn on button. Applies to every Profile, after the Daemon restarts."
+        summary = "Off stops notifications in every browser and hides the Turn on button. Applies to every Profile."
     )]
     pub notifications_enabled: bool,
 
@@ -2640,8 +2690,9 @@ pub struct WebConfig {
     #[setting(
         label = "A Session needs you",
         widget = "toggle",
+        restart,
         global_only,
-        summary = "The Agent is waiting for your answer or approval. Applies after the Daemon restarts."
+        summary = "The Agent is waiting for your answer or approval."
     )]
     pub notify_on_waiting: bool,
 
@@ -2652,14 +2703,20 @@ pub struct WebConfig {
     #[setting(
         label = "A Session finishes",
         widget = "toggle",
+        restart,
         global_only,
-        summary = "The Agent is done and the Session is Idle. Applies after the Daemon restarts."
+        summary = "The Agent is done and the Session is Idle."
     )]
     pub notify_on_idle: bool,
 
     /// Default: send a push when a session errors (Running to Error).
     #[serde(default = "default_true")]
-    #[setting(label = "A Session hits an error", widget = "toggle", global_only)]
+    #[setting(
+        label = "A Session hits an error",
+        widget = "toggle",
+        restart,
+        global_only
+    )]
     pub notify_on_error: bool,
 
     /// Default: send a push when an acp session's ScheduleWakeup timer
@@ -2669,8 +2726,9 @@ pub struct WebConfig {
     #[setting(
         label = "A scheduled wake-up fires",
         widget = "toggle",
+        restart,
         global_only,
-        summary = "When an Agent set itself a timer to check back. Skipped if you were using AoE in the last 30 seconds. Applies after the Daemon restarts."
+        summary = "When an Agent set itself a timer to check back. Skipped if you were using AoE in the last 30 seconds."
     )]
     pub notify_on_wake_fire: bool,
 
@@ -2681,8 +2739,9 @@ pub struct WebConfig {
     #[setting(
         label = "Let other apps control AoE",
         widget = "toggle",
+        restart,
         global_only,
-        summary = "Apps like Claude Code can list your Sessions through MCP. Read-only for now. Works when aoe serve uses the access link without a passphrase, or --auth none. Applies after the Daemon restarts."
+        summary = "Apps like Claude Code can list your Sessions through MCP. Read-only for now. Works when aoe serve uses the access link without a passphrase, or --auth none."
     )]
     pub mcp_enabled: bool,
 }
@@ -2841,6 +2900,12 @@ impl ServeConfig {
                 Ok(Self::default())
             }
         }
+    }
+
+    /// Like [`ServeConfig::load`], but propagates read and parse errors, for callers that act on
+    /// the result destructively. An absent config.toml still yields the defaults.
+    pub(crate) fn load_strict() -> Result<Self> {
+        Self::from_table(&Config::load_raw_table()?)
     }
 
     fn from_table(table: &toml::Table) -> Result<Self> {
@@ -3368,6 +3433,7 @@ pub struct SandboxConfig {
     #[setting(
         label = "Folders to leave out",
         widget = "list",
+        validate = "volume_ignore_list",
         web = "elevation:sandbox config affects host isolation",
         advanced,
         summary = "Paths inside the Project the container shouldn't see, like node_modules."
@@ -3508,6 +3574,30 @@ pub struct SandboxConfig {
     )]
     pub custom_instruction: Option<String>,
 
+    /// Where the credential an agent's sandboxes share comes from. It applies
+    /// to every agent that declares a sandbox login (today Claude). Seed from
+    /// host login fills an empty shared file from the host's own login. That
+    /// copies the host's own token, so the first side to refresh logs the
+    /// other out once. Separate sandbox login never reads the host login and
+    /// leaves the file empty until you log in for the sandboxes. That is a
+    /// different login than the host's, so a host refresh can never
+    /// invalidate the sandboxes and a sandbox refresh or logout can never
+    /// invalidate the host. Separate sandbox login is not supported with
+    /// Apple Container, which cannot run the login helper: a launch that
+    /// needs the login fails there instead of waiting for it.
+    // Global-only: profiles sharing an agent config dir share one credential
+    // file, so one profile's value cannot be honored apart from another's.
+    #[serde(default)]
+    #[setting(
+        label = "Shared agent credential",
+        widget = "select",
+        options = "host_seed:Seed from host login,separate_login:Separate sandbox login",
+        web = "elevation:sandbox credential handling affects host login isolation",
+        repo = "deny",
+        global_only
+    )]
+    pub shared_credential: SharedCredentialMode,
+
     /// Container runtime for sandboxing.
     #[serde(default)]
     #[setting(
@@ -3529,6 +3619,15 @@ pub enum ContainerRuntimeName {
     #[default]
     Docker,
     Podman,
+}
+
+/// Where the credential an agent's sandboxes share comes from.
+#[derive(Serialize, Deserialize, Debug, Default, Clone, Copy, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum SharedCredentialMode {
+    #[default]
+    HostSeed,
+    SeparateLogin,
 }
 
 /// Volume mounting strategy for volume_ignores paths.
@@ -3570,6 +3669,7 @@ impl Default for SandboxConfig {
             security_opt: Vec::new(),
             extra_run_args: Vec::new(),
             custom_instruction: None,
+            shared_credential: SharedCredentialMode::default(),
             container_runtime: ContainerRuntimeName::default(),
         }
     }
@@ -3655,11 +3755,12 @@ pub struct TmuxConfig {
     /// Run aoe's sessions on a private tmux server with this socket name (tmux
     /// `-L`), so your own `tmux ls` and hand-managed sessions stay separate
     /// from aoe's. Leave empty to share the default tmux server (the current
-    /// behavior). A bare name, not a path; takes effect on the next aoe start.
+    /// behavior). A bare name, not a path.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[setting(
         label = "Separate tmux server",
         widget = "optional_text",
+        restart,
         global_only,
         web = "local_only:changes which tmux server hosts your sessions on this machine",
         summary = "Keeps AoE's Sessions apart from your other tmux sessions. Enter a short name, like aoe. Change it when no Sessions are running."
@@ -3693,41 +3794,45 @@ pub fn default_systemd_slice() -> String {
 pub struct SystemdSettings {
     /// Place every new session in its own transient systemd scope. No-op when
     /// the systemd user manager is unreachable. Existing scopes are still
-    /// stopped with their sessions when off. Applies after an aoe restart.
+    /// stopped with their sessions when off.
     #[serde(default = "default_true")]
     #[setting(
         label = "Run Sessions in systemd scopes",
         widget = "toggle",
+        restart,
         global_only,
         summary = "Does nothing if systemd isn't available."
     )]
     pub enabled: bool,
 
-    /// Slice for the session scopes; must end in `.slice`. `{profile}` and `{session}` expand to the escaped profile name and session id. Applies after an aoe restart.
+    /// Slice for the session scopes; must end in `.slice`. `{profile}` and `{session}` expand to the escaped profile name and session id.
     #[serde(default = "default_systemd_slice")]
     #[setting(
         label = "Slice",
         widget = "text",
+        restart,
         validate = "systemd_slice",
         global_only,
         summary = "Must end in .slice. {profile} becomes the Profile name and {session} the Session's id."
     )]
     pub slice: String,
 
-    /// Keep sessions running when the aoe daemon service stops. Applies after an aoe restart.
+    /// Keep sessions running when the aoe daemon service stops.
     #[serde(default = "default_true")]
     #[setting(
         label = "Keep Sessions running when the Daemon restarts",
         widget = "toggle",
+        restart,
         global_only
     )]
     pub survive_daemon_restart: bool,
 
-    /// Per-session memory cap (e.g. `4G`, `512M`). Empty means unlimited. Applies after an aoe restart.
+    /// Per-session memory cap (e.g. `4G`, `512M`). Empty means unlimited.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[setting(
         label = "Memory limit per Session",
         widget = "optional_text",
+        restart,
         validate = "memory_limit",
         global_only,
         advanced,
@@ -3735,11 +3840,12 @@ pub struct SystemdSettings {
     )]
     pub memory_max: Option<String>,
 
-    /// Per-session task cap. 0 means unlimited. Applies after an aoe restart.
+    /// Per-session task cap. 0 means unlimited.
     #[serde(default)]
     #[setting(
         label = "Limit processes per Session",
         widget = "number",
+        restart,
         min = 0,
         max = 4194304,
         validate = "range:0:4194304",
@@ -4187,27 +4293,46 @@ fn config_save_lock() -> &'static Mutex<()> {
     LOCK.get_or_init(|| Mutex::new(()))
 }
 
-pub(super) fn read_optional_config(path: &std::path::Path) -> Result<Option<String>> {
-    match fs::read_to_string(path) {
-        Ok(content) => Ok(Some(content)),
+/// One read of a config file.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct FileRead {
+    /// The file's canonical directory, so a retargeted directory link reads as a change.
+    pub(crate) dir: Option<PathBuf>,
+    /// On error, whether the path itself exists: a dangling link is not an absent file.
+    pub(crate) content: std::result::Result<std::sync::Arc<[u8]>, (std::io::ErrorKind, bool)>,
+}
+
+/// How config resolution reads its files, so a caller can resolve from bytes it already holds.
+pub(crate) type ReadFile<'a> = &'a dyn Fn(&Path) -> FileRead;
+
+pub(crate) fn read_file(path: &Path) -> FileRead {
+    FileRead {
+        dir: path.parent().and_then(|dir| fs::canonicalize(dir).ok()),
+        content: fs::read(path)
+            .map(std::sync::Arc::from)
+            .map_err(|error| (error.kind(), fs::symlink_metadata(path).is_ok())),
+    }
+}
+
+pub(super) fn read_optional_config(path: &Path, read: ReadFile) -> Result<Option<String>> {
+    match read(path).content {
+        Ok(bytes) => Ok(Some(String::from_utf8(bytes.to_vec())?)),
         // A missing file is optional; a broken link or an unreadable path is not.
-        Err(error)
-            if error.kind() == std::io::ErrorKind::NotFound
-                && fs::symlink_metadata(path)
-                    .is_err_and(|error| error.kind() == std::io::ErrorKind::NotFound) =>
-        {
-            Ok(None)
-        }
-        Err(error) => Err(error.into()),
+        Err((std::io::ErrorKind::NotFound, false)) => Ok(None),
+        Err((kind, _)) => Err(std::io::Error::from(kind).into()),
     }
 }
 
 impl Config {
     /// Read config.toml without the obsolete inline app_state table.
     fn load_raw_table() -> Result<toml::Table> {
+        Self::load_raw_table_via(&read_file)
+    }
+
+    fn load_raw_table_via(read: ReadFile) -> Result<toml::Table> {
         let path = config_path()?;
         let result = (|| {
-            let mut table: toml::Table = match read_optional_config(&path)? {
+            let mut table: toml::Table = match read_optional_config(&path, read)? {
                 Some(content) => toml::from_str(&content)?,
                 None => toml::Table::new(),
             };
@@ -4219,7 +4344,11 @@ impl Config {
     }
 
     pub fn load() -> Result<Self> {
-        let table = Self::load_raw_table()?;
+        Self::load_via(&read_file)
+    }
+
+    pub(crate) fn load_via(read: ReadFile) -> Result<Self> {
+        let table = Self::load_raw_table_via(read)?;
         let mut config: Config = table.try_into().map_err(|error: toml::de::Error| {
             let error = anyhow::Error::new(error);
             match config_path() {
@@ -4227,7 +4356,7 @@ impl Config {
                 Err(_) => error,
             }
         })?;
-        config.app_state = AppStateConfig::load()?;
+        config.app_state = AppStateConfig::load_via(read)?;
         Ok(config)
     }
 
@@ -4343,9 +4472,13 @@ impl AppStateConfig {
     /// Read `state.toml` (fields at the TOML top level, not nested under an
     /// `[app_state]` table). A missing file deserializes to defaults.
     pub fn load() -> Result<Self> {
+        Self::load_via(&read_file)
+    }
+
+    fn load_via(read: ReadFile) -> Result<Self> {
         let path = state_path()?;
         let result = (|| {
-            let table: toml::Table = match read_optional_config(&path)? {
+            let table: toml::Table = match read_optional_config(&path, read)? {
                 Some(content) => toml::from_str(&content)?,
                 None => toml::Table::new(),
             };
@@ -4593,6 +4726,39 @@ mod model_value_quoting_tests {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_clear_alias_applies_only_to_a_custom_agent_with_its_own_acp_command() {
+        let mut config = SessionConfig::default();
+        // (agent, acp command)
+        let agents = [
+            ("own", Some("own-bridge acp")),
+            // Launched as its agent_detect_as base.
+            ("inherits", None),
+            ("empty", Some("")),
+            ("malformed", Some("bridge \"unterminated")),
+            // Built-in, in the registry without an ACP profile.
+            ("cursor", Some("cursor-bridge acp")),
+        ];
+        for (agent, cmd) in agents {
+            config
+                .agent_clear_alias
+                .insert(agent.into(), "/clear".into());
+            if let Some(cmd) = cmd {
+                config.agent_acp_cmd.insert(agent.into(), cmd.into());
+            }
+        }
+        config
+            .agent_detect_as
+            .insert("inherits".into(), "claude".into());
+        for (agent, _) in agents {
+            assert_eq!(
+                config.clear_alias_profile(agent).map(|p| p.key),
+                (agent == "own").then_some(crate::acp::agent_profiles::CUSTOM_CLEAR.key),
+                "{agent}"
+            );
+        }
+    }
 
     #[test]
     fn serve_config_ignores_errors_outside_serve_table() {
@@ -5083,6 +5249,61 @@ mod tests {
                 serde_json::to_string(&parsed).unwrap(),
                 format!("\"{value}\""),
                 "select option {value:?} must round-trip"
+            );
+        }
+    }
+
+    #[test]
+    fn shared_credential_is_an_elevated_repo_denied_select() {
+        let field = settings_schema::descriptor("sandbox", "shared_credential")
+            .expect("sandbox.shared_credential descriptor");
+        assert_eq!(field.label, "Shared agent credential");
+        assert!(!field.profile_overridable);
+        assert_eq!(
+            field.web_write,
+            settings_schema::WebWritePolicy::RequiresElevation {
+                reason: "sandbox credential handling affects host login isolation".to_string()
+            }
+        );
+        let settings_schema::WidgetKind::Select { options } = &field.widget else {
+            panic!("shared_credential must render as a select");
+        };
+        let options: Vec<(&str, &str)> = options
+            .iter()
+            .map(|o| (o.value.as_str(), o.label.as_str()))
+            .collect();
+        assert_eq!(
+            options,
+            [
+                ("host_seed", "Seed from host login"),
+                ("separate_login", "Separate sandbox login")
+            ]
+        );
+
+        // (config.toml, parsed)
+        for (toml_src, expected) in [
+            ("", Some(SharedCredentialMode::HostSeed)),
+            (
+                "shared_credential = \"host_seed\"",
+                Some(SharedCredentialMode::HostSeed),
+            ),
+            (
+                "shared_credential = \"separate_login\"",
+                Some(SharedCredentialMode::SeparateLogin),
+            ),
+            ("shared_credential = \"keychain\"", None),
+        ] {
+            let parsed = toml::from_str::<Config>(&format!("[sandbox]\n{toml_src}"))
+                .ok()
+                .map(|config| config.sandbox.shared_credential);
+            assert_eq!(parsed, expected, "{toml_src:?}");
+            let Some(mode) = parsed else { continue };
+            let mut config = Config::default();
+            config.sandbox.shared_credential = mode;
+            let round_tripped: Config = toml::from_str(&toml::to_string(&config).unwrap()).unwrap();
+            assert_eq!(
+                round_tripped.sandbox.shared_credential, mode,
+                "{toml_src:?}"
             );
         }
     }

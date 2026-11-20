@@ -729,6 +729,21 @@ impl Instance {
         }
     }
 
+    /// The native session selector in this row's own command or arguments. An unmanaged
+    /// launch then runs it instead of injecting AoE's own (see `apply_session_flags_in`).
+    /// A selector fails `validate_managed_arguments`, so such a launch is never managed.
+    pub(crate) fn command_session_selector(&self) -> Option<String> {
+        let mut words = parse_launch_command(&self.get_launch_command())?.words;
+        words.extend(shell_words::split(&self.extra_args).ok()?);
+        // The same agent an unmanaged launch checks (`build_launch_command_in`).
+        match self.declared_agent() {
+            Some(declared) => declared
+                .with_definition(|agent| self.existing_session_selector(&words, Some(agent)))
+                .flatten(),
+            None => self.existing_session_selector(&words, self.default_selector_agent()),
+        }
+    }
+
     fn existing_session_selector(
         &self,
         words: &[String],

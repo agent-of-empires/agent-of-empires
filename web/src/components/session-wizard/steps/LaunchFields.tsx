@@ -8,12 +8,14 @@ export function LabeledInput({
   value,
   onChange,
   placeholder,
+  autoFocus = false,
   children,
 }: {
   label: string;
   value: string;
   onChange: (v: string) => void;
   placeholder: string;
+  autoFocus?: boolean;
   /** Hint rendered under the input. */
   children?: React.ReactNode;
 }) {
@@ -26,6 +28,7 @@ export function LabeledInput({
       <input
         id={id}
         type="text"
+        autoFocus={autoFocus}
         value={value}
         onChange={(e) => onChange(e.target.value)}
         placeholder={placeholder}

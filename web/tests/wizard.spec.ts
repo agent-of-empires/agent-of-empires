@@ -127,6 +127,24 @@ test.describe("essentials", () => {
   });
 });
 
+test.describe("panels focus their first field", () => {
+  test("Worktree focuses the branch name, Sandbox the image, Agent the selected agent", async ({ page }) => {
+    await startWizard(page, {
+      docker: true,
+      settings: { worktree: { enabled: true }, sandbox: { enabled_by_default: true } },
+    });
+    const w = wizard(page);
+    await openPanel(page, "Worktree");
+    await expect(w.getByPlaceholder(BRANCH_PLACEHOLDER)).toBeFocused();
+    await closePanel(page);
+    await openPanel(page, "Sandbox");
+    await expect(w.getByLabel("Container image")).toBeFocused();
+    await closePanel(page);
+    await openPanel(page, "Agent");
+    await expect(w.getByRole("button", { name: "claude", exact: true })).toBeFocused();
+  });
+});
+
 test.describe("create progress", () => {
   test("a slow create shows the running hook and its output, and can continue in the background", async ({ page }) => {
     let release!: () => void;

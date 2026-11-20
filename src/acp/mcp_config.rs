@@ -11,6 +11,111 @@ use tracing::warn;
 use crate::session::mcp::mcp_model::{McpProvenance, ResolvedMcpServer};
 use crate::session::mcp::project_mcp::ProjectMcpTransport;
 
+/// What identifies the daemon to a sandboxed session's MCP set.
+pub struct DaemonIdentity {
+    /// Tokens the daemon accepts, grace token included. `None` when this process has no token
+    /// authority; remote servers are then dropped, since none can be proven token-free.
+    tokens: Option<Vec<String>>,
+    /// Canonical host names the daemon is reachable on, from `serve.url`. Best effort: only the
+    /// token check is authoritative.
+    hosts: Vec<String>,
+}
+
+impl DaemonIdentity {
+    pub fn new(tokens: Option<Vec<String>>, hosts: impl IntoIterator<Item = String>) -> Self {
+        let hosts = hosts.into_iter().map(|h| canonical_host(&h)).collect();
+        Self { tokens, hosts }
+    }
+
+    pub async fn current() -> Self {
+        let hosts = crate::cli::serve::read_serve_urls()
+            .iter()
+            .filter_map(|u| reqwest::Url::parse(&u.url).ok())
+            .filter_map(|u| u.host_str().map(str::to_owned))
+            .collect::<Vec<_>>();
+        Self::new(crate::server::token::accepted_daemon_tokens().await, hosts)
+    }
+}
+
+/// One comparable spelling per host: no brackets, no root dot, lowercase, IPv4-mapped IPv6
+/// folded to IPv4.
+fn canonical_host(host: &str) -> String {
+    let host = host.trim_matches(['[', ']']);
+    let host = host.strip_suffix('.').unwrap_or(host).to_ascii_lowercase();
+    match host.parse::<std::net::IpAddr>() {
+        Ok(ip) => ip.to_canonical().to_string(),
+        Err(_) => host,
+    }
+}
+
+const MAX_DECODE_ROUNDS: usize = 32;
+
+/// True if `value`, or any percent-decoding of it, contains a token, so a token spelled with
+/// escapes in the userinfo, path, query or fragment is still found. Fails closed: a value still
+/// changing after `MAX_DECODE_ROUNDS` counts as a hit.
+fn mentions_token(value: &str, tokens: &[String]) -> bool {
+    let mut current = value.to_owned();
+    for _ in 0..=MAX_DECODE_ROUNDS {
+        if tokens.iter().any(|token| current.contains(token.as_str())) {
+            return true;
+        }
+        let next = percent_encoding::percent_decode_str(&current)
+            .decode_utf8_lossy()
+            .into_owned();
+        if next == current {
+            return false;
+        }
+        current = next;
+    }
+    true
+}
+
+fn is_loopback_host(canonical: &str) -> bool {
+    canonical == "localhost"
+        || canonical.ends_with(".localhost")
+        || canonical
+            .parse::<std::net::IpAddr>()
+            .is_ok_and(|ip| ip.is_loopback())
+}
+
+/// Drop servers a sandboxed session must not receive: remote servers on a loopback host or on
+/// the daemon's own listener, and any remote server carrying an accepted daemon token.
+pub fn drop_daemon_servers(
+    servers: Vec<ResolvedMcpServer>,
+    daemon: &DaemonIdentity,
+) -> Vec<ResolvedMcpServer> {
+    servers
+        .into_iter()
+        .filter(|resolved| {
+            let (url, headers) = match &resolved.def.transport {
+                ProjectMcpTransport::Http { url, headers }
+                | ProjectMcpTransport::Sse { url, headers } => (url, headers),
+                ProjectMcpTransport::Stdio { .. } => return true,
+            };
+            let credential_risk = daemon.tokens.as_ref().is_none_or(|tokens| {
+                std::iter::once(url)
+                    .chain(headers.values())
+                    .any(|value| mentions_token(value, tokens))
+            });
+            let host_is_daemon = reqwest::Url::parse(url).is_ok_and(|url| {
+                url.host_str().is_some_and(|host| {
+                    let host = canonical_host(host);
+                    is_loopback_host(&host) || daemon.hosts.contains(&host)
+                })
+            });
+            let drop = host_is_daemon || credential_risk;
+            if drop {
+                warn!(
+                    target: "acp.mcp",
+                    server = %resolved.def.name,
+                    "not forwarding a daemon or loopback MCP server into a sandboxed session"
+                );
+            }
+            !drop
+        })
+        .collect()
+}
+
 /// Convert resolved, transport-typed servers (parsed and merged by
 /// `session::mcp::mcp_model`) into ACP `McpServer` values for forwarding through
 /// `session/new` and `session/load`.
@@ -215,6 +320,113 @@ mod tests {
             agent_client_protocol::v1::schema::NewSessionRequest::new("/work").mcp_servers(servers),
         )
         .unwrap()
+    }
+
+    #[test]
+    fn sandboxed_sessions_never_get_daemon_or_loopback_servers() {
+        let json = r#"{ "mcpServers": {
+            "aoe": { "type": "http", "url": "http://127.0.0.1:9000/mcp",
+                     "headers": { "Authorization": "Bearer sekrit" } },
+            "local": { "type": "sse", "url": "http://localhost:9000/sse" },
+            "mapped": { "type": "http", "url": "http://[::ffff:127.0.0.1]:9000/mcp" },
+            "v6": { "type": "http", "url": "http://[::1]:9000/mcp" },
+            "lan": { "type": "http", "url": "http://192.168.1.5:9000/mcp" },
+            "unparseable": { "type": "http", "url": "u",
+                             "headers": { "Authorization": "Bearer sekrit" } },
+            "urltoken": { "type": "http", "url": "https://proxy.example.test/mcp?token=sekrit" },
+            "previous": { "type": "http", "url": "https://alias.example.test/mcp",
+                          "headers": { "Authorization": "Bearer prev-token" } },
+            "renamed": { "type": "http", "url": "https://proxy.example.test/mcp",
+                         "headers": { "X-Key": "Bearer sekrit" } },
+            "github": { "type": "http", "url": "https://api.github.test/mcp",
+                        "headers": { "Authorization": "Bearer pat" } },
+            "fs": { "command": "fs-server", "env": { "K": "v" } }
+        } }"#;
+        let names = |daemon: &DaemonIdentity| {
+            let kept = drop_daemon_servers(resolved(json, McpProvenance::Global), daemon);
+            let mut kept: Vec<_> = kept.iter().map(|s| s.def.name.clone()).collect();
+            kept.sort();
+            kept
+        };
+        let tokens = Some(vec!["sekrit".to_string(), "prev-token".to_string()]);
+        let daemon = DaemonIdentity::new(tokens.clone(), ["192.168.1.5".to_string()]);
+        assert_eq!(names(&daemon), ["fs", "github"]);
+
+        // An unreadable or half-written `serve.url` leaves no hosts; tokens still decide.
+        let no_hosts = DaemonIdentity::new(tokens, []);
+        assert_eq!(names(&no_hosts), ["fs", "github", "lan"]);
+
+        // Without a token authority no remote server can be proven token-free.
+        let no_authority = DaemonIdentity::new(None, []);
+        assert_eq!(names(&no_authority), ["fs"]);
+    }
+
+    #[test]
+    fn escaped_tokens_in_any_url_component_are_still_found() {
+        let daemon = DaemonIdentity::new(Some(vec!["abcdef0123".into()]), []);
+        for (url, header, dropped) in [
+            ("https://p.example.test/%61bcdef0123", "", true),
+            ("https://p.example.test/mcp?k=%61bcdef0123", "", true),
+            ("https://u:%61bcdef0123@p.example.test/mcp", "", true),
+            ("https://p.example.test/mcp#%61bcdef0123", "", true),
+            ("https://p.example.test/mcp?k=%2561bcdef0123", "", true),
+            (
+                "https://p.example.test/mcp?k=%2525252561bcdef0123",
+                "",
+                true,
+            ),
+            (
+                &format!("https://p.example.test/mcp?k=%{}41", "25".repeat(40)),
+                "",
+                true,
+            ),
+            (
+                &format!("https://p.example.test/mcp?k=%{}41", "25".repeat(50_000)),
+                "",
+                true,
+            ),
+            ("https://p.example.test/mcp", "Bearer %61bcdef0123", true),
+            (
+                "https://p.example.test/mcp?k=%61bcdef9999",
+                "Bearer other",
+                false,
+            ),
+        ] {
+            let json = format!(
+                r#"{{ "mcpServers": {{ "x": {{ "type": "http", "url": "{url}",
+                    "headers": {{ "Authorization": "{header}" }} }} }} }}"#
+            );
+            let kept = drop_daemon_servers(resolved(&json, McpProvenance::Global), &daemon);
+            assert_eq!(kept.is_empty(), dropped, "{url} {header}");
+        }
+    }
+
+    #[test]
+    fn equivalent_host_spellings_make_the_same_forwarding_decision() {
+        let daemon = DaemonIdentity::new(
+            Some(vec!["sekrit".into()]),
+            [
+                "Host.Example.Test.".to_string(),
+                "::ffff:192.168.1.5".to_string(),
+            ],
+        );
+        for (url, dropped) in [
+            ("http://LOCALHOST:9000/mcp", true),
+            ("http://localhost.:9000/mcp", true),
+            ("http://foo.localhost:9000/mcp", true),
+            ("http://[::ffff:7f00:1]:9000/mcp", true),
+            ("http://127.1:9000/mcp", true),
+            ("http://host.example.test:9000/mcp", true),
+            ("http://HOST.example.test.:9000/mcp", true),
+            ("http://192.168.1.5:9000/mcp", true),
+            ("http://[::ffff:192.168.1.5]:9000/mcp", true),
+            ("http://other.example.test:9000/mcp", false),
+        ] {
+            let json =
+                format!(r#"{{ "mcpServers": {{ "x": {{ "type": "http", "url": "{url}" }} }} }}"#);
+            let kept = drop_daemon_servers(resolved(&json, McpProvenance::Global), &daemon);
+            assert_eq!(kept.is_empty(), dropped, "{url}");
+        }
     }
 
     #[test]

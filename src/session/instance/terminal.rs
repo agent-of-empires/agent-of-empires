@@ -397,7 +397,7 @@ impl Instance {
         index: u32,
         size: Option<(u16, u16)>,
         store: &dyn crate::session::SessionStore,
-        mut run_hook: impl FnMut(&mut Self, &crate::session::LaunchConfig) -> Result<()>,
+        mut run_hook: impl BeforeStartHook,
     ) -> Result<(tmux::ContainerTerminalSession, bool)> {
         let mut ownership = Some(self.acquire_auxiliary_locks_in(store)?);
         anyhow::ensure!(
@@ -416,24 +416,38 @@ impl Instance {
                 store,
                 &tokio_util::sync::CancellationToken::new(),
                 None,
-                |instance, config| {
-                    drop(ownership.take());
-                    let result = run_hook(instance, config);
-                    let title = crate::session::acquire_session_title_lock(&instance.id)?;
-                    let lifecycle = store
-                        .storage()
-                        .acquire_instance_lifecycle_lock(&instance.id)?;
-                    ownership = Some((title, lifecycle));
-                    store.check_available()?;
-                    instance.reconcile_from_store(store)?;
-                    instance.ensure_startable()?;
-                    anyhow::ensure!(
-                        instance
-                            .lifecycle_reservation_is_owned(LifecycleOperation::Launch, generation),
-                        LifecycleReservationError::Superseded
-                    );
-                    result
-                },
+                // The title and lifecycle locks are given up around the hook and taken back,
+                // in that order, once the slot is free and the caller's own locks are back.
+                Releasing::new(
+                    (&mut run_hook, &mut ownership, false),
+                    |(inner, ownership, released), instance, config| {
+                        drop(ownership.take());
+                        *released = true;
+                        inner.run(instance, config)
+                    },
+                    |(inner, ownership, released), instance| {
+                        let result = inner.restore(instance);
+                        if !std::mem::take(released) {
+                            return result;
+                        }
+                        let title = crate::session::acquire_session_title_lock(&instance.id)?;
+                        let lifecycle = store
+                            .storage()
+                            .acquire_instance_lifecycle_lock(&instance.id)?;
+                        **ownership = Some((title, lifecycle));
+                        store.check_available()?;
+                        instance.reconcile_from_store(store)?;
+                        instance.ensure_startable()?;
+                        anyhow::ensure!(
+                            instance.lifecycle_reservation_is_owned(
+                                LifecycleOperation::Launch,
+                                generation
+                            ),
+                            LifecycleReservationError::Superseded
+                        );
+                        result
+                    },
+                ),
             )?;
             let sandbox = self
                 .sandbox_info

@@ -83,6 +83,10 @@ export interface SessionResponse {
   rate_limit_auto_resume?: boolean;
   /** Account tool name the daemon is about to fail this parked session over to; absent when none. */
   rate_limit_failover_to?: string;
+  /** Messages on the Daemon's queue; absent when none. */
+  queued_count?: number;
+  /** What the Daemon's queue waits on, as a prompt sent now would be told. Only the list sets it. */
+  queue_reason?: QueueReasonWire;
   smart_rename?: "inactive" | "pending" | "running";
   /** Still carries its auto-generated name (more reliable than `smart_rename`). */
   default_name?: boolean;
@@ -487,6 +491,9 @@ export interface ImportableSession {
 
 export type AcpWorkerState = "absent" | "resuming" | "running" | "stopping";
 
+/** Why a session's server queue is waiting (the Daemon's `QueueReason`). */
+export type QueueReasonWire = "turn_active" | "cancelling" | "compacting" | "worker_down" | "integration_lost";
+
 // Settings schema mirrors `crate::session::config::settings_schema` (`GET /api/settings/schema`).
 
 /** `value` is written to disk; `label` is shown. */
@@ -557,6 +564,7 @@ export type SettingsValidation =
   | { rule: "volume_list" }
   | { rule: "env_list" }
   | { rule: "port_mapping_list" }
+  | { rule: "volume_ignore_list" }
   | { rule: "capability_list" }
   | { rule: "security_opt_list" }
   | { rule: "network" }
@@ -583,8 +591,14 @@ export interface SettingsFieldDescriptor {
   profile_overridable: boolean;
   validation: SettingsValidation;
   advanced: boolean;
+  /** One plain line for users; absent on fields without one and on plugin fields. */
+  summary?: string;
   /** Read only by the TUI; folded apart from the dashboard's own settings. */
   tui_only?: boolean;
+  /** Read only by the dashboard; sent only when set. */
+  web_only?: boolean;
+  /** Read once when an AoE process starts; sent only when set. */
+  restart?: boolean;
   /** Present only on plugin fields, which have no stored value until saved. */
   default?: unknown;
   /** Plugin field that can also be set per registered project. */

@@ -55,12 +55,12 @@ pub struct ServeArgs {
 
     /// Authentication mode: `token` (default, random URL token),
     /// `passphrase` (no token URL, passphrase login wall only),
-    /// or `none` (no auth at all, loopback-only unless --behind-proxy).
+    /// or `none` (no auth at all, requires --behind-proxy).
     /// Mutually exclusive with --no-auth (which aliases --auth=none).
     #[arg(long, value_enum, conflicts_with = "no_auth")]
     pub auth: Option<AuthMode>,
 
-    /// Disable authentication (only allowed with localhost binding).
+    /// Disable authentication (requires --behind-proxy).
     /// Alias for --auth=none.
     #[arg(long)]
     pub no_auth: bool,
@@ -392,6 +392,18 @@ fn validate_auth_combination(
              both token auth and a passphrase. If you have an external reverse\n\
              proxy, use --behind-proxy instead of --remote.",
             auth_mode.as_cli_str()
+        );
+    }
+
+    // A TCP loopback peer may be a sandbox container or another local user,
+    // so only an operator-declared proxy can vouch for unauthenticated callers.
+    if matches!(auth_mode, AuthMode::None) && !behind_proxy {
+        bail!(
+            "Refusing to start with --auth=none without --behind-proxy.\n\
+             Any process that can reach the TCP port, including sandbox containers\n\
+             on Docker Desktop, OrbStack or Podman machine, would get full control.\n\
+             Use the default token auth or --auth=passphrase. CLI access over the\n\
+             owner-only Unix socket needs no token."
         );
     }
 
@@ -1450,14 +1462,17 @@ async fn validate_launch_args(profile: &str, args: &ServeArgs) -> Result<AuthMod
     } else {
         resolve_auth_mode(args.auth, args.no_auth)
     };
-    validate_auth_combination(
-        auth_mode,
-        args.passphrase.is_some(),
-        host_is_localhost(&args.host),
-        args.behind_proxy,
-        args.remote,
-        &args.host,
-    )?;
+    // Core-only serves the owner-only Unix socket and has no TCP listener to guard.
+    if !args.core_only {
+        validate_auth_combination(
+            auth_mode,
+            args.passphrase.is_some(),
+            host_is_localhost(&args.host),
+            args.behind_proxy,
+            args.remote,
+            &args.host,
+        )?;
+    }
     validate_behind_proxy_allowlist(args.behind_proxy, args.remote, &args.allowed_host)?;
     validate_allowed_hosts(&args.allowed_host)?;
     validate_allowed_origins(&args.allowed_origin)?;
@@ -2568,6 +2583,26 @@ impl TuiControlLease {
         })
     }
 
+    /// The Funnel port of the observed Daemon's launch record, so a `--funnel-port` launch is
+    /// respected. A record from before `funnel_port` names 443. With no Daemon the `[serve]`
+    /// setting names the port. A live Daemon whose port can't be established, or that doesn't
+    /// run Funnel, is refused rather than guessed, so no unrelated port is touched.
+    pub(crate) fn funnel_port(&self) -> Result<crate::session::config::FunnelPort> {
+        let Some((pid, _, _)) = self.target.process.as_ref() else {
+            return Ok(crate::session::config::ServeConfig::load_strict()?.funnel_port);
+        };
+        let launch = running_launch(*pid)
+            .context("The Daemon has no launch record of its own; its Funnel port is unknown")?;
+        let port = rollback_args(&launch, None)?
+            .funnel_port
+            .context("The Daemon's launch does not run Funnel")?;
+        anyhow::ensure!(
+            tui_control_target()? == self.target,
+            "Daemon identity changed while resolving its Funnel port; preserving its successor"
+        );
+        Ok(port)
+    }
+
     pub(crate) async fn stop(&self) -> Result<()> {
         if self.target.process.is_none() {
             return Ok(());
@@ -3307,11 +3342,15 @@ mod tests {
     }
 
     #[test]
-    fn validate_none_loopback_ok() {
-        // Regression: --no-auth (== --auth=none) on loopback must still
-        // start, matching the legacy --no-auth behavior.
+    fn validate_none_needs_behind_proxy_even_on_loopback() {
+        // A loopback peer is not proof of a host process: Docker Desktop,
+        // OrbStack and Podman machine forward container traffic to host
+        // 127.0.0.1, so TCP no-auth would hand owner authority to sandboxes.
+        let err = validate_auth_combination(AuthMode::None, false, true, false, false, "127.0.0.1")
+            .unwrap_err();
+        assert!(err.to_string().contains("--behind-proxy"));
         assert!(
-            validate_auth_combination(AuthMode::None, false, true, false, false, "127.0.0.1")
+            validate_auth_combination(AuthMode::None, false, true, true, false, "127.0.0.1")
                 .is_ok()
         );
     }
@@ -3763,6 +3802,170 @@ mod tests {
         assert_eq!(tui_control_target().unwrap(), successor_target);
     }
 
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn lease_funnel_port_never_falls_back_to_an_unrelated_port() {
+        use std::os::unix::process::CommandExt;
+
+        struct ChildGuard(std::process::Child);
+        impl Drop for ChildGuard {
+            fn drop(&mut self) {
+                let _ = self.0.kill();
+                let _ = self.0.wait();
+            }
+        }
+
+        let _home = crate::session::test_support::isolate_app_dir();
+        crate::session::get_profile_dir("work").unwrap();
+        let config = crate::session::config::config_path().unwrap();
+        std::fs::create_dir_all(config.parent().unwrap()).unwrap();
+        std::fs::write(&config, "[serve]\nfunnel_port = \"8443\"\n").unwrap();
+        let fixture = tempfile::tempdir().unwrap();
+        nix::unistd::mkfifo(
+            &fixture.path().join("serve"),
+            nix::sys::stat::Mode::S_IRUSR | nix::sys::stat::Mode::S_IWUSR,
+        )
+        .unwrap();
+        let cancel = tokio_util::sync::CancellationToken::new();
+        let cases: [(
+            &str,
+            bool,
+            Option<crate::session::config::FunnelPort>,
+            Option<&str>,
+        ); 4] = [
+            // (case, remote funnel launch, recorded port, expected port or refusal)
+            (
+                "recorded",
+                true,
+                Some(crate::session::config::FunnelPort::Port10000),
+                Some("10000"),
+            ),
+            ("legacy", true, None, Some("443")),
+            ("no funnel", false, None, None),
+            (
+                "recorded no funnel",
+                false,
+                Some(crate::session::config::FunnelPort::Port10000),
+                None,
+            ),
+        ];
+        for (case, remote, recorded, want) in cases {
+            let mut child = ChildGuard(
+                std::process::Command::new("cat")
+                    .arg0("aoe")
+                    .arg("serve")
+                    .env(SERVE_INSTANCE_ENV, "lease-owner")
+                    .current_dir(fixture.path())
+                    .stdin(std::process::Stdio::null())
+                    .stdout(std::process::Stdio::null())
+                    .stderr(std::process::Stdio::null())
+                    .spawn()
+                    .unwrap(),
+            );
+            let mut launch = sample_launch();
+            launch.pid = child.0.id();
+            launch.instance_id = Some("lease-owner".to_owned());
+            launch.remote = remote;
+            launch.tunnel_name = None;
+            launch.tunnel_url = None;
+            launch.no_tailscale = false;
+            launch.funnel_port = recorded;
+            write_serve_launch(&launch).unwrap();
+            std::fs::write(
+                crate::session::get_app_dir().unwrap().join("serve.pid"),
+                child.0.id().to_string(),
+            )
+            .unwrap();
+            let target = wait_for_test_daemon(&mut child.0);
+            let lease = TuiControlLease::prepare(target, &cancel).await.unwrap();
+            let port = lease.funnel_port().map(|port| port.number().to_string());
+            match want {
+                Some(want) => assert_eq!(port.unwrap(), want, "{case}"),
+                None => assert!(port.is_err(), "{case}: {port:?}"),
+            }
+            // The Daemon exiting after the record was read must fail, not retarget.
+            drop(lease);
+        }
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn lease_funnel_port_without_daemon_refuses_a_broken_config() {
+        let _home = crate::session::test_support::isolate_app_dir();
+        let config = crate::session::config::config_path().unwrap();
+        std::fs::create_dir_all(config.parent().unwrap()).unwrap();
+        let cancel = tokio_util::sync::CancellationToken::new();
+        // (config.toml content, wanted port or None for an error); None content = absent file
+        for (content, want) in [
+            (None, Some("443")),
+            (Some("[serve]\nfunnel_port = \"8443\"\n"), Some("8443")),
+            (Some("[serve\nfunnel_port = "), None),
+        ] {
+            match content {
+                Some(content) => std::fs::write(&config, content).unwrap(),
+                None => drop(std::fs::remove_file(&config)),
+            }
+            let lease = TuiControlLease::prepare(tui_control_target().unwrap(), &cancel)
+                .await
+                .unwrap();
+            let port = lease.funnel_port().map(|port| port.number().to_string());
+            match want {
+                Some(want) => assert_eq!(port.unwrap(), want, "{content:?}"),
+                None => assert!(port.is_err(), "{content:?}: {port:?}"),
+            }
+        }
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn lease_funnel_port_fails_when_the_daemon_exits_before_resolution() {
+        use std::os::unix::process::CommandExt;
+
+        let _home = crate::session::test_support::isolate_app_dir();
+        crate::session::get_profile_dir("work").unwrap();
+        let config = crate::session::config::config_path().unwrap();
+        std::fs::create_dir_all(config.parent().unwrap()).unwrap();
+        std::fs::write(&config, "[serve]\nfunnel_port = \"8443\"\n").unwrap();
+        let fixture = tempfile::tempdir().unwrap();
+        nix::unistd::mkfifo(
+            &fixture.path().join("serve"),
+            nix::sys::stat::Mode::S_IRUSR | nix::sys::stat::Mode::S_IWUSR,
+        )
+        .unwrap();
+        let mut child = std::process::Command::new("cat")
+            .arg0("aoe")
+            .arg("serve")
+            .env(SERVE_INSTANCE_ENV, "lease-owner")
+            .current_dir(fixture.path())
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .unwrap();
+        let mut launch = sample_launch();
+        launch.pid = child.id();
+        launch.instance_id = Some("lease-owner".to_owned());
+        launch.remote = true;
+        launch.tunnel_name = None;
+        launch.no_tailscale = false;
+        launch.funnel_port = Some(crate::session::config::FunnelPort::Port10000);
+        write_serve_launch(&launch).unwrap();
+        std::fs::write(
+            crate::session::get_app_dir().unwrap().join("serve.pid"),
+            child.id().to_string(),
+        )
+        .unwrap();
+        let target = wait_for_test_daemon(&mut child);
+        let cancel = tokio_util::sync::CancellationToken::new();
+        let lease = TuiControlLease::prepare(target, &cancel).await.unwrap();
+        child.kill().unwrap();
+        child.wait().unwrap();
+        let port = lease.funnel_port();
+        assert!(
+            port.is_err(),
+            "an exited Daemon must not retarget: {port:?}"
+        );
+    }
     #[test]
     fn tui_restart_overlay_keeps_recorded_policy() {
         use clap::Parser;
@@ -4340,8 +4543,14 @@ mod tests {
         #[tokio::test]
         #[serial]
         async fn remote_exposure_is_refused_only_while_a_dev_plugin_is_active() {
-            let _guard = crate::session::test_support::isolate_app_dir();
             let _reload = crate::plugin::ReloadRegistryOnDrop;
+            let _guard = crate::session::test_support::isolate_app_dir();
+            std::fs::create_dir_all(
+                crate::session::get_app_dir()
+                    .unwrap()
+                    .join("profiles/default"),
+            )
+            .unwrap();
             let remote = serve_args(&["aoe", "serve", "--remote", "--passphrase", "pw"]);
             let local = serve_args(&["aoe", "serve"]);
 

@@ -20,6 +20,7 @@ pub(super) fn is_transcript_event(event: &Event) -> bool {
             | Event::ToolCallUpdated { .. }
             | Event::DiffEmitted { .. }
             | Event::PlanUpdated { .. }
+            | Event::PlanRemoved { .. }
             | Event::TodoListUpdated { .. }
             | Event::ThinkingStarted
             | Event::AgentThoughtChunk { .. }
@@ -62,6 +63,7 @@ pub(super) fn transcript_event_kind(event: &Event) -> &'static str {
         Event::ToolCallUpdated { .. } => "tool_call_updated",
         Event::DiffEmitted { .. } => "diff_emitted",
         Event::PlanUpdated { .. } => "plan_updated",
+        Event::PlanRemoved { .. } => "plan_removed",
         Event::TodoListUpdated { .. } => "todo_list_updated",
         Event::ThinkingStarted => "thinking_started",
         Event::AgentThoughtChunk { .. } => "agent_thought_chunk",

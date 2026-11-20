@@ -37,3 +37,12 @@ changes there need those teams' approval.
   other areas it touches approve their paths only.
 
 Review with the [rubric](CONTRIBUTING.md#review-rubric).
+
+## Reviewer push exclusions
+
+Reviewers do not push fixes to PR branches from these contributors (see the
+[rubric](CONTRIBUTING.md#review-rubric)):
+
+- @jerome-benoit
+
+To join, open a PR adding your handle, or ask a maintainer.

@@ -1,5 +1,6 @@
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { fetchBranches, type BranchInfo } from "../../../lib/api";
+import { hasFinePointer } from "../../../lib/platform";
 import { ProjectSearchList } from "./ProjectSearchList";
 import { useProjectPicker } from "./projectPicker";
 
@@ -114,6 +115,17 @@ export function ExtraReposPicker({
     [primaryPath],
   );
 
+  const pathRef = useRef<HTMLInputElement>(null);
+  const searchRef = useRef<HTMLInputElement>(null);
+  const opener = useRef(document.activeElement);
+  // The search box only exists once projects load, so pick the target then, unless the user moved focus since opening.
+  useEffect(() => {
+    if (loading || !hasFinePointer()) return;
+    const active = document.activeElement;
+    if (active && active !== document.body && active !== opener.current) return;
+    (searchRef.current ?? pathRef.current)?.focus();
+  }, [loading]);
+
   const setRepoBase = (path: string, base: string) => {
     const next = { ...repoBases };
     if (base.trim()) next[path] = base;
@@ -202,6 +214,7 @@ export function ExtraReposPicker({
             filteredRecent={filteredRecent}
             isSelected={isSelected}
             onSelect={toggle}
+            inputRef={searchRef}
           />
         </div>
       )}
@@ -224,6 +237,7 @@ export function ExtraReposPicker({
           type="text"
           value={freeText}
           onChange={(e) => setFreeText(e.target.value)}
+          ref={pathRef}
           onKeyDown={(e) => {
             if (e.key === "Enter") {
               e.preventDefault();

@@ -17,6 +17,7 @@ describe("agentIntegrationDetails", () => {
           container_env: { HOME_DIR: "/tmp\u001b[2J" },
           install_hint: "install \u202enow",
           host_only: true,
+          send_keys_enter_delay_ms: 150,
           resume: { kind: "flag_pair", existing: "--continue", new_session: "--new" },
           capture: { backend: "omp", host: "pane_scoped", sandbox: "unsupported" },
         },
@@ -29,6 +30,7 @@ describe("agentIntegrationDetails", () => {
       }),
     ).toEqual([
       "launch flags: oneshot -p; instruction --prompt={}; model --model; yolo AUTO=1",
+      "enter delay: 150 ms",
       "sandbox environment: HOME_DIR=/tmp\\u{1b}[2J",
       "aliases: alias",
       "resume: flags --continue / --new",

@@ -550,3 +550,70 @@ describe("a Retry of a startup error", () => {
     expect([state.startupError, state.retriedError, state.restartInFlight]).toEqual(expected);
   });
 });
+
+describe("a diagnosed startup cause", () => {
+  const frame = (seq: number, event: AcpFrame["event"]): Action => ({
+    kind: "frame",
+    frame: { session_id: "s", seq, event },
+  });
+  const gone = (seq: number) =>
+    frame(seq, { AgentStartupError: { message: "removed", cause: { kind: "container_missing" } } });
+  const failed = (seq: number) => frame(seq, { AgentStartupError: { message: "boom" } });
+  const retry: Action = { kind: "restart_started", epoch: 1, stoppedSent: false, retriedError: "boom" };
+  // [cause kind, startupError, retriedError, restartInFlight] after these.
+  it.each<[string, Action[], [string | null, string | null, string | null, boolean]]>([
+    ["the typed event sets it", [gone(1)], ["container_missing", "removed", null, false]],
+    [
+      "an unknown kind reads as none",
+      [frame(1, { AgentStartupError: { message: "x", cause: { kind: "later" } as never } })],
+      [null, "x", null, false],
+    ],
+    ["a later untyped error replaces it", [gone(1), failed(2)], [null, "boom", null, false]],
+    ["it replaces an earlier untyped error", [failed(1), gone(2)], ["container_missing", "removed", null, false]],
+    [
+      "it ends a Retry without comparing errors",
+      [failed(1), retry, gone(2)],
+      ["container_missing", "removed", null, false],
+    ],
+    [
+      "Recreate's hand-off to the startup line clears it",
+      [gone(1), { ...retry, retriedError: "removed" }],
+      [null, null, "removed", true],
+    ],
+    [
+      "a refused restart after it is untyped",
+      [
+        gone(1),
+        { ...retry, retriedError: "removed" },
+        { kind: "restart_failed", epoch: 1, message: "no", stoppedSent: false },
+      ],
+      [null, "no", "removed", false],
+    ],
+    ["sending clears it", [gone(1), { kind: "user_prompt", text: "hi" }], [null, null, null, false]],
+    [
+      "a new turn clears it",
+      [gone(1), frame(2, { UserPromptSent: { text: "hi", prompt_id: "p" } })],
+      [null, null, null, false],
+    ],
+    [
+      "the Agent starting clears it",
+      [gone(1), frame(2, { AcpSessionAssigned: { acp_session_id: "a" } })],
+      [null, null, null, false],
+    ],
+    [
+      "an Agent switch clears it",
+      [gone(1), frame(2, { AgentSwitched: { from: "claude", to: "codex", reason: "manual" } })],
+      [null, null, null, false],
+    ],
+    [
+      "a lost integration is untyped",
+      [gone(1), frame(2, { IntegrationLost: { reason: { kind: "hold_overflow" } } })],
+      [null, "Agent integration lost: hold overflow", null, false],
+    ],
+  ])("%s", (_label, actions, expected) => {
+    const state = run(empty(), ...actions);
+    expect([state.startupCause?.kind ?? null, state.startupError, state.retriedError, state.restartInFlight]).toEqual(
+      expected,
+    );
+  });
+});

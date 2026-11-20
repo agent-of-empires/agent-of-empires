@@ -89,7 +89,7 @@ const jobResult = (state: "succeeded" | "failed", tail: string, error?: string):
         started_at: 0,
         finished_at: 1,
       },
-      log: { exists: true, tail, lines_returned: 1, truncated: false },
+      log: { path: "/daemon/plugin-jobs/job1.log", exists: true, tail, lines_returned: 1, truncated: false },
     },
   }) as PluginJobResult;
 
@@ -232,11 +232,11 @@ describe("installed plugins", () => {
 
 describe("detail modal", () => {
   it("opens from an installed row with fallback fields, header icon, and closes", async () => {
-    renderWith([{ ...EXAMPLE, icon: "github", icon_asset_url: "/api/plugins/x/icon" }]);
+    renderWith([{ ...EXAMPLE, icon: "github", icon_asset_url: "/plugin-icons/x" }]);
     await click("plugin-open-example.plugin");
     const modal = await screen.findByTestId("plugin-detail-modal");
     expect(modal.textContent).toContain("v0.1.0");
-    expect((await screen.findByTestId("plugin-detail-icon")).getAttribute("src")).toBe("/api/plugins/x/icon");
+    expect((await screen.findByTestId("plugin-detail-icon")).getAttribute("src")).toBe("/plugin-icons/x");
     await click("plugin-detail-close");
     await waitFor(() => expect(screen.queryByTestId("plugin-detail-modal")).toBeNull());
     await click("plugin-open-example.plugin");
@@ -633,11 +633,15 @@ describe("uninstall and job progress", () => {
     await waitFor(() => expect(api.fetchPlugins.mock.calls.length).toBeGreaterThan(before));
   });
 
-  it("shows a failed job's error", async () => {
+  it("shows a failed job's error, bounded tail and actual Daemon-host log path", async () => {
     api.fetchPluginJob.mockResolvedValue(jobResult("failed", "uninstalling", "removing tree failed"));
     await uninstall();
     await click("plugin-uninstall-confirm-button");
     expect((await screen.findByTestId("plugin-job-error")).textContent).toContain("removing tree failed");
+    expect(screen.getByTestId("plugin-job-log").textContent).toContain("uninstalling");
+    expect(screen.getByTestId("plugin-job-host-path").textContent).toContain(
+      "Full log on Daemon host: /daemon/plugin-jobs/job1.log",
+    );
   });
 
   it("treats a vanished job (404) as terminal", async () => {

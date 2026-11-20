@@ -26,6 +26,15 @@ impl PluginSource {
                     if reference.is_empty() {
                         bail!("empty ref after '@' in {input:?}");
                     }
+                    // Refs reach git as separate arguments; a leading '-' would
+                    // be parsed as an option by checkout and ls-remote.
+                    if reference.starts_with('-')
+                        || reference
+                            .chars()
+                            .any(|c| c.is_whitespace() || c.is_control())
+                    {
+                        bail!("invalid ref {reference:?} in {input:?}");
+                    }
                     (slug, Some(reference.to_string()))
                 }
                 None => (rest, None),
@@ -109,6 +118,9 @@ mod tests {
             "gh:/widget",
             "gh:a/b/c",
             "gh:acme/widget@",
+            "gh:acme/widget@-oProxyCommand",
+            "gh:acme/widget@v1 beta",
+            "gh:acme/widget@v1\nbeta",
         ] {
             assert!(
                 PluginSource::parse(bad).is_err(),

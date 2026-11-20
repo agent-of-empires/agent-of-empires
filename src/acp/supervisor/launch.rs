@@ -524,6 +524,7 @@ impl<S: BroadcastSink> Supervisor<S> {
             McpPaths {
                 cwd: req.cwd.clone(),
                 config_path: req.config_path.clone(),
+                sandboxed: req.sandbox_info.is_some(),
             },
             host_environment.clone(),
             claude_config_dir,
@@ -1247,7 +1248,7 @@ pub(crate) async fn host_spawn_environment(
                 ))
             })?
             .map_err(|e| {
-                SupervisorError::Acp(AcpError::Spawn(format!("before_session hook: {e}")))
+                SupervisorError::Acp(AcpError::Spawn(format!("before_session hook: {e:#}")))
             })?;
         overlay_env(&mut host, minted);
     }
@@ -1421,9 +1422,11 @@ pub(super) fn discovery_key<'a>(sandboxed: bool, agent: &'a str, native: &'a str
 }
 
 /// `cwd` keys the native per-project lookup; project-local servers load from `config_path`.
+/// `sandboxed` sessions never receive daemon or loopback servers.
 pub(super) struct McpPaths {
     pub(super) cwd: PathBuf,
     pub(super) config_path: PathBuf,
+    pub(super) sandboxed: bool,
 }
 
 pub(super) async fn resolve_mcp_servers(
@@ -1435,50 +1438,38 @@ pub(super) async fn resolve_mcp_servers(
     native_config_override: Option<PathBuf>,
     failure: &'static str,
 ) -> Vec<agent_client_protocol::v1::schema::McpServer> {
+    use crate::session::mcp::mcp_model::summarize;
+
     let agent_key = agent_key.to_string();
-    let session = session_id.to_string();
-    tokio::task::spawn_blocking(move || {
+    let env = session_env.clone();
+    let sandboxed = paths.sandboxed;
+    let resolved = tokio::task::spawn_blocking(move || {
         resolve_mcp_layers(
             &agent_key,
-            &session,
             profile.as_deref(),
-            &paths.cwd,
-            &paths.config_path,
+            &paths,
             &session_env,
             native_config_override.as_deref(),
         )
     })
-    .await
-    .unwrap_or_else(|e| {
-        warn!(
-            target: "acp.mcp",
-            session = %session_id,
-            error = %e,
-            "{failure}; forwarding no servers"
-        );
-        Vec::new()
-    })
-}
-
-fn resolve_mcp_layers(
-    agent_key: &str,
-    session_id: &str,
-    profile: Option<&str>,
-    cwd: &std::path::Path,
-    config_path: &std::path::Path,
-    session_env: &[(String, String)],
-    native_config_override: Option<&std::path::Path>,
-) -> Vec<agent_client_protocol::v1::schema::McpServer> {
-    use crate::session::mcp::mcp_model::{resolve_effective, summarize};
-
-    let merged = resolve_effective(
-        agent_key,
-        profile,
-        cwd,
-        config_path,
-        session_env,
-        native_config_override,
-    );
+    .await;
+    let mut merged = match resolved {
+        Ok(merged) => merged,
+        Err(e) => {
+            warn!(
+                target: "acp.mcp",
+                session = %session_id,
+                error = %e,
+                "{failure}; forwarding no servers"
+            );
+            return Vec::new();
+        }
+    };
+    // Read the accepted tokens after the definitions so they cover every token those hold.
+    if sandboxed {
+        let daemon = crate::acp::mcp_config::DaemonIdentity::current().await;
+        merged = crate::acp::mcp_config::drop_daemon_servers(merged, &daemon);
+    }
     if !merged.is_empty() {
         info!(
             target: "acp.mcp",
@@ -1488,7 +1479,24 @@ fn resolve_mcp_layers(
             "forwarding MCP servers"
         );
     }
-    crate::acp::mcp_config::project_servers_to_acp(merged, session_env)
+    crate::acp::mcp_config::project_servers_to_acp(merged, &env)
+}
+
+fn resolve_mcp_layers(
+    agent_key: &str,
+    profile: Option<&str>,
+    paths: &McpPaths,
+    session_env: &[(String, String)],
+    native_config_override: Option<&std::path::Path>,
+) -> Vec<crate::session::mcp::mcp_model::ResolvedMcpServer> {
+    crate::session::mcp::mcp_model::resolve_effective(
+        agent_key,
+        profile,
+        &paths.cwd,
+        &paths.config_path,
+        session_env,
+        native_config_override,
+    )
 }
 
 /// Apply current model pins and effort defaults to a cached respawn config,
@@ -2699,19 +2707,20 @@ time.sleep(60)
         let resolve = |profile: Option<&'static str>,
                        cwd: std::path::PathBuf,
                        config_path: std::path::PathBuf| async move {
-            let merged = tokio::task::spawn_blocking(move || {
-                resolve_mcp_layers(
-                    "claude",
-                    "resolve-test",
-                    profile,
-                    &cwd,
-                    &config_path,
-                    &[],
-                    None,
-                )
-            })
-            .await
-            .unwrap();
+            let merged = resolve_mcp_servers(
+                "claude",
+                "resolve-test",
+                profile.map(String::from),
+                McpPaths {
+                    cwd,
+                    config_path,
+                    sandboxed: false,
+                },
+                Vec::new(),
+                None,
+                "resolve failed",
+            )
+            .await;
             let val = serde_json::to_value(&merged).unwrap();
             let mut names: Vec<String> = val
                 .as_array()

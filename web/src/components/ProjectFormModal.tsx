@@ -3,6 +3,7 @@ import type { ProjectInfo } from "../lib/types";
 import { createProject, projectTarget, updateProject } from "../lib/api";
 import { DirectoryBrowser } from "./DirectoryBrowser";
 import { type PluginSettingsDraft, ProjectPluginSettings } from "./ProjectPluginSettings";
+import { hasFinePointer } from "../lib/platform";
 
 interface Props {
   profile: string;
@@ -137,6 +138,7 @@ export function ProjectFormModal({ initial, profile, onClose, onSaved }: Props) 
             <div className="flex gap-2 mb-3">
               <input
                 type="text"
+                autoFocus={hasFinePointer()}
                 value={path}
                 onChange={(e) => setPath(e.target.value)}
                 placeholder="/path/to/repo"
@@ -181,6 +183,7 @@ export function ProjectFormModal({ initial, profile, onClose, onSaved }: Props) 
         <label className="block text-[12px] text-text-dim mb-1">Default base branch (optional)</label>
         <input
           type="text"
+          autoFocus={isEdit && hasFinePointer()}
           value={baseBranch}
           onChange={(e) => setBaseBranch(e.target.value)}
           placeholder="blank = inherit global default, then auto-detect"

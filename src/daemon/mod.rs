@@ -50,6 +50,10 @@ pub use wire::{
     UpdateNotificationsBody, UpdatePinBody, UpdateSnoozeBody, UpdateUnreadBody,
     WorkspaceRepoSummary, WorktreeEditOutcome,
 };
+pub use wire::{
+    ApplyUpdateBody, InstallPreviewBody, PluginJob, PluginJobAccepted, PluginJobKind, PluginJobLog,
+    PluginJobResponse, PluginJobStatus, StartInstallBody,
+};
 
 const DEFAULT_TIMEOUT: Duration = Duration::from_secs(15);
 /// Sandbox copies, image pulls and launch hooks can take minutes.

@@ -215,41 +215,42 @@ fn compact_log_line(raw: &str) -> String {
     }
 }
 
-pub(super) fn run_tailscale_funnel_reset(
+pub(super) fn run_tailscale_funnel_off(
+    https_port: u16,
     cancel: &tokio_util::sync::CancellationToken,
 ) -> Result<(), String> {
     use std::io::{Read, Seek};
     let mut stderr =
-        tempfile::tempfile().map_err(|e| format!("could not prepare reset diagnostics: {e}"))?;
+        tempfile::tempfile().map_err(|e| format!("could not prepare Funnel diagnostics: {e}"))?;
     let capture = stderr
         .try_clone()
-        .map_err(|e| format!("could not capture reset diagnostics: {e}"))?;
+        .map_err(|e| format!("could not capture Funnel diagnostics: {e}"))?;
     let status = crate::process::run_status_with_timeout_process_group(
         Command::new("tailscale")
-            .args(["funnel", "reset"])
+            .args(crate::server::tunnel::funnel_off_args(https_port))
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::from(capture)),
         std::time::Duration::from_secs(3),
         Some(cancel),
     )
-    .map_err(|e| format!("could not complete tailscale reset: {e}; Funnel state may have changed"))?
+    .map_err(|e| format!("could not complete tailscale funnel off: {e}; Funnel state may have changed"))?
     .ok_or_else(|| {
-        "reset timed out; Funnel state may have changed. Inspect `tailscale funnel status` before retrying."
+        "turning Funnel off timed out; Funnel state may have changed. Inspect `tailscale funnel status` before retrying."
             .to_owned()
     })?;
     if status.success() {
         return Ok(());
     }
     stderr.rewind().map_err(|e| {
-        format!("could not read reset diagnostics: {e}; Funnel state may have changed")
+        format!("could not read Funnel diagnostics: {e}; Funnel state may have changed")
     })?;
     let mut diagnostic = Vec::new();
     stderr
         .take(8192)
         .read_to_end(&mut diagnostic)
         .map_err(|e| {
-            format!("could not read reset diagnostics: {e}; Funnel state may have changed")
+            format!("could not read Funnel diagnostics: {e}; Funnel state may have changed")
         })?;
     let stderr = String::from_utf8_lossy(&diagnostic).trim().to_string();
     Err(if stderr.is_empty() {

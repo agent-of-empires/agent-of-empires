@@ -8,7 +8,10 @@ use serde_json::{Map, Value};
 use crate::agents::ResolvedHookEvent;
 
 use super::command::{hook_command, hook_command_session_id, json_command_is_aoe};
-use super::config_io::{log_installed, log_removed, log_unchanged, with_config_lock, write_json};
+use super::config_io::{
+    log_installed, log_removed, log_unchanged, with_config_lock, with_config_lock_policy,
+    SymlinkPolicy,
+};
 use super::json_settings::{drop_empty_events, remove_flat_aoe_entries};
 use super::HookInstallTarget;
 
@@ -26,14 +29,17 @@ const KIRO_HOOKS_AGENT_NAME: &str = kiro_hooks_agent_name!();
 /// user's default agent untouched.
 pub const KIRO_HOOKS_AGENT_FILE: &str = concat!(".kiro/agents/", kiro_hooks_agent_name!(), ".json");
 
-fn read_agent_config(path: &Path) -> Result<Map<String, Value>> {
-    let raw = std::fs::read_to_string(path)?;
-    Ok(serde_json::from_str(&raw).unwrap_or_else(|error| {
+fn parse_agent_config(path: &Path, raw: &str) -> Map<String, Value> {
+    serde_json::from_str(raw).unwrap_or_else(|error| {
         tracing::warn!(target: "hooks.install", path = %path.display(), %error,
             "kiro agent config is not valid JSON; rewriting"
         );
         Map::new()
-    }))
+    })
+}
+
+fn read_agent_config(path: &Path) -> Result<Map<String, Value>> {
+    Ok(parse_agent_config(path, &std::fs::read_to_string(path)?))
 }
 
 /// Install AoE hooks into a Kiro agent config, creating it with a default
@@ -47,11 +53,11 @@ pub fn install_kiro_hooks_with_events(
     if events.is_empty() && !agent_config_path.exists() {
         return Ok(());
     }
-    with_config_lock(agent_config_path, "json.lock", || {
-        let mut config = if agent_config_path.exists() {
-            read_agent_config(agent_config_path)?
-        } else {
-            Map::new()
+    let policy = SymlinkPolicy::for_target(target);
+    with_config_lock_policy(agent_config_path, "json.lock", policy, || {
+        let mut config = match policy.read(agent_config_path)? {
+            Some(raw) => parse_agent_config(agent_config_path, &raw),
+            None => Map::new(),
         };
         let before = config.clone();
 
@@ -102,7 +108,10 @@ pub fn install_kiro_hooks_with_events(
             log_unchanged(agent_config_path);
             return Ok(());
         }
-        write_json(agent_config_path, &Value::Object(config))?;
+        policy.write(
+            agent_config_path,
+            serde_json::to_string_pretty(&Value::Object(config))?.as_bytes(),
+        )?;
         log_installed(agent_config_path);
         Ok(())
     })

@@ -38,7 +38,7 @@ beforeEach(() => localStorage.clear());
 afterEach(() => vi.restoreAllMocks());
 
 describe("loadPersistedState", () => {
-  it.each(["pendingElicitations", "oldestSeq"])("backfills %s missing from an older entry", (field) => {
+  it.each(["pendingElicitations", "oldestSeq", "startupCause"])("backfills %s missing from an older entry", (field) => {
     const legacy: Record<string, unknown> = { ...emptyAcpState() };
     delete legacy[field];
     writeEntry("legacy", legacy);
@@ -217,6 +217,12 @@ describe("persistState (#1833)", () => {
     persistState("retried", { ...emptyAcpState(), startupError: "worse", retriedError: "boom" });
     const { state } = JSON.parse(localStorage.getItem(key("retried"))!) as { state: AcpState };
     expect([state.startupError, state.retriedError]).toEqual(["worse", null]);
+  });
+
+  it("keeps a startup error's cause, so a reload shows the same banner", () => {
+    const cause = { kind: "container_missing" } as const;
+    persistState("gone", { ...emptyAcpState(), startupError: "removed", startupCause: cause });
+    expect(loadPersistedState("gone")?.startupCause).toEqual(cause);
   });
 });
 

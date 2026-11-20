@@ -9,7 +9,7 @@ use crossterm::event::{KeyCode, KeyEvent};
 
 use super::{
     funnel_reset_applies, Flash, LinkChange, Logins, PendingConfirm, RestartEffect, ServeMode,
-    ServeMouse, ServeView, ServeViewState, TransportStatus, TunnelTransport, FLASH_TTL,
+    ServeMouse, ServeView, ServeViewState, TransportStatus, TunnelTransport, Unasked, FLASH_TTL,
 };
 use crate::tui::components::hint_buttons::scan_spaced_hints;
 use crate::tui::components::hover::paint_hover_bg;
@@ -121,7 +121,7 @@ pub(super) fn render(view: &ServeView, frame: &mut Frame, area: Rect, theme: &Th
                 &mut mouse,
                 message,
                 view.control_error.as_deref(),
-                &error_recovery_keys(*mode, *transport),
+                &error_keys(*mode, *transport, view.funnel_reset_armed.is_some()),
             ),
         }
     }
@@ -592,7 +592,7 @@ fn render_active(
             mouse,
             "Daemon started but no URL available yet.",
             None,
-            &[],
+            &error_keys(ServeMode::Local, None, false),
         );
         return;
     };
@@ -775,8 +775,12 @@ fn render_active(
         .border_style(Style::default().fg(theme.border));
     let footer_inner = footer_block.inner(footer);
     frame.render_widget(footer_block, footer);
-    let footer_text = match view.pending_confirm.map(|(action, _)| action) {
-        Some(action) => {
+    let asking = view
+        .pending_confirm
+        .map(|(action, _)| (action, None))
+        .or(view.unasked.map(|(action, why)| (action, Some(why))));
+    let footer_text = match asking {
+        Some((action, unasked)) => {
             let effect = RestartEffect::of(
                 *mode,
                 urls,
@@ -786,14 +790,14 @@ fn render_active(
             );
             let (first, effect_text) = match action {
                 PendingConfirm::NewPassphrase => (
-                    "Press G again for a new passphrase.",
+                    "Press Enter for a new passphrase.",
                     "Every Device signs out.",
                 ),
                 PendingConfirm::Restart if effect.link == LinkChange::Replaced => {
-                    ("Press R again to restart.", "Agents keep running.")
+                    ("Press Enter to restart.", "Agents keep running.")
                 }
                 PendingConfirm::Restart => (
-                    "Press R again to restart.",
+                    "Press Enter to restart.",
                     match effect.logins {
                         Logins::Kept => "Devices stay signed in; agents keep running.",
                         Logins::Lost => "Every Device signs out; agents keep running.",
@@ -813,15 +817,35 @@ fn render_active(
             let funnel_back = (action == PendingConfirm::Restart && effect.retakes_funnel).then_some(
                 "The Funnel link comes back only if no other server holds it; otherwise the Daemon stops and says why.",
             );
+            let again = match action {
+                PendingConfirm::NewPassphrase => "Press G to check again.",
+                PendingConfirm::Restart => "Press R to check again.",
+            };
+            let (lead, first, cancels) = match unasked {
+                None => (None, first, Some("Any other key cancels.")),
+                Some(Unasked::EarlyEnter) => {
+                    (Some("Enter was pressed before this asked. "), again, None)
+                }
+                // Only a restart re-checks its effects; a new passphrase always signs everyone out.
+                Some(Unasked::Changed) => (
+                    Some("What a restart would change is different now. "),
+                    again,
+                    None,
+                ),
+            };
             let rest = [effect_text]
                 .into_iter()
                 .chain(link)
                 .chain(funnel_back)
-                .chain(["Any other key cancels."]);
-            let mut spans = vec![Span::styled(
+                .chain(cancels);
+            let mut spans: Vec<_> = lead
+                .map(|lead| Span::styled(lead, dimmed))
+                .into_iter()
+                .collect();
+            spans.push(Span::styled(
                 first,
                 Style::default().fg(theme.waiting).bold(),
-            )];
+            ));
             spans.extend(rest.map(|s| Span::styled(format!(" {s}"), dimmed)));
             Text::from(Line::from(spans))
         }
@@ -975,15 +999,30 @@ fn split_url_and_token(url: &str) -> (String, Option<&str>) {
 }
 
 /// The keys `error_key` handles for this failure, shown before the way out.
-fn error_recovery_keys(mode: ServeMode, transport: Option<TunnelTransport>) -> Vec<&'static str> {
-    let mut keys = Vec::new();
+struct ErrorKeys {
+    recovery: Vec<&'static str>,
+    rest: &'static [&'static str],
+}
+
+fn error_keys(mode: ServeMode, transport: Option<TunnelTransport>, reset_armed: bool) -> ErrorKeys {
+    // Armed, Enter resets, so no hint offers it as the way out, nor as a click target.
+    if reset_armed {
+        return ErrorKeys {
+            recovery: Vec::new(),
+            rest: &["Press Enter to turn off Funnel on its port. Any other key cancels."],
+        };
+    }
+    let mut recovery = Vec::new();
     if mode == ServeMode::Tunnel {
-        keys.push("[P] Pick provider");
+        recovery.push("[P] Pick provider");
     }
     if funnel_reset_applies(mode, transport) {
-        keys.push("[R] Reset Funnel");
+        recovery.push("[R] Turn off Funnel on its port");
     }
-    keys
+    ErrorKeys {
+        recovery,
+        rest: &["[S] Force stop", "[Enter] Back to sessions"],
+    }
 }
 
 fn render_error(
@@ -993,14 +1032,14 @@ fn render_error(
     mouse: &mut ServeMouse,
     message: &str,
     control_error: Option<&str>,
-    recovery: &[&str],
+    keys: &ErrorKeys,
 ) {
     let inner = render_page(frame, area, " Serve failed ", theme.error, theme.error);
-    let rest = ["[S] Force stop", "[Enter] Back to sessions"];
+    let (recovery, rest) = (keys.recovery.as_slice(), keys.rest);
     const GAP: &str = "    ";
     let one_line = recovery
         .iter()
-        .chain(&rest)
+        .chain(rest)
         .copied()
         .collect::<Vec<_>>()
         .join(GAP);
@@ -1733,8 +1772,8 @@ mod tests {
             view.running_persists = running;
             view.pending_confirm = Some((key, Instant::now()));
             let first = match key {
-                G => "Press G again for a new passphrase.",
-                R => "Press R again to restart.",
+                G => "Press Enter for a new passphrase.",
+                R => "Press Enter to restart.",
             };
             // 60 columns wraps the longest confirm onto a third footer row.
             for width in [60, 80, 120] {
@@ -1752,6 +1791,29 @@ mod tests {
                 let (x, y) = crate::tui::dialogs::test_render::find(&buf, "cancels.");
                 assert_eq!(buf[(x, y)].fg, theme.dimmed, "{case}");
             }
+
+            // A check that shows its effects without asking names the key that asks again.
+            let again = match key {
+                G => "Press G to check again.",
+                R => "Press R to check again.",
+            };
+            view.pending_confirm = None;
+            let changed = (key == R).then_some((
+                Unasked::Changed,
+                "What a restart would change is different now. ",
+            ));
+            for (why, lead) in [(Unasked::EarlyEnter, "Enter was pressed before this asked. ")]
+                .into_iter()
+                .chain(changed)
+            {
+                view.unasked = Some((key, why));
+                let buf = crate::tui::dialogs::test_render::draw(120, 24, |f, theme| {
+                    render(&view, f, f.area(), theme)
+                });
+                let footer = text_in(&buf, Rect::new(0, 21, 120, 3));
+                assert_eq!(footer, format!("{lead}{again} {effects}"), "{case} {why:?}");
+            }
+            view.unasked = None;
 
             if help_restart.is_empty() {
                 continue;

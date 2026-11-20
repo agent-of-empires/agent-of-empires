@@ -768,10 +768,14 @@ pub async fn live_terminal_ws(
     let target = instances.iter().find(|i| i.id == id).map(|inst| {
         (
             crate::tmux::Session::resolve_name(&inst.id, &inst.title),
-            crate::agents::send_keys_enter_delay(&inst.tool),
+            inst.clone(),
         )
     });
     drop(instances);
+    // The pace is read from configuration for a plugin-declared tool, so it
+    // resolves after the guard is dropped: resolving it under the read guard
+    // blocks a worker, and every writer of `instances` behind it, on disk I/O.
+    let target = target.map(|(tmux_name, instance)| (tmux_name, instance.send_keys_enter_delay()));
 
     let read_only = state.read_only;
     let shutdown = state.shutdown.clone();

@@ -209,6 +209,7 @@ test.describe("Diff comments (#928)", () => {
       .first()
       .click();
     await expect(page.getByText("Send diff comments")).toBeVisible();
+    await expect(page.getByPlaceholder(/Anything you want to say/)).toBeFocused();
     await page.getByPlaceholder(/Anything you want to say/).fill("Hey:");
     // The dialog's Send button is the last in the DOM.
     await page

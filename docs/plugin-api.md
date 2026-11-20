@@ -8,7 +8,7 @@ A manifest carries two independent version axes.
 
 | Key | Meaning |
 |---|---|
-| `api_version` | The manifest *schema* version. The current schema is `21`. The host rejects a manifest whose `api_version` is newer than it supports. |
+| `api_version` | The manifest *schema* version. The current schema is `22`. The host rejects a manifest whose `api_version` is newer than it supports. |
 | `aoe_version` | A semver requirement on the *host app* version, e.g. `">=1.11.0, <2.0.0"`. The host refuses to install, and skips loading, a plugin whose requirement excludes the running version. Optional; requires `api_version >= 4`. |
 
 Each key below notes the `api_version` it needs. Target the newest schema your plugin uses, and set `aoe_version` to the host range you have tested.
@@ -19,7 +19,7 @@ Each key below notes the `api_version` it needs. Target the newest schema your p
 id = "dev.example.my-plugin"
 name = "My Plugin"
 version = "0.1.0"
-api_version = 21
+api_version = 22
 aoe_version = ">=1.11.0, <2.0.0"
 description = "What the plugin does."
 capabilities = ["runtime.worker"]
@@ -30,13 +30,13 @@ capabilities = ["runtime.worker"]
 | `id` | string | yes | Plugin id (see [Plugin id](#plugin-id)). Namespaces config, events, and action names. |
 | `name` | string | yes | Human-readable display name. |
 | `version` | string | yes | Semantic version of the plugin. |
-| `api_version` | integer | yes | Manifest schema version, `1` to `21`. |
+| `api_version` | integer | yes | Manifest schema version, `1` to `22`. |
 | `description` | string | no | Shown in plugin listings. Defaults to empty. |
 | `aoe_version` | string | no | Host-app semver requirement. Requires `api_version >= 4`. |
 | `capabilities` | array of string | no | Runtime grants the worker needs (see [Capabilities](#capabilities)). A manifest with `[runtime]` must declare `runtime.worker`. Static contributions need none; provider-native agent status and replies require `session.integration`. |
 | `screenshots` | array | no | Up to 8. Requires `api_version >= 5`. See [Screenshots](#screenshots). |
 | `setting_defaults` | table | no | Overrides for core host settings, keyed by canonical path (e.g. `"theme.idle_decay_minutes"`). Resolution is user value, then plugin override, then core default. |
-| `agent_integrations` | array of tables | no | Agent tools may declare provider-native communication or optional launch metadata. Requires `api_version >= 19`; the launch, detection, and reply-fallback extensions require API 21 and a host implementing them. Provider-native status and replies require `session.integration`. |
+| `agent_integrations` | array of tables | no | Agent tools may declare provider-native communication or optional launch metadata. Requires `api_version >= 19`; the launch, detection, and reply-fallback extensions require API 21, and the session-id capture extension requires API 22, each with a host implementing them. Provider-native status and replies require `session.integration`. |
 
 ## Agent integrations
 
@@ -67,7 +67,7 @@ replies = true
 
 Installing a plugin with agent integrations requires explicit approval. The install preview and CLI/TUI/web prompts show each tool, its command, and its agent declarations. Control and format characters are displayed as escapes. Updates require approval when an integration is added or any declaration changes; removals alone do not. AoE runs the declared command as the user only when that agent is launched.
 
-The host matches status integrations to terminal sessions and rejects missing, malformed, or unsupported runtime versions before consuming reports or sending replies. The runtime extension must also enforce supported versions before activation. These requirements are independent of the plugin's `version`, AoE host `api_version` / `aoe_version`, and report/reply `schema_version`. Launch-only agent declarations do not enable provider-native status or replies.
+The host matches status integrations to terminal sessions and rejects missing, malformed, or unsupported runtime versions before consuming reports or sending replies. A live provider that keeps reporting while naming a version outside, or unparseable against, `provider_versions` is the only case that steps aside: its report is not consumed and the session keeps pane detection rather than becoming an owned `Unknown`, with a warning naming the tool, the reported version, and the declared ranges. Any other absent, stale, or invalid report is still an owned `Unknown`: the declaration owns status once approved. The runtime extension must also enforce supported versions before activation. These requirements are independent of the plugin's `version`, AoE host `api_version` / `aoe_version`, and report/reply `schema_version`. Launch-only agent declarations do not enable provider-native status or replies.
 
 For status, a session's own integration takes precedence; an unowned tool may use the integration selected by its detection alias. Reply ownership remains tied to the session's own tool.
 
@@ -93,6 +93,7 @@ instruction_flag = "--prompt={}"
 model_flag = "--model"
 host_only = false
 install_hint = "Install example-agent from its vendor"
+send_keys_enter_delay_ms = 150
 
 [agent_integrations.launch.container_env]
 EXAMPLE_HOME = "/state"
@@ -118,12 +119,16 @@ allow = [{ kind = "named", value = "Enter" }]
 deny = [{ kind = "literal", value = "n" }]
 ```
 
-The example's `detection` requires `session.integration` in the manifest's capabilities. All three declaration types require a nonblank `command`.
+The example's `detection` requires `session.integration` in the manifest's capabilities. Every declaration type, `session_id` included, requires a nonblank `command`: the plugin must contribute the tool it captures for, because only the plugin that owns a tool may attribute an id to a session using it.
 
 - `launch.aliases` are unique lowercase agent ids, distinct from the tool. `oneshot_flag` and `model_flag` are single shell-safe flags. `instruction_flag` has one `{}` placeholder, as a whole argument or after `=`, and otherwise contains shell-safe words.
+- `launch.send_keys_enter_delay_ms` is the pause, in milliseconds, that the host leaves between typing a message into the agent's pane and sending Enter. Some agents read a fast burst as a paste and drop the Enter, which leaves the message as an unsent draft that looks like a running session. It requires `api_version >= 22` and is capped at 2000. An agent that declares nothing falls back to the host's built-in pause for its tool.
 - `launch.yolo` is `kind = "flag"` with `flag`, `kind = "always"`, or `kind = "env"` with `key` and `value`. An `always` declaration applies while active without changing the session's saved Yolo preference. `container_env` is applied to sandbox launches. Protected environment names are rejected.
 - `launch.resume` is `kind = "flag"` with `flag`, `kind = "flag_pair"` with `existing` and `new_session`, or `kind = "subcommand"` with `command`. Resume and capture require each other. Capture supports only backend `omp`, with `pane_scoped` in at least one of `host` or `sandbox` and `pane_scoped` or `unsupported` in the other.
 - `detection.mode = "native_only"` requires `session.integration`; the integration owns status rather than falling back to pane parsing when a report is missing or invalid.
+- `session_id` declares that the plugin worker owns session-id capture for the tool, so the provider's store layout and wire formats stay in the plugin. It requires `api_version >= 22` and a manifest that declares a `[runtime]` worker. The declared worker reports what it captured with the `session.capture.set` RPC, taking `session_id` (the session to attribute) and `agent_session_id` (the provider's id) and requiring `session.write`. Only the plugin that owns the session's tool may report; any other caller gets `not_capture_owner`. The host applies the id through `persist_session_with_storage`, the guarded observation path the pollers use, and answers `applied = false` with one of three reasons: `pinned` (the row pins a different conversation for its next launch), `owned_elsewhere` (another session durably owns the id), or `stale` (the row changed since the host read it, or the id is capture-excluded).
+
+A report is not tied to a launch. The host mints no launch token and the call carries none, so it cannot tell which launch produced the id, and a report that arrives late for an earlier launch is applied to whatever the row holds at that moment, subject to the reasons above. A worker must report only the id its current launch produced and stop reporting once that launch is gone. The id is also stored without an execution binding, because the report names no execution to scope it to: peer ownership and capture excludes are then judged over the whole id namespace rather than a single conversation's store. Polling, with its launch-scoped generations, is what will close both gaps. `method`, `launch_method` and `timeout_ms` are reserved for host-driven polling and are validated but not yet called by this host version: hosts do not poll the worker, apply a `launch_method` wrapper, or enforce `timeout_ms`, so a plugin must not rely on them yet. When they are implemented, `method` will be the per-poll worker RPC that returns `session_id` with the generation it was captured for, `launch_method` an optional RPC returning the launch wrapper and tmux environment the capture needs, and `timeout_ms` a per-call bound defaulting to 5000 and valid from 250 to 30000. Method names are dotted identifiers like `omp.session_id`.
 - `reply_fallback` contains nonempty `allow` and `deny` arrays, and an optional nonempty `allow_always` array, of literal or named keys. Named keys are `Enter`, `Tab`, `Escape`, `Space`, `Backspace`, `Up`, `Down`, `Left`, `Right`, `Home`, `End`, `PageUp`, `PageDown`, and `F1` through `F12`. Fallback is allowed only with `replies = false` and does not automatically approve a prompt.
 
 For reply-enabled integrations, the provider report's `reply_keys` must contain at most eight distinct function-key names from `F1` through `F12`; the host rejects a report with more than eight keys or any duplicate. AoE sends those keys only after the user submits a response. A status-only report may omit `reply_keys` or send an empty array. Prompts are ignored unless the integration enables replies and the report supplies wake keys. Missing or invalid reports for reply-enabled integrations never fall back to terminal approval keystrokes.
@@ -150,7 +155,7 @@ Capabilities gate plugin resource access and host interactions. They are prompte
 |---|---|
 | `runtime.worker` | Launching a plugin worker and using its base host RPCs. Required for either runtime kind. |
 | `session.read` | Reading sessions of the host's profile: the attached session, `sessions.list`, and the `session.status.changed` (`api_version >= 14`) and `session.lifecycle.changed` (`api_version >= 19`) notifications. |
-| `session.write` | Mutating any session of the profile: `session.meta.set`/`cas`, and archive/trash from a plugin page. |
+| `session.write` | Mutating any session of the profile: `session.meta.set`/`cas`, `session.capture.set` for a tool the plugin owns and declares `session_id` for, and archive/trash from a plugin page. |
 | `config.read` | Reading host or other-plugin configuration (not the plugin's own settings). |
 | `config.write` | Writing host or other-plugin configuration. |
 | `process.spawn` | Spawning processes beyond the plugin's own worker. |
@@ -376,7 +381,7 @@ Status notifications follow canonical row adoption. Rejected or stale operations
 
 `sessions.message.send` takes `{ session_id, message }` and delivers `message` to the session. For a structured session the message is marked as sent by the plugin, never as typed by the user: the transcript row and a queued message carry the plugin id, and the web and TUI show it. A terminal session receives the message as plain terminal input, with no attribution. It is for pings such as a PR notification, not for driving a session: it cannot create sessions or read their output, and there is no idempotency key.
 
-**Result.** `{ disposition, revived }`. `disposition` is `sent`, `steered` or `queued`. A structured session takes the same path as the web composer: a running agent that accepts steering takes the message mid-turn (`steered`), one that does not has it parked on the session's queue until the turn ends (`queued`), and an idle one starts a turn (`sent`). A busy agent is never refused. A terminal session always reports `sent`. `revived` is `true` when the host had to start something to take the message. For a structured session that is a stopped, dormant or snoozed worker, which is resumed and given the message immediately rather than queued. For a terminal session it is a stopped or dead pane that was started or respawned. A snoozed terminal keeps its live pane, so it reports `revived: false`; the message still clears the snooze.
+**Result.** `{ disposition, revived }`. `disposition` is `sent`, `steered` or `queued`. A structured session takes the same path as the web composer: a running agent that accepts steering takes the message mid-turn (`steered`), one that does not has it parked on the session's queue until the turn ends (`queued`), and an idle one starts a turn (`sent`). A busy agent is never refused. A terminal session always reports `sent`. `revived` is `true` when the host had to start something to take the message. For a structured session that is a stopped, dormant or snoozed worker, which is resumed and given the message immediately rather than queued, unless it is a sandbox waiting on its agent's sandbox login (`sandbox_login_required` below). For a terminal session it is a stopped or dead pane that was started or respawned. A snoozed terminal keeps its live pane, so it reports `revived: false`; the message still clears the snooze.
 
 **Targets.** Any session, with no ownership check: the `session.message` grant is the gate. A structured session still runs the message under its persisted permission mode, as it does for turns from the plugin that created it. A woken session does not count toward the plugin's active-session limit, which only covers sessions the plugin created. Terminal (tmux) sessions are supported and a dead pane is revived first. In CityHall mode (`AOE_CITYHALL_MODE`) terminal sessions refuse plugin input with `terminal_unavailable`; this deliberately differs from `aoe send`, which does not check CityHall.
 
@@ -394,6 +399,8 @@ Status notifications follow canonical row adoption. Rejected or stale operations
 | `session_not_running` | A terminal pane vanished between the revive and the send. |
 | `session_transient` | A terminal session is mid-start or mid-stop; retry when it settles. |
 | `worker_not_ready` | A structured session's worker did not come up, or could not be resumed. Retryable. |
+| `sandbox_login_required` | Resuming a sandbox needs the sandbox login of its agent (`aoe sandbox login --tool <tool>`, with `-p <profile>` when the session runs under a non-default profile and `--command <command>` when it runs its own command, as the message says). A structured session keeps the message in its queue (`data.queued_id`) and gets it after the login: do not retry. A terminal session has no queue: send again after the login. `sessions.turn.send` keeps a refused turn the same way. |
+| `before_start_hook_failed` | The `host_hooks.before_start` hook of a sandbox session failed, timed out, could not be started or is still running for that session while its launch was being admitted. The message is kept (`data.queued_id`) and goes out with the next revival; no hold is registered, so nothing revives the session when the hook is fixed, and no plugin session cap reservation is left behind. The error text is fixed (it never carries the hook's command or output). |
 | `terminal_unavailable` | CityHall mode refuses terminal targets. |
 | `delivery_timeout` | The call did not finish within its deadline. The outcome is unknown: the message may still have been delivered. |
 | `capability_missing` | The manifest lacks, or the user has not approved, `session.message`. |

@@ -238,6 +238,16 @@ async fn run_shutdown_sequence<R, F>(
     }
 }
 
+/// The daemon's profile and every session, whose shared credential files may have login
+/// helpers.
+async fn login_helper_scopes(state: &AppState) -> Vec<super::sandbox_login::LoginScope> {
+    use super::sandbox_login::LoginScope;
+    let instances = state.instances.read().await;
+    std::iter::once(LoginScope::profile(state.served_profile().clone()))
+        .chain(instances.iter().flat_map(LoginScope::of_session))
+        .collect()
+}
+
 /// Raise the soft `RLIMIT_NOFILE` so the server can sustain many WS
 /// terminals at once. macOS's default soft cap of 256 is exhausted
 /// quickly: each WS terminal consumes ~3 file descriptors (PTY master +
@@ -587,6 +597,7 @@ pub(crate) async fn start_server(
         token_lifetime,
         token_grace,
     ));
+    super::token::register_daemon_tokens(Arc::clone(&token_manager));
     let config = crate::session::config::profile_config::resolve_config_or_warn(profile);
     // Feed the unread-feature gate from this daemon's resolved config.
     crate::session::set_unread_enabled(config.session.unread_indicator);
@@ -738,6 +749,8 @@ pub(crate) async fn start_server(
             control_cache: acp_control_cache.clone(),
         },
     ));
+    // Before any producer of a hold (plugin workers, the reconcilers) can run.
+    let login_notices = session_service.sandbox_login.subscribe();
 
     // the daemon serves fine without plugin workers.
     // The host API includes mutating session.meta.set/cas, so a read-only
@@ -1100,6 +1113,7 @@ pub(crate) async fn start_server(
         idempotency_locks,
         create_progress: Default::default(),
         list_sessions_resolver_misses: std::sync::atomic::AtomicUsize::new(0),
+        session_cfg_store: Default::default(),
         smart_rename_inflight: std::sync::Mutex::new(std::collections::HashSet::new()),
         smart_rename_attempted: std::sync::Mutex::new(std::collections::HashSet::new()),
         smart_rename_semaphore: tokio::sync::Semaphore::new(
@@ -1349,6 +1363,18 @@ pub(crate) async fn start_server(
     }
 
     push::spawn_consumer(state.clone()).await;
+    push::spawn_login_required_consumer(state.clone(), login_notices).await;
+    {
+        let profile = state.served_profile().clone();
+        let scopes = login_helper_scopes(&state).await;
+        state
+            .runtime
+            .work
+            .spawn("server.sandbox_login_sweep", async move {
+                super::sandbox_login::log_login_status(profile).await;
+                super::sandbox_login::sweep_stale_login_helpers(scopes).await;
+            });
+    }
     callback::spawn_consumer(state.clone()).await;
 
     // Report this process's own session commits exactly; the disk consumer covers the rest.
