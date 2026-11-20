@@ -15,6 +15,8 @@ const HOST = "aoe-plugin-mcp.invalid";
 const TIMEOUT_MS = 610_000;
 const EXIT_GRACE_MS = 2_000;
 const META_VERSION = "io.modelcontextprotocol/protocolVersion";
+const VERSION_SHAPE = /^\d{4}-\d{2}-\d{2}$/;
+const METHOD_SHAPE = /^[A-Za-z0-9_./-]+$/;
 // From this revision on the server checks Mcp-Method and Mcp-Name against the body.
 const STANDARD_HEADERS = "2026-07-28";
 const NAME_PARAM = {
@@ -78,8 +80,14 @@ function headersFor(message, body) {
   if (typeof version !== "string") {
     return headers;
   }
+  if (!VERSION_SHAPE.test(version)) {
+    throw new Error("invalid protocol version");
+  }
   headers["mcp-protocol-version"] = version;
   if (version >= STANDARD_HEADERS && typeof message.method === "string") {
+    if (!METHOD_SHAPE.test(message.method)) {
+      throw new Error("invalid method");
+    }
     headers["mcp-method"] = message.method;
     const name = message.params?.[NAME_PARAM[message.method]];
     if (typeof name === "string") {
@@ -120,6 +128,13 @@ function settle() {
 }
 
 function forward(message, body) {
+  let headers;
+  try {
+    headers = headersFor(message, body);
+  } catch {
+    fail(message, -32600, "Invalid protocol version or method.");
+    return;
+  }
   pending += 1;
   let settled = false;
   const finish = () => {
@@ -132,7 +147,7 @@ function forward(message, body) {
     }
   };
   const request = http.request(
-    { socketPath, path: endpoint, method: "POST", headers: headersFor(message, body), timeout: TIMEOUT_MS },
+    { socketPath, path: endpoint, method: "POST", headers, timeout: TIMEOUT_MS },
     (response) => {
       const chunks = [];
       response.on("data", (chunk) => chunks.push(chunk));
