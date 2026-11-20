@@ -164,7 +164,9 @@ function lruInsert(sessionId: string, value: AcpState): void {
 
 export function cacheGet(sessionId: string): AcpState | undefined {
   const memory = stateCache.get(sessionId);
-  const value = memory ? reopenState(memory) : loadPersistedState(sessionId);
+  // An evicted session can still have unflushed state, newer than anything in storage.
+  const known = memory ?? pendingPersist.get(sessionId)?.state;
+  const value = known ? reopenState(known) : loadPersistedState(sessionId);
   if (value === undefined) return undefined;
   lruInsert(sessionId, value);
   // Wake subscribers that rendered before the cache was primed or saw a pre-reset entry; deferred so it never fires mid-render.
