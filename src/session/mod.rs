@@ -197,7 +197,7 @@ pub use config::profile_config::{
     save_profile_config, update_profile_config, validate_capability_format,
     validate_check_interval, validate_env_format, validate_memory_limit, validate_network_format,
     validate_port_mapping_format, validate_security_opt_format, validate_systemd_slice,
-    validate_volume_format, ProfileConfig,
+    validate_volume_format, validate_volume_ignore_format, ProfileConfig,
 };
 pub use config::repo_config::{
     check_repo_trust, execute_hooks, execute_hooks_in_container, load_repo_config,

@@ -1162,7 +1162,7 @@ done
             .await;
             assert!(matches!(
                 events.last(),
-                Some(Event::PromptRejected { reason, text }) if reason == "agent_busy" && text == "/new"
+                Some(Event::PromptRejected { reason, text, .. }) if reason == "agent_busy" && text == "/new"
             ));
             assert_eq!(requests(&capture, "session/new"), 1);
             let _ = client.shutdown().await;
@@ -1341,7 +1341,7 @@ done
             events_until(&mut client, |e| matches!(e, Event::PromptRejected { .. })).await;
         assert!(matches!(
             rejected.last(),
-            Some(Event::PromptRejected { reason, text }) if reason == "agent_busy" && text == "/new"
+            Some(Event::PromptRejected { reason, text, .. }) if reason == "agent_busy" && text == "/new"
         ));
         std::fs::write(tmp.path().join("capture.ndjson.prompt-release"), "release").unwrap();
         let rest = events_until(&mut client, |e| matches!(e, Event::Stopped { .. })).await;

@@ -304,6 +304,10 @@ pub(crate) struct TerminalHandoffIntent {
     pub(crate) launch_required: bool,
     pub(crate) launch_started: bool,
     pub(crate) launch: Option<TerminalHandoffLaunch>,
+    /// The owed launch was refused for the command's own session selector, so the switch ended
+    /// without a pane. Missing on rows from before the refusal, which never ended this way.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub(crate) selector_ended: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

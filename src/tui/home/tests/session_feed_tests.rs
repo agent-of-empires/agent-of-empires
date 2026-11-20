@@ -2674,8 +2674,7 @@ fn snooze_refusal_preserves_target_duration_and_requires_explicit_resubmit() {
         let bytes = payload_bytes("test");
         if mouse {
             let buffer = draw(110, 40, |frame, theme| {
-                env.view
-                    .render(frame, frame.area(), theme, None, None, None)
+                env.view.render(frame, frame.area(), theme, None)
             });
             let (column, row) = find(&buffer, "2 hours");
             assert!(env.view.handle_dialog_click(column, row));
@@ -2689,8 +2688,7 @@ fn snooze_refusal_preserves_target_duration_and_requires_explicit_resubmit() {
         assert!(env.view.snooze_duration_dialog.is_some());
         assert_eq!(payload_bytes("test"), bytes);
         let buffer = draw(110, 40, |frame, theme| {
-            env.view
-                .render(frame, frame.area(), theme, None, None, None)
+            env.view.render(frame, frame.area(), theme, None)
         });
         find(&buffer, "Snooze Not Changed");
         let (submitted, _) = respond(Err("held operation rejected".into())).unwrap();
@@ -2698,8 +2696,7 @@ fn snooze_refusal_preserves_target_duration_and_requires_explicit_resubmit() {
         env.view.apply_session_feed();
         env.view.select_session_by_id(&other);
         let buffer = draw(110, 40, |frame, theme| {
-            env.view
-                .render(frame, frame.area(), theme, None, None, None)
+            env.view.render(frame, frame.area(), theme, None)
         });
         find(&buffer, "Runtime change");
         if mouse {
@@ -2714,8 +2711,7 @@ fn snooze_refusal_preserves_target_duration_and_requires_explicit_resubmit() {
         );
         assert!(env.view.snooze_duration_dialog.is_some());
         let buffer = draw(110, 40, |frame, theme| {
-            env.view
-                .render(frame, frame.area(), theme, None, None, None)
+            env.view.render(frame, frame.area(), theme, None)
         });
         find(&buffer, "Snooze Not Changed");
         if mouse {
@@ -2834,8 +2830,7 @@ fn diff_keyboard_and_mouse_refusal_are_visible_dismissible_and_keep_comparison()
             .unwrap();
         if mouse {
             draw(120, 40, |frame, theme| {
-                env.view
-                    .render(frame, frame.area(), theme, None, None, None)
+                env.view.render(frame, frame.area(), theme, None)
             });
             let rect = env
                 .view
@@ -2870,8 +2865,7 @@ fn diff_keyboard_and_mouse_refusal_are_visible_dismissible_and_keep_comparison()
             .flat_map(|hunk| &hunk.lines)
             .any(|line| line.old_line_num.is_some() && line.content.trim() == "base"));
         let buffer = draw(120, 40, |frame, theme| {
-            env.view
-                .render(frame, frame.area(), theme, None, None, None)
+            env.view.render(frame, frame.area(), theme, None)
         });
         find(&buffer, "Diff Base Not Saved");
         env.view.handle_key(key(KeyCode::Enter), None);
@@ -2883,8 +2877,7 @@ fn diff_keyboard_and_mouse_refusal_are_visible_dismissible_and_keep_comparison()
             .warning_dialog
             .is_none());
         let buffer = draw(120, 40, |frame, theme| {
-            env.view
-                .render(frame, frame.area(), theme, None, None, None)
+            env.view.render(frame, frame.area(), theme, None)
         });
         find(&buffer, "[not saved]");
         assert_eq!(payload_bytes("test"), bytes);
@@ -3076,8 +3069,7 @@ fn diff_save_uses_its_own_receipt_and_surfaces_rejection_or_unknown_in_takeover(
         assert!(diff.base_save.is_none());
         assert_eq!(diff.base_unsaved, outcome != "saved");
         let buffer = draw(120, 40, |frame, theme| {
-            env.view
-                .render(frame, frame.area(), theme, None, None, None)
+            env.view.render(frame, frame.area(), theme, None)
         });
         if outcome != "saved" {
             find(&buffer, "Diff Base Not Saved");
@@ -3381,8 +3373,7 @@ fn projects_home_dispatch_reads_current_policy_for_keyboard_mouse_and_auto_add()
                         }
                     }
                     let before = draw(120, 42, |frame, theme| {
-                        env.view
-                            .render(frame, frame.area(), theme, None, None, None)
+                        env.view.render(frame, frame.area(), theme, None)
                     });
                     let gesture = find(&before, if remove { "d remove" } else { "Enter save" });
                     let registry = crate::session::get_app_dir().unwrap().join("projects.json");
@@ -3424,8 +3415,7 @@ fn projects_home_dispatch_reads_current_policy_for_keyboard_mouse_and_auto_add()
                     assert!(env.view.projects_dialog.is_some());
                     if policy != "disconnected" {
                         let buffer = draw(120, 42, |frame, theme| {
-                            env.view
-                                .render(frame, frame.area(), theme, None, None, None)
+                            env.view.render(frame, frame.area(), theme, None)
                         });
                         find(
                             &buffer,
@@ -3473,8 +3463,7 @@ fn retained_serve_takeover_owns_keyboard_and_mouse_without_consuming_other_draft
             &mut env.view.serve_jobs,
         ));
         let foreground = draw(120, 42, |frame, theme| {
-            env.view
-                .render(frame, frame.area(), theme, None, None, None)
+            env.view.render(frame, frame.area(), theme, None)
         });
         let close = find(&foreground, "[Esc] cancel");
         if mouse {
@@ -3573,8 +3562,6 @@ fn purge_dialog_rejects_stale_target_on_keyboard_and_mouse() {
                         frame,
                         frame.area(),
                         &crate::tui::styles::Theme::default(),
-                        None,
-                        None,
                         None,
                     );
                 })
