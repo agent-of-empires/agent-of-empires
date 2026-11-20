@@ -65,8 +65,9 @@ import { profileDefaults, type ProfileDefaults } from "./profileDefaults";
 import { useSandboxImageRowStatus } from "./useSandboxImageRowStatus";
 import { useLatestRef } from "../../hooks/useLatestRef";
 import { PULL_GATED_HINT, PULL_LATEST_HINT, pullLatestChecked, pullLatestOffer } from "./pullLatestImage";
+import { WaitForUpdateChoice } from "./WaitForUpdateChoice";
 import { CopyCommand } from "../SandboxImageBanner";
-import { notifySandboxImagePulled } from "../../lib/sandboxImageEvents";
+import { notifySandboxImagePulled, notifySandboxImagePullStarted } from "../../lib/sandboxImageEvents";
 
 // Validated against ACP_CAPABLE_TOOLS on read, since another install may have written it.
 const LAST_USED_TOOL_KEY = "aoe-acp-last-tool";
@@ -280,6 +281,8 @@ export function SessionWizard({
   const [rechecking, setRechecking] = useState(false);
   const viewGroupRef = useRef<HTMLDivElement>(null);
   const pullLatestRef = useRef<HTMLDivElement>(null);
+  // The create joined a running download, so its pull stage waits rather than pulls.
+  const [waitingForUpdate, setWaitingForUpdate] = useState(false);
   // The failure box grows the footer and shrinks the form above it; keep the pull box it blames in view.
   useEffect(() => {
     if (state.failure && failureFields(state.failure).includes("pullLatestImage"))
@@ -699,6 +702,7 @@ export function SessionWizard({
       // Recorded before the request goes out, so a reload mid-flight still has the key.
       if (pending) registerPendingCreate(pending, { claimed: true });
       const send = (retry: boolean) => createSession(pending && retry ? retryBody(pending) : body);
+      if (body.pull_latest_image) notifySandboxImagePullStarted();
       let result = await send(!!resume);
       for (let attempt = 0; result.network && pending && attempt < NETWORK_RETRIES; attempt++) {
         await waitUntilOnline();
@@ -809,6 +813,7 @@ export function SessionWizard({
       ),
       idempotency_key: newIdempotencyKey(),
     };
+    setWaitingForUpdate(!!body.pull_latest_image && !!pullOfferRef.current?.running);
     // A failed preview counts as nothing to confirm, so it never blocks creation.
     if (d.sandboxEnabled && !d.scratch && d.path) {
       const preview = await fetchVolumeIgnoresPreview(d.path, d.profile || undefined);
@@ -1212,7 +1217,16 @@ export function SessionWizard({
           />
         </FieldRow>
       </RowGroup>
-      {pullOffer && (
+      {pullOffer?.running && (
+        <div ref={pullLatestRef} className="mt-3">
+          <WaitForUpdateChoice
+            progress={pullOffer.running}
+            wait={pullLatestChecked(pullOffer, d.pullLatestImage)}
+            onChange={(wait) => handleChange("pullLatestImage", wait)}
+          />
+        </div>
+      )}
+      {pullOffer && !pullOffer.running && (
         <div ref={pullLatestRef} className="mt-3 flex flex-col gap-1" data-testid="wizard-pull-latest">
           <label className={`flex items-center gap-2 ${pullOffer.command ? "" : "cursor-pointer"}`}>
             <input
@@ -1284,7 +1298,7 @@ export function SessionWizard({
             </div>
           )}
           {creating ? (
-            <CreateProgressView progress={progress} />
+            <CreateProgressView progress={progress} waitingForUpdate={waitingForUpdate} />
           ) : panel ? (
             <>
               <PanelHeader title={PANEL_TITLE[panel]} onBack={() => setPanel(null)} />

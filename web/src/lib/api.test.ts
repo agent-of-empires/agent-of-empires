@@ -695,6 +695,20 @@ const requestCases: RequestCase[] = [
     () => api.pullSandboxImage(),
     { respond: json({ message: "pulls are off" }, 403), result: { ok: false, message: "pulls are off" } },
   ],
+  // The cancel's reply carries the pull's new state, so the banner shows the outcome without waiting for a poll.
+  [
+    "POST /api/sandbox/image-pull/cancel",
+    () => api.cancelSandboxImagePull(),
+    {
+      respond: json({ image: "sb:1", pull: { state: "cancelled" } }),
+      result: { ok: true, pull: { state: "cancelled" } },
+    },
+  ],
+  [
+    "POST /api/sandbox/image-pull/cancel",
+    () => api.cancelSandboxImagePull(),
+    { respond: json({ message: "pulls are off" }, 403), result: { ok: false, message: "pulls are off" } },
+  ],
   [
     "POST /api/sandbox/image-dismiss",
     () => api.dismissSandboxImage("sha256:new"),
@@ -811,6 +825,7 @@ const failureCases: [string, () => Promise<unknown>, unknown][] = [
   ["fetchProfileAgents", () => api.fetchProfileAgents("work"), null],
   ["pullSandboxImage", () => api.pullSandboxImage(), { ok: false }],
   ["dismissSandboxImage", () => api.dismissSandboxImage("sha256:new"), false],
+  ["cancelSandboxImagePull", () => api.cancelSandboxImagePull(), { ok: false }],
 ];
 
 describe("failure fallbacks", () => {

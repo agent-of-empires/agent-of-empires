@@ -711,7 +711,7 @@ test.describe("Sandbox row", () => {
         const asked: string[] = [];
         await page.route("**/api/sandbox/image-status**", (r) => {
           asked.push(new URL(r.request().url()).search);
-          return r.fulfill({ json: { image, ...reply } });
+          return r.fulfill({ json: { image, pull: { state: "idle" }, ...reply } });
         });
         await startWizard(page, {
           docker: true,
@@ -758,6 +758,7 @@ test.describe("Sandbox row", () => {
             dismissed: false,
             pull_blocked: null,
             pull_command: `docker pull ${image}`,
+            pull: { state: "idle" },
           },
         }),
       );
@@ -825,7 +826,7 @@ test.describe("Sandbox row", () => {
     }) => {
       const image = "ghcr.io/example-org/a-long-sandbox-image-name-for-narrow-screens:2026.11.12";
       await page.route("**/api/sandbox/image-status**", (r) =>
-        r.fulfill({ json: { image, state: "check_failed", error: "registry unreachable" } }),
+        r.fulfill({ json: { image, state: "check_failed", error: "registry unreachable", pull: { state: "idle" } } }),
       );
       await page.route("**/api/sandbox/volume-ignores-preview**", (r) =>
         r.fulfill({ json: { acknowledged: true, globs: [] } }),

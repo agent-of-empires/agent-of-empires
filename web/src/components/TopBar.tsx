@@ -4,6 +4,7 @@ import { PaletteTriggerPill } from "./PaletteTriggerPill";
 import { OverflowMenu, type OverflowItem } from "./OverflowMenu";
 import { TOUR_ANCHORS, tourAnchor } from "../lib/tourSteps";
 import { PluginHeaderStartSegments, PluginStatusBarSegments } from "./plugin/PluginSlots";
+import { SandboxPullChip } from "./SandboxPullChip";
 import { PluginPageButtons } from "./plugin/PluginPageButtons";
 import { ActivityBar } from "./ActivityBar";
 import type { PaneDisplay } from "./Dock";
@@ -217,6 +218,7 @@ export function TopBar({
           rightColumnVisible ? "md:w-[var(--aoe-right-panel-width)] md:border-b-0 md:border-l" : ""
         }`}
       >
+        <SandboxPullChip />
         <PluginStatusBarSegments />
         {isDevBuild && (
           <span

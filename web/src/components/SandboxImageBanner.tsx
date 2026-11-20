@@ -1,9 +1,11 @@
 import { useId, useRef, useState, type ReactNode } from "react";
-import type { SandboxImageBannerView } from "../hooks/useSandboxImageBanner";
+import { layerCount, type SandboxImageBannerView } from "../hooks/useSandboxImageBanner";
 import { writeClipboard } from "../lib/clipboard";
 
-const WHY =
-  "Sandboxed sessions run in a container image that AoE doesn't update automatically. Newer AoE versions can need a newer image; without it, Structured view sessions stop with an adapter error.";
+const WHY = [
+  "Sandboxed Sessions run in the current image. Newer AoE versions may need this update, or Structured view stops with an adapter error.",
+  "Existing Sessions keep their image. To move one over after an update, use Recreate container in its menu.",
+];
 
 // Text stays at text contrast on every tint in every built-in theme (text-primary at least 5.99:1,
 // text-subtle 4.84:1). A status hue on its own tint falls short (status-running is 2.68:1 and
@@ -21,52 +23,74 @@ export function SandboxImageBanner({ view }: { view: SandboxImageBannerView }) {
   switch (view.kind) {
     case "available":
       return (
-        <Bar tone="brand" label="Sandbox image update available" onDismiss={view.onDismiss}>
-          <span>Sandbox image update available</span>
+        <Bar tone="brand" status="Sandbox image update available" onDismiss={view.onDismiss}>
           <Image name={view.image} />
           <button type="button" onClick={view.onUpdate} className={linkButton}>
             Update now
           </button>
-          <Disclosure label="Why?">{WHY}</Disclosure>
+          <Disclosure label="Why?">
+            <span className="block">{WHY[0]}</span>
+            <span className="mt-3 block">{WHY[1]}</span>
+          </Disclosure>
         </Bar>
       );
     case "gated":
       return (
-        <Bar tone="brand" label="Sandbox image update available" onDismiss={view.onDismiss}>
-          <span>Sandbox image update available. Run on the Daemon&apos;s machine:</span>
+        <Bar
+          tone="brand"
+          status="Sandbox image update available. Run on the Daemon's machine:"
+          onDismiss={view.onDismiss}
+        >
           <CopyCommand command={view.command} />
         </Bar>
       );
-    case "updating":
+    case "updating": {
+      const { progress } = view;
       return (
-        <Bar tone="brand" label="Downloading sandbox image">
-          <svg className="animate-spin h-3.5 w-3.5 shrink-0" viewBox="0 0 24 24" aria-hidden="true">
-            <circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4" fill="none" />
-            <path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8v4a4 4 0 00-4 4H4z" />
-          </svg>
-          <span>Downloading sandbox image…</span>
-          <span className="text-text-subtle">· sessions keep running</span>
+        <Bar
+          tone="brand"
+          lead={<Spinner />}
+          status={progress.phase === "unpacking" ? "Unpacking sandbox image…" : "Downloading sandbox image…"}
+          onDismiss={view.onHide}
+          dismissLabel="Hide sandbox image notice"
+          fraction={progress.known ? (progress.done ?? 0) / progress.known : undefined}
+        >
+          {layerCount(progress) && <span aria-hidden="true">{layerCount(progress)}</span>}
+          <span className="text-text-subtle">· Sessions keep running</span>
+          {view.onCancel && (
+            <button
+              type="button"
+              onClick={view.onCancel}
+              disabled={view.cancelling}
+              className={`${linkButton} disabled:opacity-50 disabled:cursor-default`}
+            >
+              Cancel
+            </button>
+          )}
         </Bar>
       );
+    }
     case "done":
+      return <Bar tone="done" status="Sandbox image updated. Applies to new Sessions." onDismiss={view.onDismiss} />;
+    case "cancelled":
       return (
-        <Bar tone="done" label="Sandbox image updated" onDismiss={view.onDismiss}>
-          <span>Sandbox image updated. New sessions use it; running sessions keep the image they started with.</span>
+        <Bar tone="brand" status="Update cancelled. Sessions keep the current image." onDismiss={view.onDismiss}>
+          <button type="button" onClick={view.onUpdate} className={linkButton}>
+            Update now
+          </button>
         </Bar>
       );
     case "config_unreadable":
       return (
-        <Bar tone="failed" label="AoE can't read its configuration" onDismiss={view.onDismiss}>
-          <span>
-            AoE can&apos;t read its configuration (config.toml or state.toml), so sandbox image updates aren&apos;t
-            checked. Fix the file, then reload.
-          </span>
-        </Bar>
+        <Bar
+          tone="failed"
+          status="AoE can't read its configuration (config.toml or state.toml), so sandbox image updates aren't checked. Fix the file, then reload."
+          onDismiss={view.onDismiss}
+        />
       );
     case "failed":
       return (
-        <Bar tone="failed" label="Couldn't download the sandbox image" onDismiss={view.onDismiss}>
-          <span>Couldn&apos;t download the sandbox image</span>
+        <Bar tone="failed" status={view.message} onDismiss={view.onDismiss}>
           <button type="button" onClick={view.onRetry} className={linkButton}>
             Retry
           </button>
@@ -78,38 +102,65 @@ export function SandboxImageBanner({ view }: { view: SandboxImageBannerView }) {
   }
 }
 
+/** `status` is the only live part, so a changing count beside it isn't announced; `fraction` draws the
+ *  progress bar on the bottom edge, which the text duplicates. */
 function Bar({
   tone,
-  label,
+  lead,
+  status,
   onDismiss,
+  dismissLabel = "Dismiss sandbox image notice",
+  fraction,
   children,
 }: {
   tone: keyof typeof TONES;
-  label: string;
+  lead?: ReactNode;
+  status: string;
   onDismiss?: () => void;
-  children: ReactNode;
+  dismissLabel?: string;
+  fraction?: number;
+  children?: ReactNode;
 }) {
   const { bar, dot } = TONES[tone];
   return (
     <div
-      role="status"
-      aria-label={label}
+      data-testid="sandbox-image-banner"
       className={`relative border-b px-4 py-2 flex flex-wrap items-center justify-center gap-x-3 gap-y-1 text-xs font-mono animate-fade-in ${onDismiss ? "pr-10 sm:pr-4" : ""} ${bar}`}
     >
       {/* On a phone the line wraps, and a lone dot or close button would take a row of its own. */}
       <span className={`hidden sm:block w-1.5 h-1.5 rounded-full shrink-0 ${dot}`} />
+      {lead}
+      <span role="status">{status}</span>
       {children}
+      {fraction !== undefined && (
+        <span
+          aria-hidden="true"
+          data-testid="sandbox-image-progress"
+          className="absolute left-0 bottom-0 h-0.5 bg-brand-500"
+          style={{ width: `${Math.min(1, Math.max(0, fraction)) * 100}%` }}
+        />
+      )}
       {onDismiss && (
         <button
           type="button"
           onClick={onDismiss}
-          aria-label="Dismiss sandbox image notice"
+          aria-label={dismissLabel}
           className="absolute right-2 top-1 sm:static sm:ml-2 min-h-8 text-text-subtle hover:text-text-primary cursor-pointer text-base leading-none px-1"
         >
           &times;
         </button>
       )}
     </div>
+  );
+}
+
+/** Still while the user prefers reduced motion; the text carries the progress. */
+export function Spinner({ size = "h-3.5 w-3.5" }: { size?: string }) {
+  return (
+    <svg className={`animate-spin motion-reduce:animate-none ${size} shrink-0`} viewBox="0 0 24 24" aria-hidden="true">
+      <circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4" fill="none" />
+      <path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8v4a4 4 0 00-4 4H4z" />
+    </svg>
   );
 }
 

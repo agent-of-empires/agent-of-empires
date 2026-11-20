@@ -25,7 +25,7 @@ import { toastBus } from "../../../lib/toastBus";
 import { useAgentDisplayNames } from "../../../lib/agentDisplayName";
 import { startPendingCreates } from "../../../lib/pendingCreates";
 import type { AgentInfo, DockerStatusResponse } from "../../../lib/types";
-import { SANDBOX_IMAGE_PULLED_EVENT } from "../../../lib/sandboxImageEvents";
+import { SANDBOX_IMAGE_PULLED_EVENT, SANDBOX_IMAGE_PULL_STARTED_EVENT } from "../../../lib/sandboxImageEvents";
 
 const createSession = vi.fn();
 const reviewCreationTrust = vi.fn();
@@ -1578,6 +1578,7 @@ describe("SessionWizard Sandbox image status", () => {
       image: "ghcr.io/x/sb:1",
       state: "available",
       remote_digest: "sha256:b",
+      pull: { state: "idle" },
     } as never);
     renderWizard();
     const row = screen.getByTestId("wizard-sandbox-row");
@@ -1599,6 +1600,7 @@ describe("SessionWizard Pull latest image first", () => {
     dismissed: false,
     pull_blocked: null,
     pull_command: `docker pull ${IMAGE}`,
+    pull: { state: "idle" },
   };
   afterEach(() => {
     vi.mocked(fetchDockerStatus)
@@ -1640,6 +1642,60 @@ describe("SessionWizard Pull latest image first", () => {
     expect(payload(0).pull_latest_image).toBe(checked || undefined);
     // Only a create that pulled tells the update banner to ask again.
     await waitFor(() => expect(pulled).toHaveBeenCalledTimes(checked ? 1 : 0));
+  });
+
+  describe("while the image downloads", () => {
+    const RUNNING = {
+      ...UPDATE,
+      state: "current",
+      pull: { state: "running", phase: "downloading", layers_done: 3, layers_known: 7 },
+    };
+    const choice = (name: string) => screen.findByRole("radio", { name: new RegExp(`^${name}`) });
+
+    it("offers Wait, by default, and Launch joins the download and says it waits", async () => {
+      const started = vi.fn();
+      window.addEventListener(SANDBOX_IMAGE_PULL_STARTED_EVENT, started);
+      onTestFinished(() => window.removeEventListener(SANDBOX_IMAGE_PULL_STARTED_EVENT, started));
+      let resolve!: (v: unknown) => void;
+      createSession.mockReturnValueOnce(new Promise((r) => (resolve = r)));
+      vi.mocked(fetchCreateProgress).mockResolvedValue({ stage: "pulling_image", hook: null, output: [] });
+      onTestFinished(() => {
+        resolve({ ok: true, session: { id: "s1" } });
+        vi.mocked(fetchCreateProgress).mockResolvedValue(null);
+      });
+      open(RUNNING);
+      const group = await screen.findByRole("radiogroup", { name: "Sandbox image" });
+      expect(group.textContent).toContain(
+        "An update is downloading (3 of 7 layers). This Session starts on the new image when it finishes.",
+      );
+      expect(((await choice("Wait for the update")) as HTMLInputElement).checked).toBe(true);
+      expect(screen.queryByRole("checkbox", { name: "Pull latest image first" })).toBeNull();
+      await launch();
+      await waitFor(() => expect(createSession).toHaveBeenCalledOnce());
+      expect(payload(0).pull_latest_image).toBe(true);
+      expect(started).toHaveBeenCalledOnce();
+      await screen.findByText("Waiting for the sandbox image update…", undefined, { timeout: 3000 });
+    });
+
+    it("Start now launches on the current image without joining", async () => {
+      const started = vi.fn();
+      window.addEventListener(SANDBOX_IMAGE_PULL_STARTED_EVENT, started);
+      onTestFinished(() => window.removeEventListener(SANDBOX_IMAGE_PULL_STARTED_EVENT, started));
+      open(RUNNING);
+      fireEvent.click(await choice("Start now on the current image"));
+      await launch();
+      await waitFor(() => expect(createSession).toHaveBeenCalledOnce());
+      expect(payload(0).pull_latest_image).toBeUndefined();
+      expect(started).not.toHaveBeenCalled();
+    });
+  });
+
+  it("shows no image option at all when the image is current and nothing downloads", async () => {
+    open({ ...UPDATE, state: "current" });
+    const row = screen.getByTestId("wizard-sandbox-row");
+    await waitFor(() => expect(row.textContent).toContain(IMAGE));
+    expect(screen.queryByTestId("wizard-pull-latest")).toBeNull();
+    expect(screen.queryByTestId("wizard-wait-for-update")).toBeNull();
   });
 
   it("unchecking it launches with the current image", async () => {

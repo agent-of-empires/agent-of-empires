@@ -34,13 +34,13 @@ describe("CreateProgressView", () => {
   });
 });
 
-it.each<[CreateProgress["stage"], boolean]>([
-  ["pulling_image", true],
-  ["running_hooks", false],
-])("at %s, says a slow download is expected: %s", (stage, hint) => {
-  render(<CreateProgressView progress={{ stage, hook: null, output: [] }} />);
-  expect(screen.getByTestId("create-progress").textContent?.includes("Pulling latest image")).toBe(
-    stage === "pulling_image",
-  );
+// (stage, joined a running download, label, slow-download hint)
+it.each<[CreateProgress["stage"], boolean, string, boolean]>([
+  ["pulling_image", false, "Pulling latest image...", true],
+  ["pulling_image", true, "Waiting for the sandbox image update…", true],
+  ["running_hooks", true, "Running on_create hooks...", false],
+])("at %s, joined: %s, reads %s", (stage, waitingForUpdate, label, hint) => {
+  render(<CreateProgressView progress={{ stage, hook: null, output: [] }} waitingForUpdate={waitingForUpdate} />);
+  expect(screen.getByText(label)).toBeTruthy();
   expect(screen.queryByText("A large image can take a few minutes to download.") !== null).toBe(hint);
 });

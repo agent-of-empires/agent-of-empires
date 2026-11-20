@@ -205,6 +205,7 @@ import { useTips, shouldAutoPopTips } from "./hooks/useTips";
 import { CommandPalette } from "./components/command-palette/CommandPalette";
 import { useConversationSearch } from "./hooks/useConversationSearch";
 import { BannerStack } from "./components/BannerStack";
+import { SandboxImageProvider } from "./components/SandboxImageProvider";
 import { ElevationPrompt } from "./components/ElevationPrompt";
 
 // Pre-#1832 per-browser tour-seen flag. Read once on load to migrate users who
@@ -2700,44 +2701,46 @@ function AppContent({
         available={!error}
       >
         <div className="h-(--app-height) flex flex-col bg-surface-900 text-text-primary overflow-hidden safe-area-inset">
-          {/* Wrapped unconditionally, not behind the `headerCollapsible`
+          <SandboxImageProvider>
+            {/* Wrapped unconditionally, not behind the `headerCollapsible`
             ternary: swapping the element type at this position would remount
             `TopBar` (and reset its overflow menu) every time the boundary
             flips, e.g. opening settings on a phone. An expanded region is a
             `1fr` grid row around a fixed-height bar, so the wrapper is inert
             for every view that cannot collapse. */}
-          <CollapsibleRegion id="conversation-header" collapsed={headerCollapsible && headerCollapsed}>
-            <TopBar
-              activeWorkspace={activeWorkspace}
-              activeSession={activeSession ?? null}
-              onToggleSidebar={handleToggleSidebar}
-              onOpenPalette={() => setShowPalette(true)}
-              onToggleDiff={toggleDiff}
-              paneIds={allPaneIds}
-              paneDescriptor={paneDescriptor}
-              isPaneOpen={isPaneOpen}
-              onTogglePane={togglePaneAny}
-              onOpenHelp={handleOpenHelp}
-              onOpenAbout={handleOpenAbout}
-              onStartTutorial={tour.startTour}
-              unreadCount={unreadCount}
-              waitingCount={waitingCount}
-              attentionBadgeColors={attentionBadgeColors}
-              onLogout={onLogout}
-              loginRequired={loginRequired}
-              isOffline={!!error}
-              isDevBuild={isDebugBuild(serverAbout)}
-              onOpenTips={tips.open}
-              onGoDashboard={handleGoDashboard}
-              onExitFocusMode={focusMode ? exitFocusMode : undefined}
-              sidebarColumnVisible={!focusMode && !fullPageView && sidebarOpen}
-              rightColumnVisible={
-                isMdUp && !fullPageView && !!activeWorkspace && !!activeSession && !rightDockCollapsed
-              }
-            />
-          </CollapsibleRegion>
+            <CollapsibleRegion id="conversation-header" collapsed={headerCollapsible && headerCollapsed}>
+              <TopBar
+                activeWorkspace={activeWorkspace}
+                activeSession={activeSession ?? null}
+                onToggleSidebar={handleToggleSidebar}
+                onOpenPalette={() => setShowPalette(true)}
+                onToggleDiff={toggleDiff}
+                paneIds={allPaneIds}
+                paneDescriptor={paneDescriptor}
+                isPaneOpen={isPaneOpen}
+                onTogglePane={togglePaneAny}
+                onOpenHelp={handleOpenHelp}
+                onOpenAbout={handleOpenAbout}
+                onStartTutorial={tour.startTour}
+                unreadCount={unreadCount}
+                waitingCount={waitingCount}
+                attentionBadgeColors={attentionBadgeColors}
+                onLogout={onLogout}
+                loginRequired={loginRequired}
+                isOffline={!!error}
+                isDevBuild={isDebugBuild(serverAbout)}
+                onOpenTips={tips.open}
+                onGoDashboard={handleGoDashboard}
+                onExitFocusMode={focusMode ? exitFocusMode : undefined}
+                sidebarColumnVisible={!focusMode && !fullPageView && sidebarOpen}
+                rightColumnVisible={
+                  isMdUp && !fullPageView && !!activeWorkspace && !!activeSession && !rightDockCollapsed
+                }
+              />
+            </CollapsibleRegion>
 
-          <BannerStack onRetryServerSettings={serverAbout ? undefined : () => void recoverServerAbout()} />
+            <BannerStack onRetryServerSettings={serverAbout ? undefined : () => void recoverServerAbout()} />
+          </SandboxImageProvider>
           {focusMode && focusSession.title !== null && !focusSession.gone && (
             <FocusModeNote title={focusSession.title} />
           )}
