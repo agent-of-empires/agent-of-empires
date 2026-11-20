@@ -620,9 +620,6 @@ jobs:
           node-version: '22'
           cache: npm
           cache-dependency-path: web/package-lock.json
-      - name: Install web deps
-        working-directory: web
-        run: npm ci
       - uses: ./.github/actions/rust-toolchain
       - uses: ./.github/actions/kache
         with:
