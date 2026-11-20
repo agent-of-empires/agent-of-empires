@@ -164,6 +164,9 @@ pub struct App {
     /// The row whose in-flight mount just took the screen for Enter: the run
     /// loop delivers paste buffered for it once the poll returns.
     structured_paste_drain: Option<String>,
+    /// Enter pressed while that mount connected: the draft it restores is
+    /// submitted once the landed view has it.
+    structured_submit_pending: Option<String>,
     /// Cleared on failure so the user can retry.
     pending_install_version: Option<String>,
     /// The running binary keeps its old version until restart, so this stops
@@ -367,6 +370,7 @@ impl App {
             structured_mount_failed: None,
             structured_mount_activate: None,
             structured_paste_drain: None,
+            structured_submit_pending: None,
             pending_view_switch: None,
             pending_smart_rename: None,
             dashboard_launch: None,
@@ -831,26 +835,7 @@ impl App {
                                             "paste-burst: routed {} chars via handle_paste (chars={:?})",
                                             paste_text.len(), paste_text
                                         );
-                                        // Only an ACTIVE structured view owns text input.
-                                        if let Some(view) = self
-                                            .home
-                                            .structured_preview
-                                            .as_mut()
-                                            .filter(|v| v.is_active())
-                                        {
-                                            if let Err(e) = view
-                                                .handle_event(Event::Paste(paste_text.clone()))
-                                                .await
-                                            {
-                                                self.close_embedded_structured();
-                                                self.update_status =
-                                                    Some(UpdateStatus::transient(format!(
-                                                        "structured view: {e}"
-                                                    )));
-                                            }
-                                        } else {
-                                            self.home.handle_paste(&paste_text);
-                                        }
+                                        self.route_pasted_text(&paste_text).await;
                                     }
                                     if let Some(enter) = trailing_enter {
                                         if !self.should_quit {
@@ -867,7 +852,7 @@ impl App {
                                     if let Some(evt) = deferred {
                                         match evt {
                                             Event::Key(k) => { self.handle_key(k, terminal).await?; }
-                                            Event::Paste(text) => { self.home.handle_paste(&text); }
+                                            Event::Paste(text) => { self.route_pasted_text(&text).await; }
                                             Event::Resize(_, _) => { terminal.autoresize()?; self.needs_redraw = true; }
                                             Event::Mouse(mouse) => {
                                                 let hit_list = self.home.hit_list(mouse.column, mouse.row);
@@ -1213,34 +1198,7 @@ impl App {
                         }
                         Some(Ok(Event::Paste(text))) => {
                             crate::session::write_tui_activity();
-                            // Only an ACTIVE structured view owns pasted text.
-                            if let Some(view) = self
-                                .home
-                                .structured_preview
-                                .as_mut()
-                                .filter(|v| v.is_active())
-                            {
-                                if let Err(e) = view.handle_event(Event::Paste(text)).await {
-                                    self.close_embedded_structured();
-                                    self.update_status = Some(UpdateStatus::transient(format!(
-                                        "structured view: {e}"
-                                    )));
-                                }
-                                self.draw(terminal)?;
-                                continue;
-                            }
-                            // Enter returned while its mount connects: the paste
-                            // belongs to that row's composer, not Home.
-                            if let Some(target) = self.structured_mount_activate.clone() {
-                                self.home
-                                    .pending_paste_for_structured_view
-                                    .entry(target)
-                                    .or_default()
-                                    .push_str(&text);
-                                self.draw(terminal)?;
-                                continue;
-                            }
-                            self.home.handle_paste(&text);
+                            self.route_pasted_text(&text).await;
 
                             self.draw(terminal)?;
 
@@ -2524,6 +2482,33 @@ impl App {
         }
     }
 
+    /// Where pasted text goes: the active view, else the row Enter is still
+    /// connecting, else Home. Every paste path (bracketed paste and a Mosh-stripped
+    /// burst replayed as keys) routes through here.
+    async fn route_pasted_text(&mut self, text: &str) {
+        if let Some(view) = self
+            .home
+            .structured_preview
+            .as_mut()
+            .filter(|v| v.is_active())
+        {
+            if let Err(e) = view.handle_event(Event::Paste(text.to_owned())).await {
+                self.close_embedded_structured();
+                self.update_status = Some(UpdateStatus::transient(format!("structured view: {e}")));
+            }
+            return;
+        }
+        if let Some(target) = self.structured_mount_activate.clone() {
+            self.home
+                .pending_paste_for_structured_view
+                .entry(target)
+                .or_default()
+                .push_str(text);
+            return;
+        }
+        self.home.handle_paste(text);
+    }
+
     /// Hold keys typed while the mount Enter asked for is still connecting, so
     /// they reach that row's composer instead of Home's shortcuts. Returns true
     /// when the key was consumed.
@@ -2531,16 +2516,20 @@ impl App {
         let Some(target) = self.structured_mount_activate.clone() else {
             return false;
         };
-        let buf = self
-            .home
-            .pending_paste_for_structured_view
-            .entry(target)
-            .or_default();
         match (key.code, key.modifiers) {
-            (KeyCode::Char(c), KeyModifiers::NONE | KeyModifiers::SHIFT) => buf.push(c),
-            (KeyCode::Enter, KeyModifiers::NONE) => buf.push('\n'),
+            (KeyCode::Char(c), KeyModifiers::NONE | KeyModifiers::SHIFT) => {
+                self.home
+                    .pending_paste_for_structured_view
+                    .entry(target)
+                    .or_default()
+                    .push(c);
+            }
+            // Enter is a submit, not text: keep it out of the draft.
+            (KeyCode::Enter, KeyModifiers::NONE) => self.structured_submit_pending = Some(target),
             (KeyCode::Backspace, KeyModifiers::NONE) => {
-                buf.pop();
+                if let Some(buf) = self.home.pending_paste_for_structured_view.get_mut(&target) {
+                    buf.pop();
+                }
             }
             _ => {}
         }
@@ -2557,6 +2546,7 @@ impl App {
 
     /// Consume the requested session's draft only if that session mounted.
     async fn drain_pending_paste_for_structured_view(&mut self, session_id: &str) {
+        let submit = self.structured_submit_pending.as_deref() == Some(session_id);
         let Some(view) = self
             .home
             .structured_preview
@@ -2565,12 +2555,26 @@ impl App {
         else {
             return;
         };
-        if let Some(buf) = self
+        self.structured_submit_pending = None;
+        let Some(buf) = self
             .home
             .pending_paste_for_structured_view
             .remove(session_id)
-        {
-            view.paste_text_with_file_load(&buf).await;
+        else {
+            return;
+        };
+        view.paste_text_with_file_load(&buf).await;
+        if submit && !buf.is_empty() {
+            if let Err(e) = view
+                .handle_event(Event::Key(KeyEvent::new(
+                    KeyCode::Enter,
+                    KeyModifiers::NONE,
+                )))
+                .await
+            {
+                self.close_embedded_structured();
+                self.update_status = Some(UpdateStatus::transient(format!("structured view: {e}")));
+            }
         }
     }
 
@@ -2682,6 +2686,7 @@ impl App {
             Ok(_) => true,
             Err(e) => {
                 self.structured_mount_activate = None;
+                self.structured_submit_pending = None;
                 if wanted {
                     self.structured_mount_failed = Some(target);
                     self.set_status(e);
@@ -2718,6 +2723,7 @@ impl App {
         {
             self.structured_mount = None;
             self.structured_mount_activate = None;
+            self.structured_submit_pending = None;
         }
         // A failure is remembered only for the row it belongs to, so the early
         // returns below cannot strand it on a row the user has come back to.
@@ -2775,6 +2781,7 @@ impl App {
             self.clear_preview_mount_pending();
             self.structured_mount = None;
             self.structured_mount_activate = None;
+            self.structured_submit_pending = None;
             self.structured_mount_failed = None;
             return self.home.structured_preview.take().is_some();
         }
@@ -3919,7 +3926,58 @@ mod tests {
                 .await
                 .unwrap();
         }
+        app.handle_key(
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+            &mut terminal,
+        )
+        .await
+        .unwrap();
         assert!(!app.should_quit, "`q` must be composer text, not Quit");
+
+        assert!(tx.send(Ok(EmbeddedView::for_test(&id))).is_ok());
+        assert!(app.poll_structured_mount());
+        app.drain_structured_paste().await;
+
+        let view = app
+            .home
+            .structured_preview
+            .as_ref()
+            .expect("the mount Enter asked for is on screen");
+        assert_eq!(
+            view.composer_text(),
+            "quit",
+            "the keys reach the view Enter opened, and Enter is not kept as a newline"
+        );
+        assert!(
+            view.toast_text().is_some(),
+            "the Enter submits the draft it restores instead of leaving it unsent"
+        );
+    }
+
+    /// A paste burst is replayed through the same owner check as a bracketed
+    /// paste: while a mount connects, neither may fall through to Home.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn a_paste_burst_while_enter_connects_stays_with_the_requested_row() {
+        use crate::tui::structured_view::embedded::EmbeddedView;
+        let (mut app, _guard, id) = app_on_a_structured_row();
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        app.structured_mount = Some((id.clone(), rx));
+
+        app.open_structured_view(&id).await.unwrap();
+        app.route_pasted_text("pasted while connecting").await;
+
+        assert!(
+            app.home.pending_paste.is_none(),
+            "a burst must not fall through to Home's paste target"
+        );
+        assert_eq!(
+            app.home
+                .pending_paste_for_structured_view
+                .get(&id)
+                .map(String::as_str),
+            Some("pasted while connecting")
+        );
 
         assert!(tx.send(Ok(EmbeddedView::for_test(&id))).is_ok());
         assert!(app.poll_structured_mount());
@@ -3930,8 +3988,8 @@ mod tests {
                 .structured_preview
                 .as_ref()
                 .map(|view| view.composer_text()),
-            Some("quit".to_owned()),
-            "keys typed while connecting reach the view Enter opened"
+            Some("pasted while connecting".to_owned()),
+            "the burst reaches the view Enter opened"
         );
     }
 
