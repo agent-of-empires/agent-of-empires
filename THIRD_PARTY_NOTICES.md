@@ -21,3 +21,16 @@ writer outright. The version here wraps ratatui's `CrosstermBackend` and
 resolves a cell's target through a side map keyed by position, because aoe's
 grid comes from `vt100`, which does not model hyperlinks per cell. The
 surrounding backend, the map, and the tests are original.
+
+## Crossterm
+
+- Project: <https://github.com/crossterm-rs/crossterm>
+- Version: 0.29.0, vendored in `vendor/crossterm`
+- License: MIT, full copyright and permission notice in
+  [`licenses/crossterm-MIT.txt`](licenses/crossterm-MIT.txt)
+
+The Unix Mio consumer retains fetched control events across early returns and
+refreshes TTY readiness before polling again instead of reading a saved hint.
+The upstream parser and other backends are unchanged. Maintenance, archive
+identity, and release checks are documented in
+[`docs/development/releases.md`](docs/development/releases.md#vendored-terminal-dependency).

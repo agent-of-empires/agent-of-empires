@@ -4441,25 +4441,74 @@ exit 0
         h.wait_for("Press Enter for a new passphrase.");
         h.send_keys_unfenced("Enter");
         if replacement_succeeds {
-            let (successor, running) =
-                wait_until(Duration::from_secs(30), Duration::from_millis(50), || {
-                    let successor = daemon_pid(&h).ok_or("replacement PID not published")?;
-                    let running = std::fs::read_to_string(app.join("serve.passphrase"))
-                        .map_err(|error| error.to_string())?;
-                    if successor != predecessor
-                        && pid_alive(successor as i32)
-                        && !running.trim().is_empty()
-                        && running != original
-                    {
-                        let (port, token) = loopback_serve_endpoint(&h)?;
-                        if !login_status_required(port, &token)? {
-                            return Err("successor passphrase gate is not ready".to_owned());
+            let mut observations = std::collections::VecDeque::with_capacity(16);
+            let mut seen_successor = None;
+            let (successor, running) = wait_until(
+                Duration::from_secs(30),
+                Duration::from_millis(50),
+                || {
+                    let mut current_pid = None;
+                    let mut stage = "pid_read";
+                    let result = (|| {
+                        let raw =
+                            std::fs::read_to_string(daemon_pid_path(&h)).map_err(|error| {
+                                format!(
+                                    "PID read: {:?}, OS {:?}",
+                                    error.kind(),
+                                    error.raw_os_error()
+                                )
+                            })?;
+                        stage = "pid_parse";
+                        let successor = raw
+                            .trim()
+                            .parse::<u32>()
+                            .map_err(|_| "PID is not an integer".to_owned())?;
+                        current_pid = Some(successor);
+                        if successor != predecessor {
+                            seen_successor = Some(successor);
                         }
-                        Ok((successor, running))
-                    } else {
-                        Err("replacement has not published its credential".to_owned())
-                    }
-                });
+                        stage = "credential_read";
+                        let running = std::fs::read_to_string(app.join("serve.passphrase"))
+                            .map_err(|error| format!("credential read: {:?}", error.kind()))?;
+                        stage = "replacement_predicates";
+                        if successor != predecessor
+                            && pid_alive(successor as i32)
+                            && !running.trim().is_empty()
+                            && running != original
+                        {
+                            stage = "endpoint_lookup";
+                            let (port, token) = loopback_serve_endpoint(&h)
+                                .map_err(|_| "successor endpoint unavailable".to_owned())?;
+                            stage = "login_status";
+                            if !login_status_required(port, &token)
+                                .map_err(|_| "successor login status unavailable".to_owned())?
+                            {
+                                return Err("successor passphrase gate is not ready".to_owned());
+                            }
+                            Ok((successor, running))
+                        } else {
+                            Err("replacement has not published its credential".to_owned())
+                        }
+                    })();
+                    result.map_err(|error| {
+                        let observation = (
+                            stage,
+                            current_pid,
+                            seen_successor,
+                            pid_alive(predecessor as i32),
+                        );
+                        if observations.back() != Some(&observation) {
+                            if observations.len() == 16 {
+                                observations.pop_front();
+                            }
+                            observations.push_back(observation);
+                        }
+                        format!(
+                            "replacement_succeeds={replacement_succeeds}, reconnect_fails={reconnect_fails}: {error}; observations={observations:?}"
+                        )
+                    })
+                },
+            );
             if reconnect_fails {
                 h.wait_for("Serve failed");
                 assert!(!app.join("profiles/client-only").exists());
@@ -4467,9 +4516,7 @@ exit 0
                 assert_eq!(
                     daemon_pid(&h),
                     Some(successor),
-                    "ready successor disappeared after reconnect failure; screen:\n{}\nlog:\n{}",
-                    h.capture_screen(),
-                    std::fs::read_to_string(app.join("debug.log")).unwrap_or_default(),
+                    "ready successor disappeared after reconnect failure",
                 );
                 assert!(pid_alive(successor as i32));
             } else {

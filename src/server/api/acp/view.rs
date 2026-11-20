@@ -5015,8 +5015,7 @@ mod tests {
         }
         assert!(!argv.exists(), "a refused switch launched the agent");
 
-        // A no-choice switch whose reservation lands but whose adoption fails stays pending. A
-        // retry with a choice is refused as before reservation, not driven into the command.
+        // Failed adoption leaves a reservation; a choice must not drive its command.
         {
             let (native, durable) = load_handoff_row(&state, "default", &reserved.id).await?;
             let cached = find_instance(&state, &reserved.id).await.unwrap();

@@ -238,6 +238,43 @@ pub(in crate::tui) struct ReadyNativeAttachment {
     pub intent: crate::tui::home::panes::PaneIntent,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(in crate::tui) struct ConfirmationToken {
+    dialog: u64,
+    input: u64,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(in crate::tui) struct HomeRowsPaint {
+    revision: u64,
+    cursor: usize,
+    search_bar_visible: bool,
+    list_width: u16,
+    list_height: Option<u16>,
+    sidebar_position: crate::session::config::SidebarPosition,
+    sidebar_collapsed: bool,
+    narrow_layout: crate::session::config::NarrowLayout,
+    show_diagnostics: bool,
+    show_shortcut_bar: bool,
+    show_last_prompt: bool,
+    non_live_overlay: bool,
+}
+
+#[derive(PartialEq, Eq)]
+enum RowClickTarget {
+    Session(String),
+    Group {
+        path: String,
+        profile: Option<String>,
+    },
+}
+
+struct RowClick {
+    at: std::time::Instant,
+    row: u16,
+    target: RowClickTarget,
+}
+
 pub struct HomeView {
     pub(super) storages: HashMap<String, Storage>,
     pub(super) active_profile: Option<String>,
@@ -413,6 +450,13 @@ pub struct HomeView {
     /// The last frame painted the mounted structured transcript into the preview, so
     /// `preview_text_view` maps transcript rows rather than the tmux capture.
     pub(super) structured_transcript_painted: bool,
+    pub(in crate::tui) presentation_ready: bool,
+    rows_revision: u64,
+    pub(in crate::tui) painted_rows: Option<HomeRowsPaint>,
+    presented_rows: Option<HomeRowsPaint>,
+    pub(in crate::tui) painted_confirmation: Option<ConfirmationToken>,
+    pub(super) presented_confirmation: Option<ConfirmationToken>,
+    pub(super) confirmation_input_revision: u64,
     /// Exact canonical purge owner captured when Force Remove confirmation opens.
     pub(super) pending_force_remove_session: Option<(String, std::num::NonZeroU64)>,
     pub(super) pending_trash_session: Option<TrashDialogTarget>,
@@ -492,7 +536,7 @@ pub struct HomeView {
     pub(super) footer_buttons: Vec<(crossterm::event::KeyEvent, Rect)>,
     pub(super) footer_hover: Option<crossterm::event::KeyEvent>,
     pub(super) mouse_pos: Option<(u16, u16)>,
-    pub(super) last_click: Option<(std::time::Instant, u16, u16)>,
+    last_click: Option<RowClick>,
 
     pub(super) last_preview_click: Option<(std::time::Instant, u16, u16)>,
 

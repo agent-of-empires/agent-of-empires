@@ -425,7 +425,7 @@ fn every_opener_failure_ready_before_a_poll_is_reported() {
         opener_failure_feedback(&failed),
         Some((
             "vscode://file/a\nvscode://file/b".to_string(),
-            "nothing opened 2 links; copied vscode://file/a vscode://file/b".to_string()
+            "nothing opened 2 links: vscode://file/a vscode://file/b".to_string()
         ))
     );
     let status = failed[0].1;
@@ -433,7 +433,7 @@ fn every_opener_failure_ready_before_a_poll_is_reported() {
         opener_failure_feedback(&failed[..1]),
         Some((
             "vscode://file/a".to_string(),
-            format!("nothing opened it ({status}); copied vscode://file/a")
+            format!("nothing opened it ({status}); vscode://file/a")
         ))
     );
     assert_eq!(opener_failure_feedback(&[]), None);

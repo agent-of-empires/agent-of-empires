@@ -420,11 +420,7 @@ async fn config_watch_keys_distinguish_global_from_profile_named_global() {
         .contains_key(&ConfigWatchKey::profile(profile_name)));
 }
 
-/// Render the view once into an off-screen backend so geometry-dependent
-/// fields (`list_inner_area`, `shelf_inner_area`, scroll offsets) reflect a
-/// real layout. Needed by mouse tests that click rows in the pinned Trash /
-/// Archived shelf, whose position can't be faked the way `setup_inner` fakes
-/// the flat list rect.
+/// Complete a real layout and acknowledge its synchronous TestBackend output.
 fn render_geometry(view: &mut HomeView) {
     use crate::tui::styles::load_theme;
     use ratatui::backend::TestBackend;
@@ -438,6 +434,8 @@ fn render_geometry(view: &mut HomeView) {
             view.render(f, area, &theme, None);
         })
         .unwrap();
+    view.acknowledge_confirmation(view.painted_confirmation);
+    view.acknowledge_rows(view.painted_rows);
 }
 
 /// Screen row (0-indexed) of the shelf item at absolute `flat_items` index
@@ -935,6 +933,8 @@ fn render_home_to_string(view: &mut HomeView, width: u16, height: u16) -> String
             view.render(f, area, &theme, None);
         })
         .unwrap();
+    view.acknowledge_confirmation(view.painted_confirmation);
+    view.acknowledge_rows(view.painted_rows);
     let buf = terminal.backend().buffer().clone();
     let mut screen = String::new();
     for y in 0..buf.area.height {

@@ -22,6 +22,8 @@ The lint command checks Rust environment reads against the live fixture's
 isolation contract using `scripts/check-env-isolation.mjs`. The source-inventory
 test in `isolatedEnv.test.ts` invokes the same guard with a 30-second budget;
 the remaining Vitest cases exercise actual hostile-value isolation.
+Gate out-of-line Rust test modules with `#[cfg(test)]`, stacking platform gates
+separately so the source inventory recognizes their test-only ownership.
 
 ## Tests
 

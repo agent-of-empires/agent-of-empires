@@ -120,14 +120,11 @@ fn session_actions_refuse_the_creating_stub() {
     assert!(view.rename_dialog.is_none());
     assert!(view.status_flash_text().is_some());
 
-    // A menu whose every entry would refuse the row is never opened. The
-    // sidebar geometry is only known once the list rects are set, exactly as
-    // `right_click_context_menu` does.
     view.status_flash = None;
-    view.list_inner_area = ratatui::layout::Rect::new(1, 1, 28, 10);
-    view.list_area = ratatui::layout::Rect::new(0, 0, 30, 12);
-    let row = 1 + view.cursor as u16;
-    assert!(view.handle_right_click(5, row));
+    render_geometry(&mut view);
+    let list = view.list_inner_area;
+    let row = list.y + view.cursor as u16;
+    assert!(view.handle_right_click(list.x, row));
     assert!(view.context_menu.is_none(), "no menu for the creating stub");
     assert!(view.status_flash_text().is_some());
 

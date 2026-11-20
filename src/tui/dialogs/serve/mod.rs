@@ -884,7 +884,10 @@ pub struct ServeView {
     unasked: Option<(PendingConfirm, Unasked)>,
     show_help: bool,
     mouse: RefCell<ServeMouse>,
-    copied: Option<(&'static str, Instant)>,
+    /// Clipboard admission or output feedback, shown for `FLASH_TTL`.
+    copied: Option<(String, Instant)>,
+    /// The setting the running daemon started with, when this view started it; `None` for a
+    /// reattached daemon.
     running_persists: Option<bool>,
     restart_probe: RestartProbe,
     pending_launch: Option<ServeLaunchRequest>,
@@ -1073,6 +1076,10 @@ impl ServeView {
             return None;
         }
         hit(&mouse.keys, col, row)
+    }
+
+    pub(crate) fn clipboard_feedback(&mut self, message: String) {
+        self.copied = Some((message, Instant::now()));
     }
 
     pub fn handle_hover(&mut self, col: u16, row: u16) -> bool {
@@ -1719,6 +1726,7 @@ impl ServeView {
         }
         if self
             .copied
+            .as_ref()
             .is_some_and(|(_, when)| when.elapsed() > FLASH_TTL)
         {
             self.copied = None;
@@ -2092,8 +2100,8 @@ impl ServeView {
                 self.access_checked_at = Some(Instant::now());
                 return observation.is_some_and(|observation| self.apply_access(observation));
             }
-            (PendingJob::Copy, JobResult::Copied(label)) => {
-                self.copied = Some((label, Instant::now()))
+            (PendingJob::Copy, JobResult::CopyFeedback(message)) => {
+                self.copied = Some((message, Instant::now()))
             }
             (kind, _) => self.fail_pending(
                 kind,

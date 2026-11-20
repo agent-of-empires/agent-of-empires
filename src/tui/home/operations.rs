@@ -916,7 +916,11 @@ impl HomeView {
         let Some(id) = self.selected_session.clone() else {
             return;
         };
-        if !self.instances.get(&id).is_some_and(|row| row.is_trashed()) {
+        let Some(instance) = self.instances.get(&id).filter(|row| row.is_trashed()) else {
+            return;
+        };
+        if instance.has_pending_trash() {
+            self.flash_status("Retry Trash first");
             return;
         }
         if let Err(error) = self

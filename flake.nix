@@ -57,14 +57,47 @@
                 ./tests/fixtures/cli-read
                 ./tests/fixtures/pull-stderr
                 ./web/tests/helpers/fakeAcpAgent.mjs
+                ./LICENSE
+                ./THIRD_PARTY_NOTICES.md
+                ./licenses
+                ./vendor/crossterm/LICENSE
               ];
             };
             strictDeps = true;
             inherit nativeBuildInputs buildInputs;
           };
 
-          # Build only workspace dependencies first (for caching)
-          cargoArtifacts = craneLib.buildDepsOnly commonArgs;
+          dependencyMetadata = craneLib.crateNameFromCargoToml {
+            cargoToml = ./Cargo.toml;
+          };
+          dependencyVendorDir = craneLib.vendorCargoDeps {
+            src = commonArgs.src;
+            cargoLock = ./Cargo.lock;
+          };
+          # Registry dependencies call the path patch while workspace crates are stubs.
+          # Keep this copy input vendor-only to preserve caching across application edits.
+          vendoredPatchSource = pkgs.lib.fileset.toSource {
+            root = ./vendor;
+            fileset = ./vendor;
+          };
+          dependencyDummySrc = craneLib.mkDummySrc {
+            src = commonArgs.src;
+            extraDummyScript = ''
+              rm -rf "$out/vendor"
+              cp -R "${vendoredPatchSource}" "$out/vendor"
+            '';
+          };
+
+          # Checks compile their own test targets.
+          cargoArtifacts = craneLib.buildDepsOnly (
+            (builtins.removeAttrs commonArgs [ "src" ]) // dependencyMetadata // {
+              dummySrc = dependencyDummySrc;
+              cargoVendorDir = dependencyVendorDir;
+              doCheck = false;
+              buildPhaseCargoCommand =
+                "${commonArgs.cargoBuildCommand or "cargoWithProfile build"} ${commonArgs.cargoExtraArgs or "--locked"}";
+            }
+          );
 
           aoe = craneLib.buildPackage (commonArgs // {
             inherit cargoArtifacts;
@@ -75,6 +108,8 @@
                 --bash <($out/bin/aoe completion bash) \
                 --fish <($out/bin/aoe completion fish) \
                 --zsh <($out/bin/aoe completion zsh)
+              install -Dm644 LICENSE THIRD_PARTY_NOTICES.md -t "$out/share/licenses/aoe"
+              install -Dm644 licenses/* -t "$out/share/licenses/aoe/licenses"
             '';
 
             meta = with pkgs.lib; {
@@ -122,7 +157,15 @@
           };
 
           # Rust dep cache compiled with --features web (no npm involved).
-          cargoArtifactsWithWeb = craneLib.buildDepsOnly commonArgsWithWeb;
+          cargoArtifactsWithWeb = craneLib.buildDepsOnly (
+            (builtins.removeAttrs commonArgsWithWeb [ "src" ]) // dependencyMetadata // {
+              dummySrc = dependencyDummySrc;
+              cargoVendorDir = dependencyVendorDir;
+              doCheck = false;
+              buildPhaseCargoCommand =
+                "${commonArgsWithWeb.cargoBuildCommand or "cargoWithProfile build"} ${commonArgsWithWeb.cargoExtraArgs or "--locked"}";
+            }
+          );
 
           aoeWithWeb = craneLib.buildPackage (commonArgsWithWeb // {
             cargoArtifacts = cargoArtifactsWithWeb;
@@ -135,6 +178,8 @@
                 --bash <($out/bin/aoe completion bash) \
                 --fish <($out/bin/aoe completion fish) \
                 --zsh <($out/bin/aoe completion zsh)
+              install -Dm644 LICENSE THIRD_PARTY_NOTICES.md -t "$out/share/licenses/aoe"
+              install -Dm644 licenses/* -t "$out/share/licenses/aoe/licenses"
             '';
             meta = aoe.meta;
             # Expose npmDeps so `nix-update` can automatically recompute the
