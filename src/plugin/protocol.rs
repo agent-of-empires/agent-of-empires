@@ -127,6 +127,9 @@ pub fn parse_worker_reply(line: &str) -> Option<WorkerReply> {
     }
     let id = obj.get("id")?.as_str()?.to_string();
     let outcome = match obj.get("error").filter(|error| !error.is_null()) {
+        _ if obj.get("jsonrpc").and_then(Value::as_str) != Some("2.0") => {
+            Err("worker reply is not a JSON-RPC 2.0 response".to_string())
+        }
         Some(error) => Err(error
             .get("message")
             .and_then(Value::as_str)
@@ -198,6 +201,20 @@ mod tests {
         )
         .unwrap();
         assert_eq!(err.outcome.unwrap_err(), "nope");
+
+        for line in [
+            r#"{"id":"h-4","result":{"drop":"*"}}"#,
+            r#"{"jsonrpc":"1.0","id":"h-4","result":{"drop":"*"}}"#,
+            r#"{"jsonrpc":2,"id":"h-4","result":{"drop":"*"}}"#,
+            r#"{"id":"h-4","error":{"code":-32601}}"#,
+        ] {
+            let reply = parse_worker_reply(line).unwrap();
+            assert_eq!(reply.id, "h-4", "{line}");
+            assert!(
+                reply.outcome.is_err(),
+                "a reply without the 2.0 envelope is rejected, not applied: {line}"
+            );
+        }
 
         let null_error =
             parse_worker_reply(r#"{"jsonrpc":"2.0","id":"h-3","result":{"ok":1},"error":null}"#)
