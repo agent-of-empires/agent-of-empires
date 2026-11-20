@@ -492,6 +492,7 @@ pub(crate) fn launch_owed_handoff(
         terminal: None,
         launch_required: true,
         launch_started: false,
+        selector_ended: false,
         launch: None,
     }
 }

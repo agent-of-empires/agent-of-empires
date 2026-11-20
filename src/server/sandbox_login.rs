@@ -4,7 +4,7 @@ use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::{Mutex, PoisonError};
 
-use tokio::sync::broadcast;
+use tokio::sync::mpsc;
 
 use crate::session::config::container_config::{
     login_capable_agents, sandbox_login_status, SandboxLoginStatus,
@@ -28,10 +28,10 @@ pub(crate) struct LoginRequiredNotice {
 }
 
 /// Hands each notice to `handle` until `shutdown` is cancelled. The receiver must come from
-/// [`SandboxLoginService::subscribe`] before anything that can hold a session runs: a notice
-/// sent while no receiver exists is gone, and its episode never pushes again.
+/// [`SandboxLoginService::subscribe`]. Notices queue until handled, since a lost one would
+/// leave its episode never pushing again.
 pub(crate) async fn forward_notices<F, Fut>(
-    mut notices: broadcast::Receiver<LoginRequiredNotice>,
+    mut notices: mpsc::UnboundedReceiver<LoginRequiredNotice>,
     shutdown: &tokio_util::sync::CancellationToken,
     mut handle: F,
 ) where
@@ -41,9 +41,8 @@ pub(crate) async fn forward_notices<F, Fut>(
     loop {
         let notice = tokio::select! {
             recv = notices.recv() => match recv {
-                Ok(notice) => notice,
-                Err(broadcast::error::RecvError::Lagged(_)) => continue,
-                Err(broadcast::error::RecvError::Closed) => return,
+                Some(notice) => notice,
+                None => return,
             },
             _ = shutdown.cancelled() => return,
         };
@@ -69,14 +68,17 @@ struct State {
 #[derive(Debug)]
 pub(crate) struct SandboxLoginService {
     state: Mutex<State>,
-    notices: broadcast::Sender<LoginRequiredNotice>,
+    notices: mpsc::UnboundedSender<LoginRequiredNotice>,
+    receiver: Mutex<Option<mpsc::UnboundedReceiver<LoginRequiredNotice>>>,
 }
 
 impl Default for SandboxLoginService {
     fn default() -> Self {
+        let (notices, receiver) = mpsc::unbounded_channel();
         Self {
             state: Mutex::new(State::default()),
-            notices: broadcast::channel(16).0,
+            notices,
+            receiver: Mutex::new(Some(receiver)),
         }
     }
 }
@@ -173,8 +175,14 @@ impl SandboxLoginService {
         state.end_episode_if_unused(&released.credential);
     }
 
-    pub(crate) fn subscribe(&self) -> broadcast::Receiver<LoginRequiredNotice> {
-        self.notices.subscribe()
+    /// The notice stream, holding every notice since the service was made. There is one
+    /// consumer, so a second call is a bug.
+    pub(crate) fn subscribe(&self) -> mpsc::UnboundedReceiver<LoginRequiredNotice> {
+        self.receiver
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .take()
+            .expect("sandbox login notices have one subscriber")
     }
 }
 
@@ -312,7 +320,7 @@ pub(crate) async fn log_login_status(profile: String) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use tokio::sync::broadcast::error::TryRecvError;
+    use tokio::sync::mpsc::error::TryRecvError;
 
     fn blocked(tool: &str, credential: &str) -> SandboxLoginRequired {
         SandboxLoginRequired {
@@ -356,16 +364,61 @@ mod tests {
         consumer.await.unwrap();
     }
 
-    /// The loss the early subscription prevents: a receiver made after the hold sees nothing,
-    /// and the episode has already used up its one push.
+    /// More notices than a bounded buffer holds queue up while the consumer is busy, and none
+    /// is lost or repeated.
+    #[tokio::test]
+    async fn a_burst_of_holds_before_the_consumer_drains_loses_no_notice() {
+        const CREDENTIALS: usize = 40;
+        let service = SandboxLoginService::default();
+        let notices = service.subscribe();
+        let credential = |i: usize| format!("/h/.claude-{i}/sandbox-v2/.credentials.json");
+        for i in 0..CREDENTIALS {
+            assert!(service.hold(
+                &format!("s{i}"),
+                LaunchOrigin::Unattended,
+                &blocked("claude", &credential(i))
+            ));
+        }
+
+        let shutdown = tokio_util::sync::CancellationToken::new();
+        let (seen_tx, mut seen) = tokio::sync::mpsc::unbounded_channel();
+        let consumer = tokio::spawn({
+            let shutdown = shutdown.clone();
+            async move {
+                forward_notices(notices, &shutdown, |notice| {
+                    let seen_tx = seen_tx.clone();
+                    async move { seen_tx.send(notice).unwrap() }
+                })
+                .await;
+            }
+        });
+        for i in 0..CREDENTIALS {
+            assert_eq!(seen.recv().await, Some(notice(&format!("s{i}"), "claude")));
+        }
+
+        // The episodes are still running: re-holding pushes nothing.
+        for i in 0..CREDENTIALS {
+            assert!(!service.hold(
+                &format!("s{i}"),
+                LaunchOrigin::Unattended,
+                &blocked("claude", &credential(i))
+            ));
+        }
+        // Dropping the only sender lets the consumer drain what is queued before it stops.
+        drop(service);
+        consumer.await.unwrap();
+        assert_eq!(seen.recv().await, None, "no duplicate notice");
+    }
+
+    /// A subscription made after the hold still sees its notice, once.
     #[test]
-    fn a_subscription_made_after_the_hold_never_sees_its_notice() {
+    fn a_subscription_made_after_the_hold_still_sees_its_notice() {
         let service = SandboxLoginService::default();
         let main = "/h/.claude/sandbox-v2/.credentials.json";
         assert!(service.hold("a", LaunchOrigin::Unattended, &blocked("claude", main)));
 
         let mut late = service.subscribe();
-        assert_eq!(late.try_recv(), Err(TryRecvError::Empty));
+        assert_eq!(late.try_recv(), Ok(notice("a", "claude")));
         assert!(!service.hold("a", LaunchOrigin::Unattended, &blocked("claude", main)));
         assert_eq!(late.try_recv(), Err(TryRecvError::Empty));
     }

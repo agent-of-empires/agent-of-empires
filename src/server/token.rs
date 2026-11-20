@@ -68,6 +68,22 @@ impl TokenManager {
         (false, false)
     }
 
+    /// Every token `validate` accepts right now: the current one and the previous one inside its
+    /// grace window.
+    pub async fn accepted_tokens(&self) -> Vec<String> {
+        let state = self.state.read().await;
+        let previous = state
+            .previous
+            .iter()
+            .filter(|_| {
+                state
+                    .grace_expires
+                    .is_some_and(|expires| tokio::time::Instant::now() < expires)
+            })
+            .cloned();
+        state.current.iter().cloned().chain(previous).collect()
+    }
+
     /// Get the current token value (for setting cookies).
     pub async fn current_token(&self) -> Option<String> {
         self.state.read().await.current.clone()
@@ -128,6 +144,22 @@ impl TokenManager {
             }
         });
     }
+}
+
+static DAEMON_TOKENS: std::sync::Mutex<Option<Arc<TokenManager>>> = std::sync::Mutex::new(None);
+
+/// Register this process's token authority. Called once by the daemon at startup.
+pub(super) fn register_daemon_tokens(manager: Arc<TokenManager>) {
+    *DAEMON_TOKENS.lock().unwrap_or_else(|e| e.into_inner()) = Some(manager);
+}
+
+/// The tokens the daemon in this process accepts, or `None` when no daemon registered one.
+pub(crate) async fn accepted_daemon_tokens() -> Option<Vec<String>> {
+    let manager = DAEMON_TOKENS
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .clone()?;
+    Some(manager.accepted_tokens().await)
 }
 
 /// Read `AOE_TEST_TOKEN_LIFETIME_SECS`.
@@ -247,6 +279,25 @@ pub(super) async fn load_or_generate_token_at(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The grace token stays accepted until its deadline, exactly as `validate` treats it.
+    #[tokio::test(start_paused = true)]
+    async fn accepted_tokens_follow_the_grace_window() {
+        let _app_dir = crate::session::test_support::isolate_app_dir();
+        let grace = Duration::from_secs(8);
+        let manager = TokenManager::with_grace(Some("old".into()), Duration::from_secs(60), grace);
+        assert_eq!(manager.accepted_tokens().await, ["old"]);
+
+        let deadline = manager.rotate().await;
+        let accepted = manager.accepted_tokens().await;
+        assert_eq!(accepted.len(), 2);
+        assert_eq!(accepted[1], "old");
+        assert!(manager.validate("old").await.0);
+
+        tokio::time::sleep_until(deadline).await;
+        assert_eq!(manager.accepted_tokens().await.len(), 1);
+        assert!(!manager.validate("old").await.0);
+    }
 
     #[test]
     fn token_format_accepts_hex_64_and_legacy_32() {

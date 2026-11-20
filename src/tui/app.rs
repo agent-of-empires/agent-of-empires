@@ -11,6 +11,7 @@ use std::path::PathBuf;
 use std::process::Stdio;
 use std::time::Duration;
 
+use super::home::update_bar::{DrawnBar, UpdateBar};
 use super::home::{bindings, HomeView, TerminalMode};
 use super::styles::Theme;
 use crate::containers::image_update::ImageUpdate;
@@ -128,6 +129,8 @@ pub struct App {
     image_pull_rx: Option<tokio::sync::oneshot::Receiver<anyhow::Result<()>>>,
     /// Snoozed via Ctrl+x while the registry still resolves to this digest.
     dismissed_image_digest: Option<String>,
+    /// The update bar's last drawn line: the only one its keys act on.
+    drawn_bar: Option<DrawnBar>,
     /// Optional so it can be dropped before spawning children: its stdin
     /// reader thread would compete with `tmux attach`.
     event_stream: Option<EventStream>,
@@ -350,6 +353,7 @@ impl App {
             image_update_rx: None,
             image_pull_rx: None,
             dismissed_image_digest,
+            drawn_bar: None,
             // Crossterm's stream needs a live event reader, which tests lack.
             event_stream: (!cfg!(test)).then(EventStream::new),
             mouse_captured: crate::tui::mouse_capture_requested(&config.session) && !mosh_active,
@@ -1698,26 +1702,20 @@ impl App {
         if self.update_status.as_ref().is_some_and(|s| s.is_expired()) {
             self.update_status = None;
         }
-        let store_move_line = self.home.store_move_status_line();
-        let status_text = self
-            .update_status
-            .as_ref()
-            .map(|s| s.text.as_str())
-            .or(store_move_line.as_deref());
-        // Hidden while its own pull runs, so it can't re-render under the toast.
-        let image_update = self
-            .image_banner_active()
-            .then_some(self.image_update.as_ref());
+        let live = self.home.store_move_status_line();
+        let bar = UpdateBar::pick(
+            self.update_status.as_ref().map(|s| s.text.as_str()),
+            live.as_deref(),
+            self.update_info.as_ref(),
+            self.image_update.as_ref(),
+            self.image_pull_rx.is_some(),
+        );
         // Reset so a frame that skips the preview path reports zero.
         self.home.preview_timings = Default::default();
-        self.home.render(
-            frame,
-            frame.area(),
-            &self.theme,
-            self.update_info.as_ref(),
-            status_text,
-            image_update.flatten(),
-        );
+        self.home.render(frame, frame.area(), &self.theme, bar);
+        self.drawn_bar = bar
+            .filter(|_| self.home.update_bar_drawn)
+            .map(DrawnBar::from);
         // Sampled: only frames over the 16ms budget and live-send frames.
         let elapsed = start.elapsed();
         let in_live = self.home.live_send.is_some();
@@ -1823,15 +1821,63 @@ impl App {
         self.home.instances().any(|i| i.is_sandboxed())
     }
 
-    /// The image banner has the lowest priority and stays hidden while its own
-    /// pull runs, so `u` can't re-arm into a no-op.
-    fn image_banner_active(&self) -> bool {
-        should_show_image_banner(
-            self.image_update.is_some(),
-            self.update_info.is_some(),
-            self.update_status.is_some(),
-            self.image_pull_rx.is_some(),
-        )
+    /// Ctrl+X on the update bar: returns whether a line was drawn. It dismisses that line if
+    /// it is still current; a live line, or one whose state has since changed, spends the key.
+    /// Expired statuses are cleared only by draw: until then they are the line on screen.
+    fn dismiss_update_bar(&mut self) -> bool {
+        let Some(drawn) = &self.drawn_bar else {
+            return false;
+        };
+        match drawn {
+            DrawnBar::Live => {}
+            // A pull keeps running and reports its outcome as a new status.
+            DrawnBar::Status(text) => {
+                if self.update_status.as_ref().is_some_and(|s| &s.text == text) {
+                    self.update_status = None;
+                }
+            }
+            DrawnBar::AppUpdate { version } => {
+                if self
+                    .update_info
+                    .as_ref()
+                    .is_some_and(|info| &info.latest_version == version)
+                {
+                    self.dismissed_update_version = Some(version.clone());
+                    persist_dismissed_update_version(Some(version.clone()));
+                    self.update_info = None;
+                }
+            }
+            DrawnBar::ImageUpdate { digest } => {
+                if self
+                    .image_update
+                    .as_ref()
+                    .is_some_and(|update| &update.remote_digest == digest)
+                {
+                    self.dismissed_image_digest = Some(digest.clone());
+                    persist_dismissed_image_digest(Some(digest.clone()));
+                    self.image_update = None;
+                }
+            }
+        }
+        true
+    }
+
+    /// The Update key on a drawn sandbox image line: opens the pull prompt if that update is
+    /// still current and no pull runs, and otherwise spends the key. Any other drawn line
+    /// returns false, leaving the key to the home Update action.
+    fn pull_from_update_bar(&mut self) -> bool {
+        let Some(DrawnBar::ImageUpdate { digest }) = &self.drawn_bar else {
+            return false;
+        };
+        if let Some(update) = self
+            .image_update
+            .as_ref()
+            .filter(|update| &update.remote_digest == digest && self.image_pull_rx.is_none())
+        {
+            let image = update.image.clone();
+            self.home.prompt_pull_sandbox_image(image);
+        }
+        true
     }
 
     fn spawn_image_update_check(&mut self) {
@@ -2177,15 +2223,6 @@ fn plan_disk_refresh(
     }
 }
 
-fn should_show_image_banner(
-    has_image_update: bool,
-    has_app_update: bool,
-    has_status: bool,
-    pull_in_flight: bool,
-) -> bool {
-    has_image_update && !has_app_update && !has_status && !pull_in_flight
-}
-
 /// Log and record reload errors; the loop keeps the previous in-memory state.
 fn handle_tick_reload_storage(
     result: anyhow::Result<()>,
@@ -2397,37 +2434,15 @@ impl App {
                 bindings::ActionId::DismissUpdateBanner,
                 self.home.strict_hotkeys,
                 &key,
-            ) && (self.update_info.is_some()
-                || self.update_status.is_some()
-                || self.image_update.is_some())
-                && !self.home.has_dialog() =>
+            ) && !self.home.has_dialog()
+                && self.dismiss_update_bar() =>
             {
-                if self.image_banner_active() {
-                    if let Some(update) = self.image_update.as_ref() {
-                        let digest = update.remote_digest.clone();
-                        self.dismissed_image_digest = Some(digest.clone());
-                        persist_dismissed_image_digest(Some(digest));
-                    }
-                    self.image_update = None;
-                    return Ok(());
-                }
-                if let Some(info) = self.update_info.as_ref() {
-                    let v = info.latest_version.clone();
-                    self.dismissed_update_version = Some(v.clone());
-                    persist_dismissed_update_version(Some(v));
-                }
-                self.update_info = None;
-                self.update_status = None;
                 return Ok(());
             }
-            // The image banner only shows without an app update, so `u` is free.
-            (KeyCode::Char('u'), KeyModifiers::NONE)
-                if self.image_banner_active() && !self.home.has_dialog() =>
+            _ if bindings::is_bound(bindings::ActionId::Update, self.home.strict_hotkeys, &key)
+                && !self.home.has_dialog()
+                && self.pull_from_update_bar() =>
             {
-                if let Some(update) = self.image_update.as_ref() {
-                    let image = update.image.clone();
-                    self.home.prompt_pull_sandbox_image(image);
-                }
                 return Ok(());
             }
             _ => {}
@@ -4290,6 +4305,270 @@ mod tests {
             .any(|bytes| bytes == b"\x1b[?1000l"));
     }
 
+    fn key_app() -> (App, Terminal<TuiBackend>) {
+        let app = App::new(
+            "test",
+            AvailableTools::with_tools(&[]),
+            true,
+            false,
+            crate::file_watch::FileWatchService::noop(),
+        )
+        .unwrap();
+        let backend =
+            crate::tui::hyperlink::HyperlinkBackend::new(std::io::stdout(), Default::default());
+        let terminal = Terminal::with_options(
+            backend,
+            ratatui::TerminalOptions {
+                viewport: ratatui::Viewport::Fixed(ratatui::layout::Rect::new(0, 0, 100, 40)),
+            },
+        )
+        .unwrap();
+        (app, terminal)
+    }
+
+    fn app_update() -> UpdateInfo {
+        UpdateInfo {
+            available: true,
+            current_version: "1.0.0".into(),
+            latest_version: "1.1.0".into(),
+        }
+    }
+
+    fn image_update() -> ImageUpdate {
+        ImageUpdate {
+            image: "ghcr.io/agent-of-empires/aoe-sandbox:latest".into(),
+            remote_digest: "sha256:abc".into(),
+        }
+    }
+
+    const CTRL_X: KeyEvent = KeyEvent::new(KeyCode::Char('x'), KeyModifiers::CONTROL);
+
+    /// One frame, as the event loop draws before each key; returns the screen text.
+    fn draw(app: &mut App) -> String {
+        let mut screen = Terminal::new(ratatui::backend::TestBackend::new(100, 30)).unwrap();
+        screen.draw(|f| app.render(f)).unwrap();
+        screen
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|c| c.symbol())
+            .collect()
+    }
+
+    /// #5747: each Ctrl+X acts on the line on screen, never one hidden behind it.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn dismiss_during_a_pull_hides_only_the_pull_line() {
+        let _home = crate::session::test_support::isolate_app_dir();
+        crate::session::get_profile_dir("test").unwrap();
+        let (mut app, mut terminal) = key_app();
+        app.update_info = Some(app_update());
+        app.image_update = Some(image_update());
+        app.update_status = Some(UpdateStatus::persistent(
+            "pulling the sandbox image…".into(),
+        ));
+        let (pull_done, pull_rx) = tokio::sync::oneshot::channel();
+        app.image_pull_rx = Some(pull_rx);
+        let dismissed = || AppStateConfig::load().unwrap().dismissed_update_version;
+
+        draw(&mut app);
+        app.handle_key(CTRL_X, &mut terminal).await.unwrap();
+        assert!(app.update_status.is_none());
+        assert_eq!(app.update_info, Some(app_update()));
+        assert_eq!(app.dismissed_update_version, None);
+        assert_eq!(dismissed(), None);
+
+        pull_done.send(Ok(())).unwrap();
+        assert!(app.poll_image_pull_status());
+        assert!(app
+            .update_status
+            .as_ref()
+            .is_some_and(|s| s.text.starts_with("sandbox image updated")));
+
+        draw(&mut app);
+        app.handle_key(CTRL_X, &mut terminal).await.unwrap();
+        assert!(app.update_status.is_none());
+        assert_eq!(app.update_info, Some(app_update()));
+
+        draw(&mut app);
+        app.handle_key(CTRL_X, &mut terminal).await.unwrap();
+        assert!(app.update_info.is_none());
+        assert_eq!(dismissed(), Some("1.1.0".into()));
+    }
+
+    /// A status that expires after it was drawn is still the line on screen until the next
+    /// draw, so Ctrl+X dismisses it and not the AoE update it hid.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn dismiss_acts_on_a_drawn_status_that_has_since_expired() {
+        let _home = crate::session::test_support::isolate_app_dir();
+        crate::session::get_profile_dir("test").unwrap();
+        let (mut app, mut terminal) = key_app();
+        app.update_info = Some(app_update());
+        app.update_status = Some(UpdateStatus::transient("restart failed".into()));
+        let drawn = draw(&mut app);
+        assert!(drawn.contains("restart failed") && !drawn.contains("update available"));
+
+        app.update_status.as_mut().unwrap().expires_at = Some(std::time::Instant::now());
+        app.handle_key(CTRL_X, &mut terminal).await.unwrap();
+        assert!(app.update_status.is_none());
+        assert_eq!(app.update_info, Some(app_update()));
+        assert_eq!(app.dismissed_update_version, None);
+        assert_eq!(
+            AppStateConfig::load().unwrap().dismissed_update_version,
+            None
+        );
+    }
+
+    /// The store-move line has nothing to dismiss: Ctrl+X and the pull key leave the image
+    /// update behind it alone.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn keys_leave_the_image_update_behind_the_store_move_line() {
+        let _home = crate::session::test_support::isolate_app_dir();
+        crate::session::get_profile_dir("test").unwrap();
+        let (mut app, mut terminal) = key_app();
+        let _lane = app
+            .home
+            .session_feed
+            .show_sandbox_progress_for_test("copying files");
+        assert!(app.home.store_move_status_line().is_some());
+        app.image_update = Some(image_update());
+        assert!(draw(&mut app).contains("moving the agent store"));
+
+        app.handle_key(CTRL_X, &mut terminal).await.unwrap();
+        app.handle_key(KeyEvent::from(KeyCode::Char('u')), &mut terminal)
+            .await
+            .unwrap();
+        assert_eq!(app.image_update, Some(image_update()));
+        assert_eq!(app.dismissed_image_digest, None);
+        assert_eq!(AppStateConfig::load().unwrap().dismissed_image_digest, None);
+        assert!(app.home.confirm_dialog.is_none());
+    }
+
+    /// #5773: the store move finishes after its line is drawn and before the next frame. The
+    /// keys act on the line that was drawn, so they neither dismiss nor pull the image update
+    /// the finished move uncovered.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn keys_act_on_the_drawn_store_move_line_after_the_move_finishes() {
+        let mut acted = Vec::new();
+        for (label, key) in [
+            ("Ctrl+X", CTRL_X),
+            ("pull key", KeyEvent::from(KeyCode::Char('u'))),
+        ] {
+            // Its own app dir, so one key's persisted dismissal can't show up under the other.
+            let _home = crate::session::test_support::isolate_app_dir();
+            crate::session::get_profile_dir("test").unwrap();
+            let (mut app, mut terminal) = key_app();
+            let _lane = app
+                .home
+                .session_feed
+                .show_sandbox_progress_for_test("copying files");
+            app.image_update = Some(image_update());
+            assert!(draw(&mut app).contains("moving the agent store"), "{label}");
+
+            app.home.session_feed.finish_sandbox_progress_for_test();
+            assert!(app.home.store_move_status_line().is_none(), "{label}");
+            app.handle_key(key, &mut terminal).await.unwrap();
+            let effects = [
+                (
+                    "cleared image_update",
+                    app.image_update != Some(image_update()),
+                ),
+                (
+                    "set dismissed_image_digest",
+                    app.dismissed_image_digest.is_some(),
+                ),
+                (
+                    "persisted dismissed_image_digest",
+                    AppStateConfig::load()
+                        .unwrap()
+                        .dismissed_image_digest
+                        .is_some(),
+                ),
+                ("opened the pull prompt", app.home.confirm_dialog.is_some()),
+            ];
+            for (effect, _) in effects.iter().filter(|(_, happened)| *happened) {
+                acted.push(format!("{label} {effect}"));
+            }
+        }
+        // Both keys are checked before failing, so each one's outcome shows.
+        assert!(acted.is_empty(), "acted on a line not on screen: {acted:?}");
+    }
+
+    /// A takeover view hides the update bar, so its keys have no line to act on until the
+    /// bar is drawn again.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn a_takeover_view_clears_the_drawn_update_bar() {
+        let _home = crate::session::test_support::isolate_app_dir();
+        crate::session::get_profile_dir("test").unwrap();
+        let (mut app, _terminal) = key_app();
+        app.image_update = Some(image_update());
+        let on_screen = Some(DrawnBar::ImageUpdate {
+            digest: image_update().remote_digest,
+        });
+        draw(&mut app);
+        assert_eq!(app.drawn_bar, on_screen);
+
+        app.home.settings_view = Some(
+            crate::tui::settings::SettingsView::new(&app.home.config_profile(), None).unwrap(),
+        );
+        draw(&mut app);
+        assert_eq!(app.drawn_bar, None, "settings hides the bar");
+
+        app.home.settings_view = None;
+        draw(&mut app);
+        assert_eq!(app.drawn_bar, on_screen);
+    }
+
+    /// A terminal too small for the update bar's row shows no line, so its keys have nothing
+    /// to act on.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn a_terminal_too_small_for_the_update_bar_records_no_line() {
+        let _home = crate::session::test_support::isolate_app_dir();
+        crate::session::get_profile_dir("test").unwrap();
+        let (mut app, _terminal) = key_app();
+        app.image_update = Some(image_update());
+        for (width, height) in [(100, 1), (100, 0), (0, 30)] {
+            let mut screen =
+                Terminal::new(ratatui::backend::TestBackend::new(width, height)).unwrap();
+            screen.draw(|f| app.render(f)).unwrap();
+            assert_eq!(app.drawn_bar, None, "{width}x{height}");
+        }
+        draw(&mut app);
+        assert!(app.drawn_bar.is_some(), "a full-size frame draws the bar");
+    }
+
+    /// The pull key is the registry's Update chord: bare `u`, or Ctrl+U under strict hotkeys.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn image_pull_key_follows_strict_hotkeys() {
+        let _home = crate::session::test_support::isolate_app_dir();
+        crate::session::get_profile_dir("test").unwrap();
+        let bare_u = KeyEvent::from(KeyCode::Char('u'));
+        let ctrl_u = KeyEvent::new(KeyCode::Char('u'), KeyModifiers::CONTROL);
+        for (strict, key, opens) in [
+            (false, bare_u, true),
+            (true, bare_u, false),
+            (true, ctrl_u, true),
+        ] {
+            let (mut app, mut terminal) = key_app();
+            app.home.strict_hotkeys = strict;
+            app.image_update = Some(image_update());
+            draw(&mut app);
+            app.handle_key(key, &mut terminal).await.unwrap();
+            assert_eq!(
+                app.home.confirm_dialog.is_some(),
+                opens,
+                "strict={strict} key={key:?}"
+            );
+        }
+    }
+
     #[tokio::test]
     #[serial_test::serial]
     async fn startup_onboarding_preserves_saved_state_during_config_edits() {
@@ -4855,8 +5134,7 @@ mod tests {
                     app.reconcile_structured_preview().await;
                     terminal
                         .draw(|frame| {
-                            app.home
-                                .render(frame, frame.area(), theme, None, None, None);
+                            app.home.render(frame, frame.area(), theme, None);
                         })
                         .unwrap();
                     if app
@@ -4914,8 +5192,7 @@ mod tests {
         );
         terminal
             .draw(|frame| {
-                app.home
-                    .render(frame, frame.area(), &theme, None, None, None);
+                app.home.render(frame, frame.area(), &theme, None);
             })
             .unwrap();
         let pending_offset = app.home.retained_scroll_offset;
@@ -4967,8 +5244,7 @@ mod tests {
             select(&mut app, &terminal);
             terminal
                 .draw(|frame| {
-                    app.home
-                        .render(frame, frame.area(), &theme, None, None, None);
+                    app.home.render(frame, frame.area(), &theme, None);
                 })
                 .unwrap();
             assert!(
@@ -4990,8 +5266,6 @@ mod tests {
                         frame,
                         frame.area(),
                         if resize { &theme } else { &changed_theme },
-                        None,
-                        None,
                         None,
                     );
                 })
@@ -5370,20 +5644,6 @@ mod tests {
         reset_creates(2);
         clear_reported_session_creates(5, SendOutcome::Sent);
         assert_eq!(TUI_SESSION_CREATES.load(Ordering::Relaxed), 0);
-    }
-
-    #[test]
-    fn image_banner_shows_only_when_it_owns_the_row() {
-        assert!(should_show_image_banner(true, false, false, false));
-        assert!(!should_show_image_banner(false, false, false, false));
-        assert!(!should_show_image_banner(true, true, false, false));
-        assert!(!should_show_image_banner(true, false, true, false));
-    }
-
-    #[test]
-    fn image_banner_stays_hidden_while_its_own_pull_runs() {
-        assert!(!should_show_image_banner(true, false, false, true));
-        assert!(!should_show_image_banner(true, false, true, true));
     }
 
     #[test]
@@ -5925,6 +6185,102 @@ mod tests {
         );
     }
 
+    /// #5766: the Serve key that opened Connections opens the Web dashboard from any row, in
+    /// either mode, but a held key stays in Connections. On the offline and outdated takeovers,
+    /// where only r and q act, it does nothing. Hold timing is `ConnectionsView`'s own test;
+    /// this one checks the hub is opened at the opening press's time.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn the_serve_key_in_connections_opens_the_web_dashboard_except_on_a_takeover() {
+        use crate::tui::dialogs::{ConnectionsView, DaemonAttention as A, DialogResult, WebState};
+        use crate::tui::session_feed::SidebarSource;
+        let _home = crate::session::test_support::isolate_app_dir();
+        crate::session::get_profile_dir("test").unwrap();
+        for (strict, key) in [
+            (
+                false,
+                KeyEvent::new(KeyCode::Char('R'), KeyModifiers::SHIFT),
+            ),
+            (
+                true,
+                KeyEvent::new(KeyCode::Char('r'), KeyModifiers::CONTROL),
+            ),
+        ] {
+            let mut app = App::new(
+                "test",
+                AvailableTools::with_tools(&[]),
+                true,
+                false,
+                crate::file_watch::FileWatchService::noop(),
+            )
+            .unwrap();
+            app.home.strict_hotkeys = strict;
+            // A held key opens Connections, then never reaches the Serve screen, whose restart
+            // and reset use the same key. Times come from `before`, not the wall clock, so a
+            // stalled test can't make the hold look like a separate press.
+            let before = std::time::Instant::now();
+            app.home.handle_key(key, None);
+            let hub = app
+                .home
+                .connections_view
+                .as_mut()
+                .expect("the key opens Connections");
+            let later = |ms| before + std::time::Duration::from_millis(ms);
+            assert!(
+                matches!(
+                    hub.handle_key(key, strict, later(150)),
+                    DialogResult::Continue
+                ),
+                "strict={strict}: a repeat just after the opening press stays"
+            );
+            let repeat = KeyEvent::new_with_kind(key.code, key.modifiers, KeyEventKind::Repeat);
+            for _ in 0..30 {
+                app.home.handle_key(repeat, None);
+            }
+            assert!(app.home.connections_view.is_some(), "strict={strict}: held");
+            assert!(app.home.serve_view.is_none(), "strict={strict}: held");
+            // The Daemon row comes first and is selected, so Enter would do nothing here.
+            app.home.connections_view =
+                Some(ConnectionsView::new(Some(A::ReadOnly), WebState::Off));
+            app.home.handle_key(key, None);
+            assert!(app.home.connections_view.is_none(), "strict={strict}");
+            assert!(
+                app.home.serve_view.is_some(),
+                "strict={strict}: opens the Web dashboard"
+            );
+
+            for attention in [
+                A::Offline,
+                A::Outdated(crate::daemon::DaemonIncarnation::sample("old")),
+            ] {
+                let case = format!("strict={strict} {attention:?}");
+                app.home.serve_view = None;
+                app.home.sidebar_source = SidebarSource::Disconnected;
+                app.home.offline_attention = attention;
+                assert!(!app.handle_runtime_gate_key(key), "{case}");
+                assert!(app.home.serve_view.is_none(), "{case}");
+                assert!(app.home.connections_view.is_none(), "{case}");
+                assert!(app.daemon_restart.is_none(), "{case}");
+                assert_eq!(
+                    app.home.sidebar_source,
+                    SidebarSource::Disconnected,
+                    "{case}"
+                );
+                assert!(
+                    matches!(
+                        ConnectionsView::offline(attention, None, false).handle_key(
+                            key,
+                            strict,
+                            std::time::Instant::now()
+                        ),
+                        DialogResult::Continue
+                    ),
+                    "{case}: the takeover view ignores it"
+                );
+            }
+        }
+    }
+
     #[tokio::test]
     #[serial_test::serial]
     async fn r_restarts_only_a_restartable_daemon_and_reports_the_outcome() {
@@ -5945,8 +6301,7 @@ mod tests {
         let q = KeyEvent::from(KeyCode::Char('q'));
         let takeover = |app: &mut App| {
             test_render::text(&test_render::draw(110, 40, |frame, theme| {
-                app.home
-                    .render(frame, frame.area(), theme, None, None, None)
+                app.home.render(frame, frame.area(), theme, None)
             }))
         };
         let mismatched = |app: &mut App, attention| {
@@ -6065,8 +6420,7 @@ mod tests {
         // The whole home screen as the user sees it, including a takeover.
         let home = |app: &mut App| {
             test_render::text(&test_render::draw(110, 40, |frame, theme| {
-                app.home
-                    .render(frame, frame.area(), theme, None, None, None)
+                app.home.render(frame, frame.area(), theme, None)
             }))
         };
         let screen = |app: &App| {

@@ -1,6 +1,7 @@
 //! Status updates, row decoration, and the context menu.
 
 use super::*;
+use crate::tui::home::update_bar::UpdateBar;
 
 #[test]
 #[serial]
@@ -152,7 +153,8 @@ fn update_bar_renders_status_toast_without_update_info() {
     terminal
         .draw(|f| {
             let area = f.area();
-            env.view.render(f, area, &theme, None, Some(toast), None);
+            env.view
+                .render(f, area, &theme, Some(UpdateBar::Status(toast)));
         })
         .unwrap();
 
@@ -182,14 +184,15 @@ fn update_bar_renders_status_toast_without_update_info() {
 #[test]
 #[serial]
 fn update_bar_renders_sandbox_image_banner() {
-    // Image banner alone.
-    {
+    // Image banner alone; its pull key is the registry's Update chord.
+    for (strict, pull) in [(false, "[u] pull"), (true, "[Ctrl+U] pull")] {
         use crate::containers::image_update::ImageUpdate;
         use crate::tui::styles::load_theme;
         use ratatui::backend::TestBackend;
         use ratatui::Terminal;
 
         let mut env = create_test_env_empty();
+        env.view.strict_hotkeys = strict;
         let backend = TestBackend::new(100, 30);
         let mut terminal = Terminal::new(backend).unwrap();
         let theme = load_theme("empire");
@@ -203,7 +206,7 @@ fn update_bar_renders_sandbox_image_banner() {
             .draw(|f| {
                 let area = f.area();
                 env.view
-                    .render(f, area, &theme, None, None, Some(&image_update));
+                    .render(f, area, &theme, Some(UpdateBar::ImageUpdate(&image_update)));
             })
             .unwrap();
 
@@ -221,7 +224,7 @@ fn update_bar_renders_sandbox_image_banner() {
             "expected the sandbox image banner to render.\nFull buffer:\n{out}"
         );
         assert!(
-            out.contains("[u] pull") && out.contains("[Ctrl+X] dismiss"),
+            out.contains(pull) && out.contains("[Ctrl+X] dismiss"),
             "expected the pull/dismiss hints alongside the image banner.\nFull buffer:\n{out}"
         );
     }
@@ -251,14 +254,9 @@ fn update_bar_renders_sandbox_image_banner() {
         terminal
             .draw(|f| {
                 let area = f.area();
-                env.view.render(
-                    f,
-                    area,
-                    &theme,
-                    Some(&update_info),
-                    None,
-                    Some(&image_update),
-                );
+                let bar =
+                    UpdateBar::pick(None, None, Some(&update_info), Some(&image_update), false);
+                env.view.render(f, area, &theme, bar);
             })
             .unwrap();
 
@@ -419,7 +417,7 @@ fn footer_hides_attention_workflow_hints_outside_attention_sort() {
         terminal
             .draw(|f| {
                 let area = f.area();
-                env.view.render(f, area, &theme, None, None, None);
+                env.view.render(f, area, &theme, None);
             })
             .unwrap();
         let buf = terminal.backend().buffer();
@@ -765,7 +763,7 @@ fn right_click_trash_header_shows_bulk_menu() {
         terminal
             .draw(|f| {
                 let area = f.area();
-                env.view.render(f, area, &theme, None, None, None);
+                env.view.render(f, area, &theme, None);
             })
             .unwrap();
         let buf = terminal.backend().buffer().clone();
@@ -2077,4 +2075,36 @@ fn due_serve_probe_is_requested_after_a_queued_result_is_applied() {
         env.view.serve_probe_in_flight,
         "the due probe must be requested in the same tick"
     );
+}
+
+/// The live sandbox line has nothing to dismiss, so the bar must not advertise Ctrl+X there.
+#[test]
+#[serial]
+fn update_bar_live_line_shows_no_dismiss_hint() {
+    use crate::tui::styles::load_theme;
+    use ratatui::backend::TestBackend;
+    use ratatui::Terminal;
+
+    let mut env = create_test_env_empty();
+    let mut terminal = Terminal::new(TestBackend::new(100, 30)).unwrap();
+    let theme = load_theme("empire");
+    terminal
+        .draw(|f| {
+            let area = f.area();
+            env.view.render(
+                f,
+                area,
+                &theme,
+                Some(UpdateBar::Live("moving the sandbox store")),
+            );
+        })
+        .unwrap();
+
+    let buf = terminal.backend().buffer();
+    let out: String = (0..buf.area.height)
+        .flat_map(|y| (0..buf.area.width).map(move |x| (x, y)))
+        .map(|(x, y)| buf[(x, y)].symbol().to_string())
+        .collect();
+    assert!(out.contains("moving the sandbox store"), "{out}");
+    assert!(!out.contains("dismiss"), "{out}");
 }

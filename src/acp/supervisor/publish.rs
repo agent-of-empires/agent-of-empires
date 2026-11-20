@@ -161,16 +161,7 @@ impl<S: BroadcastSink> Supervisor<S> {
         let mut prompt_ids = prompt_ids.into_iter();
         let event = Event::UserPromptSent {
             text,
-            attachments: attachments
-                .iter()
-                .map(|blob| crate::daemon::PromptAttachmentRef {
-                    id: blob.id.clone(),
-                    kind: blob.kind,
-                    mime_type: blob.mime_type.clone(),
-                    name: blob.name.clone(),
-                    size: blob.data.len() as u64,
-                })
-                .collect(),
+            attachments: attachments.iter().map(AttachmentBlob::to_ref).collect(),
             prompt_id: prompt_ids.next(),
             merged_prompt_ids: prompt_ids.collect(),
             synthesized,

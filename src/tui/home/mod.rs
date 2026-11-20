@@ -31,6 +31,7 @@ mod status;
 mod store_move;
 #[cfg(test)]
 mod tests;
+pub(crate) mod update_bar;
 mod user_action;
 mod watchers;
 
@@ -411,6 +412,8 @@ pub struct HomeView {
     pub(super) hover_cell: Option<(u16, u16)>,
     pub(super) status_flash: Option<overlays::StatusFlash>,
     pub(super) live_send_ctrl_c_flash_until: Option<std::time::Instant>,
+    /// Whether the last frame drew the update bar; a takeover view hides it.
+    pub(super) update_bar_drawn: bool,
     /// Session whose live control another window took, until the selection moves or live
     /// mode starts again.
     pub(super) live_takeover: Option<live_send::TakenLive>,
