@@ -34,6 +34,10 @@ jobs:
   cachix:
     name: Build and push (${{ matrix.os }})
     runs-on: ${{ matrix.os }}
+    # Job level: the matrix context is not available at workflow level.
+    concurrency:
+      group: cachix-push-${{ matrix.os }}
+      cancel-in-progress: true
     permissions:
       contents: read
     strategy:
