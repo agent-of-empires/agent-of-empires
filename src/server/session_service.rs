@@ -2844,9 +2844,11 @@ fn wait_for_terminal_agent(instance: &Instance, budget: std::time::Duration) -> 
         !instance.expects_shell() && !instance.has_command_override(),
         "initial prompts are only typed into a known agent"
     );
-    let marker = crate::agents::ready_marker(&instance.tool).ok_or_else(|| {
-        anyhow::anyhow!("this agent has no ready marker, so the prompt is not typed")
-    })?;
+    let markers = crate::agents::ready_markers(&instance.tool);
+    anyhow::ensure!(
+        !markers.is_empty(),
+        "this agent has no ready marker, so the prompt is not typed"
+    );
     let deadline = std::time::Instant::now() + budget;
     // A probe error is "not ready yet" while the pane is still starting; the
     // last one is reported only when the budget runs out.
@@ -2870,7 +2872,7 @@ fn wait_for_terminal_agent(instance: &Instance, budget: std::time::Duration) -> 
     anyhow::ensure!(
         instance
             .tmux_session()?
-            .wait_until_ready(remaining, Some(marker)),
+            .wait_until_ready(remaining, markers),
         "the agent was not ready within {}s",
         budget.as_secs()
     );
@@ -4804,6 +4806,36 @@ mod tests {
             .expect("capture pane")
     }
 
+    /// A Claude session is typed into once its input box shows the mode line,
+    /// not while the trust dialog is still up.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn terminal_initial_turn_is_typed_into_claude_once_its_input_box_is_up() {
+        if !crate::tmux::is_tmux_available() {
+            return;
+        }
+        let _app_dir = crate::session::test_support::isolate_app_dir();
+        let mut inst = terminal_turn_instance("sess-claude", "term-claude", "claude-first-turn");
+        inst.tool = "claude".into();
+        let pane = start_terminal_pane(
+            &inst,
+            "echo 'Yes, I trust this folder'; sleep 1.5; clear; \
+             echo '  bypass permissions on (shift+tab to cycle)'; exec cat",
+            false,
+        );
+        let service = crate::server::test_support::build_test_app_state(vec![inst])
+            .session_service
+            .clone();
+
+        service
+            .drain_terminal_initial_turn_within("sess-claude", std::time::Duration::from_secs(10))
+            .await;
+
+        let screen = pane_text(&pane);
+        assert_eq!(screen.matches("claude-first-turn").count(), 2, "{screen}");
+        assert!(pending_turn(&service, "sess-claude").await.is_none());
+    }
+
     /// A ready agent is typed once even when the create-path and reconciler
     /// drains race, and the turn is cleared in memory and on disk.
     #[tokio::test]
@@ -5077,7 +5109,7 @@ mod tests {
         let _app_dir = crate::session::test_support::isolate_app_dir();
         let mut inst = terminal_turn_instance("sess-no-marker", "term-no-marker", "must-not-type");
         inst.tool = "gemini".into();
-        assert!(crate::agents::ready_marker("gemini").is_none());
+        assert!(crate::agents::ready_markers("gemini").is_empty());
         let pane = start_terminal_pane(
             &inst,
             "echo 'Do you trust this folder? (y/n) [stable dialog]'; exec cat",

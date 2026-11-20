@@ -133,7 +133,7 @@ impl<'a> DefinitionData<'a> {
             fork_strategy: ForkStrategy::Unsupported,
             host_only: launch.host_only,
             send_keys_enter_delay_ms: launch.send_keys_enter_delay_ms.unwrap_or(0),
-            ready_marker: None,
+            ready_markers: &[],
             install_hint: launch.install_hint.as_deref().unwrap_or(&entry.tool),
             permission_response: entry.reply_fallback.as_ref().map(|_| PermissionResponse {
                 allow: &self.allow,
