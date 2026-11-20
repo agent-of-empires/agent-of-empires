@@ -32,5 +32,6 @@ export function reportFeatureUse(feature: FeatureUse): void {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({ feature }),
+    keepalive: true,
   }).catch(() => {});
 }

@@ -480,7 +480,12 @@ fn record_snapshot_fp(snapshot: &UsageSnapshot) {
 }
 
 /// Only confirmed sends are recorded, so a failed send never suppresses a retry.
+/// `feature_uses` are deltas, so a snapshot carrying any never dedups: the same count
+/// in a later window is a new use.
 fn snapshot_matches_last(snapshot: &UsageSnapshot) -> bool {
+    if snapshot.feature_uses.values().any(|&n| n > 0) {
+        return false;
+    }
     let fp = snapshot_fingerprint(snapshot);
     match LAST_SNAPSHOT_FP.lock() {
         Ok(last) => *last == Some(fp),
@@ -724,6 +729,14 @@ mod tests {
         assert!(
             snapshot_matches_last(&changed_again),
             "repeating the latest snapshot dedups against it"
+        );
+
+        let mut used = changed.clone();
+        used.feature_uses.insert("command_palette".into(), 1);
+        record_snapshot_fp(&used);
+        assert!(
+            !snapshot_matches_last(&used),
+            "a repeated feature use in a later window must not dedupe"
         );
 
         *LAST_SNAPSHOT_FP.lock().unwrap() = None;

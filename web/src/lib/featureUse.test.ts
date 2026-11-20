@@ -13,7 +13,11 @@ it("POSTs the feature fire-and-forget and swallows failures", async () => {
   reportFeatureUse("sort_attention");
   expect(fetchSpy).toHaveBeenCalledWith(
     "/api/telemetry/feature-use",
-    expect.objectContaining({ method: "POST", body: JSON.stringify({ feature: "sort_attention" }) }),
+    expect.objectContaining({
+      method: "POST",
+      keepalive: true,
+      body: JSON.stringify({ feature: "sort_attention" }),
+    }),
   );
 
   vi.stubGlobal("fetch", vi.fn().mockRejectedValue(new Error("offline")));

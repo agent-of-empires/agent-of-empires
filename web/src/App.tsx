@@ -1726,6 +1726,8 @@ function AppContent({
   const handlePickView = useCallback(
     (view: RightPanelView) => {
       if (view !== rightPanelView && !confirmFileEditPanes([null])) return;
+      if (view === "files") reportFeatureUse("files_pane");
+      if (view === "agents") reportFeatureUse("agents_pane");
       transitionKeyboardProxy(activeSessionId, view);
       setRightPanelView(view);
       setPickerOpen(false);

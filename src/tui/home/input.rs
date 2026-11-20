@@ -4425,6 +4425,9 @@ impl HomeView {
     }
 
     fn open_command_palette(&mut self) {
+        crate::telemetry::feature_use::record(
+            crate::telemetry::feature_use::FeatureUse::CommandPalette,
+        );
         let mut entries: Vec<PaletteCommand> = builtin_commands(self.strict_hotkeys);
 
         // Quit lives in the registry but is excluded from `builtin_commands` (no palette
@@ -5822,6 +5825,7 @@ impl HomeView {
     /// and the badge. Always opens, even with nothing eligible, so an explicit "Show tips"
     /// gives an empty state rather than silence.
     pub(super) fn open_tips_dialog(&mut self) {
+        crate::telemetry::feature_use::record(crate::telemetry::feature_use::FeatureUse::Tips);
         let config = load_config().ok().flatten().unwrap_or_default();
         let signals = crate::tips::TipSignals::from(&config);
         let eligible = crate::tips::eligible(crate::tips::TipSurface::Tui, &signals);

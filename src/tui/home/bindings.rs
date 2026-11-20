@@ -114,7 +114,8 @@ pub enum ActionId {
 
 impl ActionId {
     /// The accessory feature this action counts as a use of. Sort and group-by
-    /// count at apply time, since their actions only open a picker.
+    /// count at apply time, since their actions only open a picker; tips and the
+    /// command palette count in their openers, which mouse and leader paths also reach.
     pub fn feature_use(self) -> Option<crate::telemetry::feature_use::FeatureUse> {
         use crate::telemetry::feature_use::FeatureUse as F;
         Some(match self {
@@ -133,13 +134,11 @@ impl ActionId {
             ActionId::OpenSystemHealth => F::SystemHealth,
             ActionId::NextWaiting => F::AttentionJump,
             ActionId::ToggleProjectPin => F::ProjectPinToggle,
-            ActionId::Tips => F::Tips,
             ActionId::Fork => F::Fork,
             ActionId::AutoName => F::AutoName,
             ActionId::EmptyTrash => F::TrashEmpty,
             ActionId::RestoreTrash => F::TrashRestore,
             ActionId::ToggleSplitTerminal => F::SplitTerminalToggle,
-            ActionId::OpenCommandPalette => F::CommandPalette,
             _ => return None,
         })
     }
