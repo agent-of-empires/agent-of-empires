@@ -11,6 +11,52 @@ pub(super) use super::unix::{
     restore_environment_value, terminate_process_group, try_wait_status_hook,
 };
 
+/// Mount points of this mount namespace; an error when `/proc` is unavailable.
+pub(crate) fn mount_points() -> std::io::Result<std::collections::HashSet<std::path::PathBuf>> {
+    read_mount_points(Path::new("/proc/self/mountinfo"))
+}
+
+fn read_mount_points(
+    mountinfo: &Path,
+) -> std::io::Result<std::collections::HashSet<std::path::PathBuf>> {
+    fs::read(mountinfo).map(|bytes| parse_mount_points(&bytes))
+}
+
+/// The kernel escapes only space, tab, newline and backslash in a path
+/// (as `\ooo`), so fields split on a literal space and paths stay raw bytes.
+fn parse_mount_points(mountinfo: &[u8]) -> std::collections::HashSet<std::path::PathBuf> {
+    use std::os::unix::ffi::OsStringExt;
+
+    mountinfo
+        .split(|&b| b == b'\n')
+        .filter_map(|line| line.split(|&b| b == b' ').nth(4))
+        .map(|point| {
+            let mut out = Vec::with_capacity(point.len());
+            let mut i = 0;
+            while i < point.len() {
+                let octal = (point[i] == b'\\')
+                    .then(|| point.get(i + 1..i + 4))
+                    .flatten()
+                    .filter(|o| o.iter().all(|d| (b'0'..=b'7').contains(d)))
+                    .and_then(|o| {
+                        u8::try_from(o.iter().fold(0u32, |n, d| n * 8 + u32::from(d - b'0'))).ok()
+                    });
+                match octal {
+                    Some(b) => {
+                        out.push(b);
+                        i += 4;
+                    }
+                    None => {
+                        out.push(point[i]);
+                        i += 1;
+                    }
+                }
+            }
+            std::path::PathBuf::from(std::ffi::OsString::from_vec(out))
+        })
+        .collect()
+}
+
 pub(crate) const HAS_CODEX_MANAGED_PREFERENCES: bool = false;
 
 pub(crate) fn codex_managed_preferences_present() -> bool {
@@ -2054,6 +2100,40 @@ impl super::SleepInhibit for SystemdInhibitor {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn mount_points_come_from_the_fifth_mountinfo_field_unescaped() {
+        let mountinfo = "\
+36 35 98:0 /mnt1 /mnt2 rw,noatime master:1 - ext3 /dev/root rw
+41 35 0:3 / /tmp/aoe-hooks/abc rw - ext4 /dev/root rw
+42 35 0:4 / /tmp/with\\040space rw - tmpfs tmpfs rw
+";
+        let points = parse_mount_points(mountinfo.as_bytes());
+        assert!(points.contains(Path::new("/mnt2")));
+        assert!(points.contains(Path::new("/tmp/aoe-hooks/abc")));
+        assert!(points.contains(Path::new("/tmp/with space")));
+        assert!(!points.contains(Path::new("/mnt1")));
+        assert_eq!(points.len(), 3);
+    }
+
+    #[test]
+    fn an_unreadable_mountinfo_is_an_error_not_an_empty_inventory() {
+        assert!(read_mount_points(Path::new("/nonexistent/mountinfo")).is_err());
+    }
+
+    #[test]
+    fn one_unusual_record_does_not_hide_the_others() {
+        use std::os::unix::ffi::OsStrExt;
+        let mut mountinfo = b"40 35 0:5 / /mnt/\xff/odd rw - tmpfs tmpfs rw\n".to_vec();
+        mountinfo
+            .extend_from_slice("43 35 0:6 /a\u{a0}b /tmp/nbsp rw - tmpfs tmpfs rw\n".as_bytes());
+        mountinfo.extend_from_slice(b"41 35 0:3 / /tmp/aoe-hooks/abc rw - ext4 /dev/root rw\n");
+        let points = parse_mount_points(&mountinfo);
+        assert!(points.contains(Path::new("/tmp/aoe-hooks/abc")));
+        assert!(points.contains(Path::new("/tmp/nbsp")));
+        assert!(points.contains(Path::new(std::ffi::OsStr::from_bytes(b"/mnt/\xff/odd"))));
+        assert_eq!(points.len(), 3);
+    }
 
     #[test]
     fn stat_state_reads_after_the_last_paren_and_excludes_exited() {

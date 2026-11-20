@@ -52,6 +52,19 @@ pub(crate) fn inherit_file_at_fd(
     }
 }
 
+/// Mount points visible to this process. Errors where the table is
+/// unavailable on Linux; other platforms have none to list and return empty.
+pub(crate) fn mount_points() -> std::io::Result<std::collections::HashSet<std::path::PathBuf>> {
+    #[cfg(target_os = "linux")]
+    {
+        linux::mount_points()
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        Ok(Default::default())
+    }
+}
+
 #[cfg(target_os = "linux")]
 use linux as platform;
 #[cfg(target_os = "macos")]
