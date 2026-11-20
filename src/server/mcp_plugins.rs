@@ -22,7 +22,7 @@ use serde_json::{json, Value};
 use super::auth::AuthenticatedPluginCaller;
 use super::state::AppState;
 use crate::plugin::worker_call::WorkerCall;
-use crate::plugin::worker_requests::{WorkerRef, WorkerRequestError};
+use crate::plugin::worker_requests::{CallTicket, WorkerRef, WorkerRequestError};
 
 /// The route service for `/mcp/plugins/{plugin}/{server}`: the MCP transport answers every
 /// method itself.
@@ -199,10 +199,11 @@ impl PluginServerHandler {
         context: &RequestContext<RoleServer>,
     ) -> Result<T, Failure> {
         let plugin = self.caller.plugin.as_str();
-        // The envelope id the worker sees, so `mcp.cancel` names this request unambiguously.
-        let id = self.worker.request_id();
+        // The ticket's envelope id is what the worker sees, so `mcp.cancel` names this request
+        // unambiguously, and the ticket records which worker instance received it.
+        let ticket = self.worker.new_ticket();
         let call = self.worker.call_as(
-            &id,
+            &ticket,
             WorkerRef {
                 plugin_id: plugin,
                 manifest_hash: &self.manifest_hash,
@@ -216,12 +217,12 @@ impl PluginServerHandler {
             reply = call => reply,
             // rmcp cancels the context when the HTTP client goes away mid-request.
             () = context.ct.cancelled() => {
-                self.cancel(&id).await;
+                self.cancel(&ticket).await;
                 return Err(Failure::Cancelled);
             }
         };
         if matches!(reply, Err(WorkerRequestError::Timeout)) {
-            self.cancel(&id).await;
+            self.cancel(&ticket).await;
         }
         let value = reply.map_err(Failure::Worker)?;
         if serde_json::to_vec(&value).map_or(true, |bytes| bytes.len() > MAX_RESULT_BYTES) {
@@ -238,11 +239,11 @@ impl PluginServerHandler {
         Ok(result)
     }
 
-    async fn cancel(&self, id: &str) {
-        let params = self.params(json!({"request_id": id}));
-        self.worker
-            .notify(&self.caller.plugin, "mcp.cancel", params)
-            .await;
+    /// Tells the worker instance that received the call to drop it; nothing is sent when the
+    /// call was never queued or that instance has ended.
+    async fn cancel(&self, ticket: &CallTicket) {
+        let params = self.params(json!({"request_id": ticket.id()}));
+        self.worker.notify_sent(ticket, "mcp.cancel", params).await;
     }
 }
 
@@ -943,16 +944,16 @@ mod tests {
             unreachable!("forwarding sends with a correlatable id")
         }
 
-        fn request_id(&self) -> String {
+        fn new_ticket(&self) -> CallTicket {
             let n = self
                 .next_id
                 .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            format!("h-fake-{n}")
+            CallTicket::new(format!("h-fake-{n}"))
         }
 
         fn call_as<'a>(
             &'a self,
-            id: &'a str,
+            ticket: &'a CallTicket,
             worker: WorkerRef<'a>,
             method: &'a str,
             params: Value,
@@ -965,20 +966,23 @@ mod tests {
             assert_eq!(timeout, MCP_SERVE_CALL_TIMEOUT);
             let _ = self
                 .calls
-                .send((id.to_string(), method.to_string(), params));
+                .send((ticket.id().to_string(), method.to_string(), params));
+            ticket.set_queued_to(tokio::sync::mpsc::unbounded_channel().0);
             match (self.reply)() {
                 Some(reply) => Box::pin(async move { reply }),
                 None => Box::pin(std::future::pending()),
             }
         }
 
-        fn notify<'a>(
+        fn notify_sent<'a>(
             &'a self,
-            plugin_id: &'a str,
+            ticket: &'a CallTicket,
             method: &'a str,
             params: Value,
         ) -> BoxFuture<'a, bool> {
-            assert_eq!(plugin_id, "acme.plug");
+            if ticket.queued_to().is_none() {
+                return Box::pin(async { false });
+            }
             let _ = self.notes.send((method.to_string(), params));
             Box::pin(async { true })
         }

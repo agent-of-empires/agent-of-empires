@@ -43,6 +43,37 @@ impl std::fmt::Display for WorkerRequestError {
     }
 }
 
+/// A host request's envelope id and the stdin channel of the worker process it was queued
+/// to, set once it is. A later notification about the request goes to that instance only.
+#[derive(Debug)]
+pub struct CallTicket {
+    id: String,
+    queued_to: std::sync::OnceLock<tokio::sync::mpsc::UnboundedSender<String>>,
+}
+
+impl CallTicket {
+    pub fn new(id: String) -> Self {
+        Self {
+            id,
+            queued_to: Default::default(),
+        }
+    }
+
+    pub fn id(&self) -> &str {
+        &self.id
+    }
+
+    /// The channel of the process that was handed the request. It is closed once that process
+    /// ends, whatever replaces it.
+    pub fn queued_to(&self) -> Option<&tokio::sync::mpsc::UnboundedSender<String>> {
+        self.queued_to.get()
+    }
+
+    pub fn set_queued_to(&self, channel: tokio::sync::mpsc::UnboundedSender<String>) {
+        let _ = self.queued_to.set(channel);
+    }
+}
+
 struct Entry {
     plugin_id: String,
     generation: u64,
