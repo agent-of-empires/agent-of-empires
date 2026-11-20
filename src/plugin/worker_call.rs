@@ -6,7 +6,7 @@ use futures_util::future::BoxFuture;
 use serde_json::Value;
 
 use crate::plugin::host::PluginHost;
-use crate::plugin::worker_requests::{WorkerRef, WorkerRequestError};
+use crate::plugin::worker_requests::{CallTicket, WorkerRef, WorkerRequestError};
 
 pub trait WorkerCall: Send + Sync {
     fn call<'a>(
@@ -17,14 +17,15 @@ pub trait WorkerCall: Send + Sync {
         timeout: Duration,
     ) -> BoxFuture<'a, Result<Value, WorkerRequestError>>;
 
-    /// A fresh envelope id for [`Self::call_as`], unique for the host.
-    fn request_id(&self) -> String;
+    /// A fresh ticket for [`Self::call_as`], with an envelope id unique for the host.
+    fn new_ticket(&self) -> CallTicket;
 
-    /// [`Self::call`] with envelope id `id`, so a later notification can name the request.
-    /// Waits at most `start_wait` for a worker that is still starting.
+    /// [`Self::call`] with the envelope id of `ticket`, so a later notification can name the
+    /// request, and the ticket records the worker instance that was handed it. Waits at most
+    /// `start_wait` for a worker that is still starting.
     fn call_as<'a>(
         &'a self,
-        id: &'a str,
+        ticket: &'a CallTicket,
         worker: WorkerRef<'a>,
         method: &'a str,
         params: Value,
@@ -32,10 +33,11 @@ pub trait WorkerCall: Send + Sync {
         timeout: Duration,
     ) -> BoxFuture<'a, Result<Value, WorkerRequestError>>;
 
-    /// Sends a JSON-RPC notification; `false` when the plugin has no running worker.
-    fn notify<'a>(
+    /// Sends a JSON-RPC notification to the worker instance `ticket` was queued to; `false` when the
+    /// call was never queued or that instance has ended.
+    fn notify_sent<'a>(
         &'a self,
-        plugin_id: &'a str,
+        ticket: &'a CallTicket,
         method: &'a str,
         params: Value,
     ) -> BoxFuture<'a, bool>;
@@ -60,29 +62,33 @@ impl WorkerCall for PluginHost {
         Box::pin(self.request_worker(worker, method, params, timeout))
     }
 
-    fn request_id(&self) -> String {
-        self.next_request_id()
+    fn new_ticket(&self) -> CallTicket {
+        CallTicket::new(self.next_request_id())
     }
 
     fn call_as<'a>(
         &'a self,
-        id: &'a str,
+        ticket: &'a CallTicket,
         worker: WorkerRef<'a>,
         method: &'a str,
         params: Value,
         start_wait: Duration,
         timeout: Duration,
     ) -> BoxFuture<'a, Result<Value, WorkerRequestError>> {
-        Box::pin(self.request_worker_as(id, worker, method, params, start_wait, timeout))
+        Box::pin(self.request_worker_as(ticket, worker, method, params, start_wait, timeout))
     }
 
-    fn notify<'a>(
+    fn notify_sent<'a>(
         &'a self,
-        plugin_id: &'a str,
+        ticket: &'a CallTicket,
         method: &'a str,
         params: Value,
     ) -> BoxFuture<'a, bool> {
-        Box::pin(self.notify_worker(plugin_id, method, params))
+        let line = serde_json::json!({ "jsonrpc": "2.0", "method": method, "params": params })
+            .to_string()
+            + "\n";
+        let sent = ticket.queued_to().is_some_and(|tx| tx.send(line).is_ok());
+        Box::pin(async move { sent })
     }
 
     fn report_failure(&self, plugin_id: &str, message: &str) {

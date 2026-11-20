@@ -229,7 +229,7 @@ impl McpRewriter for PluginMcpRewriter {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::plugin::worker_requests::WorkerRequestError;
+    use crate::plugin::worker_requests::{CallTicket, WorkerRequestError};
     use crate::session::mcp::project_mcp::ProjectMcpTransport;
     use futures_util::future::BoxFuture;
     use serde_json::{json, Value};
@@ -369,13 +369,13 @@ mod tests {
             Box::pin(async move { reply })
         }
 
-        fn request_id(&self) -> String {
+        fn new_ticket(&self) -> CallTicket {
             unreachable!("the rewrite chain never names its requests")
         }
 
         fn call_as<'a>(
             &'a self,
-            _id: &'a str,
+            _ticket: &'a CallTicket,
             _worker: WorkerRef<'a>,
             _method: &'a str,
             _params: Value,
@@ -385,9 +385,9 @@ mod tests {
             unreachable!("the rewrite chain never names its requests")
         }
 
-        fn notify<'a>(
+        fn notify_sent<'a>(
             &'a self,
-            _plugin_id: &'a str,
+            _ticket: &'a CallTicket,
             _method: &'a str,
             _params: Value,
         ) -> BoxFuture<'a, bool> {
