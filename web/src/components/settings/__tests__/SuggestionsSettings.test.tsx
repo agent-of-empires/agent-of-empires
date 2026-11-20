@@ -229,6 +229,11 @@ describe("SuggestionsSettings", () => {
 
     fireEvent.change(screen.getByLabelText("Agent"), { target: { value: "codex" } });
     fireEvent.click(screen.getByRole("radio", { name: "Terminal" }));
+    // Base border/bg utilities would override the selected ones, so the picked view must not carry them.
+    const picked = screen.getByRole("radio", { name: "Terminal" }).className;
+    expect(picked).toContain("border-brand-500");
+    expect(picked).not.toContain("border-surface-700");
+    expect(screen.getByRole("radio", { name: "Structured" }).className).not.toContain("border-brand-500");
     fireEvent.click(screen.getByRole("switch", { name: "Sandbox" }));
     fireEvent.click(screen.getByRole("switch", { name: "Yolo mode" }));
     fireEvent.change(screen.getByLabelText("GitHub review-requested prompt"), { target: { value: "Review {repo}" } });
