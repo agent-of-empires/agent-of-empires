@@ -161,6 +161,14 @@ describe("cacheSet persistence throttle", () => {
     expect(stored("thr")?.lastSeq).toBe(3);
   });
 
+  it("reads unflushed state after in-memory eviction, not the older persisted entry", () => {
+    writeEntry("evicted", withSeq(1));
+    cacheSet("evicted", withSeq(2));
+    for (let i = 0; i < 32; i++) cacheSet(`other-${i}`, withSeq(i));
+    expect(stored("evicted")?.lastSeq).toBe(1);
+    expect(cacheGet("evicted")?.lastSeq).toBe(2);
+  });
+
   it("flushes on pagehide and on a hidden visibilitychange, not a visible one", () => {
     const visibility = vi.spyOn(document, "visibilityState", "get");
     cacheSet("hide", withSeq(5));
