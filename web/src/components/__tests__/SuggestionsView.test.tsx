@@ -318,7 +318,9 @@ describe("SuggestionsView", () => {
     await open(snapshot({ items: [{ ...item, mapping_key: "acme/web", resolved_project: null }] }));
     expect(screen.queryByRole("button", { name: "Start" })).toBeNull();
     fireEvent.click(await screen.findByRole("button", { name: /^Start in…/ }));
-    fireEvent.click(await screen.findByRole("menuitem", { name: "website" }));
+    // Projects load after the menu opens; focus still moves to the first one.
+    await waitFor(() => expect(document.activeElement).toBe(screen.getByRole("menuitem", { name: "website" })));
+    fireEvent.click(screen.getByRole("menuitem", { name: "website" }));
     await waitFor(() =>
       expect(startSuggestion).toHaveBeenCalledWith("github", "issue-1", { project: { path: "/w/site" } }),
     );

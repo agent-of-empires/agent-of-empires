@@ -1,4 +1,4 @@
-import { useCallback, useId, useRef, useState, type KeyboardEvent, type ReactNode } from "react";
+import { useEffect, useId, useRef, useState, type KeyboardEvent, type ReactNode } from "react";
 import { ChevronDown } from "lucide-react";
 import { fetchSuggestionProjects } from "../lib/api";
 import type { SuggestionProject } from "../lib/types";
@@ -34,9 +34,12 @@ export function MenuPopover({
     setOpen(false);
     if (refocus) document.querySelector<HTMLElement>(`[data-menu="${id}"] [aria-haspopup]`)?.focus();
   };
-  const focusFirst = useCallback((el: HTMLDivElement | null) => {
-    el?.querySelector<HTMLElement>(ENABLED_ITEMS)?.focus();
-  }, []);
+  const menu = useRef<HTMLDivElement>(null);
+  // Every render, since items can arrive after opening (Start in… loads its Projects then).
+  useEffect(() => {
+    const el = menu.current;
+    if (el && !el.contains(document.activeElement)) el.querySelector<HTMLElement>(ENABLED_ITEMS)?.focus();
+  });
   const onMenuKey = (e: KeyboardEvent<HTMLDivElement>) => {
     if (e.key === "Tab") return close(false);
     const items = [...e.currentTarget.querySelectorAll<HTMLElement>(ENABLED_ITEMS)];
@@ -65,7 +68,7 @@ export function MenuPopover({
         <>
           <div aria-hidden="true" className="fixed inset-0 z-30 bg-black/40 md:hidden" onClick={() => setOpen(false)} />
           <div
-            ref={focusFirst}
+            ref={menu}
             role="menu"
             aria-label={label}
             onKeyDown={onMenuKey}
