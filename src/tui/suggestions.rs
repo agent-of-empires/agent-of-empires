@@ -1709,6 +1709,10 @@ impl SuggestionsFeed {
         std::mem::take(&mut self.hooks_changed)
     }
 
+    pub(super) fn drop_held_trust(&mut self) {
+        self.held_trust = None;
+    }
+
     pub(super) fn has_held_trust(&self) -> bool {
         self.held_trust.is_some()
     }

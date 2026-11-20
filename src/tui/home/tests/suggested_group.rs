@@ -387,6 +387,30 @@ fn the_hooks_review_opened_from_the_full_view_is_drawn_and_takes_the_keys() {
 
 #[test]
 #[serial]
+fn cancelling_the_hooks_review_in_the_full_view_says_nothing_started() {
+    let answer = StartAnswer::NeedsTrust {
+        mcp_summaries: vec![],
+        commands: vec!["on create: make setup".into()],
+        fingerprint: serde_json::json!({ "project_path": "/repo" }),
+    };
+    let (mut env, requests) = expanded_env_answering(2, answer);
+    with_authenticated_local_project_registry(&mut env.view, |view| {
+        view.open_suggestions_view();
+        view.handle_key(key(KeyCode::Enter), None);
+    });
+    assert_eq!(next_request(&requests), "start gh/i0");
+    poll_until(&mut env, |env| env.view.confirm_dialog.is_some());
+    env.view.handle_key(key(KeyCode::Esc), None);
+    env.view.apply_suggestions_results();
+
+    assert!(!env.view.suggestions_feed.has_held_trust());
+    let text = render_home_to_string(&mut env.view, 120, 40);
+    assert!(!text.contains("Starting…"), "{text}");
+    assert!(text.contains("Not started"), "{text}");
+}
+
+#[test]
+#[serial]
 fn a_profile_switch_closes_the_hooks_review_and_nothing_is_approved() {
     let answer = StartAnswer::NeedsTrust {
         mcp_summaries: vec![],
