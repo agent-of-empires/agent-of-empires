@@ -2196,6 +2196,15 @@ fn only_a_title_the_user_typed_is_marked_typed() {
     assert!(data.title_typed, "an edited suggestion is typed");
 }
 
+#[test]
+fn an_unfocused_long_title_shows_its_start() {
+    let mut dialog = single_tool_dialog();
+    dialog.focused_field = 0;
+    dialog.set_title(format!("Review: the start {}the end", "x".repeat(200)));
+    let screen = screen_of(&mut dialog, 100, 40);
+    assert!(screen.contains("Title: Review: the start"), "{screen}");
+}
+
 /// A session on `tool`, sandboxed and in yolo as asked.
 fn source_session(tool: &str, sandboxed: bool, yolo: bool) -> Instance {
     let mut inst = Instance::new("source", TEST_PATH);
