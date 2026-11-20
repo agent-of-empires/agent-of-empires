@@ -1515,7 +1515,8 @@ describe("retryRejectedPrompt (#5662)", () => {
   it("does not resend without an attachment it cannot reload", async () => {
     const result = await rejectedThenRetry("look at this", () => new Response("gone", { status: 404 }));
     expect(posts("/acp/prompt")).toHaveLength(0);
-    expect(result.current.state.lastError).toMatch(/attachments/);
+    expect(result.current.state.interactionError?.message).toMatch(/attachments/);
+    expect(result.current.state.lastError).toBeNull();
   });
 });
 
