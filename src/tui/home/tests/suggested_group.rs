@@ -1146,3 +1146,46 @@ fn a_home_row_leads_with_the_title_not_the_source() {
     assert!(text.contains("Item 0 #0"), "{text}");
     assert!(!text.contains("GitHub #0"), "{text}");
 }
+
+#[test]
+#[serial]
+fn a_prompt_blocked_on_folder_trust_turns_on_pre_trust_then_tries_again() {
+    use crate::tui::session_feed::SessionFeedResult;
+    let mut env = create_test_env_with_sessions(1);
+    let instance = env.view.instances().next().unwrap().clone();
+    let mut row = crate::server::api::sessions::session_response_from_instance(&instance, false);
+    row.initial_prompt_error = Some("Claude Code is asking whether to trust this folder.".into());
+    row.initial_prompt_error_code = Some("agent_folder_not_trusted".into());
+    let rows = fixture_snapshot(vec![row], "test", "test", 5);
+    env.view
+        .session_feed
+        .publish_for_test(SessionFeedResult::Snapshot(Arc::new(rows)));
+    env.view.apply_session_feed();
+    env.view.info_dialog = None;
+    let mut snap = snapshot(1, &[]);
+    snap["items"][0]["started_session"] =
+        serde_json::json!({ "id": instance.id, "status": "Idle" });
+    env.view.suggestions_feed.set_snapshot_for_test(snap);
+    env.view.apply_suggestions_results();
+    env.view.open_suggestions_view();
+
+    let text = render_home_to_string(&mut env.view, 120, 40);
+    assert!(text.contains("t turn on pre-trust"), "{text}");
+    with_authenticated_local_project_registry(&mut env.view, |view| {
+        view.handle_key(key(KeyCode::Char('t')), None);
+        let text = render_home_to_string(view, 120, 40);
+        assert!(text.contains("Turn on pre-trust"), "{text}");
+        view.handle_key(key(KeyCode::Char('y')), None);
+        assert!(
+            crate::session::config::Config::load()
+                .unwrap()
+                .session
+                .pre_trust_agent_folders
+        );
+        view.handle_key(key(KeyCode::Enter), None);
+    });
+    assert_eq!(
+        env.view.start_after_trash,
+        Some((instance.id.clone(), ("gh".to_string(), "i0".to_string())))
+    );
+}

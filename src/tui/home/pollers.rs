@@ -56,6 +56,26 @@ impl HomeView {
         self.suggestions_feed
             .tick(self.session_feed.latest_snapshot().is_some());
         let mut polled = self.suggestions_feed.poll();
+        let blocked: std::collections::HashMap<_, _> = self
+            .session_feed
+            .applied_snapshot()
+            .map(|snapshot| {
+                snapshot
+                    .contents
+                    .sessions
+                    .iter()
+                    .filter_map(|row| {
+                        let message = row.initial_prompt_error.clone()?;
+                        Some((
+                            row.id.clone(),
+                            (message, row.initial_prompt_error_code.clone()),
+                        ))
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+        let blocked_changed = blocked != self.suggestions_feed.blocked_prompts;
+        self.suggestions_feed.blocked_prompts = blocked;
         let mut review_closed = false;
         let reviewing = self
             .confirm_dialog
@@ -74,6 +94,7 @@ impl HomeView {
             review_closed = true;
         }
         let mut changed = review_closed
+            || blocked_changed
             || match &mut self.suggestions_view {
                 Some(view) => view.apply(&mut self.suggestions_feed, &mut polled),
                 None => false,
@@ -195,6 +216,8 @@ impl HomeView {
     pub(super) fn open_suggestions_view(&mut self) {
         let mut view = SuggestionsView::new(&mut self.suggestions_feed);
         view.strict = self.strict_hotkeys;
+        view.pretrusted =
+            crate::session::config::Config::load().is_ok_and(|c| c.session.pre_trust_agent_folders);
         self.suggestions_view = Some(view);
     }
 

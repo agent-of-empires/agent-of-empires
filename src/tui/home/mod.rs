@@ -574,6 +574,8 @@ pub struct HomeView {
     pub(super) suggested_section_collapsed: bool,
     /// Sessions whose undelivered first prompt was already announced.
     pub(super) prompt_failures_announced: std::collections::HashSet<String>,
+    /// A suggestion to start again once its blocked Session, by id, is in Trash.
+    pub(super) start_after_trash: Option<(String, (String, String))>,
     pub(super) suggestions_feed: super::suggestions::SuggestionsFeed,
 
     /// Non-web links handed to the system opener until their exit status arrives.

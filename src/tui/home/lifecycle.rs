@@ -369,6 +369,7 @@ impl HomeView {
             trashed_section_collapsed: true,
             suggested_section_collapsed: true,
             prompt_failures_announced: std::collections::HashSet::new(),
+            start_after_trash: None,
             suggestions_feed: crate::tui::suggestions::SuggestionsFeed::new(),
             hide_stopped_in_groups: false,
             group_totals: HashMap::new(),

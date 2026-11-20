@@ -1153,19 +1153,30 @@ impl HomeView {
         let mut purge_notes: Vec<(String, String)> = Vec::new();
         for (id, outcome) in row_outcomes {
             match outcome {
-                SessionCommandOutcome::Trashed(receipt) => match receipt.outcome.relocation {
-                    crate::daemon::TrashRelocationOutcome::Failed { reason } => {
-                        self.record_runtime_message(format!("{id}: Session is in Trash, but its worktree relocation is incomplete: {reason}"));
+                SessionCommandOutcome::Trashed(receipt) => {
+                    if self
+                        .start_after_trash
+                        .as_ref()
+                        .is_some_and(|(trashed, _)| *trashed == id)
+                    {
+                        if let Some((_, key)) = self.start_after_trash.take() {
+                            self.suggestions_feed.start(key);
+                        }
                     }
-                    crate::daemon::TrashRelocationOutcome::TeardownFailed { reason } => {
-                        self.record_runtime_message(format!("{id}: Session is in Trash, but its tmux sessions could not be stopped: {reason}"));
+                    match receipt.outcome.relocation {
+                        crate::daemon::TrashRelocationOutcome::Failed { reason } => {
+                            self.record_runtime_message(format!("{id}: Session is in Trash, but its worktree relocation is incomplete: {reason}"));
+                        }
+                        crate::daemon::TrashRelocationOutcome::TeardownFailed { reason } => {
+                            self.record_runtime_message(format!("{id}: Session is in Trash, but its tmux sessions could not be stopped: {reason}"));
+                        }
+                        crate::daemon::TrashRelocationOutcome::Relocated {
+                            warning: Some(warning),
+                        } => self.record_runtime_message(format!("{id}: {warning}")),
+                        crate::daemon::TrashRelocationOutcome::Relocated { warning: None }
+                        | crate::daemon::TrashRelocationOutcome::Skipped => {}
                     }
-                    crate::daemon::TrashRelocationOutcome::Relocated {
-                        warning: Some(warning),
-                    } => self.record_runtime_message(format!("{id}: {warning}")),
-                    crate::daemon::TrashRelocationOutcome::Relocated { warning: None }
-                    | crate::daemon::TrashRelocationOutcome::Skipped => {}
-                },
+                }
                 SessionCommandOutcome::Purged(receipt) => {
                     self.record_purge_outcome(&id, receipt.outcome, &mut purge_notes)
                 }

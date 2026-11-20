@@ -1429,6 +1429,23 @@ impl HomeView {
                 self.suggestions_feed.approve_held_trust();
                 None
             }
+            "suggestion_pre_trust" => {
+                let saved = crate::session::config::update_config(|c| {
+                    c.session.pre_trust_agent_folders = true;
+                });
+                if let Some(view) = &mut self.suggestions_view {
+                    match saved {
+                        Ok(_) => {
+                            view.pretrusted = true;
+                            view.set_notice("Pre-trust is on. Enter tries again: the blocked Session goes to Trash and a new one starts.");
+                        }
+                        Err(error) => {
+                            view.set_error(format!("Couldn't turn on pre-trust: {error}"))
+                        }
+                    }
+                }
+                None
+            }
             "stop_session" => self.pending_stop_session.take().map(Action::StopSession),
             "resume_reveal" => {
                 if let Some(intent) = self.retained_reveal.take() {
@@ -2327,6 +2344,26 @@ impl HomeView {
             match view.handle_key(key, block, &mut self.suggestions_feed) {
                 SuggestionsAction::Continue => {}
                 SuggestionsAction::Close => self.suggestions_view = None,
+                SuggestionsAction::TurnOnPreTrust => {
+                    self.confirm_dialog = Some(
+                        ConfirmDialog::new(
+                            "Turn on pre-trust",
+                            "Claude Code asked whether to trust this folder, so the prompt was not typed.\n\nPre-trust starts each new Session's folder trusted. It also turns on the repository's own Claude Code settings file, so its hooks run without asking.\n\nTurn it on?",
+                            "suggestion_pre_trust",
+                        )
+                        .neutral()
+                        .buttons("Turn on pre-trust", "Cancel"),
+                    );
+                }
+                SuggestionsAction::TryAgain(key, session_id) => {
+                    self.start_after_trash = Some((session_id.clone(), key));
+                    self.trash_session_by_id(&session_id);
+                    if let Some(view) = &mut self.suggestions_view {
+                        view.set_notice(
+                            "Moving the blocked Session to Trash, then starting again…",
+                        );
+                    }
+                }
                 SuggestionsAction::OpenSession(id) => match self.try_open_linked_session(&id) {
                     Ok(()) => self.suggestions_view = None,
                     Err(reason) => {
