@@ -60,7 +60,7 @@ const IPHONE = "Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) AppleWebK
 const IPAD = "Mozilla/5.0 (iPad; CPU OS 17_0 like Mac OS X) AppleWebKit/605.1.15";
 const ANDROID = "Mozilla/5.0 (Linux; Android 14; Pixel 8) AppleWebKit/537.36 Chrome/126.0 Mobile Safari/537.36";
 const MAC = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 Version/17.0 Safari/605.1.15";
-const FIREFOX_TOUCH = "Mozilla/5.0 (X11; Linux x86_64; rv:128.0) Gecko/20100101 Firefox/128.0";
+const LINUX_FIREFOX = "Mozilla/5.0 (X11; Linux x86_64; rv:128.0) Gecko/20100101 Firefox/128.0";
 
 describe("installHint", () => {
   it.each([
@@ -92,15 +92,15 @@ describe("installHint", () => {
       want: "android",
     },
     {
-      name: "another touch browser",
-      ua: FIREFOX_TOUCH,
+      name: "a touch-only Linux browser (coarse pointer, not a phone)",
+      ua: LINUX_FIREFOX,
       touch: 5,
       standalone: false,
       finePointer: false,
       secure: true,
       want: "other",
     },
-    { name: "a desktop", ua: FIREFOX_TOUCH, touch: 0, standalone: false, finePointer: true, secure: true, want: null },
+    { name: "a desktop", ua: LINUX_FIREFOX, touch: 0, standalone: false, finePointer: true, secure: true, want: null },
     // Push on an iPad needs the installed app too, whatever the pointer.
     {
       name: "an iPad with a trackpad",

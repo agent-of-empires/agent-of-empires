@@ -18,16 +18,16 @@ const LOCALE = { skip: "Skip tour", last: "Done", next: "Next", back: "Back" };
 function StepBody({
   body,
   shortcutHints,
-  hint,
+  installLine,
 }: {
   body: string;
   shortcutHints?: readonly TourShortcutHint[];
-  hint?: string;
+  installLine?: string;
 }) {
   return (
     <div>
       <p>{body}</p>
-      {hint && <p className="mt-2">{hint}</p>}
+      {installLine && <p className="mt-2">{installLine}</p>}
       {shortcutHints && shortcutHints.length > 0 && (
         <ul className="mt-2 space-y-0.5 text-[11px] text-text-muted">
           {shortcutHints.map((hint) => (
@@ -41,13 +41,17 @@ function StepBody({
   );
 }
 
-function toJoyrideStep(step: TourStep, hint: string | undefined): Step {
+function toJoyrideStep(step: TourStep, installLine: string | undefined): Step {
   return {
     id: step.id,
     target: tourSelector(step.anchor),
     title: step.title,
     content: (
-      <StepBody body={step.body} shortcutHints={step.shortcutHints} hint={step.installHint ? hint : undefined} />
+      <StepBody
+        body={step.body}
+        shortcutHints={step.shortcutHints}
+        installLine={step.installHint ? installLine : undefined}
+      />
     ),
     placement: "auto",
   };
@@ -56,8 +60,8 @@ function toJoyrideStep(step: TourStep, hint: string | undefined): Step {
 export default function TourRunner({ run, steps, onFinish }: TourRunnerProps) {
   const joyrideSteps = useMemo(() => {
     const platformHint = installHint();
-    const hint = platformHint ? INSTALL_HINTS[platformHint] : undefined;
-    return steps.map((step) => toJoyrideStep(step, hint));
+    const installLine = platformHint ? INSTALL_HINTS[platformHint] : undefined;
+    return steps.map((step) => toJoyrideStep(step, installLine));
   }, [steps]);
   const [stepIndex, setStepIndex] = useState(0);
 

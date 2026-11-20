@@ -20,12 +20,14 @@ async function openLastStep(page: Page) {
   await page.getByRole("button", { name: "More options" }).click();
   await page.getByRole("menuitem", { name: "Show tutorial" }).click();
   const step = page.getByRole("alertdialog");
-  for (let i = 0; i < 12; i++) {
-    await expect(step).toBeVisible();
-    const next = step.getByRole("button", { name: /^Next/ });
-    const done = step.getByRole("button", { name: "Done" });
+  const next = step.getByRole("button", { name: /^Next/ });
+  const done = step.getByRole("button", { name: "Done" });
+  // Far above the tour's length; it only stops a tour that never reaches Done.
+  const maxSteps = 20;
+  for (let steps = 0; ; steps++) {
     await expect(next.or(done)).toBeVisible();
     if (await done.isVisible()) break;
+    expect(steps, "the tour never reached Done").toBeLessThan(maxSteps);
     const title = await step.getAttribute("aria-label");
     await next.click();
     await expect(step).not.toHaveAttribute("aria-label", title ?? "");
