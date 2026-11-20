@@ -120,14 +120,16 @@ function Harness({
   );
 }
 
-function open(props: { readOnly?: boolean; presetFocus?: PresetFocus; presets?: typeof PRESETS } = {}) {
+function open(
+  props: { readOnly?: boolean; presetFocus?: PresetFocus; presets?: typeof PRESETS; mappings?: unknown[] } = {},
+) {
   api.fetchSuggestions.mockResolvedValue(snapshot());
   api.fetchSuggestionPresets.mockResolvedValue(props.presets ?? PRESETS);
   api.fetchAgents.mockResolvedValue([
     { name: "claude", display_name: "Claude Code", kind: "builtin", installed: true },
     { name: "codex", display_name: "Codex", kind: "builtin", installed: true },
   ]);
-  api.fetchSuggestionMappings.mockResolvedValue([]);
+  api.fetchSuggestionMappings.mockResolvedValue((props.mappings ?? []) as never);
   api.fetchProjects.mockResolvedValue([{ name: "aoe", path: "/p/aoe", scope: "global", pinned: false }]);
   for (const f of [
     api.updateSuggestionPrefs,
@@ -332,6 +334,18 @@ describe("SuggestionsSettings", () => {
       fireEvent.click(within(row).getByRole("button", { name: "Edit" }));
       return (await screen.findByLabelText("Link github.com/o/r")) as HTMLSelectElement;
     };
+
+    it("the Advanced row counts linked repos", async () => {
+      open({
+        mappings: [
+          { key: "a", projects: [{ name: "aoe", path: "/p/aoe" }] },
+          { key: "b", projects: [{ name: "aoe", path: "/p/aoe" }] },
+          { key: "c", projects: [] },
+        ],
+      });
+      fireEvent.click(await screen.findByText("Advanced"));
+      expect(await screen.findByText("2 repos linked to Projects.")).toBeTruthy();
+    });
 
     it("links a repo to a Project", async () => {
       const select = await openLinked();
