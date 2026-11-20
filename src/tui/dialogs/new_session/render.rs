@@ -253,12 +253,19 @@ impl NewSessionDialog {
         ci += 1;
 
         let area = chunks[ci];
+        let title_focused = self.focused_field == fields.title;
+        // A long prefilled title reads from its start until the field is focused.
+        let title = if title_focused {
+            self.title.clone()
+        } else {
+            self.title.clone().with_cursor(0)
+        };
         render_text_field(
             frame,
             area,
             "Title:",
-            &self.title,
-            self.focused_field == fields.title,
+            &title,
+            title_focused,
             Some("(random civ)"),
             theme,
         );
