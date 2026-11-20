@@ -42,9 +42,9 @@ type ServerMessage =
   | { kind: "heartbeat" }
   | {
       kind: "reduced_state";
+      seq?: number;
       state?: ReducedState;
       unchanged?: string[];
-      seq?: number;
     }
   | { kind: "transcript_snapshot"; rows?: TranscriptRow[] }
   | { kind: "transcript_delta"; delta?: TranscriptDelta };
@@ -296,11 +296,7 @@ export function useAcpConnection(
             state: reduced,
             unchanged,
             seq,
-          } = data as {
-            state?: ReducedState;
-            unchanged?: string[];
-            seq?: number;
-          };
+          } = data as { seq?: number; state?: ReducedState; unchanged?: string[] };
           if (!reduced) return;
           lastActivityRef.current = Date.now();
           dispatch({
@@ -343,6 +339,7 @@ export function useAcpConnection(
       const myGen = dialGenRef.current;
       const isCurrentDial = () => !cancelled && dialGenRef.current === myGen;
       setStatus("connecting");
+      dispatch({ kind: "native_authority_pending" });
       void (async () => {
         // Replay is best effort and the socket's `since=` covers the gap, so a hung fetch must not block the dial.
         // On timeout the replay is aborted so a late snapshot cannot overwrite rows the socket has since updated.
@@ -388,11 +385,15 @@ export function useAcpConnection(
           setRetryCountdown(0);
         };
         ws.onerror = () => {
-          if (isCurrentDial()) setStatus("error");
+          if (isCurrentDial()) {
+            dispatch({ kind: "native_authority_pending" });
+            setStatus("error");
+          }
         };
         ws.onclose = () => {
           clearTimeout(handshakeTimer);
           if (!isCurrentDial()) return;
+          dispatch({ kind: "native_authority_pending" });
           setStatus("closed");
           wsRef.current = null;
           scheduleReconnect();

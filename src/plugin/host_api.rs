@@ -428,6 +428,7 @@ fn session_capture_set(
         &session_id,
         &observation,
         &expected,
+        None,
     );
     match commit.outcome {
         crate::session::SidWrite::Applied => Ok(json!({ "applied": true })),

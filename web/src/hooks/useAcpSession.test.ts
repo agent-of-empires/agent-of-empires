@@ -1,16 +1,20 @@
 // @vitest-environment jsdom
 
-import { act, renderHook, waitFor } from "@testing-library/react";
+import { act, fireEvent, render as renderView, renderHook, waitFor, within } from "@testing-library/react";
+import { createElement, useLayoutEffect } from "react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
-import { emptyAcpState } from "../lib/acpTypes";
+import { emptyAcpState, nativeInputAvailable, type SubagentRecord } from "../lib/acpTypes";
 import { STATE_TTL_MS, STORAGE_KEY_PREFIX, getLiveQueueCount } from "../lib/acpStateStorage";
 import { listServerQueue, reportAcpInteraction, type ServerQueuedPrompt } from "../lib/api";
 import type { SessionResponse } from "../lib/types";
 import { cacheGet } from "./acpSession/stateCache";
+import { useCancelEscalation } from "../components/acp/useCancelEscalation";
+import { BackgroundAgentsPanel } from "../components/acp/BackgroundAgentsPanel";
 import { ACP_DIAL_TIMEOUT_MS, ACP_MAX_RETRIES, ACP_WS_STALE_MS, acpRetryDelayMs } from "./acpSession/useAcpConnection";
 import {
   FakeWebSocket,
+  currentControlSnapshot,
   flushAsync,
   installAcpFakes,
   json,
@@ -48,12 +52,17 @@ function render(...args: HookArgs) {
   return renderHook(() => useAcpSession(...args), { wrapper: profileWrapper });
 }
 
-async function openSession(...args: HookArgs) {
+async function openSessionWithReceipt(receipt: Parameters<typeof currentControlSnapshot>[1], ...args: HookArgs) {
   const hook = render(...args);
   await flushAsync();
   lastSocket().open();
   await flushAsync();
+  lastSocket().message(currentControlSnapshot(hook.result.current.state, receipt));
   return hook;
+}
+
+async function openSession(...args: HookArgs) {
+  return openSessionWithReceipt({ ready: true }, ...args);
 }
 
 const posts = (fragment: string) => calls.filter((c) => c.method === "POST" && c.url.includes(fragment));
@@ -626,7 +635,13 @@ describe("sendPrompt outcomes", () => {
 
     it("wakes a snoozed session before sending", async () => {
       calls = installAcpFakes(queuedPrompt);
-      const { result } = render("sess-wake", "absent", null, "2099-01-01T00:00:00Z");
+      const { result } = await openSessionWithReceipt(
+        { ready: false, wakeEligible: true },
+        "sess-wake",
+        "absent",
+        null,
+        "2099-01-01T00:00:00Z",
+      );
       await flushAsync();
       await act(() => result.current.sendPrompt("wake me up"));
       await flushAsync();
@@ -646,12 +661,12 @@ describe("sendPrompt outcomes", () => {
       await flushAsync();
       expect(calls.filter((c) => c.method === "PATCH")).toHaveLength(0);
       expect(posts("/acp/prompt")).toHaveLength(0);
-      expect(result.current.state.lastError).toBe("session is archived; unarchive it first");
+      expect(result.current.state.interactionError?.message).toBe("session is archived; unarchive it first");
     });
 
     it("does not call wake endpoints for a live session", async () => {
       calls = installAcpFakes(queuedPrompt);
-      const { result } = render("sess-live", "absent", null, null);
+      const { result } = await openSession("sess-live", "absent", null, null);
       await flushAsync();
       await act(() => result.current.sendPrompt("just a prompt"));
       await flushAsync();
@@ -661,13 +676,19 @@ describe("sendPrompt outcomes", () => {
 
     it("sends nothing when the snooze wake fails", async () => {
       calls = installAcpFakes(failingWake("/snooze"));
-      const { result } = render("sess-wake-fail", "absent", null, "2099-01-01T00:00:00Z");
+      const { result } = await openSessionWithReceipt(
+        { ready: false, wakeEligible: true },
+        "sess-wake-fail",
+        "absent",
+        null,
+        "2099-01-01T00:00:00Z",
+      );
       await flushAsync();
       await act(() => result.current.sendPrompt("wake me up"));
       await flushAsync();
       expect(posts("/acp/prompt")).toHaveLength(0);
       expect(result.current.state.queuedPrompts).toHaveLength(0);
-      expect(result.current.state.lastError).toMatch(/wake/i);
+      expect(result.current.state.interactionError?.message).toMatch(/wake/i);
     });
   });
 
@@ -687,8 +708,13 @@ describe("sendPrompt outcomes", () => {
           )
         : undefined,
     );
-    const { result } = render("sess-login", "absent", null, null);
-    await flushAsync();
+    const { result } = await openSessionWithReceipt(
+      { ready: false, wakeEligible: true },
+      "sess-login",
+      "absent",
+      null,
+      null,
+    );
     await act(() => result.current.sendPrompt("after the login"));
     await flushAsync();
     expect(result.current.state.queuedPrompts.map((q) => q.text)).toEqual(["after the login"]);
@@ -712,8 +738,13 @@ describe("sendPrompt outcomes", () => {
           )
         : undefined,
     );
-    const { result } = render("sess-hook-failed", "absent", null, null);
-    await flushAsync();
+    const { result } = await openSessionWithReceipt(
+      { ready: false, wakeEligible: true },
+      "sess-hook-failed",
+      "absent",
+      null,
+      null,
+    );
     await act(() => result.current.sendPrompt("once the hook works"));
     await flushAsync();
     expect(result.current.state.queuedPrompts.map((q) => q.text)).toEqual(["once the hook works"]);
@@ -731,12 +762,12 @@ describe("sendPrompt outcomes", () => {
       if (url.includes("/queue") && method === "GET") return json([]);
       return undefined;
     });
-    const { result } = render("sess-capacity", "running", null, null);
+    const { result } = await openSession("sess-capacity", "running", null, null);
     await flushAsync();
     await act(() => result.current.sendPrompt("no room at the inn"));
     await flushAsync();
     expect(posts("/queue")).toHaveLength(0);
-    expect(result.current.state.lastError).toMatch(/capacity/i);
+    expect(result.current.state.interactionError?.message).toMatch(/capacity/i);
   });
 
   // Both park kinds are sendable at `dispatch::decide`, and a still-limited spawn answers 503
@@ -758,12 +789,17 @@ describe("sendPrompt outcomes", () => {
         return undefined;
       };
 
-    // The re-queue keys on the daemon's `worker_not_ready`, not on this flag: a park the client
-    // has not learned about yet must not cost the prompt, so BOTH rows re-enqueue. The flag is
-    // still asserted because `canSendQueuedNow` reads it.
+    // Replay flags are not admission. The explicit current server governor can
+    // report a park the client has not learned about yet.
     it.each([[true], [false]])("parked=%s re-enqueues a 503'd prompt", async (isParked) => {
       calls = installAcpFakes(parked(isParked));
-      const { result } = render(`sess-${tag}`, "running", null, null);
+      const { result } = await openSessionWithReceipt(
+        { ready: false, wakeEligible: true },
+        `sess-${tag}`,
+        "running",
+        null,
+        null,
+      );
       await flushAsync();
       expect(result.current.state[flag]).toBe(isParked);
       await act(() => result.current.sendPrompt("try again after the park"));
@@ -774,7 +810,13 @@ describe("sendPrompt outcomes", () => {
 
     it("offers Send now on a row stranded behind the park", async () => {
       installAcpFakes(parked(true));
-      const { result } = await openSession(`sess-${tag}-send`, "absent", null, null);
+      const { result } = await openSessionWithReceipt(
+        { ready: false, wakeEligible: true },
+        `sess-${tag}-send`,
+        "absent",
+        null,
+        null,
+      );
       expect(result.current.status).toBe("open");
       expect(result.current.canSendQueuedNow).toBe(true);
     });
@@ -922,6 +964,8 @@ describe("server queue", () => {
     serverBusy = true;
     lastSocket().message({ session_id: id, seq: 1, event: { UserPromptSent: { text: "kick" } } });
     await flushAsync();
+    lastSocket().message(currentControlSnapshot(hook.result.current.state, { ready: true }));
+    await flushAsync();
     act(() => void hook.result.current.sendPrompt("follow-up"));
     await flushAsync();
     expect(getLiveQueueCount(id)).toBe(2);
@@ -1007,6 +1051,7 @@ describe("server queue", () => {
     queuePostHeld = post.promise;
     queuePostStarted = started.resolve;
     lastSocket().open();
+    lastSocket().message(currentControlSnapshot(hook.result.current.state, { ready: true }));
     await started.promise;
     // The first POST commits, which moves the poll, and the Daemon delivers it before its response arrives.
     hook.rerender({ polled: 1 });
@@ -1019,6 +1064,40 @@ describe("server queue", () => {
     expect(serverQueue.has("u1")).toBe(false);
     expect(hook.result.current.state.queuedPrompts.every((q) => !q.pending)).toBe(true);
     hook.unmount();
+  });
+
+  it("does not replay migrated input after a lost POST response", async () => {
+    const id = "sess-migration-response-lost";
+    const state = {
+      ...emptyAcpState(),
+      queuedPrompts: [{ id: "lost", text: "send once", queuedAt: "2026-01-01T00:00:00.000Z", pending: true }],
+    };
+    localStorage.setItem(`${STORAGE_KEY_PREFIX}${id}`, JSON.stringify({ savedAt: Date.now(), state }));
+    const post = Promise.withResolvers<void>();
+    const started = Promise.withResolvers<void>();
+    queuePostHeld = post.promise;
+    queuePostStarted = started.resolve;
+    const hook = renderHook(({ polled }) => useAcpSession(id, "running", null, null, polled), {
+      wrapper: profileWrapper,
+      initialProps: { polled: 0 },
+    });
+    await flushAsync();
+    lastSocket().open();
+    lastSocket().message(currentControlSnapshot(hook.result.current.state, { ready: true }));
+    await started.promise;
+    expect(serverQueue.delete("lost")).toBe(true);
+    queuePostHeld = null;
+    post.reject(new TypeError("response lost"));
+    await flushAsync();
+    const before = calls.filter((call) => call.method === "GET" && call.url.includes("/queue")).length;
+    hook.rerender({ polled: 1 });
+    await waitFor(() =>
+      expect(calls.filter((call) => call.method === "GET" && call.url.includes("/queue")).length).toBeGreaterThan(
+        before,
+      ),
+    );
+    expect(posts("/queue")).toHaveLength(1);
+    expect(serverQueue.has("lost")).toBe(false);
   });
 
   it("retries a failed queue list a bounded number of times, and stops on success or cleanup", async () => {
@@ -1089,6 +1168,7 @@ describe("server queue", () => {
     queuePostHeld = post.promise;
     queuePostStarted = started.resolve;
     lastSocket().open();
+    lastSocket().message(currentControlSnapshot(first.result.current.state, { ready: true }));
     await started.promise;
     // The user leaves A; the Daemon then delivers u1 before its response arrives.
     if (leave === "switch") first.rerender({ id: "sess-elsewhere" });
@@ -1128,6 +1208,7 @@ describe("server queue", () => {
     queuePostHeld = post.promise;
     queuePostStarted = started.resolve;
     lastSocket().open();
+    lastSocket().message(currentControlSnapshot(first.result.current.state, { ready: true }));
     await started.promise;
     queuePostHeld = null;
     queuePostStarted = null;
@@ -1136,6 +1217,7 @@ describe("server queue", () => {
     const again = render(a);
     await flushAsync();
     lastSocket().open();
+    lastSocket().message(currentControlSnapshot(again.result.current.state, { ready: true }));
     await flushAsync();
     const listed = lists();
     post.resolve();
@@ -1161,6 +1243,7 @@ describe("server queue", () => {
     });
     await flushAsync();
     lastSocket().open();
+    lastSocket().message(currentControlSnapshot(first.result.current.state, { ready: true }));
     await flushAsync();
     const post = Promise.withResolvers<void>();
     const started = Promise.withResolvers<void>();
@@ -1212,6 +1295,7 @@ describe("server queue", () => {
     queuePostHeld = post.promise;
     queuePostStarted = started.resolve;
     lastSocket().open();
+    lastSocket().message(currentControlSnapshot(hook.result.current.state, { ready: true }));
     await started.promise;
     queuePostHeld = null;
     queuePostStarted = null;
@@ -1244,6 +1328,7 @@ describe("server queue", () => {
     queuePostUncommitted = commit.promise;
     queuePostStarted = started.resolve;
     lastSocket().open();
+    lastSocket().message(currentControlSnapshot(hook.result.current.state, { ready: true }));
     await started.promise;
     queuePostUncommitted = null;
     queuePostStarted = null;
@@ -1294,6 +1379,7 @@ describe("server queue", () => {
     const bStarted = () => posts("/queue").some((c) => JSON.parse(c.body!).id === "B");
     if (when === "before") queuePostStarted = started.resolve;
     lastSocket().open();
+    lastSocket().message(currentControlSnapshot(hook.result.current.state, { ready: true }));
     if (when === "before") await started.promise;
     else await waitFor(() => expect(bStarted()).toBe(true));
     queuePostHeld = null;
@@ -1359,6 +1445,7 @@ describe("server queue", () => {
     queuePostHeld = post.promise;
     queuePostStarted = started.resolve;
     lastSocket().open();
+    lastSocket().message(currentControlSnapshot(hook.result.current.state, { ready: true }));
     await started.promise;
     serverQueue.delete("u1");
     queuePostHeld = null;
@@ -1425,6 +1512,68 @@ describe("server queue", () => {
     expect(result.current.state.queuedPrompts.map((q) => q.id)).toEqual(["unsent"]);
   });
 
+  it.each([
+    ["legacy", false],
+    ["legacy", true],
+    ["lost", false],
+    ["lost", true],
+  ] as const)(
+    "holds cached intent across %s refusal, then migrates on governed=%s eligibility",
+    async (refusal, governed) => {
+      const id = `sess-cache-${refusal}-${governed}`;
+      const queuedAt = "2026-01-01T00:00:00.000Z";
+      localStorage.setItem(
+        `${STORAGE_KEY_PREFIX}${id}`,
+        JSON.stringify({
+          savedAt: Date.now(),
+          state: {
+            ...emptyAcpState(),
+            connectionReady: true,
+            nativeSnapshotSeq: 42,
+            queuedPrompts: [
+              { id: "unsent", text: "cached intent", queuedAt, pending: true },
+              { id: "drained", text: "already delivered", queuedAt, pending: false },
+            ],
+          },
+        }),
+      );
+      const { result } = render(id);
+      await flushAsync();
+      lastSocket().open();
+      await flushAsync();
+      expect(calls.some((call) => call.method === "GET" && call.url.includes("/queue"))).toBe(true);
+      expect(posts("/queue")).toHaveLength(0);
+      expect(result.current.state.queuedPrompts).toMatchObject([{ id: "unsent", pending: true }]);
+
+      lastSocket().message(
+        currentControlSnapshot(result.current.state, {
+          ready: false,
+          unavailable: refusal === "lost" ? { source: "native", cause: "stdout_eof", phase: "established" } : null,
+        }),
+      );
+      await flushAsync();
+      expect(posts("/queue")).toHaveLength(0);
+      expect(result.current.state.queuedPrompts).toMatchObject([{ id: "unsent", pending: true }]);
+
+      lastSocket().message(
+        currentControlSnapshot(result.current.state, {
+          ready: !governed,
+          wakeEligible: governed,
+        }),
+      );
+      await flushAsync();
+      expect(posts("/queue").map((call) => JSON.parse(call.body!).id)).toEqual(["unsent"]);
+      expect(result.current.state.queuedPrompts).toMatchObject([{ id: "unsent" }]);
+      expect(result.current.state.queuedPrompts[0]?.pending).not.toBe(true);
+      expect(serverQueue.has("drained")).toBe(false);
+      expect(posts("/acp/prompt")).toHaveLength(0);
+
+      lastSocket().message(currentControlSnapshot(result.current.state, { ready: !governed, wakeEligible: governed }));
+      await flushAsync();
+      expect(posts("/queue")).toHaveLength(1);
+    },
+  );
+
   describe("sendQueuedNow", () => {
     async function sendNow(id: string, prepare: () => void = () => {}) {
       const { result } = await openSession(`sess-${id}`);
@@ -1469,6 +1618,7 @@ describe("server queue", () => {
       expect(posts("/queue")).toHaveLength(0);
       expect(result.current.state.queuedPrompts.map((q) => q.id)).not.toContain("r1");
       expect(result.current.state.lastError).toBeNull();
+      expect(result.current.state.interactionError).toBeNull();
     });
   });
 });
@@ -1514,7 +1664,8 @@ describe("retryRejectedPrompt (#5662)", () => {
   it("does not resend without an attachment it cannot reload", async () => {
     const result = await rejectedThenRetry("look at this", () => new Response("gone", { status: 404 }));
     expect(posts("/acp/prompt")).toHaveLength(0);
-    expect(result.current.state.lastError).toMatch(/attachments/);
+    expect(result.current.state.interactionError?.message).toMatch(/attachments/);
+    expect(result.current.state.lastError).toBeNull();
   });
 });
 
@@ -1530,10 +1681,10 @@ describe("resolveApproval outcomes", () => {
     ],
   ])("rejects and reports %s so the card can retry", async (_label, respond, error) => {
     installAcpFakes(({ url }) => (url.includes("/acp/approvals/") ? respond() : undefined));
-    const { result } = render("sess-approve");
+    const { result } = await openSession("sess-approve");
     await flushAsync();
     await act(() => expect(result.current.resolveApproval("n-1", "Allow")).rejects.toThrow());
-    expect(result.current.state.lastError).toMatch(error);
+    expect(result.current.state.interactionError?.message).toMatch(error);
   });
 
   it.each([
@@ -1541,18 +1692,18 @@ describe("resolveApproval outcomes", () => {
     ["a 404 for an approval already resolved", () => new Response("no pending approval n-1", { status: 404 })],
   ])("resolves on %s", async (_label, respond) => {
     calls = installAcpFakes(({ url }) => (url.includes("/acp/approvals/") ? respond() : undefined));
-    const { result } = render("sess-approve");
+    const { result } = await openSession("sess-approve");
     await flushAsync();
     await act(() => result.current.resolveApproval("n-1", "Allow", "opt-1"));
     const [post] = posts("/api/sessions/sess-approve/acp/approvals/n-1");
     expect(JSON.parse(post!.body!)).toEqual({ decision: "Allow", option_id: "opt-1" });
-    expect(result.current.state.lastError).toBeFalsy();
+    expect(result.current.state.interactionError).toBeNull();
   });
 });
 
 describe("setConfigOption", () => {
   it("posts the config id and value", async () => {
-    const { result } = render("sess-cfg");
+    const { result } = await openSession("sess-cfg");
     await flushAsync();
     await act(() => result.current.setConfigOption("model", "claude-sonnet-4-6"));
     const [post] = posts("/api/sessions/sess-cfg/acp/config-option");
@@ -1570,11 +1721,11 @@ describe("setConfigOption", () => {
     ],
   ])("clears pending and reports %s", async (_label, respond, error) => {
     installAcpFakes(({ url }) => (url.includes("/acp/config-option") ? respond() : undefined));
-    const { result } = render("sess-cfg-fail");
+    const { result } = await openSession("sess-cfg-fail");
     await flushAsync();
     await act(() => result.current.setConfigOption("model", "claude-sonnet-4-6"));
     expect(result.current.state.pendingConfigOption).toBeNull();
-    expect(result.current.state.lastError).toMatch(error);
+    expect(result.current.state.interactionError?.message).toMatch(error);
   });
 
   it("is a no-op without a session", async () => {
@@ -1596,4 +1747,472 @@ describe("setConfigOption", () => {
     act(() => result.current.dismissConfigOptionSwitchFailed());
     expect(result.current.state.configOptionSwitchFailed).toBeNull();
   });
+});
+
+describe("current native admission", () => {
+  it.each([
+    [false, true, 1],
+    [true, false, 0],
+  ] as const)(
+    "admits %s→%s native readiness from the committed active turn before passive effects (%i cancels)",
+    async (before, after, expectedCancels) => {
+      const id = "sess-native-commit";
+      const admission = Promise.withResolvers<Response>();
+      calls = installAcpFakes(({ method, url }) => {
+        if (method === "POST" && url.endsWith("/acp/cancel")) return admission.promise;
+        if (method === "POST" && url.endsWith("/acp/prompt")) return json({ disposition: "sent" }, 202);
+        return undefined;
+      });
+      let armed: boolean | null = null;
+      let gesture: Promise<void> | undefined;
+      let gestures = 0;
+      let observed: { available: boolean; active: boolean; status: string; seq: number; turn: number } | undefined;
+      const hook = renderHook(
+        () => {
+          const acp = useAcpSession(id);
+          const escalation = useCancelEscalation(
+            id,
+            acp.state.promptSeq,
+            acp.state.cancelling,
+            acp.cancelPrompt,
+            acp.forceEndTurn,
+          );
+          const { onCancel } = escalation;
+          // Host layout follows both real hooks, before their passive effects.
+          useLayoutEffect(() => {
+            if (armed === null || acp.state.connectionReady !== armed) return;
+            armed = null;
+            gestures += 1;
+            observed = {
+              available: nativeInputAvailable(acp.state),
+              active: acp.state.turnActive,
+              status: acp.status,
+              seq: acp.state.lastSeq,
+              turn: acp.state.promptSeq,
+            };
+            gesture = onCancel();
+          }, [acp.state, acp.status, onCancel]);
+          return { acp, escalation };
+        },
+        { wrapper: profileWrapper },
+      );
+      await flushAsync();
+      lastSocket().open();
+      await flushAsync();
+      lastSocket().message(currentControlSnapshot(hook.result.current.acp.state, { ready: true }));
+      await flushAsync();
+      await act(() => hook.result.current.acp.sendPrompt("a genuinely active turn"));
+      lastSocket().message({
+        session_id: id,
+        seq: 1,
+        event: { UserPromptSent: { text: "a genuinely active turn" } },
+      });
+      await flushAsync();
+      expect(posts("/acp/prompt")).toHaveLength(1);
+      expect(hook.result.current.acp.state.turnActive).toBe(true);
+      expect(hook.result.current.acp.state.serverTurnActive).toBe(true);
+      const frontier = hook.result.current.acp.state.lastSeq;
+      const turn = hook.result.current.acp.state.promptSeq;
+      expect(turn).toBeGreaterThan(0);
+      lastSocket().message(currentControlSnapshot(hook.result.current.acp.state, { ready: before }, frontier));
+      await flushAsync();
+      expect(nativeInputAvailable(hook.result.current.acp.state)).toBe(before);
+      armed = after;
+      lastSocket().message(currentControlSnapshot(hook.result.current.acp.state, { ready: after }, frontier));
+      const forceBeforeAcceptance = hook.result.current.escalation.canForceEndTurn;
+      await act(async () => {
+        admission.resolve(json({}, 202));
+        await gesture;
+      });
+      expect(gestures).toBe(1);
+      expect(observed).toEqual({ available: after, active: true, status: "open", seq: frontier, turn });
+      expect(posts("/acp/cancel")).toHaveLength(expectedCancels);
+      expect(forceBeforeAcceptance).toBe(false);
+      expect(hook.result.current.escalation.canForceEndTurn).toBe(after);
+      expect(posts("/acp/force_end_turn")).toEqual([]);
+      expect(hook.result.current.acp.state.promptSeq).toBe(turn);
+      expect(hook.result.current.acp.state.nativeSnapshotSeq).toBe(frontier);
+      hook.unmount();
+    },
+  );
+
+  it("does not treat socket-open as a native receipt or wake permission", async () => {
+    const { result, unmount } = render("sess-open-unknown", "absent", null, "2099-01-01T00:00:00Z");
+    await flushAsync();
+    lastSocket().open();
+    await flushAsync();
+    await act(async () => {
+      await result.current.sendPrompt("retain this unsent intent");
+      await result.current.setConfigOption("model", "other");
+      await result.current.cancelPrompt();
+    });
+    expect(posts("/acp/prompt")).toEqual([]);
+    expect(posts("/queue")).toEqual([]);
+    expect(posts("/config-option")).toEqual([]);
+    expect(posts("/cancel")).toEqual([]);
+    expect(calls.filter((c) => c.method === "PATCH" && c.url.endsWith("/snooze"))).toEqual([]);
+    expect(result.current.state.optimisticRows.map((row) => row.text)).toContain("retain this unsent intent");
+    unmount();
+  });
+
+  it("does not wake or queue from generic Unknown, native loss, or a legacy-owner refusal", async () => {
+    for (const unavailable of [
+      null,
+      { source: "native", cause: "stdout_eof", phase: "established" },
+      { source: "runner_record", cause: "control_protocol_unknown", phase: "establishing" },
+    ] as const) {
+      calls = installAcpFakes();
+      const { result, unmount } = await openSessionWithReceipt(
+        {
+          ready: false,
+          unavailable,
+          wakeEligible: unavailable !== null,
+        },
+        `sess-refused-${unavailable?.source ?? "unknown"}`,
+        "absent",
+        null,
+        "2099-01-01T00:00:00Z",
+      );
+      await act(async () => {
+        await result.current.sendPrompt("must not wake");
+        await result.current.setConfigOption("model", "other");
+      });
+      expect(posts("/acp/prompt")).toEqual([]);
+      expect(posts("/queue")).toEqual([]);
+      expect(posts("/config-option")).toEqual([]);
+      expect(calls.filter((c) => c.method === "PATCH" && c.url.endsWith("/snooze"))).toEqual([]);
+      expect(result.current.canSendQueuedNow).toBe(false);
+      unmount();
+    }
+  });
+
+  it("finishes only its already-authorized snooze intent if its own wake consumes the current eligibility", async () => {
+    let queued: ServerQueuedPrompt[] = [];
+    calls = installAcpFakes(({ url, method, body }) => {
+      if (method === "PATCH" && url.endsWith("/snooze")) {
+        lastSocket().message(currentControlSnapshot(emptyAcpState(), { ready: false }));
+        return json({});
+      }
+      if (url.includes("/queue") && method === "GET") return json(queued);
+      if (url.includes("/acp/prompt")) {
+        queued = [{ id: "governed", seq: 0, text: JSON.parse(body!).text, created_at: "2026-01-01T00:00:00Z" }];
+        return json({ disposition: "queued", queued_id: "governed" }, 202);
+      }
+      return undefined;
+    });
+    const { result } = await openSessionWithReceipt(
+      { ready: false, wakeEligible: true },
+      "sess-governed-wake",
+      "absent",
+      null,
+      "2099-01-01T00:00:00Z",
+    );
+    await act(() => result.current.sendPrompt("one governed intent"));
+    expect(posts("/acp/prompt")).toHaveLength(1);
+    expect(result.current.state.queuedPrompts.map((row) => row.text)).toEqual(["one governed intent"]);
+    await act(() => result.current.setConfigOption("model", "other"));
+    expect(posts("/config-option")).toEqual([]);
+  });
+
+  it("withdraws the receipt on disconnect without erasing the operation diagnostic", async () => {
+    const { result } = await openSession("sess-lost-receipt");
+    lastSocket().message({
+      session_id: "sess-lost-receipt",
+      seq: 1,
+      event: { PromptRuntimeError: { message: "canonical request failure" } },
+    });
+    lastSocket().drop();
+    expect(result.current.state.connectionReady).toBe(false);
+    expect(result.current.state.nativeSnapshotSeq).toBeNull();
+    expect(result.current.state.lastError).toBe("canonical request failure");
+  });
+
+  it("retains the existing explicit initial-start queue intent without enabling native controls", async () => {
+    calls = installAcpFakes(({ url }) =>
+      url.includes("/acp/prompt") ? json({ disposition: "queued", queued_id: "starting-intent" }, 202) : undefined,
+    );
+    const { result } = await openSessionWithReceipt(
+      { ready: false, wakeEligible: true },
+      "sess-initial-intent",
+      "resuming",
+    );
+    await act(() => result.current.sendPrompt("initial explicit intent"));
+    await act(() => result.current.setConfigOption("model", "other"));
+    expect(posts("/acp/prompt")).toHaveLength(1);
+    expect(posts("/config-option")).toEqual([]);
+    expect(result.current.state.queuedPrompts.map((row) => row.text)).toEqual(["initial explicit intent"]);
+    expect(result.current.state.connectionReady).toBe(false);
+  });
+});
+
+describe("live panel cancellation authority", () => {
+  const childId = "panel-child";
+  const startedAt = "2026-01-01T00:00:00Z";
+  const panelElements = (sessionId: string) =>
+    createElement(
+      "div",
+      null,
+      ...["desktop background work", "mobile background work"].map((name) =>
+        createElement(
+          "section",
+          { key: name, "aria-label": name },
+          createElement(BackgroundAgentsPanel, { sessionId }),
+        ),
+      ),
+    );
+  const seedChild = (socket: FakeWebSocket, sessionId: string, seq = 0) => {
+    const child: SubagentRecord = {
+      session_id: childId,
+      parent_session_id: sessionId,
+      parent_tool_call_id: "panel-tool",
+      state: "running",
+      cancel_capable: true,
+    };
+    socket.message({
+      session_id: sessionId,
+      seq: seq + 1,
+      event: {
+        BackgroundAgentLaunched: {
+          agent_id: "panel-agent",
+          tool_call_id: "panel-tool",
+          description: "Linked panel child",
+          prompt: "Retained child instructions",
+          model: "test-model",
+          started_at: startedAt,
+        },
+      },
+    });
+    socket.message({
+      session_id: sessionId,
+      seq: seq + 2,
+      event: { SubagentUpdated: { subagent: child, at: startedAt } },
+    });
+  };
+
+  it.each(["native revocation", "runtime unmount"] as const)(
+    "rechecks whole-session authority when confirmation opens before %s",
+    async (transition) => {
+      const id = "sess-panel-confirmation";
+      const hook = await openSession(id);
+      seedChild(lastSocket(), id);
+      await flushAsync();
+      const view = renderView(panelElements(id), { wrapper: profileWrapper });
+      const regions = view.getAllByRole("region", { name: /^(desktop|mobile) background work$/ });
+      expect(regions).toHaveLength(2);
+      for (const region of regions) {
+        fireEvent.click(within(region).getByTitle("Interrupt the session and stop running sub-agents"));
+        expect(within(region).getByRole("alertdialog")).toBeTruthy();
+      }
+      expect(posts("/cancel")).toEqual([]);
+
+      if (transition === "native revocation") {
+        await act(async () => {
+          lastSocket().message(currentControlSnapshot(hook.result.current.state, { ready: false }, 20));
+        });
+        expect(nativeInputAvailable(hook.result.current.state)).toBe(false);
+      } else {
+        hook.unmount();
+      }
+      for (const region of regions) {
+        fireEvent.click(within(region).getByRole("button", { name: "Interrupt session" }));
+      }
+      await flushAsync();
+      expect(posts("/cancel")).toEqual([]);
+      for (const region of regions) {
+        expect(within(region).queryByRole("alertdialog")).toBeNull();
+      }
+      expect(sockets).toHaveLength(1);
+      view.unmount();
+      if (transition === "native revocation") hook.unmount();
+    },
+  );
+
+  it.each(["unknown", "disconnected"] as const)(
+    "refuses child and whole-turn gestures from both cached panels while %s",
+    async (phase) => {
+      const id = "sess-panel-refused";
+      const hook = await openSessionWithReceipt({ ready: phase !== "unknown" }, id);
+      seedChild(lastSocket(), id);
+      await flushAsync();
+      if (phase === "disconnected") lastSocket().drop();
+      expect(nativeInputAvailable(hook.result.current.state)).toBe(false);
+      const view = renderView(panelElements(id), { wrapper: profileWrapper });
+      const regions = view.getAllByRole("region", { name: /^(desktop|mobile) background work$/ });
+      expect(regions).toHaveLength(2);
+      for (const region of regions) {
+        fireEvent.click(within(region).getByTitle("Stop this sub-agent"));
+        expect(posts("/cancel")).toEqual([]);
+        fireEvent.click(within(region).getByRole("button", { name: "Stop sub-agent" }));
+        await flushAsync();
+        const previousRootPosts = posts("/acp/cancel").length;
+        fireEvent.click(within(region).getByTitle("Interrupt the session and stop running sub-agents"));
+        expect(posts("/acp/cancel")).toHaveLength(previousRootPosts);
+        expect(within(region).getByRole("alertdialog").textContent).toContain("interrupts the main agent");
+        fireEvent.click(within(region).getByRole("button", { name: "Interrupt session" }));
+      }
+      await flushAsync();
+      expect(posts("/cancel")).toEqual([]);
+      for (const region of regions) {
+        await waitFor(() => expect(region.textContent).toContain("Native input is not currently confirmed"));
+      }
+      expect(sockets).toHaveLength(1);
+      view.unmount();
+      hook.unmount();
+    },
+  );
+
+  it("checks the committed runtime before cached panel publication and permits a fresh Available gesture", async () => {
+    const id = "sess-panel-layout";
+    let clickAtCommit: (() => void) | undefined;
+    const hook = renderHook(
+      () => {
+        const session = useAcpSession(id);
+        useLayoutEffect(() => {
+          if (!clickAtCommit || nativeInputAvailable(session.state)) return;
+          const click = clickAtCommit;
+          clickAtCommit = undefined;
+          click();
+        }, [session.state, session.status]);
+        return session;
+      },
+      { wrapper: profileWrapper },
+    );
+    await flushAsync();
+    lastSocket().open();
+    lastSocket().message(currentControlSnapshot(hook.result.current.state, { ready: true }));
+    seedChild(lastSocket(), id);
+    await flushAsync();
+    const view = renderView(panelElements(id), { wrapper: profileWrapper });
+    const region = view.getByRole("region", { name: "desktop background work" });
+    fireEvent.click(within(region).getByTitle("Stop this sub-agent"));
+    const stop = within(region).getByRole("button", { name: "Stop sub-agent" });
+    clickAtCommit = () => stop.click();
+    await act(async () => {
+      lastSocket().message(currentControlSnapshot(hook.result.current.state, { ready: false }, 20));
+    });
+    expect(clickAtCommit).toBeUndefined();
+    await flushAsync();
+    expect(posts("/cancel")).toEqual([]);
+    await waitFor(() => expect(region.textContent).toContain("Native input is not currently confirmed"));
+
+    await act(async () => {
+      lastSocket().message(currentControlSnapshot(hook.result.current.state, { ready: true }, 20));
+    });
+    expect(nativeInputAvailable(hook.result.current.state)).toBe(true);
+    fireEvent.click(within(region).getByTitle("Stop this sub-agent"));
+    await act(async () => {
+      fireEvent.click(within(region).getByRole("button", { name: "Stop sub-agent" }));
+    });
+    await flushAsync();
+    expect(posts("/cancel")).toEqual([
+      { method: "POST", url: `/api/sessions/${id}/acp/subagents/${childId}/cancel`, body: null },
+    ]);
+    await waitFor(() => expect(region.textContent).not.toContain("Native input is not currently confirmed"));
+    expect(sockets).toHaveLength(1);
+    view.unmount();
+    hook.unmount();
+  });
+
+  it("uses exactly the selected child and root routes from both Available panels without a second socket", async () => {
+    const id = "sess-panel-available";
+    const hook = await openSession(id);
+    seedChild(lastSocket(), id);
+    await flushAsync();
+    const view = renderView(panelElements(id), { wrapper: profileWrapper });
+    for (const region of view.getAllByRole("region", { name: /^(desktop|mobile) background work$/ })) {
+      fireEvent.click(within(region).getByTitle("Stop this sub-agent"));
+      fireEvent.click(within(region).getByRole("button", { name: "Stop sub-agent" }));
+      await flushAsync();
+      const previousRootPosts = posts("/acp/cancel").length;
+      fireEvent.click(within(region).getByTitle("Interrupt the session and stop running sub-agents"));
+      expect(posts("/acp/cancel")).toHaveLength(previousRootPosts);
+      expect(within(region).getByRole("alertdialog").textContent).toContain("interrupts the main agent");
+      fireEvent.click(within(region).getByRole("button", { name: "Interrupt session" }));
+    }
+    await flushAsync();
+    expect(posts(`/acp/subagents/${childId}/cancel`)).toEqual([
+      { method: "POST", url: `/api/sessions/${id}/acp/subagents/${childId}/cancel`, body: null },
+      { method: "POST", url: `/api/sessions/${id}/acp/subagents/${childId}/cancel`, body: null },
+    ]);
+    expect(posts("/acp/cancel")).toEqual([
+      { method: "POST", url: `/api/sessions/${id}/acp/cancel`, body: null },
+      { method: "POST", url: `/api/sessions/${id}/acp/cancel`, body: null },
+    ]);
+    expect(sockets).toHaveLength(1);
+    view.unmount();
+    hook.unmount();
+  });
+
+  it("keeps a refused current child cancellation visible in each sibling panel", async () => {
+    calls = installAcpFakes(({ method, url }) =>
+      method === "POST" && url.endsWith(`/subagents/${childId}/cancel`)
+        ? new Response("subagent cannot be cancelled", { status: 409 })
+        : undefined,
+    );
+    const id = "sess-panel-error";
+    const hook = await openSession(id);
+    seedChild(lastSocket(), id);
+    await flushAsync();
+    const view = renderView(panelElements(id), { wrapper: profileWrapper });
+    for (const region of view.getAllByRole("region", { name: /^(desktop|mobile) background work$/ })) {
+      fireEvent.click(within(region).getByTitle("Stop this sub-agent"));
+      fireEvent.click(within(region).getByRole("button", { name: "Stop sub-agent" }));
+      expect(await within(region).findByText(/Could not stop subagent \(409\)/)).toBeTruthy();
+    }
+    expect(posts(`/subagents/${childId}/cancel`)).toHaveLength(2);
+    view.unmount();
+    hook.unmount();
+  });
+
+  it.each(["target replacement", "runtime unmount"] as const)(
+    "invalidates saved child and whole-turn callbacks after %s without redirecting them",
+    async (transition) => {
+      const oldId = "sess-panel-old";
+      const nextId = transition === "target replacement" ? "sess-panel-new" : oldId;
+      const previous = renderHook(({ id }) => useAcpSession(id), {
+        initialProps: { id: oldId },
+        wrapper: profileWrapper,
+      });
+      await flushAsync();
+      lastSocket().open();
+      lastSocket().message(currentControlSnapshot(previous.result.current.state, { ready: true }));
+      seedChild(lastSocket(), oldId);
+      await flushAsync();
+      const savedChild = previous.result.current.cancelSubagent;
+      const savedRoot = previous.result.current.cancelPrompt;
+      const view = renderView(panelElements(oldId), { wrapper: profileWrapper });
+      let current = previous;
+      if (transition === "target replacement") {
+        previous.rerender({ id: nextId });
+      } else {
+        previous.unmount();
+        current = renderHook(({ id }) => useAcpSession(id), {
+          initialProps: { id: nextId },
+          wrapper: profileWrapper,
+        });
+      }
+      await flushAsync();
+      lastSocket().open();
+      lastSocket().message(currentControlSnapshot(current.result.current.state, { ready: true }));
+      seedChild(lastSocket(), nextId, current.result.current.state.lastSeq);
+      await flushAsync();
+      expect(nativeInputAvailable(current.result.current.state)).toBe(true);
+      await act(async () => {
+        await savedChild(childId);
+        await savedRoot();
+      });
+      expect(posts("/cancel")).toEqual([]);
+
+      view.rerender(panelElements(nextId));
+      const region = view.getByRole("region", { name: "mobile background work" });
+      fireEvent.click(within(region).getByTitle("Stop this sub-agent"));
+      fireEvent.click(within(region).getByRole("button", { name: "Stop sub-agent" }));
+      await flushAsync();
+      expect(posts("/cancel")).toEqual([
+        { method: "POST", url: `/api/sessions/${nextId}/acp/subagents/${childId}/cancel`, body: null },
+      ]);
+      view.unmount();
+      current.unmount();
+    },
+  );
 });

@@ -17,6 +17,100 @@ pub enum Status {
     Creating,
 }
 
+/// Observed runtime facts, not readiness or authority to retry an operation.
+#[derive(
+    Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema,
+)]
+#[serde(rename_all = "snake_case")]
+pub enum RuntimeEvidence {
+    #[default]
+    Unknown,
+    PaneAlive,
+    PaneExited {
+        exit_code: Option<i32>,
+    },
+    AcpTransportClosed,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum ErrorEvidenceSource {
+    TerminalText,
+    TmuxObservation,
+    LocalPromptResult,
+    RunnerCompletion,
+    TranscriptRecovery,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum ErrorOperation {
+    Prompt,
+    ContextReset,
+    TerminalObservation,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum ErrorOrigin {
+    TmuxObservation,
+    AcpTransport,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum ErrorBlockingScope {
+    Operation,
+    Runtime,
+}
+
+/// Worker epochs and terminal lifecycle generations are different namespaces.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum ErrorEvidenceGeneration {
+    TerminalLifecycle(u64),
+    AcpWorker(u64),
+}
+
+/// Metadata for the existing canonical diagnostic. Missing metadata is unknown.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct OperationErrorEvidence {
+    pub source: ErrorEvidenceSource,
+    pub operation: ErrorOperation,
+    #[serde(default)]
+    pub runtime: RuntimeEvidence,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub origin: Option<ErrorOrigin>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub blocking_scope: Option<ErrorBlockingScope>,
+    /// `None` never grants retry permission.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub retryable: Option<bool>,
+    /// A reported code does not establish whether the SDK or agent produced it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reported_code: Option<i32>,
+    /// Ingestion time, not the age of text retained on a terminal screen.
+    pub observed_at_ms: i64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub generation: Option<ErrorEvidenceGeneration>,
+}
+
+impl OperationErrorEvidence {
+    pub(crate) fn new(source: ErrorEvidenceSource, operation: ErrorOperation) -> Self {
+        Self {
+            source,
+            operation,
+            runtime: RuntimeEvidence::Unknown,
+            origin: None,
+            blocking_scope: None,
+            retryable: None,
+            reported_code: None,
+            observed_at_ms: Utc::now().timestamp_millis(),
+            generation: None,
+        }
+    }
+}
+
 impl Status {
     const ALL: [(Status, &'static str, &'static str); 9] = [
         (Status::Running, "running", "Running"),

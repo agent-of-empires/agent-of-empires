@@ -14,10 +14,19 @@
 // chrome still wins the header, but not the action area: holding cannot
 // express which answer was meant.
 //
-// Buttons stay disabled while a decision is in flight, until the server's
-// broadcast removes the approval; a rejected submit re-enables them.
+// Submitting disables actions until the hook confirms resolution or rejects
+// to permit retry. Confirmed HTTP responses and broadcasts remove the card.
 
-import { Fragment, useCallback, useEffect, useMemo, useRef, useState, type KeyboardEvent } from "react";
+import {
+  Fragment,
+  useCallback,
+  useEffect,
+  useLayoutEffect,
+  useMemo,
+  useRef,
+  useState,
+  type KeyboardEvent,
+} from "react";
 import { AlertTriangle, Check, ChevronDown, MessageCircleQuestion, Shield, X } from "lucide-react";
 import type { Approval, ApprovalDecision, ApprovalOptionKind } from "../../lib/acpTypes";
 import { useServerDown, OFFLINE_TITLE } from "../../lib/connectionState";
@@ -26,12 +35,13 @@ import { PlanModal } from "./PlanModal";
 
 interface Props {
   approval: Approval;
+  canDecide: boolean;
   onResolve: (decision: ApprovalDecision, optionId?: string) => Promise<void>;
 }
 
 const LONG_PRESS_MS = 800;
 
-export function ApprovalCard({ approval, onResolve }: Props) {
+export function ApprovalCard({ approval, canDecide, onResolve }: Props) {
   const offline = useServerDown();
   const [phase, setPhase] = useState<"pending" | "submitting" | "rolled-back">("pending");
   const [progress, setProgress] = useState(0);
@@ -40,6 +50,9 @@ export function ApprovalCard({ approval, onResolve }: Props) {
   const pressTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
   const progressTimer = useRef<ReturnType<typeof setInterval> | null>(null);
   const holdGeneration = useRef(0);
+  const decisionsEnabled = canDecide && !offline && phase !== "submitting";
+  const decisionAllowedRef = useRef(decisionsEnabled);
+  const [previousDecisionsEnabled, setPreviousDecisionsEnabled] = useState(decisionsEnabled);
 
   const raw = approval.tool_call.args_preview;
   const options = approval.options ?? [];
@@ -62,6 +75,13 @@ export function ApprovalCard({ approval, onResolve }: Props) {
   const showEmptyArgsState = raw.trim() === "";
   const Header = canExpand ? "button" : "div";
 
+  // Reset only the hold presentation; a permission change must not close the plan.
+  if (previousDecisionsEnabled !== decisionsEnabled) {
+    setPreviousDecisionsEnabled(decisionsEnabled);
+    setHeld(null);
+    setProgress(0);
+  }
+
   useEffect(() => {
     return () => {
       if (pressTimer.current) clearTimeout(pressTimer.current);
@@ -71,6 +91,7 @@ export function ApprovalCard({ approval, onResolve }: Props) {
 
   const submit = useCallback(
     async (decision: ApprovalDecision, optionId?: string) => {
+      if (!decisionAllowedRef.current) return;
       setPhase("submitting");
       try {
         await onResolve(decision, optionId);
@@ -92,30 +113,21 @@ export function ApprovalCard({ approval, onResolve }: Props) {
     }
   }, []);
 
-  // `held` names the button currently under a hold, so a destructive
-  // answer list can put the ring on whichever option is being pressed
-  // rather than on a single Allow button.
-  //
-  // At most one hold exists at a time. Two fingers on two options would
-  // otherwise leave the first timer armed with its own captured option,
-  // running the answer the user moved away from, so starting a hold
-  // cancels any hold already running.
-  //
-  // `holdGeneration` covers what `clearTimeout` cannot: a timer that
-  // fired just before the finger lifted, whose callback is already
-  // queued. It finds a newer generation and submits nothing.
+  // One hold owns the timers. Generations retire callbacks queued before
+  // another hold, pointer release, or authority change.
   const startLongPress = (key: string, run: () => void) => {
-    if (phase === "submitting") return;
+    if (!decisionAllowedRef.current) return;
     clearHoldTimers();
     holdGeneration.current += 1;
     const generation = holdGeneration.current;
     setHeld(key);
     setProgress(0);
     progressTimer.current = setInterval(() => {
+      if (holdGeneration.current !== generation || !decisionAllowedRef.current) return;
       setProgress((p) => Math.min(100, p + (100 / LONG_PRESS_MS) * 30));
     }, 30);
     pressTimer.current = setTimeout(() => {
-      if (holdGeneration.current !== generation) return;
+      if (holdGeneration.current !== generation || !decisionAllowedRef.current) return;
       clearHoldTimers();
       if (typeof navigator !== "undefined" && "vibrate" in navigator) {
         try {
@@ -137,6 +149,19 @@ export function ApprovalCard({ approval, onResolve }: Props) {
     setHeld(null);
     setProgress(0);
   }, [clearHoldTimers]);
+
+  // Only native decisions need authority. Retire a withdrawn hold before paint,
+  // including callbacks already queued when the current receipt changed.
+  useLayoutEffect(() => {
+    decisionAllowedRef.current = decisionsEnabled;
+    if (!decisionsEnabled) {
+      holdGeneration.current += 1;
+      clearHoldTimers();
+    }
+    return () => {
+      decisionAllowedRef.current = false;
+    };
+  }, [decisionsEnabled, clearHoldTimers]);
 
   // A key or button released after the window lost focus never reaches the
   // card, so losing the window or hiding the page ends any hold in progress.
@@ -169,9 +194,9 @@ export function ApprovalCard({ approval, onResolve }: Props) {
   };
 
   const submitting = phase === "submitting";
-  const blocked = offline || submitting;
-  // Dimmed like PlanModal's disabled footer; an in-flight decision also shows the wait cursor.
-  const blockedClass = submitting ? "cursor-wait opacity-60" : offline ? "cursor-not-allowed opacity-50" : "";
+  const blocked = !decisionsEnabled;
+  // Native authority, offline state, and submission all disable native decisions.
+  const blockedClass = submitting ? "cursor-wait opacity-60" : blocked ? "cursor-not-allowed opacity-50" : "";
 
   return (
     <div
@@ -241,6 +266,7 @@ export function ApprovalCard({ approval, onResolve }: Props) {
       {planOpen && approval.plan && (
         <PlanModal
           plan={approval.plan}
+          canDecide={canDecide}
           submitting={submitting}
           offline={offline}
           options={isChoice ? options : undefined}

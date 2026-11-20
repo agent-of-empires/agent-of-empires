@@ -66,6 +66,7 @@ export interface AcpContext {
   retryRejectedPrompt: (prompt: RejectedPrompt) => Promise<void>;
   /** The composer's Stop, escalating a cancel the Agent ignores. */
   stopTurn: () => void;
+  canForceEndTurn: boolean;
   /** Staged for the next send; owned here so assistant-ui's `onNew` can send them. */
   pendingAttachments: PromptAttachmentInput[];
   setPendingAttachments: React.Dispatch<React.SetStateAction<PromptAttachmentInput[]>>;
@@ -167,7 +168,7 @@ export function AcpRuntime({
   const acp = useAcpSession(sessionId, acpWorkerState, archivedAt, snoozedUntil, queuedCount);
   const agentProfile = useAgentProfile();
   const { pendingAttachments, setPendingAttachments, pendingAttachmentsRef } = usePendingAttachments(sessionId);
-  const onCancel = useCancelEscalation(
+  const { onCancel, canForceEndTurn } = useCancelEscalation(
     sessionId,
     acp.state.promptSeq,
     acp.state.cancelling,
@@ -256,6 +257,7 @@ export function AcpRuntime({
         sendPrompt: acp.sendPrompt,
         retryRejectedPrompt: acp.retryRejectedPrompt,
         stopTurn: () => void onCancel(),
+        canForceEndTurn,
         pendingAttachments,
         setPendingAttachments,
         forceEndTurn: acp.forceEndTurn,

@@ -520,6 +520,16 @@ impl TranscriptModel {
                 deltas.push(self.notice(seq, format!("agent startup failed: {message}")));
                 deltas
             }
+            Event::AcpConnectionUnavailable { source, cause, .. } => {
+                let mut deltas = self.sweep_open_tools(seq);
+                self.turn_active = false;
+                self.turn_has_output = true;
+                deltas.push(self.notice(
+                    seq,
+                    format!("ACP connection unavailable ({source:?}, {cause:?})"),
+                ));
+                deltas
+            }
             // A dedicated remediation screen renders this, so the timeline stays quiet.
             Event::IncompatibleAgent { .. } => {
                 let deltas = self.sweep_open_tools(seq);
@@ -566,7 +576,7 @@ impl TranscriptModel {
                     None => vec![self.push(id, TranscriptRowKind::CompactionSummary, text.clone())],
                 }
             }
-            Event::SessionContextReset { reason } => {
+            Event::SessionContextReset { reason, .. } => {
                 let has_prior_prompt = self.rows.iter().any(|r| {
                     matches!(
                         r.kind,
@@ -590,7 +600,7 @@ impl TranscriptModel {
                     text,
                 )]
             }
-            Event::PromptRuntimeError { message } => {
+            Event::PromptRuntimeError { message, .. } => {
                 self.turn_has_output = true;
                 vec![self.notice(seq, format!("prompt failed: {message}"))]
             }
@@ -1409,9 +1419,7 @@ mod tests {
                 "agent startup failed: node missing".to_string(),
             ),
             (
-                Event::PromptRuntimeError {
-                    message: "stream died".into(),
-                },
+                Event::PromptRuntimeError { message: "stream died".into(), evidence: None, native_subject: None },
                 "notice-1",
                 TranscriptRowKind::Notice,
                 "prompt failed: stream died".to_string(),
@@ -1532,6 +1540,7 @@ mod tests {
         // A context-reset divider needs a reason or a prior prompt.
         let reset = |reason: &str| Event::SessionContextReset {
             reason: reason.into(),
+            fork_rejection: None,
         };
         assert!(fold([reset("")]).rows().is_empty());
         assert!(fold([reset("session/load failed: bad id")])
@@ -2665,6 +2674,8 @@ mod tests {
         };
         let runtime_error = Event::PromptRuntimeError {
             message: "boom".into(),
+            evidence: None,
+            native_subject: None,
         };
         // (events between the prompt and its stop, notice expected)
         let cases = [

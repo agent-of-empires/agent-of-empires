@@ -1,7 +1,7 @@
 import { useEffect, useId, useRef, useState } from "react";
 
 import { useRespawnSession } from "../../hooks/useRespawnSession";
-import type { AcpState } from "../../lib/acpTypes";
+import { nativeInputAvailable, type AcpConnectionUnavailability, type AcpState } from "../../lib/acpTypes";
 import { RATTLES } from "../../lib/rattles";
 import type { RecreateContainerBlock } from "../sidebar/sessionActionTargets";
 import { ContainerGoneBanner, type NewSessionLike } from "./ContainerGoneBanner";
@@ -50,19 +50,35 @@ export function SessionBanners({
   onSwitchToTerminal?: () => void;
   dismissError: () => void;
 }) {
-  const variant = pickWorkerStoppedVariant({
-    workerStopped: state.workerStopped,
-    startupError: state.startupError,
-    trashedAt,
-    archivedAt,
-    snoozedUntil,
-    workerStopping: acpWorkerState === "stopping",
-  });
-  const healthy = !state.startupError && !state.workerStopped && !state.workerRestarting;
+  const nativeReady = nativeInputAvailable(state);
+  const startupDiagnosticOnly = nativeReady || state.connectionUnavailable !== null;
+  const reason = state.integrationLost;
+  const integrationError = reason
+    ? `Agent integration lost: ${reason.kind === "contract_violation" ? reason.detail : reason.kind.replace("_", " ")}`
+    : null;
+  const startupError = state.startupError;
+  const variant = reason
+    ? "none"
+    : pickWorkerStoppedVariant({
+        workerStopped: state.workerStopped,
+        startupError,
+        trashedAt,
+        archivedAt,
+        snoozedUntil,
+        workerStopping: acpWorkerState === "stopping",
+      });
+  const healthy =
+    !reason &&
+    !state.workerStopped &&
+    !state.workerRestarting &&
+    !state.connectionUnavailable &&
+    (!startupError || nativeReady);
   const idle = healthy && !state.turnActive;
+  const errorMessage = state.interactionError?.message ?? state.lastError;
   return (
     <>
-      {state.startupError && state.startupCause?.kind === "container_missing" && (
+      {integrationError && <InteractionErrorBanner title="Structured view diagnostic" message={integrationError} />}
+      {state.startupError && !startupDiagnosticOnly && state.startupCause?.kind === "container_missing" && (
         <ContainerGoneBanner
           sessionId={sessionId}
           message={state.startupError}
@@ -75,10 +91,10 @@ export function SessionBanners({
           onRecreated={() => onRestarted?.(state.restartEpoch, false, state.startupError ?? "")}
         />
       )}
-      {state.startupError && state.startupCause?.kind !== "container_missing" && (
+      {startupError && !startupDiagnosticOnly && state.startupCause?.kind !== "container_missing" && (
         <StartupErrorBanner
           sessionId={sessionId}
-          message={state.startupError}
+          message={startupError}
           acpWorkerState={acpWorkerState}
           sentStopped={state.restartStoppedSent}
           retriedError={state.retriedError}
@@ -88,6 +104,26 @@ export function SessionBanners({
           onSwitchToTerminal={onSwitchToTerminal}
         />
       )}
+      {startupError && startupDiagnosticOnly && (
+        <InteractionErrorBanner message={startupError} onDismiss={dismissError} />
+      )}
+      {state.connectionUnavailable ? (
+        <NativeChannelNotice observation={state.connectionUnavailable} current />
+      ) : state.connectionUnavailableNotice ? (
+        <NativeChannelNotice observation={state.connectionUnavailableNotice} current={false} />
+      ) : null}
+      {state.nativeSnapshotSeq !== null &&
+        !nativeReady &&
+        !state.connectionUnavailable &&
+        !startingAgent &&
+        acpWorkerState === "running" && (
+          <div
+            className="border-b border-surface-700 px-4 py-2 text-xs text-text-muted"
+            data-testid="native-channel-unknown"
+          >
+            Native input readiness is unconfirmed. The transcript remains available.
+          </div>
+        )}
       {variant === "trashed" && <TrashedWorkerStoppedBanner sessionId={sessionId} onRestore={onRestore} />}
       {variant === "archived" && <ArchivedWorkerStoppedBanner sessionId={sessionId} />}
       {variant === "snoozed" && snoozedUntil && (
@@ -100,10 +136,10 @@ export function SessionBanners({
           sentStopped={state.restartStoppedSent}
         />
       )}
-      {state.workerRestarting && !state.startupError && !state.workerStopped && (
+      {state.workerRestarting && !startupError && !reason && !state.workerStopped && (
         <WorkerRestartingBanner agentUnresponsive={state.agentUnresponsive} agentOrphaned={state.agentOrphaned} />
       )}
-      {startingAgent ? (
+      {!reason && startingAgent ? (
         <StartupWaitLine
           sessionId={sessionId}
           agent={startingAgent}
@@ -125,11 +161,12 @@ export function SessionBanners({
           </PulseBanner>
         )
       )}
-      {showWorkerStoppingBanner({
-        acpWorkerState,
-        startupError: state.startupError,
-        restartInFlight: state.restartInFlight,
-      }) && <WorkerStoppingBanner />}
+      {!reason &&
+        showWorkerStoppingBanner({
+          acpWorkerState,
+          startupError,
+          restartInFlight: state.restartInFlight,
+        }) && <WorkerStoppingBanner />}
       {state.nextWakeupAt && idle && (
         <ScheduledWakeupBanner wakeAt={state.nextWakeupAt} reason={state.nextWakeupReason} />
       )}
@@ -138,8 +175,24 @@ export function SessionBanners({
           Monitoring a background job
         </ChipBanner>
       )}
-      {state.lastError && <InteractionErrorBanner message={state.lastError} onDismiss={dismissError} />}
+      {errorMessage && <InteractionErrorBanner message={errorMessage} onDismiss={dismissError} />}
     </>
+  );
+}
+
+function NativeChannelNotice({ observation, current }: { observation: AcpConnectionUnavailability; current: boolean }) {
+  return (
+    <div
+      className="border-b border-status-warning/30 bg-status-warning/10 px-4 py-2 text-xs text-status-warning"
+      data-testid={current ? "native-channel-unavailable" : "native-channel-diagnostic"}
+    >
+      <div className="font-medium">{current ? "Native input unavailable" : "Previous native-channel diagnostic"}</div>
+      <div className="mt-0.5">
+        {observation.cause.replaceAll("_", " ")} ({observation.source}; {observation.phase}).
+        {current &&
+          " The retained conversation has not been replaced. Channel loss alone does not prove the process exited."}
+      </div>
+    </div>
   );
 }
 
@@ -315,20 +368,30 @@ function ChipBanner({
   );
 }
 
-function InteractionErrorBanner({ message, onDismiss }: { message: string; onDismiss: () => void }) {
+function InteractionErrorBanner({
+  title = "Action did not complete",
+  message,
+  onDismiss,
+}: {
+  title?: string;
+  message: string;
+  onDismiss?: () => void;
+}) {
   return (
     <div className="flex items-start justify-between gap-3 border-b border-status-warning/30 bg-status-warning/10 px-4 py-2 text-status-warning">
       <div className="flex-1 min-w-0">
-        <div className="text-xs font-medium">Action did not complete</div>
+        <div className="text-xs font-medium">{title}</div>
         <div className="mt-0.5 text-xs text-status-warning/90 break-words">{message}</div>
       </div>
-      <button
-        type="button"
-        onClick={onDismiss}
-        className="shrink-0 rounded-md border border-status-warning/40 bg-status-warning/20 px-2 py-1 text-[10px] font-mono uppercase tracking-wide text-status-warning hover:bg-status-warning/30"
-      >
-        Dismiss
-      </button>
+      {onDismiss && (
+        <button
+          type="button"
+          onClick={onDismiss}
+          className="shrink-0 rounded-md border border-status-warning/40 bg-status-warning/20 px-2 py-1 text-[10px] font-mono uppercase tracking-wide text-status-warning hover:bg-status-warning/30"
+        >
+          Dismiss
+        </button>
+      )}
     </div>
   );
 }

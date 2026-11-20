@@ -1,5 +1,19 @@
 //! Disk-backed event log for structured view sessions.
 
+// Management admission does not end work retained by the native runner. Keep
+// this predicate identical across turn, responder, monitor and budget queries.
+macro_rules! native_channel_loss_sql {
+    ($json:literal) => {
+        concat!(
+            "(CASE WHEN discriminant = 'AcpConnectionUnavailable' THEN json_extract(",
+            $json,
+            ", '$.AcpConnectionUnavailable.source') IN ('sdk','control','native')",
+            " AND json_type(",
+            $json,
+            ", '$.AcpConnectionUnavailable.native_subject.kind.AdmissionRefusal') IS NULL ELSE 0 END)"
+        )
+    };
+}
 mod account_limits;
 mod attachments;
 pub(crate) mod identity;
@@ -74,6 +88,7 @@ const RETENTION_PINNED_EVENT_DISCRIMINANTS: &[&str] = &[
     "ModesAvailable",
     "CurrentModeChanged",
     "AcpSessionAssigned",
+    "AcpConnectionUnavailable",
     "SessionContextReset",
     "SessionCleared",
     "PromptCapabilities",
@@ -232,9 +247,27 @@ impl EventStore {
             .unwrap();
     }
 
+    /// Public serde omits the subject; only the private journal adds it back.
+    fn encode_event(event: &Event) -> Result<String> {
+        let Some(subject) = event.native_subject() else {
+            return Ok(serde_json::to_string(event)?);
+        };
+        let mut json = serde_json::to_vec(event)?;
+        // These are externally tagged struct variants: {"Variant":{...}}.
+        anyhow::ensure!(
+            json.ends_with(b"}}"),
+            "native subject requires a structured event payload"
+        );
+        json.truncate(json.len() - 2);
+        json.extend_from_slice(b",\"native_subject\":");
+        serde_json::to_writer(&mut json, &subject)?;
+        json.extend_from_slice(b"}}");
+        String::from_utf8(json).context("event serializer produced invalid UTF-8")
+    }
+
     /// Append one event (a duplicate seq is ignored), then prune past the retention cap.
     pub fn record(&self, session_id: &str, seq: u64, event: &Event) -> Result<()> {
-        let json = serde_json::to_string(event)
+        let json = Self::encode_event(event)
             .with_context(|| format!("serialise event for {session_id}@{seq}"))?;
         let now_ms = chrono::Utc::now().timestamp_millis();
         let mut conn = self.conn();
@@ -286,7 +319,7 @@ impl EventStore {
         event: &Event,
         created_at_ms: i64,
     ) -> Result<()> {
-        let json = serde_json::to_string(event)?;
+        let json = Self::encode_event(event)?;
         events::insert_event(
             &self.conn(),
             &self.schema,
@@ -751,6 +784,8 @@ mod tests {
             },
             Event::AcpSessionAssigned {
                 acp_session_id: "acp-xyz".into(),
+                connection_ready: false,
+                native_subject: None,
             },
         ];
         record_from(&store, "s-1", 1, snapshots);

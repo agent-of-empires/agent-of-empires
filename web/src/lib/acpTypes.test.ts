@@ -193,13 +193,14 @@ describe("applyEvent control state", () => {
     ],
     ...["user_stopped", "restart_pending", "idle_auto_stop", "prompt_orphaned"].map(
       (reason): [string, AcpEvent[], Partial<AcpState>] => [
-        `AcpSessionAssigned clears the ${reason} banner`,
+        `Raw AcpSessionAssigned cannot heal the ${reason} banner`,
         [stopped(reason), assigned],
         {
-          workerStopped: false,
-          workerRestarting: false,
-          workerIdleStopped: false,
-          agentOrphaned: false,
+          workerStopped: reason === "user_stopped",
+          workerRestarting: reason === "restart_pending" || reason === "prompt_orphaned",
+          workerIdleStopped: reason === "idle_auto_stop",
+          agentOrphaned: reason === "prompt_orphaned",
+          connectionReady: false,
         },
       ],
     ),
@@ -209,9 +210,9 @@ describe("applyEvent control state", () => {
       { incompatibleAgent: incompatibleDetail },
     ],
     [
-      "AcpSessionAssigned heals IncompatibleAgent",
+      "Raw AcpSessionAssigned cannot heal a compatibility diagnostic",
       [{ IncompatibleAgent: { detail: incompatibleDetail } }, assigned],
-      { incompatibleAgent: null },
+      { incompatibleAgent: incompatibleDetail, connectionReady: false },
     ],
     [
       "AgentStartupError closes the turn",
@@ -219,9 +220,9 @@ describe("applyEvent control state", () => {
       { turnActive: false, startupError: "boom" },
     ],
     [
-      "IntegrationLost closes the turn and surfaces the reason",
+      "IntegrationLost closes the turn",
       [prompt(), { IntegrationLost: { reason: { kind: "contract_violation", detail: "bad key" } } }],
-      { turnActive: false, startupError: "Agent integration lost: bad key" },
+      { turnActive: false },
     ],
     [
       "a reset after a prompt arms the primer",
@@ -739,14 +740,17 @@ describe("turnActive: daemon truth plus an optimistic overlay (#3417)", () => {
 
   it("N prompts steered into one turn are all closed by its single Stopped", () => {
     let state = fold(emptyAcpState(), steering);
+    state = applyReducedState(state, { ...reduced(false), connection_ready: true }, [], state.lastSeq);
     for (const id of ["p1", "p2", "p3", "p4", "p5"]) {
       state = acpHookReducer(state, { kind: "user_prompt", id, text: id });
       expect(state.turnActive).toBe(true);
-      state = applyReducedState(fold(state, prompt(id, id)), reduced(true));
+      state = fold(state, prompt(id, id));
+      state = applyReducedState(state, { ...reduced(true), connection_ready: true }, [], state.lastSeq);
       expect(state.turnActive).toBe(true);
     }
     expect(state).toMatchObject({ inflightPromptIds: [], promptSeq: 5 });
-    state = applyReducedState(fold(state, stopped("prompt_complete")), reduced(false));
+    state = fold(state, stopped("prompt_complete"));
+    state = applyReducedState(state, { ...reduced(false), connection_ready: true }, [], state.lastSeq);
     expect(state).toMatchObject({ turnActive: false, serverTurnActive: false });
   });
 
@@ -785,11 +789,9 @@ describe("turnActive: daemon truth plus an optimistic overlay (#3417)", () => {
   });
 
   it("an idle session's own first prompt is not a steered continuation", () => {
-    let state: AcpState = {
-      ...fold(emptyAcpState(), steering),
-      workerStopped: true,
-      workerRestarting: true,
-    };
+    let state = fold(emptyAcpState(), steering);
+    state = applyReducedState(state, { ...reduced(false), connection_ready: true }, [], state.lastSeq);
+    state = { ...state, workerStopped: true, workerRestarting: true };
     state = acpHookReducer(state, {
       kind: "user_prompt",
       id: "cmp-first",

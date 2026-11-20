@@ -180,12 +180,12 @@ pub(super) fn gc_reconciler_session_maps(
     attempted: &mut std::collections::HashSet<String>,
     respawn_history: &mut std::collections::HashMap<String, Vec<std::time::Instant>>,
     parked: &mut std::collections::HashSet<String>,
-    capacity_deferred: &mut std::collections::HashSet<String>,
+    resume_deferred: &mut std::collections::HashMap<String, super::acp_reconciler::ResumeDeferral>,
 ) {
     attempted.retain(|id| live_ids.contains(id.as_str()));
     respawn_history.retain(|id, _| live_ids.contains(id.as_str()));
     parked.retain(|id| live_ids.contains(id.as_str()));
-    capacity_deferred.retain(|id| live_ids.contains(id.as_str()));
+    resume_deferred.retain(|id, _| live_ids.contains(id.as_str()));
 }
 
 async fn sample_sandbox_health(
@@ -358,8 +358,7 @@ pub(super) async fn maintenance_loop(
     let mut acp_respawn_history: std::collections::HashMap<String, Vec<std::time::Instant>> =
         std::collections::HashMap::new();
     let mut acp_parked: std::collections::HashSet<String> = std::collections::HashSet::new();
-    let mut acp_capacity_deferred: std::collections::HashSet<String> =
-        std::collections::HashSet::new();
+    let mut acp_resume_deferred = std::collections::HashMap::new();
     let mut acp_stop_notified = std::collections::HashSet::new();
     let mut last_container_check: Option<std::time::Instant> = None;
     let mut last_credential_refresh = std::time::Instant::now();
@@ -384,7 +383,7 @@ pub(super) async fn maintenance_loop(
                 &mut attempted_acp_spawns,
                 &mut acp_respawn_history,
                 &mut acp_parked,
-                &mut acp_capacity_deferred,
+                &mut acp_resume_deferred,
             );
         }
         if last_container_check
@@ -408,7 +407,7 @@ pub(super) async fn maintenance_loop(
             &mut acp_reap_cadence,
             &mut acp_respawn_history,
             &mut acp_parked,
-            &mut acp_capacity_deferred,
+            &mut acp_resume_deferred,
             &mut acp_stop_notified,
         )
         .await;
@@ -772,7 +771,7 @@ mod tests {
         let mut attempted: HashSet<String> = HashSet::new();
         let mut respawn_history: HashMap<String, Vec<Instant>> = HashMap::new();
         let mut parked: HashSet<String> = HashSet::new();
-        let mut capacity_deferred: HashSet<String> = HashSet::new();
+        let mut resume_deferred = std::collections::HashMap::new();
 
         // A session that has been spawn-attempted, parked (crash-loop), has
         // respawn history, and is capacity-deferred.
@@ -782,7 +781,10 @@ mod tests {
             attempted.insert(id.clone());
             respawn_history.insert(id.clone(), vec![Instant::now()]);
             parked.insert(id.clone());
-            capacity_deferred.insert(id.clone());
+            resume_deferred.insert(
+                id.clone(),
+                crate::server::acp_reconciler::ResumeDeferral::capacity(),
+            );
         }
 
         // Tick with both sessions live: nothing is swept.
@@ -794,7 +796,7 @@ mod tests {
             &mut attempted,
             &mut respawn_history,
             &mut parked,
-            &mut capacity_deferred,
+            &mut resume_deferred,
         );
         assert!(attempted.contains(&doomed) && attempted.contains(&kept));
         assert!(parked.contains(&doomed) && parked.contains(&kept));
@@ -806,7 +808,7 @@ mod tests {
             &mut attempted,
             &mut respawn_history,
             &mut parked,
-            &mut capacity_deferred,
+            &mut resume_deferred,
         );
 
         assert!(
@@ -822,15 +824,15 @@ mod tests {
             "parked must forget the deleted session id"
         );
         assert!(
-            !capacity_deferred.contains(&doomed),
-            "capacity_deferred must forget the deleted session id"
+            !resume_deferred.contains_key(&doomed),
+            "resume_deferred must forget the deleted session id"
         );
 
         // The still-live session is untouched.
         assert!(attempted.contains(&kept));
         assert!(respawn_history.contains_key(&kept));
         assert!(parked.contains(&kept));
-        assert!(capacity_deferred.contains(&kept));
+        assert!(resume_deferred.contains_key(&kept));
     }
 
     #[test]

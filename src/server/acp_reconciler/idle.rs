@@ -205,6 +205,18 @@ pub(super) async fn reap_idle_workers(state: &Arc<AppState>) {
         if !should_auto_stop(now_ms, last_ms, idle_secs, false) {
             continue;
         }
+        if super::query_flushed(
+            &state.acp_supervisor,
+            &state.acp_event_store,
+            &id,
+            "idle-reap quota hold",
+            |store, id| store.rate_limit_park(id).is_some(),
+        )
+        .await
+        .unwrap_or(true)
+        {
+            continue;
+        }
         // Re-check mid-turn: work may have started since the snapshot. A failed probe counts
         // as busy so live work is never stopped.
         let holds_live_work = super::query_flushed(
@@ -345,11 +357,12 @@ mod tests {
                     id,
                     1,
                     &Event::Stopped {
-                        reason: "rate_limited".into(),
+                        reason: "prompt_complete".into(),
                     },
                     stale_ms,
                 )
                 .unwrap();
+            assert!(state.acp_event_store.rate_limit_park(id).is_none());
             let sup = &state.acp_supervisor;
             let (_hold, before) = match worker {
                 Worker::Starting => (Some(sup.test_hold_starting(id)), Resuming),
@@ -650,6 +663,8 @@ mod tests {
                     vec![],
                     vec![Event::AcpSessionAssigned {
                         acp_session_id: "acp-1".to_string(),
+                        connection_ready: false,
+                        native_subject: None,
                     }],
                 ),
                 Running,

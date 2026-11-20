@@ -30,6 +30,7 @@ async function openGoneSession(
     about: { ...(readOnly ? { read_only: true } : {}), ...(nearFull ? REMINDER_ABOUT : {}) },
     reducedState: nearFull ? WITH_COMPACT : undefined,
     workerState: "absent",
+    nativeAvailable: false,
     acpSessionId: "acp-1",
     sessionFields: { is_sandboxed: true, group_path: "infra", acp_agent: "claude", ...fields },
     initialEvents: [
@@ -233,6 +234,7 @@ test("an untyped startup error keeps the composer and the compaction reminder, a
     about: REMINDER_ABOUT,
     reducedState: WITH_COMPACT,
     workerState: "absent",
+    nativeAvailable: false,
     acpSessionId: "acp-1",
     sessionFields: { is_sandboxed: true, acp_agent: "claude" },
     initialEvents: [...NEAR_FULL, { AgentStartupError: { message: MESSAGE } }],
