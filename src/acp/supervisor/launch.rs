@@ -1561,6 +1561,17 @@ pub(super) async fn resolve_mcp_servers(
     };
     (ctx.plugin_served, ctx.unreachable_notified) =
         crate::plugin::mcp_serve::session_plugin_entries(&ctx).await;
+    // An agent that cannot expand credential references gets no plugin-served entries. They are
+    // not injected at all, so none replaces a server the user configured under its key.
+    let expands_refs = crate::acp::agent_profiles::resolve(agent_key).expands_mcp_env_refs;
+    let declined: Vec<(String, String)> = if expands_refs {
+        Vec::new()
+    } else {
+        std::mem::take(&mut ctx.plugin_served)
+            .into_iter()
+            .map(|p| (p.plugin_id, p.server.name))
+            .collect()
+    };
     let mut provenance: std::collections::HashMap<String, McpProvenance> = resolved
         .iter()
         .map(|s| (s.def.name.clone(), s.provenance.clone()))
@@ -1642,25 +1653,32 @@ pub(super) async fn resolve_mcp_servers(
     // see a value. An agent that expands references gets the values in its environment, which
     // other local users cannot read, unlike the command line its entries end up on. Any other
     // agent gets no plugin-served entries rather than a literal value on that command line.
-    if !crate::acp::agent_profiles::resolve(agent_key).expands_mcp_env_refs {
+    if !expands_refs {
         let (plugin_served, resolved): (Vec<ResolvedMcpServer>, Vec<ResolvedMcpServer>) = resolved
             .into_iter()
             .partition(|server| matches!(server.provenance, McpProvenance::Plugin { .. }));
-        let mut skipped: std::collections::BTreeMap<&str, Vec<&str>> = Default::default();
-        for server in &plugin_served {
-            if let McpProvenance::Plugin { plugin_id } = &server.provenance {
-                skipped
-                    .entry(plugin_id.as_str())
-                    .or_default()
-                    .push(&server.def.name);
-            }
+        let mut skipped: std::collections::BTreeMap<&str, std::collections::BTreeSet<&str>> =
+            Default::default();
+        let hook_served = plugin_served
+            .iter()
+            .filter_map(|server| match &server.provenance {
+                McpProvenance::Plugin { plugin_id } => {
+                    Some((plugin_id.as_str(), server.def.name.as_str()))
+                }
+                _ => None,
+            });
+        let declined = declined
+            .iter()
+            .map(|(plugin, name)| (plugin.as_str(), name.as_str()));
+        for (plugin_id, name) in declined.chain(hook_served) {
+            skipped.entry(plugin_id).or_default().insert(name);
         }
         for (plugin_id, keys) in skipped {
             crate::acp::mcp_rewrite::report_serve_failure(
                 plugin_id,
                 &format!(
                     "This session's agent does not expand MCP credential references, so these MCP servers are not forwarded to it: {}.",
-                    keys.join(", ")
+                    keys.into_iter().collect::<Vec<_>>().join(", ")
                 ),
             );
         }
@@ -3367,6 +3385,12 @@ time.sleep(60)
         let _endpoint = EndpointGuard::install(endpoint);
         let credentials = [("acme.a", "docs"), ("acme.b", "git")]
             .map(|(p, n)| (p, n, secret.plugin_server_credential_for(p, n, "sess-c")));
+        // A server the user configured under a plugin entry's key.
+        std::fs::write(
+            crate::session::get_app_dir().unwrap().join("mcp.json"),
+            r#"{ "mcpServers": { "acme_a__docs": { "command": "user" } } }"#,
+        )
+        .unwrap();
 
         for (agent, expands) in [
             ("claude", true),
@@ -3409,15 +3433,25 @@ time.sleep(60)
                     let reference = format!("Bearer ${{{}}}", credential_var_name(c));
                     assert!(message.contains(&reference), "{agent}: {message}");
                 }
+                assert!(
+                    !message.contains("\"command\":\"user\""),
+                    "{agent}: the plugin entry replaces the configured server: {message}"
+                );
             } else {
                 assert!(out.credentials.is_empty(), "{agent}");
                 for (_, _, c) in &credentials {
                     assert!(!message.contains(c.as_str()), "{agent}: {message}");
                     assert!(!message.contains(&credential_var_name(c)), "{agent}");
                 }
-                for key in ["acme_a__docs", "acme_b__git"] {
-                    assert!(!message.contains(key), "{agent}: {message}");
-                }
+                assert!(!message.contains("acme_b__git"), "{agent}: {message}");
+                assert!(
+                    message.contains("\"command\":\"user\""),
+                    "{agent}: the configured server stays when the plugin entry cannot be used: {message}"
+                );
+                assert!(
+                    rewriter.notices().is_empty(),
+                    "{agent}: nothing was replaced, so no replace notice"
+                );
                 let mut skipped: Vec<_> = rewriter
                     .skipped()
                     .into_iter()
@@ -4037,7 +4071,9 @@ time.sleep(60)
                 name: name.into(),
                 transport,
             };
-            let bearer = stolen.unwrap();
+            // An agent that expands no reference gets no plugin entry in front of the hook,
+            // so there is nothing to copy; a guessed reference must get nothing either.
+            let bearer = stolen.unwrap_or_else(|| "Bearer ${AOE_PLUGIN_MCP_CRED_0000}".into());
             out.push(leak(
                 "copied",
                 ProjectMcpTransport::Http {
