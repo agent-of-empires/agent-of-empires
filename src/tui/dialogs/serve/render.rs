@@ -565,6 +565,23 @@ fn render_qr(_url: &str) -> String {
     String::new()
 }
 
+const HANDOFF_INSTALL: &str = "Scan with your phone's camera, or open the link on any phone or computer. For notifications, install it (iPhone: Share › Add to Home Screen; Android and desktop: the browser's Install app), open it, sign in with the passphrase, and turn them on.";
+const HANDOFF_QUICK_TUNNEL: &str = "Scan with your phone's camera, or open the link on any phone or computer. The address changes on restart, so an installed app stops working; use Tailscale Funnel for that.";
+
+/// The line above the QR code. Tunnel only, because install and push need HTTPS. The host
+/// rather than the transport spots a quick tunnel, since a reattached Daemon has no transport.
+fn handoff_line(mode: ServeMode, url: &str, scannable: bool) -> Option<&'static str> {
+    if mode != ServeMode::Tunnel || !scannable || !cfg!(feature = "web") {
+        return None;
+    }
+    let quick = super::link_host(url).is_some_and(|host| host.ends_with(".trycloudflare.com"));
+    Some(if quick {
+        HANDOFF_QUICK_TUNNEL
+    } else {
+        HANDOFF_INSTALL
+    })
+}
+
 fn render_active(
     view: &ServeView,
     frame: &mut Frame,
@@ -749,7 +766,30 @@ fn render_active(
         rows.push((1, labeled("Passphrase: ", value, style), copy));
     }
 
-    let total: u16 = rows.iter().map(|(h, _, _)| h).sum();
+    let mut total: u16 = rows.iter().map(|(h, _, _)| h).sum();
+    // Drawn only when it fits, so a short terminal drops it before the QR code.
+    if let Some(text) = handoff_line(*mode, url, notice.is_none()) {
+        let line = Line::from(text);
+        let height = crate::tui::components::text::wrapped_line_count(
+            &line,
+            content.width.saturating_sub(2),
+        ) as u16
+            + 1;
+        if total + height <= content.height {
+            total += height;
+            rows.insert(
+                0,
+                (
+                    height,
+                    Paragraph::new(line)
+                        .style(dimmed)
+                        .wrap(Wrap { trim: true })
+                        .alignment(Alignment::Center),
+                    None,
+                ),
+            );
+        }
+    }
     let top_pad = Constraint::Length(content.height.saturating_sub(total) / 2);
     let constraints = std::iter::once(top_pad)
         .chain(rows.iter().map(|(h, _, _)| Constraint::Length(*h)))
@@ -1914,6 +1954,107 @@ mod tests {
                 view.handle_click(x, y).map(|k| k.code),
                 Some(KeyCode::Enter),
                 "{card}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_handoff_line_follows_the_mode_and_host() {
+        let funnel = "https://host.tailnet.ts.net/?token=t";
+        let named = "https://aoe.example.com/?token=t";
+        let quick = "https://a-b-c.trycloudflare.com/?token=t";
+        let lan = "http://192.168.1.42:8080/?token=t";
+        // (mode, URL, scannable, line)
+        for (mode, url, scannable, want) in [
+            (ServeMode::Tunnel, funnel, true, Some(HANDOFF_INSTALL)),
+            (ServeMode::Tunnel, named, true, Some(HANDOFF_INSTALL)),
+            (ServeMode::Tunnel, quick, true, Some(HANDOFF_QUICK_TUNNEL)),
+            // A withdrawn Funnel shows why in place of the QR code.
+            (ServeMode::Tunnel, funnel, false, None),
+            (ServeMode::Local, lan, true, None),
+        ] {
+            assert_eq!(
+                handoff_line(mode, url, scannable),
+                want.filter(|_| cfg!(feature = "web")),
+                "{mode:?} {url} scannable={scannable}"
+            );
+        }
+    }
+
+    /// Each non-blank QR row drawn whole, in order.
+    #[cfg(feature = "web")]
+    fn qr_drawn_whole(buf: &ratatui::buffer::Buffer, url: &str) -> bool {
+        let rows: Vec<String> = crate::tui::dialogs::test_render::text(buf)
+            .lines()
+            .map(str::to_owned)
+            .collect();
+        let qr = render_qr(url);
+        let mut from = 0;
+        qr.lines().filter(|l| !l.trim().is_empty()).all(|line| {
+            match rows[from..].iter().position(|row| row.contains(line)) {
+                Some(i) => {
+                    from += i + 1;
+                    true
+                }
+                None => false,
+            }
+        })
+    }
+
+    /// The line is drawn when it fits and dropped before the QR code is cut, for a Daemon
+    /// this TUI started and for a reattached one, whose transport is unknown.
+    #[cfg(feature = "web")]
+    #[test]
+    fn the_handoff_line_never_costs_the_qr_code() {
+        use crate::server::tunnel::FunnelReach;
+        use crate::tui::dialogs::test_render::draw;
+        let funnel = "https://host.tailnet.ts.net/?token=t";
+        let quick = "https://a-b-c.trycloudflare.com/?token=t";
+        // (transport, URL, line)
+        for (transport, url, line) in [
+            (Some(TunnelTransport::Tailscale), funnel, HANDOFF_INSTALL),
+            (None, funnel, HANDOFF_INSTALL),
+            (
+                Some(TunnelTransport::Cloudflare),
+                quick,
+                HANDOFF_QUICK_TUNNEL,
+            ),
+            (None, quick, HANDOFF_QUICK_TUNNEL),
+        ] {
+            let view = view(ServeViewState::Active {
+                mode: ServeMode::Tunnel,
+                transport,
+                urls: vec![ServeUrl {
+                    label: None,
+                    url: url.to_string(),
+                }],
+                url_index: 0,
+                passphrase: Some("correct-horse".to_string()),
+                funnel: FunnelReach::Ours,
+                opened_at: Instant::now(),
+                log_offset: 0,
+            });
+            let shows = |width: u16, height: u16| {
+                let buf = draw(width, height, |f, theme| render(&view, f, f.area(), theme));
+                let drawn = text_in(&buf, buf.area).contains(line);
+                (drawn, qr_drawn_whole(&buf, url))
+            };
+            let case = format!("{transport:?} {url}");
+            assert_eq!(shows(120, 40), (true, true), "{case} at 120x40");
+            // At 80x24 the QR code alone fills the screen.
+            assert!(!shows(80, 24).0, "{case} at 80x24");
+            let mut dropped_while_qr_fits = false;
+            for height in 24..=40 {
+                let (drawn, whole) = shows(80, height);
+                assert!(
+                    !drawn || whole,
+                    "{case}: line drawn over a cut QR at 80x{height}"
+                );
+                dropped_while_qr_fits |= !drawn && whole;
+            }
+            assert!(
+                dropped_while_qr_fits,
+                "{case}: never dropped before the QR code"
             );
         }
     }
