@@ -90,9 +90,9 @@ type Undo = Box<dyn FnOnce(&mut crate::session::Instance) + Send>;
 struct MirroredFields {
     /// The mutation cleared `pending_initial_turn`, so the disk row must drop it in the same write.
     pending_turn_cleared: bool,
-    /// `(lifecycle_generation, text, error)` of a failed pending turn; applied
+    /// `(lifecycle_generation, text, error, error_code)` of a failed pending turn; applied
     /// only to a disk row of the same launch and turn.
-    pending_turn_failure: Option<(u64, String, String)>,
+    pending_turn_failure: Option<(u64, String, String, Option<String>)>,
     queued_prompts: Vec<crate::daemon::QueuedPromptEntry>,
     queued_prompt_next_seq: u64,
     idle_dormant_since: Option<chrono::DateTime<chrono::Utc>>,
@@ -1495,7 +1495,10 @@ impl SessionService {
             error = %error,
             "initial prompt not delivered"
         );
-        self.fail_pending_initial_turn(waited, text, error.to_string())
+        let code = error
+            .downcast_ref::<TerminalPromptBlocker>()
+            .map(|blocker| blocker.code());
+        self.fail_pending_initial_turn(waited, text, error.to_string(), code)
             .await;
     }
 
@@ -1506,6 +1509,7 @@ impl SessionService {
         waited: &Instance,
         text: &str,
         reason: String,
+        code: Option<&'static str>,
     ) {
         let (waited, text) = (waited.clone(), text.to_string());
         let outcome = self
@@ -1519,6 +1523,7 @@ impl SessionService {
                     .filter(|turn| same && turn.text == text)
                 {
                     turn.error = Some(reason);
+                    turn.error_code = code.map(str::to_string);
                 }
                 ((), None)
             })
@@ -1687,6 +1692,7 @@ impl SessionService {
             attachments,
             synthesized: true,
             error: None,
+            error_code: None,
         };
         let profile = {
             let mut instances = self.instances.write().await;
@@ -1863,7 +1869,12 @@ impl SessionService {
                     pending_turn_cleared: clear_pending_turn_on_disk,
                     pending_turn_failure: inst.pending_initial_turn.as_ref().and_then(|turn| {
                         let error = turn.error.clone()?;
-                        Some((inst.lifecycle_generation, turn.text.clone(), error))
+                        Some((
+                            inst.lifecycle_generation,
+                            turn.text.clone(),
+                            error,
+                            turn.error_code.clone(),
+                        ))
                     }),
                     queued_prompts: inst.queued_prompts.clone(),
                     queued_prompt_next_seq: inst.queued_prompt_next_seq,
@@ -1886,7 +1897,7 @@ impl SessionService {
                             if mirrored.pending_turn_cleared {
                                 inst.pending_initial_turn = None;
                             }
-                            if let Some((generation, text, error)) = mirrored.pending_turn_failure
+                            if let Some((generation, text, error, code)) = mirrored.pending_turn_failure
                             {
                                 if inst.lifecycle_generation == generation {
                                     if let Some(turn) = inst
@@ -1895,6 +1906,7 @@ impl SessionService {
                                         .filter(|turn| turn.text == text)
                                     {
                                         turn.error = Some(error);
+                                        turn.error_code = code;
                                     }
                                 }
                             }
@@ -2834,6 +2846,57 @@ impl SessionService {
 
 const TERMINAL_INITIAL_TURN_READY_BUDGET: std::time::Duration = std::time::Duration::from_secs(60);
 
+/// A one-time Claude Code dialog that holds the input box back. The prompt is
+/// never typed into it, and neither screen is ever accepted on the user's behalf.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum TerminalPromptBlocker {
+    FolderNotTrusted,
+    BypassNotAccepted,
+}
+
+impl TerminalPromptBlocker {
+    /// Recognizes the dialogs from the plain-text screen of a Claude Code pane.
+    pub(crate) fn detect(tool: &str, screen: &str) -> Option<Self> {
+        if tool != "claude" {
+            return None;
+        }
+        let screen = screen.to_lowercase();
+        if screen.contains("yes, i trust this folder") {
+            Some(Self::FolderNotTrusted)
+        } else if screen.contains("yes, i accept") && screen.contains("bypass permissions mode") {
+            Some(Self::BypassNotAccepted)
+        } else {
+            None
+        }
+    }
+
+    pub(crate) fn code(self) -> &'static str {
+        match self {
+            Self::FolderNotTrusted => "agent_folder_not_trusted",
+            Self::BypassNotAccepted => "agent_bypass_not_accepted",
+        }
+    }
+}
+
+impl std::fmt::Display for TerminalPromptBlocker {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::FolderNotTrusted => f.write_str(
+                "Claude Code is asking whether to trust this folder, so the prompt was not typed. \
+                 Turn on `pre_trust_agent_folders` (Settings, Agents, \"Skip the Agent's trust this \
+                 folder prompt\", or `[session] pre_trust_agent_folders = true` in config.toml) to \
+                 start new sessions trusted, or open the session once and trust the folder.",
+            ),
+            Self::BypassNotAccepted => f.write_str(
+                "Claude Code is asking you to accept Bypass Permissions mode, so the prompt was not \
+                 typed. Open the session once and accept it.",
+            ),
+        }
+    }
+}
+
+impl std::error::Error for TerminalPromptBlocker {}
+
 /// Blocks until the terminal session's agent process is up (alive pane, not a
 /// bare shell) and its ready marker is showing. An agent without a ready marker
 /// is refused: stable output alone cannot tell a prompt from a dialog.
@@ -2869,10 +2932,14 @@ fn wait_for_terminal_agent(instance: &Instance, budget: std::time::Duration) -> 
         std::thread::sleep(std::time::Duration::from_millis(200));
     }
     let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+    let ready = instance
+        .tmux_session()?
+        .wait_until_ready_unless(remaining, markers, |screen| {
+            TerminalPromptBlocker::detect(&instance.tool, screen)
+        })
+        .map_err(anyhow::Error::from)?;
     anyhow::ensure!(
-        instance
-            .tmux_session()?
-            .wait_until_ready(remaining, markers),
+        ready,
         "the agent was not ready within {}s",
         budget.as_secs()
     );
@@ -3814,6 +3881,7 @@ mod tests {
             attachments: Vec::new(),
             synthesized: false,
             error: error.map(str::to_string),
+            error_code: None,
         };
 
         assert!(service.turn_is_deliverable("sess-switch", &turn("fresh", None)));
@@ -4746,6 +4814,7 @@ mod tests {
             attachments: Vec::new(),
             synthesized: false,
             error: None,
+            error_code: None,
         });
         inst
     }
@@ -4806,8 +4875,111 @@ mod tests {
             .expect("capture pane")
     }
 
+    /// Claude Code 2.1.326 first-run folder-trust dialog, as `capture-pane -p -e` returns it.
+    const TRUST_DIALOG_CAPTURE: &str = concat!(
+        "\x1b[39m \x1b[1m\x1b[38;5;220mAccessing\x1b[0m \x1b[1m\x1b[38;5;220mworkspace:\x1b[0m\n",
+        " \x1b[1m/private/tmp/aoe-cap/untrusted3\x1b[0m\n",
+        " Quick safety check: Is this a project you created or one you trust? (Like your own code, a well-known open source\n",
+        " project, or work from your team). If not, take a moment to review what's in this folder first.\n",
+        " Claude Code'll be able to read, edit, and execute files here.\n",
+        " \x1b[38;5;246m\x1b]8;id=zaxmda;https://code.claude.com/docs/en/security\x1b\\Security guide\x1b[39m\x1b]8;;\x1b\\\n",
+        " \x1b[38;5;153m\u{276f}\x1b[39m \x1b[38;5;153mNo,\x1b[39m \x1b[38;5;153mexit\x1b[39m\n",
+        "   Yes, I trust this folder\n",
+        " \x1b[38;5;246mEnter\x1b[39m \x1b[38;5;246mto\x1b[39m \x1b[38;5;246mconfirm\x1b[39m \x1b[38;5;246m\u{b7}\x1b[39m \x1b[38;5;246mEsc\x1b[39m \x1b[38;5;246mto\x1b[39m \x1b[38;5;246mcancel\x1b[39m\n",
+    );
+
+    /// Claude Code 2.1.326 Bypass Permissions acceptance screen, as `capture-pane -p -e` returns it.
+    const BYPASS_DIALOG_CAPTURE: &str = concat!(
+        "\x1b[39m  \x1b[1m\x1b[38;5;211mWARNING:\x1b[0m \x1b[1m\x1b[38;5;211mClaude\x1b[0m \x1b[1m\x1b[38;5;211mCode\x1b[0m \x1b[1m\x1b[38;5;211mrunning\x1b[0m \x1b[1m\x1b[38;5;211min\x1b[0m \x1b[1m\x1b[38;5;211mBypass\x1b[0m \x1b[1m\x1b[38;5;211mPermissions\x1b[0m \x1b[1m\x1b[38;5;211mmode\x1b[0m\n",
+        "  In Bypass Permissions mode, Claude Code will not ask for your approval before running potentially dangerous\n",
+        "  commands.\n",
+        "  This mode should only be used in a sandboxed container/VM that has restricted internet access and can easily be\n",
+        "  restored if damaged.\n",
+        "  By proceeding, you accept all responsibility for actions taken while running in Bypass Permissions mode.\n",
+        "  \x1b]8;id=zaxmda;https://code.claude.com/docs/en/security\x1b\\https://code.claude.com/docs/en/security\x1b]8;;\x1b\\\n",
+        "  \x1b[38;5;153m\u{276f}\x1b[39m \x1b[38;5;153mNo,\x1b[39m \x1b[38;5;153mexit\x1b[39m\n",
+        "    Yes, I accept\n",
+        "  \x1b[3m\x1b[38;5;246mEnter\x1b[0m \x1b[3m\x1b[38;5;246mto\x1b[0m \x1b[3m\x1b[38;5;246mconfirm\x1b[0m \x1b[3m\x1b[38;5;246m\u{b7}\x1b[0m \x1b[3m\x1b[38;5;246mEsc\x1b[0m \x1b[3m\x1b[38;5;246mto\x1b[0m \x1b[3m\x1b[38;5;246mcancel\x1b[0m\n",
+    );
+
+    #[test]
+    fn claude_dialogs_are_recognized_from_real_colored_captures() {
+        let plain = |capture: &str| crate::tmux::utils::strip_ansi(capture);
+        assert_eq!(
+            TerminalPromptBlocker::detect("claude", &plain(TRUST_DIALOG_CAPTURE)),
+            Some(TerminalPromptBlocker::FolderNotTrusted)
+        );
+        assert_eq!(
+            TerminalPromptBlocker::detect("claude", &plain(BYPASS_DIALOG_CAPTURE)),
+            Some(TerminalPromptBlocker::BypassNotAccepted)
+        );
+        assert_eq!(
+            TerminalPromptBlocker::detect("opencode", &plain(TRUST_DIALOG_CAPTURE)),
+            None
+        );
+        assert_eq!(
+            TerminalPromptBlocker::detect(
+                "claude",
+                "❯ Try \"fix typecheck errors\"\n  ⏵⏵ auto mode on (shift+tab to cycle)"
+            ),
+            None
+        );
+    }
+
+    /// Either dialog stops the wait within seconds, types nothing, and records a
+    /// machine-readable code beside the message.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn terminal_initial_turn_stops_at_once_on_a_claude_dialog() {
+        if !crate::tmux::is_tmux_available() {
+            return;
+        }
+        let _app_dir = crate::session::test_support::isolate_app_dir();
+        let fixtures = tempfile::tempdir().unwrap();
+        for (case, capture, code, hint) in [
+            (
+                "trust",
+                TRUST_DIALOG_CAPTURE,
+                "agent_folder_not_trusted",
+                "pre_trust_agent_folders",
+            ),
+            (
+                "bypass",
+                BYPASS_DIALOG_CAPTURE,
+                "agent_bypass_not_accepted",
+                "accept it",
+            ),
+        ] {
+            let id = format!("sess-dialog-{case}");
+            let mut inst =
+                terminal_turn_instance(&id, &format!("term-dialog-{case}"), "must-not-type");
+            inst.tool = "claude".into();
+            let file = fixtures.path().join(case);
+            std::fs::write(&file, capture).unwrap();
+            let pane =
+                start_terminal_pane(&inst, &format!("cat '{}'; exec cat", file.display()), false);
+            let service = crate::server::test_support::build_test_app_state(vec![inst])
+                .session_service
+                .clone();
+
+            let started = std::time::Instant::now();
+            service
+                .drain_terminal_initial_turn_within(&id, std::time::Duration::from_secs(40))
+                .await;
+
+            assert!(
+                started.elapsed() < std::time::Duration::from_secs(15),
+                "{case}"
+            );
+            assert!(!pane_text(&pane).contains("must-not-type"), "{case}");
+            let turn = pending_turn(&service, &id).await.expect("turn is kept");
+            assert_eq!(turn.error_code.as_deref(), Some(code), "{case}");
+            assert!(turn.error.is_some_and(|e| e.contains(hint)), "{case}");
+        }
+    }
+
     /// A Claude session is typed into once its input box shows the mode line,
-    /// not while the trust dialog is still up.
+    /// not while it is still starting.
     #[tokio::test]
     #[serial_test::serial]
     async fn terminal_initial_turn_is_typed_into_claude_once_its_input_box_is_up() {
@@ -4819,7 +4991,7 @@ mod tests {
         inst.tool = "claude".into();
         let pane = start_terminal_pane(
             &inst,
-            "echo 'Yes, I trust this folder'; sleep 1.5; clear; \
+            "echo 'Starting Claude Code...'; sleep 1.5; clear; \
              echo '  bypass permissions on (shift+tab to cycle)'; exec cat",
             false,
         );
@@ -5146,7 +5318,7 @@ mod tests {
         service.instances.write().await[0].lifecycle_generation += 1;
 
         service
-            .fail_pending_initial_turn(&waited, "same", "stale failure".to_string())
+            .fail_pending_initial_turn(&waited, "same", "stale failure".to_string(), None)
             .await;
 
         assert!(pending_turn(&service, "sess-fence")
@@ -5175,8 +5347,12 @@ mod tests {
             .clone();
 
         let reload = service.disk_reload_guard().await;
-        let mut failing =
-            Box::pin(service.fail_pending_initial_turn(&waited, "turn", "wait failed".to_string()));
+        let mut failing = Box::pin(service.fail_pending_initial_turn(
+            &waited,
+            "turn",
+            "wait failed".to_string(),
+            None,
+        ));
         let blocked =
             tokio::time::timeout(std::time::Duration::from_millis(200), &mut failing).await;
         assert!(blocked.is_err(), "the write must wait for the reload");
@@ -5428,6 +5604,7 @@ mod tests {
                 attachments: Vec::new(),
                 synthesized: false,
                 error: None,
+                error_code: None,
             });
             inst
         }
@@ -5894,6 +6071,7 @@ mod tests {
             attachments: vec![],
             synthesized: true,
             error: None,
+            error_code: None,
         };
         type Mutate = fn(Arc<SessionService>) -> futures_util::future::BoxFuture<'static, ()>;
         type Check = fn(&Instance) -> bool;
@@ -6229,6 +6407,7 @@ mod tests {
         inst.view = crate::session::View::Structured;
         inst.pending_initial_turn = Some(crate::session::PendingInitialTurn {
             error: None,
+            error_code: None,
             text: "continuation".to_string(),
             attachments: Vec::new(),
             synthesized: true,
@@ -6286,6 +6465,7 @@ mod tests {
         inst.view = crate::session::View::Structured;
         inst.pending_initial_turn = Some(crate::session::PendingInitialTurn {
             error: None,
+            error_code: None,
             text: "continuation".to_string(),
             attachments: Vec::new(),
             synthesized: true,
@@ -6327,6 +6507,7 @@ mod tests {
         let _app_dir = crate::session::test_support::isolate_app_dir();
         let seeded = crate::session::PendingInitialTurn {
             error: None,
+            error_code: None,
             text: "continuation".to_string(),
             attachments: Vec::new(),
             synthesized: true,
@@ -6378,6 +6559,7 @@ mod tests {
         let _app_dir = crate::session::test_support::isolate_app_dir();
         let seeded = crate::session::PendingInitialTurn {
             error: None,
+            error_code: None,
             text: "continuation".to_string(),
             attachments: Vec::new(),
             synthesized: true,

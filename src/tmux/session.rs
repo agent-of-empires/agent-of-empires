@@ -1,19 +1,5 @@
 //! tmux session management
 
-/// A real Claude Code 2.1.326 footer as `capture-pane -e` returns it: every
-/// word carries its own color escape, so a raw substring match misses it.
-#[test]
-fn ready_markers_match_a_colored_claude_footer() {
-    let capture = "\x1b[39m  \x1b[38;5;211m\u{23f5}\u{23f5}\x1b[39m \x1b[38;5;211mbypass\x1b[39m \x1b[38;5;211mpermissions\x1b[39m \x1b[38;5;211mon\x1b[38;5;246m (shift+tab\x1b[39m \x1b[38;5;246mto\x1b[39m \x1b[38;5;246mcycle)\x1b[39m \x1b[38;5;246m\u{b7}\x1b[39m \x1b[38;5;246mPR\x1b[39m \x1b[4m\x1b[38;5;211m\x1b]8;id=1;https://example.test/pull/1\x1b\\#1\x1b[0m\x1b]8;;\x1b\\\n";
-    assert!(!capture.to_lowercase().contains("shift+tab to cycle"));
-    let markers: Vec<String> = crate::agents::ready_markers("claude")
-        .iter()
-        .map(|m| m.to_lowercase())
-        .collect();
-    assert!(shows_ready_marker(capture, &markers));
-    assert!(!shows_ready_marker("\x1b[2mTry\x1b[0m \"x\"", &markers));
-}
-
 use anyhow::{bail, Result};
 use std::io::Write;
 use std::process::Stdio;
@@ -868,6 +854,18 @@ impl Session {
     /// The polling budget bounds readiness checks, not each native subprocess.
     /// Returns false when the budget ran out first.
     pub fn wait_until_ready(&self, max_wait: std::time::Duration, ready_markers: &[&str]) -> bool {
+        self.wait_until_ready_unless(max_wait, ready_markers, |_| None::<()>)
+            .unwrap_or(false)
+    }
+
+    /// [`Self::wait_until_ready`] that also stops at once with `Err` when
+    /// `blocked` recognizes the plain-text screen as a dialog.
+    pub fn wait_until_ready_unless<B>(
+        &self,
+        max_wait: std::time::Duration,
+        ready_markers: &[&str],
+        blocked: impl Fn(&str) -> Option<B>,
+    ) -> Result<bool, B> {
         let poll_interval = std::time::Duration::from_millis(200);
         let deadline = std::time::Instant::now() + max_wait;
         let ready_markers: Vec<String> = ready_markers.iter().map(|m| m.to_lowercase()).collect();
@@ -879,20 +877,25 @@ impl Session {
             };
             #[cfg(test)]
             tests::observe_ready_capture(&now);
+            let screen = crate::tmux::utils::strip_ansi(&now);
+            if let Some(blocker) = blocked(&screen) {
+                return Err(blocker);
+            }
             if !ready_markers.is_empty() {
-                if shows_ready_marker(&now, &ready_markers) {
-                    return true;
+                let screen = screen.to_lowercase();
+                if ready_markers.iter().any(|m| screen.contains(m)) {
+                    return Ok(true);
                 }
                 continue;
             }
             if now.trim().len() > 20 {
                 if last.as_deref() == Some(now.as_str()) {
-                    return true;
+                    return Ok(true);
                 }
                 last = Some(now);
             }
         }
-        false
+        Ok(false)
     }
 
     /// Capture the whole first window, panes composited, for the passive
@@ -2720,13 +2723,6 @@ pub(crate) fn build_create_args(
     }
 
     args
-}
-
-/// Whether `capture` (taken with `-e`) shows any of the lowercase `markers`.
-/// Agents color each word separately, so escapes are dropped before matching.
-fn shows_ready_marker(capture: &str, markers: &[String]) -> bool {
-    let screen = crate::tmux::utils::strip_ansi(capture).to_lowercase();
-    markers.iter().any(|m| screen.contains(m))
 }
 
 #[cfg(test)]

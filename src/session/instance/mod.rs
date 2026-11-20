@@ -241,6 +241,10 @@ pub struct PendingInitialTurn {
     /// is not retried; the user's next terminal send discards it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
+    /// Stable machine-readable form of `error`, for the causes a client can act
+    /// on (`agent_folder_not_trusted`, `agent_bypass_not_accepted`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error_code: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
