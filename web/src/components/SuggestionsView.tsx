@@ -3,10 +3,10 @@ import { ChevronDown, ChevronRight, RefreshCw, Search, Settings, X } from "lucid
 import { OFFLINE_TITLE } from "../lib/connectionState";
 import { agoLabel } from "../lib/suggestionTime";
 import { chipId, filterSuggestions, keyChipGroups, type KeyChip } from "../lib/suggestionFilter";
-import type { SuggestionItem, SuggestionProvider } from "../lib/types";
+import type { SessionResponse, SuggestionItem, SuggestionProvider } from "../lib/types";
 import { suggestionKey, useDismissUndo, useSuggestions } from "../hooks/useSuggestions";
 import { SuggestionFilterMenu, FilterMenuItem } from "./SuggestionFilterMenu";
-import { shortRef } from "../lib/suggestionPlan";
+import { liveSession, shortRef } from "../lib/suggestionPlan";
 import { useAgentNames } from "../hooks/useAgentNames";
 import { useSuggestionPresets } from "../hooks/useSuggestionPresets";
 import { SuggestionItemActions } from "./SuggestionItemActions";
@@ -28,6 +28,8 @@ interface Props {
   canLink?: boolean;
   /** Set when the first-run hint can open the Marketplace (not read-only or CityHall). */
   onOpenMarketplace?: () => void;
+  /** Live sessions, so a started row follows its Session's state. */
+  sessions?: SessionResponse[];
 }
 
 type Filter = "all" | "dismissed" | { provider: string };
@@ -72,6 +74,7 @@ export function SuggestionsView({
   onEditPreset,
   canLink = true,
   onOpenMarketplace,
+  sessions,
 }: Props) {
   const ctrl = useSuggestions(onPrepare, onOpenSession);
   const { snapshot, loading, loadFailed, refreshing, busy, notice, failures, offline, act, refresh, load } = ctrl;
@@ -381,7 +384,7 @@ export function SuggestionsView({
                             title={item.title}
                             inlineRef={snapshot.prefs.show_source_ref ? shortRef(item.source_ref) : ""}
                             reason={item.reason}
-                            session={item.started_session}
+                            session={liveSession(item.started_session, sessions)}
                             stale={item.stale}
                             failure={failures[key]}
                             actions={

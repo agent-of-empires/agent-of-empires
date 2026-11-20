@@ -4,7 +4,7 @@ import { act, cleanup, fireEvent, render, screen, waitFor, within } from "@testi
 import { SuggestionsView } from "../SuggestionsView";
 import { setServerDown } from "../../lib/connectionState";
 import { toastBus } from "../../lib/toastBus";
-import type { SuggestionItem, SuggestionsSnapshot } from "../../lib/types";
+import type { SessionResponse, SuggestionItem, SuggestionsSnapshot } from "../../lib/types";
 
 const {
   fetchSuggestions,
@@ -81,7 +81,10 @@ afterEach(() => {
   fetchPresets.mockResolvedValue([]);
 });
 
-async function open(snap: SuggestionsSnapshot | null, props: { readOnly?: boolean; initialDismissed?: boolean } = {}) {
+async function open(
+  snap: SuggestionsSnapshot | null,
+  props: { readOnly?: boolean; initialDismissed?: boolean; sessions?: SessionResponse[] } = {},
+) {
   fetchSuggestions.mockResolvedValue(snap);
   const onPrepare = vi.fn();
   const onOpenSession = vi.fn();
@@ -383,6 +386,14 @@ describe("SuggestionsView", () => {
       expect(row.querySelector("p:nth-of-type(2)")?.textContent).toBe("example/1 · ⠋ Running · started 3 min ago");
       fireEvent.click(screen.getByRole("button", { name: "Open" }));
       expect(onPrepare.onOpenSession).toHaveBeenCalledWith("sess-1");
+    });
+
+    it("follows the live Session state, not the one captured at start", async () => {
+      await open(snapshot({ items: [{ ...item, started_session: { ...started, status: "Starting" } }] }), {
+        sessions: [{ id: "sess-1", status: "Idle" } as SessionResponse],
+      });
+      const row = (await screen.findByText("Fix lifecycle")).closest("li") as HTMLElement;
+      expect(row.querySelector("p:nth-of-type(2)")?.textContent).toBe("example/1 · ⠒ Idle · started 3 min ago");
     });
 
     it("Start another opens the wizard without linking the new Session", async () => {

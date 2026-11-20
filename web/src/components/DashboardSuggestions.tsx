@@ -1,3 +1,5 @@
+import type { SessionResponse } from "../lib/types";
+import { liveSession } from "../lib/suggestionPlan";
 import { updateSuggestionSource } from "../lib/api";
 import { useAgentNames } from "../hooks/useAgentNames";
 import { useSuggestionPresets } from "../hooks/useSuggestionPresets";
@@ -15,6 +17,8 @@ interface Props {
   canLink?: boolean;
   onViewAll: () => void;
   onOpenSession: (sessionId: string) => void;
+  /** Live sessions, so a started row follows its Session's state. */
+  sessions?: SessionResponse[];
 }
 
 export function DashboardSuggestions({
@@ -24,6 +28,7 @@ export function DashboardSuggestions({
   canLink = true,
   onViewAll,
   onOpenSession,
+  sessions,
 }: Props) {
   const wide = useIsWideViewport();
   const ctrl = useSuggestions(onPrepare, onOpenSession);
@@ -74,7 +79,7 @@ export function DashboardSuggestions({
             sourceRef={snapshot.prefs.show_source_ref ? item.source_ref : undefined}
             reason={item.reason}
             project={item.resolved_project?.name ?? item.project}
-            session={item.started_session}
+            session={liveSession(item.started_session, sessions)}
             stale={item.stale}
             failure={failures[suggestionKey(item)]}
             actions={
