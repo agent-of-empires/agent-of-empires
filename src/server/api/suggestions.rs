@@ -525,6 +525,34 @@ async fn start_outcome(
     start_failed(reason, hint)
 }
 
+/// The create a Start asks for. A worktree preset makes its own branch, as the
+/// new-session form does, so a fresh Start never looks for one that does not exist.
+fn create_body(
+    prefill: &serde_json::Value,
+    path: &str,
+    (provider_id, id): (&str, &str),
+    prompt: Option<&str>,
+    (trust_hooks, trust_review): (
+        Option<bool>,
+        Option<crate::daemon::CreationTrustFingerprint>,
+    ),
+) -> serde_json::Result<crate::daemon::CreateSessionBody> {
+    serde_json::from_value(json!({
+        "title": prefill["title"],
+        "path": path,
+        "tool": prefill["tool"],
+        "view": prefill["view"],
+        "yolo_mode": prefill["yolo"],
+        "worktree_enabled": prefill["worktree"],
+        "create_new_branch": prefill["worktree"],
+        "sandbox": prefill["sandbox"],
+        "initial_prompt": prompt,
+        "suggestion": { "provider_id": provider_id, "id": id },
+        "trust_hooks": trust_hooks,
+        "trust_review": trust_review,
+    }))
+}
+
 pub async fn start_suggestion(
     State(state): State<Arc<AppState>>,
     body: Result<Json<StartBody>, axum::extract::rejection::JsonRejection>,
@@ -621,19 +649,13 @@ pub async fn start_suggestion(
     let prompt = prefill["initial_prompt"]
         .as_str()
         .filter(|prompt| !prompt.is_empty());
-    let create = serde_json::from_value::<crate::daemon::CreateSessionBody>(json!({
-        "title": prefill["title"],
-        "path": path,
-        "tool": prefill["tool"],
-        "view": prefill["view"],
-        "yolo_mode": prefill["yolo"],
-        "worktree_enabled": prefill["worktree"],
-        "sandbox": prefill["sandbox"],
-        "initial_prompt": prompt,
-        "suggestion": { "provider_id": provider_id, "id": id },
-        "trust_hooks": trust_hooks,
-        "trust_review": trust_review,
-    }));
+    let create = create_body(
+        &prefill,
+        &path,
+        (&provider_id, &id),
+        prompt,
+        (trust_hooks, trust_review),
+    );
     let create = match create {
         Ok(create) => create,
         Err(error) => return internal(error),
@@ -1055,6 +1077,17 @@ mod tests {
             (None, "assigned", preset("claude", 1), StatusCode::NOT_FOUND),
         ] {
             assert_eq!(status(provider, criterion, &preset), Some(expected));
+        }
+    }
+
+    #[test]
+    fn a_worktree_preset_creates_its_branch() {
+        for (worktree, expected) in [(true, true), (false, false)] {
+            let prefill = json!({ "title": "t", "tool": "claude", "view": "terminal",
+                "yolo": false, "worktree": worktree, "sandbox": false });
+            let body = create_body(&prefill, "/repo", ("p", "1"), None, (None, None)).unwrap();
+            assert_eq!(body.worktree_enabled, expected);
+            assert_eq!(body.create_new_branch, expected);
         }
     }
 }
