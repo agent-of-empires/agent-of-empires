@@ -1002,7 +1002,10 @@ fn apply_prepared(
         }
         return Err(error);
     }
-    let cleared = run_suggestions_cleanup(id, &cleanup);
+    // With a daemon running, its worker is retired after this and the daemon
+    // clears again behind it, then drops the marker. Without one, this is the last clear.
+    let retired = crate::acp::client::discovery::discover_local().is_err();
+    let cleared = run_suggestions_cleanup(id, &cleanup, retired);
     super::reload_registry();
     cleared?;
     tracing::info!(target: "plugin.install", plugin = %id, version = %prepared.fetched.manifest.version, "plugin updated");
@@ -1480,7 +1483,7 @@ fn cleanup_marker(plugin_id: &str) -> Result<std::path::PathBuf> {
 
 /// Where an update stands on clearing the plugin's published suggestions.
 #[derive(Debug, PartialEq, Eq)]
-enum Cleanup {
+pub(crate) enum Cleanup {
     /// Nothing to clear.
     None,
     /// An earlier cleanup is still pending.
@@ -1493,7 +1496,7 @@ enum Cleanup {
 /// changes or an earlier cleanup is pending. Runs before the update commits, so
 /// an interruption or a write failure cannot lose it, and a failure here stops
 /// the update.
-fn persist_suggestions_cleanup(plugin_id: &str, spec_changed: bool) -> Result<Cleanup> {
+pub(crate) fn persist_suggestions_cleanup(plugin_id: &str, spec_changed: bool) -> Result<Cleanup> {
     let marker = cleanup_marker(plugin_id)?;
     if marker.exists() {
         return Ok(Cleanup::Pending);
@@ -1508,14 +1511,31 @@ fn persist_suggestions_cleanup(plugin_id: &str, spec_changed: bool) -> Result<Cl
     Ok(Cleanup::Persisted)
 }
 
-/// Runs a persisted cleanup and forgets the marker only once it succeeds.
-fn run_suggestions_cleanup(plugin_id: &str, cleanup: &Cleanup) -> Result<()> {
+/// Runs a persisted cleanup. The marker stays until a clear has succeeded
+/// with the old worker retired: `worker_retired` is false while a running daemon
+/// has yet to stop it, and that daemon then ends the obligation itself.
+fn run_suggestions_cleanup(plugin_id: &str, cleanup: &Cleanup, worker_retired: bool) -> Result<()> {
     if *cleanup == Cleanup::None {
         return Ok(());
     }
     forget_suggestion_publication(plugin_id)?;
-    std::fs::remove_file(cleanup_marker(plugin_id)?)?;
+    if worker_retired {
+        finish_suggestions_cleanup(plugin_id)?;
+    }
     Ok(())
+}
+
+/// Whether a cleanup of the plugin's published suggestions is still owed.
+pub(crate) fn suggestions_cleanup_owed(plugin_id: &str) -> bool {
+    cleanup_marker(plugin_id).is_ok_and(|marker| marker.exists())
+}
+
+/// Ends the obligation once a clear has succeeded behind a retired worker.
+pub(crate) fn finish_suggestions_cleanup(plugin_id: &str) -> Result<()> {
+    match std::fs::remove_file(cleanup_marker(plugin_id)?) {
+        Err(e) if e.kind() != std::io::ErrorKind::NotFound => Err(e.into()),
+        _ => Ok(()),
+    }
 }
 
 /// Clears the plugin's published rows through the database file, for when no
@@ -2719,7 +2739,7 @@ mod tests {
         std::fs::write(&db, b"not a sqlite database, long enough to be read as one").unwrap();
         let first = persist_suggestions_cleanup("acme.thing", true).unwrap();
         assert_eq!(first, Cleanup::Persisted);
-        assert!(run_suggestions_cleanup("acme.thing", &first).is_err());
+        assert!(run_suggestions_cleanup("acme.thing", &first, true).is_err());
         assert!(cleanup_marker("acme.thing").unwrap().exists());
 
         std::fs::remove_file(&db).unwrap();
@@ -2736,7 +2756,13 @@ mod tests {
         // The retry's manifest matches the installed one: only the marker asks for it.
         let retry = persist_suggestions_cleanup("acme.thing", false).unwrap();
         assert_eq!(retry, Cleanup::Pending);
-        run_suggestions_cleanup("acme.thing", &retry).unwrap();
+        // A running daemon has not retired the old worker yet: it owns the last clear.
+        run_suggestions_cleanup("acme.thing", &retry, false).unwrap();
+        assert!(
+            cleanup_marker("acme.thing").unwrap().exists(),
+            "the marker outlives a clear the old worker could still undo"
+        );
+        run_suggestions_cleanup("acme.thing", &retry, true).unwrap();
         let conn = rusqlite::Connection::open(&db).unwrap();
         let left: i64 = conn
             .query_row("SELECT COUNT(*) FROM suggestion_items", [], |r| r.get(0))

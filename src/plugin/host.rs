@@ -572,7 +572,7 @@ impl PluginHost {
 
     /// Clear what a plugin gone from the registry published. Runs after its
     /// worker is stopped, so the worker cannot publish again behind the clear.
-    async fn forget_suggestions(&self, plugin_id: String) {
+    async fn forget_suggestions(&self, plugin_id: String) -> bool {
         let api = self.api.clone();
         let id = plugin_id.clone();
         let cleared = tokio::task::spawn_blocking(move || {
@@ -582,15 +582,38 @@ impl PluginHost {
         })
         .await;
         match cleared {
-            Ok(Ok(())) => {}
-            Ok(Err(e)) => tracing::warn!(
-                target: "plugin.host", plugin = %plugin_id,
-                "could not clear published suggestions: {e}"
-            ),
-            Err(e) => tracing::warn!(
-                target: "plugin.host", plugin = %plugin_id,
-                "clearing published suggestions did not finish: {e}"
-            ),
+            Ok(Ok(())) => true,
+            Ok(Err(e)) => {
+                tracing::warn!(
+                    target: "plugin.host", plugin = %plugin_id,
+                    "could not clear published suggestions: {e}"
+                );
+                false
+            }
+            Err(e) => {
+                tracing::warn!(
+                    target: "plugin.host", plugin = %plugin_id,
+                    "clearing published suggestions did not finish: {e}"
+                );
+                false
+            }
+        }
+    }
+
+    /// Clears what an update owes behind a retired worker, and ends the
+    /// installer's obligation only once that clear has succeeded.
+    async fn settle_owed_cleanup(&self, plugin_id: &str, spec_changed: bool) {
+        let owed = crate::plugin::install::suggestions_cleanup_owed(plugin_id);
+        if !(spec_changed || owed) {
+            return;
+        }
+        if self.forget_suggestions(plugin_id.to_string()).await && owed {
+            if let Err(e) = crate::plugin::install::finish_suggestions_cleanup(plugin_id) {
+                tracing::warn!(
+                    target: "plugin.host", plugin = %plugin_id,
+                    "could not end the suggestions cleanup obligation: {e}"
+                );
+            }
         }
     }
 
@@ -623,21 +646,25 @@ impl PluginHost {
                 (stale, reservation)
             })
         };
+        let new_spec = registry.get(plugin_id).and_then(|p| {
+            p.manifest
+                .suggestions
+                .as_ref()
+                .map(crate::plugin::suggestions::spec_hash)
+        });
+        if replaced.is_none() {
+            // No worker runs, so nothing can publish behind a clear an update owes.
+            self.settle_owed_cleanup(plugin_id, false).await;
+        }
         if let Some((stale, reservation)) = replaced {
             let old_spec = stale.suggestions_hash.clone();
             self.teardown_workers(vec![(plugin_id.to_string(), stale)])
                 .await;
             // The old worker is fenced now, so it cannot publish behind this clear:
-            // what it published under another spec must not outlive the swap.
-            let new_spec = registry.get(plugin_id).and_then(|p| {
-                p.manifest
-                    .suggestions
-                    .as_ref()
-                    .map(crate::plugin::suggestions::spec_hash)
-            });
-            if old_spec != new_spec {
-                self.forget_suggestions(plugin_id.to_string()).await;
-            }
+            // what it published under another spec, or that an update still owes
+            // a clear for, must not outlive the swap.
+            self.settle_owed_cleanup(plugin_id, old_spec != new_spec)
+                .await;
             let mut table = self.state.lock().await;
             // A concurrent reconcile or restart may have claimed the slot since.
             if table
@@ -2231,6 +2258,32 @@ variables = []
             published(),
             0,
             "another spec clears it behind the old worker"
+        );
+
+        // An update that owes a clear keeps its marker through the installer's
+        // own clear; the same spec is cleared behind the retired worker, which
+        // then ends the obligation.
+        crate::plugin::install::persist_suggestions_cleanup(plugin_id, true).unwrap();
+        host.api.with_suggestions_db(|conn, _| {
+            conn.execute(
+                "INSERT INTO suggestion_providers (profile, provider_id, updated_at) VALUES ('p', ?1, 0)",
+                [plugin_id],
+            )
+            .unwrap();
+        });
+        let third = worker_pid(&host, plugin_id).await.unwrap();
+        host.restart_worker(plugin_id, &install("1.1.1", "Renamed"))
+            .await;
+        wait_until("the third replacement", || async {
+            worker_pid(&host, plugin_id)
+                .await
+                .is_some_and(|pid| pid != third)
+        })
+        .await;
+        assert_eq!(published(), 0, "an owed clear runs for an unchanged spec");
+        assert!(
+            !crate::plugin::install::suggestions_cleanup_owed(plugin_id),
+            "and ends the obligation"
         );
         host.shutdown().await;
     }
