@@ -113,6 +113,9 @@ pub enum AcpCommands {
         session: String,
     },
     /// Print the persisted transcript for an agent session.
+    ///
+    /// By default prints a readable transcript: streamed agent chunks joined
+    /// into whole messages, user prompts, and one line per tool call.
     History {
         /// Acp session id.
         session: String,
@@ -122,6 +125,12 @@ pub enum AcpCommands {
         /// Emit raw frames as JSON (one frame per line).
         #[arg(long)]
         json: bool,
+        /// Only the last N transcript entries (after `--role` filtering).
+        #[arg(long, value_name = "N", conflicts_with = "json")]
+        last: Option<usize>,
+        /// Only entries from these roles (comma-separated).
+        #[arg(long, value_enum, value_delimiter = ',', conflicts_with = "json")]
+        role: Vec<super::acp_history::Role>,
     },
     /// Print live status for an agent session: highest/lowest seq, and
     /// whether the on-disk retention window has truncated history.
@@ -272,7 +281,9 @@ pub async fn run(command: AcpCommands) -> Result<()> {
             session,
             since,
             json,
-        } => history(&session, since, json).await,
+            last,
+            role,
+        } => history(&session, since, json, last, &role).await,
         AcpCommands::Status { session, json } => status(&session, json).await,
         AcpCommands::Prompt { session, text } => prompt(&session, &text).await,
         AcpCommands::SetOption {
@@ -1102,39 +1113,68 @@ async fn restart(session: &str) -> Result<()> {
 use crate::acp::client::{require_daemon, HttpClient, HttpError, WsMessage, REPLAY_PAGE_SIZE};
 use crate::acp::protocol::ApprovalDecisionWire;
 
-async fn history(session: &str, since: u64, json: bool) -> Result<()> {
+async fn history(
+    session: &str,
+    since: u64,
+    json: bool,
+    last: Option<usize>,
+    roles: &[super::acp_history::Role],
+) -> Result<()> {
     let endpoint = require_daemon().await?;
     let client = HttpClient::new(endpoint)?;
-    let resp = client
-        .replay_paged(session, since, REPLAY_PAGE_SIZE)
-        .await
-        .map_err(map_http)?;
-    if resp.lost {
-        eprintln!(
-            "warning: retention window evicted events before seq {}; transcript is partial.",
-            since
-        );
-    }
     if json {
+        let resp = client
+            .replay_paged(session, since, REPLAY_PAGE_SIZE)
+            .await
+            .map_err(map_http)?;
+        if resp.lost {
+            eprintln!(
+                "warning: retention window evicted events before seq {}; transcript is partial.",
+                since
+            );
+        }
         for frame in &resp.frames {
             println!("{}", serde_json::to_string(&frame)?);
         }
         return Ok(());
     }
-    if resp.frames.is_empty() {
+    let transcript = transcript_entries(&client, session, since, REPLAY_PAGE_SIZE).await?;
+    if transcript.partial {
+        eprintln!("warning: retention window evicted earlier events; transcript is partial.");
+    }
+    if transcript.entries.is_empty() {
         println!(
-            "(no events; highest_seq={}, lowest_seq={})",
-            resp.highest_seq,
-            resp.lowest_seq
-                .map(|v| v.to_string())
-                .unwrap_or_else(|| "-".into())
+            "(no transcript entries after seq {since}; highest_seq={})",
+            transcript.highest_seq
         );
         return Ok(());
     }
-    for frame in &resp.frames {
-        println!("seq {:>6}  {}", frame.seq, event_kind(&frame.event));
-    }
+    use super::acp_history::{render, select};
+    print!("{}", render(&select(transcript.entries, roles, last)));
     Ok(())
+}
+
+struct Transcript {
+    entries: Vec<super::acp_history::Entry>,
+    partial: bool,
+    highest_seq: u64,
+}
+
+async fn transcript_entries(
+    client: &HttpClient,
+    session: &str,
+    since: u64,
+    page_size: u64,
+) -> Result<Transcript> {
+    let retained = client
+        .replay_retained_snapshot_since(session, since, page_size)
+        .await
+        .map_err(map_http)?;
+    Ok(Transcript {
+        entries: super::acp_history::entries(&retained.transcript.rows),
+        partial: retained.incomplete,
+        highest_seq: retained.highest_seq,
+    })
 }
 
 async fn status(session: &str, json: bool) -> Result<()> {
@@ -1322,73 +1362,49 @@ fn map_http(e: HttpError) -> anyhow::Error {
     anyhow::Error::new(e)
 }
 
-fn event_kind(event: &crate::acp::Event) -> &'static str {
-    use crate::acp::Event;
-    match event {
-        Event::PlanUpdated { .. } => "plan_updated",
-        Event::PlanRemoved { .. } => "plan_removed",
-        Event::TodoListUpdated { .. } => "todo_list_updated",
-        Event::SessionTitleSuggested { .. } => "session_title_suggested",
-        Event::ToolCallStarted { .. } => "tool_call_started",
-        Event::ToolCallCompleted { .. } => "tool_call_completed",
-        Event::ToolCallContent { .. } => "tool_call_content",
-        Event::ToolCallUpdated { .. } => "tool_call_updated",
-        Event::ApprovalRequested { .. } => "approval_requested",
-        Event::ApprovalResolved { .. } => "approval_resolved",
-        Event::ElicitationRequested { .. } => "elicitation_requested",
-        Event::ElicitationResolved { .. } => "elicitation_resolved",
-        Event::DiffEmitted { .. } => "diff_emitted",
-        Event::ThinkingStarted => "thinking_started",
-        Event::AgentThoughtChunk { .. } => "agent_thought_chunk",
-        Event::ThinkingEnded => "thinking_ended",
-        Event::RateLimit { .. } => "rate_limit",
-        Event::RateLimitAutoResumed { .. } => "rate_limit_auto_resumed",
-        Event::UsageUpdated { .. } => "usage_updated",
-        Event::ModeChanged { .. } => "mode_changed",
-        Event::ModesAvailable { .. } => "modes_available",
-        Event::CurrentModeChanged { .. } => "current_mode_changed",
-        Event::ModeSwitchFailed { .. } => "mode_switch_failed",
-        Event::AvailableCommandsUpdated { .. } => "available_commands_updated",
-        Event::ConfigOptionsUpdated { .. } => "config_options_updated",
-        Event::ConfigOptionSwitchFailed { .. } => "config_option_switch_failed",
-        Event::AuthStatusUpdated { .. } => "auth_status_updated",
-        Event::RawAgentUpdate { .. } => "raw_agent_update",
-        Event::BackgroundAgentLaunched { .. } => "background_agent_launched",
-        Event::BackgroundAgentProgress { .. } => "background_agent_progress",
-        Event::BackgroundAgentCompleted { .. } => "background_agent_completed",
-        Event::SubagentUpdated { .. } => "subagent_updated",
-        Event::BackgroundTaskStarted { .. } => "background_task_started",
-        Event::BackgroundTaskFinished { .. } => "background_task_finished",
-        Event::PromptRuntimeError { .. } => "prompt_runtime_error",
-        Event::AgentMessageChunk { .. } => "agent_message_chunk",
-        Event::CancelRequested { .. } => "cancel_requested",
-        Event::Stopped { .. } => "stopped",
-        Event::AgentStartupError { .. } => "agent_startup_error",
-        Event::IntegrationLost { .. } => "integration_lost",
-        Event::IncompatibleAgent { .. } => "incompatible_agent",
-        Event::UserPromptSent { .. } => "user_prompt_sent",
-        Event::UserDiffCommentsPrompt { .. } => "user_diff_comments_prompt",
-        Event::PromptCapabilities { .. } => "prompt_capabilities",
-        Event::AcpSessionAssigned { .. } => "acp_session_assigned",
-        Event::SessionContextReset { .. } => "session_context_reset",
-        Event::SessionCleared => "session_cleared",
-        Event::ConversationCompactionStarted => "conversation_compaction_started",
-        Event::ConversationCompacted => "conversation_compacted",
-        Event::ConversationCompactionFailed => "conversation_compaction_failed",
-        Event::ConversationCompactionSummary { .. } => "conversation_compaction_summary",
-        Event::ConversationSummary { .. } => "conversation_summary",
-        Event::WakeupScheduled { .. } => "wakeup_scheduled",
-        Event::MonitorArmed { .. } => "monitor_armed",
-        Event::PromptRejected { .. } => "prompt_rejected",
-        Event::AgentSwitched { .. } => "agent_switched",
-        Event::SessionNotice { .. } => "session_notice",
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::os::unix::process::CommandExt;
+
+    /// A pruned log (first retained seq 5) served in two pages of two frames.
+    #[tokio::test]
+    async fn transcript_reads_past_a_retention_gap_to_the_newest_entries() {
+        use axum::{extract::Query, routing::get, Router};
+        use std::collections::HashMap;
+        let frame = move |seq: u64| {
+            serde_json::json!({
+                "session_id": "s", "seq": seq,
+                "event": {"AgentMessageChunk": {"text": format!("m{seq}"), "message_id": format!("id{seq}")}},
+            })
+        };
+        let app = Router::new().route(
+            "/api/sessions/{id}/acp/replay",
+            get(move |Query(q): Query<HashMap<String, String>>| async move {
+                let first = q["since"] == "0";
+                axum::Json(serde_json::json!({
+                    "frames": if first { vec![frame(5), frame(6)] } else { vec![frame(7), frame(8)] },
+                    "lost": first, "highest_seq": 8, "lowest_seq": 5,
+                    "next_cursor": if first { 6 } else { 8 }, "has_more": first,
+                    "history_identity": "snapshot",
+                }))
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let client = HttpClient::new(crate::daemon::DaemonEndpoint::new(
+            base,
+            Some("token".into()),
+            crate::daemon::Source::Env,
+        ))
+        .unwrap();
+        let got = transcript_entries(&client, "s", 0, 2).await.unwrap();
+        server.abort();
+        let texts: Vec<_> = got.entries.iter().map(|e| e.text.as_str()).collect();
+        assert_eq!(texts, ["m5", "m6", "m7", "m8"]);
+        assert!(got.partial);
+    }
 
     #[tokio::test]
     #[serial_test::serial]
