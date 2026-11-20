@@ -516,6 +516,9 @@ async fn start_outcome(
         "acp_adapter_missing" | "agent_not_allowed" => {
             "Choose another agent in the preset, then try again."
         }
+        "agent_hooks_not_approved" => {
+            "Approve agent hooks with `aoe hooks approve` in a terminal, then try again."
+        }
         _ => "Try again, or use Start with changes to see the full error.",
     };
     let reason = body["message"]
@@ -1089,5 +1092,23 @@ mod tests {
             assert_eq!(body.worktree_enabled, expected);
             assert_eq!(body.create_new_branch, expected);
         }
+    }
+
+    #[tokio::test]
+    async fn unapproved_agent_hooks_say_how_to_approve_them() {
+        let refused = api_error(
+            StatusCode::from_u16(422).unwrap(),
+            "agent_hooks_not_approved",
+            "Agent hooks are not approved",
+        );
+        let response = start_outcome(refused, "default".into(), "/repo".into()).await;
+        let bytes = axum::body::to_bytes(response.into_body(), 1 << 20)
+            .await
+            .unwrap();
+        let body: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert!(
+            body["hint"].as_str().unwrap().contains("aoe hooks approve"),
+            "{body}"
+        );
     }
 }
