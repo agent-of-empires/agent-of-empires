@@ -37,13 +37,6 @@ fn is_starting(session_id: &str) -> bool {
         .any(|id| id == session_id)
 }
 
-/// Drops every pending claim: at daemon start nothing is in flight, so any left
-/// behind belongs to a start that died with the previous process.
-pub(crate) fn clear_pending_links(conn: &Connection) -> rusqlite::Result<()> {
-    conn.execute("DELETE FROM suggestion_links WHERE pending = 1", [])?;
-    Ok(())
-}
-
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) enum Claim {
     Won,
@@ -55,7 +48,8 @@ pub(crate) enum Claim {
 
 /// Claims the primary link of an item for the Session `session_id`, named before it
 /// is created. A link is taken over when its Session is not `is_live` (trashed or
-/// gone; asked inside the claim, so the answer is not older than the row) or its claim is no longer in flight.
+/// gone; asked inside the claim, so the answer is not older than the row) and its
+/// claim is no longer in flight.
 pub(crate) fn claim_link(
     conn: &Connection,
     profile: &str,
@@ -65,7 +59,6 @@ pub(crate) fn claim_link(
     is_live: &dyn Fn(&str) -> bool,
 ) -> rusqlite::Result<Claim> {
     let tx = conn.unchecked_transaction()?;
-    let key = params![profile, provider_id, item_id];
     let inserted = tx.execute(
         "INSERT OR IGNORE INTO suggestion_links (profile, provider_id, item_id, holder, pending)
          VALUES (?1, ?2, ?3, ?4, 1)",
@@ -78,16 +71,22 @@ pub(crate) fn claim_link(
     let (holder, pending): (String, bool) = tx.query_row(
         "SELECT holder, pending FROM suggestion_links
          WHERE profile = ?1 AND provider_id = ?2 AND item_id = ?3",
-        key,
+        params![profile, provider_id, item_id],
         |row| Ok((row.get(0)?, row.get(1)?)),
     )?;
-    let held = if pending {
-        is_starting(&holder).then(|| Claim::Starting(holder.clone()))
-    } else {
-        is_live(&holder).then(|| Claim::Session(holder.clone()))
-    };
-    if let Some(held) = held {
-        return Ok(held);
+    if pending && is_starting(&holder) {
+        return Ok(Claim::Starting(holder));
+    }
+    if is_live(&holder) {
+        // A Session that was persisted but whose claim never settled: it is the
+        // primary, whatever happened to the process that created it.
+        tx.execute(
+            "UPDATE suggestion_links SET pending = 0
+             WHERE profile = ?1 AND provider_id = ?2 AND item_id = ?3",
+            params![profile, provider_id, item_id],
+        )?;
+        tx.commit()?;
+        return Ok(Claim::Session(holder));
     }
     tx.execute(
         "UPDATE suggestion_links SET holder = ?4, pending = 1
@@ -98,17 +97,16 @@ pub(crate) fn claim_link(
     Ok(Claim::Won)
 }
 
-/// `(provider_id, item_id, session_id)` of every created primary Session of `profile`.
-pub(crate) fn settled_links(
+/// `(provider_id, item_id, session_id)` of every primary link of `profile`. A
+/// claim still provisioning names a Session that is not recorded yet, so a join
+/// to live Sessions drops it.
+pub(crate) fn links(
     conn: &Connection,
     profile: &str,
 ) -> rusqlite::Result<Vec<(String, String, String)>> {
-    conn.prepare(
-        "SELECT provider_id, item_id, holder FROM suggestion_links
-         WHERE profile = ?1 AND pending = 0",
-    )?
-    .query_map([profile], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))?
-    .collect()
+    conn.prepare("SELECT provider_id, item_id, holder FROM suggestion_links WHERE profile = ?1")?
+        .query_map([profile], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))?
+        .collect()
 }
 
 /// Marks the claim of `session_id` as a created Session.
@@ -195,11 +193,28 @@ mod tests {
         // The process dies: nothing is in flight any more, and the row is left.
         drop(slow);
         assert_eq!(claim("after-crash"), Claim::Won, "no timer to wait out");
-        // A restart clears what the dead process left, whoever was starting.
-        clear_pending_links(&conn).unwrap();
-        let count: i64 = conn
-            .query_row("SELECT COUNT(*) FROM suggestion_links", [], |r| r.get(0))
+    }
+
+    #[test]
+    fn a_pending_claim_whose_session_was_persisted_is_settled_not_taken_over() {
+        let conn = store();
+        let live = |id: &str| id == "made";
+        let claim =
+            |session: &str| claim_link(&conn, "p", "acme.github", "a", session, &live).unwrap();
+        // The create persisted its Session, then the process died (or the settle
+        // failed) before the row left pending.
+        let starting = mark_starting("made");
+        assert_eq!(claim("made"), Claim::Won);
+        drop(starting);
+        assert_eq!(claim("dup"), Claim::Session("made".into()));
+        let rows = links(&conn, "p").unwrap();
+        assert_eq!(
+            rows,
+            vec![("acme.github".into(), "a".into(), "made".into())]
+        );
+        let pending: bool = conn
+            .query_row("SELECT pending FROM suggestion_links", [], |r| r.get(0))
             .unwrap();
-        assert_eq!(count, 0);
+        assert!(!pending, "recovery settles the row");
     }
 }
