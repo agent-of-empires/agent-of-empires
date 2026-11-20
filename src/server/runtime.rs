@@ -702,7 +702,6 @@ async fn follow_runtime(mut socket: WebSocket, state: Arc<AppState>, local: Opti
     if first_subscriber {
         state.runtime.terminal_wake.notify_one();
     }
-    state.runtime.request_publish();
     if let Err(error) = state.runtime.publish(&state).await {
         tracing::debug!(target: "server.runtime", %error, "runtime publish failed");
         return;
