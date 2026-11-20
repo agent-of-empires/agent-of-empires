@@ -1601,7 +1601,8 @@ pub(super) fn runner_group_identities(
         let Ok(pid) = entry.file_name().to_string_lossy().parse::<u32>() else {
             continue;
         };
-        let stat = match fs::read_to_string(entry.path().join("stat")) {
+        // Bytes: any process's name sits in its stat, and it need not be UTF-8.
+        let stat = match fs::read(entry.path().join("stat")) {
             Ok(stat) => stat,
             Err(error) if process_disappeared(&error) => continue,
             Err(error) => {
@@ -1612,8 +1613,7 @@ pub(super) fn runner_group_identities(
                 return Err(error).context("inspecting owned runner group");
             }
         };
-        let (_, tail) = stat.rsplit_once(") ").context("invalid process stat")?;
-        let mut fields = tail.split_ascii_whitespace();
+        let mut fields = stat_fields(&stat)?;
         let state = fields.next().context("missing process state")?;
         let pgrp = parse_process_group(fields.nth(1).context("missing process group")?)?;
         if state != "Z" && pgrp == Some(group) {
@@ -2223,6 +2223,49 @@ mod tests {
                 expected
             );
         }
+    }
+
+    #[test]
+    fn a_group_scan_reads_past_a_process_whose_name_is_not_utf8() -> anyhow::Result<()> {
+        use std::os::unix::ffi::OsStrExt as _;
+        use std::os::unix::process::CommandExt as _;
+        use std::time::{Duration, Instant};
+        let dir = tempfile::tempdir()?;
+        let shell = dir.path().join(std::ffi::OsStr::from_bytes(b"\xffsh"));
+        fs::copy(fs::canonicalize("/bin/sh")?, &shell)?;
+        // `read` is a builtin, so the shell waits with no child and keeps its name.
+        let mut named = Command::new(&shell)
+            .args(["-c", "read line"])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()?;
+        let mut leader = Command::new("sleep")
+            .arg("120")
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .process_group(0)
+            .spawn()?;
+        let scanned = (|| {
+            let comm = format!("/proc/{}/comm", named.id());
+            let deadline = Instant::now() + Duration::from_secs(5);
+            while fs::read(&comm)? != b"\xffsh\n" {
+                anyhow::ensure!(
+                    Instant::now() < deadline,
+                    "the shell copy never took its name"
+                );
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            runner_group_identities(leader.id())
+        })();
+        let _ = named.kill();
+        named.wait()?;
+        let _ = leader.kill();
+        leader.wait()?;
+        let pids: Vec<u32> = scanned?.iter().map(|identity| identity.pid).collect();
+        assert_eq!(pids, [leader.id()]);
+        Ok(())
     }
 
     #[test]
