@@ -291,6 +291,12 @@ impl HomeView {
                     Line::from(Span::styled(entry.title.clone(), bold)),
                     Line::from(source.join(" · ")),
                 ];
+                if let Some(reason) = &entry.failed {
+                    lines.push(Line::from(Span::styled(
+                        format!("Couldn't start: {reason} · Enter tries again"),
+                        Style::default().fg(theme.error),
+                    )));
+                }
                 if entry.provider_error.is_some() {
                     lines.push(Line::from(Span::styled(
                         format!(
