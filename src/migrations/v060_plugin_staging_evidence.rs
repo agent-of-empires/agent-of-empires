@@ -44,7 +44,7 @@ fn migrate_root(path: &Path) -> Result<()> {
         root.open_regular(recovery, MAX_EVIDENCE_BYTES)?
             .context("existing plugin recovery evidence is not a bounded regular file")?;
     }
-    tracing::info!(target: "migrations.v059", "Preserved legacy plugin staging evidence; explicit ownership recovery remains required");
+    tracing::info!(target: "migrations.v060", "Preserved legacy plugin staging evidence; explicit ownership recovery remains required");
     Ok(())
 }
 

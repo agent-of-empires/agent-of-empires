@@ -39,7 +39,7 @@ const ROWS: Row[] = [
   ["sandbox", "environment", "Environment variables", { kind: "list" }, true, true, "env_list"],
   ["sandbox", "extra_volumes", "Extra volumes", { kind: "list" }, true, true, "volume_list"],
   ["sandbox", "port_mappings", "Port mappings", { kind: "list" }, true, true, "port_mapping_list"],
-  ["sandbox", "volume_ignores", "Volume ignores", { kind: "list" }, true],
+  ["sandbox", "volume_ignores", "Volume ignores", { kind: "list" }, true, true, "volume_ignore_list"],
   ["systemd", "enabled", "Use systemd scopes", { kind: "toggle" }, false],
   ["systemd", "slice", "Systemd slice", { kind: "text" }, false],
   ["systemd", "survive_daemon_restart", "Sessions survive daemon restart", { kind: "toggle" }, false],
@@ -308,6 +308,7 @@ describe("Settings Advanced fold", () => {
     addListItem(container, "Extra volumes", "/h:/c");
     addListItem(container, "Port mappings", "bad");
     addListItem(container, "Port mappings", "3000:3000");
+    addListItem(container, "Volume ignores", "../..:/host");
     addListItem(container, "Volume ignores", "node_modules");
 
     await waitFor(() =>
@@ -327,6 +328,12 @@ describe("Settings Advanced fold", () => {
     expect(vi.mocked(api.updateSettings)).toHaveBeenCalledWith(
       {
         sandbox: { port_mappings: ["3000:3000"] },
+      },
+      "main",
+    );
+    expect(vi.mocked(api.updateSettings)).toHaveBeenCalledWith(
+      {
+        sandbox: { volume_ignores: ["node_modules"] },
       },
       "main",
     );

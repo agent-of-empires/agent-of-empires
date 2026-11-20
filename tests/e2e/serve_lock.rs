@@ -68,7 +68,16 @@ fn direct_serve_upgrades_legacy_policy_under_its_existing_transaction() {
         let port = crate::harness::pick_free_port();
         let port_arg = port.to_string();
         let foreground = if detached {
-            h.run_cli_ok(&["serve", "--daemon", "--port", &port_arg, "--no-auth"]);
+            h.run_cli_ok(&[
+                "serve",
+                "--daemon",
+                "--port",
+                &port_arg,
+                "--no-auth",
+                "--behind-proxy",
+                "--allowed-host",
+                "127.0.0.1",
+            ]);
             None
         } else {
             Some(Foreground(h.spawn_cli(&[
@@ -76,6 +85,9 @@ fn direct_serve_upgrades_legacy_policy_under_its_existing_transaction() {
                 "--port",
                 &port_arg,
                 "--no-auth",
+                "--behind-proxy",
+                "--allowed-host",
+                "127.0.0.1",
             ])))
         };
         assert!(
@@ -147,6 +159,9 @@ fn explicit_profile_serve_preserves_bootstrap_and_config_recovery() {
                     "--port",
                     &port,
                     "--no-auth",
+                    "--behind-proxy",
+                    "--allowed-host",
+                    "127.0.0.1",
                 ]);
             }
             assert!(
@@ -179,7 +194,7 @@ fn managed_controls_migrate_historical_launch_before_replay() {
         if protected {
             args.extend(["--passphrase", "legacy-auth"]);
         } else {
-            args.push("--no-auth");
+            args.extend(["--no-auth", "--behind-proxy", "--allowed-host", "127.0.0.1"]);
         }
         h.run_cli_ok(&args);
         let app = app_dir_in(h.home_path());
@@ -242,6 +257,9 @@ fn managed_controls_refuse_future_launch_schema_without_stopping_predecessor() {
                 "--port",
                 &port.to_string(),
                 "--no-auth",
+                "--behind-proxy",
+                "--allowed-host",
+                "127.0.0.1",
             ]);
         }
         let app = app_dir_in(h.home_path());
@@ -277,6 +295,9 @@ fn managed_controls_refuse_future_launch_schema_without_stopping_predecessor() {
                 "--port",
                 &port.to_string(),
                 "--no-auth",
+                "--behind-proxy",
+                "--allowed-host",
+                "127.0.0.1",
             ]),
         };
         assert!(!refused.status.success());
@@ -336,6 +357,9 @@ fn managed_core_promotion_migrates_historical_launch_before_replay() {
         "--port",
         &port.to_string(),
         "--no-auth",
+        "--behind-proxy",
+        "--allowed-host",
+        "127.0.0.1",
     ]);
     let current: serde_json::Value =
         serde_json::from_slice(&std::fs::read(app.join("serve.launch")).unwrap()).unwrap();
@@ -402,11 +426,11 @@ fn tui_restart_failure_retains_predecessor_credential_for_rotation_and_removal()
         let key = if rotate { "g" } else { "r" };
         h.send_keys_unfenced(key);
         h.wait_for(if rotate {
-            "Press G again for a new passphrase."
+            "Press Enter for a new passphrase."
         } else {
-            "Press R again to restart."
+            "Press Enter to restart."
         });
-        h.send_keys_unfenced(key);
+        h.send_keys_unfenced("Enter");
         h.wait_for_timeout("Dashboard start failed", Duration::from_secs(75));
         let retained: serde_json::Value =
             serde_json::from_slice(&std::fs::read(app.join("serve.rollback.launch")).unwrap())

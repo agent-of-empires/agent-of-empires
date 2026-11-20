@@ -67,7 +67,8 @@ mod v055_global_max_concurrent_workers;
 mod v056_launch_resolved_executable;
 mod v057_worker_launch_executable;
 mod v058_account_limits_window_shape;
-mod v059_plugin_staging_evidence;
+mod v059_owner_only_event_logs;
+mod v060_plugin_staging_evidence;
 
 /// Fixtures shared by migrations that rewrite agent hook files.
 #[cfg(test)]
@@ -108,7 +109,7 @@ use anyhow::{Context, Result};
 use std::fs;
 use tracing::{debug, info};
 
-const CURRENT_VERSION: u32 = 59;
+const CURRENT_VERSION: u32 = 60;
 const VERSION_FILE: &str = ".schema_version";
 
 /// Version, log name, and the one-time transformation to run.
@@ -309,10 +310,11 @@ const MIGRATIONS: &[Migration] = &[
         "account_limits_window_shape",
         v058_account_limits_window_shape::run,
     ),
+    (59, "owner_only_event_logs", v059_owner_only_event_logs::run),
     (
-        59,
+        60,
         "plugin_staging_evidence",
-        v059_plugin_staging_evidence::run,
+        v060_plugin_staging_evidence::run,
     ),
 ];
 

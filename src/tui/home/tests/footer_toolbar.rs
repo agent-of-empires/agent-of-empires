@@ -12,7 +12,7 @@ fn render_at(env: &mut TestEnv, w: u16, h: u16) {
     terminal
         .draw(|f| {
             let area = f.area();
-            env.view.render(f, area, &theme, None, None, None);
+            env.view.render(f, area, &theme, None);
         })
         .unwrap();
 }

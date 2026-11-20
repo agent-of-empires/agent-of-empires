@@ -82,7 +82,16 @@ fn test_serve_refuses_when_web_plugin_disabled() {
     let disable = h.run_cli(&["plugin", "disable", "aoe.web"]);
     assert!(disable.status.success(), "disable aoe.web failed");
 
-    let refused = h.run_cli(&["serve", "--daemon", "--port", &free_port, "--no-auth"]);
+    let refused = h.run_cli(&[
+        "serve",
+        "--daemon",
+        "--port",
+        &free_port,
+        "--no-auth",
+        "--behind-proxy",
+        "--allowed-host",
+        "127.0.0.1",
+    ]);
     assert!(
         !refused.status.success(),
         "serve must refuse while aoe.web is disabled"
@@ -98,7 +107,16 @@ fn test_serve_refuses_when_web_plugin_disabled() {
     // The disable auto-started a Daemon; stop it so the explicit start below binds its own port.
     assert!(h.run_cli(&["serve", "--stop"]).status.success());
 
-    let started = h.run_cli(&["serve", "--daemon", "--port", &free_port, "--no-auth"]);
+    let started = h.run_cli(&[
+        "serve",
+        "--daemon",
+        "--port",
+        &free_port,
+        "--no-auth",
+        "--behind-proxy",
+        "--allowed-host",
+        "127.0.0.1",
+    ]);
     assert!(
         started.status.success(),
         "serve must start once aoe.web is enabled:\n{}",

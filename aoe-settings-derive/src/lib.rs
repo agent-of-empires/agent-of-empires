@@ -347,6 +347,7 @@ fn build_validation(
         "volume_list" => quote!(ValidationKind::VolumeList),
         "env_list" => quote!(ValidationKind::EnvList),
         "port_mapping_list" => quote!(ValidationKind::PortMappingList),
+        "volume_ignore_list" => quote!(ValidationKind::VolumeIgnoreList),
         "capability_list" => quote!(ValidationKind::CapabilityList),
         "security_opt_list" => quote!(ValidationKind::SecurityOptList),
         "network" => quote!(ValidationKind::Network),
