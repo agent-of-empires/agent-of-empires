@@ -1276,7 +1276,7 @@ impl Session {
         deadline: &crate::tmux::TmuxCommandDeadline,
     ) -> Result<String> {
         #[cfg(unix)]
-        if let Some(id) = crate::tmux::vt::channel_pane_id(&self.name) {
+        if let Some(id) = crate::tmux::vt::channel_pane_id(&self.name, deadline) {
             return Ok(id);
         }
         super::utils::first_pane_id_with_deadline(&self.name, deadline)
@@ -5173,6 +5173,8 @@ mod tests {
             .expect("set pane title")
             .success());
         let pid = pane_field(&pane, "#{pane_pid}");
+        let deadline = crate::tmux::TmuxCommandDeadline::new();
+        let server_pid = pane_field(&pane, "#{pid}");
         let cases = [
             (
                 "pane PID",
@@ -5183,6 +5185,24 @@ mod tests {
                 "pane title",
                 crate::tmux::utils::pane_title(&session_name),
                 title,
+            ),
+            (
+                "server PID",
+                crate::tmux::vt::server_pid(&pane, &deadline),
+                server_pid.as_str(),
+            ),
+            (
+                "session pane membership",
+                Some(
+                    crate::tmux::vt::session_holds_pane(
+                        &session_name,
+                        &server_pid,
+                        &pane,
+                        &deadline,
+                    )
+                    .to_string(),
+                ),
+                "true",
             ),
         ];
         for (query, read, expected) in cases {
