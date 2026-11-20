@@ -646,7 +646,7 @@ describe("sendPrompt outcomes", () => {
       await flushAsync();
       expect(calls.filter((c) => c.method === "PATCH")).toHaveLength(0);
       expect(posts("/acp/prompt")).toHaveLength(0);
-      expect(result.current.state.lastError).toBe("session is archived; unarchive it first");
+      expect(result.current.state.interactionError?.message).toBe("session is archived; unarchive it first");
     });
 
     it("does not call wake endpoints for a live session", async () => {
@@ -667,7 +667,7 @@ describe("sendPrompt outcomes", () => {
       await flushAsync();
       expect(posts("/acp/prompt")).toHaveLength(0);
       expect(result.current.state.queuedPrompts).toHaveLength(0);
-      expect(result.current.state.lastError).toMatch(/wake/i);
+      expect(result.current.state.interactionError?.message).toMatch(/wake/i);
     });
   });
 
@@ -736,7 +736,7 @@ describe("sendPrompt outcomes", () => {
     await act(() => result.current.sendPrompt("no room at the inn"));
     await flushAsync();
     expect(posts("/queue")).toHaveLength(0);
-    expect(result.current.state.lastError).toMatch(/capacity/i);
+    expect(result.current.state.interactionError?.message).toMatch(/capacity/i);
   });
 
   // Both park kinds are sendable at `dispatch::decide`, and a still-limited spawn answers 503
@@ -1469,6 +1469,7 @@ describe("server queue", () => {
       expect(posts("/queue")).toHaveLength(0);
       expect(result.current.state.queuedPrompts.map((q) => q.id)).not.toContain("r1");
       expect(result.current.state.lastError).toBeNull();
+      expect(result.current.state.interactionError).toBeNull();
     });
   });
 });
@@ -1514,7 +1515,8 @@ describe("retryRejectedPrompt (#5662)", () => {
   it("does not resend without an attachment it cannot reload", async () => {
     const result = await rejectedThenRetry("look at this", () => new Response("gone", { status: 404 }));
     expect(posts("/acp/prompt")).toHaveLength(0);
-    expect(result.current.state.lastError).toMatch(/attachments/);
+    expect(result.current.state.interactionError?.message).toMatch(/attachments/);
+    expect(result.current.state.lastError).toBeNull();
   });
 });
 
@@ -1533,7 +1535,7 @@ describe("resolveApproval outcomes", () => {
     const { result } = render("sess-approve");
     await flushAsync();
     await act(() => expect(result.current.resolveApproval("n-1", "Allow")).rejects.toThrow());
-    expect(result.current.state.lastError).toMatch(error);
+    expect(result.current.state.interactionError?.message).toMatch(error);
   });
 
   it.each([
@@ -1546,7 +1548,7 @@ describe("resolveApproval outcomes", () => {
     await act(() => result.current.resolveApproval("n-1", "Allow", "opt-1"));
     const [post] = posts("/api/sessions/sess-approve/acp/approvals/n-1");
     expect(JSON.parse(post!.body!)).toEqual({ decision: "Allow", option_id: "opt-1" });
-    expect(result.current.state.lastError).toBeFalsy();
+    expect(result.current.state.interactionError).toBeNull();
   });
 });
 
@@ -1574,7 +1576,7 @@ describe("setConfigOption", () => {
     await flushAsync();
     await act(() => result.current.setConfigOption("model", "claude-sonnet-4-6"));
     expect(result.current.state.pendingConfigOption).toBeNull();
-    expect(result.current.state.lastError).toMatch(error);
+    expect(result.current.state.interactionError?.message).toMatch(error);
   });
 
   it("is a no-op without a session", async () => {

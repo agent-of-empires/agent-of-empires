@@ -707,7 +707,7 @@ async fn rejected_prompt_over_the_runner_keeps_the_connection() {
         let reason = timeout(Duration::from_secs(5), async {
             loop {
                 match client.next_event().await.expect("connection remains open") {
-                    Event::PromptRuntimeError { message } => {
+                    Event::PromptRuntimeError { message, .. } => {
                         surfaced = message.contains("a turn is already running");
                     }
                     Event::PromptRejected {

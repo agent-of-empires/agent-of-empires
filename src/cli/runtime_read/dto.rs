@@ -199,6 +199,8 @@ pub(crate) struct SessionRead {
     pub idle_entered_at: Option<String>,
     #[serde(deserialize_with = "deserialize_required_nullable")]
     pub last_error: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_error_evidence: Option<crate::session::OperationErrorEvidence>,
     #[serde(deserialize_with = "deserialize_required_nullable")]
     pub archived_at: Option<String>,
     #[serde(deserialize_with = "deserialize_required_nullable")]
@@ -239,6 +241,7 @@ impl SessionRead {
             last_accessed_at: timestamp(row.last_accessed_at),
             idle_entered_at: timestamp(row.idle_entered_at),
             last_error: row.last_error.map(str::to_string),
+            last_error_evidence: row.last_error_evidence,
             archived_at: timestamp(row.archived_at),
             trashed_at: timestamp(row.trashed_at),
             active_snoozed_until: timestamp(row.active_snoozed_until),
@@ -1266,6 +1269,7 @@ mod tests {
             last_accessed_at: None,
             idle_entered_at: None,
             last_error: None,
+            last_error_evidence: None,
             archived_at: None,
             trashed_at: None,
             active_snoozed_until: None,
@@ -1344,6 +1348,7 @@ mod tests {
             last_accessed_at: None,
             idle_entered_at: None,
             last_error: None,
+            last_error_evidence: None,
             archived_at: None,
             trashed_at: None,
             active_snoozed_until: None,
@@ -1671,6 +1676,7 @@ mod tests {
             last_accessed_at: None,
             idle_entered_at: None,
             last_error: None,
+            last_error_evidence: None,
             archived_at: None,
             trashed_at: None,
             active_snoozed_until: None,

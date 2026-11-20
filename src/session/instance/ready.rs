@@ -2,13 +2,15 @@
 
 use super::*;
 
+use crate::session::storage::{NativeInputRevision, NativeInputStore, StorageFlock};
+
 /// Outcome of `Instance::ensure_pane_ready`. Callers surface this so the user
 /// knows what (if anything) happened on their behalf before a send.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum EnsureReadyOutcome {
     /// Pane was already alive; no action taken.
     AlreadyAlive,
-    /// Pane was dead (`#{pane_dead}=1`) and was respawned via the restart path.
+    /// A confirmed dead pane was conditionally removed and started without Restart intent.
     Respawned,
     /// Tmux session did not exist and was started via the resume-fallback
     /// path. Healthy resume and fresh launch both use this outcome;
@@ -17,6 +19,8 @@ pub enum EnsureReadyOutcome {
     /// Resume failed ambiguously while trying to start or respawn the pane.
     /// The durable sid remains stored for an explicit retry.
     ResumeFailed { sid: String },
+    /// Readiness is unknown. No input may be sent on this outcome.
+    Indeterminate { cause: LaunchIndeterminateCause },
 }
 
 /// Errors `ensure_pane_ready` can return. Separating transient lifecycle
@@ -69,39 +73,153 @@ impl std::error::Error for EnsureReadyError {}
 #[error("session no longer exists")]
 pub struct SessionGone;
 
+#[derive(Debug, thiserror::Error)]
+pub(crate) enum NativeInputError {
+    #[error(
+        "Native target ownership changed or is unavailable; input delivery stopped without retry"
+    )]
+    Ownership,
+    #[error("Agent is not ready for programmatic input; no message was submitted")]
+    AgentNotReady,
+}
+
+/// Immutable native admission scope shared by one captured physical input route.
+pub(crate) struct NativeInputFence {
+    store: NativeInputStore,
+    instance_id: String,
+    created_at: DateTime<Utc>,
+    lifecycle_generation: u64,
+    agent: bool,
+    cache: std::sync::Mutex<NativeInputCache>,
+}
+
+#[derive(Default)]
+struct NativeInputCache {
+    witness: Option<NativeInputWitness>,
+    invalidated: bool,
+}
+
+struct NativeInputWitness {
+    revision: NativeInputRevision,
+    row: Instance,
+}
+
+impl std::fmt::Debug for NativeInputFence {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("NativeInputFence")
+            .field("profile", &self.store.profile())
+            .field("instance_id", &self.instance_id)
+            .field("created_at", &self.created_at)
+            .field("lifecycle_generation", &self.lifecycle_generation)
+            .field("agent", &self.agent)
+            .finish_non_exhaustive()
+    }
+}
+
+impl NativeInputFence {
+    pub(crate) fn capture(
+        profile: &str,
+        instance_id: &str,
+        created_at: DateTime<Utc>,
+        lifecycle_generation: u64,
+        agent: bool,
+        expected_profile: Option<(u64, u64)>,
+    ) -> Result<std::sync::Arc<Self>> {
+        let fence = Self::capture_route(
+            profile,
+            instance_id,
+            created_at,
+            lifecycle_generation,
+            agent,
+            expected_profile,
+        )?;
+        drop(fence.lock()?);
+        Ok(fence)
+    }
+
+    /// Pin the profile before enqueueing; row admission remains an effect-time check.
+    pub(crate) fn capture_route(
+        profile: &str,
+        instance_id: &str,
+        created_at: DateTime<Utc>,
+        lifecycle_generation: u64,
+        agent: bool,
+        expected_profile: Option<(u64, u64)>,
+    ) -> Result<std::sync::Arc<Self>> {
+        let storage = crate::session::storage::Storage::open_reference(profile)
+            .context(NativeInputError::Ownership)?;
+        if let Some(expected) = expected_profile {
+            anyhow::ensure!(
+                storage.bound_profile_identity()? == expected,
+                NativeInputError::Ownership
+            );
+        }
+        let store = storage
+            .bind_native_input(instance_id)
+            .context(NativeInputError::Ownership)?;
+        Ok(std::sync::Arc::new(Self {
+            store,
+            instance_id: instance_id.to_owned(),
+            created_at,
+            lifecycle_generation,
+            agent,
+            cache: std::sync::Mutex::new(NativeInputCache::default()),
+        }))
+    }
+
+    /// Retain the guard through the native effect acknowledgement, not user hooks or waits.
+    pub(crate) fn lock(&self) -> Result<StorageFlock> {
+        let mut cache = self.cache.lock().map_err(|_| NativeInputError::Ownership)?;
+        anyhow::ensure!(!cache.invalidated, NativeInputError::Ownership);
+        let result = (|| {
+            let lock = self
+                .store
+                .acquire_lifecycle_lock()
+                .context(NativeInputError::Ownership)?;
+            let revision = self.store.revision().context(NativeInputError::Ownership)?;
+            if cache
+                .witness
+                .as_ref()
+                .is_none_or(|witness| witness.revision != revision)
+            {
+                let (revision, rows) = self
+                    .store
+                    .load_complete()
+                    .context(NativeInputError::Ownership)?;
+                let mut matching = rows.into_iter().filter(|row| row.id == self.instance_id);
+                let row = matching.next().ok_or(NativeInputError::Ownership)?;
+                anyhow::ensure!(matching.next().is_none(), NativeInputError::Ownership);
+                cache.witness = Some(NativeInputWitness { revision, row });
+            }
+            let row = &cache
+                .witness
+                .as_ref()
+                .ok_or(NativeInputError::Ownership)?
+                .row;
+            anyhow::ensure!(
+                row.created_at == self.created_at
+                    && row.lifecycle_generation == self.lifecycle_generation
+                    && row.source_profile == self.store.profile()
+                    && !row.has_fresh_lifecycle_reservation(Utc::now()),
+                LifecycleReservationError::Superseded
+            );
+            if self.agent {
+                row.ensure_startable()?;
+                anyhow::ensure!(!row.is_structured(), NativeInputError::AgentNotReady);
+            }
+            Ok(lock)
+        })();
+        if result.is_err() {
+            cache.invalidated = true;
+        }
+        result
+    }
+}
+
 impl Instance {
-    /// Smart-send precondition: bring this session's tmux pane to a state
-    /// where `send_keys_with_delay` is safe.
-    ///
-    /// Without this, a send to a dead pane silently writes keystrokes to a
-    /// corpse with no agent to respond, and the user sees no error.
-    ///
-    /// Handles three states the caller would otherwise hit:
-    /// - Tmux session missing: start from scratch via `start_with_size`.
-    /// - Pane dead (`#{pane_dead}=1`): reuse the restart path (same path
-    ///   E/F5 uses; well-tested).
-    /// - Already alive: no-op.
-    ///
-    /// Bails on Creating/Deleting (transient lifecycle states) and on
-    /// structured view-mode sessions (no backing tmux pane).
-    ///
-    /// On `Started` / `Respawned`, polls briefly so keystrokes don't race the
-    /// agent's startup splash. Best-effort: returns after the timeout even if
-    /// the pane is still settling.
-    ///
-    /// Latency: `AlreadyAlive` is ~tmux RTT. The `Respawned` path routes
-    /// through `restart_with_size` -> `start_with_resume_fallback`, which
-    /// on a dead resume-eligible pane can block for the resume probe window
-    /// (~3s; see `start_with_resume_fallback` for the breakdown) plus up to
-    /// 3s of `wait_for_pane_ready` polling.
-    /// Smart-send, TUI Enter, and `aoe send` callers should size timeouts
-    /// and spinner copy accordingly.
-    ///
-    /// Note: callers that mutate a clone (e.g. inside `spawn_blocking`) must
-    /// sync the post-start state (`status`, `agent_session_id`,
-    /// `last_start_time`, `last_error`) back onto the in-memory entry, since
-    /// `finalize_launch` writes those fields and they would otherwise be
-    /// dropped with the clone. See `apply_post_restart_sync`.
+    /// Ensure physical presence without inferring death from Status or a shell.
+    /// Implicit launch carries its Missing/Dead proof across hooks. Positive
+    /// readiness is still required here; input revalidates its physical fence at effect time.
     pub fn ensure_pane_ready(&mut self) -> Result<EnsureReadyOutcome, EnsureReadyError> {
         self.ensure_pane_ready_with_size(None)
     }
@@ -117,8 +235,7 @@ impl Instance {
     /// startup: if it lands before the agent installs its resize handler the
     /// reflow is lost, and because the per-frame resize loop is deduped on the
     /// (already-correct) tmux window size, nothing re-issues it. The pane then
-    /// stays pinned at ~80 cols (≈50% of a wide live area) until live mode is
-    /// exited and re-entered. Booting at the right size sidesteps the race.
+    /// stays pinned at ~80 cols until live mode is exited and re-entered.
     ///
     /// `None` keeps tmux's default for callers with no target geometry.
     pub fn ensure_pane_ready_with_size(
@@ -131,100 +248,437 @@ impl Instance {
         if self.is_structured() {
             return Err(EnsureReadyError::StructuredView);
         }
-        let session = self.tmux_session().map_err(EnsureReadyError::Tmux)?;
-        if !session.exists() {
-            // Route fresh starts through the resume probe so a sid loaded
-            // from disk that crashes the agent on launch is detected and
-            // preserved on the first failure. The next attempt starts fresh
-            // rather than repeating that resume. Always `Allow`: sends must
-            // keep trying to preserve agent context regardless of
-            // `auto_resume_on_restart`, which only scopes explicit
-            // restart/reattach. See #2609.
-            let outcome =
-                self.start_with_resume_fallback(size, false, ResumeAttemptPolicy::Allow)?;
-            match outcome {
-                StartOutcome::ResumeFailed { sid } => {
-                    return Ok(EnsureReadyOutcome::ResumeFailed { sid });
+        let (_, _, physical) = match self.observe_native_pane() {
+            Ok(observation) => observation,
+            Err(error) => {
+                if let Some(cause) = error.downcast_ref::<LaunchIndeterminateCause>() {
+                    return Ok(EnsureReadyOutcome::Indeterminate { cause: *cause });
                 }
-                StartOutcome::Resumed
-                | StartOutcome::Fresh
-                | StartOutcome::FreshAfterFailedResume { .. } => {}
+                return Err(error.into());
             }
-            self.wait_for_pane_ready(&session);
-            return Ok(EnsureReadyOutcome::Started);
-        }
-        if session.is_pane_dead() {
-            let outcome =
-                self.restart_with_resume_policy(size, false, ResumeAttemptPolicy::Allow)?;
-            match outcome {
-                StartOutcome::ResumeFailed { sid } => {
-                    return Ok(EnsureReadyOutcome::ResumeFailed { sid });
-                }
-                StartOutcome::Resumed
-                | StartOutcome::Fresh
-                | StartOutcome::FreshAfterFailedResume { .. } => {}
-            }
-            self.wait_for_pane_ready(&session);
-            return Ok(EnsureReadyOutcome::Respawned);
-        }
-        Ok(EnsureReadyOutcome::AlreadyAlive)
-    }
-
-    /// Keystrokes into a live pane are refused for an archived or trashed session, like a start.
-    /// Rechecks the stored row under the lifecycle lock, which CLI archive and trash also take;
-    /// hold the returned guard until the send lands. `ensure_pane_ready` takes the same lock, so
-    /// call this after it.
-    pub(crate) fn lock_for_input(&self) -> Result<crate::session::storage::StorageFlock> {
-        let storage = crate::session::storage::Storage::new(
-            &self.effective_profile(),
-            self.resolve_file_watch(),
-        )?;
-        let lock = storage.acquire_instance_lifecycle_lock(&self.id)?;
-        let Some(row) = storage.load()?.into_iter().find(|row| row.id == self.id) else {
-            return Err(SessionGone.into());
         };
-        row.ensure_startable()?;
-        Ok(lock)
+        if physical == crate::tmux::utils::PaneProbe::Alive {
+            return Ok(match self.positive_pane_readiness() {
+                Ok(true) => EnsureReadyOutcome::AlreadyAlive,
+                Ok(false) => EnsureReadyOutcome::Indeterminate {
+                    cause: LaunchIndeterminateCause::StabilizationExpired,
+                },
+                Err(_) => EnsureReadyOutcome::Indeterminate {
+                    cause: LaunchIndeterminateCause::ObservationFailed,
+                },
+            });
+        }
+        let generation = self.lifecycle_generation;
+        // Sends permit resume regardless of the automatic restart setting.
+        let outcome = match self.start_with_resume_fallback(size, false, ResumeAttemptPolicy::Allow)
+        {
+            Ok(outcome) => outcome,
+            Err(error) => {
+                if let Some(cause) = error.downcast_ref::<LaunchIndeterminateCause>() {
+                    return Ok(EnsureReadyOutcome::Indeterminate { cause: *cause });
+                }
+                return Err(error.into());
+            }
+        };
+        match outcome {
+            StartOutcome::ResumeFailed { sid } => {
+                return Ok(EnsureReadyOutcome::ResumeFailed { sid });
+            }
+            StartOutcome::Indeterminate { cause } => {
+                return Ok(EnsureReadyOutcome::Indeterminate { cause });
+            }
+            StartOutcome::Resumed
+            | StartOutcome::Fresh
+            | StartOutcome::FreshAfterFailedResume { .. } => {}
+        }
+        if let Err(cause) = self.wait_for_pane_ready() {
+            return Ok(EnsureReadyOutcome::Indeterminate { cause });
+        }
+        // A peer's unchanged generation does not itself establish readiness.
+        Ok(if self.lifecycle_generation == generation {
+            EnsureReadyOutcome::AlreadyAlive
+        } else if physical == crate::tmux::utils::PaneProbe::Dead {
+            EnsureReadyOutcome::Respawned
+        } else {
+            EnsureReadyOutcome::Started
+        })
     }
 
-    /// Best-effort wait for a freshly-started pane to settle past its initial
-    /// shell/splash so subsequent `send-keys` land in the agent instead of a
-    /// boot prompt. Polls up to 3s in 50ms increments; returns even on
-    /// timeout so a sluggish agent doesn't block the send indefinitely.
-    ///
-    /// Readiness signal:
-    /// - Agents that expect a shell, run a custom command override, or have
-    ///   an active hook status file: just wait for the pane to not be dead.
-    ///   Wrapper scripts look like shells to tmux, so `is_pane_running_shell`
-    ///   would never clear for them and we would eat the full 3s every time.
-    ///   This mirrors the same guard chain `ensure_session` uses.
-    /// - Real agents (e.g. claude, opencode): also wait for the pane to no
-    ///   longer be running a shell, so a keystroke doesn't land in the boot
-    ///   prompt that runs before the agent binary takes over.
-    pub(crate) fn wait_for_pane_ready(&self, session: &tmux::Session) {
-        let shell_check_unreliable = self.expects_shell()
+    pub(super) fn positive_pane_readiness(&self) -> Result<bool> {
+        let panes = crate::tmux::batch_pane_metadata()?;
+        let Some((_, pane)) = crate::tmux::agent_pane_metadata_in(&panes, &self.id, &self.title)?
+        else {
+            return Ok(false);
+        };
+        self.pane_is_ready(pane)
+    }
+
+    pub(crate) fn pane_is_ready(&self, pane: &crate::tmux::PaneMetadata) -> Result<bool> {
+        if pane.pane_dead {
+            return Ok(false);
+        }
+        if self.expects_shell()
             || self.has_command_override()
-            || crate::hooks::read_hook_status(&self.id).is_some();
+            || self.current_launch_hook_status().is_some()
+        {
+            return Ok(true);
+        }
+        let command = pane
+            .pane_current_command
+            .as_deref()
+            .ok_or_else(|| anyhow::anyhow!("Agent pane command is unknown"))?;
+        Ok(!crate::tmux::utils::is_pane_running_shell_command(
+            command,
+            pane.pane_start_command_is_protected,
+        ))
+    }
+
+    fn current_launch_hook_status(&self) -> Option<crate::session::Status> {
+        let active = self.active_execution.as_ref()?;
+        let binding = self.agent_session_binding.as_ref()?;
+        let session_id = self.agent_session_id.as_deref()?;
+        if active.binding.agent != self.tool
+            || binding.session_id != session_id
+            || !Self::execution_identity_matches(binding.execution.as_ref()?, &active.binding)
+        {
+            return None;
+        }
+        crate::hooks::read_hook_status_for_launch(&self.id, &active.launch_id, session_id)
+    }
+
+    /// Wait up to three seconds for a newly born live pane to leave its boot shell.
+    /// Missing, dead, unknown and still-settling panes remain indeterminate.
+    pub(crate) fn wait_for_pane_ready(&self) -> Result<(), LaunchIndeterminateCause> {
         let deadline = std::time::Instant::now() + std::time::Duration::from_millis(3000);
         loop {
-            if !session.exists() {
-                return;
+            let panes = crate::tmux::batch_pane_metadata()
+                .map_err(|error| self.probe_failure_cause(error))?;
+            let Some((_, pane)) =
+                crate::tmux::agent_pane_metadata_in(&panes, &self.id, &self.title)
+                    .map_err(|error| self.probe_failure_cause(error))?
+            else {
+                return Err(LaunchIndeterminateCause::OwnershipUnproven);
+            };
+            if pane.pane_dead {
+                return Err(LaunchIndeterminateCause::OwnershipUnproven);
             }
-            let pane_alive = !session.is_pane_dead();
-            if pane_alive && (shell_check_unreliable || !session.is_pane_running_shell()) {
-                return;
+            if self
+                .pane_is_ready(pane)
+                .map_err(|error| self.probe_failure_cause(error))?
+            {
+                return Ok(());
             }
             if std::time::Instant::now() >= deadline {
-                return;
+                return Err(LaunchIndeterminateCause::StabilizationExpired);
             }
             std::thread::sleep(std::time::Duration::from_millis(50));
         }
+    }
+
+    /// Conditional equality for queued native preparation, not permission to launch.
+    /// Stream only selected context into a fixed digest; never expose the bindings.
+    pub(crate) fn native_preparation_selection(&self) -> serde_json::Result<[u8; 32]> {
+        use sha2::{Digest, Sha256};
+
+        struct SelectionDigest(Sha256);
+        impl std::io::Write for SelectionDigest {
+            fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+                self.0.update(bytes);
+                Ok(bytes.len())
+            }
+
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+
+        let mut digest = SelectionDigest(Sha256::new());
+        digest.0.update(b"aoe-native-preparation-selection-v1\0");
+        serde_json::to_writer(
+            &mut digest,
+            &(
+                &self.tool,
+                &self.command,
+                &self.extra_args,
+                &self.agent_session_id,
+                &self.agent_session_binding,
+                &self.resume_intent,
+                &self.resume_binding,
+                &self.pi_session_path,
+            ),
+        )?;
+        Ok(digest.0.finalize().into())
+    }
+
+    /// Capture authority once for a physical input route; never retarget it after invalidation.
+    pub(crate) fn native_input_fence(
+        &self,
+        agent: bool,
+    ) -> Result<std::sync::Arc<NativeInputFence>> {
+        NativeInputFence::capture(
+            &self.effective_profile(),
+            &self.id,
+            self.created_at,
+            self.lifecycle_generation,
+            agent,
+            None,
+        )
+    }
+
+    pub(crate) fn agent_input_session(
+        &self,
+        name: &str,
+        physical: std::sync::Arc<LegacyToolObservation>,
+        wait: bool,
+        captured_fence: Option<std::sync::Arc<NativeInputFence>>,
+    ) -> Result<tmux::Session> {
+        self.ensure_startable()?;
+        anyhow::ensure!(
+            !self.is_structured(),
+            "Session no longer has a terminal agent"
+        );
+        let fence = match captured_fence {
+            Some(fence) => fence,
+            None => self.native_input_fence(true)?,
+        };
+        let mut session =
+            tmux::Session::from_observation(name, physical).with_native_input_fence(fence);
+        if wait {
+            session.wait_until_ready(
+                std::time::Duration::from_secs(5),
+                crate::agents::ready_marker(&self.tool),
+            );
+        }
+        session.admit_agent_input(self.expects_shell())?;
+        Ok(session)
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn input_fixture(profile: &str) -> Result<(crate::session::storage::Storage, Instance)> {
+        let storage = crate::session::storage::Storage::new_unwatched(profile)?;
+        let mut row = Instance::new("input witness", "/tmp/input-witness");
+        row.source_profile = profile.into();
+        row.lifecycle_generation = 7;
+        storage.update(|rows, _| {
+            rows.push(row.clone());
+            Ok(())
+        })?;
+        Ok((storage, row))
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn native_input_witness_requires_complete_rows_without_recovery() -> Result<()> {
+        let _app = crate::session::test_support::isolate_app_dir();
+        for refresh in [false, true] {
+            let profile = if refresh {
+                "input-refresh"
+            } else {
+                "input-capture"
+            };
+            let (storage, row) = input_fixture(profile)?;
+            let original = std::fs::read(storage.sessions_path())?;
+            let fence = refresh.then(|| row.native_input_fence(false)).transpose()?;
+            let corrupt = serde_json::to_vec(&serde_json::json!([
+                row,
+                {"id": "undecodable-peer", "created_at": 17}
+            ]))?;
+            let quarantine = storage
+                .sessions_path()
+                .with_file_name("sessions.corrupt.jsonl");
+            std::fs::write(&quarantine, b"prior evidence\n")?;
+            crate::session::storage::atomic_write(storage.sessions_path(), &corrupt)?;
+            let error = match &fence {
+                Some(fence) => fence
+                    .lock()
+                    .err()
+                    .expect("refresh must reject incomplete rows"),
+                None => row.native_input_fence(false).unwrap_err(),
+            };
+            assert!(error.downcast_ref::<NativeInputError>().is_some());
+            assert_eq!(std::fs::read(storage.sessions_path())?, corrupt);
+            assert_eq!(std::fs::read(&quarantine)?, b"prior evidence\n");
+            crate::session::storage::atomic_write(storage.sessions_path(), &original)?;
+            if let Some(fence) = fence {
+                assert!(fence.lock().is_err(), "invalidated scope must not rearm");
+            }
+            drop(row.native_input_fence(false)?.lock()?);
+        }
+        Ok(())
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn native_input_witness_checks_atomic_replacement_not_retained_fd_or_mtime() -> Result<()> {
+        use std::os::unix::fs::MetadataExt;
+        let _app = crate::session::test_support::isolate_app_dir();
+        let (storage, row) = input_fixture("input-atomic-replacement")?;
+        let fence = row.native_input_fence(false)?;
+        let old_file = std::fs::File::open(storage.sessions_path())?;
+        let old_metadata = old_file.metadata()?;
+        let mut replacement = row.clone();
+        replacement.lifecycle_generation += 1;
+        let replacement = serde_json::to_vec_pretty(&vec![replacement])?;
+        crate::session::storage::atomic_write(storage.sessions_path(), &replacement)?;
+        let current = std::fs::File::options()
+            .write(true)
+            .open(storage.sessions_path())?;
+        current.set_times(std::fs::FileTimes::new().set_modified(old_metadata.modified()?))?;
+        assert_ne!(old_metadata.ino(), current.metadata()?.ino());
+        assert_eq!(old_metadata.ino(), old_file.metadata()?.ino());
+        assert_eq!(old_metadata.modified()?, current.metadata()?.modified()?);
+        let error = fence
+            .lock()
+            .err()
+            .expect("new anchored inode must refresh authority");
+        assert_eq!(
+            error.downcast_ref::<LifecycleReservationError>(),
+            Some(&LifecycleReservationError::Superseded)
+        );
+        assert_eq!(std::fs::read(storage.sessions_path())?, replacement);
+        Ok(())
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn native_input_generation_change_rejects_stale_scope_but_allows_fresh_capture() -> Result<()> {
+        let root = tempfile::tempdir()?;
+        let _app = crate::session::test_support::isolate_app_dir_at(root.path());
+        let storage = crate::session::storage::Storage::new_unwatched("input-generation")?;
+        let mut row = super::super::test_helpers::reserved_claude_instance(
+            root.path(),
+            "11111111-2222-4333-8444-555555555555",
+        );
+        row.source_profile = storage.profile().into();
+        row.lifecycle_generation = 7;
+        row.status = Status::Error;
+        row.started_at = Some(Utc::now());
+        storage.update(|rows, _| {
+            rows.push(row.clone());
+            Ok(())
+        })?;
+        let stale = row.native_input_fence(true)?;
+        let execution = row.active_execution.clone();
+        let sid = row.agent_session_id.clone();
+        let started_at = row.started_at;
+        row.advance_auxiliary_generation_in(&storage)?;
+        assert_eq!(row.active_execution, execution);
+        assert_eq!(row.agent_session_id, sid);
+        assert_eq!(row.started_at, started_at);
+        let error = stale
+            .lock()
+            .err()
+            .expect("same execution cannot revive stale generation");
+        assert_eq!(
+            error.downcast_ref::<LifecycleReservationError>(),
+            Some(&LifecycleReservationError::Superseded)
+        );
+        drop(row.native_input_fence(true)?.lock()?);
+        assert_eq!(storage.load_instances_complete()?[0].status, Status::Error);
+        Ok(())
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn native_input_same_generation_rename_and_peer_write_allow_raw_inactive_agent() -> Result<()> {
+        let _app = crate::session::test_support::isolate_app_dir();
+        let (storage, mut row) = input_fixture("input-display-refresh")?;
+        row.view = View::Structured;
+        row.status = Status::Stopped;
+        row.archived_at = Some(Utc::now());
+        row.terminal_info = Some(TerminalInfo { created: true });
+        storage.update(|rows, _| {
+            rows[0] = row.clone();
+            Ok(())
+        })?;
+        let fence = row.native_input_fence(false)?;
+        assert_eq!(
+            row.native_input_fence(true)
+                .unwrap_err()
+                .downcast_ref::<StartBlocked>(),
+            Some(&StartBlocked::Archived)
+        );
+        storage.update(|rows, _| {
+            rows[0].title = "display rename".into();
+            rows.push(Instance::new("unrelated peer", "/tmp/unrelated-peer"));
+            Ok(())
+        })?;
+        drop(fence.lock()?);
+        drop(fence.lock()?);
+        assert_eq!(
+            fence
+                .cache
+                .lock()
+                .unwrap()
+                .witness
+                .as_ref()
+                .unwrap()
+                .row
+                .title,
+            "display rename"
+        );
+        storage.update(|rows, _| {
+            rows[0].archived_at = None;
+            Ok(())
+        })?;
+        assert!(matches!(
+            row.native_input_fence(true)
+                .unwrap_err()
+                .downcast_ref::<NativeInputError>(),
+            Some(NativeInputError::AgentNotReady)
+        ));
+        drop(fence.lock()?);
+        Ok(())
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn native_input_reservation_or_creation_change_permanently_invalidates_scope() -> Result<()> {
+        let _app = crate::session::test_support::isolate_app_dir();
+        for reservation in [false, true] {
+            let profile = if reservation {
+                "input-reservation"
+            } else {
+                "input-creation"
+            };
+            let (storage, row) = input_fixture(profile)?;
+            let fence = row.native_input_fence(false)?;
+            storage.update(|rows, _| {
+                if reservation {
+                    rows[0].lifecycle_reservation = Some(LifecycleReservation {
+                        op: LifecycleOperation::Capture,
+                        generation: row.lifecycle_generation,
+                        at: Utc::now(),
+                    });
+                } else {
+                    rows[0].created_at += chrono::Duration::seconds(1);
+                }
+                Ok(())
+            })?;
+            let error = fence
+                .lock()
+                .err()
+                .expect("changed authority must reject input");
+            assert_eq!(
+                error.downcast_ref::<LifecycleReservationError>(),
+                Some(&LifecycleReservationError::Superseded)
+            );
+            storage.update(|rows, _| {
+                rows[0] = row.clone();
+                Ok(())
+            })?;
+            assert!(
+                fence.lock().is_err(),
+                "restored data must not rearm old scope"
+            );
+            drop(row.native_input_fence(false)?.lock()?);
+        }
+        Ok(())
+    }
 
     #[test]
     fn test_ensure_pane_ready_bails_on_creating() {
@@ -256,6 +710,178 @@ mod tests {
         }
     }
 
+    #[cfg(unix)]
+    #[test]
+    #[serial_test::serial]
+    fn cached_presence_never_makes_an_unknown_probe_ready() {
+        if std::env::var_os("AOE_TEST_READY_UNKNOWN_CHILD").is_none() {
+            if !crate::tmux::test_helpers::tmux_available() {
+                return;
+            }
+            let root = tempfile::tempdir().unwrap();
+            let not_directory = root.path().join("not-directory");
+            std::fs::write(&not_directory, b"not a socket directory").unwrap();
+            let mut child = std::process::Command::new(std::env::current_exe().unwrap());
+            child
+                .args([
+                    "--exact",
+                    "session::instance::ready::tests::cached_presence_never_makes_an_unknown_probe_ready",
+                    "--nocapture",
+                ])
+                .env("AOE_TEST_READY_UNKNOWN_CHILD", "1")
+                .env("AOE_TMUX_SOCKET", not_directory.join("socket"))
+                .env("HOME", root.path())
+                .env("XDG_CONFIG_HOME", root.path().join("config"));
+            let output =
+                crate::process::run_with_timeout(&mut child, crate::tmux::TMUX_COMMAND_TIMEOUT * 3)
+                    .unwrap()
+                    .expect("private unknown-probe test must complete");
+            assert!(
+                output.status.success(),
+                "{}{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            return;
+        }
+        let root = tempfile::tempdir().unwrap();
+        let _app = crate::session::test_support::isolate_app_dir_at(root.path());
+        let mut instance = Instance::new("cached-unknown-readiness", root.path().to_str().unwrap());
+        instance.status = Status::Running;
+        let session = instance.tmux_session().unwrap();
+        assert_eq!(
+            crate::tmux::utils::probe_pane(session.name()),
+            crate::tmux::utils::PaneProbe::Unknown
+        );
+        let cache = crate::tmux::SessionCacheGuard::capture();
+        cache.force_present(&[session.name()]);
+        assert!(
+            session.exists(),
+            "the stale positive cache must be established"
+        );
+        assert_eq!(
+            instance.ensure_pane_ready().unwrap(),
+            EnsureReadyOutcome::Indeterminate {
+                cause: LaunchIndeterminateCause::ObservationFailed,
+            }
+        );
+        assert_eq!(instance.status, Status::Running);
+        assert_eq!(instance.last_start_time, None);
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn alive_boot_shell_requires_positive_readiness_before_reuse() {
+        crate::tmux::test_helpers::require_tmux!();
+        let root = tempfile::tempdir().unwrap();
+        let _app = crate::session::test_support::isolate_app_dir_at(root.path());
+        let mut instance = Instance::new("unsettled-readiness", root.path().to_str().unwrap());
+        instance.tool = "claude".into();
+        instance.command = "claude".into();
+        instance.source_profile = "unsettled-readiness".into();
+        instance.status = Status::Starting;
+        let storage = crate::session::Storage::new_unwatched(&instance.source_profile).unwrap();
+        storage
+            .update(|rows, _| {
+                rows.push(instance.clone());
+                Ok(())
+            })
+            .unwrap();
+        let name = crate::tmux::Session::generate_name(&instance.id, &instance.title);
+        let _pane = crate::tmux::test_helpers::TmuxTestSession::from_name(&name);
+        assert!(crate::tmux::tmux_command()
+            .args(["new-session", "-d", "-s", &name, "/bin/sh",])
+            .status()
+            .unwrap()
+            .success());
+        let pane = crate::tmux::test_helpers::only_pane_id(&name);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            let panes = crate::tmux::batch_pane_metadata().unwrap();
+            let (_, observed) =
+                crate::tmux::agent_pane_metadata_in(&panes, &instance.id, &instance.title)
+                    .expect("unambiguous boot-shell target")
+                    .expect("the boot shell must appear in the readiness batch");
+            assert_eq!(observed.pane_id, pane);
+            if !observed.pane_dead
+                && observed.pane_pid.is_some()
+                && observed
+                    .pane_current_command
+                    .as_deref()
+                    .is_some_and(|command| {
+                        crate::tmux::utils::is_pane_running_shell_command(
+                            command,
+                            observed.pane_start_command_is_protected,
+                        )
+                    })
+            {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the controlled unprotected boot shell did not become observable: {:?}",
+                observed.pane_current_command
+            );
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        assert!(matches!(
+            instance.ensure_pane_ready().unwrap(),
+            EnsureReadyOutcome::Indeterminate { .. }
+        ));
+        assert_eq!(crate::tmux::test_helpers::only_pane_id(&name), pane);
+        assert!(crate::tmux::tmux_command()
+            .args(["respawn-pane", "-k", "-t", &pane, "exec sleep 60",])
+            .status()
+            .unwrap()
+            .success());
+        crate::tmux::test_helpers::wait_for_pane_command(&pane, "sleep");
+        assert_eq!(
+            instance.ensure_pane_ready().unwrap(),
+            EnsureReadyOutcome::AlreadyAlive
+        );
+        assert_eq!(crate::tmux::test_helpers::only_pane_id(&name), pane);
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn missing_pane_with_positive_cache_requires_a_real_launch() {
+        crate::tmux::test_helpers::require_tmux!();
+        let root = tempfile::tempdir().unwrap();
+        let _app = crate::session::test_support::isolate_app_dir_at(root.path());
+        crate::session::config::update_config(|config| {
+            config.systemd.enabled = false;
+            config.session.agent_status_hooks = false;
+            config.session.smart_rename = false;
+        })
+        .unwrap();
+        let mut instance = Instance::new("missing-positive-cache", root.path().to_str().unwrap());
+        instance.tool = "bash".into();
+        instance.command = "bash".into();
+        instance.source_profile = "missing-positive-cache".into();
+        let storage = crate::session::Storage::new_unwatched(&instance.source_profile).unwrap();
+        storage
+            .update(|rows, _| {
+                rows.push(instance.clone());
+                Ok(())
+            })
+            .unwrap();
+        let session = instance.tmux_session().unwrap();
+        let _pane = crate::tmux::test_helpers::TmuxTestSession::from_name(session.name());
+        let cache = crate::tmux::SessionCacheGuard::capture();
+        cache.force_present(&[session.name()]);
+        assert_eq!(
+            crate::tmux::utils::probe_pane(session.name()),
+            crate::tmux::utils::PaneProbe::Missing
+        );
+        let outcome = instance.ensure_pane_ready().unwrap();
+        assert_eq!(
+            crate::tmux::utils::probe_pane(session.name()),
+            crate::tmux::utils::PaneProbe::Alive,
+            "successful ensure must create a physical pane, not trust cached presence: {outcome:?}"
+        );
+        assert!(matches!(outcome, EnsureReadyOutcome::Started));
+    }
+
     /// Real-tmux integration: an alive pane yields AlreadyAlive with no
     /// status/start_time mutations. Skipped if tmux isn't installed.
     // Serialized: this test creates and kills a real tmux session.
@@ -267,30 +893,36 @@ mod tests {
             return;
         }
 
-        let mut inst = Instance::new("ensure_alive_test", "/tmp/test");
-        let tmux_name = crate::tmux::Session::generate_name(&inst.id, &inst.title);
-        let _ = crate::tmux::tmux_command()
-            .args(["kill-session", "-t", &tmux_name])
-            .output();
-        let created = crate::tmux::tmux_command()
-            .args([
-                "new-session",
-                "-d",
-                "-s",
-                &tmux_name,
-                "-x",
-                "80",
-                "-y",
-                "24",
-                "sleep",
-                "60",
-            ])
-            .status();
-        if !created.map(|s| s.success()).unwrap_or(false) {
-            eprintln!("tmux new-session failed; skipping");
-            return;
-        }
+        let root = tempfile::TempDir::new().unwrap();
+        let cwd = root.path().to_str().unwrap();
+        let mut inst = Instance::new("ensure_alive_test", cwd);
+        inst.tool = "claude".into();
+        inst.command = "sleep 60".into();
+        assert_eq!(
+            crate::agents::get_agent(&inst.tool).map(|agent| agent.binary),
+            Some("claude")
+        );
+        // An explicit command override accepts its live protected launch shell.
+        assert!(inst.has_command_override());
+        let session = inst.tmux_session().unwrap();
+        let _pane_guard = crate::tmux::test_helpers::TmuxTestSession::from_name(session.name());
+        session
+            .create_with_size(
+                cwd,
+                Some(&inst.command),
+                Some((80, 24)),
+                &inst.source_profile,
+            )
+            .expect("managed agent pane");
         crate::tmux::refresh_session_cache();
+        let pane = crate::tmux::test_helpers::only_pane_id(session.name());
+        let panes = crate::tmux::batch_pane_metadata().unwrap();
+        let (_, before) = crate::tmux::agent_pane_metadata_in(&panes, &inst.id, &inst.title)
+            .expect("unambiguous managed agent target")
+            .expect("managed agent pane appears in the readiness batch");
+        assert_eq!(before.pane_id, pane);
+        assert!(!before.pane_dead);
+        let pid = before.pane_pid.expect("live pane has a PID");
 
         inst.status = Status::Running;
         let prev_start = inst.last_start_time;
@@ -300,9 +932,11 @@ mod tests {
         assert_eq!(outcome, EnsureReadyOutcome::AlreadyAlive);
         assert_eq!(inst.last_start_time, prev_start);
         assert_eq!(inst.status, prev_status);
-
-        let _ = crate::tmux::tmux_command()
-            .args(["kill-session", "-t", &tmux_name])
-            .output();
+        let panes = crate::tmux::batch_pane_metadata().unwrap();
+        let (_, after) = crate::tmux::agent_pane_metadata_in(&panes, &inst.id, &inst.title)
+            .unwrap()
+            .expect("same managed agent after ensure");
+        assert_eq!(after.pane_id, pane);
+        assert_eq!(after.pane_pid, Some(pid));
     }
 }

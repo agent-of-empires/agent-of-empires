@@ -79,6 +79,7 @@ function toPersistedState(state: AcpState): AcpState {
     state.restartInFlight ||
     state.restartStoppedSent ||
     state.restartFailure !== null ||
+    state.interactionError ||
     state.retriedError !== null
       ? {
           ...state,
@@ -87,6 +88,7 @@ function toPersistedState(state: AcpState): AcpState {
           restartInFlight: false,
           restartStoppedSent: false,
           restartFailure: null,
+          interactionError: null,
           retriedError: null,
         }
       : state;
