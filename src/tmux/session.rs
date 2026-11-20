@@ -330,6 +330,21 @@ fn capture_output(success: bool, stdout: &[u8]) -> Option<String> {
     success.then(|| String::from_utf8_lossy(stdout).into_owned())
 }
 
+fn capture_pane_target(target: &str, lines: usize) -> std::io::Result<Option<String>> {
+    let output = crate::tmux::tmux_command()
+        .args([
+            "capture-pane",
+            "-t",
+            target,
+            "-p",
+            "-e",
+            "-S",
+            &format!("-{lines}"),
+        ])
+        .output()?;
+    Ok(capture_output(output.status.success(), &output.stdout))
+}
+
 impl Session {
     pub fn new(id: &str, title: &str) -> Result<Self> {
         Ok(Self {
@@ -836,18 +851,16 @@ impl Session {
         }
         let target =
             self.live_pane_target_with_deadline(&crate::tmux::TmuxCommandDeadline::new())?;
-        let output = crate::tmux::tmux_command()
-            .args([
-                "capture-pane",
-                "-t",
-                &target,
-                "-p",
-                "-e",
-                "-S",
-                &format!("-{}", lines),
-            ])
-            .output()?;
-        Ok(capture_output(output.status.success(), &output.stdout))
+        Ok(capture_pane_target(&target, lines)?)
+    }
+
+    /// Capture a pane the caller already resolved, skipping the existence and pane-id probes.
+    /// A failed `capture-pane` reads as an empty pane, like [`Self::capture_pane`].
+    pub(crate) fn capture_pane_at(&self, pane_id: &str, lines: usize) -> String {
+        capture_pane_target(pane_id, lines)
+            .ok()
+            .flatten()
+            .unwrap_or_default()
     }
 
     /// Wait for a known marker, or for two stable captures when no marker exists.
