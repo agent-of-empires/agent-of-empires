@@ -157,7 +157,7 @@ export function SuggestionPresetEditor({ provider, source, entry, item, disabled
                 aria-checked={draft.view === v}
                 disabled={off}
                 onClick={() => set("view", v)}
-                className={`${BUTTON} ${draft.view === v ? "border-brand-500 bg-brand-500/10" : ""}`}
+                className={`inline-flex h-8 items-center rounded-md border px-3 text-xs font-medium text-text-primary disabled:opacity-50 ${draft.view === v ? "border-brand-500 bg-brand-500/10" : "border-surface-700 bg-surface-800 hover:bg-surface-700/50"}`}
               >
                 {v === "structured" ? "Structured" : "Terminal"}
               </button>
