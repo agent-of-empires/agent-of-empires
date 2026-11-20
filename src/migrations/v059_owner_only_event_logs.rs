@@ -161,9 +161,11 @@ mod tests {
     #[test]
     fn a_target_forty_links_away_is_restricted_and_a_forty_first_link_is_refused() {
         let dir = tempfile::tempdir().unwrap();
-        let target = dir.path().join("history.sqlite");
-        let files =
-            ["", "-wal", "-shm"].map(|suffix| dir.path().join(format!("history.sqlite{suffix}")));
+        // The kernel counts every link it follows, and each absolute hop would re-walk a
+        // symlinked TMPDIR.
+        let root = std::fs::canonicalize(dir.path()).unwrap();
+        let target = root.join("history.sqlite");
+        let files = ["", "-wal", "-shm"].map(|suffix| root.join(format!("history.sqlite{suffix}")));
         for file in &files {
             std::fs::write(file, b"x").unwrap();
             std::fs::set_permissions(file, std::fs::Permissions::from_mode(0o644)).unwrap();
@@ -175,11 +177,11 @@ mod tests {
                 .collect::<Vec<_>>()
         };
         // `acp_events.db` is the first of `links` links, the last of which names `target`.
-        let link = dir.path().join("acp_events.db");
+        let link = root.join("acp_events.db");
         let chain = |links: usize| {
             let hop = |n: usize| match n {
                 1 => link.clone(),
-                n => dir.path().join(format!("hop-{n}")),
+                n => root.join(format!("hop-{n}")),
             };
             for n in 1..=41 {
                 let _ = std::fs::remove_file(hop(n));
@@ -197,14 +199,17 @@ mod tests {
         // The kernel refuses the 41st link too, so the refusal comes before any change.
         chain(41);
         assert!(super::link_target(&link).is_err());
-        assert!(super::restrict(dir.path()).is_err());
+        assert!(super::restrict(&root).is_err());
         assert_eq!(modes(), [0o644; 3], "nothing restricted");
 
-        // The 40th link's target is accepted, and a rerun after the repair completes.
+        // The 40th link's target is accepted, and a rerun after the repair completes. macOS
+        // resolves only 32 links, so `stat` fails on this chain there.
         chain(40);
         assert_eq!(super::link_target(&link).unwrap(), target);
-        assert_eq!(super::restrict(dir.path()).unwrap(), 3);
-        assert_eq!(modes(), [0o600; 3], "the database and both sidecars");
+        if cfg!(target_os = "linux") {
+            assert_eq!(super::restrict(&root).unwrap(), 3);
+            assert_eq!(modes(), [0o600; 3], "the database and both sidecars");
+        }
     }
 
     #[test]
