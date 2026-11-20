@@ -142,8 +142,8 @@ fn wait_for_local_dashboard(h: &TuiTestHarness) -> (u16, String) {
 fn restart_local_from_tui(h: &TuiTestHarness) -> u32 {
     let before = daemon_pid(h).expect("serve.pid missing before restart");
     h.send_keys_unfenced("R");
-    h.wait_for("Press R again to restart.");
-    h.send_keys_unfenced("R");
+    h.wait_for("Press Enter to restart.");
+    h.send_keys_unfenced("Enter");
     wait_until(Duration::from_secs(30), Duration::from_millis(100), || {
         let pid = daemon_pid(h).ok_or("serve.pid missing after restart")?;
         if pid == before {
@@ -3183,8 +3183,8 @@ fn tui_local_restart_preserves_the_gate_without_the_env_variable() {
     h.wait_for("R: restart");
     std::fs::remove_file(app_dir_in(h.home_path()).join("serve.passphrase")).unwrap();
     h.send_keys_unfenced("R");
-    h.wait_for("Press R again to restart.");
-    h.send_keys_unfenced("R");
+    h.wait_for("Press Enter to restart.");
+    h.send_keys_unfenced("Enter");
     h.wait_for("Dashboard start failed");
     assert_eq!(daemon_pid(&h), Some(successor));
     assert!(
@@ -4438,8 +4438,8 @@ exit 0
             std::fs::write(&reconnect_flag, "").unwrap();
         }
         h.send_keys_unfenced("G");
-        h.wait_for("Press G again for a new passphrase.");
-        h.send_keys_unfenced("G");
+        h.wait_for("Press Enter for a new passphrase.");
+        h.send_keys_unfenced("Enter");
         if replacement_succeeds {
             let (successor, running) =
                 wait_until(Duration::from_secs(30), Duration::from_millis(50), || {
@@ -4568,8 +4568,8 @@ exit 0
         fs2::FileExt::try_lock_exclusive(&transaction).map_err(|error| error.to_string())
     });
     h.send_keys_unfenced("R");
-    h.wait_for("Press R again to restart.");
-    h.send_keys_unfenced("R");
+    h.wait_for("Press Enter to restart.");
+    h.send_keys_unfenced("Enter");
     h.wait_for("Elapsed:");
     assert!(!running.exists());
     std::fs::rename(&hidden, &running).unwrap();
