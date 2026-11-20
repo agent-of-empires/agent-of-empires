@@ -12,7 +12,7 @@ import {
 } from "../lib/api";
 import { useServerDown } from "../lib/connectionState";
 import { onSuggestionsChanged } from "../lib/suggestionEvents";
-import { toastBus } from "../lib/toastBus";
+import { reportError, toastBus } from "../lib/toastBus";
 import { STALE_NOTICE, toWizardPrefill } from "../lib/suggestionPrefill";
 import type { SuggestionItem, SuggestionsSnapshot } from "../lib/types";
 import type { WizardPrefill } from "../components/session-wizard/SessionWizard";
@@ -134,7 +134,12 @@ export function useSuggestions(
     setNotice(null);
     const result = await startSuggestion(item.provider_id, item.id, options);
     setStarting((s) => s.filter((k) => k !== key));
-    if (!mounted.current && result.kind !== "started") return;
+    if (!mounted.current) {
+      // No row to show the reason on any more.
+      if (result.kind === "failed") reportError(result.reason);
+      else if (result.kind === "error") reportError(result.error);
+      if (result.kind !== "started") return;
+    }
     switch (result.kind) {
       case "started": {
         if (mounted.current) {
