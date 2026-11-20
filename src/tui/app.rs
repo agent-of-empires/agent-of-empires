@@ -1229,6 +1229,17 @@ impl App {
                                 self.draw(terminal)?;
                                 continue;
                             }
+                            // Enter returned while its mount connects: the paste
+                            // belongs to that row's composer, not Home.
+                            if let Some(target) = self.structured_mount_activate.clone() {
+                                self.home
+                                    .pending_paste_for_structured_view
+                                    .entry(target)
+                                    .or_default()
+                                    .push_str(&text);
+                                self.draw(terminal)?;
+                                continue;
+                            }
                             self.home.handle_paste(&text);
 
                             self.draw(terminal)?;
@@ -2303,6 +2314,11 @@ impl App {
             }
             return Ok(());
         }
+        // Enter returned while the mount it asked for connects: Home would read
+        // the next keys as commands (`q` quits), so hold them for that composer.
+        if !ctrl_c && !self.home.has_dialog() && self.hold_key_for_pending_structured_view(&key) {
+            return Ok(());
+        }
         match (key.code, key.modifiers) {
             // Ctrl+C belongs to the agent in live-send.
             (KeyCode::Char('c'), KeyModifiers::CONTROL) if !self.home.is_live_send_capturing() => {
@@ -2506,6 +2522,29 @@ impl App {
         if let Some(v) = self.home.structured_preview.as_mut() {
             v.activate();
         }
+    }
+
+    /// Hold keys typed while the mount Enter asked for is still connecting, so
+    /// they reach that row's composer instead of Home's shortcuts. Returns true
+    /// when the key was consumed.
+    fn hold_key_for_pending_structured_view(&mut self, key: &KeyEvent) -> bool {
+        let Some(target) = self.structured_mount_activate.clone() else {
+            return false;
+        };
+        let buf = self
+            .home
+            .pending_paste_for_structured_view
+            .entry(target)
+            .or_default();
+        match (key.code, key.modifiers) {
+            (KeyCode::Char(c), KeyModifiers::NONE | KeyModifiers::SHIFT) => buf.push(c),
+            (KeyCode::Enter, KeyModifiers::NONE) => buf.push('\n'),
+            (KeyCode::Backspace, KeyModifiers::NONE) => {
+                buf.pop();
+            }
+            _ => {}
+        }
+        true
     }
 
     /// Deliver paste buffered for the row whose in-flight mount just took the
@@ -3851,6 +3890,49 @@ mod tests {
             "the buffered paste reaches the view Enter opened"
         );
         assert!(!app.home.pending_paste_for_structured_view.contains_key(&id));
+    }
+
+    /// Keys typed while the mount Enter asked for is still connecting belong to
+    /// the composer, not to Home: `q` must not quit.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn typing_while_enter_connects_is_held_for_the_composer() {
+        use crate::tui::structured_view::embedded::EmbeddedView;
+        let (mut app, _guard, id) = app_on_a_structured_row();
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        app.structured_mount = Some((id.clone(), rx));
+        let backend =
+            crate::tui::hyperlink::HyperlinkBackend::new(std::io::stdout(), Default::default());
+        let mut terminal = Terminal::with_options(
+            backend,
+            ratatui::TerminalOptions {
+                viewport: ratatui::Viewport::Fixed(ratatui::layout::Rect::new(0, 0, 100, 40)),
+            },
+        )
+        .unwrap();
+
+        app.open_structured_view(&id).await.unwrap();
+        assert_eq!(app.structured_mount_activate.as_deref(), Some(id.as_str()));
+
+        for c in ['q', 'u', 'i', 't'] {
+            app.handle_key(KeyEvent::from(KeyCode::Char(c)), &mut terminal)
+                .await
+                .unwrap();
+        }
+        assert!(!app.should_quit, "`q` must be composer text, not Quit");
+
+        assert!(tx.send(Ok(EmbeddedView::for_test(&id))).is_ok());
+        assert!(app.poll_structured_mount());
+        app.drain_structured_paste().await;
+
+        assert_eq!(
+            app.home
+                .structured_preview
+                .as_ref()
+                .map(|view| view.composer_text()),
+            Some("quit".to_owned()),
+            "keys typed while connecting reach the view Enter opened"
+        );
     }
 
     /// The daemon connection can drop while its row stays selected, and a
