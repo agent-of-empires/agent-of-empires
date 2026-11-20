@@ -538,7 +538,6 @@ fn structured_click_keeps_a_relay_on_the_same_session() {
     // relay stays: the user did not move off the pane it is aimed at.
     use crate::tui::home::live_send::{LiveSendState, LiveSendTarget};
     let mut env = create_test_env_with_sessions(3);
-    setup_inner(&mut env);
     env.view.cursor = 0;
     env.view.update_selected();
     let id = env.view.selected_session.clone().unwrap();
@@ -554,8 +553,13 @@ fn structured_click_keeps_a_relay_on_the_same_session() {
         leader: None,
     });
 
+    setup_inner(&mut env);
     let now = std::time::Instant::now();
     assert_eq!(env.view.handle_click_at(now, 5, 1), None);
+    assert!(matches!(
+        env.view.last_click.as_ref().map(|click| &click.target),
+        Some(super::super::RowClickTarget::Session(clicked)) if clicked == &id
+    ));
     assert!(
         env.view.live_send.is_some(),
         "a relay on the clicked session is left alone"

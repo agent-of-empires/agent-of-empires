@@ -98,6 +98,7 @@ struct PendingPresentation {
     structured: Option<u64>,
     confirmation: Option<super::home::ConfirmationToken>,
     rows: Option<super::home::HomeRowsPaint>,
+    update_bar: Option<DrawnBar>,
 }
 
 pub struct App {
@@ -507,13 +508,15 @@ impl App {
     /// candidate window isn't dragged by transient cursor moves.
     fn draw(&mut self, terminal: &mut Terminal<TuiBackend>) -> Result<()> {
         let mut mouse_capture = None;
+        let mut update_bar = None;
         let outcome = super::terminal_output::frame(|redraw| {
             if redraw {
                 crate::tui::clear_terminal(terminal)?;
                 self.host_title.invalidate();
             }
             mouse_capture = Some(self.sync_mouse_capture(terminal, redraw)?);
-            self.draw_frame(terminal)
+            update_bar = self.draw_frame(terminal)?;
+            Ok(())
         })?;
         if let Some(frame) = outcome.captured {
             self.pending_presentation = Some(PendingPresentation {
@@ -531,6 +534,7 @@ impl App {
                     .map(|view| view.interaction_revision()),
                 confirmation: self.home.painted_confirmation,
                 rows: self.home.painted_rows,
+                update_bar,
             });
         }
         let matching = self
@@ -540,6 +544,7 @@ impl App {
         if matching {
             let pending = self.pending_presentation.take().expect("presented frame");
             self.mouse_captured = pending.mouse_capture;
+            self.drawn_bar = pending.update_bar;
             self.home.presentation_ready = match (&pending.retained, &self.home.retained_preview) {
                 (Some(paint), Some(view)) => view.matches_paint(paint),
                 (None, None) => true,
@@ -576,7 +581,7 @@ impl App {
         Ok(())
     }
 
-    fn draw_frame(&mut self, terminal: &mut Terminal<TuiBackend>) -> Result<()> {
+    fn draw_frame(&mut self, terminal: &mut Terminal<TuiBackend>) -> Result<Option<DrawnBar>> {
         // A visible caret (active embedded view, or live-send without an
         // overlay) strobes if hidden before every redraw.
         let embedded_active = self
@@ -595,21 +600,22 @@ impl App {
             terminal.backend_mut(),
             crossterm::terminal::BeginSynchronizedUpdate
         )?;
-        let draw_result = (|| -> Result<()> {
+        let draw_result = (|| -> Result<Option<DrawnBar>> {
             if !skip_hide {
                 crossterm::queue!(terminal.backend_mut(), crossterm::cursor::Hide)?;
             }
-            terminal.draw(|f| self.render(f))?;
-            Ok(())
+            let mut bar = None;
+            terminal.draw(|frame| bar = self.render(frame))?;
+            Ok(bar)
         })();
         let end_result = crossterm::execute!(
             terminal.backend_mut(),
             crossterm::terminal::EndSynchronizedUpdate
         );
-        draw_result?;
+        let bar = draw_result?;
         end_result?;
         self.sync_host_title(terminal)?;
-        Ok(())
+        Ok(bar)
     }
 
     fn admit_terminal_handoff(&mut self) -> Result<Option<super::terminal_output::Suspension>> {
@@ -648,6 +654,7 @@ impl App {
         F: FnOnce() -> R,
     {
         self.pending_presentation = None;
+        self.drawn_bar = None;
         self.home.invalidate_presentation();
         crossterm::terminal::disable_raw_mode()?;
         self.event_stream.take();
@@ -1286,6 +1293,9 @@ impl App {
                             // Actions stashed by dialog button clicks.
                             if let Some(action) = self.home.pending_dialog_click_action.take() {
                                 self.execute_action(action, terminal)?;
+                                if let Some(session_id) = self.pending_structured_view_open.take() {
+                                    self.open_structured_view(&session_id).await?;
+                                }
                                 if let Some(session_id) = self.pending_view_switch.take() {
                                     self.perform_view_switch(&session_id, terminal).await;
                                 }
@@ -1697,7 +1707,7 @@ impl App {
         }
     }
 
-    fn render(&mut self, frame: &mut Frame) {
+    fn render(&mut self, frame: &mut Frame) -> Option<DrawnBar> {
         let start = std::time::Instant::now();
         if self.update_status.as_ref().is_some_and(|s| s.is_expired()) {
             self.update_status = None;
@@ -1713,9 +1723,6 @@ impl App {
         // Reset so a frame that skips the preview path reports zero.
         self.home.preview_timings = Default::default();
         self.home.render(frame, frame.area(), &self.theme, bar);
-        self.drawn_bar = bar
-            .filter(|_| self.home.update_bar_drawn)
-            .map(DrawnBar::from);
         // Sampled: only frames over the 16ms budget and live-send frames.
         let elapsed = start.elapsed();
         let in_live = self.home.live_send.is_some();
@@ -1735,6 +1742,8 @@ impl App {
                 "render frame sample",
             );
         }
+        bar.filter(|_| self.home.update_bar_drawn)
+            .map(DrawnBar::from)
     }
 
     /// Callers gate on the check mode and on no check being in flight.
@@ -4314,8 +4323,10 @@ mod tests {
             crate::file_watch::FileWatchService::noop(),
         )
         .unwrap();
-        let backend =
-            crate::tui::hyperlink::HyperlinkBackend::new(std::io::stdout(), Default::default());
+        let backend = crate::tui::hyperlink::HyperlinkBackend::new(
+            crate::tui::terminal_output::Output::default(),
+            Default::default(),
+        );
         let terminal = Terminal::with_options(
             backend,
             ratatui::TerminalOptions {
@@ -4346,7 +4357,9 @@ mod tests {
     /// One frame, as the event loop draws before each key; returns the screen text.
     fn draw(app: &mut App) -> String {
         let mut screen = Terminal::new(ratatui::backend::TestBackend::new(100, 30)).unwrap();
-        screen.draw(|f| app.render(f)).unwrap();
+        screen
+            .draw(|frame| app.drawn_bar = app.render(frame))
+            .unwrap();
         screen
             .backend()
             .buffer()
@@ -4354,6 +4367,57 @@ mod tests {
             .iter()
             .map(|c| c.symbol())
             .collect()
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn dismiss_does_not_act_on_a_buffered_update_bar() {
+        use crate::tui::terminal_output::{
+            install_test_output,
+            tests::{block_terminal, drain_terminal, private_terminal, resume_terminal},
+        };
+        let _home = crate::session::test_support::isolate_app_dir();
+        crate::session::get_profile_dir("test").unwrap();
+        let (mut app, _) = key_app();
+        let (mut master, slave) = private_terminal();
+        let mut control = slave.try_clone().unwrap();
+        let (_output_guard, _) = install_test_output(slave);
+        let mut terminal = output_test_terminal();
+        let mut emitted = Vec::new();
+        app.update_info = Some(app_update());
+        app.update_status = Some(UpdateStatus::persistent("visible status".into()));
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            app.draw(&mut terminal).unwrap();
+            drain_terminal(&mut master, &mut emitted);
+            if matches!(app.drawn_bar, Some(DrawnBar::Status(_))) {
+                break;
+            }
+            assert!(std::time::Instant::now() < deadline);
+        }
+
+        app.update_status.as_mut().unwrap().expires_at = Some(std::time::Instant::now());
+        block_terminal(&mut control);
+        app.draw(&mut terminal).unwrap();
+        assert!(app.pending_presentation.is_some());
+        app.handle_key(CTRL_X, &mut terminal).await.unwrap();
+        assert_eq!(app.update_info, Some(app_update()));
+        assert_eq!(app.dismissed_update_version, None);
+
+        resume_terminal(&control);
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            drain_terminal(&mut master, &mut emitted);
+            app.draw(&mut terminal).unwrap();
+            if matches!(app.drawn_bar, Some(DrawnBar::AppUpdate { .. })) {
+                break;
+            }
+            assert!(std::time::Instant::now() < deadline);
+        }
+        app.handle_key(CTRL_X, &mut terminal).await.unwrap();
+        assert!(app.update_info.is_none());
+        assert_eq!(app.dismissed_update_version.as_deref(), Some("1.1.0"));
     }
 
     /// #5747: each Ctrl+X acts on the line on screen, never one hidden behind it.
@@ -4536,7 +4600,9 @@ mod tests {
         for (width, height) in [(100, 1), (100, 0), (0, 30)] {
             let mut screen =
                 Terminal::new(ratatui::backend::TestBackend::new(width, height)).unwrap();
-            screen.draw(|f| app.render(f)).unwrap();
+            screen
+                .draw(|frame| app.drawn_bar = app.render(frame))
+                .unwrap();
             assert_eq!(app.drawn_bar, None, "{width}x{height}");
         }
         draw(&mut app);
