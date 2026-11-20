@@ -18,7 +18,7 @@ Model names map to a coarse family vocabulary (`claude`, `openai`, `gemini`, ...
 
 Prompts, file or project paths, session titles, branch names, group paths, custom command lines, raw model strings, hostnames, usernames, or anything derived from them. Deployment signals carry only the coarse enums above, never a tunnel name, hostname, token, or passphrase.
 
-The install id exists only to count distinct installs: a random UUID generated locally on opt-in, never derived from hostname, username, MAC, or filesystem. It lives in an owner-only `<app_dir>/telemetry.json`, deliberately outside `config.toml` since people paste that into bug reports. Opting out deletes the file, and `aoe telemetry reset-id` rotates it, which makes the install count as a new one.
+The install id exists only to count distinct installs: a random UUID generated locally on opt-in, never derived from hostname, username, MAC, or filesystem. It lives in an owner-only `<app_dir>/telemetry.json`, deliberately outside `config.toml` since people paste that into bug reports. Opting out deletes the file, and `aoe telemetry reset-id` rotates it, which makes the install count as a new one. Usage counts gathered while telemetry is off, or before an opt-in or `reset-id`, are discarded, never sent under the new id.
 
 ## Controlling it
 

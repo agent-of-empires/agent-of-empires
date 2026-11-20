@@ -10,6 +10,7 @@ pub mod plugins;
 pub mod sanitize;
 mod state;
 pub mod usage_signals;
+pub mod window;
 
 use std::collections::BTreeMap;
 use std::time::Duration;
@@ -480,10 +481,8 @@ fn record_snapshot_fp(snapshot: &UsageSnapshot) {
 }
 
 /// Only confirmed sends are recorded, so a failed send never suppresses a retry.
-/// `feature_uses` are deltas, so a snapshot carrying any never dedups: the same count
-/// in a later window is a new use.
 fn snapshot_matches_last(snapshot: &UsageSnapshot) -> bool {
-    if snapshot.feature_uses.values().any(|&n| n > 0) {
+    if snapshot.carries_deltas() {
         return false;
     }
     let fp = snapshot_fingerprint(snapshot);
@@ -731,13 +730,36 @@ mod tests {
             "repeating the latest snapshot dedups against it"
         );
 
-        let mut used = changed.clone();
-        used.feature_uses.insert("command_palette".into(), 1);
-        record_snapshot_fp(&used);
-        assert!(
-            !snapshot_matches_last(&used),
-            "a repeated feature use in a later window must not dedupe"
-        );
+        // Deltas are zeroed after a confirmed send, so an equal count later is new usage.
+        let deltas: [(&str, fn(&mut UsageSnapshot)); 8] = [
+            ("feature_uses", |s| {
+                s.feature_uses.insert("command_palette".into(), 1);
+            }),
+            ("usage_seen", |s| {
+                s.usage_seen.insert("web".into(), 1);
+            }),
+            ("web_clients_seen", |s| {
+                s.web_clients_seen.insert("desktop".into(), true);
+            }),
+            ("session_creates", |s| {
+                s.session_creates_since_last_snapshot = 1
+            }),
+            ("approvals", |s| s.approvals_resolved = 1),
+            ("agent_switches", |s| s.agent_switches = 1),
+            ("plan_mode", |s| s.plan_mode_seen = true),
+            ("prompts_queued", |s| s.prompts_queued = 1),
+        ];
+        for (name, add) in deltas {
+            let mut used = changed.clone();
+            add(&mut used);
+            record_snapshot_fp(&used);
+            assert!(
+                !snapshot_matches_last(&used),
+                "{name}: a repeated count must not dedupe"
+            );
+            used.clear_deltas();
+            assert!(!used.carries_deltas(), "{name}: clear_deltas zeroes it");
+        }
 
         *LAST_SNAPSHOT_FP.lock().unwrap() = None;
     }

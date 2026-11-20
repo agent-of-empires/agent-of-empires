@@ -158,6 +158,8 @@ pub struct App {
     /// The running binary keeps its old version until restart, so this stops
     /// periodic re-checks from re-offering a release we already installed.
     last_installed_version_in_session: Option<String>,
+    telemetry_send: crate::telemetry::window::SingleFlight,
+    telemetry_consent: crate::telemetry::window::ConsentWindow,
 }
 
 struct ToolDetection {
@@ -360,6 +362,8 @@ impl App {
             dashboard_stop: None,
             pending_install_version: None,
             last_installed_version_in_session: None,
+            telemetry_send: Default::default(),
+            telemetry_consent: Default::default(),
         };
         app.finish_startup_dialogs(false);
         Ok(app)
@@ -1556,7 +1560,9 @@ impl App {
         self.home.cleanup_pending_creation().await;
 
         // Bounded and deduped so a dead endpoint or an unchanged launch-then-quit costs nothing.
-        if let Some(snapshot) = self.build_telemetry_snapshot() {
+        // A periodic send still in flight is awaited first so both never report the same counts.
+        self.telemetry_send.settle().await;
+        if let Some(snapshot) = self.next_telemetry_snapshot() {
             let reported = snapshot.session_creates_since_last_snapshot;
             let feature_uses = snapshot.feature_uses.clone();
             let outcome = crate::telemetry::flush_snapshot_if_changed(snapshot).await;
@@ -1567,34 +1573,53 @@ impl App {
     }
 
     /// `None` unless telemetry is opted in. The TUI hosts no dashboard or
-    /// server, so those signals are zeroed or empty.
-    fn build_telemetry_snapshot(&self) -> Option<crate::telemetry::UsageSnapshot> {
+    /// server, so those signals are zeroed or empty. Counts read while opted out or
+    /// across a consent change are cleared, never reported.
+    fn next_telemetry_snapshot(&mut self) -> Option<crate::telemetry::UsageSnapshot> {
+        let creates = reported_session_creates();
         let instances: Vec<crate::session::Instance> = self.home.instances().cloned().collect();
-        crate::telemetry::build_usage_snapshot(
+        let mut snapshot = crate::telemetry::build_usage_snapshot(
             crate::telemetry::Surface::Tui,
             &instances,
             crate::telemetry::usage_signals::zeroed(),
-            reported_session_creates(),
+            creates,
             None,
             None,
             &crate::telemetry::StructuredInteractionCounts::default(),
-        )
+        );
+        let install_id = snapshot.as_ref().map(|s| s.install_id.as_str());
+        if self.telemetry_consent.discard(install_id) {
+            let feature_uses = snapshot
+                .as_ref()
+                .map_or_else(crate::telemetry::feature_use::snapshot, |s| {
+                    s.feature_uses.clone()
+                });
+            clear_reported_tui_signals(creates, &feature_uses, crate::telemetry::SendOutcome::Sent);
+            if let Some(snapshot) = snapshot.as_mut() {
+                snapshot.clear_deltas();
+            }
+        }
+        snapshot
     }
 
-    /// Detached send; the create count is cleared only after a confirmed send.
-    fn emit_telemetry_snapshot(&self) {
-        if let Some(snapshot) = self.build_telemetry_snapshot() {
-            let reported = snapshot.session_creates_since_last_snapshot;
-            let feature_uses = snapshot.feature_uses.clone();
-            tokio::spawn(async move {
-                let outcome = if crate::telemetry::send_snapshot(snapshot).await {
-                    crate::telemetry::SendOutcome::Sent
-                } else {
-                    crate::telemetry::SendOutcome::Failed
-                };
-                clear_reported_tui_signals(reported, &feature_uses, outcome);
-            });
+    /// Detached and single-flight; counts are cleared only after a confirmed send.
+    fn emit_telemetry_snapshot(&mut self) {
+        if self.telemetry_send.is_busy() {
+            return;
         }
+        let Some(snapshot) = self.next_telemetry_snapshot() else {
+            return;
+        };
+        let reported = snapshot.session_creates_since_last_snapshot;
+        let feature_uses = snapshot.feature_uses.clone();
+        self.telemetry_send.spawn_if_idle(async move {
+            let outcome = if crate::telemetry::send_snapshot(snapshot).await {
+                crate::telemetry::SendOutcome::Sent
+            } else {
+                crate::telemetry::SendOutcome::Failed
+            };
+            clear_reported_tui_signals(reported, &feature_uses, outcome);
+        });
     }
 
     fn render(&mut self, frame: &mut Frame) {

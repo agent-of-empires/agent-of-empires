@@ -146,6 +146,45 @@ pub struct UsageSnapshot {
     pub plugins_active: BTreeMap<String, bool>,
 }
 
+impl UsageSnapshot {
+    /// Whether any counter that is cleared after a confirmed send is non-zero. Such a
+    /// snapshot is never deduped: the same count in a later window is new usage.
+    pub fn carries_deltas(&self) -> bool {
+        self.feature_uses
+            .values()
+            .chain(self.usage_seen.values())
+            .any(|&n| n > 0)
+            || self
+                .web_clients_seen
+                .values()
+                .chain(self.structured_clients_seen.values())
+                .any(|&seen| seen)
+            || self.session_creates_since_last_snapshot > 0
+            || self.approvals_resolved > 0
+            || self.agent_switches > 0
+            || self.plan_mode_seen
+            || self.prompts_queued > 0
+    }
+
+    /// Zero every delta, keeping map keys, for counts that must not be reported.
+    pub fn clear_deltas(&mut self) {
+        self.feature_uses.values_mut().for_each(|n| *n = 0);
+        self.usage_seen.values_mut().for_each(|n| *n = 0);
+        self.web_clients_seen
+            .values_mut()
+            .for_each(|seen| *seen = false);
+        self.structured_clients_seen
+            .values_mut()
+            .for_each(|seen| *seen = false);
+        self.session_creates_since_last_snapshot = 0;
+        self.approvals_resolved = 0;
+        self.approvals_by_decision.clear();
+        self.agent_switches = 0;
+        self.plan_mode_seen = false;
+        self.prompts_queued = 0;
+    }
+}
+
 #[derive(Debug, Clone, Default)]
 pub struct StructuredInteractionCounts {
     pub approvals_allow: u32,
