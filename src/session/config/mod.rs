@@ -1209,9 +1209,11 @@ pub struct SessionConfig {
     pub narrow_layout: NarrowLayout,
 
     /// Width in columns below which the TUI switches to `narrow_layout`: the
-    /// list above the preview instead of beside it, and the preview's compact
-    /// title instead of its info header. Narrower than this is also where a
-    /// collapsed sidebar stops being available to `one_pane`. Values below 50
+    /// list above the preview instead of beside it. The preview also compares
+    /// its own pane width against this value to pick its compact title over its
+    /// info header, so a narrow preview can be compact while the layout is still
+    /// side by side. Narrower than this is also where a collapsed sidebar stops
+    /// being available to `one_pane`. Values below 50
     /// are raised to 50, the narrowest side-by-side split that keeps the
     /// preview's 40-column floor beside a minimal 10-column list. A value
     /// greater than the terminal width puts every width below it, so the narrow
