@@ -2032,11 +2032,9 @@ impl SessionService {
     /// control cache was cold or behind, so no status rode with it.
     ///
     /// A frame at the fold's last seq answers from the fold. A frame ahead of it
-    /// folds only the events after the fold, and a cold session hydrates through
-    /// [`Self::fold_control_state`] first, so that hydration is the only path that
-    /// reads the session's whole log. A frame behind the fold is projected at its
-    /// own seq from the log, because reading the fold there would show a later
-    /// level and lose the transition the frame carries, such as running to idle.
+    /// folds only the events through its seq. A cold session hydrates through
+    /// [`Self::fold_control_state`] first. A frame behind the fold is projected
+    /// at its own seq from the log to preserve transitions such as running to idle.
     pub(crate) async fn sidebar_status_at(
         &self,
         id: &str,
@@ -2083,10 +2081,7 @@ impl SessionService {
             }
             let mut state = fold;
             let mut folded = 0usize;
-            for (at, event) in store.replay_from(&sid, since) {
-                if at > seq {
-                    break;
-                }
+            for (at, event) in store.replay_through(&sid, since, seq) {
                 if state.apply_event(at, event).is_ok() {
                     folded += 1;
                 }
