@@ -1166,6 +1166,8 @@ impl SuggestionsView {
 
 /// How often the Home list reloads the suggestions snapshot.
 const FEED_RELOAD: std::time::Duration = std::time::Duration::from_secs(60);
+/// How often the feed reloads while a provider shows "refreshing…".
+const REFRESHING_RELOAD: std::time::Duration = std::time::Duration::from_secs(2);
 
 /// What the Home list shows for one suggestion; provider text is untrusted and
 /// already stripped of control characters.
@@ -1553,10 +1555,21 @@ impl SuggestionsFeed {
         })
     }
 
-    /// Reloads when the snapshot is stale and nothing is in flight. Never
-    /// while `connected` is false, and a failed load waits a full interval.
+    /// Reloads when the snapshot is stale and nothing is in flight, sooner
+    /// while a provider refreshes. Never while `connected` is false, and a
+    /// failed load waits the same interval.
     pub(super) fn tick(&mut self, connected: bool) {
-        let due = |at: Option<std::time::Instant>| at.is_none_or(|at| at.elapsed() >= FEED_RELOAD);
+        let refreshing = self
+            .snapshot
+            .iter()
+            .flat_map(|s| &s.providers)
+            .any(|p| p.refreshing);
+        let every = if refreshing {
+            REFRESHING_RELOAD
+        } else {
+            FEED_RELOAD
+        };
+        let due = |at: Option<std::time::Instant>| at.is_none_or(|at| at.elapsed() >= every);
         if connected && !self.busy && due(self.loaded_at) && due(self.load_attempt_at) {
             self.send(Req::Load, false);
         }
@@ -2680,6 +2693,28 @@ mod tests {
                 .recv_timeout(std::time::Duration::from_secs(5))
                 .unwrap(),
             "prepare p/a"
+        );
+    }
+
+    #[test]
+    fn a_refreshing_provider_is_reloaded_until_its_refresh_ends() {
+        let (sink, requests) = std::sync::mpsc::channel();
+        let mut feed = SuggestionsFeed::recording_for_test(
+            serde_json::json!({ "providers": [], "items": [] }),
+            sink,
+        );
+        let ago = std::time::Instant::now() - std::time::Duration::from_secs(3);
+        (feed.loaded_at, feed.load_attempt_at) = (Some(ago), Some(ago));
+        feed.set_snapshot_for_test(serde_json::json!({
+            "providers": [{ "id": "gh", "name": "GitHub", "refreshing": true }],
+            "items": []
+        }));
+        feed.tick(true);
+        assert_eq!(
+            requests
+                .recv_timeout(std::time::Duration::from_secs(5))
+                .unwrap(),
+            "load"
         );
     }
 
