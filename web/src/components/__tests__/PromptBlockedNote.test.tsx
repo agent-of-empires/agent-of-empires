@@ -67,6 +67,38 @@ describe("PromptBlockedNote", () => {
     expect(screen.getByRole("alert").textContent).toBe("Prompt not sent: the agent was not ready");
   });
 
+  it("Try again runs once while it is in flight, and focus follows each step", async () => {
+    updateSettings.mockResolvedValue("committed");
+    let finish!: () => void;
+    const onTryAgain = vi.fn(() => new Promise<void>((r) => (finish = r)));
+    render(
+      <PromptBlockedNote
+        label="Prompt not sent"
+        code="agent_folder_not_trusted"
+        message={LONG}
+        onTryAgain={onTryAgain}
+      />,
+    );
+    fireEvent.click(screen.getByRole("button", { name: "Turn on pre-trust" }));
+    expect(document.activeElement).toBe(screen.getByRole("button", { name: "Turn on" }));
+    fireEvent.click(screen.getByRole("button", { name: "Turn on" }));
+    const again = await screen.findByRole("button", { name: "Try again" });
+    expect(document.activeElement).toBe(again);
+    fireEvent.click(again);
+    fireEvent.click(again);
+    expect(onTryAgain).toHaveBeenCalledTimes(1);
+    finish();
+    await waitFor(() =>
+      expect((screen.getByRole("button", { name: "Try again" }) as HTMLButtonElement).disabled).toBe(false),
+    );
+  });
+
+  it("a row note is a status, not an alert", () => {
+    render(<PromptBlockedNote label="Prompt not sent" code="x" message="m" live="status" />);
+    expect(screen.getByRole("status").textContent).toBe("Prompt not sent: m");
+    expect(screen.queryByRole("alert")).toBeNull();
+  });
+
   it("read-only shows the reason without actions", () => {
     render(<PromptBlockedNote label="Prompt not sent" code="agent_folder_not_trusted" message={LONG} disabled />);
     expect(screen.queryByRole("button")).toBeNull();
