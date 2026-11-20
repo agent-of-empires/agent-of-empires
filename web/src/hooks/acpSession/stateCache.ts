@@ -172,9 +172,41 @@ export function cacheGet(sessionId: string): AcpState | undefined {
   return value;
 }
 
+const PERSIST_THROTTLE_MS = 2000;
+const pendingPersist = new Map<string, { state: AcpState; timer: ReturnType<typeof setTimeout> }>();
+
+function schedulePersist(sessionId: string, state: AcpState): void {
+  const pending = pendingPersist.get(sessionId);
+  if (pending) {
+    pending.state = state;
+    return;
+  }
+  const timer = setTimeout(() => flushPersist(sessionId), PERSIST_THROTTLE_MS);
+  pendingPersist.set(sessionId, { state, timer });
+}
+
+/** Persist pending state now, for one session or all. */
+export function flushPersist(sessionId?: string): void {
+  for (const id of sessionId === undefined ? [...pendingPersist.keys()] : [sessionId]) {
+    const pending = pendingPersist.get(id);
+    if (!pending) continue;
+    clearTimeout(pending.timer);
+    pendingPersist.delete(id);
+    persistState(id, pending.state);
+  }
+}
+
+// localStorage only needs the latest state by the time the page is hidden or unloaded.
+if (typeof window !== "undefined" && typeof document !== "undefined") {
+  window.addEventListener("pagehide", () => flushPersist());
+  document.addEventListener("visibilitychange", () => {
+    if (document.visibilityState === "hidden") flushPersist();
+  });
+}
+
 export function cacheSet(sessionId: string, value: AcpState): void {
   lruInsert(sessionId, value);
-  persistState(sessionId, value);
+  schedulePersist(sessionId, value);
   notifyStateListeners(sessionId);
 }
 
@@ -250,6 +282,11 @@ export function useWorkflowRuns(sessionId: string | null): Record<string, Workfl
 
 /** Drop one session's cached state, or all of it, so a reused id never shows a prior transcript. */
 export function clearAcpCache(sessionId?: string): void {
+  for (const id of sessionId === undefined ? [...pendingPersist.keys()] : [sessionId]) {
+    const pending = pendingPersist.get(id);
+    if (pending) clearTimeout(pending.timer);
+    pendingPersist.delete(id);
+  }
   if (sessionId === undefined) {
     stateCache.clear();
     removePersisted(persistedKeys);
