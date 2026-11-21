@@ -21,6 +21,7 @@ import {
   type PromptAttachmentInput,
   type QueuedPrompt,
   type ReducedState,
+  type StartupCause,
   type TranscriptDelta,
   type TranscriptRow,
 } from "../../lib/acpTypes";
@@ -58,7 +59,7 @@ export type Action =
   | { kind: "rollback_optimistic_prompt"; id: string }
   | { kind: "error"; message: string }
   // A launch the daemon refused and kept the prompt for: shown through the startup banner.
-  | { kind: "blocked_launch"; message: string }
+  | { kind: "blocked_launch"; message: string; cause: StartupCause | null; promptId: string }
   | { kind: "clear_error" }
   | { kind: "approval_resolved_locally"; nonce: string }
   | {
@@ -272,8 +273,17 @@ export function reducer(state: AcpState, action: Action): AcpState {
       return { ...state, lagged: false };
     case "error":
       return { ...state, lastError: action.message };
-    case "blocked_launch":
-      return { ...state, startupError: action.message };
+    case "blocked_launch": {
+      // A recovery event that landed while the refused response was in flight outranks it.
+      const { [action.promptId]: sentAt, ...promptRecoveries } = state.promptRecoveries;
+      if (sentAt !== undefined && sentAt !== state.startupRecoveries) return { ...state, promptRecoveries };
+      return {
+        ...state,
+        promptRecoveries,
+        startupError: action.message,
+        startupCause: action.cause,
+      };
+    }
     case "clear_error":
       return { ...state, lastError: null };
     case "approval_resolved_locally": {
@@ -316,6 +326,7 @@ export function reducer(state: AcpState, action: Action): AcpState {
       return {
         ...state,
         optimisticRows: state.optimisticRows.concat(row),
+        promptRecoveries: { ...state.promptRecoveries, [id]: state.startupRecoveries },
         startupError: null,
         startupCause: null,
         // A Retry still running keeps its line.

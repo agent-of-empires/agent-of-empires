@@ -25,6 +25,7 @@ mod projects;
 pub(crate) mod render;
 mod reorder;
 mod rows;
+mod sandbox_login;
 mod selection;
 mod send;
 mod status;
@@ -340,6 +341,11 @@ pub struct HomeView {
     pub(super) projects_dialog: Option<ProjectsDialog>,
     pub(super) plugin_manager_dialog: Option<crate::tui::dialogs::PluginManagerDialog>,
     pub(super) skills_manager_dialog: Option<crate::tui::dialogs::SkillsManagerDialog>,
+    pub(super) sandbox_login_dialog: Option<super::dialogs::SandboxLoginDialog>,
+    /// The login the dialog shows; dropped (and so cancelled) with it.
+    pub(super) sandbox_login_poller: Option<super::sandbox_login_poller::SandboxLoginPoller>,
+    /// What the open dialog logs in, resolved once when it opened.
+    pub(super) sandbox_login_selection: Option<sandbox_login::LoginSelection>,
     pub(super) command_palette: Option<CommandPaletteDialog>,
     pub(super) serve_view: Option<ServeView>,
     pub(super) serve_jobs: super::dialogs::ServeJobs,

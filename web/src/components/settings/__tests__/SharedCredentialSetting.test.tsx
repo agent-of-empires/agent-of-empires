@@ -30,6 +30,8 @@ const SHARED_CREDENTIAL = descriptor({
 vi.mock("../../../lib/api", () => ({
   fetchProfiles: vi.fn(() => Promise.resolve([{ name: "main", is_default: true }])),
   fetchPlugins: vi.fn(() => Promise.resolve(null)),
+  // The Sandbox tab's login status row reads it; null renders nothing.
+  getSandboxLoginStatus: vi.fn(() => Promise.resolve(null)),
   fetchSettings: vi.fn(() => Promise.resolve({ sandbox: { shared_credential: "host_seed" } })),
   getSettingsSchema: vi.fn(() => Promise.resolve([SHARED_CREDENTIAL])),
   updateSettings: vi.fn(() => Promise.resolve("committed" as const)),

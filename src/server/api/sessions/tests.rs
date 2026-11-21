@@ -8079,7 +8079,10 @@ async fn sandbox_login_gate_tmux_start_ensure_and_send_are_409() {
             serde_json::from_slice(&to_bytes(response.into_body(), 1024).await.unwrap()).unwrap();
         assert_eq!(
             body,
-            serde_json::json!({"error": "sandbox_login_required", "message": message, "tool": "claude"}),
+            serde_json::json!({
+                "error": "sandbox_login_required", "message": message, "tool": "claude",
+                "profile": crate::session::config::effective_profile(""),
+            }),
             "{which}"
         );
         assert!(!spawned, "{which}");

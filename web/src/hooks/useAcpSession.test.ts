@@ -694,6 +694,38 @@ describe("sendPrompt outcomes", () => {
     expect(result.current.state.queuedPrompts.map((q) => q.text)).toEqual(["after the login"]);
     expect(result.current.state.lastError).toBeNull();
     expect(result.current.state.startupError).toBe(message);
+    // The banner offers Log in from this state.
+    expect(result.current.state.startupCause).toEqual({ kind: "sandbox_login_required" });
+  });
+
+  // The 409 names the `command` its recovery needs; the banner starts the login with it.
+  it("keeps the command of a 409 login-required prompt for the banner's login", async () => {
+    const message = "sandbox login required for personal: run `aoe sandbox login --tool personal --command claude`";
+    calls = installAcpFakes(({ url }) =>
+      url.includes("/acp/prompt")
+        ? json(
+            {
+              error: "sandbox_login_required",
+              message,
+              tool: "personal",
+              command: "claude",
+              profile: "work",
+              queued_id: "0b6f1c1e-3c55-4b8e-9a51-2f3d4c5b6a79",
+            },
+            409,
+          )
+        : undefined,
+    );
+    const { result } = render("sess-login-command", "absent", null, null);
+    await flushAsync();
+    await act(() => result.current.sendPrompt("after the login"));
+    await flushAsync();
+    expect(result.current.state.startupError).toBe(message);
+    expect(result.current.state.startupCause).toEqual({
+      kind: "sandbox_login_required",
+      command: "claude",
+      profile: "work",
+    });
   });
 
   // A failing `before_start` hook: the daemon kept the prompt (502 with a queue id). It is a queue
@@ -720,6 +752,8 @@ describe("sendPrompt outcomes", () => {
     expect(result.current.state.lastError).toBeNull();
     expect(result.current.state.startupError).toMatch(/before_start hook failed; your message is queued/);
     expect(result.current.state.startupError).not.toMatch(/502|\{/);
+    // Not a login: the banner offers no Log in action for a hook the user has to fix.
+    expect(result.current.state.startupCause).toBeNull();
   });
 
   // A 503 that is not `worker_not_ready` is a real failure: it keeps its banner and the prompt

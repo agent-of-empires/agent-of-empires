@@ -1366,6 +1366,7 @@ impl HomeView {
             group_delete_options_dialog,
             rename_dialog,
             worktree_name_dialog,
+            sandbox_login_dialog,
             restart_dialog,
             hooks_install_dialog,
             volume_ignores_glob_dialog,
@@ -1893,6 +1894,7 @@ impl HomeView {
             || self.group_delete_options_dialog.is_some()
             || self.rename_dialog.is_some()
             || self.worktree_name_dialog.is_some()
+            || self.sandbox_login_dialog.is_some()
             || self.repo_trust_dialog.is_some()
             || self.create_hook_failed.is_some()
             || self.hooks_install_dialog.is_some()
