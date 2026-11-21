@@ -245,6 +245,24 @@ pub struct PendingInitialTurn {
     /// on (`agent_folder_not_trusted`, `agent_bypass_not_accepted`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub error_code: Option<String>,
+    /// Identifies this turn across reloads, so state kept for one turn never
+    /// applies to a later turn with the same text. Empty on rows written before
+    /// it existed.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub id: String,
+}
+
+impl PendingInitialTurn {
+    pub fn fresh_id() -> String {
+        uuid::Uuid::new_v4().to_string()
+    }
+
+    /// A create-time prompt typed by the user. The terminal drain delivers only
+    /// these: a rate-limit continuation is ACP-only and carries attachments the
+    /// terminal cannot send.
+    pub fn is_creation_prompt(&self) -> bool {
+        !self.synthesized && self.attachments.is_empty()
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

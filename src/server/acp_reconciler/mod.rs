@@ -604,9 +604,10 @@ async fn drain_pending_initial_turns(state: &Arc<AppState>) {
             .iter()
             .filter(|i| {
                 !i.is_structured()
-                    && i.pending_initial_turn
-                        .as_ref()
-                        .is_some_and(|turn| state.session_service.turn_is_deliverable(&i.id, turn))
+                    && i.pending_initial_turn.as_ref().is_some_and(|turn| {
+                        turn.is_creation_prompt()
+                            && state.session_service.turn_is_deliverable(&i.id, turn)
+                    })
             })
             .map(|i| i.id.clone())
             .collect()

@@ -21,6 +21,17 @@ impl Instance {
 
     /// Keep launch-owned process state without replacing a fresh status observation.
     pub(crate) fn inherit_process_runtime(&mut self, prior: Self) {
+        // An error that could not be written to disk survives the reload that
+        // re-reads the row without it; a turn never errors back to deliverable.
+        if let (Some(fresh), Some(previous)) = (
+            self.pending_initial_turn.as_mut(),
+            prior.pending_initial_turn.as_ref(),
+        ) {
+            if fresh.error.is_none() && !fresh.id.is_empty() && fresh.id == previous.id {
+                fresh.error = previous.error.clone();
+                fresh.error_code = previous.error_code.clone();
+            }
+        }
         self.inherit_acp_load_capability(&prior);
         self.last_start_time = prior.last_start_time;
         self.capture_poller = prior.capture_poller;
@@ -541,6 +552,30 @@ fn splice<T: PartialEq + Clone>(dst: &mut T, pre: &T, post: &T) {
 mod tests {
     use super::*;
     use crate::session::instance::test_helpers::*;
+
+    /// An error that never reached disk survives a reload of the same turn, and
+    /// does not mark a later turn with the same text.
+    #[test]
+    fn unpersisted_turn_error_survives_reload_of_the_same_turn_only() {
+        let turn = |id: &str, error: Option<&str>| PendingInitialTurn {
+            text: "same".into(),
+            attachments: Vec::new(),
+            synthesized: false,
+            error: error.map(str::to_string),
+            error_code: error.map(|_| "code".to_string()),
+            id: id.into(),
+        };
+        for (fresh_id, kept) in [("a", true), ("b", false), ("", false)] {
+            let mut prior = inst();
+            prior.pending_initial_turn = Some(turn("a", Some("not typed")));
+            let mut fresh = inst();
+            fresh.pending_initial_turn = Some(turn(fresh_id, None));
+            fresh.inherit_process_runtime(prior);
+            let got = fresh.pending_initial_turn.unwrap();
+            assert_eq!(got.error.is_some(), kept, "fresh id {fresh_id:?}");
+            assert_eq!(got.error_code.is_some(), kept);
+        }
+    }
 
     fn inst() -> Instance {
         Instance::new("s", "/tmp/x")

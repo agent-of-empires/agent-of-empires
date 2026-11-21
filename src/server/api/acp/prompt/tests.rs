@@ -180,6 +180,7 @@ async fn wake_prompt_frees_instance_lock_and_publishes_nothing_without_a_worker(
         text: "queued before the park".to_string(),
         attachments: Vec::new(),
         synthesized: true,
+        id: String::new(),
     };
     state.instances.write().await[0].pending_initial_turn = Some(seeded.clone());
     seed_native_row(&state).await;
@@ -259,6 +260,7 @@ async fn a_rejected_enqueue_keeps_the_pending_turn_and_an_accepted_one_clears_it
         text: "queued before the park".to_string(),
         attachments: Vec::new(),
         synthesized: true,
+        id: String::new(),
     };
     state.instances.write().await[0].pending_initial_turn = Some(seeded.clone());
     seed_native_row(&state).await;
@@ -445,6 +447,7 @@ async fn no_revive_refuses_a_stopped_or_dormant_worker_without_side_effects() {
                 synthesized: true,
                 error: None,
                 error_code: None,
+                id: String::new(),
             });
         }
         seed_native_row(&state).await;
@@ -591,6 +594,7 @@ async fn no_revive_refuses_a_prompt_on_a_rate_limit_park() {
                 synthesized: true,
                 error: None,
                 error_code: None,
+                id: String::new(),
             });
         seed_native_row(&state).await;
 
@@ -652,6 +656,7 @@ async fn no_revive_refuses_a_workerless_rate_limit_park_with_a_stale_turn() {
             synthesized: true,
             error: None,
             error_code: None,
+            id: String::new(),
         });
     seed_native_row(&state).await;
 
@@ -1634,6 +1639,7 @@ async fn sandbox_login_queue_keeps_http_prompt() {
         synthesized: false,
         error: None,
         error_code: None,
+        id: String::new(),
     });
     crate::session::test_support::sandbox_needing_login(app_dir.path(), &mut inst);
     let state = crate::server::test_support::build_native_test_app_state(vec![inst]).await;
