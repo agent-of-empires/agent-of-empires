@@ -161,7 +161,7 @@ impl Instance {
     /// orthogonal to the sink states. A favorited session that was snoozed
     /// stays favorited when the user wakes it.
     pub fn touch_last_accessed(&mut self) {
-        self.last_accessed_at = Some(Utc::now());
+        self.last_accessed_at = Some(Timestamp::now());
         self.archived_at = None;
         self.snoozed_until = None;
         self.idle_dormant_since = None;
@@ -173,7 +173,7 @@ impl Instance {
         if self.ensure_startable().is_ok() {
             self.touch_last_accessed();
         } else {
-            self.last_accessed_at = Some(Utc::now());
+            self.last_accessed_at = Some(Timestamp::now());
         }
     }
 
@@ -187,7 +187,7 @@ impl Instance {
     /// Mark the session dormant after its structured view worker was auto-stopped
     /// for inactivity. Idempotent: re-marking refreshes the timestamp.
     pub fn mark_idle_dormant(&mut self) {
-        self.idle_dormant_since = Some(Utc::now());
+        self.idle_dormant_since = Some(Timestamp::now());
     }
 
     /// Whether this session should render as "dormant" (worker auto-stopped
@@ -225,7 +225,7 @@ impl Instance {
     /// Idle. Callers can record Stopped after runtime teardown.
     pub fn archive(&mut self) {
         super::forget_before_start_resolution(&self.id);
-        self.archived_at = Some(Utc::now());
+        self.archived_at = Some(Timestamp::now());
         self.favorited_at = None;
         self.snoozed_until = None;
         self.pinned_at = None;
@@ -261,7 +261,7 @@ impl Instance {
     pub fn trash(&mut self) {
         super::forget_before_start_resolution(&self.id);
         if self.trashed_at.is_none() {
-            self.trashed_at = Some(Utc::now());
+            self.trashed_at = Some(Timestamp::now());
             self.failed_purge = None;
             self.trash_lifecycle_id = Some(Uuid::new_v4().to_string());
         }
@@ -338,7 +338,7 @@ impl Instance {
     /// unarchives," extended to snooze because snooze shares tier 99 and
     /// shares the burial outcome.
     pub fn favorite(&mut self) {
-        self.favorited_at = Some(Utc::now());
+        self.favorited_at = Some(Timestamp::now());
         self.archived_at = None;
         self.snoozed_until = None;
     }
@@ -385,7 +385,7 @@ impl Instance {
     }
 
     /// Temporarily defer this session for `minutes`; sets `snoozed_until`
-    /// to `Utc::now() + minutes`. Behaves like a timed archive: the row
+    /// to `Timestamp::now() + minutes`. Behaves like a timed archive: the row
     /// sinks to tier 99, renders italic+dim with a `z ` prefix, and shows
     /// remaining time in the age column. When the timestamp expires the
     /// row rejoins the active attention sort automatically (next render
@@ -399,7 +399,12 @@ impl Instance {
     /// (favorite is the TUI within-tier signal, snoozed favorites keep
     /// their star when they wake; see field doc for `favorited_at`).
     pub fn snooze(&mut self, minutes: u32) {
-        self.snoozed_until = Some(Utc::now() + chrono::Duration::minutes(minutes as i64));
+        // Saturate: u32 minutes can pass the latest representable instant.
+        self.snoozed_until = Some(
+            Timestamp::now()
+                .checked_add(crate::time::Duration::minutes(minutes as i64))
+                .unwrap_or(Timestamp::MAX),
+        );
         self.pinned_at = None;
     }
 
@@ -435,14 +440,16 @@ impl Instance {
     /// return false so the row naturally rejoins the main sort on the next
     /// render; the stale timestamp stays on disk until the next mutation
     /// rewrites the session (harmless; `snoozed_until` is always compared
-    /// against `Utc::now()`).
+    /// against `Timestamp::now()`).
     pub fn is_snoozed(&self) -> bool {
-        self.snoozed_until.map(|t| t > Utc::now()).unwrap_or(false)
+        self.snoozed_until
+            .map(|t| t > Timestamp::now())
+            .unwrap_or(false)
     }
 
     /// `snoozed_until` only while the snooze is active; a persisted past date is not one.
-    pub fn active_snoozed_until(&self) -> Option<DateTime<Utc>> {
-        self.snoozed_until.filter(|t| *t > Utc::now())
+    pub fn active_snoozed_until(&self) -> Option<Timestamp> {
+        self.snoozed_until.filter(|t| *t > Timestamp::now())
     }
 
     /// Combined "don't bother me" sink-state check: trashed, snoozed, or
@@ -453,12 +460,12 @@ impl Instance {
         self.is_trashed() || self.is_snoozed() || self.is_archived()
     }
 
-    /// Remaining snooze duration as a `chrono::Duration`, or `None` if the
+    /// Remaining snooze duration, or `None` if the
     /// session isn't snoozed (or the timestamp has already expired).
-    pub fn snooze_remaining(&self) -> Option<chrono::Duration> {
+    pub fn snooze_remaining(&self) -> Option<crate::time::Duration> {
         self.snoozed_until.and_then(|t| {
-            let delta = t - Utc::now();
-            if delta > chrono::Duration::zero() {
+            let delta = t - Timestamp::now();
+            if delta > crate::time::Duration::ZERO {
                 Some(delta)
             } else {
                 None
@@ -477,7 +484,7 @@ impl Instance {
     /// contradict the entire point of pinning (surface this), so the
     /// sinks come off, identical to how `favorite()` handles it.
     pub fn pin(&mut self) {
-        self.pinned_at = Some(Utc::now());
+        self.pinned_at = Some(Timestamp::now());
         self.archived_at = None;
         self.snoozed_until = None;
     }
@@ -494,13 +501,13 @@ impl Instance {
     /// `Idle`. `None` for non-Idle sessions, sessions with a missing
     /// timestamp (legacy state), or sessions whose `idle_entered_at` is in
     /// the future (clock skew). Negative deltas are clamped away rather than
-    /// returned as `Duration` since `chrono::Duration::to_std` rejects them.
+    /// returned as `Duration` since the conversion to `std::time::Duration` rejects them.
     pub fn idle_age(&self) -> Option<std::time::Duration> {
         if self.status != Status::Idle {
             return None;
         }
         let since = self.idle_entered_at?;
-        (Utc::now() - since).to_std().ok()
+        std::time::Duration::try_from(Timestamp::now() - since).ok()
     }
 
     /// True iff this session should keep the machine awake: it is active
@@ -543,10 +550,10 @@ mod tests {
 
         // `sessions.turn.send` marks pending before the wake that follows clears these; a
         // concurrent count caught in that gap must still see it as occupying a slot.
-        i.archived_at = Some(Utc::now());
+        i.archived_at = Some(Timestamp::now());
         assert!(i.counts_toward_plugin_session_cap());
         i.archived_at = None;
-        i.snoozed_until = Some(Utc::now() + chrono::Duration::hours(1));
+        i.snoozed_until = Some(Timestamp::now() + crate::time::Duration::hours(1));
         assert!(i.counts_toward_plugin_session_cap());
         i.snoozed_until = None;
 
@@ -568,7 +575,7 @@ mod tests {
         i.plugin_revival_pending = true;
         assert!(i.counts_toward_plugin_session_cap());
 
-        i.trashed_at = Some(Utc::now());
+        i.trashed_at = Some(Timestamp::now());
         assert!(!i.counts_toward_plugin_session_cap());
     }
 
@@ -967,7 +974,7 @@ mod tests {
     fn test_idle_age_returns_none_for_non_idle() {
         let mut inst = Instance::new("test", "/tmp/test");
         inst.status = Status::Running;
-        inst.idle_entered_at = Some(Utc::now() - chrono::Duration::seconds(60));
+        inst.idle_entered_at = Some(Timestamp::now() - crate::time::Duration::seconds(60));
         // A Running session never has an idle age, even if a stale
         // `idle_entered_at` timestamp is sitting around (e.g. a transition
         // that bumped from Idle → Running but missed the cleanup path).
@@ -986,7 +993,7 @@ mod tests {
     fn test_idle_age_returns_positive_duration() {
         let mut inst = Instance::new("test", "/tmp/test");
         inst.status = Status::Idle;
-        inst.idle_entered_at = Some(Utc::now() - chrono::Duration::seconds(5));
+        inst.idle_entered_at = Some(Timestamp::now() - crate::time::Duration::seconds(5));
         let age = inst.idle_age().expect("idle age should be present");
         // Allow generous slack so the test isn't flaky on slow CI.
         assert!(age.as_secs() >= 4 && age.as_secs() <= 30);
@@ -996,11 +1003,11 @@ mod tests {
     fn test_idle_age_clamps_negative_to_none() {
         let mut inst = Instance::new("test", "/tmp/test");
         inst.status = Status::Idle;
-        // Future timestamp (clock skew, hand-crafted state). `to_std()` on a
-        // negative `chrono::Duration` returns Err, which we map to None so
+        // Future timestamp (clock skew, hand-crafted state). Converting a
+        // negative duration to `std::time::Duration` returns Err, which we map to None so
         // the freshness logic sees "fully decayed" rather than panicking
         // or treating the session as freshly stopped.
-        inst.idle_entered_at = Some(Utc::now() + chrono::Duration::seconds(60));
+        inst.idle_entered_at = Some(Timestamp::now() + crate::time::Duration::seconds(60));
         assert_eq!(inst.idle_age(), None);
     }
 
@@ -1045,7 +1052,7 @@ mod tests {
         let window = std::time::Duration::from_secs(15 * 60);
         let mut inst = Instance::new("test", "/tmp/test");
         inst.status = Status::Idle;
-        inst.idle_entered_at = Some(Utc::now() - chrono::Duration::seconds(60));
+        inst.idle_entered_at = Some(Timestamp::now() - crate::time::Duration::seconds(60));
         assert!(inst.has_recent_activity(window));
     }
 
@@ -1054,7 +1061,7 @@ mod tests {
         let window = std::time::Duration::from_secs(15 * 60);
         let mut inst = Instance::new("test", "/tmp/test");
         inst.status = Status::Idle;
-        inst.idle_entered_at = Some(Utc::now() - chrono::Duration::minutes(30));
+        inst.idle_entered_at = Some(Timestamp::now() - crate::time::Duration::minutes(30));
         assert!(!inst.has_recent_activity(window));
     }
 

@@ -1,7 +1,7 @@
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fmt;
 
-use chrono::{DateTime, Utc};
+use crate::time::Timestamp;
 use serde::de::{self, MapAccess, Visitor};
 use serde::{Deserialize, Deserializer, Serialize};
 
@@ -224,7 +224,7 @@ impl SessionRead {
     }
 
     fn from_projection(row: &SessionProjection<'_>) -> Self {
-        let timestamp = |value: Option<DateTime<Utc>>| value.map(wire_timestamp);
+        let timestamp = |value: Option<Timestamp>| value.map(wire_timestamp);
         Self {
             id: row.id.to_string(),
             title: row.title.to_string(),
@@ -266,8 +266,8 @@ impl SessionRead {
     }
 }
 
-pub(crate) fn wire_timestamp(value: DateTime<Utc>) -> String {
-    value.to_rfc3339_opts(chrono::SecondsFormat::AutoSi, true)
+pub(crate) fn wire_timestamp(value: Timestamp) -> String {
+    value.to_rfc3339_opts(crate::time::SecondsFormat::AutoSi, true)
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
@@ -1043,7 +1043,7 @@ fn is_c1_c0(value: char) -> bool {
 }
 
 /// `YYYY-MM-DDTHH:MM:SS[.f{3,6,9}]Z`: UTC, `Z` zoned, and either a whole
-/// second or the three fractional widths chrono's `AutoSi` writes. The fixed
+/// second or the three fractional widths `SecondsFormat::AutoSi` writes. The fixed
 /// separators are checked by position and the value must parse, so a
 /// permissive length is the only thing that is relaxed: a control character, a
 /// numeric offset or a lowercase `t`/`z` is still refused.
@@ -1075,7 +1075,7 @@ fn valid_timestamp(value: &str) -> bool {
     if !matches!(fraction.len(), 0 | 3 | 6 | 9) || !fraction.iter().all(u8::is_ascii_digit) {
         return false;
     }
-    value.ends_with('Z') && chrono::DateTime::parse_from_rfc3339(value).is_ok()
+    value.ends_with('Z') && crate::time::Timestamp::parse_rfc3339(value).is_ok()
 }
 
 /// Canonical absolute POSIX spelling; native components may contain controls, but not NUL.

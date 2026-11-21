@@ -934,7 +934,7 @@ impl PluginJobRegistry {
                 kind,
                 target,
                 status: PluginJobStatus::Running,
-                started_at: chrono::Utc::now().timestamp(),
+                started_at: crate::time::Timestamp::now().as_unix_secs(),
                 finished_at: None,
             },
             log_path: log_path.clone(),
@@ -949,7 +949,7 @@ impl PluginJobRegistry {
         if let Some(tracked) = self.jobs.lock().unwrap().get_mut(id) {
             let duration_ms = tracked.started.elapsed().as_millis();
             let job = &mut tracked.job;
-            job.finished_at = Some(chrono::Utc::now().timestamp());
+            job.finished_at = Some(crate::time::Timestamp::now().as_unix_secs());
             job.status = match result {
                 Ok(()) => {
                     tracing::info!(target: "plugin.install", job_id = %id, kind = ?job.kind, target = %job.target, duration_ms, "plugin job finished");
@@ -971,7 +971,7 @@ impl PluginJobRegistry {
 
     /// Drop finished jobs older than the TTL and remove their log files.
     fn prune(&self) {
-        let cutoff = chrono::Utc::now().timestamp() - FINISHED_JOB_TTL_SECS;
+        let cutoff = crate::time::Timestamp::now().as_unix_secs() - FINISHED_JOB_TTL_SECS;
         self.jobs.lock().unwrap().retain(|_, job| {
             let stale = job.job.finished_at.is_some_and(|t| t < cutoff);
             if stale {
@@ -2335,7 +2335,7 @@ id = "voice"
                         grant: Some(CapabilityGrant {
                             manifest_hash: PluginManifest::hash_bytes(manifest.as_bytes()),
                             capabilities: Vec::new(),
-                            granted_at: chrono::Utc::now(),
+                            granted_at: crate::time::Timestamp::now(),
                         }),
                         ..PluginConfig::default()
                     },
@@ -2613,7 +2613,7 @@ id = "voice"
                 grant: Some(CapabilityGrant {
                     manifest_hash: reader_hash,
                     capabilities: reader_caps.iter().map(|cap| cap.to_string()).collect(),
-                    granted_at: chrono::Utc::now(),
+                    granted_at: crate::time::Timestamp::now(),
                 }),
                 ..PluginConfig::default()
             },
@@ -2624,7 +2624,7 @@ id = "voice"
                 grant: Some(CapabilityGrant {
                     manifest_hash: plain_hash,
                     capabilities: plain_caps.iter().map(|cap| cap.to_string()).collect(),
-                    granted_at: chrono::Utc::now(),
+                    granted_at: crate::time::Timestamp::now(),
                 }),
                 ..PluginConfig::default()
             },
@@ -2667,7 +2667,7 @@ id = "voice"
                     grant: Some(CapabilityGrant {
                         manifest_hash: hash,
                         capabilities: caps.iter().map(|cap| cap.to_string()).collect(),
-                        granted_at: chrono::Utc::now(),
+                        granted_at: crate::time::Timestamp::now(),
                     }),
                     ..PluginConfig::default()
                 },

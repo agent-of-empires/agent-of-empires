@@ -6,8 +6,8 @@ use agent_of_empires::session::{
 };
 use agent_of_empires::telemetry::usage_signals::{self, UsageSeenCounters, USAGE_SIGNALS};
 use agent_of_empires::telemetry::{self, Surface, UsageSnapshot};
+use agent_of_empires::time::Timestamp;
 use agent_of_empires::update::{ReleasesBehind, UpdateStatus};
-use chrono::Utc;
 use serial_test::serial;
 use std::sync::{Arc, Barrier};
 use std::time::Duration;
@@ -84,7 +84,7 @@ fn with_worktree(mut inst: Instance) -> Instance {
         branch: "feature/x".to_string(),
         main_repo_path: "/repo".to_string(),
         managed_by_aoe: true,
-        created_at: Utc::now(),
+        created_at: Timestamp::now(),
         base_branch: None,
     });
     inst
@@ -95,7 +95,7 @@ fn with_workspace(mut inst: Instance) -> Instance {
         branch: "feature/x".to_string(),
         workspace_dir: "/ws".to_string(),
         repos: Vec::new(),
-        created_at: Utc::now(),
+        created_at: Timestamp::now(),
         cleanup_on_delete: true,
     });
     inst

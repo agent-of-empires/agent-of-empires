@@ -628,7 +628,7 @@ pub(crate) async fn purge_expired_trash(state: &Arc<AppState>) {
         .runtime
         .purge_namespace_lease(&state.profile_namespace)
         .await;
-    let now = chrono::Utc::now();
+    let now = crate::time::Timestamp::now();
     let candidates: Vec<String> = state
         .instances
         .read()
@@ -1093,7 +1093,7 @@ pub async fn abandon_purge(
                     .as_ref()
                     .filter(|reservation| {
                         reservation.op != LifecycleOperation::Purge
-                            && row.has_fresh_lifecycle_reservation(chrono::Utc::now())
+                            && row.has_fresh_lifecycle_reservation(crate::time::Timestamp::now())
                     })
                     .map(|reservation| reservation.op);
                 return Err(holder
@@ -1173,7 +1173,7 @@ pub struct DeleteWorkspaceBody {
 
 #[derive(Clone, Deserialize)]
 pub struct TrashPurgeConsent {
-    pub expected_trashed_at: chrono::DateTime<chrono::Utc>,
+    pub expected_trashed_at: crate::time::Timestamp,
     pub expected_trash_lifecycle_id: String,
     pub expected_generation: u64,
 }

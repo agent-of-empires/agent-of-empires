@@ -99,7 +99,8 @@ fn seed_with_default(default: &str) -> Vec<Instance> {
     instance.command = "claude".into();
     instance.tool = "claude".into();
     instance.status = Status::Waiting;
-    instance.created_at = RECORDED_AT.parse().expect("recorded instant");
+    instance.created_at =
+        agent_of_empires::time::Timestamp::parse_rfc3339(RECORDED_AT).expect("recorded instant");
     seed_instances_on_disk_for_test("main", vec![instance.clone()]);
     vec![instance]
 }
@@ -219,7 +220,8 @@ fn re_record_the_affected_transcripts() {
         runtime_epoch: "3f2b1c4d-5e6f-4a7b-8c9d-0e1f2a3b4c5d".into(),
         prebind_instance_id: "9a8b7c6d-5e4f-4a3b-8c2d-1e0f9a8b7c6d".into(),
         runtime_instance_id: "1a2b3c4d-5e6f-4a7b-8c9d-0e1f2a3b4c5e".into(),
-        observed_at: RECORDED_AT.parse().expect("recorded instant"),
+        observed_at: agent_of_empires::time::Timestamp::parse_rfc3339(RECORDED_AT)
+            .expect("recorded instant"),
     };
     for (case, owner) in AFFECTED {
         let _app_dir = TempAppDir::new();

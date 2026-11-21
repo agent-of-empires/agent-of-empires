@@ -4,7 +4,7 @@ use std::collections::HashSet;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use chrono::{DateTime, Utc};
+use crate::time::Timestamp;
 use tokio::io::{AsyncReadExt, AsyncSeekExt, SeekFrom};
 use tokio::sync::mpsc::{Sender, WeakSender};
 use tokio_util::sync::CancellationToken;
@@ -228,8 +228,8 @@ async fn run_progress_tailer(
     let mut offset: u64 = 0;
     let mut line_buf = String::new();
     let mut snap = Snapshot::default();
-    let mut last_progress = Utc::now() - chrono::Duration::seconds(10);
-    let mut last_growth = Utc::now();
+    let mut last_progress = Timestamp::now() - crate::time::Duration::seconds(10);
+    let mut last_growth = Timestamp::now();
     let mut stalled_emitted = false;
     loop {
         let stopping = stop.is_cancelled();
@@ -245,19 +245,18 @@ async fn run_progress_tailer(
             }
             return;
         }
-        let now = Utc::now();
+        let now = Timestamp::now();
         if grew {
             last_growth = now;
             stalled_emitted = false;
         }
-        let idle = (now - last_growth).to_std().unwrap_or(Duration::ZERO);
+        let idle = std::time::Duration::try_from(now - last_growth).unwrap_or(Duration::ZERO);
         let status = if idle >= STALL_AFTER {
             BackgroundAgentStatus::Stalled
         } else {
             BackgroundAgentStatus::Running
         };
-        let throttle_ok = (now - last_progress)
-            .to_std()
+        let throttle_ok = std::time::Duration::try_from(now - last_progress)
             .map(|d| d >= PROGRESS_THROTTLE)
             .unwrap_or(true);
         let stall_edge = status == BackgroundAgentStatus::Stalled && !stalled_emitted;
@@ -291,8 +290,8 @@ struct ToolEntry {
     name: String,
     title: Option<String>,
     ok: Option<bool>,
-    started_at: Option<DateTime<Utc>>,
-    ended_at: Option<DateTime<Utc>>,
+    started_at: Option<Timestamp>,
+    ended_at: Option<Timestamp>,
 }
 
 /// Hard cap on per-agent tool entries carried in events, so a runaway
@@ -358,14 +357,14 @@ async fn run_tailer(
     let mut offset: u64 = 0;
     let mut line_buf = String::new();
     let mut snap = Snapshot::default();
-    let mut last_progress = Utc::now() - chrono::Duration::seconds(10);
-    let mut last_growth = Utc::now();
+    let mut last_progress = Timestamp::now() - crate::time::Duration::seconds(10);
+    let mut last_growth = Timestamp::now();
     let mut stalled_emitted = false;
 
     loop {
         let grew =
             read_new_lines(&source, &output_file, &mut offset, &mut line_buf, &mut snap).await;
-        let now = Utc::now();
+        let now = Timestamp::now();
         if grew {
             last_growth = now;
             stalled_emitted = false;
@@ -386,7 +385,7 @@ async fn run_tailer(
             return;
         }
 
-        let idle = (now - last_growth).to_std().unwrap_or(Duration::ZERO);
+        let idle = std::time::Duration::try_from(now - last_growth).unwrap_or(Duration::ZERO);
         if idle >= ABORT_AFTER {
             // Stopped tracking.
             let (status, result, warning) = infer_idle_outcome(&snap);
@@ -410,8 +409,7 @@ async fn run_tailer(
 
         // Emit a throttled snapshot on real growth, or once when the
         // agent first transitions to Stalled so the panel reflects it.
-        let throttle_ok = (now - last_progress)
-            .to_std()
+        let throttle_ok = std::time::Duration::try_from(now - last_progress)
             .map(|d| d >= PROGRESS_THROTTLE)
             .unwrap_or(true);
         let stall_edge = status == BackgroundAgentStatus::Stalled && !stalled_emitted;
@@ -473,8 +471,7 @@ fn fold_line(line: &str, snap: &mut Snapshot) {
     let at = v
         .get("timestamp")
         .and_then(|t| t.as_str())
-        .and_then(|t| DateTime::parse_from_rfc3339(t).ok())
-        .map(|t| t.with_timezone(&Utc));
+        .and_then(|t| Timestamp::parse_rfc3339(t).ok());
     let Some(msg) = v.get("message") else {
         return;
     };
@@ -522,7 +519,7 @@ fn fold_line(line: &str, snap: &mut Snapshot) {
 }
 
 /// Record a tool call.
-fn fold_tool_use(block: &serde_json::Value, at: Option<DateTime<Utc>>, snap: &mut Snapshot) {
+fn fold_tool_use(block: &serde_json::Value, at: Option<Timestamp>, snap: &mut Snapshot) {
     snap.tool_count += 1;
     snap.last_was_text = false;
     let name = block
@@ -555,7 +552,7 @@ fn fold_tool_use(block: &serde_json::Value, at: Option<DateTime<Utc>>, snap: &mu
 
 /// Fill in a tool's outcome from its `tool_result`, matched by id, and
 /// clear it from the unresolved set (which, unlike `tools`, is uncapped).
-fn fold_tool_result(block: &serde_json::Value, at: Option<DateTime<Utc>>, snap: &mut Snapshot) {
+fn fold_tool_result(block: &serde_json::Value, at: Option<Timestamp>, snap: &mut Snapshot) {
     let Some(id) = block.get("tool_use_id").and_then(|i| i.as_str()) else {
         return;
     };
@@ -661,7 +658,7 @@ fn progress(agent_id: String, status: BackgroundAgentStatus, snap: &Snapshot) ->
         tools: snapshot_tools(snap),
         last_tool: snap.last_tool.clone(),
         last_text: snap.last_text.clone(),
-        at: Utc::now(),
+        at: Timestamp::now(),
     }
 }
 
@@ -678,7 +675,7 @@ fn completed(
         tools,
         result,
         warning,
-        ended_at: Utc::now(),
+        ended_at: Timestamp::now(),
     }
 }
 
@@ -936,7 +933,7 @@ mod tests {
             r#"{"type":"user","timestamp":"not a time","message":{"content":[{"type":"tool_result","tool_use_id":"t2","is_error":false}]}}"#,
         ]);
         let tools = snapshot_tools(&snap);
-        let at = |s: &str| Some(DateTime::parse_from_rfc3339(s).unwrap().with_timezone(&Utc));
+        let at = |s: &str| Some(Timestamp::parse_rfc3339(s).unwrap());
         assert_eq!(tools[0].id.as_deref(), Some("t1"));
         assert_eq!(tools[0].started_at, at("2026-11-06T10:00:00Z"));
         assert_eq!(tools[0].ended_at, at("2026-11-06T10:00:03.500Z"));

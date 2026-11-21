@@ -1,6 +1,6 @@
 //! Group tree management
 
-use chrono::{DateTime, Utc};
+use crate::time::Timestamp;
 use serde::{Deserialize, Serialize};
 use std::cmp::Reverse;
 use std::collections::HashMap;
@@ -83,7 +83,7 @@ pub struct Group {
     #[serde(default)]
     pub collapsed: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub archived_at: Option<DateTime<Utc>>,
+    pub archived_at: Option<Timestamp>,
     #[serde(skip)]
     pub children: Vec<Group>,
 }
@@ -316,7 +316,7 @@ impl GroupTree {
                 group.archived_at = None;
                 false
             } else {
-                group.archived_at = Some(Utc::now());
+                group.archived_at = Some(Timestamp::now());
                 true
             }
         };
@@ -332,7 +332,11 @@ impl GroupTree {
             match (group.archived_at, archived) {
                 (Some(_), true) | (None, false) => {}
                 _ => {
-                    group.archived_at = if archived { Some(Utc::now()) } else { None };
+                    group.archived_at = if archived {
+                        Some(Timestamp::now())
+                    } else {
+                        None
+                    };
                     changed = true;
                 }
             }
@@ -342,7 +346,7 @@ impl GroupTree {
         }
     }
 
-    pub fn group_archived_at(&self, path: &str) -> Option<DateTime<Utc>> {
+    pub fn group_archived_at(&self, path: &str) -> Option<Timestamp> {
         self.groups_by_path.get(path).and_then(|g| g.archived_at)
     }
 
@@ -412,7 +416,7 @@ pub enum Item {
         /// Which profile this group belongs to (set in all-profiles mode)
         profile: Option<String>,
         /// When the group was archived (None = active).
-        archived_at: Option<DateTime<Utc>>,
+        archived_at: Option<Timestamp>,
     },
     Session {
         id: String,
@@ -486,7 +490,7 @@ fn sort_groups<T, N, P, A>(
 ) where
     N: Fn(&T) -> &str,
     P: Fn(&T) -> &str,
-    A: Fn(&T) -> Option<DateTime<Utc>>,
+    A: Fn(&T) -> Option<Timestamp>,
 {
     sort_groups_inner(
         items,
@@ -512,7 +516,7 @@ fn sort_groups_inner<T, N, P, A>(
 ) where
     N: Fn(&T) -> &str,
     P: Fn(&T) -> &str,
-    A: Fn(&T) -> Option<DateTime<Utc>>,
+    A: Fn(&T) -> Option<Timestamp>,
 {
     match sort_order {
         SortOrder::Oldest => {
@@ -564,16 +568,16 @@ fn has_live_favorite(path: &str, instances: &[Instance]) -> bool {
 
 /// Newest and oldest `created_at` in a group, defaulted so an empty group sinks to
 /// the bottom of either ordering.
-fn created_at_bounds(path: &str, instances: &[Instance]) -> (DateTime<Utc>, DateTime<Utc>) {
+fn created_at_bounds(path: &str, instances: &[Instance]) -> (Timestamp, Timestamp) {
     let stamps = || group_members(path, instances).map(|i| i.created_at);
     (
-        stamps().max().unwrap_or(DateTime::<Utc>::MIN_UTC),
-        stamps().min().unwrap_or(DateTime::<Utc>::MAX_UTC),
+        stamps().max().unwrap_or(Timestamp::MIN),
+        stamps().min().unwrap_or(Timestamp::MAX),
     )
 }
 
 /// Most recent `last_accessed_at` among all sessions (direct and nested) in a group.
-fn max_last_accessed_in_group(path: &str, instances: &[Instance]) -> Option<DateTime<Utc>> {
+fn max_last_accessed_in_group(path: &str, instances: &[Instance]) -> Option<Timestamp> {
     group_members(path, instances)
         .filter_map(|i| i.last_accessed_at)
         .max()
@@ -581,7 +585,7 @@ fn max_last_accessed_in_group(path: &str, instances: &[Instance]) -> Option<Date
 
 /// Key used to sort sessions by LastActivity in descending order, pushing sessions with no recorded
 /// activity to the bottom.
-fn last_activity_session_key(inst: &Instance) -> (bool, Reverse<Option<DateTime<Utc>>>) {
+fn last_activity_session_key(inst: &Instance) -> (bool, Reverse<Option<Timestamp>>) {
     (
         inst.last_accessed_at.is_none(),
         Reverse(inst.last_accessed_at),
@@ -593,7 +597,7 @@ fn last_activity_session_key(inst: &Instance) -> (bool, Reverse<Option<DateTime<
 fn last_activity_group_key(
     path: &str,
     instances: &[Instance],
-) -> (bool, Reverse<Option<DateTime<Utc>>>) {
+) -> (bool, Reverse<Option<Timestamp>>) {
     let ts = max_last_accessed_in_group(path, instances);
     (ts.is_none(), Reverse(ts))
 }
@@ -636,8 +640,8 @@ fn attention_session_key(
     u8,
     bool,
     bool,
-    std::cmp::Reverse<Option<DateTime<Utc>>>,
-    Option<DateTime<Utc>>,
+    std::cmp::Reverse<Option<Timestamp>>,
+    Option<Timestamp>,
 ) {
     let tier = attention_tier(inst);
     // Urgent is the cross-tier promoter: an agent that has flagged itself urgent rises above all
@@ -677,15 +681,15 @@ fn attention_session_key(
 #[allow(clippy::type_complexity)]
 fn attention_group_key(
     path: &str,
-    group_archived_at: Option<DateTime<Utc>>,
+    group_archived_at: Option<Timestamp>,
     instances: &[Instance],
 ) -> (
     bool,
     u8,
     bool,
     bool,
-    Reverse<Option<DateTime<Utc>>>,
-    Option<DateTime<Utc>>,
+    Reverse<Option<Timestamp>>,
+    Option<Timestamp>,
 ) {
     let prefix = format!("{}/", path);
     let members: Vec<&Instance> = instances
@@ -962,7 +966,7 @@ fn append_section(
     path: &str,
     name: &str,
     collapsed: bool,
-    stamp: impl Fn(&Instance) -> Option<DateTime<Utc>>,
+    stamp: impl Fn(&Instance) -> Option<Timestamp>,
 ) {
     if members.is_empty() {
         return;
@@ -1093,7 +1097,7 @@ fn sort_archived_project_buckets(buckets: &mut [(String, Vec<&Instance>)], sort_
                     .iter()
                     .filter_map(|i| i.archived_at)
                     .min()
-                    .unwrap_or(DateTime::<Utc>::MAX_UTC)
+                    .unwrap_or(Timestamp::MAX)
             });
         }
         SortOrder::Custom | SortOrder::Newest | SortOrder::Attention => {
@@ -1103,7 +1107,7 @@ fn sort_archived_project_buckets(buckets: &mut [(String, Vec<&Instance>)], sort_
                         .iter()
                         .filter_map(|i| i.archived_at)
                         .max()
-                        .unwrap_or(DateTime::<Utc>::MIN_UTC),
+                        .unwrap_or(Timestamp::MIN),
                 )
             });
         }
@@ -1114,7 +1118,7 @@ fn sort_archived_project_buckets(buckets: &mut [(String, Vec<&Instance>)], sort_
                         .iter()
                         .filter_map(|i| i.last_accessed_at)
                         .max()
-                        .unwrap_or(DateTime::<Utc>::MIN_UTC),
+                        .unwrap_or(Timestamp::MIN),
                 )
             });
         }
@@ -1125,7 +1129,7 @@ fn sort_archived_project_buckets(buckets: &mut [(String, Vec<&Instance>)], sort_
 mod tests {
     use super::*;
     use crate::session::Status;
-    use chrono::Duration;
+    use crate::time::Duration;
 
     fn inst(title: &str, group: &str) -> Instance {
         let mut inst = Instance::new(title, &format!("/tmp/{title}"));
@@ -1403,7 +1407,7 @@ mod tests {
 
     #[test]
     fn last_activity_sorts_descending_with_none_last() {
-        let now = Utc::now();
+        let now = Timestamp::now();
         let mut recent = inst("recent", "");
         recent.last_accessed_at = Some(now);
         let mut older = inst("older", "");
@@ -1442,7 +1446,7 @@ mod tests {
         assert!(snoozed.snoozed_until.is_none());
         snoozed.unarchive();
         snoozed.status = Status::Waiting;
-        snoozed.snoozed_until = Some(Utc::now() - Duration::seconds(1));
+        snoozed.snoozed_until = Some(Timestamp::now() - Duration::seconds(1));
         assert!(!snoozed.is_snoozed() && snoozed.snooze_remaining().is_none());
         assert_eq!(
             attention_tier(&snoozed),
@@ -1456,7 +1460,7 @@ mod tests {
 
     #[test]
     fn attention_session_sort() {
-        let now = Utc::now();
+        let now = Timestamp::now();
         let idle_at = |title: &str, ago: Option<Duration>| {
             let mut i = with_status(title, "", Status::Idle);
             i.last_accessed_at = ago.map(|ago| now - ago);
@@ -1503,7 +1507,7 @@ mod tests {
     #[test]
     #[serial_test::serial]
     fn attention_group_key_cases() {
-        let now = Utc::now();
+        let now = Timestamp::now();
         let mut fresh = with_status("f", "fresh", Status::Idle);
         fresh.last_accessed_at = Some(now - Duration::minutes(5));
         let mut stale = with_status("s", "stale", Status::Idle);
@@ -1588,7 +1592,7 @@ mod tests {
 
     #[test]
     fn live_favorite_excludes_snoozed_archived_and_trashed() {
-        let now = Utc::now();
+        let now = Timestamp::now();
         let mut fav = inst("fav", "work");
         fav.favorite();
         assert!(is_live_favorite(&fav));
@@ -1620,7 +1624,7 @@ mod tests {
     fn favorites_first_session_sorts() {
         let aged = |title: &str, days: i64, favorite: bool| {
             let mut i = inst(title, "");
-            i.created_at = Utc::now() - Duration::days(days);
+            i.created_at = Timestamp::now() - Duration::days(days);
             if favorite {
                 i.favorite();
             }
@@ -1654,7 +1658,7 @@ mod tests {
     fn favorites_first_group_sorts() {
         let member = |title: &str, group: &str, days: i64| {
             let mut i = inst(title, group);
-            i.created_at = Utc::now() - Duration::days(days);
+            i.created_at = Timestamp::now() - Duration::days(days);
             i
         };
         let sorted_first = |instances: &[Instance], favorites_first: bool| {
@@ -1678,7 +1682,7 @@ mod tests {
 
         let mut archived = instances.clone();
         archived[0].archive();
-        archived[0].favorited_at = Some(Utc::now());
+        archived[0].favorited_at = Some(Timestamp::now());
         assert_eq!(
             sorted_first(&archived, true),
             "new",
@@ -1692,7 +1696,7 @@ mod tests {
         let _flag = crate::session::test_support::FavoritesFirstGuard::new();
         let mut old_fav = inst("old_fav", "old");
         old_fav.source_profile = "p1".to_string();
-        old_fav.created_at = Utc::now() - Duration::days(10);
+        old_fav.created_at = Timestamp::now() - Duration::days(10);
         old_fav.favorite();
         let mut new_plain = inst("new_plain", "new");
         new_plain.source_profile = "p2".to_string();
@@ -1724,7 +1728,7 @@ mod tests {
         assert!(!inst.is_snoozed(), "favorite clears snooze");
 
         inst.snooze(30);
-        inst.archived_at = Some(Utc::now());
+        inst.archived_at = Some(Timestamp::now());
         inst.touch_last_accessed();
         assert!(
             !inst.is_archived() && !inst.is_snoozed(),

@@ -1891,7 +1891,8 @@ mod tests {
         let parks: Vec<Park> = vec![
             ("idle-dormant", |i| i.mark_idle_dormant()),
             ("snoozed", |i| {
-                i.snoozed_until = Some(chrono::Utc::now() + chrono::Duration::hours(1))
+                i.snoozed_until =
+                    Some(crate::time::Timestamp::now() + crate::time::Duration::hours(1))
             }),
             ("stopped, nothing to clear", |_| {}),
         ];
@@ -2233,7 +2234,7 @@ mod tests {
             (
                 "cancelling",
                 vec![Event::CancelRequested {
-                    escalates_at: chrono::Utc::now(),
+                    escalates_at: crate::time::Timestamp::now(),
                 }],
                 crate::acp::dispatch::PromptDispatch::Queued {
                     reason: crate::acp::dispatch::QueueReason::Cancelling,
@@ -2291,7 +2292,8 @@ mod tests {
         let parks: Vec<Park> = vec![
             ("idle-dormant", |i| i.mark_idle_dormant()),
             ("snoozed", |i| {
-                i.snoozed_until = Some(chrono::Utc::now() + chrono::Duration::hours(1))
+                i.snoozed_until =
+                    Some(crate::time::Timestamp::now() + crate::time::Duration::hours(1))
             }),
             ("stopped by the user, nothing to clear", |_| {}),
         ];
@@ -2341,7 +2343,8 @@ mod tests {
         type Park = (&'static str, fn(&mut Instance));
         let parks: Vec<Park> = vec![
             ("snoozed", |i| {
-                i.snoozed_until = Some(chrono::Utc::now() + chrono::Duration::hours(1))
+                i.snoozed_until =
+                    Some(crate::time::Timestamp::now() + crate::time::Duration::hours(1))
             }),
             ("idle-dormant", |i| i.mark_idle_dormant()),
             ("idle", |i| i.status = Status::Idle),

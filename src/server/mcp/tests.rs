@@ -1442,7 +1442,7 @@ fn approval_requested(
                 kind: "execute".into(),
                 args_preview: json!({"command": "cargo test\nmore"}).to_string(),
                 prompt: None,
-                started_at: chrono::Utc::now(),
+                started_at: crate::time::Timestamp::now(),
                 parent_tool_call_id: None,
                 memory_recall: None,
                 diffs: Vec::new(),
@@ -1451,7 +1451,7 @@ fn approval_requested(
             choice: is_choice_list(&options),
             options,
             plan: None,
-            requested_at: chrono::Utc::now(),
+            requested_at: crate::time::Timestamp::now(),
             resolved: None,
         },
     }

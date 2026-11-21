@@ -1132,7 +1132,7 @@ async fn canonical_fork_refusals_do_not_create_sessions() -> anyhow::Result<()> 
     state.instances.write().await[0].try_acquire_lifecycle_reservation(
         crate::session::LifecycleOperation::Launch,
         Instance::LIFECYCLE_RESERVATION_TTL,
-        chrono::Utc::now(),
+        crate::time::Timestamp::now(),
     )?;
     let body = serde_json::json!({
         "path": project.path(), "profile": "fork-source", "tool": "claude",
@@ -1323,7 +1323,7 @@ async fn trash_preserves_idempotency_and_rejects_stale_generations_or_profiles(
             row.try_acquire_lifecycle_reservation(
                 operation,
                 Instance::LIFECYCLE_RESERVATION_TTL,
-                chrono::Utc::now(),
+                crate::time::Timestamp::now(),
             )?;
         }
         let id = row.id.clone();
@@ -1488,7 +1488,7 @@ async fn startup_reconcile_keeps_worktree_after_failed_trash_teardown() -> anyho
         branch: "failed-teardown".into(),
         main_repo_path: main.to_string_lossy().into_owned(),
         managed_by_aoe: true,
-        created_at: chrono::Utc::now(),
+        created_at: crate::time::Timestamp::now(),
         base_branch: None,
     });
     let id = row.id.clone();
@@ -1635,13 +1635,15 @@ async fn trash_retry_releases_missing_worktree_for_direct_purge() -> anyhow::Res
             branch: "missing-trash".into(),
             main_repo_path: main.to_string_lossy().into_owned(),
             managed_by_aoe: true,
-            created_at: chrono::Utc::now(),
+            created_at: crate::time::Timestamp::now(),
             base_branch: None,
         });
         row.try_acquire_lifecycle_reservation(
             crate::session::LifecycleOperation::Trash,
             Instance::LIFECYCLE_RESERVATION_TTL,
-            chrono::Utc::now() - Instance::LIFECYCLE_RESERVATION_TTL - chrono::Duration::seconds(1),
+            crate::time::Timestamp::now()
+                - Instance::LIFECYCLE_RESERVATION_TTL
+                - crate::time::Duration::seconds(1),
         )?;
         row.trash();
         let mut moved = row.clone();
@@ -1786,7 +1788,7 @@ async fn trash_retry_finishes_expired_transition_after_startup() -> anyhow::Resu
             branch: "interrupted-trash".into(),
             main_repo_path: main_repo.to_string_lossy().into_owned(),
             managed_by_aoe: true,
-            created_at: chrono::Utc::now(),
+            created_at: crate::time::Timestamp::now(),
             base_branch: None,
         });
         let id = row.id.clone();
@@ -1807,7 +1809,9 @@ async fn trash_retry_finishes_expired_transition_after_startup() -> anyhow::Resu
         row.try_acquire_lifecycle_reservation(
             crate::session::LifecycleOperation::Trash,
             Instance::LIFECYCLE_RESERVATION_TTL,
-            chrono::Utc::now() - Instance::LIFECYCLE_RESERVATION_TTL - chrono::Duration::seconds(1),
+            crate::time::Timestamp::now()
+                - Instance::LIFECYCLE_RESERVATION_TTL
+                - crate::time::Duration::seconds(1),
         )?;
         row.trash();
         let mut generation = row.lifecycle_generation;
@@ -1932,7 +1936,7 @@ async fn trash_retry_finishes_expired_transition_after_startup() -> anyhow::Resu
                     .find(|row| row.id == id)
                     .unwrap();
                 assert!(pending.has_pending_trash());
-                assert!(!pending.has_fresh_lifecycle_reservation(chrono::Utc::now()));
+                assert!(!pending.has_fresh_lifecycle_reservation(crate::time::Timestamp::now()));
                 assert_eq!(pending.lifecycle_generation, generation + 1);
                 generation = pending.lifecycle_generation;
                 let response = restore_session(State(state.clone()), Path(id.clone()))
@@ -2050,7 +2054,7 @@ async fn lifecycle_requests_reject_a_peer_reservation_without_acknowledging_it(
         row.try_acquire_lifecycle_reservation(
             operation,
             Instance::LIFECYCLE_RESERVATION_TTL,
-            chrono::Utc::now(),
+            crate::time::Timestamp::now(),
         )?;
         let id = row.id.clone();
         let generation = row.lifecycle_generation;
@@ -2157,7 +2161,7 @@ async fn restart_refusal_preserves_authoritative_launch_fields() -> anyhow::Resu
             row.try_acquire_lifecycle_reservation(
                 crate::session::LifecycleOperation::Launch,
                 Instance::LIFECYCLE_RESERVATION_TTL,
-                chrono::Utc::now(),
+                crate::time::Timestamp::now(),
             )?;
         }
         let before = row.clone();
@@ -2415,7 +2419,7 @@ async fn archived_session_cannot_be_started_or_ensured() -> anyhow::Result<()> {
     let mut row = Instance::new("archived launch", "/tmp/archived-launch");
     row.source_profile = "archive-guard".into();
     row.status = Status::Stopped;
-    row.archived_at = Some(chrono::Utc::now());
+    row.archived_at = Some(crate::time::Timestamp::now());
     let id = row.id.clone();
     let state = crate::server::test_support::build_test_app_state(vec![row.clone()]);
     let storage = Storage::new("archive-guard", state.file_watch.clone())?;
@@ -2598,7 +2602,7 @@ async fn engagement_unsinks_archived_and_snoozed_row_in_one_canonical_commit() -
     row.source_profile = "receipt".into();
     row.archive();
     row.snooze(30);
-    row.last_accessed_at = Some(chrono::Utc::now() - chrono::Duration::days(1));
+    row.last_accessed_at = Some(crate::time::Timestamp::now() - crate::time::Duration::days(1));
     let previous_access = row.last_accessed_at;
     let id = row.id.clone();
     let state = crate::server::test_support::build_test_app_state(vec![row.clone()]);
@@ -2787,7 +2791,7 @@ async fn trash_restore_receipts_publish_complete_peer_bundles() -> anyhow::Resul
         branch: "receipt-branch".into(),
         main_repo_path: main_repo.to_string_lossy().into_owned(),
         managed_by_aoe: true,
-        created_at: chrono::Utc::now(),
+        created_at: crate::time::Timestamp::now(),
         base_branch: None,
     });
     row.source_profile = "receipt".into();
@@ -2976,7 +2980,7 @@ async fn purge_of_a_busy_session_names_the_holder_and_retries_after_release() ->
             .try_acquire_lifecycle_reservation(
                 crate::session::LifecycleOperation::Restore,
                 Instance::LIFECYCLE_RESERVATION_TTL,
-                chrono::Utc::now(),
+                crate::time::Timestamp::now(),
             )
             .unwrap())
     })?;
@@ -3396,7 +3400,7 @@ async fn abandon_purge_requires_current_ownership_without_waiting_for_teardown(
     let generation = row.try_acquire_lifecycle_reservation(
         LifecycleOperation::Purge,
         Instance::LIFECYCLE_RESERVATION_TTL,
-        chrono::Utc::now(),
+        crate::time::Timestamp::now(),
     )?;
     let id = row.id.clone();
     let storage = Storage::new_unwatched(profile)?;
@@ -3573,7 +3577,7 @@ async fn abandon_purge_preserves_read_only_and_cityhall_policy() -> anyhow::Resu
         let generation = row.try_acquire_lifecycle_reservation(
             LifecycleOperation::Purge,
             Instance::LIFECYCLE_RESERVATION_TTL,
-            chrono::Utc::now(),
+            crate::time::Timestamp::now(),
         )?;
         let id = row.id.clone();
         let storage = Storage::new_unwatched("abandon-policy")?;
@@ -4243,7 +4247,7 @@ fn worktree(
         branch: branch.to_string(),
         main_repo_path: main_repo_path.into(),
         managed_by_aoe: true,
-        created_at: chrono::Utc::now(),
+        created_at: crate::time::Timestamp::now(),
         base_branch: base_branch.map(str::to_string),
     }
 }
@@ -4911,7 +4915,7 @@ async fn list_sessions_state_filter() {
     trashed.trash();
     let mut archived = Instance::new("archived", "/tmp/scope-archived");
     archived.id = "scope-archived".to_string();
-    archived.archived_at = Some(chrono::Utc::now());
+    archived.archived_at = Some(crate::time::Timestamp::now());
 
     let state = crate::server::test_support::build_test_app_state(vec![
         live.clone(),
@@ -5001,7 +5005,7 @@ async fn wait_until_left_starting_resolves_on_broadcast() {
             effective_profile: "default".to_string(),
             old: Status::Starting,
             new: Status::Waiting,
-            at: chrono::Utc::now(),
+            at: crate::time::Timestamp::now(),
         })
         .expect("the waiter must be subscribed before the transition");
 
@@ -5672,7 +5676,7 @@ fn session_response_from_instance_reports_managed_worktree_for_workspace_session
             base_branch: None,
             base_branch_override: None,
         }],
-        created_at: chrono::Utc::now(),
+        created_at: crate::time::Timestamp::now(),
         cleanup_on_delete: true,
     });
 
@@ -6085,7 +6089,7 @@ fn diff_repos_of_scopes_bases_per_workspace_repo() {
             repo("web", Some("develop"), Some("epic/checkout")),
             repo("infra", None, None),
         ],
-        created_at: chrono::Utc::now(),
+        created_at: crate::time::Timestamp::now(),
         cleanup_on_delete: true,
     });
 
@@ -6118,7 +6122,7 @@ fn diff_repos_of_scopes_bases_per_workspace_repo() {
         branch: "feature/x".to_string(),
         main_repo_path: "/src/only".to_string(),
         managed_by_aoe: true,
-        created_at: chrono::Utc::now(),
+        created_at: crate::time::Timestamp::now(),
         base_branch: Some("develop".to_string()),
     });
     let repos = diff_repos_of(&single);
@@ -6218,7 +6222,7 @@ fn session_response_flags_a_working_directory_outside_any_repository() {
         branch: "feature/x".to_string(),
         workspace_dir: plain_path.to_string(),
         repos: Vec::new(),
-        created_at: chrono::Utc::now(),
+        created_at: crate::time::Timestamp::now(),
         cleanup_on_delete: true,
     });
 
@@ -6268,7 +6272,7 @@ fn apply_diff_base_override_writes_only_the_named_repo() {
                 base_branch_override: None,
             })
             .collect(),
-        created_at: chrono::Utc::now(),
+        created_at: crate::time::Timestamp::now(),
         cleanup_on_delete: true,
     });
 
@@ -6318,7 +6322,7 @@ fn diff_base_target_defaults_only_an_unambiguous_workspace_repo() {
                         base_branch_override: None,
                     })
                     .collect(),
-                created_at: chrono::Utc::now(),
+                created_at: crate::time::Timestamp::now(),
                 cleanup_on_delete: true,
             });
         }
@@ -6358,7 +6362,7 @@ fn session_response_gates_snoozed_until_on_active_snooze() {
     // but the API gates on `is_snoozed()` so the wire value is None.
     // This prevents the web from rendering "snoozed 0m" on rows that
     // have already woken on the server.
-    inst.snoozed_until = Some(chrono::Utc::now() - chrono::Duration::seconds(1));
+    inst.snoozed_until = Some(crate::time::Timestamp::now() - crate::time::Duration::seconds(1));
     let resp = session_response_from_instance(&inst, false);
     assert!(
         resp.snoozed_until.is_none(),
@@ -6391,7 +6395,7 @@ async fn rename_session_distinguishes_cwd_stable_title_and_branch_changes() {
             .to_string_lossy()
             .into_owned(),
         managed_by_aoe: true,
-        created_at: chrono::Utc::now(),
+        created_at: crate::time::Timestamp::now(),
         base_branch: None,
     });
 
@@ -6409,7 +6413,7 @@ async fn rename_session_distinguishes_cwd_stable_title_and_branch_changes() {
             .to_string_lossy()
             .into_owned(),
         managed_by_aoe: true,
-        created_at: chrono::Utc::now(),
+        created_at: crate::time::Timestamp::now(),
         base_branch: None,
     });
 
@@ -6973,7 +6977,7 @@ async fn the_retention_purge_takes_submission_before_the_instance_lock() {
     )
     .unwrap();
     let mut inst = make_test_instance();
-    inst.trashed_at = Some(chrono::Utc::now() - chrono::Duration::days(2));
+    inst.trashed_at = Some(crate::time::Timestamp::now() - crate::time::Duration::days(2));
     let id = inst.id.clone();
     let state = crate::server::test_support::build_test_app_state(vec![inst]);
     let submission = state.session_service.prompt_submission(&id).await;
@@ -7503,7 +7507,7 @@ async fn diff_file_rejects_workspace_with_no_repos() {
         branch: "main".to_string(),
         workspace_dir: "/tmp/aoe-empty-ws".to_string(),
         repos: Vec::new(),
-        created_at: chrono::Utc::now(),
+        created_at: crate::time::Timestamp::now(),
         cleanup_on_delete: true,
     });
     let state = crate::server::test_support::build_test_app_state(vec![inst]);
@@ -7572,7 +7576,7 @@ mod open_file {
             branch: "feature/x".to_string(),
             workspace_dir: dir.to_string_lossy().into_owned(),
             repos,
-            created_at: chrono::Utc::now(),
+            created_at: crate::time::Timestamp::now(),
             cleanup_on_delete: true,
         });
         inst
@@ -7808,7 +7812,7 @@ mod open_file {
             name: "Write".to_string(),
             kind: "edit".to_string(),
             args_preview: serde_json::json!({ "file_path": &touched }).to_string(),
-            started_at: chrono::Utc::now(),
+            started_at: crate::time::Timestamp::now(),
             parent_tool_call_id: None,
             memory_recall: None,
             diffs: Vec::new(),
@@ -8109,7 +8113,7 @@ async fn structured_start_and_prompt_wake_recheck_the_stored_row() {
         inst.source_profile = profile.to_string();
         inst.status = Status::Stopped;
         // Snoozed in memory so the prompt path would wake (and persist) it.
-        inst.snoozed_until = Some(chrono::Utc::now() + chrono::Duration::hours(1));
+        inst.snoozed_until = Some(crate::time::Timestamp::now() + crate::time::Duration::hours(1));
         let id = inst.id.clone();
         let mut peer = inst.clone();
         peer.archive();
@@ -8480,19 +8484,21 @@ async fn archive_refuses_trashed_row_and_keeps_preserved_flags() -> anyhow::Resu
     let mut trashed = make_test_instance();
     trashed.source_profile = profile.to_string();
     trashed.status = Status::Stopped;
-    trashed.pinned_at = Some(chrono::Utc::now());
+    trashed.pinned_at = Some(crate::time::Timestamp::now());
     trashed.trash();
     let mut active = make_test_instance();
     active.source_profile = profile.to_string();
     active.status = Status::Stopped;
-    active.pinned_at = Some(chrono::Utc::now());
+    active.pinned_at = Some(crate::time::Timestamp::now());
     let mut pending = make_test_instance();
     pending.source_profile = profile.to_string();
     pending.status = Status::Stopped;
     pending.try_acquire_lifecycle_reservation(
         crate::session::LifecycleOperation::Trash,
         Instance::LIFECYCLE_RESERVATION_TTL,
-        chrono::Utc::now() - Instance::LIFECYCLE_RESERVATION_TTL - chrono::Duration::seconds(1),
+        crate::time::Timestamp::now()
+            - Instance::LIFECYCLE_RESERVATION_TTL
+            - crate::time::Duration::seconds(1),
     )?;
     pending.trash();
     assert!(pending.has_pending_trash());
@@ -10098,7 +10104,7 @@ async fn list_sessions_projects_pending_approvals_only_for_running_workers() {
             name: "shell".to_string(),
             kind: "execute".to_string(),
             args_preview: r#"{"command":"echo hello"}"#.to_string(),
-            started_at: chrono::Utc::now(),
+            started_at: crate::time::Timestamp::now(),
             parent_tool_call_id: None,
             memory_recall: None,
             diffs: Vec::new(),
@@ -10168,7 +10174,7 @@ async fn list_sessions_applies_project_smart_rename_override_to_worktree_session
         branch: "feat".to_string(),
         main_repo_path: repo.path().to_string_lossy().into_owned(),
         managed_by_aoe: true,
-        created_at: chrono::Utc::now(),
+        created_at: crate::time::Timestamp::now(),
         base_branch: None,
     });
     // Same checkout without the worktree link: unregistered, so it stays eligible.
@@ -10339,7 +10345,7 @@ async fn permanent_delete_keeps_a_worktree_a_surviving_session_uses() {
                 branch: "feat".into(),
                 main_repo_path: main_repo.to_string_lossy().into_owned(),
                 managed_by_aoe: managed,
-                created_at: chrono::Utc::now(),
+                created_at: crate::time::Timestamp::now(),
                 base_branch: None,
             });
             inst
@@ -12171,7 +12177,7 @@ async fn workspace_purge_retains_changed_trash_lifecycles_and_requires_complete_
             "timestamp" => {
                 current.trashed_at = selected
                     .trashed_at
-                    .map(|at| at + chrono::Duration::seconds(1));
+                    .map(|at| at + crate::time::Duration::seconds(1));
             }
             _ => {}
         }
@@ -12250,7 +12256,7 @@ async fn committed_setting_reports_unconfirmed_until_canonical_recovery() -> any
         "default".into(),
         "favorite adoption",
         move |rows| {
-            rows[0].favorited_at = Some(chrono::Utc::now());
+            rows[0].favorited_at = Some(crate::time::Timestamp::now());
             failing_state
                 .canonical_metadata
                 .blocking_write()
@@ -12344,7 +12350,7 @@ async fn workspace_trash_consent_follows_siblings_and_protects_the_shared_owner(
                 branch: "selected".into(),
                 main_repo_path: repo.to_string_lossy().into_owned(),
                 managed_by_aoe: managed,
-                created_at: chrono::Utc::now(),
+                created_at: crate::time::Timestamp::now(),
                 base_branch: None,
             });
             row.trash();
@@ -12610,7 +12616,7 @@ async fn recreate_container_removes_the_container_before_the_agent_restarts() ->
             row.try_acquire_lifecycle_reservation(
                 crate::session::LifecycleOperation::Launch,
                 Instance::LIFECYCLE_RESERVATION_TTL,
-                chrono::Utc::now(),
+                crate::time::Timestamp::now(),
             )?;
         }
         crate::server::test_support::seed_instances_on_disk_for_test("default", vec![row.clone()]);
@@ -12680,7 +12686,7 @@ async fn empty_trash_purges_one_profiles_trash_and_reports_busy_rows() -> anyhow
     busy.try_acquire_lifecycle_reservation(
         LifecycleOperation::Restore,
         Instance::LIFECYCLE_RESERVATION_TTL,
-        chrono::Utc::now(),
+        crate::time::Timestamp::now(),
     )?;
     let live = row("live", profile, false);
     let elsewhere = row("elsewhere", other, true);
@@ -13787,7 +13793,7 @@ async fn create_with_a_parent_joins_its_group_one_level_deep() {
     let mut trashed = Instance::new("trashed", "/tmp/aoe-trashed");
     trashed.id = "trashed".into();
     trashed.source_profile = "test".into();
-    trashed.trashed_at = Some(chrono::Utc::now());
+    trashed.trashed_at = Some(crate::time::Timestamp::now());
     crate::session::Storage::new_unwatched("other").unwrap();
     let mut elsewhere = Instance::new("elsewhere", "/tmp/aoe-elsewhere");
     elsewhere.id = "other-parent".into();
@@ -13960,7 +13966,7 @@ async fn cli_create_refuses_a_trashed_parent() {
     let mut trashed = Instance::new("old", project.path().to_str().unwrap());
     trashed.id = "trashed-id".into();
     trashed.source_profile = "test".into();
-    trashed.trashed_at = Some(chrono::Utc::now());
+    trashed.trashed_at = Some(crate::time::Timestamp::now());
     support::seed_instances_on_disk_for_test("test", vec![trashed.clone()]);
     let state = support::build_test_app_state(vec![trashed]);
     support::refresh_canonical_metadata_for_test(&state).await;
@@ -14004,7 +14010,7 @@ async fn cli_refused_parent_leaves_no_worktree_branch_or_session() {
         row
     };
     let mut trashed = seeded("trashed-id");
-    trashed.trashed_at = Some(chrono::Utc::now());
+    trashed.trashed_at = Some(crate::time::Timestamp::now());
     let mut child = seeded("child-id");
     child.parent_session_id = Some("top-id".into());
     support::seed_instances_on_disk_for_test("test", vec![trashed.clone(), child.clone()]);
@@ -14183,7 +14189,7 @@ async fn recreate_container_checks_the_sandbox_login_before_discarding_anything(
                     let stored = crate::session::Storage::open_unwatched("default")?.load()?;
                     assert_eq!(stored[0].status, Status::Stopped, "{case}");
                     assert!(
-                        !stored[0].has_fresh_lifecycle_reservation(chrono::Utc::now()),
+                        !stored[0].has_fresh_lifecycle_reservation(crate::time::Timestamp::now()),
                         "{case}: nothing was reserved"
                     );
                 }
@@ -14524,7 +14530,7 @@ async fn a_refused_account_swap_leaves_every_kind_of_session_untouched() {
         inst.tool = "claude".into();
         inst.view = crate::session::View::Structured;
         inst.status = status;
-        inst.idle_dormant_since = dormant.then(chrono::Utc::now);
+        inst.idle_dormant_since = dormant.then(crate::time::Timestamp::now);
         let before = inst.clone();
         let intent_before = crate::process::worker_registry::stop_intent(&inst.id)
             .unwrap()
@@ -14600,7 +14606,7 @@ async fn an_account_swap_out_of_a_rate_limit_park_continues_the_interrupted_prom
     }
     crate::server::test_support::seed_instances_on_disk_for_test("default", rows.clone());
     let state = crate::server::test_support::build_test_app_state(rows);
-    let resets_at = chrono::Utc::now() + chrono::Duration::hours(1);
+    let resets_at = crate::time::Timestamp::now() + crate::time::Duration::hours(1);
     let prompt = || Event::UserPromptSent {
         text: "finish the migration".into(),
         attachments: Vec::new(),
@@ -14759,7 +14765,7 @@ async fn the_selected_work_verdict_survives_a_concurrent_pending_turn_drain() {
     crate::server::test_support::seed_instances_on_disk_for_test("default", vec![row.clone()]);
     let generation = row.lifecycle_generation;
     let state = crate::server::test_support::build_test_app_state(vec![row]);
-    let resets_at = chrono::Utc::now() + chrono::Duration::hours(1);
+    let resets_at = crate::time::Timestamp::now() + crate::time::Duration::hours(1);
     for (seq, event) in [
         Event::UserPromptSent {
             text: "finish the migration".into(),
@@ -15142,7 +15148,7 @@ async fn a_failover_swap_refuses_once_the_park_moved_on() {
         Event::RateLimit {
             info: crate::acp::state::RateLimitInfo {
                 status: "limited".into(),
-                resets_at: Some(chrono::Utc::now() + chrono::Duration::hours(1)),
+                resets_at: Some(crate::time::Timestamp::now() + crate::time::Duration::hours(1)),
                 kind: "usage".into(),
             },
         },
@@ -15211,7 +15217,7 @@ async fn a_failed_failover_swap_leaves_the_row_on_its_account() {
         Event::RateLimit {
             info: crate::acp::state::RateLimitInfo {
                 status: "limited".into(),
-                resets_at: Some(chrono::Utc::now() + chrono::Duration::days(2)),
+                resets_at: Some(crate::time::Timestamp::now() + crate::time::Duration::days(2)),
                 kind: "weekly".into(),
             },
         },
@@ -15313,7 +15319,7 @@ async fn failing_failover_swap_fixture(
         Event::RateLimit {
             info: crate::acp::state::RateLimitInfo {
                 status: "limited".into(),
-                resets_at: Some(chrono::Utc::now() + chrono::Duration::days(2)),
+                resets_at: Some(crate::time::Timestamp::now() + crate::time::Duration::days(2)),
                 kind: "weekly".into(),
             },
         },
@@ -15377,7 +15383,7 @@ async fn a_failed_failover_rollback_leaves_a_newer_stop_alone() {
         async move {
             another_operation_completes(&state, &row, |row| {
                 row.status = Status::Stopped;
-                row.idle_dormant_since = Some(chrono::Utc::now());
+                row.idle_dormant_since = Some(crate::time::Timestamp::now());
             })
             .await;
         }
@@ -15529,7 +15535,9 @@ fn rate_limited_then_working_launcher(
                     crate::acp::acp_client::AcpError::RateLimited(Box::new(
                         crate::acp::state::RateLimitInfo {
                             status: "limited".into(),
-                            resets_at: Some(chrono::Utc::now() + chrono::Duration::hours(3)),
+                            resets_at: Some(
+                                crate::time::Timestamp::now() + crate::time::Duration::hours(3),
+                            ),
                             kind: "usage".into(),
                         },
                     )),
@@ -15597,7 +15605,7 @@ async fn failover_pool_fixture(
         Event::RateLimit {
             info: crate::acp::state::RateLimitInfo {
                 status: "limited".into(),
-                resets_at: Some(chrono::Utc::now() + chrono::Duration::days(2)),
+                resets_at: Some(crate::time::Timestamp::now() + crate::time::Duration::days(2)),
                 kind: "weekly".into(),
             },
         },
@@ -15657,7 +15665,7 @@ async fn a_target_limited_at_initialize_is_skipped_by_the_next_pass() {
     );
     let on_b = state.acp_event_store.account_state(&key("b")).unwrap();
     let usage = on_b.window("usage").expect("B's limit is B's");
-    assert!(usage.until_ms > chrono::Utc::now().timestamp_millis());
+    assert!(usage.until_ms > crate::time::Timestamp::now().as_millis());
     let on_a = state.acp_event_store.account_state(&key("a")).unwrap();
     assert!(on_a.window("usage").is_none(), "A never saw B's window");
     assert!(on_a.window("weekly").is_some(), "A keeps its own park");
@@ -15885,9 +15893,9 @@ async fn project_sessions_omits_context_resume_for_archived_and_trashed_rows() {
     };
     let live = row("live");
     let mut archived = row("archived");
-    archived.archived_at = Some(chrono::Utc::now());
+    archived.archived_at = Some(crate::time::Timestamp::now());
     let mut trashed = row("trashed");
-    trashed.trashed_at = Some(chrono::Utc::now());
+    trashed.trashed_at = Some(crate::time::Timestamp::now());
     let state = crate::server::test_support::build_test_app_state(vec![live, archived, trashed]);
     let response = project_sessions(&state).await;
     let resume = |id: &str| {
@@ -16006,7 +16014,9 @@ async fn the_list_projects_each_queues_count_and_what_it_waits_on() {
             let limit = Event::RateLimit {
                 info: crate::acp::state::RateLimitInfo {
                     status: "limited".into(),
-                    resets_at: Some(chrono::Utc::now() + chrono::Duration::hours(1)),
+                    resets_at: Some(
+                        crate::time::Timestamp::now() + crate::time::Duration::hours(1),
+                    ),
                     kind: "usage".into(),
                 },
             };

@@ -4530,7 +4530,7 @@ mod tests {
                                 manifest.as_bytes(),
                             ),
                             capabilities: vec![],
-                            granted_at: chrono::Utc::now(),
+                            granted_at: crate::time::Timestamp::now(),
                         }),
                         ..PluginConfig::default()
                     },

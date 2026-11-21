@@ -1116,9 +1116,7 @@ mod tests {
             effective_profile: "default".to_string(),
             old,
             new,
-            at: chrono::DateTime::parse_from_rfc3339("2026-10-03T12:00:00Z")
-                .unwrap()
-                .with_timezone(&chrono::Utc),
+            at: crate::time::Timestamp::parse_rfc3339("2026-10-03T12:00:00Z").unwrap(),
         }
     }
 
@@ -1143,9 +1141,7 @@ mod tests {
             session_id: "sess-1".to_string(),
             effective_profile: profile.to_string(),
             kind,
-            at: chrono::DateTime::parse_from_rfc3339("2026-10-05T12:00:00Z")
-                .unwrap()
-                .with_timezone(&chrono::Utc),
+            at: crate::time::Timestamp::parse_rfc3339("2026-10-05T12:00:00Z").unwrap(),
             summary: (kind != LifecycleKind::Deleted).then_some(summary),
         }
     }
@@ -1640,7 +1636,7 @@ command = ["sleep", "600"]
                             manifest.as_bytes(),
                         ),
                         capabilities: vec!["runtime.worker".to_string()],
-                        granted_at: chrono::Utc::now(),
+                        granted_at: crate::time::Timestamp::now(),
                     }),
                     ..PluginConfig::default()
                 },

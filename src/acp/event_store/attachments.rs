@@ -31,7 +31,7 @@ impl EventStore {
     /// Persist a blob keyed to its `UserPromptSent` seq, so retention and
     /// session delete drop it with that event.
     pub fn record_attachment(&self, session_id: &str, seq: u64, blob: &AttachmentBlob) -> bool {
-        let now_ms = chrono::Utc::now().timestamp_millis();
+        let now_ms = crate::time::Timestamp::now().as_millis();
         events::insert_attachment(
             &self.conn(),
             &self.schema,
@@ -67,7 +67,7 @@ impl EventStore {
         ref_id: &str,
         blob: &AttachmentBlob,
     ) -> bool {
-        let now_ms = chrono::Utc::now().timestamp_millis();
+        let now_ms = crate::time::Timestamp::now().as_millis();
         events::insert_pending_attachment(
             &self.conn(),
             &self.schema,
@@ -113,7 +113,8 @@ impl EventStore {
     /// Prune queued blobs older than `max_age`, so a prompt queued against a
     /// session that never idles again cannot buffer bytes forever.
     pub fn prune_pending_attachments_older_than(&self, max_age: std::time::Duration) -> usize {
-        let cutoff_ms = chrono::Utc::now().timestamp_millis() - (max_age.as_millis() as i64).max(0);
+        let cutoff_ms =
+            crate::time::Timestamp::now().as_millis() - (max_age.as_millis() as i64).max(0);
         events::prune_pending_attachments_older_than(&self.conn(), &self.schema, cutoff_ms)
     }
 }

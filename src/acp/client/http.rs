@@ -1377,7 +1377,7 @@ mod tests {
         let output = vec![ToolOutputBlock::Text {
             text: "structured output".into(),
         }];
-        let completed_at = chrono::DateTime::from_timestamp(1_700_000_000, 0).unwrap();
+        let completed_at = crate::time::Timestamp::from_unix_secs(1_700_000_000).unwrap();
         state
             .acp_event_store
             .record(
@@ -1527,7 +1527,7 @@ mod tests {
         use crate::acp::state::Event;
         use axum::{routing::get, Router};
         let mut inst = crate::session::Instance::new("retained", "/tmp");
-        inst.trashed_at = Some(chrono::Utc::now());
+        inst.trashed_at = Some(crate::time::Timestamp::now());
         let id = inst.id.clone();
         let state = crate::server::test_support::build_test_app_state(vec![inst]);
         for seq in 10..=16 {
@@ -1577,7 +1577,7 @@ mod tests {
         let inst = crate::session::Instance::new("retained state", "/tmp");
         let id = inst.id.clone();
         let state = crate::server::test_support::build_test_app_state(vec![inst]);
-        let at = chrono::DateTime::from_timestamp(100, 0).unwrap();
+        let at = crate::time::Timestamp::from_unix_secs(100).unwrap();
         let completed = |tool_call_id: &str| Event::ToolCallCompleted {
             tool_call_id: tool_call_id.into(),
             is_error: false,

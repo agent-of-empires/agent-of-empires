@@ -476,10 +476,11 @@ mod tests {
             .into_iter()
             .next()
             .expect("the row must land");
-        let stamped = chrono::DateTime::parse_from_rfc3339(&row.created_at)
-            .expect("the server stamps a readable instant")
-            .with_timezone(&chrono::Utc);
-        let skew = (stamped - chrono::Utc::now()).num_seconds().abs();
+        let stamped = crate::time::Timestamp::parse_rfc3339(&row.created_at)
+            .expect("the server stamps a readable instant");
+        let skew = (stamped - crate::time::Timestamp::now())
+            .whole_seconds()
+            .abs();
         assert!(
             skew < 60,
             "the row carries the client's 2999 clock, {skew}s from now"

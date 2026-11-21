@@ -1022,7 +1022,7 @@ kind = "always"
                 grant: Some(crate::session::CapabilityGrant {
                     manifest_hash: aoe_plugin_api::PluginManifest::hash_bytes(manifest.as_bytes()),
                     capabilities: Vec::new(),
-                    granted_at: chrono::Utc::now(),
+                    granted_at: crate::time::Timestamp::now(),
                 }),
                 ..Default::default()
             },

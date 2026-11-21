@@ -432,7 +432,7 @@ pub(crate) async fn spawn_structured_session(
             let _title = crate::session::acquire_session_title_lock(&instance.id)?;
             let _lifecycle = native.storage().acquire_instance_lifecycle_lock(&instance.id)?;
             let generation = instance.try_acquire_lifecycle_reservation(
-                LifecycleOperation::Launch, Instance::LIFECYCLE_RESERVATION_TTL, chrono::Utc::now(),
+                LifecycleOperation::Launch, Instance::LIFECYCLE_RESERVATION_TTL, crate::time::Timestamp::now(),
             )?;
             instance.status = Status::Creating;
             store.update(|rows, groups| {
@@ -1812,7 +1812,7 @@ mod tests {
                         .try_acquire_lifecycle_reservation(
                             LifecycleOperation::Capture,
                             Instance::LIFECYCLE_RESERVATION_TTL,
-                            chrono::Utc::now(),
+                            crate::time::Timestamp::now(),
                         )
                         .map_err(anyhow::Error::from)
                 });

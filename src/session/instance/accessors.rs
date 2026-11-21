@@ -34,7 +34,7 @@ impl Instance {
             detect_as: String::new(),
             yolo_mode: false,
             status: Status::Idle,
-            created_at: Utc::now(),
+            created_at: Timestamp::now(),
             last_accessed_at: None,
             idle_entered_at: None,
             archived_at: None,
@@ -1112,7 +1112,7 @@ mod tests {
             branch: "feature/abc".to_string(),
             main_repo_path: main_repo_path.to_string(),
             managed_by_aoe: true,
-            created_at: Utc::now(),
+            created_at: Timestamp::now(),
             base_branch: None,
         }
     }
@@ -1421,7 +1421,7 @@ mod tests {
                 base_branch: None,
                 base_branch_override: None,
             }],
-            created_at: Utc::now(),
+            created_at: Timestamp::now(),
             cleanup_on_delete: true,
         });
         assert!(ws.has_managed_worktree_or_workspace());

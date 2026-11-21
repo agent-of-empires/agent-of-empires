@@ -37,7 +37,7 @@ use crate::acp::acp_client::SessionState;
 use crate::acp::control_protocol::PromptOutcome;
 
 pub(super) fn now_ms() -> i64 {
-    chrono::Utc::now().timestamp_millis()
+    crate::time::Timestamp::now().as_millis()
 }
 
 pub(super) struct Shared {
