@@ -160,11 +160,10 @@ fn latest_future_reset<'a>(
     now: crate::time::Timestamp,
 ) -> Option<CapturedReset> {
     captures
-        .filter_map(|(window, secs)| {
-            Some(CapturedReset {
-                window: window.clone(),
-                resets_at: crate::time::Timestamp::from_unix_secs(*secs)?,
-            })
+        .map(|(window, secs)| CapturedReset {
+            window: window.clone(),
+            resets_at: crate::time::Timestamp::from_unix_secs(*secs)
+                .unwrap_or(crate::time::Timestamp::MAX),
         })
         .filter(|captured| captured.resets_at > now)
         .max_by_key(|captured| captured.resets_at)
@@ -403,6 +402,14 @@ mod tests {
                 assert_eq!(info, want);
                 assert!(take_rate_limit_from_captured_rejection(&captures, now).is_none());
             }
+
+            // A reset past year 9999 still reports the limit.
+            let captures = std::sync::Mutex::new(HashMap::from([(
+                "seven_day".to_string(),
+                253_402_300_800 + 86_400,
+            )]));
+            let info = take_rate_limit_from_captured_rejection(&captures, now).unwrap();
+            assert_eq!(info.resets_at, Some(crate::time::Timestamp::MAX));
         }
     }
 
