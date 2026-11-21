@@ -90,8 +90,7 @@ mod tests {
         let dir = home.path().join(".claude");
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("settings.json");
-        let previous = std::env::var_os("HOME");
-        std::env::set_var("HOME", home.path());
+        let _guard = crate::session::test_support::isolate_app_dir_at(home.path());
 
         std::fs::write(&path, r#"{"tui":"fullscreen"}"#).unwrap();
         assert!(read_tui_fullscreen());
@@ -109,10 +108,5 @@ mod tests {
 
         std::fs::write(&path, r#"{"tui":"default"}"#).unwrap();
         assert!(!read_tui_fullscreen(), "changed length must re-read");
-
-        match previous {
-            Some(value) => std::env::set_var("HOME", value),
-            None => std::env::remove_var("HOME"),
-        }
     }
 }
