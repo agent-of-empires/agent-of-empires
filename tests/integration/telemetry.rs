@@ -618,6 +618,7 @@ fn cli_usage_records_allowlisted_subcommands_only_when_opted_in() {
 #[serial]
 fn concurrent_ensure_install_id_yields_single_id() {
     let _tmp = isolate();
+    update_config(|config| config.telemetry.enabled = true).expect("save config");
     const N: usize = 32;
     let barrier = Arc::new(Barrier::new(N));
     let handles: Vec<_> = (0..N)

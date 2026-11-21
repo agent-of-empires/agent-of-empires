@@ -79,13 +79,7 @@ fn opted_in_with(config: &crate::session::Config) -> bool {
 }
 
 pub fn apply_opt_in_change(enabled: bool) {
-    if enabled {
-        if !do_not_track() {
-            let _ = state::ensure_install_id();
-        }
-    } else if let Err(e) = state::delete_install_id() {
-        tracing::debug!(target: "telemetry", "failed to delete install id on opt-out: {e}");
-    }
+    consent::apply_opt_in_change(enabled);
 }
 
 fn now_rfc3339() -> String {

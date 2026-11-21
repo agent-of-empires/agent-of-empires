@@ -62,11 +62,36 @@ pub(super) async fn spawn_serve_snapshot_loop(state: Arc<AppState>) {
                 }
                 _ = sample.tick() => {
                     let instances = state.instances.read().await.clone();
-                    aggregator.sample(&instances);
+                    sample_in_window(&instances, &mut aggregator, &mut window);
                 }
             }
         }
     });
+}
+
+/// Folds one sample into the window aggregate, first resetting it when consent changed
+/// since the last sample or build, so every sample in it shares one consent window.
+fn sample_in_window(
+    instances: &[crate::session::Instance],
+    aggregator: &mut crate::telemetry::aggregate::UsageAggregator,
+    window: &mut Option<crate::telemetry::consent::Bound>,
+) {
+    let (bound, ()) = crate::telemetry::consent::capture(|| ());
+    enter_window(bound, aggregator, window);
+    aggregator.sample(instances);
+}
+
+fn enter_window(
+    bound: crate::telemetry::consent::Bound,
+    aggregator: &mut crate::telemetry::aggregate::UsageAggregator,
+    window: &mut Option<crate::telemetry::consent::Bound>,
+) {
+    if window
+        .replace(bound.clone())
+        .is_some_and(|prev| !prev.same_window(&bound))
+    {
+        *aggregator = crate::telemetry::aggregate::UsageAggregator::default();
+    }
 }
 
 /// Per-form-factor open counters for one web surface (dashboard or acp).
@@ -274,6 +299,7 @@ pub(super) async fn build_serve_snapshot(
     window: &mut Option<crate::telemetry::consent::Bound>,
 ) -> Option<crate::telemetry::UsageSnapshot> {
     use std::sync::atomic::Ordering;
+    let instances = state.instances.read().await.clone();
     let (
         bound,
         (usage_seen, web_clients, structured_clients, session_creates, feature_uses, reported_acp),
@@ -295,13 +321,8 @@ pub(super) async fn build_serve_snapshot(
             },
         )
     });
-    // Window samples taken under an earlier consent state are not reported either.
-    if window
-        .replace(bound.clone())
-        .is_some_and(|prev| !prev.same_window(&bound))
-    {
-        *aggregator = crate::telemetry::aggregate::UsageAggregator::default();
-    }
+    enter_window(bound.clone(), aggregator, window);
+    aggregator.sample(&instances);
     let acp = crate::telemetry::StructuredInteractionCounts {
         approvals_allow: reported_acp.approvals_allow,
         approvals_allow_always: reported_acp.approvals_allow_always,
@@ -319,8 +340,6 @@ pub(super) async fn build_serve_snapshot(
         session_creates,
         acp: reported_acp,
     });
-    let instances = state.instances.read().await.clone();
-    aggregator.sample(&instances);
     let mut snapshot = crate::telemetry::build_usage_snapshot(
         crate::telemetry::Surface::Serve,
         &instances,
@@ -334,11 +353,24 @@ pub(super) async fn build_serve_snapshot(
     // Layer the per-form-factor was-seen maps onto the snapshot.
     snapshot.web_clients_seen = web_clients.seen_map();
     snapshot.structured_clients_seen = structured_clients.seen_map();
+    apply_window(&bound, aggregator, &mut snapshot);
+    Some(snapshot)
+}
+
+/// Layers the window aggregate onto a snapshot sent under the window's consent. Under
+/// any other id the window is discarded and the point-in-time values stand.
+fn apply_window(
+    bound: &crate::telemetry::consent::Bound,
+    aggregator: &mut crate::telemetry::aggregate::UsageAggregator,
+    snapshot: &mut crate::telemetry::UsageSnapshot,
+) {
+    if !bound.bind(snapshot) {
+        *aggregator = crate::telemetry::aggregate::UsageAggregator::default();
+        return;
+    }
     snapshot.peak_concurrent_sessions = aggregator.peak_concurrent_sessions();
     snapshot.distinct_sessions_by_agent = aggregator.distinct_by_agent();
     snapshot.distinct_sessions_by_model_bucket = aggregator.distinct_by_model();
-    bound.bind(&mut snapshot);
-    Some(snapshot)
 }
 
 /// Clear the signals a serve snapshot reported, but only when the send was
@@ -458,6 +490,52 @@ mod tests {
             "a confirmed send keeps later counts"
         );
         assert_eq!(next.feature_uses["search"], 1);
+
+        crate::telemetry::apply_opt_in_change(false);
+    }
+
+    /// A sample taken after a consent change survives the next build even when its session
+    /// has ended; a snapshot that lands under a different id drops the window aggregate.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn window_aggregates_stay_inside_one_consent_window() {
+        let _env = crate::session::test_support::EnvGuard::unset(&["DO_NOT_TRACK"]);
+        let _app_dir = crate::session::test_support::isolate_app_dir();
+        crate::session::update_config(|c| c.telemetry.enabled = true).unwrap();
+        crate::telemetry::apply_opt_in_change(true);
+        let state = crate::server::test_support::build_test_app_state(vec![]);
+        let mut aggregator = crate::telemetry::aggregate::UsageAggregator::default();
+        let mut window = None;
+        assert!(build_serve_snapshot(&state, &mut aggregator, &mut window)
+            .await
+            .is_some());
+
+        crate::telemetry::reset_install_id().unwrap();
+        let short_lived = [crate::session::Instance::new("short", "/tmp/short")];
+        sample_in_window(&short_lived, &mut aggregator, &mut window);
+        let snapshot = build_serve_snapshot(&state, &mut aggregator, &mut window)
+            .await
+            .expect("opted in");
+        assert_eq!(snapshot.peak_concurrent_sessions, 1);
+        assert_eq!(snapshot.distinct_sessions_by_agent.values().sum::<u32>(), 1);
+
+        sample_in_window(&short_lived, &mut aggregator, &mut window);
+        let (bound, ()) = crate::telemetry::consent::capture(|| ());
+        crate::telemetry::reset_install_id().unwrap();
+        let mut moved = crate::telemetry::build_usage_snapshot(
+            crate::telemetry::Surface::Serve,
+            &[],
+            Default::default(),
+            0,
+            None,
+            None,
+            &Default::default(),
+        )
+        .expect("opted in");
+        apply_window(&bound, &mut aggregator, &mut moved);
+        assert_eq!(moved.peak_concurrent_sessions, 0, "point-in-time value");
+        assert!(moved.distinct_sessions_by_agent.is_empty());
+        assert_eq!(aggregator.peak_concurrent_sessions(), 0, "window discarded");
 
         crate::telemetry::apply_opt_in_change(false);
     }
