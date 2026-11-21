@@ -22,6 +22,9 @@ SHIM
 chmod +x "$B/bin/tmux"
 
 export HOME="$B/home" AOE_TMUX_SOCKET="$B/tmux.sock"
+# An inherited absolute XDG path would beat the throwaway HOME.
+export XDG_CONFIG_HOME="$B/home/.config" XDG_DATA_HOME="$B/home/.local/share" \
+  XDG_STATE_HOME="$B/home/.local/state" XDG_CACHE_HOME="$B/home/.cache"
 IDS=()
 cleanup() {
   [ -n "${SERVE_PID:-}" ] && kill "$SERVE_PID" 2>/dev/null || true
