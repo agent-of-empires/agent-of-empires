@@ -607,6 +607,20 @@ describe("persist flush on cleanup", () => {
     expect(JSON.parse(localStorage.getItem(storedKey("sess-unmount"))!).state.lastSeq).toBe(7);
   });
 
+  it("persists a queue confirmation at once, so another window cannot read the row as unconfirmed", async () => {
+    const id = "sess-confirm";
+    const queuedAt = "2026-01-01T00:00:00.000Z";
+    cacheSet(id, { ...emptyAcpState(), queuedPrompts: [{ id: "u1", text: "u1", queuedAt, pending: true }] });
+    const hook = render(id, "running");
+    await flushAsync();
+    lastSocket().open();
+    await waitFor(() => expect(hook.result.current.state.queuedPrompts).toMatchObject([{ id: "u1", pending: false }]));
+    expect(JSON.parse(localStorage.getItem(storedKey(id))!).state.queuedPrompts).toMatchObject([
+      { id: "u1", pending: false },
+    ]);
+    hook.unmount();
+  });
+
   it("writes the previous session's pending state on a session switch", async () => {
     installAcpFakes();
     seed("sess-a");

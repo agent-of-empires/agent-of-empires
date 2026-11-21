@@ -143,7 +143,9 @@ function acknowledgeQueued(sessionId: string, action: Action): void {
     return;
   }
   const stored = cacheGet(sessionId);
-  if (stored) cacheSet(sessionId, reducer(stored, action));
+  if (!stored) return;
+  cacheSet(sessionId, reducer(stored, action));
+  flushPersist(sessionId);
 }
 
 function postQueuedInOrder(sessionId: string, task: (entry: QueuePosts) => Promise<void>): Promise<void> {
@@ -236,8 +238,14 @@ export function useAcpSession(
   const archivedAtRef = useLatestRef(archivedAt);
   const snoozedUntilRef = useLatestRef(snoozedUntil);
   const sessionIdRef = useLatestRef(sessionId);
+  const unconfirmedRef = useRef(0);
   useEffect(() => {
-    if (sessionIdRef.current) cacheSet(sessionIdRef.current, state);
+    if (!sessionIdRef.current) return;
+    cacheSet(sessionIdRef.current, state);
+    // Another window must not read a delivered row as unconfirmed and POST it again, so persist confirmations now.
+    const unconfirmed = state.queuedPrompts.filter((q) => q.pending).length;
+    if (unconfirmed < unconfirmedRef.current) flushPersist(sessionIdRef.current);
+    unconfirmedRef.current = unconfirmed;
   }, [state, sessionIdRef]);
   // Separate from the `[state]` effect: its cleanup runs on every state change and would defeat the throttle.
   useEffect(
