@@ -43,7 +43,7 @@ class Bench:
         self.aoe = str(Path(aoe).resolve())
         self.root = Path(tempfile.mkdtemp(prefix="ab", dir="/tmp"))
         self.log = self.root / "tmux.log"
-        self.socket = f"aoe-bench-{os.getpid()}"
+        self.socket = str(self.root / "tmux.sock")
         shim = self.root / "bin"
         shim.mkdir()
         (shim / "tmux").write_text(
@@ -81,7 +81,7 @@ class Bench:
         self.aoe_cmd("session", "stop", "sandboxed", check=False)
         self.aoe_cmd("serve", "--stop", check=False)
         subprocess.run(
-            [shutil.which("tmux"), "-L", self.socket, "kill-server"], capture_output=True
+            [shutil.which("tmux"), "-S", self.socket, "kill-server"], capture_output=True
         )
         shutil.rmtree(self.root, ignore_errors=True)
 
