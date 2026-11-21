@@ -4,6 +4,7 @@ use std::sync::Arc;
 
 use tokio::sync::broadcast;
 
+use crate::acp::acp_client::FIVE_HOUR_WINDOW_SECS;
 use crate::acp::approvals::Nonce;
 use crate::acp::event_store::{AttachmentBlob, EventStore, UnresolvedBackgroundAgentLaunch};
 use crate::acp::state::{BackgroundTaskLaunch, Event, RateLimitInfo, SubagentRecord};
@@ -365,12 +366,36 @@ pub(super) fn blocking_io<T>(f: impl FnOnce() -> T) -> T {
     }
 }
 
-/// Reset time a fresh rejection inherits from the previous one, while still ahead of `now`.
+/// Window and reset time a fresh rejection of quota window `kind` inherits from the previous
+/// one, while the reset is still ahead of `now`. A report naming no window (`rate_limit`) may
+/// take any quota window's reset and keeps that window; a report of another limit, such as
+/// `billing_error`, never takes a quota window's. An unnamed reset a five-hour window could not
+/// have reached from when it was observed (`previous.1`, epoch ms) is not that window's.
 fn inheritable_rate_limit_reset(
-    previous: Option<RateLimitInfo>,
+    previous: Option<(RateLimitInfo, i64)>,
+    kind: &str,
     now: chrono::DateTime<chrono::Utc>,
-) -> Option<chrono::DateTime<chrono::Utc>> {
-    previous?.resets_at.filter(|resets_at| *resets_at > now)
+) -> Option<(String, chrono::DateTime<chrono::Utc>)> {
+    let compatible = |p: &str| {
+        p == kind
+            || (p != "billing_error"
+                && kind != "billing_error"
+                && (p == "rate_limit" || kind == "rate_limit"))
+    };
+    let (previous, observed_at_ms) = previous.filter(|(p, _)| compatible(&p.kind))?;
+    let resets_at = previous.resets_at.filter(|resets_at| *resets_at > now)?;
+    let unreachable = kind == "five_hour"
+        && previous.kind == "rate_limit"
+        && resets_at.timestamp_millis() - observed_at_ms > FIVE_HOUR_WINDOW_SECS * 1000;
+    if unreachable {
+        return None;
+    }
+    let window = if kind == "rate_limit" {
+        previous.kind
+    } else {
+        kind.to_string()
+    };
+    Some((window, resets_at))
 }
 
 impl Persister {
@@ -408,16 +433,26 @@ impl Persister {
         event: &Event,
         worker_generation: Option<u64>,
     ) -> bool {
+        let mut observed_at_ms = None;
         let inherited = match event {
             Event::RateLimit { info } if info.resets_at.is_none() => inheritable_rate_limit_reset(
-                self.event_store
-                    .latest_rate_limit_event(session_id)
-                    .map(|(previous, _)| previous),
+                self.event_store.latest_rate_limit_event(session_id).map(
+                    |(previous, recorded_at_ms)| {
+                        let observed = self
+                            .event_store
+                            .latest_rate_limit_observed_ms(session_id)
+                            .unwrap_or(recorded_at_ms);
+                        observed_at_ms = Some(observed);
+                        (previous, observed)
+                    },
+                ),
+                &info.kind,
                 chrono::Utc::now(),
             )
-            .map(|resets_at| Event::RateLimit {
+            .map(|(kind, resets_at)| Event::RateLimit {
                 info: RateLimitInfo {
                     resets_at: Some(resets_at),
+                    kind,
                     ..info.clone()
                 },
             }),
@@ -425,8 +460,11 @@ impl Persister {
         };
         let event = inherited.as_ref().unwrap_or(event);
         let failure;
-        let (event, persisted) = match blocking_io(|| {
-            self.event_store.record(session_id, seq, event)
+        let (event, persisted) = match blocking_io(|| match (&inherited, observed_at_ms) {
+            (Some(_), Some(observed)) => self
+                .event_store
+                .record_inherited_rate_limit(session_id, seq, event, observed),
+            _ => self.event_store.record(session_id, seq, event),
         }) {
             Ok(()) => (event, true),
             Err(e) => {
@@ -636,16 +674,128 @@ mod tests {
             resets_at,
             kind: "rate_limit".into(),
         };
+        let generic = |at| Some(("rate_limit".to_string(), at));
+        // Observed just now, unless a case says otherwise.
+        let inheritable_rate_limit_reset =
+            |previous: Option<RateLimitInfo>, kind: &str, now: chrono::DateTime<chrono::Utc>| {
+                super::inheritable_rate_limit_reset(
+                    previous.map(|p| (p, now.timestamp_millis())),
+                    kind,
+                    now,
+                )
+            };
         assert_eq!(
-            inheritable_rate_limit_reset(Some(info(Some(future))), now),
-            Some(future)
+            inheritable_rate_limit_reset(Some(info(Some(future))), "rate_limit", now),
+            generic(future)
         );
         assert_eq!(
-            inheritable_rate_limit_reset(Some(info(Some(now - chrono::Duration::minutes(1)))), now),
+            inheritable_rate_limit_reset(
+                Some(info(Some(now - chrono::Duration::minutes(1)))),
+                "rate_limit",
+                now
+            ),
             None
         );
-        assert_eq!(inheritable_rate_limit_reset(Some(info(None)), now), None);
-        assert_eq!(inheritable_rate_limit_reset(None, now), None);
+        assert_eq!(
+            inheritable_rate_limit_reset(Some(info(None)), "rate_limit", now),
+            None
+        );
+        assert_eq!(inheritable_rate_limit_reset(None, "rate_limit", now), None);
+        // An unnamed capture's reset is compatible with a later report naming its window; a
+        // billing error is compatible with neither.
+        let unnamed = RateLimitInfo {
+            kind: "rate_limit".into(),
+            ..info(Some(future))
+        };
+        assert_eq!(
+            inheritable_rate_limit_reset(Some(unnamed.clone()), "seven_day", now),
+            Some(("seven_day".to_string(), future))
+        );
+        // ...unless a five-hour window cannot reach it: that reset is some longer window's.
+        let multi_day = now + chrono::Duration::days(3);
+        let long_unnamed = RateLimitInfo {
+            kind: "rate_limit".into(),
+            ..info(Some(multi_day))
+        };
+        assert_eq!(
+            inheritable_rate_limit_reset(Some(long_unnamed.clone()), "five_hour", now),
+            None
+        );
+        assert_eq!(
+            inheritable_rate_limit_reset(Some(unnamed.clone()), "five_hour", now),
+            Some(("five_hour".to_string(), future))
+        );
+        // The reach is measured from when the reset was observed, so a later look, now
+        // within five hours of it, does not make it a five-hour window's.
+        let observed_long_ago = (now - chrono::Duration::days(3)).timestamp_millis();
+        let later = multi_day - chrono::Duration::hours(1);
+        assert_eq!(
+            super::inheritable_rate_limit_reset(
+                Some((long_unnamed.clone(), observed_long_ago)),
+                "five_hour",
+                later
+            ),
+            None
+        );
+        assert_eq!(
+            super::inheritable_rate_limit_reset(
+                Some((long_unnamed.clone(), observed_long_ago)),
+                "seven_day",
+                later
+            ),
+            Some(("seven_day".to_string(), multi_day))
+        );
+        // The bound is inclusive: five hours exactly is reachable, one second more is not.
+        for (secs, expected) in [(5 * 3600, true), (5 * 3600 + 1, false)] {
+            let edge = now + chrono::Duration::seconds(secs);
+            let edge_unnamed = RateLimitInfo {
+                kind: "rate_limit".into(),
+                ..info(Some(edge))
+            };
+            assert_eq!(
+                inheritable_rate_limit_reset(Some(edge_unnamed), "five_hour", now).is_some(),
+                expected,
+                "reset {secs}s out"
+            );
+        }
+        // An unnamed report keeps the window the reset belonged to.
+        let long_weekly = RateLimitInfo {
+            kind: "seven_day".into(),
+            ..info(Some(multi_day))
+        };
+        assert_eq!(
+            inheritable_rate_limit_reset(Some(long_weekly), "rate_limit", now),
+            Some(("seven_day".to_string(), multi_day))
+        );
+        assert_eq!(
+            inheritable_rate_limit_reset(Some(unnamed), "billing_error", now),
+            None
+        );
+        let billing = RateLimitInfo {
+            kind: "billing_error".into(),
+            ..info(Some(future))
+        };
+        assert_eq!(
+            inheritable_rate_limit_reset(Some(billing), "rate_limit", now),
+            None
+        );
+        // Only a quota window's own report, or one naming no window, takes its reset.
+        let weekly = RateLimitInfo {
+            kind: "seven_day".into(),
+            ..info(Some(future))
+        };
+        for (kind, want) in [
+            ("seven_day", Some(("seven_day".to_string(), future))),
+            ("rate_limit", Some(("seven_day".to_string(), future))),
+            ("five_hour", None),
+            ("billing_error", None),
+        ] {
+            assert_eq!(
+                inheritable_rate_limit_reset(Some(weekly.clone()), kind, now),
+                want,
+                "{kind}"
+            );
+        }
     }
 
     #[tokio::test]
