@@ -330,6 +330,21 @@ fn capture_output(success: bool, stdout: &[u8]) -> Option<String> {
     success.then(|| String::from_utf8_lossy(stdout).into_owned())
 }
 
+fn capture_pane_target(target: &str, lines: usize) -> std::io::Result<Option<String>> {
+    let output = crate::tmux::tmux_command()
+        .args([
+            "capture-pane",
+            "-t",
+            target,
+            "-p",
+            "-e",
+            "-S",
+            &format!("-{lines}"),
+        ])
+        .output()?;
+    Ok(capture_output(output.status.success(), &output.stdout))
+}
+
 impl Session {
     pub fn new(id: &str, title: &str) -> Result<Self> {
         Ok(Self {
@@ -836,18 +851,13 @@ impl Session {
         }
         let target =
             self.live_pane_target_with_deadline(&crate::tmux::TmuxCommandDeadline::new())?;
-        let output = crate::tmux::tmux_command()
-            .args([
-                "capture-pane",
-                "-t",
-                &target,
-                "-p",
-                "-e",
-                "-S",
-                &format!("-{}", lines),
-            ])
-            .output()?;
-        Ok(capture_output(output.status.success(), &output.stdout))
+        Ok(capture_pane_target(&target, lines)?)
+    }
+
+    /// Capture a pane the caller already resolved, skipping the existence and pane-id probes.
+    /// `None` when `capture-pane` failed, so a stale id never reads as a blank pane.
+    pub(crate) fn capture_pane_at(&self, pane_id: &str, lines: usize) -> Option<String> {
+        capture_pane_target(pane_id, lines).ok().flatten()
     }
 
     /// Wait for a known marker, or for two stable captures when no marker exists.
@@ -1271,12 +1281,25 @@ impl Session {
         self.capture_pane_with_cursor_with_deadline(lines, &deadline)
     }
 
+    /// The pane a held VT channel owns, which input and capture must keep targeting.
+    pub(crate) fn live_channel_pane(
+        &self,
+        deadline: &crate::tmux::TmuxCommandDeadline,
+    ) -> Option<String> {
+        #[cfg(unix)]
+        return crate::tmux::vt::channel_pane_id(&self.name, deadline);
+        #[cfg(not(unix))]
+        {
+            let _ = deadline;
+            None
+        }
+    }
+
     pub(crate) fn live_pane_target_with_deadline(
         &self,
         deadline: &crate::tmux::TmuxCommandDeadline,
     ) -> Result<String> {
-        #[cfg(unix)]
-        if let Some(id) = crate::tmux::vt::channel_pane_id(&self.name, deadline) {
+        if let Some(id) = self.live_channel_pane(deadline) {
             return Ok(id);
         }
         super::utils::first_pane_id_with_deadline(&self.name, deadline)

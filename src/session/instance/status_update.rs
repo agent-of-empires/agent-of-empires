@@ -15,6 +15,25 @@ fn detection_content<'a>(
     fresh.or(reuse.map(|(reused, _)| reused))
 }
 
+/// Capture the pane a live VT channel holds, else the tick's batched pane id. A failed capture
+/// by id retries through the session resolver, so a stale id never reads as a blank pane.
+fn capture_for_status(
+    session: &tmux::Session,
+    metadata: Option<&tmux::PaneMetadata>,
+    lines: usize,
+) -> String {
+    let known = session
+        .live_channel_pane(&tmux::TmuxCommandDeadline::new())
+        .or_else(|| {
+            metadata
+                .map(|m| m.pane_id.clone())
+                .filter(|id| !id.is_empty())
+        });
+    known
+        .and_then(|pane_id| session.capture_pane_at(&pane_id, lines))
+        .unwrap_or_else(|| session.capture_pane(lines).unwrap_or_default())
+}
+
 /// Whether this poll can reuse the last verdict instead of capturing the pane.
 fn skip_capture(
     activity: Option<i64>,
@@ -132,9 +151,13 @@ impl Instance {
 
     /// Explain a pane failure from what the pane last printed, keeping any explanation already
     /// recorded.
-    fn explain_error_from_pane(&mut self, session: &tmux::Session) {
+    fn explain_error_from_pane(
+        &mut self,
+        session: &tmux::Session,
+        metadata: Option<&tmux::PaneMetadata>,
+    ) {
         if self.last_error.is_none() {
-            let pane_content = session.capture_pane(20).unwrap_or_default();
+            let pane_content = capture_for_status(session, metadata, 20);
             self.last_error = Some(summarize_error_from_pane(&pane_content));
         }
     }
@@ -288,7 +311,7 @@ impl Instance {
             });
             if self.status == Status::Error {
                 if is_dead {
-                    self.explain_error_from_pane(&session);
+                    self.explain_error_from_pane(&session, metadata);
                 } else if self.last_error.is_none() {
                     self.last_error = Some(summarize_error_from_pane(
                         &session.capture_pane(20).unwrap_or_default(),
@@ -325,7 +348,7 @@ impl Instance {
         // reported hooks at all: a hookless agent's pane is allowed to end.
         if is_dead && hook.is_some() {
             self.status = Status::Error;
-            self.explain_error_from_pane(&session);
+            self.explain_error_from_pane(&session, metadata);
             return;
         }
 
@@ -357,7 +380,7 @@ impl Instance {
                 self.status = hook.status;
                 // An Error keeps its explanation, as the manifest path does.
                 if hook.status == Status::Error {
-                    self.explain_error_from_pane(&session);
+                    self.explain_error_from_pane(&session, metadata);
                 } else {
                     self.last_error = None;
                 }
@@ -368,7 +391,7 @@ impl Instance {
                 self.title, hook_tool, hook.age);
         }
 
-        let pane_content = session.capture_pane(50).unwrap_or_default();
+        let pane_content = capture_for_status(&session, metadata, 50);
         let detected = if pane_tool == "prime-agent" {
             if is_dead {
                 Status::Error
@@ -572,9 +595,7 @@ impl Instance {
 
         // Stamped before the capture, never after.
         let captured_at = Utc::now().timestamp();
-        let pane_content = session
-            .capture_pane(policy.scope.lines())
-            .unwrap_or_default();
+        let pane_content = capture_for_status(session, metadata, policy.scope.lines());
         let clean = tmux::utils::strip_ansi(&pane_content);
         let detection = plan.detect(&clean, &observation);
 
@@ -1163,6 +1184,48 @@ Esc to cancel \u{b7} Tab to amend \u{b7} ctrl+e to explain\n\
         );
     }
 
+    #[test]
+    #[serial_test::serial]
+    fn capture_by_known_pane_id_skips_the_pane_lookup_forks() {
+        let _home = crate::session::test_support::isolate_app_dir();
+        if !tmux_available() {
+            eprintln!("skipping: tmux not available");
+            return;
+        }
+        let name = tmux::Session::generate_name("aoe_test_5788_cap", "pane id capture");
+        let _guard = spawn_pane(&name, "echo pane-id-marker; sleep 300");
+        assert!(wait_for_pane(&name, "pane-id-marker"));
+        crate::tmux::refresh_session_cache();
+        let session = tmux::Session::from_name(&name);
+        let mut metadata = live_pane_metadata(&name, "sleep", None);
+
+        let forks = |metadata: Option<&tmux::PaneMetadata>, session: &tmux::Session| {
+            let _ = crate::tmux::fork_probe::take();
+            let _probe = crate::tmux::fork_probe::arm();
+            let out = capture_for_status(session, metadata, 20);
+            (out, crate::tmux::fork_probe::take())
+        };
+
+        let (out, count) = forks(Some(&metadata), &session);
+        assert!(out.contains("pane-id-marker"), "{out:?}");
+        assert_eq!(count, 1, "only capture-pane may fork when the id is known");
+
+        let (out, count) = forks(None, &session);
+        assert!(out.contains("pane-id-marker"), "{out:?}");
+        assert!(count > 1, "the fallback still resolves the pane first");
+
+        metadata.pane_id = "%999999".into();
+        let (out, count) = forks(Some(&metadata), &session);
+        assert!(
+            out.contains("pane-id-marker"),
+            "a stale id falls back: {out:?}"
+        );
+        assert!(
+            count > 1,
+            "the fallback resolves the pane after the failed id"
+        );
+    }
+
     /// Pane metadata for a live agent pane: not dead, running the agent itself, so neither the
     /// dead-pane branch nor the stale-shell check spawns tmux behind the test.
     fn agent_pane_metadata(command: &str, window_activity: Option<i64>) -> tmux::PaneMetadata {
@@ -1180,6 +1243,17 @@ Esc to cancel \u{b7} Tab to amend \u{b7} ctrl+e to explain\n\
             window_activity,
             window_size: None,
         }
+    }
+
+    /// [`agent_pane_metadata`] aimed at the spawned pane, so a capture reads the fixture.
+    fn live_pane_metadata(
+        session_name: &str,
+        command: &str,
+        window_activity: Option<i64>,
+    ) -> tmux::PaneMetadata {
+        let mut metadata = agent_pane_metadata(command, window_activity);
+        metadata.pane_id = tmux::first_pane_id(session_name).expect("first pane id");
+        metadata
     }
 
     fn write_hook_status(instance_id: &str, status: &str) {
@@ -1341,7 +1415,7 @@ Esc to cancel \u{b7} Tab to amend \u{b7} ctrl+e to explain\n\
         // Presence TTL is not the activity clock under test.
         let poll = |inst: &mut Instance, activity: Option<i64>| {
             cache.force_present(&[session_name.as_str()]);
-            let metadata = agent_pane_metadata("claude", activity);
+            let metadata = live_pane_metadata(&session_name, "claude", activity);
             inst.update_status_with_metadata_inner(Some(&metadata), Some(&session_name));
         };
 
@@ -1413,7 +1487,7 @@ Esc to cancel \u{b7} Tab to amend \u{b7} ctrl+e to explain\n\
 
         let cache = crate::tmux::SessionCacheGuard::capture();
         cache.force_present(&[session_name.as_str()]);
-        let metadata = agent_pane_metadata("claude", None);
+        let metadata = live_pane_metadata(&session_name, "claude", None);
 
         // Both rows come off disk on `Running`, which is what the CLI reads.
         polled.status = Status::Running;
@@ -1502,7 +1576,7 @@ Esc to cancel \u{b7} Tab to amend \u{b7} ctrl+e to explain\n\
             );
             let cache = crate::tmux::SessionCacheGuard::capture();
             cache.force_present(&[session_name.as_str()]);
-            let mut metadata = agent_pane_metadata("omp", None);
+            let mut metadata = live_pane_metadata(&session_name, "omp", None);
             metadata.pane_title = Some(String::new());
 
             inst.update_status_with_metadata_inner(Some(&metadata), Some(&session_name));
@@ -1570,7 +1644,7 @@ Esc to cancel \u{b7} Tab to amend \u{b7} ctrl+e to explain\n\
             assert!(wait_for_pane(&session_name, "PLUGIN_READY"));
             let cache = crate::tmux::SessionCacheGuard::capture();
             cache.force_present(&[session_name.as_str()]);
-            let mut metadata = agent_pane_metadata("omp", None);
+            let mut metadata = live_pane_metadata(&session_name, "omp", None);
             metadata.pane_title = Some(String::new());
 
             inst.update_status_with_metadata_inner(Some(&metadata), Some(&session_name));
@@ -1618,7 +1692,7 @@ HISTORY_READY",
             cache.force_present(&[session_name.as_str()]);
             inst.update_status_with_metadata_inner(Some(metadata), Some(&session_name));
         };
-        let mut metadata = agent_pane_metadata("omp", None);
+        let mut metadata = live_pane_metadata(&session_name, "omp", None);
         metadata.pane_title = Some(String::new());
         for status in [
             Status::Idle,
@@ -1697,7 +1771,7 @@ HISTORY_READY",
             "metadata-free readers fetch the title"
         );
 
-        let mut metadata = agent_pane_metadata("omp", Some(1));
+        let mut metadata = live_pane_metadata(&session_name, "omp", Some(1));
         metadata.pane_title = Some("π: Task".to_owned());
         inst.update_status_with_metadata_inner(Some(&metadata), Some(&session_name));
         assert_eq!(
