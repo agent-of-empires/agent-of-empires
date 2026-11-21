@@ -628,7 +628,6 @@ pub(super) async fn status_poll_loop_observed(
             if !changes.is_empty() {
                 if let Err(error) = state.runtime.publish(&state).await {
                     tracing::error!(target: "server.status", %error, "terminal snapshot publication failed");
-                    continue;
                 }
             }
             for change in changes {
