@@ -170,7 +170,6 @@ function ShikiSyntaxHighlighter({ language, code }: SyntaxHighlighterProps) {
   // NUL-delimited (as the escape sequence: a raw NUL byte in source makes
   // git treat the file as binary) so field concatenations cannot collide.
   const inputKey = `${language ?? ""}\u0000${code}`;
-  const [result, setResult] = useState<{ key: string; html: string } | null>(null);
   const shiki = useShikiTheme();
   // A cache hit renders highlighted on first paint, so a remounted block never flashes plain text.
   const cached = useMemo(
@@ -179,6 +178,10 @@ function ShikiSyntaxHighlighter({ language, code }: SyntaxHighlighterProps) {
         ? peekHighlight(code, { langHint: language, theme: shiki.theme, appearance: shiki.appearance })
         : undefined,
     [language, code, shiki.theme, shiki.appearance],
+  );
+  // Seeded from a mount-time cache hit so a later theme switch keeps that palette.
+  const [result, setResult] = useState<{ key: string; html: string } | null>(() =>
+    cached !== undefined ? { key: inputKey, html: cached } : null,
   );
   const [wrapped, toggleWrap] = useWrapState();
 

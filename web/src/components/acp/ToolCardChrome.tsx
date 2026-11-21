@@ -326,7 +326,6 @@ export function HighlightedBlock({
   // a theme switch keeps the old palette until the re-highlight lands.
   // NUL-delimited (as the escape sequence: a raw NUL byte in source makes git
   // treat the file as binary) so field concatenations cannot collide.
-  const [result, setResult] = useState<{ key: string; html: string } | null>(null);
   const [showAll, setShowAll] = useState(false);
   const [wrapped, toggleWrap] = useWrapState();
   const shiki = useShikiTheme();
@@ -346,6 +345,10 @@ export function HighlightedBlock({
         ? peekHighlight(shown, { langHint: effectiveLang, theme: shiki.theme, appearance: shiki.appearance })
         : undefined,
     [ansi, effectiveLang, shown, shiki.theme, shiki.appearance],
+  );
+  // Seeded from a mount-time cache hit so a later theme switch keeps that palette.
+  const [result, setResult] = useState<{ key: string; html: string } | null>(() =>
+    cached !== undefined ? { key: inputKey, html: cached } : null,
   );
 
   useEffect(() => {
