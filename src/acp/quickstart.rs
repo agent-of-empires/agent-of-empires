@@ -174,12 +174,14 @@ impl Changes {
 
 /// Settings to write for `plan`. Only a value that is still the built-in
 /// default is written, so a user-set value and a concurrent write are both left
-/// alone.
-pub fn changes(config: &AcpConfig, plan: &Plan) -> Changes {
+/// alone. `explicit` is an `--agent` request, which replaces whatever is there:
+/// that is the user asking for this default, not a plan guessing at one.
+pub fn changes(config: &AcpConfig, plan: &Plan, explicit: bool) -> Changes {
     let configured = config.default_agent.trim();
     let still_default = configured.is_empty() || configured == DEFAULT_ACP_AGENT;
     Changes {
-        default_agent: (still_default && configured != plan.agent).then(|| plan.agent.clone()),
+        default_agent: ((still_default || explicit) && configured != plan.agent)
+            .then(|| plan.agent.clone()),
         structured_view: config.structured_view == StructuredView::Auto,
     }
 }
@@ -274,7 +276,11 @@ mod tests {
             let plan = plan(&detection, &config, true);
             assert_eq!(plan.agent, existing);
             assert_eq!(plan.bundled, existing == BUNDLED_AGENT);
-            assert_eq!(changes(&config, &plan).default_agent, None, "{existing}");
+            assert_eq!(
+                changes(&config, &plan, false).default_agent,
+                None,
+                "{existing}"
+            );
             // A detected agent that is chosen is never installed over.
             assert_eq!(plan.install, None, "{existing}");
         }
@@ -288,14 +294,14 @@ mod tests {
             true,
         );
 
-        let fresh = changes(&config("", StructuredView::Auto), &plan);
+        let fresh = changes(&config("", StructuredView::Auto), &plan, false);
         assert_eq!(fresh.default_agent.as_deref(), Some(BUNDLED_AGENT));
         assert!(fresh.structured_view);
         assert!(!fresh.is_empty());
 
         // Second run: nothing left to write.
         let settled = config(BUNDLED_AGENT, StructuredView::Structured);
-        assert!(changes(&settled, &plan).is_empty());
+        assert!(changes(&settled, &plan, false).is_empty());
 
         // The user's view choice is theirs, whatever it is.
         for view in [
@@ -304,7 +310,7 @@ mod tests {
             StructuredView::Structured,
         ] {
             let chosen = config(DEFAULT_ACP_AGENT, view);
-            assert!(!changes(&chosen, &plan).structured_view, "{view:?}");
+            assert!(!changes(&chosen, &plan, false).structured_view, "{view:?}");
         }
     }
 
@@ -317,7 +323,14 @@ mod tests {
         );
         // Another writer set a default while the install ran: the plan is stale.
         let raced = config("codex", StructuredView::Auto);
-        assert_eq!(changes(&raced, &plan).default_agent, None);
+        assert_eq!(changes(&raced, &plan, false).default_agent, None);
+
+        // An `--agent` request replaces even a non-default value: that is the
+        // user asking for it, and setup reported it as the default.
+        assert_eq!(
+            changes(&raced, &plan, true).default_agent.as_deref(),
+            Some(BUNDLED_AGENT)
+        );
     }
 
     #[test]

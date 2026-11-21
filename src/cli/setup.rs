@@ -89,16 +89,18 @@ pub async fn run(args: SetupArgs) -> Result<()> {
     }
 
     let mut adapter_ready = !plan.bundled || detection.bundled_installed;
+    let mut install_failed = false;
     if let (Some(binary), Some(app_dir)) = (plan.install, app_dir.as_deref()) {
-        adapter_ready = crate::cli::acp::install_adapters(app_dir, &[binary]).await;
+        let installed = crate::cli::acp::install_adapters(app_dir, &[binary]).await;
         // An install can still leave the runtime short, and the success line
         // has to match what launch would do.
-        adapter_ready &= quickstart::bundled_ready(Some(app_dir));
+        adapter_ready = installed && quickstart::bundled_ready(Some(app_dir));
+        install_failed = !adapter_ready;
     }
 
     let mut written: Vec<(&'static str, String, &'static str)> = Vec::new();
     let result = crate::session::config::update_config(|config| {
-        let changes = quickstart::changes(&config.acp, &plan);
+        let changes = quickstart::changes(&config.acp, &plan, args.agent.is_some());
         if let Some(agent) = changes.default_agent {
             config.acp.default_agent = agent.clone();
             written.push(("acp.default_agent", agent, DEFAULT_ACP_AGENT));
@@ -186,9 +188,22 @@ pub async fn run(args: SetupArgs) -> Result<()> {
         );
     }
 
-    match write_error {
-        Some(e) => Err(e),
-        None => Ok(()),
+    // A requested install that failed leaves the default unusable, so the run
+    // reports it. A configuration write error is reported first, since it is
+    // the setting the caller asked to persist.
+    let install_error = install_failed.then(|| {
+        anyhow::anyhow!(
+            "the bundled {} adapter could not be installed; run `aoe acp doctor --fix \
+             --adapter {}` and re-run setup",
+            quickstart::BUNDLED_AGENT,
+            quickstart::BUNDLED_AGENT
+        )
+    });
+    match (write_error, install_error) {
+        (Some(e), Some(install)) => Err(e.context(install.to_string())),
+        (Some(e), None) => Err(e),
+        (None, Some(install)) => Err(install),
+        (None, None) => Ok(()),
     }
 }
 

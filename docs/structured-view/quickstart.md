@@ -2,22 +2,27 @@
 
 The default AoE session is a **Structured view** session running the bundled `aoe-agent`
 adapter against **Otari**, Mozilla AI's model gateway. Nothing global gets installed, no
-`[acp]` section has to be hand-written, and the only thing you supply is a provider key.
+`[acp]` section has to be hand-written, and the only thing you supply is the Otari key.
 
 ```bash
 aoe setup
 ```
 
-`aoe setup` prints every setting it wrote, how to undo it, and starts nothing until you
-create a session:
+`aoe setup` prints every setting it wrote, how to undo it, and the session command that fits
+this machine; it starts nothing itself. Where it installed the bundled adapter, that command
+is:
 
 ```bash
 aoe add . --agent aoe-agent --structured-view \
   --model openai-compatible:anthropic/claude-fable-5
 ```
 
-The model id is what routes the turn through Otari; without one the adapter falls back to
-its Anthropic default. [Choosing the model](#choosing-the-model) has the other forms.
+Two things have to be in place first. The model id is what routes the turn through Otari, so
+this command needs `OTARI_API_KEY` ([Create an Otari account](#create-an-otari-account)
+below); a direct-provider model such as `claude-opus-4-7` uses that provider's key instead,
+and [Choosing the model](#choosing-the-model) has the other forms. And the bundled adapter
+has to be installed: if no install was agreed to, `aoe setup` falls back to an agent that is
+already on the machine and names it in the command it prints.
 
 ## What `aoe setup` does
 
