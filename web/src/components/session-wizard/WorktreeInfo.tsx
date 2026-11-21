@@ -13,7 +13,7 @@ export function WorktreeInfo({ onOpenSettings }: { onOpenSettings: () => void })
     <InfoPopover title="What's a worktree?">
       <p className="mt-1 text-text-secondary">
         A separate copy of the repo on its own branch, so this Session&apos;s changes don&apos;t touch your main
-        checkout. AoE removes it when you delete the Session, unless you choose to keep it.
+        checkout. Moving the Session to Trash keeps it. Deleting it for good may remove it.
       </p>
       <a
         href="/settings/worktree"
