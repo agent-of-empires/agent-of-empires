@@ -52,6 +52,7 @@ export const docsNav: NavSection[] = [
     title: "Structured View",
     items: [
       { title: "Overview", href: "/docs/structured-view/" },
+      { title: "Quickstart", href: "/docs/structured-view/quickstart/" },
       { title: "Interface", href: "/docs/structured-view/interface/" },
       { title: "Modes, Approvals & Models", href: "/docs/structured-view/controls/" },
       { title: "Troubleshooting", href: "/docs/structured-view/troubleshooting/" },
