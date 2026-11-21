@@ -11,8 +11,8 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::SystemTime;
 
+use crate::time::Timestamp;
 use anyhow::{Context, Result};
-use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
@@ -278,7 +278,7 @@ impl PendingInitialTurn {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub(crate) struct FailedPurge {
     lifecycle_generation: u64,
-    trashed_at: DateTime<Utc>,
+    trashed_at: Timestamp,
     trash_lifecycle_id: String,
     forced: bool,
 }
@@ -539,9 +539,9 @@ pub struct Instance {
     pub yolo_mode: bool,
     #[serde(default)]
     pub status: Status,
-    pub created_at: DateTime<Utc>,
+    pub created_at: Timestamp,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub last_accessed_at: Option<DateTime<Utc>>,
+    pub last_accessed_at: Option<Timestamp>,
     /// Wall-clock time of the most recent transition into `Idle`. Used by
     /// the TUI and web dashboard to highlight a freshly-stopped session
     /// for the duration of the configured idle-decay window
@@ -556,10 +556,10 @@ pub struct Instance {
     /// in-process `Instant` for push-notification dwell timing, a
     /// different concept with a different type and lifetime.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub idle_entered_at: Option<DateTime<Utc>>,
+    pub idle_entered_at: Option<Timestamp>,
     /// Wall-clock launch of the current agent process; `None` until the first launch after upgrade.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub started_at: Option<DateTime<Utc>>,
+    pub started_at: Option<Timestamp>,
     /// The absolute agent program the last host launch ran, when native launch resolved it. It is
     /// a path only; hook output is never recorded here.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -569,7 +569,7 @@ pub struct Instance {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub launch_resolved_executable: Option<std::path::PathBuf>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub archived_at: Option<DateTime<Utc>>,
+    pub archived_at: Option<Timestamp>,
 
     /// Managed-session ignore marker. A session driven by another session may
     /// be ignored without being archived or trashed. Ignore is a sink state:
@@ -579,7 +579,7 @@ pub struct Instance {
     /// Additive: absent in older `sessions.json` rows, so no migration is
     /// needed.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub ignored_at: Option<DateTime<Utc>>,
+    pub ignored_at: Option<Timestamp>,
 
     /// Favorite marker; sibling of archive. When set AND the session is in
     /// a "needs help" status (Waiting, Error, Idle, Unknown), the session
@@ -588,7 +588,7 @@ pub struct Instance {
     /// statuses the flag is visible (⭐ glyph + bold) but does NOT re-rank
     /// since live work isn't interrupted by a decoration. Opposite of archive.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub favorited_at: Option<DateTime<Utc>>,
+    pub favorited_at: Option<Timestamp>,
 
     /// Snooze marker, a "temporary archive." When `snoozed_until` is in the
     /// future, the session sorts to tier 99 alongside archived rows and
@@ -601,7 +601,7 @@ pub struct Instance {
     /// Archive wins over snooze (archiving a snoozed session clears nothing
     /// but renders as archive since is_archived() is checked first).
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub snoozed_until: Option<DateTime<Utc>>,
+    pub snoozed_until: Option<Timestamp>,
 
     /// Unread marker: a session that needs attention. Set automatically when a
     /// turn finishes (`Running -> Idle`) and also by the manual `u` toggle;
@@ -625,7 +625,7 @@ pub struct Instance {
     /// and `archived_at` (user-facing hide): dormancy is invisible to
     /// the UI sort and exists only to suppress auto-respawn. See #1689.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub idle_dormant_since: Option<DateTime<Utc>>,
+    pub idle_dormant_since: Option<Timestamp>,
 
     /// Web-only pin marker. Distinct from `favorited_at`: favorite is the
     /// TUI attention-sort within-tier pin, while pin is a hard top-of-sort
@@ -638,7 +638,7 @@ pub struct Instance {
     /// because it is an explicit persistent surfacing signal, not a sink
     /// state that "user is engaging" implicitly contradicts. See #1581.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub pinned_at: Option<DateTime<Utc>>,
+    pub pinned_at: Option<Timestamp>,
 
     /// Trash marker: the session is soft-deleted. A trashed row is hidden
     /// from every normal and archived view (trash is its own bucket, see
@@ -655,7 +655,7 @@ pub struct Instance {
     /// preserved, so a restored favorite comes back a favorite. Additive:
     /// absent in older `sessions.json` rows, so no migration is needed.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub trashed_at: Option<DateTime<Utc>>,
+    pub trashed_at: Option<Timestamp>,
     /// UUID of the current trash lifecycle. Unlike the timestamp, it cannot
     /// collide across restore/retrash; v037 and v043 initialize older rows.
     #[serde(default, skip_serializing_if = "Option::is_none")]

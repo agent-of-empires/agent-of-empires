@@ -8,8 +8,8 @@ use std::{
     path::{Path, PathBuf},
 };
 
+use crate::time::Timestamp;
 use anyhow::{bail, Result};
-use chrono::Utc;
 
 use super::path_identity::CleanupProtection;
 use crate::containers;
@@ -548,7 +548,7 @@ impl WorkspacePlan {
                     base_branch_override: None,
                 })
                 .collect(),
-            created_at: Utc::now(),
+            created_at: Timestamp::now(),
             cleanup_on_delete: false,
         }
     }
@@ -979,7 +979,7 @@ pub(crate) fn plan_instance(
                         branch: branch.clone(),
                         main_repo_path: main_repo_path.to_string_lossy().to_string(),
                         managed_by_aoe: false,
-                        created_at: Utc::now(),
+                        created_at: Timestamp::now(),
                         base_branch: None,
                     });
                 } else {
@@ -1006,7 +1006,7 @@ pub(crate) fn plan_instance(
                         branch: branch.clone(),
                         main_repo_path: main_repo_path.to_string_lossy().to_string(),
                         managed_by_aoe: false,
-                        created_at: Utc::now(),
+                        created_at: Timestamp::now(),
                         base_branch: None,
                     });
                 }
@@ -1051,7 +1051,7 @@ pub(crate) fn plan_instance(
                     branch: branch.clone(),
                     main_repo_path: main_repo_path.to_string_lossy().to_string(),
                     managed_by_aoe: false,
-                    created_at: Utc::now(),
+                    created_at: Timestamp::now(),
                     base_branch: base,
                 });
             }
@@ -2410,7 +2410,7 @@ mod tests {
             }
         }
 
-        let timestamp = chrono::Utc::now().timestamp();
+        let timestamp = crate::time::Timestamp::now().as_unix_secs();
         for civ in civilizations::CIVILIZATIONS {
             for n in timestamp - 60..timestamp + 1060 {
                 taken.insert(branch_name_from_title(&format!("{} {}", civ, n)));

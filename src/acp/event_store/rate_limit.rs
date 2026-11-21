@@ -440,13 +440,15 @@ fn seed_budget_from_log(
 mod tests {
     use super::super::test_support::*;
     use super::*;
-    use chrono::Utc;
+    use crate::time::Timestamp;
 
     fn rate_limit_event(secs_until_reset: i64) -> Event {
         Event::RateLimit {
             info: RateLimitInfo {
                 status: "usage limit reached".into(),
-                resets_at: Some(Utc::now() + chrono::Duration::seconds(secs_until_reset)),
+                resets_at: Some(
+                    Timestamp::now() + crate::time::Duration::seconds(secs_until_reset),
+                ),
                 kind: "rate_limit".into(),
             },
         }
@@ -454,7 +456,7 @@ mod tests {
 
     fn auto_resume() -> Event {
         Event::RateLimitAutoResumed {
-            resets_at: Utc::now(),
+            resets_at: Timestamp::now(),
             manual: false,
         }
     }
@@ -501,7 +503,7 @@ mod tests {
                 "resumed with nothing to redeliver",
                 vec![
                     Event::RateLimitAutoResumed {
-                        resets_at: Utc::now(),
+                        resets_at: Timestamp::now(),
                         manual: true,
                     },
                     Event::AcpSessionAssigned {
@@ -615,7 +617,7 @@ mod tests {
             assert_eq!(store.rate_limited_turn_prompt(&id), want, "case {i}");
         }
 
-        let before = Utc::now().timestamp_millis();
+        let before = Timestamp::now().as_millis();
         store.record("latest", 1, &rate_limit_event(3600)).unwrap();
         let second = rate_limit_event(7200);
         let Event::RateLimit { info: ref expected } = second else {
@@ -623,7 +625,7 @@ mod tests {
         };
         let expected_resets = expected.resets_at;
         store.record("latest", 2, &second).unwrap();
-        let after = Utc::now().timestamp_millis();
+        let after = Timestamp::now().as_millis();
 
         let (info, recorded_at) = store.latest_rate_limit_event("latest").expect("stored");
         assert_eq!(info.resets_at, expected_resets, "latest event wins");
@@ -635,7 +637,7 @@ mod tests {
     fn rate_limit_redelivery_streak_counts_resumes_and_resets_organically() {
         let (_tmp, store) = open_store(1000);
         let manual_resume = || Event::RateLimitAutoResumed {
-            resets_at: Utc::now(),
+            resets_at: Timestamp::now(),
             manual: true,
         };
         let streak = || store.rate_limit_redelivery_streak("s-1");

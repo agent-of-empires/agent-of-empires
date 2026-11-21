@@ -1467,7 +1467,7 @@ mod dirty_tracking_tests {
             a.grant = Some(crate::session::CapabilityGrant {
                 manifest_hash: "sha256:abc".into(),
                 capabilities: vec!["net".into()],
-                granted_at: chrono::Utc::now(),
+                granted_at: crate::time::Timestamp::now(),
             });
         })
         .unwrap();

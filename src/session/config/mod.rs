@@ -213,7 +213,7 @@ pub struct CapabilityGrant {
     #[serde(default)]
     pub capabilities: Vec<String>,
     /// When the user approved the grant.
-    pub granted_at: chrono::DateTime<chrono::Utc>,
+    pub granted_at: crate::time::Timestamp,
 }
 
 fn default_enabled() -> bool {

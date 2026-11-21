@@ -95,7 +95,7 @@ struct MirroredFields {
     pending_turn_failure: Option<(u64, String, String, Option<String>)>,
     queued_prompts: Vec<crate::daemon::QueuedPromptEntry>,
     queued_prompt_next_seq: u64,
-    idle_dormant_since: Option<chrono::DateTime<chrono::Utc>>,
+    idle_dormant_since: Option<crate::time::Timestamp>,
     /// Mirrored as `disk = max(disk, memory)`, not copied, because the field is
     /// documented monotone non-decreasing and disk can legitimately lead memory
     /// when a peer process touched the row.
@@ -112,7 +112,7 @@ struct MirroredFields {
     /// recency but never clears `archived_at` / `snoozed_until` /
     /// `idle_dormant_since`, so no queue mutation can lift a sink. Writing this
     /// as `touch_last_accessed()` would.
-    last_accessed_at: Option<chrono::DateTime<chrono::Utc>>,
+    last_accessed_at: Option<crate::time::Timestamp>,
 }
 
 /// Append `text` to the instance's queue, or update the row already holding `prompt_id`.
@@ -124,7 +124,9 @@ fn enqueue_row(
     origin_device: Option<String>,
     origin_plugin: Option<String>,
 ) -> crate::daemon::QueuedPromptEntry {
-    inst.last_accessed_at = inst.last_accessed_at.max(Some(chrono::Utc::now()));
+    inst.last_accessed_at = inst
+        .last_accessed_at
+        .max(Some(crate::time::Timestamp::now()));
     if let Some(existing) = inst.queued_prompts.iter_mut().find(|q| q.id == prompt_id) {
         // A repost of unchanged content (a client restoring its cache) keeps the
         // sender; other content is the poster's.
@@ -154,7 +156,7 @@ fn enqueue_row(
         // The server's clock, drawn in the same critical section that
         // assigns `seq`, so row order and stamp order agree and the
         // resume admission can order rows against the park (#4092).
-        created_at: chrono::Utc::now().to_rfc3339(),
+        created_at: crate::time::Timestamp::now().to_rfc3339(),
         origin_device: origin_device.clone(),
         origin_plugin: origin_plugin.clone(),
     };
@@ -3537,7 +3539,7 @@ pub(crate) fn apply_prompt_persist_to_disk(disk: &mut crate::session::Instance, 
     if wake {
         disk.touch_last_accessed();
     } else {
-        let now = chrono::Utc::now();
+        let now = crate::time::Timestamp::now();
         disk.last_accessed_at = disk.last_accessed_at.max(Some(now));
         disk.ignored_at = None;
     }
@@ -3729,9 +3731,9 @@ mod tests {
     #[test]
     fn idempotent_match_survives_triage_but_not_removal() {
         let mut archived = plugin_instance("cron", "k", "h");
-        archived.archived_at = Some(chrono::Utc::now());
+        archived.archived_at = Some(crate::time::Timestamp::now());
         let mut trashed = plugin_instance("cron", "k2", "h");
-        trashed.trashed_at = Some(chrono::Utc::now());
+        trashed.trashed_at = Some(crate::time::Timestamp::now());
         let instances = vec![archived, trashed];
 
         assert!(matches!(
@@ -6190,7 +6192,7 @@ mod tests {
         let _tmp = isolate_app_dir();
         let profile = "default";
 
-        let stale = chrono::Utc::now() - chrono::Duration::seconds(600);
+        let stale = crate::time::Timestamp::now() - crate::time::Duration::seconds(600);
         let mut inst = Instance::new("queue", "/tmp/aoe-queue-recency");
         inst.id = "sess-recency".to_string();
         inst.view = crate::session::View::Structured;
@@ -6621,7 +6623,7 @@ mod tests {
             inst.view = crate::session::View::Structured;
             inst.source_profile = "default".into();
             inst.pending_initial_turn = pending_turn;
-            inst.idle_dormant_since = dormant.then(chrono::Utc::now);
+            inst.idle_dormant_since = dormant.then(crate::time::Timestamp::now);
             let storage = crate::session::Storage::new_unwatched("default").unwrap();
             storage
                 .update(|rows, _| {
@@ -6770,7 +6772,7 @@ mod tests {
                 .try_acquire_lifecycle_reservation(
                     LifecycleOperation::Stop,
                     Instance::LIFECYCLE_RESERVATION_TTL,
-                    chrono::Utc::now(),
+                    crate::time::Timestamp::now(),
                 )
                 .unwrap();
             crate::server::test_support::seed_instances_on_disk_for_test(
@@ -6830,7 +6832,7 @@ mod tests {
                             let newer = row.try_acquire_lifecycle_reservation(
                                 LifecycleOperation::Stop,
                                 Instance::LIFECYCLE_RESERVATION_TTL,
-                                chrono::Utc::now(),
+                                crate::time::Timestamp::now(),
                             )?;
                             row.status = Status::Stopped;
                             row.mark_idle_dormant();
@@ -6896,7 +6898,7 @@ mod tests {
             let mut visible = Instance::new("prompt-wake", "/tmp/aoe-prompt-wake");
             visible.source_profile = "default".into();
             visible.view = crate::session::View::Structured;
-            visible.idle_dormant_since = Some(chrono::Utc::now());
+            visible.idle_dormant_since = Some(crate::time::Timestamp::now());
             let mut persisted = visible.clone();
             match reason {
                 "archived" => persisted.archive(),
@@ -6967,7 +6969,7 @@ mod tests {
         let mut instance = Instance::new("failed-prompt-wake", "/tmp/aoe-failed-prompt-wake");
         instance.source_profile = "default".into();
         instance.view = crate::session::View::Structured;
-        instance.idle_dormant_since = Some(chrono::Utc::now());
+        instance.idle_dormant_since = Some(crate::time::Timestamp::now());
         let storage = crate::session::Storage::new_unwatched("default").unwrap();
         storage
             .update(|rows, _| {
@@ -7654,7 +7656,7 @@ mod tests {
         inst.id = id.to_string();
         inst.view = crate::session::View::Structured;
         let state = crate::server::test_support::build_test_app_state(vec![inst]);
-        let at = chrono::Utc::now().timestamp_millis();
+        let at = crate::time::Timestamp::now().as_millis();
         let store = &state.acp_event_store;
         let service = &state.session_service;
         let first = prompt("go");

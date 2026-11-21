@@ -368,7 +368,7 @@ mod serve {
 mod tests {
     use super::*;
     use crate::acp::state::{Event, ToolCall};
-    use chrono::Utc;
+    use crate::time::Timestamp;
 
     fn user(text: &str) -> Event {
         Event::UserPromptSent {
@@ -404,7 +404,7 @@ mod tests {
                 name: name.into(),
                 kind: "execute".into(),
                 args_preview: args.into(),
-                started_at: Utc::now(),
+                started_at: Timestamp::now(),
                 parent_tool_call_id: None,
                 memory_recall: None,
                 diffs: vec![],

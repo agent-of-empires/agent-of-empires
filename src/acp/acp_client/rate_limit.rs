@@ -8,7 +8,7 @@ use std::collections::HashMap;
 pub(crate) struct CapturedReset {
     /// `rateLimitType`, or empty when the report named none.
     pub(crate) window: String,
-    pub(crate) resets_at: chrono::DateTime<chrono::Utc>,
+    pub(crate) resets_at: crate::time::Timestamp,
 }
 
 impl CapturedReset {
@@ -157,13 +157,13 @@ pub(super) fn record_rate_limit_report(
 /// The window with the latest future reset, since every rejected window must clear.
 fn latest_future_reset<'a>(
     captures: impl Iterator<Item = (&'a String, &'a i64)>,
-    now: chrono::DateTime<chrono::Utc>,
+    now: crate::time::Timestamp,
 ) -> Option<CapturedReset> {
     captures
         .filter_map(|(window, secs)| {
             Some(CapturedReset {
                 window: window.clone(),
-                resets_at: chrono::DateTime::from_timestamp(*secs, 0)?,
+                resets_at: crate::time::Timestamp::from_unix_secs(*secs)?,
             })
         })
         .filter(|captured| captured.resets_at > now)
@@ -172,7 +172,7 @@ fn latest_future_reset<'a>(
 
 pub(super) fn captured_rate_limit_reset(
     captures: &std::sync::Mutex<HashMap<String, i64>>,
-    now: chrono::DateTime<chrono::Utc>,
+    now: crate::time::Timestamp,
 ) -> Option<CapturedReset> {
     latest_future_reset(
         captures
@@ -188,7 +188,7 @@ pub(super) fn captured_rate_limit_reset(
 /// one lock so a window recorded meanwhile is never cleared unobserved.
 pub(super) fn take_rate_limit_from_captured_rejection(
     captures: &std::sync::Mutex<HashMap<String, i64>>,
-    now: chrono::DateTime<chrono::Utc>,
+    now: crate::time::Timestamp,
 ) -> Option<RateLimitInfo> {
     let drained = std::mem::take(&mut *captures.lock().expect("rate-limit capture mutex poisoned"));
     latest_future_reset(drained.iter(), now).map(|captured| RateLimitInfo {
@@ -221,7 +221,7 @@ mod tests {
     #[test]
     fn classify_rate_limit_error_cases() {
         let limit = json!({ "errorKind": "rate_limit" });
-        let resets_at = chrono::Utc::now() + chrono::Duration::minutes(10);
+        let resets_at = crate::time::Timestamp::now() + crate::time::Duration::minutes(10);
         let captured = CapturedReset {
             window: "seven_day".into(),
             resets_at,
@@ -249,7 +249,7 @@ mod tests {
         assert!(classify_rate_limit_error(&invalid, None).is_none());
 
         // The same fingerprint inside a flattened error message.
-        let resets_at = chrono::Utc::now() + chrono::Duration::minutes(20);
+        let resets_at = crate::time::Timestamp::now() + crate::time::Duration::minutes(20);
         for msg in [
             "ACP connection failed: Internal error: limit: {\n  \"errorKind\":\"rate_limit\"\n}",
             "{\n  \"errorKind\": \"rate_limit\"\n}",
@@ -370,10 +370,10 @@ mod tests {
         }
 
         {
-            let now = chrono::DateTime::from_timestamp(1_800_000_000, 0).unwrap();
-            let five_hour = now + chrono::Duration::hours(2);
-            let seven_day = now + chrono::Duration::days(3);
-            let past = now - chrono::Duration::minutes(1);
+            let now = crate::time::Timestamp::from_unix_secs(1_800_000_000).unwrap();
+            let five_hour = now + crate::time::Duration::hours(2);
+            let seven_day = now + crate::time::Duration::days(3);
+            let past = now - crate::time::Duration::minutes(1);
             let cases = [
                 (
                     vec![("five_hour", five_hour), ("seven_day", seven_day)],
@@ -391,7 +391,7 @@ mod tests {
                 let captures = std::sync::Mutex::new(
                     resets
                         .iter()
-                        .map(|(window, dt)| (window.to_string(), dt.timestamp()))
+                        .map(|(window, dt)| (window.to_string(), dt.as_unix_secs()))
                         .collect(),
                 );
                 let captured =
