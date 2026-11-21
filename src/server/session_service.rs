@@ -1056,6 +1056,72 @@ impl SessionService {
         }
     }
 
+    /// Whether the canonical row is ignored. A delivery that must not clear Ignore reads the
+    /// store rather than the watcher's snapshot, which lags a write from the CLI or another
+    /// request.
+    pub(crate) async fn is_ignored_on_disk(&self, id: &str) -> anyhow::Result<bool> {
+        let state = self.native_state()?;
+        let profile = self
+            .instances
+            .read()
+            .await
+            .iter()
+            .find(|row| row.id == id)
+            .map(|row| row.source_profile.clone())
+            .ok_or(crate::session::SessionGone)?;
+        let id = id.to_owned();
+        tokio::task::spawn_blocking(move || -> anyhow::Result<bool> {
+            use crate::session::SessionStore;
+            let native = super::session_store::NativeSessionStore::open(state, &profile, None)?;
+            Ok(native
+                .load()?
+                .iter()
+                .any(|row| row.id == id && row.is_ignored()))
+        })
+        .await?
+    }
+
+    /// Input reached an open pane, which is user input like `send`: an ignored row does not
+    /// stay hidden under the operator's own keystrokes. Only the marker and recency change,
+    /// and only while the canonical row is still ignored and startable, so the write happens
+    /// once rather than per keystroke.
+    pub(crate) async fn touch_after_direct_input(&self, id: &str) -> anyhow::Result<()> {
+        if !self
+            .instances
+            .read()
+            .await
+            .iter()
+            .any(|row| row.id == id && row.is_ignored())
+        {
+            return Ok(());
+        }
+        let state = self.native_state()?;
+        let profile = self
+            .instances
+            .read()
+            .await
+            .iter()
+            .find(|row| row.id == id)
+            .map(|row| row.source_profile.clone())
+            .ok_or(crate::session::SessionGone)?;
+        let id = id.to_owned();
+        tokio::task::spawn_blocking(move || -> anyhow::Result<()> {
+            use crate::session::SessionStore;
+            let native = super::session_store::NativeSessionStore::open(state, &profile, None)?;
+            let store: &dyn SessionStore = &native;
+            store.update(|rows, _| {
+                if let Some(row) = rows.iter_mut().find(|row| row.id == id) {
+                    if row.is_ignored() {
+                        row.touch_after_input();
+                    }
+                }
+                Ok(())
+            })?;
+            Ok(())
+        })
+        .await?
+    }
+
     /// Deliver a turn to a structured session: resume a dead/dormant worker
     /// if needed, publish the prompt into the event stream, then forward it
     /// to the agent. Extracted from the `acp_prompt` HTTP handler so a
@@ -4997,6 +5063,73 @@ mod tests {
             .await;
 
             assert!(check(&state.instances.read().await[0]), "{name}");
+        }
+    }
+
+    /// A peer write is what counts: the canonical check sees an ignore the watcher has not
+    /// delivered to the in-memory snapshot yet.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn a_peer_ignore_is_visible_to_the_canonical_check() {
+        let _home = crate::session::test_support::isolate_app_dir();
+        let mut managed = Instance::new("peer-ignored", "/tmp/aoe-peer-ignored");
+        managed.id = "peer-ignored".into();
+        managed.source_profile = "default".into();
+        managed.parent_session_id = Some("manager".into());
+        crate::server::test_support::seed_instances_on_disk_for_test(
+            "default",
+            vec![managed.clone()],
+        );
+        let state = crate::server::test_support::build_test_app_state(vec![managed.clone()]);
+        let service = state.session_service.clone();
+        assert!(!service.is_ignored_on_disk("peer-ignored").await.unwrap());
+
+        let mut ignored = managed;
+        ignored.ignore();
+        crate::server::test_support::seed_instances_on_disk_for_test("default", vec![ignored]);
+        assert!(service.is_ignored_on_disk("peer-ignored").await.unwrap());
+        assert!(
+            !state.instances.read().await[0].is_ignored(),
+            "the snapshot was never refreshed, so the check above read the store"
+        );
+    }
+
+    /// Typing in an open pane is user input, so it clears Ignore on a row that can still
+    /// start; an archived row keeps the marker that its archive outranks.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn direct_input_clears_ignore_only_on_a_startable_row() {
+        let _home = crate::session::test_support::isolate_app_dir();
+        let cases = [("live", false, false), ("sunk", true, true)];
+        for (id, archived, still_ignored) in cases {
+            let mut row = Instance::new(id, "/tmp/aoe-direct-input");
+            row.id = id.into();
+            row.source_profile = "default".into();
+            row.parent_session_id = Some("manager".into());
+            if archived {
+                row.archive();
+            }
+            row.ignore();
+            let stored = crate::session::Storage::new_unwatched("default").unwrap();
+            stored
+                .update(|rows, _| {
+                    rows.retain(|row| row.id != id);
+                    rows.push(row.clone());
+                    Ok(())
+                })
+                .unwrap();
+            let state = crate::server::test_support::build_test_app_state(vec![row]);
+            crate::server::test_support::refresh_canonical_metadata_for_test(&state).await;
+            state
+                .session_service
+                .touch_after_direct_input(id)
+                .await
+                .unwrap();
+
+            let rows = stored.load().unwrap();
+            let written = rows.iter().find(|row| row.id == id).unwrap();
+            assert_eq!(written.is_ignored(), still_ignored, "{id}");
+            assert!(written.last_accessed_at.is_some(), "{id}");
         }
     }
 

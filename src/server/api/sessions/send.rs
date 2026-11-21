@@ -94,8 +94,16 @@ async fn send_terminal_message_inner(
         .cloned()
         .ok_or(SendKeysError::NotFound)?;
     before.ensure_startable().map_err(SendKeysError::Blocked)?;
-    // Refuse before reviving; the locked disk check below covers a concurrent ignore.
-    if refuse_if_ignored && before.is_ignored() {
+    // Ignore outranks the revive below: a row ignored while its pane was coming up is not
+    // typed into, and the canonical row is what counts, not the snapshot. The check under
+    // the instance lock covers an ignore that lands after this one.
+    if refuse_if_ignored
+        && (before.is_ignored()
+            || service
+                .is_ignored_on_disk(&before.id)
+                .await
+                .map_err(SendKeysError::Tmux)?)
+    {
         return Err(SendKeysError::Ignored);
     }
     if before.is_structured() {

@@ -34,6 +34,11 @@ const PROMPT_READY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs
 /// Pane lines `read_output` captures when the caller names none, as `GET /output` does.
 const DEFAULT_LINES: u32 = 200;
 
+/// Why a `create_session` prompt did not reach a session another one manages.
+const IGNORED_PROMPT: &str =
+    "The session is ignored because another session manages it, so nothing was typed. Take \
+     ownership back, then `send` the prompt.";
+
 /// The create fields a model may set. Hook trust, callbacks, command and environment
 /// overrides, fork and import sources and UI-only fields stay with the dashboard and CLI.
 #[derive(Debug, Deserialize, JsonSchema)]
@@ -96,6 +101,9 @@ enum PromptDelivery {
     BlockedWaiting,
     /// The terminal agent did not reach its input prompt in time, so nothing was typed.
     NotReady,
+    /// The terminal session was ignored, because another session manages it, before the
+    /// prompt could be typed: nothing was typed.
+    Ignored,
     /// The create was a retry of an earlier one with the same `idempotency_key`, so the prompt
     /// was not attempted by this call; the first create's outcome is unknown here.
     Replayed,
@@ -230,10 +238,26 @@ impl McpServer {
         )
         .await;
         let (session, fresh) = success_body(response).await.map_err(|e| *e)?;
+        // Ignore outranks the readiness wait: a person who ignores the new row while its pane
+        // comes up did not ask for this prompt to land there.
+        let ignored = prompt.is_some()
+            && fresh
+            && !structured
+            && self
+                .state
+                .session_service
+                .is_ignored_on_disk(&session.id)
+                .await
+                .unwrap_or(false);
         let (prompt_sent, prompt_delivery, prompt_error) = match prompt {
             None => (false, PromptDelivery::None, None),
             Some(_) if !fresh => (false, PromptDelivery::Replayed, None),
             Some(_) if structured => (true, PromptDelivery::PendingInitialTurn, None),
+            Some(_) if ignored => (
+                false,
+                PromptDelivery::Ignored,
+                Some(IGNORED_PROMPT.to_string()),
+            ),
             Some(text) => match wait_for_input_prompt(&self.state, &session.id).await {
                 PaneReadiness::Waiting => (
                     false,
@@ -270,7 +294,7 @@ impl McpServer {
                     &session.id,
                     text.clone(),
                     false,
-                    false,
+                    true,
                 )
                 .await
                 {
@@ -280,6 +304,11 @@ impl McpServer {
                         (true, PromptDelivery::Sent, None)
                     }
                     Err(e) => match e.error {
+                        SendKeysError::Ignored => (
+                            false,
+                            PromptDelivery::Ignored,
+                            Some(IGNORED_PROMPT.to_string()),
+                        ),
                         SendKeysError::NotRunning => (false, PromptDelivery::NotRunning, None),
                         other => {
                             let refusal = terminal_refusal(&session.id, other).await;
