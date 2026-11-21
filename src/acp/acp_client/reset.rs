@@ -901,15 +901,17 @@ done
             ("load_failed", true, true, true, false, false, 1),
             ("unavailable_new_failed", true, false, false, true, false, 0),
             ("load_and_new_failed", true, true, true, true, false, 0),
-            ("fork_unsupported", true, false, false, false, true, 1),
+            // An adapter without session/fork fails a requested fork before
+            // any load or new, so it cannot start the child empty.
+            ("fork_unsupported", true, false, false, false, true, 0),
             (
-                "fork_unsupported_load_failed",
-                true,
+                "fork_unsupported_load_capable",
                 true,
                 true,
                 false,
+                false,
                 true,
-                1,
+                0,
             ),
         ] {
             let tmp = tempfile::TempDir::new().unwrap();
@@ -976,17 +978,24 @@ done
                 }
             }
             client.shutdown().await.unwrap();
+            let fails = new_fails || fork;
             let position = |pred: fn(&Event) -> bool| events.iter().position(pred);
             let assignment = position(|e| matches!(e, Event::AcpSessionAssigned { .. }));
-            assert_eq!(assignment.is_some(), !new_fails, "{name}");
-            assert_eq!(
-                position(|e| matches!(e, Event::AgentStartupError { .. })).is_some(),
-                new_fails,
-                "{name}"
-            );
+            assert_eq!(assignment.is_some(), !fails, "{name}");
+            let startup_error = events.iter().find_map(|e| match e {
+                Event::AgentStartupError { message, .. } => Some(message.as_str()),
+                _ => None,
+            });
+            assert_eq!(startup_error.is_some(), fails, "{name}");
+            if fork {
+                assert!(
+                    startup_error.is_some_and(|m| m.contains("session/fork")),
+                    "{name}: {startup_error:?}"
+                );
+            }
             assert_eq!(
                 position(|e| matches!(e, Event::Stopped { .. })).is_some(),
-                !new_fails,
+                !fails,
                 "{name}"
             );
             let is_reset = |e: &Event| matches!(e, Event::SessionContextReset { .. });
@@ -1035,7 +1044,11 @@ done
                 .iter()
                 .filter(|r| r["method"] == "session/load")
                 .collect();
-            assert_eq!(loads.len(), usize::from(stored && load_capable), "{name}");
+            assert_eq!(
+                loads.len(),
+                usize::from(!fork && stored && load_capable),
+                "{name}"
+            );
             if let Some(load) = loads.first() {
                 assert_eq!(load["params"]["sessionId"], "previous-session", "{name}");
             }
@@ -1045,7 +1058,7 @@ done
                 .count();
             assert_eq!(
                 news,
-                usize::from(!(stored && load_capable && !load_fails)),
+                usize::from(!fork && !(stored && load_capable && !load_fails)),
                 "{name}"
             );
         }

@@ -1041,8 +1041,7 @@ pub(super) fn apply_acp_session_change(
                 "clearing stored ACP session id after a context reset (session/load or session/fork failure)"
             );
             inst.acp_session_id = None;
-            // A structured fork that failed (or was refused by a resume-only agent) reaches
-            // here via SessionContextReset.
+            // A structured fork that failed reaches here via SessionContextReset.
             if inst.fork_pending.take().is_some() {
                 inst.import_pending = None;
             }
