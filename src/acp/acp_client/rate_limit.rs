@@ -160,10 +160,15 @@ fn latest_future_reset<'a>(
     now: crate::time::Timestamp,
 ) -> Option<CapturedReset> {
     captures
-        .map(|(window, secs)| CapturedReset {
-            window: window.clone(),
-            resets_at: crate::time::Timestamp::from_unix_secs(*secs)
-                .unwrap_or(crate::time::Timestamp::MAX),
+        .filter_map(|(window, &secs)| {
+            // chrono read resets up to year 262142; anything beyond is malformed.
+            let resets_at = crate::time::Timestamp::from_unix_secs(secs).or((secs > 0
+                && secs <= 8_210_266_876_799)
+                .then_some(crate::time::Timestamp::MAX))?;
+            Some(CapturedReset {
+                window: window.clone(),
+                resets_at,
+            })
         })
         .filter(|captured| captured.resets_at > now)
         .max_by_key(|captured| captured.resets_at)
@@ -410,6 +415,13 @@ mod tests {
             )]));
             let info = take_rate_limit_from_captured_rejection(&captures, now).unwrap();
             assert_eq!(info.resets_at, Some(crate::time::Timestamp::MAX));
+
+            // One chrono could not represent is dropped, as chrono did.
+            for secs in [8_210_266_876_800, i64::MAX, -1_000_000_000_000] {
+                let captures =
+                    std::sync::Mutex::new(HashMap::from([("seven_day".to_string(), secs)]));
+                assert!(take_rate_limit_from_captured_rejection(&captures, now).is_none());
+            }
         }
     }
 
