@@ -333,7 +333,7 @@ impl Instance {
     /// the patch's lifecycle generation is current. This prevents an old pane
     /// poll from repainting a newer Stop/Restart/Archive commit.
     ///
-    /// The `>=` guard on `last_accessed_at` compares `chrono::Utc::now()`
+    /// The `>=` guard on `last_accessed_at` compares `crate::time::Timestamp::now()`
     /// values, which delegate to `SystemTime::now()` (wall clock, not
     /// monotonic). Under an NTP rewind, a genuinely newer live observation
     /// stamped after the rewind can compare less than a value stamped
@@ -578,8 +578,8 @@ mod tests {
 
     fn patch(
         status: Status,
-        idle_entered_at: Option<DateTime<Utc>>,
-        last_accessed_at: Option<DateTime<Utc>>,
+        idle_entered_at: Option<Timestamp>,
+        last_accessed_at: Option<Timestamp>,
     ) -> PassiveStatusPatch {
         PassiveStatusPatch {
             lifecycle_generation: 0,
@@ -744,12 +744,12 @@ mod tests {
 
             // A stale poll or TUI snapshot must not land a live status on an archived row.
             let mut disk = inst();
-            disk.archived_at = Some(Utc::now());
+            disk.archived_at = Some(Timestamp::now());
             disk.merge_passive_status_patch(&disk.id.clone(), &patch(status, None, None));
             assert_eq!(disk.status, Status::Idle, "patch {status:?}");
 
             let mut stored = inst();
-            stored.archived_at = Some(Utc::now());
+            stored.archived_at = Some(Timestamp::now());
             let mut src = stored.clone();
             src.status = status;
             stored.merge_from_tui(&src);
@@ -783,7 +783,7 @@ mod tests {
         let mut live = inst();
         live.lifecycle_generation = 7;
         live.status = Status::Starting;
-        live.idle_entered_at = Some(Utc::now() - chrono::Duration::minutes(5));
+        live.idle_entered_at = Some(Timestamp::now() - crate::time::Duration::minutes(5));
         live.last_error = Some("stale pane observation".to_string());
         live.capture_started_at = floor(1_000_000);
         let mut disk = live.clone();
@@ -836,7 +836,7 @@ mod tests {
         previous.view = View::Structured;
         previous.lifecycle_generation = 3;
         previous.status = Status::Error;
-        previous.idle_entered_at = Some(Utc::now());
+        previous.idle_entered_at = Some(Timestamp::now());
         previous.last_error = Some(TMUX_SESSION_GONE_ERROR.to_string());
         previous.capture_started_at = floor(1_000_000);
         previous.acp_load_session_capable = Some(true);
@@ -890,7 +890,7 @@ mod tests {
             reserved.lifecycle_reservation = Some(LifecycleReservation {
                 op,
                 generation: 4,
-                at: Utc::now(),
+                at: Timestamp::now(),
             });
             reserved.merge_runtime_from_reload(&deleting);
             assert_eq!(reserved.lifecycle_generation, 4);
@@ -1210,7 +1210,9 @@ mod tests {
             ),
             (
                 "peer touch beats tui archive",
-                |i| i.last_accessed_at = Some(Utc::now() - chrono::Duration::seconds(60)),
+                |i| {
+                    i.last_accessed_at = Some(Timestamp::now() - crate::time::Duration::seconds(60))
+                },
                 |i| i.archive(),
                 |i| i.touch_last_accessed(),
                 &[(archived, false)],
@@ -1252,7 +1254,9 @@ mod tests {
             ),
             (
                 "peer touch keeps tui pin",
-                |i| i.last_accessed_at = Some(Utc::now() - chrono::Duration::seconds(60)),
+                |i| {
+                    i.last_accessed_at = Some(Timestamp::now() - crate::time::Duration::seconds(60))
+                },
                 |i| i.pin(),
                 |i| i.touch_last_accessed(),
                 &[(pinned, true)],
@@ -1295,8 +1299,8 @@ mod tests {
             let mut pre = inst();
             pre.live_status_baseline = Some(Status::Idle);
             pre.status = Status::Idle;
-            pre.last_accessed_at = Some(Utc::now() - chrono::Duration::seconds(60));
-            pre.idle_dormant_since = Some(Utc::now() - chrono::Duration::hours(5));
+            pre.last_accessed_at = Some(Timestamp::now() - crate::time::Duration::seconds(60));
+            pre.idle_dormant_since = Some(Timestamp::now() - crate::time::Duration::hours(5));
             let mut disk = pre.clone();
             let _cache = force_session_absent();
             disk.update_status_with_metadata(None, None);
@@ -1312,13 +1316,13 @@ mod tests {
     fn passive_status_patch_is_a_narrow_generation_guarded_splice() {
         let mut disk = inst();
         disk.status = Status::Running;
-        disk.last_accessed_at = Some(Utc::now() - chrono::Duration::hours(1));
+        disk.last_accessed_at = Some(Timestamp::now() - crate::time::Duration::hours(1));
         disk.title = "peer-title".to_string();
         disk.group_path = "peer/group".to_string();
         disk.unread = true;
-        disk.pinned_at = Some(Utc::now());
+        disk.pinned_at = Some(Timestamp::now());
         let before = disk.clone();
-        let now = Utc::now();
+        let now = Timestamp::now();
         let fresh = patch(Status::Idle, Some(now), Some(now));
         disk.merge_passive_status_patch(&disk.id.clone(), &fresh);
         assert_eq!(
@@ -1351,8 +1355,8 @@ mod tests {
 
     #[test]
     fn passive_status_patch_only_advances_last_accessed_at() {
-        let ts = Utc::now();
-        let older = ts - chrono::Duration::minutes(5);
+        let ts = Timestamp::now();
+        let older = ts - crate::time::Duration::minutes(5);
         // (disk last_accessed_at, patch last_accessed_at, expected)
         for (disk_ts, patch_ts, expected) in [
             (None, None, None),
@@ -1379,8 +1383,8 @@ mod tests {
 
     #[test]
     fn merge_from_tui_copies_status_and_launch_config_only() {
-        let earlier = Utc::now() - chrono::Duration::minutes(5);
-        let later = Utc::now();
+        let earlier = Timestamp::now() - crate::time::Duration::minutes(5);
+        let later = Timestamp::now();
         let mut stored = inst();
         let (id, path, created) = (
             stored.id.clone(),

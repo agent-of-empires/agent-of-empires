@@ -278,7 +278,7 @@ fn events_publish(state: &HostApiState, params: &Value) -> Result<Value, Dispatc
         serde_json::to_string(payload).map_err(|e| DispatchError::internal(e.to_string()))?;
     let conn = state.events.lock().unwrap_or_else(|p| p.into_inner());
     let seq = events::highest_seq(&conn, &state.schema, topic) + 1;
-    let created_at = chrono::Utc::now().timestamp_millis();
+    let created_at = crate::time::Timestamp::now().as_millis();
     events::insert_event(&conn, &state.schema, topic, seq, &payload_json, created_at)
         .map_err(|e| DispatchError::internal(e.to_string()))?;
     events::prune_retention(&conn, &state.schema, topic, state.retention, &[]);
@@ -680,7 +680,7 @@ fn plugin_storage_set(
 ) -> Result<Value, DispatchError> {
     let key = storage_key(params)?;
     let value_json = storage_value(params)?;
-    let now = chrono::Utc::now().timestamp_millis();
+    let now = crate::time::Timestamp::now().as_millis();
     let conn = state.events.lock().unwrap_or_else(|p| p.into_inner());
     enforce_key_quota(&conn, &ctx.plugin_id, &key)?;
     conn.execute(
@@ -704,7 +704,7 @@ fn plugin_storage_cas(
         .get("expected")
         .cloned()
         .ok_or_else(|| DispatchError::invalid_params("missing param \"expected\""))?;
-    let now = chrono::Utc::now().timestamp_millis();
+    let now = crate::time::Timestamp::now().as_millis();
     let mut conn = state.events.lock().unwrap_or_else(|p| p.into_inner());
     let tx = conn
         .transaction()
@@ -1188,8 +1188,8 @@ mod tests {
 
         let tmp = tempfile::tempdir().unwrap();
         let _home = crate::session::test_support::isolate_app_dir_at(tmp.path());
-        let now = chrono::Utc::now();
-        let hour = chrono::Duration::hours(1);
+        let now = crate::time::Timestamp::now();
+        let hour = crate::time::Duration::hours(1);
 
         let mut rows = Vec::new();
         let mut seed = |title: &str, f: &dyn Fn(&mut Instance)| {
@@ -1620,7 +1620,7 @@ method = "{tool}.session_id"
                             manifest.as_bytes(),
                         ),
                         capabilities: vec!["runtime.worker".into()],
-                        granted_at: chrono::Utc::now(),
+                        granted_at: crate::time::Timestamp::now(),
                     }),
                     ..Default::default()
                 },

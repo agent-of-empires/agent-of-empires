@@ -639,9 +639,7 @@ async fn archive_and_trash_after_a_clock_correction_remain_readable() {
     let _home = TempAppDir::new();
     agent_of_empires::session::create_profile("main").unwrap();
     agent_of_empires::session::create_profile("healthy").unwrap();
-    let future = chrono::DateTime::parse_from_rfc3339("9999-12-31T23:59:59Z")
-        .unwrap()
-        .with_timezone(&chrono::Utc);
+    let future = agent_of_empires::time::Timestamp::parse_rfc3339("9999-12-31T23:59:59Z").unwrap();
     let mut live = Instance::new("clock live", "/repo");
     live.id = "live-row".into();
     live.source_profile = "main".into();

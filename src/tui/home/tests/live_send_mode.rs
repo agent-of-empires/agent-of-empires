@@ -1350,7 +1350,7 @@ fn tool_admission_rejects_reserved_rows_and_uses_fresh_configuration() {
         .try_acquire_lifecycle_reservation(
             LifecycleOperation::Purge,
             Instance::LIFECYCLE_RESERVATION_TTL,
-            chrono::Utc::now(),
+            crate::time::Timestamp::now(),
         )
         .unwrap();
     storage

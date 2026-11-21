@@ -248,9 +248,9 @@ mod trash_reservation_tests {
             crate::server::test_support::refresh_canonical_metadata_for_test(&state).await;
             let worker_state = state.clone();
             let worker_id = id.clone();
-            let peer_at = chrono::Utc::now()
+            let peer_at = crate::time::Timestamp::now()
                 + Instance::LIFECYCLE_RESERVATION_TTL
-                + chrono::Duration::seconds(1);
+                + crate::time::Duration::seconds(1);
             let result = tokio::task::spawn_blocking(move || -> anyhow::Result<()> {
                 let native = crate::server::session_store::NativeSessionStore::open(
                     worker_state.clone(),
@@ -277,7 +277,7 @@ mod trash_reservation_tests {
                     let generation = row.try_acquire_lifecycle_reservation(
                         LifecycleOperation::Trash,
                         Instance::LIFECYCLE_RESERVATION_TTL,
-                        chrono::Utc::now(),
+                        crate::time::Timestamp::now(),
                     )?;
                     retirement.generation = Some(generation);
                     row.trash();
@@ -334,14 +334,14 @@ mod trash_reservation_tests {
                 _ => {
                     assert_eq!(stored.lifecycle_generation, initial_generation + 1);
                     assert!(stored.has_pending_trash());
-                    assert!(!stored.has_fresh_lifecycle_reservation(chrono::Utc::now()));
+                    assert!(!stored.has_fresh_lifecycle_reservation(crate::time::Timestamp::now()));
                     let mut retry = stored;
                     assert_eq!(
                         retry
                             .try_acquire_lifecycle_reservation(
                                 LifecycleOperation::Trash,
                                 Instance::LIFECYCLE_RESERVATION_TTL,
-                                chrono::Utc::now(),
+                                crate::time::Timestamp::now(),
                             )
                             .unwrap(),
                         initial_generation + 2
@@ -368,7 +368,7 @@ mod archive_reservation_tests {
             let generation = row.try_acquire_lifecycle_reservation(
                 LifecycleOperation::Stop,
                 Instance::LIFECYCLE_RESERVATION_TTL,
-                chrono::Utc::now(),
+                crate::time::Timestamp::now(),
             )?;
             crate::server::test_support::seed_instances_on_disk_for_test(
                 "default",
@@ -408,7 +408,7 @@ mod archive_reservation_tests {
                     expected_generation = rows[0].try_acquire_lifecycle_reservation(
                         LifecycleOperation::Stop,
                         Instance::LIFECYCLE_RESERVATION_TTL,
-                        chrono::Utc::now(),
+                        crate::time::Timestamp::now(),
                     )?;
                     Ok(())
                 })?;
@@ -420,7 +420,7 @@ mod archive_reservation_tests {
                 retired_file = Some(retired.join(storage.sessions_path().file_name().unwrap()));
                 let replacement = Storage::new_unwatched("default")?;
                 row.title = "replacement must retain its matching numeric token".into();
-                row.created_at += chrono::Duration::seconds(1);
+                row.created_at += crate::time::Duration::seconds(1);
                 replacement.update(|rows, _| {
                     *rows = vec![row.clone()];
                     Ok(())
@@ -511,7 +511,7 @@ pub async fn update_session_archive(
             if row.is_trashed() {
                 return Err(LifecycleTargetError::Blocked(crate::session::StartBlocked::Trashed).into());
             }
-            let now = chrono::Utc::now();
+            let now = crate::time::Timestamp::now();
             if matches!(row.status, Status::Creating | Status::Deleting)
                 || row.has_fresh_lifecycle_reservation(now) {
                 return Err(LifecycleTargetError::Busy.into());
@@ -766,7 +766,7 @@ pub async fn trash_session(
             }
             let retrying = row.is_trashed();
             if retrying {
-                if row.has_fresh_lifecycle_reservation(chrono::Utc::now()) {
+                if row.has_fresh_lifecycle_reservation(crate::time::Timestamp::now()) {
                     return Err(LifecycleTargetError::Busy.into());
                 }
                 if !row.lifecycle_reservation_is_owned(LifecycleOperation::Trash, row.lifecycle_generation) {
@@ -774,7 +774,7 @@ pub async fn trash_session(
                 }
             }
             row.try_acquire_lifecycle_reservation(
-                LifecycleOperation::Trash, Instance::LIFECYCLE_RESERVATION_TTL, chrono::Utc::now(),
+                LifecycleOperation::Trash, Instance::LIFECYCLE_RESERVATION_TTL, crate::time::Timestamp::now(),
             )?;
             retirement.generation = Some(row.lifecycle_generation);
             row.trash();
@@ -866,7 +866,7 @@ pub async fn trash_session(
                 if terminal {
                     row.release_lifecycle_reservation_if_owned(LifecycleOperation::Trash, generation);
                 } else {
-                    row.retire_trash_reservation_if_owned(generation, chrono::Utc::now());
+                    row.retire_trash_reservation_if_owned(generation, crate::time::Timestamp::now());
                 }
             }
             if let Err(error) = &stopped {
@@ -989,7 +989,7 @@ pub async fn restore_session(
                 if worker_state.cityhall_mode && !row.is_structured() {
                     return Err(LifecycleTargetError::CityHall.into());
                 }
-                let now = chrono::Utc::now();
+                let now = crate::time::Timestamp::now();
                 if !row.is_trashed() {
                     if row.has_fresh_lifecycle_reservation(now) {
                         return Err(row.lifecycle_reservation.as_ref().map_or(
@@ -1530,7 +1530,7 @@ fn reserve_structured_user_stop(row: &mut Instance) -> anyhow::Result<u64> {
     let generation = row.try_acquire_lifecycle_reservation(
         LifecycleOperation::Stop,
         Instance::LIFECYCLE_RESERVATION_TTL,
-        chrono::Utc::now(),
+        crate::time::Timestamp::now(),
     )?;
     // Even a row already presented as Stopped can own a live or pending worker.
     row.status = Status::Stopped;
@@ -1706,7 +1706,7 @@ pub(crate) async fn resume_structured_stop(
         anyhow::ensure!(row.is_structured(), LifecycleTargetError::NotStructured);
         if row.terminal_handoff.is_some()
             || matches!(row.status, Status::Creating | Status::Deleting)
-            || (row.has_fresh_lifecycle_reservation(chrono::Utc::now())
+            || (row.has_fresh_lifecycle_reservation(crate::time::Timestamp::now())
                 && !row
                     .lifecycle_reservation_is_owned(LifecycleOperation::Stop, expected_generation))
         {
@@ -1840,7 +1840,7 @@ async fn stop_with_commit(
             let generation = row.try_acquire_lifecycle_reservation(
                 LifecycleOperation::Stop,
                 Instance::LIFECYCLE_RESERVATION_TTL,
-                chrono::Utc::now(),
+                crate::time::Timestamp::now(),
             )?;
             if row.status == Status::Stopped {
                 row.release_lifecycle_reservation_if_owned(LifecycleOperation::Stop, generation);
@@ -2340,7 +2340,7 @@ fn admit_restart(
     body: &crate::daemon::RestartSessionBody,
     account_swap: bool,
 ) -> anyhow::Result<()> {
-    let now = chrono::Utc::now();
+    let now = crate::time::Timestamp::now();
     if let Err(blocked) = row.ensure_startable() {
         return Err(LifecycleTargetError::Blocked(blocked).into());
     }
@@ -2616,14 +2616,14 @@ fn reserve_structured_restart(
             crate::session::LifecycleReservationError::Superseded
         );
         if matches!(row.status, Status::Creating | Status::Deleting)
-            || row.has_fresh_lifecycle_reservation(chrono::Utc::now())
+            || row.has_fresh_lifecycle_reservation(crate::time::Timestamp::now())
         {
             return Err(LifecycleTargetError::Busy.into());
         }
         row.try_acquire_lifecycle_reservation(
             LifecycleOperation::Launch,
             Instance::LIFECYCLE_RESERVATION_TTL,
-            chrono::Utc::now(),
+            crate::time::Timestamp::now(),
         )?;
         row.status = Status::Starting;
         Ok(row.clone())
@@ -2684,7 +2684,7 @@ pub(super) async fn continue_interrupted_prompt(
     state: &Arc<AppState>,
     id: &str,
     generation: u64,
-    resets_at: chrono::DateTime<chrono::Utc>,
+    resets_at: crate::time::Timestamp,
     explicit_wake: bool,
 ) -> bool {
     let submission = state.session_service.prompt_submission(id).await;
@@ -3069,8 +3069,7 @@ fn rate_limit_of(body: &serde_json::Value) -> Option<crate::acp::state::RateLimi
         status: body["status"].as_str()?.to_owned(),
         resets_at: body["resets_at"]
             .as_str()
-            .and_then(|at| chrono::DateTime::parse_from_rfc3339(at).ok())
-            .map(|at| at.with_timezone(&chrono::Utc)),
+            .and_then(|at| crate::time::Timestamp::parse_rfc3339(at).ok()),
         kind: body["kind"].as_str()?.to_owned(),
     })
 }
@@ -3504,7 +3503,7 @@ async fn prepare_agent_session_inner(
                     LifecycleOperation::Launch,
                     reserved.lifecycle_generation,
                 );
-                row.idle_dormant_since = Some(chrono::Utc::now());
+                row.idle_dormant_since = Some(crate::time::Timestamp::now());
                 Ok(row.clone())
             })
         })
@@ -3703,7 +3702,7 @@ async fn prepare_agent_session_inner(
                     admit_restart(row, body, account_swap)?;
                     return Ok(Some(row.clone()));
                 }
-                let now = chrono::Utc::now();
+                let now = crate::time::Timestamp::now();
                 if row.is_structured() {
                     anyhow::ensure!(
                         row.lifecycle_generation == instance.lifecycle_generation,
@@ -4788,7 +4787,7 @@ mod durable_stop_tests {
             .try_acquire_lifecycle_reservation(
                 LifecycleOperation::Stop,
                 Instance::LIFECYCLE_RESERVATION_TTL,
-                chrono::Utc::now(),
+                crate::time::Timestamp::now(),
             )
             .unwrap();
         crate::server::test_support::seed_instances_on_disk_for_test("default", vec![row.clone()]);

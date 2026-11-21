@@ -1,6 +1,6 @@
 //! Permission UI bridge.
 
-use chrono::Utc;
+use crate::time::Timestamp;
 
 use super::approvals::{
     is_choice_list, is_destructive, Approval, ApprovalOption, Nonce, ResolvedApproval,
@@ -17,7 +17,7 @@ pub fn build_approval(tool_call: ToolCall, options: Vec<ApprovalOption>) -> Appr
         choice: is_choice_list(&options),
         options,
         plan: None,
-        requested_at: Utc::now(),
+        requested_at: Timestamp::now(),
         resolved: None,
     }
 }
@@ -31,7 +31,7 @@ pub fn resolve(
     approval.resolved = Some(ResolvedApproval {
         decision,
         message,
-        resolved_at: Utc::now(),
+        resolved_at: Timestamp::now(),
     });
 }
 
@@ -47,7 +47,7 @@ mod tests {
             name: name.into(),
             kind: kind.into(),
             args_preview: args_preview.into(),
-            started_at: Utc::now(),
+            started_at: Timestamp::now(),
             parent_tool_call_id: None,
             memory_recall: None,
             diffs: Vec::new(),

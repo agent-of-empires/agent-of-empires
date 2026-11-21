@@ -1816,7 +1816,7 @@ mod tests {
     }
 
     fn usable_credential() -> String {
-        let expires_at = chrono::Utc::now().timestamp_millis() + 3_600_000;
+        let expires_at = crate::time::Timestamp::now().as_millis() + 3_600_000;
         crate::session::sandbox_login::claude::fixtures::usable(expires_at as u64)
     }
 
@@ -2163,7 +2163,7 @@ mod tests {
                     Some(instance.try_acquire_lifecycle_reservation(
                         LifecycleOperation::Launch,
                         Instance::LIFECYCLE_RESERVATION_TTL,
-                        Utc::now(),
+                        Timestamp::now(),
                     )?)
                 } else {
                     None
@@ -2278,7 +2278,9 @@ mod tests {
         let generation = stale.try_acquire_lifecycle_reservation(
             LifecycleOperation::Launch,
             Instance::LIFECYCLE_RESERVATION_TTL,
-            Utc::now() - Instance::SANDBOX_PREPARATION_WINDOW - chrono::Duration::seconds(1),
+            Timestamp::now()
+                - Instance::SANDBOX_PREPARATION_WINDOW
+                - crate::time::Duration::seconds(1),
         )?;
         store.update(|rows, _| {
             rows.push(stale.clone());
@@ -2289,7 +2291,7 @@ mod tests {
             let stop = row.try_acquire_lifecycle_reservation(
                 LifecycleOperation::Stop,
                 Instance::LIFECYCLE_RESERVATION_TTL,
-                Utc::now(),
+                Timestamp::now(),
             )?;
             assert!(row.finish_lifecycle_status(LifecycleOperation::Stop, stop, Status::Stopped));
             Ok(())
@@ -4094,7 +4096,7 @@ mod tests {
             branch: "feat".to_string(),
             workspace_dir: "/ws/feat".to_string(),
             repos: vec![repo("backend"), repo("frontend")],
-            created_at: chrono::Utc::now(),
+            created_at: crate::time::Timestamp::now(),
             cleanup_on_delete: true,
         });
         assert_eq!(inst.repo_config_path(), Path::new("/ws/feat/backend"));

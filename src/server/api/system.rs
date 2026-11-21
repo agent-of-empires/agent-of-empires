@@ -3100,10 +3100,10 @@ mod tests {
         live.group_path = "client/api".into();
         let mut archived = live.clone();
         archived.id = "archived".into();
-        archived.archived_at = Some(chrono::Utc::now());
+        archived.archived_at = Some(crate::time::Timestamp::now());
         let mut trashed = live.clone();
         trashed.id = "trashed".into();
-        trashed.trashed_at = Some(chrono::Utc::now());
+        trashed.trashed_at = Some(crate::time::Timestamp::now());
         let mut other = live.clone();
         other.id = "other".into();
         other.source_profile = "other".into();
@@ -3163,7 +3163,7 @@ mod tests {
             Group, ARCHIVED_SECTION_PATH, SCRATCH_GROUP_PATH, TRASH_SECTION_PATH,
         };
         let mut archived = Group::new("old", "old");
-        archived.archived_at = Some(chrono::Utc::now());
+        archived.archived_at = Some(crate::time::Timestamp::now());
         let stored = [Group::new("empty", "empty"), archived];
         let sessions: Vec<String> = [
             "client/api",
@@ -3997,7 +3997,7 @@ command = "zzzeta"
                             manifest.as_bytes(),
                         ),
                         capabilities: Vec::new(),
-                        granted_at: chrono::Utc::now(),
+                        granted_at: crate::time::Timestamp::now(),
                     }),
                     ..Default::default()
                 },

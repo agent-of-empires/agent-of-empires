@@ -82,7 +82,7 @@ impl<S: BroadcastSink> Supervisor<S> {
     pub fn publish_rate_limit_auto_resumed(
         &self,
         session_id: &str,
-        resets_at: chrono::DateTime<chrono::Utc>,
+        resets_at: crate::time::Timestamp,
         manual: bool,
     ) -> u64 {
         self.publish_next(
@@ -389,7 +389,7 @@ pub(super) fn detach_orphaned_background_agents_on<S: BroadcastSink>(
             session_id,
             &Event::BackgroundTaskFinished {
                 task_id,
-                ended_at: Some(chrono::Utc::now()),
+                ended_at: Some(crate::time::Timestamp::now()),
             },
         );
     }
@@ -421,7 +421,7 @@ pub(super) fn cancelled_open_subagents<S: BroadcastSink>(sink: &S, session_id: &
             subagent.stop_reason = Some("cancelled".into());
             Event::SubagentUpdated {
                 subagent,
-                at: chrono::Utc::now(),
+                at: crate::time::Timestamp::now(),
             }
         })
         .collect()
@@ -444,7 +444,7 @@ fn publish_background_agent_detached<S: BroadcastSink>(
             tools: Vec::new(),
             result: None,
             warning: Some(warning.to_string()),
-            ended_at: chrono::Utc::now(),
+            ended_at: crate::time::Timestamp::now(),
         },
     );
 }
@@ -552,7 +552,7 @@ mod tests {
 
         sup.publish_startup_error("s-1", "boom".into());
         sup.publish_user_prompt("s-1", "first prompt".into()).await;
-        let resets_at = chrono::Utc::now();
+        let resets_at = crate::time::Timestamp::now();
         assert_eq!(
             sup.publish_rate_limit_auto_resumed("s-1", resets_at, false),
             3

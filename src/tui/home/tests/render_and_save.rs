@@ -8,7 +8,7 @@ fn worktree_instance(title: &str) -> Instance {
         branch: "feature/foo".to_string(),
         main_repo_path: "/tmp/a-main".to_string(),
         managed_by_aoe: true,
-        created_at: chrono::Utc::now(),
+        created_at: crate::time::Timestamp::now(),
         base_branch: None,
     });
     inst
@@ -31,7 +31,7 @@ fn workspace_instance() -> Instance {
         branch: "feature/foo".to_string(),
         workspace_dir: "/tmp/workspace".to_string(),
         repos: vec![repo("api"), repo("web")],
-        created_at: chrono::Utc::now(),
+        created_at: crate::time::Timestamp::now(),
         cleanup_on_delete: true,
     });
     inst
@@ -160,7 +160,7 @@ fn plugin_statuses_align_before_activity_age() {
     let (_temp, _guard) = test_home();
     let mut first = Instance::new("short", "/tmp/a");
     first.status = Status::Idle;
-    first.idle_entered_at = Some(chrono::Utc::now() - chrono::Duration::minutes(5));
+    first.idle_entered_at = Some(crate::time::Timestamp::now() - crate::time::Duration::minutes(5));
     let mut second = Instance::new("a longer title", "/tmp/a");
     second.view = crate::session::View::Structured;
     let ids = [first.id.clone(), second.id.clone()];
@@ -256,7 +256,7 @@ fn test_show_activity_age_toggles_age_column() {
     let (_temp, _guard) = test_home();
     let mut inst = Instance::new("a-very-long-session-title", "/tmp/a");
     inst.status = Status::Idle;
-    inst.idle_entered_at = Some(chrono::Utc::now() - chrono::Duration::minutes(5));
+    inst.idle_entered_at = Some(crate::time::Timestamp::now() - crate::time::Duration::minutes(5));
     seed_profile("alpha", &[inst]);
     let mut view = test_view(Some("alpha"));
     view.group_by = crate::session::config::GroupByMode::Manual;
@@ -833,7 +833,7 @@ async fn test_rename_selected_rejects_all_identity_collisions_and_allows_group_o
         branch: "throwaway".to_string(),
         main_repo_path: "/tmp/repo".to_string(),
         managed_by_aoe: true,
-        created_at: chrono::Utc::now(),
+        created_at: crate::time::Timestamp::now(),
         base_branch: None,
     });
     let tied_id = tied_target.id.clone();

@@ -422,7 +422,7 @@ impl NativeSessionStore {
 
     pub(crate) fn retire_trash_reservation(&self, id: &str, generation: u64) -> Result<()> {
         self.settle_lifecycle_reservation(id, None, |row| {
-            row.retire_trash_reservation_if_owned(generation, chrono::Utc::now());
+            row.retire_trash_reservation_if_owned(generation, crate::time::Timestamp::now());
         })
     }
 
@@ -1281,16 +1281,18 @@ mod tests {
             let mut row = Instance::new("live structured", "/tmp");
             row.source_profile = "default".into();
             row.view = crate::session::View::Structured;
-            let prior_access = chrono::Utc::now() - chrono::Duration::days(2);
+            let prior_access = crate::time::Timestamp::now() - crate::time::Duration::days(2);
             row.last_accessed_at = Some(prior_access);
-            row.idle_entered_at = Some(chrono::Utc::now() - chrono::Duration::hours(3));
+            row.idle_entered_at =
+                Some(crate::time::Timestamp::now() - crate::time::Duration::hours(3));
             let storage = Storage::new_unwatched("default")?;
             storage.update(|rows, _| {
                 *rows = vec![row.clone()];
                 Ok(())
             })?;
             row.status = status;
-            row.idle_entered_at = Some(chrono::Utc::now() - chrono::Duration::minutes(7));
+            row.idle_entered_at =
+                Some(crate::time::Timestamp::now() - crate::time::Duration::minutes(7));
             row.plugin_revival_pending = true;
             row.last_error = Some("live diagnostic".into());
             let idle = row.idle_entered_at;
@@ -1685,7 +1687,7 @@ mod tests {
                 branch: "work".into(),
                 main_repo_path: main.to_string_lossy().into_owned(),
                 managed_by_aoe: true,
-                created_at: chrono::Utc::now(),
+                created_at: crate::time::Timestamp::now(),
                 base_branch: None,
             });
             if policy == "cityhall_structured" {

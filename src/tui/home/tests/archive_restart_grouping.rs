@@ -2162,11 +2162,13 @@ fn archived_section_nests_by_project_in_project_mode() {
             .unwrap();
         env.view.mutate_instance(&alpha_id, |row| {
             row.archive();
-            row.archived_at = Some(chrono::Utc::now() - chrono::Duration::minutes(2));
+            row.archived_at =
+                Some(crate::time::Timestamp::now() - crate::time::Duration::minutes(2));
         });
         env.view.mutate_instance(&beta_id, |row| {
             row.archive();
-            row.archived_at = Some(chrono::Utc::now() - chrono::Duration::minutes(1));
+            row.archived_at =
+                Some(crate::time::Timestamp::now() - crate::time::Duration::minutes(1));
         });
         env.view.archived_section_collapsed = false;
         env.view.flat_items = env.view.build_flat_items();
@@ -2277,15 +2279,17 @@ fn archived_section_nests_by_project_in_project_mode() {
             .find(|i| i.title == "beta-error")
             .map(|i| i.id.clone())
             .unwrap();
-        // Archive alpha first, then beta. archived_at is `Utc::now()` at the
+        // Archive alpha first, then beta. archived_at is `Timestamp::now()` at the
         // moment of `archive()`, so beta is strictly more recent than alpha.
         env.view.mutate_instance(&alpha_id, |row| {
             row.archive();
-            row.archived_at = Some(chrono::Utc::now() - chrono::Duration::minutes(2));
+            row.archived_at =
+                Some(crate::time::Timestamp::now() - crate::time::Duration::minutes(2));
         });
         env.view.mutate_instance(&beta_id, |row| {
             row.archive();
-            row.archived_at = Some(chrono::Utc::now() - chrono::Duration::minutes(1));
+            row.archived_at =
+                Some(crate::time::Timestamp::now() - crate::time::Duration::minutes(1));
         });
         env.view.archived_section_collapsed = false;
 
@@ -2351,11 +2355,13 @@ fn archived_section_nests_by_project_in_project_mode() {
             .unwrap();
         env.view.mutate_instance(&alpha_id, |row| {
             row.archive();
-            row.archived_at = Some(chrono::Utc::now() - chrono::Duration::minutes(2));
+            row.archived_at =
+                Some(crate::time::Timestamp::now() - crate::time::Duration::minutes(2));
         });
         env.view.mutate_instance(&beta_id, |row| {
             row.archive();
-            row.archived_at = Some(chrono::Utc::now() - chrono::Duration::minutes(1));
+            row.archived_at =
+                Some(crate::time::Timestamp::now() - crate::time::Duration::minutes(1));
         });
         env.view.archived_section_collapsed = false;
         // Collapse only alpha's archived sub-folder.
@@ -2407,7 +2413,8 @@ fn archived_section_nests_by_project_in_project_mode() {
             .unwrap();
         env.view.mutate_instance(&alpha_id, |row| {
             row.archive();
-            row.archived_at = Some(chrono::Utc::now() - chrono::Duration::minutes(2));
+            row.archived_at =
+                Some(crate::time::Timestamp::now() - crate::time::Duration::minutes(2));
         });
         env.view.archived_section_collapsed = true;
         env.view.flat_items = env.view.build_flat_items();
@@ -2522,9 +2529,9 @@ fn every_view_mode_paints_the_same_sunk_row_decoration() {
             // every mode if the sink override were missing.
             env.view.mutate_instance(&id, |inst| {
                 inst.status = Status::Running;
-                inst.archived_at = archived.then(chrono::Utc::now);
-                inst.snoozed_until =
-                    snoozed.then(|| chrono::Utc::now() + chrono::Duration::minutes(15));
+                inst.archived_at = archived.then(crate::time::Timestamp::now);
+                inst.snoozed_until = snoozed
+                    .then(|| crate::time::Timestamp::now() + crate::time::Duration::minutes(15));
             });
 
             let line = env
@@ -2562,7 +2569,7 @@ fn every_view_mode_paints_the_same_sunk_row_decoration() {
         for status in [Status::Error, Status::Deleting] {
             env.view.mutate_instance(&id, |inst| {
                 inst.status = status;
-                inst.archived_at = Some(chrono::Utc::now());
+                inst.archived_at = Some(crate::time::Timestamp::now());
                 inst.snoozed_until = None;
             });
             let line = env
@@ -2897,7 +2904,7 @@ async fn trashed_row_healing_lands_through_the_native_daemon_snapshot() {
         branch: "feat".to_string(),
         main_repo_path: main_repo.to_string_lossy().into_owned(),
         managed_by_aoe: true,
-        created_at: chrono::Utc::now(),
+        created_at: crate::time::Timestamp::now(),
         base_branch: None,
     });
     instance.trash();

@@ -1231,7 +1231,7 @@ esac
 
         // `--force` over a usable credential: exit 0 without a write is no new login.
         let fake = Fake::new();
-        let expires = chrono::Utc::now().timestamp_millis() + 3_600_000;
+        let expires = crate::time::Timestamp::now().as_millis() + 3_600_000;
         std::fs::write(
             &fake.shared,
             crate::session::sandbox_login::claude::fixtures::usable(expires as u64),
@@ -1798,7 +1798,7 @@ esac
 
         // A usable login for plain claude does not release, nor does it answer `--check`.
         std::fs::create_dir_all(plain.parent().unwrap()).unwrap();
-        let expires_at = chrono::Utc::now().timestamp_millis() + 3_600_000;
+        let expires_at = crate::time::Timestamp::now().as_millis() + 3_600_000;
         std::fs::write(
             &plain,
             crate::session::sandbox_login::claude::fixtures::usable(expires_at as u64),

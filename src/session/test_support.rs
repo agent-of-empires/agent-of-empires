@@ -534,7 +534,7 @@ sandbox = "pane_scoped"
                 grant: Some(crate::session::CapabilityGrant {
                     manifest_hash: aoe_plugin_api::PluginManifest::hash_bytes(manifest.as_bytes()),
                     capabilities: Vec::new(),
-                    granted_at: chrono::Utc::now(),
+                    granted_at: crate::time::Timestamp::now(),
                 }),
                 ..crate::session::PluginConfig::default()
             },
@@ -596,7 +596,7 @@ pub(crate) fn sandbox_needing_login(home: &Path, inst: &mut crate::session::Inst
 
 /// Writes a fake Claude credential valid for an hour, as a login would.
 pub(crate) fn write_fake_shared_credential(shared: &Path) {
-    let expires_at = chrono::Utc::now().timestamp_millis() + 3_600_000;
+    let expires_at = crate::time::Timestamp::now().as_millis() + 3_600_000;
     std::fs::write(
         shared,
         crate::session::sandbox_login::claude::fixtures::usable(expires_at as u64),

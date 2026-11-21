@@ -5007,7 +5007,7 @@ mod tests {
                 base_branch: None,
                 base_branch_override: None,
             }],
-            created_at: chrono::Utc::now(),
+            created_at: crate::time::Timestamp::now(),
             cleanup_on_delete: true,
         };
 

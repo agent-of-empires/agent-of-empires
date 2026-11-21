@@ -26,6 +26,9 @@ pub enum SecondsFormat {
 }
 
 impl Timestamp {
+    pub const MIN: Self = Self(UtcDateTime::MIN);
+    pub const MAX: Self = Self(UtcDateTime::MAX);
+
     pub fn now() -> Self {
         Self(UtcDateTime::now())
     }
@@ -131,6 +134,13 @@ impl fmt::Display for Timestamp {
 impl fmt::Debug for Timestamp {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str(&self.to_rfc3339_opts(SecondsFormat::AutoSi, true))
+    }
+}
+
+/// The Unix epoch, as chrono's `Default`.
+impl Default for Timestamp {
+    fn default() -> Self {
+        Self(UtcDateTime::UNIX_EPOCH)
     }
 }
 
@@ -359,6 +369,7 @@ mod tests {
             Some(at(-1_000_086_399, 500_000_000))
         );
         assert_eq!(Timestamp::from_unix_secs(B), Some(at(B, 0)));
+        assert_eq!(Timestamp::default(), at(0, 0));
     }
 
     #[test]

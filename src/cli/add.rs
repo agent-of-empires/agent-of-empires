@@ -962,7 +962,7 @@ mod tests {
             .try_acquire_lifecycle_reservation(
                 LifecycleOperation::Launch,
                 Instance::LIFECYCLE_RESERVATION_TTL,
-                chrono::Utc::now(),
+                crate::time::Timestamp::now(),
             )
             .unwrap();
         for view in [View::Terminal, View::Structured] {
