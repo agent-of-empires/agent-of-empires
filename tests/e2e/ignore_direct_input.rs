@@ -92,7 +92,7 @@ fn typing_in_a_live_agent_terminal_clears_ignore() {
             "{}",
             ignored.text().await.unwrap()
         );
-        let ignored_at = row_of(&http, &sessions_url, &id).await["ignored_at"].clone();
+        let ignored_at = row_of(&http, sessions_url, &id).await["ignored_at"].clone();
         assert!(ignored_at.is_string(), "row was not ignored: {ignored_at}");
 
         let stream = tokio::net::UnixStream::connect(&socket)
@@ -131,7 +131,7 @@ fn typing_in_a_live_agent_terminal_clears_ignore() {
 
         let deadline = Instant::now() + INPUT_DEADLINE;
         loop {
-            let row = row_of(&http, &sessions_url, &id).await;
+            let row = row_of(&http, sessions_url, &id).await;
             if row["ignored_at"].is_null() {
                 break;
             }
