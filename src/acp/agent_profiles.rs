@@ -33,7 +33,7 @@ pub struct AgentProfile {
     pub supports_subagents: bool,
     /// The agent expands `${VAR}` in MCP entries from its own environment, so aoe can pass
     /// plugin credentials as references and keep the values off the command line. Verified
-    /// for `claude-agent-acp` only; every other agent receives the literal credential.
+    /// for `claude-agent-acp` only; other agents get no plugin entries.
     pub expands_mcp_env_refs: bool,
 }
 
