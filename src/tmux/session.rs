@@ -829,6 +829,12 @@ impl Session {
             .ok_or_else(|| anyhow::anyhow!("could not capture tmux session '{}'", self.name))
     }
 
+    /// [`Self::try_capture_pane`] of exactly `pane`, a `#{pane_id}`, never a re-resolved one.
+    pub fn try_capture_pane_in(&self, pane: &str, lines: usize) -> Result<String> {
+        self.capture_target(pane, lines)?
+            .ok_or_else(|| anyhow::anyhow!("could not capture tmux pane '{pane}'"))
+    }
+
     /// `None` when the session is gone or `capture-pane` failed; `Err` when tmux could not run.
     fn capture(&self, lines: usize) -> Result<Option<String>> {
         if !self.exists() {
@@ -836,11 +842,15 @@ impl Session {
         }
         let target =
             self.live_pane_target_with_deadline(&crate::tmux::TmuxCommandDeadline::new())?;
+        self.capture_target(&target, lines)
+    }
+
+    fn capture_target(&self, target: &str, lines: usize) -> Result<Option<String>> {
         let output = crate::tmux::tmux_command()
             .args([
                 "capture-pane",
                 "-t",
-                &target,
+                target,
                 "-p",
                 "-e",
                 "-S",
@@ -1380,9 +1390,13 @@ impl Session {
     pub fn send_raw_bytes(&self, bytes: &[u8]) -> Result<()> {
         let target =
             self.live_pane_target_with_deadline(&crate::tmux::TmuxCommandDeadline::new())?;
+        Self::send_raw_bytes_to(&target, bytes)
+    }
+
+    fn send_raw_bytes_to(target: &str, bytes: &[u8]) -> Result<()> {
         for batch in raw_byte_batches(bytes) {
             let output = crate::tmux::tmux_command()
-                .args(["send-keys", "-t", &target, "-H"])
+                .args(["send-keys", "-t", target, "-H"])
                 .args(&batch)
                 .output()?;
             if !output.status.success() {
@@ -1449,6 +1463,19 @@ impl Session {
 
         let target =
             self.live_pane_target_with_deadline(&crate::tmux::TmuxCommandDeadline::new())?;
+        Self::send_keys_to(&target, text, enter_delay_ms)
+    }
+
+    /// [`Self::send_keys_with_delay`] to exactly `pane`, a `#{pane_id}`: text and Enter
+    /// reach the pane that was checked, or fail if it is gone.
+    pub fn send_keys_to_pane(&self, pane: &str, text: &str, enter_delay_ms: u64) -> Result<()> {
+        if !self.exists() {
+            bail!("Session does not exist: {}", self.name);
+        }
+        Self::send_keys_to(pane, text, enter_delay_ms)
+    }
+
+    fn send_keys_to(target: &str, text: &str, enter_delay_ms: u64) -> Result<()> {
         let delivery = submit_text(text);
         tracing::debug!(target: "tmux.command",
             "send_keys_with_delay: bytes={} lines={} paste={} target={}",
@@ -1459,15 +1486,15 @@ impl Session {
         );
 
         match delivery {
-            SubmitText::Paste(text) => Self::send_via_paste_buffer(&target, text)?,
+            SubmitText::Paste(text) => Self::send_via_paste_buffer(target, text)?,
             SubmitText::Literal(payload) => {
                 let (head, semis) = peel_trailing_semicolons(&payload);
                 if !head.is_empty() {
                     // `--` so lines starting with `-` are not read as tmux flags.
-                    Self::tmux_send(&target, &["-l", "--", head])?;
+                    Self::tmux_send(target, &["-l", "--", head])?;
                 }
                 if semis > 0 {
-                    self.send_raw_bytes(&vec![b';'; semis])?;
+                    Self::send_raw_bytes_to(target, &vec![b';'; semis])?;
                 }
             }
         }
@@ -1477,7 +1504,7 @@ impl Session {
         }
 
         // Enter to submit
-        Self::tmux_send(&target, &["Enter"])?;
+        Self::tmux_send(target, &["Enter"])?;
 
         Ok(())
     }

@@ -356,7 +356,8 @@ pub(crate) async fn spawn_structured_session(
                 synthesized: false,
                 error: None,
  error_code: None,
-            });
+ id: crate::session::PendingInitialTurn::fresh_id(),
+});
         instance.acp_mode_id = acp_mode_id;
         instance.callback_url = callback_url;
         instance.idempotency_key = idempotency_key;

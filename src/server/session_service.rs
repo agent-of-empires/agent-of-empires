@@ -1425,18 +1425,15 @@ impl SessionService {
                     return Ok(false);
                 }
             }
-            anyhow::ensure!(
-                crate::server::api::sessions::ready_agent_session_for_automatic_input(&target)?
-                    .is_some(),
-                "the agent is no longer running"
-            );
+            let pane = crate::server::api::sessions::ready_agent_pane_for_automatic_input(&target)?
+                .ok_or_else(|| anyhow::anyhow!("the agent is no longer running"))?;
             // The waits ran before these guards; what is on screen now decides.
-            if !pane_accepts_automatic_input(&target)? {
+            // Check, capture and type address the pane the process check saw.
+            let tmux = target.tmux_session()?;
+            if !pane_accepts_automatic_input(&target, &tmux, &pane)? {
                 return Ok(false);
             }
-            target
-                .tmux_session()?
-                .send_keys_with_delay(&typed, target.send_keys_enter_delay())?;
+            tmux.send_keys_to_pane(&pane, &typed, target.send_keys_enter_delay())?;
             Ok(true)
         })
         .await
@@ -1467,7 +1464,7 @@ impl SessionService {
             })
             .and_then(|i| {
                 let turn = i.pending_initial_turn.as_ref()?;
-                self.turn_is_deliverable(id, turn)
+                (turn.is_creation_prompt() && self.turn_is_deliverable(id, turn))
                     .then(|| (i.clone(), turn.text.clone()))
             })
     }
@@ -1697,6 +1694,7 @@ impl SessionService {
             synthesized: true,
             error: None,
             error_code: None,
+            id: crate::session::PendingInitialTurn::fresh_id(),
         };
         let profile = {
             let mut instances = self.instances.write().await;
@@ -2904,8 +2902,12 @@ impl std::error::Error for TerminalPromptBlocker {}
 /// Whether the visible screen, not its scrollback, shows the agent's input box. A first-run dialog
 /// is an error carrying its [`TerminalPromptBlocker`]; any other screen without
 /// a ready marker, such as a stale one that has since scrolled away, is `false`.
-fn pane_accepts_automatic_input(instance: &Instance) -> anyhow::Result<bool> {
-    let screen = crate::tmux::utils::strip_ansi(&instance.tmux_session()?.capture_pane(0)?);
+fn pane_accepts_automatic_input(
+    instance: &Instance,
+    tmux: &crate::tmux::Session,
+    pane: &str,
+) -> anyhow::Result<bool> {
+    let screen = crate::tmux::utils::strip_ansi(&tmux.try_capture_pane_in(pane, 0)?);
     if let Some(blocker) = TerminalPromptBlocker::detect(&instance.tool, &screen) {
         return Err(blocker.into());
     }
@@ -3900,6 +3902,7 @@ mod tests {
             synthesized: false,
             error: error.map(str::to_string),
             error_code: None,
+            id: String::new(),
         };
 
         assert!(service.turn_is_deliverable("sess-switch", &turn("fresh", None)));
@@ -4833,6 +4836,7 @@ mod tests {
             synthesized: false,
             error: None,
             error_code: None,
+            id: String::new(),
         });
         inst
     }
@@ -5029,19 +5033,104 @@ mod tests {
             }
         };
 
+        let tmux = crate::tmux::Session::from_name(pane.name());
+        let pane_id = tmux
+            .live_pane_target_with_deadline(&crate::tmux::TmuxCommandDeadline::new())
+            .unwrap();
+        let accepts = || pane_accepts_automatic_input(&inst, &tmux, &pane_id);
+
         wait_for(&|screen| screen.contains("shift+tab to cycle"));
-        assert!(pane_accepts_automatic_input(&inst).unwrap());
+        assert!(accepts().unwrap());
 
         std::fs::write(&go, b"").unwrap();
         wait_for(&|screen| screen.contains("Yes, I trust this folder"));
-        let error = pane_accepts_automatic_input(&inst).unwrap_err();
+        let error = accepts().unwrap_err();
         assert_eq!(
             error.downcast_ref::<TerminalPromptBlocker>(),
             Some(&TerminalPromptBlocker::FolderNotTrusted)
         );
 
         wait_for(&|screen| screen.contains("loading"));
-        assert!(!pane_accepts_automatic_input(&inst).unwrap());
+        assert!(!accepts().unwrap());
+    }
+
+    /// Capture and send address the pane that was checked. When it is gone, a
+    /// surviving pane of the session receives nothing.
+    #[test]
+    #[serial_test::serial]
+    fn the_final_send_never_retargets_another_pane() {
+        if !crate::tmux::is_tmux_available() {
+            return;
+        }
+        let _app_dir = crate::session::test_support::isolate_app_dir();
+        let inst = terminal_turn_instance("sess-pane", "term-pane", "unused");
+        let pane = start_terminal_pane(&inst, READY_AGENT_SCRIPT, false);
+        let tmux = crate::tmux::Session::from_name(pane.name());
+        let pane_id = crate::server::api::sessions::ready_agent_pane_for_automatic_input(&inst)
+            .unwrap()
+            .expect("agent pane");
+        let tmux_ok = |args: &[&str]| {
+            let out = crate::tmux::tmux_command().args(args).output().unwrap();
+            assert!(out.status.success(), "{args:?}");
+            String::from_utf8_lossy(&out.stdout).trim().to_string()
+        };
+        let survivor = tmux_ok(&[
+            "split-window",
+            "-d",
+            "-P",
+            "-F",
+            "#{pane_id}",
+            "-t",
+            &pane_id,
+            "exec cat",
+        ]);
+        tmux.send_keys_to_pane(&pane_id, "reaches-checked-pane", 0)
+            .unwrap();
+
+        tmux_ok(&["kill-pane", "-t", &pane_id]);
+        assert!(tmux.try_capture_pane_in(&pane_id, 0).is_err());
+        assert!(tmux
+            .send_keys_to_pane(&pane_id, "must-not-land", 0)
+            .is_err());
+        let screen = tmux_ok(&["capture-pane", "-p", "-t", &survivor]);
+        assert!(!screen.contains("must-not-land"), "{screen}");
+    }
+
+    /// A rate-limit continuation is ACP-only: the terminal drain skips it and
+    /// anything carrying attachments, which it cannot send.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn terminal_drain_takes_only_creation_prompts() {
+        let _app_dir = crate::session::test_support::isolate_app_dir();
+        let attachment = crate::daemon::PromptAttachmentRef {
+            id: "a1".into(),
+            kind: crate::daemon::PromptAttachmentKind::Resource,
+            mime_type: "text/plain".into(),
+            name: None,
+            size: 1,
+        };
+        for (synthesized, attachments, taken) in [
+            (false, Vec::new(), true),
+            (true, Vec::new(), false),
+            (false, vec![attachment.clone()], false),
+            (true, vec![attachment], false),
+        ] {
+            let mut inst = terminal_turn_instance("sess-kind", "term-kind", "continue");
+            let turn = inst.pending_initial_turn.as_mut().unwrap();
+            turn.synthesized = synthesized;
+            turn.attachments = attachments;
+            let service = crate::server::test_support::build_test_app_state(vec![inst])
+                .session_service
+                .clone();
+            assert_eq!(
+                service
+                    .undelivered_terminal_turn("sess-kind")
+                    .await
+                    .is_some(),
+                taken,
+                "synthesized={synthesized}"
+            );
+        }
     }
 
     /// A Claude session is typed into once its input box shows the mode line,
@@ -5671,6 +5760,7 @@ mod tests {
                 synthesized: false,
                 error: None,
                 error_code: None,
+                id: String::new(),
             });
             inst
         }
@@ -6138,6 +6228,7 @@ mod tests {
             synthesized: true,
             error: None,
             error_code: None,
+            id: crate::session::PendingInitialTurn::fresh_id(),
         };
         type Mutate = fn(Arc<SessionService>) -> futures_util::future::BoxFuture<'static, ()>;
         type Check = fn(&Instance) -> bool;
@@ -6477,6 +6568,7 @@ mod tests {
             text: "continuation".to_string(),
             attachments: Vec::new(),
             synthesized: true,
+            id: crate::session::PendingInitialTurn::fresh_id(),
         });
         let state = crate::server::test_support::build_test_app_state(vec![inst]);
         let service = state.session_service.clone();
@@ -6535,6 +6627,7 @@ mod tests {
             text: "continuation".to_string(),
             attachments: Vec::new(),
             synthesized: true,
+            id: crate::session::PendingInitialTurn::fresh_id(),
         });
         let state = crate::server::test_support::build_test_app_state(vec![inst]);
         let profile = state.instances.read().await[0].source_profile.clone();
@@ -6577,6 +6670,7 @@ mod tests {
             text: "continuation".to_string(),
             attachments: Vec::new(),
             synthesized: true,
+            id: crate::session::PendingInitialTurn::fresh_id(),
         };
         let mut inst = Instance::new("queue", "/tmp/aoe-queue-project");
         inst.id = "sess-undo".to_string();
@@ -6629,6 +6723,7 @@ mod tests {
             text: "continuation".to_string(),
             attachments: Vec::new(),
             synthesized: true,
+            id: crate::session::PendingInitialTurn::fresh_id(),
         };
         let mut inst = Instance::new("queue", "/tmp/aoe-queue-project");
         inst.id = "sess-cancel".to_string();

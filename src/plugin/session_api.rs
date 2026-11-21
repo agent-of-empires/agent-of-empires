@@ -1945,6 +1945,7 @@ mod tests {
             synthesized: true,
             error: None,
             error_code: None,
+            id: String::new(),
         };
         parked.pending_initial_turn = Some(seeded.clone());
         let (deps, state, _dir) = test_deps(vec![parked]);
@@ -3043,6 +3044,7 @@ mod tests {
                 synthesized: false,
                 error: None,
                 error_code: None,
+                id: String::new(),
             });
             crate::session::test_support::sandbox_needing_login(home.path(), &mut row);
             let (deps, state, _dir) = test_deps_native(vec![row]).await;
