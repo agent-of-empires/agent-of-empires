@@ -556,7 +556,7 @@ fn collect_tmux_states(instances: &mut [Instance]) -> Vec<TmuxState> {
         states.push(TmuxState {
             session_name: name.clone(),
             status: inst.status,
-            pid: meta.get(&name).and_then(live_pane_pid),
+            pid: pane_pid_or(meta.get(&name), || crate::process::get_pane_pid(&name)),
             activity_epoch: crate::tmux::session_activity(&name),
             agent,
         });
@@ -582,6 +582,18 @@ fn collect_tmux_states(instances: &mut [Instance]) -> Vec<TmuxState> {
     }
 
     states
+}
+
+/// The snapshot only holds pane 0, so a session it lacks (for example a
+/// first window with pane-base-index 1) goes to the per-session probe.
+fn pane_pid_or(
+    meta: Option<&crate::tmux::PaneMetadata>,
+    probe: impl FnOnce() -> Option<u32>,
+) -> Option<u32> {
+    match meta {
+        Some(meta) => live_pane_pid(meta),
+        None => probe(),
+    }
 }
 
 /// Same filter as `process::get_pane_pid`, read from the batched snapshot.
@@ -900,7 +912,7 @@ mod tests {
     }
 
     #[test]
-    fn live_pane_pid_matches_the_per_session_probe_filter() {
+    fn pane_pid_matches_the_per_session_probe() {
         let meta = |pane_dead, pane_pid| crate::tmux::PaneMetadata {
             server: None,
             session_id: "$1".into(),
@@ -922,8 +934,11 @@ mod tests {
             (false, Some(u32::MAX), None),
             (false, None, None),
         ] {
-            assert_eq!(live_pane_pid(&meta(pane_dead, pane_pid)), expected);
+            let found = meta(pane_dead, pane_pid);
+            assert_eq!(live_pane_pid(&found), expected);
+            assert_eq!(pane_pid_or(Some(&found), || panic!("probed")), expected);
         }
+        assert_eq!(pane_pid_or(None, || Some(7)), Some(7));
     }
 
     fn tmux_state(name: &str, status: Status) -> TmuxState {
