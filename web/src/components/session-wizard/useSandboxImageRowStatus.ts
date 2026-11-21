@@ -27,6 +27,7 @@ export type SandboxImageReply = SandboxImageStatus | { error: string } | null;
 export function useSandboxImageRowStatus(
   image: string,
   enabled: boolean,
+  profile?: string,
 ): { label: string; reply: SandboxImageReply } | null {
   const [answer, setAnswer] = useState<{ image: string; label: string; reply: SandboxImageReply } | null>(null);
   const started = useRef(false);
@@ -35,7 +36,7 @@ export function useSandboxImageRowStatus(
     if (!enabled) return;
     let cancelled = false;
     const check = async () => {
-      const reply = await fetchSandboxImageStatus(image || undefined, { fresh: !answered.current });
+      const reply = await fetchSandboxImageStatus(image || undefined, { fresh: !answered.current, profile });
       if (cancelled) return;
       answered.current = true;
       setAnswer({ image, label: sandboxImageStatusLabel(reply), reply });
@@ -47,6 +48,6 @@ export function useSandboxImageRowStatus(
       cancelled = true;
       if (timer) clearTimeout(timer);
     };
-  }, [image, enabled]);
+  }, [image, enabled, profile]);
   return enabled && answer?.image === image ? { label: answer.label, reply: answer.reply } : null;
 }

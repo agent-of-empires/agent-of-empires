@@ -2554,16 +2554,17 @@ fn cli_review_boundary_repo_base_from_a_linked_worktree() {
 #[test]
 #[parallel]
 fn cli_sandbox_images_preserve_normalization_and_default_fallback() {
+    // Blank resolves to the image tagged with this build's version.
+    const AUTOMATIC: &str = concat!(
+        "ghcr.io/agent-of-empires/aoe-sandbox:",
+        env!("CARGO_PKG_VERSION")
+    );
     for (flag, configured, expected) in [
         (Some(" ubuntu:latest "), "ignored:latest", "ubuntu:latest"),
         (None, " ubuntu:latest ", "ubuntu:latest"),
-        (None, "   ", "ghcr.io/agent-of-empires/aoe-sandbox:latest"),
+        (None, "   ", AUTOMATIC),
         (Some("   "), " custom:latest ", "custom:latest"),
-        (
-            Some(""),
-            "   ",
-            "ghcr.io/agent-of-empires/aoe-sandbox:latest",
-        ),
+        (Some(""), "   ", AUTOMATIC),
     ] {
         let mut h = TuiTestHarness::new("cli_sandbox_image");
         let bin = h.install_path_command("docker");

@@ -1073,8 +1073,12 @@ pub(crate) async fn create_session_with(
                 "pull_latest_image requires sandbox",
             );
         }
-        if let Some(refusal) =
-            crate::server::api::create_pull_refusal(&state, body.sandbox_image.as_deref()).await
+        if let Some(refusal) = crate::server::api::create_pull_refusal(
+            &state,
+            body.sandbox_image.as_deref(),
+            body.profile.as_deref(),
+        )
+        .await
         {
             return refusal;
         }
@@ -1897,6 +1901,17 @@ pub(super) fn public_create_session_error(e: &anyhow::Error) -> (&'static str, S
                 format!("Couldn't pull the latest Sandbox image {}.", failed.image)
             };
             return ("sandbox_image_update_failed", message);
+        }
+        if let Some(both) =
+            cause.downcast_ref::<crate::containers::sandbox_image::AutomaticImagesUnavailable>()
+        {
+            return (
+                "sandbox_image_pull_failed",
+                format!(
+                    "Couldn't pull the Sandbox image {} or its minor tag {}.",
+                    both.exact, both.minor
+                ),
+            );
         }
         match cause.downcast_ref::<DockerError>() {
             Some(DockerError::NotInstalled) => return unavailable(not_installed(runtime())),

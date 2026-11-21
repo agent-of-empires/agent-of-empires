@@ -73,7 +73,7 @@ fn draw(dialog: &mut NewSessionDialog) -> ratatui::buffer::Buffer {
 fn config_seeds_the_worktree_toggle_and_sandbox_image() {
     let mut config = Config::default();
     config.worktree.enabled = true;
-    config.sandbox.default_image = "my-custom-sandbox:local".to_string();
+    config.sandbox.default_image = Some("my-custom-sandbox:local".to_string());
     let dialog =
         NewSessionDialog::new_with_config(vec!["claude"], "/tmp/project".to_string(), config);
     assert!(dialog.worktree_enabled);
@@ -493,7 +493,7 @@ fn the_sandbox_config_overlay_opens_on_ctrl_p_and_edits_the_image() {
         dialog.sandbox_image.value(),
         format!(
             "{}abc",
-            crate::containers::get_container_runtime().effective_default_image()
+            crate::containers::sandbox_image::automatic_sandbox_image()
         )
     );
 

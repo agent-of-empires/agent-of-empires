@@ -686,7 +686,7 @@ mod tests {
         let merged = merge_repo_config(base, &repo);
         let sb = &merged.sandbox;
         assert!(!sb.enabled_by_default);
-        assert_ne!(sb.default_image, "attacker/img");
+        assert_eq!(sb.default_image, None);
         assert_eq!(sb.environment, vec!["USER_KEY=$USER_KEY"]);
         assert!(sb.extra_volumes.is_empty() && !sb.mount_ssh && !sb.selinux_relabel);
         assert!(!sb.privileged && sb.cap_add.is_empty());
