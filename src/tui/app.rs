@@ -164,9 +164,10 @@ pub struct App {
     /// The row whose in-flight mount just took the screen for Enter: the run
     /// loop delivers paste buffered for it once the poll returns.
     structured_paste_drain: Option<String>,
-    /// Enter pressed while that mount connected: the draft it restores is
-    /// submitted once the landed view has it.
-    structured_submit_pending: Option<String>,
+    /// Enter presses made while that row's mount connected, as offsets into the
+    /// draft buffered for it. Each submits the text before it, so what the user
+    /// typed after an Enter stays in the composer instead of riding along.
+    structured_submit_boundaries: Option<(String, Vec<usize>)>,
     /// Cleared on failure so the user can retry.
     pending_install_version: Option<String>,
     /// The running binary keeps its old version until restart, so this stops
@@ -370,7 +371,7 @@ impl App {
             structured_mount_failed: None,
             structured_mount_activate: None,
             structured_paste_drain: None,
-            structured_submit_pending: None,
+            structured_submit_boundaries: None,
             pending_view_switch: None,
             pending_smart_rename: None,
             dashboard_launch: None,
@@ -2498,7 +2499,7 @@ impl App {
             }
             return;
         }
-        if let Some(target) = self.structured_mount_activate.clone() {
+        if let Some(target) = self.pending_structured_owner() {
             self.home
                 .pending_paste_for_structured_view
                 .entry(target)
@@ -2509,11 +2510,23 @@ impl App {
         self.home.handle_paste(text);
     }
 
+    /// The row Enter is still connecting, while it is still the selected one.
+    /// A click moves the selection before the mount is reconciled, and input
+    /// must not then be buffered for the row the user has left.
+    fn pending_structured_owner(&mut self) -> Option<String> {
+        let target = self.structured_mount_activate.clone()?;
+        if self.home.selected_structured_session().as_deref() == Some(target.as_str()) {
+            return Some(target);
+        }
+        self.structured_mount_activate = None;
+        None
+    }
+
     /// Hold keys typed while the mount Enter asked for is still connecting, so
     /// they reach that row's composer instead of Home's shortcuts. Returns true
     /// when the key was consumed.
     fn hold_key_for_pending_structured_view(&mut self, key: &KeyEvent) -> bool {
-        let Some(target) = self.structured_mount_activate.clone() else {
+        let Some(target) = self.pending_structured_owner() else {
             return false;
         };
         match (key.code, key.modifiers) {
@@ -2524,8 +2537,22 @@ impl App {
                     .or_default()
                     .push(c);
             }
-            // Enter is a submit, not text: keep it out of the draft.
-            (KeyCode::Enter, KeyModifiers::NONE) => self.structured_submit_pending = Some(target),
+            // Enter is a submit, not text: record where in the draft it fell so
+            // the replay can submit what preceded it.
+            (KeyCode::Enter, KeyModifiers::NONE) => {
+                let at = self
+                    .home
+                    .pending_paste_for_structured_view
+                    .get(&target)
+                    .map_or(0, String::len);
+                let (owner, mut boundaries) = self
+                    .structured_submit_boundaries
+                    .take()
+                    .filter(|(owner, _)| *owner == target)
+                    .unwrap_or((target, Vec::new()));
+                boundaries.push(at);
+                self.structured_submit_boundaries = Some((owner, boundaries));
+            }
             (KeyCode::Backspace, KeyModifiers::NONE) => {
                 if let Some(buf) = self.home.pending_paste_for_structured_view.get_mut(&target) {
                     buf.pop();
@@ -2546,7 +2573,14 @@ impl App {
 
     /// Consume the requested session's draft only if that session mounted.
     async fn drain_pending_paste_for_structured_view(&mut self, session_id: &str) {
-        let submit = self.structured_submit_pending.as_deref() == Some(session_id);
+        let boundaries = match self.structured_submit_boundaries.take() {
+            Some((owner, boundaries)) if owner == session_id => boundaries,
+            // Another row's Enter is not this row's submit.
+            other => {
+                self.structured_submit_boundaries = other;
+                Vec::new()
+            }
+        };
         let Some(view) = self
             .home
             .structured_preview
@@ -2555,7 +2589,6 @@ impl App {
         else {
             return;
         };
-        self.structured_submit_pending = None;
         let Some(buf) = self
             .home
             .pending_paste_for_structured_view
@@ -2563,8 +2596,17 @@ impl App {
         else {
             return;
         };
-        view.paste_text_with_file_load(&buf).await;
-        if submit && !buf.is_empty() {
+        // Replay the edits and submits in the order they were made: each Enter
+        // submits exactly the text before it, and anything typed after the last
+        // one is left in the composer for the user to send.
+        let mut sent = 0;
+        for end in boundaries {
+            let end = end.clamp(sent, buf.len());
+            if end == sent {
+                continue;
+            }
+            view.paste_text_with_file_load(&buf[sent..end]).await;
+            sent = end;
             if let Err(e) = view
                 .handle_event(Event::Key(KeyEvent::new(
                     KeyCode::Enter,
@@ -2574,7 +2616,11 @@ impl App {
             {
                 self.close_embedded_structured();
                 self.update_status = Some(UpdateStatus::transient(format!("structured view: {e}")));
+                return;
             }
+        }
+        if sent < buf.len() {
+            view.paste_text_with_file_load(&buf[sent..]).await;
         }
     }
 
@@ -2686,7 +2732,7 @@ impl App {
             Ok(_) => true,
             Err(e) => {
                 self.structured_mount_activate = None;
-                self.structured_submit_pending = None;
+                self.structured_submit_boundaries = None;
                 if wanted {
                     self.structured_mount_failed = Some(target);
                     self.set_status(e);
@@ -2723,7 +2769,7 @@ impl App {
         {
             self.structured_mount = None;
             self.structured_mount_activate = None;
-            self.structured_submit_pending = None;
+            self.structured_submit_boundaries = None;
         }
         // A failure is remembered only for the row it belongs to, so the early
         // returns below cannot strand it on a row the user has come back to.
@@ -2781,7 +2827,7 @@ impl App {
             self.clear_preview_mount_pending();
             self.structured_mount = None;
             self.structured_mount_activate = None;
-            self.structured_submit_pending = None;
+            self.structured_submit_boundaries = None;
             self.structured_mount_failed = None;
             return self.home.structured_preview.take().is_some();
         }
@@ -3951,6 +3997,123 @@ mod tests {
         assert!(
             view.toast_text().is_some(),
             "the Enter submits the draft it restores instead of leaving it unsent"
+        );
+    }
+
+    /// Text typed after Enter must not ride along on that submission: the Enter
+    /// sends what preceded it, and the rest waits in the composer.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn text_typed_after_enter_waits_in_the_composer() {
+        use crate::tui::structured_view::embedded::EmbeddedView;
+        let (mut app, _guard, id) = app_on_a_structured_row();
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        app.structured_mount = Some((id.clone(), rx));
+        app.open_structured_view(&id).await.unwrap();
+
+        app.route_pasted_text("send this").await;
+        assert!(app.hold_key_for_pending_structured_view(&KeyEvent::new(
+            KeyCode::Enter,
+            KeyModifiers::NONE,
+        )));
+        app.route_pasted_text(" not this").await;
+
+        assert!(tx.send(Ok(EmbeddedView::for_test(&id))).is_ok());
+        assert!(app.poll_structured_mount());
+        app.drain_structured_paste().await;
+
+        let view = app
+            .home
+            .structured_preview
+            .as_ref()
+            .expect("the mount Enter asked for is on screen");
+        assert_eq!(
+            view.submitted_prompts(),
+            ["send this".to_string()],
+            "only the text before Enter is submitted"
+        );
+        assert!(
+            view.composer_text().ends_with(" not this"),
+            "text typed after Enter stays in the composer, got {:?}",
+            view.composer_text()
+        );
+    }
+
+    /// Two Enter presses while the mount connects are two submissions, not one
+    /// draft with the boundary lost.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn repeated_enter_presses_stay_separate_submissions() {
+        use crate::tui::structured_view::embedded::EmbeddedView;
+        let (mut app, _guard, id) = app_on_a_structured_row();
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        app.structured_mount = Some((id.clone(), rx));
+        app.open_structured_view(&id).await.unwrap();
+
+        for (text, enter) in [("first", true), ("second", true)] {
+            app.route_pasted_text(text).await;
+            if enter {
+                app.hold_key_for_pending_structured_view(&KeyEvent::new(
+                    KeyCode::Enter,
+                    KeyModifiers::NONE,
+                ));
+            }
+        }
+
+        assert!(tx.send(Ok(EmbeddedView::for_test(&id))).is_ok());
+        assert!(app.poll_structured_mount());
+        app.drain_structured_paste().await;
+
+        // The fake daemon refuses every send and restores the draft, so the
+        // second submission carries the first one's text back with it. The
+        // count is what the collapsed boundary broke; the exact split is
+        // asserted above against the composer.
+        let submitted = app
+            .home
+            .structured_preview
+            .as_ref()
+            .map(|view| view.submitted_prompts().to_vec())
+            .unwrap_or_default();
+        assert_eq!(
+            submitted.len(),
+            2,
+            "each Enter is its own submission, got {submitted:?}"
+        );
+        assert_eq!(submitted.first().map(String::as_str), Some("first"));
+    }
+
+    /// A click can move the selection before the mount is reconciled, so the
+    /// next paste must not still be buffered for the row the user left.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn a_paste_after_clicking_another_row_does_not_use_the_old_owner() {
+        let (mut app, _guard, ids) = app_on_two_structured_rows();
+        let (_tx, rx) = tokio::sync::oneshot::channel();
+        app.structured_mount = Some((ids[0].clone(), rx));
+        app.open_structured_view(&ids[0]).await.unwrap();
+        assert_eq!(
+            app.structured_mount_activate.as_deref(),
+            Some(ids[0].as_str())
+        );
+
+        // The click lands before the event loop reconciles the mount target.
+        app.home.selected_session = Some(ids[1].clone());
+        app.route_pasted_text("pasted after the click").await;
+
+        assert!(
+            app.structured_mount_activate.is_none(),
+            "the row Enter asked for no longer owns new input"
+        );
+        assert!(
+            !app.home
+                .pending_paste_for_structured_view
+                .contains_key(&ids[0]),
+            "the paste must not be buffered for the row the user left"
+        );
+        assert!(
+            app.home.send_message_dialog.is_some()
+                || app.home.pending_paste.as_deref() == Some("pasted after the click"),
+            "the paste goes where Home's paste target is now"
         );
     }
 

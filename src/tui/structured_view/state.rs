@@ -126,6 +126,10 @@ pub struct StructuredViewState {
     /// or `None` when off or the fetch failed. Read from the daemon's `/api/about`,
     /// not local config, so a remote-attached view honours that daemon (#3253).
     pub compaction_reminder_percent: Option<u8>,
+    /// Every prompt the composer submitted, in order. Test-only, so the paste
+    /// handoff can assert what each Enter actually sent.
+    #[cfg(test)]
+    pub submitted_prompts: Vec<String>,
 }
 
 /// One open choice-picker: a titled option list plus what accepting means.
@@ -350,6 +354,8 @@ impl StructuredViewState {
             auto_presented_elicitation: None,
             last_scroll_max: std::cell::Cell::new(0),
             compaction_reminder_percent: None,
+            #[cfg(test)]
+            submitted_prompts: Vec::new(),
         }
     }
 

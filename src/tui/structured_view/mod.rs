@@ -1806,6 +1806,8 @@ async fn send_prompt_now(
     text: &str,
 ) {
     use crate::acp::client::http::PromptDispositionWire;
+    #[cfg(test)]
+    state.submitted_prompts.push(text.to_owned());
     state.in_flight = true;
     match state.http.prompt(&state.session_id, text, false).await {
         Ok(dispatch) => match dispatch.disposition {

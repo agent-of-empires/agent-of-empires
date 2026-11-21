@@ -453,6 +453,13 @@ impl EmbeddedView {
         self.state.toast.as_ref().map(|toast| toast.text.as_str())
     }
 
+    /// Prompts this view submitted, in order: test read for the paste-drain
+    /// handoff's Enter boundary.
+    #[cfg(test)]
+    pub(crate) fn submitted_prompts(&self) -> &[String] {
+        &self.state.submitted_prompts
+    }
+
     /// Composer content, joined on newlines: test read for the paste-drain
     /// handoff.
     #[cfg(test)]
