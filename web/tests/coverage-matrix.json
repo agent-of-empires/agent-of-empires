@@ -718,6 +718,14 @@
       "notes": "The real schema-driven switch persists machine-wide, rejects profile overrides, survives reload, and changes MCP route availability only after daemon restart."
     },
     {
+      "id": "settings.mcp-enabled-copy",
+      "kind": "deferred",
+      "issue": "https://github.com/agent-of-empires/agent-of-empires/issues/5769",
+      "risk": "low",
+      "reason": "Copy only: the Let other apps control AoE description and summary say what the MCP tools allow instead of read-only. The switch and its persistence are covered by settings.mcp-server-toggle.",
+      "components": ["web/src/components/settings/SchemaSection.tsx"]
+    },
+    {
       "id": "settings.startup-recovery-wake",
       "kind": "live-playwright",
       "risk": "high",
