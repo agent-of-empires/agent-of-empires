@@ -110,9 +110,11 @@ impl Timestamp {
     }
 
     fn date(self) -> String {
+        let year = self.0.year();
+        let sign = if year < 0 { "-" } else { "" };
         format!(
-            "{:04}-{:02}-{:02}",
-            self.0.year(),
+            "{sign}{:04}-{:02}-{:02}",
+            year.unsigned_abs(),
             u8::from(self.0.month()),
             self.0.day()
         )
@@ -355,10 +357,19 @@ mod tests {
                 "1969-12-31T23:59:59.999999Z",
                 "1969-12-31 23:59:59.999999999 UTC",
             ),
+            (
+                -62_198_755_200,
+                0,
+                "-0001-01-01T00:00:00Z",
+                "-0001-01-01T00:00:00+00:00",
+                "-0001-01-01T00:00:00.000Z",
+                "-0001-01-01T00:00:00.000000Z",
+                "-0001-01-01 00:00:00 UTC",
+            ),
         ];
         for &(secs, nanos, serde, rfc, millis, micros, display) in cases {
             let t = at(secs, nanos);
-            let whole = &serde[..19];
+            let whole = &micros[..micros.len() - 8];
             let ymd_hms = whole.replace('T', " ");
             assert_eq!(serde_json::to_string(&t).unwrap(), format!("\"{serde}\""));
             assert_eq!(format!("{t:?}"), serde);
@@ -380,11 +391,14 @@ mod tests {
             assert_eq!(t.to_ymd_hms(), ymd_hms);
             assert_eq!(t.to_string(), display);
             assert_eq!(t.as_unix_secs(), secs);
-            assert_eq!(
-                serde_json::from_str::<Timestamp>(&format!("\"{serde}\"")).unwrap(),
-                t
-            );
-            assert_eq!(Timestamp::parse_rfc3339(rfc).unwrap(), t);
+            // RFC 3339 has no signed years, so those do not parse.
+            if !serde.starts_with('-') {
+                assert_eq!(
+                    serde_json::from_str::<Timestamp>(&format!("\"{serde}\"")).unwrap(),
+                    t
+                );
+                assert_eq!(Timestamp::parse_rfc3339(rfc).unwrap(), t);
+            }
         }
         // chrono's timestamp_millis floors.
         assert_eq!(at(-1, 999_999_999).as_millis(), -1);
