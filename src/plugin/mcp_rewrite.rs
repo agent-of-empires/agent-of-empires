@@ -159,6 +159,17 @@ impl McpRewriter for PluginMcpRewriter {
             run_hooks(caller, &hooks, ctx, servers).await
         })
     }
+
+    fn applies(&self, sandboxed: bool) -> bool {
+        let registry = crate::plugin::registry();
+        !hooks_for(
+            registry
+                .active()
+                .map(|p| (&p.manifest, p.manifest_hash.as_str())),
+            sandboxed,
+        )
+        .is_empty()
+    }
 }
 
 #[cfg(test)]
@@ -395,7 +406,13 @@ mod tests {
                 Box::pin(async move { run_chain(&self.0, &[hook("acme.a")], ctx, servers).await })
             }
         }
-        for reply in [json!([]), json!([null, []]), json!(null), json!("ok")] {
+        for reply in [
+            json!([]),
+            json!([null, []]),
+            json!(null),
+            json!("ok"),
+            json!({"add": [["x", "stdio", "c"]]}),
+        ] {
             let rewriter: std::sync::Arc<dyn McpRewriter> =
                 std::sync::Arc::new(Chain(FakeCaller::new(vec![Ok(reply.clone())])));
             let out = crate::acp::mcp_rewrite::rewrite_servers_with(

@@ -258,8 +258,15 @@ struct RawEdit {
 
 /// Errors carry categories and server names only, never values from the response.
 pub fn parse_edit(value: Value) -> Result<McpEdit, String> {
-    // serde decodes a sequence into a struct by position, so an empty array would read as "no edit".
-    if !value.is_object() {
+    // serde decodes a sequence into a struct by position, so every struct-shaped value must be
+    // an object before it is decoded: an empty array would read as "no edit", and
+    // `["x","stdio","c"]` as a server.
+    let not_objects = !value.is_object()
+        || value
+            .get("add")
+            .and_then(Value::as_array)
+            .is_some_and(|add| add.iter().any(|entry| !entry.is_object()));
+    if not_objects {
         return Err("response does not match the mcp.rewrite schema (not an object)".into());
     }
     let raw: RawEdit = serde_json::from_value(value).map_err(|e| {
@@ -321,6 +328,12 @@ pub trait McpRewriter: Send + Sync {
         ctx: &'a McpRewriteContext,
         servers: Vec<ProjectMcpServer>,
     ) -> RewriteFuture<'a>;
+
+    /// Whether a hook would run for a session of this kind. The sandbox layout, which can ask
+    /// the container runtime, is only worth resolving when one does.
+    fn applies(&self, _sandboxed: bool) -> bool {
+        true
+    }
 }
 
 static REWRITER: Mutex<Option<Arc<dyn McpRewriter>>> = Mutex::new(None);
@@ -331,6 +344,11 @@ fn current_rewriter() -> Option<Arc<dyn McpRewriter>> {
 
 pub fn set_rewriter(rewriter: Option<Arc<dyn McpRewriter>>) {
     *REWRITER.lock().unwrap_or_else(|e| e.into_inner()) = rewriter;
+}
+
+/// Whether the installed rewriter has a hook for a session of this kind.
+pub fn rewriter_applies(sandboxed: bool) -> bool {
+    current_rewriter().is_some_and(|r| r.applies(sandboxed))
 }
 
 pub async fn rewrite_servers(
@@ -797,6 +815,14 @@ mod tests {
             ),
             ("not an object", json!([1, 2])),
             ("empty array", json!([])),
+            (
+                "positional add entry",
+                json!({"add": [["x", "stdio", "c"]]}),
+            ),
+            (
+                "positional entry among objects",
+                json!({"add": [{"name": "ok", "command": "c"}, ["y", "stdio", "c"]]}),
+            ),
             ("array of nulls", json!([null, null])),
             ("array of defaults", json!([null, []])),
             ("null", json!(null)),

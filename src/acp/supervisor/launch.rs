@@ -1477,7 +1477,12 @@ pub(super) async fn resolve_mcp_servers(
     let sandbox_info = scope.sandbox_info.filter(|info| info.enabled).cloned();
     let projection_env = session_env.clone();
     let workspace_info = scope.workspace_info.cloned();
-    let runtime = scope.runtime;
+    // The layout is only for the hook; without one, don't ask the container runtime for it.
+    let runtime = if crate::acp::mcp_rewrite::rewriter_applies(true) {
+        scope.runtime
+    } else {
+        crate::acp::mcp_rewrite::RuntimeUse::Skip
+    };
     let resolved = {
         let (agent_key, session, profile, paths) = (
             agent_key.to_string(),
@@ -3001,6 +3006,78 @@ time.sleep(60)
             .map(|s| s["name"].as_str().unwrap().to_string())
             .collect();
         assert_eq!(names, ["kept"], "a server the hook adds is screened too");
+    }
+
+    /// Without a hook for the session, resolving the sandbox must not ask the container runtime:
+    /// that probe can stall for its whole timeout ahead of the launcher's own lookup.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn the_sandbox_is_inspected_only_when_a_hook_applies() {
+        use crate::acp::mcp_rewrite::test_support::{RecordingRewriter, SlotGuard};
+        use std::os::unix::fs::PermissionsExt;
+
+        let (_home, tmp) = isolate_home();
+        let _env = crate::session::test_support::EnvGuard::unset(&["CLAUDE_CONFIG_DIR"]);
+        crate::session::config::update_config(|config| {
+            config.sandbox.container_runtime = crate::session::ContainerRuntimeName::Docker
+        })
+        .unwrap();
+        let bin = tmp.path().join("bin");
+        std::fs::create_dir(&bin).unwrap();
+        let calls = tmp.path().join("calls");
+        std::fs::write(
+            bin.join("docker"),
+            format!("#!/bin/sh\necho \"$@\" >> {}\nexit 1\n", calls.display()),
+        )
+        .unwrap();
+        std::fs::set_permissions(bin.join("docker"), std::fs::Permissions::from_mode(0o755))
+            .unwrap();
+        let _path = crate::session::test_support::path_prepended(&bin);
+        let info = crate::session::SandboxInfo {
+            enabled: true,
+            container_id: None,
+            image: "aoe-sandbox:test".into(),
+            container_name: "aoe-sandbox-no-hook".into(),
+            extra_env: None,
+            custom_instruction: None,
+            container_workdir: None,
+            before_start_env: Vec::new(),
+            before_start_hook_env: Vec::new(),
+            provider: None,
+        };
+        let resolve = || {
+            resolve_mcp_servers(
+                "claude",
+                "no-hook",
+                None,
+                McpPaths {
+                    cwd: tmp.path().to_path_buf(),
+                    config_path: tmp.path().join("config.toml"),
+                    sandboxed: true,
+                },
+                McpHostEnv::default(),
+                McpSandboxScope {
+                    sandbox_info: Some(&info),
+                    workspace_info: None,
+                    runtime: Default::default(),
+                },
+                "failed",
+            )
+        };
+
+        resolve().await;
+        assert!(
+            !calls.exists(),
+            "no hook applies, yet the runtime was asked: {:?}",
+            std::fs::read_to_string(&calls)
+        );
+
+        let _slot = SlotGuard::install(RecordingRewriter::returning(Vec::new()));
+        resolve().await;
+        assert!(
+            calls.exists(),
+            "a hook that applies is given the real layout"
+        );
     }
 
     #[tokio::test]
