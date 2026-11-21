@@ -75,6 +75,8 @@ pub(crate) struct SessionJson {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) archived_at: Option<chrono::DateTime<chrono::Utc>>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) ignored_at: Option<chrono::DateTime<chrono::Utc>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) snoozed_until: Option<chrono::DateTime<chrono::Utc>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) pinned_at: Option<chrono::DateTime<chrono::Utc>>,

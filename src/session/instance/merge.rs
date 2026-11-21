@@ -434,6 +434,9 @@ impl Instance {
         if pre.archived_at != post.archived_at {
             self.archived_at = post.archived_at;
         }
+        if pre.ignored_at != post.ignored_at {
+            self.ignored_at = post.ignored_at;
+        }
         if pre.favorited_at != post.favorited_at {
             self.favorited_at = post.favorited_at;
         }
@@ -487,6 +490,7 @@ impl Instance {
         self.last_accessed_at = self.last_accessed_at.max(post.last_accessed_at);
 
         let archived_changed = pre.archived_at != post.archived_at;
+        let ignored_changed = pre.ignored_at != post.ignored_at;
         let favorited_changed = pre.favorited_at != post.favorited_at;
         let snoozed_changed = pre.snoozed_until != post.snoozed_until;
         let pinned_changed = pre.pinned_at != post.pinned_at;
@@ -496,33 +500,43 @@ impl Instance {
 
         // archive(): archived=Some => favorited=None, snoozed=None, pinned=None
         if archived_changed && post.archived_at.is_some() {
+            self.ignored_at = None;
             self.favorited_at = None;
             self.snoozed_until = None;
             self.pinned_at = None;
         }
-        // favorite(): favorited=Some => archived=None, snoozed=None
+        // favorite(): favorited=Some => archived=None, ignored=None, snoozed=None
         if favorited_changed && post.favorited_at.is_some() {
             self.archived_at = None;
+            self.ignored_at = None;
             self.snoozed_until = None;
         }
-        // snooze(): snoozed=Some => pinned=None (sink clears surface).
+        // snooze(): snoozed=Some => ignored=None, pinned=None.
         if snoozed_changed && post.snoozed_until.is_some() {
+            self.ignored_at = None;
             self.pinned_at = None;
         }
-        // pin(): pinned=Some => archived=None, snoozed=None (surface clears sinks).
+        // ignore(): ignored=Some => pinned=None.
+        if ignored_changed && post.ignored_at.is_some() {
+            self.pinned_at = None;
+        }
+        // pin(): pinned=Some => archived=None, ignored=None, snoozed=None.
         if pinned_changed && post.pinned_at.is_some() {
             self.archived_at = None;
+            self.ignored_at = None;
             self.snoozed_until = None;
         }
         // Viewing clears sink states, not explicit favorite/pin signals.
         if touched {
             self.archived_at = None;
+            self.ignored_at = None;
             self.snoozed_until = None;
             self.idle_dormant_since = None;
         }
-        // Archive takes precedence over snooze.
+        // Archive takes precedence over snooze and ignore.
         if self.archived_at.is_some() {
             self.snoozed_until = None;
+            self.ignored_at = None;
         }
         // Archived rows cannot retain live-interaction status.
         if self.is_archived() {
@@ -1182,6 +1196,7 @@ mod tests {
         type Action = fn(&mut Instance);
         type Check = fn(&Instance) -> bool;
         let archived: Check = |i| i.archived_at.is_some();
+        let ignored: Check = |i| i.ignored_at.is_some();
         let favorited: Check = |i| i.favorited_at.is_some();
         let pinned: Check = |i| i.pinned_at.is_some();
         let snoozed: Check = |i| i.snoozed_until.is_some();
@@ -1256,6 +1271,41 @@ mod tests {
                 |i| i.pin(),
                 |i| i.touch_last_accessed(),
                 &[(pinned, true)],
+            ),
+            (
+                "tui ignore reaches disk",
+                |_| {},
+                |i| i.ignore(),
+                |_| {},
+                &[(ignored, true)],
+            ),
+            (
+                "tui ignore clears peer pin",
+                |_| {},
+                |i| i.ignore(),
+                |i| i.pin(),
+                &[(ignored, true), (pinned, false)],
+            ),
+            (
+                "tui pin beats peer ignore",
+                |_| {},
+                |i| i.pin(),
+                |i| i.ignore(),
+                &[(pinned, true), (ignored, false)],
+            ),
+            (
+                "peer archive beats tui ignore",
+                |_| {},
+                |i| i.ignore(),
+                |i| i.archive(),
+                &[(archived, true), (ignored, false)],
+            ),
+            (
+                "tui touch beats peer ignore",
+                |_| {},
+                |i| i.touch_last_accessed(),
+                |i| i.ignore(),
+                &[(ignored, false)],
             ),
         ];
         for (label, setup, tui, peer, checks) in cases {

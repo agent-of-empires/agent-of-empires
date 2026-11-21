@@ -946,6 +946,72 @@ async fn send_reports_the_dispatch_and_the_prompts_seq() {
     }
 }
 
+/// Routine MCP access must not unsnooze or unignore a managed session: a send
+/// is refused with its own code, and reading leaves the row's markers intact.
+#[tokio::test]
+#[serial_test::serial]
+async fn mcp_send_and_read_leave_an_ignored_managed_session_alone() {
+    let _guard = crate::session::test_support::isolate_app_dir();
+    let managed = {
+        let mut inst = structured_session("mcp-managed");
+        inst.parent_session_id = Some("mcp-manager".into());
+        inst.ignore();
+        inst.snooze(30);
+        inst.ignore();
+        inst
+    };
+    let ignored_at = managed.ignored_at;
+    let snoozed_until = managed.snoozed_until;
+    let (app, state) = seeded_app(vec![structured_session("mcp-manager"), managed], false).await;
+
+    let refused = call_result(
+        &app,
+        "send",
+        json!({"session_id": "mcp-managed", "message": "hello"}),
+    )
+    .await;
+    assert_eq!(error_code(&refused), Some("ignored"), "{refused}");
+
+    let read = call(&app, "read_output", json!({"session_id": "mcp-managed"})).await;
+    assert_eq!(read["view"], "structured", "{read}");
+
+    let instances = state.instances.read().await;
+    let row = instances
+        .iter()
+        .find(|inst| inst.id == "mcp-managed")
+        .unwrap();
+    assert_eq!(
+        row.ignored_at, ignored_at,
+        "MCP access must not clear ignore"
+    );
+    assert_eq!(
+        row.snoozed_until, snoozed_until,
+        "MCP access must not unsnooze"
+    );
+    assert_eq!(row.parent_session_id.as_deref(), Some("mcp-manager"));
+}
+
+/// A terminal send re-reads the canonical row under the instance lock: an ignore committed
+/// after the dashboard snapshot refuses before any keys are typed.
+#[tokio::test]
+#[serial_test::serial]
+async fn mcp_terminal_send_refuses_an_ignore_committed_after_the_snapshot() {
+    let _guard = crate::session::test_support::isolate_app_dir();
+    let mut live = Instance::new("mcp-ignored-pane", "/tmp/aoe-mcp-ignored-pane");
+    live.source_profile = "default".into();
+    let id = live.id.clone();
+    let (app, _state) = seeded_app(vec![live.clone()], false).await;
+
+    // A local CLI or another process marks the stored row ignored; the in-memory
+    // snapshot the pre-check reads still looks live.
+    let mut ignored = live;
+    ignored.ignore();
+    test_support::seed_instances_on_disk_for_test("default", vec![ignored]);
+
+    let refused = call_result(&app, "send", json!({"session_id": id, "message": "hello"})).await;
+    assert_eq!(error_code(&refused), Some("ignored"), "{refused}");
+}
+
 /// A structured transcript reads as text from a cursor, pages on from `next_since`, and comes
 /// back raw on request.
 #[tokio::test]

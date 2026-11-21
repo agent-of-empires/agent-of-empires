@@ -3182,6 +3182,24 @@ export async function setSessionSnooze(id: string, minutes: number | null): Prom
   }
 }
 
+/** Ignore or unignore a session managed by another session. The row stays present and live. */
+export async function setSessionIgnored(id: string, ignored: boolean): Promise<SessionResponse | null> {
+  try {
+    return await sessionUpdate(id, "ignored", jsonInit("PATCH", { ignored }));
+  } catch {
+    return null;
+  }
+}
+
+/** Take ownership back from a managing session: clears its manager link and ignore marker. */
+export async function reclaimSessionOwnership(id: string): Promise<SessionResponse | null> {
+  try {
+    return await sessionUpdate(id, "reclaim-ownership", jsonInit("POST", { reclaim: true }));
+  } catch {
+    return null;
+  }
+}
+
 /** Flag a session manually unread (`true`) or mark it read (`false`, clearing
  *  both auto and manual markers). Mirrors the TUI `u` toggle; the caller
  *  computes the target from the current state so an optimistic update stays in

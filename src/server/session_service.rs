@@ -423,6 +423,10 @@ pub(crate) enum PromptTouch {
     RevivalRefused,
     /// The session is archived or trashed; refused before any mutation.
     Blocked(crate::session::StartBlocked),
+    /// The caller refuses ignored rows and this one is ignored; refused before
+    /// any mutation. Checked under the per-session lock, so an ignore that
+    /// committed after the caller's own read still wins.
+    Ignored,
     WorkerNotReady,
 }
 
@@ -852,6 +856,28 @@ impl SessionService {
     /// (#4081 review: a client-side liveness check before this call would
     /// race a concurrent archive, snooze, or wake).
     pub(crate) async fn touch_and_wake_on_prompt(&self, id: &str, no_revive: bool) -> PromptTouch {
+        self.touch_and_wake_on_prompt_with(id, no_revive, false)
+            .await
+    }
+
+    /// Like [`Self::touch_and_wake_on_prompt`], but refuses an ignored row under
+    /// the instance lock. MCP sends use this so a concurrent ignore is never
+    /// cleared by the send.
+    pub(crate) async fn touch_and_wake_on_prompt_refusing_ignored(
+        &self,
+        id: &str,
+        no_revive: bool,
+    ) -> PromptTouch {
+        self.touch_and_wake_on_prompt_with(id, no_revive, true)
+            .await
+    }
+
+    async fn touch_and_wake_on_prompt_with(
+        &self,
+        id: &str,
+        no_revive: bool,
+        refuse_if_ignored: bool,
+    ) -> PromptTouch {
         let Ok(state) = self.native_state() else {
             return PromptTouch::WorkerNotReady;
         };
@@ -859,13 +885,20 @@ impl SessionService {
         let service = state.session_service.clone();
         let id = id.to_owned();
         work.run("server.prompt_touch", async move {
-            service.touch_and_wake_on_prompt_inner(&id, no_revive).await
+            service
+                .touch_and_wake_on_prompt_inner(&id, no_revive, refuse_if_ignored)
+                .await
         })
         .await
         .unwrap_or(PromptTouch::WorkerNotReady)
     }
 
-    async fn touch_and_wake_on_prompt_inner(&self, id: &str, no_revive: bool) -> PromptTouch {
+    async fn touch_and_wake_on_prompt_inner(
+        &self,
+        id: &str,
+        no_revive: bool,
+        refuse_if_ignored: bool,
+    ) -> PromptTouch {
         let Ok(state) = self.native_state() else {
             return PromptTouch::WorkerNotReady;
         };
@@ -909,6 +942,9 @@ impl SessionService {
                         .into_iter()
                         .find(|row| row.id == worker_id)
                         .ok_or(crate::session::SessionGone)?;
+                    if refuse_if_ignored && row.is_ignored() {
+                        return Ok(Err(PromptTouch::Ignored));
+                    }
                     if let Some(outcome) = prompt_touch_rejection(
                         &row,
                         generation,
@@ -976,6 +1012,10 @@ impl SessionService {
             let committed = store.update(|rows, _| {
                 let row = rows.iter_mut().find(|row| row.id == worker_id)
                     .ok_or(crate::session::SessionGone)?;
+                if refuse_if_ignored && row.is_ignored() {
+                    refused = Some(PromptTouch::Ignored);
+                    anyhow::bail!(crate::session::LifecycleReservationError::Superseded);
+                }
                 if let Some(outcome) = prompt_touch_rejection(
                     row, generation, &title, provider.as_deref(), view, no_revive,
                 ) {
@@ -1014,6 +1054,72 @@ impl SessionService {
                 PromptTouch::WorkerNotReady
             }
         }
+    }
+
+    /// Whether the canonical row is ignored. A delivery that must not clear Ignore reads the
+    /// store rather than the watcher's snapshot, which lags a write from the CLI or another
+    /// request.
+    pub(crate) async fn is_ignored_on_disk(&self, id: &str) -> anyhow::Result<bool> {
+        let state = self.native_state()?;
+        let profile = self
+            .instances
+            .read()
+            .await
+            .iter()
+            .find(|row| row.id == id)
+            .map(|row| row.source_profile.clone())
+            .ok_or(crate::session::SessionGone)?;
+        let id = id.to_owned();
+        tokio::task::spawn_blocking(move || -> anyhow::Result<bool> {
+            use crate::session::SessionStore;
+            let native = super::session_store::NativeSessionStore::open(state, &profile, None)?;
+            Ok(native
+                .load()?
+                .iter()
+                .any(|row| row.id == id && row.is_ignored()))
+        })
+        .await?
+    }
+
+    /// Input reached an open pane, which is user input like `send`: an ignored row does not
+    /// stay hidden under the operator's own keystrokes. Only the marker and recency change,
+    /// and only while the canonical row is still ignored and startable, so the write happens
+    /// once rather than per keystroke.
+    pub(crate) async fn touch_after_direct_input(&self, id: &str) -> anyhow::Result<()> {
+        if !self
+            .instances
+            .read()
+            .await
+            .iter()
+            .any(|row| row.id == id && row.is_ignored())
+        {
+            return Ok(());
+        }
+        let state = self.native_state()?;
+        let profile = self
+            .instances
+            .read()
+            .await
+            .iter()
+            .find(|row| row.id == id)
+            .map(|row| row.source_profile.clone())
+            .ok_or(crate::session::SessionGone)?;
+        let id = id.to_owned();
+        tokio::task::spawn_blocking(move || -> anyhow::Result<()> {
+            use crate::session::SessionStore;
+            let native = super::session_store::NativeSessionStore::open(state, &profile, None)?;
+            let store: &dyn SessionStore = &native;
+            store.update(|rows, _| {
+                if let Some(row) = rows.iter_mut().find(|row| row.id == id) {
+                    if row.is_ignored() {
+                        row.touch_after_input();
+                    }
+                }
+                Ok(())
+            })?;
+            Ok(())
+        })
+        .await?
     }
 
     /// Deliver a turn to a structured session: resume a dead/dormant worker
@@ -2969,6 +3075,7 @@ fn prompt_touch_rejection(
 
 /// Apply an accepted prompt gesture to the authoritative row before native commit.
 /// A wake lifts snooze/dormancy; other prompts advance recency monotonically.
+/// Both paths clear Ignore, since the user engaged with the row.
 ///
 /// Advancing `last_accessed_at` on disk is the signal `merge_user_action_diff`
 /// (`session/instance/merge.rs`) keys on to clear a park, which is right for a
@@ -2979,6 +3086,7 @@ pub(crate) fn apply_prompt_persist_to_disk(disk: &mut crate::session::Instance, 
     } else {
         let now = chrono::Utc::now();
         disk.last_accessed_at = disk.last_accessed_at.max(Some(now));
+        disk.ignored_at = None;
     }
 }
 
@@ -4973,6 +5081,73 @@ mod tests {
         }
     }
 
+    /// A peer write is what counts: the canonical check sees an ignore the watcher has not
+    /// delivered to the in-memory snapshot yet.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn a_peer_ignore_is_visible_to_the_canonical_check() {
+        let _home = crate::session::test_support::isolate_app_dir();
+        let mut managed = Instance::new("peer-ignored", "/tmp/aoe-peer-ignored");
+        managed.id = "peer-ignored".into();
+        managed.source_profile = "default".into();
+        managed.parent_session_id = Some("manager".into());
+        crate::server::test_support::seed_instances_on_disk_for_test(
+            "default",
+            vec![managed.clone()],
+        );
+        let state = crate::server::test_support::build_test_app_state(vec![managed.clone()]);
+        let service = state.session_service.clone();
+        assert!(!service.is_ignored_on_disk("peer-ignored").await.unwrap());
+
+        let mut ignored = managed;
+        ignored.ignore();
+        crate::server::test_support::seed_instances_on_disk_for_test("default", vec![ignored]);
+        assert!(service.is_ignored_on_disk("peer-ignored").await.unwrap());
+        assert!(
+            !state.instances.read().await[0].is_ignored(),
+            "the snapshot was never refreshed, so the check above read the store"
+        );
+    }
+
+    /// Typing in an open pane is user input, so it clears Ignore on a row that can still
+    /// start; an archived row keeps the marker that its archive outranks.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn direct_input_clears_ignore_only_on_a_startable_row() {
+        let _home = crate::session::test_support::isolate_app_dir();
+        let cases = [("live", false, false), ("sunk", true, true)];
+        for (id, archived, still_ignored) in cases {
+            let mut row = Instance::new(id, "/tmp/aoe-direct-input");
+            row.id = id.into();
+            row.source_profile = "default".into();
+            row.parent_session_id = Some("manager".into());
+            if archived {
+                row.archive();
+            }
+            row.ignore();
+            let stored = crate::session::Storage::new_unwatched("default").unwrap();
+            stored
+                .update(|rows, _| {
+                    rows.retain(|row| row.id != id);
+                    rows.push(row.clone());
+                    Ok(())
+                })
+                .unwrap();
+            let state = crate::server::test_support::build_test_app_state(vec![row]);
+            crate::server::test_support::refresh_canonical_metadata_for_test(&state).await;
+            state
+                .session_service
+                .touch_after_direct_input(id)
+                .await
+                .unwrap();
+
+            let rows = stored.load().unwrap();
+            let written = rows.iter().find(|row| row.id == id).unwrap();
+            assert_eq!(written.is_ignored(), still_ignored, "{id}");
+            assert!(written.last_accessed_at.is_some(), "{id}");
+        }
+    }
+
     #[tokio::test]
     #[serial_test::serial]
     async fn explicit_prompt_wake_consumes_only_the_retired_native_stop_observation() {
@@ -5107,6 +5282,7 @@ mod tests {
         for reason in [
             "archived",
             "trashed",
+            "ignored",
             "no_revive",
             "unfinished",
             "superseded",
@@ -5119,6 +5295,7 @@ mod tests {
             match reason {
                 "archived" => persisted.archive(),
                 "trashed" => persisted.trash(),
+                "ignored" => persisted.ignore(),
                 "unfinished" => persisted.status = crate::session::Status::Creating,
                 "superseded" => persisted.lifecycle_generation += 1,
                 _ => {}
@@ -5135,10 +5312,17 @@ mod tests {
             let memory_before = serde_json::to_value(&visible).unwrap();
             let disk_before = std::fs::read(storage.sessions_path()).unwrap();
             let mut status_rx = state.status_tx.subscribe();
-            let outcome = state
-                .session_service
-                .touch_and_wake_on_prompt(&visible.id, reason == "no_revive")
-                .await;
+            let outcome = if reason == "ignored" {
+                state
+                    .session_service
+                    .touch_and_wake_on_prompt_refusing_ignored(&visible.id, false)
+                    .await
+            } else {
+                state
+                    .session_service
+                    .touch_and_wake_on_prompt(&visible.id, reason == "no_revive")
+                    .await
+            };
             match reason {
                 "archived" => assert!(matches!(
                     outcome,
@@ -5148,6 +5332,7 @@ mod tests {
                     outcome,
                     PromptTouch::Blocked(crate::session::StartBlocked::Trashed)
                 )),
+                "ignored" => assert!(matches!(outcome, PromptTouch::Ignored)),
                 "no_revive" => assert!(matches!(outcome, PromptTouch::RevivalRefused)),
                 _ => assert!(matches!(outcome, PromptTouch::WorkerNotReady)),
             }
