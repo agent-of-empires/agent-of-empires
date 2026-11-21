@@ -556,7 +556,7 @@ fn collect_tmux_states(instances: &mut [Instance]) -> Vec<TmuxState> {
         states.push(TmuxState {
             session_name: name.clone(),
             status: inst.status,
-            pid: crate::process::get_pane_pid(&name),
+            pid: meta.get(&name).and_then(live_pane_pid),
             activity_epoch: crate::tmux::session_activity(&name),
             agent,
         });
@@ -575,13 +575,19 @@ fn collect_tmux_states(instances: &mut [Instance]) -> Vec<TmuxState> {
             } else {
                 Status::Idle
             },
-            pid: crate::process::get_pane_pid(name),
+            pid: live_pane_pid(m),
             activity_epoch: crate::tmux::session_activity(name),
             agent: m.pane_current_command.clone().unwrap_or_default(),
         });
     }
 
     states
+}
+
+/// Same filter as `process::get_pane_pid`, read from the batched snapshot.
+fn live_pane_pid(meta: &crate::tmux::PaneMetadata) -> Option<u32> {
+    meta.pane_pid
+        .filter(|pid| !meta.pane_dead && *pid > 0 && i32::try_from(*pid).is_ok())
 }
 
 fn acp_state_from_record(rec: crate::process::worker_registry::WorkerRecord) -> AcpState {
@@ -890,6 +896,33 @@ mod tests {
             id: id.to_string(),
             title: title.to_string(),
             created_at_epoch: CREATED_AT,
+        }
+    }
+
+    #[test]
+    fn live_pane_pid_matches_the_per_session_probe_filter() {
+        let meta = |pane_dead, pane_pid| crate::tmux::PaneMetadata {
+            server: None,
+            session_id: "$1".into(),
+            pane_id: "%1".into(),
+            session_kind: None,
+            tool_owner: crate::tmux::ToolPaneOwner::Unmarked,
+            pane_dead,
+            pane_current_command: None,
+            pane_start_command_is_protected: false,
+            pane_pid,
+            pane_title: None,
+            window_activity: None,
+            window_size: None,
+        };
+        for (pane_dead, pane_pid, expected) in [
+            (false, Some(4242), Some(4242)),
+            (true, Some(4242), None),
+            (false, Some(0), None),
+            (false, Some(u32::MAX), None),
+            (false, None, None),
+        ] {
+            assert_eq!(live_pane_pid(&meta(pane_dead, pane_pid)), expected);
         }
     }
 
