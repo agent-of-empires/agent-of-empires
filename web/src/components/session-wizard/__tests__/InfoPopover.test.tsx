@@ -1,7 +1,7 @@
 // @vitest-environment jsdom
 // Keyboard opening and Tab order need a real browser: tests/wizard-worktree-info.spec.ts.
 import { afterEach, describe, expect, it } from "vitest";
-import { cleanup, fireEvent, render, screen } from "@testing-library/react";
+import { act, cleanup, fireEvent, render, screen } from "@testing-library/react";
 import { InfoPopover } from "../InfoPopover";
 
 afterEach(cleanup);
@@ -13,6 +13,7 @@ function renderPopover() {
         <a href="/settings/worktree">Worktree settings ›</a>
       </InfoPopover>
       <p>outside</p>
+      <button type="button">wizard field</button>
     </>,
   );
   return screen.getByRole("button", { name: "What's a worktree?" });
@@ -21,6 +22,16 @@ function renderPopover() {
 const dialog = () => screen.queryByRole("dialog", { name: "What's a worktree?" });
 
 describe("InfoPopover", () => {
+  it("closes when focus moves outside it, leaving focus there, and stays open for the link", () => {
+    fireEvent.click(renderPopover());
+    screen.getByRole("link", { name: "Worktree settings ›" }).focus();
+    expect(dialog()).not.toBeNull();
+    const field = screen.getByRole("button", { name: "wizard field" });
+    act(() => field.focus());
+    expect(dialog()).toBeNull();
+    expect(document.activeElement).toBe(field);
+  });
+
   it("opens a dialog that takes focus, and a second click closes it", () => {
     const icon = renderPopover();
     expect(icon.getAttribute("aria-expanded")).toBe("false");

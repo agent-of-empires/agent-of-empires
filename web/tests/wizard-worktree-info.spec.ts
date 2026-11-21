@@ -28,6 +28,31 @@ test.describe("desktop", () => {
     }
   });
 
+  test("Shift+Tab out of the open popover closes it and leaves focus where Tab put it", async ({ page }) => {
+    await startWizard(page, WORKTREE_ON);
+    await icon(page).focus();
+    await page.keyboard.press("Enter");
+    await expect(popover(page)).toBeFocused();
+    await page.keyboard.press("Shift+Tab");
+    await expect(popover(page)).toHaveCount(0);
+    await expect(page.getByTestId("session-wizard")).toBeVisible();
+    // Focus stays on the wizard control Shift+Tab reached; the popover doesn't take it back.
+    expect(await page.evaluate(() => !!document.activeElement?.closest('[data-testid="session-wizard"]'))).toBe(true);
+  });
+
+  // Opened first, then resized: only a width change can leave it off-screen.
+  test("an open popover closes when the window narrows, and stays open when only the height changes", async ({
+    page,
+  }) => {
+    await startWizard(page, WORKTREE_ON);
+    await icon(page).click();
+    await expect(popover(page)).toBeVisible();
+    await page.setViewportSize({ width: 1280, height: 600 });
+    await expect(popover(page)).toBeVisible();
+    await page.setViewportSize({ width: 375, height: 600 });
+    await expect(popover(page)).toHaveCount(0);
+  });
+
   test("the link closes the wizard and opens Settings › Worktree without reloading the page", async ({ page }) => {
     await startWizard(page, WORKTREE_ON);
     // One Worktree setting, so the tab's own row proves where it landed.

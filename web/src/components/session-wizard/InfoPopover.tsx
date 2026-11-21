@@ -25,9 +25,14 @@ export function InfoPopover({ title, children }: { title: string; children: Reac
     if (!open) return;
     // Non-modal, so it takes focus itself: Escape then reaches it and Tab goes on to the link.
     panelRef.current?.focus({ preventScroll: true });
+    const outside = (target: EventTarget | null) =>
+      !panelRef.current?.contains(target as Node) && !buttonRef.current?.contains(target as Node);
     const onPointerDown = (e: PointerEvent) => {
-      const target = e.target as Node;
-      if (!panelRef.current?.contains(target) && !buttonRef.current?.contains(target)) setPos(null);
+      if (outside(e.target)) setPos(null);
+    };
+    // Shift+Tab out of the portalled panel would leave it open over the wizard, where Escape closes the wizard.
+    const onFocusIn = (e: FocusEvent) => {
+      if (outside(e.target)) setPos(null);
     };
     // It's placed once, so a scroll under it (the wizard's list) or a narrower window would leave it behind.
     const onScroll = (e: Event) => {
@@ -39,10 +44,12 @@ export function InfoPopover({ title, children }: { title: string; children: Reac
       if (window.innerWidth !== openWidth) setPos(null);
     };
     document.addEventListener("pointerdown", onPointerDown, true);
+    document.addEventListener("focusin", onFocusIn, true);
     document.addEventListener("scroll", onScroll, true);
     window.addEventListener("resize", onResize);
     return () => {
       document.removeEventListener("pointerdown", onPointerDown, true);
+      document.removeEventListener("focusin", onFocusIn, true);
       document.removeEventListener("scroll", onScroll, true);
       window.removeEventListener("resize", onResize);
     };
