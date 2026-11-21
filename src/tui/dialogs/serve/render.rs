@@ -398,7 +398,7 @@ fn render_confirm(
                 "URL rotates each restart",
                 "Not PWA-friendly",
             ],
-            "Not installed (brew install cloudflared)",
+            "Not installed (needs cloudflared)",
         ),
     ];
     for (card_area, title, transport, status, body_lines, not_installed) in cards {

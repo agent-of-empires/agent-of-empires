@@ -624,7 +624,12 @@ impl ServeStartup {
 }
 
 /// Establish lifecycle authority and serve/migrate exclusion before migrations.
-pub async fn lock_for_startup(profile: &str, args: &mut ServeArgs) -> Result<Option<ServeStartup>> {
+/// `announce` is false when the TUI owns the terminal.
+pub async fn lock_for_startup(
+    profile: &str,
+    args: &mut ServeArgs,
+    announce: bool,
+) -> Result<Option<ServeStartup>> {
     if args.stop || args.status || args.restart || args.rollback {
         return Ok(None);
     }
@@ -658,7 +663,9 @@ pub async fn lock_for_startup(profile: &str, args: &mut ServeArgs) -> Result<Opt
                 old_pid = pid,
                 "replacing core-only daemon with full daemon"
             );
-            println!("Replacing the background aoe daemon (PID {pid}) with the web dashboard");
+            if announce {
+                println!("Replacing the background aoe daemon (PID {pid}) with the web dashboard");
+            }
             stop_daemon_locked(&transaction, false).await?;
         }
         DaemonStatus::Unverified => {
@@ -1537,7 +1544,7 @@ pub async fn run_control(args: &ServeArgs) -> Option<Result<()>> {
 pub async fn run(profile: &str, mut args: ServeArgs, startup: Option<ServeStartup>) -> Result<()> {
     let startup = match startup {
         Some(startup) => startup,
-        None => lock_for_startup(profile, &mut args)
+        None => lock_for_startup(profile, &mut args, true)
             .await?
             .context("serve startup guard missing")?,
     };
@@ -1907,7 +1914,7 @@ pub(crate) async fn start_dashboard_for_tui(
         let launch = if let Some(lease) = restart {
             lease.restart(args).await?
         } else {
-            let startup = lock_for_startup(profile, &mut args)
+            let startup = lock_for_startup(profile, &mut args, false)
                 .await?
                 .context("Dashboard startup guard is unavailable")?;
             let startup = tokio::task::spawn_blocking(move || {
