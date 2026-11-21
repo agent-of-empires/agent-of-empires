@@ -887,6 +887,19 @@
       ]
     },
     {
+      "id": "telemetry.feature-use",
+      "kind": "mocked-playwright",
+      "risk": "medium",
+      "specs": ["tests/telemetry-feature-use.spec.ts", "src/lib/featureUse.test.ts"],
+      "components": [
+        "web/src/lib/featureUse.ts",
+        "web/src/App.tsx",
+        "web/src/hooks/useSidebarPrefs.ts",
+        "web/src/components/command-palette/CommandPalette.tsx"
+      ],
+      "notes": "Sort picker, attention shortcut and palette cheat codes post their registry names to /api/telemetry/feature-use."
+    },
+    {
       "id": "settings.theme-persistence-passphrase",
       "kind": "live-playwright",
       "risk": "high",

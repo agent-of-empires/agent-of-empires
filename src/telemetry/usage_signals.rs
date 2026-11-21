@@ -25,10 +25,14 @@ impl Default for UsageSeenCounters {
 
 impl UsageSeenCounters {
     pub fn new() -> Self {
+        Self::with_names(USAGE_SIGNALS.iter().copied())
+    }
+
+    pub fn with_names(names: impl IntoIterator<Item = &'static str>) -> Self {
         Self {
-            counts: USAGE_SIGNALS
-                .iter()
-                .map(|&name| (name, AtomicU32::new(0)))
+            counts: names
+                .into_iter()
+                .map(|name| (name, AtomicU32::new(0)))
                 .collect(),
         }
     }
@@ -36,10 +40,16 @@ impl UsageSeenCounters {
     pub fn record(&self, name: &str) -> bool {
         match self.counts.get(name) {
             Some(counter) => {
-                counter.fetch_add(1, Ordering::Relaxed);
+                super::consent::bump(counter);
                 true
             }
             None => false,
+        }
+    }
+
+    pub fn zero(&self) {
+        for counter in self.counts.values() {
+            counter.store(0, Ordering::Relaxed);
         }
     }
 

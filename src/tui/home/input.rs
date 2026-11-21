@@ -3440,6 +3440,9 @@ impl HomeView {
         {
             return None;
         }
+        if let Some(feature) = id.feature_use() {
+            crate::telemetry::feature_use::record(feature);
+        }
         match id {
             ActionId::Quit => return Some(Action::Quit),
             ActionId::ResolveIndeterminate => {
@@ -4425,6 +4428,9 @@ impl HomeView {
     }
 
     fn open_command_palette(&mut self) {
+        crate::telemetry::feature_use::record(
+            crate::telemetry::feature_use::FeatureUse::CommandPalette,
+        );
         let mut entries: Vec<PaletteCommand> = builtin_commands(self.strict_hotkeys);
 
         // Quit lives in the registry but is excluded from `builtin_commands` (no palette
@@ -4967,6 +4973,9 @@ impl HomeView {
     }
 
     pub(super) fn apply_sort_order(&mut self, new_order: SortOrder) {
+        if new_order != self.sort_order {
+            crate::telemetry::feature_use::record(new_order.into());
+        }
         self.sort_order = new_order;
         if self.search_active && !self.search_query.value().is_empty() {
             self.refresh_flat_items();
@@ -4984,6 +4993,7 @@ impl HomeView {
     }
 
     pub(super) fn apply_group_by(&mut self, new_mode: GroupByMode) {
+        crate::telemetry::feature_use::record(new_mode.into());
         self.group_by = new_mode;
         self.rebuild_flat_items();
         self.reseat_cursor_after_rebuild();
@@ -5696,6 +5706,9 @@ impl HomeView {
             self.flash_status("Still creating this session; it has no runtime yet");
             return;
         }
+        if let Some(feature) = action.feature_use() {
+            crate::telemetry::feature_use::record(feature);
+        }
         match action {
             ContextMenuAction::Rename => self.open_rename_for_selected(),
             ContextMenuAction::Delete => self.open_delete_for_selected(),
@@ -5815,6 +5828,7 @@ impl HomeView {
     /// and the badge. Always opens, even with nothing eligible, so an explicit "Show tips"
     /// gives an empty state rather than silence.
     pub(super) fn open_tips_dialog(&mut self) {
+        crate::telemetry::feature_use::record(crate::telemetry::feature_use::FeatureUse::Tips);
         let config = load_config().ok().flatten().unwrap_or_default();
         let signals = crate::tips::TipSignals::from(&config);
         let eligible = crate::tips::eligible(crate::tips::TipSurface::Tui, &signals);

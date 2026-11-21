@@ -2,13 +2,16 @@
 //! fire-and-forget with hard timeouts, and every field is sanitized to closed allowlists.
 
 pub mod aggregate;
+pub mod consent;
 pub mod events;
+pub mod feature_use;
 pub mod features;
 pub mod form_factor;
 pub mod plugins;
 pub mod sanitize;
 mod state;
 pub mod usage_signals;
+pub mod window;
 
 use std::collections::BTreeMap;
 use std::time::Duration;
@@ -345,6 +348,8 @@ fn assemble_usage_snapshot(
         distinct_sessions_by_agent: BTreeMap::new(),
         distinct_sessions_by_model_bucket: BTreeMap::new(),
         features,
+        prefs: features::active_prefs(config),
+        feature_uses: BTreeMap::new(),
         usage_seen,
         web_clients_seen: BTreeMap::new(),
         structured_clients_seen: BTreeMap::new(),
@@ -477,6 +482,9 @@ fn record_snapshot_fp(snapshot: &UsageSnapshot) {
 
 /// Only confirmed sends are recorded, so a failed send never suppresses a retry.
 fn snapshot_matches_last(snapshot: &UsageSnapshot) -> bool {
+    if snapshot.carries_deltas() {
+        return false;
+    }
     let fp = snapshot_fingerprint(snapshot);
     match LAST_SNAPSHOT_FP.lock() {
         Ok(last) => *last == Some(fp),
@@ -599,6 +607,8 @@ mod tests {
             distinct_sessions_by_agent: BTreeMap::new(),
             distinct_sessions_by_model_bucket: BTreeMap::new(),
             features: BTreeMap::new(),
+            prefs: BTreeMap::new(),
+            feature_uses: BTreeMap::new(),
             usage_seen: usage_signals::zeroed(),
             web_clients_seen: BTreeMap::new(),
             structured_clients_seen: BTreeMap::new(),
@@ -720,6 +730,37 @@ mod tests {
             "repeating the latest snapshot dedups against it"
         );
 
+        // Deltas are zeroed after a confirmed send, so an equal count later is new usage.
+        let deltas: [(&str, fn(&mut UsageSnapshot)); 8] = [
+            ("feature_uses", |s| {
+                s.feature_uses.insert("command_palette".into(), 1);
+            }),
+            ("usage_seen", |s| {
+                s.usage_seen.insert("web".into(), 1);
+            }),
+            ("web_clients_seen", |s| {
+                s.web_clients_seen.insert("desktop".into(), true);
+            }),
+            ("session_creates", |s| {
+                s.session_creates_since_last_snapshot = 1
+            }),
+            ("approvals", |s| s.approvals_resolved = 1),
+            ("agent_switches", |s| s.agent_switches = 1),
+            ("plan_mode", |s| s.plan_mode_seen = true),
+            ("prompts_queued", |s| s.prompts_queued = 1),
+        ];
+        for (name, add) in deltas {
+            let mut used = changed.clone();
+            add(&mut used);
+            record_snapshot_fp(&used);
+            assert!(
+                !snapshot_matches_last(&used),
+                "{name}: a repeated count must not dedupe"
+            );
+            used.clear_deltas();
+            assert!(!used.carries_deltas(), "{name}: clear_deltas zeroes it");
+        }
+
         *LAST_SNAPSHOT_FP.lock().unwrap() = None;
     }
 
@@ -743,6 +784,7 @@ mod tests {
         assert_eq!(snapshot.session_total, 1);
         assert_eq!(snapshot.session_creates_since_last_snapshot, 3);
         assert_eq!(snapshot.features, features::active_features(&config));
+        assert_eq!(snapshot.prefs, features::active_prefs(&config));
     }
 
     #[test]

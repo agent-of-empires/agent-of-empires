@@ -209,10 +209,7 @@ pub async fn post_telemetry_structured_interaction(
     };
     match req.kind.as_str() {
         "prompt_queued" => {
-            state
-                .telemetry_structured
-                .prompts_queued
-                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            crate::telemetry::consent::bump(&state.telemetry_structured.prompts_queued);
         }
         other => {
             return api_error(
@@ -221,6 +218,33 @@ pub async fn post_telemetry_structured_interaction(
                 format!("unknown interaction kind '{other}'"),
             );
         }
+    }
+    StatusCode::NO_CONTENT.into_response()
+}
+
+#[derive(Deserialize)]
+pub struct FeatureUseRequest {
+    feature: String,
+}
+
+/// Count one use of an accessory dashboard feature from the `feature_use` registry.
+pub async fn post_telemetry_feature_use(
+    State(state): State<Arc<AppState>>,
+    body: Result<Json<FeatureUseRequest>, axum::extract::rejection::JsonRejection>,
+) -> impl IntoResponse {
+    if state.read_only {
+        return super::read_only_response();
+    }
+    let Json(req) = match body {
+        Ok(b) => b,
+        Err(rej) => return rej.into_response(),
+    };
+    if !crate::telemetry::feature_use::record_name(&req.feature) {
+        return api_error(
+            StatusCode::BAD_REQUEST,
+            "bad_feature",
+            format!("unknown feature '{}'", req.feature),
+        );
     }
     StatusCode::NO_CONTENT.into_response()
 }
