@@ -1018,6 +1018,19 @@ pub(super) struct PrimeProcessSample {
     pub marked: bool,
 }
 
+/// `pid` with its start, or `None` once it has exited.
+pub(crate) fn process_identity(pid: u32) -> anyhow::Result<Option<PrimeProcessIdentity>> {
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    {
+        Ok(platform::process_start_id(pid)?.map(|start_id| PrimeProcessIdentity { pid, start_id }))
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    {
+        let _ = pid;
+        anyhow::bail!("process identity is not supported on this platform")
+    }
+}
+
 /// A process in a root's tree, with what a person needs to recognise it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct CommandSample {

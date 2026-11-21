@@ -551,23 +551,9 @@ impl Instance {
             conversation_carry,
             processes,
         } = options;
-        // Under the same locks as the pane stop below, which nothing before it touches.
-        if let Some(recheck) = processes {
-            use crate::session::background_processes::{pane_census, refusal};
-            if let Some(fields) = refusal(
-                pane_census(self),
-                &recheck.confirmed,
-                recheck.stop_unclassified,
-            ) {
-                self.withdraw_reserved_restart(storage, generation, &recheck.admitted)?;
-                return Err(
-                    crate::session::background_processes::BackgroundProcessesAppeared(fields)
-                        .into(),
-                );
-            }
-        }
         // Capture may refresh memory, but publication must compare against durable prior state.
         let prior = self.conversation_state();
+        let fresh_requested = self.force_fresh_next_launch;
         self.capture_resume_launch_target_in(CaptureStorage::Scoped(storage));
         let skipped_failed_resume_sid = self.apply_resume_policy(resume_policy);
         if let Err(error) = self.preflight_resume_launch() {
@@ -578,9 +564,14 @@ impl Instance {
         if std::mem::take(&mut self.force_fresh_next_launch) {
             self.resume_intent = ResumeIntent::Cleared;
         }
-        let result = (|| {
-            let mut prepared =
-                self.stop_carry_and_prepare_in(storage, restart, conversation_carry, prior)?;
+        let result: Result<StartOutcome> = (|| {
+            let mut prepared = self.stop_carry_and_prepare_in(
+                storage,
+                restart,
+                conversation_carry,
+                prior.clone(),
+                processes.as_ref(),
+            )?;
             prepared.require_conversation_publication |= skipped_failed_resume_sid.is_some();
             let launch_outcome = self.spawn_prepared_launch(size, storage, prepared)?;
             let outcome =
@@ -589,6 +580,16 @@ impl Instance {
             Ok(outcome)
         })();
         if let Err(error) = result {
+            // Refused at the pane stop: nothing was torn down, so the restart is given back.
+            if let (true, Some(recheck)) = (
+                error.is::<crate::session::background_processes::BackgroundProcessesAppeared>(),
+                &processes,
+            ) {
+                self.adopt_conversation_state(prior);
+                self.force_fresh_next_launch = fresh_requested;
+                self.withdraw_reserved_restart(storage, generation, &recheck.admitted)?;
+                return Err(error);
+            }
             self.fail_reserved_launch(storage, generation, &error, true);
             return Err(error);
         }
@@ -675,14 +676,20 @@ impl Instance {
         restart: bool,
         conversation_carry: Option<ConversationCarry>,
         expected: ConversationState,
+        processes: Option<&crate::session::background_processes::ProcessRecheck>,
     ) -> Result<PreparedLaunch> {
+        #[cfg(test)]
+        crate::session::background_processes::BoundaryHook::fire(
+            self,
+            crate::session::background_processes::Boundary::Teardown,
+        );
         let publication = if restart {
             self.prime_root_publication(true)
         } else {
             None
         };
         if restart {
-            self.kill_clean_locked()?;
+            self.kill_clean_locked_checked(processes)?;
         }
         if let Some(carry) = conversation_carry {
             self.absorb_published_prime_session(publication);
@@ -736,7 +743,7 @@ impl Instance {
     ) -> Result<PreparedLaunch> {
         let storage =
             crate::session::storage::Storage::new_unwatched(&self.effective_profile()).unwrap();
-        self.stop_carry_and_prepare_in(&storage, restart, conversation_carry, expected)
+        self.stop_carry_and_prepare_in(&storage, restart, conversation_carry, expected, None)
     }
 
     /// A failure fails the restart: relaunching into the old container would run the new tool
@@ -1211,13 +1218,12 @@ mod tests {
                 Ok(())
             })
             .unwrap();
-        let generation = inst
-            .acquire_lifecycle_reservation(
-                &storage,
-                LifecycleOperation::Launch,
-                Some(Status::Starting),
-            )
-            .unwrap();
+        inst.acquire_lifecycle_reservation(
+            &storage,
+            LifecycleOperation::Launch,
+            Some(Status::Starting),
+        )
+        .unwrap();
         crate::hooks::write_session_id_via_guard(&inst.id, fresh, Some(&launch_id)).unwrap();
         assert_eq!(
             storage.load().unwrap()[0].agent_session_id.as_deref(),
@@ -1225,7 +1231,64 @@ mod tests {
         );
         assert_eq!(inst.capture_freshest_conversation().unwrap().sid, fresh);
         let name = crate::tmux::Session::generate_name(&inst.id, &inst.title);
-        let _pane = crate::tmux::test_helpers::TmuxTestSession::from_name(name);
+        let _pane = crate::tmux::test_helpers::TmuxTestSession::from_name(name.clone());
+
+        // #5858: refused at the pane stop, after capture moved memory to the fresh conversation,
+        // the restart is given back as it was before capture.
+        inst.release_lifecycle_reservation(&storage, LifecycleOperation::Launch)
+            .unwrap();
+        inst.force_fresh_next_launch = true;
+        let prior = inst.conversation_state();
+        let mut refused_generation = 0;
+        let admitted =
+            crate::session::background_processes::AdmittedRestart::admit(&mut inst, |row| {
+                refused_generation = row.acquire_lifecycle_reservation(
+                    &storage,
+                    LifecycleOperation::Launch,
+                    Some(Status::Starting),
+                )?;
+                Ok(())
+            })
+            .unwrap();
+        let unknown = crate::tmux::TmuxTimeoutGuard::arm(&name);
+        let refused = inst.finish_reserved_launch(
+            &storage,
+            None,
+            ResumeLaunchOptions {
+                resume_policy: ResumeAttemptPolicy::Allow,
+                restart: true,
+                conversation_carry: None,
+                processes: Some(crate::session::background_processes::ProcessRecheck {
+                    confirmed: vec![],
+                    stop_unclassified: false,
+                    admitted,
+                }),
+            },
+            refused_generation,
+            Ok(()),
+        );
+        drop(unknown);
+        let error = refused.unwrap_err();
+        assert!(
+            error.is::<crate::session::background_processes::BackgroundProcessesAppeared>(),
+            "{error:#}"
+        );
+        assert_eq!(inst.conversation_state(), prior);
+        assert_eq!(inst.agent_session_id.as_deref(), Some(old));
+        assert!(inst.force_fresh_next_launch);
+        let stored = storage.load().unwrap().remove(0);
+        assert_eq!(stored.agent_session_id.as_deref(), Some(old));
+        assert!(stored.lifecycle_reservation.is_none());
+        inst.capture_poller.stop();
+        inst.force_fresh_next_launch = false;
+        let generation = inst
+            .acquire_lifecycle_reservation(
+                &storage,
+                LifecycleOperation::Launch,
+                Some(Status::Starting),
+            )
+            .unwrap();
+
         let outcome = inst
             .finish_reserved_launch(
                 &storage,

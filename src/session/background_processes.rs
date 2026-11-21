@@ -8,28 +8,131 @@ use crate::session::Instance;
 
 /// What a restart of `instance` would stop besides its Agent. Blocks on `ps` or `/proc`.
 pub(crate) fn pane_census(instance: &Instance) -> PaneCensus {
+    rooted_pane_census(instance).0
+}
+
+/// [`pane_census`], with the pane's root process it read, when it read one.
+fn rooted_pane_census(instance: &Instance) -> (PaneCensus, Option<PrimeProcessIdentity>) {
     let Ok(session) = instance.tmux_session() else {
-        return PaneCensus::Unclassified;
+        return (PaneCensus::Unclassified, None);
     };
     // A pane tmux can't classify might be running anything, so it isn't taken for an empty one.
     match crate::tmux::utils::probe_pane(session.name()) {
-        crate::tmux::utils::PaneProbe::Missing => return PaneCensus::Background(Vec::new()),
-        crate::tmux::utils::PaneProbe::Unknown => return PaneCensus::Unclassified,
+        crate::tmux::utils::PaneProbe::Missing => {
+            return (PaneCensus::Background(Vec::new()), None)
+        }
+        crate::tmux::utils::PaneProbe::Unknown => return (PaneCensus::Unclassified, None),
         crate::tmux::utils::PaneProbe::Alive | crate::tmux::utils::PaneProbe::Dead => {}
     }
     let Some(tree) = session
         .get_pane_pid()
         .and_then(|pid| crate::process::process_tree_commands(pid).ok())
     else {
-        return PaneCensus::Unclassified;
+        return (PaneCensus::Unclassified, None);
     };
+    let root = tree.first().map(|sample| sample.identity.clone());
     let launch = AgentLaunch::recorded(
         instance.launch_executable.as_deref(),
         instance.launch_resolved_executable.as_deref(),
     );
-    match census(&tree, &launch, &|arg| canonical(Path::new(arg))) {
+    let census = match census(&tree, &launch, &|arg| canonical(Path::new(arg))) {
         PaneCensus::Background(found) if found.len() > MAX_LISTED => PaneCensus::Unclassified,
         census => census,
+    };
+    (census, root)
+}
+
+/// The final check, at the pane stop: the refusal when the pane runs something unconfirmed,
+/// else the pane root it read, which the stop must still find just before it kills the pane.
+pub(crate) fn final_census(
+    instance: &Instance,
+    recheck: &ProcessRecheck,
+) -> Result<Option<PrimeProcessIdentity>, BackgroundProcessesAppeared> {
+    let (census, root) = rooted_pane_census(instance);
+    match refusal(census, &recheck.confirmed, recheck.stop_unclassified) {
+        Some(fields) => Err(BackgroundProcessesAppeared(fields)),
+        None => Ok(root),
+    }
+}
+
+/// Whether the live pane about to be stopped is the one [`final_census`] read (`None` when it
+/// found no pane). Any other pane was never checked, so it refuses as unclassified unless that
+/// was accepted.
+pub(crate) fn pane_still_checked(
+    session: &crate::tmux::Session,
+    root: Option<&PrimeProcessIdentity>,
+    recheck: &ProcessRecheck,
+) -> Result<(), BackgroundProcessesAppeared> {
+    let current = session
+        .get_pane_pid()
+        .and_then(|pid| crate::process::process_identity(pid).ok().flatten());
+    if current.is_some() && current.as_ref() == root {
+        return Ok(());
+    }
+    match refusal(PaneCensus::Unclassified, &[], recheck.stop_unclassified) {
+        Some(fields) => Err(BackgroundProcessesAppeared(fields)),
+        None => Ok(()),
+    }
+}
+
+/// Test-only: where a restart's teardown runs a [`BoundaryHook`].
+#[cfg(test)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Boundary {
+    /// After capture and preflight, before the outgoing pane's Prime observation and its stop.
+    Teardown,
+    /// After the final census, just before the pane is killed.
+    BeforeStop,
+}
+
+#[cfg(test)]
+type BoundaryCallback = std::sync::Arc<dyn Fn(Boundary) + Send + Sync>;
+
+#[cfg(test)]
+static BOUNDARY_HOOKS: std::sync::Mutex<Vec<(String, BoundaryCallback)>> =
+    std::sync::Mutex::new(Vec::new());
+
+/// Test-only: keyed by tmux session name, so a parallel test's restarts run normally.
+#[cfg(test)]
+pub(crate) struct BoundaryHook(String);
+
+#[cfg(test)]
+impl BoundaryHook {
+    pub(crate) fn arm(
+        session_name: &str,
+        callback: impl Fn(Boundary) + Send + Sync + 'static,
+    ) -> Self {
+        BOUNDARY_HOOKS
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .push((session_name.to_owned(), std::sync::Arc::new(callback)));
+        Self(session_name.to_owned())
+    }
+
+    pub(crate) fn fire(instance: &Instance, at: Boundary) {
+        let Ok(session) = instance.tmux_session() else {
+            return;
+        };
+        let callbacks: Vec<_> = BOUNDARY_HOOKS
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .iter()
+            .filter(|(name, _)| name == session.name())
+            .map(|(_, callback)| callback.clone())
+            .collect();
+        for callback in callbacks {
+            callback(at);
+        }
+    }
+}
+
+#[cfg(test)]
+impl Drop for BoundaryHook {
+    fn drop(&mut self) {
+        BOUNDARY_HOOKS
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .retain(|(name, _)| name != &self.0);
     }
 }
 
@@ -296,25 +399,45 @@ pub(crate) fn census(
         }
     };
     let matched: Vec<_> = tree.iter().filter(|sample| matches(sample)).collect();
-    let Some(mut agent) = matched.iter().copied().find(|outer| {
+    let Some(top) = matched.iter().copied().find(|outer| {
         matched
             .iter()
             .all(|other| is_ancestor(outer.identity.pid, other.identity.pid))
     }) else {
         return PaneCensus::Unclassified;
     };
-    // A launcher that relaunches itself as its only child: the Agent is the child. A match
-    // beside other children is a helper the Agent bundles, or a copy one of its shells runs.
-    loop {
-        let mut children = tree.iter().filter(|s| s.parent == agent.identity.pid);
-        match (children.next(), children.next()) {
-            (Some(only), None) if !is_shell(only) && matches(only) => agent = only,
-            _ => break,
-        }
+    // The Agent's processes: the outermost match and every non-shell match below it through
+    // matches, so a launcher's relaunched Agent and its bundled helpers all count. A shell is
+    // never one, and a copy a shell runs stays inside that shell's branch.
+    let mut agent = vec![top.identity.pid];
+    let mut next = 0;
+    while let Some(&pid) = agent.get(next) {
+        next += 1;
+        agent.extend(
+            tree.iter()
+                .filter(|s| s.parent == pid && !is_shell(s) && matches(s))
+                .map(|s| s.identity.pid),
+        );
+    }
+    let runs_a_shell = |root: u32| {
+        tree.iter()
+            .any(|s| s.identity.pid != root && is_shell(s) && is_ancestor(root, s.identity.pid))
+    };
+    // A launcher (an Agent process with a matching child) beside an unmatched branch that runs
+    // shells: either branch could be the Agent, so neither's shells can be attributed.
+    let ambiguous = agent.iter().any(|&pid| {
+        let children: Vec<_> = tree.iter().filter(|s| s.parent == pid).collect();
+        children.iter().any(|c| agent.contains(&c.identity.pid))
+            && children.iter().any(|c| {
+                !agent.contains(&c.identity.pid) && !is_shell(c) && runs_a_shell(c.identity.pid)
+            })
+    });
+    if ambiguous {
+        return PaneCensus::Unclassified;
     }
     PaneCensus::Background(
         tree.iter()
-            .filter(|sample| sample.parent == agent.identity.pid && is_shell(sample))
+            .filter(|sample| agent.contains(&sample.parent) && is_shell(sample))
             .map(|shell| BackgroundProcess {
                 identity: shell.identity.clone(),
                 argv: named_command(tree, shell),
@@ -642,6 +765,52 @@ mod tests {
         }
     }
 
+    fn gemini_launch() -> AgentLaunch {
+        AgentLaunch {
+            files: vec!["/usr/lib/node_modules/@google/gemini-cli/bundle/gemini.js".into()],
+            dirs: vec!["/usr/lib/node_modules/@google/gemini-cli".into()],
+        }
+    }
+
+    fn resolve(arg: &str) -> Option<PathBuf> {
+        Some(match arg {
+            "/usr/bin/gemini" | "/home/u/.npm/bin/gemini" => {
+                "/usr/lib/node_modules/@google/gemini-cli/bundle/gemini.js".into()
+            }
+            other => other.into(),
+        })
+    }
+
+    /// gemini's launcher (20) beside its relaunched Agent (21), plus `beside`.
+    fn gemini_launcher(beside: Vec<CommandSample>) -> Vec<CommandSample> {
+        let mut tree = vec![
+            sample(20, 1, "/usr/bin/node", &["node", "/usr/bin/gemini"]),
+            sample(
+                21,
+                20,
+                "/usr/bin/node",
+                &["/usr/bin/node", "/home/u/.npm/bin/gemini"],
+            ),
+        ];
+        tree.extend(beside);
+        tree
+    }
+
+    fn agent_tail() -> Vec<CommandSample> {
+        vec![
+            sample(22, 21, "/usr/bin/bash", &["bash", "-c", "tail -f log"]),
+            sample(23, 22, "/usr/bin/tail", &["tail", "-f", "log"]),
+        ]
+    }
+
+    /// A helper the launcher runs that isn't the Agent's package, running a shell.
+    fn unmatched_helper_with_a_shell() -> Vec<CommandSample> {
+        vec![
+            sample(24, 20, "/usr/bin/node", &["node", "/opt/other/worker.js"]),
+            sample(25, 24, "/usr/bin/bash", &["bash", "-c", "sleep 9"]),
+        ]
+    }
+
     #[test]
     fn only_the_shells_the_agent_started_are_named_by_what_they_run() {
         let claude = AgentLaunch {
@@ -657,10 +826,7 @@ mod tests {
             files: vec!["/usr/lib/node_modules/@openai/codex/bin/codex.js".into()],
             dirs: vec!["/usr/lib/node_modules/@openai/codex".into()],
         };
-        let gemini = AgentLaunch {
-            files: vec!["/usr/lib/node_modules/@google/gemini-cli/bundle/gemini.js".into()],
-            dirs: vec!["/usr/lib/node_modules/@google/gemini-cli".into()],
-        };
+        let gemini = gemini_launch();
         let login = sample(10, 1, "/usr/bin/zsh", &["-zsh", "-lc", "claude"]);
         let dev_shell = |parent| {
             sample(
@@ -672,14 +838,6 @@ mod tests {
         };
         let npm = sample(31, 30, "/usr/bin/node", &["npm", "run", "dev"]);
         let esbuild = sample(32, 31, "/opt/esbuild", &["esbuild", "--watch"]);
-        let resolve = |arg: &str| -> Option<PathBuf> {
-            Some(match arg {
-                "/usr/bin/gemini" | "/home/u/.npm/bin/gemini" => {
-                    "/usr/lib/node_modules/@google/gemini-cli/bundle/gemini.js".into()
-                }
-                other => other.into(),
-            })
-        };
         let cases: Vec<(&str, &AgentLaunch, Vec<CommandSample>, Option<Vec<&[&str]>>)> = vec![
             (
                 "login shell, native claude, a dev server: one entry",
@@ -785,6 +943,44 @@ mod tests {
                     sample(23, 22, "/usr/bin/tail", &["tail", "-f", "log"]),
                 ],
                 Some(vec![&["tail", "-f", "log"]]),
+            ),
+            (
+                "a launcher beside its Agent and a bundled helper: the Agent's shells",
+                &gemini,
+                gemini_launcher(
+                    [
+                        agent_tail(),
+                        vec![sample(
+                            24,
+                            20,
+                            "/usr/lib/node_modules/@google/gemini-cli/vendor/rg",
+                            &["rg"],
+                        )],
+                    ]
+                    .concat(),
+                ),
+                Some(vec![&["tail", "-f", "log"]]),
+            ),
+            (
+                "shells on both the launcher and its Agent",
+                &gemini,
+                gemini_launcher([agent_tail(), vec![dev_shell(20), npm.clone()]].concat()),
+                Some(vec![&["tail", "-f", "log"], &["npm", "run", "dev"]]),
+            ),
+            (
+                "a launcher beside an unmatched branch running a shell: unclassified",
+                &gemini,
+                gemini_launcher([agent_tail(), unmatched_helper_with_a_shell()].concat()),
+                None,
+            ),
+            (
+                "an MCP server under a relaunched Agent: nothing",
+                &gemini,
+                gemini_launcher(vec![
+                    sample(24, 21, "/usr/bin/node", &["npx", "some-mcp"]),
+                    sample(25, 24, "/usr/bin/sh", &["sh", "-c", "some-mcp"]),
+                ]),
+                Some(vec![]),
             ),
             (
                 "a shell running one of the package's scripts is a background shell",
@@ -1052,6 +1248,36 @@ mod tests {
             .map(|p| (p.identity.pid, p.identity.start_id.as_str()))
             .collect();
         assert_eq!(left, [(30, "proc:2"), (31, "proc:1")]);
+    }
+
+    /// #5858: a launcher's census reaches the refusal: its Agent's shell is listed until
+    /// confirmed, and an ambiguous tree refuses as unclassified unless that was accepted.
+    #[test]
+    fn a_launchers_agent_shells_are_refused_until_confirmed() {
+        let listed = gemini_launcher(agent_tail());
+        let shell = PrimeProcessIdentity {
+            pid: 22,
+            start_id: "proc:220".into(),
+        };
+        let fields = refusal(census(&listed, &gemini_launch(), &resolve), &[], false).unwrap();
+        assert_eq!(fields["classified"], true);
+        assert_eq!(fields["total"], 1);
+        assert_eq!(fields["processes"][0]["pid"], 22);
+        assert_eq!(
+            fields["processes"][0]["argv"],
+            serde_json::json!(["tail", "-f", "log"])
+        );
+        assert_eq!(
+            refusal(census(&listed, &gemini_launch(), &resolve), &[shell], false),
+            None
+        );
+        let ambiguous = gemini_launcher(unmatched_helper_with_a_shell());
+        let fields = refusal(census(&ambiguous, &gemini_launch(), &resolve), &[], false).unwrap();
+        assert_eq!(fields["classified"], false);
+        assert_eq!(
+            refusal(census(&ambiguous, &gemini_launch(), &resolve), &[], true),
+            None
+        );
     }
 
     #[test]

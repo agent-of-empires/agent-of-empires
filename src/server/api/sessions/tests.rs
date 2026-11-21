@@ -9916,6 +9916,160 @@ async fn restart_refuses_a_check_sent_without_a_json_content_type() {
     }
 }
 
+/// The pane's process, read each time: a test step can replace it.
+fn pane_pid(pane: &str) -> u32 {
+    String::from_utf8(
+        crate::tmux::tmux_command()
+            .args(["display", "-p", "-t", pane, "#{pane_pid}"])
+            .output()
+            .unwrap()
+            .stdout,
+    )
+    .unwrap()
+    .trim()
+    .parse()
+    .unwrap()
+}
+/// The agent's background sleeps in `pane`, once there are `count` (10 s deadline).
+fn sleeping_in(pane: &str, count: usize) -> usize {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    loop {
+        let tree = crate::process::process_tree_commands(pane_pid(pane)).unwrap();
+        let sleeps = tree
+            .iter()
+            .filter(|sample| sample.argv.first().is_some_and(|arg| arg == "sleep"))
+            .filter(|sample| sample.argv.get(1).is_some_and(|arg| arg != "0.05"))
+            .count();
+        if sleeps == count || std::time::Instant::now() > deadline {
+            return sleeps;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+}
+
+/// #5858: with real processes, a launcher that runs the Agent beside a bundled helper still has
+/// the Agent's shell named before anything is stopped.
+#[tokio::test]
+#[serial_test::serial]
+async fn a_launchers_agent_shell_is_named_beside_its_bundled_helper() {
+    if crate::tmux::tmux_command().arg("-V").output().is_err() {
+        eprintln!("tmux not available; skipping");
+        return;
+    }
+    let python = std::process::Command::new("python3")
+        .args(["-I", "-c", ""])
+        .status();
+    if !python.is_ok_and(|status| status.success()) {
+        eprintln!("python3 not on PATH; skipping");
+        return;
+    }
+    let _home = crate::session::test_support::isolate_app_dir();
+    let project = tempfile::tempdir().unwrap();
+    let package = std::fs::canonicalize(project.path()).unwrap().join("pkg");
+    std::fs::create_dir_all(package.join("vendor")).unwrap();
+    std::fs::write(package.join("package.json"), "{}").unwrap();
+    let helper = package.join("vendor").join("helper.py");
+    std::fs::write(&helper, "import time\ntime.sleep(600)\n").unwrap();
+    let launcher = package.join("launcher.py");
+    std::fs::write(
+        &launcher,
+        "import os, subprocess, sys\n\
+         here = os.path.dirname(os.path.abspath(__file__))\n\
+         agent = subprocess.Popen([sys.executable, '-I', os.path.join(here, 'agent.py')])\n\
+         helper = subprocess.Popen([sys.executable, '-I', os.path.join(here, 'vendor', 'helper.py')])\n\
+         agent.wait()\n",
+    )
+    .unwrap();
+    std::fs::write(
+        package.join("agent.py"),
+        "import subprocess\nsubprocess.Popen(['bash', '-c', 'sleep 600; :']).wait()\n",
+    )
+    .unwrap();
+
+    let mut inst = make_test_instance();
+    inst.source_profile = "default".to_string();
+    inst.project_path = project.path().to_str().unwrap().to_owned();
+    inst.status = Status::Idle;
+    inst.launch_executable = Some(launcher.clone());
+    inst.launch_resolved_executable = Some(launcher.clone());
+    let pane = crate::tmux::Session::generate_name(&inst.id, &inst.title);
+    let command = format!("python3 -I '{}'", launcher.display());
+    let created = crate::tmux::tmux_command()
+        .args(["new-session", "-d", "-s", &pane, &command])
+        .status();
+    if !created.map(|status| status.success()).unwrap_or(false) {
+        eprintln!("tmux new-session failed; skipping");
+        return;
+    }
+    let _pane_guard = crate::tmux::test_helpers::TmuxTestSession::from_name(pane.clone());
+    // Killing the session leaves the launcher's children running, so they are stopped here.
+    struct StopTree(u32);
+    impl Drop for StopTree {
+        fn drop(&mut self) {
+            if let Ok(tree) = crate::process::process_tree_commands(self.0) {
+                for sample in tree {
+                    let _ = std::process::Command::new("kill")
+                        .args(["-9", &sample.identity.pid.to_string()])
+                        .status();
+                }
+            }
+        }
+    }
+    crate::tmux::refresh_session_cache();
+    let _stop = StopTree(pane_pid(&pane));
+    assert_eq!(sleeping_in(&pane, 1), 1);
+    let helpers = || {
+        crate::process::process_tree_commands(pane_pid(&pane))
+            .unwrap()
+            .iter()
+            .filter(|sample| {
+                sample
+                    .argv
+                    .iter()
+                    .any(|arg| std::path::Path::new(arg) == helper)
+            })
+            .count()
+    };
+    assert_eq!(helpers(), 1, "the helper runs beside the Agent");
+
+    Storage::new_unwatched("default")
+        .unwrap()
+        .update(|rows, _| {
+            *rows = vec![inst.clone()];
+            Ok(())
+        })
+        .unwrap();
+    let state = crate::server::test_support::build_test_app_state(vec![inst.clone()]);
+    crate::server::test_support::refresh_canonical_metadata_for_test(&state).await;
+    let body = crate::daemon::RestartSessionBody {
+        only_if_idle: true,
+        stop_processes: Some(vec![]),
+        ..Default::default()
+    };
+    let response = Box::pin(lifecycle::prepare_agent_session(
+        state,
+        inst.id.clone(),
+        Ok(None),
+        lifecycle::AgentPreparation::Restart,
+        Some(Arc::new(body)),
+    ))
+    .await;
+    let status = response.status();
+    let body = axum::body::to_bytes(response.into_body(), 64 * 1024)
+        .await
+        .unwrap();
+    let body: serde_json::Value = serde_json::from_slice(&body).unwrap_or_default();
+    assert_eq!(status, StatusCode::CONFLICT, "{body}");
+    assert_eq!(body["error"], "background_processes");
+    assert_eq!(body["classified"], true);
+    assert_eq!(body["total"], 1);
+    assert_eq!(
+        body["processes"][0]["argv"],
+        serde_json::json!(["sleep", "600"])
+    );
+    assert_eq!(sleeping_in(&pane, 1), 1, "a refusal stops nothing");
+}
+
 /// #5762: a restart that asks for the check names the shells the Agent started and stops
 /// nothing until each one, by PID and start, is confirmed.
 #[tokio::test]
@@ -9932,6 +10086,7 @@ async fn an_update_restart_names_the_agents_background_shells_before_stopping_th
     let third = project.path().join("third");
     let fourth = project.path().join("fourth");
     let fifth = project.path().join("fifth");
+    let sixth = project.path().join("sixth");
     std::fs::write(
         &agent,
         format!(
@@ -9939,11 +10094,13 @@ async fn an_update_restart_names_the_agents_background_shells_before_stopping_th
              bash -c 'sleep 700; :' &\nwhile [ ! -e {1} ]; do sleep 0.05; done\n\
              bash -c 'sleep 800; :' &\nwhile [ ! -e {2} ]; do sleep 0.05; done\n\
              bash -c 'sleep 900; :' &\nwhile [ ! -e {3} ]; do sleep 0.05; done\n\
-             bash -c 'sleep 1000; :' &\nwait\n",
+             bash -c 'sleep 1000; :' &\nwhile [ ! -e {4} ]; do sleep 0.05; done\n\
+             bash -c 'sleep 1100; :' &\nwait\n",
             second.display(),
             third.display(),
             fourth.display(),
-            fifth.display()
+            fifth.display(),
+            sixth.display()
         ),
     )
     .unwrap();
@@ -9977,32 +10134,7 @@ async fn an_update_restart_names_the_agents_background_shells_before_stopping_th
     }
     let _pane_guard = crate::tmux::test_helpers::TmuxTestSession::from_name(pane.clone());
     crate::tmux::refresh_session_cache();
-    let pane_pid: u32 = String::from_utf8(
-        crate::tmux::tmux_command()
-            .args(["display", "-p", "-t", &pane, "#{pane_pid}"])
-            .output()
-            .unwrap()
-            .stdout,
-    )
-    .unwrap()
-    .trim()
-    .parse()
-    .unwrap();
-    let sleeping = |count: usize| {
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
-        loop {
-            let tree = crate::process::process_tree_commands(pane_pid).unwrap();
-            let sleeps = tree
-                .iter()
-                .filter(|sample| sample.argv.first().is_some_and(|arg| arg == "sleep"))
-                .filter(|sample| sample.argv.get(1).is_some_and(|arg| arg != "0.05"))
-                .count();
-            if sleeps == count || std::time::Instant::now() > deadline {
-                return sleeps;
-            }
-            std::thread::sleep(std::time::Duration::from_millis(20));
-        }
-    };
+    let sleeping = |count: usize| sleeping_in(&pane, count);
     assert_eq!(sleeping(1), 1);
 
     let restart =
@@ -10025,13 +10157,13 @@ async fn an_update_restart_names_the_agents_background_shells_before_stopping_th
                     stop_unclassified: unclassified,
                     ..Default::default()
                 };
-                let response = lifecycle::prepare_agent_session(
+                let response = Box::pin(lifecycle::prepare_agent_session(
                     state,
                     id,
                     Ok(None),
                     lifecycle::AgentPreparation::Restart,
                     Some(Arc::new(body)),
-                )
+                ))
                 .await;
                 let status = response.status();
                 let body = axum::body::to_bytes(response.into_body(), 64 * 1024)
@@ -10137,7 +10269,7 @@ async fn an_update_restart_names_the_agents_background_shells_before_stopping_th
     let state = crate::server::test_support::build_test_app_state(vec![live]);
     crate::server::test_support::refresh_canonical_metadata_for_test(&state).await;
     let before = storage.load().unwrap().remove(0);
-    let confirm = |stop: Vec<crate::daemon::ProcessIdentity>, skip_on_launch| {
+    let confirm = |stop: Vec<crate::daemon::ProcessIdentity>, skip_on_launch, unclassified| {
         let state = state.clone();
         let id = id.clone();
         async move {
@@ -10145,16 +10277,17 @@ async fn an_update_restart_names_the_agents_background_shells_before_stopping_th
                 only_if_idle: true,
                 stop_processes: Some(stop),
                 skip_on_launch,
+                stop_unclassified: unclassified,
                 unsnooze: true,
                 ..Default::default()
             };
-            let response = lifecycle::prepare_agent_session(
+            let response = Box::pin(lifecycle::prepare_agent_session(
                 state,
                 id,
                 Ok(None),
                 lifecycle::AgentPreparation::Restart,
                 Some(Arc::new(body)),
-            )
+            ))
             .await;
             let status = response.status();
             let body = axum::body::to_bytes(response.into_body(), 64 * 1024)
@@ -10175,7 +10308,7 @@ async fn an_update_restart_names_the_agents_background_shells_before_stopping_th
             let stage = lifecycle::launch_hook_gate::Stage::BeforeHooks;
             let (entered, release) = lifecycle::launch_hook_gate::arm(&id, stage);
             let _disarm = lifecycle::launch_hook_gate::Disarm(id.clone());
-            let mut late = tokio::spawn(confirm(stop, skip_on_launch));
+            let mut late = tokio::spawn(confirm(stop, skip_on_launch, false));
             tokio::select! {
                 entered = tokio::time::timeout(std::time::Duration::from_secs(30), entered) => {
                     entered
@@ -10224,14 +10357,71 @@ async fn an_update_restart_names_the_agents_background_shells_before_stopping_th
     // hooks' turn. The refusal still says they ran, so the confirm after it skips them too.
     std::fs::write(&fifth, "").unwrap();
     assert_eq!(sleeping(5), 5);
-    let (status, early) = confirm(identities(&skipped), true).await;
+    let (status, early) = confirm(identities(&skipped), true, false).await;
     assert_eq!(status, StatusCode::CONFLICT, "{early}");
     assert_eq!(early["launch_hooks_ran"], true);
     assert_eq!(early["total"], 5);
     assert_eq!(hook_runs(), 1);
 
-    // Confirming that list with `skip_on_launch` restarts without running the hooks again.
-    let (status, confirmed) = confirm(identities(&early), true).await;
+    // A shell that starts after capture and preflight, just before the pane stops, is found by
+    // the final census at the stop itself.
+    let teardown = {
+        let (sixth, pane) = (sixth.clone(), pane.clone());
+        crate::session::background_processes::BoundaryHook::arm(&pane.clone(), move |at| {
+            if at == crate::session::background_processes::Boundary::Teardown {
+                std::fs::write(&sixth, "").unwrap();
+                assert_eq!(sleeping_in(&pane, 6), 6);
+            }
+        })
+    };
+    let (status, boundary) = confirm(identities(&early), true, false).await;
+    drop(teardown);
+    assert_eq!(status, StatusCode::CONFLICT, "{boundary}");
+    assert_eq!(boundary["error"], "background_processes");
+    assert_eq!(boundary["total"], 6);
+    assert_eq!(sleeping(6), 6, "the census at the stop stopped nothing");
+    assert_eq!(hook_runs(), 1);
+    let after = storage.load().unwrap().remove(0);
+    assert_eq!(after.status, before.status);
+    assert_eq!(after.snoozed_until, before.snoozed_until);
+    assert!(after.lifecycle_reservation.is_none());
+
+    // The stop checks it still stops the pane the census read: one replaced after the census
+    // was never checked, so it refuses as unclassified unless that was accepted.
+    let replace_before_stop = || {
+        let pane = pane.clone();
+        let agent = agent.clone();
+        crate::session::background_processes::BoundaryHook::arm(&pane.clone(), move |at| {
+            if at == crate::session::background_processes::Boundary::BeforeStop {
+                let replaced = crate::tmux::tmux_command()
+                    .args(["respawn-pane", "-k", "-t", &pane, agent.to_str().unwrap()])
+                    .status()
+                    .unwrap();
+                assert!(replaced.success());
+                // Every trigger file exists, so the new agent starts all six shells at once.
+                assert_eq!(sleeping_in(&pane, 6), 6);
+            }
+        })
+    };
+    let replaced = replace_before_stop();
+    let old_pid = pane_pid(&pane);
+    let (status, unbound) = confirm(identities(&boundary), true, false).await;
+    drop(replaced);
+    assert_ne!(pane_pid(&pane), old_pid, "the pane was replaced");
+    assert_eq!(status, StatusCode::CONFLICT, "{unbound}");
+    assert_eq!(unbound["error"], "background_processes");
+    assert_eq!(unbound["classified"], false);
+    assert_eq!(sleeping(6), 6, "the replaced pane was not stopped");
+    assert!(storage.load().unwrap()[0].lifecycle_reservation.is_none());
+
+    // The replacement's shells are new, so they are listed first; accepting an unclassified
+    // check then lets the same replacement go ahead at the stop, and the hooks still ran once.
+    let (status, relisted) = confirm(identities(&boundary), true, false).await;
+    assert_eq!(status, StatusCode::CONFLICT, "{relisted}");
+    assert_eq!(relisted["total"], 6);
+    let replaced = replace_before_stop();
+    let (status, confirmed) = confirm(identities(&relisted), true, true).await;
+    drop(replaced);
     assert!(status.is_success(), "{status} {confirmed}");
     assert_eq!(hook_runs(), 1, "on_launch ran once for the whole restart");
 
