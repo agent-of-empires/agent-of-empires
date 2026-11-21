@@ -196,6 +196,28 @@ describe("cacheSet persistence throttle", () => {
     expect(stored("two")?.lastSeq).toBe(2);
   });
 
+  it("skips a flush whose snapshot is older than the stored entry (two tabs)", () => {
+    vi.setSystemTime(1_000_000);
+    cacheSet("tabs", withSeq(1));
+    vi.setSystemTime(1_000_500);
+    const queued = [{ id: "q1", text: "hello" }] as unknown as AcpState["queuedPrompts"];
+    writeEntry("tabs", { ...withSeq(2), queuedPrompts: queued }, 1_000_500);
+    vi.setSystemTime(1_002_000);
+    flushPersist("tabs");
+    expect(stored("tabs")?.lastSeq).toBe(2);
+    expect(stored("tabs")?.queuedPrompts).toHaveLength(1);
+  });
+
+  it("persists the snapshot when the stored entry is older or absent", () => {
+    vi.setSystemTime(2_000_000);
+    writeEntry("older", withSeq(1), 1_999_000);
+    cacheSet("older", withSeq(2));
+    cacheSet("absent", withSeq(3));
+    flushPersist();
+    expect(stored("older")?.lastSeq).toBe(2);
+    expect(stored("absent")?.lastSeq).toBe(3);
+  });
+
   it("clearAcpCache cancels pending writes", () => {
     cacheSet("cleared", withSeq(1));
     cacheSet("kept", withSeq(2));

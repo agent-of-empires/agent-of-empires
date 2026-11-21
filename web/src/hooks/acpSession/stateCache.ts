@@ -175,16 +175,26 @@ export function cacheGet(sessionId: string): AcpState | undefined {
 }
 
 const PERSIST_THROTTLE_MS = 2000;
-const pendingPersist = new Map<string, { state: AcpState; timer: ReturnType<typeof setTimeout> }>();
+// `at` is when the snapshot was last captured, to detect another tab writing after it.
+const pendingPersist = new Map<string, { state: AcpState; at: number; timer: ReturnType<typeof setTimeout> }>();
 
 function schedulePersist(sessionId: string, state: AcpState): void {
   const pending = pendingPersist.get(sessionId);
   if (pending) {
     pending.state = state;
+    pending.at = Date.now();
     return;
   }
   const timer = setTimeout(() => flushPersist(sessionId), PERSIST_THROTTLE_MS);
-  pendingPersist.set(sessionId, { state, timer });
+  pendingPersist.set(sessionId, { state, at: Date.now(), timer });
+}
+
+function storedSavedAt(sessionId: string): number {
+  try {
+    return parseEntry(window.localStorage.getItem(storageKey(sessionId)))?.savedAt ?? -Infinity;
+  } catch {
+    return -Infinity;
+  }
 }
 
 /** Persist pending state now, for one session or all. */
@@ -194,6 +204,8 @@ export function flushPersist(sessionId?: string): void {
     if (!pending) continue;
     clearTimeout(pending.timer);
     pendingPersist.delete(id);
+    // Another tab wrote after this snapshot was captured: its entry is newer, keep it.
+    if (storedSavedAt(id) > pending.at) continue;
     persistState(id, pending.state);
   }
 }
