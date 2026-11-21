@@ -845,6 +845,7 @@ mod tests {
         let (_health_tx, health_rx) = tokio::sync::watch::channel(Arc::default());
         let mut snapshots = state.runtime.snapshots.subscribe();
         let (completed_tx, mut completed_rx) = tokio::sync::mpsc::unbounded_channel();
+        let publisher = tokio::spawn(publish_loop(state.clone()));
         let mut polling = Box::pin(super::super::status_poll::status_poll_loop_observed(
             state.clone(),
             health_rx,
@@ -858,17 +859,9 @@ mod tests {
         })
         .await
         .unwrap();
-        assert_eq!(
-            snapshots
-                .borrow_and_update()
-                .as_ref()
-                .unwrap()
-                .value
-                .contents
-                .sessions[0]
-                .title,
-            "before"
-        );
+        // The tick only requests a publish; publish_loop performs it.
+        let title = published_title(&mut snapshots, "before").await;
+        assert_eq!(title, "before");
         storage
             .update(|rows, _| {
                 rows[0].title = "after".into();
@@ -888,12 +881,31 @@ mod tests {
             completed_rx.try_recv().is_err(),
             "exactly one tick ran after the write"
         );
-        let snapshot = snapshots.borrow_and_update().clone().unwrap();
-        let published = &snapshot.value.contents.sessions[0];
-        assert_eq!(published.title, "after");
-        assert_eq!(published.status, "Creating");
+        published_title(&mut snapshots, "after").await;
+        let snapshot = snapshots.borrow().clone().unwrap();
+        assert_eq!(snapshot.value.contents.sessions[0].status, "Creating");
         state.shutdown.cancel();
         polling.await;
+        publisher.await.unwrap();
+    }
+
+    async fn published_title(
+        snapshots: &mut tokio::sync::watch::Receiver<Option<Arc<PublishedSnapshot>>>,
+        want: &str,
+    ) -> String {
+        tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                if let Some(snapshot) = snapshots.borrow_and_update().as_ref() {
+                    let title = &snapshot.value.contents.sessions[0].title;
+                    if title == want {
+                        return title.clone();
+                    }
+                }
+                snapshots.changed().await.unwrap();
+            }
+        })
+        .await
+        .unwrap()
     }
 
     #[test]
