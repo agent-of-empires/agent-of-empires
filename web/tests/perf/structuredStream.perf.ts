@@ -10,7 +10,14 @@ import { appendFileSync } from "node:fs";
 import type { Page } from "@playwright/test";
 import { test, expect } from "../helpers/liveTest";
 import { composer, openStructuredView, postPrompt, releaseTurn, startAcpSession, stopButton } from "../helpers/acp";
-import { HISTORY_DONE, MEASURED_CHUNKS, MEASURED_DONE, structuredScript } from "./structuredScript";
+import {
+  HISTORY_DONE,
+  HISTORY_FENCE_SEED,
+  MEASURED_CHUNKS,
+  MEASURED_DONE,
+  MEASURED_FENCE_SEED,
+  structuredScript,
+} from "./structuredScript";
 
 const RUNS = Number(process.env.PERF_RUNS) || 5;
 const TYPED_BURST = "x".repeat(10);
@@ -115,6 +122,8 @@ for (let run = 1; run <= RUNS; run++) {
     await openStructuredView(page, serve, sessionId);
     await expect(page.getByText(HISTORY_DONE)).toBeAttached({ timeout: 60_000 });
     await waitForQuiet(page);
+    const codeBlocks = (seed: string) => page.locator(".acp-code-block", { hasText: `const ${seed} =` });
+    await expect(codeBlocks(HISTORY_FENCE_SEED)).toHaveCount(10);
 
     // The second prompt starts the measured turn, which parks on the release gate.
     const box = composer(page);
@@ -147,6 +156,7 @@ for (let run = 1; run <= RUNS; run++) {
     try {
       await expect(page.getByText(MEASURED_DONE)).toBeAttached({ timeout: 120_000 });
       await expect(stopButton(page)).toBeHidden({ timeout: 30_000 });
+      await expect(codeBlocks(MEASURED_FENCE_SEED)).toHaveCount(1);
     } finally {
       stopTyping = true;
       await typing;
