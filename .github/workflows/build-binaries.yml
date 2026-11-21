@@ -166,6 +166,22 @@ jobs:
               exit 1
           fi
 
+      - name: Verify macOS binary links only system libraries
+        if: runner.os == 'macOS'
+        run: |
+          # The runner has Homebrew, so a C dependency that finds a Homebrew
+          # library through pkg-config links against /opt/homebrew and the
+          # release binary fails to start on Macs without it. Fail the
+          # release if any dylib outside the OS is referenced.
+          BIN="target/${{ matrix.target }}/release/aoe"
+          otool -L "$BIN"
+          NON_SYSTEM=$(otool -L "$BIN" | tail -n +2 | awk '{print $1}' \
+              | grep -vE '^(/usr/lib/|/System/Library/)' || true)
+          if [ -n "$NON_SYSTEM" ]; then
+              echo "::error::Binary links non-system libraries: $NON_SYSTEM"
+              exit 1
+          fi
+
       - name: Package
         run: |
           mkdir -p dist

@@ -11,20 +11,21 @@ pub fn run() -> Result<()> {
 }
 
 fn migrate_file(path: &Path) -> Result<()> {
-    let metadata = match std::fs::symlink_metadata(path) {
-        Ok(metadata) => metadata,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
-        Err(error) => return Err(error.into()),
-    };
-    anyhow::ensure!(
-        metadata.file_type().is_file(),
-        "terminal handoff migration requires a regular sessions file: {}",
-        path.display()
-    );
+    // Follows links, so a dangling link (missing leaf or directory) is skipped like v045.
+    if !path.try_exists()? {
+        return Ok(());
+    }
     let parent = path.parent().context("sessions file has no parent")?;
     let _lock =
         crate::session::acquire_storage_flock(parent, crate::session::STORAGE_LOCK_FILENAME)?;
-    let bytes = std::fs::read(path)?;
+    let Some((mut file, _)) = crate::session::ResolvedDataFile::open(path)?
+        .open_read_snapshot()
+        .with_context(|| format!("terminal handoff migration cannot read {}", path.display()))?
+    else {
+        return Ok(());
+    };
+    let mut bytes = Vec::new();
+    std::io::Read::read_to_end(&mut file, &mut bytes)?;
     let value: Value = match serde_json::from_slice(&bytes) {
         Ok(value) => value,
         Err(error) => {
@@ -47,6 +48,11 @@ fn migrate_file(path: &Path) -> Result<()> {
             .filter(|value| !value.is_null())
         {
             (|| -> Result<()> {
+                // v060 records the outcome; these relationships don't read it.
+                let mut intent = intent.clone();
+                if let Some(fields) = intent.as_object_mut() {
+                    fields.entry("outcome").or_insert_with(|| "fresh".into());
+                }
                 let intent: crate::session::TerminalHandoffIntent =
                     serde::Deserialize::deserialize(intent)
                         .context("existing terminal handoff authority is malformed")?;
@@ -90,6 +96,30 @@ mod tests {
                 assert!(crate::session::migration_backups(&path)?.is_empty());
             }
         }
+        Ok(())
+    }
+
+    #[test]
+    fn linked_sessions_file_validates_through_the_link() -> Result<()> {
+        let root = tempfile::tempdir()?;
+        let target = root.path().join("real.json");
+        let original = serde_json::to_vec(&json!([serde_json::to_value(
+            crate::session::Instance::new("old", "/tmp/repo")
+        )?]))?;
+        std::fs::write(&target, &original)?;
+        std::fs::create_dir(root.path().join("dir"))?;
+        for (name, goal, accepted) in [
+            ("ok", target.clone(), true),
+            ("dir", root.path().join("dir"), false),
+            ("missing", root.path().join("missing.json"), true),
+            ("no-dir", root.path().join("absent/missing.json"), true),
+        ] {
+            let link = root.path().join(format!("{name}-sessions.json"));
+            std::os::unix::fs::symlink(&goal, &link)?;
+            assert_eq!(migrate_file(&link).is_ok(), accepted, "{name}");
+            assert_eq!(std::fs::read_link(&link)?, goal, "{name}");
+        }
+        assert_eq!(std::fs::read(&target)?, original);
         Ok(())
     }
 
@@ -160,8 +190,10 @@ mod tests {
             },
             unborn_fence: None,
             terminal: None,
+            outcome: crate::session::TerminalHandoffOutcome::Fresh,
             launch_required: false,
             launch_started: false,
+            selector_ended: false,
             launch: None,
         };
         let mut pending = serde_json::to_value(&row)?;

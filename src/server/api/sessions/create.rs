@@ -25,6 +25,19 @@ impl CreateHookFailed {
             from_repo,
         }
     }
+
+    /// The error for a failed on_create run. A cancelled create stays a cancel, so it is
+    /// answered and kept out of the replay map as one.
+    pub(crate) fn wrap(
+        error: anyhow::Error,
+        origin_hint: Option<&str>,
+        from_repo: bool,
+    ) -> anyhow::Error {
+        if error.is::<crate::server::session_service::CreationCancelled>() {
+            return error;
+        }
+        Self::new(error, origin_hint, from_repo).into()
+    }
 }
 
 /// Hard cap on one `idempotency_key`'s length, so a request cannot persist an
@@ -660,6 +673,7 @@ pub(crate) fn run_create_hooks(
     instance: &mut Instance,
     plan: &CreateHookPlan,
     store: &dyn crate::session::SessionStore,
+    cancel: &tokio_util::sync::CancellationToken,
     progress: Option<&dyn Fn(crate::session::config::repo_config::HookProgress)>,
 ) -> anyhow::Result<()> {
     use crate::session::config::repo_config;
@@ -670,7 +684,12 @@ pub(crate) fn run_create_hooks(
 
     let hook_env = repo_config::lifecycle_env_vars(instance);
     if instance.sandbox_info.is_some() {
-        instance.ensure_container_in(store, None)?;
+        // The create's cancel reaches a missing image's pull, which may be shared.
+        instance
+            .ensure_container_with_hook_in(store, cancel, None, Instance::mint_before_start_env)
+            .map_err(|error| {
+                crate::server::session_service::CreationCancelled::or_error(cancel, error)
+            })?;
         let workdir = instance.hook_container_workdir(plan.on_create_from_repo);
         if let Some(sandbox) = instance.sandbox_info.as_ref() {
             repo_config::execute_hooks_in_container_streamed(
@@ -1629,12 +1648,27 @@ pub(super) async fn run_create_task<T>(
         let stage = progress.stage();
         if let Some(failure) = create_failure(e, stage, reference) {
             log_create_failure(e, stage, reference);
-            if let Some(key) = key {
+            if let Some(key) = key.filter(|_| !lost_shared_pull(e)) {
                 failures.record_failure(key, failure);
             }
         }
     }
     result
+}
+
+/// A create whose image pull was cancelled for everyone provisioned nothing, so a same-key
+/// retry may run again once the image can be pulled.
+fn lost_shared_pull(e: &anyhow::Error) -> bool {
+    use crate::containers::error::DockerError;
+    create_cause(e).0.chain().any(|cause| {
+        cause
+            .downcast_ref::<crate::server::session_spawn::ImageUpdateFailed>()
+            .is_some_and(|failed| failed.cancelled)
+            || matches!(
+                cause.downcast_ref::<DockerError>(),
+                Some(DockerError::PullCancelled(_))
+            )
+    })
 }
 
 pub(super) fn log_create_failure(
@@ -1803,6 +1837,16 @@ async fn created_session_response(
     crate::server::runtime::mutation_response(&snapshot.value.cursor, (status, Json(response)))
 }
 
+/// What a create failed on, seen through a failed on_create hook, which keeps its cause as a
+/// field, not a source, so `chain()` alone doesn't reach it. Container setup, and with it a
+/// missing image's pull, runs inside the hooks.
+fn create_cause(e: &anyhow::Error) -> (&anyhow::Error, Option<&CreateHookFailed>) {
+    let hook = e
+        .chain()
+        .find_map(|cause| cause.downcast_ref::<CreateHookFailed>());
+    (hook.map_or(e, |hook| &hook.cause), hook)
+}
+
 /// Expose typed creation failures without leaking raw output or internal paths.
 pub(super) fn public_create_session_error(e: &anyhow::Error) -> (&'static str, String) {
     if let Some(duplicate) = e.downcast_ref::<crate::server::session_spawn::CliDuplicateSession>() {
@@ -1812,12 +1856,8 @@ pub(super) fn public_create_session_error(e: &anyhow::Error) -> (&'static str, S
     use crate::session::builder::BuildRefusal;
     use crate::session::config::repo_config::HookFailed;
 
-    // A failed on_create hook keeps its cause, so its typed parts can still be found.
-    let create_hook = e
-        .chain()
-        .find_map(|cause| cause.downcast_ref::<CreateHookFailed>());
+    let (e, create_hook) = create_cause(e);
     let from_repo = create_hook.is_some_and(|hook| hook.from_repo);
-    let e = create_hook.map_or(e, |hook| &hook.cause);
     let runtime = || crate::containers::get_container_runtime().display_name();
     let unavailable = |why: String| ("sandbox_unavailable", why);
     for cause in e.chain() {
@@ -1847,10 +1887,16 @@ pub(super) fn public_create_session_error(e: &anyhow::Error) -> (&'static str, S
         if let Some(failed) =
             cause.downcast_ref::<crate::server::session_spawn::ImageUpdateFailed>()
         {
-            return (
-                "sandbox_image_update_failed",
-                format!("Couldn't pull the latest Sandbox image {}.", failed.image),
-            );
+            let message = if failed.cancelled {
+                format!(
+                    "Couldn't pull the latest Sandbox image {}: {}.",
+                    failed.image,
+                    crate::server::session_spawn::CANCELLED_UPDATE
+                )
+            } else {
+                format!("Couldn't pull the latest Sandbox image {}.", failed.image)
+            };
+            return ("sandbox_image_update_failed", message);
         }
         match cause.downcast_ref::<DockerError>() {
             Some(DockerError::NotInstalled) => return unavailable(not_installed(runtime())),
@@ -1865,6 +1911,13 @@ pub(super) fn public_create_session_error(e: &anyhow::Error) -> (&'static str, S
                 return (
                     "sandbox_image_pull_failed",
                     format!("Couldn't pull the Sandbox image {image}."),
+                )
+            }
+            // A missing image's pull, cancelled for everyone while this create waited on it.
+            Some(DockerError::PullCancelled(image)) => {
+                return (
+                    "sandbox_image_pull_failed",
+                    format!("Couldn't pull the Sandbox image {image}: the pull was cancelled."),
                 )
             }
             _ => {}

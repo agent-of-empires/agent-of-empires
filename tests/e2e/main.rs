@@ -43,6 +43,7 @@ mod ignore_direct_input;
 mod intro;
 mod kiro_launch;
 mod live_send_paste_e2e;
+mod live_send_unknown_status_e2e;
 mod live_takeover;
 mod live_terminal_swap_e2e;
 mod logs;

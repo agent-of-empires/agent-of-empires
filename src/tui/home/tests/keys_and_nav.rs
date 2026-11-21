@@ -174,7 +174,7 @@ fn preview_info_follows_flag_and_never_auto_shows_in_live() {
         terminal
             .draw(|f| {
                 let area = f.area();
-                view.render(f, area, &theme, None, None, None);
+                view.render(f, area, &theme, None);
             })
             .unwrap();
         let buf = terminal.backend().buffer().clone();
@@ -334,7 +334,7 @@ fn ctrl_c_flash_renders_in_live_footer() {
         terminal
             .draw(|f| {
                 let area = f.area();
-                view.render(f, area, &theme, None, None, None);
+                view.render(f, area, &theme, None);
             })
             .unwrap();
         let buf = terminal.backend().buffer().clone();
@@ -394,7 +394,7 @@ fn preview_visible_rows_equal_output_area_with_info_shown() {
     terminal
         .draw(|f| {
             let area = f.area();
-            env.view.render(f, area, &theme, None, None, None);
+            env.view.render(f, area, &theme, None);
         })
         .unwrap();
 
@@ -427,7 +427,7 @@ fn unread_dot_yields_to_a_running_status() {
         let backend = TestBackend::new(120, 40);
         let mut terminal = Terminal::new(backend).unwrap();
         terminal
-            .draw(|f| env.view.render(f, f.area(), &theme, None, None, None))
+            .draw(|f| env.view.render(f, f.area(), &theme, None))
             .unwrap();
         let buf = terminal.backend().buffer();
         let mut out = String::new();
@@ -478,7 +478,7 @@ fn unread_dot_suppressed_on_archived_snoozed_and_ignored() {
         let backend = TestBackend::new(120, 40);
         let mut terminal = Terminal::new(backend).unwrap();
         terminal
-            .draw(|f| env.view.render(f, f.area(), &theme, None, None, None))
+            .draw(|f| env.view.render(f, f.area(), &theme, None))
             .unwrap();
         let buf = terminal.backend().buffer();
         let mut out = String::new();
@@ -562,7 +562,7 @@ fn unread_dot_never_paints_in_terminal_view() {
         let backend = TestBackend::new(120, 40);
         let mut terminal = Terminal::new(backend).unwrap();
         terminal
-            .draw(|f| env.view.render(f, f.area(), &theme, None, None, None))
+            .draw(|f| env.view.render(f, f.area(), &theme, None))
             .unwrap();
         let buf = terminal.backend().buffer();
         let mut out = String::new();

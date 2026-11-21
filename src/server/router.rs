@@ -273,6 +273,10 @@ pub(super) fn build_router(state: Arc<AppState>) -> Router {
             post(api::sandbox_image_pull).layer(read_only.clone()),
         )
         .route(
+            "/api/sandbox/image-pull/cancel",
+            post(api::sandbox_image_cancel).layer(read_only.clone()),
+        )
+        .route(
             "/api/sandbox/image-dismiss",
             post(api::sandbox_image_dismiss).layer(read_only.clone()),
         )

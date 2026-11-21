@@ -201,7 +201,36 @@ async fn call(app: &axum::Router, name: &str, arguments: Value) -> Value {
     assert_eq!(status, StatusCode::OK);
     let result = message.unwrap()["result"].clone();
     assert_ne!(result["isError"], json!(true), "{result}");
-    result["structuredContent"].clone()
+    structured_content(name, &result)
+}
+
+/// Every tool the server can list, `send_to_parent` included.
+fn all_tools() -> Vec<rmcp::model::Tool> {
+    (super::McpServer::tool_router()
+        + super::McpServer::control_router()
+        + super::McpServer::wait_router())
+    .list_all()
+}
+
+/// A successful result's `structuredContent`, checked as a strict MCP 2025-06-18 client
+/// checks it: an object that validates against the tool's `outputSchema`, with the text
+/// content carrying the same JSON.
+fn structured_content(name: &str, result: &Value) -> Value {
+    let tool = all_tools().into_iter().find(|tool| tool.name == name);
+    let schema = tool.and_then(|tool| tool.output_schema).expect(name);
+    let validator = jsonschema::validator_for(&Value::Object(schema.as_ref().clone())).unwrap();
+    let content = result["structuredContent"].clone();
+    assert!(content.is_object(), "{name}: {result}");
+    if let Err(error) = validator.validate(&content) {
+        panic!("{name}: {error}: {content}");
+    }
+    let text = result["content"][0]["text"].as_str().expect(name);
+    assert_eq!(
+        serde_json::from_str::<Value>(text).unwrap(),
+        content,
+        "{name}"
+    );
+    content
 }
 
 fn session_in(title: &str, group: &str, parent: Option<&str>) -> Instance {
@@ -361,9 +390,6 @@ async fn tools_list_advertises_each_tool_with_an_output_schema() {
             "whoami"
         ]
     );
-    for tool in tools.as_array().unwrap() {
-        assert!(tool["outputSchema"].is_object(), "{tool}");
-    }
     let list = tools
         .as_array()
         .unwrap()
@@ -402,10 +428,25 @@ async fn tools_list_advertises_each_tool_with_an_output_schema() {
     assert!(properties.contains_key("prompt") && properties.contains_key("parent_session_id"));
 }
 
+/// MCP 2025-06-18 types `outputSchema` as `{type: "object", ...}`; a strict client rejects the
+/// whole tool list over one tool without it, so an `Option`, enum or array result can't be one.
+#[test]
+fn every_tool_declares_an_object_output_schema() {
+    let tools = all_tools();
+    assert!(tools.iter().any(|tool| tool.name == "send_to_parent"));
+    for tool in tools {
+        let schema = tool.output_schema.as_deref().expect(&tool.name);
+        assert_eq!(schema.get("type"), Some(&json!("object")), "{}", tool.name);
+    }
+}
+
 #[tokio::test]
 async fn whoami_is_null() {
     let app = app(true, vec![]);
-    assert_eq!(call(&app, "whoami", json!({})).await, Value::Null);
+    assert_eq!(
+        call(&app, "whoami", json!({})).await,
+        json!({"session": null})
+    );
 }
 
 /// The daemon-wide bearer still authenticates `/mcp` with no `X-AoE-Session` header, even
@@ -413,7 +454,10 @@ async fn whoami_is_null() {
 #[tokio::test]
 async fn whoami_is_null_for_the_plain_daemon_bearer_even_with_a_secret_configured() {
     let (app, _secret) = app_with_mcp_session_secret(vec![]);
-    assert_eq!(call(&app, "whoami", json!({})).await, Value::Null);
+    assert_eq!(
+        call(&app, "whoami", json!({})).await,
+        json!({"session": null})
+    );
 }
 
 /// `--auth=none` skips the token gate entirely, but a caller presenting a valid session
@@ -436,7 +480,7 @@ async fn whoami_resolves_the_calling_session_under_auth_none() {
     assert_eq!(status, StatusCode::OK);
     let result = message.unwrap()["result"].clone();
     assert_ne!(result["isError"], json!(true), "{result}");
-    assert_eq!(result["structuredContent"]["id"], id);
+    assert_eq!(structured_content("whoami", &result)["session"]["id"], id);
 }
 
 /// `--auth=passphrase` bypasses the passphrase wall entirely for a real Unix-socket peer
@@ -481,7 +525,7 @@ async fn whoami_resolves_the_calling_session_under_auth_passphrase_on_loopback()
     assert_eq!(status, StatusCode::OK);
     let result = message.unwrap()["result"].clone();
     assert_ne!(result["isError"], json!(true), "{result}");
-    assert_eq!(result["structuredContent"]["id"], id);
+    assert_eq!(structured_content("whoami", &result)["session"]["id"], id);
 }
 
 /// Off-box, a valid session credential must not bypass the passphrase wall: that wall
@@ -574,7 +618,7 @@ async fn whoami_resolves_the_calling_session_for_a_browser_authenticated_request
     let message: Value = serde_json::from_slice(&bytes).unwrap();
     let result = message["result"].clone();
     assert_ne!(result["isError"], json!(true), "{result}");
-    assert_eq!(result["structuredContent"]["id"], id);
+    assert_eq!(structured_content("whoami", &result)["session"]["id"], id);
 }
 
 fn tools_call(id: i64, name: &str, arguments: Value) -> Value {
@@ -604,7 +648,7 @@ async fn whoami_resolves_the_calling_session_for_a_valid_credential() {
     assert_eq!(status, StatusCode::OK);
     let result = message.unwrap()["result"].clone();
     assert_ne!(result["isError"], json!(true), "{result}");
-    assert_eq!(result["structuredContent"]["id"], id);
+    assert_eq!(structured_content("whoami", &result)["session"]["id"], id);
 }
 
 #[tokio::test]
@@ -1634,6 +1678,29 @@ async fn wait_for_after_seq_waits_for_that_turn_and_returns_its_messages() {
     assert!(!messages.contains("two plus two"), "{messages}");
     assert_eq!(done["next_since"], 3);
     assert_eq!(done["has_more"], false);
+}
+
+/// A failed turn-end query is not a confirmed turn end: the wait times out instead.
+#[tokio::test]
+#[serial_test::serial]
+async fn wait_for_after_seq_does_not_settle_when_the_event_query_fails() {
+    let _guard = crate::session::test_support::isolate_app_dir();
+    let id = "mcp-wait-seq-query-fails";
+    let (app, state) = seeded_app(vec![structured_session(id)], false).await;
+    seed_events(&state, id, &[user_prompt("what is two plus two")]);
+    state
+        .acp_event_store
+        .hold_writer()
+        .execute_batch("DROP TABLE acp_events")
+        .expect("break the store");
+
+    let result = call(
+        &app,
+        "wait_for",
+        json!({"session_id": id, "after_seq": 1, "timeout_s": 0}),
+    )
+    .await;
+    assert_eq!(result["timed_out"], true, "{result}");
 }
 
 /// Approvals seeded through the event log are listed, by `wait_for` too, and each decision

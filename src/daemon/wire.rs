@@ -1349,9 +1349,7 @@ pub struct SessionResponse {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub warnings: Vec<String>,
     /// Latest plan snapshot summarised for the sidebar. Present only on
-    /// structured view sessions whose agent has emitted a Plan (directly via
-    /// ACP `SessionUpdate::Plan` or indirectly via the ExitPlanMode
-    /// bridge in `acp_client::map_update_to_events`). See #1061.
+    /// structured view sessions whose agent has emitted a plan. See #1061.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub plan_summary: Option<PlanSummary>,
     /// Absolute RFC3339 timestamp at which the structured view session's

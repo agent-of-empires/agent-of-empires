@@ -9,13 +9,13 @@ use std::time::{Duration, Instant};
 use rattles::presets::prelude as spinners;
 
 use super::bindings::ActionId;
+use super::update_bar::UpdateBar;
 use super::{
     get_indent, live_send, DragKind, HomeView, TerminalMode, ViewMode, ICON_ARCHIVED_SECTION,
     ICON_COLLAPSED, ICON_DELETING, ICON_DORMANT, ICON_ERROR, ICON_EXPANDED, ICON_FAVORITE,
     ICON_IDLE, ICON_PINNED, ICON_STOPPED, ICON_TERMINAL, ICON_TRASH_SECTION, ICON_UNKNOWN,
     ICON_UNREAD,
 };
-use crate::containers::image_update::ImageUpdate;
 use crate::session::config::{GroupByMode, NarrowLayout, RowTagMode, SidebarPosition, SortOrder};
 use crate::session::{Item, Status};
 use crate::tui::components::preview::{self, CachedPreview};
@@ -25,7 +25,6 @@ use crate::tui::components::{
 };
 use crate::tui::responsive;
 use crate::tui::styles::{has_min_contrast, Theme};
-use crate::update::UpdateInfo;
 
 /// Derive a frame offset from a session's creation timestamp so that
 /// sessions started at different times show visually distinct spinner positions.
@@ -1058,13 +1057,12 @@ impl HomeView {
         frame: &mut Frame,
         area: Rect,
         theme: &Theme,
-        update_info: Option<&UpdateInfo>,
-        update_status: Option<&str>,
-        image_update: Option<&ImageUpdate>,
+        update_bar: Option<UpdateBar<'_>>,
     ) {
         // Hidden bars and takeover views must not retain clickable regions.
         self.footer_buttons.clear();
         self.tips_badge_rect = None;
+        self.update_bar_drawn = false;
         if !self.show_shortcut_bar {
             self.footer_hover = None;
             self.tips_badge_hovered = false;
@@ -1185,8 +1183,7 @@ impl HomeView {
         let has_status_bar = self.show_shortcut_bar
             || self.status_flash_text().is_some()
             || (self.live_send.is_some() && self.live_send_pending_leader);
-        let has_update_bar =
-            update_info.is_some() || update_status.is_some() || image_update.is_some();
+        let has_update_bar = update_bar.is_some();
         let mut constraints = vec![Constraint::Min(0)];
         if last_prompt.is_some() {
             constraints.push(Constraint::Length(1)); // last-prompt footer
@@ -1327,15 +1324,11 @@ impl HomeView {
             self.render_status_bar(frame, row, theme);
         }
 
-        if let Some(idx) = update_bar_idx {
-            self.render_update_bar(
-                frame,
-                main_chunks[idx],
-                theme,
-                update_info,
-                update_status,
-                image_update,
-            );
+        if let (Some(idx), Some(bar)) = (update_bar_idx, update_bar) {
+            let row = main_chunks[idx];
+            self.render_update_bar(frame, row, theme, bar);
+            // A terminal too small for every footer row can leave this one empty.
+            self.update_bar_drawn = !row.is_empty();
         }
 
         // Render dialogs on top
@@ -4898,37 +4891,26 @@ impl HomeView {
         }
     }
 
-    fn render_update_bar(
-        &self,
-        frame: &mut Frame,
-        area: Rect,
-        theme: &Theme,
-        info: Option<&UpdateInfo>,
-        status: Option<&str>,
-        image_update: Option<&ImageUpdate>,
-    ) {
+    fn render_update_bar(&self, frame: &mut Frame, area: Rect, theme: &Theme, bar: UpdateBar<'_>) {
         let update_style = Style::default().fg(theme.waiting).bold();
         // Pull the keys from the binding registry so these hints can't drift from the
         // dispatcher.
         let update_key = super::bindings::label(ActionId::Update, self.strict_hotkeys);
         let dismiss_key =
             super::bindings::label(ActionId::DismissUpdateBanner, self.strict_hotkeys);
-        // Precedence: transient status, app update, then sandbox-image update. Only one
-        // banner shows at a time so its keys are unambiguous; a lower-priority banner
-        // surfaces once the ones above clear.
-        let text = if let Some(s) = status {
-            format!(" {s}  [{dismiss_key}] dismiss")
-        } else if let Some(info) = info {
+        let text = match bar {
+            UpdateBar::Status(s) => format!(" {s}  [{dismiss_key}] dismiss"),
+            UpdateBar::Live(s) => format!(" {s}"),
             // Reassure users (#2220) that updating never tears down running sessions.
             // Kept after the keys so the action hints stay visible on narrow terminals.
-            format!(
+            UpdateBar::AppUpdate(info) => format!(
                 " update available {} → {}  [{update_key}] update  [{dismiss_key}] dismiss  ·  running sessions stay safe",
                 info.current_version, info.latest_version
-            )
-        } else if image_update.is_some() {
-            format!(" sandbox image update available  [u] pull  [{dismiss_key}] dismiss")
-        } else {
-            return;
+            ),
+            // The pull key is the Update binding: this line only shows with no AoE update pending.
+            UpdateBar::ImageUpdate(_) => {
+                format!(" sandbox image update available  [{update_key}] pull  [{dismiss_key}] dismiss")
+            }
         };
         let bar = Paragraph::new(Line::from(Span::styled(text, update_style)))
             .style(Style::default().bg(theme.selection));

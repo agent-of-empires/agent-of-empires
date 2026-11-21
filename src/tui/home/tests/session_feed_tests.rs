@@ -1444,6 +1444,14 @@ fn restart_attachment_waits_for_its_receipt_and_lifecycle_generation() {
             true,
         ),
         (
+            "Unknown",
+            PanePresence::Alive,
+            5,
+            Some("restarted-agent"),
+            "test",
+            true,
+        ),
+        (
             "Starting",
             PanePresence::Alive,
             6,
@@ -1583,6 +1591,88 @@ fn restart_attachment_waits_for_its_receipt_and_lifecycle_generation() {
             assert!(
                 attachment.is_none(),
                 "invalid target attached: {reflected_status} {presence:?} {reflected_generation} {target_name:?} {receipt_profile}"
+            );
+        }
+        assert!(env.view.take_native_attachment().is_none());
+    }
+}
+
+/// Live send into an agent whose status adapter has not classified its screen
+/// yet must attach: the daemon confirms the pane by identity, and the snapshot
+/// reports that same pane alive. A status the row is not in (stopped) still
+/// refuses the attachment.
+#[test]
+#[serial]
+fn live_send_attaches_an_agent_pane_whose_status_is_unclassified() {
+    use crate::daemon::{RuntimeCursor, TerminalTarget, TerminalTargetStatus};
+    use crate::session::{PaneObservation, PanePresence};
+    use crate::tui::home::live_send::LiveSendTarget;
+    use crate::tui::home::panes::PaneIntent;
+
+    for (reflected_status, attach) in [("Unknown", true), ("Stopped", false)] {
+        let mut env = create_test_env_with_sessions(1);
+        let id = env.view.instance_at(0).id.clone();
+        env.view.select_session_by_id(&id);
+        let mut row = daemon_row(env.view.get_instance(&id).unwrap(), "Unknown");
+        row.view = crate::session::View::Terminal;
+        row.lifecycle_generation = 4;
+        row.agent_pane = PaneObservation {
+            state: PanePresence::Alive,
+            tmux_session: Some("agent-4".into()),
+            legacy_tool: None,
+        };
+        let SessionFeedResult::Snapshot(mut snapshot) = snapshot_of(vec![row]) else {
+            unreachable!()
+        };
+        env.view
+            .session_feed
+            .publish_for_test(SessionFeedResult::Snapshot(snapshot.clone()));
+        env.view.apply_session_feed();
+        let mut respond = env.view.session_feed.engagement_native_driver_for_test();
+        env.view
+            .prepare_live_send_target(&id, LiveSendTarget::Agent, None)
+            .unwrap();
+        assert!(matches!(
+            respond(
+                Ok(RuntimeCursor {
+                    epoch: "test".into(),
+                    revision: 2,
+                }),
+                Some(TerminalTarget {
+                    tmux_session: "agent-4".into(),
+                    status: TerminalTargetStatus::Alive,
+                    lifecycle_generation: 4,
+                    profile: "test".into(),
+                }),
+            ),
+            Some(crate::tui::session_feed::SessionRequest::EnsureAgent { .. })
+        ));
+        env.view.apply_session_feed();
+        assert!(
+            env.view.take_native_attachment().is_none(),
+            "{reflected_status}: the receipt alone is not canonical application"
+        );
+
+        let committed = std::sync::Arc::make_mut(&mut snapshot);
+        committed.cursor.revision = 2;
+        committed.contents.sessions[0].status = reflected_status.into();
+        env.view
+            .session_feed
+            .publish_for_test(SessionFeedResult::Snapshot(snapshot));
+        env.view.apply_session_feed();
+        let attachment = env.view.take_native_attachment();
+        if attach {
+            let attachment = attachment.expect("an unclassified but live pane must go live");
+            assert_eq!(attachment.id, id);
+            assert_eq!(attachment.tmux_name, "agent-4");
+            assert!(matches!(
+                attachment.intent,
+                PaneIntent::LiveSend(LiveSendTarget::Agent)
+            ));
+        } else {
+            assert!(
+                attachment.is_none(),
+                "{reflected_status}: a stopped row must not attach"
             );
         }
         assert!(env.view.take_native_attachment().is_none());
@@ -2640,8 +2730,7 @@ fn snooze_refusal_preserves_target_duration_and_requires_explicit_resubmit() {
         let bytes = payload_bytes("test");
         if mouse {
             let buffer = draw(110, 40, |frame, theme| {
-                env.view
-                    .render(frame, frame.area(), theme, None, None, None)
+                env.view.render(frame, frame.area(), theme, None)
             });
             let (column, row) = find(&buffer, "2 hours");
             assert!(env.view.handle_dialog_click(column, row));
@@ -2655,8 +2744,7 @@ fn snooze_refusal_preserves_target_duration_and_requires_explicit_resubmit() {
         assert!(env.view.snooze_duration_dialog.is_some());
         assert_eq!(payload_bytes("test"), bytes);
         let buffer = draw(110, 40, |frame, theme| {
-            env.view
-                .render(frame, frame.area(), theme, None, None, None)
+            env.view.render(frame, frame.area(), theme, None)
         });
         find(&buffer, "Snooze Not Changed");
         let (submitted, _) = respond(Err("held operation rejected".into())).unwrap();
@@ -2664,8 +2752,7 @@ fn snooze_refusal_preserves_target_duration_and_requires_explicit_resubmit() {
         env.view.apply_session_feed();
         env.view.select_session_by_id(&other);
         let buffer = draw(110, 40, |frame, theme| {
-            env.view
-                .render(frame, frame.area(), theme, None, None, None)
+            env.view.render(frame, frame.area(), theme, None)
         });
         find(&buffer, "Runtime change");
         if mouse {
@@ -2680,8 +2767,7 @@ fn snooze_refusal_preserves_target_duration_and_requires_explicit_resubmit() {
         );
         assert!(env.view.snooze_duration_dialog.is_some());
         let buffer = draw(110, 40, |frame, theme| {
-            env.view
-                .render(frame, frame.area(), theme, None, None, None)
+            env.view.render(frame, frame.area(), theme, None)
         });
         find(&buffer, "Snooze Not Changed");
         if mouse {
@@ -2800,8 +2886,7 @@ fn diff_keyboard_and_mouse_refusal_are_visible_dismissible_and_keep_comparison()
             .unwrap();
         if mouse {
             draw(120, 40, |frame, theme| {
-                env.view
-                    .render(frame, frame.area(), theme, None, None, None)
+                env.view.render(frame, frame.area(), theme, None)
             });
             let rect = env
                 .view
@@ -2836,8 +2921,7 @@ fn diff_keyboard_and_mouse_refusal_are_visible_dismissible_and_keep_comparison()
             .flat_map(|hunk| &hunk.lines)
             .any(|line| line.old_line_num.is_some() && line.content.trim() == "base"));
         let buffer = draw(120, 40, |frame, theme| {
-            env.view
-                .render(frame, frame.area(), theme, None, None, None)
+            env.view.render(frame, frame.area(), theme, None)
         });
         find(&buffer, "Diff Base Not Saved");
         env.view.handle_key(key(KeyCode::Enter), None);
@@ -2849,8 +2933,7 @@ fn diff_keyboard_and_mouse_refusal_are_visible_dismissible_and_keep_comparison()
             .warning_dialog
             .is_none());
         let buffer = draw(120, 40, |frame, theme| {
-            env.view
-                .render(frame, frame.area(), theme, None, None, None)
+            env.view.render(frame, frame.area(), theme, None)
         });
         find(&buffer, "[not saved]");
         assert_eq!(payload_bytes("test"), bytes);
@@ -3042,8 +3125,7 @@ fn diff_save_uses_its_own_receipt_and_surfaces_rejection_or_unknown_in_takeover(
         assert!(diff.base_save.is_none());
         assert_eq!(diff.base_unsaved, outcome != "saved");
         let buffer = draw(120, 40, |frame, theme| {
-            env.view
-                .render(frame, frame.area(), theme, None, None, None)
+            env.view.render(frame, frame.area(), theme, None)
         });
         if outcome != "saved" {
             find(&buffer, "Diff Base Not Saved");
@@ -3347,8 +3429,7 @@ fn projects_home_dispatch_reads_current_policy_for_keyboard_mouse_and_auto_add()
                         }
                     }
                     let before = draw(120, 42, |frame, theme| {
-                        env.view
-                            .render(frame, frame.area(), theme, None, None, None)
+                        env.view.render(frame, frame.area(), theme, None)
                     });
                     let gesture = find(&before, if remove { "d remove" } else { "Enter save" });
                     let registry = crate::session::get_app_dir().unwrap().join("projects.json");
@@ -3390,8 +3471,7 @@ fn projects_home_dispatch_reads_current_policy_for_keyboard_mouse_and_auto_add()
                     assert!(env.view.projects_dialog.is_some());
                     if policy != "disconnected" {
                         let buffer = draw(120, 42, |frame, theme| {
-                            env.view
-                                .render(frame, frame.area(), theme, None, None, None)
+                            env.view.render(frame, frame.area(), theme, None)
                         });
                         find(
                             &buffer,
@@ -3439,8 +3519,7 @@ fn retained_serve_takeover_owns_keyboard_and_mouse_without_consuming_other_draft
             &mut env.view.serve_jobs,
         ));
         let foreground = draw(120, 42, |frame, theme| {
-            env.view
-                .render(frame, frame.area(), theme, None, None, None)
+            env.view.render(frame, frame.area(), theme, None)
         });
         let close = find(&foreground, "[Esc] cancel");
         if mouse {
@@ -3539,8 +3618,6 @@ fn purge_dialog_rejects_stale_target_on_keyboard_and_mouse() {
                         frame,
                         frame.area(),
                         &crate::tui::styles::Theme::default(),
-                        None,
-                        None,
                         None,
                     );
                 })

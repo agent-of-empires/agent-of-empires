@@ -134,13 +134,26 @@ impl ContainerRuntime {
     pub(crate) fn join_pull(&self, image: &str) -> image_pull::Waiter {
         let base = self.base;
         let pulled = image.to_string();
-        image_pull::join_with(self.pull_key(image), move |kill| {
-            base.pull_until_cancelled(&pulled, kill)
+        image_pull::join_with(self.pull_key(image), move |pull| {
+            base.pull_until_cancelled(&pulled, pull)
         })
     }
 
     pub(crate) fn pull_state(&self, image: &str) -> image_pull::PullState {
         image_pull::state(&self.pull_key(image))
+    }
+
+    pub(crate) fn running_pull_id(&self, image: &str) -> Option<u64> {
+        image_pull::running_flight_id(&self.pull_key(image))
+    }
+
+    /// Cancels this process's running pull of `image` for every waiter; see [`image_pull::cancel`].
+    pub(crate) fn cancel_pull(
+        &self,
+        image: &str,
+        backstop: std::time::Duration,
+    ) -> image_pull::PullState {
+        image_pull::cancel(&self.pull_key(image), backstop)
     }
 
     fn pull_key(&self, image: &str) -> image_pull::PullKey {

@@ -2733,15 +2733,16 @@ pub struct WebConfig {
     pub notify_on_wake_fire: bool,
 
     /// Serve a Model Context Protocol server at `/mcp` on the daemon so MCP
-    /// clients holding the daemon token can list sessions (read-only tools for
-    /// now). When false the route does not exist. Read at daemon startup.
+    /// clients holding the daemon token can list, create and send to sessions,
+    /// read their output, wait on them and approve requests. When false the
+    /// route does not exist. Read at daemon startup.
     #[serde(default)]
     #[setting(
         label = "Let other apps control AoE",
         widget = "toggle",
         restart,
         global_only,
-        summary = "Apps like Claude Code can list your Sessions through MCP. Read-only for now. Works when aoe serve uses the access link without a passphrase, or --auth none."
+        summary = "Apps like Claude Code can list, create and send to your Sessions, read their output, wait on them and approve requests. Works when aoe serve uses the access link without a passphrase, or --auth none."
     )]
     pub mcp_enabled: bool,
 }
@@ -3433,6 +3434,7 @@ pub struct SandboxConfig {
     #[setting(
         label = "Folders to leave out",
         widget = "list",
+        validate = "volume_ignore_list",
         web = "elevation:sandbox config affects host isolation",
         advanced,
         summary = "Paths inside the Project the container shouldn't see, like node_modules."

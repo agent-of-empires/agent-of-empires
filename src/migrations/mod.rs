@@ -67,6 +67,8 @@ mod v055_global_max_concurrent_workers;
 mod v056_launch_resolved_executable;
 mod v057_worker_launch_executable;
 mod v058_account_limits_window_shape;
+mod v059_owner_only_event_logs;
+mod v060_terminal_handoff_outcome;
 
 /// Fixtures shared by migrations that rewrite agent hook files.
 #[cfg(test)]
@@ -107,7 +109,7 @@ use anyhow::{Context, Result};
 use std::fs;
 use tracing::{debug, info};
 
-const CURRENT_VERSION: u32 = 58;
+const CURRENT_VERSION: u32 = 60;
 const VERSION_FILE: &str = ".schema_version";
 
 /// Version, log name, and the one-time transformation to run.
@@ -307,6 +309,12 @@ const MIGRATIONS: &[Migration] = &[
         58,
         "account_limits_window_shape",
         v058_account_limits_window_shape::run,
+    ),
+    (59, "owner_only_event_logs", v059_owner_only_event_logs::run),
+    (
+        60,
+        "terminal_handoff_outcome",
+        v060_terminal_handoff_outcome::run,
     ),
 ];
 
@@ -538,7 +546,9 @@ fn run_explicit_recovery(
         }
     };
     crate::cli::serve::with_inactive_serve_state(transaction, Some(serve), |_| {
-        recovery::reconcile_repaired_components()
+        recovery::reconcile_repaired_components()?;
+        // Not in the helper: registered v046 calls it, and an upgrade must reach v060 in order.
+        v060_terminal_handoff_outcome::run()
     })?;
     legacy_scope_recovery::run_under_exclusion(transaction, serve)
 }
