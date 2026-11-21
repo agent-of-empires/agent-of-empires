@@ -17,7 +17,15 @@ if (!arg) throw new Error("usage: bench-load.mjs <aoe-binary> [runs]");
 const home = mkdtempSync(join(tmpdir(), "aoe-bench-home-"));
 const repo = mkdtempSync(join(tmpdir(), "aoe-bench-repo-"));
 const port = 8090 + (process.pid % 500);
-const env = { ...process.env, HOME: home, AOE_TMUX_SOCKET: `aoe-bench-${process.pid}` };
+const tmuxSocket = join(home, "tmux.sock");
+const env = {
+  ...process.env,
+  HOME: home,
+  XDG_CONFIG_HOME: join(home, ".config"),
+  XDG_DATA_HOME: join(home, ".local/share"),
+  XDG_STATE_HOME: join(home, ".local/state"),
+  AOE_TMUX_SOCKET: tmuxSocket,
+};
 const sh = (cmd, args, cwd) => execFileSync(cmd, args, { cwd, env, stdio: "pipe" });
 
 sh("git", ["init", "-q", "-b", "main"], repo);
