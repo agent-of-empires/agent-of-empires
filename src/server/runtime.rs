@@ -433,6 +433,15 @@ impl NativeRuntime {
         self.wake.notify_one();
     }
 
+    /// Test-only: whether a publish was requested since the last call. Nothing else may be
+    /// waiting on the wake, as `publish_loop` would be.
+    #[cfg(test)]
+    pub(crate) async fn take_publish_request(&self) -> bool {
+        tokio::time::timeout(Duration::ZERO, self.wake.notified())
+            .await
+            .is_ok()
+    }
+
     pub(super) async fn wait_for_terminal_subscriber(&self) {
         self.terminal_wake.notified().await;
     }

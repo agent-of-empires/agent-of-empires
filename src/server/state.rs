@@ -234,9 +234,8 @@ pub struct AppState {
     /// last-summary seq). Synchronous mutex; tiny critical sections. See
     /// `session::conversation_summary` and #2808.
     pub summary_inflight: std::sync::Mutex<std::collections::HashSet<String>>,
-    /// Structured sessions a Retry moved to `Starting`, each with the latest event seq at that
-    /// write. While the row stays `Starting`, frames at or below it are the retired worker's.
-    pub retry_starting: super::acp_events::RetryStarting,
+    /// Structured sessions a Retry holds at `Starting`, each with the attempt that owns it.
+    pub(crate) retry_starting: super::acp_events::RetryStarting,
     /// Global cap on concurrent conversation-summary one-shots. Separate from
     /// `smart_rename_semaphore` (permits=2) and sized to 1: a summary runs the
     /// agent over the whole transcript, so it is slower and costlier than a
@@ -418,6 +417,13 @@ impl AppState {
         if *profile == old_name {
             new_name.clone_into(&mut *profile);
         }
+    }
+
+    /// Invalidates disk reads taken before an in-memory row change, so a reload can't
+    /// apply one over it. Bump before releasing `instances.write()` to leave no gap.
+    pub(crate) fn note_row_mutation(&self) {
+        self.mutation_epoch
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
     }
 
     pub(crate) async fn mark_reload_failure(&self, health: crate::daemon::RuntimeHealth) {
