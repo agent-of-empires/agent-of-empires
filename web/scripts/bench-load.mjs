@@ -165,7 +165,7 @@ try {
     sh(bin, ["serve", "--stop"], repo);
   } catch {}
   try {
-    execFileSync("tmux", ["-L", env.AOE_TMUX_SOCKET, "kill-server"], { stdio: "ignore" });
+    execFileSync("tmux", ["-S", tmuxSocket, "kill-server"], { stdio: "ignore" });
   } catch {}
 }
 const m = Object.fromEntries(
