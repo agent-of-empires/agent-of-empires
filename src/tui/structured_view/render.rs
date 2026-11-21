@@ -679,7 +679,12 @@ fn visible_controls(text: &str) -> String {
     text.chars()
         .map(|c| match c {
             '\t' => '\u{2409}',
+            // DEL sits past the C0 pictures, whose offset would land on a digit.
+            '\x7f' => '\u{2421}',
             c if c.is_ascii_control() => char::from_u32(0x2400 + c as u32).unwrap_or('\u{fffd}'),
+            // C1 controls have no control picture; a replacement keeps them from
+            // vanishing out of the command being approved.
+            c if c.is_control() => '\u{fffd}',
             c => c,
         })
         .collect()
@@ -3337,27 +3342,35 @@ mod tests {
     }
 
     /// A command's control characters are shown, not dropped: a tab would
-    /// otherwise join the words either side of it on screen.
+    /// otherwise join the words either side of it, and DEL would reach the
+    /// terminal as a digit-like glyph.
     #[test]
-    fn approval_shelf_shows_a_tab_in_the_command() {
-        let mut state = test_state();
-        state.transcript.pending_approvals = vec![PendingApproval {
-            nonce: "n-1".into(),
-            title: "Bash".into(),
-            kind: "execute".into(),
-            args: serde_json::json!({ "command": "echo\tok" }).to_string(),
-            destructive: false,
-            options: Vec::new(),
-            choice: false,
-        }];
-        state.selected_approval = Some("n-1".into());
-        state.focus = Focus::Approval;
-        let lines = render_rows(&state, 80, 24, true);
-        let dump = lines.join("\n");
-        assert!(
-            lines.iter().any(|line| line.contains("echo\u{2409}ok")),
-            "the tab is shown as one cell rather than dropped:\n{dump}"
-        );
+    fn approval_shelf_shows_control_characters_in_the_command() {
+        let cases = [
+            ("\t", "echo\u{2409}ok", "the tab is shown as one cell"),
+            ("\u{7f}", "echo\u{2421}ok", "DEL is the delete symbol"),
+            ("\u{9b}", "echo\u{fffd}ok", "a C1 control is replaced"),
+        ];
+        for (byte, expected, why) in cases {
+            let mut state = test_state();
+            state.transcript.pending_approvals = vec![PendingApproval {
+                nonce: "n-1".into(),
+                title: "Bash".into(),
+                kind: "execute".into(),
+                args: serde_json::json!({ "command": format!("echo{byte}ok") }).to_string(),
+                destructive: false,
+                options: Vec::new(),
+                choice: false,
+            }];
+            state.selected_approval = Some("n-1".into());
+            state.focus = Focus::Approval;
+            let lines = render_rows(&state, 80, 24, true);
+            let dump = lines.join("\n");
+            assert!(
+                lines.iter().any(|line| line.contains(expected)),
+                "{why} ({expected:?} missing):\n{dump}"
+            );
+        }
     }
 
     /// The kind decides the leading argument: a path-based call that also
