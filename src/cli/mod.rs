@@ -29,6 +29,7 @@ pub mod serve;
 pub mod session;
 pub mod session_move;
 pub mod settings;
+pub mod setup;
 pub mod skill;
 pub mod sounds;
 pub mod status;

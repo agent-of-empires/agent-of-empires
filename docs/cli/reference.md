@@ -8,6 +8,7 @@ This document contains the help content for the `aoe` command-line program.
 * [`aoe add`↴](#aoe-add)
 * [`aoe agents`↴](#aoe-agents)
 * [`aoe init`↴](#aoe-init)
+* [`aoe setup`↴](#aoe-setup)
 * [`aoe list`↴](#aoe-list)
 * [`aoe ps`↴](#aoe-ps)
 * [`aoe logs`↴](#aoe-logs)
@@ -160,6 +161,7 @@ Run without arguments to launch the TUI dashboard.
 * `add` — Add a new session
 * `agents` — List supported agents and their install status
 * `init` — Initialize .agent-of-empires/config.toml in a repository
+* `setup` — Configure the default Structured view in one run: the bundled aoe-agent adapter, structured view as the new-session default, and the Otari steps when no provider key is present. Never overwrites a value you set
 * `list` — List all sessions
 * `ps` — Show a substrate-agnostic runtime view of in-flight sessions (tmux agent panes and ACP structured-view workers), one row each
 * `logs` — View the configured AoE log file with a pretty viewer
@@ -270,6 +272,20 @@ Initialize .agent-of-empires/config.toml in a repository
 * `<PATH>` — Directory to initialize (defaults to current directory)
 
   Default value: `.`
+
+
+
+## `aoe setup`
+
+Configure the default Structured view in one run: the bundled aoe-agent adapter, structured view as the new-session default, and the Otari steps when no provider key is present. Never overwrites a value you set
+
+**Usage:** `aoe setup [OPTIONS]`
+
+###### **Options:**
+
+* `--quick` — Never prompt. The bundled adapter is installed only with `--install-adapter`; otherwise the command that installs it is printed
+* `--install-adapter` — Consent to installing the bundled `aoe-agent` adapter into the data dir (no global npm install, no sudo)
+* `--agent <AGENT>` — Default to this agent, which must already be on the machine, instead of the bundled one. Reuses the CLI you already have and its login
 
 
 

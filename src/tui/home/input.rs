@@ -14,6 +14,7 @@ use super::{
 use crate::session::config::repo_config;
 use crate::session::config::{
     load_config, update_app_state, update_config, GroupByMode, SidebarPosition, SortOrder,
+    StructuredView,
 };
 use crate::session::{list_profiles_for_display, Instance, Item, LifecycleOperation, Status};
 use crate::tui::app::Action;
@@ -62,10 +63,21 @@ fn apply_intro_outcome(outcome: &IntroOutcome) {
     if outcome.final_theme.is_none()
         && outcome.final_attach_mode.is_none()
         && outcome.telemetry_opt_in.is_none()
+        && outcome.acp_default_agent.is_none()
     {
         return;
     }
     let result = update_config(|config| {
+        if let Some(agent) = &outcome.acp_default_agent {
+            // The page preselects the current default, so this only moves a
+            // choice the user made on it.
+            if config.acp.default_agent.trim() != agent.as_str() {
+                config.acp.default_agent = agent.clone();
+            }
+            if config.acp.structured_view == StructuredView::Auto {
+                config.acp.structured_view = StructuredView::Structured;
+            }
+        }
         if let Some(theme) = &outcome.final_theme {
             config.theme.name = theme.clone();
         }
