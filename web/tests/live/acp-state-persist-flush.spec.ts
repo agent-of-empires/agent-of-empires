@@ -6,6 +6,13 @@ import { chunk, endTurn, openStructuredView, script, startAcpSession } from "../
 
 const REPLY = "persist-flush reply marker";
 
+// Swallow the 2000 ms throttle timer so only the leave event can persist.
+const swallowThrottleTimer = () => {
+  const realSetTimeout = window.setTimeout.bind(window);
+  window.setTimeout = ((handler: TimerHandler, delay?: number, ...args: unknown[]) =>
+    delay === 2000 ? 0 : realSetTimeout(handler, delay, ...args)) as typeof window.setTimeout;
+};
+
 const persistedText = (page: Page, sessionId: string) =>
   page.evaluate((key) => window.localStorage.getItem(key) ?? "", `aoe:acp-state:v1:${sessionId}`);
 
@@ -24,6 +31,7 @@ for (const [leave, act] of Object.entries(leaves)) {
       title: "persist-flush",
       fakeAcpScript: script(endTurn(chunk(REPLY))),
     });
+    await page.addInitScript(swallowThrottleTimer);
     await openStructuredView(page, serve, sessionId, "hello");
     await expect(page.getByText(REPLY)).toBeVisible({ timeout: 10_000 });
 
