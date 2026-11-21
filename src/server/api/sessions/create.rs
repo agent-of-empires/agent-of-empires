@@ -239,6 +239,13 @@ pub(super) async fn resolve_canonical_fork_seed(
         )
         .map_err(|_| StatusCode::BAD_REQUEST.into_response());
     }
+    // Judged for the request's agent, which the checks below hold to the source's.
+    let profile = body
+        .profile
+        .clone()
+        .unwrap_or_else(|| state.served_profile().clone());
+    let structured_fork_capable = body.view == crate::session::View::Structured
+        && request_structured_fork_capable(&profile, body).await;
     let instances = state.instances.read().await;
     let source = instances
         .iter()
@@ -260,10 +267,7 @@ pub(super) async fn resolve_canonical_fork_seed(
         return Err(StatusCode::BAD_REQUEST.into_response());
     }
     let parent_id = if source.is_structured() {
-        if !crate::session::fork::structured_fork_capable(
-            &source.tool,
-            source.agent_name.as_deref(),
-        ) {
+        if !structured_fork_capable {
             return Err(StatusCode::BAD_REQUEST.into_response());
         }
         source.acp_session_id.as_deref()
@@ -320,6 +324,25 @@ pub(crate) fn agent_is_acp_capable(
         // A custom agent inheriting a registry-backed base spawns through that
         // base adapter, so report it capable up front.
         || crate::acp::inherited_acp_base(resolved, &session.agent_detect_as).is_some()
+}
+
+/// [`crate::session::fork::structured_fork_capable_in`] for a create request's
+/// agent, off the async runtime because a custom agent reads config.
+async fn request_structured_fork_capable(profile: &str, body: &CreateSessionBody) -> bool {
+    let profile = profile.to_string();
+    let project_path = std::path::PathBuf::from(&body.path);
+    let tool = body.tool.clone();
+    let agent_name = body.agent_name.clone();
+    tokio::task::spawn_blocking(move || {
+        crate::session::fork::structured_fork_capable_in(
+            &profile,
+            &project_path,
+            &tool,
+            agent_name.as_deref(),
+        )
+    })
+    .await
+    .unwrap_or(false)
 }
 
 pub(super) fn validate_session_tool_identity(
@@ -1347,12 +1370,7 @@ pub(crate) async fn create_session_with(
             // A structured fork needs a live ACP connection. Reject it here, or
             // the post-build capability check silently downgrades it to a
             // non-forked terminal session, dropping the fork.
-            if structured
-                && !crate::session::fork::structured_fork_capable(
-                    &body.tool,
-                    body.agent_name.as_deref(),
-                )
-            {
+            if structured && !request_structured_fork_capable(validation_profile, &body).await {
                 return api_error(
                     StatusCode::BAD_REQUEST,
                     "fork_unsupported",

@@ -4792,6 +4792,15 @@ async fn list_sessions_judges_custom_agent_capability_by_the_agent_name() {
         c.session
             .agent_acp_cmd
             .insert("acp-helper".into(), "acp-helper --acp".into());
+        c.session
+            .agent_acp_cmd
+            .insert("claude-acct".into(), "/state/acct-acp.sh".into());
+        c.session
+            .agent_execution_as
+            .insert("claude-acct".into(), "claude".into());
+        c.session
+            .agent_config_dir
+            .insert("claude-acct".into(), "~/.claude-acct".into());
     })
     .unwrap();
 
@@ -4806,6 +4815,7 @@ async fn list_sessions_judges_custom_agent_capability_by_the_agent_name() {
     let state = crate::server::test_support::build_test_app_state(vec![
         mk("named-agent", Some("acp-helper")),
         mk("tool-only", None),
+        mk("claude-wrapper", Some("claude-acct")),
     ]);
 
     let response = list_sessions(
@@ -4822,9 +4832,16 @@ async fn list_sessions_judges_custom_agent_capability_by_the_agent_name() {
     let capable: Vec<_> = envelope
         .sessions
         .iter()
-        .map(|s| (s.id.as_str(), s.acp_capable))
+        .map(|s| (s.id.as_str(), s.acp_capable, s.acp_can_fork))
         .collect();
-    assert_eq!(capable, [("named-agent", true), ("tool-only", false)]);
+    assert_eq!(
+        capable,
+        [
+            ("named-agent", true, false),
+            ("tool-only", false, false),
+            ("claude-wrapper", true, true),
+        ]
+    );
 }
 
 /// The list advertises the solo commands of the agent that classifies the session's prompts:
