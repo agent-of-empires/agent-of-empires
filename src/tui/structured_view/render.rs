@@ -18,7 +18,9 @@ use super::input::{Focus, Intent};
 use super::reducer::{
     AcpTranscript, NoteKind, PendingApproval, ToolCallRow, ToolCompletion, ToolOutcome,
 };
-use super::state::{FileIndex, PickerKind, PickerTarget, StructuredViewState, ViewLayout};
+use super::state::{
+    FileIndex, PickerKind, PickerTarget, StructuredViewState, TranscriptTextCache, ViewLayout,
+};
 use crate::acp::approvals::{tool_target, ToolTarget, CMD_KEYS, PATH_KEYS};
 use crate::acp::session_paths::{relative_display_path, SessionPathRoots};
 use crate::acp::state::{
@@ -932,8 +934,48 @@ pub(super) enum ToolOutputMode<'a> {
 }
 
 /// The transcript pre-wrapped at `width`: the single source of transcript
-/// geometry for painting, scroll clamping, and selection.
+/// geometry for painting, scroll clamping, and selection. The live projection
+/// is cached, so an unchanged transcript costs a clone rather than a re-wrap.
 pub(super) fn wrapped_transcript(
+    state: &StructuredViewState,
+    theme: &Theme,
+    width: u16,
+    tool_output: ToolOutputMode,
+) -> Text<'static> {
+    let revision = state.transcript.projection_revision();
+    if let ToolOutputMode::Compact = tool_output {
+        let cached = state.transcript_cache.borrow();
+        if let Some(hit) = cached.as_ref().filter(|hit| {
+            hit.matches(
+                revision,
+                width,
+                theme,
+                state.path_roots.as_ref(),
+                state.show_full_thinking,
+            )
+        }) {
+            return hit.text.clone();
+        }
+    }
+    let text = project_transcript(state, theme, width, tool_output);
+    // The retained reader builds its own cache over outputs the state does not
+    // hold, so only the compact projection is stored here.
+    if let ToolOutputMode::Compact = tool_output {
+        *state.transcript_cache.borrow_mut() = Some(TranscriptTextCache {
+            revision,
+            width,
+            theme: theme.clone(),
+            roots: state.path_roots.clone(),
+            full_thinking: state.show_full_thinking,
+            text: text.clone(),
+        });
+    }
+    text
+}
+
+/// Project and wrap without touching the cache. Selection extraction passes a
+/// placeholder theme, so it reads this rather than evicting the painted text.
+pub(super) fn project_transcript(
     state: &StructuredViewState,
     theme: &Theme,
     width: u16,
@@ -1128,16 +1170,36 @@ fn join_split_graphemes(line: &mut Line<'static>) {
     line.spans.retain(|span| !span.content.is_empty());
 }
 
+/// Text whose graphemes all sit inside one span and paint one cell each. Most
+/// transcript text is this, and it needs no grapheme walk to measure or split.
+fn is_plain_ascii(text: &str) -> bool {
+    text.is_ascii() && !text.bytes().any(|byte| byte.is_ascii_control())
+}
+
+fn painted_cells(text: &str) -> usize {
+    if is_plain_ascii(text) {
+        return text.len();
+    }
+    crate::tui::components::text::rendered_width(text)
+}
+
 pub(super) fn wrap_line_into(mut line: Line<'static>, width: u16, out: &mut Vec<Line<'static>>) {
     use ratatui::buffer::CellWidth;
     use unicode_segmentation::UnicodeSegmentation;
 
-    join_split_graphemes(&mut line);
+    // A grapheme can only span a span boundary when a span ends inside one, so
+    // plain ASCII (which has no combining or joined clusters) skips the join.
+    let plain = line.spans.iter().all(|span| is_plain_ascii(&span.content));
+    if plain {
+        line.spans.retain(|span| !span.content.is_empty());
+    } else {
+        join_split_graphemes(&mut line);
+    }
     let width = width.max(1) as usize;
     let painted_width: usize = line
         .spans
         .iter()
-        .map(|span| crate::tui::components::text::rendered_width(&span.content))
+        .map(|span| painted_cells(&span.content))
         .sum();
     if painted_width <= width {
         out.push(line);
@@ -1170,39 +1232,59 @@ pub(super) fn wrap_line_into(mut line: Line<'static>, width: u16, out: &mut Vec<
     let mut row: Vec<(usize, std::ops::Range<usize>, usize)> = Vec::new();
     let mut row_width = 0;
     let mut last_space = None;
+    let mut push = |span_index: usize,
+                    range: std::ops::Range<usize>,
+                    cells: usize,
+                    is_space: bool,
+                    out: &mut Vec<Line<'static>>| {
+        while row_width + cells > width && row_width > 0 {
+            if let Some(cut) = last_space {
+                emit(&row[..cut], out);
+                row.drain(..=cut);
+            } else {
+                emit(&row, out);
+                row.clear();
+            }
+            row_width = row.iter().map(|glyph| glyph.2).sum();
+            last_space = row
+                .iter()
+                .rposition(|(index, range, _)| &line.spans[*index].content[range.clone()] == " ");
+        }
+        if is_space {
+            last_space = Some(row.len());
+        }
+        row.push((span_index, range, cells));
+        row_width += cells;
+        if cells > width {
+            emit(&row, out);
+            row.clear();
+            row_width = 0;
+            last_space = None;
+        }
+    };
     for (span_index, span) in line.spans.iter().enumerate() {
+        if plain {
+            for (byte, glyph) in span.content.bytes().enumerate() {
+                push(span_index, byte..byte + 1, 1, glyph == b' ', out);
+            }
+            continue;
+        }
         for (byte, grapheme) in span.content.grapheme_indices(true) {
             let cells = if grapheme.contains(char::is_control) {
                 0
             } else {
                 grapheme.cell_width() as usize
             };
-            while row_width + cells > width && row_width > 0 {
-                if let Some(cut) = last_space {
-                    emit(&row[..cut], out);
-                    row.drain(..=cut);
-                } else {
-                    emit(&row, out);
-                    row.clear();
-                }
-                row_width = row.iter().map(|glyph| glyph.2).sum();
-                last_space = row.iter().rposition(|(index, range, _)| {
-                    &line.spans[*index].content[range.clone()] == " "
-                });
-            }
-            if grapheme == " " {
-                last_space = Some(row.len());
-            }
-            row.push((span_index, byte..byte + grapheme.len(), cells));
-            row_width += cells;
-            if cells > width {
-                emit(&row, out);
-                row.clear();
-                row_width = 0;
-                last_space = None;
-            }
+            push(
+                span_index,
+                byte..byte + grapheme.len(),
+                cells,
+                grapheme == " ",
+                out,
+            );
         }
     }
+    drop(push);
     emit(&row, out);
 }
 
@@ -1579,7 +1661,7 @@ fn transcript_lines(
     full_thinking: bool,
     tool_output: ToolOutputMode,
 ) -> Vec<Line<'static>> {
-    let rows = &transcript.server_rows;
+    let rows = transcript.rows();
     // One card per tool call at its start row; the last terminal row wins.
     let mut completions: HashMap<&str, &TranscriptRow> = HashMap::new();
     for row in rows {
@@ -1609,7 +1691,7 @@ fn transcript_lines(
     let blocks = ToolBlocks {
         completions: &completions,
         children: &children,
-        subagents: &transcript.subagents,
+        subagents: transcript.subagents(),
         theme,
         path_roots,
         tool_output,
@@ -2810,6 +2892,78 @@ mod tests {
         }
     }
 
+    /// The wrapped transcript is cached across frames, so it must never serve
+    /// text older than its rows or narrower than the frame it paints into.
+    #[test]
+    fn transcript_cache_follows_rows_and_width() {
+        let chunk = |text: &str| Event::AgentMessageChunk {
+            text: text.into(),
+            message_id: Some("m-1".into()),
+        };
+        let mut state = test_state();
+        state.transcript.set_rows(server_rows(&[chunk("alpha")]));
+        assert!(render_dump(&state, 60, 12).contains("alpha"));
+
+        state.transcript.set_rows(server_rows(&[chunk("beta")]));
+        let dump = render_dump(&state, 60, 12);
+        assert!(
+            dump.contains("beta") && !dump.contains("alpha"),
+            "a replaced transcript must not reuse the cached text: {dump}"
+        );
+
+        state
+            .transcript
+            .set_rows(server_rows(&[chunk(&"wide ".repeat(20))]));
+        let theme = crate::tui::styles::load_theme_with_mode("empire", false);
+        let rows = |width| {
+            wrapped_transcript(&state, &theme, width, ToolOutputMode::Compact)
+                .lines
+                .len()
+        };
+        let wide = rows(60);
+        assert!(rows(30) > wide, "a narrower frame must re-wrap");
+    }
+
+    /// A child's state turns its parent's card on and off with no row delta, so
+    /// the roster alone has to invalidate the cached transcript.
+    #[test]
+    fn transcript_cache_follows_the_subagent_roster() {
+        use crate::acp::state::{SubagentRecord, SubagentState};
+        let record = |state| SubagentRecord {
+            session_id: "child".into(),
+            parent_session_id: "s-1".into(),
+            parent_tool_call_id: Some("msg-1".into()),
+            title: Some("Explore repo".into()),
+            description: None,
+            state,
+            stop_reason: None,
+            error: None,
+            cancel_capable: true,
+            model: None,
+            background: false,
+        };
+        let mut state = test_state();
+        state
+            .transcript
+            .set_rows(server_rows(&[tool_event("msg-1", "Explore repo", None)]));
+        state
+            .transcript
+            .set_subagents(vec![record(SubagentState::Running)]);
+        assert!(
+            render_dump(&state, 80, 20).contains("Explore repo · running"),
+            "the roster badges the card"
+        );
+
+        state
+            .transcript
+            .set_subagents(vec![record(SubagentState::Idle)]);
+        let dump = render_dump(&state, 80, 20);
+        assert!(
+            dump.contains("Explore repo · idle") && !dump.contains("running"),
+            "a roster change must not reuse the cached badges: {dump}"
+        );
+    }
+
     #[test]
     fn wrap_line_rows_and_styles() {
         let rows = |line: Line<'static>, width| {
@@ -3031,14 +3185,14 @@ mod tests {
             message_id: Some(id.into()),
         };
         let mut t = AcpTranscript::new("s-1");
-        t.server_rows = server_rows(&[
+        t.set_rows(server_rows(&[
             chunk("for #4656.", "m-a"),
             chunk("", "m-b"),
             chunk("The waiter has the lock.", "m-b"),
             Event::ThinkingStarted,
             chunk("Build", "m-c"),
             chunk("ing now", "m-c"),
-        ]);
+        ]));
         let out = joined(&transcript_lines(
             &t,
             &Theme::default(),
@@ -3063,11 +3217,11 @@ mod tests {
         };
         let long = "é".repeat(130);
         let mut t = AcpTranscript::new("s-1");
-        t.server_rows = server_rows(&[
+        t.set_rows(server_rows(&[
             thought("Weighing ", "t-a"),
             thought("options\nsecond line", "t-a"),
             thought(&long, "t-b"),
-        ]);
+        ]));
         let lines: Vec<String> =
             transcript_lines(&t, &Theme::default(), None, false, ToolOutputMode::Compact)
                 .iter()
@@ -3107,7 +3261,10 @@ mod tests {
             message_id: Some(id.into()),
         };
         let mut t = AcpTranscript::new("s-1");
-        t.server_rows = server_rows(&[thought("<div>\nCompare both alternatives.\n</div>", "t-a")]);
+        t.set_rows(server_rows(&[thought(
+            "<div>\nCompare both alternatives.\n</div>",
+            "t-a",
+        )]));
         let body = joined(&transcript_lines(
             &t,
             &Theme::default(),
@@ -3141,7 +3298,7 @@ mod tests {
                 &format!("m-{index}"),
             ));
         }
-        state.transcript.server_rows = server_rows(&events);
+        state.transcript.set_rows(server_rows(&events));
 
         // Scroll back into the replies, then expand the thought above them. The
         // projection separates rows with blanks, so land on a reply rather than
@@ -3238,7 +3395,7 @@ mod tests {
             options: Vec::new(),
             choice: false,
         });
-        t.server_rows = server_rows(&[
+        t.set_rows(server_rows(&[
             Event::AgentMessageChunk {
                 text: "working on it".into(),
                 message_id: None,
@@ -3256,7 +3413,7 @@ mod tests {
                 compaction_id: "c-2".into(),
                 text: String::new(),
             },
-        ]);
+        ]));
         let out = joined(&transcript_lines(
             &t,
             &Theme::default(),
@@ -3330,13 +3487,13 @@ mod tests {
     #[test]
     fn child_tool_calls_nest_under_their_parent_with_orphan_fallback() {
         let mut t = AcpTranscript::new("s-1");
-        t.server_rows = server_rows(&[
+        t.set_rows(server_rows(&[
             tool_event("p1", "Agent", None),
             tool_event("c1", "Read", Some("p1")),
             tool_event("c2", "Grep", Some("p1")),
             tool_event("o1", "Orphan", Some("gone")),
             tool_event("n1", "Plain", None),
-        ]);
+        ]));
         assert_eq!(
             tool_lines(&t),
             [
@@ -3383,11 +3540,11 @@ mod tests {
         ];
         for (state, stop_reason, head) in cases {
             let mut t = AcpTranscript::new("s-1");
-            t.server_rows = server_rows(&[
+            t.set_rows(server_rows(&[
                 tool_event("msg-1", "Explore repo", None),
                 tool_event("c1", "Read", Some("msg-1")),
-            ]);
-            t.subagents = vec![SubagentRecord {
+            ]));
+            t.set_subagents(vec![SubagentRecord {
                 session_id: "child".into(),
                 parent_session_id: "s-1".into(),
                 parent_tool_call_id: Some("msg-1".into()),
@@ -3399,7 +3556,7 @@ mod tests {
                 cancel_capable: true,
                 model: None,
                 background: false,
-            }];
+            }]);
             let mut want: Vec<String> = head.into_iter().map(Into::into).collect();
             want.push("  tool ▶ · Read".into());
             assert_eq!(tool_lines(&t), want);
@@ -3426,8 +3583,8 @@ mod tests {
             events.push(Event::Stopped {
                 reason: "end_turn".into(),
             });
-            t.server_rows = server_rows(&events);
-            t.subagents = vec![SubagentRecord {
+            t.set_rows(server_rows(&events));
+            t.set_subagents(vec![SubagentRecord {
                 session_id: "child".into(),
                 parent_session_id: "s-1".into(),
                 parent_tool_call_id: Some("msg-1".into()),
@@ -3439,7 +3596,7 @@ mod tests {
                 cancel_capable: true,
                 model: None,
                 background: false,
-            }];
+            }]);
             let lines = tool_lines(&t);
             assert_eq!(lines[0], head);
             assert!(
@@ -3768,7 +3925,7 @@ mod tests {
             main_repo_path: None,
             workspace_repos: Vec::new(),
         });
-        state.transcript.server_rows = server_rows(&[
+        state.transcript.set_rows(server_rows(&[
             Event::UserPromptSent {
                 merged_prompt_ids: Vec::new(),
                 prompt_id: None,
@@ -3781,7 +3938,7 @@ mod tests {
                 text: "What should we build?".into(),
                 message_id: None,
             },
-        ]);
+        ]));
 
         let rows = render_rows(&state, 80, 20, true);
         let card_right = rows[0].chars().position(|ch| ch == '╮').expect("card edge");
@@ -3808,14 +3965,16 @@ mod tests {
         );
 
         // A plugin-sent message names its sender; a typed one does not.
-        state.transcript.server_rows = server_rows(&[Event::UserPromptSent {
-            merged_prompt_ids: Vec::new(),
-            prompt_id: None,
-            text: "PR merged".into(),
-            attachments: Vec::new(),
-            synthesized: false,
-            origin_plugin: Some("cron".into()),
-        }]);
+        state
+            .transcript
+            .set_rows(server_rows(&[Event::UserPromptSent {
+                merged_prompt_ids: Vec::new(),
+                prompt_id: None,
+                text: "PR merged".into(),
+                attachments: Vec::new(),
+                synthesized: false,
+                origin_plugin: Some("cron".into()),
+            }]));
         let rows = render_rows(&state, 80, 20, true);
         assert!(
             rows.iter()

@@ -22,6 +22,7 @@ use crate::plugin::ui_state::{Notification, UiSnapshot};
 use crate::session::config::NoticePolicy;
 use crate::tui::components::hover::HoverState;
 use crate::tui::plugin_ui;
+use crate::tui::styles::Theme;
 
 /// Most plugin notifications buffered awaiting a free toast slot. The daemon
 /// already bounds its ring; this second guard drops old un-shown toasts rather
@@ -141,6 +142,39 @@ pub struct StructuredViewState {
     /// or `None` when off or the fetch failed. Read from the daemon's `/api/about`,
     /// not local config, so a remote-attached view honours that daemon (#3253).
     pub compaction_reminder_percent: Option<u8>,
+    /// The wrapped transcript painted by the last frame. Wrapping a long
+    /// transcript costs far more than everything else in a frame, and most
+    /// frames repaint identical rows. Interior-mutable: the render borrows the
+    /// state immutably.
+    pub transcript_cache: RefCell<Option<TranscriptTextCache>>,
+}
+
+/// A wrapped transcript and the inputs it was built from. Any of them changing
+/// makes the text stale, so the cache is a match on all of them or nothing.
+pub struct TranscriptTextCache {
+    pub revision: u64,
+    pub width: u16,
+    pub theme: Theme,
+    pub roots: Option<SessionPathRoots>,
+    pub full_thinking: bool,
+    pub text: ratatui::text::Text<'static>,
+}
+
+impl TranscriptTextCache {
+    pub fn matches(
+        &self,
+        revision: u64,
+        width: u16,
+        theme: &Theme,
+        roots: Option<&SessionPathRoots>,
+        full_thinking: bool,
+    ) -> bool {
+        self.revision == revision
+            && self.width == width
+            && &self.theme == theme
+            && self.roots.as_ref() == roots
+            && self.full_thinking == full_thinking
+    }
 }
 
 impl StructuredViewState {
@@ -386,6 +420,7 @@ impl StructuredViewState {
             last_scroll_max: std::cell::Cell::new(0),
             compaction_reminder_percent: None,
             show_full_thinking: false,
+            transcript_cache: RefCell::new(None),
         }
     }
 
