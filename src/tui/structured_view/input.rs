@@ -87,6 +87,9 @@ pub enum Intent {
     /// Open the Fast mode / Ultracode toggle picker (transcript `t`, when the
     /// agent advertised any).
     OpenToggles,
+    /// Show every thought in full, or collapse them back to one preview line
+    /// (transcript `e`).
+    ToggleThinking,
     /// Open the answer picker for the oldest pending elicitation (transcript
     /// `a`). The view decides whether the form is natively answerable.
     AnswerElicitation,
@@ -381,6 +384,9 @@ fn transcript_keys(key: &KeyEvent, ctx: InputContext) -> Intent {
         // Permission-mode picker, when the agent advertised modes.
         (m, KeyCode::Char('m')) if m.is_empty() && ctx.has_modes => Intent::OpenModePicker,
         (m, KeyCode::Char('t')) if m.is_empty() && ctx.has_toggles => Intent::OpenToggles,
+        // `e` expands the agent's reasoning: the preview line is only ever a
+        // reminder that a thought is there.
+        (m, KeyCode::Char('e')) if m.is_empty() => Intent::ToggleThinking,
         // Esc backs out one level to the composer (the home base) rather than
         // leaving the view.
         (m, KeyCode::Esc) if m.is_empty() => Intent::SetFocus(Focus::Composer),
