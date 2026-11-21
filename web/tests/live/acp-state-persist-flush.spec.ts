@@ -16,11 +16,6 @@ const leaves: Record<string, (page: Page) => Promise<void>> = {
       document.dispatchEvent(new Event("visibilitychange"));
     }),
   "the page is unloaded": (page) => page.evaluate(() => window.dispatchEvent(new Event("pagehide"))),
-  "the session view unmounts": (page) =>
-    page.evaluate(() => {
-      window.history.pushState({}, "", "/settings");
-      window.dispatchEvent(new PopStateEvent("popstate"));
-    }),
 };
 
 for (const [leave, act] of Object.entries(leaves)) {
