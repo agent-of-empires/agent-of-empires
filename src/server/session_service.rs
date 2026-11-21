@@ -190,6 +190,10 @@ pub(crate) struct QueuePersistFailed;
 /// than just memory.
 pub(crate) const MAX_QUEUED_PROMPTS_PER_SESSION: usize = 100;
 
+/// How many delivered prompt ids a session remembers, see
+/// [`SessionService::was_prompt_delivered`].
+const MAX_DELIVERED_PROMPT_IDS: usize = 64;
+
 /// Cap on a single queued prompt's text. Unlike `/acp/prompt`, which streams straight to the
 /// agent, this text is persisted and rewritten on every subsequent queue mutation, so
 /// 256 KiB bounds that rewrite.
@@ -300,6 +304,9 @@ pub struct SessionService {
     /// Per-session prompt-submission locks. See
     /// [`SessionService::prompt_submission`].
     prompt_locks: RwLock<HashMap<String, Arc<tokio::sync::Mutex<()>>>>,
+    /// Recently delivered queue-row ids per session, newest last, so a re-POST
+    /// of a delivered id is answered rather than queued again. In memory only.
+    delivered_prompt_ids: std::sync::Mutex<HashMap<String, std::collections::VecDeque<String>>>,
     /// Test-only tap on [`SessionService::prompt_submission`], fired before it
     /// reaches `prompt_locks`. See [`SessionService::watch_submission_claims`].
     #[cfg(test)]
@@ -505,6 +512,7 @@ impl SessionService {
             persist_locks: RwLock::new(HashMap::new()),
             reload_gate: Arc::new(RwLock::new(())),
             prompt_locks: RwLock::new(HashMap::new()),
+            delivered_prompt_ids: std::sync::Mutex::new(HashMap::new()),
             #[cfg(test)]
             submission_claims: std::sync::OnceLock::new(),
             #[cfg(test)]
@@ -2202,9 +2210,40 @@ impl SessionService {
             rows = sent_ids.len(),
             "queued prompts delivered"
         );
+        // Recorded before the retire, under the submission guard, so any later
+        // POST of one of these ids sees it.
+        self.record_delivered_prompts(id, &sent_ids);
         // Retire only the delivered rows; prompts enqueued during the send
         // survive into the next drain.
         self.retire_drained_rows(id, sent_ids).await;
+    }
+
+    fn record_delivered_prompts(&self, id: &str, ids: &[String]) {
+        let mut all = self
+            .delivered_prompt_ids
+            .lock()
+            .expect("delivered_prompt_ids mutex poisoned");
+        let recent = all.entry(id.to_string()).or_default();
+        recent.extend(ids.iter().cloned());
+        while recent.len() > MAX_DELIVERED_PROMPT_IDS {
+            recent.pop_front();
+        }
+    }
+
+    /// Whether the drain delivered `prompt_id` recently and its row is gone.
+    pub(crate) fn was_prompt_delivered(&self, id: &str, prompt_id: &str) -> bool {
+        self.delivered_prompt_ids
+            .lock()
+            .expect("delivered_prompt_ids mutex poisoned")
+            .get(id)
+            .is_some_and(|recent| recent.iter().any(|p| p == prompt_id))
+    }
+
+    pub(crate) fn forget_delivered_prompts(&self, id: &str) {
+        self.delivered_prompt_ids
+            .lock()
+            .expect("delivered_prompt_ids mutex poisoned")
+            .remove(id);
     }
 
     /// Drop a set of queue rows and the attachment bytes buffered for them.
@@ -4227,6 +4266,22 @@ mod tests {
             1,
             "no worker ever arrived, so the batch stays queued for the next tick"
         );
+    }
+
+    #[tokio::test]
+    async fn delivered_prompt_ids_are_bounded_and_dropped_with_the_session() {
+        let service = crate::server::test_support::build_test_app_state(vec![])
+            .session_service
+            .clone();
+        let ids: Vec<String> = (0..=MAX_DELIVERED_PROMPT_IDS)
+            .map(|n| format!("q{n}"))
+            .collect();
+        service.record_delivered_prompts("s", &ids);
+        assert!(!service.was_prompt_delivered("s", "q0"), "oldest evicted");
+        assert!(service.was_prompt_delivered("s", &format!("q{MAX_DELIVERED_PROMPT_IDS}")));
+        assert!(!service.was_prompt_delivered("other", "q1"));
+        service.forget_delivered_prompts("s");
+        assert!(!service.was_prompt_delivered("s", "q1"));
     }
 
     #[tokio::test]

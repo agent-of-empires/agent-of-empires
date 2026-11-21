@@ -1961,7 +1961,8 @@ const stringList = (value: unknown) => (Array.isArray(value) ? value : []);
 /** Enqueue a prompt server-side (POST /queue). `id` is the client-minted stable
  *  id so an optimistic row reconciles against the returned entry; re-posting the
  *  same id updates it in place rather than duplicating. Returns the stored entry
- *  (with its assigned `seq`) or null on non-2xx. */
+ *  (with its assigned `seq`), `{ id, delivered: true }` when the daemon already
+ *  delivered that id (nothing is queued), or null on non-2xx. */
 export async function enqueueServerPrompt(
   sessionId: string,
   prompt: {
@@ -1970,8 +1971,8 @@ export async function enqueueServerPrompt(
     originDevice?: string;
     attachments?: QueueAttachmentUpload[];
   },
-): Promise<ServerQueuedPrompt | null> {
-  return fetchJson<ServerQueuedPrompt>(
+): Promise<ServerQueuedPrompt | { id: string; delivered: true } | null> {
+  return fetchJson<ServerQueuedPrompt | { id: string; delivered: true }>(
     queuePath(sessionId),
     jsonInit("POST", {
       id: prompt.id,
