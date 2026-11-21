@@ -93,6 +93,9 @@ fn served_by_key(plugin_id: &str, entries: Vec<Entry>) -> Vec<ServedServer> {
     let mut served: Vec<ServedServer> = Vec::new();
     for Entry { name, prefix } in entries {
         let entry = ServedServer::new(plugin_id, name, prefix);
+        if !is_valid_mcp_server_name(&entry.entry_key) {
+            continue;
+        }
         match served.iter().position(|s| s.entry_key == entry.entry_key) {
             Some(i) => {
                 if entry.prefixed() && !served[i].prefixed() {
@@ -645,6 +648,25 @@ mod tests {
         assert_eq!(keys(&out), ["acme_a__ok"]);
     }
 
+    /// The prefixed key is `<prefix>__<name>`: a valid name can still make a key past the limit.
+    #[tokio::test]
+    async fn an_entry_key_past_the_name_limit_is_dropped() {
+        let long = "n".repeat(125);
+        let max = "m".repeat(128);
+        let caller = FakeCaller::with(vec![("acme.a", names(&[&long, "ok"]))]);
+        let out = run(&caller, &[manifest("acme.a", true)], CALLBACK_TIMEOUT).await;
+        assert_eq!(keys(&out), ["acme_a__ok"]);
+
+        let reply = json!([
+            {"name": long, "prefix": false},
+            {"name": max, "prefix": false},
+            {"name": long},
+        ]);
+        let caller = FakeCaller::with(vec![("acme.a", Ok(reply))]);
+        let out = run(&caller, &[manifest("acme.a", true)], CALLBACK_TIMEOUT).await;
+        // Served entries come out sorted by name.
+        assert_eq!(keys(&out), [max.as_str(), long.as_str()]);
+    }
     #[tokio::test]
     async fn only_the_first_64_valid_names_are_kept() {
         let all: Vec<String> = (0..65).map(|i| format!("s{i:02}")).collect();
