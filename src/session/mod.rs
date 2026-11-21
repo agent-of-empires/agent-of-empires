@@ -109,7 +109,7 @@ pub use instance::{
     WorkspaceInfo, WorkspaceRepo, WorktreeInfo, SESSION_COLORS, TMUX_SERVER_UNREACHABLE_ERROR,
     TMUX_SESSION_GONE_ERROR,
 };
-pub(crate) use instance::{resolved_agent_for, UNBOUND_STORE_HINT};
+pub(crate) use instance::{reports_tmux_session_gone, resolved_agent_for, UNBOUND_STORE_HINT};
 pub(crate) use instance::{
     ConversationState, LaunchReservation, ManagedResumeRefused, ResumeAttemptPolicy,
     ResumeLaunchOptions, ResumeProfileConfig, TerminalContextResume,

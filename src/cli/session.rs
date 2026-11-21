@@ -1557,7 +1557,7 @@ fn wait_decision(
 
 /// Confirmed absence only. An unreachable tmux server leaves a plain `Error`, and a launch that
 /// holds the reservation has not created its pane yet.
-fn is_terminated(
+pub(crate) fn is_terminated(
     status: Status,
     last_error: Option<&str>,
     launching: bool,
@@ -1565,8 +1565,7 @@ fn is_terminated(
 ) -> bool {
     !launching
         && (status == Status::Stopped
-            || (status == Status::Error
-                && last_error == Some(crate::session::TMUX_SESSION_GONE_ERROR))
+            || (status == Status::Error && crate::session::reports_tmux_session_gone(last_error))
             // A capture that loses a vanishing pane reads as Idle, so recheck the pane itself.
             || existence == crate::tmux::SessionExistence::Absent)
 }

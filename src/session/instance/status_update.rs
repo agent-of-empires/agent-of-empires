@@ -15,6 +15,16 @@ fn detection_content<'a>(
     fresh.or(reuse.map(|(reused, _)| reused))
 }
 
+/// What ended a pane, as a sentence the remedy can follow: the adapter's diagnostic when it saw
+/// one, else that the terminal ended.
+fn ended_sentence(diagnostic: Option<&str>) -> String {
+    match diagnostic {
+        Some(line) if line.ends_with(['.', '!', '?', '…']) => line.to_string(),
+        Some(line) => format!("{line}."),
+        None => "The terminal ended.".to_string(),
+    }
+}
+
 /// Whether this poll can reuse the last verdict instead of capturing the pane.
 fn skip_capture(
     activity: Option<i64>,
@@ -112,11 +122,11 @@ impl Instance {
         );
     }
 
-    /// Drop a [`TMUX_SESSION_GONE_ERROR`] left on a row that no longer has a tmux pane to speak for
-    /// it, so the UI stops showing a message that cannot apply to it any more (a session converted
-    /// to, or restarted in, the structured view).
+    /// Drop a gone-pane error ([`reports_tmux_session_gone`]) left on a row that no longer has a
+    /// tmux pane to speak for it, so the UI stops showing a message that cannot apply to it any more
+    /// (a session converted to, or restarted in, the structured view).
     pub(crate) fn clear_stale_tmux_error(&mut self) {
-        if self.last_error.as_deref() == Some(TMUX_SESSION_GONE_ERROR) {
+        if reports_tmux_session_gone(self.last_error.as_deref()) {
             self.last_error = None;
         }
     }
@@ -134,7 +144,7 @@ impl Instance {
     /// recorded.
     fn explain_error_from_pane(&mut self, session: &tmux::Session) {
         if self.last_error.is_none() {
-            self.last_error = self.refused_restart_error("The terminal ended.");
+            self.last_error = self.refused_restart_error(&ended_sentence(None));
         }
         if self.last_error.is_none() {
             let pane_content = session.capture_pane(20).unwrap_or_default();
@@ -239,7 +249,7 @@ impl Instance {
                     session.name()
                 );
                 self.unknown_since = None;
-                self.latch_missing_pane(TMUX_SESSION_GONE_ERROR, "The tmux session is gone.");
+                self.latch_missing_pane(TMUX_SESSION_GONE_ERROR, TMUX_SESSION_GONE_LEAD);
                 return;
             }
             tmux::SessionExistence::Unknown => {
@@ -641,10 +651,16 @@ impl Instance {
             self.status = status;
             if status == Status::Error {
                 if self.last_error.is_none() {
+                    let diagnostic = detection
+                        .diagnostic
+                        .map(pane_status::summarize_error_diagnostic);
+                    // A pane that ended takes the remedy after what ended it.
+                    let ended = (is_dead || shell_stale)
+                        .then(|| self.refused_restart_error(&ended_sentence(diagnostic.as_deref())))
+                        .flatten();
                     self.last_error = Some(
-                        detection
-                            .diagnostic
-                            .map(pane_status::summarize_error_diagnostic)
+                        ended
+                            .or(diagnostic)
                             .unwrap_or_else(|| summarize_error_from_pane(&pane_content)),
                     );
                 }
@@ -1355,24 +1371,41 @@ Esc to cancel \u{b7} Tab to amend \u{b7} ctrl+e to explain\n\
             inst
         };
 
+        let mut latched = conflicting();
+        let gone = refused(&latched, TMUX_SESSION_GONE_LEAD);
         {
             let _cache = force_session_absent();
-            let inst = conflicting();
-            let gone = refused(&inst, "The tmux session is gone.");
-            for (mut inst, expected) in [
-                (inst, gone.as_str()),
-                (flag_removed(), TMUX_SESSION_GONE_ERROR),
-                (id_cleared(), TMUX_SESSION_GONE_ERROR),
-            ] {
+            latched.update_status_with_metadata_inner(None, None);
+            assert_eq!(latched.last_error.as_deref(), Some(gone.as_str()));
+            for mut inst in [flag_removed(), id_cleared()] {
                 inst.update_status_with_metadata_inner(None, None);
                 assert_eq!(inst.status, Status::Error, "{}", inst.command);
                 assert_eq!(
                     inst.last_error.as_deref(),
-                    Some(expected),
+                    Some(TMUX_SESSION_GONE_ERROR),
                     "{}",
                     inst.command
                 );
             }
+        }
+
+        // Once the last pane is gone the tmux server exits, so a later poll can't reach it. The
+        // gone pane's explanation stays, so `aoe session wait` still sees the Session terminated,
+        // and a switch to the structured view still clears it.
+        {
+            let guard = crate::tmux::SessionCacheGuard::capture();
+            guard.force_unreachable();
+            latched.unknown_since = Some(std::time::Instant::now() - Duration::from_secs(60));
+            latched.update_status_with_metadata_inner(None, None);
+            assert_eq!(latched.last_error.as_deref(), Some(gone.as_str()));
+            assert!(crate::cli::session::is_terminated(
+                latched.status,
+                latched.last_error.as_deref(),
+                false,
+                crate::tmux::SessionExistence::Unknown,
+            ));
+            latched.clear_stale_tmux_error();
+            assert_eq!(latched.last_error, None);
         }
 
         // No tmux server, as after the last pane ended, past the window that waits for one.
@@ -1409,6 +1442,49 @@ Esc to cancel \u{b7} Tab to amend \u{b7} ctrl+e to explain\n\
                 assert_ne!(inst.status, Status::Error);
                 assert_eq!(inst.last_error, None);
             }
+        }
+
+        // What ended the pane leads, then the remedy: the adapter's diagnostic when it saw one.
+        for (diagnostic, sentence) in [
+            (None, "The terminal ended."),
+            (Some("API Error: 401"), "API Error: 401."),
+            (Some("Login expired."), "Login expired."),
+        ] {
+            assert_eq!(ended_sentence(diagnostic), sentence);
+        }
+
+        // Without a hook, a pane that ended goes through detection, which reads its last frame as
+        // Idle, and gets the same explanation.
+        if !tmux_available() {
+            eprintln!("skipping the hookless pane: tmux not available");
+            return;
+        }
+        let home = crate::session::test_support::isolate_app_dir();
+        let frame = home.path().join("idle.txt");
+        std::fs::write(&frame, format!("{}turn over\n", "\n".repeat(150))).expect("write frame");
+        for (mut inst, remedy) in [(conflicting(), true), (flag_removed(), false)] {
+            let name = tmux::Session::generate_name(&inst.id, &inst.title);
+            let _pane = spawn_pane(&name, &format!("cat {}; sleep 300", shell_quote(&frame)));
+            assert!(
+                wait_for_pane(&name, "turn over"),
+                "idle frame never painted"
+            );
+            let guard = crate::tmux::SessionCacheGuard::capture();
+            guard.force_present(&[name.as_str()]);
+            let metadata = tmux::PaneMetadata {
+                pane_dead: true,
+                ..agent_pane_metadata("claude", None)
+            };
+            inst.update_status_with_metadata_inner(Some(&metadata), Some(&name));
+            assert_eq!(inst.status, Status::Error, "{}", inst.command);
+            let ended = refused(&inst, "The terminal ended.");
+            assert_eq!(
+                inst.last_error.as_deref() == Some(ended.as_str()),
+                remedy,
+                "{}: {:?}",
+                inst.command,
+                inst.last_error
+            );
         }
     }
 
