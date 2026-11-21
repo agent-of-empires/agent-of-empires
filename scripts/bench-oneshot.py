@@ -71,7 +71,7 @@ class Bench:
 
     def time_cmd(self, *args):
         start = time.perf_counter()
-        self.aoe_cmd(*args, check=False)
+        self.aoe_cmd(*args)
         return (time.perf_counter() - start) * 1000
 
     def tmux_execs(self):
