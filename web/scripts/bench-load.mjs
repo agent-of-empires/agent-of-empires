@@ -61,7 +61,11 @@ execFileSync(bin, ["add", repo, "-t", "bench", "-c", "sh -c 'echo claude; exec s
   stdio: "pipe",
 });
 
-const median = (a) => [...a].sort((x, y) => x - y)[Math.floor(a.length / 2)];
+const median = (a) => {
+  const v = [...a].sort((x, y) => x - y);
+  const mid = v.length >> 1;
+  return v.length % 2 ? v[mid] : (v[mid - 1] + v[mid]) / 2;
+};
 // Script CPU (ms) from a Chrome trace: main-thread compile + module evaluate, and
 // off-thread streaming parse of every script (workers included).
 const scriptMs = (trace) => {
