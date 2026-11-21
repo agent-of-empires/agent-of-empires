@@ -519,7 +519,7 @@ mod tests {
         pin.runtime.stop_container(&pin.container_id).unwrap();
         assert_eq!(
             std::fs::read_to_string(&calls).unwrap().trim(),
-            "tcp://created:2375 stop c1"
+            "tcp://created:2375 stop -t 0 c1"
         );
     }
 

@@ -4937,7 +4937,7 @@ mod durable_stop_tests {
             let log = std::fs::read_to_string(&calls).unwrap_or_default();
             assert_eq!(
                 log.trim(),
-                if superseded { "" } else { "stop c1" },
+                if superseded { "" } else { "stop -t 0 c1" },
                 "superseded={superseded}"
             );
         }
