@@ -89,7 +89,7 @@ jobs:
         run: |
           set -euo pipefail
           PREVIOUS=$(gh run list --repo "$REPO" --workflow cachix-push.yml --branch main \
-            --status completed --limit 5 --json databaseId,conclusion \
+            --status completed --limit 20 --json databaseId,conclusion \
             --jq "[.[] | select(.databaseId != $RUN_ID and .conclusion != \"cancelled\")][0].conclusion // \"\"")
           # --build-step must match the build step's `name:` above.
           gh api "repos/$REPO/actions/runs/$RUN_ID/jobs" \
