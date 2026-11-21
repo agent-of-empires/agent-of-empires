@@ -40,7 +40,7 @@ test.describe("desktop", () => {
     expect(await page.evaluate(() => !!document.activeElement?.closest('[data-testid="session-wizard"]'))).toBe(true);
   });
 
-  // Opened first, then resized: only a width change can leave it off-screen.
+  // Opened first, then resized: a narrower window closes it, a shorter one keeps it open (re-clamped, see below).
   test("an open popover closes when the window narrows, and stays open when only the height changes", async ({
     page,
   }) => {
