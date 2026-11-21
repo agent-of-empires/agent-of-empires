@@ -447,6 +447,12 @@ impl EmbeddedView {
         }
     }
 
+    /// Toast the view is showing, for the paste handoff's submit assertion.
+    #[cfg(test)]
+    pub(crate) fn toast_text(&self) -> Option<&str> {
+        self.state.toast.as_ref().map(|toast| toast.text.as_str())
+    }
+
     /// Composer content, joined on newlines: test read for the paste-drain
     /// handoff.
     #[cfg(test)]
