@@ -25,17 +25,21 @@ fn ended_sentence(diagnostic: Option<&str>) -> String {
     }
 }
 
-/// Capture by the tick's batched pane id when it has one, else resolve the pane.
+/// Capture the pane a live VT channel holds, else the tick's batched pane id, else resolve it.
 fn capture_for_status(
     session: &tmux::Session,
     metadata: Option<&tmux::PaneMetadata>,
     lines: usize,
 ) -> String {
-    match metadata
-        .map(|m| m.pane_id.as_str())
-        .filter(|id| !id.is_empty())
-    {
-        Some(pane_id) => session.capture_pane_at(pane_id, lines),
+    let known = session
+        .live_channel_pane(&tmux::TmuxCommandDeadline::new())
+        .or_else(|| {
+            metadata
+                .map(|m| m.pane_id.clone())
+                .filter(|id| !id.is_empty())
+        });
+    match known {
+        Some(pane_id) => session.capture_pane_at(&pane_id, lines),
         None => session.capture_pane(lines).unwrap_or_default(),
     }
 }
