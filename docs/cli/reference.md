@@ -2050,7 +2050,9 @@ Restart a wedged worker after its runner and native workers have stopped
 
 ## `aoe acp history`
 
-Print the persisted transcript for an agent session
+Print the persisted transcript for an agent session.
+
+By default prints a readable transcript: streamed agent chunks joined into whole messages, user prompts, and one line per tool call.
 
 **Usage:** `aoe acp history [OPTIONS] <SESSION>`
 
@@ -2064,6 +2066,16 @@ Print the persisted transcript for an agent session
 
   Default value: `0`
 * `--json` — Emit raw frames as JSON (one frame per line)
+* `--last <N>` — Only the last N transcript entries (after `--role` filtering)
+* `--role <ROLE>` — Only entries from these roles (comma-separated)
+
+  Possible values:
+  - `user`
+  - `agent`
+  - `tool`
+  - `notice`:
+    Errors and lifecycle notices
+
 
 
 

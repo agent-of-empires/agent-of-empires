@@ -281,7 +281,7 @@ Every structured-view operation has a matching `aoe acp <verb>` against the same
 
 | Verb | What it does |
 |------|--------------|
-| `aoe acp history <id>` | Dump the persisted transcript |
+| `aoe acp history <id>` | Print the transcript: whole agent messages, user prompts, one line per tool call. `--last N` and `--role user,agent,tool,notice` select entries; `--json` emits raw frames |
 | `aoe acp status <id>` | Print highest/lowest seq and the daemon source |
 | `aoe acp prompt <id> <text>` | Send a prompt (`-` reads stdin) |
 | `aoe acp approve <id> <nonce> [--always\|--deny\|--option <id>]` | Resolve a pending approval |
