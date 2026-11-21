@@ -64,6 +64,7 @@ async function waitForQuiet(page: Page): Promise<void> {
     steady = nodes === last ? steady + 1 : 0;
     last = nodes;
   }
+  if (steady < 6) throw new Error("history render never settled before the measured turn");
 }
 
 async function installProbes(page: Page) {
