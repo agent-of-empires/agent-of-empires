@@ -3721,6 +3721,29 @@
       "notes": "Provider requests remain single-flight across keyed session-view remounts and keep controls locked until settlement. Canonical changes observed during a pending request invalidate its late echo, including a return to the previous provider. Open model menus close when turn or provider locks arrive. Model search filters case-insensitively by display name and provider/model id with whitespace-separated terms. Unit tests cover empty results, pending choices, confirmed values, and reset on reopen; mocked browser tests cover search focus, Arrow/Enter selection without prompt submission, Escape/outside dismissal, and pinned search with scrollable results. Desktop and short viewports center the current model on open, reopen, and search clearing without moving the page or taking search focus. Before searching, Enter preserves the current model and arrows navigate from it; reopening after a switch reveals the newly confirmed model. Keyboard selection from the search field or from a result returns focus to the chip while pointer clicks are left alone, Escape during IME composition cancels the candidate without closing the menu, and an advertised list with no options reads as unavailable rather than as a failed search. Fast mode and Ultracode arrive as model_config selects with exactly on and off choices and render as switches beside the model and effort pickers: a click sends the opposite value, the switch shows the confirmed value and disables while its request is pending, other model_config options and categories render nothing, and a switch disappears when the adapter stops advertising its option (SessionConfigControls.test.tsx). Persistence, respawn and reset re-apply are covered by the Rust integration tests in tests/integration/acp_model_respawn.rs, and the TUI picker and status line by unit tests in src/tui/structured_view."
     },
     {
+      "id": "acp.model-default",
+      "kind": "mocked-playwright",
+      "risk": "medium",
+      "specs": [
+        "tests/acp-model-default.spec.ts",
+        "tests/live/acp-worker-api.spec.ts",
+        "src/components/acp/SessionConfigControls.test.tsx",
+        "src/lib/agentModelDefault.test.ts",
+        "src/components/__tests__/Toasts.test.tsx"
+      ],
+      "components": [
+        "web/src/components/acp/SessionConfigControls.tsx",
+        "web/src/lib/agentModelDefault.ts",
+        "web/src/components/Toasts.tsx",
+        "web/src/lib/toastBus.ts",
+        "web/src/components/acp/Composer.tsx",
+        "web/src/components/acp/StructuredView.tsx",
+        "web/src/components/MobileMainPane.tsx",
+        "web/src/App.tsx"
+      ],
+      "notes": "#5909: the model picker's checkbox makes the picked model the Session Agent's default for new Structured view Sessions in the Session's profile. Unchecked when another model or none is configured; checked and aria-disabled when it is the default; a pin shows a link to Agent defaults instead. The save writes the profile's own acp_defaults back with only this Agent's model changed, so inherited fields stay inherited. A 6 s toast links to Settings > Structured view in the app. Hidden on read-only and CityHall dashboards."
+    },
+    {
       "id": "acp.mode-switch",
       "kind": "live-playwright",
       "risk": "medium",

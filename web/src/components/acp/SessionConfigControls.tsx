@@ -4,6 +4,21 @@ import { ChevronUp } from "lucide-react";
 import { useEffect, useLayoutEffect, useRef, useState, type KeyboardEvent as ReactKeyboardEvent } from "react";
 
 import type { ConfigOptionChoice, ConfigOptionDescriptor, AcpState } from "../../lib/acpTypes";
+import {
+  loadAgentModelDefault,
+  saveAgentModelDefault,
+  type AgentDefaultsTarget,
+  type AgentModelDefault,
+} from "../../lib/agentModelDefault";
+import { REJECTED_ERROR, UNCERTAIN_ERROR } from "../../lib/settingsStore";
+import { toastBus } from "../../lib/toastBus";
+
+/** The Session's Agent and where its default model saves. */
+export interface ModelDefaultTarget extends AgentDefaultsTarget {
+  agent: string;
+  /** How copy names the Agent, such as "Claude Code". */
+  agentLabel: string;
+}
 
 interface Props {
   configOptions: AcpState["configOptions"];
@@ -17,6 +32,8 @@ interface Props {
   onSetProvider?: (provider: string) => void | Promise<void>;
   /** Why the provider cannot change right now, if it cannot. */
   providerLockedReason?: string | null;
+  /** Offers the picked model as the Agent's default; absent where Settings can't be written. */
+  modelDefault?: ModelDefaultTarget | null;
 }
 
 const MODEL_LABEL_MAX = 24;
@@ -77,6 +94,7 @@ export function SessionConfigControls({
   providerPending,
   onSetProvider,
   providerLockedReason,
+  modelDefault,
 }: Props) {
   const model = findByCategory(configOptions, "model");
   const effort = findByCategory(configOptions, "thought_level");
@@ -91,6 +109,7 @@ export function SessionConfigControls({
           option={model}
           pending={pendingConfigOption?.configId === model.id ? pendingConfigOption.value : null}
           onSelect={(value) => onSetConfigOption(model.id, value)}
+          modelDefault={modelDefault}
         />
       )}
       {effort && (
@@ -127,6 +146,7 @@ interface SubProps {
   onSelect: (value: string) => void | Promise<void>;
   /** Disables the trigger and explains why. */
   lockedReason?: string | null;
+  modelDefault?: ModelDefaultTarget | null;
 }
 
 interface MenuLayout {
@@ -157,7 +177,7 @@ function computeMenuLayout(rect: DOMRect, viewportHeight: number, viewportTop = 
   return { direction, maxHeight: Math.max(0, Math.min(MENU_MAX_HEIGHT_CAP, available)) };
 }
 
-function ModelDropdown({ option, pending, onSelect, lockedReason }: SubProps) {
+function ModelDropdown({ option, pending, onSelect, lockedReason, modelDefault }: SubProps) {
   const [open, setOpen] = useState(false);
   if (lockedReason && open) setOpen(false);
   const [query, setQuery] = useState("");
@@ -195,7 +215,9 @@ function ModelDropdown({ option, pending, onSelect, lockedReason }: SubProps) {
       return;
     }
     const items = Array.from(
-      menuRef.current?.querySelectorAll<HTMLButtonElement>('[role="menuitem"]:not(:disabled)') ?? [],
+      menuRef.current?.querySelectorAll<HTMLButtonElement>(
+        '[role="menuitem"]:not(:disabled), [role="menuitemcheckbox"]',
+      ) ?? [],
     );
     const currentIndex = query.trim() ? -1 : items.findIndex((item) => item === currentOptionRef.current);
     if (e.key === "ArrowDown" || e.key === "ArrowUp") {
@@ -361,10 +383,107 @@ function ModelDropdown({ option, pending, onSelect, lockedReason }: SubProps) {
                 </button>
               );
             })}
+            {modelDefault && (
+              <ModelDefaultItem
+                target={modelDefault}
+                option={option}
+                onDone={(keyboard) => {
+                  if (keyboard) triggerRef.current?.focus({ preventScroll: true });
+                  setOpen(false);
+                }}
+              />
+            )}
           </div>
         </div>
       )}
     </div>
+  );
+}
+
+type DefaultState = { status: "loading" } | { status: "ready"; value: AgentModelDefault } | { status: "failed" };
+
+/** Below the models: makes the picked model the Agent's default, or says the default is pinned. */
+function ModelDefaultItem({
+  target,
+  option,
+  onDone,
+}: {
+  target: ModelDefaultTarget;
+  option: ConfigOptionDescriptor;
+  onDone: (keyboard: boolean) => void;
+}) {
+  const { profile, agent, agentLabel, open } = target;
+  const [state, setState] = useState<DefaultState>({ status: "loading" });
+  useEffect(() => {
+    let alive = true;
+    loadAgentModelDefault(profile, agent).then(
+      (value) => alive && setState(value ? { status: "ready", value } : { status: "failed" }),
+      () => alive && setState({ status: "failed" }),
+    );
+    return () => {
+      alive = false;
+    };
+  }, [profile, agent]);
+
+  if (state.status === "failed") return null;
+  const itemClass =
+    "sticky bottom-0 flex w-full items-center gap-2 border-t border-surface-800 bg-surface-850 px-3 py-2 text-left text-[12px]";
+
+  if (state.status === "ready" && state.value.pinned) {
+    return (
+      <button
+        type="button"
+        role="menuitem"
+        onClick={(e) => {
+          onDone(e.detail === 0);
+          open();
+        }}
+        className={`${itemClass} text-text-secondary hover:bg-surface-800 hover:text-text-primary`}
+      >
+        Pinned in Agent defaults ›
+      </button>
+    );
+  }
+
+  const picked = option.current_value;
+  const checked = state.status === "ready" && state.value.model === picked;
+  const inert = checked || state.status === "loading";
+  const save = async () => {
+    const outcome = await saveAgentModelDefault(profile, agent, picked);
+    if (outcome === "committed") {
+      const name = option.options.find((o) => o.value === picked)?.name ?? picked;
+      toastBus.handler?.infoAction(
+        `${name} is now the default for new ${agentLabel} Sessions in Structured view`,
+        "Agent defaults ›",
+        open,
+      );
+    } else {
+      toastBus.handler?.error(outcome === "rejected" ? REJECTED_ERROR : UNCERTAIN_ERROR);
+    }
+  };
+  return (
+    <button
+      type="button"
+      role="menuitemcheckbox"
+      aria-checked={checked}
+      aria-disabled={inert || undefined}
+      onClick={(e) => {
+        if (inert) return;
+        onDone(e.detail === 0);
+        void save();
+      }}
+      className={`${itemClass} ${inert ? "cursor-default text-text-dim" : "text-text-secondary hover:bg-surface-800 hover:text-text-primary"}`}
+    >
+      <span
+        aria-hidden
+        className={`inline-flex h-3.5 w-3.5 shrink-0 items-center justify-center rounded-[3px] border text-[10px] font-bold ${
+          checked ? "border-surface-600 bg-surface-700 text-text-secondary" : "border-text-dim"
+        }`}
+      >
+        {checked ? "✓" : ""}
+      </span>
+      Default for new {agentLabel} Sessions in Structured view
+    </button>
   );
 }
 

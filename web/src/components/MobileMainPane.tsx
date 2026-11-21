@@ -22,6 +22,7 @@ import type { WebSettings } from "../hooks/useWebSettings";
 import type { FileRef } from "../lib/fileRef";
 import type { ServerAbout } from "../lib/api";
 import { autoResumeSettingsHref } from "../lib/autoResumeSettingsHref";
+import { agentDefaultsHref } from "../lib/agentModelDefault";
 
 const StructuredView = lazy(() => import("./acp/StructuredView").then((m) => ({ default: m.StructuredView })));
 
@@ -77,6 +78,8 @@ interface Props {
   onClearSelectedFile: () => void;
   /** Decides whether the usage-limit banner links to Settings. */
   serverAbout: ServerAbout | null;
+  /** Opens a Settings link in the app. */
+  onOpenSettings: (href: string) => void;
 }
 
 function layerClass(active: boolean): string {
@@ -128,6 +131,7 @@ export function MobileMainPane({
   onCloseSendDialog,
   onClearSelectedFile,
   serverAbout,
+  onOpenSettings,
 }: Props) {
   const activePluginPane = isPluginPaneId(view) ? (pluginPanes.find((p) => p.id === view) ?? null) : null;
   const viewLabel =
@@ -174,6 +178,9 @@ export function MobileMainPane({
                     rateLimitAutoResume={session.rate_limit_auto_resume}
                     rateLimitFailoverTo={session.rate_limit_failover_to}
                     settingsHref={autoResumeSettingsHref(session.profile, serverAbout)}
+                    profile={session.profile}
+                    agentDefaultsHref={agentDefaultsHref(session.profile, serverAbout)}
+                    onOpenSettings={onOpenSettings}
                     tool={session.tool}
                     acpAgent={session.acp_agent ?? null}
                     startedBefore={hasStartedBefore(session)}
