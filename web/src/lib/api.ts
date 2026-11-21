@@ -1251,6 +1251,35 @@ export function updateSettings(updates: Record<string, unknown>, profile?: strin
   return announceOutcome(sendSave(`/api/settings${params}`, jsonInit("PATCH", updates)));
 }
 
+/** An Agent's default model for new Structured view Sessions in a profile, as the Daemon resolves it. */
+export interface AgentModelDefault {
+  /** The `acp_defaults` key it reads from: `claude` for a legacy `claude-code` Session. */
+  agent_key: string;
+  /** Null when the Agent picks its own. */
+  model: string | null;
+  pinned: boolean;
+}
+
+const agentModelUrl = (profile: string, agent: string) =>
+  `/api/profiles/${encodeURIComponent(profile)}/acp-defaults/${encodeURIComponent(agent)}/model`;
+
+export function fetchAgentModelDefault(profile: string, agent: string): Promise<AgentModelDefault | null> {
+  return fetchJson<AgentModelDefault>(agentModelUrl(profile, agent));
+}
+
+/** Sets only `agent`'s default model in `profile`. `pinned`: a pin in either layer refused it, so nothing changed. */
+export async function putAgentModelDefault(
+  profile: string,
+  agent: string,
+  model: string,
+): Promise<SaveOutcome | "pinned"> {
+  const reply = await send(agentModelUrl(profile, agent), jsonInit("PUT", { model })).catch(() => null);
+  if (reply?.status === 409 && stringField(reply.payload, "error") === "model_pinned") return "pinned";
+  const outcome = reply ? saveOutcome(reply) : "uncertain";
+  if (outcome !== "rejected") notifySettingsChanged();
+  return outcome;
+}
+
 /** Set the machine-wide value of every field in `updates`, for editors that
  *  set the value a profile inherits. */
 export function updateMachineSettings(updates: Record<string, unknown>): Promise<SaveOutcome> {

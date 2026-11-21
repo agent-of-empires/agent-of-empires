@@ -19,22 +19,32 @@ const model = (current: string) =>
     },
   ]);
 
-/** Serves the profile's resolved and own `acp_defaults`, and records settings saves. */
-async function mockDefaults(page: Page, resolved: Record<string, unknown>, own: Record<string, unknown>) {
-  const saves: Array<{ url: string; body: unknown }> = [];
+const MODEL_URL = "/api/profiles/default/acp-defaults/claude/model";
+
+/** Serves the Agent's default as the Daemon resolves it, and records its saves. `put` answers them. */
+async function mockDefaults(
+  page: Page,
+  current: { model: string | null; pinned: boolean },
+  put: () => { status: number; json: unknown } = () => ({ status: 200, json: {} }),
+) {
+  const saves: unknown[] = [];
+  const patches: string[] = [];
   await page.route(
-    (url) => url.pathname === "/api/settings",
+    (url) => url.pathname === MODEL_URL,
     (r) => {
-      if (r.request().method() !== "PATCH") return r.fulfill({ json: { acp: { acp_defaults: resolved } } });
-      saves.push({ url: r.request().url(), body: r.request().postDataJSON() });
-      return r.fulfill({ json: {} });
+      if (r.request().method() !== "PUT") return r.fulfill({ json: { agent_key: "claude", ...current } });
+      saves.push(r.request().postDataJSON());
+      return r.fulfill(put());
     },
   );
   await page.route(
-    (url) => url.pathname === "/api/profiles/default/settings",
-    (r) => r.fulfill({ json: { acp: { acp_defaults: own } } }),
+    (url) => url.pathname === "/api/settings",
+    (r) => {
+      if (r.request().method() === "PATCH") patches.push(r.request().url());
+      return r.fallback();
+    },
   );
-  return saves;
+  return { saves, patches };
 }
 
 async function openSession(page: Page, current: string, about: Record<string, unknown> = {}) {
@@ -53,11 +63,7 @@ const checkbox = (page: Page) => page.getByRole("menuitemcheckbox", { name: LABE
 test("checking it saves only this Agent's model, and the toast's link opens Agent defaults in the app", async ({
   page,
 }) => {
-  const saves = await mockDefaults(
-    page,
-    { claude: { model: "claude-sonnet-4-6", effort: "high" }, codex: { model: "gpt-5" } },
-    { claude: { mode: "plan" } },
-  );
+  const { saves, patches } = await mockDefaults(page, { model: "claude-sonnet-4-6", pinned: false });
   await openSession(page, "claude-opus-4-7");
   await expect(checkbox(page)).toHaveAttribute("aria-checked", "false");
   await checkbox(page).click();
@@ -65,13 +71,9 @@ test("checking it saves only this Agent's model, and the toast's link opens Agen
   await expect(
     page.getByText("Claude Opus 4.7 is now the default for new Claude Code Sessions in Structured view"),
   ).toBeVisible();
-  // The profile's own entries go back with one field changed; global's effort and codex stay inherited.
-  expect(saves).toEqual([
-    {
-      url: expect.stringContaining("/api/settings?profile=default"),
-      body: { acp: { acp_defaults: { claude: { mode: "plan", model: "claude-opus-4-7" } } } },
-    },
-  ]);
+  // Only the model goes to the Daemon, which writes it into this Agent's entry alone.
+  expect(saves).toEqual([{ model: "claude-opus-4-7" }]);
+  expect(patches).toEqual([]);
 
   await page.evaluate(() => ((window as unknown as { sameDocument: boolean }).sameDocument = true));
   await page.getByRole("button", { name: "Agent defaults ›" }).click();
@@ -80,7 +82,7 @@ test("checking it saves only this Agent's model, and the toast's link opens Agen
 });
 
 test("the default is checked and can't be unchecked here", async ({ page }) => {
-  const saves = await mockDefaults(page, { claude: { model: "claude-opus-4-7" } }, {});
+  const { saves } = await mockDefaults(page, { model: "claude-opus-4-7", pinned: false });
   await openSession(page, "claude-opus-4-7");
   await expect(checkbox(page)).toHaveAttribute("aria-checked", "true");
   await expect(checkbox(page)).toHaveAttribute("aria-disabled", "true");
@@ -91,7 +93,7 @@ test("the default is checked and can't be unchecked here", async ({ page }) => {
 });
 
 test("a pinned model shows a link to Agent defaults instead", async ({ page }) => {
-  await mockDefaults(page, { claude: { model: "claude-opus-4-7", pin_model: true } }, {});
+  await mockDefaults(page, { model: "claude-opus-4-7", pinned: true });
   await openSession(page, "claude-sonnet-4-6");
   await expect(page.getByRole("menuitem", { name: "Pinned in Agent defaults ›" })).toBeVisible();
   await expect(checkbox(page)).toHaveCount(0);
@@ -99,8 +101,21 @@ test("a pinned model shows a link to Agent defaults instead", async ({ page }) =
   await expect(page).toHaveURL(/\/settings\/structured-view\?profile=default&field=acp\.acp_defaults$/);
 });
 
+test("a pin added after the picker opened refuses the save and says so", async ({ page }) => {
+  const { saves, patches } = await mockDefaults(page, { model: null, pinned: false }, () => ({
+    status: 409,
+    json: { error: "model_pinned", message: "Claude Code's model is pinned in Agent defaults; change it there." },
+  }));
+  await openSession(page, "claude-opus-4-7");
+  await checkbox(page).click();
+  await expect(page.getByText("Claude Code's model is pinned in Agent defaults. Nothing was changed.")).toBeVisible();
+  expect(saves).toEqual([{ model: "claude-opus-4-7" }]);
+  expect(patches).toEqual([]);
+  await expect(page.getByText(/is now the default for new/)).toHaveCount(0);
+});
+
 test("the keyboard reaches and checks it", async ({ page }) => {
-  const saves = await mockDefaults(page, {}, {});
+  const { saves } = await mockDefaults(page, { model: null, pinned: false });
   await openSession(page, "claude-opus-4-7");
   // Loaded, not the default: neither checked nor disabled.
   await expect(checkbox(page)).not.toHaveAttribute("aria-disabled", "true");
@@ -112,7 +127,7 @@ test("the keyboard reaches and checks it", async ({ page }) => {
 });
 
 test("CityHall dashboards don't offer it", async ({ page }) => {
-  await mockDefaults(page, {}, {});
+  await mockDefaults(page, { model: null, pinned: false });
   await openSession(page, "claude-opus-4-7", { cityhall_mode: true });
   await expect(page.getByRole("menuitem", { name: /Claude Sonnet 4.6/ })).toBeVisible();
   await expect(checkbox(page)).toHaveCount(0);
@@ -122,7 +137,7 @@ test.describe("phone", () => {
   test.use({ viewport: { width: 375, height: 812 }, hasTouch: true, isMobile: true });
 
   test("the menu and the toast fit without sideways scroll", async ({ page }) => {
-    await mockDefaults(page, {}, {});
+    await mockDefaults(page, { model: null, pinned: false });
     await openSession(page, "claude-opus-4-7");
     await expect(checkbox(page)).toBeInViewport({ ratio: 1 });
     await checkbox(page).tap();

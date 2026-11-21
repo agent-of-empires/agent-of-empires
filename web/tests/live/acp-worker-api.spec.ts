@@ -172,6 +172,31 @@ test.describe("config options", () => {
     await picker.click();
     await expect(box).toHaveAttribute("aria-checked", "true");
   });
+
+  test("a pin saved after the picker opened refuses the checkbox's save", async ({ spawnServe, page }) => {
+    const { serve, sessionId } = await start(spawnServe, "config-pickers-pinned");
+    const profile = (await listSessions(serve.baseUrl)).find((s) => s.id === sessionId)!.profile as string;
+    const own = `/api/profiles/${encodeURIComponent(profile)}/settings`;
+    await openSession(page, serve, sessionId);
+    await waitForStructuredView(page);
+    const picker = page.getByTestId("config-option-model");
+    await expect(picker).toContainText("Claude Opus 4.7");
+    await picker.click();
+    const box = page.getByRole("menuitemcheckbox", { name: "Default for new Claude Code Sessions in Structured view" });
+    await expect(box).toHaveAttribute("aria-checked", "false");
+    // Settings, in another tab, pins the Agent while this menu is open.
+    const pin = { claude: { model: "claude-sonnet-4-6", pin_model: true } };
+    expect2xx(
+      await fetch(`${serve.baseUrl}/api/settings?profile=${encodeURIComponent(profile)}`, {
+        method: "PATCH",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ acp: { acp_defaults: pin } }),
+      }),
+    );
+    await box.click();
+    await expect(page.getByText("Claude Code's model is pinned in Agent defaults. Nothing was changed.")).toBeVisible();
+    expect((await (await fetch(`${serve.baseUrl}${own}`)).json()).acp.acp_defaults).toEqual(pin);
+  });
 });
 
 // #1449: the runner stderr drain, readable without host terminal access.

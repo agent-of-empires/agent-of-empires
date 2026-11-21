@@ -463,6 +463,13 @@ function ModelDefaultItem({
         "Agent defaults ›",
         open,
       );
+    } else if (outcome === "pinned") {
+      // Pinned since the menu opened; the next open shows the pinned link.
+      toastBus.handler?.action(
+        `${agentLabel}'s model is pinned in Agent defaults. Nothing was changed.`,
+        "Agent defaults ›",
+        open,
+      );
     } else {
       toastBus.handler?.error(outcome === "rejected" ? REJECTED_ERROR : UNCERTAIN_ERROR);
     }

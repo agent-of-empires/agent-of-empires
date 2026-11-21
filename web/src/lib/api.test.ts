@@ -763,6 +763,37 @@ describe("settings saves", () => {
     expect(await api.updateSettings({ a: 1 })).toBe("rejected");
   });
 
+  it("reads one Agent's default model from the Daemon, and gives null when it can't", async () => {
+    const reply = { agent_key: "claude", model: "opus", pinned: false };
+    fetchSpy.mockResolvedValueOnce(json(reply)).mockResolvedValueOnce(json({ error: "not_found" }, 404));
+    expect(await api.fetchAgentModelDefault("my work", "claude-code")).toEqual(reply);
+    expect(fetchSpy.mock.calls[0][0]).toBe("/api/profiles/my%20work/acp-defaults/claude-code/model");
+    expect(await api.fetchAgentModelDefault("my work", "claude-code")).toBeNull();
+  });
+
+  it.each([
+    ["a saved model", () => json({ agent_key: "claude", model: "opus", pinned: false }), "committed", true],
+    ["a pin", () => json({ error: "model_pinned", message: "" }, 409), "pinned", false],
+    ["another conflict", () => json({ error: "read_only", message: "" }, 409), "rejected", false],
+    ["an unknown Agent", () => json({ error: "unknown_agent", message: "" }, 400), "rejected", false],
+    ["a server error", () => json({ error: "internal", message: "" }, 500), "uncertain", true],
+    ["no reply", () => Promise.reject(new Error("offline")), "uncertain", true],
+  ])("PUTs only the model, and maps %s", async (_name, reply, outcome, announced) => {
+    const listener = vi.fn();
+    const off = onSettingsChanged(listener);
+    try {
+      fetchSpy.mockImplementationOnce(async () => reply());
+      expect(await api.putAgentModelDefault("work", "claude", "opus")).toBe(outcome);
+      const [url, init] = fetchSpy.mock.calls[0];
+      expect(url).toBe("/api/profiles/work/acp-defaults/claude/model");
+      expect(init?.method).toBe("PUT");
+      expect(JSON.parse(String(init?.body))).toEqual({ model: "opus" });
+      expect(listener).toHaveBeenCalledTimes(announced ? 1 : 0);
+    } finally {
+      off();
+    }
+  });
+
   it("setDefaultProfile announces a landed save and stays quiet on a rejected one", async () => {
     const listener = vi.fn();
     const off = onSettingsChanged(listener);

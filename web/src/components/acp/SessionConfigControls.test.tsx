@@ -403,7 +403,7 @@ describe("model default", () => {
   const open = vi.fn();
   const target: ModelDefaultTarget = { profile: "work", agent: "claude", agentLabel: "Claude Code", open };
   const LABEL = "Default for new Claude Code Sessions in Structured view";
-  const toasts = { infoAction: vi.fn(), error: vi.fn() };
+  const toasts = { infoAction: vi.fn(), error: vi.fn(), action: vi.fn() };
   let resolveLoad: (value: unknown) => void = () => {};
 
   async function mountWithDefault(loaded: unknown, extra: Partial<Parameters<typeof SessionConfigControls>[0]> = {}) {
@@ -497,6 +497,24 @@ describe("model default", () => {
     fireEvent.click(item()!);
     await waitFor(() => expect(toasts.error).toHaveBeenCalledWith(message));
     expect(toasts.infoAction).not.toHaveBeenCalled();
+  });
+
+  it("says a pin added since the menu opened refused the save, and shows the pinned link next time", async () => {
+    defaults.saveAgentModelDefault.mockResolvedValue("pinned");
+    await mountWithDefault({ model: null, pinned: false });
+    fireEvent.click(item()!);
+    await waitFor(() =>
+      expect(toasts.action).toHaveBeenCalledWith(
+        "Claude Code's model is pinned in Agent defaults. Nothing was changed.",
+        "Agent defaults ›",
+        open,
+      ),
+    );
+    expect(toasts.infoAction).not.toHaveBeenCalled();
+    expect(toasts.error).not.toHaveBeenCalled();
+    defaults.loadAgentModelDefault.mockResolvedValue({ model: "claude-sonnet-4-6", pinned: true });
+    fireEvent.click(byId("model")!);
+    expect(await screen.findByRole("menuitem", { name: "Pinned in Agent defaults ›" })).toBeTruthy();
   });
 
   it("shows a pinned default as a link to Agent defaults instead of the checkbox", async () => {
