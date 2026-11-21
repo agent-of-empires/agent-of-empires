@@ -88,9 +88,10 @@ jobs:
           RUN_ID: ${{ github.run_id }}
         run: |
           set -euo pipefail
+          # No earlier non-cancelled push run in the window is inconclusive: alert.
           PREVIOUS=$(gh run list --repo "$REPO" --workflow cachix-push.yml --branch main --event push \
-            --status completed --limit 20 --json databaseId,conclusion \
-            --jq "[.[] | select(.databaseId < $RUN_ID and .conclusion != \"cancelled\")][0].conclusion // \"\"")
+            --status completed --limit 100 --json databaseId,conclusion \
+            --jq "[.[] | select(.databaseId < $RUN_ID and .conclusion != \"cancelled\")][0].conclusion // \"failure\"")
           # --build-step must match the build step's `name:` above.
           gh api "repos/$REPO/actions/runs/$RUN_ID/jobs" \
             | python3 .github/scripts/classify-cachix-failure.py \
