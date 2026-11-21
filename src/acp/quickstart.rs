@@ -65,9 +65,8 @@ impl Detection {
         } else {
             None
         };
-        let bundled_installed = app_dir.is_some_and(|app_dir| {
-            crate::acp::adapters::installation_is_current(app_dir, BUNDLED_AGENT)
-        });
+        let bundled_installed = app_dir
+            .is_some_and(|app_dir| crate::acp::adapters::runtime_is_ready(app_dir, BUNDLED_AGENT));
         Self {
             present_agents,
             bundled_installed,
@@ -84,6 +83,12 @@ impl Detection {
 
 fn non_empty(env: &dyn Fn(&str) -> Option<String>, name: &str) -> bool {
     env(name).is_some_and(|value| !value.trim().is_empty())
+}
+
+/// Whether the bundled agent can start a turn here, by the rule launch applies:
+/// the adapter is installed and its Node runtime can run the sources.
+pub fn bundled_ready(app_dir: Option<&Path>) -> bool {
+    app_dir.is_some_and(|app_dir| crate::acp::adapters::runtime_is_ready(app_dir, BUNDLED_AGENT))
 }
 
 /// What the quickstart will do, once detection is folded in with the user's
@@ -167,12 +172,14 @@ impl Changes {
     }
 }
 
-/// Settings to write for `plan`. A value the user already set (anything but the
-/// built-in default) is left alone, so re-running changes nothing.
+/// Settings to write for `plan`. Only a value that is still the built-in
+/// default is written, so a user-set value and a concurrent write are both left
+/// alone.
 pub fn changes(config: &AcpConfig, plan: &Plan) -> Changes {
     let configured = config.default_agent.trim();
+    let still_default = configured.is_empty() || configured == DEFAULT_ACP_AGENT;
     Changes {
-        default_agent: (configured != plan.agent).then(|| plan.agent.clone()),
+        default_agent: (still_default && configured != plan.agent).then(|| plan.agent.clone()),
         structured_view: config.structured_view == StructuredView::Auto,
     }
 }
@@ -299,6 +306,18 @@ mod tests {
             let chosen = config(DEFAULT_ACP_AGENT, view);
             assert!(!changes(&chosen, &plan).structured_view, "{view:?}");
         }
+    }
+
+    #[test]
+    fn a_default_written_after_planning_is_not_replaced() {
+        let plan = plan(
+            &detection(&[], false, false),
+            &config(DEFAULT_ACP_AGENT, StructuredView::Auto),
+            true,
+        );
+        // Another writer set a default while the install ran: the plan is stale.
+        let raced = config("codex", StructuredView::Auto);
+        assert_eq!(changes(&raced, &plan).default_agent, None);
     }
 
     #[test]

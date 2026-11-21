@@ -10,14 +10,15 @@ use anyhow::{bail, Result};
 use clap::Args;
 
 use crate::acp::quickstart::{
-    self, Detection, OTARI_QUICKSTART_URL, OTARI_SIGNUP_URL, OTARI_SUPPORT_URL,
+    self, Detection, GatewayCredential, OTARI_QUICKSTART_URL, OTARI_SIGNUP_URL, OTARI_SUPPORT_URL,
 };
 use crate::session::config::{StructuredView, DEFAULT_ACP_AGENT};
 
 #[derive(Args)]
 pub struct SetupArgs {
     /// Never prompt. The bundled adapter is installed only with
-    /// `--install-adapter`; otherwise the command that installs it is printed.
+    /// `--install-adapter` or an `acp.allow_agent_install` already set;
+    /// otherwise the command that installs it is printed.
     #[arg(long)]
     quick: bool,
     /// Consent to installing the bundled `aoe-agent` adapter into the data dir
@@ -25,7 +26,9 @@ pub struct SetupArgs {
     #[arg(long)]
     install_adapter: bool,
     /// Default to this agent, which must already be on the machine, instead of
-    /// the bundled one. Reuses the CLI you already have and its login.
+    /// the bundled one. Reuses the CLI you already have and its login. A rerun
+    /// without this flag keeps the default it finds; passing it changes that
+    /// default.
     #[arg(long, value_name = "AGENT")]
     agent: Option<String>,
 }
@@ -88,6 +91,9 @@ pub async fn run(args: SetupArgs) -> Result<()> {
     let mut adapter_ready = !plan.bundled || detection.bundled_installed;
     if let (Some(binary), Some(app_dir)) = (plan.install, app_dir.as_deref()) {
         adapter_ready = crate::cli::acp::install_adapters(app_dir, &[binary]).await;
+        // An install can still leave the runtime short, and the success line
+        // has to match what launch would do.
+        adapter_ready &= quickstart::bundled_ready(Some(app_dir));
     }
 
     let mut written: Vec<(&'static str, String, &'static str)> = Vec::new();
@@ -102,16 +108,25 @@ pub async fn run(args: SetupArgs) -> Result<()> {
             written.push(("acp.structured_view", "structured".to_string(), "auto"));
         }
     });
-    if let Err(e) = result {
-        println!("Could not write the configuration: {e}");
-    } else if written.is_empty() {
-        println!("Configuration already set; nothing to change.");
-    } else {
-        println!();
-        println!("Configured in {}:", crate::session::config_path_display());
-        for (key, value, undo) in &written {
-            println!("  {key} = \"{value}\"");
-            println!("    undo: set {key} = \"{undo}\" in that file");
+    let write_error = match result {
+        Ok(()) => None,
+        Err(e) => {
+            println!("Could not write the configuration: {e}");
+            Some(e)
+        }
+    };
+    // Recovery guidance still prints below; a failed write is returned at the
+    // end so a script cannot read the run as configured.
+    if write_error.is_none() {
+        if written.is_empty() {
+            println!("Configuration already set; nothing to change.");
+        } else {
+            println!();
+            println!("Configured in {}:", crate::session::config_path_display());
+            for (key, value, undo) in &written {
+                println!("  {key} = \"{value}\"");
+                println!("    undo: set {key} = \"{undo}\" in that file");
+            }
         }
     }
 
@@ -132,22 +147,34 @@ pub async fn run(args: SetupArgs) -> Result<()> {
     }
 
     println!();
-    if otari {
-        // The model is pinned per session: the Daemon forwards only allowlisted
-        // provider variables, so an exported AOE_AGENT_MODEL would be dropped.
+    // The bundled agent's default model routes straight to Anthropic, so its
+    // session line always pins a gateway model id. The id is pinned per
+    // session: the Daemon forwards only allowlisted provider variables, so an
+    // exported AOE_AGENT_MODEL would be dropped.
+    let own_gateway =
+        plan.bundled && detection.gateway_credential == Some(GatewayCredential::Gateway) && !otari;
+    if plan.bundled && otari {
         println!("Once the key is exported, start a session on an Otari model:");
-        println!(
-            "  aoe add . --agent {} --structured-view --model {}",
-            plan.agent,
-            quickstart::OTARI_MODEL_EXAMPLE
-        );
+    } else if plan.bundled && own_gateway {
+        println!("Start a session, pinning a model id your gateway serves:");
+    } else if plan.bundled {
+        println!("Start a session on an Otari model:");
     } else if !adapter_ready {
         println!("Once the adapter is installed:");
     } else {
         println!("Start a structured session:");
     }
-    if !otari {
-        println!("  aoe add . --agent {} --structured-view", plan.agent);
+    match (plan.bundled, own_gateway) {
+        (false, _) => println!("  aoe add . --agent {} --structured-view", plan.agent),
+        (true, true) => println!(
+            "  aoe add . --agent {} --structured-view --model openai-compatible:<vendor>/<model>",
+            plan.agent
+        ),
+        (true, false) => println!(
+            "  aoe add . --agent {} --structured-view --model {}",
+            plan.agent,
+            quickstart::OTARI_MODEL_EXAMPLE
+        ),
     }
 
     if !plan.alternatives.is_empty() {
@@ -158,7 +185,11 @@ pub async fn run(args: SetupArgs) -> Result<()> {
             plan.alternatives.join(", ")
         );
     }
-    Ok(())
+
+    match write_error {
+        Some(e) => Err(e),
+        None => Ok(()),
+    }
 }
 
 /// Ask before an install. A non-tty caller (CI, a piped run) never installs
@@ -190,7 +221,7 @@ fn print_otari_guidance() {
     println!("       {OTARI_SIGNUP_URL}");
     println!("  2. Create an API key in the dashboard.");
     println!("  3. Export it where the daemon runs, then re-run setup:");
-    println!("       export OTARI_API_KEY=<your key>");
+    println!("       export OTARI_API_KEY=\"paste-the-key-here\"");
     println!("  Docs: {OTARI_QUICKSTART_URL}");
     println!("  Support: Mozilla AI Discord {OTARI_SUPPORT_URL}");
 }

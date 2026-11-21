@@ -169,6 +169,23 @@ fn sha256_hex(bytes: &[u8]) -> String {
     out
 }
 
+/// Whether `binary` can start a turn here: installed and current, and its Node
+/// runtime can run in-tree sources. The readiness rule `aoe setup` and the
+/// wizard report is this one, so neither can call an adapter ready that launch
+/// would refuse.
+pub fn runtime_is_ready(app_dir: &Path, binary: &str) -> bool {
+    if !installation_is_current(app_dir, binary) {
+        return false;
+    }
+    if !ships_sources(binary) {
+        return true;
+    }
+    match crate::acp::node::resolve_for("", app_dir, true) {
+        Ok(node) => crate::acp::node::supports_strip_types(&node.version),
+        Err(_) => false,
+    }
+}
+
 /// The Node an in-tree adapter would launch with, when it cannot run the
 /// adapter's sources: the version string, for the refusal message.
 pub fn runtime_too_old_for(app_dir: &Path, binary: &str) -> Option<String> {

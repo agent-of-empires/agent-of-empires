@@ -283,9 +283,9 @@ Configure the default Structured view in one run: the bundled aoe-agent adapter,
 
 ###### **Options:**
 
-* `--quick` — Never prompt. The bundled adapter is installed only with `--install-adapter`; otherwise the command that installs it is printed
+* `--quick` — Never prompt. The bundled adapter is installed only with `--install-adapter` or an `acp.allow_agent_install` already set; otherwise the command that installs it is printed
 * `--install-adapter` — Consent to installing the bundled `aoe-agent` adapter into the data dir (no global npm install, no sudo)
-* `--agent <AGENT>` — Default to this agent, which must already be on the machine, instead of the bundled one. Reuses the CLI you already have and its login
+* `--agent <AGENT>` — Default to this agent, which must already be on the machine, instead of the bundled one. Reuses the CLI you already have and its login. A rerun without this flag keeps the default it finds; passing it changes that default
 
 
 

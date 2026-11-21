@@ -128,6 +128,21 @@ pub struct IntroDialog {
 
 impl IntroDialog {
     pub fn new(original_theme: impl Into<String>) -> Self {
+        let config = crate::session::config::Config::load_or_warn();
+        Self::with_detection(
+            original_theme,
+            &config.acp,
+            &quickstart::Detection::detect_env(),
+        )
+    }
+
+    /// The wizard for an explicit configuration and detection, so tests never
+    /// depend on the host's config or installed agents.
+    fn with_detection(
+        original_theme: impl Into<String>,
+        acp: &crate::session::config::AcpConfig,
+        detection: &quickstart::Detection,
+    ) -> Self {
         let original_theme = original_theme.into();
         let themes = available_themes();
         let theme_cursor = themes
@@ -137,8 +152,7 @@ impl IntroDialog {
         // The default agent comes from the shared planner, so this wizard and
         // `aoe setup` cannot disagree. Installing the adapter needs consent the
         // wizard cannot ask for here, so the page names the command instead.
-        let config = crate::session::config::Config::load_or_warn();
-        let plan = quickstart::plan(&quickstart::Detection::detect_env(), &config.acp, false);
+        let plan = quickstart::plan(detection, acp, false);
         let mut agent_options = vec![quickstart::BUNDLED_AGENT.to_string()];
         agent_options.extend(
             plan.alternatives
@@ -884,6 +898,32 @@ impl IntroDialog {
         frame.render_widget(hint, layout[4]);
     }
 
+    /// What the selected agent needs. Derived from the row under the cursor, so
+    /// moving away from the planner's choice stops describing it.
+    fn structured_guidance(&self) -> Vec<String> {
+        let selected = self.agent_options.get(self.agent_cursor);
+        let selected_bundled = selected.is_some_and(|agent| agent == quickstart::BUNDLED_AGENT);
+        let mut guidance = Vec::new();
+        if selected_bundled && self.plan.needs_gateway_key {
+            guidance.push(format!(
+                "The bundled agent needs an Otari key: {}.",
+                quickstart::OTARI_SIGNUP_URL
+            ));
+        }
+        if selected_bundled && !self.plan.bundled_installed {
+            guidance.push(format!(
+                "Its adapter installs into the aoe data dir: aoe acp doctor --fix --adapter {}",
+                quickstart::BUNDLED_AGENT
+            ));
+        }
+        if selected == Some(&self.plan.agent) {
+            if let Some(reason) = self.plan.fallback {
+                guidance.push(format!("Bundled default unavailable: {reason}."));
+            }
+        }
+        guidance
+    }
+
     /// The Structured view default: the bundled agent, or an agent already on
     /// this machine, both decided by the shared planner.
     fn render_structured_default(&mut self, frame: &mut Frame, area: Rect, theme: &Theme) {
@@ -922,28 +962,13 @@ impl IntroDialog {
                 style,
             )));
         }
-        if self.plan.needs_gateway_key {
+        let guidance = self.structured_guidance();
+        if !guidance.is_empty() {
             lines.push(Line::from(""));
-            lines.push(Line::from(Span::styled(
-                format!(
-                    "The bundled agent needs an Otari key: {}.",
-                    quickstart::OTARI_SIGNUP_URL
-                ),
-                Style::default().fg(theme.dimmed),
-            )));
         }
-        if self.plan.bundled && !self.plan.bundled_installed {
+        for line in guidance {
             lines.push(Line::from(Span::styled(
-                format!(
-                    "Its adapter installs into the aoe data dir: aoe acp doctor --fix --adapter {}",
-                    quickstart::BUNDLED_AGENT
-                ),
-                Style::default().fg(theme.dimmed),
-            )));
-        }
-        if let Some(reason) = self.plan.fallback {
-            lines.push(Line::from(Span::styled(
-                format!("Bundled default unavailable: {reason}."),
+                line,
                 Style::default().fg(theme.dimmed),
             )));
         }
@@ -1212,9 +1237,40 @@ mod tests {
         Page::Done,
     ];
 
+    /// An unconfigured machine whose bundled adapter is ready, so every
+    /// assertion here is independent of the host.
+    fn fresh() -> IntroDialog {
+        IntroDialog::with_detection(
+            "zinc",
+            &crate::session::config::AcpConfig::default(),
+            &quickstart::Detection {
+                present_agents: vec![quickstart::BUNDLED_AGENT.to_string()],
+                bundled_installed: true,
+                gateway_credential: Some(quickstart::GatewayCredential::Otari),
+            },
+        )
+    }
+
+    /// A machine where only `claude` resolves and the bundled adapter is
+    /// missing, so the planner falls back to it.
+    fn fallback_to_claude() -> IntroDialog {
+        IntroDialog::with_detection(
+            "zinc",
+            &crate::session::config::AcpConfig::default(),
+            &quickstart::Detection {
+                present_agents: vec!["claude".to_string()],
+                bundled_installed: false,
+                gateway_credential: None,
+            },
+        )
+    }
+
     /// A dialog parked on `page`, having walked there with Enter.
     fn on_page(page: Page) -> IntroDialog {
-        let mut dialog = IntroDialog::new("zinc");
+        park(fresh(), page)
+    }
+
+    fn park(mut dialog: IntroDialog, page: Page) -> IntroDialog {
         let steps = PAGES.iter().position(|p| *p == page).expect("known page");
         for _ in 0..steps {
             assert!(matches!(
@@ -1224,6 +1280,58 @@ mod tests {
         }
         assert_eq!(dialog.current_page(), page);
         dialog
+    }
+
+    #[test]
+    fn the_structured_page_guides_the_selected_agent() {
+        // Only `claude` resolves, so the planner falls back to it and the page
+        // explains that while its row is selected.
+        let mut dialog = park(fallback_to_claude(), Page::StructuredDefault);
+        assert_eq!(dialog.agent_options, vec!["aoe-agent", "claude"]);
+        assert_eq!(dialog.agent_cursor, 1);
+        let guidance = dialog.structured_guidance();
+        assert!(guidance
+            .iter()
+            .any(|line| line.contains("Bundled default unavailable")));
+        assert!(!guidance.iter().any(|line| line.contains("doctor --fix")));
+
+        // Moving to the missing bundled agent names its install, and the
+        // fallback explanation stops applying.
+        dialog.handle_key(key(KeyCode::Up));
+        assert_eq!(dialog.agent_cursor, 0);
+        let guidance = dialog.structured_guidance();
+        assert!(guidance
+            .iter()
+            .any(|line| line.contains("doctor --fix --adapter aoe-agent")));
+        assert!(guidance.iter().any(|line| line.contains("Otari key")));
+        assert!(!guidance
+            .iter()
+            .any(|line| line.contains("Bundled default unavailable")));
+    }
+
+    #[test]
+    fn a_configured_default_is_preselected_and_kept() {
+        let acp = crate::session::config::AcpConfig {
+            default_agent: "codex".to_string(),
+            ..Default::default()
+        };
+        let mut dialog = park(
+            IntroDialog::with_detection(
+                "zinc",
+                &acp,
+                &quickstart::Detection {
+                    present_agents: vec!["aoe-agent".to_string(), "codex".to_string()],
+                    bundled_installed: true,
+                    gateway_credential: Some(quickstart::GatewayCredential::Otari),
+                },
+            ),
+            Page::StructuredDefault,
+        );
+        assert_eq!(dialog.agent_options, vec!["aoe-agent", "codex"]);
+        assert_eq!(dialog.agent_cursor, 1, "the configured default is selected");
+
+        let _ = dialog.handle_key(key(KeyCode::Enter));
+        assert_eq!(dialog.outcome().acp_default_agent.as_deref(), Some("codex"));
     }
 
     fn row_rect() -> Rect {
@@ -1237,7 +1345,7 @@ mod tests {
 
     #[test]
     fn enter_walks_every_page_and_marks_the_ones_it_visits() {
-        let mut dialog = IntroDialog::new("zinc");
+        let mut dialog = fresh();
         assert_eq!(dialog.page_idx, 0);
         for page in &PAGES[1..] {
             assert!(matches!(
@@ -1264,7 +1372,7 @@ mod tests {
 
         // Esc skips out without submitting.
         assert!(matches!(
-            IntroDialog::new("zinc").handle_key(key(KeyCode::Esc)),
+            fresh().handle_key(key(KeyCode::Esc)),
             DialogResult::Cancel
         ));
     }
@@ -1290,7 +1398,7 @@ mod tests {
     #[test]
     fn the_outcome_reports_only_the_choices_the_user_reached() {
         // Skipping on the first page reaches no choice at all.
-        let mut skipped = IntroDialog::new("zinc");
+        let mut skipped = fresh();
         let _ = skipped.handle_key(key(KeyCode::Esc));
         let outcome = skipped.outcome();
         assert!(outcome.final_theme.is_none());
@@ -1304,7 +1412,7 @@ mod tests {
         // leaving its default is an explicit decline, LiveSend is the
         // wizard's attach default, and the Structured view page leaves the
         // planner's default agent selected.
-        let mut untouched = IntroDialog::new("zinc");
+        let mut untouched = fresh();
         for _ in 0..7 {
             let _ = untouched.handle_key(key(KeyCode::Enter));
         }
@@ -1362,7 +1470,7 @@ mod tests {
     fn welcome_links_click_only_while_they_render_unwrapped() {
         use crate::tui::dialogs::test_render::{draw, find};
         let url = WELCOME_LINKS[0].1;
-        let mut dialog = IntroDialog::new("zinc");
+        let mut dialog = fresh();
         let buf = draw(100, 30, |f, theme| dialog.render(f, f.area(), theme));
         find(&buf, "Click a link above");
         let (x, y) = find(&buf, url);
@@ -1374,7 +1482,7 @@ mod tests {
         assert_eq!(dialog.take_pending_link(), Some(url));
 
         // Too narrow: the links wrap, so they are neither targets nor advertised.
-        let mut dialog = IntroDialog::new("zinc");
+        let mut dialog = fresh();
         let buf = draw(50, 40, |f, theme| dialog.render(f, f.area(), theme));
         assert!(dialog.link_areas.is_empty());
         let text: String = buf.content().iter().map(|c| c.symbol()).collect();
@@ -1384,7 +1492,7 @@ mod tests {
     #[test]
     fn hover_tracks_the_current_page_s_rows_and_clears_when_it_changes() {
         // Rects the render pass would normally populate.
-        let mut dialog = IntroDialog::new("zinc");
+        let mut dialog = fresh();
         dialog.attach_mode_areas[1] = Rect {
             x: 5,
             y: 5,
@@ -1403,7 +1511,7 @@ mod tests {
 
         // A theme row's rect is ignored off the theme page, so a stale rect
         // cannot paint a highlight over whatever now occupies those cells.
-        let mut dialog = IntroDialog::new("zinc");
+        let mut dialog = fresh();
         dialog.theme_row_areas = vec![row_rect(); dialog.themes.len()];
         assert!(!dialog.handle_hover(5, 0));
         assert_eq!(dialog.hovered_theme_row, None);

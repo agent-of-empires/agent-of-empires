@@ -12,30 +12,36 @@ aoe setup
 create a session:
 
 ```bash
-aoe add . --agent aoe-agent --structured-view
+aoe add . --agent aoe-agent --structured-view \
+  --model openai-compatible:anthropic/claude-fable-5
 ```
+
+The model id is what routes the turn through Otari; without one the adapter falls back to
+its Anthropic default. [Choosing the model](#choosing-the-model) has the other forms.
 
 ## What `aoe setup` does
 
 | Step | Effect |
 |------|--------|
 | Detect | Reads what `aoe agents` and `aoe acp doctor` already report: which agents resolve on this machine, and whether the bundled adapter is installed. |
-| Default the agent | Writes `acp.default_agent = "aoe-agent"`, the one adapter AoE ships and maintains. Any value you already set is kept. |
+| Default the agent | Writes `acp.default_agent = "aoe-agent"`, the one adapter AoE ships and maintains, while the value is still the built-in `claude-code`. A value you already set is kept, and `--agent` is how you change it. |
 | Default the view | Writes `acp.structured_view = "structured"` while it is still `auto`. `terminal` and `off` are left alone. |
 | Install the adapter | Offers the bundled `aoe-agent` adapter with consent. It installs into the data dir with bundled Node's npm, exactly as `aoe acp doctor --fix --adapter aoe-agent` does. |
 | Otari guidance | With no gateway credential present, prints the account steps below. Setup never blocks on it. |
 
 Flags:
 
-- `--quick` never prompts. The adapter is installed only with `--install-adapter`; otherwise
-  the install command is printed.
+- `--quick` never prompts. The adapter is installed only with `--install-adapter` or an
+  `acp.allow_agent_install = true` already in `config.toml`; otherwise the install command is
+  printed.
 - `--install-adapter` is the consent, so an unattended run can install in one go.
 - `--agent <name>` defaults to an agent that is already on this machine instead of the
   bundled one. Reusing `claude`, `codex`, `opencode` and friends keeps their existing login
   and needs no provider key of its own.
 
-Re-running is safe: a setting already at the target value is not written again, and a value
-you chose yourself is never overwritten. To undo, edit `config.toml` (see
+Re-running is safe: a setting already at the target value is not written again, and a run
+without `--agent` never overwrites a default you chose (including one written by an earlier
+`--agent` run). To undo, edit `config.toml` (see
 `aoe settings explain acp.default_agent`) and set the key back to `claude-code` or `auto`.
 
 ## Create an Otari account
@@ -46,7 +52,7 @@ you chose yourself is never overwritten. To undo, edit `config.toml` (see
 2. Create an API key in the dashboard.
 3. Export it where `aoe serve` runs, then re-run `aoe setup`:
    ```bash
-   export OTARI_API_KEY=<your key>
+   export OTARI_API_KEY="paste-the-key-here"
    ```
 4. Pin the model on the session, using an id from Otari's catalogue:
    ```bash
