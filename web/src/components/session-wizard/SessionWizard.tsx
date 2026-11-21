@@ -50,6 +50,7 @@ import { ProjectStep } from "./steps/ProjectStep";
 import { ExtraReposPicker } from "./steps/ExtraReposPicker";
 import { AgentPanel } from "./steps/AgentPanel";
 import { WorktreePanel } from "./steps/WorktreePanel";
+import { WorktreeInfo } from "./WorktreeInfo";
 import { SandboxPanel } from "./steps/SandboxPanel";
 import { ProfilePresetPicker } from "./steps/ProfilePresetPicker";
 import { GroupCombobox } from "./steps/GroupCombobox";
@@ -1182,6 +1183,7 @@ export function SessionWizard({
           disabled={!!worktreeBlocked && !d.useWorktree}
           summary={worktreeBlocked ?? (d.useWorktree ? worktreeSummary(d) : "run in the repo folder")}
           onConfigure={!worktreeBlocked && d.useWorktree ? openPanel("worktree") : undefined}
+          info={<WorktreeInfo />}
         />
         <SwitchRow
           label="Sandbox"

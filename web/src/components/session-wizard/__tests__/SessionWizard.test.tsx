@@ -2,7 +2,7 @@
 
 import { StrictMode, useState } from "react";
 import { afterEach, beforeEach, describe, expect, it, onTestFinished, vi } from "vitest";
-import { act, cleanup, fireEvent, render, renderHook, screen, waitFor } from "@testing-library/react";
+import { act, cleanup, fireEvent, render, renderHook, screen, waitFor, within } from "@testing-library/react";
 
 import { SessionWizard, type WizardPrefill } from "../SessionWizard";
 import { initialData } from "../wizardReducer";
@@ -568,6 +568,25 @@ describe("SessionWizard rows", () => {
     renderWizard(prefill);
     await waitFor(() => expect(screen.getByTestId("wizard-worktree-row").textContent).toContain(reason));
     expect((screen.getByRole("switch", { name: "Create a worktree" }) as HTMLButtonElement).disabled).toBe(true);
+  });
+
+  it.each([
+    ["on", { path: "/tmp/proj", tool: "claude", worktreeEnabled: true }, null, "new branch"],
+    ["off", { path: "/tmp/proj", tool: "claude", worktreeEnabled: false }, null, "run in the repo folder"],
+    ["not a git repository", { path: "/tmp/plain" }, null, "not a git repository"],
+    ["scratch", { scratch: true }, null, "not for scratch sessions"],
+    ["host-only", { path: "/tmp/proj", tool: "settl" }, [agent("settl", { host_only: true })], "runs on the host only"],
+  ] as const)("explains worktrees from the row when it is %s", async (_state, prefill, agents, summary) => {
+    if (agents) vi.mocked(fetchProfileAgents).mockResolvedValueOnce([...agents]);
+    renderWizard({ ...prefill });
+    const row = screen.getByTestId("wizard-worktree-row");
+    await waitFor(() => expect(row.textContent).toContain(summary));
+    fireEvent.click(within(row).getByRole("button", { name: "What's a worktree?" }));
+    const dialog = await screen.findByRole("dialog", { name: "What's a worktree?" });
+    const link = within(dialog).getByRole("link", { name: "Worktree settings ›" });
+    expect(link.getAttribute("href")).toBe("/settings/worktree");
+    expect(link.getAttribute("target")).toBe("_blank");
+    expect(link.getAttribute("rel")).toBe("noopener");
   });
 
   // A blocked switch left on shows on, matching the create payload, and can be turned off.
