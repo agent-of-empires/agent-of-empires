@@ -26,11 +26,11 @@ impl CapturedReset {
 /// message is displayed verbatim, never parsed.
 pub(crate) fn classify_rate_limit_error(
     err: &agent_client_protocol::Error,
-    captured: Option<CapturedReset>,
+    captured: Option<&CapturedReset>,
 ) -> Option<RateLimitInfo> {
     let kind = err.data.as_ref()?.get("errorKind")?.as_str()?;
     (kind == "rate_limit").then(|| RateLimitInfo {
-        status: err.message.clone(),
+        status: super::errors::public_error_message(err),
         resets_at: captured.as_ref().map(|c| c.resets_at),
         kind: captured
             .as_ref()
@@ -41,7 +41,7 @@ pub(crate) fn classify_rate_limit_error(
 /// Fallback for an outer error that kept only the serialized `errorKind`.
 pub(crate) fn classify_rate_limit_from_message(
     message: &str,
-    captured: Option<CapturedReset>,
+    captured: Option<&CapturedReset>,
 ) -> Option<RateLimitInfo> {
     let matched = [
         "\"errorKind\":\"rate_limit\"",
@@ -235,7 +235,7 @@ mod tests {
         assert!(info.status.contains("hit your limit"));
         assert_eq!(info.resets_at, None);
 
-        let info = classify_rate_limit_error(&err("limit", Some(limit)), Some(captured)).unwrap();
+        let info = classify_rate_limit_error(&err("limit", Some(limit)), Some(&captured)).unwrap();
         assert_eq!(info.resets_at, Some(resets_at));
         assert_eq!(info.kind, "seven_day", "the window names the limit");
 
@@ -259,7 +259,7 @@ mod tests {
                     window: window.into(),
                     resets_at,
                 };
-                let info = classify_rate_limit_from_message(msg, Some(captured)).unwrap();
+                let info = classify_rate_limit_from_message(msg, Some(&captured)).unwrap();
                 assert_eq!(info.kind, kind);
                 assert_eq!(info.resets_at, Some(resets_at));
             }

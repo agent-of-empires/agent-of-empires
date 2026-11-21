@@ -37,7 +37,7 @@ pub(super) struct DaemonControlClient {
     handshake_rx: Mutex<mpsc::Receiver<ControlBody>>,
     sessions_established: AtomicU64,
     sessions_replayed: watch::Sender<u64>,
-    completion: Arc<std::sync::Mutex<PromptCompletion>>,
+    pub(super) completion: Arc<std::sync::Mutex<PromptCompletion>>,
     /// Released waiters whose `PromptStarted` has not arrived. The runner
     /// starts prompts in order, so the next that many starts belong to them.
     /// Only touched under the `completion` lock.
@@ -48,6 +48,8 @@ pub(super) struct DaemonControlClient {
     closed_locally: Arc<AtomicBool>,
     loss: Arc<std::sync::OnceLock<ControlLoss>>,
     pub(super) disconnected: tokio_util::sync::CancellationToken,
+    #[cfg(test)]
+    completion_relayed: Arc<AtomicBool>,
 }
 
 /// The runner side ended a channel this daemon did not close. The runner may
@@ -67,7 +69,7 @@ enum CompletionDelivery {
     Adopted(control_protocol::PromptOutcome),
 }
 
-enum PromptCompletion {
+pub(super) enum PromptCompletion {
     Adopted,
     Pending {
         // `None` until `PromptStarted`, so retained history read during send
@@ -108,9 +110,9 @@ impl ShimCorrelation {
 
 /// `true` once the line sits in the pipe for the crate; `false` once this
 /// write half is closed, by the crate hanging up or by the reader's teardown.
-async fn shim_write_line(
+async fn shim_write_line<T: serde::Serialize + ?Sized>(
     duplex: &Mutex<tokio::io::WriteHalf<tokio::io::DuplexStream>>,
-    value: &serde_json::Value,
+    value: &T,
 ) -> bool {
     use tokio::io::AsyncWriteExt;
     let Ok(mut bytes) = serde_json::to_vec(value) else {
@@ -127,13 +129,10 @@ fn release_settled(settled: &std::sync::Mutex<VecDeque<CompletionDelivery>>) {
     settled.lock().expect("settled mutex poisoned").clear();
 }
 
-/// Every relay the reader makes to the crate, so a failed one releases the
-/// settled sender: the crate is gone, and no marker will reach it. Only a
-/// write failure returns `false` here, since a `serde_json::Value` always
-/// encodes.
-async fn shim_write_line_releasing(
+/// A failed relay releases any local outcome whose marker can no longer arrive.
+async fn shim_write_line_releasing<T: serde::Serialize + ?Sized>(
     duplex: &Mutex<tokio::io::WriteHalf<tokio::io::DuplexStream>>,
-    value: &serde_json::Value,
+    value: &T,
     settled: &std::sync::Mutex<VecDeque<CompletionDelivery>>,
 ) -> bool {
     if shim_write_line(duplex, value).await {
@@ -246,6 +245,7 @@ impl DaemonControlClient {
     pub(super) fn deliver_prompt_completion(
         &self,
         _: PromptCompletedMarker,
+        delivered: impl FnOnce(),
     ) -> Option<control_protocol::PromptOutcome> {
         let completion = self.completion.lock().expect("completion mutex poisoned");
         let settled = self
@@ -255,12 +255,14 @@ impl DaemonControlClient {
             .pop_front();
         match settled {
             Some(CompletionDelivery::Local(tx, outcome)) => {
+                delivered();
                 let _ = tx.send(outcome);
                 None
             }
             Some(CompletionDelivery::Adopted(outcome))
                 if matches!(*completion, PromptCompletion::Adopted) =>
             {
+                delivered();
                 Some(outcome)
             }
             _ => None,
@@ -429,6 +431,10 @@ pub(super) async fn connect_runner_control_v3(
     let (reader_closed_locally, reader_loss) = (closed_locally.clone(), loss.clone());
     let disconnected = tokio_util::sync::CancellationToken::new();
     let reader_disconnected = disconnected.clone();
+    #[cfg(test)]
+    let completion_relayed = Arc::new(AtomicBool::new(false));
+    #[cfg(test)]
+    let reader_completion_relayed = completion_relayed.clone();
     tokio::spawn(async move {
         let _disconnected = reader_disconnected.drop_guard();
         let record_loss = |io_error| {
@@ -532,6 +538,8 @@ pub(super) async fn connect_runner_control_v3(
                         {
                             return;
                         }
+                        #[cfg(test)]
+                        reader_completion_relayed.store(true, AtomicOrdering::Release);
                     }
 
                     // Reverse lane: served by the crate's request handlers. The
@@ -566,6 +574,9 @@ pub(super) async fn connect_runner_control_v3(
                     // Preserve producer bytes across the private SDK transport
                     // without nesting or trusting any native accounting claim.
                     Ok(Some((ControlBody::Notify { method, mut params }, wire_bytes))) => {
+                        if PromptCompletedMarker::matches_method(&method) {
+                            continue;
+                        }
                         if method == "session/update" {
                             match &mut params {
                                 serde_json::Value::Object(fields) => {
@@ -647,6 +658,7 @@ pub(super) async fn connect_runner_control_v3(
         .await;
         {
             let mut completion = reader_completion.lock().expect("completion mutex poisoned");
+            // EOF aborts a pending waiter, not an already queued completion.
             if matches!(*completion, PromptCompletion::Pending { .. }) {
                 *completion = PromptCompletion::LocalIdle;
             }
@@ -813,27 +825,32 @@ pub(super) async fn connect_runner_control_v3(
             closed_locally,
             loss,
             disconnected,
+            #[cfg(test)]
+            completion_relayed,
         }),
         crate_side,
     ))
 }
 
-/// Known ACP stop reasons pass through verbatim; anything else ends as
-/// `prompt_complete`.
+/// Unknown successful stop reasons retain the existing completion fallback.
 pub(super) fn control_outcome_reason(
     outcome: &crate::acp::control_protocol::PromptOutcome,
-) -> String {
+) -> &'static str {
     use crate::acp::control_protocol::PromptOutcome;
     match outcome {
         PromptOutcome::Completed {
             stop_reason: Some(r),
         } => match r.as_str() {
             // The adapter spells it both ways.
-            "rate_limited" | "rate_limit" => "rate_limited".to_string(),
-            "cancelled" | "max_tokens" | "refusal" | "max_turn_requests" => r.clone(),
-            _ => "prompt_complete".to_string(),
+            "rate_limited" | "rate_limit" => "rate_limited",
+            "cancelled" => "cancelled",
+            "max_tokens" => "max_tokens",
+            "refusal" => "refusal",
+            "max_turn_requests" => "max_turn_requests",
+            _ => "prompt_complete",
         },
-        _ => "prompt_complete".to_string(),
+        PromptOutcome::Completed { stop_reason: None } => "prompt_complete",
+        PromptOutcome::Error { .. } | PromptOutcome::Aborted => "prompt_failed",
     }
 }
 
@@ -850,9 +867,8 @@ pub(super) async fn establish_session_v3<Resp: serde::de::DeserializeOwned>(
         .map_err(|e| acp_internal_error(format!("deserialize {method} result: {e}")))
 }
 
-/// Maps a runner outcome onto the prompt loop's direct-stdio result shape.
-/// Errors keep code and data so rate limits still classify; an abort ends
-/// the turn as `end_turn`.
+/// Preserve private error code/data for structured classifiers. An abort is
+/// an unsuccessful operation, not a synthetic successful `end_turn`.
 pub(super) fn prompt_outcome_to_response(
     outcome: control_protocol::PromptOutcome,
 ) -> Result<PromptResponse, agent_client_protocol::Error> {
@@ -866,7 +882,9 @@ pub(super) fn prompt_outcome_to_response(
         PromptOutcome::Completed { stop_reason } => {
             build(stop_reason.as_deref().unwrap_or("end_turn"))
         }
-        PromptOutcome::Aborted => build("end_turn"),
+        PromptOutcome::Aborted => Err(acp_internal_error(
+            "prompt aborted before completion".into(),
+        )),
         PromptOutcome::Error {
             code,
             message,
@@ -920,8 +938,12 @@ mod tests {
         client: Arc<DaemonControlClient>,
         peer: UnixStream,
         transport: BufReader<tokio::io::DuplexStream>,
+        events: mpsc::Receiver<Event>,
+        event_tx: mpsc::Sender<Event>,
         terminal: Arc<TerminalClaim>,
         in_flight: Arc<AtomicBool>,
+        state: Arc<super::super::SessionState>,
+        consumer: Option<super::super::connection::PromptTestSession>,
     }
 
     impl Drop for PromptControlPeer {
@@ -934,7 +956,9 @@ mod tests {
         async fn new() -> Self {
             let tmp = tempfile::tempdir().unwrap();
             let (socket, listener) = bind(&tmp);
-            let terminal = Arc::new(TerminalClaim::new());
+            let state = Arc::new(super::super::SessionState::default());
+            let terminal = state.terminal_claim.clone();
+            let (event_tx, events) = mpsc::channel(64);
             let in_flight = Arc::new(AtomicBool::new(true));
             let (client, peer) = tokio::join!(
                 connect_runner_control_v3(
@@ -962,9 +986,33 @@ mod tests {
                 client,
                 peer,
                 transport: BufReader::new(transport),
+                events,
+                event_tx,
                 terminal,
                 in_flight,
+                state,
+                consumer: None,
             }
+        }
+
+        async fn consumer(&mut self) -> &super::super::connection::PromptTestSession {
+            if self.consumer.is_none() {
+                self.consumer = Some(
+                    super::super::connection::PromptTestSession::new(
+                        self.client.clone(),
+                        self.state.clone(),
+                        self.in_flight.clone(),
+                        self.event_tx.clone(),
+                    )
+                    .await,
+                );
+            }
+            self.consumer.as_ref().unwrap()
+        }
+
+        async fn take_consumer(&mut self) -> super::super::connection::PromptTestSession {
+            self.consumer().await;
+            self.consumer.take().unwrap()
         }
 
         async fn send(&mut self, frame: ControlBody) {
@@ -1011,8 +1059,11 @@ mod tests {
                     return;
                 }
                 assert_eq!(notification["method"], "_aoe/prompt_completed");
-                self.client
-                    .deliver_prompt_completion(PromptCompletedMarker::default());
+                let marker: PromptCompletedMarker =
+                    serde_json::from_value(notification["params"].clone()).unwrap();
+                if let Some(outcome) = self.client.deliver_prompt_completion(marker, || {}) {
+                    self.consumer().await.finish(outcome).await;
+                }
             }
         }
 
@@ -1105,6 +1156,198 @@ mod tests {
             peer.drain().await;
             peer.assert_local_terminal_ownership();
         }
+    }
+
+    #[tokio::test]
+    async fn adopted_request_errors_preserve_diagnostics_and_next_local_prompt() {
+        for (message, kind) in [
+            ("provider connection failure", "provider_error"),
+            ("invalid credentials", "auth_error"),
+            ("tool failure", "tool_error"),
+            ("unknown failure", "unknown"),
+        ] {
+            let mut peer = PromptControlPeer::new().await;
+            let error = PromptOutcome::Error {
+                code: -32603,
+                message: message.into(),
+                data: Some(serde_json::json!({"errorKind": kind, "privateTokenMarker": "secret"})),
+            };
+            peer.send(ControlBody::PromptCompleted {
+                prompt_req_id: 7,
+                outcome: error.clone(),
+            })
+            .await;
+            peer.drain().await;
+            let failure = peer
+                .events
+                .try_recv()
+                .expect("diagnostic precedes terminal");
+            match &failure {
+                Event::PromptRuntimeError {
+                    message: got,
+                    evidence: Some(evidence),
+                } => {
+                    assert_eq!(got, message);
+                    assert_eq!(
+                        evidence.source,
+                        crate::session::ErrorEvidenceSource::RunnerCompletion
+                    );
+                    assert_eq!(evidence.runtime, crate::session::RuntimeEvidence::Unknown);
+                    assert_eq!(evidence.origin, None);
+                    assert_eq!(evidence.retryable, None);
+                }
+                event => panic!("expected operation error, got {event:?}"),
+            }
+            assert!(!serde_json::to_string(&failure)
+                .unwrap()
+                .contains("privateTokenMarker"));
+            assert!(
+                matches!(peer.events.try_recv(), Ok(Event::Stopped { reason }) if reason == "prompt_failed")
+            );
+            assert!(peer.terminal.claimed());
+            assert!(peer.terminal.failed());
+            assert!(!peer.in_flight.load(AtomicOrdering::Relaxed));
+            peer.client.supersede_adopted_turn();
+            peer.terminal.begin_turn();
+            peer.in_flight.store(true, AtomicOrdering::Relaxed);
+            let mut next = peer.prompt().await;
+            peer.send(ControlBody::PromptStarted { prompt_req_id: 9 })
+                .await;
+            peer.send(ControlBody::PromptCompleted {
+                prompt_req_id: 7,
+                outcome: error,
+            })
+            .await;
+            peer.drain().await;
+            assert_eq!(next.try_recv(), Err(oneshot::error::TryRecvError::Empty));
+            peer.assert_local_terminal_ownership();
+            peer.completed(9, "end_turn").await;
+            peer.drain().await;
+            assert_eq!(next.await.unwrap(), end("end_turn"));
+            peer.assert_local_terminal_ownership();
+        }
+        let mut peer = PromptControlPeer::new().await;
+        peer.send(ControlBody::PromptCompleted {
+            prompt_req_id: 7,
+            outcome: PromptOutcome::Aborted,
+        })
+        .await;
+        peer.drain().await;
+        assert!(matches!(
+            peer.events.try_recv(),
+            Ok(Event::PromptRuntimeError { .. })
+        ));
+        assert!(
+            matches!(peer.events.try_recv(), Ok(Event::Stopped { reason }) if reason == "prompt_failed")
+        );
+        assert!(prompt_outcome_to_response(PromptOutcome::Aborted).is_err());
+    }
+
+    #[tokio::test]
+    async fn adopted_error_waiting_for_capacity_cannot_close_a_new_local_turn() {
+        use crate::acp::acp_client::commands::ClientCmd;
+        use futures_util::FutureExt as _;
+        let mut peer = PromptControlPeer::new().await;
+        let (events, received) = mpsc::channel(1);
+        peer.event_tx = events;
+        peer.events = received;
+        peer.event_tx.send(Event::ThinkingStarted).await.unwrap();
+        let consumer = peer.take_consumer().await;
+        let commands = consumer.commands();
+        consumer.queue(PromptOutcome::Error {
+            code: -32603,
+            message: "old failure".into(),
+            data: None,
+        });
+        let running = tokio::spawn(consumer.run());
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while !peer.terminal.claimed() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        assert!(peer.terminal.failed());
+        let old_turn = peer.terminal.current_turn();
+        commands
+            .send(ClientCmd::Prompt(Vec::new().into()))
+            .await
+            .unwrap();
+        let (flushed, mut flush) = oneshot::channel();
+        commands
+            .send(ClientCmd::FlushForTest(flushed))
+            .await
+            .unwrap();
+        assert!((&mut flush).now_or_never().is_none());
+        assert_eq!(peer.terminal.current_turn(), old_turn);
+        assert!(matches!(
+            *peer.client.completion.lock().unwrap(),
+            PromptCompletion::Adopted
+        ));
+        assert!(matches!(
+            peer.events.recv().await,
+            Some(Event::ThinkingStarted)
+        ));
+        assert!(matches!(peer.events.recv().await,
+            Some(Event::PromptRuntimeError { message, .. }) if message == "old failure"));
+        assert!(matches!(peer.events.recv().await,
+            Some(Event::Stopped { reason }) if reason == "prompt_failed"));
+        assert!(matches!(
+            control_protocol::read_frame(&mut peer.peer).await.unwrap(),
+            Some(ControlBody::Prompt { .. })
+        ));
+        flush.await.unwrap();
+        assert!(peer.terminal.current_turn() > old_turn);
+        peer.assert_local_terminal_ownership();
+        assert!(!peer.terminal.failed());
+        assert!(peer.events.try_recv().is_err());
+        peer.send(ControlBody::PromptStarted { prompt_req_id: 9 })
+            .await;
+        peer.completed(9, "end_turn").await;
+        peer.drain().await;
+        assert!(matches!(peer.events.recv().await,
+            Some(Event::Stopped { reason }) if reason == "prompt_complete"));
+        assert!(peer.events.try_recv().is_err());
+        commands.send(ClientCmd::Shutdown).await.unwrap();
+        running.await.unwrap().unwrap();
+    }
+
+    #[tokio::test]
+    async fn adopted_error_claims_terminal_before_waiting_for_event_capacity() {
+        use futures_util::FutureExt as _;
+        let mut peer = PromptControlPeer::new().await;
+        let (events, received) = mpsc::channel(1);
+        peer.event_tx = events;
+        peer.events = received;
+        peer.event_tx.send(Event::ThinkingStarted).await.unwrap();
+        let consumer = peer.take_consumer().await;
+        let delivery = consumer.finish(PromptOutcome::Error {
+            code: -32603,
+            message: "request failed".into(),
+            data: None,
+        });
+        tokio::pin!(delivery);
+        assert!(delivery.as_mut().now_or_never().is_none());
+        assert!(
+            !peer.terminal.claim(),
+            "idle fallback cannot replace completion"
+        );
+        assert!(peer.terminal.failed());
+        assert!(matches!(
+            peer.events.recv().await,
+            Some(Event::ThinkingStarted)
+        ));
+        assert!(matches!(
+            peer.events.recv().await,
+            Some(Event::PromptRuntimeError { .. })
+        ));
+        assert!(matches!(peer.events.recv().await,
+            Some(Event::Stopped { reason }) if reason == "prompt_failed"));
+        assert!(
+            !delivery.await,
+            "operation failure does not park connection"
+        );
+        assert!(peer.events.try_recv().is_err());
     }
 
     #[tokio::test]
@@ -1235,7 +1478,7 @@ mod tests {
             &serde_json::json!(PromptCompletedMarker::default().method())
         );
         peer.client
-            .deliver_prompt_completion(PromptCompletedMarker::default());
+            .deliver_prompt_completion(PromptCompletedMarker::default(), || {});
         assert_eq!(completion.await.unwrap(), end("end_turn"));
     }
 
@@ -1490,6 +1733,7 @@ mod tests {
                         Event::SessionContextReset { .. } => recovery.push("reset"),
                         Event::Stopped { reason } if reason == "stored_session_rejected" => {
                             recovery.push("stopped");
+                            break;
                         }
                         // Any other rejection ends only the turn (#5662).
                         Event::Stopped { reason } if reason == "prompt_rejected" => {
@@ -1890,7 +2134,44 @@ mod tests {
         .unwrap();
     }
 
-    /// An untrusted Hello, an absent socket, or a hard dial error yields no client.
+    /// A waiterless completion for an adopted turn publishes its terminal,
+    /// in order after any rate-limit metadata, and hands idle ownership back.
+    #[tokio::test]
+    async fn adopted_completion_publishes_terminal() {
+        for (outcome, want) in [
+            (end("end_turn"), vec!["stopped:prompt_complete"]),
+            (
+                PromptOutcome::Error {
+                    code: -32000,
+                    message: "rate limit exceeded".into(),
+                    data: Some(serde_json::json!({"errorKind": "rate_limit"})),
+                },
+                vec!["rate_limit", "stopped:rate_limited"],
+            ),
+        ] {
+            let mut peer = PromptControlPeer::new().await;
+            peer.send(ControlBody::PromptCompleted {
+                prompt_req_id: 5,
+                outcome,
+            })
+            .await;
+            peer.drain().await;
+            let mut got = Vec::new();
+            while let Ok(event) = peer.events.try_recv() {
+                got.push(match event {
+                    Event::RateLimit { .. } => "rate_limit".to_string(),
+                    Event::Stopped { reason } => format!("stopped:{reason}"),
+                    other => panic!("unexpected event {other:?}"),
+                });
+            }
+            assert_eq!(got, want);
+            assert!(peer.terminal.claimed());
+            assert!(!peer.in_flight.load(AtomicOrdering::Relaxed));
+        }
+    }
+
+    /// An untrusted Hello, an absent socket, or a hard dial error yields no
+    /// client, no terminal claim, and no event.
     #[tokio::test]
     #[serial_test::serial]
     async fn failed_attach_leaves_guard_unclaimed() {
@@ -2055,7 +2336,7 @@ mod tests {
                                     }
                                     SessionIngressNotification::PromptCompleted(marker) => {
                                         if let Some(outcome) =
-                                            control.deliver_prompt_completion(marker)
+                                            control.deliver_prompt_completion(marker, || {})
                                         {
                                             adopted_tx.send(outcome).unwrap();
                                         }
@@ -2138,5 +2419,425 @@ mod tests {
         })
         .await
         .unwrap();
+    }
+    async fn send_adopted_backlog(peer: &mut PromptControlPeer) {
+        for index in 0..12 {
+            peer.send(ControlBody::Notify {
+                method: "session/update".into(),
+                params: serde_json::json!({
+                    "sessionId":"sid-adopted", "update":{
+                        "sessionUpdate":"agent_message_chunk",
+                        "content":{"type":"text","text":format!("prior output {index}\n")}
+                    }
+                }),
+            })
+            .await;
+        }
+        peer.send(ControlBody::PromptCompleted {
+            prompt_req_id: 7,
+            outcome: PromptOutcome::Error {
+                code: -32603,
+                message: "adopted request failed".into(),
+                data: Some(serde_json::json!({"privateTokenMarker":"must-not-leak"})),
+            },
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    async fn adopted_failure_barrier_orders_buffered_notifications_and_bootstrap_commit() {
+        use crate::acp::acp_client::commands::{ClientCmd, ConnectMode};
+        use crate::acp::acp_client::connection::{
+            run_connection_task, ConnectionParams, RunnerLink,
+        };
+        use crate::acp::acp_client::SessionResources;
+        use crate::acp::agent_compat::ExpectedAgent;
+        use crate::acp::fs_handler::FsPolicy;
+        use crate::acp::terminal_handler::TerminalManager;
+        use tokio_util::compat::{TokioAsyncReadCompatExt, TokioAsyncWriteCompatExt};
+        for (cached_before_initialize, fail_handshake, close_control, established_first) in [
+            (true, false, false, false),
+            (false, false, false, false),
+            (true, true, false, false),
+            (true, false, true, false),
+            (false, false, true, false),
+            (false, false, true, true),
+        ] {
+            let mut peer = PromptControlPeer::new().await;
+            let control = peer.client.clone();
+            let commit = if established_first {
+                None
+            } else {
+                Some(control.ingress.fence.write().await)
+            };
+            let adopted_turn = peer.terminal.current_turn();
+            if cached_before_initialize {
+                send_adopted_backlog(&mut peer).await;
+            }
+            let cwd = tempfile::tempdir().unwrap();
+            let (ready_tx, ready_rx) = oneshot::channel();
+            let (commands, cmd_rx) = mpsc::channel(4);
+            let (replacement, discarded) = tokio::io::duplex(1);
+            drop(discarded);
+            let transport =
+                std::mem::replace(&mut peer.transport, BufReader::new(replacement)).into_inner();
+            let (read, write) = tokio::io::split(transport);
+            let shutdown = tokio_util::sync::CancellationToken::new();
+            let task = tokio::spawn(run_connection_task(
+                agent_client_protocol::ByteStreams::new(write.compat_write(), read.compat()),
+                ConnectionParams {
+                    claude_home: None,
+                    event_tx: peer.event_tx.clone(),
+                    cmd_rx,
+                    child: None,
+                    pending_responders: Arc::new(Mutex::new(HashMap::new())),
+                    resources: SessionResources {
+                        fs_policy: Arc::new(FsPolicy::new(vec![cwd.path().to_path_buf()])),
+                        terminals: TerminalManager::new(),
+                        cwd: cwd.path().to_path_buf(),
+                        label: "prompt".into(),
+                        sandbox: None,
+                    },
+                    mode: ConnectMode::Resume {
+                        acp_session_id: "sid-adopted".into(),
+                        in_flight_turn: true,
+                        live_recovery: None,
+                    },
+                    ready_tx,
+                    profile: &crate::acp::agent_profiles::GEMINI,
+                    expected_agent: ExpectedAgent::Gemini,
+                    source_profile: None,
+                    default_effort: None,
+                    default_model_config: Default::default(),
+                    default_mode: None,
+                    default_model: None,
+                    mcp_servers: Vec::new(),
+                    runner: Some(RunnerLink {
+                        control: control.clone(),
+                        state: peer.state.clone(),
+                        prompt_in_flight: peer.in_flight.clone(),
+                    }),
+                    cancellation: tokio_util::sync::CancellationToken::new(),
+                    shutdown: shutdown.clone(),
+                },
+            ));
+            let initialize = tokio::time::timeout(
+                Duration::from_secs(10),
+                control_protocol::read_frame(&mut peer.peer),
+            )
+            .await
+            .unwrap()
+            .unwrap();
+            assert!(matches!(initialize, Some(ControlBody::Initialize { .. })));
+            if fail_handshake {
+                peer.send(ControlBody::HandshakeFailed {
+                    error: serde_json::json!({"code":-32603,"message":"initialize failed","data":{"privateTokenMarker":"must-not-leak"}}),
+                }).await;
+                let error = ready_rx.await.unwrap().unwrap_err();
+                assert!(!error.to_string().contains("privateTokenMarker"));
+                tokio::time::timeout(Duration::from_secs(10), task)
+                    .await
+                    .unwrap()
+                    .unwrap();
+                continue;
+            }
+            peer.send(ControlBody::Initialized {
+                result: serde_json::json!({"protocolVersion":1,"agentCapabilities":{}}),
+            })
+            .await;
+            let resume = tokio::time::timeout(
+                Duration::from_secs(10),
+                control_protocol::read_frame(&mut peer.peer),
+            )
+            .await
+            .unwrap()
+            .unwrap();
+            assert!(matches!(resume, Some(ControlBody::ResumeSession)));
+            ready_rx.await.unwrap().unwrap();
+            let mut events = Vec::new();
+            if !established_first {
+                while peer
+                    .event_tx
+                    .try_send(Event::AuthStatusUpdated { status: None })
+                    .is_ok()
+                {}
+            }
+            peer.send(ControlBody::SessionReady {
+                acp_session_id: "sid-adopted".into(),
+                result: serde_json::json!({}),
+            })
+            .await;
+            if established_first {
+                tokio::time::timeout(Duration::from_secs(10), async {
+                    loop {
+                        let event = peer.events.recv().await.unwrap();
+                        let assigned = matches!(event, Event::AcpSessionAssigned { .. });
+                        events.push(event);
+                        if assigned {
+                            break;
+                        }
+                    }
+                })
+                .await
+                .unwrap();
+                while peer
+                    .event_tx
+                    .try_send(Event::AuthStatusUpdated { status: None })
+                    .is_ok()
+                {}
+            }
+            assert_eq!(
+                peer.event_tx.capacity(),
+                0,
+                "public queue is full before adopted completion"
+            );
+            if !cached_before_initialize {
+                send_adopted_backlog(&mut peer).await;
+            }
+            tokio::time::timeout(Duration::from_secs(10), async {
+                while !peer.client.completion_relayed.load(AtomicOrdering::Acquire) {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .unwrap();
+            assert!(
+                peer.in_flight.load(AtomicOrdering::Acquire),
+                "buffered notifications still belong to the adopted operation"
+            );
+            if close_control {
+                peer.peer.shutdown().await.unwrap();
+                // Only the reader owns hs_tx. Closed proves EOF cleanup finished
+                // while publication is still blocked. Do not consume SessionReady.
+                tokio::time::timeout(Duration::from_secs(10), async {
+                    loop {
+                        let ended = {
+                            let receiver = control.handshake_rx.lock().await;
+                            receiver.is_closed()
+                        };
+                        if ended {
+                            break;
+                        }
+                        tokio::task::yield_now().await;
+                    }
+                })
+                .await
+                .unwrap();
+                assert!(
+                    matches!(
+                        *control.completion.lock().unwrap(),
+                        PromptCompletion::Adopted
+                    ),
+                    "EOF must not supersede the already-ordered adopted marker"
+                );
+            }
+            drop(commit);
+            tokio::time::timeout(Duration::from_secs(10), async {
+                loop {
+                    let event = peer.events.recv().await.unwrap();
+                    let stopped = matches!(event, Event::Stopped { .. });
+                    events.push(event);
+                    if stopped {
+                        break;
+                    }
+                }
+            })
+            .await
+            .unwrap();
+            let diagnostic = events
+                .iter()
+                .position(|event| matches!(event, Event::PromptRuntimeError { .. }))
+                .unwrap();
+            assert_eq!(
+                events[..diagnostic]
+                    .iter()
+                    .filter(|event| matches!(event, Event::AgentMessageChunk { .. }))
+                    .count(),
+                12
+            );
+            assert_eq!(
+                events
+                    .iter()
+                    .filter(|event| matches!(event, Event::Stopped { .. }))
+                    .count(),
+                1
+            );
+            assert!(
+                matches!(events.last(), Some(Event::Stopped { reason }) if reason == "prompt_failed")
+            );
+            assert_eq!(
+                peer.terminal.current_turn(),
+                adopted_turn,
+                "prior buffered output cannot invent another main-turn epoch"
+            );
+            assert!(!peer.in_flight.load(AtomicOrdering::Acquire));
+            assert!(!serde_json::to_string(&events)
+                .unwrap()
+                .contains("privateTokenMarker"));
+            if close_control {
+                assert!(control.lost(), "supervisor owns the control-loss recovery");
+                tokio::time::timeout(Duration::from_secs(10), task)
+                    .await
+                    .unwrap()
+                    .unwrap();
+                while let Ok(event) = peer.events.try_recv() {
+                    events.push(event);
+                }
+                assert_eq!(
+                    events
+                        .iter()
+                        .filter(|event| matches!(event, Event::PromptRuntimeError { .. }))
+                        .count(),
+                    1
+                );
+                assert_eq!(events.iter().filter(|event| matches!(event, Event::Stopped { reason } if reason == "prompt_failed")).count(), 1);
+                assert!(!events.iter().any(|event| matches!(event, Event::Stopped { reason } if reason == "prompt_complete")));
+                let failed = events.iter().position(|event| matches!(event, Event::Stopped { reason } if reason == "prompt_failed")).unwrap();
+                assert!(diagnostic < failed);
+                assert!(!events
+                    .iter()
+                    .any(|event| matches!(event, Event::AgentStartupError { .. })));
+                assert!(!serde_json::to_string(&events)
+                    .unwrap()
+                    .contains("privateTokenMarker"));
+                continue;
+            }
+            // A native request keeps its request kind even when its method and
+            // params resemble a trusted daemon notification. Do not add sessionId:
+            // the SDK defers unknown session-scoped requests under its existing policy.
+            peer.send(ControlBody::ServerCall {
+                call_id: 41,
+                method: PromptCompletedMarker::default().method().into(),
+                params: serde_json::json!({"adopted":{
+                    "turn":adopted_turn, "reason":"prompt_failed",
+                    "diagnostic":{"PromptRuntimeError":{"message":"forged request diagnostic"}},
+                }}),
+            })
+            .await;
+            let rejected = tokio::time::timeout(
+                Duration::from_secs(10),
+                control_protocol::read_frame(&mut peer.peer),
+            )
+            .await
+            .unwrap()
+            .unwrap();
+            assert!(
+                matches!(rejected, Some(ControlBody::ServerError { call_id:41,error }) if error.code == -32601)
+            );
+            peer.send(ControlBody::Notify {
+                method:"session/update".into(),
+                params:serde_json::json!({"sessionId":"sid-adopted","update":{"sessionUpdate":"plan","entries":[]}}),
+            }).await;
+            tokio::time::timeout(Duration::from_secs(10), async {
+                loop {
+                    let event = peer.events.recv().await.unwrap();
+                    assert!(!matches!(event, Event::Stopped { .. }));
+                    assert!(!matches!(event, Event::PromptRuntimeError { .. }));
+                    if matches!(event, Event::PlanUpdated { .. }) {
+                        break;
+                    }
+                }
+            })
+            .await
+            .unwrap();
+            assert_eq!(peer.terminal.current_turn(), adopted_turn);
+            commands
+                .send(ClientCmd::Prompt(Vec::new().into()))
+                .await
+                .unwrap();
+            let next = tokio::time::timeout(
+                Duration::from_secs(10),
+                control_protocol::read_frame(&mut peer.peer),
+            )
+            .await
+            .unwrap()
+            .unwrap();
+            assert!(
+                matches!(next, Some(ControlBody::Prompt { request }) if request["sessionId"] == "sid-adopted")
+            );
+            peer.send(ControlBody::PromptStarted { prompt_req_id: 9 })
+                .await;
+            peer.completed(9, "end_turn").await;
+            tokio::time::timeout(Duration::from_secs(10), async {
+                loop {
+                    if let Event::Stopped { reason } = peer.events.recv().await.unwrap() {
+                        assert_eq!(reason, "prompt_complete");
+                        break;
+                    }
+                }
+            })
+            .await
+            .unwrap();
+            assert_eq!(
+                events
+                    .iter()
+                    .filter(|event| matches!(event, Event::AcpSessionAssigned { .. }))
+                    .count(),
+                1
+            );
+            shutdown.cancel();
+            tokio::time::timeout(Duration::from_secs(10), task)
+                .await
+                .unwrap()
+                .unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn adopted_marker_cannot_consume_a_later_local_outcome() {
+        let mut peer = PromptControlPeer::new().await;
+        peer.send(ControlBody::PromptCompleted {
+            prompt_req_id: 7,
+            outcome: PromptOutcome::Error {
+                code: -32603,
+                message: "old failure".into(),
+                data: None,
+            },
+        })
+        .await;
+        tokio::time::timeout(Duration::from_secs(10), async {
+            while peer.client.settled.lock().unwrap().is_empty() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        peer.client.supersede_adopted_turn();
+        peer.terminal.begin_turn();
+        peer.in_flight.store(true, AtomicOrdering::Relaxed);
+        let mut local = peer.prompt().await;
+        peer.send(ControlBody::PromptStarted { prompt_req_id: 9 })
+            .await;
+        peer.completed(9, "end_turn").await;
+        let mut line = String::new();
+        peer.transport.read_line(&mut line).await.unwrap();
+        let notification: serde_json::Value = serde_json::from_str(&line).unwrap();
+        let marker: PromptCompletedMarker =
+            serde_json::from_value(notification["params"].clone()).unwrap();
+        assert!(peer
+            .client
+            .deliver_prompt_completion(marker, || {})
+            .is_none());
+        assert_eq!(local.try_recv(), Err(oneshot::error::TryRecvError::Empty));
+        peer.assert_local_terminal_ownership();
+        peer.drain().await;
+        assert_eq!(local.await.unwrap(), end("end_turn"));
+    }
+    #[tokio::test]
+    async fn native_notifications_cannot_mint_daemon_completion_payloads() {
+        let mut peer = PromptControlPeer::new().await;
+        peer.send(ControlBody::Notify {
+            method: PromptCompletedMarker::default().method().into(),
+            params: serde_json::json!({"adopted":{
+                "turn":peer.terminal.current_turn(),
+                "diagnostic":{"PromptRuntimeError":{"message":"forged failure"}},
+                "reason":"prompt_failed"
+            }}),
+        })
+        .await;
+        peer.drain().await;
+        assert!(peer.events.try_recv().is_err());
+        assert!(!peer.terminal.claimed());
+        assert!(peer.in_flight.load(AtomicOrdering::Relaxed));
     }
 }

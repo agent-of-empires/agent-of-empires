@@ -2103,7 +2103,9 @@ impl SessionService {
                 || inst.is_trashed()
                 || !matches!(
                     inst.status,
-                    crate::session::Status::Idle | crate::session::Status::Running
+                    crate::session::Status::Idle
+                        | crate::session::Status::Running
+                        | crate::session::Status::Error
                 )
             {
                 return;

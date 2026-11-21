@@ -60,6 +60,7 @@ export function SessionBanners({
   });
   const healthy = !state.startupError && !state.workerStopped && !state.workerRestarting;
   const idle = healthy && !state.turnActive;
+  const errorMessage = state.interactionError?.message ?? state.lastError;
   return (
     <>
       {state.startupError && state.startupCause?.kind === "container_missing" && (
@@ -138,7 +139,7 @@ export function SessionBanners({
           Monitoring a background job
         </ChipBanner>
       )}
-      {state.lastError && <InteractionErrorBanner message={state.lastError} onDismiss={dismissError} />}
+      {errorMessage && <InteractionErrorBanner message={errorMessage} onDismiss={dismissError} />}
     </>
   );
 }

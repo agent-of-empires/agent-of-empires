@@ -71,6 +71,8 @@ pub(super) struct Shared {
     pub(super) adopted_turn_active: AtomicBool,
     /// While set, the per-prompt watchdog owns idle detection.
     pub(super) prompt_in_flight: Arc<AtomicBool>,
+    pub(super) local_prompt_settled: tokio::sync::Notify,
+    pub(super) runner_completion_pending: AtomicBool,
     /// Bumped before each prompt so stale lifecycle envelopes are discarded.
     pub(super) prompt_epoch: AtomicU64,
     lifecycle_tx: mpsc::Sender<LifecycleEnvelope>,
@@ -139,6 +141,8 @@ impl Shared {
             terminal_claim: state.terminal_claim.clone(),
             adopted_turn_active: AtomicBool::new(false),
             prompt_in_flight,
+            local_prompt_settled: tokio::sync::Notify::new(),
+            runner_completion_pending: AtomicBool::new(false),
             prompt_epoch: AtomicU64::new(0),
             lifecycle_tx,
             between_prompt: BetweenPromptTracker::default(),
@@ -215,6 +219,9 @@ impl Shared {
             }
             let _ = event_tx.send(Event::Stopped { reason }).await;
         });
+        if self.runner_completion_pending.swap(false, Ordering::AcqRel) {
+            self.local_prompt_settled.notify_waiters();
+        }
         let _ = publication.await;
     }
 
@@ -224,7 +231,7 @@ impl Shared {
         &self,
         id: SessionId,
     ) -> Result<(), agent_client_protocol::Error> {
-        let _guard = self.ingress.fence.lock().await;
+        let _guard = self.ingress.fence.write().await;
         let replay = self.ingress.finish(Some(id.clone()))?;
         self.emit(Event::AcpSessionAssigned {
             acp_session_id: id.0.to_string(),
@@ -441,7 +448,8 @@ impl Shared {
         if lifecycle.is_some() || wakeup.is_some() {
             self.first_event_after_attach.store(true, Ordering::Relaxed);
         }
-        let prompt_active = self.prompt_in_flight.load(Ordering::Relaxed);
+        let prompt_active = self.prompt_in_flight.load(Ordering::Acquire);
+        let failed_main_turn = !prompt_active && self.terminal_claim.failed();
         if !prompt_active
             && self.between_prompt.observe(
                 lifecycle.as_ref(),
@@ -485,6 +493,9 @@ impl Shared {
         )
         .await;
         for mut event in events {
+            if failed_main_turn && matches!(event, Event::ThinkingStarted) {
+                continue;
+            }
             if let Event::BackgroundAgentLaunched {
                 agent_id,
                 output_file,

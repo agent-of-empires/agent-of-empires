@@ -211,23 +211,8 @@ pub(super) fn ready_agent_session(instance: &Instance) -> anyhow::Result<Option<
     else {
         return Ok(None);
     };
-    if pane.pane_dead {
+    if !instance.pane_is_ready(pane)? {
         return Ok(None);
-    }
-    if !instance.expects_shell()
-        && !instance.has_command_override()
-        && crate::hooks::read_hook_status(&instance.id).is_none()
-    {
-        let command = pane
-            .pane_current_command
-            .as_deref()
-            .ok_or_else(|| anyhow::anyhow!("Agent pane command is unknown"))?;
-        if crate::tmux::utils::is_pane_running_shell_command(
-            command,
-            pane.pane_start_command_is_protected,
-        ) {
-            return Ok(None);
-        }
     }
     Ok(Some(name.to_owned()))
 }
@@ -236,11 +221,27 @@ pub(super) fn ready_agent_session(instance: &Instance) -> anyhow::Result<Option<
 #[error("Agent pane is not ready")]
 struct AgentTargetUnavailable;
 
+pub(super) fn indeterminate_launch_response(
+    cause: crate::session::LaunchIndeterminateCause,
+) -> axum::response::Response {
+    (
+        StatusCode::CONFLICT,
+        crate::daemon::ApiErrorCode::LaunchIndeterminate.header(),
+        Json(serde_json::json!({
+            "error": "launch_indeterminate", "cause": cause.as_str(), "message": cause.message(),
+        })),
+    )
+        .into_response()
+}
+
 pub(super) async fn agent_target_response(
     state: &Arc<AppState>,
     id: &str,
     outcome: Option<crate::session::StartOutcome>,
 ) -> axum::response::Response {
+    if let Some(crate::session::StartOutcome::Indeterminate { cause }) = outcome {
+        return indeterminate_launch_response(cause);
+    }
     let Some(mut instance) = state
         .instances
         .read()
@@ -256,8 +257,7 @@ pub(super) async fn agent_target_response(
     }
     if outcome.is_some() {
         instance = match tokio::task::spawn_blocking(move || -> anyhow::Result<_> {
-            let session = instance.tmux_session()?;
-            instance.wait_for_pane_ready(&session);
+            instance.wait_for_pane_ready()?;
             Ok(instance)
         })
         .await
@@ -352,6 +352,7 @@ pub(super) async fn agent_target_response(
             crate::session::StartOutcome::Resumed => "resumed",
             crate::session::StartOutcome::Fresh => "fresh",
             crate::session::StartOutcome::ResumeFailed { .. } => "resume_failed",
+            crate::session::StartOutcome::Indeterminate { .. } => unreachable!("indeterminate launch cannot produce a ready target"),
             crate::session::StartOutcome::FreshAfterFailedResume { sid } => {
                 body["message"] = format!("Started fresh; the prior conversation {sid} remains available in the agent's history.").into();
                 body["prior_session_id"] = sid.into();
@@ -364,10 +365,15 @@ pub(super) async fn agent_target_response(
 }
 
 fn agent_target_error(state: &AppState, error: anyhow::Error) -> axum::response::Response {
+    if let Some(cause) = error.downcast_ref::<crate::session::LaunchIndeterminateCause>() {
+        return indeterminate_launch_response(*cause);
+    }
     if let Some(response) = lifecycle_rejection(state, &error) {
         return response;
     }
-    if error.is::<crate::session::NativeStoreUnavailable>() {
+    if error.is::<crate::session::NativeStoreUnavailable>()
+        || error.is::<crate::session::LaunchFinalizationPending>()
+    {
         return StatusCode::SERVICE_UNAVAILABLE.into_response();
     }
     if error.is::<AgentTargetUnavailable>() {
@@ -624,6 +630,48 @@ pub async fn kill_terminal(
             }
             tracing::error!(target: "http.api.sessions", session = %id, %error, "Terminal kill failed");
             (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({"error": "kill_failed", "message": "Failed to kill terminal"}))).into_response()
+        }
+    }
+}
+
+#[cfg(test)]
+mod indeterminate_tests {
+    use super::*;
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn indeterminate_launch_never_returns_a_ready_target() {
+        let _home = crate::session::test_support::isolate_app_dir();
+        let row = Instance::new("uncertain", "/tmp");
+        let state = crate::server::test_support::build_test_app_state(vec![row.clone()]);
+        for cause in [
+            crate::session::LaunchIndeterminateCause::CommandTimedOut,
+            crate::session::LaunchIndeterminateCause::ObservationFailed,
+            crate::session::LaunchIndeterminateCause::StabilizationExpired,
+            crate::session::LaunchIndeterminateCause::OwnershipUnproven,
+        ] {
+            let response = agent_target_response(
+                &state,
+                &row.id,
+                Some(crate::session::StartOutcome::Indeterminate { cause }),
+            )
+            .await;
+            assert_eq!(response.status(), StatusCode::CONFLICT);
+            assert_eq!(
+                response.headers()[crate::daemon::ERROR_CODE_HEADER],
+                "launch_indeterminate"
+            );
+            let body = axum::body::to_bytes(response.into_body(), 4096)
+                .await
+                .unwrap();
+            let body: serde_json::Value = serde_json::from_slice(&body).unwrap();
+            assert_eq!(body["cause"], cause.as_str());
+            assert!(body.get("tmux_session").is_none());
+            assert!(body.get("resume_outcome").is_none());
+            let rows = state.instances.read().await;
+            assert_eq!(rows[0].lifecycle_generation, row.lifecycle_generation);
+            assert_eq!(rows[0].conversation_state(), row.conversation_state());
+            assert_eq!(rows[0].resume_probe_failed_sid, None);
         }
     }
 }
