@@ -6,6 +6,8 @@ import { HOLD, chunk, endTurn, script } from "../helpers/acp";
 export const HISTORY_DONE = "PERF_HISTORY_DONE";
 export const MEASURED_DONE = "PERF_MEASURED_DONE";
 export const MEASURED_CHUNKS = 500;
+export const HISTORY_FENCE_SEED = "history";
+export const MEASURED_FENCE_SEED = "measured";
 
 type Update = object;
 
@@ -13,7 +15,8 @@ type Update = object;
 const DIFF_LINES = Number(process.env.PERF_DIFF_LINES) || 200;
 
 const lines = (prefix: string, n: number) => Array.from({ length: n }, (_, i) => `${prefix} ${i}`).join("\n");
-const fence = (n: number) => `\`\`\`ts\n${lines("const value =", n)}\n\`\`\``;
+// Own lines, blank-separated, so Markdown sees a block; `seed` makes bodies differ for cold highlighting.
+const fence = (seed: string, n: number) => `\n\n\`\`\`ts\n${lines(`const ${seed} =`, n)}\n\`\`\`\n\n`;
 
 let nextId = 0;
 const toolCall = (title: string, kind: string, extra: Record<string, unknown> = {}): [string, Update] => {
@@ -60,7 +63,7 @@ function historyUpdates(): Update[] {
   const codeEvery = 150;
   let t = 0;
   for (let i = 0; i < 1500; i++) {
-    out.push(chunk(i % codeEvery === 0 ? `${fence(300)}\n` : `History line ${i}. `));
+    out.push(chunk(i % codeEvery === 0 ? fence(HISTORY_FENCE_SEED, 300) : `History line ${i}. `));
     while (t < tools.length && t <= (i + 1) / toolEvery) out.push(tools[t++]!);
   }
   while (t < tools.length) out.push(tools[t++]!);
@@ -75,7 +78,10 @@ function measuredUpdates(): Update[] {
   const bigNew = lines("new line", DIFF_LINES);
   const task = taskWithChildren("measured", 20);
   for (let i = 0; i < MEASURED_CHUNKS; i++) {
-    out.push(chunk(i === 100 ? `${fence(300)}\n` : `Streamed ${i} `), { sessionUpdate: "wait_ms", ms: 20 });
+    out.push(chunk(i === 100 ? fence(MEASURED_FENCE_SEED, 300) : `Streamed ${i} `), {
+      sessionUpdate: "wait_ms",
+      ms: 20,
+    });
     if (i % 50 === 25 && i / 50 < edits) out.push(editCall(`src/live-${i}.ts`, bigOld, bigNew));
     if (i >= 200 && i < 200 + task.length) out.push(task[i - 200]!);
   }
