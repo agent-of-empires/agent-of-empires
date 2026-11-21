@@ -258,6 +258,10 @@ struct RawEdit {
 
 /// Errors carry categories and server names only, never values from the response.
 pub fn parse_edit(value: Value) -> Result<McpEdit, String> {
+    // serde decodes a sequence into a struct by position, so an empty array would read as "no edit".
+    if !value.is_object() {
+        return Err("response does not match the mcp.rewrite schema (not an object)".into());
+    }
     let raw: RawEdit = serde_json::from_value(value).map_err(|e| {
         format!(
             "response does not match the mcp.rewrite schema ({:?})",
@@ -792,6 +796,11 @@ mod tests {
                 json!({"add":[{"name":"x","command":"c","bogus":1}]}),
             ),
             ("not an object", json!([1, 2])),
+            ("empty array", json!([])),
+            ("array of nulls", json!([null, null])),
+            ("array of defaults", json!([null, []])),
+            ("null", json!(null)),
+            ("string", json!("ok")),
         ];
         for (label, v) in cases {
             assert!(parse_edit(v).is_err(), "{label} must be rejected");
