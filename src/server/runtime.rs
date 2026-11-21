@@ -845,7 +845,6 @@ mod tests {
         let (_health_tx, health_rx) = tokio::sync::watch::channel(Arc::default());
         let mut snapshots = state.runtime.snapshots.subscribe();
         let (completed_tx, mut completed_rx) = tokio::sync::mpsc::unbounded_channel();
-        let publisher = tokio::spawn(publish_loop(state.clone()));
         let mut polling = Box::pin(super::super::status_poll::status_poll_loop_observed(
             state.clone(),
             health_rx,
@@ -860,6 +859,10 @@ mod tests {
         .await
         .unwrap();
         // The tick only requests a publish; publish_loop performs it.
+        tokio::time::timeout(Duration::ZERO, state.runtime.wake.notified())
+            .await
+            .expect("tick left a publish request");
+        let publisher = tokio::spawn(publish_loop(state.clone()));
         let title = published_title(&mut snapshots, "before").await;
         assert_eq!(title, "before");
         storage
