@@ -18,8 +18,12 @@ const home = mkdtempSync(join(tmpdir(), "aoe-bench-home-"));
 const repo = mkdtempSync(join(tmpdir(), "aoe-bench-repo-"));
 const port = 8090 + (process.pid % 500);
 const tmuxSocket = join(home, "tmux.sock");
+// Drop host git, AoE and tmux state so nothing redirects the repo or reaches a host daemon.
+const hostState = /^(GIT_|AOE_|AGENT_OF_EMPIRES_|TMUX)/;
 const env = {
-  ...process.env,
+  ...Object.fromEntries(Object.entries(process.env).filter(([k]) => !hostState.test(k))),
+  GIT_CONFIG_GLOBAL: join(home, ".gitconfig"),
+  GIT_CONFIG_SYSTEM: "/dev/null",
   HOME: home,
   XDG_CONFIG_HOME: join(home, ".config"),
   XDG_DATA_HOME: join(home, ".local/share"),
