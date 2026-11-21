@@ -230,7 +230,10 @@ function ModelDropdown({ option, pending, onSelect, lockedReason, modelDefault }
       items[next]?.scrollIntoView({ block: "nearest" });
     } else if (e.key === "Enter" && e.target instanceof HTMLInputElement) {
       e.preventDefault();
-      items[Math.max(0, currentIndex)]?.click();
+      // Only a model: with no match the default row would be the first item, and Enter would save it.
+      const models = items.filter((item) => !item.hasAttribute("data-model-default"));
+      const current = query.trim() ? -1 : models.findIndex((item) => item === currentOptionRef.current);
+      models[Math.max(0, current)]?.click();
     }
   };
 
@@ -385,6 +388,8 @@ function ModelDropdown({ option, pending, onSelect, lockedReason, modelDefault }
             })}
             {modelDefault && (
               <ModelDefaultItem
+                // A new profile or Agent starts from loading, not the last one's default.
+                key={`${modelDefault.profile}\0${modelDefault.agent}`}
                 target={modelDefault}
                 option={option}
                 onDone={(keyboard) => {
@@ -434,6 +439,7 @@ function ModelDefaultItem({
       <button
         type="button"
         role="menuitem"
+        data-model-default
         onClick={(e) => {
           onDone(e.detail === 0);
           open();
@@ -465,6 +471,7 @@ function ModelDefaultItem({
     <button
       type="button"
       role="menuitemcheckbox"
+      data-model-default
       aria-checked={checked}
       aria-disabled={inert || undefined}
       onClick={(e) => {

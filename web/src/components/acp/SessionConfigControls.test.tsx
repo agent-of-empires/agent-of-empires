@@ -409,7 +409,7 @@ describe("model default", () => {
   async function mountWithDefault(loaded: unknown, extra: Partial<Parameters<typeof SessionConfigControls>[0]> = {}) {
     defaults.loadAgentModelDefault.mockReturnValue(new Promise((r) => (resolveLoad = r)));
     toastBus.handler = toasts as unknown as ToastApi;
-    render(
+    const view = render(
       <SessionConfigControls
         configOptions={[MODEL]}
         pendingConfigOption={null}
@@ -420,6 +420,7 @@ describe("model default", () => {
     );
     fireEvent.click(byId("model")!);
     await act(async () => resolveLoad(loaded));
+    return view;
   }
   const item = () => screen.queryByRole("menuitemcheckbox", { name: LABEL });
 
@@ -504,6 +505,45 @@ describe("model default", () => {
     fireEvent.click(screen.getByRole("menuitem", { name: "Pinned in Agent defaults ›" }));
     expect(open).toHaveBeenCalledOnce();
     expect(screen.queryByRole("menu")).toBeNull();
+  });
+
+  it.each([
+    { search: "no matching model", query: "no such model", row: "the checkbox", pinned: false },
+    { search: "no matching model", query: "no such model", row: "the pinned link", pinned: true },
+    { search: "an empty search", query: "", row: "the checkbox", pinned: false },
+    { search: "an empty search", query: "", row: "the pinned link", pinned: true },
+  ])("Enter with $search doesn't activate $row", async ({ query, pinned }) => {
+    const loaded = { model: "claude-sonnet-4-6", pinned };
+    const onSetConfigOption = vi.fn();
+    await mountWithDefault(loaded, { onSetConfigOption });
+    const search = screen.getByRole("textbox", { name: "Search models" });
+    fireEvent.change(search, { target: { value: query } });
+    fireEvent.keyDown(search, { key: "Enter" });
+    expect(defaults.saveAgentModelDefault).not.toHaveBeenCalled();
+    expect(open).not.toHaveBeenCalled();
+    // No match picks nothing; an empty search keeps the current model.
+    expect(onSetConfigOption).not.toHaveBeenCalled();
+  });
+
+  it("reloads for a new Agent while the menu is open, and saves for that Agent", async () => {
+    const view = await mountWithDefault({ model: "claude-sonnet-4-6", pinned: false });
+    defaults.loadAgentModelDefault.mockReturnValue(new Promise((r) => (resolveLoad = r)));
+    view.rerender(
+      <SessionConfigControls
+        configOptions={[MODEL]}
+        pendingConfigOption={null}
+        onSetConfigOption={vi.fn()}
+        modelDefault={{ ...target, agent: "codex", agentLabel: "Codex" }}
+      />,
+    );
+    const codex = screen.getByRole("menuitemcheckbox", { name: "Default for new Codex Sessions in Structured view" });
+    // Claude's loaded default must not carry over to Codex.
+    expect(codex.getAttribute("aria-disabled")).toBe("true");
+    expect(defaults.loadAgentModelDefault).toHaveBeenLastCalledWith("work", "codex");
+    defaults.saveAgentModelDefault.mockResolvedValue("committed");
+    await act(async () => resolveLoad({ model: "gpt-5", pinned: false }));
+    await act(async () => fireEvent.click(codex));
+    expect(defaults.saveAgentModelDefault).toHaveBeenCalledWith("work", "codex", "claude-opus-4-7");
   });
 
   it("is reached with the arrow keys", async () => {
