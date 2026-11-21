@@ -34,15 +34,14 @@ export function InfoPopover({ title, children }: { title: string; children: Reac
     const onFocusIn = (e: FocusEvent) => {
       if (outside(e.target)) setPos(null);
     };
-    // It's placed once, so a scroll under it (the wizard's list) or a narrower window would leave it behind.
+    // It's placed once, so a scroll under it (the wizard's list) would leave it behind.
     const onScroll = (e: Event) => {
       if (!panelRef.current?.contains(e.target as Node)) setPos(null);
     };
-    // Width only: a phone's keyboard and address bar resize the height, and opening this can close the keyboard.
+    // A narrower window moves the icon, so close. A height change (a phone's keyboard or address bar, which
+    // opening this can trigger) keeps it open, re-clamped: the clamp hook only watches the panel's own size.
     const openWidth = window.innerWidth;
-    const onResize = () => {
-      if (window.innerWidth !== openWidth) setPos(null);
-    };
+    const onResize = () => setPos((p) => (window.innerWidth !== openWidth || !p ? null : { ...p }));
     document.addEventListener("pointerdown", onPointerDown, true);
     document.addEventListener("focusin", onFocusIn, true);
     document.addEventListener("scroll", onScroll, true);

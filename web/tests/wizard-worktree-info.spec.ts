@@ -53,6 +53,18 @@ test.describe("desktop", () => {
     await expect(popover(page)).toHaveCount(0);
   });
 
+  test("a height-only shrink past the open popover's bottom edge moves it back inside the window", async ({ page }) => {
+    await startWizard(page, WORKTREE_ON);
+    await icon(page).click();
+    const bottom = () => popover(page).evaluate((el) => el.getBoundingClientRect().bottom);
+    const before = await bottom();
+    const height = Math.floor(before) - 100;
+    await page.setViewportSize({ width: 1280, height });
+    await expect(popover(page)).toBeVisible();
+    await expect.poll(bottom).toBeLessThanOrEqual(height);
+    await expect(link(page)).toBeInViewport({ ratio: 1 });
+  });
+
   test("the link closes the wizard and opens Settings › Worktree without reloading the page", async ({ page }) => {
     await startWizard(page, WORKTREE_ON);
     // One Worktree setting, so the tab's own row proves where it landed.
