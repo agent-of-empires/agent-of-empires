@@ -1215,7 +1215,8 @@ pub struct SessionConfig {
     /// side by side. Narrower than this is also where a collapsed sidebar stops
     /// being available to `one_pane`. Values below 50
     /// are raised to 50, the narrowest side-by-side split that keeps the
-    /// preview's 40-column floor beside a minimal 10-column list. A value
+    /// preview's 40-column floor beside a minimal 10-column list, so the range
+    /// accepts them rather than blocking a config that holds one. A value
     /// greater than the terminal width puts every width below it, so the narrow
     /// layout always applies, which the arrangement handles like any other
     /// narrow height.
@@ -1223,9 +1224,9 @@ pub struct SessionConfig {
     #[setting(
         label = "Narrow layout below this width",
         widget = "number",
-        min = 50,
+        min = 0,
         max = 1000,
-        validate = "range:50:1000",
+        validate = "range:0:1000",
         tui_only,
         global_only,
         summary = "Window width in columns. Narrower terminal app windows stack the list over the preview. Values under 50 are raised to 50."
