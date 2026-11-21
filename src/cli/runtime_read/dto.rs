@@ -1058,6 +1058,7 @@ fn is_c1_c0(value: char) -> bool {
 fn valid_timestamp(value: &str) -> bool {
     let bytes = value.as_bytes();
     if bytes.len() < 20
+        || !bytes[..4].iter().all(u8::is_ascii_digit)
         || bytes[4] != b'-'
         || bytes[7] != b'-'
         || bytes[10] != b'T'
@@ -1518,6 +1519,8 @@ mod tests {
             "2026-01-01T00:00:00.1234567890Z", // ten
             "2026-01-01T00:00:00.12a456Z",     // a non-digit in the fraction
             "2026-01-01T00:00:0\u{1b}Z",       // a control character
+            "+999-01-01T00:00:00Z",            // a signed three-digit year
+            "-001-01-01T00:00:00Z",            // a negative year
         ] {
             assert!(!valid_timestamp(refused), "{refused} must be refused");
         }
