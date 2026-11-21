@@ -5749,9 +5749,16 @@
       "id": "onboarding.first-run-tutorial",
       "kind": "live-playwright",
       "risk": "medium",
-      "specs": ["tests/live/onboarding.spec.ts"],
+      "specs": [
+        "tests/live/onboarding.spec.ts",
+        "tests/tour-install-hint.spec.ts",
+        "src/lib/__tests__/platform.test.ts",
+        "src/components/tour/TourRunner.installHint.test.tsx"
+      ],
       "components": [
         "web/src/components/tour/TourRunner.tsx",
+        "web/src/lib/platform.ts",
+        "web/src/lib/tourSteps.ts",
         "web/src/components/TopBar.tsx",
         "web/src/components/OverflowMenu.tsx",
         "web/src/components/Dashboard.tsx",
@@ -5760,7 +5767,8 @@
         "web/src/components/acp/Composer.tsx",
         "web/src/components/SettingsView.tsx",
         "web/src/components/settings/SettingsIntro.tsx"
-      ]
+      ],
+      "notes": "#4595: the last step adds iOS, Android or generic install and notifications steps only in a phone or tablet browser tab over a secure origin. Any iPad gets the iOS steps, with a trackpad or in desktop mode; installed apps, desktops and plain HTTP get none."
     },
     {
       "id": "onboarding.settings-tab-intros",

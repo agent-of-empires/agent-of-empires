@@ -1,5 +1,6 @@
 // Engine-independent tour steps. Attach anchors only via `tourAnchor()` so the drift guard in tourSteps.test.ts catches renames.
 
+import type { InstallHint } from "./platform";
 import type { ShortcutId } from "./shortcuts";
 
 /** Values land in the DOM as `data-tour`; keep them on stable region containers. */
@@ -36,7 +37,15 @@ export interface TourStep {
   shortcutHints?: readonly TourShortcutHint[];
   writableOnly?: boolean;
   desktopOnly?: boolean;
+  /** Adds the install and notifications steps when the page is a phone's browser tab. */
+  installHint?: true;
 }
+
+export const INSTALL_HINTS: Record<InstallHint, string> = {
+  ios: "For notifications, add this page to your Home Screen (Share › Add to Home Screen), open it from there, sign in, and turn them on.",
+  android: "For notifications, install this app (browser menu › Install app), open it, sign in, and turn them on.",
+  other: "For notifications, install this app from your browser's menu, open it, sign in, and turn them on.",
+};
 
 /** Skips inert retained views, whose hidden anchors would otherwise match first and end the tour. */
 export function tourSelector(anchor: TourAnchorId): string {
@@ -126,6 +135,7 @@ export const TOUR_STEPS: readonly TourStep[] = [
     scopes: ["dashboard", "session", "structured-view"],
     title: "Replay this tour any time",
     body: "Reopen this walkthrough whenever you like from here: More, then Show tutorial.",
+    installHint: true,
   },
 ] as const;
 
