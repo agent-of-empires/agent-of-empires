@@ -9,6 +9,9 @@ use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 use tokio_util::sync::CancellationToken;
 
+/// PID 1 is `sleep`, which ignores SIGTERM, so waiting out the grace only delays SIGKILL.
+pub(crate) const STOP_NOW_ARGS: [&str; 3] = ["stop", "-t", "0"];
+
 /// `docker pull` has no timeout of its own; this only fires on a wedged pull.
 const PULL_TIMEOUT: Duration = Duration::from_secs(600);
 
@@ -796,7 +799,7 @@ impl RuntimeBase {
     pub fn stop_container(&self, name: &str) -> Result<()> {
         tracing::info!(target: "containers.runtime", runtime = %self.name, %name, "stopping container");
         let mut cmd = self.command();
-        cmd.args(["stop", "-t", "0", name]);
+        cmd.args(STOP_NOW_ARGS).arg(name);
         let output = self.probe_output(&mut cmd)?;
 
         if !output.status.success() {
