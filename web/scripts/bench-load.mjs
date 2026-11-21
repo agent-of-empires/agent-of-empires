@@ -4,6 +4,7 @@
 // cache off, and prints medians: cold-load bytes, script CPU, and first-diff cost.
 import { chromium } from "@playwright/test";
 import { spawn, execFileSync } from "node:child_process";
+import { createServer } from "node:net";
 import { mkdtempSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
@@ -16,7 +17,13 @@ if (!arg) throw new Error("usage: bench-load.mjs <aoe-binary> [runs]");
 
 const home = mkdtempSync(join(tmpdir(), "aoe-bench-home-"));
 const repo = mkdtempSync(join(tmpdir(), "aoe-bench-repo-"));
-const port = 8090 + (process.pid % 500);
+// The OS hands out a free port; the daemon must bind it or exit (checked below).
+const port = await new Promise((ok) => {
+  const probe = createServer().listen(0, "127.0.0.1", () => {
+    const { port: p } = probe.address();
+    probe.close(() => ok(p));
+  });
+});
 const tmuxSocket = join(home, "tmux.sock");
 // Drop host git, AoE and tmux state so nothing redirects the repo or reaches a host daemon.
 const hostState = /^(GIT_|AOE_|AGENT_OF_EMPIRES_|TMUX)/;
@@ -102,12 +109,14 @@ try {
   const url = `http://127.0.0.1:${port}/`;
   let up = false;
   for (let i = 0; i < 600 && !up; i++) {
+    // A child that failed to bind exits; never accept another daemon answering on its port.
+    if (server.exitCode !== null) throw new Error(`aoe serve exited with ${server.exitCode}`);
     try {
       up = (await fetch(url)).ok;
     } catch {}
     if (!up) await new Promise((r) => setTimeout(r, 250));
   }
-  if (!up) throw new Error("aoe serve did not come up");
+  if (!up || server.exitCode !== null) throw new Error("aoe serve did not come up");
 
   // The CLI attaches to the serve daemon; the command must name a supported tool to keep a pane alive.
   execFileSync(bin, ["add", repo, "-t", "bench", "-c", "sh -c 'echo claude; exec sh'"], {
