@@ -52,10 +52,22 @@ describe("InfoPopover", () => {
     expect(document.activeElement).not.toBe(icon);
   });
 
-  it("closes when the page under it scrolls", () => {
+  const resize = (width: number, height: number) => () => {
+    Object.assign(window, { innerWidth: width, innerHeight: height });
+    fireEvent(window, new Event("resize"));
+  };
+  // A narrower window moves the icon but not the panel's size, so nothing else would re-place it. A phone's
+  // keyboard and address bar change only the height, and opening the popover can close the keyboard.
+  it.each([
+    ["closes when the page under it scrolls", () => fireEvent.scroll(screen.getByText("outside")), false],
+    ["closes when the window's width changes", resize(375, 768), false],
+    ["stays open when only the window's height changes", resize(1024, 400), true],
+  ])("%s", (_label, act, staysOpen) => {
+    Object.assign(window, { innerWidth: 1024, innerHeight: 768 });
     renderPopover();
     fireEvent.click(screen.getByRole("button", { name: "What's a worktree?" }));
-    fireEvent.scroll(screen.getByText("outside"));
-    expect(dialog()).toBeNull();
+    act();
+    expect(dialog() !== null).toBe(staysOpen);
+    Object.assign(window, { innerWidth: 1024, innerHeight: 768 });
   });
 });

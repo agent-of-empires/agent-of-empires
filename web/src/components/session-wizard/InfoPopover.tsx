@@ -29,15 +29,22 @@ export function InfoPopover({ title, children }: { title: string; children: Reac
       const target = e.target as Node;
       if (!panelRef.current?.contains(target) && !buttonRef.current?.contains(target)) setPos(null);
     };
-    // It's placed once, so a scroll under it (the wizard's list) would leave it behind.
+    // It's placed once, so a scroll under it (the wizard's list) or a narrower window would leave it behind.
     const onScroll = (e: Event) => {
       if (!panelRef.current?.contains(e.target as Node)) setPos(null);
     };
+    // Width only: a phone's keyboard and address bar resize the height, and opening this can close the keyboard.
+    const openWidth = window.innerWidth;
+    const onResize = () => {
+      if (window.innerWidth !== openWidth) setPos(null);
+    };
     document.addEventListener("pointerdown", onPointerDown, true);
     document.addEventListener("scroll", onScroll, true);
+    window.addEventListener("resize", onResize);
     return () => {
       document.removeEventListener("pointerdown", onPointerDown, true);
       document.removeEventListener("scroll", onScroll, true);
+      window.removeEventListener("resize", onResize);
     };
   }, [open]);
 
