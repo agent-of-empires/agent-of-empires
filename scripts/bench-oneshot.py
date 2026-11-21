@@ -78,6 +78,7 @@ class Bench:
         return len(self.log.read_text().splitlines()) if self.log.exists() else 0
 
     def close(self):
+        self.aoe_cmd("session", "stop", "sandboxed", check=False)
         self.aoe_cmd("serve", "--stop", check=False)
         subprocess.run(
             [shutil.which("tmux"), "-L", self.socket, "kill-server"], capture_output=True
