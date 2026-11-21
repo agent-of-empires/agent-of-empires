@@ -270,6 +270,14 @@ pub(super) async fn resolve_canonical_fork_seed(
         if !structured_fork_capable {
             return Err(StatusCode::BAD_REQUEST.into_response());
         }
+        if !crate::session::fork::structured_fork_profile_compatible(
+            &source.tool,
+            source.agent_name.as_deref(),
+            &source.source_profile,
+            &profile,
+        ) {
+            return Err(StatusCode::CONFLICT.into_response());
+        }
         source.acp_session_id.as_deref()
     } else {
         source.agent_session_id.as_deref()
@@ -294,13 +302,15 @@ fn acp_agent_key<'a>(tool: &'a str, agent_name: Option<&'a str>) -> &'a str {
 /// The `agent_name` a structured fork of `parent_id` runs, held to the agent of
 /// the rows that recorded that conversation as `fork_session_id` holds it. A
 /// request naming no agent under the parent's tool inherits the parent's
-/// `agent_name`; a parent no row records leaves the request as it is.
+/// `agent_name`; a parent no row records leaves the request as it is. The error
+/// is the refusal's message.
 pub(super) fn structured_fork_agent_name(
     rows: &[crate::session::Instance],
     parent_id: &str,
+    profile: &str,
     tool: &str,
     agent_name: Option<&str>,
-) -> Result<Option<String>, ()> {
+) -> Result<Option<String>, &'static str> {
     let parents: Vec<_> = rows
         .iter()
         .filter(|row| row.acp_session_id.as_deref() == Some(parent_id))
@@ -314,7 +324,7 @@ pub(super) fn structured_fork_agent_name(
         .iter()
         .any(|row| acp_agent_key(&row.tool, row.agent_name.as_deref()) != parent_key)
     {
-        return Err(());
+        return Err(FORK_AGENT_MISMATCH);
     }
     // The rows agree on the agent, so any row under the requested tool names it.
     let agent_name = match agent_name {
@@ -324,12 +334,25 @@ pub(super) fn structured_fork_agent_name(
             .and_then(|row| row.agent_name.clone()),
         named => named.map(str::to_string),
     };
-    if acp_agent_key(tool, agent_name.as_deref()) == parent_key {
-        Ok(agent_name)
-    } else {
-        Err(())
+    if acp_agent_key(tool, agent_name.as_deref()) != parent_key {
+        return Err(FORK_AGENT_MISMATCH);
     }
+    if !parents.iter().all(|row| {
+        crate::session::fork::structured_fork_profile_compatible(
+            &row.tool,
+            row.agent_name.as_deref(),
+            &row.source_profile,
+            profile,
+        )
+    }) {
+        return Err(FORK_PROFILE_MISMATCH);
+    }
+    Ok(agent_name)
 }
+
+const FORK_AGENT_MISMATCH: &str = "A structured fork must run the agent of the session it forks";
+const FORK_PROFILE_MISMATCH: &str =
+    "A structured fork of a custom agent must stay in the profile of the session it forks";
 
 /// True iff the agent can run a structured (ACP) session in this project: a
 /// built-in ACP agent in the registry, or a custom tool with a valid
@@ -1285,16 +1308,13 @@ pub(crate) async fn create_session_with(
             match structured_fork_agent_name(
                 &instances,
                 parent_id,
+                validation_profile,
                 &body.tool,
                 body.agent_name.as_deref(),
             ) {
                 Ok(agent_name) => body.agent_name = agent_name,
-                Err(()) => {
-                    return api_error(
-                        StatusCode::BAD_REQUEST,
-                        "fork_unsupported",
-                        "A structured fork must run the agent of the session it forks",
-                    );
+                Err(message) => {
+                    return api_error(StatusCode::BAD_REQUEST, "fork_unsupported", message);
                 }
             }
         }

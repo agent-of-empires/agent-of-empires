@@ -5065,6 +5065,7 @@ fn a_structured_fork_runs_the_parents_agent() {
         inst.tool = tool.into();
         inst.agent_name = agent_name.map(Into::into);
         inst.acp_session_id = Some(acp.into());
+        inst.source_profile = "work".into();
         inst
     };
     let rows = [
@@ -5105,44 +5106,100 @@ fn a_structured_fork_runs_the_parents_agent() {
         ("unrecorded", "claude", Some("x"), ok(Some("x"))),
     ] {
         assert_eq!(
-            create::structured_fork_agent_name(&rows, parent, tool, agent_name),
+            create::structured_fork_agent_name(&rows, parent, "work", tool, agent_name)
+                .map_err(|_| ()),
             want,
             "{parent} / {tool} / {agent_name:?}"
         );
     }
+    // Two profiles can share a custom alias with different commands and stores,
+    // so only a built-in parent forks into another profile.
+    for (parent, tool) in [("tool-only", "claude-acct"), ("named", "claude")] {
+        let refused = create::structured_fork_agent_name(&rows, parent, "home", tool, None);
+        assert!(
+            refused.is_err_and(|message| message.contains("profile")),
+            "{parent}"
+        );
+    }
+    assert_eq!(
+        create::structured_fork_agent_name(&rows, "builtin", "home", "claude", None),
+        Ok(None)
+    );
 }
 
+/// Both fork routes hold a custom parent to its own agent and profile: two
+/// profiles can share an alias that launches different commands and stores.
 #[tokio::test]
 #[serial_test::serial]
-async fn create_refuses_a_structured_fork_under_another_agent() {
+async fn create_holds_a_structured_fork_to_the_parents_agent_and_profile() {
     let _home = crate::session::test_support::isolate_app_dir();
+    crate::session::config::update_config(|c| {
+        c.session
+            .agent_acp_cmd
+            .insert("claude-acct".into(), "/state/acct-acp.sh".into());
+        c.session
+            .agent_execution_as
+            .insert("claude-acct".into(), "claude".into());
+        c.session
+            .agent_config_dir
+            .insert("claude-acct".into(), "~/.claude-acct".into());
+    })
+    .unwrap();
     let project = tempfile::tempdir().unwrap();
+    let acp_id = "11111111-1111-4111-8111-111111111111";
     let mut parent = make_test_instance();
+    parent.source_profile = "work".into();
     parent.tool = "claude".into();
     parent.agent_name = Some("claude-acct".into());
     parent.view = crate::session::View::Structured;
-    parent.acp_session_id = Some("11111111-1111-4111-8111-111111111111".into());
+    parent.acp_session_id = Some(acp_id.into());
+    let parent_id = parent.id.clone();
     let state = crate::server::test_support::build_test_app_state(vec![parent]);
-    let response = create::create_session(
-        State(state),
-        axum::extract::Query(create::CreateSessionQuery { wait: None }),
-        None,
-        None,
-        Ok(Json(create_body_from_json(serde_json::json!({
-            "path": project.path(), "tool": "claude", "agent_name": "claude",
-            "view": "structured", "fork_from": "11111111-1111-4111-8111-111111111111",
-        })))),
-    )
-    .await
-    .into_response();
-    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
-    let body = axum::body::to_bytes(response.into_body(), 1024 * 1024)
+
+    // `fork_from`, from the served "test" profile.
+    for (agent_name, refusal) in [
+        ("claude", "the agent of the session it forks"),
+        ("claude-acct", "the profile of the session it forks"),
+    ] {
+        let response = create::create_session(
+            State(state.clone()),
+            axum::extract::Query(create::CreateSessionQuery { wait: None }),
+            None,
+            None,
+            Ok(Json(create_body_from_json(serde_json::json!({
+                "path": project.path(), "tool": "claude", "agent_name": agent_name,
+                "view": "structured", "fork_from": acp_id,
+            })))),
+        )
+        .await
+        .into_response();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST, "{agent_name}");
+        let body = axum::body::to_bytes(response.into_body(), 1024 * 1024)
+            .await
+            .unwrap();
+        let body = String::from_utf8_lossy(&body);
+        assert!(body.contains(refusal), "{agent_name}: {body}");
+    }
+
+    // `fork_session_id`.
+    let body = |profile: &str| {
+        create_body_from_json(serde_json::json!({
+            "path": project.path(), "profile": profile, "tool": "claude",
+            "agent_name": "claude-acct", "view": "structured",
+        }))
+    };
+    let refusal = create::resolve_canonical_fork_seed(&state, &body("test"), &parent_id)
+        .await
+        .unwrap_err();
+    assert_eq!(refusal.status(), StatusCode::CONFLICT);
+    let seed = create::resolve_canonical_fork_seed(&state, &body("work"), &parent_id)
         .await
         .unwrap();
-    assert!(
-        String::from_utf8_lossy(&body).contains("the agent of the session it forks"),
-        "{}",
-        String::from_utf8_lossy(&body)
+    assert_eq!(
+        seed,
+        crate::session::ForkSeed::Structured {
+            parent_acp_session_id: acp_id.into(),
+        }
     );
 }
 

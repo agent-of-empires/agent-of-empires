@@ -219,6 +219,22 @@ pub fn custom_structured_fork_capable(
             .is_some_and(|base| structured_fork_capable(base, None))
 }
 
+/// Whether a structured fork of a parent running `tool`/`agent_name` in
+/// `parent_profile` may run in `profile`. A built-in launches the same adapter
+/// everywhere, but a custom agent launches what its profile declares, and a
+/// repository cannot override those keys, so the profile fixes its command and
+/// store.
+pub fn structured_fork_profile_compatible(
+    tool: &str,
+    agent_name: Option<&str>,
+    parent_profile: &str,
+    profile: &str,
+) -> bool {
+    structured_fork_capable(tool, agent_name)
+        || crate::session::config::effective_profile(parent_profile)
+            == crate::session::config::effective_profile(profile)
+}
+
 /// Whether the agent can run a structured fork for `profile` and the project at
 /// `project_path`, reading config only when the agent is not a built-in.
 pub fn structured_fork_capable_in(

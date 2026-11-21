@@ -317,7 +317,7 @@ Give the agent an ACP launch command; it must speak the [Agent Client Protocol](
 
 The value is split into argv and executed with no shell, so wrap explicitly for shell features (`sh -lc '...'`). A matching `custom_agents` entry is needed only for the agent picker, not for an explicit ACP switch target. Built-in names take precedence.
 
-A structured session of such an agent can be forked when the agent also declares `agent_execution_as` and `agent_config_dir` for a built-in whose adapter forks (currently `claude`). The fork runs `session/fork` through the agent's own command. `agent_detect_as` alone does not enable it.
+A structured session of such an agent can be forked when the agent also declares `agent_execution_as` and `agent_config_dir` for a built-in whose adapter forks (currently `claude`). The fork runs `session/fork` through the agent's own command and stays in the parent's profile, since another profile can give the same name another command and store. It fails, rather than starting an empty session, when that command's adapter does not advertise `session/fork`. `agent_detect_as` alone does not enable it.
 
 A wrapper around a supported agent needs no `agent_acp_cmd` at all: map it with `agent_detect_as` and it inherits the base agent's ACP adapter, which also lights up **Switch to structured view** on an existing terminal session. **The wrapper binary is never executed** in that case, so anything it does outside the CLI (selecting an account, gateway, or profile by setting env) does not apply. Inheritance works only for bases with a built-in adapter (`claude`, `codex`, `opencode`, `gemini`, `vibe`, `pi`, `omp`, `kimi`, `prime-agent`).
 
