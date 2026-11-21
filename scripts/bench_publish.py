@@ -8,13 +8,13 @@ Run the daemon with AOE_LOG_LEVEL=debug, then:
 import math
 import re
 import sys
-from datetime import datetime
+from datetime import datetime, timezone
 
 EVENT = re.compile(r"(\d{4}-\d\d-\d\dT[\d:.]+)Z?.*projected.*project_ms=([\d.]+).*changed=(true|false)")
 
 
 def stamp(text):
-    return datetime.fromisoformat(text).timestamp()
+    return datetime.fromisoformat(text).replace(tzinfo=timezone.utc).timestamp()
 
 
 def main():
