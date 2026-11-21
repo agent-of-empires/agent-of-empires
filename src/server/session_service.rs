@@ -5614,6 +5614,48 @@ mod tests {
         assert!(pending_turn(&service, "sess-term-super").await.is_none());
     }
 
+    /// The supersession clear queues blocking work of its own, so a send must
+    /// not hold the only blocking slot while it waits for that clear.
+    #[test]
+    #[serial_test::serial]
+    fn a_terminal_send_clears_the_pending_turn_with_one_blocking_slot() {
+        if !crate::tmux::is_tmux_available() {
+            return;
+        }
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .max_blocking_threads(1)
+            .enable_all()
+            .build()
+            .unwrap();
+        runtime.block_on(async {
+            let _app_dir = crate::session::test_support::isolate_app_dir();
+            let inst = terminal_turn_instance("sess-one-slot", "one-slot", "initial-turn-A");
+            crate::server::test_support::seed_instances_on_disk_for_test(
+                &inst.source_profile,
+                vec![inst.clone()],
+            );
+            let _pane = start_terminal_pane(&inst, READY_AGENT_SCRIPT, false);
+            let state = crate::server::test_support::build_test_app_state(vec![inst]);
+            let service = state.session_service.clone();
+            crate::server::test_support::refresh_canonical_metadata_for_test(&state).await;
+
+            let sent = tokio::time::timeout(
+                std::time::Duration::from_secs(20),
+                crate::server::api::sessions::send_terminal_message(
+                    &service,
+                    "sess-one-slot",
+                    "user-message-B".to_string(),
+                    false,
+                ),
+            )
+            .await
+            .expect("the send finished instead of waiting on the blocking pool");
+            assert!(sent.is_ok());
+            assert!(pending_turn(&service, "sess-one-slot").await.is_none());
+        });
+    }
+
     /// An archived or snoozed session is set aside: its pending turn is
     /// neither typed nor marked failed.
     #[tokio::test]

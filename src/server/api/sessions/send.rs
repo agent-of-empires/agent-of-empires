@@ -143,7 +143,7 @@ async fn send_terminal_message_inner(
         .await
         .ok_or(SendKeysError::NotFound)?;
     let guard = service.instance_lock(id).await.lock_owned().await;
-    let mut instance = service
+    let instance = service
         .instances
         .read()
         .await
@@ -153,62 +153,78 @@ async fn send_terminal_message_inner(
         .ok_or(SendKeysError::NotFound)?;
     let revived = instance.lifecycle_generation != before.lifecycle_generation;
     let worker_state = state.clone();
-    let runtime = tokio::runtime::Handle::current();
-    let clear_state = state.clone();
+    let clear_service = state.session_service.clone();
     let clear_id = id.to_string();
-    // The guards move into the worker: it outlives a dropped request future, and
-    // the supersession of the initial prompt must finish under them.
-    let result = tokio::task::spawn_blocking(move || -> anyhow::Result<bool> {
+    // An owned task holds the guards: it outlives a dropped request future, and
+    // the supersession of the initial prompt must finish under them. Only the
+    // tmux and store work is blocking, so the clear never waits on a pool slot
+    // this task already holds.
+    let result = tokio::spawn(async move {
         let _submission = submission;
         let _guard = guard;
         use crate::session::SessionStore;
-        let native = crate::server::session_store::NativeSessionStore::open(
-            worker_state,
-            &instance.source_profile,
-            None,
-        )?;
-        let store: &dyn SessionStore = &native;
-        let expected = (instance.lifecycle_generation, instance.title.clone());
-        let _ownership = instance.acquire_auxiliary_locks_in(&native)?;
-        anyhow::ensure!(
-            instance.lifecycle_generation == expected.0 && instance.title == expected.1,
-            crate::session::LifecycleReservationError::Superseded
-        );
-        instance.ensure_startable()?;
-        anyhow::ensure!(
-            !instance.is_structured(),
-            "Session no longer has a terminal agent"
-        );
-        anyhow::ensure!(
-            super::ensure::ready_agent_session(&instance)?.is_some(),
-            TerminalNotRunning
-        );
-        let session = instance.tmux_session()?;
-        session.wait_until_ready(
-            std::time::Duration::from_secs(5),
-            crate::agents::ready_markers(&instance.tool),
-        );
-        session.send_keys_with_delay(&message, instance.send_keys_enter_delay())?;
-        // A newer prompt supersedes an undelivered initial one, as in ACP. Cleared
-        // once tmux accepted the text, even if the recency write below fails.
-        runtime.block_on(
-            clear_state
-                .session_service
-                .clear_pending_initial_turn(&clear_id),
-        );
-        store.update(|rows, _| {
-            let row = rows
-                .iter_mut()
-                .find(|row| row.id == instance.id)
-                .ok_or(crate::session::SessionGone)?;
+        let send_state = worker_state.clone();
+        let (instance, ownership) = tokio::task::spawn_blocking(move || {
+            let mut instance = instance;
+            let native = crate::server::session_store::NativeSessionStore::open(
+                send_state,
+                &instance.source_profile,
+                None,
+            )?;
+            let expected = (instance.lifecycle_generation, instance.title.clone());
+            let ownership = instance.acquire_auxiliary_locks_in(&native)?;
             anyhow::ensure!(
-                row.lifecycle_generation == instance.lifecycle_generation,
+                instance.lifecycle_generation == expected.0 && instance.title == expected.1,
                 crate::session::LifecycleReservationError::Superseded
             );
-            row.touch_after_input();
-            Ok(())
-        })?;
-        Ok(revived)
+            instance.ensure_startable()?;
+            anyhow::ensure!(
+                !instance.is_structured(),
+                "Session no longer has a terminal agent"
+            );
+            anyhow::ensure!(
+                super::ensure::ready_agent_session(&instance)?.is_some(),
+                TerminalNotRunning
+            );
+            let session = instance.tmux_session()?;
+            session.wait_until_ready(
+                std::time::Duration::from_secs(5),
+                crate::agents::ready_markers(&instance.tool),
+            );
+            session.send_keys_with_delay(&message, instance.send_keys_enter_delay())?;
+            anyhow::Ok((instance, ownership))
+        })
+        .await
+        .map_err(anyhow::Error::from)
+        .and_then(|result| result)?;
+        // A newer prompt supersedes an undelivered initial one, as in ACP. Cleared
+        // once tmux accepted the text, even if the recency write below fails.
+        clear_service.clear_pending_initial_turn(&clear_id).await;
+        tokio::task::spawn_blocking(move || {
+            let _ownership = ownership;
+            let native = crate::server::session_store::NativeSessionStore::open(
+                worker_state,
+                &instance.source_profile,
+                None,
+            )?;
+            let store: &dyn SessionStore = &native;
+            store.update(|rows, _| {
+                let row = rows
+                    .iter_mut()
+                    .find(|row| row.id == instance.id)
+                    .ok_or(crate::session::SessionGone)?;
+                anyhow::ensure!(
+                    row.lifecycle_generation == instance.lifecycle_generation,
+                    crate::session::LifecycleReservationError::Superseded
+                );
+                row.touch_after_input();
+                Ok(())
+            })?;
+            Ok(revived)
+        })
+        .await
+        .map_err(anyhow::Error::from)
+        .and_then(|result| result)
     })
     .await
     .map_err(anyhow::Error::from)
