@@ -39,28 +39,6 @@ writeFileSync(
   'import { useState } from "react";\nexport function greet(name: string): string {\n  return `hi ${name}`;\n}\n',
 );
 
-const server = spawn(
-  bin,
-  ["serve", "--no-auth", "--behind-proxy", "--allowed-host", "bench.local", "--no-autostart", "--port", String(port)],
-  { env, stdio: "ignore" },
-);
-const url = `http://127.0.0.1:${port}/`;
-let up = false;
-for (let i = 0; i < 600 && !up; i++) {
-  try {
-    up = (await fetch(url)).ok;
-  } catch {}
-  if (!up) await new Promise((r) => setTimeout(r, 250));
-}
-if (!up) throw new Error("aoe serve did not come up");
-
-// The CLI attaches to the serve daemon; the command must name a supported tool to keep a pane alive.
-execFileSync(bin, ["add", repo, "-t", "bench", "-c", "sh -c 'echo claude; exec sh'"], {
-  cwd: repo,
-  env: { ...env, AOE_DAEMON_URL: url.slice(0, -1) },
-  stdio: "pipe",
-});
-
 const median = (a) => {
   const v = [...a].sort((x, y) => x - y);
   const mid = v.length >> 1;
@@ -96,7 +74,6 @@ const highlighted = () => {
   return colors.size >= 3;
 };
 
-const browser = await chromium.launch();
 const R = {
   coldBytes: [],
   entryBytes: [],
@@ -110,7 +87,32 @@ const R = {
   workerFiles: [],
 };
 const cats = ["devtools.timeline", "v8", "disabled-by-default-v8.compile"];
+let server;
+let browser;
 try {
+  server = spawn(
+    bin,
+    ["serve", "--no-auth", "--behind-proxy", "--allowed-host", "bench.local", "--no-autostart", "--port", String(port)],
+    { env, stdio: "ignore" },
+  );
+  const url = `http://127.0.0.1:${port}/`;
+  let up = false;
+  for (let i = 0; i < 600 && !up; i++) {
+    try {
+      up = (await fetch(url)).ok;
+    } catch {}
+    if (!up) await new Promise((r) => setTimeout(r, 250));
+  }
+  if (!up) throw new Error("aoe serve did not come up");
+
+  // The CLI attaches to the serve daemon; the command must name a supported tool to keep a pane alive.
+  execFileSync(bin, ["add", repo, "-t", "bench", "-c", "sh -c 'echo claude; exec sh'"], {
+    cwd: repo,
+    env: { ...env, AOE_DAEMON_URL: url.slice(0, -1) },
+    stdio: "pipe",
+  });
+
+  browser = await chromium.launch();
   for (let i = 0; i < runs; i++) {
     const ctx = await browser.newContext({ viewport: { width: 1280, height: 800 } });
     const page = await ctx.newPage();
@@ -159,8 +161,8 @@ try {
     await ctx.close();
   }
 } finally {
-  await browser.close();
-  server.kill();
+  await browser?.close();
+  server?.kill();
   try {
     sh(bin, ["serve", "--stop"], repo);
   } catch {}
