@@ -13,7 +13,8 @@ import { composer, openStructuredView, postPrompt, releaseTurn, startAcpSession,
 import { HISTORY_DONE, MEASURED_CHUNKS, MEASURED_DONE, structuredScript } from "./structuredScript";
 
 const RUNS = Number(process.env.PERF_RUNS) || 5;
-const TYPED = "x".repeat(40);
+const TYPED_BURST = "x".repeat(10);
+const MAX_TYPING_BURSTS = 400;
 
 interface RunResult {
   scriptLayoutMsPerChunk: number;
@@ -131,10 +132,22 @@ for (let run = 1; run <= RUNS; run++) {
     const before = await cdpMetrics(cdp);
     releaseTurn(serve);
 
+    // Type for the whole turn, clearing between bursts so the composer stays small.
     await box.focus();
-    await page.keyboard.type(TYPED, { delay: 50 });
-    await expect(page.getByText(MEASURED_DONE)).toBeAttached({ timeout: 120_000 });
-    await expect(stopButton(page)).toBeHidden({ timeout: 30_000 });
+    let stopTyping = false;
+    const typing = (async () => {
+      for (let i = 0; i < MAX_TYPING_BURSTS && !stopTyping; i++) {
+        await page.keyboard.type(TYPED_BURST, { delay: 50 });
+        await box.fill("");
+      }
+    })();
+    try {
+      await expect(page.getByText(MEASURED_DONE)).toBeAttached({ timeout: 120_000 });
+      await expect(stopButton(page)).toBeHidden({ timeout: 30_000 });
+    } finally {
+      stopTyping = true;
+      await typing;
+    }
     const after = await cdpMetrics(cdp);
 
     const probe = await page.evaluate(() => {
