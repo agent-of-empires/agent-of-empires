@@ -500,6 +500,10 @@ pub(super) const CITYHALL_MUTATION_DENY: &[(&str, &str)] = &[
     ("PUT", "/mcp"),
     ("PATCH", "/mcp"),
     ("DELETE", "/mcp"),
+    ("POST", "/mcp/plugins/{plugin}/{server}"),
+    ("PUT", "/mcp/plugins/{plugin}/{server}"),
+    ("PATCH", "/mcp/plugins/{plugin}/{server}"),
+    ("DELETE", "/mcp/plugins/{plugin}/{server}"),
     ("POST", "/api/mcp/servers"),
     ("PUT", "/api/mcp/servers/{name}"),
     ("DELETE", "/api/mcp/servers/{name}"),
@@ -696,6 +700,17 @@ impl<'a> RouteAudit<'a> {
             syn::Expr::Path(path) => path.path.is_ident("state"),
             syn::Expr::Field(field) => Self::condition(&field.base),
             syn::Expr::Paren(paren) => Self::condition(&paren.expr),
+            // Only `is_some()` on a state field: the plugin route is served when a session
+            // secret exists.
+            syn::Expr::MethodCall(call) => {
+                call.method == "is_some"
+                    && call.args.is_empty()
+                    && matches!(&*call.receiver, syn::Expr::Field(_))
+                    && Self::condition(&call.receiver)
+            }
+            syn::Expr::Binary(binary) if matches!(binary.op, syn::BinOp::Or(_)) => {
+                Self::condition(&binary.left) && Self::condition(&binary.right)
+            }
             _ => false,
         }
     }
@@ -936,6 +951,36 @@ mod tests {
             .into_iter()
             .map(|route| (route.method.to_owned(), route.path.to_owned()))
             .collect()
+    }
+
+    /// The audit trusts a conditional route only when its guard is one the router really
+    /// uses; any other shape would let a future route pass for the wrong reason.
+    #[test]
+    fn route_conditions_accept_only_the_guards_the_router_uses() {
+        let accepted = |text: &str| {
+            let expression: syn::Expr = syn::parse_str(text).expect("a Rust expression");
+            RouteAudit::condition(&expression)
+        };
+        for text in [
+            "state.core_only",
+            "state.web_config.mcp_enabled",
+            "state.mcp_session_secret.is_some()",
+            "state.web_config.mcp_enabled || state.mcp_session_secret.is_some()",
+        ] {
+            assert!(accepted(text), "{text}");
+        }
+        for text in [
+            "state.anything()",
+            "state.web_config.mcp_enabled()",
+            "state.mcp_session_secret.is_some(true)",
+            "state.mcp_session_secret.unwrap()",
+            "state.core_only && state.web_config.mcp_enabled",
+            "!state.core_only",
+            "state.core_only || other",
+            "other.is_some()",
+        ] {
+            assert!(!accepted(text), "{text}");
+        }
     }
 
     #[test]
