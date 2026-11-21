@@ -5,7 +5,7 @@
 import { chromium } from "@playwright/test";
 import { spawn, execFileSync } from "node:child_process";
 import { createServer } from "node:net";
-import { mkdtempSync, writeFileSync } from "node:fs";
+import { mkdtempSync, readdirSync, readFileSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 
@@ -107,13 +107,20 @@ try {
     { env, stdio: "ignore" },
   );
   const url = `http://127.0.0.1:${port}/`;
+  // The daemon writes serve.url under the isolated home only after it binds the port,
+  // so a listener we did not spawn cannot satisfy this wait.
+  const published = () => {
+    const f = readdirSync(home, { recursive: true }).find((p) => p.endsWith("serve.url"));
+    return f !== undefined && readFileSync(join(home, f), "utf8").includes(`:${port}/`);
+  };
   let up = false;
   for (let i = 0; i < 600 && !up; i++) {
-    // A child that failed to bind exits; never accept another daemon answering on its port.
     if (server.exitCode !== null) throw new Error(`aoe serve exited with ${server.exitCode}`);
-    try {
-      up = (await fetch(url)).ok;
-    } catch {}
+    if (published()) {
+      try {
+        up = (await fetch(url)).ok;
+      } catch {}
+    }
     if (!up) await new Promise((r) => setTimeout(r, 250));
   }
   if (!up || server.exitCode !== null) throw new Error("aoe serve did not come up");
