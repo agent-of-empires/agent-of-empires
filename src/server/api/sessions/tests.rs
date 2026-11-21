@@ -4800,6 +4800,12 @@ fn a_structured_fork_runs_the_parents_agent() {
         row("claude", None, "builtin"),
         row("claude", None, "ambiguous"),
         row("claude", Some("claude-acct"), "ambiguous"),
+        row("claude", Some("claude-acct"), "ambiguous-reversed"),
+        row("claude", None, "ambiguous-reversed"),
+        row("claude-acct", None, "tool-first"),
+        row("claude", Some("claude-acct"), "tool-first"),
+        row("claude", Some("claude-acct"), "named-first"),
+        row("claude-acct", None, "named-first"),
     ];
     let ok = |agent: Option<&str>| Ok(agent.map(str::to_string));
     for (parent, tool, agent_name, want) in [
@@ -4817,6 +4823,12 @@ fn a_structured_fork_runs_the_parents_agent() {
         ("builtin", "claude", None, ok(None)),
         ("builtin", "claude-acct", None, Err(())),
         ("ambiguous", "claude", None, Err(())),
+        ("ambiguous-reversed", "claude", None, Err(())),
+        // Rows agreeing on the agent resolve the same in either order.
+        ("tool-first", "claude", None, ok(Some("claude-acct"))),
+        ("named-first", "claude", None, ok(Some("claude-acct"))),
+        ("tool-first", "claude-acct", None, ok(None)),
+        ("named-first", "claude-acct", None, ok(None)),
         ("unrecorded", "claude", Some("x"), ok(Some("x"))),
     ] {
         assert_eq!(

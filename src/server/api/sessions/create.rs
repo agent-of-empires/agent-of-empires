@@ -301,19 +301,27 @@ pub(super) fn structured_fork_agent_name(
     tool: &str,
     agent_name: Option<&str>,
 ) -> Result<Option<String>, ()> {
-    let mut parents = rows
+    let parents: Vec<_> = rows
         .iter()
-        .filter(|row| row.acp_session_id.as_deref() == Some(parent_id));
+        .filter(|row| row.acp_session_id.as_deref() == Some(parent_id))
+        .collect();
     let agent_name = agent_name.filter(|s| !s.is_empty());
-    let Some(parent) = parents.next() else {
+    let Some(parent) = parents.first() else {
         return Ok(agent_name.map(str::to_string));
     };
     let parent_key = acp_agent_key(&parent.tool, parent.agent_name.as_deref());
-    if parents.any(|row| acp_agent_key(&row.tool, row.agent_name.as_deref()) != parent_key) {
+    if parents
+        .iter()
+        .any(|row| acp_agent_key(&row.tool, row.agent_name.as_deref()) != parent_key)
+    {
         return Err(());
     }
+    // The rows agree on the agent, so any row under the requested tool names it.
     let agent_name = match agent_name {
-        None if tool == parent.tool => parent.agent_name.clone(),
+        None => parents
+            .iter()
+            .find(|row| row.tool == tool)
+            .and_then(|row| row.agent_name.clone()),
         named => named.map(str::to_string),
     };
     if acp_agent_key(tool, agent_name.as_deref()) == parent_key {
