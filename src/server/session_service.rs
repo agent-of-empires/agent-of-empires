@@ -5665,6 +5665,59 @@ mod tests {
         });
     }
 
+    /// A send dropped after tmux accepted the text still finishes under the
+    /// profile namespace, so a profile rename cannot move the profile first.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn a_cancelled_terminal_send_keeps_the_profile_namespace_until_it_finishes() {
+        if !crate::tmux::is_tmux_available() {
+            return;
+        }
+        let _app_dir = crate::session::test_support::isolate_app_dir();
+        let inst = terminal_turn_instance("sess-cancel-ns", "cancel-ns", "initial-turn-A");
+        crate::server::test_support::seed_instances_on_disk_for_test(
+            &inst.source_profile,
+            vec![inst.clone()],
+        );
+        let pane = start_terminal_pane(&inst, READY_AGENT_SCRIPT, false);
+        let state = crate::server::test_support::build_test_app_state(vec![inst]);
+        let service = state.session_service.clone();
+        crate::server::test_support::refresh_canonical_metadata_for_test(&state).await;
+
+        // The clear after the typed text waits on this gate.
+        let gate = service.disk_reload_guard().await;
+        let sender = {
+            let service = service.clone();
+            tokio::spawn(async move {
+                crate::server::api::sessions::send_terminal_message(
+                    &service,
+                    "sess-cancel-ns",
+                    "user-message-B".to_string(),
+                    false,
+                )
+                .await
+            })
+        };
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+        while !pane_text(&pane).contains("user-message-B") {
+            assert!(std::time::Instant::now() < deadline, "{}", pane_text(&pane));
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+        sender.abort();
+        let _ = sender.await;
+
+        assert!(
+            state.profile_namespace.try_write().is_err(),
+            "the detached send released the profile namespace"
+        );
+        drop(gate);
+        while state.profile_namespace.try_write().is_err() {
+            assert!(std::time::Instant::now() < deadline, "send never finished");
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        assert!(pending_turn(&service, "sess-cancel-ns").await.is_none());
+    }
+
     /// An archived or snoozed session is set aside: its pending turn is
     /// neither typed nor marked failed.
     #[tokio::test]

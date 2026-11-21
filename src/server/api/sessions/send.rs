@@ -132,7 +132,7 @@ async fn send_terminal_message_inner(
                 );
         }
     }
-    let namespace = state.profile_namespace.read().await;
+    let namespace = state.profile_namespace.clone().read_owned().await;
     if *state.canonical_health.read().await != crate::daemon::RuntimeHealth::Healthy {
         return Err(SendKeysError::Tmux(
             crate::session::NativeStoreUnavailable.into(),
@@ -155,13 +155,15 @@ async fn send_terminal_message_inner(
     let worker_state = state.clone();
     let clear_service = state.session_service.clone();
     let clear_id = id.to_string();
-    // An owned task holds the guards: it outlives a dropped request future, and
-    // the supersession of the initial prompt must finish under them. Only the
+    // An owned task holds the guards, namespace included: it outlives a dropped
+    // request future, and the supersession of the initial prompt and the recency
+    // write must finish under them. Only the
     // tmux and store work is blocking, so the clear never waits on a pool slot
     // this task already holds.
     let result = tokio::spawn(async move {
         let _submission = submission;
         let _guard = guard;
+        let _namespace = namespace;
         use crate::session::SessionStore;
         let send_state = worker_state.clone();
         let (instance, ownership) = tokio::task::spawn_blocking(move || {
@@ -229,7 +231,6 @@ async fn send_terminal_message_inner(
     .await
     .map_err(anyhow::Error::from)
     .and_then(|result| result);
-    drop(namespace);
     result.map_err(|error| {
         if let Some(blocked) = error.downcast_ref::<crate::session::StartBlocked>() {
             SendKeysError::Blocked(*blocked)
