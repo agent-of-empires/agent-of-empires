@@ -9,8 +9,32 @@ use std::time::SystemTime;
 use ::time::format_description::well_known::Rfc3339;
 use ::time::{OffsetDateTime, UtcDateTime};
 
-pub use ::time::error::Parse as ParseError;
 pub use ::time::SignedDuration as Duration;
+
+#[derive(Debug)]
+pub enum ParseError {
+    Format(::time::error::Parse),
+    /// Valid text whose UTC instant falls outside years -9999..=9999.
+    OutOfRange,
+}
+
+impl fmt::Display for ParseError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Format(e) => e.fmt(f),
+            Self::OutOfRange => f.write_str("timestamp out of range"),
+        }
+    }
+}
+
+impl std::error::Error for ParseError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Format(e) => Some(e),
+            Self::OutOfRange => None,
+        }
+    }
+}
 
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct Timestamp(UtcDateTime);
@@ -35,7 +59,11 @@ impl Timestamp {
 
     /// Accepts any RFC 3339 offset and normalizes it to UTC.
     pub fn parse_rfc3339(s: &str) -> Result<Self, ParseError> {
-        Ok(Self(OffsetDateTime::parse(s, &Rfc3339)?.to_utc()))
+        OffsetDateTime::parse(s, &Rfc3339)
+            .map_err(ParseError::Format)?
+            .checked_to_utc()
+            .map(Self)
+            .ok_or(ParseError::OutOfRange)
     }
 
     pub fn from_unix_secs(secs: i64) -> Option<Self> {
@@ -400,6 +428,7 @@ mod tests {
             );
         }
         assert!(Timestamp::parse_rfc3339("2024-01-02T03:04:05").is_err());
+        assert!(Timestamp::parse_rfc3339("9999-12-31T23:59:59-01:00").is_err());
 
         #[derive(serde::Deserialize)]
         struct Row {
