@@ -50,10 +50,11 @@ session list before creating again.
 Press `t` to toggle between the structured view and the paired shell terminal, where you can run builds and git commands without interrupting the agent.
 
 Drag the border between the session list and preview to resize the list. In terminals
-narrower than 80 columns, the list moves above the preview: drag their horizontal border
-up or down to change its height, including in live mode. Width and height are remembered
-separately across restarts. A shorter window temporarily limits the height to leave room
-for the preview; enlarging it restores your chosen height.
+narrower than `session.narrow_breakpoint` columns (80 by default), the list moves above
+the preview: drag their horizontal border up or down to change its height, including in
+live mode. Width and height are remembered separately across restarts. A shorter window
+temporarily limits the height to leave room for the preview; enlarging it restores your
+chosen height.
 
 ## Projects and groups
 
