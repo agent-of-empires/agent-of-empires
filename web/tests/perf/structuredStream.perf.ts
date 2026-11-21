@@ -135,12 +135,15 @@ for (let run = 1; run <= RUNS; run++) {
     // Type for the whole turn, clearing between bursts so the composer stays small.
     await box.focus();
     let stopTyping = false;
+    let typingError: unknown;
     const typing = (async () => {
       for (let i = 0; i < MAX_TYPING_BURSTS && !stopTyping; i++) {
         await page.keyboard.type(TYPED_BURST, { delay: 50 });
         await box.fill("");
       }
-    })();
+    })().catch((e) => {
+      typingError = e;
+    });
     try {
       await expect(page.getByText(MEASURED_DONE)).toBeAttached({ timeout: 120_000 });
       await expect(stopButton(page)).toBeHidden({ timeout: 30_000 });
@@ -148,6 +151,7 @@ for (let run = 1; run <= RUNS; run++) {
       stopTyping = true;
       await typing;
     }
+    if (typingError) throw typingError;
     const after = await cdpMetrics(cdp);
 
     const probe = await page.evaluate(() => {
