@@ -584,15 +584,16 @@ fn collect_tmux_states(instances: &mut [Instance]) -> Vec<TmuxState> {
     states
 }
 
-/// The snapshot only holds pane 0, so a session it lacks (for example a
-/// first window with pane-base-index 1) goes to the per-session probe.
+/// The snapshot only holds pane 0, so a session it lacks or whose pane 0 came
+/// from a later window (for example a first window with pane-base-index 1)
+/// goes to the per-session probe.
 fn pane_pid_or(
     meta: Option<&crate::tmux::PaneMetadata>,
     probe: impl FnOnce() -> Option<u32>,
 ) -> Option<u32> {
     match meta {
-        Some(meta) => live_pane_pid(meta),
-        None => probe(),
+        Some(meta) if meta.first_window => live_pane_pid(meta),
+        _ => probe(),
     }
 }
 
@@ -923,6 +924,7 @@ mod tests {
             pane_current_command: None,
             pane_start_command_is_protected: false,
             pane_pid,
+            first_window: true,
             pane_title: None,
             window_activity: None,
             window_size: None,
@@ -939,6 +941,9 @@ mod tests {
             assert_eq!(pane_pid_or(Some(&found), || panic!("probed")), expected);
         }
         assert_eq!(pane_pid_or(None, || Some(7)), Some(7));
+        let mut later_window = meta(false, Some(4242));
+        later_window.first_window = false;
+        assert_eq!(pane_pid_or(Some(&later_window), || Some(7)), Some(7));
     }
 
     fn tmux_state(name: &str, status: Status) -> TmuxState {
