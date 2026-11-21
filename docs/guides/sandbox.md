@@ -62,7 +62,7 @@ environment = ["ANTHROPIC_API_KEY"]
 | `extra_run_args` | `[]` | Extra arguments passed to container run, before the image |
 | `shared_credential` | `"host_seed"` | `"host_seed"` or `"separate_login"`: where the credential an agent shares across its sandboxes comes from (see [Shared credentials](#shared-credentials)); applies to every agent with a sandbox login, today Claude. `"separate_login"` is not supported with Apple Container. Global only |
 
-Docker and Podman honor every run-policy option. Apple Container honors `cap_add` / `cap_drop` and ignores `privileged` and `security_opt` with a warning; `extra_run_args` is passed through everywhere.
+Docker and Podman honor every run-policy option. Apple Container honors `cap_add` / `cap_drop` and ignores `privileged` and `security_opt` with a warning; `extra_run_args` is passed through everywhere. Apple Container also ignores read-only mounts, including the `.git` overlays described in [Git config and hooks](#git-config-and-hooks).
 
 ## Volume mounts
 
@@ -71,11 +71,20 @@ Docker and Podman honor every run-policy option. Apple Container honors `cap_add
 | Host path | Container path | Mode |
 |-----------|----------------|------|
 | Project directory | `/workspace` | RW |
+| `<repo>/.git/config`, `config.worktree`, `hooks` (bare repo: the same names in the bare dir); for a linked worktree also its `.git` file and the admin dir's `commondir`, `gitdir` and `config.worktree` | the same path under the repo's mount | RO (none on Apple Container) |
 | `~/.gitconfig` | `/root/.gitconfig` | RO |
 | `~/.ssh/` (with `mount_ssh`) | `/root/.ssh/` | RO |
 | The session's artifact dir | `/aoe/artifacts` | RW |
 | `<agent config>/sandbox-v2/<instance-id>/` | the agent's config path, e.g. `/root/.claude/` | RW |
 | `~/.claude/sandbox-v2/.credentials.json` | `/root/.claude/.credentials.json` | RW |
+
+### Git config and hooks
+
+Git runs a repo's hooks and config-defined commands (`core.sshCommand`, `credential.helper`, `core.fsmonitor`) on whichever machine invokes it. AoE and your own terminal run git on the host against the same repo the sandbox mounts, so a writable `.git/config` or `.git/hooks` would let code in the container execute on the host. AoE therefore mounts both read-only, over the writable repo mount, for the session's repo, including the main repo of a worktree. Apple Container cannot mount read-only, so it gets no overlays: the repo's `.git` stays writable from the container, and AoE never runs repo hooks on the host there, `git worktree add` included (its post-checkout hook is skipped with a warning). Your own terminal still runs hooks the sandbox wrote, so on Apple Container treat the repo's `.git` as untrusted after a session.
+
+Inside the container, commands that write `.git/config` fail, for example `git remote add`, `git push -u` (the push succeeds, recording the upstream fails) and `git branch --set-upstream-to`, `git sparse-checkout` and `git worktree repair`. Run them on the host. Each overlay is a single-file bind mount and git writes files by rename, so after such a host-side change the container can keep showing the old config until the session restarts. Commits and refs are unaffected, and so are checkouts of existing local branches. Creating a branch with upstream tracking, for example `git checkout -b feature origin/main` or `git switch -c feature origin/feature`, can fail because git records the tracking setup in `.git/config`. Installing hooks from inside the container is not possible; install them on the host. Protection covers the session's repository, a worktree's main repo and each workspace repo. A repository nested inside the project directory (a submodule, a vendored clone, or one the sandbox creates) is not protected: running git inside it on the host can execute what the sandbox wrote. Hooks in a writable checkout path (`core.hooksPath=.githooks`) are not protected, so do not point `core.hooksPath` into the checkout of a sandboxed repo.
+
+Containers created by an older AoE keep a writable `.git` until you recreate the session. AoE's own host git calls also ignore repo-local `core.fsmonitor`, `core.sshCommand`, `credential.helper`, the `ext::` transport and, except for `git worktree add`, hooks. Set `core.sshCommand` and `credential.helper` in your global git config; repo-local values are not used by AoE.
 
 ### Volume ignores
 

@@ -47,7 +47,7 @@ impl GitWorktree {
     /// `git fetch <remote> <branch>` with stdin nulled (no passphrase prompts)
     /// and a 10 second bound.
     fn fetch_branch(&self, remote: &str, branch: &str) -> FetchOutcome {
-        let mut cmd = std::process::Command::new("git");
+        let mut cmd = crate::git::command::hardened_git(false);
         cmd.args(["fetch", remote, branch])
             .current_dir(&self.repo_path)
             .stdin(std::process::Stdio::null());
@@ -303,12 +303,20 @@ impl GitWorktree {
 
     /// `git worktree add`. A post-checkout hook can fail after the checkout
     /// exists; that worktree is usable, so the failure becomes a warning.
+    /// Hooks run only when the sandbox runtime mounts `.git/hooks` read-only;
+    /// otherwise a sandbox-planted hook would execute on the host.
     fn add_worktree(&self, branch: &str, path: &Path, warnings: &mut Vec<String>) -> Result<()> {
         let t = Instant::now();
-        let output = crate::git::command::run_git(
-            &self.repo_path,
-            ["worktree", "add", path_str(path)?, branch],
-        )?;
+        let args = ["worktree", "add", path_str(path)?, branch];
+        let output = if crate::containers::get_container_runtime().supports_read_only_volumes() {
+            crate::git::command::run_git_with_hooks(&self.repo_path, args)?
+        } else {
+            warnings.push(
+                "post-checkout hooks skipped: the sandbox runtime cannot mount .git/hooks read-only"
+                    .to_string(),
+            );
+            crate::git::command::run_git(&self.repo_path, args)?
+        };
         let add_elapsed = t.elapsed();
 
         if !output.status.success() {
