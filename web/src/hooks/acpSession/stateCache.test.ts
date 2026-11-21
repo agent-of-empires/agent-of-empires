@@ -18,6 +18,7 @@ import {
   cacheSet,
   clearAcpCache,
   evictOldestPersistedAcpState,
+  flushPersist,
   loadPersistedState,
   persistState,
   useBackgroundAgents,
@@ -126,6 +127,108 @@ describe("cacheGet mid-turn in-memory entry (#4530)", () => {
     const activity = [{ id: "t", kind: "tool_start", text: "t", at: "t" }] as ActivityRow[];
     cacheSet("mem", { ...emptyAcpState(), lastSeq: 900, oldestSeq: 40, activity, queuedPrompts: queued });
     expect(cacheGet("mem")).toMatchObject({ lastSeq: 900, oldestSeq: 0, activity: [], queuedPrompts: queued });
+  });
+});
+
+describe("cacheSet persistence throttle", () => {
+  const withSeq = (lastSeq: number): AcpState => ({ ...emptyAcpState(), lastSeq });
+  const stored = (id: string) =>
+    (JSON.parse(localStorage.getItem(key(id)) ?? "null") as { state: AcpState } | null)?.state;
+  const setItem = () => vi.spyOn(Storage.prototype, "setItem");
+
+  beforeEach(() => vi.useFakeTimers());
+  afterEach(() => {
+    clearAcpCache();
+    vi.useRealTimers();
+  });
+
+  it("updates memory and notifies synchronously but persists once per window with the latest state", () => {
+    const spy = setItem();
+    const { result } = renderHook(() => useBackgroundAgents("thr"));
+    act(() => cacheSet("thr", withSeq(1)));
+    act(() => cacheSet("thr", { ...withSeq(2), backgroundAgents: [{ id: "a" } as unknown as BackgroundAgent] }));
+    expect(result.current).toHaveLength(1);
+    expect(cacheGet("thr")?.lastSeq).toBe(2);
+    expect(spy).not.toHaveBeenCalled();
+    vi.advanceTimersByTime(1999);
+    expect(spy).not.toHaveBeenCalled();
+    vi.advanceTimersByTime(1);
+    expect(spy).toHaveBeenCalledTimes(1);
+    expect(stored("thr")?.lastSeq).toBe(2);
+    cacheSet("thr", withSeq(3));
+    vi.advanceTimersByTime(2000);
+    expect(spy).toHaveBeenCalledTimes(2);
+    expect(stored("thr")?.lastSeq).toBe(3);
+  });
+
+  it("reads unflushed state after in-memory eviction, not the older persisted entry", () => {
+    writeEntry("evicted", withSeq(1));
+    cacheSet("evicted", withSeq(2));
+    for (let i = 0; i < 32; i++) cacheSet(`other-${i}`, withSeq(i));
+    expect(stored("evicted")?.lastSeq).toBe(1);
+    expect(cacheGet("evicted")?.lastSeq).toBe(2);
+  });
+
+  it("flushes on pagehide and on a hidden visibilitychange, not a visible one", () => {
+    const visibility = vi.spyOn(document, "visibilityState", "get");
+    cacheSet("hide", withSeq(5));
+    visibility.mockReturnValue("visible");
+    document.dispatchEvent(new Event("visibilitychange"));
+    expect(stored("hide")).toBeUndefined();
+    visibility.mockReturnValue("hidden");
+    document.dispatchEvent(new Event("visibilitychange"));
+    expect(stored("hide")?.lastSeq).toBe(5);
+    cacheSet("gone", withSeq(6));
+    window.dispatchEvent(new Event("pagehide"));
+    expect(stored("gone")?.lastSeq).toBe(6);
+    const spy = setItem();
+    vi.advanceTimersByTime(2000);
+    expect(spy).not.toHaveBeenCalled();
+  });
+
+  it("flushPersist(id) writes only that session", () => {
+    cacheSet("one", withSeq(1));
+    cacheSet("two", withSeq(2));
+    flushPersist("one");
+    expect(stored("one")?.lastSeq).toBe(1);
+    expect(stored("two")).toBeUndefined();
+    flushPersist();
+    expect(stored("two")?.lastSeq).toBe(2);
+  });
+
+  it("skips a flush whose snapshot is older than the stored entry (two tabs)", () => {
+    vi.setSystemTime(1_000_000);
+    cacheSet("tabs", withSeq(1));
+    vi.setSystemTime(1_000_500);
+    const queued = [{ id: "q1", text: "hello" }] as unknown as AcpState["queuedPrompts"];
+    writeEntry("tabs", { ...withSeq(2), queuedPrompts: queued }, 1_000_500);
+    vi.setSystemTime(1_002_000);
+    flushPersist("tabs");
+    expect(stored("tabs")?.lastSeq).toBe(2);
+    expect(stored("tabs")?.queuedPrompts).toHaveLength(1);
+  });
+
+  it("persists the snapshot when the stored entry is older or absent", () => {
+    vi.setSystemTime(2_000_000);
+    writeEntry("older", withSeq(1), 1_999_000);
+    cacheSet("older", withSeq(2));
+    cacheSet("absent", withSeq(3));
+    flushPersist();
+    expect(stored("older")?.lastSeq).toBe(2);
+    expect(stored("absent")?.lastSeq).toBe(3);
+  });
+
+  it("clearAcpCache cancels pending writes", () => {
+    cacheSet("cleared", withSeq(1));
+    cacheSet("kept", withSeq(2));
+    clearAcpCache("cleared");
+    vi.advanceTimersByTime(2000);
+    expect(stored("cleared")).toBeUndefined();
+    expect(stored("kept")?.lastSeq).toBe(2);
+    cacheSet("all", withSeq(3));
+    clearAcpCache();
+    vi.advanceTimersByTime(2000);
+    expect(stored("all")).toBeUndefined();
   });
 });
 

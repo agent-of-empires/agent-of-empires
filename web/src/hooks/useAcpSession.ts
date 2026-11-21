@@ -25,7 +25,7 @@ import {
 } from "../lib/api";
 import { classifyResolveResponse, reducer, type Action } from "./acpSession/reducer";
 import { ACP_MAX_RETRIES, useAcpConnection } from "./acpSession/useAcpConnection";
-import { cacheGet, cacheSet, sweepExpiredStorage } from "./acpSession/stateCache";
+import { cacheGet, cacheSet, flushPersist, sweepExpiredStorage } from "./acpSession/stateCache";
 import { setLiveQueueCount } from "../lib/acpStateStorage";
 import { useLatestRef } from "./useLatestRef";
 
@@ -239,6 +239,15 @@ export function useAcpSession(
   useEffect(() => {
     if (sessionIdRef.current) cacheSet(sessionIdRef.current, state);
   }, [state, sessionIdRef]);
+  // Separate from the `[state]` effect: its cleanup runs on every state change and would defeat the throttle.
+  useEffect(
+    () => () => {
+      // Cleanup on session switch or unmount.
+      // eslint-disable-next-line react-you-might-not-need-an-effect/no-event-handler
+      if (sessionId) flushPersist(sessionId);
+    },
+    [sessionId],
+  );
   const queuedPromptsRef = useLatestRef(state.queuedPrompts);
   const connection = useAcpConnection(sessionId, sessionIdRef, state, dispatch);
   const { status, lastActivityRef } = connection;

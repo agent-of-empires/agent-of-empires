@@ -164,7 +164,9 @@ function lruInsert(sessionId: string, value: AcpState): void {
 
 export function cacheGet(sessionId: string): AcpState | undefined {
   const memory = stateCache.get(sessionId);
-  const value = memory ? reopenState(memory) : loadPersistedState(sessionId);
+  // An evicted session can still have unflushed state, newer than anything in storage.
+  const known = memory ?? pendingPersist.get(sessionId)?.state;
+  const value = known ? reopenState(known) : loadPersistedState(sessionId);
   if (value === undefined) return undefined;
   lruInsert(sessionId, value);
   // Wake subscribers that rendered before the cache was primed or saw a pre-reset entry; deferred so it never fires mid-render.
@@ -172,9 +174,53 @@ export function cacheGet(sessionId: string): AcpState | undefined {
   return value;
 }
 
+const PERSIST_THROTTLE_MS = 2000;
+// `at` is when the snapshot was last captured, to detect another tab writing after it.
+const pendingPersist = new Map<string, { state: AcpState; at: number; timer: ReturnType<typeof setTimeout> }>();
+
+function schedulePersist(sessionId: string, state: AcpState): void {
+  const pending = pendingPersist.get(sessionId);
+  if (pending) {
+    pending.state = state;
+    pending.at = Date.now();
+    return;
+  }
+  const timer = setTimeout(() => flushPersist(sessionId), PERSIST_THROTTLE_MS);
+  pendingPersist.set(sessionId, { state, at: Date.now(), timer });
+}
+
+function storedSavedAt(sessionId: string): number {
+  try {
+    return parseEntry(window.localStorage.getItem(storageKey(sessionId)))?.savedAt ?? -Infinity;
+  } catch {
+    return -Infinity;
+  }
+}
+
+/** Persist pending state now, for one session or all. */
+export function flushPersist(sessionId?: string): void {
+  for (const id of sessionId === undefined ? [...pendingPersist.keys()] : [sessionId]) {
+    const pending = pendingPersist.get(id);
+    if (!pending) continue;
+    clearTimeout(pending.timer);
+    pendingPersist.delete(id);
+    // Another tab wrote after this snapshot was captured: its entry is newer, keep it.
+    if (storedSavedAt(id) > pending.at) continue;
+    persistState(id, pending.state);
+  }
+}
+
+// localStorage only needs the latest state by the time the page is hidden or unloaded.
+if (typeof window !== "undefined" && typeof document !== "undefined") {
+  window.addEventListener("pagehide", () => flushPersist());
+  document.addEventListener("visibilitychange", () => {
+    if (document.visibilityState === "hidden") flushPersist();
+  });
+}
+
 export function cacheSet(sessionId: string, value: AcpState): void {
   lruInsert(sessionId, value);
-  persistState(sessionId, value);
+  schedulePersist(sessionId, value);
   notifyStateListeners(sessionId);
 }
 
@@ -250,6 +296,11 @@ export function useWorkflowRuns(sessionId: string | null): Record<string, Workfl
 
 /** Drop one session's cached state, or all of it, so a reused id never shows a prior transcript. */
 export function clearAcpCache(sessionId?: string): void {
+  for (const id of sessionId === undefined ? [...pendingPersist.keys()] : [sessionId]) {
+    const pending = pendingPersist.get(id);
+    if (pending) clearTimeout(pending.timer);
+    pendingPersist.delete(id);
+  }
   if (sessionId === undefined) {
     stateCache.clear();
     removePersisted(persistedKeys);
