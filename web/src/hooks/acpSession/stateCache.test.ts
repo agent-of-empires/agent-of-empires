@@ -218,6 +218,28 @@ describe("cacheSet persistence throttle", () => {
     expect(stored("absent")?.lastSeq).toBe(3);
   });
 
+  it("stamps the entry with capture time so an older capture cannot shadow a newer one", () => {
+    vi.setSystemTime(3_000_000);
+    cacheSet("stamp", withSeq(1));
+    vi.setSystemTime(3_001_900);
+    flushPersist("stamp");
+    expect(JSON.parse(localStorage.getItem(key("stamp"))!).savedAt).toBe(3_000_000);
+    // Other tab captured between this capture and its flush, then flushed first.
+    vi.setSystemTime(3_002_000);
+    cacheSet("order", withSeq(1));
+    vi.setSystemTime(3_002_500);
+    writeEntry("order", withSeq(2), 3_002_300);
+    flushPersist("order");
+    expect(stored("order")?.lastSeq).toBe(2);
+    // This capture is newer than the stored entry: it wins even though the other flushed earlier.
+    vi.setSystemTime(3_003_000);
+    cacheSet("order2", withSeq(3));
+    writeEntry("order2", withSeq(2), 3_002_900);
+    vi.setSystemTime(3_004_000);
+    flushPersist("order2");
+    expect(stored("order2")?.lastSeq).toBe(3);
+  });
+
   it("clearAcpCache cancels pending writes", () => {
     cacheSet("cleared", withSeq(1));
     cacheSet("kept", withSeq(2));

@@ -94,9 +94,9 @@ function toPersistedState(state: AcpState): AcpState {
   return { ...base, queuedPrompts: base.queuedPrompts.filter((q) => !q.attachments?.length) };
 }
 
-export function persistState(sessionId: string, state: AcpState): void {
+export function persistState(sessionId: string, state: AcpState, savedAt = Date.now()): void {
   const key = storageKey(sessionId);
-  const body = JSON.stringify({ savedAt: Date.now(), state: toPersistedState(state) } satisfies PersistedEntry);
+  const body = JSON.stringify({ savedAt, state: toPersistedState(state) } satisfies PersistedEntry);
   // On a quota failure evict one entry and retry once; the cache is best effort.
   if (!safeSetItem(key, body) && evictOldestPersistedAcpState(key)) safeSetItem(key, body);
 }
@@ -204,9 +204,9 @@ export function flushPersist(sessionId?: string): void {
     if (!pending) continue;
     clearTimeout(pending.timer);
     pendingPersist.delete(id);
-    // Another tab wrote after this snapshot was captured: its entry is newer, keep it.
+    // Entries carry capture time, so the newer capture wins whichever tab flushes first.
     if (storedSavedAt(id) > pending.at) continue;
-    persistState(id, pending.state);
+    persistState(id, pending.state, pending.at);
   }
 }
 
