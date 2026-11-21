@@ -381,6 +381,32 @@ mod tests {
         }
     }
 
+    /// A sandboxed session gets nothing when a hook answers with something that is not an object,
+    /// including an empty array that a struct decoder would take for "no edit".
+    #[tokio::test]
+    async fn a_non_object_result_withholds_the_sandboxed_set() {
+        struct Chain(FakeCaller);
+        impl McpRewriter for Chain {
+            fn rewrite<'a>(
+                &'a self,
+                ctx: &'a McpRewriteContext,
+                servers: Vec<ProjectMcpServer>,
+            ) -> RewriteFuture<'a> {
+                Box::pin(async move { run_chain(&self.0, &[hook("acme.a")], ctx, servers).await })
+            }
+        }
+        for reply in [json!([]), json!([null, []]), json!(null), json!("ok")] {
+            let rewriter: std::sync::Arc<dyn McpRewriter> =
+                std::sync::Arc::new(Chain(FakeCaller::new(vec![Ok(reply.clone())])));
+            let out = crate::acp::mcp_rewrite::rewrite_servers_with(
+                Some(rewriter),
+                &ctx(),
+                vec![stdio("a")],
+            )
+            .await;
+            assert!(out.is_empty(), "{reply} must withhold the set, got {out:?}");
+        }
+    }
     #[tokio::test]
     async fn no_hooks_returns_servers_unchanged_without_calling_workers() {
         let caller = FakeCaller::new(vec![]);
