@@ -36,8 +36,8 @@ fn capture_for_status(
         .live_channel_pane(&tmux::TmuxCommandDeadline::new())
         .or_else(|| {
             metadata
+                .filter(|m| m.first_window && !m.pane_id.is_empty())
                 .map(|m| m.pane_id.clone())
-                .filter(|id| !id.is_empty())
         });
     known
         .and_then(|pane_id| session.capture_pane_at(&pane_id, lines))
