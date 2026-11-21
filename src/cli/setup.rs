@@ -98,16 +98,28 @@ pub async fn run(args: SetupArgs) -> Result<()> {
         install_failed = !adapter_ready;
     }
 
-    let mut written: Vec<(&'static str, String, &'static str)> = Vec::new();
+    let mut written: Vec<(&'static str, String, String)> = Vec::new();
     let result = crate::session::config::update_config(|config| {
         let changes = quickstart::changes(&config.acp, &plan, args.agent.is_some());
         if let Some(agent) = changes.default_agent {
+            // The undo value is whatever was there, so `--agent` over an
+            // existing default can be reverted.
+            let previous = config.acp.default_agent.trim().to_string();
+            let previous = if previous.is_empty() {
+                DEFAULT_ACP_AGENT.to_string()
+            } else {
+                previous
+            };
             config.acp.default_agent = agent.clone();
-            written.push(("acp.default_agent", agent, DEFAULT_ACP_AGENT));
+            written.push(("acp.default_agent", agent, previous));
         }
         if changes.structured_view {
             config.acp.structured_view = StructuredView::Structured;
-            written.push(("acp.structured_view", "structured".to_string(), "auto"));
+            written.push((
+                "acp.structured_view",
+                "structured".to_string(),
+                "auto".to_string(),
+            ));
         }
     });
     let write_error = match result {

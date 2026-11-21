@@ -22,7 +22,9 @@ this command needs `OTARI_API_KEY` ([Create an Otari account](#create-an-otari-a
 below); a direct-provider model such as `claude-opus-4-7` uses that provider's key instead,
 and [Choosing the model](#choosing-the-model) has the other forms. And the bundled adapter
 has to be installed: if no install was agreed to, `aoe setup` falls back to an agent that is
-already on the machine and names it in the command it prints.
+already on the machine and names it in the command it prints. On a machine with no such
+agent, it keeps `aoe-agent` and prints the install command, so install the adapter before
+running this.
 
 ## What `aoe setup` does
 
