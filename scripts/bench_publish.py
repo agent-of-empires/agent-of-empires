@@ -3,6 +3,10 @@
 
 Run the daemon with AOE_LOG_LEVEL=debug, then:
     aoe logs --no-pager | python3 scripts/bench_publish.py
+
+The logger appends across daemon restarts, and `aoe logs` prints the whole file.
+Move the file printed by `aoe logs --path` aside, then start the daemon, so each
+run reads only its own events.
 """
 
 import math
