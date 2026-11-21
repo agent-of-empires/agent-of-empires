@@ -141,10 +141,10 @@ impl Instance {
     }
 
     /// Explain a pane failure from what the pane last printed, keeping any explanation already
-    /// recorded.
-    fn explain_error_from_pane(&mut self, session: &tmux::Session) {
-        if self.last_error.is_none() {
-            self.last_error = self.refused_restart_error(&ended_sentence(None));
+    /// recorded. A pane that `ended` also names the remedy its restart needs.
+    fn explain_error_from_pane(&mut self, session: &tmux::Session, ended: bool) {
+        if ended {
+            self.name_refused_restart(None, None);
         }
         if self.last_error.is_none() {
             let pane_content = session.capture_pane(20).unwrap_or_default();
@@ -153,24 +153,44 @@ impl Instance {
     }
 
     /// Latch an Error for a pane tmux can't show: `message`, or when every launch of this row is
-    /// refused, `ended` and the remedy.
-    fn latch_missing_pane(&mut self, message: &str, ended: &str) {
-        if self.last_error.is_none() {
-            self.last_error = self.refused_restart_error(ended);
-        }
+    /// refused, `lead` and the remedy.
+    fn latch_missing_pane(&mut self, message: &str, lead: &str) {
+        self.name_refused_restart(Some(lead), None);
         self.latch_tmux_error(message);
     }
 
-    /// `ended`, what happened to the pane, then the fix a restart needs first, when every launch of
-    /// this row is refused. The remedy itself isn't stored, so after a reload or a daemon restart
-    /// this is how it comes back. Only asked while nothing explains the Error yet.
-    fn refused_restart_error(&self, ended: &str) -> Option<String> {
-        self.command_selector_refuses_launch().then(|| {
-            format!(
-                "{ended} Terminal view can't start this Session again: {}",
-                Self::command_selector_remedy(&self.id)
-            )
-        })
+    /// For a pane that ended while every launch of this row is refused: what ended it, then the
+    /// fix a restart needs first. What ended it is `lead` (the pane itself is gone) followed by the
+    /// diagnostic, else the diagnostic alone. The diagnostic is the one already recorded, such as
+    /// a live error the agent showed, else `seen`. The remedy itself isn't stored, so after a
+    /// reload or a daemon restart this is how it comes back; once named it stays as it is.
+    fn name_refused_restart(&mut self, lead: Option<&str>, seen: Option<String>) {
+        let remedy = Self::command_selector_remedy(&self.id);
+        if !self.command_selector_refuses_launch()
+            || self
+                .last_error
+                .as_deref()
+                .is_some_and(|error| error.contains(&remedy))
+        {
+            return;
+        }
+        let diagnostic = self
+            .last_error
+            .take()
+            .filter(|error| {
+                error != TMUX_SESSION_GONE_ERROR && error != TMUX_SERVER_UNREACHABLE_ERROR
+            })
+            .or(seen);
+        let ended = match (lead, diagnostic.as_deref()) {
+            (Some(lead), Some(diagnostic)) => {
+                format!("{lead} {}", ended_sentence(Some(diagnostic)))
+            }
+            (Some(lead), None) => lead.to_string(),
+            (None, diagnostic) => ended_sentence(diagnostic),
+        };
+        self.last_error = Some(format!(
+            "{ended} Terminal view can't start this Session again: {remedy}"
+        ));
     }
 
     pub(super) fn update_status_with_metadata_inner(
@@ -325,7 +345,7 @@ impl Instance {
             });
             if self.status == Status::Error {
                 if is_dead {
-                    self.explain_error_from_pane(&session);
+                    self.explain_error_from_pane(&session, true);
                 } else if self.last_error.is_none() {
                     self.last_error = Some(summarize_error_from_pane(
                         &session.capture_pane(20).unwrap_or_default(),
@@ -362,7 +382,7 @@ impl Instance {
         // reported hooks at all: a hookless agent's pane is allowed to end.
         if is_dead && hook.is_some() {
             self.status = Status::Error;
-            self.explain_error_from_pane(&session);
+            self.explain_error_from_pane(&session, true);
             return;
         }
 
@@ -394,7 +414,7 @@ impl Instance {
                 self.status = hook.status;
                 // An Error keeps its explanation, as the manifest path does.
                 if hook.status == Status::Error {
-                    self.explain_error_from_pane(&session);
+                    self.explain_error_from_pane(&session, false);
                 } else {
                     self.last_error = None;
                 }
@@ -650,18 +670,15 @@ impl Instance {
         if let Some(status) = confirmed {
             self.status = status;
             if status == Status::Error {
+                let diagnostic = detection
+                    .diagnostic
+                    .map(pane_status::summarize_error_diagnostic);
+                if is_dead || shell_stale {
+                    self.name_refused_restart(None, diagnostic.clone());
+                }
                 if self.last_error.is_none() {
-                    let diagnostic = detection
-                        .diagnostic
-                        .map(pane_status::summarize_error_diagnostic);
-                    // A pane that ended takes the remedy after what ended it.
-                    let ended = (is_dead || shell_stale)
-                        .then(|| self.refused_restart_error(&ended_sentence(diagnostic.as_deref())))
-                        .flatten();
                     self.last_error = Some(
-                        ended
-                            .or(diagnostic)
-                            .unwrap_or_else(|| summarize_error_from_pane(&pane_content)),
+                        diagnostic.unwrap_or_else(|| summarize_error_from_pane(&pane_content)),
                     );
                 }
             } else {
@@ -1442,6 +1459,72 @@ Esc to cancel \u{b7} Tab to amend \u{b7} ctrl+e to explain\n\
                 assert_ne!(inst.status, Status::Error);
                 assert_eq!(inst.last_error, None);
             }
+        }
+
+        // A live error the agent showed stays first when its pane then ends; a gone pane still
+        // leads with that, so a later poll that can't reach tmux still reads it as terminated.
+        let live = "API Error: 401";
+        {
+            let mut inst = conflicting();
+            inst.status = Status::Error;
+            inst.last_error = Some(live.into());
+            let _cache = force_session_absent();
+            inst.update_status_with_metadata_inner(None, None);
+            let gone = refused(&inst, &format!("{TMUX_SESSION_GONE_LEAD} {live}."));
+            assert_eq!(inst.last_error.as_deref(), Some(gone.as_str()));
+            drop(_cache);
+            let guard = crate::tmux::SessionCacheGuard::capture();
+            guard.force_unreachable();
+            inst.unknown_since = Some(std::time::Instant::now() - Duration::from_secs(60));
+            inst.update_status_with_metadata_inner(None, None);
+            assert_eq!(inst.last_error.as_deref(), Some(gone.as_str()));
+            assert!(crate::cli::session::is_terminated(
+                inst.status,
+                inst.last_error.as_deref(),
+                false,
+                crate::tmux::SessionExistence::Unknown,
+            ));
+        }
+        {
+            let mut inst = conflicting();
+            inst.status = Status::Error;
+            inst.last_error = Some(live.into());
+            write_hook_status(&inst.id, "running");
+            let name = tmux::Session::generate_name(&inst.id, &inst.title);
+            let guard = crate::tmux::SessionCacheGuard::capture();
+            guard.force_present(&[name.as_str()]);
+            let metadata = tmux::PaneMetadata {
+                pane_dead: true,
+                ..agent_pane_metadata("claude", None)
+            };
+            inst.update_status_with_metadata_inner(Some(&metadata), None);
+            crate::hooks::cleanup_hook_status_dir(&inst.id);
+            let dead = refused(&inst, &format!("{live}."));
+            assert_eq!(inst.last_error.as_deref(), Some(dead.as_str()));
+        }
+
+        // A live pane's Error hook keeps the pane's own explanation. A `detect_as` alias whose
+        // target has no manifest (settl) takes such a row down the hook path.
+        {
+            const PROFILE: &str = "selector-alias-hook-test";
+            let _registry = install_status_rules(PROFILE, "settl", Vec::new());
+            let mut inst = conflicting();
+            inst.source_profile = PROFILE.to_string();
+            inst.detect_as = "settl".to_string();
+            assert!(!crate::tmux::detect::has_manifest("settl"));
+            assert!(inst.command_selector_refuses_launch());
+            write_hook_status(&inst.id, "error");
+            let name = tmux::Session::generate_name(&inst.id, &inst.title);
+            let guard = crate::tmux::SessionCacheGuard::capture();
+            guard.force_present(&[name.as_str()]);
+            let metadata = agent_pane_metadata("claude", None);
+            inst.update_status_with_metadata_inner(Some(&metadata), None);
+            crate::hooks::cleanup_hook_status_dir(&inst.id);
+            assert_eq!(inst.status, Status::Error);
+            assert_eq!(
+                inst.last_error.as_deref(),
+                Some(summarize_error_from_pane("").as_str())
+            );
         }
 
         // What ended the pane leads, then the remedy: the adapter's diagnostic when it saw one.
