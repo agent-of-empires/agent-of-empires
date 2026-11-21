@@ -1,4 +1,4 @@
-// The Worktree row's "What's a worktree?" popover (#5910): keyboard, the link's new tab, and phones.
+// The Worktree row's "What's a worktree?" popover (#5910): keyboard, the Settings link, and phones.
 
 import type { Page } from "@playwright/test";
 import { test, expect } from "./helpers/mockedTest";
@@ -28,16 +28,29 @@ test.describe("desktop", () => {
     }
   });
 
-  test("the link opens Settings › Worktree in a new tab and the wizard stays open", async ({ page }) => {
+  test("the link closes the wizard and opens Settings › Worktree without reloading the page", async ({ page }) => {
     await startWizard(page, WORKTREE_ON);
-    await wizard(page).getByPlaceholder("Auto-generated if empty").fill("keep-me");
+    // One Worktree setting, so the tab's own row proves where it landed.
+    const setting = {
+      section: "worktree",
+      field: "path_template",
+      category: "Worktree",
+      label: "Path template",
+      description: "",
+      widget: { kind: "text" },
+      web_write: { policy: "allow" },
+      profile_overridable: true,
+      validation: {},
+      advanced: false,
+    };
+    await page.route("**/api/settings/schema", (r) => r.fulfill({ json: [setting] }));
+    await page.evaluate(() => ((window as unknown as { sameDocument: boolean }).sameDocument = true));
     await icon(page).click();
-    const [tab] = await Promise.all([page.context().waitForEvent("page"), link(page).click()]);
-    await tab.waitForLoadState();
-    expect(new URL(tab.url()).pathname).toBe("/settings/worktree");
-    expect(await tab.evaluate(() => window.opener)).toBeNull();
-    await expect(page.getByTestId("session-wizard")).toBeVisible();
-    await expect(wizard(page).getByPlaceholder("Auto-generated if empty")).toHaveValue("keep-me");
+    await link(page).click();
+    await expect(page.getByTestId("session-wizard")).toHaveCount(0);
+    await expect(page).toHaveURL(/\/settings\/worktree$/);
+    await expect(page.getByText("Path template", { exact: true })).toBeVisible();
+    expect(await page.evaluate(() => (window as unknown as { sameDocument?: boolean }).sameDocument)).toBe(true);
   });
 });
 

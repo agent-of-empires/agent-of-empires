@@ -1,7 +1,14 @@
+import type { MouseEvent } from "react";
 import { InfoPopover } from "./InfoPopover";
 
-/** What the Worktree row turns on. The link opens a new tab so the wizard keeps its form. */
-export function WorktreeInfo() {
+/** What the Worktree row turns on, with a link to its settings. */
+export function WorktreeInfo({ onOpenSettings }: { onOpenSettings: () => void }) {
+  const open = (e: MouseEvent) => {
+    // A modified click keeps the browser's own new-tab or new-window behaviour.
+    if (e.metaKey || e.ctrlKey || e.shiftKey || e.altKey) return;
+    e.preventDefault();
+    onOpenSettings();
+  };
   return (
     <InfoPopover title="What's a worktree?">
       <p className="mt-1 text-text-secondary">
@@ -10,8 +17,7 @@ export function WorktreeInfo() {
       </p>
       <a
         href="/settings/worktree"
-        target="_blank"
-        rel="noopener"
+        onClick={open}
         className="mt-2 inline-flex min-h-8 items-center text-brand-400 underline hover:opacity-80"
       >
         Worktree settings ›

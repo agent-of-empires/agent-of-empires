@@ -2829,6 +2829,7 @@ function AppContent({
                 setWizardPrefill(undefined);
                 clearRestore();
               }}
+              onOpenSettingsTab={openSettingsTab}
               onCreated={(session?: SessionResponse) => {
                 if (session) {
                   injectSession(session);
