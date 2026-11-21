@@ -103,6 +103,7 @@ pub(crate) use sid_persist::{
 };
 pub use start::{LaunchSidOutcome, StartOutcome};
 pub(crate) use status::PassiveStatusPatch;
+pub(crate) use status::{reports_tmux_session_gone, TMUX_SESSION_GONE_LEAD};
 pub use status::{Status, TMUX_SERVER_UNREACHABLE_ERROR, TMUX_SESSION_GONE_ERROR};
 pub(crate) use terminal::ToolLaunchUnavailable;
 #[cfg(test)]

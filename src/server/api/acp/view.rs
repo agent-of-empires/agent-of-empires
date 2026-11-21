@@ -590,7 +590,8 @@ const COMMAND_SELECTOR_CONFLICT: &str = "This Session's command picks a conversa
 /// id is a way out only here, in Terminal view; Structured view refuses that clear.
 fn command_selector_ended(session_id: &str) -> String {
     format!(
-        "Terminal view couldn't start this Session: its command picks a conversation with its own session flag, and AoE holds one for it too. Restart the Session with the session flag removed from its command or arguments, or run `aoe session set-session-id {session_id} \"\"` and restart it to run its command as written."
+        "Terminal view couldn't start this Session: {}",
+        Instance::command_selector_remedy(session_id)
     )
 }
 
@@ -757,7 +758,11 @@ async fn terminal_plan(
 /// Whether the launch refuses `row`'s command selector beside AoE's own conversation. A switch
 /// that `keeps_target` commits one; otherwise the row's own state decides.
 fn command_selector_conflicts(row: &Instance, keeps_target: bool) -> bool {
-    row.command_session_selector().is_some() && (keeps_target || row.conversation_state().resumes())
+    if keeps_target {
+        row.command_session_selector().is_some()
+    } else {
+        row.command_selector_refuses_launch()
+    }
 }
 
 async fn agent_terminal_plan(
@@ -5375,6 +5380,29 @@ mod tests {
             Ok(rows.into_iter().find(|r| r.id == id).unwrap())
         };
 
+        // A poll of an ended row without its remedy, past the wait for a missing tmux server
+        // (none is left once the last pane ends), gives the remedy back after the pane's fate
+        // (#5829).
+        let poll = |row: &mut Instance| {
+            crate::tmux::refresh_session_cache();
+            row.unknown_since =
+                Some(std::time::Instant::now() - std::time::Duration::from_secs(60));
+            row.update_status_with_metadata(None, None);
+            let remedy = format!(
+                " Terminal view can't start this Session again: {}",
+                Instance::command_selector_remedy(&row.id)
+            );
+            assert_eq!(row.status, Status::Error, "{}", row.title);
+            assert!(
+                row.last_error
+                    .as_deref()
+                    .is_some_and(|error| error.ends_with(&remedy)),
+                "{}: {:?}",
+                row.title,
+                row.last_error
+            );
+        };
+
         let mut kept_pane = None;
         for (held, tried, resume) in &cases {
             // Reserve as a daemon without the refusal did; the switch then drives it.
@@ -5613,9 +5641,8 @@ mod tests {
             let cached = find_instance(&state, &held.id).await.unwrap();
             assert_eq!(cached.status, Status::Error);
             if *resume == Resume::SwitchAdoptionFails {
-                // The 409 above is the only place the remedy reaches: the degraded store keeps
-                // the stale published row, and `last_error` is runtime only, so reconciliation
-                // rebuilds the row from disk without it, as after a daemon restart.
+                // The degraded store keeps the stale published row, so only the 409 above carried
+                // the remedy, and reconciliation rebuilds the row from disk, where it isn't kept.
                 assert!(cached.last_error.is_none());
                 assert_ne!(
                     *state.canonical_health.read().await,
@@ -5632,6 +5659,8 @@ mod tests {
                 assert_eq!(reconciled.view, View::Terminal);
                 assert_eq!(reconciled.status, Status::Error);
                 assert!(reconciled.last_error.is_none());
+                // The next poll explains the Error with the remedy again.
+                poll(&mut reconciled.clone());
                 // The ended switch is in Terminal view, so a retry just reports that.
                 assert_eq!(switch().await.into_response().status(), StatusCode::OK);
             } else {
@@ -5640,6 +5669,14 @@ mod tests {
                     Some(command_selector_ended(&held.id).as_str())
                 );
             }
+            // A daemon restart loads the row without the remedy too, and its first poll puts it
+            // back.
+            let mut restarted = stored(&held.id)?;
+            assert_eq!(
+                (restarted.status, restarted.last_error.as_deref()),
+                (Status::Error, None)
+            );
+            poll(&mut restarted);
             assert!(!argv.exists(), "the refused launch ran nothing");
         }
 
@@ -5692,6 +5729,12 @@ mod tests {
             let restarted = stored(&row.id)?;
             assert_eq!(restarted.command, command, "{}", row.title);
             assert!(restarted.terminal_handoff.is_none());
+            // Either remedy leaves nothing for a later poll to explain with it.
+            assert!(
+                !restarted.command_selector_refuses_launch(),
+                "{}",
+                row.title
+            );
         }
         let cleared = stored(&id_cleared.id)?;
         assert_eq!(cleared.agent_session_id, None, "the clear dropped AoE's id");
