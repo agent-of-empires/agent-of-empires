@@ -37,7 +37,16 @@ trap cleanup EXIT
 PATH="$B/bin:$PATH" "$AOE" serve --host 127.0.0.1 --port "$PORT" --no-autostart \
   >"$B/serve.log" 2>&1 &
 SERVE_PID=$!
-until grep -q 'token=' "$B/serve.log"; do sleep 1; done
+for _ in $(seq 1 60); do
+  grep -q 'token=' "$B/serve.log" && break
+  kill -0 "$SERVE_PID" 2>/dev/null || break
+  sleep 1
+done
+if ! grep -q 'token=' "$B/serve.log"; then
+  echo "Daemon did not start:" >&2
+  cat "$B/serve.log" >&2
+  exit 1
+fi
 TOKEN=$(grep -o 'token=[0-9a-f]*' "$B/serve.log" | head -1 | cut -d= -f2)
 API="http://127.0.0.1:$PORT/api/sessions"
 AUTH="Authorization: Bearer $TOKEN"
