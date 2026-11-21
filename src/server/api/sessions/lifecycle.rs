@@ -2069,17 +2069,14 @@ pub async fn start_session(
 pub async fn restart_session(
     State(state): State<Arc<AppState>>,
     Path(id): Path<String>,
-    body: Result<
-        Option<Json<crate::daemon::RestartSessionBody>>,
-        axum::extract::rejection::JsonRejection,
-    >,
+    request: axum::extract::Request,
 ) -> axum::response::Response {
     if let Some(response) = crate::server::api::cityhall_block(&state) {
         return response;
     }
-    let body = match body {
-        Ok(body) => body.map(|Json(body)| body).unwrap_or_default(),
-        Err(error) => return error.into_response(),
+    let body: crate::daemon::RestartSessionBody = match json_or_default(request).await {
+        Ok(body) => body,
+        Err(response) => return response,
     };
     // The restart body sets the same spawn fields the create route accepts, so
     // it answers with the same gate and the same `400 validation_failed`.
@@ -2142,10 +2139,15 @@ pub async fn recreate_container(
 pub async fn restart_for_update(
     State(state): State<Arc<AppState>>,
     Path(id): Path<String>,
+    request: axum::extract::Request,
 ) -> axum::response::Response {
     if let Some(resp) = cityhall_block_non_structured(&state, &id).await {
         return resp;
     }
+    let check: crate::daemon::RestartForUpdateBody = match json_or_default(request).await {
+        Ok(check) => check,
+        Err(response) => return response,
+    };
     let instance = {
         let instances = state.instances.read().await;
         let Some(inst) = instances.iter().find(|i| i.id == id) else {
@@ -2172,7 +2174,108 @@ pub async fn restart_for_update(
             "Session is busy or its agent is not out of date".to_string(),
         );
     }
-    apply_update_restart(&state, id, instance).await
+    apply_update_restart(&state, id, instance, check).await
+}
+
+/// The refusal for a restart that would stop background processes `body` didn't confirm.
+async fn background_processes_refusal(
+    instance: &Instance,
+    body: &crate::daemon::RestartSessionBody,
+) -> Option<axum::response::Response> {
+    use crate::session::background_processes::{pane_census, refusal, PaneCensus};
+    let confirmed: Vec<_> = body
+        .stop_processes
+        .iter()
+        .flatten()
+        .map(|identity| crate::process::PrimeProcessIdentity {
+            pid: identity.pid,
+            start_id: identity.start_id.clone(),
+        })
+        .collect();
+    let row = instance.clone();
+    let census = tokio::task::spawn_blocking(move || pane_census(&row))
+        .await
+        .unwrap_or_else(|error| {
+            tracing::warn!(target: "http.api.sessions", session = %instance.id, %error, "background-process census failed");
+            PaneCensus::Unclassified
+        });
+    let fields = refusal(census, &confirmed, body.stop_unclassified)?;
+    // A confirm that skips the hooks does so because an earlier attempt ran them.
+    Some(background_processes_response(fields, body.skip_on_launch))
+}
+
+/// A restart body: empty asks for the defaults; any other body must be JSON, so a
+/// background-process check sent without a `Content-Type` is refused instead of dropped.
+async fn json_or_default<T: serde::de::DeserializeOwned + Default>(
+    request: axum::extract::Request,
+) -> Result<T, axum::response::Response> {
+    use axum::extract::FromRequest as _;
+    let (parts, body) = request.into_parts();
+    let bytes = axum::body::Bytes::from_request(
+        axum::extract::Request::from_parts(parts.clone(), body),
+        &(),
+    )
+    .await
+    .map_err(IntoResponse::into_response)?;
+    if bytes.is_empty() {
+        return Ok(T::default());
+    }
+    let request = axum::extract::Request::from_parts(parts, axum::body::Body::from(bytes));
+    Json::from_request(request, &())
+        .await
+        .map(|Json(body)| body)
+        .map_err(IntoResponse::into_response)
+}
+
+/// A background-process check with a setting a refusal after the hooks couldn't undo.
+fn check_with_unrestorable_setting(body: &crate::daemon::RestartSessionBody) -> bool {
+    body.stop_processes.is_some()
+        && (body.profile.is_some()
+            || body.tool.is_some()
+            || body.command_override.is_some()
+            || body.extra_args.is_some()
+            || body.discard_sandbox_container)
+}
+
+/// The 409 for a restart that found unconfirmed background processes. `launch_hooks_ran` says
+/// the launch hooks have run for this restart, so the confirm skips `on_launch`: this request
+/// reached their turn, or skipped them because an earlier attempt ran them.
+fn background_processes_response(
+    fields: serde_json::Value,
+    launch_hooks_ran: bool,
+) -> axum::response::Response {
+    let code = crate::daemon::ApiErrorCode::BackgroundProcesses;
+    let mut payload = serde_json::json!({
+        "error": code.as_str(),
+        "message": "The restart would stop background processes that were not confirmed",
+        "launch_hooks_ran": launch_hooks_ran,
+    });
+    if let (Some(payload), serde_json::Value::Object(fields)) = (payload.as_object_mut(), fields) {
+        payload.extend(fields);
+    }
+    (code.status(), code.header(), Json(payload)).into_response()
+}
+
+/// The background-process recheck for `body`, when it asked for one.
+fn process_recheck(
+    body: Option<&crate::daemon::RestartSessionBody>,
+    structured: bool,
+    admitted: Option<crate::session::background_processes::AdmittedRestart>,
+) -> Option<crate::session::background_processes::ProcessRecheck> {
+    let body = body.filter(|body| body.stop_processes.is_some() && !structured)?;
+    Some(crate::session::background_processes::ProcessRecheck {
+        confirmed: body
+            .stop_processes
+            .iter()
+            .flatten()
+            .map(|identity| crate::process::PrimeProcessIdentity {
+                pid: identity.pid,
+                start_id: identity.start_id.clone(),
+            })
+            .collect(),
+        stop_unclassified: body.stop_unclassified,
+        admitted: admitted?,
+    })
 }
 
 /// Restart an eligible session onto the updated agent.
@@ -2180,6 +2283,7 @@ pub(super) async fn apply_update_restart(
     state: &Arc<AppState>,
     id: String,
     instance: Instance,
+    check: crate::daemon::RestartForUpdateBody,
 ) -> axum::response::Response {
     if instance.is_structured() {
         // The reconciler terminates the worker once its turn drains and respawns it against the
@@ -2207,6 +2311,9 @@ pub(super) async fn apply_update_restart(
     let body = crate::daemon::RestartSessionBody {
         wake_message: Some(String::new()),
         only_if_idle: true,
+        stop_processes: check.stop_processes,
+        stop_unclassified: check.stop_unclassified,
+        skip_on_launch: check.skip_on_launch,
         ..Default::default()
     };
     prepare_agent_session(
@@ -2445,6 +2552,7 @@ async fn admit_restart_sandbox_login(
     if row.ensure_startable().is_err()
         || matches!(row.status, Status::Creating | Status::Deleting)
         || (body.only_if_idle && row.status != Status::Idle)
+        || (!row.is_structured() && check_with_unrestorable_setting(body))
         || (state.cityhall_mode && !row.is_structured())
         || *state.canonical_health.read().await != crate::daemon::RuntimeHealth::Healthy
     {
@@ -3403,6 +3511,16 @@ async fn prepare_agent_session_inner(
             "Session is busy or its agent is not out of date".to_string(),
         );
     }
+    if restart
+        .as_ref()
+        .is_some_and(|body| !instance.is_structured() && check_with_unrestorable_setting(body))
+    {
+        return api_error(
+            StatusCode::BAD_REQUEST,
+            "validation_failed",
+            "stop_processes applies only to a restart that changes no setting".to_string(),
+        );
+    }
     // #4116: a shelved row refuses every start path with its own code, decided on
     // the row this request reloaded. It answers before the lifecycle reservation,
     // before the store write that would report it missing, and before the
@@ -3411,6 +3529,15 @@ async fn prepare_agent_session_inner(
     // peer that shelves it while this request waits.
     if let Err(blocked) = instance.ensure_startable() {
         return crate::server::api::start_blocked_response(blocked);
+    }
+    // Structured workers are stopped by their reconciler, not here, so they skip the check.
+    if let Some(body) = restart
+        .as_ref()
+        .filter(|body| body.stop_processes.is_some() && !instance.is_structured())
+    {
+        if let Some(response) = background_processes_refusal(&instance, body).await {
+            return response;
+        }
     }
     let body = match body {
         Ok(body) => body.map(|Json(body)| body).unwrap_or_default(),
@@ -3660,6 +3787,7 @@ async fn prepare_agent_session_inner(
                 outgoing.capture_before_restart_in(&native)?;
             }
         }
+        let mut admitted = None;
         let mut started = if let (Some(body), Some(target_native)) =
             (&worker_restart, target_native)
         {
@@ -3690,6 +3818,7 @@ async fn prepare_agent_session_inner(
             moved
         } else {
             let store: &dyn crate::session::SessionStore = &native;
+            let admitted = &mut admitted;
             store.update(|rows, _| {
                 let row = rows
                     .iter_mut()
@@ -3700,7 +3829,11 @@ async fn prepare_agent_session_inner(
                 }
                 if let Some(body) = &worker_restart {
                     row.source_profile.clone_from(&profile);
-                    admit_restart(row, body, account_swap)?;
+                    *admitted = Some(
+                        crate::session::background_processes::AdmittedRestart::admit(row, |row| {
+                            admit_restart(row, body, account_swap)
+                        })?,
+                    );
                     return Ok(Some(row.clone()));
                 }
                 let now = chrono::Utc::now();
@@ -3795,6 +3928,7 @@ async fn prepare_agent_session_inner(
             started,
             native,
             (account_swap, conversation_carry),
+            admitted,
         )))
     })
     .await;
@@ -3806,7 +3940,8 @@ async fn prepare_agent_session_inner(
     let reason = restart_reason(restart_origin, restart.as_deref());
     let requested_wake_message = restart.as_ref().and_then(|body| body.wake_message.clone());
     let hooked = match result {
-        Ok(Ok(Some((generation, mut started, native, conversation_carry)))) => {
+        Ok(Ok(Some((generation, mut started, native, conversation_carry, admitted)))) => {
+            let processes = process_recheck(restart.as_deref(), started.is_structured(), admitted);
             tokio::task::spawn_blocking(move || {
                 let _timeout = restart.as_ref().filter(|body| body.bound_hooks).map(|_| {
                     crate::session::recovery::HookTimeoutScope::new(
@@ -3825,6 +3960,7 @@ async fn prepare_agent_session_inner(
                     native,
                     hooks,
                     conversation_carry,
+                    processes,
                 )))
             })
             .await
@@ -3834,7 +3970,7 @@ async fn prepare_agent_session_inner(
         Err(error) => Err(error),
     };
     let hooked = match hooked {
-        Ok(Ok(Some((generation, started, native, hooks, carry)))) if started.is_structured() => {
+        Ok(Ok(Some((generation, started, native, hooks, carry, _)))) if started.is_structured() => {
             return finish_structured_restart(
                 &state,
                 &id,
@@ -3862,7 +3998,7 @@ async fn prepare_agent_session_inner(
     let guard = lock.lock().await;
     let mut restart_identity = None;
     let result = match hooked {
-        Ok(Ok(Some((generation, mut started, native, hooks, conversation_carry)))) => {
+        Ok(Ok(Some((generation, mut started, native, hooks, conversation_carry, processes)))) => {
             tokio::task::spawn_blocking(move || -> anyhow::Result<_> {
                 use crate::session::SessionStore;
                 let outcome = started.finish_reserved_launch(
@@ -3876,6 +4012,7 @@ async fn prepare_agent_session_inner(
                         },
                         restart: true,
                         conversation_carry: conversation_carry.1,
+                        processes,
                     },
                     generation,
                     hooks,
@@ -3966,6 +4103,10 @@ async fn prepare_agent_session_inner(
         Err(error) => {
             let response = if let Some(response) = lifecycle_rejection(&state, &error) {
                 response
+            } else if let Some(appeared) =
+                error.downcast_ref::<crate::session::background_processes::BackgroundProcessesAppeared>()
+            {
+                background_processes_response(appeared.0.clone(), true)
             } else if error.is::<crate::session::NativeStoreUnavailable>() {
                 StatusCode::SERVICE_UNAVAILABLE.into_response()
             } else if error.is::<crate::session::HostHookApprovalRequired>() {
@@ -4174,6 +4315,22 @@ pub(super) mod launch_hook_gate {
         let (release_tx, release_rx) = tokio::sync::oneshot::channel();
         *GATE.lock().unwrap() = Some((id.to_owned(), stage, entered_tx, release_rx));
         (entered_rx, release_tx)
+    }
+
+    /// On drop, clears a gate armed for its session that no restart reached, so a test that
+    /// fails before the restart gets there can't hold a later one.
+    pub(in crate::server::api::sessions) struct Disarm(pub(in crate::server::api::sessions) String);
+
+    impl Drop for Disarm {
+        fn drop(&mut self) {
+            let mut gate = GATE.lock().unwrap_or_else(|e| e.into_inner());
+            if gate
+                .as_ref()
+                .is_some_and(|(session, ..)| *session == self.0)
+            {
+                *gate = None;
+            }
+        }
     }
 
     pub(super) async fn pause(id: &str, stage: Stage) {
@@ -4444,7 +4601,12 @@ mod durable_stop_tests {
             let before = state.runtime.publish(&state).await?;
             let response = match target {
                 "restart" => {
-                    restart_session(State(state.clone()), Path(row.id.clone()), Ok(None)).await
+                    restart_session(
+                        State(state.clone()),
+                        Path(row.id.clone()),
+                        axum::extract::Request::new(axum::body::Body::empty()),
+                    )
+                    .await
                 }
                 "container-terminal" => super::super::ensure::ensure_container_terminal(
                     State(state.clone()),
@@ -4663,11 +4825,11 @@ mod durable_stop_tests {
             let response = restart_session(
                 State(state.clone()),
                 Path(row.id.clone()),
-                Ok(Some(Json(crate::daemon::RestartSessionBody {
+                crate::server::test_support::json_request(&crate::daemon::RestartSessionBody {
                     skip_on_launch: true,
                     wake_message: Some(String::new()),
                     ..Default::default()
-                }))),
+                }),
             )
             .await;
             let status = response.status();
@@ -4815,11 +4977,11 @@ mod durable_stop_tests {
         let response = restart_session(
             State(state.clone()),
             Path(row.id.clone()),
-            Ok(Some(Json(crate::daemon::RestartSessionBody {
+            crate::server::test_support::json_request(&crate::daemon::RestartSessionBody {
                 skip_on_launch: true,
                 wake_message: Some(String::new()),
                 ..Default::default()
-            }))),
+            }),
         )
         .await;
         let status = response.status();

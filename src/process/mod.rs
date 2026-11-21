@@ -1139,6 +1139,56 @@ pub(super) struct PrimeProcessSample {
     pub marked: bool,
 }
 
+/// `pid` with its start, or `None` once it has exited.
+pub(crate) fn process_identity(pid: u32) -> anyhow::Result<Option<PrimeProcessIdentity>> {
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    {
+        Ok(platform::process_start_id(pid)?.map(|start_id| PrimeProcessIdentity { pid, start_id }))
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    {
+        let _ = pid;
+        anyhow::bail!("process identity is not supported on this platform")
+    }
+}
+
+/// A process in a root's tree, with what a person needs to recognise it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct CommandSample {
+    pub identity: PrimeProcessIdentity,
+    pub parent: u32,
+    pub exe: Option<std::path::PathBuf>,
+    pub argv: Vec<String>,
+    pub elapsed_secs: u64,
+}
+
+/// `root` and its live descendants by parent link, each with its command line and age, root
+/// first. An exited root is an error.
+pub(crate) fn process_tree_commands(root: u32) -> anyhow::Result<Vec<CommandSample>> {
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    {
+        let start_id = platform::process_start_id(root)?
+            .ok_or_else(|| anyhow::anyhow!("process {root} exited before its census"))?;
+        let root = PrimeProcessIdentity {
+            pid: root,
+            start_id,
+        };
+        let samples = platform::process_tree_samples(&root)?;
+        let selected = prime_selection_mask(&samples, std::slice::from_ref(&root));
+        let mut tree: Vec<_> = samples
+            .into_iter()
+            .zip(selected)
+            .filter_map(|(sample, selected)| selected.then_some(sample))
+            .collect();
+        tree.sort_by_key(|sample| sample.identity != root);
+        platform::describe_processes(tree)
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    {
+        anyhow::bail!("process {root}: command census is unavailable on this platform")
+    }
+}
+
 fn prime_selection_mask(
     samples: &[PrimeProcessSample],
     known: &[PrimeProcessIdentity],

@@ -793,6 +793,88 @@ pub(super) fn foreign_runner_group_absent(pid: u32) -> anyhow::Result<bool> {
     let ruid = unsafe { libc::getuid() };
     Ok((info.pbsi_uid != uid || info.pbsi_ruid != ruid) && !runner_group_executing(pid)?)
 }
+
+/// `samples` with each one's command line, executable and age. Arguments come whole from the
+/// kernel, or not at all: a secret's value can't be split across words. A process that exited, or
+/// whose PID now names another process, is left out.
+pub(super) fn describe_processes(
+    samples: Vec<super::PrimeProcessSample>,
+) -> anyhow::Result<Vec<super::CommandSample>> {
+    if samples.is_empty() {
+        return Ok(Vec::new());
+    }
+    let pids: Vec<String> = samples.iter().map(|s| s.identity.pid.to_string()).collect();
+    let mut command = Command::new("ps");
+    command.args(["-o", "pid=,etime=", "-p", &pids.join(",")]);
+    let output = crate::session::capture::run_with_timeout_limit(
+        command,
+        std::time::Duration::from_secs(2),
+        "process command census",
+        1024 * 1024,
+    )?;
+    let mut rows = HashMap::new();
+    for line in String::from_utf8_lossy(&output).lines() {
+        let mut fields = line.split_ascii_whitespace();
+        let (Some(pid), Some(etime)) = (fields.next(), fields.next()) else {
+            continue;
+        };
+        let (Ok(pid), Some(elapsed)) = (pid.parse::<u32>(), parse_etime(etime)) else {
+            continue;
+        };
+        rows.insert(pid, elapsed);
+    }
+    let mut described = Vec::new();
+    for sample in samples {
+        let pid = sample.identity.pid;
+        let Some(elapsed_secs) = rows.remove(&pid) else {
+            continue;
+        };
+        let argv = process_argv(pid).unwrap_or_default();
+        let exe = executable_path(pid);
+        if process_start_id(pid)?.as_ref() != Some(&sample.identity.start_id) {
+            continue;
+        }
+        described.push(super::CommandSample {
+            identity: sample.identity,
+            parent: sample.parent,
+            exe,
+            argv,
+            elapsed_secs,
+        });
+    }
+    Ok(described)
+}
+
+fn executable_path(pid: u32) -> Option<std::path::PathBuf> {
+    use std::os::unix::ffi::OsStrExt as _;
+    let mut buffer = vec![0u8; libc::PROC_PIDPATHINFO_MAXSIZE as usize];
+    let len = unsafe {
+        libc::proc_pidpath(
+            pid as libc::c_int,
+            buffer.as_mut_ptr().cast(),
+            buffer.len() as u32,
+        )
+    };
+    (len > 0).then(|| std::ffi::OsStr::from_bytes(&buffer[..len as usize]).into())
+}
+
+/// `ps`'s `etime`: `[[dd-]hh:]mm:ss`.
+fn parse_etime(etime: &str) -> Option<u64> {
+    let (days, clock) = match etime.split_once('-') {
+        Some((days, clock)) => (days.parse::<u64>().ok()?, clock),
+        None => (0, etime),
+    };
+    let mut secs = 0u64;
+    let parts: Vec<_> = clock.split(':').collect();
+    if !(2..=3).contains(&parts.len()) {
+        return None;
+    }
+    for part in parts {
+        secs = secs * 60 + part.parse::<u64>().ok()?;
+    }
+    Some(days * 86_400 + secs)
+}
+
 pub(super) fn process_tree_samples(
     root: &super::PrimeProcessIdentity,
 ) -> anyhow::Result<Vec<super::PrimeProcessSample>> {
@@ -1359,59 +1441,62 @@ pub(super) fn foreground_arguments(shell_pid: u32) -> Vec<super::ProcessArgument
             if unsafe { libc::getpgid(pid as i32) } != group {
                 return None;
             }
-            let mut mib = [libc::CTL_KERN, libc::KERN_PROCARGS2, pid as i32];
-            let mut length = 0usize;
-            if unsafe {
-                libc::sysctl(
-                    mib.as_mut_ptr(),
-                    3,
-                    std::ptr::null_mut(),
-                    &mut length,
-                    std::ptr::null_mut(),
-                    0,
-                )
-            } != 0
-                || length > 256 * 1024
-            {
-                return None;
-            }
-            let mut bytes = vec![0u8; length];
-            if unsafe {
-                libc::sysctl(
-                    mib.as_mut_ptr(),
-                    3,
-                    bytes.as_mut_ptr().cast(),
-                    &mut length,
-                    std::ptr::null_mut(),
-                    0,
-                )
-            } != 0
-            {
-                return None;
-            }
-            bytes.truncate(length);
-            let count = i32::from_ne_bytes(bytes.get(..4)?.try_into().ok()?);
-            if !(1..=4096).contains(&count) {
-                return None;
-            }
-            let tail = bytes.get(4..)?;
-            let executable_end = tail.iter().position(|byte| *byte == 0)?;
-            let padding = tail.get(executable_end + 1..)?;
-            let start = padding.iter().position(|byte| *byte != 0)?;
-            let mut arguments = padding[start..].split(|byte| *byte == 0);
-            let argv: Vec<String> = arguments
-                .by_ref()
-                .take(count as usize)
-                .map(|word| std::str::from_utf8(word).map(str::to_owned))
-                .collect::<Result<_, _>>()
-                .ok()?;
-
             Some(super::ProcessArguments {
-                argv,
+                argv: process_argv(pid)?,
                 stdin_is_tty: None,
             })
         })
         .collect()
+}
+
+/// `pid`'s arguments as the kernel holds them (`KERN_PROCARGS2`), each one whole. `None` when
+/// they can't be read: another user's process, or one that isn't UTF-8.
+fn process_argv(pid: u32) -> Option<Vec<String>> {
+    let mut mib = [libc::CTL_KERN, libc::KERN_PROCARGS2, pid as i32];
+    let mut length = 0usize;
+    if unsafe {
+        libc::sysctl(
+            mib.as_mut_ptr(),
+            3,
+            std::ptr::null_mut(),
+            &mut length,
+            std::ptr::null_mut(),
+            0,
+        )
+    } != 0
+        || length > 256 * 1024
+    {
+        return None;
+    }
+    let mut bytes = vec![0u8; length];
+    if unsafe {
+        libc::sysctl(
+            mib.as_mut_ptr(),
+            3,
+            bytes.as_mut_ptr().cast(),
+            &mut length,
+            std::ptr::null_mut(),
+            0,
+        )
+    } != 0
+    {
+        return None;
+    }
+    bytes.truncate(length);
+    let count = i32::from_ne_bytes(bytes.get(..4)?.try_into().ok()?);
+    if !(1..=4096).contains(&count) {
+        return None;
+    }
+    let tail = bytes.get(4..)?;
+    let executable_end = tail.iter().position(|byte| *byte == 0)?;
+    let padding = tail.get(executable_end + 1..)?;
+    let start = padding.iter().position(|byte| *byte != 0)?;
+    padding[start..]
+        .split(|byte| *byte == 0)
+        .take(count as usize)
+        .map(|word| std::str::from_utf8(word).map(str::to_owned))
+        .collect::<Result<_, _>>()
+        .ok()
 }
 
 pub(super) fn parent_and_argv0(pid: u32) -> Option<(u32, String)> {
@@ -1530,6 +1615,20 @@ impl super::SleepInhibit for CaffeinateInhibitor {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn ps_elapsed_time_reads_in_seconds() {
+        for (etime, secs) in [
+            ("00:05", Some(5)),
+            ("12:34", Some(754)),
+            ("01:00:00", Some(3600)),
+            ("2-03:04:05", Some(2 * 86_400 + 3 * 3600 + 4 * 60 + 5)),
+            ("5", None),
+            ("a:b", None),
+        ] {
+            assert_eq!(parse_etime(etime), secs, "{etime}");
+        }
+    }
 
     #[test]
     fn codex_managed_preferences_refuse_either_key() {

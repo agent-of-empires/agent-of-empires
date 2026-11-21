@@ -154,8 +154,22 @@ impl Instance {
     }
 
     pub(super) fn kill_clean_locked(&self) -> Result<()> {
+        self.kill_clean_locked_checked(None)
+    }
+
+    /// Stops the pane, first rechecking a restart's confirmed background processes against it:
+    /// a refusal returns before anything is torn down.
+    pub(super) fn kill_clean_locked_checked(
+        &self,
+        recheck: Option<&crate::session::background_processes::ProcessRecheck>,
+    ) -> Result<()> {
+        use crate::session::background_processes::{final_census, pane_still_checked};
         use crate::tmux::utils::{probe_pane, PaneProbe};
         self.capture_poller.stop();
+        let checked = match recheck {
+            Some(recheck) => Some((recheck, final_census(self, recheck)?)),
+            None => None,
+        };
         let pane = self.tmux_session().and_then(|session| {
             match probe_pane(session.name()) {
                 PaneProbe::Missing => return Ok(()),
@@ -163,7 +177,16 @@ impl Instance {
                     "cannot prove tmux pane state for {} before teardown",
                     session.name()
                 ),
-                PaneProbe::Alive => {}
+                PaneProbe::Alive => {
+                    if let Some((recheck, root)) = &checked {
+                        #[cfg(test)]
+                        crate::session::background_processes::BoundaryHook::fire(
+                            self,
+                            crate::session::background_processes::Boundary::BeforeStop,
+                        );
+                        pane_still_checked(&session, root.as_ref(), recheck)?;
+                    }
+                }
                 PaneProbe::Dead => {
                     let shell = crate::session::environment::user_shell();
                     if let Err(error) = session.respawn_dead_pane(&self.project_path, Some(&shell)) {
@@ -175,6 +198,12 @@ impl Instance {
             std::thread::sleep(std::time::Duration::from_millis(100));
             Ok(())
         });
+        // A refusal stops nothing, the Prime runtime included.
+        if let Err(error) = &pane {
+            if error.is::<crate::session::background_processes::BackgroundProcessesAppeared>() {
+                return pane;
+            }
+        }
         let native = self
             .prime_runtime()
             .map_or(Ok(()), |runtime| runtime.cleanup());

@@ -5674,10 +5674,10 @@ mod tests {
             let response = crate::server::api::restart_session(
                 State(state.clone()),
                 Path(row.id.clone()),
-                Ok(Some(axum::Json(crate::daemon::RestartSessionBody {
+                crate::server::test_support::json_request(&crate::daemon::RestartSessionBody {
                     command_override,
                     ..Default::default()
-                }))),
+                }),
             )
             .await;
             let status = response.status();

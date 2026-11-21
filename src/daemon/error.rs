@@ -44,6 +44,7 @@ pub enum ApiErrorCode {
     SessionArchived,
     SessionTrashed,
     AccountSwapUnavailable,
+    BackgroundProcesses,
     TerminalSwitchRefused(TerminalSwitchReason),
 }
 
@@ -85,6 +86,7 @@ impl ApiErrorCode {
             Self::SessionArchived => "session_archived",
             Self::SessionTrashed => "session_trashed",
             Self::AccountSwapUnavailable => "account_swap_unavailable",
+            Self::BackgroundProcesses => "background_processes",
             Self::TerminalSwitchRefused(reason) => reason.as_str(),
         }
     }
@@ -116,7 +118,8 @@ impl ApiErrorCode {
             | Self::SessionNotRunning
             | Self::SessionArchived
             | Self::SessionTrashed
-            | Self::AccountSwapUnavailable => StatusCode::CONFLICT,
+            | Self::AccountSwapUnavailable
+            | Self::BackgroundProcesses => StatusCode::CONFLICT,
             Self::PendingTargetGone => StatusCode::NOT_FOUND,
             Self::TlsRequired => StatusCode::UPGRADE_REQUIRED,
             Self::CreateHookFailed => StatusCode::BAD_REQUEST,
@@ -194,6 +197,7 @@ impl ApiErrorCode {
             b"session_archived" => Self::SessionArchived,
             b"session_trashed" => Self::SessionTrashed,
             b"account_swap_unavailable" => Self::AccountSwapUnavailable,
+            b"background_processes" => Self::BackgroundProcesses,
             other => Self::TerminalSwitchRefused(
                 TerminalSwitchReason::ALL
                     .into_iter()
