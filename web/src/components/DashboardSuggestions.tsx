@@ -1,0 +1,161 @@
+import type { SessionResponse } from "../lib/types";
+import { liveSession } from "../lib/suggestionPlan";
+import { StartedPromptNote } from "./PromptBlockedNote";
+import { updateSuggestionSource } from "../lib/api";
+import { useAgentNames } from "../hooks/useAgentNames";
+import { useSuggestionPresets } from "../hooks/useSuggestionPresets";
+import { SuggestionItemActions } from "./SuggestionItemActions";
+import { SuggestionHooksReview } from "./SuggestionHooksReview";
+import { suggestionKey, useDismissUndo, useSuggestions } from "../hooks/useSuggestions";
+import { useIsWideViewport } from "../hooks/useIsWideViewport";
+import { SUGGESTION_NOTE_CLASS, SuggestionRow, SuggestionStatusNotes, UndoBar } from "./SuggestionRow";
+import type { WizardPrefill } from "./session-wizard/SessionWizard";
+
+interface Props {
+  readOnly?: boolean;
+  onPrepare: (prefill: WizardPrefill) => void;
+  onEditPreset?: (providerId: string, criterion: string) => void;
+  canLink?: boolean;
+  onViewAll: () => void;
+  onOpenSession: (sessionId: string) => void;
+  /** Live sessions, so a started row follows its Session's state. */
+  sessions?: SessionResponse[];
+}
+
+export function DashboardSuggestions({
+  readOnly = false,
+  onPrepare,
+  onEditPreset,
+  canLink = true,
+  onViewAll,
+  onOpenSession,
+  sessions,
+}: Props) {
+  const wide = useIsWideViewport();
+  const ctrl = useSuggestions(onPrepare, onOpenSession);
+  const { snapshot, loadFailed, busy, refreshing, notice, failures, offline, act, refresh } = ctrl;
+  const agentName = useAgentNames();
+  const presetOf = useSuggestionPresets();
+  const { undo, dismiss, clearUndo } = useDismissUndo(act);
+
+  if (!snapshot || snapshot.providers.length === 0 || !snapshot.prefs.homepage) return null;
+
+  const active = snapshot.items.filter((item) => !item.dismissed);
+  const rows = active.slice(0, wide ? 3 : 2);
+  const pending = snapshot.providers.filter((p) => p.status === "pending");
+  const errored = snapshot.providers.filter((p) => p.status === "error");
+  const kindOf = (item: { provider_id: string; criterion: string }) =>
+    snapshot.providers
+      .find((p) => p.id === item.provider_id)
+      ?.sources.find((src) => src.criterion === item.criterion)
+      ?.label.toLowerCase();
+  const alert = notice ?? (loadFailed ? "Could not load suggestions." : null);
+
+  return (
+    <section className="mb-4 mt-3 w-full max-w-2xl" aria-labelledby="suggested-sessions-heading">
+      <div className="mb-2 flex items-baseline justify-between px-1">
+        <h2
+          id="suggested-sessions-heading"
+          className="text-[11px] font-mono uppercase tracking-[0.16em] text-text-muted"
+        >
+          Suggested sessions
+        </h2>
+        <a
+          href="/suggestions"
+          onClick={(e) => {
+            if (e.button !== 0 || e.metaKey || e.ctrlKey || e.shiftKey || e.altKey) return;
+            e.preventDefault();
+            onViewAll();
+          }}
+          className="text-xs text-brand-500 hover:underline"
+        >
+          View all ({active.length})
+        </a>
+      </div>
+      <ul className="rounded-lg border border-surface-700/40 bg-surface-900">
+        {rows.map((item) => (
+          <SuggestionRow
+            key={suggestionKey(item)}
+            title={item.title}
+            sourceRef={snapshot.prefs.show_source_ref ? item.source_ref : undefined}
+            reason={item.reason}
+            project={item.resolved_project?.name ?? item.project}
+            session={liveSession(item.started_session, sessions)}
+            stale={item.stale}
+            failure={failures[suggestionKey(item)]}
+            note={
+              <StartedPromptNote
+                session={liveSession(item.started_session, sessions)}
+                onTryAgain={() => ctrl.retryBlocked(item)}
+                disabled={readOnly || offline}
+              />
+            }
+            actions={
+              <SuggestionItemActions
+                item={item}
+                snapshot={snapshot}
+                ctrl={ctrl}
+                readOnly={readOnly}
+                agentName={agentName}
+                presetOf={presetOf}
+                onOpenSession={onOpenSession}
+                onToggleDismiss={() => void dismiss(item, true)}
+                onEditPreset={onEditPreset}
+                canLink={canLink}
+              />
+            }
+          />
+        ))}
+        {rows.length === 0 && pending.length > 0 && (
+          <li className={SUGGESTION_NOTE_CLASS}>
+            <span aria-hidden="true" className="font-mono text-brand-500">
+              ⠙
+            </span>{" "}
+            Getting your first suggestions from {pending.map((p) => p.name).join(", ")}…
+          </li>
+        )}
+        {errored.map((p) => (
+          <li key={p.id} className={`${SUGGESTION_NOTE_CLASS} text-status-error`}>
+            {p.name}: couldn&apos;t refresh, {p.error ?? "provider error"}
+          </li>
+        ))}
+        {rows.length === 0 && pending.length === 0 && (
+          <li className={SUGGESTION_NOTE_CLASS}>
+            {errored.length === 0 && "Nothing to suggest right now. "}
+            {!readOnly && !offline && (
+              <button
+                type="button"
+                onClick={() => void refresh()}
+                disabled={busy !== null || refreshing}
+                className="cursor-pointer text-brand-500 hover:underline disabled:opacity-50"
+              >
+                Refresh
+              </button>
+            )}
+          </li>
+        )}
+        <SuggestionStatusNotes readOnly={readOnly} offline={offline} />
+      </ul>
+      {alert && (
+        <p role="alert" className="mt-2 px-1 text-xs text-status-error">
+          {alert}
+        </p>
+      )}
+      <SuggestionHooksReview ctrl={ctrl} />
+      {undo && (
+        <UndoBar
+          title={undo.title}
+          disabled={busy !== null || readOnly || offline}
+          onUndo={() => void dismiss(undo, false)}
+          stopLabel={kindOf(undo)}
+          onStop={() => {
+            void act(`stop:${suggestionKey(undo)}`, () =>
+              updateSuggestionSource(undo.provider_id, undo.criterion, false),
+            );
+            clearUndo();
+          }}
+        />
+      )}
+    </section>
+  );
+}

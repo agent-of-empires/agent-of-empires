@@ -8,6 +8,8 @@ interface Props {
   mcpSummaries: string[];
   onConfirm: () => Promise<void> | void;
   onCancel: () => void;
+  /** A Start from a suggestion words the review around the Session it starts. */
+  starting?: string;
 }
 
 /** Shown when a create is refused until the repo's hooks are trusted; confirming resubmits with `trust_hooks`. */
@@ -19,6 +21,7 @@ export function HooksTrustDialog({
   mcpSummaries,
   onConfirm,
   onCancel,
+  starting,
 }: Props) {
   // Approval trusts the whole hooks hash, so every covered hook type is listed.
   const groups = [
@@ -31,15 +34,31 @@ export function HooksTrustDialog({
   return (
     <ConfirmCreateDialog
       id="hooks-trust"
-      title={needsMcpTrust ? "Trust repository hooks and MCP servers" : "Trust repository hooks"}
-      confirmLabel="Trust and create"
+      title={
+        starting
+          ? "Review this repo's hooks"
+          : needsMcpTrust
+            ? "Trust repository hooks and MCP servers"
+            : "Trust repository hooks"
+      }
+      confirmLabel={starting ? "Approve and start" : "Trust and create"}
       onConfirm={onConfirm}
       onCancel={onCancel}
     >
       <p className="text-[13px] text-text-secondary">
-        This repository defines lifecycle hooks{needsMcpTrust ? " and MCP servers" : ""}. They run on your machine;
-        approving trusts every hook type and redacted MCP server listed below, not only the ones that run now. Review
-        the commands before approving.
+        {starting ? (
+          <>
+            These commands run on your machine when a Session starts. Approve them once to start &ldquo;{starting}
+            &rdquo;. Approving trusts every hook type{needsMcpTrust ? " and redacted MCP server" : ""} listed below, not
+            only the ones that run now.
+          </>
+        ) : (
+          <>
+            This repository defines lifecycle hooks{needsMcpTrust ? " and MCP servers" : ""}. They run on your machine;
+            approving trusts every hook type and redacted MCP server listed below, not only the ones that run now.
+            Review the commands before approving.
+          </>
+        )}
       </p>
 
       <div className="space-y-2 max-h-40 overflow-y-auto" data-testid="hooks-trust-list">

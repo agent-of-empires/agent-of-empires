@@ -125,6 +125,13 @@ const PAGES = [
       "Launch a session in a fresh scratch directory under ~/.agent-of-empires/scratch/ with no project path. The directory is removed when the session is deleted.",
   },
   {
+    source: "docs/guides/suggested-sessions.md",
+    dest: "guides/suggested-sessions.md",
+    title: "Suggested Sessions",
+    description:
+      "Start sessions from suggestions published by plugins, in the web dashboard or the TUI: set up, start, dismiss, templates and project mapping.",
+  },
+  {
     source: "docs/guides/live-mode.md",
     dest: "guides/live-mode.md",
     title: "Live Mode",

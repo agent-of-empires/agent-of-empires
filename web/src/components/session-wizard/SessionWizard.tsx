@@ -37,6 +37,7 @@ import {
   claimPendingCreate,
   isPendingCreateExpired,
   PENDING_CREATE_EXPIRED_MESSAGE,
+  newIdempotencyKey,
   peekPendingCreate,
   registerPendingCreate,
   releasePendingCreate,
@@ -59,6 +60,7 @@ import { CreateProgressView } from "./CreateProgressView";
 import { FieldRow, NavRow, PanelHeader, ROW_INPUT, RowGroup, SegmentedRow, SwitchRow } from "./WizardRows";
 import { LaunchFooter } from "./LaunchFooter";
 import { agentsView, initialData, reducer, type WizardData } from "./wizardReducer";
+import { slugifyBranch } from "./sessionNames";
 import { buildCreateRequest, launchEligible } from "./createRequest";
 import { commandMapsFromSettings, EMPTY_COMMAND_MAPS, type CommandMaps } from "./commandMaps";
 import { profileDefaults, type ProfileDefaults } from "./profileDefaults";
@@ -93,6 +95,23 @@ export interface WizardPrefill {
   worktreeEnabled?: boolean;
   /** Kept over the profile's view default, as a direct edit would be. */
   useStructuredView?: boolean;
+  /** A preset's worktree choice, kept over project and profile defaults like a direct edit. */
+  useWorktree?: boolean;
+  initialPrompt?: string;
+  title?: string;
+  /** Where a suggested session came from, shown as the "From" strip. */
+  source?: {
+    label: string;
+    title: string;
+    url: string;
+    kindLabel?: string;
+    /** The Start that just failed, so the dialog says why. */
+    failure?: { reason: string; hint?: string };
+  };
+  /** Set when a kind's preset produced `initialPrompt`. */
+  template?: { providerId: string; criterion: string };
+  /** Suggestion to link the created Session to. */
+  suggestion?: { provider_id: string; id: string };
 }
 
 function initialWizardData(prefill: WizardPrefill | undefined, nameOnly: boolean): WizardData {
@@ -114,6 +133,10 @@ function initialWizardData(prefill: WizardPrefill | undefined, nameOnly: boolean
     sandboxEnabled: prefill.sandboxEnabled ?? false,
     profile: prefill.profile || "",
     group: prefill.group || "",
+    // A name-only wizard shows no Prompt row, so a provider draft would be sent unseen.
+    initialPrompt: nameOnly ? "" : (prefill.initialPrompt ?? ""),
+    title: prefill.title ?? "",
+    worktreeBranch: prefill.title ? slugifyBranch(prefill.title) : base.worktreeBranch,
     scratch: prefill.scratch ?? false,
     useWorktree: prefill.scratch ? false : (prefill.worktreeEnabled ?? base.useWorktree),
     // Seeded here rather than dispatched so APPLY_PROFILE_DEFAULTS cannot clobber it.
@@ -123,6 +146,8 @@ function initialWizardData(prefill: WizardPrefill | undefined, nameOnly: boolean
       useStructuredView: prefill.useStructuredView,
       structuredViewDirty: true,
     }),
+    ...(prefill.useWorktree !== undefined &&
+      !prefill.scratch && { useWorktree: prefill.useWorktree, worktreeDirty: true }),
   };
 }
 
@@ -154,12 +179,6 @@ const profileMissingError = (profile: string) =>
 
 const REGISTRY_UNRESOLVED_ERROR =
   "Could not load this project's settings, so its sandbox and worktree defaults are unknown. Select the project again to retry.";
-
-function newIdempotencyKey(): string {
-  // randomUUID needs a secure context, which a LAN or tunnel dashboard may not be.
-  if (typeof crypto !== "undefined" && typeof crypto.randomUUID === "function") return crypto.randomUUID();
-  return `${Date.now().toString(36)}-${Math.random().toString(36).slice(2)}-${Math.random().toString(36).slice(2)}`;
-}
 
 function waitUntilOnline(): Promise<void> {
   if (typeof navigator === "undefined" || navigator.onLine !== false) return Promise.resolve();
@@ -222,6 +241,7 @@ export interface WizardRestore {
   failure: CreateFailure;
   /** The create's last progress snapshot, for a failed hook's output tail. */
   progress?: CreateProgress | null;
+  suggestion?: WizardPrefill["suggestion"];
 }
 
 interface Props {
@@ -239,9 +259,34 @@ interface Props {
   onRetryServedProfile?: () => Promise<void>;
   /** CityHall client mode: only a title is asked; the server derives the rest. */
   nameOnly?: boolean;
+  /** Opens the preset that produced the prefilled fields for editing. */
+  onEditPreset?: (preset: NonNullable<WizardPrefill["template"]>) => void;
 }
 
 const NO_GROUPS: GroupInfo[] = [];
+
+function SourceStrip({ source }: { source: NonNullable<WizardPrefill["source"]> }) {
+  return (
+    <div
+      data-testid="wizard-source"
+      className="flex flex-wrap items-center gap-2 rounded-md border border-surface-700/60 bg-surface-900 px-2.5 py-2 text-xs text-text-secondary"
+    >
+      <span className="font-mono font-medium">{source.label}</span>
+      <span className="min-w-[200px] flex-1 text-text-primary">{source.title}</span>
+      <span className="text-[11px] text-text-dim">issue text not included</span>
+      {/^https?:\/\//i.test(source.url) && (
+        <a href={source.url} target="_blank" rel="noreferrer" className="text-brand-500 hover:underline">
+          Open &#8599;
+        </a>
+      )}
+      {source.failure && (
+        <p data-testid="wizard-source-failure" className="w-full text-status-error">
+          Couldn&apos;t start: {source.failure.reason}.{source.failure.hint ? ` ${source.failure.hint}` : ""}
+        </p>
+      )}
+    </div>
+  );
+}
 
 export function SessionWizard({
   onClose,
@@ -253,6 +298,7 @@ export function SessionWizard({
   servedProfile,
   onRetryServedProfile,
   nameOnly = false,
+  onEditPreset,
 }: Props) {
   const [state, dispatch] = useReducer(reducer, {
     data: restore?.data ?? initialWizardData(prefill, nameOnly),
@@ -741,7 +787,12 @@ export function SessionWizard({
       } else if (background) {
         const failure = result.failure;
         if (failure && onReopenFailure && sent) {
-          const restored = { data: sent, failure, progress: lastProgressRef.current };
+          const restored = {
+            data: sent,
+            failure,
+            progress: lastProgressRef.current,
+            suggestion: body.suggestion,
+          };
           const { title } = failureView(failure, { sandboxEnabled: restored.data.sandboxEnabled, runtimeDown: false });
           const reference = failure.reference ? ` Reference ${failure.reference.slice(0, 8)}… · in debug.log` : "";
           toastBus.handler?.action(`Session was not created: ${title}.${reference}`, "Reopen", () =>
@@ -807,6 +858,7 @@ export function SessionWizard({
         ),
         { skipOnCreate, pullLatest: pullLatestChecked(pullOfferRef.current, d.pullLatestImage) },
       ),
+      suggestion: prefill?.suggestion ?? restore?.suggestion,
       idempotency_key: newIdempotencyKey(),
     };
     // A failed preview counts as nothing to confirm, so it never blocks creation.
@@ -1078,6 +1130,7 @@ export function SessionWizard({
     <RowGroup>{titleRow}</RowGroup>
   ) : (
     <div className="space-y-4">
+      {prefill?.source && <SourceStrip source={prefill.source} />}
       <RowGroup>
         {/* A deleted Profile needs a way out even when only one other is left. */}
         {(state.profiles.length > 1 || agentsStatus === "missing") && (
@@ -1210,6 +1263,29 @@ export function SessionWizard({
             onChange={(v) => handleChange("group", v)}
             groups={state.groupsFor === groupsKey ? state.groups : NO_GROUPS}
           />
+        </FieldRow>
+        <FieldRow label="Prompt" htmlFor="wizard-initial-prompt">
+          <textarea
+            id="wizard-initial-prompt"
+            value={d.initialPrompt}
+            onChange={(e) => handleChange("initialPrompt", e.target.value)}
+            placeholder="Sent to the agent once it is ready"
+            rows={2}
+            className={`${ROW_INPUT} resize-y`}
+          />
+          {prefill?.template && onEditPreset && (
+            <p data-testid="wizard-template" className="pb-2 text-[11px] text-text-dim">
+              From the {prefill.source?.kindLabel ?? prefill.template.criterion} preset
+              {" \u00b7 "}
+              <button
+                type="button"
+                onClick={() => onEditPreset(prefill.template!)}
+                className="cursor-pointer text-brand-500 hover:underline"
+              >
+                Edit preset
+              </button>
+            </p>
+          )}
         </FieldRow>
       </RowGroup>
       {pullOffer && (

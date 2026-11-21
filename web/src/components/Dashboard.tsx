@@ -1,10 +1,13 @@
-import { useMemo, type ReactNode } from "react";
+import { useMemo, useState, type ReactNode } from "react";
 import type { SessionResponse } from "../lib/types";
 import { getStatusTextClass, isSessionActive } from "../lib/session";
 import { useIdleDecayWindowMs } from "../lib/idleDecay";
 import { useIsWideViewport } from "../hooks/useIsWideViewport";
 import { AOE_BRAND_MARK_COLORS, AOE_BRAND_MARK_TEXT_SHADOW } from "../lib/brandMark";
 import { TOUR_ANCHORS, type TourAnchorId } from "../lib/tourSteps";
+import { DashboardSuggestions } from "./DashboardSuggestions";
+import { SuggestionsSetupHint } from "./SuggestionsSetupHint";
+import type { WizardPrefill } from "./session-wizard/SessionWizard";
 import { PluginCards, PluginHomePanes } from "./plugin/PluginSlots";
 import { StatusGlyph } from "./StatusGlyph";
 import { StrokeIcon } from "./icons";
@@ -21,6 +24,17 @@ interface Props {
   readOnly?: boolean;
   /** Shown above the action panes, e.g. the setup checklist. */
   banner?: ReactNode;
+  /** Both required to show the Suggested sessions section. */
+  onPrepareSuggestion?: (prefill: WizardPrefill) => void;
+  onEditSuggestionPreset?: (providerId: string, criterion: string) => void;
+  canLinkSuggestions?: boolean;
+  /** False in CityHall: suggestions are read-only there. Defaults to true. */
+  canManageSuggestions?: boolean;
+  onViewAllSuggestions?: () => void;
+  /** The onboarding tour is running; the first-run hint stays out of it. */
+  tourActive?: boolean;
+  /** Opens Settings > Plugins > Marketplace filtered to Suggestions; the first-run hint shows only when set. */
+  onOpenSuggestionsMarketplace?: () => void;
 }
 
 export function Dashboard({
@@ -32,7 +46,16 @@ export function Dashboard({
   readOnly,
   canManageProjects = true,
   banner,
+  onPrepareSuggestion,
+  onEditSuggestionPreset,
+  canLinkSuggestions,
+  canManageSuggestions = true,
+  onViewAllSuggestions,
+  onOpenSuggestionsMarketplace,
+  tourActive = false,
 }: Props) {
+  // Bumped when the setup sheet finishes so the Suggested section refetches.
+  const [suggestionsEpoch, setSuggestionsEpoch] = useState(0);
   const idleDecayWindowMs = useIdleDecayWindowMs();
   const isWideViewport = useIsWideViewport();
   const stats = useMemo(() => {
@@ -143,6 +166,19 @@ export function Dashboard({
         </div>
       )}
 
+      {onPrepareSuggestion && onViewAllSuggestions && (
+        <DashboardSuggestions
+          key={suggestionsEpoch}
+          readOnly={readOnly || !canManageSuggestions}
+          onPrepare={onPrepareSuggestion}
+          onEditPreset={onEditSuggestionPreset}
+          canLink={canLinkSuggestions}
+          onViewAll={onViewAllSuggestions}
+          onOpenSession={onSelectSession}
+          sessions={sessions}
+        />
+      )}
+
       {/* The desktop sidebar is always available, but mobile starts at this dashboard. */}
       {!isWideViewport && recentSessions.length > 0 && (
         <section className="md:hidden mb-4 w-full max-w-md" aria-labelledby="recent-sessions-heading">
@@ -233,6 +269,13 @@ export function Dashboard({
             icon="book"
           />
         </div>
+      )}
+
+      {!readOnly && canManageProjects && !tourActive && onOpenSuggestionsMarketplace && (
+        <SuggestionsSetupHint
+          onOpenMarketplace={onOpenSuggestionsMarketplace}
+          onFinished={() => setSuggestionsEpoch((n) => n + 1)}
+        />
       )}
 
       {/* Plugin-contributed dashboard cards (#2366). Renders nothing (and adds
