@@ -20,10 +20,12 @@ import json
 import math
 import os
 from pathlib import Path
+import re
 import shutil
 import socket
 import statistics
 import subprocess
+import sys
 import tempfile
 import threading
 import time
@@ -50,9 +52,17 @@ class Bench:
             f'#!/bin/sh\necho x >> "{self.log}"\nexec "{shutil.which("tmux")}" "$@"\n'
         )
         (shim / "tmux").chmod(0o755)
+        self.sandbox_id = None
+        # Drop inherited routing (XDG_*, AOE_*) so nothing reaches real state.
+        inherited = {
+            k: v
+            for k, v in os.environ.items()
+            if not k.startswith(("XDG_", "AOE_", "AGENT_OF_EMPIRES_"))
+        }
         self.env = dict(
-            os.environ,
+            inherited,
             HOME=str(self.root / "home"),
+            XDG_CONFIG_HOME=str(self.root / "xdg"),
             AOE_TMUX_SOCKET=self.socket,
             PATH=f"{shim}:{os.environ['PATH']}",
         )
@@ -78,12 +88,22 @@ class Bench:
         return len(self.log.read_text().splitlines()) if self.log.exists() else 0
 
     def close(self):
-        self.aoe_cmd("remove", "sandboxed", "--purge", check=False)
+        purged = True
+        if self.sandbox_id:
+            result = self.aoe_cmd("remove", self.sandbox_id, "--purge", check=False)
+            purged = result.returncode == 0
+            if not purged:
+                print(
+                    f"purge of {self.sandbox_id} failed: {result.stderr.strip()}\n"
+                    f"keeping {self.root}; remove the leftover container by hand",
+                    file=sys.stderr,
+                )
         self.aoe_cmd("serve", "--stop", check=False)
         subprocess.run(
             [shutil.which("tmux"), "-S", self.socket, "kill-server"], capture_output=True
         )
-        shutil.rmtree(self.root, ignore_errors=True)
+        if purged:
+            shutil.rmtree(self.root, ignore_errors=True)
 
 
 def summarize(name, samples, extra):
@@ -127,13 +147,14 @@ def bench_list(bench, runs):
 
 
 def bench_stop(bench, runs):
-    bench.aoe_cmd(
+    added = bench.aoe_cmd(
         "add", str(bench.project), "-t", "sandboxed", "--cmd", AGENT_CMD, "--sandbox", "--launch"
     )
+    bench.sandbox_id = re.search(r"^\s*ID:\s*(\S+)", added.stdout, re.M).group(1)
     samples = []
     for _ in range(runs):
-        bench.aoe_cmd("session", "start", "sandboxed")
-        samples.append(bench.time_cmd("session", "stop", "sandboxed"))
+        bench.aoe_cmd("session", "start", bench.sandbox_id)
+        samples.append(bench.time_cmd("session", "stop", bench.sandbox_id))
     summarize("stop", samples, {})
 
 
