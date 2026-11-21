@@ -51,12 +51,23 @@ test("a running pull shows its layers, hides to the chip and cancels for everyon
       pull: { state: string; layers_done?: number; layers_known?: number };
     };
 
-  const started = await fetch(`${serve.baseUrl}/api/sandbox/image-pull`, { method: "POST" });
+  const started = await fetch(`${serve.baseUrl}/api/sandbox/image-pull`, {
+    method: "POST",
+  });
   expect(started.status).toBe(202);
-  // The fake prints every line at once, so the counts settle on the fixture's.
   await expect.poll(async () => (await status()).pull, { timeout: 15_000 }).toMatchObject({ state: "running" });
-  await expect.poll(async () => (await status()).pull.layers_known ?? 0, { timeout: 15_000 }).toBeGreaterThan(0);
-  const { layers_done: done, layers_known: known } = (await status()).pull;
+  // The Daemon reads the fixture a line at a time; it ends at 1 of 7 layers, as
+  // `docker_transcripts_count_layers_unpack_after_the_last_download_and_resume` asserts.
+  const [done, known] = [1, 7];
+  await expect
+    .poll(
+      async () => {
+        const { pull } = await status();
+        return [pull.layers_done ?? 0, pull.layers_known ?? 0];
+      },
+      { timeout: 15_000 },
+    )
+    .toEqual([done, known]);
 
   // The server can reach GitHub, and AoE's own update would outrank this banner.
   await page.route("**/api/system/update-status", (r) =>

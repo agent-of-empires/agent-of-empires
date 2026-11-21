@@ -86,6 +86,26 @@ describe("useSandboxImageRowStatus", () => {
     expect(fetchStatus).toHaveBeenCalledTimes(calls);
   });
 
+  it.each([
+    ["the Daemon can't be reached", null],
+    ["the Daemon refuses", { error: "http_502" }],
+  ])("keeps showing a running pull and re-checking when %s", async (_name, failure) => {
+    const running = status({ state: "current", pull: { state: "running" } });
+    fetchStatus.mockResolvedValue(running);
+    const { result } = renderHook(() => useSandboxImageRowStatus("sb:1", true));
+    await settle();
+    fetchStatus.mockResolvedValue(failure as never);
+    await act(async () => vi.advanceTimersByTime(RUNNING_RECHECK_MS));
+    await act(async () => vi.advanceTimersByTime(RUNNING_RECHECK_MS));
+    expect(fetchStatus).toHaveBeenCalledTimes(3);
+    expect(result.current?.reply).toBe(running);
+    fetchStatus.mockResolvedValue(status({ state: "current", pull: { state: "done" } }));
+    await act(async () => vi.advanceTimersByTime(RUNNING_RECHECK_MS));
+    expect(result.current?.reply).toMatchObject({ pull: { state: "done" } });
+    await act(async () => vi.advanceTimersByTime(RUNNING_RECHECK_MS * 3));
+    expect(fetchStatus).toHaveBeenCalledTimes(4);
+  });
+
   it("asks for the default image when none is set, and not at all while disabled", async () => {
     const { result, rerender } = renderHook(({ enabled }) => useSandboxImageRowStatus("", enabled), {
       initialProps: { enabled: false },

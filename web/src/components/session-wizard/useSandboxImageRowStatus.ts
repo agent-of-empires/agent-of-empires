@@ -25,8 +25,8 @@ export type SandboxImageReply = SandboxImageStatus | { error: string } | null;
 
 /** The status label and reply for `image` (empty: the default image), or null until it is answered.
  *  Only the first check runs at once; an edited image is re-checked once typing stops, even while that
- *  first check is pending, and every 2 s while it downloads. The first answered check skips the Daemon's
- *  cache. */
+ *  first check is pending, and every 2 s while it downloads, through failed checks. The first answered
+ *  check skips the Daemon's cache. */
 export function useSandboxImageRowStatus(
   image: string,
   enabled: boolean,
@@ -38,12 +38,20 @@ export function useSandboxImageRowStatus(
     if (!enabled) return;
     let cancelled = false;
     let timer: ReturnType<typeof setTimeout> | null = null;
+    let pulling = false;
     const check = async () => {
       const reply = await fetchSandboxImageStatus(image || undefined, { fresh: !answered.current });
       if (cancelled) return;
       answered.current = true;
+      const conclusive = !!reply && "state" in reply;
+      // A failed check says nothing about a running pull: keep showing it, and ask again.
+      if (!conclusive && pulling) {
+        timer = setTimeout(check, RUNNING_RECHECK_MS);
+        return;
+      }
+      pulling = conclusive && reply.pull.state === "running";
       setAnswer({ image, label: sandboxImageStatusLabel(reply), reply });
-      if (reply && "state" in reply && reply.pull.state === "running") timer = setTimeout(check, RUNNING_RECHECK_MS);
+      if (pulling) timer = setTimeout(check, RUNNING_RECHECK_MS);
     };
     if (started.current) timer = setTimeout(check, IMAGE_RECHECK_MS);
     else void check();

@@ -41,7 +41,7 @@ export function SandboxImageBanner({ view }: { view: SandboxImageBannerView }) {
           status="Sandbox image update available. Run on the Daemon's machine:"
           onDismiss={view.onDismiss}
         >
-          <CopyCommand command={view.command} />
+          <CopyCommand command={view.command} announce />
         </Bar>
       );
     case "updating": {
@@ -82,9 +82,11 @@ export function SandboxImageBanner({ view }: { view: SandboxImageBannerView }) {
     case "cancelled":
       return (
         <Bar tone="brand" status="Update cancelled. Sessions keep the current image." onDismiss={view.onDismiss}>
-          <button type="button" onClick={view.onUpdate} className={linkButton}>
-            Update now
-          </button>
+          {view.onUpdate && (
+            <button type="button" onClick={view.onUpdate} className={linkButton}>
+              Update now
+            </button>
+          )}
         </Bar>
       );
     case "config_unreadable":
@@ -98,9 +100,11 @@ export function SandboxImageBanner({ view }: { view: SandboxImageBannerView }) {
     case "failed":
       return (
         <Bar tone="failed" status={view.message} onDismiss={view.onDismiss}>
-          <button type="button" onClick={view.onRetry} className={linkButton}>
-            Retry
-          </button>
+          {view.onRetry && (
+            <button type="button" onClick={view.onRetry} className={linkButton}>
+              Retry
+            </button>
+          )}
           <Disclosure label="Details">
             <pre className="whitespace-pre-wrap break-all font-mono">{view.error}</pre>
           </Disclosure>
@@ -201,7 +205,8 @@ function Disclosure({ label, children }: { label: string; children: ReactNode })
   );
 }
 
-export function CopyCommand({ command }: { command: string }) {
+/** `announce` makes the copy feedback its own live region, for a caller that doesn't hold it in one. */
+export function CopyCommand({ command, announce = false }: { command: string; announce?: boolean }) {
   const [feedback, setFeedback] = useState<"copied" | "failed" | null>(null);
   const codeRef = useRef<HTMLElement>(null);
   const copy = async () => {
@@ -225,8 +230,7 @@ export function CopyCommand({ command }: { command: string }) {
       <button type="button" onClick={() => void copy()} className={linkButton} aria-label={`Copy ${command}`}>
         Copy
       </button>
-      {/* Callers put it inside a live region, so this is announced without a nested one. */}
-      <span>
+      <span role={announce ? "status" : undefined}>
         {feedback === "copied" ? "Copied" : feedback === "failed" ? "Couldn't copy. Select and copy it." : ""}
       </span>
     </span>

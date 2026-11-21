@@ -27,6 +27,7 @@ vi.mock("../../lib/clipboard", () => ({ writeClipboard: (text: string) => writeC
 const IMAGE = "ghcr.io/agent-of-empires/aoe-sandbox:latest";
 const DOWNLOADING = "Downloading sandbox image…";
 const UPDATED = "Sandbox image updated. Applies to new Sessions.";
+const CANCELLED = "Update cancelled. Sessions keep the current image.";
 const FAILED = "Couldn't download the sandbox image.";
 
 function status(overrides: Partial<SandboxImageStatus> = {}): SandboxImageStatus {
@@ -137,7 +138,8 @@ describe("SandboxImageBanner", () => {
       fireEvent.click(screen.getByRole("button", { name: `Copy ${pull_command}` }));
       await act(() => vi.advanceTimersByTimeAsync(0));
       expect(writeClipboard).toHaveBeenLastCalledWith(pull_command);
-      expect(screen.getByText("Copied")).toBeTruthy();
+      // The banner's own status holds only the phase, so the feedback needs a live region of its own.
+      expect(screen.getAllByRole("status").map((el) => el.textContent)).toContain("Copied");
       unmount();
     }
   });
@@ -690,6 +692,57 @@ describe("SandboxImageBanner progress, cancel and hide (#5751)", () => {
     fetchSandboxImageStatus.mockResolvedValue(running());
     await pollAfter(30_000);
     expect(banner()?.textContent).toBe(DOWNLOADING);
+  });
+
+  it("ignores a Cancel reply that arrives after a newer update started", async () => {
+    let answer!: (r: { ok: boolean; pull?: SandboxImagePull }) => void;
+    cancelSandboxImagePull.mockReturnValueOnce(new Promise((r) => (answer = r)));
+    await mount(running());
+    fireEvent.click(screen.getByRole("button", { name: "Cancel" }));
+    // A poll sees the cancel land before its reply does, and the user starts another update.
+    fetchSandboxImageStatus.mockResolvedValue(status({ pull: { state: "cancelled" } }));
+    await pollAfter(2000);
+    fireEvent.click(screen.getByRole("button", { name: "Update now" }));
+    fetchSandboxImageStatus.mockResolvedValue(running());
+    await pollAfter(0);
+    expect((screen.getByRole("button", { name: "Cancel" }) as HTMLButtonElement).disabled).toBe(false);
+    // Hold the next poll, so what shows is the old reply's doing alone.
+    fetchSandboxImageStatus.mockReturnValueOnce(new Promise(() => {}));
+    await act(async () => answer({ ok: true, pull: { state: "cancelled" } }));
+    expect(banner()?.textContent).toBe(DOWNLOADING);
+  });
+
+  it("keeps a cancelled outcome once Cancel answers, while the Update now reply is still out", async () => {
+    pullSandboxImage.mockReturnValueOnce(new Promise(() => {}));
+    await mount(status());
+    fireEvent.click(screen.getByRole("button", { name: "Update now" }));
+    await pollAfter(0);
+    expect(banner()?.textContent).toBe(DOWNLOADING);
+    // The Daemon never reported the pull running before it was cancelled.
+    fetchSandboxImageStatus.mockResolvedValue(status({ pull: { state: "cancelled" } }));
+    fireEvent.click(screen.getByRole("button", { name: "Cancel" }));
+    await pollAfter(0);
+    expect(banner()?.textContent).toBe(CANCELLED);
+    await pollAfter(2000);
+    expect(banner()?.textContent).toBe(CANCELLED);
+  });
+
+  it("offers no Update now or Retry on an outcome while the Daemon won't pull from the web", async () => {
+    const cases: [SandboxImagePull, string, string][] = [
+      [{ state: "cancelled" }, CANCELLED, "Update now"],
+      [{ state: "failed", message: FAILED, error: "denied" } as SandboxImagePull, FAILED, "Retry"],
+    ];
+    for (const [pull, words, action] of cases) {
+      for (const pull_blocked of [null, "read_only"] as const) {
+        const { unmount } = await mount(running({}));
+        fetchSandboxImageStatus.mockResolvedValue(status({ pull, pull_blocked }));
+        await pollAfter(2000);
+        const label = `${pull.state} ${pull_blocked}`;
+        expect(banner()?.textContent, label).toBe(words);
+        expect(screen.queryByRole("button", { name: action }) !== null, label).toBe(pull_blocked === null);
+        unmount();
+      }
+    }
   });
 
   it("offers no Cancel while the Daemon won't pull from the web", async () => {
