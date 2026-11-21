@@ -27,7 +27,8 @@ for (const [leave, act] of Object.entries(leaves)) {
     await openStructuredView(page, serve, sessionId, "hello");
     await expect(page.getByText(REPLY)).toBeVisible({ timeout: 10_000 });
 
-    // No wait: the reply is newer than the last throttled write.
+    // The reply must be newer than the last throttled write, or the flush is not what persists it.
+    expect(await persistedText(page, sessionId)).not.toContain(REPLY);
     await act(page);
     expect(await persistedText(page, sessionId)).toContain(REPLY);
   });
