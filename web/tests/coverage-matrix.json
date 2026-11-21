@@ -862,7 +862,7 @@
       "risk": "medium",
       "specs": ["tests/live/acp-state-persist-flush.spec.ts"],
       "components": ["web/src/hooks/acpSession/stateCache.ts", "web/src/hooks/useAcpSession.ts"],
-      "notes": "Structured view state is written to localStorage on a 2 s trailing throttle; hiding, unloading, or leaving the session before it expires still persists the latest state."
+      "notes": "Structured view state is written to localStorage on a 2 s trailing throttle; hiding or unloading the page before it expires still persists the latest state."
     },
     {
       "id": "acp.server-owned-prompt-dispatch",
