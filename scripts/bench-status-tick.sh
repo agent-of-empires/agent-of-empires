@@ -26,7 +26,9 @@ IDS=()
 cleanup() {
   [ -n "${SERVE_PID:-}" ] && kill "$SERVE_PID" 2>/dev/null || true
   "$REAL_TMUX" -S "$B/tmux.sock" kill-server 2>/dev/null || true
-  for id in "${IDS[@]:-}"; do rm -rf "/tmp/aoe-hooks-$(id -u)/$id"; done
+  for id in ${IDS[@]+"${IDS[@]}"}; do
+    [ -n "$id" ] && rm -rf "/tmp/aoe-hooks-$(id -u)/$id"
+  done
   rm -rf "$B"
 }
 trap cleanup EXIT
