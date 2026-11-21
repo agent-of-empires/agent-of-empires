@@ -1012,6 +1012,29 @@ async fn mcp_terminal_send_refuses_an_ignore_committed_after_the_snapshot() {
     assert_eq!(error_code(&refused), Some("ignored"), "{refused}");
 }
 
+/// An ignored row whose pane is still coming up is refused as ignored rather than
+/// left to the transient "still starting" status: the person who hid it is not told
+/// to retry into it.
+#[tokio::test]
+#[serial_test::serial]
+async fn mcp_send_reports_ignored_before_a_pane_is_ready() {
+    let _guard = crate::session::test_support::isolate_app_dir();
+    let mut live = Instance::new("mcp-ignored-starting", "/tmp/aoe-mcp-ignored-starting");
+    live.source_profile = "default".into();
+    live.status = crate::session::Status::Creating;
+    let id = live.id.clone();
+    let (app, _state) = seeded_app(vec![live.clone()], false).await;
+
+    // A peer ignores the row while its pane is still starting; the snapshot this
+    // daemon holds still shows it live.
+    let mut ignored = live;
+    ignored.ignore();
+    test_support::seed_instances_on_disk_for_test("default", vec![ignored]);
+
+    let refused = call_result(&app, "send", json!({"session_id": id, "message": "hello"})).await;
+    assert_eq!(error_code(&refused), Some("ignored"), "{refused}");
+}
+
 /// A structured transcript reads as text from a cursor, pages on from `next_since`, and comes
 /// back raw on request.
 #[tokio::test]
