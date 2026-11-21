@@ -87,9 +87,12 @@ impl RuntimeExecutionSnapshot {
     /// Stops container `id` on this endpoint; an absent container is already stopped.
     pub(crate) fn stop_container(&self, id: &str) -> anyhow::Result<()> {
         let runtime = self.runtime();
-        let output = runtime
-            .base
-            .probe_output(&mut self.command(&["stop".to_owned(), id.to_owned()]))?;
+        let output = runtime.base.probe_output(&mut self.command(&[
+            "stop".to_owned(),
+            "-t".to_owned(),
+            "0".to_owned(),
+            id.to_owned(),
+        ]))?;
         let stderr = String::from_utf8_lossy(&output.stderr);
         anyhow::ensure!(
             output.status.success() || runtime.base.is_not_found(&stderr),

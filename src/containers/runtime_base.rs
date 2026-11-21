@@ -751,7 +751,7 @@ impl RuntimeBase {
     pub fn stop_container(&self, name: &str) -> Result<()> {
         tracing::info!(target: "containers.runtime", runtime = %self.name, %name, "stopping container");
         let mut cmd = self.command();
-        cmd.args(["stop", name]);
+        cmd.args(["stop", "-t", "0", name]);
         let output = self.probe_output(&mut cmd)?;
 
         if !output.status.success() {
