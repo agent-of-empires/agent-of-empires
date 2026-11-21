@@ -5002,6 +5002,7 @@ async fn wait_until_left_starting_resolves_on_broadcast() {
             old: Status::Starting,
             new: Status::Waiting,
             at: chrono::Utc::now(),
+            restores_prior: false,
         })
         .expect("the waiter must be subscribed before the transition");
 

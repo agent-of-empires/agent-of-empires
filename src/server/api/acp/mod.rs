@@ -515,6 +515,15 @@ mod tests {
         project: &std::path::Path,
         id: &str,
     ) -> Arc<crate::server::state::AppState> {
+        let (launcher, _launches) = crate::server::test_support::counting_failing_launcher();
+        errored_retry_state_with(project, id, launcher).await
+    }
+
+    async fn errored_retry_state_with(
+        project: &std::path::Path,
+        id: &str,
+        launcher: crate::acp::supervisor::Launcher,
+    ) -> Arc<crate::server::state::AppState> {
         use crate::server::test_support as support;
         let mut inst = crate::session::Instance::new("acp-5671", project.to_str().unwrap());
         inst.id = id.into();
@@ -522,7 +531,6 @@ mod tests {
         inst.view = crate::session::View::Structured;
         inst.status = crate::session::Status::Error;
         support::seed_instances_on_disk_for_test("default", vec![inst.clone()]);
-        let (launcher, _launches) = support::counting_failing_launcher();
         let state = support::build_test_app_state_with_launcher(vec![inst], launcher);
         support::refresh_canonical_metadata_for_test(&state).await;
         state
@@ -578,6 +586,66 @@ mod tests {
                 state.retry_starting.lock().unwrap().is_empty(),
                 "{endpoint}"
             );
+        }
+    }
+
+    /// #5921: restart takes its capacity slot before it shows `Starting`. With the only slot held
+    /// by another session it is refused with no status change; its own worker in that slot is
+    /// stopped first, so it restarts.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn a_restart_is_admitted_at_capacity_before_it_shows_starting() {
+        use crate::acp::supervisor::ResumeKind;
+        use crate::process::worker_registry::ResumeAuthority;
+        let _app_dir = crate::session::test_support::isolate_app_dir();
+        let project = tempfile::tempdir().unwrap();
+        for held_by_another in [true, false] {
+            let id = format!("sess-5921-capacity-{held_by_another}");
+            let launcher = crate::server::test_support::succeeding_launcher();
+            let state = errored_retry_state_with(project.path(), &id, launcher).await;
+            let _other = if held_by_another {
+                Some(
+                    state
+                        .acp_supervisor
+                        .reserve_spawn("other", ResumeKind::SpawnFirst, ResumeAuthority::Explicit)
+                        .await
+                        .expect("the other session takes the only slot"),
+                )
+            } else {
+                state.acp_supervisor.test_insert_worker(&id).await;
+                None
+            };
+            let mut changes = state.status_tx.subscribe();
+            let response = restart_acp(State(state.clone()), Path(id.clone()), retry_request())
+                .await
+                .into_response();
+            if held_by_another {
+                let status = response.status();
+                let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+                    .await
+                    .unwrap();
+                assert!(
+                    String::from_utf8_lossy(&body).contains("capacity"),
+                    "{status}: {}",
+                    String::from_utf8_lossy(&body)
+                );
+                // Every status change is sent before the handler returns.
+                assert!(matches!(
+                    changes.try_recv(),
+                    Err(tokio::sync::broadcast::error::TryRecvError::Empty)
+                ));
+                assert_eq!(
+                    state.instances.read().await[0].status,
+                    crate::session::Status::Error
+                );
+                assert!(state.retry_starting.lock().unwrap().is_empty());
+            } else {
+                assert!(response.status().is_success(), "{}", response.status());
+                assert_ne!(
+                    state.acp_supervisor.worker_state(&id).await,
+                    crate::daemon::AcpWorkerState::Absent
+                );
+            }
         }
     }
 

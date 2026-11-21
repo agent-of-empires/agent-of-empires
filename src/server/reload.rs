@@ -1566,6 +1566,7 @@ pub(super) fn merge_loaded_rows(
                     old: prior.status,
                     new: row.status,
                     at: now,
+                    restores_prior: false,
                 });
             }
         }

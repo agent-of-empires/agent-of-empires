@@ -32,20 +32,10 @@ impl<S: BroadcastSink> Supervisor<S> {
         req: SpawnRequest,
         authority: crate::process::worker_registry::ResumeAuthority,
     ) -> Result<(), SupervisorError> {
-        self.spawn_with_restart_claim(req, authority, None, None)
-            .await
-    }
-
-    /// Start the replacement worker under the restart claim that excludes
-    /// concurrent ordinary starts for this session.
-    pub(crate) async fn spawn_for_restart(
-        &self,
-        req: SpawnRequest,
-        authority: crate::process::worker_registry::ResumeAuthority,
-        restart: &RestartRequestGuard,
-    ) -> Result<(), SupervisorError> {
-        self.spawn_with_restart_claim(req, authority, Some(restart), None)
-            .await
+        let reservation = self
+            .reserve_spawn(&req.session_id, req.resume_kind(), authority)
+            .await?;
+        self.spawn_inner(req, reservation).await
     }
 
     /// Reserve a worker slot for callers that perform the launch body
@@ -57,39 +47,35 @@ impl<S: BroadcastSink> Supervisor<S> {
         kind: ResumeKind,
         authority: crate::process::worker_registry::ResumeAuthority,
     ) -> Result<ResumeReservation, SupervisorError> {
-        match self.begin_resume(session_id, kind, authority).await? {
+        Self::reserved(
+            session_id,
+            self.begin_resume(session_id, kind, authority).await?,
+        )
+    }
+
+    /// [`Self::reserve_spawn`] under the restart claim that excludes concurrent ordinary starts,
+    /// so a restart is refused at capacity before it shows anything.
+    pub(crate) async fn reserve_for_restart(
+        &self,
+        session_id: &str,
+        kind: ResumeKind,
+        authority: crate::process::worker_registry::ResumeAuthority,
+        restart: &RestartRequestGuard,
+    ) -> Result<ResumeReservation, SupervisorError> {
+        let outcome = self
+            .begin_resume_with_restart_claim(session_id, kind, authority, Some(restart), None)
+            .await?;
+        Self::reserved(session_id, outcome)
+    }
+
+    fn reserved(
+        session_id: &str,
+        outcome: ResumeReservationOutcome,
+    ) -> Result<ResumeReservation, SupervisorError> {
+        match outcome {
             ResumeReservationOutcome::Reserved(reservation) => Ok(reservation),
             ResumeReservationOutcome::AlreadyPresent => {
                 Err(SupervisorError::AlreadyRunning(session_id.to_owned()))
-            }
-        }
-    }
-
-    async fn spawn_with_restart_claim(
-        &self,
-        req: SpawnRequest,
-        authority: crate::process::worker_registry::ResumeAuthority,
-        restart: Option<&RestartRequestGuard>,
-        cancellation: Option<CancellationToken>,
-    ) -> Result<(), SupervisorError> {
-        let kind = if req.stored_acp_session_id.is_some() {
-            ResumeKind::Spawn
-        } else {
-            ResumeKind::SpawnFirst
-        };
-        match self
-            .begin_resume_with_restart_claim(
-                &req.session_id,
-                kind,
-                authority,
-                restart,
-                cancellation,
-            )
-            .await?
-        {
-            ResumeReservationOutcome::Reserved(r) => self.spawn_inner(req, r).await,
-            ResumeReservationOutcome::AlreadyPresent => {
-                Err(SupervisorError::AlreadyRunning(req.session_id))
             }
         }
     }
@@ -1651,8 +1637,9 @@ time.sleep(60)
 
         supervisor.cancel_restart_request("s-restart").await;
         let result = supervisor
-            .spawn_for_restart(
-                spawn_request("s-restart"),
+            .reserve_for_restart(
+                "s-restart",
+                ResumeKind::SpawnFirst,
                 crate::process::worker_registry::ResumeAuthority::Explicit,
                 &restart,
             )

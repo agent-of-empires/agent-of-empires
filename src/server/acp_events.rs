@@ -811,6 +811,26 @@ pub(crate) fn retired_before_retry(
             .is_some_and(|owner| seq <= owner.watermark)
 }
 
+/// The seq a fold's projection speaks for, for [`retired_before_retry`]. While a Retry owns the
+/// row only a status-bearing event counts: an unrelated one, such as a summary, advances
+/// `last_seq` without the new worker reporting.
+pub(crate) async fn newest_status_seq(
+    retry_starting: &RetryStarting,
+    service: &crate::server::session_service::SessionService,
+    id: &str,
+    last_seq: u64,
+) -> u64 {
+    let watermark = retry_starting
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .get(id)
+        .map(|owner| owner.watermark);
+    match watermark {
+        Some(watermark) if !service.reports_status_after(id, watermark).await => watermark,
+        _ => last_seq,
+    }
+}
+
 /// Forget a Retry's attempt once its row has left `Starting`.
 fn settle_retry_starting(retry_starting: &RetryStarting, inst: &Instance, old_status: Status) {
     if old_status == Status::Starting && inst.status != Status::Starting {
@@ -925,7 +945,9 @@ async fn revert_retry_starting(state: &AppState, id: &str, attempt: u64) {
             .find(|i| i.id == id && i.status == Status::Starting),
         prior,
     ) {
-        apply_status_intent(inst, StatusPolicy::Authoritative, prior, &state.status_tx);
+        if let Some(prev) = commit_status_intent(inst, StatusPolicy::Authoritative, prior) {
+            crate::server::push::publish_retry_rollback(&state.status_tx, inst, prev);
+        }
         state.note_row_mutation();
         drop(instances);
         state.runtime.request_publish();
@@ -942,13 +964,24 @@ pub(crate) fn apply_status_intent(
     target: Status,
     status_tx: &broadcast::Sender<StatusChange>,
 ) {
+    if let Some(prev) = commit_status_intent(inst, policy, target) {
+        publish_status_change(status_tx, inst, prev);
+    }
+}
+
+/// [`apply_status_intent`] without the publish: the status it moved the row from, if it did.
+fn commit_status_intent(
+    inst: &mut Instance,
+    policy: StatusPolicy,
+    target: Status,
+) -> Option<Status> {
     // Genuine in-flight terminal states: never fight them.
     if inst.is_trashed() || matches!(inst.status, Status::Deleting | Status::Creating) {
-        return;
+        return None;
     }
     match policy {
         // A Stopped session must not be woken by a trailing worker event.
-        StatusPolicy::Authoritative if inst.status == Status::Stopped => return,
+        StatusPolicy::Authoritative if inst.status == Status::Stopped => return None,
         StatusPolicy::Authoritative => {}
         // Background sub-agent events must not speak for the main turn: they
         // preserve its Waiting (a pending approval/elicitation) and Error (a
@@ -961,7 +994,7 @@ pub(crate) fn apply_status_intent(
                 inst.status,
                 Status::Stopped | Status::Waiting | Status::Error
             ) {
-                return;
+                return None;
             }
         }
         // Only from AcpSessionAssigned / RateLimitAutoResumed, emitted when a
@@ -972,12 +1005,12 @@ pub(crate) fn apply_status_intent(
                 inst.status,
                 Status::Error | Status::Stopped | Status::Starting
             ) {
-                return;
+                return None;
             }
         }
         StatusPolicy::Launch => {
             if !matches!(inst.status, Status::Error | Status::Stopped) {
-                return;
+                return None;
             }
         }
     }
@@ -989,7 +1022,7 @@ pub(crate) fn apply_status_intent(
         inst.plugin_revival_pending = false;
     }
     if inst.status == target {
-        return;
+        return None;
     }
     let prev = inst.status;
     inst.status = target;
@@ -1000,7 +1033,7 @@ pub(crate) fn apply_status_intent(
     } else {
         None
     };
-    publish_status_change(status_tx, inst, prev);
+    Some(prev)
 }
 
 /// Whether a structured row whose ACP status just moved should take the
@@ -1127,6 +1160,8 @@ pub(super) async fn recover_structured_unread_after_lag(
             continue;
         }
         let projected = fold.sidebar_status();
+        let newest_status_seq =
+            newest_status_seq(retry_starting, service, &id, fold.last_seq).await;
         // Same snapshot-around-apply as the live path, so "the transition that
         // was actually applied" means the same thing in both.
         let unread_profile = {
@@ -1138,7 +1173,7 @@ pub(super) async fn recover_structured_unread_after_lag(
                 continue;
             }
             let old_status = inst.status;
-            if !retired_before_retry(retry_starting, inst, fold.last_seq) {
+            if !retired_before_retry(retry_starting, inst, newest_status_seq) {
                 apply_status_intent(inst, StatusPolicy::Authoritative, projected, status_tx);
                 settle_retry_starting(retry_starting, inst, old_status);
             }
@@ -2519,33 +2554,50 @@ mod tests {
         }
     }
 
-    /// #5671: lag recovery applies a fold projection, not a frame, so it checks the fold's last seq
-    /// against the Retry watermark: a fold the retired worker wrote leaves `Starting`, a newer
-    /// one moves it.
+    /// #5671: lag recovery applies a fold projection, not a frame, so it checks the newest
+    /// status-bearing seq against the Retry watermark: a fold the retired worker wrote, or one
+    /// past it only by an unrelated event, leaves `Starting`; a newer status moves it.
     #[tokio::test]
     #[serial_test::serial]
     async fn recover_structured_unread_after_lag_holds_a_retry_starting() {
         let temp = tempfile::tempdir().expect("tempdir");
         let _app_dir = crate::session::test_support::isolate_app_dir_at(temp.path());
-        // (watermark, status after recovery); the retired worker's Stopped is at seq 1.
-        for (watermark, want) in [(1, Status::Starting), (0, Status::Idle)] {
+        let summary = || crate::acp::Event::ConversationSummary {
+            text: "recap".into(),
+            summarized_until_seq: 1,
+        };
+        let stopped = || crate::acp::Event::Stopped {
+            reason: "user_stopped".into(),
+        };
+        // (watermark, events after the retired worker's Stopped at seq 1, status after recovery)
+        let cases = [
+            (1, vec![], Status::Starting),
+            (0, vec![], Status::Idle),
+            (1, vec![summary()], Status::Starting),
+            (1, vec![summary(), stopped()], Status::Idle),
+        ];
+        for (watermark, later, want) in cases {
             let mut inst = Instance::new("acp-5671-lag", "/tmp/acp");
             inst.view = crate::session::View::Structured;
             inst.status = Status::Error;
             let id = inst.id.clone();
             let state = test_support::build_test_app_state(vec![inst]);
-            let stopped = crate::acp::Event::Stopped {
-                reason: "user_stopped".into(),
-            };
             state
                 .acp_event_store
-                .record(&id, 1, &stopped)
+                .record(&id, 1, &stopped())
                 .expect("record");
             state.acp_supervisor.hydrate_seqs([(id.clone(), watermark)]);
             RetryStartingGuard::begin(&state, &id)
                 .await
                 .expect("an Error row starts")
                 .disarm();
+            let kinds = format!("{later:?}");
+            for (seq, event) in (2..).zip(later) {
+                state
+                    .acp_event_store
+                    .record(&id, seq, &event)
+                    .expect("record");
+            }
 
             recover_structured_unread_after_lag(
                 &state.instances,
@@ -2560,7 +2612,7 @@ mod tests {
             assert_eq!(
                 state.instances.read().await[0].status,
                 want,
-                "watermark {watermark}"
+                "watermark {watermark}, then {kinds}"
             );
         }
     }

@@ -239,11 +239,7 @@ pub async fn spawn_acp(
         .acp_supervisor
         .reserve_spawn(
             &id,
-            if request.stored_acp_session_id.is_some() {
-                crate::acp::supervisor::ResumeKind::Spawn
-            } else {
-                crate::acp::supervisor::ResumeKind::SpawnFirst
-            },
+            request.resume_kind(),
             crate::process::worker_registry::ResumeAuthority::Explicit,
         )
         .await
@@ -619,18 +615,24 @@ async fn restart_acp_inner(state: Arc<AppState>, id: String, req: SpawnAcpReques
             &crate::acp::supervisor::SupervisorError::SpawnCancelled(id.clone()),
         );
     }
-    // Past every refusal, and after resume_structured_stop read the row's `Stopped`.
-    let starting = RetryStartingGuard::begin(&state, &id).await;
-    drop(exclusion);
-    match state
+    let reservation = match state
         .acp_supervisor
-        .spawn_for_restart(
-            request,
+        .reserve_for_restart(
+            &id,
+            request.resume_kind(),
             crate::process::worker_registry::ResumeAuthority::Explicit,
             &restart,
         )
         .await
     {
+        Ok(reservation) => reservation,
+        Err(e) => return supervisor_error_response("restart spawn failed", &e),
+    };
+    // Past every refusal, capacity included, and after resume_structured_stop read the row's
+    // `Stopped`.
+    let starting = RetryStartingGuard::begin(&state, &id).await;
+    drop(exclusion);
+    match state.acp_supervisor.spawn_inner(request, reservation).await {
         Ok(()) => {
             if let Some(starting) = starting {
                 starting.disarm();
@@ -1317,11 +1319,7 @@ pub async fn switch_acp_provider(
         .acp_supervisor
         .reserve_spawn(
             &id,
-            if request.stored_acp_session_id.is_some() {
-                crate::acp::supervisor::ResumeKind::Spawn
-            } else {
-                crate::acp::supervisor::ResumeKind::SpawnFirst
-            },
+            request.resume_kind(),
             crate::process::worker_registry::ResumeAuthority::Explicit,
         )
         .await

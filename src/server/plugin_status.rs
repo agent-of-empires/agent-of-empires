@@ -81,6 +81,7 @@ mod tests {
             old: Status::Running,
             new: Status::Idle,
             at: chrono::Utc::now(),
+            restores_prior: false,
         }
     }
 

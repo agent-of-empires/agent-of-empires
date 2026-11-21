@@ -386,13 +386,16 @@ async fn seed_in_flight_status(state: &AppState, id: &str) {
     if fold.last_seq == 0 {
         return;
     }
+    let newest = crate::server::acp_events::newest_status_seq(
+        &state.retry_starting,
+        &state.session_service,
+        id,
+        fold.last_seq,
+    )
+    .await;
     let mut instances = state.instances.write().await;
     if let Some(inst) = instances.iter_mut().find(|i| i.id == id) {
-        if !crate::server::acp_events::retired_before_retry(
-            &state.retry_starting,
-            inst,
-            fold.last_seq,
-        ) {
+        if !crate::server::acp_events::retired_before_retry(&state.retry_starting, inst, newest) {
             crate::server::acp_events::apply_status_seed(
                 inst,
                 fold.sidebar_status(),

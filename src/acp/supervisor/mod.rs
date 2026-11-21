@@ -466,6 +466,17 @@ pub struct SpawnRequest {
     pub claude_store_pin: Option<crate::session::capture::ClaudeStorePin>,
 }
 
+impl SpawnRequest {
+    /// `Spawn` resumes a stored conversation; `SpawnFirst` starts one.
+    pub(crate) fn resume_kind(&self) -> ResumeKind {
+        if self.stored_acp_session_id.is_some() {
+            ResumeKind::Spawn
+        } else {
+            ResumeKind::SpawnFirst
+        }
+    }
+}
+
 #[derive(Clone)]
 pub(crate) struct LaunchAdmission {
     pub store: Arc<dyn crate::session::SessionStore>,
