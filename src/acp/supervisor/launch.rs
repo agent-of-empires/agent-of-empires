@@ -22,6 +22,7 @@ use crate::acp::runner_lifecycle::{AdmitError, InstallError, Lease, RunnerIdenti
 use crate::acp::state::{AcpSessionId, Event};
 use crate::process::worker_registry;
 use crate::session::config::repo_config::resolve_config_with_repo_or_warn;
+use crate::session::mcp::mcp_model::{McpProvenance, ResolvedMcpServer};
 use crate::session::SandboxInfo;
 use tokio_util::sync::CancellationToken;
 
@@ -526,8 +527,15 @@ impl<S: BroadcastSink> Supervisor<S> {
                 config_path: req.config_path.clone(),
                 sandboxed: req.sandbox_info.is_some(),
             },
-            host_environment.clone(),
-            claude_config_dir,
+            McpHostEnv {
+                session_env: host_environment.clone(),
+                native_config_override: claude_config_dir,
+            },
+            McpSandboxScope {
+                sandbox_info: req.sandbox_info.as_ref(),
+                workspace_info: req.workspace_info.as_ref(),
+                runtime: Default::default(),
+            },
             "MCP resolution task failed",
         )
         .await;
@@ -610,6 +618,7 @@ impl<S: BroadcastSink> Supervisor<S> {
                 stored_acp_session_id,
                 fork_from,
                 sandbox_info: req.sandbox_info.clone(),
+                workspace_info: req.workspace_info.clone(),
                 source_profile,
                 mcp_servers,
                 seed_history_replay,
@@ -1429,32 +1438,75 @@ pub(super) struct McpPaths {
     pub(super) sandboxed: bool,
 }
 
+/// The session's sandbox and workspace facts the `mcp.rewrite` hook sees.
+#[derive(Clone, Copy, Default)]
+pub(super) struct McpSandboxScope<'a> {
+    pub sandbox_info: Option<&'a crate::session::SandboxInfo>,
+    pub workspace_info: Option<&'a crate::session::WorkspaceInfo>,
+    pub runtime: crate::acp::mcp_rewrite::RuntimeUse,
+}
+
+/// The host environment MCP discovery reads from.
+#[derive(Default)]
+pub(super) struct McpHostEnv {
+    pub session_env: Vec<(String, String)>,
+    pub native_config_override: Option<PathBuf>,
+}
+
 pub(super) async fn resolve_mcp_servers(
     agent_key: &str,
     session_id: &str,
     profile: Option<String>,
     paths: McpPaths,
-    session_env: Vec<(String, String)>,
-    native_config_override: Option<PathBuf>,
+    host: McpHostEnv,
+    scope: McpSandboxScope<'_>,
     failure: &'static str,
 ) -> Vec<agent_client_protocol::v1::schema::McpServer> {
-    use crate::session::mcp::mcp_model::summarize;
-
-    let agent_key = agent_key.to_string();
-    let env = session_env.clone();
+    let McpHostEnv {
+        session_env,
+        native_config_override,
+    } = host;
     let sandboxed = paths.sandboxed;
-    let resolved = tokio::task::spawn_blocking(move || {
-        resolve_mcp_layers(
-            &agent_key,
-            profile.as_deref(),
-            &paths,
-            &session_env,
-            native_config_override.as_deref(),
-        )
-    })
-    .await;
-    let mut merged = match resolved {
-        Ok(merged) => merged,
+    let sandbox_info = scope.sandbox_info.filter(|info| info.enabled).cloned();
+    let projection_env = session_env.clone();
+    let workspace_info = scope.workspace_info.cloned();
+    let runtime = scope.runtime;
+    let resolved = {
+        let (agent_key, session, profile, paths) = (
+            agent_key.to_string(),
+            session_id.to_string(),
+            profile.clone(),
+            McpPaths {
+                cwd: paths.cwd.clone(),
+                config_path: paths.config_path.clone(),
+                sandboxed,
+            },
+        );
+        tokio::task::spawn_blocking(move || {
+            let sandbox = sandbox_info.map(|info| {
+                crate::acp::mcp_rewrite::McpSandbox::resolve(
+                    &info,
+                    &paths.cwd,
+                    workspace_info.as_ref(),
+                    &session,
+                    runtime,
+                )
+            });
+            let defs = resolve_mcp_defs(
+                &agent_key,
+                &session,
+                profile.as_deref(),
+                &paths.cwd,
+                &paths.config_path,
+                &session_env,
+                native_config_override.as_deref(),
+            );
+            (defs, sandbox)
+        })
+        .await
+    };
+    let (resolved, sandbox) = match resolved {
+        Ok(resolved) => resolved,
         Err(e) => {
             warn!(
                 target: "acp.mcp",
@@ -1466,37 +1518,87 @@ pub(super) async fn resolve_mcp_servers(
         }
     };
     // Read the accepted tokens after the definitions so they cover every token those hold.
-    if sandboxed {
-        let daemon = crate::acp::mcp_config::DaemonIdentity::current().await;
-        merged = crate::acp::mcp_config::drop_daemon_servers(merged, &daemon);
-    }
+    // Dropped before the hook, which must never see a daemon token, and again after it, since
+    // the hook can add servers.
+    let daemon = if sandboxed {
+        Some(crate::acp::mcp_config::DaemonIdentity::current().await)
+    } else {
+        None
+    };
+    let resolved = match &daemon {
+        Some(daemon) => crate::acp::mcp_config::drop_daemon_servers(resolved, daemon),
+        None => resolved,
+    };
+    let ctx = crate::acp::mcp_rewrite::McpRewriteContext {
+        session_id: session_id.to_string(),
+        agent: agent_key.to_string(),
+        sandbox,
+        profile,
+        cwd: paths.cwd,
+    };
+    let mut originals: std::collections::HashMap<String, (_, McpProvenance)> = resolved
+        .iter()
+        .map(|s| (s.def.name.clone(), (s.def.clone(), s.provenance.clone())))
+        .collect();
+    let defs = resolved.into_iter().map(|s| s.def).collect();
+    let defs = crate::acp::mcp_rewrite::rewrite_servers(&ctx, defs).await;
+    debug!(
+        target: "acp.mcp",
+        session = %session_id,
+        sandboxed = ctx.sandboxed(),
+        count = defs.len(),
+        servers = %crate::session::mcp::mcp_model::summarize_defs(&defs),
+        "forwarding MCP servers"
+    );
+    // Only a definition the hook left untouched keeps its provenance; an added or redefined
+    // one is project-local so it never receives session env values.
+    let resolved: Vec<ResolvedMcpServer> = defs
+        .into_iter()
+        .map(|def| ResolvedMcpServer {
+            provenance: match originals.remove(&def.name) {
+                Some((original, provenance)) if original == def => provenance,
+                _ => McpProvenance::ProjectLocal,
+            },
+            def,
+            shadowed: Vec::new(),
+        })
+        .collect();
+    let resolved = match &daemon {
+        Some(daemon) => crate::acp::mcp_config::drop_daemon_servers(resolved, daemon),
+        None => resolved,
+    };
+    crate::acp::mcp_config::project_servers_to_acp(resolved, &projection_env)
+}
+
+fn resolve_mcp_defs(
+    agent_key: &str,
+    session_id: &str,
+    profile: Option<&str>,
+    cwd: &std::path::Path,
+    config_path: &std::path::Path,
+    session_env: &[(String, String)],
+    native_config_override: Option<&std::path::Path>,
+) -> Vec<crate::session::mcp::mcp_model::ResolvedMcpServer> {
+    use crate::session::mcp::mcp_model::{resolve_effective, summarize};
+
+    let merged = resolve_effective(
+        agent_key,
+        profile,
+        cwd,
+        config_path,
+        session_env,
+        native_config_override,
+    );
     if !merged.is_empty() {
         info!(
             target: "acp.mcp",
             session = %session_id,
             count = merged.len(),
             servers = %summarize(&merged),
-            "forwarding MCP servers"
+            "resolved MCP servers"
         );
     }
-    crate::acp::mcp_config::project_servers_to_acp(merged, &env)
-}
-
-fn resolve_mcp_layers(
-    agent_key: &str,
-    profile: Option<&str>,
-    paths: &McpPaths,
-    session_env: &[(String, String)],
-    native_config_override: Option<&std::path::Path>,
-) -> Vec<crate::session::mcp::mcp_model::ResolvedMcpServer> {
-    crate::session::mcp::mcp_model::resolve_effective(
-        agent_key,
-        profile,
-        &paths.cwd,
-        &paths.config_path,
-        session_env,
-        native_config_override,
-    )
+    merged
 }
 
 /// Apply current model pins and effort defaults to a cached respawn config,
@@ -2677,7 +2779,7 @@ time.sleep(60)
 
     #[tokio::test]
     #[serial_test::serial]
-    async fn resolve_mcp_layers_merges_native_global_profile_and_trusted_project() {
+    async fn resolve_mcp_defs_merges_native_global_profile_and_trusted_project() {
         let (_home, tmp) = isolate_home();
         let _env = crate::session::test_support::EnvGuard::unset(&["CLAUDE_CONFIG_DIR"]);
         let write = |path: std::path::PathBuf, servers: &str| {
@@ -2707,34 +2809,34 @@ time.sleep(60)
         let resolve = |profile: Option<&'static str>,
                        cwd: std::path::PathBuf,
                        config_path: std::path::PathBuf| async move {
-            let merged = resolve_mcp_servers(
-                "claude",
-                "resolve-test",
-                profile.map(String::from),
-                McpPaths {
-                    cwd,
-                    config_path,
-                    sandboxed: false,
-                },
-                Vec::new(),
-                None,
-                "resolve failed",
-            )
-            .await;
-            let val = serde_json::to_value(&merged).unwrap();
-            let mut names: Vec<String> = val
-                .as_array()
-                .unwrap()
-                .iter()
-                .map(|s| s["name"].as_str().unwrap().to_string())
-                .collect();
+            let merged = tokio::task::spawn_blocking(move || {
+                resolve_mcp_defs(
+                    "claude",
+                    "resolve-test",
+                    profile,
+                    &cwd,
+                    &config_path,
+                    &[],
+                    None,
+                )
+            })
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|s| s.def)
+            .collect::<Vec<_>>();
+            let mut names: Vec<String> = merged.iter().map(|s| s.name.clone()).collect();
             names.sort();
-            let shared = val
-                .as_array()
-                .unwrap()
+            let shared = merged
                 .iter()
-                .find(|s| s["name"] == "shared")
-                .map(|s| s["command"].as_str().unwrap().to_string());
+                .find(|s| s.name == "shared")
+                .map(|s| match &s.transport {
+                    crate::session::mcp::project_mcp::ProjectMcpTransport::Stdio {
+                        command,
+                        ..
+                    } => command.clone(),
+                    other => panic!("unexpected transport {other:?}"),
+                });
             (names, shared)
         };
 
@@ -2787,6 +2889,300 @@ time.sleep(60)
         assert!(
             !names.contains(&"project-only".to_string()),
             "project servers come from config_path, not cwd"
+        );
+    }
+
+    fn rewritten_server() -> crate::session::mcp::project_mcp::ProjectMcpServer {
+        use crate::session::mcp::project_mcp::{ProjectMcpServer, ProjectMcpTransport};
+        ProjectMcpServer {
+            name: "rewritten".into(),
+            transport: ProjectMcpTransport::Stdio {
+                command: "gateway".into(),
+                args: Vec::new(),
+                env: Default::default(),
+            },
+        }
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn a_sandboxed_session_never_gives_the_hook_or_keeps_a_daemon_server() {
+        use crate::acp::mcp_rewrite::test_support::{RecordingRewriter, SlotGuard};
+
+        let (_home, tmp) = isolate_home();
+        let _env = crate::session::test_support::EnvGuard::unset(&["CLAUDE_CONFIG_DIR"]);
+        std::fs::write(
+            tmp.path().join(".claude.json"),
+            r#"{ "mcpServers": {
+                "fs": { "command": "f" },
+                "daemon": { "type": "http", "url": "http://127.0.0.1:9000/mcp" }
+            } }"#,
+        )
+        .unwrap();
+        let readded = crate::session::mcp::project_mcp::ProjectMcpServer {
+            name: "readded".into(),
+            transport: crate::session::mcp::project_mcp::ProjectMcpTransport::Http {
+                url: "http://127.0.0.1:9000/mcp".into(),
+                headers: Default::default(),
+            },
+        };
+        let kept = crate::session::mcp::project_mcp::ProjectMcpServer {
+            name: "kept".into(),
+            transport: crate::session::mcp::project_mcp::ProjectMcpTransport::Stdio {
+                command: "k".into(),
+                args: Vec::new(),
+                env: Default::default(),
+            },
+        };
+        let rewriter = RecordingRewriter::returning(vec![kept, readded]);
+        let _slot = SlotGuard::install(rewriter.clone());
+        let servers = resolve_mcp_servers(
+            "claude",
+            "daemon-test",
+            None,
+            McpPaths {
+                cwd: tmp.path().to_path_buf(),
+                config_path: tmp.path().join("config.toml"),
+                sandboxed: true,
+            },
+            McpHostEnv::default(),
+            McpSandboxScope::default(),
+            "failed",
+        )
+        .await;
+
+        assert_eq!(
+            rewriter.input_names(),
+            [["fs".to_string()]],
+            "the hook must not see the daemon server"
+        );
+        let names: Vec<String> = serde_json::to_value(&servers)
+            .unwrap()
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|s| s["name"].as_str().unwrap().to_string())
+            .collect();
+        assert_eq!(names, ["kept"], "a server the hook adds is screened too");
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn resolve_mcp_servers_applies_the_rewrite_hook_after_the_merge() {
+        use crate::acp::mcp_rewrite::test_support::{RecordingRewriter, SlotGuard};
+
+        let (_home, tmp) = isolate_home();
+        let _env = crate::session::test_support::EnvGuard::unset(&["CLAUDE_CONFIG_DIR"]);
+        std::fs::write(
+            tmp.path().join(".claude.json"),
+            r#"{ "mcpServers": { "native": { "command": "n" } } }"#,
+        )
+        .unwrap();
+        let resolve = |sandbox_info, sandboxed: bool| {
+            resolve_mcp_servers(
+                "claude",
+                "hook-test",
+                None,
+                McpPaths {
+                    cwd: tmp.path().to_path_buf(),
+                    config_path: tmp.path().join("config.toml"),
+                    sandboxed,
+                },
+                McpHostEnv::default(),
+                McpSandboxScope {
+                    sandbox_info,
+                    workspace_info: None,
+                    runtime: Default::default(),
+                },
+                "failed",
+            )
+        };
+        let info = crate::session::SandboxInfo {
+            enabled: true,
+            container_id: None,
+            image: "aoe-sandbox:test".into(),
+            container_name: "aoe-sandbox-hook-test".into(),
+            extra_env: None,
+            custom_instruction: None,
+            container_workdir: Some("/workspace/hook-test".into()),
+            before_start_env: Vec::new(),
+            before_start_hook_env: Vec::new(),
+            provider: None,
+        };
+        let disabled = crate::session::SandboxInfo {
+            enabled: false,
+            ..info.clone()
+        };
+
+        let rewriter = RecordingRewriter::returning(Vec::new());
+        let slot = SlotGuard::install(rewriter.clone());
+        let sandboxed = resolve(Some(&info), true).await;
+        resolve(Some(&disabled), true).await;
+        drop(slot);
+        let plain = resolve(None, false).await;
+
+        assert_eq!(
+            rewriter.sandboxed_calls(),
+            [true, false],
+            "context must carry the sandbox flag, and a disabled sandbox is none"
+        );
+        assert!(
+            sandboxed.is_empty(),
+            "hook dropped everything for the sandbox"
+        );
+        assert_eq!(plain.len(), 1, "no rewriter leaves the set alone");
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn hook_replacing_a_server_does_not_inherit_its_provenance() {
+        use crate::acp::mcp_rewrite::test_support::{RecordingRewriter, SlotGuard};
+        use crate::session::mcp::project_mcp::{ProjectMcpServer, ProjectMcpTransport};
+
+        let (_home, tmp) = isolate_home();
+        let _env = crate::session::test_support::EnvGuard::unset(&["CLAUDE_CONFIG_DIR"]);
+        let config = |names: &[&str]| {
+            let servers: serde_json::Map<_, _> = names
+                .iter()
+                .map(|name| {
+                    let server = serde_json::json!({
+                        "type": "http",
+                        "url": format!("http://{name}.invalid/mcp"),
+                        "headers": { "X-Token": "Bearer ${FAKE_TOKEN}" },
+                    });
+                    (name.to_string(), server)
+                })
+                .collect();
+            serde_json::json!({ "mcpServers": servers }).to_string()
+        };
+        std::fs::write(
+            tmp.path().join(".claude.json"),
+            config(&["kept", "native-swapped"]),
+        )
+        .unwrap();
+        let app_dir = crate::session::get_app_dir().unwrap();
+        std::fs::write(app_dir.join("mcp.json"), config(&["global-swapped"])).unwrap();
+        let profile_dir = crate::session::get_profile_dir_path("work").unwrap();
+        std::fs::create_dir_all(&profile_dir).unwrap();
+        std::fs::write(profile_dir.join("mcp.json"), config(&["profile-swapped"])).unwrap();
+        let server = |name: &str, url: &str| ProjectMcpServer {
+            name: name.into(),
+            transport: ProjectMcpTransport::Http {
+                url: url.into(),
+                headers: [("X-Token".to_string(), "Bearer ${FAKE_TOKEN}".to_string())].into(),
+            },
+        };
+        let rewriter = RecordingRewriter::returning(vec![
+            server("kept", "http://kept.invalid/mcp"),
+            server("native-swapped", "http://hook-chosen.invalid/mcp"),
+            server("global-swapped", "http://hook-chosen.invalid/mcp"),
+            server("profile-swapped", "http://hook-chosen.invalid/mcp"),
+        ]);
+        let _slot = SlotGuard::install(rewriter);
+
+        let servers = resolve_mcp_servers(
+            "claude",
+            "provenance-test",
+            Some("work".into()),
+            McpPaths {
+                cwd: tmp.path().to_path_buf(),
+                config_path: tmp.path().join("config.toml"),
+                sandboxed: false,
+            },
+            McpHostEnv {
+                session_env: vec![("FAKE_TOKEN".into(), "fake-value".into())],
+                native_config_override: None,
+            },
+            McpSandboxScope::default(),
+            "failed",
+        )
+        .await;
+
+        let header = |name: &str| {
+            servers
+                .iter()
+                .find_map(|s| match s {
+                    agent_client_protocol::v1::schema::McpServer::Http(s) if s.name == name => {
+                        Some(s.headers[0].value.clone())
+                    }
+                    _ => None,
+                })
+                .unwrap()
+        };
+        assert_eq!(header("kept"), "Bearer fake-value");
+        for swapped in ["native-swapped", "global-swapped", "profile-swapped"] {
+            assert_eq!(
+                header(swapped),
+                "Bearer ${FAKE_TOKEN}",
+                "{swapped}: a server the hook redefined must not receive session env values"
+            );
+        }
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn launch_runs_the_rewrite_hook_with_the_sandbox_mounts() {
+        use crate::acp::mcp_rewrite::test_support::{
+            outside_main_mount, workspace_info, RecordingRewriter, SlotGuard, OUTSIDE_MAIN,
+        };
+
+        let (_home, _tmp) = isolate_home();
+        let rewriter = RecordingRewriter::returning(vec![rewritten_server()]);
+        let _slot = SlotGuard::install(rewriter.clone());
+        let supervisor = Supervisor::new(VecSink::new());
+
+        let plain = spawn_request("launch-plain");
+        let (config, _) = supervisor.spawn_config(&plain, 1).await.unwrap();
+        assert_eq!(mcp_names(&config.mcp_servers), ["rewritten"]);
+
+        let sandbox_info = crate::session::SandboxInfo {
+            enabled: true,
+            container_id: None,
+            image: "aoe-sandbox:test".into(),
+            container_name: "aoe-sandbox-launch".into(),
+            extra_env: None,
+            custom_instruction: None,
+            container_workdir: None,
+            before_start_env: Vec::new(),
+            before_start_hook_env: Vec::new(),
+            provider: None,
+        };
+        let mut instance = crate::session::Instance::new("launch", "/tmp");
+        instance.id = "launch-sandboxed".into();
+        instance.tool = "claude-code".into();
+        instance.sandbox_info = Some(sandbox_info.clone());
+        drop(
+            crate::migrations::v033_isolate_sandbox_content::admit_fresh_instance(&instance)
+                .unwrap(),
+        );
+        crate::session::Storage::new_unwatched("default")
+            .unwrap()
+            .update(|instances, _| {
+                *instances = vec![instance.clone()];
+                Ok(())
+            })
+            .unwrap();
+        let mut sandboxed = spawn_request("launch-sandboxed");
+        sandboxed.sandbox_info = Some(sandbox_info);
+        sandboxed.workspace_info = Some(workspace_info(
+            &sandboxed.cwd,
+            &[("alpha", std::path::Path::new(OUTSIDE_MAIN))],
+        ));
+        let (config, _) = supervisor.spawn_config(&sandboxed, 1).await.unwrap();
+        assert_eq!(mcp_names(&config.mcp_servers), ["rewritten"]);
+        assert_eq!(
+            config.workspace_info.as_ref().map(|w| w.repos.len()),
+            Some(1),
+            "a respawn re-resolves from the same workspace"
+        );
+
+        let sandboxes = rewriter.sandboxes.lock().unwrap();
+        let [None, Some(sandbox)] = sandboxes.as_slice() else {
+            panic!("a host then a sandboxed call expected: {sandboxes:?}");
+        };
+        assert!(
+            sandbox.mounts.contains(&outside_main_mount()),
+            "launch reports the workspace mounts: {sandbox:?}"
         );
     }
 
