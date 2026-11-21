@@ -1284,12 +1284,25 @@ impl Session {
         self.capture_pane_with_cursor_with_deadline(lines, &deadline)
     }
 
+    /// The pane a held VT channel owns, which input and capture must keep targeting.
+    pub(crate) fn live_channel_pane(
+        &self,
+        deadline: &crate::tmux::TmuxCommandDeadline,
+    ) -> Option<String> {
+        #[cfg(unix)]
+        return crate::tmux::vt::channel_pane_id(&self.name, deadline);
+        #[cfg(not(unix))]
+        {
+            let _ = deadline;
+            None
+        }
+    }
+
     pub(crate) fn live_pane_target_with_deadline(
         &self,
         deadline: &crate::tmux::TmuxCommandDeadline,
     ) -> Result<String> {
-        #[cfg(unix)]
-        if let Some(id) = crate::tmux::vt::channel_pane_id(&self.name, deadline) {
+        if let Some(id) = self.live_channel_pane(deadline) {
             return Ok(id);
         }
         super::utils::first_pane_id_with_deadline(&self.name, deadline)
