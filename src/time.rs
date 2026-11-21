@@ -6,8 +6,9 @@ use std::fmt;
 use std::ops::{Add, AddAssign, Sub};
 use std::time::SystemTime;
 
+use ::time::error::TryFromParsed;
 use ::time::format_description::well_known::Rfc3339;
-use ::time::{OffsetDateTime, UtcDateTime};
+use ::time::{Date, OffsetDateTime, UtcDateTime};
 
 pub use ::time::SignedDuration as Duration;
 
@@ -58,27 +59,31 @@ impl Timestamp {
     }
 
     /// Accepts any RFC 3339 offset, or a colon-less one like `+0130` as
-    /// chrono's serde reader did, and normalizes it to UTC.
+    /// chrono's serde reader did, and normalizes it to UTC. Also reads chrono's
+    /// signed years such as `-0001-01-01T00:00:00Z`.
     pub fn parse_rfc3339(s: &str) -> Result<Self, ParseError> {
-        OffsetDateTime::parse(s, &Rfc3339)
-            .or_else(|e| {
-                let b = s.as_bytes();
-                let n = b.len();
-                if n >= 6
-                    && matches!(b[n - 5], b'+' | b'-')
-                    && b[n - 6].is_ascii_digit()
-                    && b[n - 4..].iter().all(u8::is_ascii_digit)
-                {
-                    let (head, minutes) = s.split_at(n - 2);
-                    OffsetDateTime::parse(&format!("{head}:{minutes}"), &Rfc3339)
-                } else {
-                    Err(e)
+        let signed = s.strip_prefix(['+', '-']).and_then(|rest| {
+            let end = 1 + rest.find('-')?;
+            Some((s[..end].parse::<i32>().ok()?, &s[end..]))
+        });
+        let dt = match signed {
+            Some((year, tail)) => {
+                // 2000 is a leap year, so Feb 29 is checked against `year` below.
+                let dt = parse_offset(&format!("2000{tail}"))?;
+                // Clamp chrono values outside our range so stored records still load.
+                if year > 9999 {
+                    return Ok(Self::MAX);
                 }
-            })
-            .map_err(ParseError::Format)?
-            .checked_to_utc()
-            .map(Self)
-            .ok_or(ParseError::OutOfRange)
+                if year < -9999 {
+                    return Ok(Self::MIN);
+                }
+                let date = Date::from_calendar_date(year, dt.month(), dt.day())
+                    .map_err(|e| ParseError::Format(TryFromParsed::ComponentRange(e).into()))?;
+                dt.replace_date(date)
+            }
+            None => parse_offset(s)?,
+        };
+        dt.checked_to_utc().map(Self).ok_or(ParseError::OutOfRange)
     }
 
     pub fn from_unix_secs(secs: i64) -> Option<Self> {
@@ -161,6 +166,25 @@ impl Timestamp {
         let scaled = nanos / 10u32.pow(9 - digits);
         format!(".{scaled:0width$}", width = digits as usize)
     }
+}
+
+fn parse_offset(s: &str) -> Result<OffsetDateTime, ParseError> {
+    OffsetDateTime::parse(s, &Rfc3339)
+        .or_else(|e| {
+            let b = s.as_bytes();
+            let n = b.len();
+            if n >= 6
+                && matches!(b[n - 5], b'+' | b'-')
+                && b[n - 6].is_ascii_digit()
+                && b[n - 4..].iter().all(u8::is_ascii_digit)
+            {
+                let (head, minutes) = s.split_at(n - 2);
+                OffsetDateTime::parse(&format!("{head}:{minutes}"), &Rfc3339)
+            } else {
+                Err(e)
+            }
+        })
+        .map_err(ParseError::Format)
 }
 
 /// chrono's `Display`: `2024-01-02 03:04:05.123 UTC`.
@@ -406,14 +430,11 @@ mod tests {
             assert_eq!(t.to_ymd_hms(), ymd_hms);
             assert_eq!(t.to_string(), display);
             assert_eq!(t.as_unix_secs(), secs);
-            // RFC 3339 has no signed years, so those do not parse.
-            if !serde.starts_with('-') {
-                assert_eq!(
-                    serde_json::from_str::<Timestamp>(&format!("\"{serde}\"")).unwrap(),
-                    t
-                );
-                assert_eq!(Timestamp::parse_rfc3339(rfc).unwrap(), t);
-            }
+            assert_eq!(
+                serde_json::from_str::<Timestamp>(&format!("\"{serde}\"")).unwrap(),
+                t
+            );
+            assert_eq!(Timestamp::parse_rfc3339(rfc).unwrap(), t);
         }
         // chrono's timestamp_millis floors.
         assert_eq!(at(-1, 999_999_999).as_millis(), -1);
@@ -451,6 +472,9 @@ mod tests {
                 "2024-01-02T03:04:05.123456789Z",
                 at(1_704_164_645, 123_456_789),
             ),
+            ("+2024-01-02T04:34:05+0130", base),
+            ("+57000-01-01T00:00:00Z", Timestamp::MAX),
+            ("-10000-01-01T00:00:00Z", Timestamp::MIN),
         ];
         for (input, expected) in cases {
             assert_eq!(
@@ -462,6 +486,9 @@ mod tests {
         assert!(Timestamp::parse_rfc3339("2024-01-02T03:04:05").is_err());
         assert!(Timestamp::parse_rfc3339("9999-12-31T23:59:59-01:00").is_err());
         assert!(Timestamp::parse_rfc3339("2024-01-02T03:04:05+000").is_err());
+        for bad in ["-0001-02-29T00:00:00Z", "+", "-x-01-01T00:00:00Z", "+57000"] {
+            assert!(Timestamp::parse_rfc3339(bad).is_err(), "{bad}");
+        }
 
         #[derive(serde::Deserialize)]
         struct Row {
