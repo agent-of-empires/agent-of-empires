@@ -4,6 +4,44 @@ All notable changes to Agent of Empires will be documented in this file.
 
 The format follows [Conventional Commits](https://www.conventionalcommits.org/).
 
+## [1.26.0](https://github.com/agent-of-empires/agent-of-empires/releases/tag/v1.26.0) - 2026-11-21
+
+
+### Bug Fixes
+
+- **serve:** Require --behind-proxy for --auth none in [#5781](https://github.com/agent-of-empires/agent-of-empires/pull/5781) by [@Seluj78](https://github.com/Seluj78) ([`ea1dc80`](https://github.com/agent-of-empires/agent-of-empires/commit/ea1dc80afef067798080a68de5bdaa01b14ae45b))
+- **tui:** Update bar keys act only on the line on screen in [#5773](https://github.com/agent-of-empires/agent-of-empires/pull/5773) by [@klubrake](https://github.com/klubrake) ([`1351d8d`](https://github.com/agent-of-empires/agent-of-empires/commit/1351d8de48dd6de2114185cee434025a597a27ff))
+- **tmux:** Read tmux queries with the UTF-8 flag in [#5852](https://github.com/agent-of-empires/agent-of-empires/pull/5852) by [@klubrake](https://github.com/klubrake) ([`92fedad`](https://github.com/agent-of-empires/agent-of-empires/commit/92fedad089c3771c3078d96402a6ea23d12ee577))
+- **tui:** Make the live-send chord act as attach on a structured row in [#5815](https://github.com/agent-of-empires/agent-of-empires/pull/5815) by [@athal7](https://github.com/athal7) ([`26f8d25`](https://github.com/agent-of-empires/agent-of-empires/commit/26f8d25153621aeac762514a4c97d94b6f334d0b))
+- **acp:** Keep the connection when the agent rejects a prompt in [#5864](https://github.com/agent-of-empires/agent-of-empires/pull/5864) by [@njbrake](https://github.com/njbrake) ([`b47a466`](https://github.com/agent-of-empires/agent-of-empires/commit/b47a466c1c026bc535d67fdd576b83f73919ca5e))
+- **acp:** Opt into plan operations so cleared plans leave the plan strip in [#5734](https://github.com/agent-of-empires/agent-of-empires/pull/5734) by [@njbrake](https://github.com/njbrake) ([`aae582d`](https://github.com/agent-of-empires/agent-of-empires/commit/aae582dbf049e9f8ba63c6893b647d0f437b946a))
+- **mcp:** Keep wait_for waiting when the turn-end query fails in [#5872](https://github.com/agent-of-empires/agent-of-empires/pull/5872) by [@Seluj78](https://github.com/Seluj78) ([`593655e`](https://github.com/agent-of-empires/agent-of-empires/commit/593655e09152071597a86a8e8f0554c49100615b))
+- **sandbox:** Reject bind-mount and escaping entries in volume_ignores in [#5775](https://github.com/agent-of-empires/agent-of-empires/pull/5775) by [@Seluj78](https://github.com/Seluj78) ([`5e65308`](https://github.com/agent-of-empires/agent-of-empires/commit/5e65308fab6a1beda861cf7ff6e4775b104d4ddb))
+- **acp:** Keep the daemon token out of sandboxed MCP forwarding in [#5776](https://github.com/agent-of-empires/agent-of-empires/pull/5776) by [@Seluj78](https://github.com/Seluj78) ([`0b557f2`](https://github.com/agent-of-empires/agent-of-empires/commit/0b557f26949f49c4c0939a8c89d195c5cb921cd3))
+- **events:** Create event logs owner-only in [#5774](https://github.com/agent-of-empires/agent-of-empires/pull/5774) by [@Seluj78](https://github.com/Seluj78) ([`eefb8a1`](https://github.com/agent-of-empires/agent-of-empires/commit/eefb8a1def19c1251eca18f08a73d5d47a72723c))
+- **migrations:** Let v048 validate a linked sessions.json in [#5874](https://github.com/agent-of-empires/agent-of-empires/pull/5874) by [@Seluj78](https://github.com/Seluj78) ([`3e101d5`](https://github.com/agent-of-empires/agent-of-empires/commit/3e101d5a5ca3d2db9e665bb1f978eebdd4043e84))
+- **tui:** Pressing R again in Connections opens the Web dashboard in [#5832](https://github.com/agent-of-empires/agent-of-empires/pull/5832) by [@klubrake](https://github.com/klubrake) ([`1e4c41e`](https://github.com/agent-of-empires/agent-of-empires/commit/1e4c41e59d39b8453da74119e3d318f467143a77))
+- **migrations:** Skip mounted children when sweeping the legacy hook dir in [#5876](https://github.com/agent-of-empires/agent-of-empires/pull/5876) by [@cwrau](https://github.com/cwrau) ([`050ced5`](https://github.com/agent-of-empires/agent-of-empires/commit/050ced5880b847317e0820dad32a600dd033c4b7))
+- **process:** Read a group scan's process stats as bytes in [#5890](https://github.com/agent-of-empires/agent-of-empires/pull/5890) by [@klubrake](https://github.com/klubrake) ([`c46c237`](https://github.com/agent-of-empires/agent-of-empires/commit/c46c237c21da4bf6f8cd044ef5ec821fbea03c52))
+- **server:** Answer terminal auto-name with the session row in [#5785](https://github.com/agent-of-empires/agent-of-empires/pull/5785) by [@grepsedawk](https://github.com/grepsedawk) ([`4acc8fe`](https://github.com/agent-of-empires/agent-of-empires/commit/4acc8febcd54e41a93827a1512f69d221cacd0f0))
+- **server:** Queue sandbox login notices so a burst cannot drop one in [#5886](https://github.com/agent-of-empires/agent-of-empires/pull/5886) by [@cwrau](https://github.com/cwrau) ([`4fce915`](https://github.com/agent-of-empires/agent-of-empires/commit/4fce915b435129734b5dbb0cbc41d7c5c17ad1a0))
+- **acp:** Refuse Terminal switch when command session flag conflicts in [#5758](https://github.com/agent-of-empires/agent-of-empires/pull/5758) by [@klubrake](https://github.com/klubrake) ([`b0b4c0d`](https://github.com/agent-of-empires/agent-of-empires/commit/b0b4c0df91389f966b2f7db3a69646e8b74e07d7))
+- **tmux:** Stop pinning sends to a failed VT channel's dead pane in [#5718](https://github.com/agent-of-empires/agent-of-empires/pull/5718) by [@markphilipp](https://github.com/markphilipp) ([`cfca1ca`](https://github.com/agent-of-empires/agent-of-empires/commit/cfca1cac89a30b32a822342b4a07ce949a73f623))
+- **tui:** Attach live send to an alive pane whose status is unknown in [#5915](https://github.com/agent-of-empires/agent-of-empires/pull/5915) by [@athal7](https://github.com/athal7) ([`08946a2`](https://github.com/agent-of-empires/agent-of-empires/commit/08946a21cf50cf5a72ef9751c07faa0e159b1c0b))
+- **migrations:** Accept an event log 40 symlinks away in v059 in [#5897](https://github.com/agent-of-empires/agent-of-empires/pull/5897) by [@klubrake](https://github.com/klubrake) ([`26448c0`](https://github.com/agent-of-empires/agent-of-empires/commit/26448c0b15db8614ff5790e4b4f50b06a150bd4c))
+- **mcp:** Wrap whoami's result in an object so its outputSchema is one in [#5899](https://github.com/agent-of-empires/agent-of-empires/pull/5899) by [@klubrake](https://github.com/klubrake) ([`54619a5`](https://github.com/agent-of-empires/agent-of-empires/commit/54619a50c651d58364c31a7062f09f53d086428a))
+- **settings:** Say what Let other apps control AoE allows in [#5811](https://github.com/agent-of-empires/agent-of-empires/pull/5811) by [@klubrake](https://github.com/klubrake) ([`9a8605b`](https://github.com/agent-of-empires/agent-of-empires/commit/9a8605bfc0662f6792433ca7fa3f08c394c347ec))
+- Link liblzma statically in vendored builds in [#5918](https://github.com/agent-of-empires/agent-of-empires/pull/5918) by [@skalinets](https://github.com/skalinets) ([`cf14086`](https://github.com/agent-of-empires/agent-of-empires/commit/cf14086295f68c4d1347dbcdfa177b0fcf3901e5))
+
+
+### Features
+
+- **agents:** Smart-rename sessions with vibe -p in [#5848](https://github.com/agent-of-empires/agent-of-empires/pull/5848) by [@mathias-kende](https://github.com/mathias-kende) ([`cc6baeb`](https://github.com/agent-of-empires/agent-of-empires/commit/cc6baeb0012fc64b8396436bd48e8da32291e403))
+- **server:** Report sandbox image pull progress and cancel a pull in [#5846](https://github.com/agent-of-empires/agent-of-empires/pull/5846) by [@klubrake](https://github.com/klubrake) ([`125ff9c`](https://github.com/agent-of-empires/agent-of-empires/commit/125ff9c9cc451da329dd2a86603c73385eb7075d))
+
+
+**Full Changelog**: https://github.com/agent-of-empires/agent-of-empires/compare/v1.25.0...v1.26.0
+
 ## [1.25.0](https://github.com/agent-of-empires/agent-of-empires/releases/tag/v1.25.0) - 2026-11-18
 
 
