@@ -57,9 +57,24 @@ impl Timestamp {
         Self(UtcDateTime::now())
     }
 
-    /// Accepts any RFC 3339 offset and normalizes it to UTC.
+    /// Accepts any RFC 3339 offset, or a colon-less one like `+0130` as
+    /// chrono's serde reader did, and normalizes it to UTC.
     pub fn parse_rfc3339(s: &str) -> Result<Self, ParseError> {
         OffsetDateTime::parse(s, &Rfc3339)
+            .or_else(|e| {
+                let b = s.as_bytes();
+                let n = b.len();
+                if n >= 6
+                    && matches!(b[n - 5], b'+' | b'-')
+                    && b[n - 6].is_ascii_digit()
+                    && b[n - 4..].iter().all(u8::is_ascii_digit)
+                {
+                    let (head, minutes) = s.split_at(n - 2);
+                    OffsetDateTime::parse(&format!("{head}:{minutes}"), &Rfc3339)
+                } else {
+                    Err(e)
+                }
+            })
             .map_err(ParseError::Format)?
             .checked_to_utc()
             .map(Self)
@@ -423,6 +438,9 @@ mod tests {
             ("2024-01-02T05:04:05+02:00", base),
             ("2024-01-02t03:04:05z", base),
             ("2024-01-02 03:04:05Z", base),
+            ("2024-01-02T03:04:05+0000", base),
+            ("2024-01-02T04:34:05+0130", base),
+            ("2024-01-01T22:04:05-0500", base),
             ("2024-01-02T03:04:05.1Z", at(1_704_164_645, 100_000_000)),
             ("2024-01-02T03:04:05.123Z", at(1_704_164_645, 123_000_000)),
             (
@@ -443,6 +461,7 @@ mod tests {
         }
         assert!(Timestamp::parse_rfc3339("2024-01-02T03:04:05").is_err());
         assert!(Timestamp::parse_rfc3339("9999-12-31T23:59:59-01:00").is_err());
+        assert!(Timestamp::parse_rfc3339("2024-01-02T03:04:05+000").is_err());
 
         #[derive(serde::Deserialize)]
         struct Row {
