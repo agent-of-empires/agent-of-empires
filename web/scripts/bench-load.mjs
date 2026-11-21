@@ -6,11 +6,13 @@ import { chromium } from "@playwright/test";
 import { spawn, execFileSync } from "node:child_process";
 import { mkdtempSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { join, resolve } from "node:path";
 
-const bin = process.argv[2];
+// Resolve relative paths now; child processes run with other working directories.
+const arg = process.argv[2];
+const bin = arg?.includes("/") ? resolve(arg) : arg;
 const runs = Number(process.argv[3] ?? 5);
-if (!bin) throw new Error("usage: bench-load.mjs <aoe-binary> [runs]");
+if (!arg) throw new Error("usage: bench-load.mjs <aoe-binary> [runs]");
 
 const home = mkdtempSync(join(tmpdir(), "aoe-bench-home-"));
 const repo = mkdtempSync(join(tmpdir(), "aoe-bench-repo-"));
