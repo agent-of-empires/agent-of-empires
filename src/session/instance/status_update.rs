@@ -15,7 +15,8 @@ fn detection_content<'a>(
     fresh.or(reuse.map(|(reused, _)| reused))
 }
 
-/// Capture the pane a live VT channel holds, else the tick's batched pane id, else resolve it.
+/// Capture the pane a live VT channel holds, else the tick's batched pane id. A failed capture
+/// by id retries through the session resolver, so a stale id never reads as a blank pane.
 fn capture_for_status(
     session: &tmux::Session,
     metadata: Option<&tmux::PaneMetadata>,
@@ -28,10 +29,9 @@ fn capture_for_status(
                 .map(|m| m.pane_id.clone())
                 .filter(|id| !id.is_empty())
         });
-    match known {
-        Some(pane_id) => session.capture_pane_at(&pane_id, lines),
-        None => session.capture_pane(lines).unwrap_or_default(),
-    }
+    known
+        .and_then(|pane_id| session.capture_pane_at(&pane_id, lines))
+        .unwrap_or_else(|| session.capture_pane(lines).unwrap_or_default())
 }
 
 /// Whether this poll can reuse the last verdict instead of capturing the pane.
@@ -1215,8 +1215,15 @@ Esc to cancel \u{b7} Tab to amend \u{b7} ctrl+e to explain\n\
         assert!(count > 1, "the fallback still resolves the pane first");
 
         metadata.pane_id = "%999999".into();
-        let (out, _) = forks(Some(&metadata), &session);
-        assert_eq!(out, "", "a failed capture-pane reads as an empty pane");
+        let (out, count) = forks(Some(&metadata), &session);
+        assert!(
+            out.contains("pane-id-marker"),
+            "a stale id falls back: {out:?}"
+        );
+        assert!(
+            count > 1,
+            "the fallback resolves the pane after the failed id"
+        );
     }
 
     /// Pane metadata for a live agent pane: not dead, running the agent itself, so neither the

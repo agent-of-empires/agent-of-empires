@@ -855,12 +855,9 @@ impl Session {
     }
 
     /// Capture a pane the caller already resolved, skipping the existence and pane-id probes.
-    /// A failed `capture-pane` reads as an empty pane, like [`Self::capture_pane`].
-    pub(crate) fn capture_pane_at(&self, pane_id: &str, lines: usize) -> String {
-        capture_pane_target(pane_id, lines)
-            .ok()
-            .flatten()
-            .unwrap_or_default()
+    /// `None` when `capture-pane` failed, so a stale id never reads as a blank pane.
+    pub(crate) fn capture_pane_at(&self, pane_id: &str, lines: usize) -> Option<String> {
+        capture_pane_target(pane_id, lines).ok().flatten()
     }
 
     /// Wait for a known marker, or for two stable captures when no marker exists.
