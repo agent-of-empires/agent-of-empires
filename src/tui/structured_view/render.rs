@@ -737,7 +737,9 @@ fn render_transcript(
     // A projection that grew above the reader moved their row; put the content
     // they were reading back at the top of the pane.
     if let Some((anchor, row)) = state.take_scroll_anchor() {
-        if let Some(index) = anchor_offset(&text.lines, &anchor, first) {
+        // The anchor sat `row` lines below the pane top, so its own index is the
+        // hint; hinting at `first` would pick a neighbour when rows repeat.
+        if let Some(index) = anchor_offset(&text.lines, &anchor, first.saturating_add(row)) {
             first = index.saturating_sub(row).min(max);
             state.scroll_offset.set(first);
         }
@@ -3215,6 +3217,60 @@ mod tests {
             rows_after[(after.text_area.y + 1) as usize].trim(),
             content_before,
             "the content under the separator stays where the reader had it"
+        );
+    }
+
+    /// Identical replies either side of the reader must not hijack the anchor:
+    /// the stored row says which copy they were reading, so an unchanged
+    /// projection leaves the pane where it was.
+    #[test]
+    fn a_repeated_reply_keeps_the_reader_on_their_row() {
+        let chunk = |text: &str, id: &str| Event::AgentMessageChunk {
+            text: text.into(),
+            message_id: Some(id.into()),
+        };
+        let mut state = test_state();
+        let events: Vec<Event> = (0..12)
+            .map(|index| chunk("same reply", &format!("m-{index}")))
+            .collect();
+        state.transcript.server_rows = server_rows(&events);
+
+        // A separator at the top puts the anchor one row down, where the copy
+        // above the reader sits as near as the copy they are on.
+        let offset = (2..18u16)
+            .find(|offset| {
+                state.scroll_offset.set(*offset);
+                let rows = render_rows(&state, 60, 20, true);
+                let top = render_geometry(&state, 60, 20).text_area.y as usize;
+                if !rows[top].trim().is_empty() {
+                    return false;
+                }
+                let below = rows[top + 1].trim().to_string();
+                if below.is_empty() {
+                    return false;
+                }
+                // The same reply also sits directly above that separator.
+                state.scroll_offset.set(offset - 1);
+                let above = render_rows(&state, 60, 20, true);
+                above[top].trim() == below
+            })
+            .expect("fixture repeats a reply above the reader");
+        state.scroll_offset.set(offset);
+        let before = render_geometry(&state, 60, 20);
+        let rows_before = render_rows(&state, 60, 20, true);
+        let reply_before = rows_before[before.text_area.y as usize + 1].clone();
+
+        state.anchor_scroll_to_top_line();
+        let after = render_geometry(&state, 60, 20);
+        let rows_after = render_rows(&state, 60, 20, true);
+        assert_eq!(
+            after.first_line, before.first_line,
+            "an unchanged projection keeps the offset"
+        );
+        assert_eq!(
+            rows_after[after.text_area.y as usize + 1],
+            reply_before,
+            "the reader stays on the copy they were reading"
         );
     }
 

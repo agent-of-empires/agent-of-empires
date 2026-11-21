@@ -702,6 +702,14 @@ mod tests {
             ),
             (
                 Focus::Transcript,
+                Char('e'),
+                NONE,
+                ctx(),
+                Is(Intent::ToggleThinking),
+            ),
+            (Focus::Composer, Char('e'), NONE, ctx(), Composes),
+            (
+                Focus::Transcript,
                 Char('a'),
                 NONE,
                 ctx_elicitation(),
