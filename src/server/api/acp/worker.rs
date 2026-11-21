@@ -335,6 +335,14 @@ pub async fn restart_acp(
     }
 }
 
+fn restart_purge_conflict() -> Response {
+    (
+        StatusCode::CONFLICT,
+        "purge_in_progress: permanent deletion is in progress for this session",
+    )
+        .into_response()
+}
+
 async fn restart_acp_inner(state: Arc<AppState>, id: String, req: SpawnAcpRequest) -> Response {
     let restart = match state
         .acp_supervisor
@@ -355,6 +363,9 @@ async fn restart_acp_inner(state: Arc<AppState>, id: String, req: SpawnAcpReques
                 "restart_in_progress: a restart is already in progress for this session",
             )
                 .into_response();
+        }
+        Err(crate::acp::supervisor::RestartClaimConflict::Purge) => {
+            return restart_purge_conflict();
         }
     };
     let Some(preflight_instance) = find_instance(&state, &id).await else {
@@ -625,6 +636,7 @@ async fn restart_acp_inner(state: Arc<AppState>, id: String, req: SpawnAcpReques
             status: "running",
         })
         .into_response(),
+        Err(SupervisorError::PurgeInProgress(_)) => restart_purge_conflict(),
         Err(e) => supervisor_error_response("restart spawn failed", &e),
     }
 }
@@ -2165,6 +2177,81 @@ mod tests {
             .try_begin_restart_with_reason(&id)
             .await
             .is_ok());
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn restart_returns_purge_conflict_at_claim_and_replacement_admission() {
+        let _home = crate::session::test_support::isolate_app_dir();
+        let project = tempfile::tempdir().unwrap();
+        let mut row =
+            crate::session::Instance::new("restart during purge", project.path().to_str().unwrap());
+        row.source_profile = "default".into();
+        row.view = crate::session::View::Structured;
+        row.agent_name = Some("claude".into());
+        let id = row.id.clone();
+        let state = durable_stop_state(row).await;
+        let request = || SpawnAcpRequest {
+            agent: None,
+            model: None,
+            additional_dirs: Vec::new(),
+            provider_env: Vec::new(),
+        };
+
+        let fence = state.acp_supervisor.fence_spawn_admission(&id);
+        let immediate = restart_acp(State(state.clone()), Path(id.clone()), Ok(Json(request())))
+            .await
+            .into_response();
+        drop(fence);
+
+        let submission = state
+            .session_service
+            .prompt_submission_for_session(&id)
+            .await
+            .expect("session has a submission barrier");
+        let pending = tokio::spawn({
+            let state = state.clone();
+            let id = id.clone();
+            let request = request();
+            async move {
+                restart_acp(State(state), Path(id), Ok(Json(request)))
+                    .await
+                    .into_response()
+            }
+        });
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            loop {
+                match state.acp_supervisor.begin_spawn_request(&id) {
+                    Err(
+                        SupervisorError::RestartInProgress(_) | SupervisorError::SpawnCancelled(_),
+                    ) => break,
+                    Ok(probe) => drop(probe),
+                    Err(error) => panic!("unexpected spawn conflict: {error:?}"),
+                }
+                assert!(!pending.is_finished(), "restart did not reach the barrier");
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("restart claims the session before the submission barrier");
+        let fence = state.acp_supervisor.fence_spawn_admission(&id);
+        drop(submission);
+        let late = tokio::time::timeout(std::time::Duration::from_secs(5), pending)
+            .await
+            .expect("restart settles with a purge conflict")
+            .unwrap();
+
+        for response in [immediate, late] {
+            assert_eq!(response.status(), StatusCode::CONFLICT);
+            let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+                .await
+                .unwrap();
+            assert_eq!(
+                body.as_ref(),
+                b"purge_in_progress: permanent deletion is in progress for this session"
+            );
+        }
+        drop(fence);
     }
 
     #[tokio::test]

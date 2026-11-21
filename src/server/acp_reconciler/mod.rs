@@ -27,9 +27,8 @@ pub(crate) use resume::{trigger_resume_background, ResumeTrigger};
 
 use resume::{resume_one, ResumeTarget};
 
-/// Crash-loop budget (#1945): at most this many resume decisions per session
-/// per window before it is parked until an explicit retry. Looser than the
-/// supervisor's 3/60s because it counts before the outcome is known.
+/// Crash-loop budget (#1945): temporary admission and capacity refusals refund their entry.
+/// Exhaustion parks a session until explicit retry.
 const RECONCILER_MAX_RESPAWNS_IN_WINDOW: usize = 5;
 const RECONCILER_RESPAWN_WINDOW: Duration = Duration::from_secs(60);
 
@@ -53,6 +52,15 @@ fn record_and_check_respawn_budget(
     }
     entry.push(now);
     false
+}
+
+fn refund_respawn_attempt(history: &mut HashMap<String, Vec<Instant>>, id: &str) {
+    if let Some(entries) = history.get_mut(id) {
+        entries.pop();
+        if entries.is_empty() {
+            history.remove(id);
+        }
+    }
 }
 
 /// Clean slate for `id`: re-armed, un-parked, budget and capacity marker reset.
@@ -92,6 +100,8 @@ enum ResumeOutcome {
     Attached,
     /// Attachment, retirement or launch prep lost a race; retry next tick unless parked.
     Retry,
+    /// A purge fenced admission; re-arm without charging the crash-loop budget.
+    AdmissionDeferred,
     /// Spawn finished with or without error; `attempted` stays set so a
     /// permanently failing spawn does not loop.
     SpawnFinished,
@@ -483,6 +493,10 @@ pub async fn reconcile_acp_workers(
                     attempted.remove(&id);
                 }
             }
+            Ok((id, ResumeOutcome::AdmissionDeferred)) => {
+                refund_respawn_attempt(respawn_history, &id);
+                attempted.remove(&id);
+            }
             Ok((
                 id,
                 ResumeOutcome::CapacityDeferred {
@@ -491,13 +505,7 @@ pub async fn reconcile_acp_workers(
                     lifecycle_generation,
                 },
             )) => {
-                // Refund only this tick's budget entry so prior crash history survives.
-                if let Some(entries) = respawn_history.get_mut(&id) {
-                    entries.pop();
-                    if entries.is_empty() {
-                        respawn_history.remove(&id);
-                    }
-                }
+                refund_respawn_attempt(respawn_history, &id);
                 // Never pin: `attempted` would skip the session forever.
                 attempted.remove(&id);
                 // `publish_startup_error` does not dedup, so publish once per transition.
@@ -914,6 +922,119 @@ mod tests {
                 "with_marker={with_marker}"
             );
         }
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn temporary_purge_fences_rearm_but_explicit_stops_remain_terminal() {
+        for explicit_stop in [false, true] {
+            let id = "s-purge-fence";
+            let (_home, state, _project) = test_state(id);
+            let admission = state.acp_supervisor.fence_spawn_admission(id);
+            let stop = if explicit_stop {
+                Some(
+                    state
+                        .acp_supervisor
+                        .begin_stop_request(id, "user_stopped", None, false)
+                        .await,
+                )
+            } else {
+                None
+            };
+            let mut tick = Tick::default();
+            for _ in 0..RECONCILER_MAX_RESPAWNS_IN_WINDOW + 2 {
+                tick.run(&state).await;
+            }
+            assert_eq!(startup_errors(&state, id), 0);
+            assert!(!tick.parked.contains(id));
+            assert_eq!(
+                tick.respawn_history.get(id).map_or(0, Vec::len),
+                usize::from(explicit_stop)
+            );
+
+            drop(stop);
+            drop(admission);
+            tick.run(&state).await;
+            let errors = state
+                .acp_event_store
+                .replay_from(id, 0)
+                .into_iter()
+                .filter_map(|(_, event)| match event {
+                    crate::acp::Event::AgentStartupError { message, .. } => Some(message),
+                    _ => None,
+                })
+                .collect::<Vec<_>>();
+            if explicit_stop {
+                assert!(errors.is_empty());
+            } else {
+                assert!(matches!(
+                    errors.as_slice(),
+                    [message] if message.contains("aoe-no-such-agent-1027")
+                ));
+            }
+        }
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn a_purge_fence_during_attach_defers_and_refunds_the_fallback_spawn() {
+        let id = "s-purge-at-fallback";
+        let (_home, state, project) = test_state(id);
+        let sockets = tempfile::TempDir::with_prefix_in("aoe-attach-", "/tmp").unwrap();
+        let socket = sockets.path().join("runner.sock");
+        let listener =
+            tokio::net::UnixListener::bind(crate::process::worker::control_socket_sibling(&socket))
+                .unwrap();
+        let mut child = tokio::process::Command::new("sleep")
+            .arg("60")
+            .kill_on_drop(true)
+            .spawn()
+            .unwrap();
+        let record = crate::process::worker_registry::WorkerRecord::new(
+            id.into(),
+            child.id().unwrap(),
+            socket,
+            "test-agent-acp".into(),
+            "test-agent".into(),
+            project.path().to_path_buf(),
+            None,
+            vec![],
+            vec![],
+            Some("native-id".into()),
+            Some("default".into()),
+        )
+        .with_generation(17);
+        crate::process::worker_registry::save(&record).unwrap();
+
+        let first_tick = tokio::spawn({
+            let state = Arc::clone(&state);
+            async move {
+                let mut tick = Tick::default();
+                tick.run(&state).await;
+                tick
+            }
+        });
+        // The runner is still live when attach connects. Fence admission before
+        // allowing attach to fail, so only the fallback can see the purge fence.
+        let (stream, _) = tokio::time::timeout(Duration::from_secs(5), listener.accept())
+            .await
+            .expect("reconciliation must try to attach")
+            .unwrap();
+        let purge = state.acp_supervisor.fence_spawn_admission(id);
+        child.kill().await.unwrap();
+        drop(stream);
+
+        let mut tick = first_tick.await.unwrap();
+        assert!(crate::process::worker_registry::load(id).unwrap().is_none());
+        assert!(!tick.attempted.contains(id));
+        assert!(!tick.respawn_history.contains_key(id));
+        assert_eq!(startup_errors(&state, id), 0);
+
+        drop(purge);
+        tick.run(&state).await;
+        assert!(tick.attempted.contains(id));
+        assert_eq!(tick.respawn_history[id].len(), 1);
+        assert_eq!(startup_errors(&state, id), 1);
     }
 
     /// An unreadable event log neither spawns nor pins the session: it stays
