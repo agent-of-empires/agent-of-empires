@@ -204,7 +204,39 @@ pub async fn ensure_session(
     .await
 }
 
-pub(super) fn ready_agent_session(instance: &Instance) -> anyhow::Result<Option<String>> {
+pub(crate) fn ready_agent_session(instance: &Instance) -> anyhow::Result<Option<String>> {
+    agent_session_in_pane(instance, true)
+}
+
+/// Like [`ready_agent_session`] but never trusts a hook status file: an agent
+/// that exited to a live shell leaves it behind, so automatic input must see
+/// the pane itself running something other than a shell.
+pub(crate) fn ready_agent_session_for_automatic_input(
+    instance: &Instance,
+) -> anyhow::Result<Option<String>> {
+    agent_session_in_pane(instance, false)
+}
+
+/// [`ready_agent_session_for_automatic_input`], as the `#{pane_id}` the check
+/// saw, so a later capture and send address that pane and no other.
+pub(crate) fn ready_agent_pane_for_automatic_input(
+    instance: &Instance,
+) -> anyhow::Result<Option<String>> {
+    Ok(agent_pane_in(instance, false)?.map(|(_, pane_id)| pane_id))
+}
+
+fn agent_session_in_pane(
+    instance: &Instance,
+    trust_hook_status: bool,
+) -> anyhow::Result<Option<String>> {
+    Ok(agent_pane_in(instance, trust_hook_status)?.map(|(name, _)| name))
+}
+
+/// The agent pane's session name and `#{pane_id}`.
+fn agent_pane_in(
+    instance: &Instance,
+    trust_hook_status: bool,
+) -> anyhow::Result<Option<(String, String)>> {
     let panes = crate::tmux::batch_pane_metadata()?;
     let Some((name, pane)) =
         crate::tmux::agent_pane_metadata_in(&panes, &instance.id, &instance.title)?
@@ -216,7 +248,7 @@ pub(super) fn ready_agent_session(instance: &Instance) -> anyhow::Result<Option<
     }
     if !instance.expects_shell()
         && !instance.has_command_override()
-        && crate::hooks::read_hook_status(&instance.id).is_none()
+        && !(trust_hook_status && crate::hooks::read_hook_status(&instance.id).is_some())
     {
         let command = pane
             .pane_current_command
@@ -229,7 +261,7 @@ pub(super) fn ready_agent_session(instance: &Instance) -> anyhow::Result<Option<
             return Ok(None);
         }
     }
-    Ok(Some(name.to_owned()))
+    Ok(Some((name.to_owned(), pane.pane_id.clone())))
 }
 
 #[derive(Debug, thiserror::Error)]
