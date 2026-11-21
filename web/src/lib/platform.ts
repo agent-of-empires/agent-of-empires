@@ -30,12 +30,13 @@ const isIPadDesktopMode = (): boolean =>
 
 /**
  * Which install steps a phone or tablet browser tab needs; null for an installed app, a desktop,
- * or an insecure origin. An iPad gets the iOS steps even with a trackpad, since push there also
- * needs the installed app.
+ * or an insecure origin. iOS and Android are known from the userAgent, whatever the pointer (an
+ * iPad with a trackpad, an Android device with a mouse). Anything else needs touch hardware.
  */
 export function installHint(): InstallHint | null {
   if (isStandalone() || !isSecureOrigin()) return null;
   if (isIOS() || isIPadDesktopMode()) return "ios";
+  if (/Android/.test(navigator.userAgent)) return "android";
   if (hasFinePointer()) return null;
-  return /Android/.test(navigator.userAgent) ? "android" : "other";
+  return navigator.maxTouchPoints > 0 ? "other" : null;
 }

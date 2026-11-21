@@ -92,7 +92,8 @@ describe("installHint", () => {
       want: "android",
     },
     {
-      name: "a touch-only Linux browser (coarse pointer, not a phone)",
+      // "other" because it has touch points, not because its pointer is coarse.
+      name: "a touch-only Linux browser (coarse pointer, touch points, not a phone)",
       ua: LINUX_FIREFOX,
       touch: 5,
       standalone: false,
@@ -101,6 +102,24 @@ describe("installHint", () => {
       want: "other",
     },
     { name: "a desktop", ua: LINUX_FIREFOX, touch: 0, standalone: false, finePointer: true, secure: true, want: null },
+    {
+      name: "a desktop with no pointing device or touch",
+      ua: LINUX_FIREFOX,
+      touch: 0,
+      standalone: false,
+      finePointer: false,
+      secure: true,
+      want: null,
+    },
+    {
+      name: "an Android device with a mouse",
+      ua: ANDROID,
+      touch: 5,
+      standalone: false,
+      finePointer: true,
+      secure: true,
+      want: "android",
+    },
     // Push on an iPad needs the installed app too, whatever the pointer.
     {
       name: "an iPad with a trackpad",
