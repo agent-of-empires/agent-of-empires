@@ -357,17 +357,26 @@ impl ProbeFailure {
     }
 }
 
+/// Where the probe runs. Not the session slice: that sits under
+/// `background.slice`, whose `MemoryHigh` can throttle the probe past its
+/// timeout, and a probe must not leave a slice of its own behind.
+const PROBE_SLICE: &str = "app.slice";
+
 /// Runs `systemd-run ... -- true` once through `run` (argv includes the
-/// program), with the same flags and limits as a real start.
+/// program), with the same flags and limits as a real start, in `PROBE_SLICE`.
 fn probe_with(
     cfg: &ScopeConfig,
     profile: &str,
     run: &dyn Fn(&[String]) -> Result<(), ProbeFailure>,
 ) -> Result<(), ProbeFailure> {
     let unit = format!("aoe-probe-{}-{}.scope", std::process::id(), now_ms());
+    let cfg = ScopeConfig {
+        slice_template: PROBE_SLICE.into(),
+        ..cfg.clone()
+    };
     let mut argv = vec!["systemd-run".to_string()];
     argv.extend(scope_args(
-        cfg,
+        &cfg,
         &unit,
         "aoe capability probe",
         profile,
@@ -430,56 +439,73 @@ fn log_probe_failure(limits: &Limits, failure: &ProbeFailure) {
 }
 
 /// `None` outside Linux, under `cfg(test)`, when disabled, or when the probe
-/// fails.
+/// fails. Blocks until the probe gives a definitive answer.
 fn capability() -> Option<&'static Capability> {
     static CAP: OnceLock<Option<Capability>> = OnceLock::new();
-    CAP.get_or_init(|| {
-        if cfg!(test) || !cfg!(target_os = "linux") {
-            return None;
+    CAP.get_or_init(probe_capability).as_ref()
+}
+
+/// Retries a timed-out probe (a busy user manager) until the manager answers,
+/// so a slow start never disables scopes for the whole process.
+fn probe_capability() -> Option<Capability> {
+    if cfg!(test) || !cfg!(target_os = "linux") {
+        return None;
+    }
+    if !settings().enabled {
+        tracing::info!(target: "process.systemd", "systemd.enabled=false; sessions start unscoped");
+        return None;
+    }
+    let tools = which::which("systemd-run").and_then(|run| Ok((run, which::which("env")?)));
+    let Ok((systemd_run, env_bin)) = tools else {
+        tracing::info!(
+            target: "process.systemd",
+            "systemd-run or env not found; sessions start unscoped"
+        );
+        return None;
+    };
+    let cfg = ScopeConfig::from_config(settings());
+    let real = |argv: &[String]| -> Result<(), ProbeFailure> {
+        let mut cmd = Command::new(&systemd_run);
+        cmd.args(&argv[1..]);
+        match crate::process::run_with_timeout(&mut cmd, Duration::from_secs(5)) {
+            Ok(Some(o)) if o.status.success() => Ok(()),
+            Ok(Some(o)) => Err(ProbeFailure::Rejected(
+                String::from_utf8_lossy(&o.stderr).trim().to_string(),
+            )),
+            Ok(None) => Err(ProbeFailure::TimedOut),
+            Err(e) => Err(ProbeFailure::SpawnFailed(e.to_string())),
         }
-        if !settings().enabled {
-            tracing::info!(target: "process.systemd", "systemd.enabled=false; sessions start unscoped");
-            return None;
+    };
+    let profile = crate::session::config::effective_profile("");
+    match probe_until_answered(|| probe_with(&cfg, &profile, &real)) {
+        Ok(()) => {
+            tracing::info!(target: "process.systemd", "systemd scopes enabled");
+            Some(Capability {
+                systemd_run,
+                env_bin,
+                cfg,
+            })
         }
-        let tools = which::which("systemd-run").and_then(|run| Ok((run, which::which("env")?)));
-        let Ok((systemd_run, env_bin)) = tools else {
-            tracing::info!(
-                target: "process.systemd",
-                "systemd-run or env not found; sessions start unscoped"
-            );
-            return None;
-        };
-        let cfg = ScopeConfig::from_config(settings());
-        let real = |argv: &[String]| -> Result<(), ProbeFailure> {
-            let mut cmd = Command::new(&systemd_run);
-            cmd.args(&argv[1..]);
-            match crate::process::run_with_timeout(&mut cmd, Duration::from_secs(5)) {
-                Ok(Some(o)) if o.status.success() => Ok(()),
-                Ok(Some(o)) => Err(ProbeFailure::Rejected(
-                    String::from_utf8_lossy(&o.stderr).trim().to_string(),
-                )),
-                Ok(None) => Err(ProbeFailure::TimedOut),
-                Err(e) => Err(ProbeFailure::SpawnFailed(e.to_string())),
-            }
-        };
-        // The real profile, so the probe creates no slice a session would not.
-        let profile = crate::session::config::effective_profile("");
-        match probe_with(&cfg, &profile, &real) {
-            Ok(()) => {
-                tracing::info!(target: "process.systemd", "systemd scopes enabled");
-                Some(Capability {
-                    systemd_run,
-                    env_bin,
-                    cfg,
-                })
-            }
-            Err(failure) => {
-                log_probe_failure(&cfg.limits, &failure);
-                None
-            }
+        Err(failure) => {
+            log_probe_failure(&cfg.limits, &failure);
+            None
         }
-    })
-    .as_ref()
+    }
+}
+
+/// Repeats `attempt` while it times out; any other result is final. There is
+/// no cap: a user manager that never answers blocks the caller.
+fn probe_until_answered(
+    mut attempt: impl FnMut() -> Result<(), ProbeFailure>,
+) -> Result<(), ProbeFailure> {
+    loop {
+        match attempt() {
+            Err(ProbeFailure::TimedOut) => {
+                tracing::info!(target: "process.systemd", "systemd-run timed out; retrying");
+            }
+            result => return result,
+        }
+    }
 }
 
 /// The words to put in front of a session command.
@@ -1405,7 +1431,36 @@ esac
                 assert!(argv.iter().any(|a| a == flag), "{flag}");
             }
             assert!(argv.iter().any(|a| a.starts_with("--unit=aoe-probe-")));
+            assert!(argv.iter().any(|a| a == "--slice=app.slice"));
             assert_eq!(argv.last().map(String::as_str), Some("true"));
+        }
+    }
+
+    #[test]
+    fn probe_retries_timeouts_until_a_definitive_answer() {
+        let timed_out = || Err(ProbeFailure::TimedOut);
+        let cases: [(Vec<Result<(), ProbeFailure>>, Result<(), ProbeFailure>); 4] = [
+            (vec![Ok(())], Ok(())),
+            (vec![timed_out(), timed_out(), Ok(())], Ok(())),
+            (
+                vec![timed_out(), Err(ProbeFailure::Rejected("no bus".into()))],
+                Err(ProbeFailure::Rejected("no bus".into())),
+            ),
+            (
+                vec![timed_out(), Err(ProbeFailure::SpawnFailed("gone".into()))],
+                Err(ProbeFailure::SpawnFailed("gone".into())),
+            ),
+        ];
+        for (script, want) in cases {
+            let len = script.len();
+            let mut script = script.into_iter();
+            let mut calls = 0;
+            let got = probe_until_answered(|| {
+                calls += 1;
+                script.next().expect("probed past a definitive answer")
+            });
+            assert_eq!(got, want);
+            assert_eq!(calls, len, "{want:?}");
         }
     }
 
