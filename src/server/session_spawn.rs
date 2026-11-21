@@ -108,11 +108,16 @@ impl std::error::Error for SessionBuildPanicked {}
 /// A create's requested pull of the latest Sandbox image failed; `detail` is the
 /// runtime's sanitized stderr.
 #[derive(Debug, thiserror::Error)]
-#[error("Couldn't pull the latest Sandbox image {image}: {detail}")]
+#[error("Couldn't pull the latest Sandbox image {image}: {}", if *.cancelled { CANCELLED_UPDATE } else { .detail.as_str() })]
 pub(crate) struct ImageUpdateFailed {
     pub image: String,
+    /// The runtime's output; local owners only.
     pub detail: String,
+    /// The shared pull was cancelled for everyone, which every caller may be told.
+    pub cancelled: bool,
 }
+
+pub(crate) const CANCELLED_UPDATE: &str = "the update was cancelled";
 
 /// A CLI Terminal create with no `on_create` to run needs only an installed runtime; a pull needs it running.
 fn sandbox_readiness(
@@ -134,23 +139,35 @@ fn pull_latest(
     progress: Option<&crate::server::create_progress::CreateProgress>,
     cancel: &tokio_util::sync::CancellationToken,
 ) -> anyhow::Result<()> {
-    use crate::containers::error::DockerError;
     if let Some(progress) = progress {
         progress.set_stage(crate::server::create_progress::CreateStage::PullingImage);
     }
     let runtime = crate::containers::get_container_runtime();
-    match runtime.pull_image_until_cancelled(image, cancel) {
-        Ok(()) => {
-            crate::server::api::invalidate_sandbox_image_status(&runtime, image);
-            Ok(())
+    runtime
+        .pull_image_until_cancelled(image, cancel)
+        .map_err(create_pull_error)?;
+    crate::server::api::invalidate_sandbox_image_status(&runtime, image);
+    Ok(())
+}
+
+/// A create's own cancel stops the create; a pull cancelled for everyone fails it.
+fn create_pull_error(error: crate::containers::error::DockerError) -> anyhow::Error {
+    use crate::containers::error::DockerError;
+    match error {
+        DockerError::Cancelled(_) => crate::server::session_service::CreationCancelled.into(),
+        DockerError::ImagePullFailed { image, detail, .. } => ImageUpdateFailed {
+            image,
+            detail,
+            cancelled: false,
         }
-        Err(DockerError::Cancelled(_)) => {
-            Err(crate::server::session_service::CreationCancelled.into())
+        .into(),
+        DockerError::PullCancelled(image) => ImageUpdateFailed {
+            image,
+            detail: String::new(),
+            cancelled: true,
         }
-        Err(DockerError::ImagePullFailed { image, detail, .. }) => {
-            Err(ImageUpdateFailed { image, detail }.into())
-        }
-        Err(other) => Err(other.into()),
+        .into(),
+        other => other.into(),
     }
 }
 
@@ -692,6 +709,7 @@ pub(crate) async fn spawn_structured_session(
                         &mut instance,
                         &hook_plan,
                         store,
+                        &creation_guard.cancellation(),
                         Some(&creation_progress),
                     )
                     .map_err(|error| {
@@ -699,12 +717,10 @@ pub(crate) async fn spawn_structured_session(
                             .hooks
                             .as_ref()
                             .and_then(|hooks| hooks.origin_hint("on_create"));
-                        anyhow::Error::new(
-                            crate::server::api::sessions::CreateHookFailed::new(
-                                error,
-                                hint.as_deref(),
-                                hook_plan.on_create_from_repo,
-                            ),
+                        crate::server::api::sessions::CreateHookFailed::wrap(
+                            error,
+                            hint.as_deref(),
+                            hook_plan.on_create_from_repo,
                         )
                     })
                 })
@@ -775,10 +791,12 @@ pub(crate) async fn spawn_structured_session(
         }
 
         creation_guard.phase(CreationPhase::LaunchHooks);
-        let hooks = instance.run_pre_launch_hooks(false, store, Some(&creation_progress), Some(generation));
+        // With no on_create, this is where a missing image is pulled, under the create's cancel.
+        let cancel = creation_guard.cancellation();
+        let hooks = instance.run_pre_launch_hooks(false, store, Some(&creation_progress), Some(generation), &cancel);
         if let Err(error) = hooks {
             rollback(native, instance, false);
-            return Err(error);
+            return Err(crate::server::session_service::CreationCancelled::or_error(&cancel, error));
         }
         if let Err(error) = creation_guard.commit() {
             rollback(native, instance, false);
@@ -1205,6 +1223,22 @@ mod tests {
     use super::*;
 
     #[test]
+    fn a_pull_cancelled_for_everyone_fails_the_create_but_its_own_cancel_stops_it() {
+        use crate::containers::error::DockerError;
+        let own = create_pull_error(DockerError::Cancelled("pull of img".into()));
+        assert!(own
+            .downcast_ref::<crate::server::session_service::CreationCancelled>()
+            .is_some());
+
+        let shared = create_pull_error(DockerError::PullCancelled("img".into()));
+        let failed = shared
+            .downcast_ref::<ImageUpdateFailed>()
+            .expect("the create fails instead of reading as cancelled");
+        assert_eq!(failed.image, "img");
+        assert!(failed.cancelled);
+    }
+
+    #[test]
     fn only_a_cli_terminal_create_with_nothing_to_run_or_pull_skips_a_running_runtime() {
         use crate::session::View::{Structured, Terminal};
         // (cli, view, on_create runs, pull, installed only)
@@ -1351,6 +1385,205 @@ mod tests {
                 .sessions_created,
             0
         );
+    }
+
+    /// With no `on_create`, a sandbox create's pre-launch setup pulls a missing image under the
+    /// create's cancel. Joined to another create's pull of that image, a create cancelled itself
+    /// reads as cancelled, even when the pull is cancelled for everyone too, and the other pull
+    /// goes on; a pull cancelled only for everyone fails the create.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn a_create_without_hooks_cancelled_during_its_setup_pull_reads_as_cancelled() {
+        use crate::containers::error::DockerError;
+        use crate::containers::image_pull::{self, PullKey};
+        use std::os::unix::fs::PermissionsExt;
+        use std::time::{Duration, Instant};
+        const IMAGE: &str = "aoe-test/launch-setup-pull:1";
+        async fn until(what: &str, done: impl Fn() -> bool) {
+            let deadline = Instant::now() + Duration::from_secs(10);
+            while !done() {
+                assert!(Instant::now() < deadline, "{what}");
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        }
+        let root = tempfile::tempdir().unwrap();
+        let _app = crate::session::test_support::isolate_app_dir_at(root.path());
+        let app = crate::session::get_app_dir().unwrap();
+        crate::session::purge_owners::initialize(&app).unwrap();
+        crate::tmux::tool_retirement::initialize(&app).unwrap();
+        crate::session::config::update_app_state(|state| {
+            state.has_acknowledged_agent_hooks = true;
+        })
+        .unwrap();
+        crate::session::config::update_config(|config| {
+            config.systemd.enabled = false;
+        })
+        .unwrap();
+        std::fs::create_dir(root.path().join(".claude")).unwrap();
+        std::fs::write(root.path().join(".claude/settings.json"), "{}").unwrap();
+        // The runtime is up, but the image and the container are missing, so setup pulls.
+        let bin = root.path().join("bin");
+        std::fs::create_dir(&bin).unwrap();
+        for binary in ["docker", "podman", "container"] {
+            let script = bin.join(binary);
+            std::fs::write(
+                &script,
+                "#!/bin/sh\ncase \"$*\" in --version|info|'system status') exit 0;; \
+                 *inspect*) echo 'Error: No such container (container not found)' >&2; exit 1;; esac\n\
+                 exit 1\n",
+            )
+            .unwrap();
+            std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        let _path = crate::session::test_support::path_prepended(&bin);
+        let project = root.path().join("project");
+        std::fs::create_dir(&project).unwrap();
+        let profile = "default";
+        crate::session::Storage::new_unwatched(profile)
+            .unwrap()
+            .update(|instances, _| {
+                *instances = Vec::new();
+                Ok(())
+            })
+            .unwrap();
+        let state = crate::server::test_support::build_test_app_state(Vec::new());
+        crate::server::test_support::refresh_canonical_metadata_for_test(&state).await;
+        let key = PullKey {
+            runtime: crate::containers::get_container_runtime().display_name(),
+            image: IMAGE.to_string(),
+        };
+        let rows = || {
+            crate::session::Storage::open_unwatched(profile)
+                .unwrap()
+                .load()
+                .unwrap()
+        };
+
+        // (create cancelled, pull cancelled for everyone)
+        for (own, shared) in [(true, true), (false, true), (true, false)] {
+            let case = format!("own={own} shared={shared}");
+            // It outlasts the test's own waits, so setup ending first shows the cancel ended it.
+            let other = image_pull::join_with(key.clone(), |pull| {
+                let deadline = Instant::now() + Duration::from_secs(30);
+                while !pull.kill.is_cancelled() && Instant::now() < deadline {
+                    std::thread::sleep(Duration::from_millis(5));
+                }
+                Err(DockerError::Cancelled(format!("pull of {IMAGE}")))
+            });
+            let title = format!("setup-pull-{own}-{shared}");
+            let spec = StructuredSessionSpec {
+                title: Some(title.clone()),
+                title_typed: true,
+                size: None,
+                path: project.to_string_lossy().into_owned(),
+                group: String::new(),
+                tool: "claude".into(),
+                worktree_enabled: false,
+                worktree_branch: None,
+                create_new_branch: false,
+                base_branch: None,
+                sandbox: true,
+                sandbox_image: Some(IMAGE.into()),
+                pull_latest_image: false,
+                yolo_mode: false,
+                extra_env: Vec::new(),
+                before_start_hook_env: Vec::new(),
+                extra_args: String::new(),
+                command_override: String::new(),
+                extra_repo_paths: Vec::new(),
+                workspace: false,
+                repo_base_branches: Vec::new(),
+                scratch: false,
+                trust_hooks: None,
+                trust_review: None,
+                skip_on_create: false,
+                custom_instruction: None,
+                callback_url: None,
+                idempotency_key: None,
+                profile: profile.into(),
+                created_by_plugin: None,
+                plugin_create_idempotency: None,
+                pending_initial_turn: None,
+                parent_session_id: None,
+                acp_mode_id: None,
+                view: crate::session::View::Terminal,
+                agent_name: None,
+                agent_model: None,
+                agent_effort: None,
+                import_acp_session_id: None,
+                import_binding: None,
+                fork_seed: None,
+                progress: None,
+                cli: None,
+            };
+            let create = tokio::spawn({
+                let service = state.session_service.clone();
+                async move { spawn_structured_session(&service, spec).await.map(|_| ()) }
+            });
+            until(
+                &format!("{case}: setup never joined the shared pull"),
+                || create.is_finished() || image_pull::waiters_for_test(&key) == 2,
+            )
+            .await;
+            if create.is_finished() {
+                panic!(
+                    "{case}: the create ended before its pull: {:?}",
+                    create.await
+                );
+            }
+            if own {
+                let id = rows()
+                    .into_iter()
+                    .find(|row| row.title == title)
+                    .expect("the creation published its row before setup")
+                    .id;
+                assert!(state.session_service.cancel_creation(&id), "{case}");
+            }
+            if shared {
+                tokio::task::spawn_blocking(|| {
+                    crate::containers::get_container_runtime()
+                        .cancel_pull(IMAGE, Duration::from_secs(5))
+                })
+                .await
+                .unwrap();
+            } else {
+                until(
+                    &format!("{case}: the create's cancel didn't end its setup"),
+                    || create.is_finished(),
+                )
+                .await;
+                assert_eq!(
+                    image_pull::waiters_for_test(&key),
+                    1,
+                    "{case}: the other create's pull goes on"
+                );
+            }
+            let error = tokio::time::timeout(Duration::from_secs(30), create)
+                .await
+                .expect("a cancel ends the create")
+                .unwrap()
+                .expect_err("a cancelled pull fails the create");
+            let case = format!("{case}: {error:#}");
+            assert_eq!(
+                error.is::<crate::server::session_service::CreationCancelled>(),
+                own,
+                "{case}"
+            );
+            if !own {
+                assert!(
+                    error.chain().any(|cause| matches!(
+                        cause.downcast_ref::<DockerError>(),
+                        Some(DockerError::PullCancelled(_))
+                    )),
+                    "{case}"
+                );
+            }
+            drop(other);
+            until("the stand-in pull never ended", || {
+                image_pull::waiters_for_test(&key) == 0
+            })
+            .await;
+        }
     }
 
     /// `aoe add --sandbox -w`: `on_create` needs the container while the creation holds its
