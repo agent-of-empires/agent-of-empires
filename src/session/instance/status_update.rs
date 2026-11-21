@@ -1193,8 +1193,7 @@ Esc to cancel \u{b7} Tab to amend \u{b7} ctrl+e to explain\n\
         assert!(wait_for_pane(&name, "pane-id-marker"));
         crate::tmux::refresh_session_cache();
         let session = tmux::Session::from_name(&name);
-        let mut metadata = agent_pane_metadata("sleep", None);
-        metadata.pane_id = tmux::first_pane_id(&name).expect("first pane id");
+        let mut metadata = live_pane_metadata(&name, "sleep", None);
 
         let forks = |metadata: Option<&tmux::PaneMetadata>, session: &tmux::Session| {
             let _ = crate::tmux::fork_probe::take();
@@ -1233,6 +1232,17 @@ Esc to cancel \u{b7} Tab to amend \u{b7} ctrl+e to explain\n\
             window_activity,
             window_size: None,
         }
+    }
+
+    /// [`agent_pane_metadata`] aimed at the spawned pane, so a capture reads the fixture.
+    fn live_pane_metadata(
+        session_name: &str,
+        command: &str,
+        window_activity: Option<i64>,
+    ) -> tmux::PaneMetadata {
+        let mut metadata = agent_pane_metadata(command, window_activity);
+        metadata.pane_id = tmux::first_pane_id(session_name).expect("first pane id");
+        metadata
     }
 
     fn write_hook_status(instance_id: &str, status: &str) {
@@ -1394,7 +1404,7 @@ Esc to cancel \u{b7} Tab to amend \u{b7} ctrl+e to explain\n\
         // Presence TTL is not the activity clock under test.
         let poll = |inst: &mut Instance, activity: Option<i64>| {
             cache.force_present(&[session_name.as_str()]);
-            let metadata = agent_pane_metadata("claude", activity);
+            let metadata = live_pane_metadata(&session_name, "claude", activity);
             inst.update_status_with_metadata_inner(Some(&metadata), Some(&session_name));
         };
 
@@ -1466,7 +1476,7 @@ Esc to cancel \u{b7} Tab to amend \u{b7} ctrl+e to explain\n\
 
         let cache = crate::tmux::SessionCacheGuard::capture();
         cache.force_present(&[session_name.as_str()]);
-        let metadata = agent_pane_metadata("claude", None);
+        let metadata = live_pane_metadata(&session_name, "claude", None);
 
         // Both rows come off disk on `Running`, which is what the CLI reads.
         polled.status = Status::Running;
@@ -1555,7 +1565,7 @@ Esc to cancel \u{b7} Tab to amend \u{b7} ctrl+e to explain\n\
             );
             let cache = crate::tmux::SessionCacheGuard::capture();
             cache.force_present(&[session_name.as_str()]);
-            let mut metadata = agent_pane_metadata("omp", None);
+            let mut metadata = live_pane_metadata(&session_name, "omp", None);
             metadata.pane_title = Some(String::new());
 
             inst.update_status_with_metadata_inner(Some(&metadata), Some(&session_name));
@@ -1623,7 +1633,7 @@ Esc to cancel \u{b7} Tab to amend \u{b7} ctrl+e to explain\n\
             assert!(wait_for_pane(&session_name, "PLUGIN_READY"));
             let cache = crate::tmux::SessionCacheGuard::capture();
             cache.force_present(&[session_name.as_str()]);
-            let mut metadata = agent_pane_metadata("omp", None);
+            let mut metadata = live_pane_metadata(&session_name, "omp", None);
             metadata.pane_title = Some(String::new());
 
             inst.update_status_with_metadata_inner(Some(&metadata), Some(&session_name));
@@ -1671,7 +1681,7 @@ HISTORY_READY",
             cache.force_present(&[session_name.as_str()]);
             inst.update_status_with_metadata_inner(Some(metadata), Some(&session_name));
         };
-        let mut metadata = agent_pane_metadata("omp", None);
+        let mut metadata = live_pane_metadata(&session_name, "omp", None);
         metadata.pane_title = Some(String::new());
         for status in [
             Status::Idle,
@@ -1750,7 +1760,7 @@ HISTORY_READY",
             "metadata-free readers fetch the title"
         );
 
-        let mut metadata = agent_pane_metadata("omp", Some(1));
+        let mut metadata = live_pane_metadata(&session_name, "omp", Some(1));
         metadata.pane_title = Some("π: Task".to_owned());
         inst.update_status_with_metadata_inner(Some(&metadata), Some(&session_name));
         assert_eq!(
