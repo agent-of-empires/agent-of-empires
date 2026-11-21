@@ -1014,7 +1014,7 @@
         "web/src/components/settings/FormFields.tsx",
         "web/src/components/settings/SchemaSection.tsx"
       ],
-      "notes": "The Updates tab shows the Daemon port (`serve.port`) under a Daemon heading; editing it saves `{ serve: { port } }` through the normal settings path. Global only; a new value applies after a stop and start. The same block renders the Funnel port select (`serve.funnel_port`) from the schema with no web code of its own. Folder-ignore entries (`sandbox.volume_ignores`) are checked client-side from the schema's `volume_ignore_list` rule: an absolute path, a `:` or a `..` segment is rejected inline and not saved, while a relative entry such as node_modules saves as `{ sandbox: { volume_ignores } }`."
+      "notes": "The Updates tab shows the Daemon port (`serve.port`) under a Daemon heading; editing it saves `{ serve: { port } }` through the normal settings path. Global only; a new value applies after a stop and start. The same block renders the Funnel port select (`serve.funnel_port`) from the schema with no web code of its own. Folder-ignore entries (`sandbox.volume_ignores`) are checked client-side from the schema's `volume_ignore_list` rule: an absolute path, a `:` or a `..` segment is rejected inline and not saved, while a relative entry such as node_modules saves as `{ sandbox: { volume_ignores } }`. Port mappings (`sandbox.port_mappings`) reject a port above 65535 on either side inline and keep the draft, while `65535:65535` saves as `{ sandbox: { port_mappings } }`."
     },
     {
       "id": "settings.global-migration-and-persistence",
