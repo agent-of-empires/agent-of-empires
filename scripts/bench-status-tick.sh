@@ -57,12 +57,18 @@ for i in $(seq 1 "$N"); do
     \"command_override\":\"sh -c 'printf \\\"> \\\"; exec sleep 86400'\"}" >/dev/null
 done
 
+LIST=$(curl -fsS "$API" -H "$AUTH" |
+  python3 -c 'import json,sys; [print(s["id"]) for s in json.load(sys.stdin)["sessions"]]')
+[ "$(printf '%s\n' "$LIST" | grep -c .)" -eq "$N" ] || {
+  echo "expected $N sessions, got: $LIST" >&2
+  exit 1
+}
 while read -r id; do
   IDS+=("$id")
   d="/tmp/aoe-hooks-$(id -u)/$id"
   mkdir -p "$d" && chmod 700 "$d"
   echo idle > "$d/status"
-done < <(curl -fsS "$API" -H "$AUTH" | python3 -c 'import json,sys; [print(s["id"]) for s in json.load(sys.stdin)["sessions"]]')
+done <<< "$LIST"
 
 sleep 30
 : > "$B/tmux.log"
