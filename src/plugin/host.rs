@@ -1119,6 +1119,7 @@ mod tests {
             at: chrono::DateTime::parse_from_rfc3339("2026-10-03T12:00:00Z")
                 .unwrap()
                 .with_timezone(&chrono::Utc),
+            restores_prior: false,
         }
     }
 

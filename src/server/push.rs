@@ -31,6 +31,8 @@ pub struct StatusChange {
     pub old: Status,
     pub new: Status,
     pub at: DateTime<Utc>,
+    /// Puts back the status a failed Retry's `Starting` replaced, rather than reporting a new one.
+    pub restores_prior: bool,
 }
 
 /// Publish once after the authoritative status commit; unchanged rows emit nothing.
@@ -38,6 +40,24 @@ pub fn publish_status_change(
     status_tx: &tokio::sync::broadcast::Sender<StatusChange>,
     inst: &crate::session::Instance,
     old: Status,
+) {
+    publish_committed(status_tx, inst, old, false);
+}
+
+/// [`publish_status_change`] for a failed Retry's rollback to the status it replaced.
+pub fn publish_retry_rollback(
+    status_tx: &tokio::sync::broadcast::Sender<StatusChange>,
+    inst: &crate::session::Instance,
+    old: Status,
+) {
+    publish_committed(status_tx, inst, old, true);
+}
+
+fn publish_committed(
+    status_tx: &tokio::sync::broadcast::Sender<StatusChange>,
+    inst: &crate::session::Instance,
+    old: Status,
+    restores_prior: bool,
 ) {
     if inst.status == old {
         return;
@@ -51,6 +71,7 @@ pub fn publish_status_change(
             old,
             new: inst.status,
             at: Utc::now(),
+            restores_prior,
         },
     );
 }
@@ -514,6 +535,9 @@ struct DwellState {
     idle_since: Option<std::time::Instant>,
     /// When the session most recently entered Error.
     error_since: Option<std::time::Instant>,
+    /// Set while a Retry's `Starting` follows an `Error`: that error's `error_since`, `None`
+    /// once it notified. A return to Error resumes it rather than arming a new one.
+    error_before_start: Option<Option<std::time::Instant>>,
     /// Last time a push fired for this session (any event type). Used
     /// for a shared per-session cooldown: rapid-fire events like
     /// Error → brief Running → Error don't double-buzz.
@@ -589,13 +613,28 @@ fn handle_status_change(dwell: &mut HashMap<String, DwellState>, change: StatusC
     entry.title = change.instance_title;
     let now = std::time::Instant::now();
     // Exactly one `*_since` is set at a time.
+    let resumed_error = match (change.old, change.new) {
+        (Status::Error, Status::Starting) => {
+            entry.error_before_start = Some(entry.error_since);
+            None
+        }
+        // Only a rollback resumes the earlier error's dwell; any other launch failure is new.
+        (Status::Starting, Status::Error) => entry
+            .error_before_start
+            .take()
+            .filter(|_| change.restores_prior),
+        _ => {
+            entry.error_before_start = None;
+            None
+        }
+    };
     entry.waiting_since = None;
     entry.idle_since = None;
     entry.error_since = None;
     match change.new {
         Status::Waiting => entry.waiting_since = Some(now),
         Status::Idle => entry.idle_since = Some(now),
-        Status::Error => entry.error_since = Some(now),
+        Status::Error => entry.error_since = resumed_error.unwrap_or(Some(now)),
         _ => {}
     }
     // Drop entries for transitions into Stopped/Deleting so the map doesn't grow forever in
@@ -1779,6 +1818,7 @@ mod tests {
                 old: Status::Running,
                 new: Status::Waiting,
                 at: Utc::now(),
+                restores_prior: false,
             },
         );
         assert!(dwell.get(&id).unwrap().waiting_since.is_some());
@@ -1795,9 +1835,58 @@ mod tests {
                 old: Status::Waiting,
                 new: Status::Running,
                 at: Utc::now(),
+                restores_prior: false,
             },
         );
         assert!(dwell.get(&id).unwrap().waiting_since.is_none());
+    }
+
+    /// #5671: a Retry's rollback to Error resumes the earlier error instead of arming a second
+    /// "errored" push. Any other launch failure, such as a Terminal launch or a Retry's new worker
+    /// failing, is new and notifies again once the cooldown has passed, as is one from Stopped.
+    #[test]
+    fn only_a_retry_rollback_resumes_the_earlier_error() {
+        let change = |old, new, restores_prior| StatusChange {
+            instance_id: "sess-5671".into(),
+            instance_title: "retry".into(),
+            effective_profile: "default".into(),
+            old,
+            new,
+            at: Utc::now(),
+            restores_prior,
+        };
+        let watch = crate::server::state::WebWatch::Nothing;
+        let later = std::time::Instant::now() + std::time::Duration::from_secs(3600);
+        // (statuses before the launch, whether the error already notified and its cooldown has
+        // passed, whether the Error is a rollback, notifications due)
+        let cases = [
+            (vec![Status::Running, Status::Error], true, true, 0),
+            (vec![Status::Running, Status::Error], false, true, 1),
+            (vec![Status::Stopped], false, true, 1),
+            (vec![Status::Running, Status::Error], true, false, 1),
+        ];
+        for (before, notified, rollback, want) in cases {
+            let mut dwell: HashMap<String, DwellState> = HashMap::new();
+            for pair in before.windows(2) {
+                handle_status_change(&mut dwell, change(pair[0], pair[1], false));
+            }
+            if notified {
+                assert_eq!(due_events(&mut dwell, &watch, later).len(), 1, "{before:?}");
+                dwell.get_mut("sess-5671").unwrap().last_notified = None;
+            }
+            let prior = *before.last().unwrap();
+            handle_status_change(&mut dwell, change(prior, Status::Starting, false));
+            handle_status_change(
+                &mut dwell,
+                change(Status::Starting, Status::Error, rollback),
+            );
+            let due = due_events(&mut dwell, &watch, later);
+            assert_eq!(
+                due.len(),
+                want,
+                "{before:?} notified={notified} rollback={rollback}"
+            );
+        }
     }
 
     #[test]
@@ -1855,6 +1944,7 @@ mod tests {
             old: Status::Running,
             new,
             at: Utc::now(),
+            restores_prior: false,
         };
 
         handle_status_change(&mut dwell, ev(Status::Waiting));
@@ -1951,6 +2041,7 @@ mod tests {
                 old: Status::Running,
                 new: Status::Waiting,
                 at: Utc::now(),
+                restores_prior: false,
             },
         );
         assert!(dwell.contains_key(&id));
@@ -1963,6 +2054,7 @@ mod tests {
                 old: Status::Waiting,
                 new: Status::Stopped,
                 at: Utc::now(),
+                restores_prior: false,
             },
         );
         assert!(!dwell.contains_key(&id));

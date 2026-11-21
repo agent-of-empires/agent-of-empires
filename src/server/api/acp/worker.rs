@@ -6,6 +6,7 @@ use serde::{Deserialize, Serialize};
 use crate::acp::protocol::{
     SwitchAgentRequest, SwitchAgentResponse, SwitchProviderRequest, SwitchProviderResponse,
 };
+use crate::server::acp_events::RetryStartingGuard;
 use crate::server::acp_reconciler::install_rate_limit_continuation;
 use crate::server::api::find_instance;
 
@@ -238,11 +239,7 @@ pub async fn spawn_acp(
         .acp_supervisor
         .reserve_spawn(
             &id,
-            if request.stored_acp_session_id.is_some() {
-                crate::acp::supervisor::ResumeKind::Spawn
-            } else {
-                crate::acp::supervisor::ResumeKind::SpawnFirst
-            },
+            request.resume_kind(),
             crate::process::worker_registry::ResumeAuthority::Explicit,
         )
         .await
@@ -258,6 +255,12 @@ pub async fn spawn_acp(
             &SupervisorError::SpawnCancelled(id.clone()),
         );
     }
+    // Past every refusal: only the launch itself can fail from here.
+    let starting = if reservation.is_some() {
+        RetryStartingGuard::begin(&state, &id).await
+    } else {
+        None
+    };
     drop(exclusion);
     if let Some(reservation) = reservation {
         if let Err(e) = state.acp_supervisor.spawn_inner(request, reservation).await {
@@ -295,6 +298,9 @@ pub async fn spawn_acp(
         state
             .acp_supervisor
             .publish_rate_limit_auto_resumed(&id, resets_at, true);
+    }
+    if let Some(starting) = starting {
+        starting.disarm();
     }
     Json(SpawnAcpResponse {
         session_id: id,
@@ -609,22 +615,35 @@ async fn restart_acp_inner(state: Arc<AppState>, id: String, req: SpawnAcpReques
             &crate::acp::supervisor::SupervisorError::SpawnCancelled(id.clone()),
         );
     }
-    drop(exclusion);
-    match state
+    let reservation = match state
         .acp_supervisor
-        .spawn_for_restart(
-            request,
+        .reserve_for_restart(
+            &id,
+            request.resume_kind(),
             crate::process::worker_registry::ResumeAuthority::Explicit,
             &restart,
         )
         .await
     {
-        Ok(()) => Json(SpawnAcpResponse {
-            session_id: id,
-            agent,
-            status: "running",
-        })
-        .into_response(),
+        Ok(reservation) => reservation,
+        Err(e) => return supervisor_error_response("restart spawn failed", &e),
+    };
+    // Past every refusal, capacity included, and after resume_structured_stop read the row's
+    // `Stopped`.
+    let starting = RetryStartingGuard::begin(&state, &id).await;
+    drop(exclusion);
+    match state.acp_supervisor.spawn_inner(request, reservation).await {
+        Ok(()) => {
+            if let Some(starting) = starting {
+                starting.disarm();
+            }
+            Json(SpawnAcpResponse {
+                session_id: id,
+                agent,
+                status: "running",
+            })
+            .into_response()
+        }
         Err(e) => supervisor_error_response("restart spawn failed", &e),
     }
 }
@@ -1300,11 +1319,7 @@ pub async fn switch_acp_provider(
         .acp_supervisor
         .reserve_spawn(
             &id,
-            if request.stored_acp_session_id.is_some() {
-                crate::acp::supervisor::ResumeKind::Spawn
-            } else {
-                crate::acp::supervisor::ResumeKind::SpawnFirst
-            },
+            request.resume_kind(),
             crate::process::worker_registry::ResumeAuthority::Explicit,
         )
         .await

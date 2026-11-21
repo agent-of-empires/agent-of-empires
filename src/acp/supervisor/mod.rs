@@ -466,6 +466,17 @@ pub struct SpawnRequest {
     pub claude_store_pin: Option<crate::session::capture::ClaudeStorePin>,
 }
 
+impl SpawnRequest {
+    /// `Spawn` resumes a stored conversation; `SpawnFirst` starts one.
+    pub(crate) fn resume_kind(&self) -> ResumeKind {
+        if self.stored_acp_session_id.is_some() {
+            ResumeKind::Spawn
+        } else {
+            ResumeKind::SpawnFirst
+        }
+    }
+}
+
 #[derive(Clone)]
 pub(crate) struct LaunchAdmission {
     pub store: Arc<dyn crate::session::SessionStore>,
@@ -642,6 +653,11 @@ impl<S: BroadcastSink> Supervisor<S> {
                     .map(|(id, seq)| (id, Arc::new(std::sync::Mutex::new(seq)))),
             );
         }
+    }
+
+    /// The last seq allocated for the session, 0 before any.
+    pub(crate) fn latest_seq(&self, session_id: &str) -> u64 {
+        *lock_recover(&session_seq(&self.next_seqs, session_id))
     }
 
     /// The running epoch, for a caller that must stop only that epoch.

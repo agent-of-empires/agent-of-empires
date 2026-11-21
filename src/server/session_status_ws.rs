@@ -244,6 +244,7 @@ mod tests {
             old: Status::Running,
             new,
             at: Utc::now(),
+            restores_prior: false,
         }
     }
 

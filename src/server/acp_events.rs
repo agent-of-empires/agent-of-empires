@@ -150,6 +150,7 @@ pub(super) async fn acp_event_listener(state: Arc<AppState>) {
                     &state.instance_locks,
                     state.file_watch.clone(),
                     &state.status_tx,
+                    &state.retry_starting,
                 )
                 .await;
                 if recovered > 0 {
@@ -560,8 +561,11 @@ pub(super) async fn acp_event_listener(state: Arc<AppState>) {
             // between. A future refactor that makes `apply_status_intent`
             // assign `status` more than once has to revisit this.
             let old_status = inst.status;
-            if let Some((policy, projected)) = status_update.filter(|_| live_worker) {
+            if let Some((policy, projected)) = status_update.filter(|_| {
+                live_worker && !retired_before_retry(&state.retry_starting, inst, frame.seq)
+            }) {
                 apply_status_intent(inst, policy, projected, &state.status_tx);
+                settle_retry_starting(&state.retry_starting, inst, old_status);
             }
             canonical_changed |= old_status != inst.status;
             let unread_profile =
@@ -577,9 +581,7 @@ pub(super) async fn acp_event_listener(state: Arc<AppState>) {
             (profile_to_save, unread_profile, attested_profile)
         };
         if canonical_changed {
-            state
-                .mutation_epoch
-                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            state.note_row_mutation();
         }
         // Turn-end helpers acquire the same per-session lock.
         if unread_profile.is_some() {
@@ -780,6 +782,178 @@ fn revival_pending_clears_on(status: Status) -> bool {
     )
 }
 
+/// The Retry attempt that owns a row's `Starting`, by session id.
+pub(crate) type RetryStarting = std::sync::Mutex<std::collections::HashMap<String, RetryAttempt>>;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct RetryAttempt {
+    attempt: u64,
+    /// The latest event seq when the attempt began: frames at or below it are a retired worker's.
+    watermark: u64,
+    /// What the row was before the first of the attempts held `Starting`.
+    prior: Status,
+}
+
+static NEXT_RETRY_ATTEMPT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+
+/// Whether a status projected at `seq` predates a Retry's `Starting`, so it is the retired
+/// worker's and must not move the row.
+pub(crate) fn retired_before_retry(
+    retry_starting: &RetryStarting,
+    inst: &Instance,
+    seq: u64,
+) -> bool {
+    inst.status == Status::Starting
+        && retry_starting
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(&inst.id)
+            .is_some_and(|owner| seq <= owner.watermark)
+}
+
+/// The seq a fold's projection speaks for, for [`retired_before_retry`]. While a Retry owns the
+/// row only a status-bearing event counts: an unrelated one, such as a summary, advances
+/// `last_seq` without the new worker reporting.
+pub(crate) async fn newest_status_seq(
+    retry_starting: &RetryStarting,
+    service: &crate::server::session_service::SessionService,
+    id: &str,
+    last_seq: u64,
+) -> u64 {
+    let watermark = retry_starting
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .get(id)
+        .map(|owner| owner.watermark);
+    match watermark {
+        Some(watermark) if !service.reports_status_after(id, watermark).await => watermark,
+        _ => last_seq,
+    }
+}
+
+/// Forget a Retry's attempt once its row has left `Starting`.
+fn settle_retry_starting(retry_starting: &RetryStarting, inst: &Instance, old_status: Status) {
+    if old_status == Status::Starting && inst.status != Status::Starting {
+        retry_starting
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(&inst.id);
+    }
+}
+
+/// A Retry's `Starting`, held until the launch succeeds. Dropped armed (an error return, a
+/// panic or a cancelled handler), it restores the prior status unless a newer frame moved the row
+/// or a later attempt owns it.
+pub(crate) struct RetryStartingGuard {
+    state: Arc<AppState>,
+    id: String,
+    attempt: u64,
+    armed: bool,
+}
+
+impl RetryStartingGuard {
+    /// Moves an `Error` or `Stopped` row to `Starting`, or takes over the `Starting` an earlier
+    /// attempt left; `None` otherwise. Callers hold the session's launch admission (a spawn
+    /// reservation, or a restart claim with the old worker gone), which proves no earlier attempt
+    /// is still launching, so taking over is safe even before that attempt's guard has dropped.
+    pub(crate) async fn begin(state: &Arc<AppState>, id: &str) -> Option<Self> {
+        let mut instances = state.instances.write().await;
+        let inst = instances.iter_mut().find(|i| i.id == id)?;
+        let attempt = NEXT_RETRY_ATTEMPT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let watermark = state.acp_supervisor.latest_seq(id);
+        let mut owners = state
+            .retry_starting
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let prior = match (inst.status, owners.get(id)) {
+            (Status::Starting, Some(earlier)) => earlier.prior,
+            (Status::Starting, None) => return None,
+            (prior, _) => {
+                apply_status_intent(
+                    inst,
+                    StatusPolicy::Launch,
+                    Status::Starting,
+                    &state.status_tx,
+                );
+                if inst.status != Status::Starting {
+                    return None;
+                }
+                state.note_row_mutation();
+                state.runtime.request_publish();
+                prior
+            }
+        };
+        owners.insert(
+            id.to_string(),
+            RetryAttempt {
+                attempt,
+                watermark,
+                prior,
+            },
+        );
+        Some(Self {
+            state: state.clone(),
+            id: id.to_string(),
+            attempt,
+            armed: true,
+        })
+    }
+
+    /// The launch succeeded: the new worker's own frames now move the row.
+    pub(crate) fn disarm(mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for RetryStartingGuard {
+    fn drop(&mut self) {
+        // Outside a runtime (Daemon shutdown) there is nothing to revert into; boot re-projects.
+        if !self.armed || tokio::runtime::Handle::try_current().is_err() {
+            return;
+        }
+        let state = self.state.clone();
+        let id = std::mem::take(&mut self.id);
+        let attempt = self.attempt;
+        self.state
+            .runtime
+            .work
+            .spawn("server.acp.retry_starting_revert", async move {
+                revert_retry_starting(&state, &id, attempt).await;
+            });
+    }
+}
+
+async fn revert_retry_starting(state: &AppState, id: &str, attempt: u64) {
+    #[cfg(test)]
+    retry_test_gate::RevertGate::wait(id).await;
+    let mut instances = state.instances.write().await;
+    let prior = {
+        let mut owners = state
+            .retry_starting
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        // A newer frame settled the row, or a later attempt owns it now.
+        match owners.get(id) {
+            Some(owner) if owner.attempt == attempt => {}
+            _ => return,
+        }
+        owners.remove(id).map(|owner| owner.prior)
+    };
+    if let (Some(inst), Some(prior)) = (
+        instances
+            .iter_mut()
+            .find(|i| i.id == id && i.status == Status::Starting),
+        prior,
+    ) {
+        if let Some(prev) = commit_status_intent(inst, StatusPolicy::Authoritative, prior) {
+            crate::server::push::publish_retry_rollback(&state.status_tx, inst, prev);
+        }
+        state.note_row_mutation();
+        drop(instances);
+        state.runtime.request_publish();
+    }
+}
+
 /// Fold a projected status into an `Instance` under `policy`. Pure mutation;
 /// callers hold the write lock. Sends a `StatusChange` on
 /// `status_tx` so push notifications and the dashboard see the
@@ -790,13 +964,24 @@ pub(crate) fn apply_status_intent(
     target: Status,
     status_tx: &broadcast::Sender<StatusChange>,
 ) {
+    if let Some(prev) = commit_status_intent(inst, policy, target) {
+        publish_status_change(status_tx, inst, prev);
+    }
+}
+
+/// [`apply_status_intent`] without the publish: the status it moved the row from, if it did.
+fn commit_status_intent(
+    inst: &mut Instance,
+    policy: StatusPolicy,
+    target: Status,
+) -> Option<Status> {
     // Genuine in-flight terminal states: never fight them.
     if inst.is_trashed() || matches!(inst.status, Status::Deleting | Status::Creating) {
-        return;
+        return None;
     }
     match policy {
         // A Stopped session must not be woken by a trailing worker event.
-        StatusPolicy::Authoritative if inst.status == Status::Stopped => return,
+        StatusPolicy::Authoritative if inst.status == Status::Stopped => return None,
         StatusPolicy::Authoritative => {}
         // Background sub-agent events must not speak for the main turn: they
         // preserve its Waiting (a pending approval/elicitation) and Error (a
@@ -809,15 +994,23 @@ pub(crate) fn apply_status_intent(
                 inst.status,
                 Status::Stopped | Status::Waiting | Status::Error
             ) {
-                return;
+                return None;
             }
         }
         // Only from AcpSessionAssigned / RateLimitAutoResumed, emitted when a
         // fresh worker attaches. The listener drops a retired worker's identity
         // frame before it gets here, since it can trail the stop.
         StatusPolicy::Heal => {
+            if !matches!(
+                inst.status,
+                Status::Error | Status::Stopped | Status::Starting
+            ) {
+                return None;
+            }
+        }
+        StatusPolicy::Launch => {
             if !matches!(inst.status, Status::Error | Status::Stopped) {
-                return;
+                return None;
             }
         }
     }
@@ -829,7 +1022,7 @@ pub(crate) fn apply_status_intent(
         inst.plugin_revival_pending = false;
     }
     if inst.status == target {
-        return;
+        return None;
     }
     let prev = inst.status;
     inst.status = target;
@@ -840,7 +1033,7 @@ pub(crate) fn apply_status_intent(
     } else {
         None
     };
-    publish_status_change(status_tx, inst, prev);
+    Some(prev)
 }
 
 /// Whether a structured row whose ACP status just moved should take the
@@ -950,6 +1143,7 @@ pub(super) async fn recover_structured_unread_after_lag(
     instance_locks: &RwLock<std::collections::HashMap<String, Arc<tokio::sync::Mutex<()>>>>,
     file_watch: Arc<crate::file_watch::FileWatchService>,
     status_tx: &broadcast::Sender<StatusChange>,
+    retry_starting: &RetryStarting,
 ) -> usize {
     let ids: Vec<String> = instances
         .read()
@@ -961,9 +1155,13 @@ pub(super) async fn recover_structured_unread_after_lag(
     let unread_enabled = crate::session::unread_enabled();
     let mut marked = 0usize;
     for id in ids {
-        let Some(projected) = folded_sidebar_status(service, &id).await else {
+        let fold = service.fold_control_state(&id).await;
+        if fold.last_seq == 0 {
             continue;
-        };
+        }
+        let projected = fold.sidebar_status();
+        let newest_status_seq =
+            newest_status_seq(retry_starting, service, &id, fold.last_seq).await;
         // Same snapshot-around-apply as the live path, so "the transition that
         // was actually applied" means the same thing in both.
         let unread_profile = {
@@ -975,7 +1173,10 @@ pub(super) async fn recover_structured_unread_after_lag(
                 continue;
             }
             let old_status = inst.status;
-            apply_status_intent(inst, StatusPolicy::Authoritative, projected, status_tx);
+            if !retired_before_retry(retry_starting, inst, newest_status_seq) {
+                apply_status_intent(inst, StatusPolicy::Authoritative, projected, status_tx);
+                settle_retry_starting(retry_starting, inst, old_status);
+            }
             should_mark_acp_unread(inst, old_status, unread_enabled)
                 .then(|| inst.source_profile.clone())
         };
@@ -1123,8 +1324,10 @@ pub(crate) enum StatusPolicy {
     /// resolve: `Waiting`, `Stopped` or `Error`. Used only by background
     /// work events (#4001).
     Background,
-    /// Only takes effect from `Error` or `Stopped`: a fresh worker attached.
+    /// Only takes effect from `Error`, `Stopped` or a Retry's `Starting`: a fresh worker attached.
     Heal,
+    /// A Retry starting the Agent from `Error` or `Stopped`. Set by handlers, never by an event.
+    Launch,
 }
 
 /// The events that move the sidebar status, and how.
@@ -1157,6 +1360,73 @@ pub(crate) fn status_policy(event: &crate::acp::Event) -> Option<StatusPolicy> {
             Some(StatusPolicy::Heal)
         }
         _ => None,
+    }
+}
+
+#[cfg(test)]
+pub(crate) mod retry_test_gate {
+    use tokio::sync::oneshot;
+
+    type Gate = (Option<oneshot::Sender<()>>, Option<oneshot::Receiver<()>>);
+    static GATES: std::sync::Mutex<Vec<(String, Gate)>> = std::sync::Mutex::new(Vec::new());
+
+    /// Test-only: parks a Retry's rollback for `id` before it takes `instances`, until released.
+    /// Dropping the gate releases a parked rollback.
+    pub(crate) struct RevertGate {
+        id: String,
+        release: Option<oneshot::Sender<()>>,
+    }
+
+    impl RevertGate {
+        /// The gate, and a receiver that fires when a rollback parks at it.
+        pub(crate) fn arm(id: &str) -> (Self, oneshot::Receiver<()>) {
+            let (entered_tx, entered_rx) = oneshot::channel();
+            let (release_tx, release_rx) = oneshot::channel();
+            GATES
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .push((id.to_owned(), (Some(entered_tx), Some(release_rx))));
+            let gate = Self {
+                id: id.to_owned(),
+                release: Some(release_tx),
+            };
+            (gate, entered_rx)
+        }
+
+        pub(crate) fn release(mut self) {
+            if let Some(release) = self.release.take() {
+                let _ = release.send(());
+            }
+        }
+
+        pub(super) async fn wait(id: &str) {
+            let gate = {
+                let mut gates = GATES.lock().unwrap_or_else(|e| e.into_inner());
+                gates
+                    .iter_mut()
+                    .find(|(gated, _)| gated == id)
+                    .map(|(_, (entered, release))| (entered.take(), release.take()))
+            };
+            if let Some((entered, Some(release))) = gate {
+                if let Some(entered) = entered {
+                    let _ = entered.send(());
+                }
+                // A dropped gate closes the channel, which releases the rollback too.
+                let _ = release.await;
+            }
+        }
+    }
+
+    impl Drop for RevertGate {
+        fn drop(&mut self) {
+            if let Some(release) = self.release.take() {
+                let _ = release.send(());
+            }
+            GATES
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .retain(|(gated, _)| gated != &self.id);
+        }
     }
 }
 
@@ -1492,6 +1762,7 @@ mod tests {
             &locks,
             crate::file_watch::FileWatchService::noop(),
             &status_tx,
+            &state.retry_starting,
         )
         .await;
 
@@ -1608,6 +1879,7 @@ mod tests {
                 &locks,
                 crate::file_watch::FileWatchService::noop(),
                 &status_tx,
+                &state.retry_starting,
             )
             .await;
 
@@ -2213,6 +2485,306 @@ mod tests {
         listener.abort();
         let _ = listener.await;
         assert_eq!(row.status, Status::Error);
+    }
+
+    /// #5671: a Retry's `Starting` ignores the retired worker's trailing frames and moves on the
+    /// new worker's first one. The trailing frame is sent first, so the new one's change proves
+    /// it was handled.
+    #[tokio::test]
+    async fn acp_event_listener_holds_a_retry_starting_against_the_retired_worker() {
+        use crate::acp::Event;
+        let temp = tempfile::tempdir().expect("tempdir");
+        let _app_dir = crate::session::test_support::isolate_app_dir_at(temp.path());
+        let assigned = Event::AcpSessionAssigned {
+            acp_session_id: "acp-new".into(),
+        };
+        // (new worker's first frame, the status it settles the row on)
+        let cases = [
+            (assigned, Status::Idle),
+            (Event::startup_error("adapter exited"), Status::Error),
+        ];
+        for (fresh, want) in cases {
+            let mut inst = Instance::new("acp-5671", "/tmp/acp");
+            inst.view = crate::session::View::Structured;
+            inst.status = Status::Error;
+            let id = inst.id.clone();
+            let state = test_support::build_test_app_state(vec![inst]);
+            state.acp_supervisor.hydrate_seqs([(id.clone(), 5)]);
+            let guard = RetryStartingGuard::begin(&state, &id)
+                .await
+                .expect("an Error row starts");
+            guard.disarm();
+            let mut changes = state.status_tx.subscribe();
+
+            let listener = tokio::spawn(acp_event_listener(state.clone()));
+            await_subscribed(&state).await;
+            let frame = |seq, event: Event, sidebar_status| AcpBroadcastFrame {
+                session_id: id.clone(),
+                seq,
+                event: Arc::new(event),
+                worker_generation: None,
+                sidebar_status,
+            };
+            let retired = Event::Stopped {
+                reason: "user_stopped".into(),
+            };
+            for frame in [
+                frame(5, retired, Some(Status::Stopped)),
+                frame(6, fresh, Some(want)),
+            ] {
+                state
+                    .acp_events_tx
+                    .send(frame)
+                    .expect("listener is subscribed");
+            }
+
+            let change = tokio::time::timeout(std::time::Duration::from_secs(10), changes.recv())
+                .await
+                .expect("the new worker's frame moves the row")
+                .expect("status channel open");
+            listener.abort();
+            let _ = listener.await;
+            assert_eq!(
+                (change.old, change.new),
+                (Status::Starting, want),
+                "{want:?}"
+            );
+            assert!(changes.try_recv().is_err(), "{want:?}: one change only");
+            assert!(state.retry_starting.lock().unwrap().is_empty(), "{want:?}");
+        }
+    }
+
+    /// #5671: lag recovery applies a fold projection, not a frame, so it checks the newest
+    /// status-bearing seq against the Retry watermark: a fold the retired worker wrote, or one
+    /// past it only by an unrelated event, leaves `Starting`; a newer status moves it.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn recover_structured_unread_after_lag_holds_a_retry_starting() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let _app_dir = crate::session::test_support::isolate_app_dir_at(temp.path());
+        let summary = || crate::acp::Event::ConversationSummary {
+            text: "recap".into(),
+            summarized_until_seq: 1,
+        };
+        let stopped = || crate::acp::Event::Stopped {
+            reason: "user_stopped".into(),
+        };
+        // (watermark, events after the retired worker's Stopped at seq 1, status after recovery)
+        let cases = [
+            (1, vec![], Status::Starting),
+            (0, vec![], Status::Idle),
+            (1, vec![summary()], Status::Starting),
+            (1, vec![summary(), stopped()], Status::Idle),
+        ];
+        for (watermark, later, want) in cases {
+            let mut inst = Instance::new("acp-5671-lag", "/tmp/acp");
+            inst.view = crate::session::View::Structured;
+            inst.status = Status::Error;
+            let id = inst.id.clone();
+            let state = test_support::build_test_app_state(vec![inst]);
+            state
+                .acp_event_store
+                .record(&id, 1, &stopped())
+                .expect("record");
+            state.acp_supervisor.hydrate_seqs([(id.clone(), watermark)]);
+            RetryStartingGuard::begin(&state, &id)
+                .await
+                .expect("an Error row starts")
+                .disarm();
+            let kinds = format!("{later:?}");
+            for (seq, event) in (2..).zip(later) {
+                state
+                    .acp_event_store
+                    .record(&id, seq, &event)
+                    .expect("record");
+            }
+
+            recover_structured_unread_after_lag(
+                &state.instances,
+                &state.session_service,
+                &state.instance_locks,
+                crate::file_watch::FileWatchService::noop(),
+                &state.status_tx,
+                &state.retry_starting,
+            )
+            .await;
+
+            assert_eq!(
+                state.instances.read().await[0].status,
+                want,
+                "watermark {watermark}, then {kinds}"
+            );
+        }
+    }
+
+    async fn published_status(state: &Arc<AppState>, id: &str) -> Option<Status> {
+        let snapshot = state.runtime.publish(state).await.expect("publishes");
+        snapshot
+            .value
+            .contents
+            .sessions
+            .iter()
+            .find(|row| row.id == id)
+            .and_then(|row| Status::from_api_str(&row.status))
+    }
+
+    /// Joins the Retry rollbacks this test released, with a deadline.
+    async fn drained(state: &Arc<AppState>) {
+        tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            state.runtime.work.drain(),
+        )
+        .await
+        .expect("the released rollback finishes");
+    }
+
+    /// #5921: a Retry's `Starting` and its rollback each wake the publisher, so the published
+    /// snapshot follows at once rather than on the next publish tick.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn a_retry_publishes_starting_and_its_rollback() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let _app_dir = crate::session::test_support::isolate_app_dir_at(temp.path());
+        let mut inst = stopped_structured_instance();
+        inst.status = Status::Error;
+        let id = inst.id.clone();
+        let state = test_support::build_test_app_state(vec![inst]);
+        state.runtime.take_publish_request().await;
+
+        let guard = RetryStartingGuard::begin(&state, &id)
+            .await
+            .expect("an Error row starts");
+        assert!(state.runtime.take_publish_request().await, "Starting");
+        assert_eq!(published_status(&state, &id).await, Some(Status::Starting));
+
+        drop(guard);
+        drained(&state).await;
+        assert!(state.runtime.take_publish_request().await, "the rollback");
+        assert_eq!(published_status(&state, &id).await, Some(Status::Error));
+    }
+
+    /// #5921: a Retry admitted while an earlier attempt's rollback is still to run owns the row.
+    /// The earlier rollback, whether its guard drops after the new attempt began or it was
+    /// already parked when it did, leaves the row `Starting` until the new launch settles.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn a_later_retry_owns_the_row() {
+        use crate::acp::Event;
+        use retry_test_gate::RevertGate;
+        let temp = tempfile::tempdir().expect("tempdir");
+        let _app_dir = crate::session::test_support::isolate_app_dir_at(temp.path());
+        // (the later attempt begins before the earlier guard drops, the new worker's frame
+        // settles it rather than its own failure)
+        for (begins_first, launched) in [(true, true), (true, false), (false, true), (false, false)]
+        {
+            let case = format!("begins_first={begins_first} launched={launched}");
+            let mut inst = stopped_structured_instance();
+            inst.status = Status::Error;
+            let id = inst.id.clone();
+            let state = test_support::build_test_app_state(vec![inst]);
+            state.acp_supervisor.hydrate_seqs([(id.clone(), 5)]);
+            let mut changes = state.status_tx.subscribe();
+            let (gate, parked) = RevertGate::arm(&id);
+            let earlier = RetryStartingGuard::begin(&state, &id)
+                .await
+                .expect("an Error row starts");
+            let later = if begins_first {
+                let later = RetryStartingGuard::begin(&state, &id).await;
+                drop(earlier);
+                later
+            } else {
+                drop(earlier);
+                tokio::time::timeout(std::time::Duration::from_secs(10), parked)
+                    .await
+                    .expect("the earlier rollback parks")
+                    .expect("gate open");
+                RetryStartingGuard::begin(&state, &id).await
+            };
+            let later = later.unwrap_or_else(|| panic!("{case}: the later attempt owns the row"));
+            gate.release();
+            drained(&state).await;
+            assert_eq!(
+                state.instances.read().await[0].status,
+                Status::Starting,
+                "{case}"
+            );
+            assert_eq!(
+                published_status(&state, &id).await,
+                Some(Status::Starting),
+                "{case}"
+            );
+            let started = changes.try_recv().map(|c| (c.old, c.new));
+            assert_eq!(
+                started.ok(),
+                Some((Status::Error, Status::Starting)),
+                "{case}"
+            );
+            assert!(changes.try_recv().is_err(), "{case}: no other change yet");
+
+            let settled = if launched {
+                later.disarm();
+                let listener = tokio::spawn(acp_event_listener(state.clone()));
+                await_subscribed(&state).await;
+                let assigned = Event::AcpSessionAssigned {
+                    acp_session_id: "acp-new".into(),
+                };
+                state
+                    .acp_events_tx
+                    .send(AcpBroadcastFrame {
+                        session_id: id.clone(),
+                        seq: 6,
+                        event: Arc::new(assigned),
+                        worker_generation: None,
+                        sidebar_status: Some(Status::Idle),
+                    })
+                    .expect("listener is subscribed");
+                let change =
+                    tokio::time::timeout(std::time::Duration::from_secs(10), changes.recv())
+                        .await
+                        .expect("the new worker's frame moves the row")
+                        .expect("status channel open");
+                listener.abort();
+                let _ = listener.await;
+                (change.old, change.new)
+            } else {
+                // Back to what the row was before either attempt.
+                drop(later);
+                drained(&state).await;
+                let change = changes.try_recv().expect("the rollback's change");
+                (change.old, change.new)
+            };
+            let want = if launched {
+                Status::Idle
+            } else {
+                Status::Error
+            };
+            assert_eq!(settled, (Status::Starting, want), "{case}");
+            assert_eq!(state.instances.read().await[0].status, want, "{case}");
+            assert!(changes.try_recv().is_err(), "{case}: one settling change");
+            assert!(state.retry_starting.lock().unwrap().is_empty(), "{case}");
+        }
+    }
+
+    /// #5671: a guard dropped after its runtime is gone (Daemon shutdown) must not panic.
+    #[test]
+    fn retry_starting_guard_drops_quietly_outside_a_runtime() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let (state, guard) = runtime.block_on(async {
+            let mut inst = stopped_structured_instance();
+            inst.status = Status::Error;
+            let id = inst.id.clone();
+            let state = test_support::build_test_app_state(vec![inst]);
+            let guard = RetryStartingGuard::begin(&state, &id)
+                .await
+                .expect("starts");
+            (state, guard)
+        });
+        drop(runtime);
+        drop(guard);
+        assert_eq!(state.retry_starting.lock().unwrap().len(), 1);
     }
 
     /// #4001: after a daemon restart the control cache is cold. A reattached
@@ -2854,14 +3426,22 @@ mod tests {
     /// and no transition stamps `last_accessed_at` (#3465).
     #[test]
     fn apply_status_intent_matrix() {
-        use Status::{Creating, Deleting, Error, Idle, Running, Stopped, Waiting};
-        use StatusPolicy::{Authoritative, Background, Heal};
+        use Status::{Creating, Deleting, Error, Idle, Running, Starting, Stopped, Waiting};
+        use StatusPolicy::{Authoritative, Background, Heal, Launch};
         let user_touch = chrono::Utc::now() - chrono::Duration::seconds(60);
         // (from, trashed, policy, target, want)
         let cases = [
             (Stopped, false, Heal, Idle, Idle),
             (Error, false, Heal, Idle, Idle),
             (Running, false, Heal, Idle, Running),
+            (Starting, false, Heal, Idle, Idle),
+            (Error, false, Launch, Starting, Starting),
+            (Stopped, false, Launch, Starting, Starting),
+            (Idle, false, Launch, Starting, Idle),
+            (Running, false, Launch, Starting, Running),
+            (Waiting, false, Launch, Starting, Waiting),
+            (Error, true, Launch, Starting, Error),
+            (Starting, false, Authoritative, Error, Error),
             (Idle, false, Authoritative, Running, Running),
             (Running, false, Authoritative, Idle, Idle),
             (Waiting, false, Authoritative, Running, Running),

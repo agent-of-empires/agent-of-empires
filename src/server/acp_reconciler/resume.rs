@@ -382,14 +382,26 @@ pub(super) async fn resume_one(state: Arc<AppState>, target: ResumeTarget) -> Re
 }
 
 async fn seed_in_flight_status(state: &AppState, id: &str) {
-    let Some(projected) =
-        crate::server::acp_events::folded_sidebar_status(&state.session_service, id).await
-    else {
+    let fold = state.session_service.fold_control_state(id).await;
+    if fold.last_seq == 0 {
         return;
-    };
+    }
+    let newest = crate::server::acp_events::newest_status_seq(
+        &state.retry_starting,
+        &state.session_service,
+        id,
+        fold.last_seq,
+    )
+    .await;
     let mut instances = state.instances.write().await;
     if let Some(inst) = instances.iter_mut().find(|i| i.id == id) {
-        crate::server::acp_events::apply_status_seed(inst, projected, &state.status_tx);
+        if !crate::server::acp_events::retired_before_retry(&state.retry_starting, inst, newest) {
+            crate::server::acp_events::apply_status_seed(
+                inst,
+                fold.sidebar_status(),
+                &state.status_tx,
+            );
+        }
     }
 }
 

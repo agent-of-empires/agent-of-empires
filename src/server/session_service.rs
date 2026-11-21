@@ -2022,6 +2022,24 @@ impl SessionService {
         })
     }
 
+    /// Whether an event that bears a status (`status_policy`, as the live listener filters)
+    /// follows `after`. Scans at most `STATUS_SCAN_LIMIT` events; past that it answers true.
+    pub(crate) async fn reports_status_after(&self, id: &str, after: u64) -> bool {
+        const STATUS_SCAN_LIMIT: usize = 256;
+        let store = Arc::clone(&self.acp_event_store);
+        let sid = id.to_string();
+        tokio::task::spawn_blocking(move || {
+            let page = store.replay_page(&sid, after, Some(STATUS_SCAN_LIMIT));
+            page.has_more
+                || page
+                    .events
+                    .iter()
+                    .any(|(_, event)| crate::server::acp_events::status_policy(event).is_some())
+        })
+        .await
+        .unwrap_or(true)
+    }
+
     /// The sidebar status right after `seq`, rebuilt from the durable log. For
     /// a frame published while the control cache was cold, so no status rode
     /// with it; exact for whatever the journal's retention still holds.
