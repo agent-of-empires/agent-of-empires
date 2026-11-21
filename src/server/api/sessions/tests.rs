@@ -4783,6 +4783,96 @@ async fn list_sessions_flags_only_terminal_sessions_when_structured_view_is_off(
     assert_eq!(off, [("svo-terminal", true), ("svo-structured", false)]);
 }
 
+/// A structured `fork_from` runs the agent of the row that recorded the
+/// conversation, since the TUI and web forks send only the parent's tool.
+#[test]
+fn a_structured_fork_runs_the_parents_agent() {
+    let row = |tool: &str, agent_name: Option<&str>, acp: &str| {
+        let mut inst = make_test_instance();
+        inst.tool = tool.into();
+        inst.agent_name = agent_name.map(Into::into);
+        inst.acp_session_id = Some(acp.into());
+        inst
+    };
+    let rows = [
+        row("claude-acct", None, "tool-only"),
+        row("claude", Some("claude-acct"), "named"),
+        row("claude", None, "builtin"),
+        row("claude", None, "ambiguous"),
+        row("claude", Some("claude-acct"), "ambiguous"),
+        row("claude", Some("claude-acct"), "ambiguous-reversed"),
+        row("claude", None, "ambiguous-reversed"),
+        row("claude-acct", None, "tool-first"),
+        row("claude", Some("claude-acct"), "tool-first"),
+        row("claude", Some("claude-acct"), "named-first"),
+        row("claude-acct", None, "named-first"),
+    ];
+    let ok = |agent: Option<&str>| Ok(agent.map(str::to_string));
+    for (parent, tool, agent_name, want) in [
+        ("tool-only", "claude-acct", None, ok(None)),
+        ("named", "claude", None, ok(Some("claude-acct"))),
+        (
+            "named",
+            "claude",
+            Some("claude-acct"),
+            ok(Some("claude-acct")),
+        ),
+        ("named", "claude", Some("claude"), Err(())),
+        // Naming the parent's agent as the tool runs that same agent.
+        ("named", "claude-acct", None, ok(None)),
+        ("builtin", "claude", None, ok(None)),
+        ("builtin", "claude-acct", None, Err(())),
+        ("ambiguous", "claude", None, Err(())),
+        ("ambiguous-reversed", "claude", None, Err(())),
+        // Rows agreeing on the agent resolve the same in either order.
+        ("tool-first", "claude", None, ok(Some("claude-acct"))),
+        ("named-first", "claude", None, ok(Some("claude-acct"))),
+        ("tool-first", "claude-acct", None, ok(None)),
+        ("named-first", "claude-acct", None, ok(None)),
+        ("unrecorded", "claude", Some("x"), ok(Some("x"))),
+    ] {
+        assert_eq!(
+            create::structured_fork_agent_name(&rows, parent, tool, agent_name),
+            want,
+            "{parent} / {tool} / {agent_name:?}"
+        );
+    }
+}
+
+#[tokio::test]
+#[serial_test::serial]
+async fn create_refuses_a_structured_fork_under_another_agent() {
+    let _home = crate::session::test_support::isolate_app_dir();
+    let project = tempfile::tempdir().unwrap();
+    let mut parent = make_test_instance();
+    parent.tool = "claude".into();
+    parent.agent_name = Some("claude-acct".into());
+    parent.view = crate::session::View::Structured;
+    parent.acp_session_id = Some("11111111-1111-4111-8111-111111111111".into());
+    let state = crate::server::test_support::build_test_app_state(vec![parent]);
+    let response = create::create_session(
+        State(state),
+        axum::extract::Query(create::CreateSessionQuery { wait: None }),
+        None,
+        None,
+        Ok(Json(create_body_from_json(serde_json::json!({
+            "path": project.path(), "tool": "claude", "agent_name": "claude",
+            "view": "structured", "fork_from": "11111111-1111-4111-8111-111111111111",
+        })))),
+    )
+    .await
+    .into_response();
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    let body = axum::body::to_bytes(response.into_body(), 1024 * 1024)
+        .await
+        .unwrap();
+    assert!(
+        String::from_utf8_lossy(&body).contains("the agent of the session it forks"),
+        "{}",
+        String::from_utf8_lossy(&body)
+    );
+}
+
 #[tokio::test]
 #[serial_test::serial]
 async fn list_sessions_judges_custom_agent_capability_by_the_agent_name() {
@@ -4792,6 +4882,15 @@ async fn list_sessions_judges_custom_agent_capability_by_the_agent_name() {
         c.session
             .agent_acp_cmd
             .insert("acp-helper".into(), "acp-helper --acp".into());
+        c.session
+            .agent_acp_cmd
+            .insert("claude-acct".into(), "/state/acct-acp.sh".into());
+        c.session
+            .agent_execution_as
+            .insert("claude-acct".into(), "claude".into());
+        c.session
+            .agent_config_dir
+            .insert("claude-acct".into(), "~/.claude-acct".into());
     })
     .unwrap();
 
@@ -4806,6 +4905,7 @@ async fn list_sessions_judges_custom_agent_capability_by_the_agent_name() {
     let state = crate::server::test_support::build_test_app_state(vec![
         mk("named-agent", Some("acp-helper")),
         mk("tool-only", None),
+        mk("claude-wrapper", Some("claude-acct")),
     ]);
 
     let response = list_sessions(
@@ -4822,9 +4922,16 @@ async fn list_sessions_judges_custom_agent_capability_by_the_agent_name() {
     let capable: Vec<_> = envelope
         .sessions
         .iter()
-        .map(|s| (s.id.as_str(), s.acp_capable))
+        .map(|s| (s.id.as_str(), s.acp_capable, s.acp_can_fork))
         .collect();
-    assert_eq!(capable, [("named-agent", true), ("tool-only", false)]);
+    assert_eq!(
+        capable,
+        [
+            ("named-agent", true, false),
+            ("tool-only", false, false),
+            ("claude-wrapper", true, true),
+        ]
+    );
 }
 
 /// The list advertises the solo commands of the agent that classifies the session's prompts:

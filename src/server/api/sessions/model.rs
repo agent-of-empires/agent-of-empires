@@ -175,8 +175,9 @@ pub(super) fn session_response_from_instance_with_plan(
             (!resolved.is_empty()).then(|| resolved.to_string())
         },
         acp_provider: inst.agent_provider.clone(),
-        // The create-time guard calls the same classifier, so the web
-        // "Fork" affordance and server-side acceptance cannot drift.
+        // The create-time guard calls the same classifiers, so the web
+        // "Fork" affordance and server-side acceptance cannot drift. Custom
+        // agents are overlaid in list_sessions, like `acp_capable`.
         acp_can_fork: crate::session::fork::structured_fork_capable(
             &inst.tool,
             inst.agent_name.as_deref(),

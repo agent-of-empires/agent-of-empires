@@ -313,6 +313,8 @@ Give the agent an ACP launch command; it must speak the [Agent Client Protocol](
 
 The value is split into argv and executed with no shell, so wrap explicitly for shell features (`sh -lc '...'`). A matching `custom_agents` entry is needed only for the agent picker, not for an explicit ACP switch target. Built-in names take precedence.
 
+A structured session of such an agent can be forked when the agent also declares `agent_execution_as` and `agent_config_dir` for a built-in whose adapter forks (currently `claude`). The fork runs `session/fork` through the agent's own command. `agent_detect_as` alone does not enable it.
+
 A wrapper around a supported agent needs no `agent_acp_cmd` at all: map it with `agent_detect_as` and it inherits the base agent's ACP adapter, which also lights up **Switch to structured view** on an existing terminal session. **The wrapper binary is never executed** in that case, so anything it does outside the CLI (selecting an account, gateway, or profile by setting env) does not apply. Inheritance works only for bases with a built-in adapter (`claude`, `codex`, `opencode`, `gemini`, `vibe`, `pi`, `omp`, `kimi`, `prime-agent`).
 
 To pass those overrides to a host structured session anyway, use the session's `extra_env` or [`environment`](#host-environment). A Docker-sandboxed session reads only `sandbox.environment` and pins its own config dir at a container path, so set the container-side value there, or give the wrapper a real `agent_acp_cmd`. An explicit `agent_acp_cmd` wins if you set both.
