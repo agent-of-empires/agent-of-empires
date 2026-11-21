@@ -209,7 +209,10 @@ pub fn custom_structured_fork_capable(
             .agent_acp_cmd
             .get(resolved)
             .is_some_and(|cmd| crate::acp::AgentSpec::from_acp_cmd(resolved, cmd).is_ok())
-        && session.agent_config_dir.contains_key(resolved)
+        && session
+            .agent_config_dir
+            .get(resolved)
+            .is_some_and(|dir| crate::session::config::is_resolvable_agent_config_dir(dir))
         && session
             .agent_execution_as
             .get(resolved)
@@ -499,19 +502,37 @@ mod tests {
                 "claude-acct",
                 Some("/state/wrappers/acct-acp.sh"),
                 Some("claude"),
-                true,
+                Some("~/.claude-acct"),
             ),
             (
                 "codex-acct",
                 Some("/state/wrappers/codex-acp.sh"),
                 Some("codex"),
-                true,
+                Some("~/.codex-acct"),
             ),
-            ("no-acp-cmd", None, Some("claude"), true),
-            ("bad-acp-cmd", Some("'unterminated"), Some("claude"), true),
-            ("no-config-dir", Some("wrapper-acp"), Some("claude"), false),
-            ("detect-only", Some("wrapper-acp"), None, true),
-            ("pi", Some("wrapper-acp"), Some("claude"), true),
+            ("no-acp-cmd", None, Some("claude"), Some("~/.a")),
+            (
+                "bad-acp-cmd",
+                Some("'unterminated"),
+                Some("claude"),
+                Some("~/.a"),
+            ),
+            ("no-config-dir", Some("wrapper-acp"), Some("claude"), None),
+            // The launcher ignores a directory it cannot resolve.
+            (
+                "empty-config-dir",
+                Some("wrapper-acp"),
+                Some("claude"),
+                Some(""),
+            ),
+            (
+                "relative-config-dir",
+                Some("wrapper-acp"),
+                Some("claude"),
+                Some(".claude-acct"),
+            ),
+            ("detect-only", Some("wrapper-acp"), None, Some("~/.a")),
+            ("pi", Some("wrapper-acp"), Some("claude"), Some("~/.a")),
         ] {
             if let Some(cmd) = acp_cmd {
                 session.agent_acp_cmd.insert(name.into(), cmd.into());
@@ -519,10 +540,8 @@ mod tests {
             if let Some(base) = execution_as {
                 session.agent_execution_as.insert(name.into(), base.into());
             }
-            if config_dir {
-                session
-                    .agent_config_dir
-                    .insert(name.into(), format!("~/.{name}"));
+            if let Some(dir) = config_dir {
+                session.agent_config_dir.insert(name.into(), dir.into());
             }
             session.agent_detect_as.insert(name.into(), "claude".into());
         }
@@ -534,6 +553,8 @@ mod tests {
             ("no-acp-cmd", None, false),
             ("bad-acp-cmd", None, false),
             ("no-config-dir", None, false),
+            ("empty-config-dir", None, false),
+            ("relative-config-dir", None, false),
             ("detect-only", None, false),
             // A registry name launches the registry adapter, never its acp cmd.
             ("pi", None, false),
