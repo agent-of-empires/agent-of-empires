@@ -330,9 +330,11 @@ impl WireServer {
         if !is_valid_mcp_server_name(&self.name) {
             return Err("a serve entry has an invalid server name".into());
         }
-        Ok(McpEntry::Serve {
-            served: ServedServer::new(plugin_id, self.name, serve.prefix),
-        })
+        let served = ServedServer::new(plugin_id, self.name, serve.prefix);
+        if !is_valid_mcp_server_name(&served.entry_key) {
+            return Err("a serve entry's key is too long once prefixed".into());
+        }
+        Ok(McpEntry::Serve { served })
     }
 
     fn into_server(self) -> Result<ProjectMcpServer, String> {
@@ -950,6 +952,20 @@ mod tests {
         );
     }
 
+    #[test]
+    fn parse_edit_rejects_a_serve_key_past_the_name_limit() {
+        let name = "n".repeat(125);
+        let prefixed = parse_edit(
+            json!({"add": [{"name": name, "serve": {}}]}),
+            Some("acme.a"),
+        );
+        assert!(prefixed.is_err(), "acme_a__ plus 125 bytes is over 128");
+        let bare = parse_edit(
+            json!({"add": [{"name": name, "serve": {"prefix": false}}]}),
+            Some("acme.a"),
+        );
+        assert!(bare.is_ok());
+    }
     /// `prefix` defaults to true; `false` keys the entry by the bare name, with no `drop` needed.
     #[test]
     fn parse_edit_serve_prefix_chooses_the_key() {
