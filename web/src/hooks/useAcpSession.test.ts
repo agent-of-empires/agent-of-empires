@@ -7,7 +7,7 @@ import { emptyAcpState } from "../lib/acpTypes";
 import { STATE_TTL_MS, STORAGE_KEY_PREFIX, getLiveQueueCount } from "../lib/acpStateStorage";
 import { listServerQueue, reportAcpInteraction, type ServerQueuedPrompt } from "../lib/api";
 import type { SessionResponse } from "../lib/types";
-import { cacheGet } from "./acpSession/stateCache";
+import { cacheGet, cacheSet } from "./acpSession/stateCache";
 import { ACP_DIAL_TIMEOUT_MS, ACP_MAX_RETRIES, ACP_WS_STALE_MS, acpRetryDelayMs } from "./acpSession/useAcpConnection";
 import {
   FakeWebSocket,
@@ -590,6 +590,34 @@ describe("recent-first cold open + loadOlder (#2236)", () => {
     expect(result.current.loadingOlder).toBe(false);
     await flushAsync(20);
     expect(result.current.hasMoreOlder).toBe(true);
+  });
+});
+
+describe("persist flush on cleanup", () => {
+  const storedKey = (id: string) => `${STORAGE_KEY_PREFIX}${id}`;
+  const seed = (id: string) => cacheSet(id, { ...emptyAcpState(), lastSeq: 7 });
+
+  it("writes pending state on unmount, before the throttle expires", async () => {
+    installAcpFakes();
+    seed("sess-unmount");
+    const { unmount } = render("sess-unmount");
+    await flushAsync();
+    expect(localStorage.getItem(storedKey("sess-unmount"))).toBeNull();
+    unmount();
+    expect(JSON.parse(localStorage.getItem(storedKey("sess-unmount"))!).state.lastSeq).toBe(7);
+  });
+
+  it("writes the previous session's pending state on a session switch", async () => {
+    installAcpFakes();
+    seed("sess-a");
+    const { rerender } = renderHook(({ id }: { id: string }) => useAcpSession(id), {
+      initialProps: { id: "sess-a" },
+      wrapper: profileWrapper,
+    });
+    await flushAsync();
+    expect(localStorage.getItem(storedKey("sess-a"))).toBeNull();
+    rerender({ id: "sess-b" });
+    expect(JSON.parse(localStorage.getItem(storedKey("sess-a"))!).state.lastSeq).toBe(7);
   });
 });
 
