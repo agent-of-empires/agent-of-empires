@@ -2,6 +2,7 @@
 //! fire-and-forget with hard timeouts, and every field is sanitized to closed allowlists.
 
 pub mod aggregate;
+pub mod consent;
 pub mod events;
 pub mod feature_use;
 pub mod features;
@@ -300,7 +301,6 @@ pub fn build_usage_snapshot(
     let (plugins_by_source, plugins_active) = plugins::census(crate::plugin::registry().all());
     snapshot.plugins_by_source = plugins_by_source;
     snapshot.plugins_active = plugins_active;
-    snapshot.feature_uses = feature_use::snapshot();
     Some(snapshot)
 }
 

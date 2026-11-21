@@ -209,10 +209,7 @@ pub async fn post_telemetry_structured_interaction(
     };
     match req.kind.as_str() {
         "prompt_queued" => {
-            state
-                .telemetry_structured
-                .prompts_queued
-                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            crate::telemetry::consent::bump(&state.telemetry_structured.prompts_queued);
         }
         other => {
             return api_error(

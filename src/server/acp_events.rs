@@ -703,14 +703,13 @@ pub(super) async fn acp_event_listener(state: Arc<AppState>) {
 /// matched explicitly so a new variant is a compile error here.
 fn record_approval_decision(state: &AppState, decision: crate::acp::approvals::ApprovalDecision) {
     use crate::acp::approvals::ApprovalDecision;
-    use std::sync::atomic::Ordering::Relaxed;
     let counter = match decision {
         ApprovalDecision::Allow => &state.telemetry_structured.approvals_allow,
         ApprovalDecision::AllowAlways => &state.telemetry_structured.approvals_allow_always,
         ApprovalDecision::Deny => &state.telemetry_structured.approvals_deny,
         ApprovalDecision::Cancelled => return,
     };
-    counter.fetch_add(1, Relaxed);
+    crate::telemetry::consent::bump(counter);
 }
 
 /// Seed each acp-enabled session's `Instance.status` from the most

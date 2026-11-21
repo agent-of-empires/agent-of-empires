@@ -60,11 +60,32 @@ fn clear_reported_tui_signals(
     });
 }
 
+/// What a TUI snapshot captured, to subtract once its send is confirmed.
+struct TuiReported {
+    bound: crate::telemetry::consent::Bound,
+    creates: u32,
+    feature_uses: std::collections::BTreeMap<String, u32>,
+}
+
+impl TuiReported {
+    fn clear_reported(&self, outcome: crate::telemetry::SendOutcome) {
+        self.bound.clear_reported(|| {
+            clear_reported_tui_signals(self.creates, &self.feature_uses, outcome)
+        });
+    }
+}
+
 /// Count one TUI session create for the opt-in telemetry trend counter.
-/// Bounded accumulator, read-and-decremented by the snapshot paths; a no-op
-/// for opted-out installs. Called when a daemon-confirmed creation lands.
+/// Called when a daemon-confirmed creation lands.
 pub(super) fn record_session_create() {
-    TUI_SESSION_CREATES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    static REGISTER: std::sync::Once = std::sync::Once::new();
+    REGISTER.call_once(|| {
+        crate::telemetry::consent::register(|| {
+            TUI_SESSION_CREATES.store(0, std::sync::atomic::Ordering::Relaxed);
+            true
+        })
+    });
+    crate::telemetry::consent::bump(&TUI_SESSION_CREATES);
 }
 
 struct UpdateStatus {
@@ -159,7 +180,6 @@ pub struct App {
     /// periodic re-checks from re-offering a release we already installed.
     last_installed_version_in_session: Option<String>,
     telemetry_send: crate::telemetry::window::SingleFlight,
-    telemetry_consent: crate::telemetry::window::ConsentWindow,
 }
 
 struct ToolDetection {
@@ -363,7 +383,6 @@ impl App {
             pending_install_version: None,
             last_installed_version_in_session: None,
             telemetry_send: Default::default(),
-            telemetry_consent: Default::default(),
         };
         app.finish_startup_dialogs(false);
         Ok(app)
@@ -1562,21 +1581,23 @@ impl App {
         // Bounded and deduped so a dead endpoint or an unchanged launch-then-quit costs nothing.
         // A periodic send still in flight is awaited first so both never report the same counts.
         self.telemetry_send.settle().await;
-        if let Some(snapshot) = self.next_telemetry_snapshot() {
-            let reported = snapshot.session_creates_since_last_snapshot;
-            let feature_uses = snapshot.feature_uses.clone();
+        if let Some((snapshot, reported)) = self.next_telemetry_snapshot() {
             let outcome = crate::telemetry::flush_snapshot_if_changed(snapshot).await;
-            clear_reported_tui_signals(reported, &feature_uses, outcome);
+            reported.clear_reported(outcome);
         }
 
         Ok(())
     }
 
     /// `None` unless telemetry is opted in. The TUI hosts no dashboard or
-    /// server, so those signals are zeroed or empty. Counts read while opted out or
-    /// across a consent change are cleared, never reported.
-    fn next_telemetry_snapshot(&mut self) -> Option<crate::telemetry::UsageSnapshot> {
-        let creates = reported_session_creates();
+    /// server, so those signals are zeroed or empty.
+    fn next_telemetry_snapshot(&self) -> Option<(crate::telemetry::UsageSnapshot, TuiReported)> {
+        let (bound, (creates, feature_uses)) = crate::telemetry::consent::capture(|| {
+            (
+                reported_session_creates(),
+                crate::telemetry::feature_use::snapshot(),
+            )
+        });
         let instances: Vec<crate::session::Instance> = self.home.instances().cloned().collect();
         let mut snapshot = crate::telemetry::build_usage_snapshot(
             crate::telemetry::Surface::Tui,
@@ -1586,20 +1607,17 @@ impl App {
             None,
             None,
             &crate::telemetry::StructuredInteractionCounts::default(),
-        );
-        let install_id = snapshot.as_ref().map(|s| s.install_id.as_str());
-        if self.telemetry_consent.discard(install_id) {
-            let feature_uses = snapshot
-                .as_ref()
-                .map_or_else(crate::telemetry::feature_use::snapshot, |s| {
-                    s.feature_uses.clone()
-                });
-            clear_reported_tui_signals(creates, &feature_uses, crate::telemetry::SendOutcome::Sent);
-            if let Some(snapshot) = snapshot.as_mut() {
-                snapshot.clear_deltas();
-            }
-        }
-        snapshot
+        )?;
+        snapshot.feature_uses = feature_uses.clone();
+        bound.bind(&mut snapshot);
+        Some((
+            snapshot,
+            TuiReported {
+                bound,
+                creates,
+                feature_uses,
+            },
+        ))
     }
 
     /// Detached and single-flight; counts are cleared only after a confirmed send.
@@ -1607,18 +1625,16 @@ impl App {
         if self.telemetry_send.is_busy() {
             return;
         }
-        let Some(snapshot) = self.next_telemetry_snapshot() else {
+        let Some((snapshot, reported)) = self.next_telemetry_snapshot() else {
             return;
         };
-        let reported = snapshot.session_creates_since_last_snapshot;
-        let feature_uses = snapshot.feature_uses.clone();
         self.telemetry_send.spawn_if_idle(async move {
             let outcome = if crate::telemetry::send_snapshot(snapshot).await {
                 crate::telemetry::SendOutcome::Sent
             } else {
                 crate::telemetry::SendOutcome::Failed
             };
-            clear_reported_tui_signals(reported, &feature_uses, outcome);
+            reported.clear_reported(outcome);
         });
     }
 
@@ -4633,7 +4649,7 @@ mod tests {
     }
 
     #[test]
-    #[serial_test::serial(telemetry_creates)]
+    #[serial_test::serial]
     fn create_counter_clear_preserves_in_flight_create() {
         reset_creates(0);
         record_session_create();
@@ -4651,7 +4667,7 @@ mod tests {
     }
 
     #[test]
-    #[serial_test::serial(telemetry_creates)]
+    #[serial_test::serial]
     fn create_counter_clear_retains_on_unconfirmed_send() {
         for outcome in [SendOutcome::Failed, SendOutcome::Deduped] {
             reset_creates(0);
@@ -4669,7 +4685,7 @@ mod tests {
 
     // The counter is process-global, hence the serial group.
     #[test]
-    #[serial_test::serial(telemetry_creates)]
+    #[serial_test::serial]
     fn create_counter_clear_is_noop_for_zero_and_saturates() {
         reset_creates(3);
         clear_reported_tui_signals(0, &Default::default(), SendOutcome::Sent);

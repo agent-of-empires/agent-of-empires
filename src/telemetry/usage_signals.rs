@@ -40,10 +40,16 @@ impl UsageSeenCounters {
     pub fn record(&self, name: &str) -> bool {
         match self.counts.get(name) {
             Some(counter) => {
-                counter.fetch_add(1, Ordering::Relaxed);
+                super::consent::bump(counter);
                 true
             }
             None => false,
+        }
+    }
+
+    pub fn zero(&self) {
+        for counter in self.counts.values() {
+            counter.store(0, Ordering::Relaxed);
         }
     }
 

@@ -118,6 +118,10 @@ pub fn snapshot() -> BTreeMap<String, u32> {
     COUNTS.snapshot()
 }
 
+pub(super) fn zero() {
+    COUNTS.zero();
+}
+
 /// Called only after a confirmed send, so uses recorded mid-send survive.
 pub fn clear_reported(reported: &BTreeMap<String, u32>) {
     COUNTS.decrement(reported);

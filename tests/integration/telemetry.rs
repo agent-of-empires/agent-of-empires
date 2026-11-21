@@ -416,8 +416,8 @@ fn usage_seen_carries_registered_signals_only() {
     }
 }
 
-/// Accessory-feature uses and the active sort order reach the snapshot from closed
-/// vocabularies, and a confirmed send consumes exactly what was reported.
+/// Accessory-feature uses and the active sort order come from closed vocabularies, and
+/// a confirmed send consumes exactly what was reported.
 #[test]
 #[serial]
 fn snapshot_carries_feature_uses_and_prefs() {
@@ -425,17 +425,19 @@ fn snapshot_carries_feature_uses_and_prefs() {
     use agent_of_empires::telemetry::feature_use::{self, FeatureUse};
     let _tmp = opted_in();
     update_app_state(|state| state.sort_order = Some(SortOrder::Attention)).expect("save");
-    let before = feature_use::snapshot()["sort_attention"];
     feature_use::record(FeatureUse::from(SortOrder::Attention));
     assert!(feature_use::record_name("sort_attention"));
     assert!(!feature_use::record_name("not_a_feature"));
 
-    let snapshot = build_snapshot(Surface::Tui, &[]);
-    assert_eq!(snapshot.feature_uses["sort_attention"], before + 2);
-    assert!(!snapshot.feature_uses.contains_key("not_a_feature"));
-    assert_eq!(snapshot.prefs["tui_sort_order"], "attention");
+    let uses = feature_use::snapshot();
+    assert_eq!(uses["sort_attention"], 2);
+    assert!(!uses.contains_key("not_a_feature"));
+    assert_eq!(
+        build_snapshot(Surface::Tui, &[]).prefs["tui_sort_order"],
+        "attention"
+    );
 
-    feature_use::clear_reported(&snapshot.feature_uses);
+    feature_use::clear_reported(&uses);
     assert_eq!(feature_use::snapshot()["sort_attention"], 0);
 }
 

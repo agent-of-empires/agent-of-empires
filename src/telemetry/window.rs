@@ -1,28 +1,6 @@
-//! Per-loop bookkeeping that keeps a snapshot's counters inside one consent window and
-//! one send at a time.
+//! Keeps a detached snapshot's counters inside one send at a time.
 
 use std::future::Future;
-
-/// The install id a snapshot loop last saw. Opting out deletes the id and opting in
-/// creates a fresh one, as does `reset-id`, so a changed id means consent changed since
-/// the counters started accumulating.
-#[derive(Debug, Default)]
-pub struct ConsentWindow {
-    last: Option<Option<String>>,
-}
-
-impl ConsentWindow {
-    /// Records this build's id (`None` while opted out) and returns whether the counters
-    /// read for it must be discarded instead of reported. The first build of a process
-    /// keeps them: it runs at startup, before anything is counted.
-    pub fn discard(&mut self, install_id: Option<&str>) -> bool {
-        let current = install_id.map(str::to_string);
-        let changed = self.last.as_ref().is_some_and(|last| *last != current);
-        let off = current.is_none();
-        self.last = Some(current);
-        off || changed
-    }
-}
 
 /// A detached snapshot send that clears its counters on confirm. Holding one at a time
 /// keeps two sends from reporting, and then clearing, the same counts.
@@ -58,24 +36,6 @@ mod tests {
     use super::*;
     use std::sync::atomic::{AtomicU32, Ordering};
     use std::sync::Arc;
-
-    #[test]
-    fn consent_window_discards_while_off_and_across_an_id_change() {
-        let mut window = ConsentWindow::default();
-        // (install id at this build, discard expected)
-        let cases = [
-            (Some("a"), false),
-            (Some("a"), false),
-            (None, true),
-            (Some("b"), true),
-            (Some("b"), false),
-            (Some("c"), true),
-        ];
-        for (i, (id, expected)) in cases.into_iter().enumerate() {
-            assert_eq!(window.discard(id), expected, "build {i} with {id:?}");
-        }
-        assert!(ConsentWindow::default().discard(None), "starting opted out");
-    }
 
     #[tokio::test]
     async fn single_flight_skips_while_busy_and_settle_waits_for_the_clear() {
