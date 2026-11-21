@@ -291,6 +291,38 @@ fn acp_agent_key<'a>(tool: &'a str, agent_name: Option<&'a str>) -> &'a str {
     agent_name.filter(|s| !s.is_empty()).unwrap_or(tool)
 }
 
+/// The `agent_name` a structured fork of `parent_id` runs, held to the agent of
+/// the rows that recorded that conversation as `fork_session_id` holds it. A
+/// request naming no agent under the parent's tool inherits the parent's
+/// `agent_name`; a parent no row records leaves the request as it is.
+pub(super) fn structured_fork_agent_name(
+    rows: &[crate::session::Instance],
+    parent_id: &str,
+    tool: &str,
+    agent_name: Option<&str>,
+) -> Result<Option<String>, ()> {
+    let mut parents = rows
+        .iter()
+        .filter(|row| row.acp_session_id.as_deref() == Some(parent_id));
+    let agent_name = agent_name.filter(|s| !s.is_empty());
+    let Some(parent) = parents.next() else {
+        return Ok(agent_name.map(str::to_string));
+    };
+    let parent_key = acp_agent_key(&parent.tool, parent.agent_name.as_deref());
+    if parents.any(|row| acp_agent_key(&row.tool, row.agent_name.as_deref()) != parent_key) {
+        return Err(());
+    }
+    let agent_name = match agent_name {
+        None if tool == parent.tool => parent.agent_name.clone(),
+        named => named.map(str::to_string),
+    };
+    if acp_agent_key(tool, agent_name.as_deref()) == parent_key {
+        Ok(agent_name)
+    } else {
+        Err(())
+    }
+}
+
 /// True iff the agent can run a structured (ACP) session in this project: a
 /// built-in ACP agent in the registry, or a custom tool with a valid
 /// `agent_acp_cmd`. Mirrors the post-build capability check (below) so
@@ -1164,6 +1196,34 @@ pub(crate) async fn create_session_with(
             "validation_failed",
             format!("Unknown agent '{}'", body.tool),
         );
+    }
+
+    // A structured fork runs the agent that recorded the conversation, so the
+    // policy and capability checks below judge that agent.
+    if body.view == crate::session::View::Structured {
+        if let Some(parent_id) = body
+            .fork_from
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+        {
+            let instances = state.instances.read().await;
+            match structured_fork_agent_name(
+                &instances,
+                parent_id,
+                &body.tool,
+                body.agent_name.as_deref(),
+            ) {
+                Ok(agent_name) => body.agent_name = agent_name,
+                Err(()) => {
+                    return api_error(
+                        StatusCode::BAD_REQUEST,
+                        "fork_unsupported",
+                        "A structured fork must run the agent of the session it forks",
+                    );
+                }
+            }
+        }
     }
 
     // Operator agent allowlist (#3241), answered here rather than failing at
