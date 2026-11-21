@@ -2269,3 +2269,18 @@ fn workspace_is_unavailable_when_attaching_an_existing_branch() {
     dialog.create_new_branch = true;
     assert!(screen_text(&draw(&mut dialog)).contains("Workspace: [x]"));
 }
+
+/// The daemon rejects `~` as a shell metacharacter, so a home-relative path
+/// must reach it already expanded.
+#[test]
+#[serial_test::serial]
+fn tilde_path_is_submitted_expanded() {
+    let temp_home = tempfile::tempdir().expect("temp home");
+    let _home = crate::session::test_support::isolate_home(temp_home.path());
+    let mut dialog = single_tool_dialog();
+    dialog.path = Input::new("~/code".to_string());
+    assert_eq!(
+        submitted(dialog.build_submit_result()).path,
+        temp_home.path().join("code").to_string_lossy()
+    );
+}

@@ -88,8 +88,16 @@ impl GitWorktree {
         }
     }
 
-    /// Fetches `branch` and records a non-`Ok` outcome as a warning.
+    /// Fetches `branch` and records a non-`Ok` outcome as a warning. A repo
+    /// without `remote` has nothing to fetch, so that is not a warning.
     fn fetch_with_warning(&self, warnings: &mut Vec<String>, remote: &str, branch: &str) {
+        let has_remote = open_repo_at(&self.repo_path)
+            .map(|repo| repo.find_remote(remote).is_ok())
+            .unwrap_or(true);
+        if !has_remote {
+            tracing::info!(target: "git.worktree", "git fetch skipped: no remote {remote}");
+            return;
+        }
         let detail = match self.fetch_branch(remote, branch) {
             FetchOutcome::Ok => return,
             FetchOutcome::Failed(msg) | FetchOutcome::Skipped(msg) => msg,
@@ -567,12 +575,20 @@ pub(super) mod tests {
 
     #[test]
     fn fetch_branch_reports_outcome() {
-        let (no_remote, _repo) = init_repo();
+        let (no_remote, repo) = init_repo();
         let git_wt = GitWorktree::new(no_remote.path().to_path_buf()).unwrap();
         assert!(matches!(
             git_wt.fetch_branch("origin", "main"),
             FetchOutcome::Failed(_)
         ));
+        // A missing remote is skipped quietly; an unreachable one still warns.
+        let mut warnings = Vec::new();
+        git_wt.fetch_with_warning(&mut warnings, "origin", "main");
+        assert!(warnings.is_empty(), "{warnings:?}");
+        let gone = no_remote.path().join("gone");
+        repo.remote("origin", gone.to_str().unwrap()).unwrap();
+        git_wt.fetch_with_warning(&mut warnings, "origin", "main");
+        assert_eq!(warnings.len(), 1, "{warnings:?}");
 
         let (_dirs, local, _, _) = fork_upstream_layout("main");
         let git_wt = GitWorktree::new(local).unwrap();

@@ -658,7 +658,8 @@ pub async fn lock_for_startup(profile: &str, args: &mut ServeArgs) -> Result<Opt
                 old_pid = pid,
                 "replacing core-only daemon with full daemon"
             );
-            stop_daemon_locked(&transaction, true).await?;
+            println!("Replacing the background aoe daemon (PID {pid}) with the web dashboard");
+            stop_daemon_locked(&transaction, false).await?;
         }
         DaemonStatus::Unverified => {
             bail!("Cannot verify the existing daemon; refusing replacement")

@@ -173,7 +173,7 @@ Run without arguments to launch the TUI dashboard.
 * `plugin` — Manage plugins (list, info, enable, disable, install, update, uninstall)
 * `profile` — Manage profiles (separate workspaces)
 * `project` — Manage the project registry used by multi-repo session pickers
-* `sandbox` — Reclaim per-session sandbox agent stores and log agent sandboxes in
+* `sandbox` — Clean up sandbox agent stores and log in sandboxed agents
 * `worktree` — Manage git worktrees for parallel development
 * `tmux` — tmux integration utilities
 * `sounds` — Manage sound effects for agent state transitions
@@ -1238,7 +1238,7 @@ Remove a project from the registry
 
 ## `aoe sandbox`
 
-Reclaim per-session sandbox agent stores and log agent sandboxes in
+Clean up sandbox agent stores and log in sandboxed agents
 
 **Usage:** `aoe sandbox <COMMAND>`
 

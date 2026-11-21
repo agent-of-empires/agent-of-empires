@@ -913,12 +913,14 @@ impl HomeView {
     /// The session stays stopped (trash killed its panes); the user restarts
     /// it with `e` like any stopped session. See #2489.
     pub(super) fn restore_selected_from_trash(&mut self) {
-        let Some(id) = self.selected_session.clone() else {
+        let Some(id) = self
+            .selected_session
+            .clone()
+            .filter(|id| self.instances.get(id).is_some_and(|row| row.is_trashed()))
+        else {
+            self.flash_status("Select a session under Trash to restore it");
             return;
         };
-        if !self.instances.get(&id).is_some_and(|row| row.is_trashed()) {
-            return;
-        }
         if let Err(error) = self
             .session_feed
             .submit_request(id, crate::tui::session_feed::SessionRequest::Restore)

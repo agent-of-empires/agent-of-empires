@@ -582,9 +582,10 @@ impl HomeView {
     /// checkbox that flips `confirm_before_quit` off when ticked (#1569).
     pub fn show_quit_confirm(&mut self) {
         self.confirm_dialog = Some(
-            ConfirmDialog::new(
+            self.confirm_by_repeating(
+                crate::tui::home::bindings::ActionId::Quit,
                 "Quit Agent of Empires",
-                "Quit?\nYour sessions persist in the background.",
+                "Quit? Your sessions persist in the background.",
                 "quit",
             )
             .neutral()

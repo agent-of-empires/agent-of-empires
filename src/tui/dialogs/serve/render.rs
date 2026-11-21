@@ -279,7 +279,7 @@ fn render_mode_picker(
                 "Token + passphrase (2FA).",
                 "Pick transport on next screen.",
             ],
-            "  (brew install tailscale or cloudflared)",
+            "  (needs tailscale/cloudflared)",
         ),
     ];
     for (card_area, title, mode, available, headline, body_lines, unavailable_note) in cards {

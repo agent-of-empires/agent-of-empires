@@ -696,12 +696,17 @@ pub(crate) fn compute_row_tag(
     }
 }
 
+/// A single-repo branch tag that only repeats the session title is dropped.
 fn branch_row_tag(inst: &crate::session::Instance) -> Option<RowTag> {
     if let Some(ws) = &inst.workspace_info {
+        if ws.repos.len() <= 1 && ws.branch == inst.title {
+            return None;
+        }
         workspace_branch_row_tag(&ws.branch, ws.repos.len())
     } else {
         inst.worktree_info
             .as_ref()
+            .filter(|w| w.branch != inst.title)
             .and_then(|w| plain_branch_row_tag(&w.branch))
     }
 }
@@ -5696,6 +5701,24 @@ mod tests {
             rendered_width(&rendered),
             BRANCH_TAG_WIDTH + 2,
             "a wide branch name must cap at the tag contract, got {rendered:?}"
+        );
+    }
+
+    #[test]
+    fn branch_row_tag_is_dropped_when_it_repeats_the_title() {
+        let mut inst = crate::session::Instance::new("feat/x", "/tmp/a");
+        inst.worktree_info = Some(crate::session::WorktreeInfo {
+            branch: "feat/x".into(),
+            main_repo_path: "/tmp".into(),
+            managed_by_aoe: true,
+            created_at: chrono::Utc::now(),
+            base_branch: None,
+        });
+        assert!(branch_row_tag(&inst).is_none());
+        inst.title = "Teutons".into();
+        assert_eq!(
+            branch_row_tag(&inst).map(|tag| tag.content),
+            Some("x".into())
         );
     }
 

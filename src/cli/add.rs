@@ -417,7 +417,11 @@ pub async fn run(profile: &str, args: AddArgs) -> Result<()> {
     tokio::pin!(signal);
     let row = create_and_observe(&client, &body, &epoch, &key, signal.as_mut())
         .await
-        .map_err(with_skip_hint)?;
+        .map_err(with_skip_hint)
+        .map_err(|error| {
+            let existing = body.worktree_branch.as_deref();
+            with_create_branch_hint(error, existing.filter(|_| !body.create_new_branch))
+        })?;
     for warning in &row.warnings {
         eprintln!("Warning: {warning}");
     }
@@ -547,6 +551,11 @@ fn host_path(path: Option<&std::path::Path>, local: bool) -> Result<String> {
     } else {
         std::env::current_dir()?.join(path)
     };
+    anyhow::ensure!(
+        path.is_dir(),
+        "Path does not exist or is not a directory: {}",
+        path.display()
+    );
     path.into_os_string()
         .into_string()
         .map_err(|_| anyhow::anyhow!("Project path must be UTF-8"))
@@ -748,6 +757,20 @@ fn with_skip_hint(error: anyhow::Error) -> anyhow::Error {
     }
 }
 
+/// `-w <branch>` without `-b` checks out an existing branch; name the flag that creates one.
+fn with_create_branch_hint(error: anyhow::Error, existing_branch: Option<&str>) -> anyhow::Error {
+    let Some(branch) = existing_branch else {
+        return error;
+    };
+    let not_found = crate::git::error::GitError::BranchNotFound(branch.to_owned()).to_string();
+    match error.downcast_ref::<DaemonClientError>() {
+        Some(DaemonClientError::Status { body, .. }) if body.starts_with(&not_found) => {
+            anyhow::anyhow!("{error:#}\nPass -b to create branch '{branch}'.")
+        }
+        _ => error,
+    }
+}
+
 fn definitive(error: &DaemonClientError) -> bool {
     matches!(error, DaemonClientError::Status { status, code, .. }
         if status.is_client_error() && *status != reqwest::StatusCode::REQUEST_TIMEOUT
@@ -757,6 +780,40 @@ fn definitive(error: &DaemonClientError) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn missing_existing_branch_suggests_create_flag() {
+        let status = |body: &str| {
+            anyhow::Error::from(DaemonClientError::Status {
+                status: reqwest::StatusCode::BAD_REQUEST,
+                code: None,
+                body: body.to_owned(),
+                truncated: false,
+            })
+        };
+        let missing = "Branch 'feat/x' not found [stage: preparing]";
+        let hinted = with_create_branch_hint(status(missing), Some("feat/x")).to_string();
+        assert!(
+            hinted.ends_with("Pass -b to create branch 'feat/x'."),
+            "{hinted}"
+        );
+        for (body, branch) in [(missing, None), ("Branch 'main' not found", Some("feat/x"))] {
+            let error = with_create_branch_hint(status(body), branch).to_string();
+            assert!(!error.contains("-b"), "{error}");
+        }
+    }
+
+    #[test]
+    fn local_host_path_rejects_a_missing_directory() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let missing = dir.path().join("missing");
+        let error = host_path(Some(&missing), true).unwrap_err().to_string();
+        assert!(error.contains(&missing.display().to_string()), "{error}");
+        assert_eq!(
+            host_path(Some(dir.path()), true).unwrap(),
+            dir.path().to_str().unwrap()
+        );
+    }
 
     #[cfg(unix)]
     #[tokio::test]

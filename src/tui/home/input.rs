@@ -7966,7 +7966,7 @@ impl HomeView {
     /// taps of one key while a stray keystroke is harmless. The key is read off the binding
     /// table so the hint can't drift from it; a chord that isn't a bare character falls
     /// back to the dialog's own y/Enter.
-    fn confirm_by_repeating(
+    pub(super) fn confirm_by_repeating(
         &self,
         opener: ActionId,
         title: &str,
