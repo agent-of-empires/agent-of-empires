@@ -257,6 +257,16 @@ impl PendingInitialTurn {
         uuid::Uuid::new_v4().to_string()
     }
 
+    /// Stable across reloads: `id`, or for a row written before it existed, a key
+    /// built from the turn's content.
+    pub fn key(&self) -> String {
+        if self.id.is_empty() {
+            format!("legacy:{}:{}", self.synthesized, self.text)
+        } else {
+            self.id.clone()
+        }
+    }
+
     /// A create-time prompt typed by the user. The terminal drain delivers only
     /// these: a rate-limit continuation is ACP-only and carries attachments the
     /// terminal cannot send.

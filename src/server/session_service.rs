@@ -293,8 +293,8 @@ pub struct SessionService {
     /// fast path and the reconciler tick cannot queue duplicate drains.
     /// Sync mutex: critical sections are tiny and never span an `await`.
     pending_drains: std::sync::Mutex<std::collections::HashSet<String>>,
-    /// `(session, text)` of consumed initial turns whose clear never reached
-    /// disk; a reload that restores the row must not type them again.
+    /// `(session id, PendingInitialTurn::key)` of consumed initial turns whose clear never
+    /// reached disk; a reload that restores the row must not type them again.
     unpersisted_clears: std::sync::Mutex<std::collections::HashSet<(String, String)>>,
     /// Per-session persist locks for `mutate_instance_persisted`, held across
     /// snapshot AND disk write so the two cannot be reordered. Distinct from
@@ -1481,7 +1481,7 @@ impl SessionService {
                 .unpersisted_clears
                 .lock()
                 .expect("unpersisted_clears mutex poisoned")
-                .contains(&(id.to_string(), turn.text.clone()))
+                .contains(&(id.to_string(), turn.key()))
     }
 
     async fn report_undelivered_turn(
@@ -1742,17 +1742,13 @@ impl SessionService {
     /// rate-limit resume continuation, so the stale continuation must not
     /// replay after the newer message (#3028). No-op when nothing is queued.
     pub(crate) async fn clear_pending_initial_turn(self: &Arc<Self>, id: &str) {
-        let Some(text) = self
+        let Some(turn_key) = self
             .instances
             .read()
             .await
             .iter()
             .find(|i| i.id == id)
-            .and_then(|i| {
-                i.pending_initial_turn
-                    .as_ref()
-                    .map(|turn| turn.text.clone())
-            })
+            .and_then(|i| i.pending_initial_turn.as_ref().map(|turn| turn.key()))
         else {
             return;
         };
@@ -1778,7 +1774,7 @@ impl SessionService {
         self.unpersisted_clears
             .lock()
             .expect("unpersisted_clears mutex poisoned")
-            .insert((id.to_string(), text));
+            .insert((id.to_string(), turn_key));
     }
 
     /// Invalidate earlier disk snapshots under instances.write() or reload_gate.
@@ -3927,10 +3923,23 @@ mod tests {
             .unpersisted_clears
             .lock()
             .unwrap()
-            .insert(("sess-switch".to_string(), "typed".to_string()));
+            .insert(("sess-switch".to_string(), turn("typed", None).key()));
         assert!(!service.turn_is_deliverable("sess-switch", &turn("typed", None)));
         assert!(service.turn_is_deliverable("sess-switch", &turn("other", None)));
         assert!(service.turn_is_deliverable("sess-other", &turn("typed", None)));
+
+        // A later turn with the same text has its own identity.
+        let mut later = turn("typed", None);
+        later.id = crate::session::PendingInitialTurn::fresh_id();
+        let mut failed = turn("typed", None);
+        failed.id = "consumed".into();
+        service
+            .unpersisted_clears
+            .lock()
+            .unwrap()
+            .insert(("sess-switch".to_string(), failed.key()));
+        assert!(!service.turn_is_deliverable("sess-switch", &failed));
+        assert!(service.turn_is_deliverable("sess-switch", &later));
     }
 
     /// Declare `bridge` as a custom ACP agent that resets with `alias`.
