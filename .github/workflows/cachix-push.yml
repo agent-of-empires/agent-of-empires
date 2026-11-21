@@ -36,8 +36,8 @@ jobs:
     runs-on: ${{ matrix.os }}
     # Job level: the matrix context is not available at workflow level.
     concurrency:
-      group: cachix-push-${{ matrix.os }}
-      cancel-in-progress: ${{ github.event_name == 'push' }}
+      group: cachix-push-${{ matrix.os }}-${{ github.event_name }}-${{ github.ref }}
+      cancel-in-progress: true
     permissions:
       contents: read
     strategy:
