@@ -245,6 +245,13 @@ const PAGES = [
       "The web dashboard's default structured view: native rendering of AI agent state via the Agent Client Protocol (ACP). Plan panels, tool-call cards, swipe-to-approve, multi-provider support.",
   },
   {
+    source: "docs/structured-view/quickstart.md",
+    dest: "docs/structured-view/quickstart.md",
+    title: "Structured View Quickstart",
+    description:
+      "The default structured view in one command: the bundled aoe-agent adapter, structured view as the new-session default, Otari account and key setup, and the model id forms.",
+  },
+  {
     source: "docs/structured-view/interface.md",
     dest: "docs/structured-view/interface.md",
     title: "Structured View Interface",

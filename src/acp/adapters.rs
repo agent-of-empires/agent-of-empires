@@ -51,6 +51,14 @@ pub const BUNDLED_ADAPTERS: &[BundledAdapter] = &[
                 include_bytes!("../../acp-worker/aoe-agent/src/index.ts"),
             ),
             (
+                "src/aoeMeta.ts",
+                include_bytes!("../../acp-worker/aoe-agent/src/aoeMeta.ts"),
+            ),
+            (
+                "src/model.ts",
+                include_bytes!("../../acp-worker/aoe-agent/src/model.ts"),
+            ),
+            (
                 "src/toolKind.ts",
                 include_bytes!("../../acp-worker/aoe-agent/src/toolKind.ts"),
             ),
@@ -524,6 +532,87 @@ mod tests {
         assert!(fresh_tmp.exists(), "a concurrent install's staging dir");
         assert!(fresh_old.exists(), "a concurrent install's backup dir");
         assert!(installed.exists(), "the real install must never be swept");
+    }
+
+    /// Every relative import reachable from an in-tree adapter's entry must be
+    /// in its `sources`, or the installed copy dies at import time while its
+    /// digest still reports itself current (#5834).
+    #[test]
+    fn bundled_sources_cover_every_relative_import() {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("acp-worker");
+        for adapter in BUNDLED_ADAPTERS.iter().filter(|a| a.entry.is_some()) {
+            let entry = adapter.entry.unwrap();
+            let listed: Vec<&str> = adapter.sources.iter().map(|(path, _)| *path).collect();
+            let dir = root.join(adapter.binary);
+            let mut pending = vec![entry.to_string()];
+            let mut visited: Vec<String> = Vec::new();
+            while let Some(source) = pending.pop() {
+                if visited.contains(&source) {
+                    continue;
+                }
+                assert!(
+                    listed.contains(&source.as_str()),
+                    "{} reaches {source} but does not list it in `sources`",
+                    adapter.binary
+                );
+                let path = dir.join(&source);
+                let text = std::fs::read_to_string(&path)
+                    .unwrap_or_else(|e| panic!("{}: read {}: {e}", adapter.binary, path.display()));
+                pending.extend(relative_imports(&text, &source));
+                visited.push(source);
+            }
+        }
+    }
+
+    /// Relative import specifiers in `source`, resolved against the importing
+    /// file's path so a nested module maps onto the same key `sources` uses.
+    fn relative_imports(source: &str, importer: &str) -> Vec<String> {
+        let base = Path::new(importer).parent().unwrap_or(Path::new(""));
+        let mut found = Vec::new();
+        for needle in ["from \"", "import \""] {
+            let mut rest = source;
+            while let Some(start) = rest.find(needle) {
+                rest = &rest[start + needle.len()..];
+                let Some(end) = rest.find('"') else { break };
+                let specifier = &rest[..end];
+                rest = &rest[end..];
+                if !specifier.starts_with("./") && !specifier.starts_with("../") {
+                    continue;
+                }
+                found.push(normalise(&base.join(specifier)));
+            }
+        }
+        found
+    }
+
+    fn normalise(path: &Path) -> String {
+        let mut parts: Vec<std::ffi::OsString> = Vec::new();
+        for component in path.components() {
+            match component {
+                std::path::Component::CurDir => {}
+                std::path::Component::ParentDir => {
+                    parts.pop();
+                }
+                other => parts.push(other.as_os_str().to_os_string()),
+            }
+        }
+        parts
+            .iter()
+            .map(|p| p.to_string_lossy())
+            .collect::<Vec<_>>()
+            .join("/")
+    }
+
+    #[test]
+    fn bundled_sources_are_all_embedded() {
+        for adapter in BUNDLED_ADAPTERS.iter().filter(|a| a.entry.is_some()) {
+            let entry = adapter.entry.unwrap();
+            assert!(
+                adapter.sources.iter().any(|(path, _)| *path == entry),
+                "{}: entry {entry} is not among its own sources",
+                adapter.binary
+            );
+        }
     }
 
     #[test]

@@ -25,6 +25,7 @@ use super::send::SendArgs;
 use super::serve::ServeArgs;
 use super::session::SessionCommands;
 use super::settings::SettingsCommands;
+use super::setup::SetupArgs;
 use super::skill::SkillCommands;
 use super::sounds::SoundsCommands;
 use super::status::StatusArgs;
@@ -101,6 +102,11 @@ pub enum Commands {
 
     /// Initialize .agent-of-empires/config.toml in a repository
     Init(InitArgs),
+
+    /// Configure the default Structured view in one run: the bundled aoe-agent
+    /// adapter, structured view as the new-session default, and the Otari steps
+    /// when no provider key is present. Never overwrites a value you set.
+    Setup(SetupArgs),
 
     /// List all sessions
     #[command(alias = "ls")]
@@ -338,6 +344,7 @@ pub const CLI_COMMAND_NAMES: &[&str] = &[
     "add",
     "agents",
     "init",
+    "setup",
     "list",
     "ps",
     "logs",
@@ -377,6 +384,7 @@ pub fn command_name(command: &Commands) -> Option<&'static str> {
         Commands::Add(_) => "add",
         Commands::Agents => "agents",
         Commands::Init(_) => "init",
+        Commands::Setup(_) => "setup",
         Commands::List(_) => "list",
         Commands::Ps(_) => "ps",
         Commands::Logs(_) => "logs",

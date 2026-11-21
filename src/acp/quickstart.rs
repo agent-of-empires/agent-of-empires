@@ -1,0 +1,332 @@
+//! The default structured-view setup: what the machine has, what to configure,
+//! and what the bundled agent needs to answer a turn.
+//!
+//! `aoe setup` and the first-run wizard both plan through [`plan`], so a new
+//! surface cannot invent a different default. Detection reads the same ACP
+//! registry `aoe acp doctor` reports, never a second agent list.
+
+use std::path::Path;
+
+use crate::acp::agent_registry::AgentRegistry;
+use crate::acp::install_hints::AOE_AGENT_BINARY;
+use crate::session::config::{AcpConfig, StructuredView, DEFAULT_ACP_AGENT};
+
+/// The agent AoE bundles, and the quickstart's default.
+pub const BUNDLED_AGENT: &str = AOE_AGENT_BINARY;
+
+pub const OTARI_SIGNUP_URL: &str = "https://otari.ai/dashboard/#/signup";
+pub const OTARI_QUICKSTART_URL: &str = "https://docs.otari.ai/getting-started/quickstart";
+pub const OTARI_SUPPORT_URL: &str = "https://discord.gg/4gf3zXrQUc";
+
+/// An `AOE_AGENT_MODEL` value that routes the bundled agent through Otari.
+pub const OTARI_MODEL_EXAMPLE: &str = "openai-compatible:anthropic/claude-fable-5";
+
+/// The bundled agent is unusable and no install is permitted, so a detected
+/// agent takes the default.
+const FALLBACK_NO_BUNDLE: &str =
+    "the bundled aoe-agent is not installed and installing it was not requested";
+
+/// What this machine has, as `aoe agents` and `aoe acp doctor` see it.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Detection {
+    /// Registry agents whose command resolves, in registry order. Includes the
+    /// bundled agent once its adapter is installed.
+    pub present_agents: Vec<String>,
+    /// The bundled `aoe-agent` adapter is installed and current.
+    pub bundled_installed: bool,
+    /// An OpenAI-compatible gateway credential is already in the environment.
+    pub gateway_credential: Option<GatewayCredential>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GatewayCredential {
+    /// `OTARI_API_KEY`.
+    Otari,
+    /// `OPENAI_API_KEY` plus `OPENAI_BASE_URL`: a gateway the user already has.
+    Gateway,
+}
+
+impl Detection {
+    /// Read the host as the doctor does. `app_dir` is only used for the bundled
+    /// adapter's install state.
+    pub fn detect(app_dir: Option<&Path>, env: &dyn Fn(&str) -> Option<String>) -> Self {
+        let registry = AgentRegistry::with_defaults();
+        let mut present_agents: Vec<String> = registry
+            .list()
+            .into_iter()
+            .filter(|(_, spec)| crate::cli::acp::command_present(&spec.command))
+            .map(|(name, _)| name.clone())
+            .collect();
+        present_agents.sort();
+        let gateway_credential = if non_empty(env, "OTARI_API_KEY") {
+            Some(GatewayCredential::Otari)
+        } else if non_empty(env, "OPENAI_API_KEY") && non_empty(env, "OPENAI_BASE_URL") {
+            Some(GatewayCredential::Gateway)
+        } else {
+            None
+        };
+        let bundled_installed = app_dir.is_some_and(|app_dir| {
+            crate::acp::adapters::installation_is_current(app_dir, BUNDLED_AGENT)
+        });
+        Self {
+            present_agents,
+            bundled_installed,
+            gateway_credential,
+        }
+    }
+
+    /// [`Detection::detect`] against the real environment and app dir.
+    pub fn detect_env() -> Self {
+        let app_dir = crate::session::get_app_dir().ok();
+        Self::detect(app_dir.as_deref(), &|name| std::env::var(name).ok())
+    }
+}
+
+fn non_empty(env: &dyn Fn(&str) -> Option<String>, name: &str) -> bool {
+    env(name).is_some_and(|value| !value.trim().is_empty())
+}
+
+/// What the quickstart will do, once detection is folded in with the user's
+/// existing configuration.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Plan {
+    /// The agent `acp.default_agent` should name.
+    pub agent: String,
+    /// The plan's agent is the bundled one.
+    pub bundled: bool,
+    /// The bundled adapter is installed and current.
+    pub bundled_installed: bool,
+    /// Bundled adapter to install, when it is missing and allowed.
+    pub install: Option<&'static str>,
+    /// Agents already on the machine, offered as the alternative to the
+    /// bundled default.
+    pub alternatives: Vec<String>,
+    /// Explain how to get an Otari key: the bundled agent has no credential.
+    pub needs_gateway_key: bool,
+    /// Why the bundled agent did not take the default.
+    pub fallback: Option<&'static str>,
+}
+
+/// Decide the default from detection plus the current config. An existing
+/// value the user chose wins over everything: the quickstart never overwrites
+/// it.
+pub fn plan(detection: &Detection, config: &AcpConfig, install_allowed: bool) -> Plan {
+    let alternatives: Vec<String> = detection
+        .present_agents
+        .iter()
+        .filter(|name| name.as_str() != BUNDLED_AGENT && name.as_str() != "claude-code")
+        .cloned()
+        .collect();
+
+    let configured = config.default_agent.trim();
+    let user_default =
+        (!configured.is_empty() && configured != DEFAULT_ACP_AGENT).then(|| configured.to_string());
+
+    let (agent, bundled, fallback) = match user_default {
+        Some(existing) => {
+            let bundled = existing == BUNDLED_AGENT;
+            (existing, bundled, None)
+        }
+        None if detection.bundled_installed || install_allowed => {
+            (BUNDLED_AGENT.to_string(), true, None)
+        }
+        None => match alternatives.first() {
+            Some(first) => (first.clone(), false, Some(FALLBACK_NO_BUNDLE)),
+            // Nothing is present and nothing may be installed: still name the
+            // bundled default, so the doctor command the caller prints applies.
+            None => (BUNDLED_AGENT.to_string(), true, Some(FALLBACK_NO_BUNDLE)),
+        },
+    };
+
+    let install = (agent == BUNDLED_AGENT && !detection.bundled_installed && install_allowed)
+        .then_some(BUNDLED_AGENT);
+
+    Plan {
+        agent,
+        bundled,
+        bundled_installed: detection.bundled_installed,
+        install,
+        alternatives,
+        needs_gateway_key: detection.gateway_credential.is_none(),
+        fallback,
+    }
+}
+
+/// The settings a plan has to write, given what the config already says.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Changes {
+    /// `acp.default_agent`, when it is still the built-in default.
+    pub default_agent: Option<String>,
+    /// `acp.structured_view`, when it is still `auto`.
+    pub structured_view: bool,
+}
+
+impl Changes {
+    pub fn is_empty(&self) -> bool {
+        self.default_agent.is_none() && !self.structured_view
+    }
+}
+
+/// Settings to write for `plan`. A value the user already set (anything but the
+/// built-in default) is left alone, so re-running changes nothing.
+pub fn changes(config: &AcpConfig, plan: &Plan) -> Changes {
+    let configured = config.default_agent.trim();
+    Changes {
+        default_agent: (configured != plan.agent).then(|| plan.agent.clone()),
+        structured_view: config.structured_view == StructuredView::Auto,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn detection(present: &[&str], bundled_installed: bool, credential: bool) -> Detection {
+        Detection {
+            present_agents: present.iter().map(|s| s.to_string()).collect(),
+            bundled_installed,
+            gateway_credential: credential.then_some(GatewayCredential::Otari),
+        }
+    }
+
+    fn config(default_agent: &str, structured_view: StructuredView) -> AcpConfig {
+        AcpConfig {
+            default_agent: default_agent.to_string(),
+            structured_view,
+            ..AcpConfig::default()
+        }
+    }
+
+    #[test]
+    fn the_bundled_agent_is_the_default_in_every_unconfigured_case() {
+        let cases: [(&str, Detection, bool); 3] = [
+            (
+                "fresh machine, install allowed",
+                detection(&[], false, false),
+                true,
+            ),
+            (
+                "bundled adapter already installed",
+                detection(&["aoe-agent", "claude"], true, true),
+                false,
+            ),
+            (
+                "other agents present, install still allowed",
+                detection(&["claude", "codex"], false, false),
+                true,
+            ),
+        ];
+        for (name, detection, install_allowed) in cases {
+            let config = config(DEFAULT_ACP_AGENT, StructuredView::Auto);
+            let plan = plan(&detection, &config, install_allowed);
+            assert_eq!(plan.agent, BUNDLED_AGENT, "{name}");
+            assert!(plan.bundled, "{name}");
+            assert_eq!(plan.fallback, None, "{name}");
+            assert_eq!(
+                plan.install,
+                (!detection.bundled_installed && install_allowed).then_some(BUNDLED_AGENT),
+                "{name}"
+            );
+            // The bundled agent is offered alongside, never as an alternative.
+            assert!(
+                !plan.alternatives.iter().any(|a| a == BUNDLED_AGENT),
+                "{name}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_detected_agent_wins_only_when_the_bundled_one_cannot_run() {
+        let config = config(DEFAULT_ACP_AGENT, StructuredView::Auto);
+
+        let fallback = plan(
+            &detection(&["claude", "codex"], false, true),
+            &config,
+            false,
+        );
+        assert_eq!(fallback.agent, "claude");
+        assert!(!fallback.bundled);
+        assert_eq!(fallback.install, None);
+        assert_eq!(fallback.fallback, Some(FALLBACK_NO_BUNDLE));
+        assert_eq!(fallback.alternatives, vec!["claude", "codex"]);
+
+        // Nothing present and nothing installable: still name the bundled one,
+        // so the doctor command printed with it is the fix.
+        let nothing = plan(&detection(&[], false, true), &config, false);
+        assert_eq!(nothing.agent, BUNDLED_AGENT);
+        assert!(nothing.bundled);
+        assert_eq!(nothing.install, None);
+    }
+
+    #[test]
+    fn an_existing_default_is_never_overwritten() {
+        let cases = ["codex", "claude", BUNDLED_AGENT];
+        for existing in cases {
+            let config = config(existing, StructuredView::Auto);
+            let detection = detection(&["aoe-agent", "claude", "codex"], true, true);
+            let plan = plan(&detection, &config, true);
+            assert_eq!(plan.agent, existing);
+            assert_eq!(plan.bundled, existing == BUNDLED_AGENT);
+            assert_eq!(changes(&config, &plan).default_agent, None, "{existing}");
+            // A detected agent that is chosen is never installed over.
+            assert_eq!(plan.install, None, "{existing}");
+        }
+    }
+
+    #[test]
+    fn writes_happen_only_where_the_config_is_still_default() {
+        let plan = plan(
+            &detection(&[], false, false),
+            &config("", StructuredView::Auto),
+            true,
+        );
+
+        let fresh = changes(&config("", StructuredView::Auto), &plan);
+        assert_eq!(fresh.default_agent.as_deref(), Some(BUNDLED_AGENT));
+        assert!(fresh.structured_view);
+        assert!(!fresh.is_empty());
+
+        // Second run: nothing left to write.
+        let settled = config(BUNDLED_AGENT, StructuredView::Structured);
+        assert!(changes(&settled, &plan).is_empty());
+
+        // The user's view choice is theirs, whatever it is.
+        for view in [
+            StructuredView::Terminal,
+            StructuredView::Off,
+            StructuredView::Structured,
+        ] {
+            let chosen = config(DEFAULT_ACP_AGENT, view);
+            assert!(!changes(&chosen, &plan).structured_view, "{view:?}");
+        }
+    }
+
+    #[test]
+    fn the_otari_guidance_tracks_the_gateway_credential() {
+        let config = config(DEFAULT_ACP_AGENT, StructuredView::Auto);
+        assert!(
+            plan(&detection(&[], true, false), &config, true).needs_gateway_key,
+            "no credential means the account guidance applies"
+        );
+        assert!(!plan(&detection(&[], true, true), &config, true).needs_gateway_key);
+
+        // A gateway credential already in the environment counts too.
+        let env = |name: &str| match name {
+            "OPENAI_API_KEY" => Some("sk-test".to_string()),
+            "OPENAI_BASE_URL" => Some("https://gateway.example/v1".to_string()),
+            _ => None,
+        };
+        assert_eq!(
+            Detection::detect(None, &env).gateway_credential,
+            Some(GatewayCredential::Gateway)
+        );
+        let otari_env = |name: &str| (name == "OTARI_API_KEY").then(|| "key".to_string());
+        assert_eq!(
+            Detection::detect(None, &otari_env).gateway_credential,
+            Some(GatewayCredential::Otari)
+        );
+        // A blank value is not a credential.
+        let blank_env = |name: &str| (name == "OTARI_API_KEY").then(|| "  ".to_string());
+        assert_eq!(Detection::detect(None, &blank_env).gateway_credential, None);
+    }
+}
