@@ -631,6 +631,20 @@ mod tests {
         assert_eq!(info.resets_at, expected_resets, "latest event wins");
         assert!((before..=after).contains(&recorded_at));
         assert!(store.latest_rate_limit_event("latest-none").is_none());
+
+        // chrono wrote years past 9999 with a sign; such rows still load.
+        store.record("legacy", 1, &rate_limit_event(0)).unwrap();
+        store
+            .conn()
+            .execute(
+                "UPDATE acp_events SET event_json = json_set(event_json, '$.RateLimit.info.resets_at', '+57000-01-01T00:00:00Z') WHERE session_id = 'legacy'",
+                [],
+            )
+            .unwrap();
+        let (info, _) = store.latest_rate_limit_event("legacy").expect("legacy row");
+        assert_eq!(info.status, "usage limit reached");
+        assert_eq!(info.kind, "rate_limit");
+        assert_eq!(info.resets_at, Some(Timestamp::MAX));
     }
 
     #[test]
