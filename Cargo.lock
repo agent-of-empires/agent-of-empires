@@ -157,6 +157,7 @@ dependencies = [
  "tar",
  "tempfile",
  "thiserror 2.0.21",
+ "time",
  "tokio",
  "tokio-tungstenite 0.30.0",
  "tokio-util",
