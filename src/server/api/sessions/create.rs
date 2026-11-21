@@ -444,6 +444,60 @@ fn creation_trust_fingerprint(
     crate::session::config::repo_config::creation_trust_fingerprint(base, trust)
 }
 
+/// The redacted one-line summaries of the repo's MCP servers, for the trust dialog.
+fn mcp_summaries(
+    mcp: crate::session::config::repo_config::TrustSurface<
+        Vec<crate::session::mcp::project_mcp::ProjectMcpServer>,
+    >,
+) -> Vec<String> {
+    use crate::session::config::repo_config::TrustSurface;
+    match mcp {
+        TrustSurface::Trusted(servers)
+        | TrustSurface::NeedsTrust {
+            config: servers, ..
+        } => servers
+            .iter()
+            .map(|server| server.redacted_summary())
+            .collect(),
+        TrustSurface::Absent => Vec::new(),
+    }
+}
+
+/// What Start must show before it may create a Session in `path`.
+pub(crate) struct StartTrust {
+    pub(crate) fingerprint: crate::daemon::CreationTrustFingerprint,
+    pub(crate) merged_hooks: crate::session::HooksConfig,
+    pub(crate) hooks_need_trust: bool,
+    pub(crate) mcp_need_trust: bool,
+    pub(crate) mcp_summaries: Vec<String>,
+}
+
+/// The trust review of a plain (non-scratch) creation in `path`, as
+/// `POST /api/sessions/review` computes it.
+pub(crate) fn review_start_trust(
+    profile: &str,
+    path: &std::path::Path,
+) -> anyhow::Result<StartTrust> {
+    use crate::session::config::repo_config::{self, TrustSurface};
+    anyhow::ensure!(path.is_dir(), "Project path does not exist");
+    let base = crate::session::resolve_config(profile)?.hooks;
+    let trust = read_creation_trust(path, false)?;
+    let repo_hooks = match &trust.hooks {
+        TrustSurface::Trusted(hooks) | TrustSurface::NeedsTrust { config: hooks, .. } => {
+            hooks.clone()
+        }
+        TrustSurface::Absent => Default::default(),
+    };
+    let (hooks_need_trust, mcp_need_trust) = (trust.hooks.needs_trust(), trust.mcp.needs_trust());
+    Ok(StartTrust {
+        fingerprint: creation_trust_fingerprint(&base, &trust),
+        hooks_need_trust,
+        mcp_need_trust,
+        mcp_summaries: mcp_summaries(trust.mcp),
+        merged_hooks: repo_config::apply_repo_hook_overrides(base, &repo_hooks),
+    })
+}
+
 pub async fn review_creation_trust(
     State(state): State<Arc<AppState>>,
     body: Result<
@@ -498,16 +552,7 @@ pub async fn review_creation_trust(
                 }
                 TrustSurface::Absent => Default::default(),
             };
-            let mcp_summaries = match trust.mcp {
-                TrustSurface::Trusted(servers)
-                | TrustSurface::NeedsTrust {
-                    config: servers, ..
-                } => servers
-                    .iter()
-                    .map(|server| server.redacted_summary())
-                    .collect(),
-                TrustSurface::Absent => Vec::new(),
-            };
+            let mcp_summaries = mcp_summaries(trust.mcp);
             let (suggested_title, worktree_path_id) =
                 if let Some(branch) = body.generated_worktree_branch {
                     anyhow::ensure!(
@@ -827,6 +872,126 @@ pub(super) async fn wait_until_left_starting(
     }
 }
 
+/// The primary link a create holds until it settles: `(origin, Session id, in-flight mark)`.
+pub(super) type SuggestionLink = (
+    crate::session::SuggestionOrigin,
+    String,
+    crate::plugin::suggestions::Starting,
+);
+
+/// Claims the primary link of the suggestion a Session starts from. A second
+/// start of the same item is refused with 409 `already_started`.
+pub(super) async fn claim_suggestion_link(
+    state: &Arc<AppState>,
+    origin: Option<&crate::session::SuggestionOrigin>,
+    session_id: &str,
+) -> Result<Option<SuggestionLink>, axum::response::Response> {
+    use crate::plugin::suggestions::Claim;
+    let (Some(origin), Some(host)) = (origin, state.plugin_host.clone()) else {
+        return Ok(None);
+    };
+    let Some(profile) = origin.profile.clone() else {
+        return Ok(None);
+    };
+    let instances = Arc::clone(&state.instances);
+    let cityhall = state.cityhall_mode;
+    let starting = crate::plugin::suggestions::mark_starting(session_id);
+    let (item, claim_id) = (origin.clone(), session_id.to_owned());
+    let claimed = tokio::task::spawn_blocking(move || {
+        // Liveness is read under the instances lock the claim holds, so a Session
+        // a concurrent start just recorded cannot be judged gone.
+        let rows = instances.blocking_read();
+        let claim = host.with_suggestions_db(|conn, _| {
+            crate::plugin::suggestions::claim_link(
+                conn,
+                &profile,
+                &item.provider_id,
+                &item.id,
+                &claim_id,
+                &|id| rows.iter().any(|i| i.id == id && !i.is_trashed()),
+            )
+        })?;
+        // The holder's id is named only to a caller that can see that Session, by
+        // the rule the Suggestions feed and the session list use. One still being
+        // created has no row to judge, so CityHall is not told its id.
+        let visible = match &claim {
+            Claim::Won => true,
+            Claim::Starting(_) => !cityhall,
+            Claim::Session(id) => rows
+                .iter()
+                .any(|i| i.id == *id && (!cityhall || i.is_structured())),
+        };
+        Ok::<_, rusqlite::Error>((claim, visible))
+    })
+    .await;
+    let conflict = |message: &str, holder: String, visible: bool| {
+        let mut body = serde_json::json!({ "error": "already_started", "message": message });
+        if visible {
+            body["session_id"] = holder.into();
+        }
+        (StatusCode::CONFLICT, Json(body)).into_response()
+    };
+    match claimed {
+        Ok(Ok((Claim::Won, _))) => Ok(Some((origin.clone(), session_id.to_owned(), starting))),
+        Ok(Ok((Claim::Session(holder), visible))) => Err(conflict(
+            "This suggestion already has a Session",
+            holder,
+            visible,
+        )),
+        Ok(Ok((Claim::Starting(holder), visible))) => Err(conflict(
+            "This suggestion is already starting",
+            holder,
+            visible,
+        )),
+        Ok(Err(error)) => Err(api_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "internal",
+            error.to_string(),
+        )),
+        Err(error) => Err(api_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "internal",
+            error.to_string(),
+        )),
+    }
+}
+
+/// Marks the claimed Session created, or frees the link when the create failed
+/// (`created` is false).
+pub(super) async fn settle_suggestion_link(
+    state: &Arc<AppState>,
+    link: Option<&SuggestionLink>,
+    created: bool,
+) {
+    let (Some((origin, session_id, _)), Some(host)) = (link, state.plugin_host.clone()) else {
+        return;
+    };
+    let Some(profile) = origin.profile.clone() else {
+        return;
+    };
+    let (origin, session_id) = (origin.clone(), session_id.clone());
+    let settled = tokio::task::spawn_blocking(move || {
+        host.with_suggestions_db(|conn, _| {
+            let settle = if created {
+                crate::plugin::suggestions::settle_link
+            } else {
+                crate::plugin::suggestions::release_link
+            };
+            settle(conn, &profile, &origin.provider_id, &origin.id, &session_id)
+        })
+    })
+    .await;
+    match settled {
+        Ok(Ok(())) => {}
+        Ok(Err(error)) => {
+            tracing::warn!(target: "plugin.suggestions", %error, "could not update a suggestion link");
+        }
+        Err(error) => {
+            tracing::warn!(target: "plugin.suggestions", %error, "suggestion link task failed");
+        }
+    }
+}
+
 pub async fn create_session(
     State(state): State<Arc<AppState>>,
     axum::extract::Query(query): axum::extract::Query<CreateSessionQuery>,
@@ -893,6 +1058,18 @@ pub(crate) async fn create_session_with(
             StatusCode::BAD_REQUEST,
             "validation_failed",
             "initial_prompt exceeds 64 KiB",
+        );
+    }
+
+    if body.suggestion.as_ref().is_some_and(|s| {
+        [&s.provider_id, &s.id]
+            .iter()
+            .any(|v| v.trim().is_empty() || v.len() > aoe_plugin_api::suggestions::MAX_KEY_BYTES)
+    }) {
+        return api_error(
+            StatusCode::BAD_REQUEST,
+            "validation_failed",
+            "suggestion ids must be non-empty and within the key size limit",
         );
     }
 
@@ -1151,6 +1328,52 @@ pub(crate) async fn create_session_with(
         .and_then(crate::server::api::unknown_profile_response)
     {
         return resp;
+    }
+
+    if let Some(origin) = body.suggestion.clone() {
+        let host = state.plugin_host.clone();
+        let published = tokio::task::spawn_blocking(move || {
+            let Some(host) = host else {
+                return Ok(None);
+            };
+            let providers = crate::plugin::suggestions::providers();
+            host.with_suggestions_db(|conn, profile| {
+                let published =
+                    crate::plugin::suggestions::is_published(conn, profile, &providers, &origin)?;
+                Ok::<_, anyhow::Error>(published.then(|| profile.to_string()))
+            })
+        })
+        .await;
+        match published {
+            // The session may be created in another profile than the one the
+            // suggestion lives in; keep the latter so the link survives.
+            Ok(Ok(Some(profile))) => {
+                if let Some(origin) = body.suggestion.as_mut() {
+                    origin.profile = Some(profile);
+                }
+            }
+            Ok(Ok(None)) => {
+                return api_error(
+                    StatusCode::CONFLICT,
+                    "stale_suggestion",
+                    "Suggestion is no longer open; refresh and retry",
+                );
+            }
+            Ok(Err(error)) => {
+                return api_error(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "internal",
+                    error.to_string(),
+                );
+            }
+            Err(error) => {
+                return api_error(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "internal",
+                    error.to_string(),
+                );
+            }
+        }
     }
 
     let validation_profile = body.profile.as_deref().unwrap_or(&default_profile);
@@ -1469,7 +1692,7 @@ pub(crate) async fn create_session_with(
         .as_ref()
         .map_or_else(Default::default, |r| Arc::clone(&r.progress));
 
-    let spec = crate::server::session_spawn::StructuredSessionSpec {
+    let mut spec = crate::server::session_spawn::StructuredSessionSpec {
         title: body.title,
         title_typed: body.title_typed,
         size: body.size,
@@ -1507,6 +1730,7 @@ pub(crate) async fn create_session_with(
         // stamps these, through create_structured_session (#2897).
         created_by_plugin: None,
         plugin_create_idempotency: None,
+        suggestion: body.suggestion,
         pending_initial_turn: None,
         parent_session_id: body.parent_session_id,
         cli: body.cli,
@@ -1518,7 +1742,24 @@ pub(crate) async fn create_session_with(
         import_acp_session_id: body.import_acp_session_id,
         import_binding,
         fork_seed,
+        session_id: None,
         progress: Some(Arc::clone(&progress)),
+    };
+
+    // A suggestion has one primary Session: claim its link before provisioning
+    // anything, and free it again if the create fails.
+    if spec.suggestion.is_some() {
+        spec.session_id = Some(crate::session::generate_id());
+    }
+    let link = match claim_suggestion_link(
+        &state,
+        spec.suggestion.as_ref(),
+        spec.session_id.as_deref().unwrap_or_default(),
+    )
+    .await
+    {
+        Ok(link) => link,
+        Err(response) => return response,
     };
 
     // Detached so a client that drops the connection mid-create (a backgrounded
@@ -1533,7 +1774,7 @@ pub(crate) async fn create_session_with(
         let _idempotency_guard = _idempotency_guard;
         let _registration = registration;
         let _creation_profile = _creation_profile;
-        run_create_task(
+        let result = run_create_task(
             async {
                 #[cfg(test)]
                 panic_hook::fire(key.as_deref()).await;
@@ -1547,7 +1788,11 @@ pub(crate) async fn create_session_with(
             key.as_deref(),
             &task_reference,
         )
-        .await
+        .await;
+        // Settled here, not in the handler, so a client that dropped mid-create
+        // cannot leave the claim pending.
+        settle_suggestion_link(&task_state, link.as_ref(), result.is_ok()).await;
+        result
     })
     .await
     // Only a runtime shutdown cancels the task; a panic is caught inside it.
