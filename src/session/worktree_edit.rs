@@ -574,7 +574,11 @@ mod tests {
             let label = format!("{sandboxed} {pinned:?} {recorded:?} {code} {stderr}");
             assert_eq!(result.is_ok(), ok, "{label}");
             let log = std::fs::read_to_string(&calls).unwrap_or_default();
-            assert_eq!(log.trim(), if called { "stop c1" } else { "" }, "{label}");
+            assert_eq!(
+                log.trim(),
+                if called { "stop -t 0 c1" } else { "" },
+                "{label}"
+            );
         }
     }
 
