@@ -453,6 +453,18 @@ impl EmbeddedView {
         self.state.toast.as_ref().map(|toast| toast.text.as_str())
     }
 
+    /// Prompts the daemon took from this view. The paste drain advances its
+    /// replay only when this grows, so a rejected prompt is not counted as sent.
+    pub(crate) fn accepted_submits(&self) -> u64 {
+        self.state.accepted_submits
+    }
+
+    /// True when the last submit was refused and its text restored to the
+    /// composer.
+    pub(crate) fn last_submit_rejected(&self) -> bool {
+        self.state.submit_rejected
+    }
+
     /// Prompts this view submitted, in order: test read for the paste-drain
     /// handoff's Enter boundary.
     #[cfg(test)]

@@ -1810,30 +1810,35 @@ async fn send_prompt_now(
     state.submitted_prompts.push(text.to_owned());
     state.in_flight = true;
     match state.http.prompt(&state.session_id, text, false).await {
-        Ok(dispatch) => match dispatch.disposition {
-            PromptDispositionWire::Queued => {
-                // A queued prompt starts no turn, so nothing will clear the
-                // submit lock for us.
-                state.in_flight = false;
-                refresh_queue(state).await;
-                set_toast(
-                    state,
-                    toast_deadline,
-                    format!("queued ({} waiting)", state.queue.len()),
-                    ToastKind::Info,
-                );
+        Ok(dispatch) => {
+            state.accepted_submits += 1;
+            state.submit_rejected = false;
+            match dispatch.disposition {
+                PromptDispositionWire::Queued => {
+                    // A queued prompt starts no turn, so nothing will clear the
+                    // submit lock for us.
+                    state.in_flight = false;
+                    refresh_queue(state).await;
+                    set_toast(
+                        state,
+                        toast_deadline,
+                        format!("queued ({} waiting)", state.queue.len()),
+                        ToastKind::Info,
+                    );
+                }
+                PromptDispositionWire::Sent | PromptDispositionWire::Steered => {
+                    set_toast(
+                        state,
+                        toast_deadline,
+                        format!("prompt sent ({} bytes)", text.len()),
+                        ToastKind::Info,
+                    );
+                }
             }
-            PromptDispositionWire::Sent | PromptDispositionWire::Steered => {
-                set_toast(
-                    state,
-                    toast_deadline,
-                    format!("prompt sent ({} bytes)", text.len()),
-                    ToastKind::Info,
-                );
-            }
-        },
+        }
         Err(e) => {
             state.in_flight = false;
+            state.submit_rejected = true;
             state.set_composer_text(text);
             set_toast(
                 state,

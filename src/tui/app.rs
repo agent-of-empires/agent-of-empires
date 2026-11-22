@@ -2548,20 +2548,9 @@ impl App {
                 }
             }
             // Esc gives up the hold instead of being swallowed until the
-            // connect settles, and hands the text back where it came from.
+            // connect settles. The text stays this row's unsent draft: Home's
+            // paste buffer belongs to whichever row is selected next.
             (KeyCode::Esc, _) => {
-                if let Some((completed, draft)) = self
-                    .home
-                    .pending_paste_for_structured_view
-                    .remove(&target)
-                    .map(|pending| pending.into_parts())
-                {
-                    let mut text = completed.concat();
-                    text.push_str(&draft);
-                    if !text.is_empty() {
-                        self.home.pending_paste = Some(text);
-                    }
-                }
                 self.structured_mount_activate = None;
                 return false;
             }
@@ -2600,6 +2589,9 @@ impl App {
         }
         let (completed, draft) = pending.into_parts();
         let mut unsent = completed;
+        // Set when the daemon refused a prompt and put it back in the composer:
+        // replaying the next segment into that text would submit them together.
+        let mut rejected = false;
         let failure = {
             let view = self
                 .home
@@ -2610,6 +2602,7 @@ impl App {
             // Each segment was frozen when its Enter fell, so replaying them in
             // order submits exactly what the user had typed before each Enter.
             while let Some(segment) = unsent.first().cloned() {
+                let accepted = view.accepted_submits();
                 view.paste_text_with_file_load(&segment).await;
                 if let Err(e) = view
                     .handle_event(Event::Key(KeyEvent::new(
@@ -2621,13 +2614,32 @@ impl App {
                     failure = Some(e);
                     break;
                 }
+                if view.accepted_submits() == accepted {
+                    // The daemon kept nothing. A refused prompt is back in the
+                    // composer, so the replay drops just that segment; an Enter
+                    // the view never submitted keeps its text buffered.
+                    if view.last_submit_rejected() {
+                        unsent.remove(0);
+                    }
+                    rejected = true;
+                    break;
+                }
                 unsent.remove(0);
             }
-            if failure.is_none() && !draft.is_empty() {
+            if failure.is_none() && !rejected && !draft.is_empty() {
                 view.paste_text_with_file_load(&draft).await;
             }
             failure
         };
+        if rejected {
+            // What came after the refused prompt still has its own Enter to
+            // honour, and the draft was never typed into the composer.
+            self.home.pending_paste_for_structured_view.insert(
+                session_id.to_owned(),
+                PendingStructuredInput::from_parts(unsent, draft),
+            );
+            return;
+        }
         if let Some(e) = failure {
             // Nothing that never reached the composer is dropped: the rest waits
             // for the next mount of this row.
@@ -4046,10 +4058,17 @@ mod tests {
             ["send this".to_string()],
             "only the text before Enter is submitted"
         );
-        assert!(
-            view.composer_text().ends_with(" not this"),
-            "text typed after Enter stays in the composer, got {:?}",
-            view.composer_text()
+        // The refused prompt is back in the composer, so the text typed after
+        // Enter is kept for this row rather than appended to it.
+        assert_eq!(view.composer_text(), "send this");
+        assert_eq!(
+            app.home
+                .pending_paste_for_structured_view
+                .get(&id)
+                .map(PendingStructuredInput::text)
+                .as_deref(),
+            Some(" not this"),
+            "text typed after Enter waits for the next mount of this row"
         );
     }
 
@@ -4078,22 +4097,83 @@ mod tests {
         assert!(app.poll_structured_mount());
         app.drain_structured_paste().await;
 
-        // The fake daemon refuses every send and restores the draft, so the
-        // second submission carries the first one's text back with it. The
-        // count is what the collapsed boundary broke; the exact split is
-        // asserted above against the composer.
-        let submitted = app
+        // The fake daemon refuses every send and puts the prompt back in the
+        // composer. Replaying on that would paste "second" onto "first" and
+        // submit both, so the refused prompt is the last one this mount sends.
+        let view = app
             .home
             .structured_preview
             .as_ref()
-            .map(|view| view.submitted_prompts().to_vec())
-            .unwrap_or_default();
+            .expect("the mount Enter asked for is on screen");
+        assert_eq!(view.submitted_prompts(), ["first".to_string()]);
         assert_eq!(
-            submitted.len(),
-            2,
-            "each Enter is its own submission, got {submitted:?}"
+            view.composer_text(),
+            "first",
+            "the refused prompt is back in the composer on its own"
         );
-        assert_eq!(submitted.first().map(String::as_str), Some("first"));
+        assert_eq!(
+            app.home
+                .pending_paste_for_structured_view
+                .get(&id)
+                .map(PendingStructuredInput::text)
+                .as_deref(),
+            Some("second"),
+            "the later segment waits for the next mount instead of riding along"
+        );
+    }
+
+    /// Esc while a mount connects gives up the hold without handing the text to
+    /// Home, whose paste buffer feeds whichever row is selected next.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn esc_leaves_the_held_text_with_its_own_row() {
+        use crate::tui::structured_view::embedded::EmbeddedView;
+        let (mut app, _guard, ids) = app_on_two_structured_rows();
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        app.structured_mount = Some((ids[0].clone(), rx));
+        app.open_structured_view(&ids[0]).await.unwrap();
+
+        app.route_pasted_text("typed for the first row").await;
+        assert!(!app.hold_key_for_pending_structured_view(&KeyEvent::new(
+            KeyCode::Esc,
+            KeyModifiers::NONE
+        )));
+
+        assert!(
+            app.home.pending_paste.is_none(),
+            "Esc must not put one row's text in Home's paste buffer"
+        );
+        assert_eq!(
+            app.home
+                .pending_paste_for_structured_view
+                .get(&ids[0])
+                .map(PendingStructuredInput::text)
+                .as_deref(),
+            Some("typed for the first row"),
+            "the text stays the first row's unsent draft"
+        );
+
+        // Selecting the other row and sending there drains the buffer that fed
+        // Send Message; with nothing in it, the text cannot follow the reader.
+        app.home.selected_session = Some(ids[1].clone());
+        assert!(
+            app.home.pending_paste.is_none(),
+            "Send Message on the second row finds nothing to prefill"
+        );
+
+        // The first row still gets its text back when its mount lands.
+        app.home.selected_session = Some(ids[0].clone());
+        assert!(tx.send(Ok(EmbeddedView::for_test(&ids[0]))).is_ok());
+        assert!(app.poll_structured_mount());
+        // Esc dropped the activation request, so the drain belongs to the next
+        // Enter on this row, which replays the draft it kept.
+        app.drain_pending_paste_for_structured_view(&ids[0]).await;
+        let view = app
+            .home
+            .structured_preview
+            .as_ref()
+            .expect("the mount is on screen");
+        assert_eq!(view.composer_text(), "typed for the first row");
     }
 
     /// Backspace after a buffered Enter edits only the draft that has not been
@@ -4133,9 +4213,14 @@ mod tests {
             ["éa".to_string()],
             "the segment frozen by Enter is submitted whole"
         );
-        assert!(
-            view.composer_text().ends_with('界'),
-            "the multibyte draft survives, got {:?}",
+        assert_eq!(
+            app.home
+                .pending_paste_for_structured_view
+                .get(&id)
+                .map(PendingStructuredInput::text)
+                .as_deref(),
+            Some("界"),
+            "the multibyte draft survives for the next mount, got {:?}",
             view.composer_text()
         );
     }

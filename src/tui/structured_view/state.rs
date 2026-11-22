@@ -126,6 +126,13 @@ pub struct StructuredViewState {
     /// or `None` when off or the fetch failed. Read from the daemon's `/api/about`,
     /// not local config, so a remote-attached view honours that daemon (#3253).
     pub compaction_reminder_percent: Option<u8>,
+    /// Prompts the daemon took from this view. A caller replaying buffered input
+    /// advances only when this grows: a rejected prompt comes back to the
+    /// composer, and Enter can be consumed by the view without a submit.
+    pub accepted_submits: u64,
+    /// True when the last submit was refused and its text put back in the
+    /// composer, so a replay knows that text is not lost.
+    pub submit_rejected: bool,
     /// Every prompt the composer submitted, in order. Test-only, so the paste
     /// handoff can assert what each Enter actually sent.
     #[cfg(test)]
@@ -354,6 +361,8 @@ impl StructuredViewState {
             auto_presented_elicitation: None,
             last_scroll_max: std::cell::Cell::new(0),
             compaction_reminder_percent: None,
+            accepted_submits: 0,
+            submit_rejected: false,
             #[cfg(test)]
             submitted_prompts: Vec::new(),
         }
