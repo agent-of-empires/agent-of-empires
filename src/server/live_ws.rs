@@ -346,8 +346,10 @@ impl InputWake {
         let _ = self.requests.try_send(());
     }
 
+    /// Closing the sender lets a queued wake, or one already reading the store, finish, so
+    /// input the pane accepted is not lost when the tab closes.
     async fn stop(self) {
-        self.worker.abort();
+        drop(self.requests);
         let _ = self.worker.await;
     }
 }
@@ -3110,6 +3112,39 @@ mod tests {
                 "grid={grid} owned={owned} panes={panes:?} lines={lines}"
             );
         }
+    }
+
+    /// Closing the tab right after the pane accepts input must not drop the wake that
+    /// clears a peer's Ignore. The worker is only polled when the test awaits, so a queued
+    /// request that survives `stop` is one this test can see land.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn an_accepted_input_wake_survives_disconnect() {
+        let _home = crate::session::test_support::isolate_app_dir();
+        let mut managed = crate::session::Instance::new("typed", "/tmp/aoe-typed");
+        managed.id = "typed".into();
+        managed.source_profile = "default".into();
+        managed.parent_session_id = Some("manager".into());
+        managed.ignore();
+        crate::server::test_support::seed_instances_on_disk_for_test(
+            "default",
+            vec![managed.clone()],
+        );
+        let state = crate::server::test_support::build_test_app_state(vec![managed]);
+        crate::server::test_support::refresh_canonical_metadata_for_test(&state).await;
+
+        let wake = InputWake::spawn((Arc::clone(&state), "typed".into()));
+        wake.request();
+        wake.stop().await;
+
+        assert!(
+            !state
+                .session_service
+                .is_ignored_on_disk("typed")
+                .await
+                .unwrap(),
+            "accepted input must clear the canonical marker even if the tab closed"
+        );
     }
 
     #[test]
