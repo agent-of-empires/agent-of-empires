@@ -57,19 +57,30 @@ pub(super) fn web_plugin_disabled() -> bool {
 }
 
 impl HomeView {
-    /// Tools the new-session dialog offers. A machine with no terminal agent but
-    /// a runnable bundled adapter gets that adapter, so the first-run wizard's
-    /// choice can create the first Structured session here instead of only in
-    /// the CLI.
+    /// Tools the new-session dialog offers. A runnable bundled adapter is
+    /// offered alongside the terminal agents, so a machine with none still gets
+    /// a dialog rather than the no-agents pointer, and the wizard's choice stays
+    /// selectable where native tools exist.
     fn dialog_tools(&self) -> crate::tmux::AvailableTools {
-        if self.available_tools.any_available() {
-            return self.available_tools.clone();
-        }
+        self.dialog_tools_with_bundle(self.bundle_ready())
+    }
+
+    /// Whether the bundled adapter could start a turn here, under the same
+    /// setting the launch honors.
+    fn bundle_ready(&self) -> bool {
         let config = load_config().ok().flatten().unwrap_or_default();
+        if config.acp.structured_view == StructuredView::Off {
+            return false;
+        }
         let app_dir = crate::session::get_app_dir().ok();
-        if config.acp.structured_view == StructuredView::Off
-            || !crate::acp::quickstart::bundled_ready(app_dir.as_deref())
-        {
+        crate::acp::quickstart::bundled_ready(app_dir.as_deref())
+    }
+
+    pub(super) fn dialog_tools_with_bundle(
+        &self,
+        bundle_ready: bool,
+    ) -> crate::tmux::AvailableTools {
+        if !bundle_ready {
             return self.available_tools.clone();
         }
         self.available_tools
@@ -3702,7 +3713,8 @@ impl HomeView {
         // Same gate as `open_new_session_dialog`: with no agent available the dialog has
         // nothing to create, so point at setup instead. Keeps `'N'` and the group menu's
         // New Session in step with `'n'` and the empty-sidebar menu.
-        if !self.available_tools.any_available() {
+        let tools = self.dialog_tools();
+        if !tools.any_available() {
             self.show_no_agents();
             return;
         }
@@ -3750,12 +3762,8 @@ impl HomeView {
                 .unwrap_or_else(|| self.config_profile());
             let profiles =
                 list_profiles_for_display().unwrap_or_else(|_| vec![current_profile.clone()]);
-            let mut dialog = NewSessionDialog::new(
-                self.dialog_tools(),
-                existing_groups,
-                &current_profile,
-                profiles,
-            );
+            let mut dialog =
+                NewSessionDialog::new(tools, existing_groups, &current_profile, profiles);
             seed_wizard_agent(self.first_session_agent.as_deref(), &mut dialog);
             let has_prefilled_path = prefill_path.is_some();
             if let Some(path) = prefill_path {
@@ -5854,6 +5862,12 @@ impl HomeView {
     /// info dialog while a session is being created, the no-agents dialog when no tool is
     /// available, otherwise the full dialog. Shared by `'n'` and the empty-sidebar click.
     pub(super) fn open_new_session_dialog(&mut self) {
+        self.open_new_session_dialog_with(self.dialog_tools());
+    }
+
+    /// The dialog itself, for a toolset already resolved: the gate has to see
+    /// the bundled adapter the dialog can offer, not only the native tools.
+    pub(super) fn open_new_session_dialog_with(&mut self, tools: crate::tmux::AvailableTools) {
         if self.creating_stub_id.is_some() {
             self.info_dialog = Some(InfoDialog::new(
                 "Please Wait",
@@ -5861,7 +5875,7 @@ impl HomeView {
             ));
             return;
         }
-        if !self.available_tools.any_available() {
+        if !tools.any_available() {
             self.show_no_agents();
             return;
         }
@@ -5875,12 +5889,7 @@ impl HomeView {
         let current_profile = self.config_profile();
         let profiles =
             list_profiles_for_display().unwrap_or_else(|_| vec![current_profile.clone()]);
-        let mut dialog = NewSessionDialog::new(
-            self.dialog_tools(),
-            existing_groups,
-            &current_profile,
-            profiles,
-        );
+        let mut dialog = NewSessionDialog::new(tools, existing_groups, &current_profile, profiles);
         seed_wizard_agent(self.first_session_agent.as_deref(), &mut dialog);
         self.new_dialog = Some(dialog);
     }

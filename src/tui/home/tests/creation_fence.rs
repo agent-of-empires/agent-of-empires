@@ -998,3 +998,45 @@ fn a_paste_over_the_setup_failed_dialog_goes_nowhere() {
         );
     }
 }
+
+/// The bundled adapter is offered wherever it can run, beside native tools as
+/// well as instead of them, and the gate sees it: a host with only the bundle
+/// gets the dialog, not the setup pointer, seeded with the wizard's agent.
+#[test]
+#[serial]
+fn the_new_session_dialog_offers_a_runnable_bundle_beside_native_tools() {
+    let bundle = crate::acp::quickstart::BUNDLED_AGENT;
+    for (native, expected) in [
+        (&[][..], vec![bundle]),
+        (&["claude"][..], vec!["claude", bundle]),
+    ] {
+        let CreationTestEnv { mut view, .. } = setup_creation_test_env();
+        view.available_tools = AvailableTools::with_tools(native);
+        let tools = view.dialog_tools_with_bundle(true);
+        assert_eq!(
+            tools.available_list(),
+            expected,
+            "a runnable bundle is offered {native:?}"
+        );
+        view.first_session_agent = Some(bundle.to_string());
+        view.open_new_session_dialog_with(tools);
+        assert!(
+            view.no_agents_dialog.is_none(),
+            "the dialog opens with a runnable bundle {native:?}"
+        );
+        let dialog = view.new_dialog.as_ref().expect("the dialog opens");
+        assert_eq!(
+            dialog.selected_tool(),
+            bundle,
+            "the wizard's agent is the default {native:?}"
+        );
+    }
+
+    // Without a runnable bundle nothing changes: native tools alone, and the
+    // setup pointer when there are none.
+    let CreationTestEnv { mut view, .. } = setup_creation_test_env();
+    view.available_tools = AvailableTools::with_tools(&[]);
+    view.open_new_session_dialog_with(view.dialog_tools_with_bundle(false));
+    assert!(view.new_dialog.is_none(), "no tool, no dialog");
+    assert!(view.no_agents_dialog.is_some(), "the setup pointer instead");
+}
