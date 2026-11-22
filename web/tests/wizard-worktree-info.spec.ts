@@ -40,17 +40,48 @@ test.describe("desktop", () => {
     expect(await page.evaluate(() => !!document.activeElement?.closest('[data-testid="session-wizard"]'))).toBe(true);
   });
 
+  const focusInWizard = (page: Page) =>
+    page.evaluate(() => !!document.activeElement?.closest('[data-testid="session-wizard"]'));
+
   // Opened first, then resized: a narrower window closes it, a shorter one keeps it open (re-clamped, see below).
+  // Closing under focus hands it back to the icon, so the next Tab goes on through the wizard.
   test("an open popover closes when the window narrows, and stays open when only the height changes", async ({
     page,
   }) => {
     await startWizard(page, WORKTREE_ON);
-    await icon(page).click();
-    await expect(popover(page)).toBeVisible();
+    await icon(page).focus();
+    await page.keyboard.press("Enter");
+    await page.keyboard.press("Tab");
+    await expect(link(page)).toBeFocused();
     await page.setViewportSize({ width: 1280, height: 600 });
     await expect(popover(page)).toBeVisible();
+    await expect(link(page)).toBeFocused();
     await page.setViewportSize({ width: 375, height: 600 });
     await expect(popover(page)).toHaveCount(0);
+    await expect(icon(page)).toBeFocused();
+    await page.keyboard.press("Tab");
+    expect(await focusInWizard(page)).toBe(true);
+  });
+
+  test("a scroll under the open popover closes it and hands focus back to the icon", async ({ page }) => {
+    await startWizard(page, WORKTREE_ON);
+    await icon(page).focus();
+    await page.keyboard.press("Enter");
+    await page.keyboard.press("Tab");
+    await expect(link(page)).toBeFocused();
+    // The mocked wizard's fields fit, so a spacer gives its list something to scroll.
+    const scrolled = await page.evaluate(() => {
+      const list = document.querySelector<HTMLElement>("[data-wizard-scroll]");
+      if (!list) return false;
+      list.append(Object.assign(document.createElement("div"), { style: "height: 2000px" }));
+      list.scrollTop = 40;
+      return list.scrollTop > 0;
+    });
+    expect(scrolled, "the wizard's list didn't scroll").toBe(true);
+    await expect(popover(page)).toHaveCount(0);
+    await expect(icon(page)).toBeFocused();
+    await page.keyboard.press("Tab");
+    expect(await focusInWizard(page)).toBe(true);
   });
 
   test("a height-only shrink past the open popover's bottom edge moves it back inside the window", async ({ page }) => {

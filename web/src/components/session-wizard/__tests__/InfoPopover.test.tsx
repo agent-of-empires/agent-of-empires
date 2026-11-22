@@ -67,18 +67,32 @@ describe("InfoPopover", () => {
     Object.assign(window, { innerWidth: width, innerHeight: height });
     fireEvent(window, new Event("resize"));
   };
+  const scroll = () => fireEvent.scroll(screen.getByText("outside"));
   // A narrower window moves the icon but not the panel's size, so nothing else would re-place it. A phone's
   // keyboard and address bar change only the height, and opening the popover can close the keyboard.
+  // Closing with focus inside returns it to the icon, so Tab keeps its place; focus elsewhere stays put.
   it.each([
-    ["closes when the page under it scrolls", () => fireEvent.scroll(screen.getByText("outside")), false],
-    ["closes when the window's width changes", resize(375, 768), false],
-    ["stays open when only the window's height changes", resize(1024, 400), true],
-  ])("%s", (_label, act, staysOpen) => {
+    ["closes when the page under it scrolls, focus inside", scroll, "inside", "icon"],
+    ["closes when the page under it scrolls, focus elsewhere", scroll, "elsewhere", "body"],
+    ["closes when the window's width changes, focus inside", resize(375, 768), "inside", "icon"],
+    ["closes when the window's width changes, focus elsewhere", resize(375, 768), "elsewhere", "body"],
+    ["stays open when only the window's height changes", resize(1024, 400), "inside", "open"],
+  ] as const)("%s", (_label, change, focus, expected) => {
     Object.assign(window, { innerWidth: 1024, innerHeight: 768 });
-    renderPopover();
-    fireEvent.click(screen.getByRole("button", { name: "What's a worktree?" }));
-    act();
-    expect(dialog() !== null).toBe(staysOpen);
+    const icon = renderPopover();
+    fireEvent.click(icon);
+    const linkEl = screen.getByRole("link", { name: "Worktree settings ›" });
+    linkEl.focus();
+    // Focus leaving for nowhere (a removed element, a click on the page) fires no focusin, so the popover stays.
+    if (focus === "elsewhere") linkEl.blur();
+    change();
+    if (expected === "open") {
+      expect(dialog()).not.toBeNull();
+      expect(document.activeElement).toBe(linkEl);
+    } else {
+      expect(dialog()).toBeNull();
+      expect(document.activeElement).toBe(expected === "icon" ? icon : document.body);
+    }
     Object.assign(window, { innerWidth: 1024, innerHeight: 768 });
   });
 });

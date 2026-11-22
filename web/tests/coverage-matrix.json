@@ -1537,7 +1537,7 @@
         "web/src/components/session-wizard/SessionWizard.tsx",
         "web/src/hooks/useKeyboardShortcuts.ts"
       ],
-      "notes": "#5910: the Worktree row's info icon, in every row state including blocked ones, opens a dialog explaining worktrees. Enter or Space opens it, Escape closes it without closing the wizard and refocuses the icon, and the icon is a 44px target on phones. Its link closes the wizard and opens Settings > Worktree in the app, without a page load, so a passphrase login's redirect to /login doesn't apply."
+      "notes": "#5910: the Worktree row's info icon, in every row state including blocked ones, opens a dialog explaining worktrees. Enter or Space opens it, Escape closes it without closing the wizard and refocuses the icon. A scroll under it or a change of window width closes it too, refocusing the icon only when focus was inside it; a height-only change keeps it open, moved back inside the window. The icon is a 44px target on phones. Its link closes the wizard and opens Settings > Worktree in the app, without a page load, so a passphrase login's redirect to /login doesn't apply."
     },
     {
       "id": "wizard.worktree-title-derived-branch",
