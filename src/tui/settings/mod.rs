@@ -792,6 +792,12 @@ impl SettingsView {
     }
 
     /// A telemetry change the Daemon did not save: show why and put the toggle back.
+    /// Confirms a save once the Daemon has acknowledged its consent change.
+    pub(in crate::tui) fn consent_saved(&mut self) {
+        self.success_message = Some("Settings saved".to_string());
+        self.success_message_expires_at = Some(std::time::Instant::now() + SUCCESS_MESSAGE_TTL);
+    }
+
     pub(in crate::tui) fn consent_not_saved(&mut self, message: String) {
         let saved = crate::session::get_telemetry_settings().enabled;
         self.global_config.telemetry.enabled = saved;
@@ -800,6 +806,8 @@ impl SettingsView {
         }
         self.rebuild_fields();
         self.recompute_dirty();
+        self.success_message = None;
+        self.success_message_expires_at = None;
         self.error_message = Some(message);
     }
 
@@ -826,6 +834,7 @@ impl SettingsView {
         }
 
         let mut accepted_toggles = Vec::new();
+        let mut consent_pending = false;
         match self.scope {
             SettingsScope::Global => {
                 // Saving the Telemetry page counts as answering the opt-in
@@ -916,6 +925,7 @@ impl SettingsView {
                 if consent_changed {
                     self.global_config.telemetry.enabled = consent;
                     crate::tui::telemetry::set_consent(consent);
+                    consent_pending = true;
                 }
                 self.resolved_base =
                     merge_configs(self.global_config.clone(), &self.profile_config);
@@ -980,8 +990,13 @@ impl SettingsView {
 
         // The just-written state is the new clean baseline.
         self.snapshot_baseline();
-        self.success_message = Some("Settings saved".to_string());
-        self.success_message_expires_at = Some(std::time::Instant::now() + SUCCESS_MESSAGE_TTL);
+        if consent_pending {
+            // Held until the Daemon answers; see `consent_saved` and `consent_not_saved`.
+            self.success_message = Some("Saving telemetry setting…".to_string());
+            self.success_message_expires_at = None;
+        } else {
+            self.consent_saved();
+        }
         self.error_message = None;
         Ok(())
     }
@@ -1340,10 +1355,20 @@ mod dirty_tracking_tests {
     fn an_unsaved_consent_change_restores_the_toggle() {
         let (_home, _temp, mut view) = fresh_view();
         view.global_config.telemetry.enabled = true;
-        view.baseline_global = config_to_json(&view.global_config);
+        view.save().unwrap();
+        assert_eq!(
+            view.success_message.as_deref(),
+            Some("Saving telemetry setting…"),
+            "a consent change is not reported saved before the Daemon answers"
+        );
+        assert!(view.success_message_expires_at.is_none());
+        view.consent_saved();
+        assert_eq!(view.success_message.as_deref(), Some("Settings saved"));
+
         view.consent_not_saved("Telemetry setting not saved: read-only".into());
         assert!(!view.global_config.telemetry.enabled);
         assert!(!view.has_changes);
+        assert_eq!(view.success_message, None);
         assert_eq!(
             view.error_message.as_deref(),
             Some("Telemetry setting not saved: read-only")

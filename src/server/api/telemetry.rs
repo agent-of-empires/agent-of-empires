@@ -105,20 +105,17 @@ pub async fn reset_telemetry_id(State(state): State<Arc<AppState>>) -> impl Into
     if state.read_only {
         return super::read_only_response();
     }
-    let status = current_status();
-    if status.enabled && !status.do_not_track {
-        let reset = tokio::task::spawn_blocking(crate::telemetry::consent::reset_install_id)
-            .await
-            .map_err(anyhow::Error::from)
-            .and_then(|result| result);
-        if let Err(error) = reset {
-            tracing::warn!(target: "http.api.telemetry", "install id reset failed: {error}");
-            return api_error(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                "reset_failed",
-                "Could not rotate the install id",
-            );
-        }
+    let reset = tokio::task::spawn_blocking(crate::telemetry::consent::reset_install_id)
+        .await
+        .map_err(anyhow::Error::from)
+        .and_then(|result| result);
+    if let Err(error) = reset {
+        tracing::warn!(target: "http.api.telemetry", "install id reset failed: {error}");
+        return api_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "reset_failed",
+            "Could not rotate the install id",
+        );
     }
     (StatusCode::OK, Json(current_mutation())).into_response()
 }

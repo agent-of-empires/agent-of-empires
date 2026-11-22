@@ -77,9 +77,14 @@ pub fn set_consent(enabled: bool) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Replaces the install id; counts recorded under the old one are zeroed.
+/// Replaces the install id; counts recorded under the old one are zeroed. A no-op while
+/// opted out or under `DO_NOT_TRACK`, checked under the writer guard so a reset queued
+/// behind an opt-out never recreates an id.
 pub fn reset_install_id() -> anyhow::Result<()> {
     let _writer = writer();
+    if !super::is_opted_in() {
+        return Ok(());
+    }
     super::state::rotate_install_id()?;
     lock().refresh();
     Ok(())
@@ -317,6 +322,18 @@ mod tests {
         );
 
         set_consent(false).unwrap();
+    }
+
+    /// A reset that runs after an opt-out leaves no id behind.
+    #[test]
+    #[serial_test::serial]
+    fn a_reset_after_an_opt_out_does_not_recreate_the_id() {
+        let _env = crate::session::test_support::EnvGuard::unset(&["DO_NOT_TRACK"]);
+        let _app_dir = crate::session::test_support::isolate_app_dir();
+        set_consent(true).unwrap();
+        set_consent(false).unwrap();
+        reset_install_id().unwrap();
+        assert_eq!(crate::telemetry::state::install_id(), None);
     }
 
     /// Concurrent opt-ins and opt-outs leave the saved opt-in and the id in agreement:

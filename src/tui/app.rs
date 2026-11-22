@@ -1432,12 +1432,21 @@ impl App {
                 last_heartbeat = std::time::Instant::now();
             }
 
-            if let Some(failure) = crate::tui::telemetry::take_consent_failure() {
-                if let Some(view) = self.home.settings_view.as_mut() {
-                    view.consent_not_saved(failure.clone());
+            match crate::tui::telemetry::take_consent_outcome() {
+                Some(crate::tui::telemetry::ConsentOutcome::Saved) => {
+                    if let Some(view) = self.home.settings_view.as_mut() {
+                        view.consent_saved();
+                    }
+                    needs_full_refresh = true;
                 }
-                self.set_status(failure);
-                needs_full_refresh = true;
+                Some(crate::tui::telemetry::ConsentOutcome::NotSaved(failure)) => {
+                    if let Some(view) = self.home.settings_view.as_mut() {
+                        view.consent_not_saved(failure.clone());
+                    }
+                    self.set_status(failure);
+                    needs_full_refresh = true;
+                }
+                None => {}
             }
 
             if last_telemetry_seen.elapsed() >= telemetry_seen_interval {
