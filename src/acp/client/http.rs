@@ -2444,13 +2444,23 @@ mod tests {
             let address = listener.local_addr().unwrap();
             let server = tokio::spawn(async move {
                 let (mut stream, _) = listener.accept().await.unwrap();
-                let mut request = [0; 4096];
-                let n = stream.read(&mut request).await.unwrap();
+                let mut request = Vec::new();
+                let mut chunk = [0; 1024];
+                tokio::time::timeout(std::time::Duration::from_secs(5), async {
+                    while !request.windows(4).any(|w| w == b"\r\n\r\n") {
+                        assert!(request.len() < 4096, "header section over 4 KiB");
+                        let n = stream.read(&mut chunk).await.unwrap();
+                        assert!(n > 0, "connection closed before the headers ended");
+                        request.extend_from_slice(&chunk[..n]);
+                    }
+                })
+                .await
+                .expect("timed out reading the request headers");
                 stream
                     .write_all(b"HTTP/1.1 500 Error\r\nContent-Length: 0\r\n\r\n")
                     .await
                     .unwrap();
-                String::from_utf8_lossy(&request[..n]).to_lowercase()
+                String::from_utf8_lossy(&request).to_lowercase()
             });
             let client =
                 HttpClient::new(endpoint(&format!("http://{address}"), Some("secret"))).unwrap();
