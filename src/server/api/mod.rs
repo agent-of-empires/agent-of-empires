@@ -238,6 +238,16 @@ pub(crate) fn before_start_hook_failed_response(
     )
 }
 
+/// The origin a client claims with the prompt-origin header. Only the dashboard, TUI and
+/// CLI values are accepted; anything else, and any body field, is `Unknown`.
+pub(crate) fn prompt_origin(headers: &axum::http::HeaderMap) -> crate::daemon::PromptOrigin {
+    crate::daemon::PromptOrigin::from_header_value(
+        headers
+            .get(crate::daemon::PromptOrigin::HEADER)
+            .and_then(|v| v.to_str().ok()),
+    )
+}
+
 pub(crate) fn api_error(
     status: axum::http::StatusCode,
     code: &str,

@@ -4014,6 +4014,7 @@ time.sleep(60)
                     prompt_id: None,
                     synthesized: false,
                     origin_plugin: None,
+                    origin: crate::daemon::PromptOrigin::Unknown,
                 },
             );
             let control = Arc::new(ObservedProcessControl::default());

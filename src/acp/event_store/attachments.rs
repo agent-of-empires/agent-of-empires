@@ -148,6 +148,7 @@ mod tests {
             }],
             synthesized: false,
             origin_plugin: None,
+            origin: crate::daemon::PromptOrigin::Unknown,
         };
         store.record(session_id, 1, &prompt).unwrap();
         assert!(store.record_attachment(session_id, 1, &img_blob(id)));

@@ -1222,6 +1222,7 @@ mod tests {
                 prompt_id: None,
                 synthesized: false,
                 origin_plugin: None,
+                origin: crate::daemon::PromptOrigin::Unknown,
             },
         );
         let folded = state.session_service.fold_control_state("s-fold").await;

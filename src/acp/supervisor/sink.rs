@@ -546,12 +546,11 @@ mod tests {
                     .unwrap();
                 let published = runtime.block_on(sup.publish_user_prompt_with_attachments(
                     "stalled",
-                    "look".into(),
-                    &[blob],
-                    Vec::new(),
-                    false,
-                    None,
-                    None,
+                    crate::acp::supervisor::UserPrompt {
+                        text: "look".into(),
+                        attachments: &[blob],
+                        ..Default::default()
+                    },
                 ));
                 published.seq == Some(1)
             }),

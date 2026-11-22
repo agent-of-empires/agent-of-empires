@@ -478,6 +478,7 @@ impl McpServer {
                 queued_prompt_id: None,
                 no_revive: false,
                 refuse_if_ignored: true,
+                origin: crate::daemon::PromptOrigin::Mcp,
             };
             let submitted = submit_prompt(&self.state, &SessionCaller::User, &id, submission)
                 .await

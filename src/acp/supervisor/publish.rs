@@ -11,6 +11,22 @@ use crate::acp::elicitations::ElicitationOutcome;
 use crate::acp::event_store::{AttachmentBlob, UnresolvedBackgroundAgentLaunch};
 use crate::acp::state::{BackgroundAgentStatus, Event, SubagentState};
 
+/// A prompt to record and route through [`Supervisor::publish_user_prompt_with_attachments`].
+#[derive(Default)]
+pub struct UserPrompt<'a> {
+    pub text: String,
+    pub attachments: &'a [AttachmentBlob],
+    /// Transcript row id first, then the ids of queued rows folded into the same turn.
+    pub prompt_ids: Vec<String>,
+    /// A daemon-queued rate-limit continuation rather than text the user just typed,
+    /// which the transcript renders no row for (#4040).
+    pub synthesized: bool,
+    pub origin: crate::daemon::PromptOrigin,
+    pub origin_plugin: Option<String>,
+    /// The profile a caller already cut the turn with; `None` looks it up.
+    pub classified_as: Option<&'static crate::acp::agent_profiles::AgentProfile>,
+}
+
 impl<S: BroadcastSink> Supervisor<S> {
     pub(super) fn publish_next(&self, session_id: &str, event: &Event) -> u64 {
         publish_next_persisted(self.sink.as_ref(), &self.next_seqs, session_id, event).0
@@ -111,35 +127,31 @@ impl<S: BroadcastSink> Supervisor<S> {
     pub async fn publish_user_prompt(&self, session_id: &str, text: String) -> PromptDisposition {
         self.publish_user_prompt_with_attachments(
             session_id,
-            text,
-            &[],
-            Vec::new(),
-            false,
-            None,
-            None,
+            UserPrompt {
+                text,
+                ..Default::default()
+            },
         )
         .await
         .disposition
     }
 
     /// Record a `UserPromptSent` (attachments stored as blobs keyed to its seq)
-    /// and decide how the caller routes the text. `synthesized` marks a
-    /// daemon-queued rate-limit continuation rather than text the user just
-    /// typed, which the transcript renders no row for (#4040). `classified_as`
-    /// is the profile a caller already cut the turn with; `None` looks it up.
-    // Each argument is a separate field of the recorded event or of how it is routed, and the
-    // callers pass them positionally from different sources; a struct would only rename them.
-    #[allow(clippy::too_many_arguments)]
+    /// and decide how the caller routes the text. See [`UserPrompt`] for the fields.
     pub async fn publish_user_prompt_with_attachments(
         &self,
         session_id: &str,
-        text: String,
-        attachments: &[AttachmentBlob],
-        prompt_ids: Vec<String>,
-        synthesized: bool,
-        origin_plugin: Option<String>,
-        classified_as: Option<&'static crate::acp::agent_profiles::AgentProfile>,
+        prompt: UserPrompt<'_>,
     ) -> PublishedPrompt {
+        let UserPrompt {
+            text,
+            attachments,
+            prompt_ids,
+            synthesized,
+            origin,
+            origin_plugin,
+            classified_as,
+        } = prompt;
         // Before any await or store, so an idle stop cannot claim the worker in between.
         super::lock_recover(&self.lifecycle).note_admission(session_id);
         let profile = match classified_as {
@@ -166,6 +178,7 @@ impl<S: BroadcastSink> Supervisor<S> {
             merged_prompt_ids: prompt_ids.collect(),
             synthesized,
             origin_plugin,
+            origin,
         };
         let (seq, persisted) = publish_with_next_seq(&self.next_seqs, session_id, |seq| {
             (
@@ -852,12 +865,11 @@ inherits-claude = "claude"
             .await;
         sup.publish_user_prompt_with_attachments(
             "s-1",
-            "resent after rate limit".into(),
-            &[],
-            Vec::new(),
-            true,
-            None,
-            None,
+            UserPrompt {
+                text: "resent after rate limit".into(),
+                synthesized: true,
+                ..Default::default()
+            },
         )
         .await;
 
@@ -884,12 +896,11 @@ inherits-claude = "claude"
             let ids: Vec<String> = ids.into_iter().map(String::from).collect();
             sup.publish_user_prompt_with_attachments(
                 "s-1",
-                "t".into(),
-                &[],
-                ids,
-                false,
-                None,
-                None,
+                UserPrompt {
+                    text: "t".into(),
+                    prompt_ids: ids,
+                    ..Default::default()
+                },
             )
             .await;
         }
@@ -937,12 +948,10 @@ inherits-claude = "claude"
         let published = sup
             .publish_user_prompt_with_attachments(
                 "s-1",
-                "second".into(),
-                &[],
-                Vec::new(),
-                false,
-                None,
-                None,
+                UserPrompt {
+                    text: "second".into(),
+                    ..Default::default()
+                },
             )
             .await;
         let recorded = sink.frames.lock().unwrap().last().unwrap().1;
@@ -959,12 +968,10 @@ inherits-claude = "claude"
         let published = sup
             .publish_user_prompt_with_attachments(
                 "s-1",
-                "lost".into(),
-                &[],
-                Vec::new(),
-                false,
-                None,
-                None,
+                UserPrompt {
+                    text: "lost".into(),
+                    ..Default::default()
+                },
             )
             .await;
         assert_eq!(

@@ -378,9 +378,14 @@ pub(crate) async fn spawn_structured_session(
                 attachments: Vec::new(),
                 synthesized: false,
                 error: None,
- error_code: None,
- id: crate::session::PendingInitialTurn::fresh_id(),
-});
+                error_code: None,
+                id: crate::session::PendingInitialTurn::fresh_id(),
+                origin: if instance.created_by_plugin.is_some() {
+                    crate::daemon::PromptOrigin::Plugin
+                } else {
+                    crate::daemon::PromptOrigin::Unknown
+                },
+            });
         instance.acp_mode_id = acp_mode_id;
         instance.callback_url = callback_url;
         instance.idempotency_key = idempotency_key;

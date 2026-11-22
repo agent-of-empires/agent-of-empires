@@ -1528,6 +1528,7 @@ mod tests {
             prompt_id: None,
             synthesized: false,
             origin_plugin: None,
+            origin: crate::daemon::PromptOrigin::Unknown,
         };
         let stopped = || Event::Stopped {
             reason: "prompt_complete".into(),
@@ -2255,6 +2256,7 @@ mod tests {
                     prompt_id: None,
                     synthesized: false,
                     origin_plugin: None,
+                    origin: crate::daemon::PromptOrigin::Unknown,
                 },
                 Event::BackgroundAgentLaunched {
                     agent_id: "bg-1".into(),
@@ -2901,6 +2903,7 @@ mod tests {
                     attachments: Vec::new(),
                     synthesized: false,
                     origin_plugin: None,
+                    origin: crate::daemon::PromptOrigin::Unknown,
                 },
                 Status::Running,
             ),
@@ -2945,6 +2948,7 @@ mod tests {
                     attachments: Vec::new(),
                     synthesized: false,
                     origin_plugin: None,
+                    origin: crate::daemon::PromptOrigin::Unknown,
                 },
                 crate::acp::Event::BackgroundTaskStarted {
                     task_id: "task-1".into(),

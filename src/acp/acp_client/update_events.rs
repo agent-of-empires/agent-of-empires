@@ -403,6 +403,7 @@ pub(super) fn map_update_to_events(
                 prompt_id: None,
                 synthesized: false,
                 origin_plugin: None,
+                origin: crate::daemon::PromptOrigin::Unknown,
             }],
             other => vec![raw_event(&other)],
         },

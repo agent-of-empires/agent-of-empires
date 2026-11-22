@@ -9202,6 +9202,7 @@ async fn rename_session_quiesces_structured_worker_only_on_profile_move() -> any
                         prompt_ids: Vec::new(),
                         synthesized: false,
                         no_revive: false,
+                        origin: crate::daemon::PromptOrigin::Unknown,
                     },
                 )
                 .await
@@ -10520,6 +10521,7 @@ fn native_runtime_frame_stays_readable_with_a_valid_full_text_queue() {
             created_at: "2026-01-01T00:00:00Z".into(),
             origin_device: None,
             origin_plugin: None,
+            origin: crate::daemon::PromptOrigin::Unknown,
         })
         .collect();
     let snapshot = RuntimeSnapshot {
@@ -14988,6 +14990,7 @@ async fn an_account_swap_out_of_a_rate_limit_park_continues_the_interrupted_prom
         prompt_id: None,
         synthesized: false,
         origin_plugin: None,
+        origin: crate::daemon::PromptOrigin::Unknown,
     };
     let limit = || Event::RateLimit {
         info: crate::acp::state::RateLimitInfo {
@@ -15017,7 +15020,12 @@ async fn an_account_swap_out_of_a_rate_limit_park_continues_the_interrupted_prom
     }
     state
         .session_service
-        .set_pending_initial_turn("pending-only", "earlier continuation".into(), Vec::new())
+        .set_pending_initial_turn(
+            "pending-only",
+            "earlier continuation".into(),
+            Vec::new(),
+            crate::daemon::PromptOrigin::Unknown,
+        )
         .await;
     state.acp_supervisor.hydrate_seqs(
         [
@@ -15079,7 +15087,12 @@ async fn an_account_swap_out_of_a_rate_limit_park_continues_the_interrupted_prom
 
     state
         .session_service
-        .set_pending_initial_turn("explicit", "newer continuation".into(), Vec::new())
+        .set_pending_initial_turn(
+            "explicit",
+            "newer continuation".into(),
+            Vec::new(),
+            crate::daemon::PromptOrigin::Unknown,
+        )
         .await;
     let g = generation("explicit");
     assert!(
@@ -15148,6 +15161,7 @@ async fn the_selected_work_verdict_survives_a_concurrent_pending_turn_drain() {
             prompt_id: None,
             synthesized: false,
             origin_plugin: None,
+            origin: crate::daemon::PromptOrigin::Unknown,
         },
         Event::RateLimit {
             info: crate::acp::state::RateLimitInfo {
@@ -15394,7 +15408,12 @@ async fn an_explicit_wake_discards_a_stale_continuation_before_the_worker_can_dr
     };
     state
         .session_service
-        .set_pending_initial_turn("stale", "old task".into(), Vec::new())
+        .set_pending_initial_turn(
+            "stale",
+            "old task".into(),
+            Vec::new(),
+            crate::daemon::PromptOrigin::Unknown,
+        )
         .await;
     for (parked, explicit) in [(false, true), (true, false)] {
         lifecycle::discard_stale_continuation(&state, "stale", parked, explicit).await;
@@ -16298,6 +16317,7 @@ async fn the_list_projects_each_queues_count_and_what_it_waits_on() {
         created_at: "2026-01-01T00:00:00Z".into(),
         origin_device: None,
         origin_plugin: None,
+        origin: crate::daemon::PromptOrigin::Unknown,
     };
     // (id, queued texts, worker running, turn running, steerable, expected reason).
     // "parked" has no worker but a rate-limit park, so a prompt sent now would go out.
@@ -16379,6 +16399,7 @@ async fn the_list_projects_each_queues_count_and_what_it_waits_on() {
                 prompt_id: None,
                 synthesized: false,
                 origin_plugin: None,
+                origin: crate::daemon::PromptOrigin::Unknown,
             };
             state.acp_event_store.record(id, 2, &prompt).unwrap();
         }

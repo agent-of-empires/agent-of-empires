@@ -1108,6 +1108,7 @@ mod tests {
                 merged_prompt_ids: Vec::new(),
                 synthesized: false,
                 origin_plugin: None,
+                origin: crate::daemon::PromptOrigin::Unknown,
             },
             Event::Stopped {
                 reason: "prompt_complete".into(),
@@ -1341,7 +1342,14 @@ mod tests {
             }
             state
                 .session_service
-                .enqueue_prompt(name, "q".into(), text.into(), Vec::new(), None, None)
+                .enqueue_prompt(
+                    name,
+                    "q".into(),
+                    text.into(),
+                    Vec::new(),
+                    None,
+                    crate::server::session_service::QueueSender::default(),
+                )
                 .await
                 .unwrap();
             if drains {
@@ -1579,6 +1587,7 @@ mod tests {
                     prompt_ids: Vec::new(),
                     synthesized: false,
                     no_revive: false,
+                    origin: crate::daemon::PromptOrigin::Unknown,
                 },
             )
             .await;
@@ -1590,7 +1599,10 @@ mod tests {
                 "PR #7 was merged".into(),
                 Vec::new(),
                 None,
-                Some("cron".into()),
+                crate::server::session_service::QueueSender {
+                    plugin: Some("cron".into()),
+                    origin: crate::daemon::PromptOrigin::Unknown,
+                },
             )
             .await
             .unwrap();
@@ -1676,6 +1688,7 @@ mod tests {
                     prompt_ids: Vec::new(),
                     synthesized: false,
                     no_revive: false,
+                    origin: crate::daemon::PromptOrigin::Unknown,
                 },
             )
             .await;
@@ -1687,7 +1700,10 @@ mod tests {
                 "PR #7 was merged".into(),
                 Vec::new(),
                 None,
-                Some("cron".into()),
+                crate::server::session_service::QueueSender {
+                    plugin: Some("cron".into()),
+                    origin: crate::daemon::PromptOrigin::Unknown,
+                },
             )
             .await
             .unwrap();

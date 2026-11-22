@@ -41,7 +41,7 @@ pub use wire::{
     DeleteProfileQuery, DeleteSessionBody, EmptyTrashBody, EmptyTrashOutcome, EnsureToolBody,
     GroupLocation, GroupSessionFailure, GroupSessionFailureCode, GroupSessionOutcome,
     ListSessionsQuery, MoveDirection, MoveGroupBody, PendingApproval, PlanSummary,
-    PromptAttachmentKind, PromptAttachmentRef, PurgeOutcome, QueuedPromptEntry,
+    PromptAttachmentKind, PromptAttachmentRef, PromptOrigin, PurgeOutcome, QueuedPromptEntry,
     ReclaimOwnershipBody, RenameOutcome, RenameProfileBody, RenameSessionBody, ReorderBody,
     ReorderOutcome, RepoBaseInput, RestartOutcome, RestartSessionBody, RestoreOutcome,
     SessionResponse, SessionsEnvelope, SetWorktreeNameBody, StartSessionBody, StopAuxiliaryBody,

@@ -996,6 +996,12 @@ pub enum Event {
         /// text was not typed by the user.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         origin_plugin: Option<String>,
+        /// Where the prompt entered AoE. `Unknown` on events recorded before it existed.
+        #[serde(
+            default,
+            skip_serializing_if = "crate::daemon::PromptOrigin::is_unknown"
+        )]
+        origin: crate::daemon::PromptOrigin,
     },
     PromptCapabilities {
         image: bool,
@@ -1661,6 +1667,7 @@ pub(crate) mod test_support {
             attachments: Vec::new(),
             synthesized: false,
             origin_plugin: None,
+            origin: crate::daemon::PromptOrigin::Unknown,
         }
     }
 

@@ -208,7 +208,7 @@ pub(crate) async fn install_rate_limit_continuation(
     }
     state
         .session_service
-        .set_pending_initial_turn(id, text, attachments)
+        .set_pending_initial_turn(id, text, attachments, crate::daemon::PromptOrigin::Aoe)
         .await;
     ContinuationOutcome::Installed
 }
@@ -506,6 +506,7 @@ mod tests {
             prompt_id: None,
             synthesized: false,
             origin_plugin: None,
+            origin: crate::daemon::PromptOrigin::Unknown,
         };
         let stopped = || Event::Stopped {
             reason: "rate_limited".into(),
@@ -542,7 +543,12 @@ mod tests {
         let (home, state, project) = parked(id, redeliveries).await;
         state
             .session_service
-            .set_pending_initial_turn(id, "run the nightly task".into(), Vec::new())
+            .set_pending_initial_turn(
+                id,
+                "run the nightly task".into(),
+                Vec::new(),
+                crate::daemon::PromptOrigin::Unknown,
+            )
             .await;
         (home, state, project)
     }
@@ -793,6 +799,7 @@ mod tests {
             created_at: created_at.into(),
             origin_device: None,
             origin_plugin: None,
+            origin: crate::daemon::PromptOrigin::Unknown,
         };
         let after = Utc.timestamp_opt(1_700_000_001, 0).unwrap().to_rfc3339();
         let before = Utc.timestamp_opt(1_699_999_999, 0).unwrap().to_rfc3339();
@@ -862,7 +869,12 @@ mod tests {
             if installed {
                 state
                     .session_service
-                    .set_pending_initial_turn(&id, "run the nightly task".into(), Vec::new())
+                    .set_pending_initial_turn(
+                        &id,
+                        "run the nightly task".into(),
+                        Vec::new(),
+                        crate::daemon::PromptOrigin::Unknown,
+                    )
                     .await;
             }
             state.instances.write().await[0].queued_prompts.push(
@@ -874,6 +886,7 @@ mod tests {
                     created_at: queued_at,
                     origin_device: None,
                     origin_plugin: None,
+                    origin: crate::daemon::PromptOrigin::Unknown,
                 },
             );
             assert!(

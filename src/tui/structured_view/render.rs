@@ -4853,6 +4853,7 @@ mod tests {
                 attachments: Vec::new(),
                 synthesized: false,
                 origin_plugin: None,
+                origin: crate::daemon::PromptOrigin::Unknown,
             },
             Event::AgentMessageChunk {
                 text: "What should we build?".into(),
@@ -4894,6 +4895,7 @@ mod tests {
                 attachments: Vec::new(),
                 synthesized: false,
                 origin_plugin: Some("cron".into()),
+                origin: crate::daemon::PromptOrigin::Unknown,
             }]));
         let rows = render_rows(&state, 80, 20, true);
         assert!(

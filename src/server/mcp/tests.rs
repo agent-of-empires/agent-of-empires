@@ -868,6 +868,7 @@ fn user_prompt(text: &str) -> crate::acp::Event {
         merged_prompt_ids: Vec::new(),
         synthesized: false,
         origin_plugin: None,
+        origin: crate::daemon::PromptOrigin::Unknown,
     }
 }
 
@@ -938,6 +939,21 @@ async fn send_reports_the_dispatch_and_the_prompts_seq() {
                     .then_some(seq)
             });
         assert_eq!(sent["seq"].as_u64(), recorded, "{case}: {sent}");
+        if disposition != "queued" {
+            let origin = state
+                .acp_event_store
+                .replay_from(id, 0)
+                .into_iter()
+                .find_map(|(_, e)| match e {
+                    crate::acp::Event::UserPromptSent { text, origin, .. }
+                        if text == "the new prompt" =>
+                    {
+                        Some(origin)
+                    }
+                    _ => None,
+                });
+            assert_eq!(origin, Some(crate::daemon::PromptOrigin::Mcp), "{case}");
+        }
         assert_eq!(
             sent["queued_id"].is_string(),
             disposition == "queued",
