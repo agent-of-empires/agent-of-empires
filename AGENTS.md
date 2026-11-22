@@ -64,6 +64,20 @@ Settings are declared once on their `Config` field with `#[setting(...)]`.
 Read `docs/development/adding-settings.md` before adding one; do not create
 parallel field registries or override structs.
 
+## Daemon and Clients
+
+The Daemon is becoming the single owner of Session runtime state and of the
+config it reads; the TUI, CLI and Web dashboard are Clients that reach it only
+through its API (#2734, terms in `CONTEXT.md`). Build toward that:
+
+- Put a new Session state change or Daemon-read config write behind a Daemon
+  endpoint, and have each Client call it.
+- In a Client, tell errors apart by status and `AoE-Error-Code`; when a Client
+  needs to name a refusal, add an `ApiErrorCode` on the Daemon.
+- Read ADRs [0003](docs/adr/0003-local-transport-uds-service-and-disk-fallback.md)
+  and [0004](docs/adr/0004-cli-writes-through-the-daemon.md) before changing how
+  a Client reaches the Daemon.
+
 ## Tests
 
 Use in-module unit tests for pure logic and `tests/` for integration behavior.

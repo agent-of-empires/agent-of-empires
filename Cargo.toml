@@ -182,8 +182,8 @@ agent-client-protocol = { version = "5", features = ["unstable_end_turn_token_us
 semver = "1"
 
 # Tar stream handling: the structured view's bundled-Node fallback (with xz2
-# for tar.xz) and external plugin install (with flate2 for tar.gz). xz2 needs
-# system liblzma.
+# for tar.xz) and external plugin install (with flate2 for tar.gz). The
+# `vendored` feature builds liblzma from source and links it statically.
 tar = "0.4"
 flate2 = "1"
 xz2 = "0.1"
@@ -213,8 +213,8 @@ core-foundation-sys = "0.8.7"
 # dashboard bundle, which is what invokes npm; released binaries are built
 # `--features web`, so every distributed binary ships the dashboard.
 default = ["default-plugins", "vendored"]
-# OpenSSL and SQLite vendoring for portable builds.
-vendored = ["git2/vendored-openssl", "rusqlite/bundled"]
+# OpenSSL, SQLite and liblzma vendoring for portable builds.
+vendored = ["git2/vendored-openssl", "rusqlite/bundled", "xz2/static"]
 # Compatibility flag for default plugin selection.
 default-plugins = []
 # Gates the `e2e` test target (tests/e2e/main.rs). Off by default so CI can run

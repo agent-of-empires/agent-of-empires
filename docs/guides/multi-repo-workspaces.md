@@ -30,7 +30,7 @@ aoe add /path/to/backend --project frontend \
 
 `<repo>` is the repo directory name or a `--repo` path; unmatched names fail rather than falling back. The web wizard exposes the same per-repo field. Each recorded base becomes its repo's diff comparison ref, changeable with `aoe session set-base --repo <name>`; see [Base override](diff-view.md#base-override).
 
-Worktree creation runs concurrently. A failed post-checkout hook leaves the completed checkout usable and surfaces a warning rather than aborting the workspace. See [Post-checkout hooks](worktrees.md#post-checkout-hooks).
+Worktree creation runs concurrently. A non-fatal failure such as a stale fetch surfaces a warning rather than aborting the workspace. Repo `post-checkout` hooks do not run: see [Repo hooks do not run](worktrees.md#repo-hooks-do-not-run).
 
 ### Workspace layout
 
