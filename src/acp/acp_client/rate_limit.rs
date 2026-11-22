@@ -161,17 +161,19 @@ fn latest_future_reset<'a>(
 ) -> Option<CapturedReset> {
     captures
         .filter_map(|(window, &secs)| {
-            // chrono read resets up to year 262142; anything beyond is malformed.
-            let resets_at = crate::time::Timestamp::from_unix_secs(secs).or((secs > 0
-                && secs <= 8_210_266_876_799)
-                .then_some(crate::time::Timestamp::MAX))?;
-            Some(CapturedReset {
-                window: window.clone(),
-                resets_at,
-            })
+            let resets_at =
+                crate::time::Timestamp::from_millis_saturating(secs.saturating_mul(1000))?;
+            Some((
+                secs,
+                CapturedReset {
+                    window: window.clone(),
+                    resets_at,
+                },
+            ))
         })
-        .filter(|captured| captured.resets_at > now)
-        .max_by_key(|captured| captured.resets_at)
+        .filter(|(_, captured)| captured.resets_at > now)
+        .max_by_key(|(secs, _)| *secs)
+        .map(|(_, captured)| captured)
 }
 
 pub(super) fn captured_rate_limit_reset(
@@ -415,6 +417,14 @@ mod tests {
             )]));
             let info = take_rate_limit_from_captured_rejection(&captures, now).unwrap();
             assert_eq!(info.resets_at, Some(crate::time::Timestamp::MAX));
+
+            // Of two resets both past year 9999, the later raw reset wins in either order.
+            let five_hour = ("five_hour".to_string(), 253_402_300_800 + 86_400);
+            let seven_day = ("seven_day".to_string(), 253_402_300_800 + 2 * 86_400);
+            for order in [[&five_hour, &seven_day], [&seven_day, &five_hour]] {
+                let captured = latest_future_reset(order.into_iter().map(|(w, s)| (w, s)), now);
+                assert_eq!(captured.unwrap().kind(), "seven_day");
+            }
 
             // One chrono could not represent is dropped, as chrono did.
             for secs in [8_210_266_876_800, i64::MAX, -1_000_000_000_000] {

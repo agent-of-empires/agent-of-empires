@@ -271,7 +271,7 @@ pub(super) async fn reported_deadline(
 fn in_force_deadline(account: &AccountState, kind: &str, now_ms: i64) -> Option<Timestamp> {
     let window = account.window(kind)?;
     (!window.estimated && window.until_ms > now_ms)
-        .then(|| Timestamp::from_millis(window.until_ms))
+        .then(|| Timestamp::from_millis_saturating(window.until_ms))
         .flatten()
 }
 
@@ -864,6 +864,11 @@ mod tests {
             at(reported(1_000, "usage", false), "usage"),
             None,
             "already elapsed"
+        );
+        assert_eq!(
+            at(reported(253_402_300_800_000, "usage", false), "usage"),
+            Some(Timestamp::MAX),
+            "past year 9999"
         );
     }
 

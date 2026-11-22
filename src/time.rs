@@ -96,6 +96,17 @@ impl Timestamp {
             .map(Self)
     }
 
+    /// Like `from_millis`, but saturates values chrono could represent.
+    pub fn from_millis_saturating(ms: i64) -> Option<Self> {
+        const CHRONO_MIN_MS: i64 = -8_334_601_315_200_000;
+        const CHRONO_MAX_MS: i64 = 8_210_266_876_799_999;
+        Self::from_millis(ms).or(match ms {
+            1..=CHRONO_MAX_MS => Some(Self::MAX),
+            CHRONO_MIN_MS..=-1 => Some(Self::MIN),
+            _ => None,
+        })
+    }
+
     pub fn as_unix_secs(self) -> i64 {
         self.0.unix_timestamp()
     }
@@ -448,6 +459,21 @@ mod tests {
         );
         assert_eq!(Timestamp::from_unix_secs(B), Some(at(B, 0)));
         assert_eq!(Timestamp::default(), at(0, 0));
+    }
+
+    #[test]
+    fn from_millis_saturates_only_within_chronos_range() {
+        let cases = [
+            (1_704_164_645_123, Some(at(1_704_164_645, 123_000_000))),
+            (8_210_266_876_799_999, Some(Timestamp::MAX)),
+            (8_210_266_876_800_000, None),
+            (i64::MAX, None),
+            (-8_334_601_315_200_000, Some(Timestamp::MIN)),
+            (-8_334_601_315_200_001, None),
+        ];
+        for (ms, expected) in cases {
+            assert_eq!(Timestamp::from_millis_saturating(ms), expected, "{ms}");
+        }
     }
 
     #[test]
