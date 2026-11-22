@@ -254,6 +254,12 @@ describe("SuggestionsView", () => {
       review_fingerprint: "fp-a",
     });
     expect(await screen.findByText("make")).toBeTruthy();
+    // A's approval is still in flight; B's review opens fresh and approves with its own fingerprint.
+    fireEvent.click(screen.getByRole("button", { name: "Approve and start" }));
+    expect(startSuggestion).toHaveBeenLastCalledWith("github", "issue-2", {
+      approve_hooks: true,
+      review_fingerprint: "fp-b",
+    });
   });
 
   it("a Start refused after the view unmounted still toasts why", async () => {

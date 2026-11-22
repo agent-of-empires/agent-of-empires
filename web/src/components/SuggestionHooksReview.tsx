@@ -1,4 +1,4 @@
-import type { useSuggestions } from "../hooks/useSuggestions";
+import { suggestionKey, type useSuggestions } from "../hooks/useSuggestions";
 import { HooksTrustDialog } from "./session-wizard/HooksTrustDialog";
 
 /** The hooks review a one-click Start pauses on; every view that can Start renders it. */
@@ -8,6 +8,8 @@ export function SuggestionHooksReview({ ctrl }: { ctrl: ReturnType<typeof useSug
   const { review, item } = pending;
   return (
     <HooksTrustDialog
+      // A fresh dialog per review: the next one must not inherit the last one's in-flight state.
+      key={`${suggestionKey(item)}:${review.review_fingerprint}`}
       starting={item.title}
       onCreate={review.commands.on_create ?? []}
       onLaunch={review.commands.on_launch ?? []}
