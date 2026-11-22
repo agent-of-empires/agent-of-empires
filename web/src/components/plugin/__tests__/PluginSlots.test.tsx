@@ -1,11 +1,12 @@
 // @vitest-environment jsdom
 
-import { act, fireEvent, render, screen, waitFor } from "@testing-library/react";
+import { act, cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 import type { PluginUiEntry } from "../../../lib/api";
 import { PluginPaneBody } from "../PluginPane";
 import {
   PluginComposerActions,
+  PluginComposerStatus,
   PluginDetailBadges,
   PluginHeaderStartSegments,
   PluginHomePanes,
@@ -255,6 +256,35 @@ describe("plugin slots", () => {
       entriesRef.current = [badge("a"), badge("b", -1), badge("c", 5)];
       const { container } = render(<PluginDetailBadges sessionId="s1" />);
       expect([...container.querySelectorAll("[data-plugin-slot]")].map((n) => n.textContent)).toEqual(["b", "a", "c"]);
+    });
+
+    it("composer-status orders by payload order and shows only the addressed session", () => {
+      const status = (id: string, session_id: string, order?: number): PluginUiEntry => ({
+        plugin_id: "acme.kit",
+        slot: "composer-status",
+        id,
+        session_id,
+        payload: { text: id, ...(order === undefined ? {} : { order }) },
+      });
+      entriesRef.current = [status("a", "s1"), status("b", "s1", -1), status("other", "s2")];
+      const { container } = render(<PluginComposerStatus sessionId="s1" />);
+      expect([...container.querySelectorAll("[data-plugin-slot]")].map((n) => n.textContent)).toEqual(["b", "a"]);
+      cleanup();
+      entriesRef.current = [
+        {
+          plugin_id: "acme.kit",
+          slot: "composer-status",
+          id: "i",
+          session_id: "s1",
+          payload: { items: [{ text: "x" }, { text: "y" }] },
+        },
+      ];
+      render(<PluginComposerStatus sessionId="s1" />);
+      expect(screen.getByText("x")).toBeTruthy();
+      expect(screen.getByText("y")).toBeTruthy();
+      cleanup();
+      entriesRef.current = [status("other", "s2")];
+      expect(render(<PluginComposerStatus sessionId="s1" />).container.firstChild).toBeNull();
     });
 
     it("resets a detail group's position when the addressed session changes", () => {

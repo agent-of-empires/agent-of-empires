@@ -154,6 +154,18 @@ export function PluginDetailBadges({ sessionId }: { sessionId: string }) {
   );
 }
 
+export function PluginComposerStatus({ sessionId }: { sessionId: string }) {
+  const entries = byOrder(sessionEntries(usePluginUiEntries(), "composer-status", sessionId));
+  if (entries.length === 0) return null;
+  return (
+    <div className="flex min-w-0 flex-wrap items-center gap-1.5" data-testid="plugin-composer-status">
+      {entries.map((e) => (
+        <EntryBadge key={entryKey(e)} entry={e} />
+      ))}
+    </div>
+  );
+}
+
 export function PluginComposerActions({
   sessionId,
   getSnapshot,

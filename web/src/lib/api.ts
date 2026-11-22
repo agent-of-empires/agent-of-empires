@@ -1100,6 +1100,7 @@ export type PluginUiSlot =
   | "pane"
   | "composer-action"
   | "detail-badge"
+  | "composer-status"
   | "home-pane"
   | "page"
   | "notification";
