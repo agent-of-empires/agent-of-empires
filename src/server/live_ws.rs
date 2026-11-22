@@ -315,14 +315,40 @@ fn deliver_paste_via_channel(
 
 /// Input the pane accepted is the operator typing in this session, so an ignored row wakes
 /// the way `send` wakes it rather than staying hidden under its own keystrokes.
-async fn wake_after_input(wake: &Option<(Arc<AppState>, String)>) {
-    let Some((state, id)) = wake else {
-        return;
-    };
+///
+/// The check reads the canonical store, which decodes every session and group behind a lock,
+/// so the receive loop hands wakes to a worker instead of awaiting a decode per accepted
+/// frame. Requests coalesce into one read per burst; input that lands while a read is in
+/// flight queues one more.
+struct InputWake {
+    requests: tokio::sync::mpsc::Sender<()>,
+    worker: tokio::task::JoinHandle<()>,
+}
 
-    if let Err(error) = state.session_service.touch_after_direct_input(id).await {
-        warn!(target: "terminal.ws", session = %id, %error,
-            "failed to wake an ignored session after input");
+impl InputWake {
+    fn spawn(wake: (Arc<AppState>, String)) -> Self {
+        let (requests, mut queued) = tokio::sync::mpsc::channel::<()>(1);
+        let worker = tokio::spawn(async move {
+            let (state, id) = wake;
+            while queued.recv().await.is_some() {
+                if let Err(error) = state.session_service.touch_after_direct_input(&id).await {
+                    warn!(target: "terminal.ws", session = %id, %error,
+                        "failed to wake an ignored session after input");
+                }
+            }
+        });
+        Self { requests, worker }
+    }
+
+    /// A full queue already holds a wake that runs after this input, so a dropped request
+    /// is not a missed one.
+    fn request(&self) {
+        let _ = self.requests.try_send(());
+    }
+
+    async fn stop(self) {
+        self.worker.abort();
+        let _ = self.worker.await;
     }
 }
 
@@ -1027,6 +1053,7 @@ async fn handle_live_ws_inner(
     #[cfg(test)] witness_cycles: bool,
 ) {
     let LiveInput { read_only, wake } = input;
+    let wake = wake.map(InputWake::spawn);
     match wait_for_tmux_ready(&tmux_name).await {
         PaneReadiness::Ready => {}
         PaneReadiness::Dead => {
@@ -1801,7 +1828,9 @@ async fn handle_live_ws_inner(
                         .await
                         .unwrap_or(false);
                         if sent {
-                            wake_after_input(&wake).await;
+                            if let Some(wake) = wake.as_ref() {
+                                wake.request();
+                            }
                         }
                         // Capture the echo promptly rather than waiting out
                         // the current sleep.
@@ -1962,7 +1991,9 @@ async fn handle_live_ws_inner(
                                 .await
                                 .unwrap_or(false);
                                 if sent {
-                                    wake_after_input(&wake).await;
+                                    if let Some(wake) = wake.as_ref() {
+                                        wake.request();
+                                    }
                                 }
                                 nudge.notify_one();
                             }
@@ -1987,6 +2018,9 @@ async fn handle_live_ws_inner(
     let _ = capture_task.await;
     drop(out_tx);
     let _ = send_task.await;
+    if let Some(wake) = wake {
+        wake.stop().await;
+    }
 
     // Release only this viewer's size lease. The last owner restores
     // window-size latest; another viewer's lease remains untouched.
