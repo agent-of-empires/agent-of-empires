@@ -189,10 +189,14 @@ pub fn delete_install_id() -> Result<()> {
 }
 
 /// Replaces any id with a fresh one whatever the saved opt-in, for opt-in and `reset-id`.
+/// Everything recorded under the old id goes with it.
 pub fn rotate_install_id() -> Result<String> {
     update_state_locked(|state| {
         let id = uuid::Uuid::new_v4().to_string();
-        state.install_id = Some(id.clone());
+        *state = TelemetryState {
+            install_id: Some(id.clone()),
+            ..TelemetryState::default()
+        };
         (id, true)
     })
 }

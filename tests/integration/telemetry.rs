@@ -711,3 +711,38 @@ fn version_health_reports_coarse_buckets_only() {
         ReleasesBehind::OneBehind
     );
 }
+
+/// A settings save that turns telemetry on goes through the consent writer, so it replaces
+/// an id a failed opt-out left behind instead of reviving it.
+#[tokio::test]
+#[serial]
+async fn a_settings_opt_in_replaces_a_retained_install_id() {
+    use agent_of_empires::server::test_support::{build_router_for_test, build_test_app_state};
+    use tower::ServiceExt;
+    let _tmp = isolate();
+    telemetry::consent::set_consent(true).expect("save consent");
+    let retained = telemetry::install_id().expect("opted in");
+    // The opt-out saved, but its delete failed and left the id behind.
+    update_config(|config| config.telemetry.enabled = false).expect("save config");
+
+    let app = build_router_for_test(build_test_app_state(Vec::new()));
+    let mut request = axum::http::Request::builder()
+        .method("PATCH")
+        .uri("/api/settings?layer=machine")
+        .header("host", "127.0.0.1")
+        .header("content-type", "application/json")
+        .body(axum::body::Body::from(
+            serde_json::json!({"telemetry": {"enabled": true}}).to_string(),
+        ))
+        .unwrap();
+    request.extensions_mut().insert(axum::extract::ConnectInfo(
+        "127.0.0.1:5555".parse::<std::net::SocketAddr>().unwrap(),
+    ));
+    let response = app.oneshot(request).await.unwrap();
+    assert_eq!(response.status(), axum::http::StatusCode::OK);
+
+    assert!(telemetry::is_opted_in());
+    let fresh = telemetry::install_id().expect("opted in");
+    assert_ne!(fresh, retained, "the settings save revived the retained id");
+    telemetry::consent::set_consent(false).expect("save consent");
+}

@@ -1436,6 +1436,14 @@ impl App {
                 last_heartbeat = std::time::Instant::now();
             }
 
+            if let Some(failure) = crate::tui::telemetry::take_consent_failure() {
+                if let Some(view) = self.home.settings_view.as_mut() {
+                    view.consent_not_saved(failure.clone());
+                }
+                self.set_status(failure);
+                needs_full_refresh = true;
+            }
+
             if last_telemetry_seen.elapsed() >= telemetry_seen_interval {
                 last_telemetry_seen = std::time::Instant::now();
                 crate::tui::telemetry::report_seen();

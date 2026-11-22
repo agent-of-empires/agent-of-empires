@@ -791,6 +791,18 @@ impl SettingsView {
             || config_to_json(&self.repo_config) != self.baseline_repo;
     }
 
+    /// A telemetry change the Daemon did not save: show why and put the toggle back.
+    pub(in crate::tui) fn consent_not_saved(&mut self, message: String) {
+        let saved = crate::session::get_telemetry_settings().enabled;
+        self.global_config.telemetry.enabled = saved;
+        if let Some(slot) = self.baseline_global.pointer_mut("/telemetry/enabled") {
+            *slot = saved.into();
+        }
+        self.rebuild_fields();
+        self.recompute_dirty();
+        self.error_message = Some(message);
+    }
+
     /// Adopt the live configs as the new baseline and mark the view clean.
     /// Called after a save or a reload, when on-disk state matches memory.
     pub(super) fn snapshot_baseline(&mut self) {
@@ -1319,6 +1331,27 @@ mod dirty_tracking_tests {
         let _ = Storage::new_unwatched("test").unwrap();
         let view = SettingsView::new("test", None).unwrap();
         (home, temp, view)
+    }
+
+    /// A telemetry toggle the Daemon refused goes back to the saved value, with the error
+    /// shown, and leaves other unsaved edits flagged.
+    #[test]
+    #[serial]
+    fn an_unsaved_consent_change_restores_the_toggle() {
+        let (_home, _temp, mut view) = fresh_view();
+        view.global_config.telemetry.enabled = true;
+        view.baseline_global = config_to_json(&view.global_config);
+        view.consent_not_saved("Telemetry setting not saved: read-only".into());
+        assert!(!view.global_config.telemetry.enabled);
+        assert!(!view.has_changes);
+        assert_eq!(
+            view.error_message.as_deref(),
+            Some("Telemetry setting not saved: read-only")
+        );
+
+        view.global_config.default_profile = "other".into();
+        view.consent_not_saved("again".into());
+        assert!(view.has_changes, "an unrelated edit stays unsaved");
     }
 
     /// The unsaved-changes flag is diff-based, not a one-way latch, and a

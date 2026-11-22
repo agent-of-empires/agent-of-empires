@@ -293,6 +293,14 @@ pub(crate) async fn migrate_for_startup(
     .await
 }
 
+/// The TUI is a Daemon client and refuses to open without one. A Daemon that answers in
+/// another protocol still opens it, so Connections can offer its in-place restart.
+fn opens_despite_startup_error(error: &anyhow::Error) -> bool {
+    error
+        .downcast_ref::<crate::daemon::PinnedProtocolSkew>()
+        .is_some()
+}
+
 pub async fn run(profile: &str, startup_warning: Option<String>) -> Result<()> {
     // `AOE_DAEMON_URL` makes this a pure client of a remote daemon.
     if let Some(endpoint) = crate::acp::client::discovery::discover_env() {
@@ -329,10 +337,11 @@ pub async fn run(profile: &str, startup_warning: Option<String>) -> Result<()> {
         anyhow::bail!("stdin is not a terminal; aoe requires an interactive TTY");
     }
 
-    // The TUI is a Daemon client: it starts one, or reaches the running one, before it opens.
-    crate::acp::client::daemon_manager::ensure_native_daemon(profile)
-        .await
-        .map_err(|error| error.context("aoe needs its Daemon and could not reach one"))?;
+    if let Err(error) = crate::acp::client::daemon_manager::ensure_native_daemon(profile).await {
+        if !opens_despite_startup_error(&error) {
+            return Err(error.context("aoe needs its Daemon and could not reach one"));
+        }
+    }
 
     // Mosh mangles mouse-tracking escapes, so capture stays off under it.
     // `App` re-resolves the config so a mid-session toggle still applies.
@@ -472,5 +481,23 @@ mod mouse_capture_tests {
     fn env_true_does_not_re_enable_disabled_config() {
         let _g = EnvGuard::set(&[("AOE_MOUSE_CAPTURE", "1")]);
         assert!(!mouse_capture_requested(&session_with(false)));
+    }
+}
+
+#[cfg(test)]
+mod startup_tests {
+    use super::opens_despite_startup_error;
+
+    #[test]
+    fn only_a_protocol_skew_opens_without_a_usable_daemon() {
+        let skew = anyhow::Error::from(crate::daemon::PinnedProtocolSkew {
+            message: "Daemon predates this aoe".into(),
+            summary: "Daemon outdated".into(),
+            remedy: None,
+        })
+        .context("ensuring the daemon");
+        assert!(opens_despite_startup_error(&skew));
+        let absent = anyhow::anyhow!("Local daemon autostart is disabled");
+        assert!(!opens_despite_startup_error(&absent));
     }
 }

@@ -42,13 +42,18 @@ impl Gate {
     }
 }
 
-/// Saves an opt-in answer. An opt-in mints a fresh id before it saves `enabled`, so an id
-/// an earlier opt-out failed to delete is never reused; if minting fails, consent stays
-/// off. File work runs outside the gate, so counting never waits on the state lock.
+/// Saves an opt-in answer. An opt-in replaces any id before it saves `enabled`, minting a
+/// fresh one or, under `DO_NOT_TRACK`, deleting it, so an id an earlier opt-out failed to
+/// delete is never reused; if that fails, consent stays off. File work runs outside the
+/// gate, so counting never waits on the state lock.
 pub fn set_consent(enabled: bool) -> anyhow::Result<()> {
     let saved = crate::session::get_telemetry_settings().enabled;
-    if enabled && !saved && !super::do_not_track() {
-        super::state::rotate_install_id()?;
+    if enabled && !saved {
+        if super::do_not_track() {
+            super::state::delete_install_id()?;
+        } else {
+            super::state::rotate_install_id()?;
+        }
     }
     crate::session::update_config(|config| config.telemetry.enabled = enabled)?;
     if !enabled {
@@ -270,6 +275,60 @@ mod tests {
         assert!(!bound.bind(&mut snapshot));
         assert_eq!(snapshot.session_creates_since_last_snapshot, 0);
 
+        set_consent(false).unwrap();
+    }
+
+    /// CLI command counts are recorded under the id they would be sent with, so a new id,
+    /// from `reset-id` or from an opt-in over an id an opt-out failed to delete, starts
+    /// with none.
+    #[test]
+    #[serial_test::serial]
+    fn a_new_id_never_carries_cli_counts_from_the_old_one() {
+        let _env = crate::session::test_support::EnvGuard::unset(&["DO_NOT_TRACK"]);
+        let _app_dir = crate::session::test_support::isolate_app_dir();
+        set_consent(true).unwrap();
+        crate::telemetry::record_cli_command("add");
+        assert!(crate::telemetry::build_cli_usage().is_some());
+        reset_install_id().unwrap();
+        assert!(
+            crate::telemetry::build_cli_usage().is_none(),
+            "reset-id carried counts to the new id"
+        );
+
+        crate::telemetry::record_cli_command("add");
+        crate::session::update_config(|c| c.telemetry.enabled = false).unwrap();
+        set_consent(true).unwrap();
+        assert!(
+            crate::telemetry::build_cli_usage().is_none(),
+            "an opt-in over a retained id carried its counts"
+        );
+
+        set_consent(false).unwrap();
+    }
+
+    /// Under `DO_NOT_TRACK` an opt-in deletes a retained id instead of minting one, so
+    /// lifting it later never revives the old id.
+    #[test]
+    #[serial_test::serial]
+    fn an_opt_in_under_do_not_track_drops_a_retained_id() {
+        use crate::session::test_support::EnvGuard;
+        let _app_dir = crate::session::test_support::isolate_app_dir();
+        let id = {
+            let _env = EnvGuard::unset(&["DO_NOT_TRACK"]);
+            set_consent(true).unwrap();
+            crate::telemetry::install_id().expect("opted in")
+        };
+        // The opt-out saved, but its delete failed and left the id behind.
+        crate::session::update_config(|c| c.telemetry.enabled = false).unwrap();
+        {
+            let _env = EnvGuard::set(&[("DO_NOT_TRACK", "1")]);
+            set_consent(true).unwrap();
+        }
+        assert_eq!(crate::telemetry::install_id(), None);
+
+        let _env = EnvGuard::unset(&["DO_NOT_TRACK"]);
+        let fresh = crate::telemetry::ensure_install_id().expect("opted in");
+        assert_ne!(fresh, id, "lifting DO_NOT_TRACK revived the retained id");
         set_consent(false).unwrap();
     }
 }

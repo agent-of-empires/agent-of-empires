@@ -773,6 +773,18 @@ pub async fn update_settings(
     .await
 }
 
+/// Removes `telemetry.enabled` from a machine patch, dropping an emptied section. A null
+/// leaf resets to the default, off.
+fn take_telemetry_consent(machine: &mut serde_json::Value) -> Option<bool> {
+    let root = machine.as_object_mut()?;
+    let section = root.get_mut("telemetry")?.as_object_mut()?;
+    let enabled = section.remove("enabled")?;
+    if section.is_empty() {
+        root.remove("telemetry");
+    }
+    Some(enabled.as_bool().unwrap_or(false))
+}
+
 /// Write the two halves of a split settings patch and answer with the
 /// effective config of the layer written.
 async fn save_settings_patch(
@@ -830,6 +842,26 @@ async fn save_settings_patch(
         return stale_write_response();
     }
     let write_profile = profile.is_some() && !is_empty_patch(&profile_patch);
+    // Consent goes through its single writer, which rotates the install id on opt-in.
+    if let Some(enabled) = take_telemetry_consent(&mut machine) {
+        match tokio::task::spawn_blocking(move || crate::telemetry::consent::set_consent(enabled))
+            .await
+        {
+            Ok(Ok(())) => {}
+            Ok(Err(e)) => {
+                tracing::warn!(target: "http.api.system", "Telemetry consent update failed: {e}");
+                return api_error(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "save_failed",
+                    "Failed to save telemetry setting",
+                );
+            }
+            Err(e) => {
+                tracing::error!(target: "http.api.system", "Telemetry consent update panicked: {e}");
+                return internal_error();
+            }
+        }
+    }
     // The profile override is written first: a machine-wide failure then leaves
     // the narrower half in place, which is what the partial-save message says.
     if let Some(name) = profile.clone().filter(|_| write_profile) {
