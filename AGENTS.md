@@ -125,7 +125,9 @@ template, and [MAINTAINERS.md](MAINTAINERS.md) for review and merge rules.
   from `web/AGENTS.md`, including the coverage matrix requirement.
 - Update the documentation a change makes materially wrong or incomplete in the
   same PR: `docs/`, `CONTEXT.md`, ADRs, and generated references such as
-  `docs/cli/reference.md`. Do not write docs for behavior the PR leaves alone.
+  `docs/cli/reference.md`. Do not add docs for unchanged behavior; correcting
+  documentation that is already wrong is in scope for any PR, docs-only ones
+  included.
 - Do not add reviewers; CODEOWNERS routes each PR. When a review asks for
   changes on a head you have since fixed, dismiss that stale review and
   re-request the same reviewer, leaving the CODEOWNERS request in place.
