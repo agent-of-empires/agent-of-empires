@@ -420,6 +420,18 @@ impl DaemonClient {
         Ok(snapshot)
     }
 
+    /// `PATCH /api/settings`: the daemon routes each leaf to the layer it is read from.
+    pub async fn patch_settings(&self, patch: &serde_json::Value) -> Result<(), DaemonClientError> {
+        let url = self
+            .sessions_url
+            .join("settings")
+            .map_err(|_| DaemonClientError::Transport)?;
+        let mut response = self
+            .request_response(self.http.patch(url).json(patch))
+            .await?;
+        discard_bounded_body(&mut response).await
+    }
+
     /// The daemon's own default profile, which can differ from this client's config.
     pub async fn default_profile(&self) -> Result<String, DaemonClientError> {
         let url = self

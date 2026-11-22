@@ -340,6 +340,23 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn pre_trust_is_patched_through_the_settings_api() {
+        let (sent, mut received) = tokio::sync::mpsc::unbounded_channel();
+        let app = Router::new().route(
+            "/api/settings",
+            axum::routing::patch(move |Json(body): Json<serde_json::Value>| async move {
+                sent.send(body).unwrap();
+                Json(serde_json::json!({}))
+            }),
+        );
+        let (client, server) = serve(app).await;
+        let patch = serde_json::json!({ "session": { "pre_trust_agent_folders": true } });
+        client.patch_settings(&patch).await.unwrap();
+        server.abort();
+        assert_eq!(received.recv().await.unwrap(), patch);
+    }
+
+    #[tokio::test]
     async fn a_start_returns_the_typed_outcome_of_a_409_and_posts_the_approval() {
         let app = Router::new().route(
             "/api/suggestions/start",

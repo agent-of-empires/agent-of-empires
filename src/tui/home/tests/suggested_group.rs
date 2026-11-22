@@ -1216,12 +1216,13 @@ fn a_prompt_blocked_on_folder_trust_turns_on_pre_trust_then_tries_again() {
     let text = render_home_to_string(&mut env.view, 120, 40);
     assert!(text.contains("Turn on pre-trust"), "{text}");
     env.view.handle_key(key(KeyCode::Char('y')), None);
-    assert!(
-        crate::session::config::Config::load()
-            .unwrap()
-            .session
-            .pre_trust_agent_folders
-    );
+    poll_until(&mut env, |env| {
+        env.view
+            .suggestions_view
+            .as_ref()
+            .is_some_and(|view| view.pretrusted)
+    });
+    assert!(requests.try_iter().any(|r| r == "pre-trust"));
     env.view.handle_key(key(KeyCode::Enter), None);
     let (trashed, _) = commands(Ok(trashed_at("test"))).expect("Trash was sent");
     assert_eq!(trashed, id);

@@ -171,6 +171,10 @@ enum Req {
         review_fingerprint: Option<serde_json::Value>,
         origin: Option<Origin>,
     },
+    /// Turns on `pre_trust_agent_folders` through the daemon's settings API.
+    PreTrust {
+        origin: Option<Origin>,
+    },
 }
 
 impl Req {
@@ -178,7 +182,8 @@ impl Req {
         match self {
             Req::Dismiss { origin, .. }
             | Req::Prepare { origin, .. }
-            | Req::Start { origin, .. } => origin.as_ref(),
+            | Req::Start { origin, .. }
+            | Req::PreTrust { origin } => origin.as_ref(),
             _ => None,
         }
     }
@@ -214,6 +219,7 @@ enum Res {
     Refreshed(Result<(), String>),
     Prepared(Result<Prepared, String>),
     Started(Result<StartAnswer, String>),
+    PreTrusted(Result<(), String>),
 }
 
 #[cfg(not(test))]
@@ -224,7 +230,8 @@ impl Res {
             | Res::DismissKept(e)
             | Res::Refreshed(Err(e))
             | Res::Prepared(Err(e))
-            | Res::Started(Err(e)) => Some(e),
+            | Res::Started(Err(e))
+            | Res::PreTrusted(Err(e)) => Some(e),
             _ => None,
         }
     }
@@ -242,6 +249,7 @@ fn failed(req: &Req, message: String) -> Res {
         Req::Prepare { .. } => Res::Prepared(Err(message)),
         Req::Start { .. } => Res::Started(Err(message)),
         Req::Refresh => Res::Refreshed(Err(message)),
+        Req::PreTrust { .. } => Res::PreTrusted(Err(message)),
         Req::Load | Req::Dismiss { .. } => Res::Snapshot(Err(message)),
     }
 }
@@ -289,6 +297,14 @@ async fn run(req: &Req) -> Res {
     match req {
         Req::Load => Res::Snapshot(load(&client, &daemon).await),
         Req::Refresh => Res::Refreshed(client.refresh_suggestions().await.map_err(text)),
+        Req::PreTrust { .. } => Res::PreTrusted(
+            client
+                .patch_settings(
+                    &serde_json::json!({ "session": { "pre_trust_agent_folders": true } }),
+                )
+                .await
+                .map_err(|e| format!("Couldn't turn on pre-trust: {e}")),
+        ),
         Req::Dismiss {
             provider_id,
             id,
@@ -740,6 +756,12 @@ impl SuggestionsView {
             self.notice = Some("Refresh requested.".into());
             changed = true;
         }
+        if polled.pretrusted {
+            self.pretrusted = true;
+            self.notice =
+                Some("Pre-trust is on: new Sessions start with their folder trusted.".into());
+            changed = true;
+        }
         if let Some(error) = polled.error.take() {
             self.notice = None;
             match self.preparing.take() {
@@ -1121,6 +1143,8 @@ pub(super) struct FeedPoll {
     pub error: Option<String>,
     /// `error` belongs to a prepare, not to a reload, refresh or dismiss.
     pub prepare_failed: bool,
+    /// The daemon turned on pre-trust.
+    pub pretrusted: bool,
 }
 
 /// The one suggestions store, owned by `HomeView`: snapshot, worker and
@@ -1585,6 +1609,10 @@ impl SuggestionsFeed {
                     Res::Started(Ok(started.clone()))
                 }
                 Req::Refresh => Res::Refreshed(Ok(())),
+                Req::PreTrust { .. } => {
+                    let _ = sink.send("pre-trust".into());
+                    Res::PreTrusted(Ok(()))
+                }
             }
         });
         Self::with_worker(worker)
@@ -1633,6 +1661,12 @@ impl SuggestionsFeed {
     pub(super) fn start_from(&mut self, key: ItemKey, origin: Option<Origin>) {
         self.failed = None;
         self.submit_start(key, None, origin);
+    }
+
+    /// Asks the daemon to turn on pre-trust, bound to the list on screen.
+    pub(super) fn turn_on_pre_trust(&mut self) {
+        let origin = self.origin();
+        self.submit(Req::PreTrust { origin });
     }
 
     /// Remembers the hooks review shown for `key`, bound to the list on screen.
@@ -1738,6 +1772,7 @@ impl SuggestionsFeed {
             started: None,
             error: None,
             prepare_failed: false,
+            pretrusted: false,
         };
         let res = match self.worker.try_recv() {
             Ok(res) => res,
@@ -1807,7 +1842,8 @@ impl SuggestionsFeed {
             Res::Snapshot(Err(e))
             | Res::Refreshed(Err(e))
             | Res::Prepared(Err(e))
-            | Res::Started(Err(e)) => {
+            | Res::Started(Err(e))
+            | Res::PreTrusted(Err(e)) => {
                 if matches!(req_kind, ResKind::Prepare) {
                     self.prepare_key = None;
                     out.prepare_failed = true;
@@ -1853,6 +1889,7 @@ impl SuggestionsFeed {
                 }
             }
             Res::Refreshed(Ok(())) => out.refreshed = true,
+            Res::PreTrusted(Ok(())) => out.pretrusted = true,
         }
         if let Some(next) = self.queued.pop_front() {
             self.send(next, true);
@@ -2305,6 +2342,7 @@ mod tests {
             started: None,
             error: None,
             prepare_failed: false,
+            pretrusted: false,
         }
     }
 
@@ -2379,6 +2417,7 @@ mod tests {
             started: None,
             error: None,
             prepare_failed: false,
+            pretrusted: false,
         };
         for _ in 0..200 {
             failed = rig.store.poll();

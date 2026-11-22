@@ -1397,19 +1397,9 @@ impl HomeView {
                 None
             }
             "suggestion_pre_trust" => {
-                let saved = crate::session::config::update_config(|c| {
-                    c.session.pre_trust_agent_folders = true;
-                });
+                self.suggestions_feed.turn_on_pre_trust();
                 if let Some(view) = &mut self.suggestions_view {
-                    match saved {
-                        Ok(_) => {
-                            view.pretrusted = true;
-                            view.set_notice("Pre-trust is on. Enter tries again: the blocked Session goes to Trash and a new one starts.");
-                        }
-                        Err(error) => {
-                            view.set_error(format!("Couldn't turn on pre-trust: {error}"))
-                        }
-                    }
+                    view.set_notice("Turning on pre-trust…");
                 }
                 None
             }
