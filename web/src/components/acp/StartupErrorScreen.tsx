@@ -60,7 +60,6 @@ export function StartupErrorScreen({ detail, sessionId, isSandboxed = false, rec
   const sandboxed = info?.sandboxed ?? isSandboxed;
   const name = info?.display_name ?? null;
   const stepOneId = useId();
-  const versionId = useId();
   const [detailsOpen, setDetailsOpen] = useState(false);
   const [recreating, setRecreating] = useState(false);
 
@@ -92,8 +91,9 @@ export function StartupErrorScreen({ detail, sessionId, isSandboxed = false, rec
   const manualWaitsOnContainer = !webInstall && info?.install_blocked === "container_not_running";
   const updating = install.state === "installing";
   const busy = respawnState === "retrying" || updating;
-  // A stopped container has its own screen; every other failed update gets this card.
-  const updateFailed = webInstall && install.state === "failed" && install.errorCode !== "container_not_running";
+  // A stopped container, even one reported after the failure, has its own screen; every other failed update gets this card.
+  const updateFailed =
+    webInstall && !containerDown && install.state === "failed" && install.errorCode !== "container_not_running";
   const agent = name ?? "the Agent";
   const agentStart = name ?? "The Agent";
 
@@ -111,8 +111,7 @@ export function StartupErrorScreen({ detail, sessionId, isSandboxed = false, rec
       }),
     testId: "startup-error-update-restart",
     disabled: busy || !allowed,
-    // The failed card has no step 1; a refusal names the setting on its version line.
-    describedBy: allowed ? undefined : updateFailed ? versionId : stepOneId,
+    describedBy: allowed ? undefined : stepOneId,
   };
   const startContainer: RecoveryAction = {
     label: respawnState === "retrying" ? "Starting…" : "Start the container",
@@ -121,6 +120,11 @@ export function StartupErrorScreen({ detail, sessionId, isSandboxed = false, rec
     disabled: busy,
   };
   const primary = containerDown ? startContainer : webInstall ? update : checkAgain;
+  const allowStep = (
+    <Step n={1} id={stepOneId} title="Allow installs from the Web dashboard">
+      Turn on {SETTING_PATH}. The install runs <Code>npm install</Code> as the Daemon's user.
+    </Step>
+  );
   const fallback = manualCommand && (
     <div className="mt-2" data-testid="startup-error-fallback">
       <p className="text-xs text-text-subtle">
@@ -171,16 +175,20 @@ export function StartupErrorScreen({ detail, sessionId, isSandboxed = false, rec
             ? `${agentStart} couldn't be updated${sandboxed ? " in this sandbox" : ""}`
             : headlineFor(detail, agentStart, sandboxed)}
         </h2>
-        <p
-          id={versionId}
-          data-testid="startup-error-version"
-          className="mt-1 break-words font-mono text-[12px] text-text-subtle"
-        >
+        <p data-testid="startup-error-version" className="mt-1 break-words font-mono text-[12px] text-text-subtle">
           {updateFailed ? failureLine(install.result, install.error) : versionLineFor(detail)}
         </p>
 
         {updateFailed ? (
-          fallback
+          <>
+            {/* Installs turned off since the failure: Try again is disabled until the setting is back on. */}
+            {!allowed && (
+              <ol className="mt-4 text-sm" data-testid="startup-error-steps">
+                {allowStep}
+              </ol>
+            )}
+            {fallback}
+          </>
         ) : (
           <>
             {failsAgain && (
@@ -224,9 +232,7 @@ export function StartupErrorScreen({ detail, sessionId, isSandboxed = false, rec
                   {allowed ? (
                     <Step n={1} id={stepOneId} done title="Installs from the Web dashboard are allowed" />
                   ) : (
-                    <Step n={1} id={stepOneId} title="Allow installs from the Web dashboard">
-                      Turn on {SETTING_PATH}. The install runs <Code>npm install</Code> as the Daemon's user.
-                    </Step>
+                    allowStep
                   )}
                   {updating ? (
                     <Step n={2} title={sandboxed ? "Updating inside the container" : `Updating ${agent}`}>
@@ -271,8 +277,9 @@ export function StartupErrorScreen({ detail, sessionId, isSandboxed = false, rec
             secondary={secondary}
             install={{
               // The failed card and the stopped-container steps say this themselves.
-              error: updateFailed || install.errorCode === "container_not_running" ? null : install.error,
-              output: updateFailed ? null : install.output,
+              error:
+                updateFailed || containerDown || install.errorCode === "container_not_running" ? null : install.error,
+              output: updateFailed || containerDown ? null : install.output,
             }}
           />
         )}

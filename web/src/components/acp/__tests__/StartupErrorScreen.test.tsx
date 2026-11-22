@@ -540,6 +540,62 @@ describe("StartupErrorScreen", () => {
     },
   );
 
+  /** Fails the install with npm's exit code 1, then lets install-info answer `next` on the next focus. */
+  async function failThenRefresh(answer: AgentInstallInfo, next: AgentInstallInfo) {
+    installAcpAgent.mockResolvedValue({ ...installOk(), success: false, exit_code: 1, stdout: "npm ERR! 404" });
+    const view = await renderScreen(incompatible(), answer);
+    fireEvent.click(view.getByTestId("startup-error-update-restart"));
+    await waitFor(() => view.getByText("Update failed"));
+    fetchAgentInstallInfo.mockResolvedValue(next);
+    act(() => {
+      window.dispatchEvent(new Event("focus"));
+    });
+    return view;
+  }
+
+  it("an npm failure, then install-info reports the container stopped: the stopped-container steps replace the card", async () => {
+    const view = await failThenRefresh(
+      info({ ...sandbox, ...allowed }),
+      info({ ...sandbox, install_allowed: false, install_blocked: "container_not_running" }),
+    );
+    const { getByTestId, findByTestId, queryByTestId, queryByText, getByRole } = view;
+    await findByTestId("startup-error-container-down");
+    const screen = getByTestId("startup-error-screen");
+    expect(queryByText("Update failed")).toBeNull();
+    expect(getByRole("heading").textContent).toBe("Claude needs an update in this sandbox");
+    expect(buttons(screen)).toEqual(["Start the container"]);
+    expect(stepTitles(getByTestId)).toEqual(["Click Start the container", "Then update the adapter"]);
+    expectStepsNameRenderedButtons(screen, stepTitles(getByTestId));
+    // The earlier npm failure doesn't sit under Start the container.
+    expect(queryByTestId("adapter-install-error")).toBeNull();
+    expect(screen.textContent).not.toContain("npm ERR! 404");
+    expect(screen.textContent).not.toContain("Try again");
+  });
+
+  it("an npm failure, then installs turned off: Try again is disabled and described by the permission step", async () => {
+    const view = await failThenRefresh(info(allowed), info());
+    const { getByTestId, getByText, queryByTestId } = view;
+    const update = getByTestId("startup-error-update-restart") as HTMLButtonElement;
+    await waitFor(() => expect(update.disabled).toBe(true));
+    const screen = getByTestId("startup-error-screen");
+    getByText("Update failed");
+    expect(update.textContent).toBe("Try again");
+    expect(buttons(screen)).toEqual(["Try again", "Check again"]);
+    const stepOne = getByTestId("startup-error-step-1");
+    expect(stepOne.textContent).toContain(
+      'Allow installs from the Web dashboardTurn on TUI › Settings › Global › Acp › Advanced › "Let the Web dashboard install Agents".',
+    );
+    const describedBy = update.getAttribute("aria-describedby");
+    expect(describedBy ? document.getElementById(describedBy) : null).toBe(stepOne);
+    // npm's failure stays on the version line and its output under Details, apart from the action's description.
+    expect(getByTestId("startup-error-version").textContent).toBe("npm exited with code 1");
+    expect(stepOne.textContent).not.toContain("exited");
+    expect(getByTestId("startup-error-install-command").textContent).toBe(CLAUDE_NPM);
+    fireEvent.click(getByTestId("startup-error-details"));
+    expect(queryByTestId("startup-error-install-output")?.textContent).toBe("npm ERR! 404");
+    expectValidatedText(screen);
+  });
+
   it("container not running: its own steps, then Update returns once the container runs", async () => {
     installAcpAgent.mockRejectedValue(new InstallAgentError("container is not running", "container_not_running"));
     const view = await renderScreen(incompatible(), info({ ...sandbox, ...allowed }));
