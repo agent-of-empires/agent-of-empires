@@ -1,3 +1,5 @@
+import { useState } from "react";
+
 import { useWebSettings } from "../../hooks/useWebSettings";
 import {
   MAX_PERSISTENT_STRUCTURED_VIEWS,
@@ -14,6 +16,14 @@ import { FontSizeControl } from "./FontSizeControl";
 /** Structured view display preferences, stored in `aoe-web-settings` (already clamped). */
 export function StructuredViewDisplaySettings() {
   const { settings, update } = useWebSettings();
+  const [historyDraft, setHistoryDraft] = useState<string | null>(null);
+
+  const commitHistory = () => {
+    if (historyDraft === null) return;
+    const next = normalizeStructuredHistoryWindow(historyDraft.trim() === "" ? undefined : Number(historyDraft));
+    update({ structuredHistoryWindow: next });
+    setHistoryDraft(null);
+  };
 
   return (
     <div className="space-y-4">
@@ -48,10 +58,12 @@ export function StructuredViewDisplaySettings() {
           min={MIN_STRUCTURED_HISTORY_WINDOW}
           max={MAX_STRUCTURED_HISTORY_WINDOW}
           step={1}
-          value={settings.structuredHistoryWindow}
-          onChange={(e) =>
-            update({ structuredHistoryWindow: normalizeStructuredHistoryWindow(Number(e.target.value)) })
-          }
+          value={historyDraft ?? settings.structuredHistoryWindow}
+          onChange={(e) => setHistoryDraft(e.target.value)}
+          onBlur={commitHistory}
+          onKeyDown={(e) => {
+            if (e.key === "Enter") commitHistory();
+          }}
           className="bg-surface-800 border border-surface-700 rounded-md px-2 py-1 text-sm text-text-primary font-mono w-20 text-center"
         />
       </div>

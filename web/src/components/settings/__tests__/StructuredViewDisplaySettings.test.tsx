@@ -86,20 +86,36 @@ describe("StructuredViewDisplaySettings localStorage contract", () => {
     }
   });
 
-  it("stores the initial history window clamped, backfilling 150 for old blobs", () => {
+  it("commits the initial history window on blur or Enter, clamped, backfilling 150 for old blobs", () => {
     window.localStorage.setItem(KEY, JSON.stringify({ mobileFontSize: 8 }));
     const { getByLabelText } = render(<StructuredViewDisplaySettings />);
     const input = getByLabelText("Initial visible history (rows)") as HTMLInputElement;
     expect(input.value).toBe("150");
+
+    // Type digit by digit: no intermediate value may be clamped or stored.
+    for (const partial of ["3", "30", "300"]) {
+      fireEvent.change(input, { target: { value: partial } });
+      expect(input.value).toBe(partial);
+    }
+    expect(readStored().structuredHistoryWindow).toBeUndefined();
+    fireEvent.blur(input);
+    expect(readStored().structuredHistoryWindow).toBe(300);
+
     for (const [typed, expected] of [
-      ["300", 300],
       ["5", 50],
-      ["99999", 1000],
-      ["200.4", 200],
+      ["9999", 1000],
+      ["", 150],
     ] as const) {
       fireEvent.change(input, { target: { value: typed } });
+      fireEvent.blur(input);
       expect(readStored().structuredHistoryWindow, typed).toBe(expected);
+      expect(input.value).toBe(String(expected));
     }
+
+    fireEvent.change(input, { target: { value: "200" } });
+    fireEvent.keyDown(input, { key: "Enter" });
+    expect(readStored().structuredHistoryWindow).toBe(200);
+
     window.localStorage.setItem(KEY, JSON.stringify({ structuredHistoryWindow: "junk" }));
     expect(getWebSettingsSnapshot().structuredHistoryWindow).toBe(150);
   });
