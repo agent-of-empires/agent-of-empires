@@ -428,6 +428,7 @@ describe("SuggestionsView", () => {
       status: "Running" as const,
       archived: false,
       created_at: new Date(Date.now() - 3 * 60_000).toISOString(),
+      started_via: "start" as const,
     };
     const prepared = {
       ok: true,
@@ -486,6 +487,26 @@ describe("SuggestionsView", () => {
       await waitFor(() => expect(startSuggestion).toHaveBeenCalledWith("github", "issue-1", {}));
       expect(trashSession).toHaveBeenCalledWith("sess-1");
       expect(trashSession.mock.invocationCallOrder[0]).toBeLessThan(startSuggestion.mock.invocationCallOrder[0]!);
+    });
+
+    it("a blocked Session made with Start with changes offers pre-trust but no Try again", async () => {
+      updateSettings.mockResolvedValue("committed");
+      await open(snapshot({ items: [{ ...item, started_session: { ...started, started_via: "wizard" } }] }), {
+        sessions: [
+          {
+            id: "sess-1",
+            status: "Idle",
+            initial_prompt_error: "Claude Code is asking whether to trust this folder…",
+            initial_prompt_error_code: "agent_folder_not_trusted",
+          } as SessionResponse,
+        ],
+      });
+      const row = (await screen.findByText("Fix lifecycle")).closest("li") as HTMLElement;
+      fireEvent.click(within(row).getByRole("button", { name: "Turn on pre-trust" }));
+      fireEvent.click(within(row).getByRole("button", { name: "Turn on" }));
+      expect(await within(row).findByText(/Trust this folder in the terminal to go on/)).toBeTruthy();
+      expect(within(row).queryByRole("button", { name: "Try again" })).toBeNull();
+      expect(startSuggestion).not.toHaveBeenCalled();
     });
 
     it("Try again does not start when the blocked Session cannot go to Trash", async () => {

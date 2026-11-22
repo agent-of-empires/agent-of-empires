@@ -112,7 +112,8 @@ export function StartedPromptNote({
         label="Prompt not sent"
         code={session.initial_prompt_error_code}
         message={session.initial_prompt_error}
-        onTryAgain={onTryAgain}
+        // Redoing from the preset would drop a Start with changes Session's own prompt, agent or project.
+        onTryAgain={session.started_via === "start" ? onTryAgain : undefined}
         disabled={disabled}
         live="status"
       />
