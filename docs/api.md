@@ -765,7 +765,7 @@ after the request. A finished pull drops the cached answer.
 | `sandbox_in_use` | `sandbox.enabled_by_default` is on, or a sandboxed session exists |
 | `pull` | The image's pull, below |
 | `pull_blocked` | `read_only`, `cityhall` or `disabled` when the pull gate refuses, otherwise `null` |
-| `pull_command` | The runtime's pull command for the image, to run on the host when `pull_blocked` is set |
+| `pull_command` | Always present: the runtime's pull command for the image, to run on the host when `pull_blocked` is set |
 | `runtime` | `Docker`, `Podman` or `Apple Container` |
 
 `pull.state` is one of:
@@ -832,8 +832,8 @@ which the TUI shares, and answers:
 
 The dismissal holds only while the registry still serves that digest: a newer
 one shows again.
-It is refused in read-only and CityHall mode, but not by
-`sandbox.allow_image_pull`. A failed save answers `500 save_failed`.
+It is refused in read-only mode (`403 read_only`) and CityHall mode
+(`403 cityhall_mode`), but not by `sandbox.allow_image_pull`. A failed save answers `500 save_failed`.
 
 ## POST /api/sessions/{id}/restart
 
