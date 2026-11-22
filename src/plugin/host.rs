@@ -577,6 +577,10 @@ impl PluginHost {
     /// handler calls it to recover a worker without a full restart.
     pub async fn start(self: &Arc<Self>, registry: &PluginRegistry) {
         Self::log_start_observability(registry);
+        // No worker runs yet, so an interrupted update's clear is safe now.
+        for id in crate::plugin::install::owed_suggestions_cleanups() {
+            self.settle_owed_cleanup(&id, false).await;
+        }
         self.reconcile(registry).await;
     }
 
@@ -3349,6 +3353,53 @@ variables = []
         host.reconcile(&crate::plugin::reload_registry()).await;
         assert!(host.state.lock().await.running.is_empty());
         assert_eq!(published(), 0);
+        host.shutdown().await;
+    }
+
+    /// A daemon that starts with a persisted marker clears the old publication
+    /// before any worker launches.
+    #[cfg(unix)]
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn start_settles_an_owed_cleanup_before_launching_workers() {
+        let temp = tempfile::tempdir().unwrap();
+        let _reload = crate::plugin::ReloadRegistryOnDrop;
+        let _env = crate::session::test_support::EnvGuard::set(&[
+            ("XDG_CONFIG_HOME", temp.path().to_path_buf()),
+            ("HOME", temp.path().to_path_buf()),
+            ("USERPROFILE", temp.path().to_path_buf()),
+        ]);
+        let plugin_id = "acme.sleeper";
+        install_sleeper(plugin_id);
+        let registry = crate::plugin::reload_registry();
+        let host = PluginHost::new(
+            &temp.path().join("host"),
+            "default",
+            None,
+            std::sync::Arc::new(crate::server::runtime::RuntimeWork::default()),
+        )
+        .unwrap();
+        host.api.with_suggestions_db(|conn, _| {
+            conn.execute(
+                "INSERT INTO suggestion_providers (profile, provider_id, updated_at) VALUES ('p', ?1, 0)",
+                [plugin_id],
+            )
+            .unwrap();
+        });
+        crate::plugin::install::persist_suggestions_cleanup(plugin_id, true).unwrap();
+
+        host.start(&registry).await;
+
+        let left = host.api.with_suggestions_db(|conn, _| {
+            conn.query_row(
+                "SELECT COUNT(*) FROM suggestion_providers WHERE provider_id = ?1",
+                [plugin_id],
+                |row| row.get::<_, i64>(0),
+            )
+            .unwrap()
+        });
+        assert_eq!(left, 0, "the old publication is gone");
+        assert!(!crate::plugin::install::suggestions_cleanup_owed(plugin_id));
         host.shutdown().await;
     }
 

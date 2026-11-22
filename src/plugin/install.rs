@@ -2034,6 +2034,20 @@ pub(crate) fn suggestions_cleanup_owed(plugin_id: &str) -> bool {
     cleanup_marker(plugin_id).is_ok_and(|marker| marker.exists())
 }
 
+/// Plugins whose cleanup is still owed, for a daemon that starts before any
+/// worker runs.
+pub(crate) fn owed_suggestions_cleanups() -> Vec<String> {
+    let Some(dir) = cleanup_marker("").ok() else {
+        return Vec::new();
+    };
+    std::fs::read_dir(dir)
+        .into_iter()
+        .flatten()
+        .flatten()
+        .filter_map(|entry| entry.file_name().into_string().ok())
+        .collect()
+}
+
 /// Ends the obligation once a clear has succeeded behind a retired worker.
 pub(crate) fn finish_suggestions_cleanup(plugin_id: &str) -> Result<()> {
     match std::fs::remove_file(cleanup_marker(plugin_id)?) {
