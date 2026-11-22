@@ -41,6 +41,7 @@ The approval shelf shows the request itself above its buttons: the command or pa
 | Transcript  | `Tab`           | Cycle to a pending approval card |
 | Transcript  | `m`             | Open the permission-mode picker |
 | Transcript  | `t`             | Flip Fast mode or Ultracode, when the agent offers them |
+| Transcript  | `e`             | Show every thought in full, or collapse to one preview line |
 | Transcript  | `a`             | Answer a pending question (single-select forms) |
 | Transcript  | `s` / `c`       | Skip / cancel a pending question |
 | Transcript  | `o`             | Open this session in the web dashboard |

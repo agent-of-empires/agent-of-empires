@@ -18,7 +18,9 @@ use super::input::{Focus, Intent};
 use super::reducer::{
     AcpTranscript, NoteKind, PendingApproval, ToolCallRow, ToolCompletion, ToolOutcome,
 };
-use super::state::{FileIndex, PickerKind, PickerTarget, StructuredViewState, ViewLayout};
+use super::state::{
+    FileIndex, PickerKind, PickerTarget, ScrollAnchor, StructuredViewState, ViewLayout,
+};
 use crate::acp::approvals::{tool_target, ToolTarget, CMD_KEYS, PATH_KEYS};
 use crate::acp::session_paths::{relative_display_path, SessionPathRoots};
 use crate::acp::state::{
@@ -1021,13 +1023,45 @@ fn render_transcript(
         );
     }
 
-    let text = wrapped_transcript(state, theme, text_area.width, ToolOutputMode::Compact);
+    let (text, groups) =
+        wrapped_transcript_rows(state, theme, text_area.width, ToolOutputMode::Compact);
     // Pre-wrapped at the render width, so visual rows are logical rows.
     let total = text.lines.len().min(u16::MAX as usize) as u16;
     let max = total.saturating_sub(text_area.height);
     // Lets a scroll step resolve the stick-to-bottom sentinel first.
     state.last_scroll_max.set(max);
-    let first = state.scroll_offset.min(max);
+    let mut first = state.scroll_offset.get().min(max);
+    // A projection that grew above the reader moved their row; put the row they
+    // were reading back where they had it.
+    if let Some(anchor) = state.take_scroll_anchor() {
+        if let Some(index) = anchored_offset(&text.lines, &groups, &anchor, first) {
+            first = index.saturating_sub(anchor.pane_row).min(max);
+            state.scroll_offset.set(first);
+        }
+    }
+    // The topmost row with content is the one to find again: a blank separator
+    // says nothing about which row the reader is on.
+    let top_row = text
+        .lines
+        .iter()
+        .enumerate()
+        .skip(first as usize)
+        .take(text_area.height as usize)
+        .find_map(|(index, line)| {
+            let content = line_text(line);
+            if content.trim().is_empty() {
+                return None;
+            }
+            let group = groups.get(index)?.as_ref()?;
+            let (start, _) = group_bounds(&groups, group)?;
+            Some(ScrollAnchor {
+                group: group.clone(),
+                row: (index - start).min(u16::MAX as usize) as u16,
+                pane_row: (index - first as usize).min(u16::MAX as usize) as u16,
+                text: content,
+            })
+        });
+    state.note_top_row(top_row);
     let para = Paragraph::new(text).scroll((first, 0));
     frame.render_widget(para, text_area);
     TranscriptGeometry {
@@ -1035,6 +1069,87 @@ fn render_transcript(
         first_line: first as usize,
         total_lines: total as usize,
     }
+}
+
+/// The plain content of one rendered row.
+fn line_text(line: &Line<'static>) -> String {
+    line.spans
+        .iter()
+        .map(|span| span.content.as_ref())
+        .collect()
+}
+
+/// The rows of `groups` belonging to one transcript identity: `[start, end)`.
+fn group_bounds(groups: &[Option<String>], group: &str) -> Option<(usize, usize)> {
+    let start = groups
+        .iter()
+        .position(|row| row.as_deref() == Some(group))?;
+    let len = groups[start..]
+        .iter()
+        .position(|row| row.as_deref() != Some(group))
+        .unwrap_or(groups.len() - start);
+    Some((start, start + len))
+}
+
+/// Last row of `[start, end)` with text, since an identity can end on the blank
+/// separator that follows it. Anchoring on that blank pushes the identity's own
+/// content off the top when the rows below it fill the pane.
+fn last_content_row(lines: &[Line<'static>], start: usize, end: usize) -> usize {
+    (start..end)
+        .rev()
+        .find(|&row| !line_text(&lines[row]).trim().is_empty())
+        .unwrap_or(end.saturating_sub(1))
+}
+
+/// Row index of the identity the reader anchored on, found by identity rather
+/// than by text, since identical replies either side of the row they were
+/// reading are the same text. `first` hints the fallback search.
+fn anchored_offset(
+    lines: &[Line<'static>],
+    groups: &[Option<String>],
+    anchor: &ScrollAnchor,
+    first: u16,
+) -> Option<u16> {
+    if let Some((start, end)) = group_bounds(groups, &anchor.group) {
+        let expected = start + anchor.row as usize;
+        // Inside the identity, its own text says which row grew: a projection
+        // that expanded the row the reader was in still has that line.
+        let row = lines[start..end]
+            .iter()
+            .enumerate()
+            .filter(|(_, line)| line_text(line) == anchor.text)
+            .map(|(offset, _)| start + offset)
+            .min_by_key(|index| index.abs_diff(expected))
+            .unwrap_or(expected)
+            .min(last_content_row(lines, start, end));
+        return u16::try_from(row).ok();
+    }
+    // The projection no longer holds that identity (a windowed row, say): fall
+    // back to the nearest copy of its text.
+    anchor_offset(lines, &anchor.text, first.saturating_add(anchor.pane_row))
+}
+
+/// Row index of `anchor` closest to `hint`, so a blank or repeated row keeps
+/// the reader near where they were instead of jumping to the first match.
+fn anchor_offset(lines: &[Line<'static>], anchor: &str, hint: u16) -> Option<u16> {
+    // An empty anchor names no row: any match would be a different blank.
+    if anchor.trim().is_empty() {
+        return None;
+    }
+    let mut best: Option<(u16, usize)> = None;
+    for (index, line) in lines.iter().enumerate() {
+        if index > u16::MAX as usize {
+            break;
+        }
+        if line_text(line) != anchor {
+            continue;
+        }
+        let distance = (index as u16).abs_diff(hint);
+        if best.is_none_or(|(closest, _)| distance < closest) {
+            best = Some((distance, index));
+        }
+    }
+    best.map(|(_, index)| index as u16)
 }
 
 const METADATA_CARD_MAX_WIDTH: u16 = 72;
@@ -1183,17 +1298,69 @@ pub(super) fn wrapped_transcript(
     width: u16,
     tool_output: ToolOutputMode,
 ) -> Text<'static> {
-    let lines = transcript_lines(
+    wrapped_transcript_rows(state, theme, width, tool_output).0
+}
+
+/// [`wrapped_transcript`] plus, per visual row, the transcript row identity it
+/// came from, so a scroll anchor can find its own row again after the
+/// projection moves it.
+pub(super) fn wrapped_transcript_rows(
+    state: &StructuredViewState,
+    theme: &Theme,
+    width: u16,
+    tool_output: ToolOutputMode,
+) -> (Text<'static>, Vec<Option<String>>) {
+    let text = transcript_lines(
         &state.transcript,
         theme,
         state.path_roots.as_ref(),
+        state.show_full_thinking,
         tool_output,
     );
-    let mut wrapped: Vec<Line<'static>> = Vec::with_capacity(lines.len());
-    for line in lines {
+    let mut wrapped: Vec<Line<'static>> = Vec::with_capacity(text.lines.len());
+    let mut groups: Vec<Option<String>> = Vec::with_capacity(text.lines.len());
+    for (line, group) in text.lines.into_iter().zip(text.groups) {
         wrap_line_into(own_line(line), width, &mut wrapped);
+        groups.resize(wrapped.len(), group);
     }
-    Text::from(wrapped)
+    (Text::from(wrapped), groups)
+}
+
+/// Transcript rows paired with the identity each row's lines came from.
+struct TranscriptText {
+    lines: Vec<Line<'static>>,
+    groups: Vec<Option<String>>,
+    current: Option<String>,
+}
+
+impl TranscriptText {
+    fn new() -> Self {
+        Self {
+            lines: Vec::new(),
+            groups: Vec::new(),
+            current: None,
+        }
+    }
+
+    /// Lines pushed from here belong to the transcript row `key` names.
+    fn row_of(&mut self, key: String) {
+        self.current = Some(key);
+    }
+
+    fn push(&mut self, line: Line<'static>) {
+        self.lines.push(line);
+        self.groups.push(self.current.clone());
+    }
+
+    fn extend(&mut self, lines: impl IntoIterator<Item = Line<'static>>) {
+        for line in lines {
+            self.push(line);
+        }
+    }
+
+    fn is_empty(&self) -> bool {
+        self.lines.is_empty()
+    }
 }
 
 fn plan_summary_line(plan: &[super::reducer::PlanLine], theme: &Theme) -> Line<'static> {
@@ -1544,7 +1711,7 @@ fn render_status(
             Style::default().fg(theme.error),
         ));
     }
-    if state.scroll_offset != u16::MAX {
+    if state.scroll_offset.get() != u16::MAX {
         spans.push(Span::styled(
             " · G latest ",
             Style::default().fg(theme.hint),
@@ -1819,8 +1986,9 @@ fn transcript_lines(
     transcript: &AcpTranscript,
     theme: &Theme,
     path_roots: Option<&SessionPathRoots>,
+    full_thinking: bool,
     tool_output: ToolOutputMode,
-) -> Vec<Line<'static>> {
+) -> TranscriptText {
     let rows = &transcript.server_rows;
     // One card per tool call at its start row; the last terminal row wins.
     let mut completions: HashMap<&str, &TranscriptRow> = HashMap::new();
@@ -1857,10 +2025,11 @@ fn transcript_lines(
         tool_output,
     };
 
-    let mut out: Vec<Line<'static>> = Vec::new();
+    let mut out = TranscriptText::new();
     let mut i = 0;
     while i < rows.len() {
         let row = &rows[i];
+        out.row_of(group_key(row));
         match row.kind {
             TranscriptRowKind::Message => {
                 // Consecutive chunks of one group form one bubble.
@@ -1887,7 +2056,11 @@ fn transcript_lines(
                     text.push_str(&rows[i].text);
                     i += 1;
                 }
-                out.push(thinking_preview_line(&text));
+                if full_thinking {
+                    out.extend(thinking_lines(&text, theme));
+                } else {
+                    out.push(thinking_preview_line(&text));
+                }
                 out.push(Line::default());
                 continue;
             }
@@ -1983,6 +2156,15 @@ fn transcript_lines(
     out
 }
 
+/// The identity a transcript row's lines belong to: the group its chunks share,
+/// so one bubble stays one anchor, or the row's own id.
+fn group_key(row: &TranscriptRow) -> String {
+    match row.kind {
+        TranscriptRowKind::Message | TranscriptRowKind::Thinking => row.group_id.clone(),
+        _ => row.id.clone(),
+    }
+}
+
 /// The spawning tool call of `row`, when its card is in the window.
 fn in_window_parent<'a>(row: &'a TranscriptRow, starts: &HashSet<&str>) -> Option<&'a str> {
     let parent = row.tool.as_ref()?.parent_tool_call_id.as_deref()?;
@@ -2073,7 +2255,39 @@ fn subagent_badge(state: SubagentState, theme: &Theme) -> Span<'static> {
     Span::styled(format!(" · {text}"), Style::default().fg(color))
 }
 
-/// One dim preview per thought: the TUI has no expansion state to show it all.
+/// A thought in full, dimmed so it never competes with the agent's answer.
+fn thinking_lines(text: &str, theme: &Theme) -> Vec<Line<'static>> {
+    // A thought is quoted, not formatted: markup the parser would swallow as
+    // HTML still reads as the model wrote it.
+    let body = crate::tui::markdown::render_keeping_html(text);
+    if text.trim().is_empty() || body.is_empty() {
+        return vec![Line::from(Span::styled(
+            "· Thinking: …",
+            Style::default()
+                .fg(theme.hint)
+                .add_modifier(Modifier::DIM | Modifier::ITALIC),
+        ))];
+    }
+    body.into_iter()
+        .enumerate()
+        .map(|(index, mut line)| {
+            line.spans.insert(
+                0,
+                Span::styled(
+                    if index == 0 { "· " } else { "  " },
+                    Style::default().fg(theme.hint),
+                ),
+            );
+            line.style = line.style.add_modifier(Modifier::DIM);
+            for span in &mut line.spans {
+                span.style = span.style.add_modifier(Modifier::DIM);
+            }
+            line
+        })
+        .collect()
+}
+
+/// One dim preview per thought, for when the transcript is collapsed.
 fn thinking_preview_line(text: &str) -> Line<'static> {
     const MAX_CHARS: usize = 120;
     let first = text
@@ -2736,6 +2950,20 @@ mod tests {
 
     fn render_dump(state: &StructuredViewState, w: u16, h: u16) -> String {
         render_rows(state, w, h, true).concat()
+    }
+
+    /// Render once and report where the transcript landed, so a test can check
+    /// the row the pane starts on.
+    fn render_geometry(state: &StructuredViewState, w: u16, h: u16) -> TranscriptGeometry {
+        let theme = crate::tui::styles::load_theme_with_mode("empire", false);
+        let mut terminal = Terminal::new(TestBackend::new(w, h)).expect("terminal");
+        let mut geometry = None;
+        terminal
+            .draw(|f| {
+                geometry = Some(render(f, f.area(), &theme, state, true));
+            })
+            .expect("draw");
+        geometry.expect("geometry")
     }
 
     /// Server transcript rows folded from events, as the daemon ships them.
@@ -3565,12 +3793,9 @@ mod tests {
             chunk("Build", "m-c"),
             chunk("ing now", "m-c"),
         ]);
-        let out = joined(&transcript_lines(
-            &t,
-            &Theme::default(),
-            None,
-            ToolOutputMode::Compact,
-        ));
+        let out = joined(
+            &transcript_lines(&t, &Theme::default(), None, false, ToolOutputMode::Compact).lines,
+        );
         assert!(!out.contains("#4656.The waiter"), "{out:?}");
         assert!(
             out.contains("for #4656.") && out.contains("The waiter has the lock."),
@@ -3594,7 +3819,8 @@ mod tests {
             thought(&long, "t-b"),
         ]);
         let lines: Vec<String> =
-            transcript_lines(&t, &Theme::default(), None, ToolOutputMode::Compact)
+            transcript_lines(&t, &Theme::default(), None, false, ToolOutputMode::Compact)
+                .lines
                 .iter()
                 .map(|line| line.spans.iter().map(|s| s.content.as_ref()).collect())
                 .filter(|line: &String| !line.is_empty())
@@ -3605,6 +3831,304 @@ mod tests {
                 "· Thinking: Weighing options…".to_string(),
                 format!("· Thinking: {}…", "é".repeat(120)),
             ]
+        );
+
+        // Expanded, the same thoughts render whole: every line, no elision.
+        let expanded: Vec<String> =
+            transcript_lines(&t, &Theme::default(), None, true, ToolOutputMode::Compact)
+                .lines
+                .iter()
+                .map(|line| line.spans.iter().map(|s| s.content.as_ref()).collect())
+                .filter(|line: &String| !line.trim().is_empty())
+                .collect();
+        let body = expanded.join("\n");
+        assert!(body.contains("Weighing options"), "{body:?}");
+        assert!(body.contains("second line"), "{body:?}");
+        assert!(
+            body.contains(&long),
+            "the full thought, not a preview: {body:?}"
+        );
+    }
+
+    /// A thought is a quote, not formatted output: markup inside it must not be
+    /// swallowed by the parser and leave the thought looking empty.
+    #[test]
+    fn an_expanded_thought_keeps_markup_it_quotes() {
+        let thought = |text: &str, id: &str| Event::AgentThoughtChunk {
+            text: text.into(),
+            message_id: Some(id.into()),
+        };
+        let mut t = AcpTranscript::new("s-1");
+        t.server_rows = server_rows(&[thought("<div>\nCompare both alternatives.\n</div>", "t-a")]);
+        let body = joined(
+            &transcript_lines(&t, &Theme::default(), None, true, ToolOutputMode::Compact).lines,
+        );
+        assert!(body.contains("Compare both alternatives."), "{body:?}");
+    }
+
+    /// Expanding a thought above the reader grows the transcript under them, so
+    /// the row they were reading has to stay at the top of the pane.
+    #[test]
+    fn expanding_a_thought_keeps_the_reader_on_their_row() {
+        let chunk = |text: &str, id: &str| Event::AgentMessageChunk {
+            text: text.into(),
+            message_id: Some(id.into()),
+        };
+        let thought = |text: &str, id: &str| Event::AgentThoughtChunk {
+            text: text.into(),
+            message_id: Some(id.into()),
+        };
+        let mut state = test_state();
+        let mut events = vec![thought(
+            "first thought\nweighing the options\nchecking the second one\nsettling on one",
+            "t-a",
+        )];
+        for index in 0..12 {
+            events.push(chunk(
+                &format!("reply number {index}"),
+                &format!("m-{index}"),
+            ));
+        }
+        state.transcript.server_rows = server_rows(&events);
+
+        // Scroll back into the replies, then expand the thought above them. The
+        // projection separates rows with blanks, so land on a reply rather than
+        // one of them.
+        state.scroll_offset.set(2);
+        let before = render_geometry(&state, 60, 20);
+        let top_before = render_rows(&state, 60, 20, true)[before.text_area.y as usize]
+            .trim()
+            .to_string();
+        assert!(!top_before.is_empty(), "the pane must start on a row");
+
+        state.anchor_scroll_to_top_line();
+        state.show_full_thinking = true;
+        let after = render_geometry(&state, 60, 20);
+        let top_after = render_rows(&state, 60, 20, true)[after.text_area.y as usize]
+            .trim()
+            .to_string();
+        assert_eq!(
+            top_after, top_before,
+            "the reader keeps the row they were on"
+        );
+    }
+
+    /// A separator at the top of the pane names no row, so anchoring on it used
+    /// to pick whichever blank sat nearest the old offset and move the reader.
+    #[test]
+    fn a_blank_top_row_keeps_the_reader_on_their_content() {
+        let chunk = |text: &str, id: &str| Event::AgentMessageChunk {
+            text: text.into(),
+            message_id: Some(id.into()),
+        };
+        let thought = |text: &str, id: &str| Event::AgentThoughtChunk {
+            text: text.into(),
+            message_id: Some(id.into()),
+        };
+        let mut state = test_state();
+        let mut events = vec![thought(
+            "first thought\nweighing the options\nchecking the second one\nsettling on one",
+            "t-a",
+        )];
+        for index in 0..12 {
+            events.push(chunk(
+                &format!("reply number {index}"),
+                &format!("m-{index}"),
+            ));
+        }
+        state.transcript.server_rows = server_rows(&events);
+
+        // Find an offset that puts a blank separator at the top of the pane, so
+        // the reader's own row is the first line of content below it.
+        let offset = (1..20u16)
+            .find(|offset| {
+                state.scroll_offset.set(*offset);
+                let rows = render_rows(&state, 60, 20, true);
+                let top = render_geometry(&state, 60, 20).text_area.y as usize;
+                rows[top].trim().is_empty() && !rows[top + 1].trim().is_empty()
+            })
+            .expect("fixture has a blank separator above a reply");
+        state.scroll_offset.set(offset);
+        let before = render_geometry(&state, 60, 20);
+        let rows_before = render_rows(&state, 60, 20, true);
+        let content_before = rows_before[(before.text_area.y + 1) as usize]
+            .trim()
+            .to_string();
+
+        state.anchor_scroll_to_top_line();
+        state.show_full_thinking = true;
+        let after = render_geometry(&state, 60, 20);
+        let rows_after = render_rows(&state, 60, 20, true);
+        assert_eq!(
+            rows_after[(after.text_area.y + 1) as usize].trim(),
+            content_before,
+            "the content under the separator stays where the reader had it"
+        );
+    }
+
+    /// Identical replies either side of the reader must not hijack the anchor:
+    /// the stored row says which copy they were reading, so an unchanged
+    /// projection leaves the pane where it was.
+    #[test]
+    fn a_repeated_reply_keeps_the_reader_on_their_row() {
+        let chunk = |text: &str, id: &str| Event::AgentMessageChunk {
+            text: text.into(),
+            message_id: Some(id.into()),
+        };
+        let mut state = test_state();
+        let events: Vec<Event> = (0..12)
+            .map(|index| chunk("same reply", &format!("m-{index}")))
+            .collect();
+        state.transcript.server_rows = server_rows(&events);
+
+        // A separator at the top puts the anchor one row down, where the copy
+        // above the reader sits as near as the copy they are on.
+        let offset = (2..18u16)
+            .find(|offset| {
+                state.scroll_offset.set(*offset);
+                let rows = render_rows(&state, 60, 20, true);
+                let top = render_geometry(&state, 60, 20).text_area.y as usize;
+                if !rows[top].trim().is_empty() {
+                    return false;
+                }
+                let below = rows[top + 1].trim().to_string();
+                if below.is_empty() {
+                    return false;
+                }
+                // The same reply also sits directly above that separator.
+                state.scroll_offset.set(offset - 1);
+                let above = render_rows(&state, 60, 20, true);
+                above[top].trim() == below
+            })
+            .expect("fixture repeats a reply above the reader");
+        state.scroll_offset.set(offset);
+        let before = render_geometry(&state, 60, 20);
+        let rows_before = render_rows(&state, 60, 20, true);
+        let reply_before = rows_before[before.text_area.y as usize + 1].clone();
+
+        state.anchor_scroll_to_top_line();
+        let after = render_geometry(&state, 60, 20);
+        let rows_after = render_rows(&state, 60, 20, true);
+        assert_eq!(
+            after.first_line, before.first_line,
+            "an unchanged projection keeps the offset"
+        );
+        assert_eq!(
+            rows_after[after.text_area.y as usize + 1],
+            reply_before,
+            "the reader stays on the copy they were reading"
+        );
+    }
+
+    /// The same reply either side of a thought the reader expands: the copy they
+    /// were on has to stay under them even though the other copy is nearer the
+    /// text match once the thought grows.
+    #[test]
+    fn an_expanded_thought_keeps_the_reader_on_a_repeated_reply() {
+        let chunk = |text: &str, id: &str| Event::AgentMessageChunk {
+            text: text.into(),
+            message_id: Some(id.into()),
+        };
+        let thought = |text: &str, id: &str| Event::AgentThoughtChunk {
+            text: text.into(),
+            message_id: Some(id.into()),
+        };
+        let mut state = test_state();
+        let mut events = vec![
+            chunk("same reply", "m-a"),
+            thought(
+                &(0..10)
+                    .map(|line| format!("thought line {line}"))
+                    .collect::<Vec<_>>()
+                    .join("\n"),
+                "t-a",
+            ),
+            chunk("same reply", "m-b"),
+        ];
+        for index in 0..12 {
+            events.push(chunk(
+                &format!("reply number {index}"),
+                &format!("m-{index}"),
+            ));
+        }
+        state.transcript.server_rows = server_rows(&events);
+
+        // Land the pane on the second copy, with the thought's preview just above
+        // it, so the first copy sits only a few rows further up.
+        let row_at = |state: &StructuredViewState, offset: u16| {
+            state.scroll_offset.set(offset);
+            let geometry = render_geometry(state, 60, 20);
+            let rows = render_rows(state, 60, 20, true);
+            rows[geometry.text_area.y as usize].trim().to_string()
+        };
+        let offset = (3..20u16)
+            .find(|offset| {
+                if !row_at(&state, *offset).ends_with("same reply") {
+                    return false;
+                }
+                (1..=3).any(|above| row_at(&state, offset - above).contains("Thinking"))
+            })
+            .expect("fixture puts the second copy of the reply below the thought");
+        state.scroll_offset.set(offset);
+        let before = render_geometry(&state, 60, 20);
+        let rows_before = render_rows(&state, 60, 20, true);
+        let visible_before = rows_before[before.text_area.y as usize..].to_vec();
+
+        state.anchor_scroll_to_top_line();
+        state.show_full_thinking = true;
+        let after = render_geometry(&state, 60, 20);
+        let rows_after = render_rows(&state, 60, 20, true);
+        assert_eq!(
+            rows_after[after.text_area.y as usize..].to_vec(),
+            visible_before,
+            "expanding the thought leaves the reader's pane as it was"
+        );
+    }
+
+    /// Collapsing a thought the reader was inside has to keep its preview on
+    /// screen. Its group ends on a blank separator, so anchoring there with
+    /// later replies filling the pane drops the preview above the viewport.
+    #[test]
+    fn collapsing_a_thought_keeps_its_preview_visible() {
+        let thought = |text: &str, id: &str| Event::AgentThoughtChunk {
+            text: text.into(),
+            message_id: Some(id.into()),
+        };
+        let mut state = test_state();
+        let body = (0..10)
+            .map(|line| format!("thought line {line}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let mut events = vec![thought(&body, "t-a")];
+        for index in 0..20 {
+            events.push(Event::AgentMessageChunk {
+                text: format!("reply number {index}"),
+                message_id: Some(format!("m-{index}")),
+            });
+        }
+        state.transcript.server_rows = server_rows(&events);
+        state.show_full_thinking = true;
+
+        let row_at = |state: &StructuredViewState, offset: u16| {
+            state.scroll_offset.set(offset);
+            let geometry = render_geometry(state, 60, 20);
+            let rows = render_rows(state, 60, 20, true);
+            rows[geometry.text_area.y as usize].trim().to_string()
+        };
+        let offset = (1..20u16)
+            .find(|offset| row_at(&state, *offset).starts_with("thought line"))
+            .expect("fixture puts the pane inside the expanded thought");
+        state.scroll_offset.set(offset);
+        state.anchor_scroll_to_top_line();
+
+        state.show_full_thinking = false;
+        let geometry = render_geometry(&state, 60, 20);
+        let rows = render_rows(&state, 60, 20, true);
+        assert!(
+            rows[geometry.text_area.y as usize..]
+                .iter()
+                .any(|row| row.contains("Thinking")),
+            "the collapsed preview stays visible: {rows:?}"
         );
     }
 
@@ -3647,12 +4171,9 @@ mod tests {
                 text: String::new(),
             },
         ]);
-        let out = joined(&transcript_lines(
-            &t,
-            &Theme::default(),
-            None,
-            ToolOutputMode::Compact,
-        ));
+        let out = joined(
+            &transcript_lines(&t, &Theme::default(), None, false, ToolOutputMode::Compact).lines,
+        );
         assert_eq!(out.matches("Compaction summary").count(), 1, "{out:?}");
         for want in [
             "working on it",
@@ -3707,7 +4228,8 @@ mod tests {
     }
 
     fn tool_lines(t: &AcpTranscript) -> Vec<String> {
-        transcript_lines(t, &Theme::default(), None, ToolOutputMode::Compact)
+        transcript_lines(t, &Theme::default(), None, false, ToolOutputMode::Compact)
+            .lines
             .iter()
             .map(line_text)
             .filter(|line| !line.is_empty())
