@@ -123,12 +123,16 @@ template, and [MAINTAINERS.md](MAINTAINERS.md) for review and merge rules.
   `--features web` when relevant.
 - For `web/` changes also run its format, lint, type, and applicable test checks
   from `web/AGENTS.md`, including the coverage matrix requirement.
+- Update the documentation a change makes materially wrong or incomplete in the
+  same PR: `docs/`, `CONTEXT.md`, ADRs, and generated references such as
+  `docs/cli/reference.md`. Do not write docs for behavior the PR leaves alone.
 - Do not add reviewers; CODEOWNERS routes each PR. When a review asks for
   changes on a head you have since fixed, dismiss that stale review and
   re-request the same reviewer, leaving the CODEOWNERS request in place.
 - Keep a PR within one owner area where possible; split changes that cross
   areas.
-- When reviewing, follow the [rubric](CONTRIBUTING.md#review-rubric).
+- When reviewing, follow the [rubric](CONTRIBUTING.md#review-rubric), and treat
+  documentation a PR leaves materially stale as a finding worth raising.
 
 Codecov gates web changes at 75% patch coverage and prevents a project drop
 beyond its threshold. Do not add tautological tests merely to move coverage.
