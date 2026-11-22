@@ -837,7 +837,9 @@ mod tests {
         previous.lifecycle_generation = 3;
         previous.status = Status::Error;
         previous.idle_entered_at = Some(Utc::now());
-        previous.last_error.set(TMUX_SESSION_GONE_ERROR.to_string());
+        previous
+            .last_error
+            .latch_tmux(TmuxAbsence::Gone, TMUX_SESSION_GONE_ERROR);
         previous.capture_started_at = floor(1_000_000);
         previous.acp_load_session_capable = Some(true);
         previous.ever_confirmed_present = true;
@@ -861,8 +863,11 @@ mod tests {
             (Status::Stopped, None)
         );
         assert_eq!(
-            reloaded.last_error.as_deref(),
-            Some(TMUX_SESSION_GONE_ERROR)
+            (
+                reloaded.last_error.as_deref(),
+                reloaded.last_error.absence()
+            ),
+            (Some(TMUX_SESSION_GONE_ERROR), Some(TmuxAbsence::Gone))
         );
         assert_eq!(reloaded.capture_started_at, floor(2_000_000));
         assert_eq!(reloaded.acp_load_session_capable, Some(true));

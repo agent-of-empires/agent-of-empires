@@ -2933,11 +2933,17 @@ mod tests {
         // converted from a terminal session: the tmux message cannot apply to
         // it any more.
         let mut inst = phantom_structured_row("acp-session");
-        inst.last_error
-            .set(crate::session::TMUX_SESSION_GONE_ERROR.to_string());
-
+        // An error a pane printed stays, however it begins.
+        let printed = format!("{} Exiting.", crate::session::TMUX_SESSION_GONE_LEAD);
+        inst.last_error.set(printed.as_str());
         assert!(skip_tmux_decision_for_structured(&mut inst));
+        assert_eq!(inst.last_error.as_deref(), Some(printed.as_str()));
 
+        inst.last_error.latch_tmux(
+            crate::session::TmuxAbsence::Gone,
+            crate::session::TMUX_SESSION_GONE_ERROR,
+        );
+        assert!(skip_tmux_decision_for_structured(&mut inst));
         assert_eq!(inst.last_error.as_deref(), None);
     }
 

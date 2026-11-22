@@ -93,6 +93,7 @@ pub use lifecycle::{LifecycleOperation, LifecycleReservation, LifecycleReservati
 #[cfg(test)]
 pub(crate) use identity_sidecar::FAIL_PI_PATH_WRITES;
 pub use last_error::LastError;
+pub(crate) use last_error::TmuxAbsence;
 pub use polling::PollerStart;
 pub use ready::{EnsureReadyError, EnsureReadyOutcome, SessionGone};
 pub use resume::ManagedResumeCause;

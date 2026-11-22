@@ -86,6 +86,7 @@ pub(crate) use instance::resume_profile_config;
 pub(crate) use instance::test_helpers::publish_host_pi_transcript;
 #[cfg(test)]
 pub(crate) use instance::ActiveExecution;
+pub use instance::LastError;
 pub(crate) use instance::CAPTURE_FAILED_RULE;
 pub(crate) use instance::{
     duplicate_session_error, is_duplicate_session, persist_session_with_storage,
@@ -119,6 +120,8 @@ pub(crate) use instance::{
     TerminalHandoffContext, TerminalHandoffIntent, TerminalHandoffKey, TerminalHandoffOutcome,
     TerminalHandoffStage, TerminalHandoffUnbornFence,
 };
+#[cfg(test)]
+pub(crate) use instance::{TmuxAbsence, TMUX_SESSION_GONE_LEAD};
 #[cfg(test)]
 pub(crate) use move_journal::{
     record as record_move_journal, MoveJournalEntry, MOVE_JOURNAL_VERSION,
