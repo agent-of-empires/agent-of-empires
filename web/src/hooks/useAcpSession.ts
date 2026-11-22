@@ -140,10 +140,10 @@ export function pendingRowIds(state: AcpState): ReadonlySet<string> {
   return new Set(state.queuedPrompts.filter((q) => q.pending).map((q) => q.id));
 }
 
-/** True when a row pending in `before` is confirmed, removed or delivered in `state`. */
-export function confirmedPendingRow(before: ReadonlySet<string>, state: AcpState): boolean {
+/** True when a row became pending (enqueued) or stopped being pending (confirmed, removed, delivered). */
+export function pendingRowsChanged(before: ReadonlySet<string>, state: AcpState): boolean {
   const now = pendingRowIds(state);
-  return [...before].some((id) => !now.has(id));
+  return now.size !== before.size || [...now].some((id) => !before.has(id));
 }
 
 function acknowledgeQueued(sessionId: string, action: Action): void {
@@ -252,8 +252,8 @@ export function useAcpSession(
   useEffect(() => {
     if (!sessionIdRef.current) return;
     cacheSet(sessionIdRef.current, state);
-    // Another window must not read a delivered row as unconfirmed and POST it again, so persist confirmations now.
-    if (confirmedPendingRow(unconfirmedRef.current, state)) flushPersist(sessionIdRef.current);
+    // An unconfirmed row is the only retry copy, and a confirmed one must not be re-sent by another window, so persist both now.
+    if (pendingRowsChanged(unconfirmedRef.current, state)) flushPersist(sessionIdRef.current);
     unconfirmedRef.current = pendingRowIds(state);
   }, [state, sessionIdRef]);
   // Separate from the `[state]` effect: its cleanup runs on every state change and would defeat the throttle.
