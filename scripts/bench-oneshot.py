@@ -53,11 +53,11 @@ class Bench:
         )
         (shim / "tmux").chmod(0o755)
         self.sandbox_id = None
-        # Drop inherited routing (XDG_*, AOE_*) so nothing reaches real state.
+        # Drop inherited routing (XDG_*, AOE_*, GIT_*) so nothing reaches real state.
         inherited = {
             k: v
             for k, v in os.environ.items()
-            if not k.startswith(("XDG_", "AOE_", "AGENT_OF_EMPIRES_"))
+            if not k.startswith(("XDG_", "AOE_", "AGENT_OF_EMPIRES_", "GIT_"))
         }
         self.env = dict(
             inherited,
@@ -69,7 +69,7 @@ class Bench:
         (self.root / "home").mkdir()
         self.project = self.root / "project"
         self.project.mkdir()
-        subprocess.run(["git", "init", "-q", str(self.project)], check=True)
+        subprocess.run(["git", "init", "-q", str(self.project)], env=self.env, check=True)
 
     def aoe_cmd(self, *args, check=True):
         result = subprocess.run(
