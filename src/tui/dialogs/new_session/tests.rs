@@ -2277,10 +2277,13 @@ fn workspace_is_unavailable_when_attaching_an_existing_branch() {
 fn tilde_path_is_submitted_expanded() {
     let temp_home = tempfile::tempdir().expect("temp home");
     let _home = crate::session::test_support::isolate_home(temp_home.path());
-    let mut dialog = single_tool_dialog();
-    dialog.path = Input::new("~/code".to_string());
-    assert_eq!(
-        submitted(dialog.build_submit_result()).path,
-        temp_home.path().join("code").to_string_lossy()
-    );
+    for typed in ["~/code", "~//code", "~///code"] {
+        let mut dialog = single_tool_dialog();
+        dialog.path = Input::new(typed.to_string());
+        assert_eq!(
+            submitted(dialog.build_submit_result()).path,
+            temp_home.path().join("code").to_string_lossy(),
+            "{typed}"
+        );
+    }
 }

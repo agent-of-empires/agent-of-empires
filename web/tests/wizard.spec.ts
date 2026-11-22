@@ -127,6 +127,47 @@ test.describe("essentials", () => {
   });
 });
 
+test.describe("modal focus", () => {
+  test("Tab and Shift+Tab stay inside the wizard, and closing returns focus to the opener", async ({ page }) => {
+    await startWizard(page, { project: false });
+    const opener = page
+      .locator('[data-testid="sidebar-group-header"]')
+      .first()
+      .getByRole("button", { name: /New session in /i });
+    await opener.click();
+    const w = wizard(page);
+    await expect(w.getByPlaceholder("Auto-generated if empty")).toBeFocused();
+    const insideWizard = () => page.evaluate(() => !!document.activeElement?.closest('[data-testid="session-wizard"]'));
+
+    // Focus left behind the overlay enters the wizard on Tab.
+    await opener.focus();
+    await page.keyboard.press("Tab");
+    expect(await insideWizard()).toBe(true);
+
+    const close = w.getByRole("button", { name: "Close" });
+    await close.focus();
+    await page.keyboard.press("Shift+Tab");
+    await expect(close).not.toBeFocused();
+    expect(await insideWizard()).toBe(true);
+    await page.keyboard.press("Tab");
+    await expect(close).toBeFocused();
+
+    for (let i = 0; i < 40; i++) {
+      await page.keyboard.press("Tab");
+      expect(await insideWizard()).toBe(true);
+    }
+    for (let i = 0; i < 40; i++) {
+      await page.keyboard.press("Shift+Tab");
+      expect(await insideWizard()).toBe(true);
+    }
+
+    await close.focus();
+    await page.keyboard.press("Enter");
+    await expect(w).toHaveCount(0);
+    await expect(opener).toBeFocused();
+  });
+});
+
 test.describe("panels focus their first field", () => {
   test("Worktree focuses the branch name, Sandbox the image, Agent the selected agent", async ({ page }) => {
     await startWizard(page, {
