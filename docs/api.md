@@ -788,8 +788,13 @@ A finished state stays until the image's next pull starts.
 ### POST /api/sandbox/image-pull
 
 Starts a pull of the image, or joins the one already running, so at most one
-pull runs per image. It answers `202` straight away with
-`{"image", "pull": {"state": "running"}}`; read progress from `image-status`.
+pull runs per image. It answers `202` straight away, and progress is read from
+`image-status`:
+
+```json
+{ "image": "ghcr.io/acme/sandbox:latest", "pull": { "state": "running" } }
+```
+
 A pull started here keeps running when the page closes or a create waiting on it
 leaves. It ends when it finishes, is cancelled, or reaches the runtime's
 10-minute timeout (`failed` with `reason: timeout`).
@@ -797,8 +802,13 @@ leaves. It ends when it finishes, is cancelled, or reaches the runtime's
 ### POST /api/sandbox/image-pull/cancel
 
 Same body and gate as `image-pull`. Cancels the image's running pull for every
-waiter, waits up to 5 s for it to end, then answers `200` with
-`{"image", "pull"}`. `pull` is normally `cancelled`; it is `done` or `failed`
+waiter, waits up to 5 s for it to end, then answers `200`:
+
+```json
+{ "image": "ghcr.io/acme/sandbox:latest", "pull": { "state": "cancelled" } }
+```
+
+`pull` is normally `cancelled`; it is `done` or `failed`
 if the pull ended another way first, and `running` if it hasn't ended within
 5 s. With no pull running it answers the current state, so a repeat is
 harmless.
@@ -814,8 +824,14 @@ instead.
 
 Body `{"digest": "sha256:<64 lowercase hex>"}`; anything else gets
 `400 invalid_digest`. Saves the digest as `app_state.dismissed_image_digest`,
-which the TUI shares, and answers `{"dismissed_image_digest"}`. The dismissal
-holds only while the registry still serves that digest: a newer one shows again.
+which the TUI shares, and answers:
+
+```json
+{ "dismissed_image_digest": "sha256:9f2c4e6a8b0d1f3e5a7c9b1d3f5e7a9c1b3d5f7e9a1c3b5d7f9e1a3c5b7d9f1e" }
+```
+
+The dismissal holds only while the registry still serves that digest: a newer
+one shows again.
 It is refused in read-only and CityHall mode, but not by
 `sandbox.allow_image_pull`. A failed save answers `500 save_failed`.
 
