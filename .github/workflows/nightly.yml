@@ -111,8 +111,11 @@ jobs:
           BASE: ${{ needs.prepare.outputs.previous }}
         run: |
           set -euo pipefail
+          # The compare link uses the base commit, not its tag: pruning deletes old
+          # nightly tags, so a tag-based link would 404 from the oldest kept release.
+          BASE_SHA="$(git rev-parse "$BASE^{commit}")"
           python3 .github/scripts/nightly-notes.py \
-            --base "$BASE" --head "$SHA" \
+            --base "$BASE_SHA" --head "$SHA" \
             --repo-url "https://github.com/${GITHUB_REPOSITORY}" > changes.md
           {
             echo "Nightly build of \`main\` at ${SHA}."
@@ -123,7 +126,7 @@ jobs:
               echo "No user-facing changes since ${BASE}."
             fi
             echo
-            echo "**Full Changelog**: https://github.com/${GITHUB_REPOSITORY}/compare/${BASE}...${SHA}"
+            echo "**Full Changelog**: https://github.com/${GITHUB_REPOSITORY}/compare/${BASE_SHA}...${SHA}"
             echo
             echo "Moving from a nightly back to a stable release may not work until the next stable ships. See https://www.agent-of-empires.com/docs/installation/#nightly-channel"
           } > release-notes.md
