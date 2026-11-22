@@ -1,6 +1,6 @@
 //! Plugin rewrite of the MCP servers forwarded to a session's agent.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashSet};
 use std::future::Future;
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
@@ -292,16 +292,26 @@ pub fn parse_edit(value: Value) -> Result<McpEdit, String> {
 pub fn apply_edit(servers: Vec<ProjectMcpServer>, edit: McpEdit) -> Vec<ProjectMcpServer> {
     let mut out: Vec<ProjectMcpServer> = match edit.drop {
         DropSpec::All => Vec::new(),
-        DropSpec::Names(dropped) => servers
-            .into_iter()
-            .filter(|s| !dropped.contains(&s.name))
-            .collect(),
+        DropSpec::Names(dropped) => {
+            let dropped: HashSet<String> = dropped.into_iter().collect();
+            servers
+                .into_iter()
+                .filter(|s| !dropped.contains(&s.name))
+                .collect()
+        }
         DropSpec::None => servers,
     };
-    for added in edit.add {
-        out.retain(|s| s.name != added.name);
-        out.push(added);
-    }
+    // An added server replaces any of that name; the last add of a name wins.
+    let mut added_names = HashSet::new();
+    let mut added: Vec<ProjectMcpServer> = edit
+        .add
+        .into_iter()
+        .rev()
+        .filter(|s| added_names.insert(s.name.clone()))
+        .collect();
+    added.reverse();
+    out.retain(|s| !added_names.contains(&s.name));
+    out.extend(added);
     out
 }
 
