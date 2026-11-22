@@ -392,14 +392,16 @@ pub async fn run(profile: &str, startup_warning: Option<String>) -> Result<()> {
     let backend = crate::tui::hyperlink::HyperlinkBackend::new(io::stdout(), app.hyperlink_cells());
     let mut terminal = Terminal::new(backend)?;
     let result = app.run(&mut terminal, prepared).await;
-    let consent_unsaved = telemetry::finish_pending_consent().await;
 
     crate::session::clear_tui_heartbeat();
 
     // `_terminal_guard` restores the terminal on drop.
     drop(terminal);
     drop(_terminal_guard);
-    if let Some(message) = consent_unsaved {
+    if telemetry::consent_in_flight() {
+        eprintln!("Waiting for the Daemon to save the telemetry setting…");
+    }
+    if let Some(message) = telemetry::finish_pending_consent().await {
         eprintln!("{message}");
     }
     result

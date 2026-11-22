@@ -98,6 +98,13 @@ pub(crate) fn take_consent_outcome() -> Option<ConsentOutcome> {
     guard(&CONSENT_OUTCOME).take()
 }
 
+/// Whether a consent change is still waiting for the Daemon's answer.
+pub(crate) fn consent_in_flight() -> bool {
+    guard(&CONSENT_PENDING)
+        .as_ref()
+        .is_some_and(|task| !task.is_finished())
+}
+
 /// Waits for an unacknowledged consent change before the TUI exits. Returns the message
 /// to show when it was not saved and the App has not shown that yet.
 pub(crate) async fn finish_pending_consent() -> Option<String> {
@@ -107,8 +114,9 @@ pub(crate) async fn finish_pending_consent() -> Option<String> {
 async fn finish_pending_consent_within(wait: Duration) -> Option<String> {
     let task = guard(&CONSENT_PENDING).take()?;
     if tokio::time::timeout(wait, task).await.is_err() {
+        // The request may have reached the Daemon, which finishes a started save.
         return Some(
-            "Telemetry setting not saved: the Daemon did not answer before aoe exited".into(),
+            "Telemetry setting may not have been saved: the Daemon did not answer in time".into(),
         );
     }
     match take_consent_outcome() {
@@ -135,49 +143,79 @@ pub(crate) fn report_seen() {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tokio::sync::oneshot;
 
-    fn delayed(release: tokio::sync::oneshot::Receiver<Result<(), String>>) -> Post {
-        Box::pin(async move { release.await.unwrap_or_else(|_| Err("dropped".into())) })
+    /// A request that signals when it is sent and answers when released.
+    fn delayed(
+        started: oneshot::Sender<()>,
+        release: oneshot::Receiver<Result<(), String>>,
+    ) -> Post {
+        Box::pin(async move {
+            started.send(()).ok();
+            release.await.unwrap_or_else(|_| Err("dropped".into()))
+        })
+    }
+
+    fn request() -> (
+        Post,
+        oneshot::Receiver<()>,
+        oneshot::Sender<Result<(), String>>,
+    ) {
+        let (started, sent) = oneshot::channel();
+        let (answer, release) = oneshot::channel();
+        (delayed(started, release), sent, answer)
     }
 
     /// Quitting waits for a delayed consent request: an answer in time is saved silently,
-    /// a failure or no answer is reported as unsaved, and a superseded change reports
-    /// nothing.
+    /// a failure or no answer is reported, and a superseded change reports nothing.
     #[tokio::test]
     #[serial_test::serial]
     async fn quitting_finishes_a_delayed_consent_change_or_reports_it_unsaved() {
         let wait = Duration::from_secs(5);
 
-        let (answer, release) = tokio::sync::oneshot::channel();
-        send_consent(delayed(release));
+        let (post, sent, answer) = request();
+        send_consent(post);
+        sent.await.unwrap();
+        assert!(consent_in_flight());
         let quit = tokio::spawn(finish_pending_consent_within(wait));
-        tokio::task::yield_now().await;
+        for _ in 0..10 {
+            tokio::task::yield_now().await;
+        }
+        assert!(!quit.is_finished(), "quitting waits for the answer");
         answer.send(Ok(())).unwrap();
         assert_eq!(quit.await.unwrap(), None);
+        assert!(!consent_in_flight());
         assert_eq!(take_consent_outcome(), None, "the outcome is consumed once");
 
-        let (answer, release) = tokio::sync::oneshot::channel();
-        send_consent(delayed(release));
+        let (post, _sent, answer) = request();
+        send_consent(post);
         answer.send(Err("refused".into())).unwrap();
         assert_eq!(
             finish_pending_consent_within(wait).await.as_deref(),
             Some("Telemetry setting not saved: refused")
         );
 
-        let (unanswered, release) = tokio::sync::oneshot::channel::<Result<(), String>>();
-        send_consent(delayed(release));
+        let (post, _sent, unanswered) = request();
+        send_consent(post);
         assert!(finish_pending_consent_within(Duration::from_millis(50))
             .await
-            .is_some_and(|message| message.contains("did not answer")));
+            .is_some_and(|message| message.contains("may not have been saved")));
         drop(unanswered);
 
-        let (first, first_release) = tokio::sync::oneshot::channel();
-        let (second, second_release) = tokio::sync::oneshot::channel();
-        send_consent(delayed(first_release));
-        send_consent(delayed(second_release));
-        first.send(Err("superseded".into())).ok();
-        second.send(Ok(())).unwrap();
-        assert_eq!(finish_pending_consent_within(wait).await, None);
+        // The first request fails in flight after a newer change was queued.
+        let (first, first_sent, first_answer) = request();
+        send_consent(first);
+        first_sent.await.unwrap();
+        let (second, second_sent, second_answer) = request();
+        send_consent(second);
+        first_answer.send(Err("superseded".into())).unwrap();
+        second_sent.await.unwrap();
+        assert_eq!(
+            take_consent_outcome(),
+            None,
+            "a superseded failure is dropped"
+        );
+        second_answer.send(Ok(())).unwrap();
         assert_eq!(finish_pending_consent_within(wait).await, None);
     }
 }

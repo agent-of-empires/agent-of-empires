@@ -791,13 +791,13 @@ impl SettingsView {
             || config_to_json(&self.repo_config) != self.baseline_repo;
     }
 
-    /// A telemetry change the Daemon did not save: show why and put the toggle back.
     /// Confirms a save once the Daemon has acknowledged its consent change.
     pub(in crate::tui) fn consent_saved(&mut self) {
         self.success_message = Some("Settings saved".to_string());
         self.success_message_expires_at = Some(std::time::Instant::now() + SUCCESS_MESSAGE_TTL);
     }
 
+    /// A telemetry change the Daemon did not save: show why and put the toggle back.
     pub(in crate::tui) fn consent_not_saved(&mut self, message: String) {
         let saved = crate::session::get_telemetry_settings().enabled;
         self.global_config.telemetry.enabled = saved;
@@ -990,7 +990,7 @@ impl SettingsView {
 
         // The just-written state is the new clean baseline.
         self.snapshot_baseline();
-        if consent_pending {
+        if consent_pending || crate::tui::telemetry::consent_in_flight() {
             // Held until the Daemon answers; see `consent_saved` and `consent_not_saved`.
             self.success_message = Some("Saving telemetry setting…".to_string());
             self.success_message_expires_at = None;
