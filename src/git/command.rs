@@ -109,20 +109,18 @@ fn hardening_args_in(
 
 /// `git` with config a sandbox-written `.git/config` cannot steer: no
 /// `core.fsmonitor`, repo-local `core.sshCommand` or `credential.helper`, or
-/// `ext::` transport. Hooks are off unless `hooks`; only `worktree add` opts in.
-pub fn hardened_git(hooks: bool) -> Command {
-    hardened_git_within(hooks, None).expect("discovery cannot time out without a deadline")
+/// `ext::` transport. Repo hooks never run.
+pub fn hardened_git() -> Command {
+    hardened_git_within(None).expect("discovery cannot time out without a deadline")
 }
 
 /// [`hardened_git`] for a caller with a deadline: `None` once `deadline` passes
 /// before the user's git config has been read.
-pub fn hardened_git_within(hooks: bool, deadline: Option<Instant>) -> Option<Command> {
+pub fn hardened_git_within(deadline: Option<Instant>) -> Option<Command> {
     static CACHE: Mutex<Option<Vec<String>>> = Mutex::new(None);
     let mut cmd = Command::new("git");
     cmd.args(hardening_args_in(&CACHE, &[], deadline)?);
-    if !hooks {
-        cmd.args(["-c", "core.hooksPath=/dev/null"]);
-    }
+    cmd.args(["-c", "core.hooksPath=/dev/null"]);
     cmd.env("LC_ALL", "C");
     Some(cmd)
 }
@@ -138,17 +136,7 @@ where
     I: IntoIterator<Item = S>,
     S: AsRef<OsStr>,
 {
-    run(cwd, args, false, false, false)
-}
-
-/// [`run_git`] that lets the repo's hooks run. Only for `git worktree add`,
-/// whose post-checkout hook is documented behavior.
-pub fn run_git_with_hooks<I, S>(cwd: &Path, args: I) -> std::io::Result<Output>
-where
-    I: IntoIterator<Item = S>,
-    S: AsRef<OsStr>,
-{
-    run(cwd, args, false, false, true)
+    run(cwd, args, false, false)
 }
 
 /// [`run_git`] at background priority, for git commands that delete many files.
@@ -157,16 +145,10 @@ where
     I: IntoIterator<Item = S>,
     S: AsRef<OsStr>,
 {
-    run(cwd, args, false, true, false)
+    run(cwd, args, false, true)
 }
 
-fn run<I, S>(
-    cwd: &Path,
-    args: I,
-    quiet: bool,
-    throttled: bool,
-    hooks: bool,
-) -> std::io::Result<Output>
+fn run<I, S>(cwd: &Path, args: I, quiet: bool, throttled: bool) -> std::io::Result<Output>
 where
     I: IntoIterator<Item = S>,
     S: AsRef<OsStr>,
@@ -182,7 +164,7 @@ where
     );
     // Callers classify several Git failures. Keep diagnostics deterministic
     // instead of depending on the launching shell's locale.
-    let mut command = hardened_git(hooks);
+    let mut command = hardened_git();
     command.args(&argv).current_dir(cwd);
     if throttled {
         crate::process::throttle_child(&mut command);
@@ -277,7 +259,7 @@ where
         timeout_s = timeout.as_secs(),
         "running git with timeout"
     );
-    let result = match hardened_git_within(false, Some(start + timeout)) {
+    let result = match hardened_git_within(Some(start + timeout)) {
         Some(mut cmd) => {
             cmd.args(&argv).current_dir(cwd).stdin(Stdio::null());
             let remaining = timeout.saturating_sub(start.elapsed());
@@ -468,11 +450,7 @@ mod tests {
         assert!(!ran("fsmonitor"), "core.fsmonitor ran");
         assert!(!ran("fsmonitor-wt"), "config.worktree fsmonitor ran");
         assert!(!ran("ssh"), "core.sshCommand ran");
-        assert!(!ran("post-checkout"), "hook ran under run_git");
-
-        let out = run_git_with_hooks(&repo, ["checkout", "-q", "-b", "b"]).unwrap();
-        assert!(out.status.success());
-        assert!(ran("post-checkout"), "run_git_with_hooks must keep hooks");
+        assert!(!ran("post-checkout"), "repo hook ran");
     }
 
     /// A stalled `include.path` must not hang discovery, and a plain one is read.
