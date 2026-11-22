@@ -240,15 +240,8 @@ impl McpServer {
         let (session, fresh) = success_body(response).await.map_err(|e| *e)?;
         // Ignore outranks the readiness wait: a person who ignores the new row while its pane
         // comes up did not ask for this prompt to land there.
-        let ignored = prompt.is_some()
-            && fresh
-            && !structured
-            && self
-                .state
-                .session_service
-                .is_ignored_on_disk(&session.id)
-                .await
-                .unwrap_or(false);
+        let ignored =
+            prompt.is_some() && fresh && !structured && self.session_is_ignored(&session.id).await;
         let (prompt_sent, prompt_delivery, prompt_error) = match prompt {
             None => (false, PromptDelivery::None, None),
             Some(_) if !fresh => (false, PromptDelivery::Replayed, None),
@@ -258,7 +251,18 @@ impl McpServer {
                 PromptDelivery::Ignored,
                 Some(IGNORED_PROMPT.to_string()),
             ),
-            Some(text) => match wait_for_input_prompt(&self.state, &session.id).await {
+            Some(text) => {
+                let readiness = wait_for_input_prompt(&self.state, &session.id).await;
+                // The wait can outlast a person's ignore, so it is checked again before
+                // the readiness result decides what the caller is told.
+                if self.session_is_ignored(&session.id).await {
+                    (
+                        false,
+                        PromptDelivery::Ignored,
+                        Some(IGNORED_PROMPT.to_string()),
+                    )
+                } else {
+                    match readiness {
                 PaneReadiness::Waiting => (
                     false,
                     PromptDelivery::BlockedWaiting,
@@ -321,7 +325,9 @@ impl McpServer {
                         }
                     },
                 },
-            },
+                    }
+                }
+            }
         };
         Ok(Json(CreatedSession {
             session,
@@ -484,6 +490,13 @@ impl McpServer {
                 "The message is empty",
             )));
         };
+        // Ignore outranks the pane probe: an ignored row whose pane shows a dialog would
+        // report `waiting` forever, and answering that dialog would never unblock it.
+        if self.session_is_ignored(&id).await {
+            return Err(Box::new(
+                terminal_refusal(&id, SendKeysError::Ignored).await,
+            ));
+        }
         // Keys sent into a dialog answer it (Enter accepts Claude's folder trust), so MCP refuses a
         // pane whose status rules detect one; an agent without status rules gets no check. HTTP
         // `POST /send` is left as is: a person at the dashboard sees the pane.
@@ -556,6 +569,18 @@ impl McpServer {
                     && i.ensure_can_parent().is_ok()
             })
             .map(|i| i.id.clone())
+    }
+
+    /// The canonical ignore marker, which outranks the snapshot and any pane probe.
+    async fn session_is_ignored(&self, id: &str) -> bool {
+        match self.state.session_service.is_ignored_on_disk(id).await {
+            Ok(ignored) => ignored,
+            Err(error) => {
+                tracing::warn!(target: "http.mcp", session = %id, %error,
+                    "reading the canonical ignore marker failed");
+                false
+            }
+        }
     }
 
     pub(super) async fn view_of(&self, id: &str) -> Option<View> {

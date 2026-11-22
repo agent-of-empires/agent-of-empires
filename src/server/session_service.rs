@@ -1086,12 +1086,15 @@ impl SessionService {
     /// and only while the canonical row is still ignored and startable, so the write happens
     /// once rather than per keystroke.
     pub(crate) async fn touch_after_direct_input(&self, id: &str) -> anyhow::Result<()> {
+        // The snapshot lags a peer's commit, so an already-ignored row is the only case
+        // that needs no store read here; anything else asks the canonical store.
         if !self
             .instances
             .read()
             .await
             .iter()
             .any(|row| row.id == id && row.is_ignored())
+            && !self.is_ignored_on_disk(id).await?
         {
             return Ok(());
         }
@@ -5106,6 +5109,41 @@ mod tests {
         assert!(
             !state.instances.read().await[0].is_ignored(),
             "the snapshot was never refreshed, so the check above read the store"
+        );
+    }
+
+    /// Input accepted while the snapshot still shows the row unignored clears a peer's
+    /// Ignore: the snapshot lags the commit, so the store decides.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn direct_input_clears_an_ignore_the_snapshot_has_not_seen() {
+        let _home = crate::session::test_support::isolate_app_dir();
+        let mut managed = Instance::new("peer-typed", "/tmp/aoe-peer-typed");
+        managed.id = "peer-typed".into();
+        managed.source_profile = "default".into();
+        managed.parent_session_id = Some("manager".into());
+        crate::server::test_support::seed_instances_on_disk_for_test(
+            "default",
+            vec![managed.clone()],
+        );
+        let state = crate::server::test_support::build_test_app_state(vec![managed.clone()]);
+        crate::server::test_support::refresh_canonical_metadata_for_test(&state).await;
+        let service = state.session_service.clone();
+
+        // A peer commits the ignore; this daemon's snapshot still shows the row live.
+        let mut ignored = managed;
+        ignored.ignore();
+        crate::server::test_support::seed_instances_on_disk_for_test("default", vec![ignored]);
+        assert!(!state.instances.read().await[0].is_ignored());
+
+        service
+            .touch_after_direct_input("peer-typed")
+            .await
+            .unwrap();
+
+        assert!(
+            !service.is_ignored_on_disk("peer-typed").await.unwrap(),
+            "accepted input must clear the canonical marker"
         );
     }
 
