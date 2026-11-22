@@ -9,10 +9,11 @@ import {
   type ActivityRow,
   type BackgroundAgent,
   type BackgroundShell,
+  type QueuedPrompt,
   type SubagentRecord,
   type WorkflowRun,
 } from "../../lib/acpTypes";
-import { STORAGE_KEY_PREFIX, STATE_TTL_MS, type PersistedEntry } from "../../lib/acpStateStorage";
+import { PENDING_KEY_PREFIX, STORAGE_KEY_PREFIX, STATE_TTL_MS, type PersistedEntry } from "../../lib/acpStateStorage";
 import { safeSetItem } from "../../lib/safeStorage";
 
 const STATE_CACHE_CAP = 32;
@@ -34,14 +35,16 @@ function parseEntry(raw: string | null): PersistedEntry | null {
   }
 }
 
-function persistedKeys(): string[] {
+function keysWithPrefix(prefix: string): string[] {
   const keys: string[] = [];
   for (let i = 0; i < window.localStorage.length; i++) {
     const k = window.localStorage.key(i);
-    if (k?.startsWith(STORAGE_KEY_PREFIX)) keys.push(k);
+    if (k?.startsWith(prefix)) keys.push(k);
   }
   return keys;
 }
+
+const persistedKeys = () => keysWithPrefix(STORAGE_KEY_PREFIX);
 
 // Only ever touches `aoe:acp-state:v1:*`: drafts and other keys are authoritative and must survive.
 export function evictOldestPersistedAcpState(currentKey: string): boolean {
@@ -94,6 +97,61 @@ function toPersistedState(state: AcpState): AcpState {
   return { ...base, queuedPrompts: base.queuedPrompts.filter((q) => !q.attachments?.length) };
 }
 
+// Unconfirmed queued prompts are the only retry copy, so they live apart from the throttled transcript
+// entry: written at once, and merged by id so a stale transcript snapshot cannot erase them.
+interface PendingEntry {
+  savedAt: number;
+  rows: QueuedPrompt[];
+}
+
+function pendingKey(sessionId: string): string {
+  return PENDING_KEY_PREFIX + sessionId;
+}
+
+function readPendingRows(sessionId: string): QueuedPrompt[] {
+  try {
+    const raw = window.localStorage.getItem(pendingKey(sessionId));
+    const parsed = raw === null ? null : (JSON.parse(raw) as PendingEntry | null);
+    if (!parsed || !Array.isArray(parsed.rows) || Date.now() - parsed.savedAt > STATE_TTL_MS) return [];
+    return parsed.rows;
+  } catch {
+    return [];
+  }
+}
+
+// Rows with attachments are never persisted: their bytes would blow the quota.
+function pendingRowsOf(state: AcpState): QueuedPrompt[] {
+  return state.queuedPrompts.filter((q) => q.pending && !q.attachments?.length);
+}
+
+// What this tab last wrote, to tell rows it removed from rows another tab added.
+const lastPendingIds = new Map<string, ReadonlySet<string>>();
+
+function syncPendingRows(sessionId: string, state: AcpState): void {
+  if (typeof window === "undefined") return;
+  const rows = pendingRowsOf(state);
+  const ids = new Set(rows.map((q) => q.id));
+  const before = lastPendingIds.get(sessionId) ?? new Set<string>();
+  if (ids.size === before.size && [...ids].every((id) => before.has(id))) return;
+  lastPendingIds.set(sessionId, ids);
+  const kept = readPendingRows(sessionId).filter((q) => ids.has(q.id) || !before.has(q.id));
+  const merged = [...kept.filter((q) => !ids.has(q.id)), ...rows];
+  try {
+    if (merged.length === 0) window.localStorage.removeItem(pendingKey(sessionId));
+    else
+      safeSetItem(pendingKey(sessionId), JSON.stringify({ savedAt: Date.now(), rows: merged } satisfies PendingEntry));
+  } catch {
+    // Storage unavailable.
+  }
+}
+
+/** Stored pending rows the state lacks, so a stale snapshot never drops a retry copy. */
+function withStoredPendingRows(sessionId: string, state: AcpState): AcpState {
+  const known = new Set(state.queuedPrompts.map((q) => q.id));
+  const missing = readPendingRows(sessionId).filter((q) => !known.has(q.id));
+  return missing.length === 0 ? state : { ...state, queuedPrompts: [...state.queuedPrompts, ...missing] };
+}
+
 export function persistState(sessionId: string, state: AcpState, savedAt = Date.now()): void {
   const key = storageKey(sessionId);
   const body = JSON.stringify({ savedAt, state: toPersistedState(state) } satisfies PersistedEntry);
@@ -124,7 +182,9 @@ export function loadPersistedState(sessionId: string): AcpState | undefined {
       return undefined;
     }
     // Merge over defaults so entries from an older bundle gain newly added fields.
-    return reopenState(normaliseTurnState({ ...emptyAcpState(), ...(state as AcpState) }));
+    const loaded = withStoredPendingRows(sessionId, { ...emptyAcpState(), ...(state as AcpState) });
+    if (!lastPendingIds.has(sessionId)) lastPendingIds.set(sessionId, new Set(pendingRowsOf(loaded).map((q) => q.id)));
+    return reopenState(normaliseTurnState(loaded));
   } catch {
     return undefined;
   }
@@ -144,12 +204,14 @@ export function sweepExpiredStorage(): void {
   if (sweptStorage) return;
   sweptStorage = true;
   const now = Date.now();
-  removePersisted(() =>
-    persistedKeys().filter((k) => {
-      const parsed = parseEntry(window.localStorage.getItem(k));
-      return !parsed || now - parsed.savedAt > STATE_TTL_MS;
-    }),
-  );
+  for (const keys of [persistedKeys, () => keysWithPrefix(PENDING_KEY_PREFIX)]) {
+    removePersisted(() =>
+      keys().filter((k) => {
+        const parsed = parseEntry(window.localStorage.getItem(k));
+        return !parsed || now - parsed.savedAt > STATE_TTL_MS;
+      }),
+    );
+  }
 }
 
 function lruInsert(sessionId: string, value: AcpState): void {
@@ -220,6 +282,7 @@ if (typeof window !== "undefined" && typeof document !== "undefined") {
 
 export function cacheSet(sessionId: string, value: AcpState): void {
   lruInsert(sessionId, value);
+  syncPendingRows(sessionId, value);
   schedulePersist(sessionId, value);
   notifyStateListeners(sessionId);
 }
@@ -303,9 +366,12 @@ export function clearAcpCache(sessionId?: string): void {
   }
   if (sessionId === undefined) {
     stateCache.clear();
+    lastPendingIds.clear();
     removePersisted(persistedKeys);
+    removePersisted(() => keysWithPrefix(PENDING_KEY_PREFIX));
   } else {
     stateCache.delete(sessionId);
-    removePersisted(() => [storageKey(sessionId)]);
+    lastPendingIds.delete(sessionId);
+    removePersisted(() => [storageKey(sessionId), pendingKey(sessionId)]);
   }
 }

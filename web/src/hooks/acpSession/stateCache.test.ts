@@ -12,7 +12,7 @@ import {
   type BackgroundAgent,
   type BackgroundShell,
 } from "../../lib/acpTypes";
-import { STORAGE_KEY_PREFIX } from "../../lib/acpStateStorage";
+import { PENDING_KEY_PREFIX, STORAGE_KEY_PREFIX } from "../../lib/acpStateStorage";
 import {
   cacheGet,
   cacheSet,
@@ -251,6 +251,72 @@ describe("cacheSet persistence throttle", () => {
     clearAcpCache();
     vi.advanceTimersByTime(2000);
     expect(stored("all")).toBeUndefined();
+  });
+});
+
+describe("pending queued rows", () => {
+  const T = 5_000_000;
+  const row = (id: string, extra: Record<string, unknown> = {}) => ({
+    id,
+    text: id,
+    queuedAt: "2026-01-01T00:00:00.000Z",
+    pending: true,
+    ...extra,
+  });
+  const withRows = (...rows: ReturnType<typeof row>[]): AcpState => ({
+    ...emptyAcpState(),
+    lastSeq: 1,
+    queuedPrompts: rows,
+  });
+  const pendingIds = (id: string) =>
+    (
+      JSON.parse(localStorage.getItem(PENDING_KEY_PREFIX + id) ?? "null") as { rows: { id: string }[] } | null
+    )?.rows.map((r) => r.id);
+  const loadedIds = (id: string) => loadPersistedState(id)?.queuedPrompts.map((q) => q.id);
+
+  beforeEach(() => {
+    vi.useFakeTimers();
+    vi.setSystemTime(T);
+  });
+  afterEach(() => {
+    clearAcpCache();
+    vi.useRealTimers();
+  });
+
+  it("writes an enqueued row at once, with the throttled transcript write still pending", () => {
+    cacheSet("pr-now", withRows(row("a")));
+    expect(pendingIds("pr-now")).toEqual(["a"]);
+    expect(localStorage.getItem(key("pr-now"))).toBeNull();
+  });
+
+  it("keeps the row when a stale snapshot without it flushes later, in either order and on a same-millisecond tie", () => {
+    // Order 1: this tab queues the row; another tab's older snapshot (same ms) lands afterwards.
+    cacheSet("pr-o1", withRows(row("a")));
+    flushPersist("pr-o1");
+    writeEntry("pr-o1", { ...withRows(), lastSeq: 1 }, T);
+    expect(loadedIds("pr-o1")).toEqual(["a"]);
+    // Order 2: the stale snapshot is stored first, then this tab's newer one flushes on the tie.
+    writeEntry("pr-o2", { ...withRows(), lastSeq: 1 }, T);
+    cacheSet("pr-o2", withRows(row("a")));
+    flushPersist("pr-o2");
+    expect(loadedIds("pr-o2")).toEqual(["a"]);
+  });
+
+  it("drops a confirmed or removed row from storage, keeping rows another tab added", () => {
+    cacheSet("pr-confirm", withRows(row("a")));
+    localStorage.setItem(PENDING_KEY_PREFIX + "pr-confirm", JSON.stringify({ savedAt: T, rows: [row("a"), row("b")] }));
+    cacheSet("pr-confirm", withRows(row("a", { pending: false })));
+    expect(pendingIds("pr-confirm")).toEqual(["b"]);
+    cacheSet("pr-solo", withRows(row("a")));
+    cacheSet("pr-solo", withRows());
+    expect(pendingIds("pr-solo")).toBeUndefined();
+  });
+
+  it("never stores attachment rows, and clearAcpCache removes the entry", () => {
+    cacheSet("pr-att", withRows(row("a", { attachments: [{ name: "x" }] }), row("b")));
+    expect(pendingIds("pr-att")).toEqual(["b"]);
+    clearAcpCache("pr-att");
+    expect(pendingIds("pr-att")).toBeUndefined();
   });
 });
 
