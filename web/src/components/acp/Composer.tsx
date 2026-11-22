@@ -382,6 +382,7 @@ export function Composer(props: Props) {
                   providerLockedReason={turnActive ? "Switch providers once the turn finishes" : null}
                 />
                 <AuthStatusHint authStatus={props.authStatus} signIn={props.signIn} />
+                {/* Last in the wrapping cluster: on a narrow footer it takes its own row instead of pushing Stop and Send off screen. */}
                 <div className="ml-auto flex min-w-0 max-w-full items-center gap-2 pl-2">
                   <PluginComposerStatus sessionId={sessionId} />
                   <UsageHint usage={props.sessionUsage} />
