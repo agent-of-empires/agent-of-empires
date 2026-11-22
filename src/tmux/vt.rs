@@ -3789,6 +3789,23 @@ pub(crate) fn register_live_for_test(
     channel
 }
 
+/// [`register_live_for_test`] holding `target`, as a channel armed on that pane would.
+#[cfg(test)]
+pub(crate) fn register_live_target_for_test(
+    name: &str,
+    dir: &std::path::Path,
+    target: &str,
+) -> Arc<VtChannel> {
+    let (mut channel, lifecycle) = dummy_channel_with_input(name, dir, false);
+    Arc::get_mut(&mut channel).expect("fresh channel").target = target.to_string();
+    VtLifecycle::Live.store(&lifecycle);
+    REGISTRY
+        .lock()
+        .unwrap()
+        .insert(name.to_string(), Arc::downgrade(&channel));
+    channel
+}
+
 #[cfg(test)]
 pub(crate) struct HeldVtDrain {
     drain: Arc<Mutex<DrainControl>>,

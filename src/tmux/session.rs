@@ -902,6 +902,16 @@ impl Session {
             .flatten()
     }
 
+    /// Capture this session's first agent pane, ignoring any VT channel. For callers whose channel
+    /// pane was just rejected, so the same pane is never re-selected.
+    pub(crate) fn capture_first_pane(&self, lines: usize) -> Option<String> {
+        let pane_id = super::utils::first_pane_id_with_deadline(
+            &self.name,
+            &crate::tmux::TmuxCommandDeadline::new(),
+        )?;
+        self.capture_pane_at(&pane_id, lines)
+    }
+
     /// Wait for any known marker, or for two stable captures when no marker exists.
     /// The polling budget bounds readiness checks, not each native subprocess.
     /// Returns false when the budget ran out first.

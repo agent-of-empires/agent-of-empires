@@ -26,7 +26,8 @@ fn ended_sentence(diagnostic: Option<&str>) -> String {
 }
 
 /// Capture the pane a live VT channel holds, else the tick's batched pane id. A failed capture
-/// by id retries through the session resolver, so a stale id never reads as a blank pane.
+/// by id retries on the session's first pane, so a stale or moved id never reads as a blank
+/// pane and a rejected channel pane is not picked again.
 fn capture_for_status(
     session: &tmux::Session,
     metadata: Option<&tmux::PaneMetadata>,
@@ -41,7 +42,8 @@ fn capture_for_status(
         });
     known
         .and_then(|pane_id| session.capture_pane_at(&pane_id, lines))
-        .unwrap_or_else(|| session.capture_pane(lines).unwrap_or_default())
+        .or_else(|| session.capture_first_pane(lines))
+        .unwrap_or_default()
 }
 
 /// Whether this poll can reuse the last verdict instead of capturing the pane.
@@ -1424,6 +1426,19 @@ Esc to cancel \u{b7} Tab to amend \u{b7} ctrl+e to explain\n\
         );
         assert!(count > 1, "the foreign pane id is rejected, then resolved");
         assert!(session.capture_pane_at(&moved, 20).is_none());
+
+        // The previous VT channel still holds the moved pane: it is rejected, not re-selected.
+        #[cfg(unix)]
+        {
+            let dir = tempfile::tempdir().expect("tempdir");
+            let _channel =
+                crate::tmux::vt::register_live_target_for_test(&name, dir.path(), &moved);
+            let (out, _) = forks(Some(&metadata), &session);
+            assert!(
+                out.contains("pane-id-marker"),
+                "a moved pane held by a live channel falls back: {out:?}"
+            );
+        }
     }
 
     /// Pane metadata for a live agent pane: not dead, running the agent itself, so neither the
