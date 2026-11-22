@@ -1374,6 +1374,13 @@ impl SessionService {
             };
         }
 
+        // Namespace first, as a manual send takes it: a rename that finished
+        // during the wait is seen by the refresh below, and none starts until
+        // delivery and bookkeeping are done.
+        let _namespace = match self.native_state() {
+            Ok(state) => Some(state.profile_namespace.clone().read_owned().await),
+            Err(_) => None,
+        };
         let Some(_submission) = self.prompt_submission_for_session(id).await else {
             return false;
         };
@@ -5716,6 +5723,53 @@ mod tests {
             tokio::time::sleep(std::time::Duration::from_millis(20)).await;
         }
         assert!(pending_turn(&service, "sess-cancel-ns").await.is_none());
+    }
+
+    /// The automatic drain holds the profile namespace through delivery and the
+    /// clear, so a profile rename cannot move the profile under it.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn the_terminal_drain_holds_the_profile_namespace_through_delivery() {
+        if !crate::tmux::is_tmux_available() {
+            return;
+        }
+        let _app_dir = crate::session::test_support::isolate_app_dir();
+        let inst = terminal_turn_instance("sess-drain-ns", "drain-ns", "run-the-nightly-task");
+        crate::server::test_support::seed_instances_on_disk_for_test(
+            &inst.source_profile,
+            vec![inst.clone()],
+        );
+        let pane = start_terminal_pane(&inst, READY_AGENT_SCRIPT, false);
+        let state = crate::server::test_support::build_test_app_state(vec![inst]);
+        let service = state.session_service.clone();
+
+        // The clear after the typed text waits on this gate.
+        let gate = service.disk_reload_guard().await;
+        let drain = {
+            let service = service.clone();
+            tokio::spawn(async move {
+                service
+                    .drain_terminal_initial_turn_within(
+                        "sess-drain-ns",
+                        std::time::Duration::from_secs(10),
+                    )
+                    .await
+            })
+        };
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+        while !pane_text(&pane).contains("run-the-nightly-task") {
+            assert!(std::time::Instant::now() < deadline, "{}", pane_text(&pane));
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+
+        assert!(
+            state.profile_namespace.try_write().is_err(),
+            "the drain released the profile namespace before its bookkeeping"
+        );
+        drop(gate);
+        drain.await.unwrap();
+        assert!(pending_turn(&service, "sess-drain-ns").await.is_none());
+        assert!(state.profile_namespace.try_write().is_ok());
     }
 
     /// An archived or snoozed session is set aside: its pending turn is
