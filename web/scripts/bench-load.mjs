@@ -5,9 +5,22 @@
 import { chromium } from "@playwright/test";
 import { spawn, execFileSync } from "node:child_process";
 import { createServer } from "node:net";
-import { mkdtempSync, readdirSync, readFileSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, readdirSync, readFileSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join, resolve } from "node:path";
+import { dirname, join, resolve } from "node:path";
+import { fileURLToPath } from "node:url";
+import ts from "typescript";
+
+// The live fixture's isolation policy, loaded the way check-env-isolation.mjs loads it.
+const helper = join(dirname(fileURLToPath(import.meta.url)), "../tests/helpers/isolatedEnv.ts");
+const { isolateEnv } = await import(
+  "data:text/javascript;base64," +
+    Buffer.from(
+      ts.transpileModule(readFileSync(helper, "utf8"), {
+        compilerOptions: { module: ts.ModuleKind.ESNext, target: ts.ScriptTarget.ES2022 },
+      }).outputText,
+    ).toString("base64")
+);
 
 // Resolve relative paths now; child processes run with other working directories.
 const arg = process.argv[2];
@@ -25,15 +38,17 @@ const port = await new Promise((ok) => {
   });
 });
 const tmuxSocket = join(home, "tmux.sock");
-// Drop host git, AoE and tmux state so nothing redirects the repo or reaches a host daemon.
-const hostState = /^(GIT_|AOE_|AGENT_OF_EMPIRES_|TMUX)/;
+const tmp = join(home, "tmp");
+const tmuxTmp = join(home, "tmux-tmp");
+for (const d of [tmp, tmuxTmp]) mkdirSync(d);
 const env = {
-  ...Object.fromEntries(Object.entries(process.env).filter(([k]) => !hostState.test(k))),
-  GIT_CONFIG_GLOBAL: join(home, ".gitconfig"),
-  GIT_CONFIG_SYSTEM: "/dev/null",
-  HOME: home,
-  XDG_CONFIG_HOME: join(home, ".config"),
-  XDG_DATA_HOME: join(home, ".local/share"),
+  ...isolateEnv(process.env, {
+    home,
+    xdgConfig: join(home, ".config"),
+    xdgData: join(home, ".local/share"),
+    tmp,
+    tmuxTmp,
+  }),
   XDG_STATE_HOME: join(home, ".local/state"),
   AOE_TMUX_SOCKET: tmuxSocket,
 };
@@ -81,7 +96,7 @@ const highlighted = () => {
       if (c && c.startsWith("rgb")) colors.add(c);
       if (el.shadowRoot) walk(el.shadowRoot);
     });
-  walk(document);
+  document.querySelectorAll("diffs-container").forEach((h) => h.shadowRoot && walk(h.shadowRoot));
   return colors.size >= 3;
 };
 
@@ -146,6 +161,8 @@ try {
       uploadThroughput: (10 * 1024 * 1024) / 8,
     });
     const done = [];
+    const workers = [];
+    page.on("worker", (w) => workers.push(w.url()));
     // content-length is the encoded body size; worker requests expose nothing richer.
     ctx.on("response", (res) => done.push([res.url(), Number(res.headers()["content-length"] ?? 0)]));
     const total = (f = () => true) => done.filter(([u]) => f(u)).reduce((n, [, b]) => n + b, 0);
@@ -168,7 +185,15 @@ try {
     const t0 = Date.now();
     await page.getByText("example.ts").first().click();
     await page.waitForFunction(highlighted, null, { timeout: 120000 });
-    R.timeToHighlight.push(Date.now() - t0);
+    const elapsed = Date.now() - t0;
+    // The main-thread fallback also highlights; only a started worker and no fallback banner count.
+    if (
+      !workers.some((u) => /\/assets\/worker-/.test(u)) ||
+      (await page.getByText("Highlighting on the main thread").count())
+    ) {
+      throw new Error(`diff was not highlighted by the worker (workers: ${JSON.stringify(workers)})`);
+    }
+    R.timeToHighlight.push(elapsed);
     await page.waitForTimeout(2000);
     const diff = scriptMs(JSON.parse((await browser.stopTracing()).toString()));
     R.diffBytes.push(total() - before);
