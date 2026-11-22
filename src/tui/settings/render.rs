@@ -379,7 +379,7 @@ impl SettingsView {
         let layout = Layout::default()
             .direction(Direction::Horizontal)
             .constraints([
-                Constraint::Length(20), // Categories
+                Constraint::Length(21), // Categories
                 Constraint::Min(40),    // Fields
             ])
             .split(area);
@@ -1652,6 +1652,22 @@ mod status_message_tests {
             category: SettingsCategory::Sandbox,
             has_override: false,
             inherited_display: None,
+        }
+    }
+
+    /// Every category name fits the nav column whole, selected or not.
+    #[test]
+    #[serial]
+    fn category_nav_fits_every_label() {
+        let (_temp, _guard, mut view) = fresh_view();
+        let theme = load_theme("empire");
+        let mut terminal = Terminal::new(TestBackend::new(120, 40)).unwrap();
+        terminal
+            .draw(|f| view.render_content(f, f.area(), &theme))
+            .unwrap();
+        let text = buffer_text(terminal.backend().buffer());
+        for label in ["Lifecycle Hooks", "Status Hooks", "ACP"] {
+            assert!(text.contains(&format!(" {label} ")), "{label}:\n{text}");
         }
     }
 

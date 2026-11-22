@@ -2980,8 +2980,8 @@ pub enum ColorMode {
 #[setting_section(name = "theme", category = "Theme")]
 pub struct ThemeConfig {
     /// Color theme for the TUI. A global preference: one theme paints every
-    /// surface regardless of the active session profile (see
-    /// `config::resolve_theme_name`), so it is not profile-overridable.
+    /// surface regardless of the active session profile, so it is not
+    /// profile-overridable.
     #[serde(default)]
     #[setting(
         label = "Theme",
@@ -3005,7 +3005,7 @@ pub struct ThemeConfig {
     /// Idle session keeps a fresh-idle tint and an animated breathe icon for
     /// this many minutes before snapping back to the static look, and is
     /// treated as actionable by the `w` keybind. The time-since-stop column
-    /// is `session.show_activity_age`.
+    /// is the separate "Show Session age" setting.
     #[serde(default = "default_idle_decay_minutes")]
     #[setting(
         label = "Highlight Sessions that just finished",

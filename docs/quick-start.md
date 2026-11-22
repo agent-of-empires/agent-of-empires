@@ -14,8 +14,9 @@ If startup or connection fails, the TUI shows the diagnostic and masks daemon-ow
 |-----|--------|
 | `n` | New session |
 | `b` | New session from a saved project |
-| `p` | Manage saved projects |
-| `Enter` | Attach to a session |
+| `p` | Manage saved projects (on a project header, pins it instead) |
+| `Enter` | [Live mode](guides/live-mode.md): type to the agent with the list still visible |
+| `Tab` | Attach to the session's tmux pane |
 | `d` | Delete a session |
 | `t` | Toggle Agent / Terminal view |
 | `T` | Attach to the session's paired terminal |
@@ -25,6 +26,8 @@ If startup or connection fails, the TUI shows the diagnostic and masks daemon-ow
 | `?` | Full keymap |
 | `q` | Quit |
 | `Ctrl+b d` | Detach from the tmux session |
+
+These are the welcome wizard's defaults. Choosing tmux there, or skipping that page, swaps `Enter` and `Tab`.
 
 ## Your first session
 

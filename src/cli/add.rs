@@ -353,7 +353,8 @@ pub async fn run(profile: &str, args: AddArgs) -> Result<()> {
             },
             &epoch,
         )
-        .await?;
+        .await
+        .map_err(|error| with_missing_path(error.into(), &path))?;
     if args.interactive && title.is_none() {
         let titles: Vec<&str> = rows.iter().map(|row| row.title.as_str()).collect();
         let default = if args.generated_name {
@@ -476,7 +477,11 @@ pub async fn run(profile: &str, args: AddArgs) -> Result<()> {
     tokio::pin!(signal);
     let row = create_and_observe(&client, &body, &epoch, &key, signal.as_mut())
         .await
-        .map_err(with_skip_hint)?;
+        .map_err(with_skip_hint)
+        .map_err(|error| {
+            let existing = body.worktree_branch.as_deref();
+            with_create_branch_hint(error, existing.filter(|_| !body.create_new_branch))
+        })?;
     for warning in &row.warnings {
         eprintln!("Warning: {warning}");
     }
@@ -807,6 +812,33 @@ fn with_skip_hint(error: anyhow::Error) -> anyhow::Error {
     }
 }
 
+fn error_code(error: &anyhow::Error) -> Option<crate::daemon::ApiErrorCode> {
+    match error.downcast_ref::<DaemonClientError>() {
+        Some(DaemonClientError::Status { code, .. }) => *code,
+        _ => None,
+    }
+}
+
+/// Names the path the CLI sent, which a refusal without a readable body cannot.
+fn with_missing_path(error: anyhow::Error, path: &str) -> anyhow::Error {
+    match error_code(&error) {
+        Some(crate::daemon::ApiErrorCode::WorkingDirMissing) => {
+            anyhow::anyhow!("Path does not exist where the Daemon runs: {path}")
+        }
+        _ => error,
+    }
+}
+
+/// `-w <branch>` without `-b` checks out an existing branch; name the flag that creates one.
+fn with_create_branch_hint(error: anyhow::Error, existing_branch: Option<&str>) -> anyhow::Error {
+    match (existing_branch, error_code(&error)) {
+        (Some(branch), Some(crate::daemon::ApiErrorCode::BranchNotFound)) => {
+            anyhow::anyhow!("{error:#}\nPass -b to create branch '{branch}'.")
+        }
+        _ => error,
+    }
+}
+
 fn definitive(error: &DaemonClientError) -> bool {
     matches!(error, DaemonClientError::Status { status, code, .. }
         if status.is_client_error() && *status != reqwest::StatusCode::REQUEST_TIMEOUT
@@ -816,6 +848,39 @@ fn definitive(error: &DaemonClientError) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Both hints key off the Daemon's error code, never its message text.
+    #[test]
+    fn typed_refusals_name_the_path_and_the_create_flag() {
+        use crate::daemon::ApiErrorCode;
+        let status = |code: Option<ApiErrorCode>| {
+            anyhow::Error::from(DaemonClientError::Status {
+                status: reqwest::StatusCode::BAD_REQUEST,
+                code,
+                body: String::new(),
+                truncated: false,
+            })
+        };
+        let missing = with_missing_path(status(Some(ApiErrorCode::WorkingDirMissing)), "/nope");
+        assert!(missing.to_string().ends_with(": /nope"), "{missing}");
+        let hinted =
+            with_create_branch_hint(status(Some(ApiErrorCode::BranchNotFound)), Some("feat/x"));
+        assert!(
+            hinted
+                .to_string()
+                .ends_with("Pass -b to create branch 'feat/x'."),
+            "{hinted}"
+        );
+        for (code, branch) in [
+            (Some(ApiErrorCode::BranchNotFound), None),
+            (None, Some("feat/x")),
+        ] {
+            let error = with_create_branch_hint(status(code), branch).to_string();
+            assert!(!error.contains("-b"), "{error}");
+        }
+        let other = with_missing_path(status(None), "/nope").to_string();
+        assert!(!other.contains("/nope"), "{other}");
+    }
 
     #[cfg(unix)]
     #[tokio::test]
