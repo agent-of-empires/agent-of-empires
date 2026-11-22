@@ -156,6 +156,15 @@ struct Started {
     status: String,
     #[serde(default)]
     archived: bool,
+    /// `"start"` for a one-click Start; only those may be trashed and started again.
+    #[serde(default)]
+    started_via: Option<String>,
+}
+
+impl Started {
+    fn one_click(&self) -> bool {
+        self.started_via.as_deref() == Some("start")
+    }
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -832,7 +841,7 @@ impl SuggestionsView {
                     let untrusted = item
                         .and_then(|i| store.blocked_prompt(i))
                         .is_some_and(|(_, code)| code.as_deref() == Some(FOLDER_NOT_TRUSTED));
-                    if untrusted && self.pretrusted && block.is_none() {
+                    if untrusted && self.pretrusted && started.one_click() && block.is_none() {
                         return SuggestionsAction::TryAgain(key, started.id.clone());
                     }
                     return SuggestionsAction::OpenSession(started.id.clone());
@@ -1102,8 +1111,15 @@ impl SuggestionsView {
                 continue;
             }
             if let Some((_, code)) = store.blocked_prompt(item) {
+                let one_click = item
+                    .started_session
+                    .as_ref()
+                    .is_some_and(Started::one_click);
                 let next = match code.as_deref() {
-                    Some(FOLDER_NOT_TRUSTED) if self.pretrusted => "Enter tries again",
+                    Some(FOLDER_NOT_TRUSTED) if self.pretrusted && one_click => "Enter tries again",
+                    Some(FOLDER_NOT_TRUSTED) if self.pretrusted => {
+                        "trust the folder in the Session · Enter opens it"
+                    }
                     Some(FOLDER_NOT_TRUSTED) => "t turn on pre-trust",
                     Some(BYPASS_NOT_ACCEPTED) => {
                         "accept Bypass Permissions once in the Session · Enter opens it"
@@ -1439,6 +1455,7 @@ impl SuggestionsFeed {
                 id: session_id.to_owned(),
                 status: "Starting".into(),
                 archived: false,
+                started_via: None,
             });
         }
         self.reload();
@@ -2251,6 +2268,7 @@ mod tests {
             id: id.into(),
             status: status.into(),
             archived: false,
+            started_via: None,
         })
     }
 
@@ -2350,6 +2368,7 @@ mod tests {
             id: "s1".into(),
             status: "Idle".into(),
             archived: false,
+            started_via: Some("start".into()),
         });
         let mut rig = view_with(vec![started], idle_worker());
         rig.store.blocked_prompts.insert(
@@ -2388,6 +2407,26 @@ mod tests {
             press(&mut rig, KeyCode::Enter, true),
             SuggestionsAction::TryAgain(k, s) if k == key && s == "s1"
         ));
+    }
+
+    #[test]
+    fn a_session_not_made_by_one_click_start_is_opened_not_retried() {
+        let mut rig = blocked_rig("agent_folder_not_trusted");
+        rig.view.pretrusted = true;
+        for via in [None, Some("wizard")] {
+            rig.store.snapshot.as_mut().unwrap().items[0]
+                .started_session
+                .as_mut()
+                .unwrap()
+                .started_via = via.map(Into::into);
+            let text = render_text(&rig);
+            assert!(text.contains("trust the folder in the Session"), "{text}");
+            assert!(!text.contains("Enter tries again"), "{text}");
+            assert!(matches!(
+                press(&mut rig, KeyCode::Enter, true),
+                SuggestionsAction::OpenSession(s) if s == "s1"
+            ));
+        }
     }
 
     #[test]

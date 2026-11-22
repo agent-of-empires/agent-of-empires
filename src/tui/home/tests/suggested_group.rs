@@ -1164,7 +1164,7 @@ fn a_prompt_blocked_on_folder_trust_turns_on_pre_trust_then_tries_again() {
     env.view.info_dialog = None;
     let mut snap = snapshot(1, &[]);
     snap["items"][0]["started_session"] =
-        serde_json::json!({ "id": instance.id, "status": "Idle" });
+        serde_json::json!({ "id": instance.id, "status": "Idle", "started_via": "start" });
     env.view.suggestions_feed.set_snapshot_for_test(snap);
     env.view.apply_suggestions_results();
     env.view.open_suggestions_view();
