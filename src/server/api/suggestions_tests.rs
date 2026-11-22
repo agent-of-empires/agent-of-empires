@@ -154,8 +154,16 @@ impl Fixture {
 /// Records `session_id` as the settled primary Session of item `id`.
 pub(crate) fn link_session_on(host: &PluginHost, id: &str, session_id: &str) {
     host.with_suggestions_db(|conn, profile| {
-        crate::plugin::suggestions::claim_link(conn, profile, PROVIDER, id, session_id, &|_| false)
-            .unwrap();
+        crate::plugin::suggestions::claim_link(
+            conn,
+            profile,
+            PROVIDER,
+            id,
+            session_id,
+            crate::plugin::suggestions::StartedVia::Wizard,
+            &|_| false,
+        )
+        .unwrap();
         crate::plugin::suggestions::settle_link(conn, profile, PROVIDER, id, session_id).unwrap();
     });
 }

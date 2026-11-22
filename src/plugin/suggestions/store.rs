@@ -297,7 +297,7 @@ pub(crate) fn snapshot(
 /// The primary Session of each linked item, as snapshot JSON keyed by
 /// `(provider_id, id)`, for links whose Session is live. Trashed Sessions do not count.
 pub(crate) fn started_sessions<'a>(
-    links: &[(String, String, String)],
+    links: &[Link],
     instances: impl IntoIterator<Item = &'a Instance>,
 ) -> HashMap<(String, String), Value> {
     let live: HashMap<&str, &Instance> = instances
@@ -307,12 +307,13 @@ pub(crate) fn started_sessions<'a>(
         .collect();
     links
         .iter()
-        .filter_map(|(provider_id, id, session_id)| {
-            let inst = live.get(session_id.as_str())?;
+        .filter_map(|link| {
+            let inst = live.get(link.session_id.as_str())?;
             Some((
-                (provider_id.clone(), id.clone()),
+                (link.provider_id.clone(), link.item_id.clone()),
                 json!({
                     "id": inst.id,
+                    "started_via": link.started_via.as_str(),
                     "title": inst.title,
                     "status": inst.status.wire_str(),
                     "archived": inst.is_archived(),
@@ -808,12 +809,11 @@ mod tests {
         let mut archived = session("archived");
         archived.archived_at = Some(chrono::Utc::now());
         let instances = [session("unlinked"), archived, trashed];
-        let link = |item: &str, session: &str| {
-            (
-                "acme.github".to_string(),
-                item.to_string(),
-                session.to_string(),
-            )
+        let link = |item: &str, session: &str| Link {
+            provider_id: "acme.github".to_string(),
+            item_id: item.to_string(),
+            session_id: session.to_string(),
+            started_via: StartedVia::Start,
         };
         let links = [
             link("a", "archived"),
@@ -825,6 +825,7 @@ mod tests {
         let key = ("acme.github".to_string(), "a".to_string());
         assert_eq!(started[&key]["id"], "archived");
         assert_eq!(started[&key]["archived"], true);
+        assert_eq!(started[&key]["started_via"], "start");
 
         let mut snapshot = json!({ "items": [
             { "provider_id": "acme.github", "id": "a" },

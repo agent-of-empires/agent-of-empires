@@ -985,6 +985,7 @@ pub(super) async fn claim_suggestion_link(
     state: &Arc<AppState>,
     origin: Option<&crate::session::SuggestionOrigin>,
     session_id: &str,
+    via: crate::plugin::suggestions::StartedVia,
 ) -> Result<Option<SuggestionLink>, axum::response::Response> {
     use crate::plugin::suggestions::Claim;
     let (Some(origin), Some(host)) = (origin, state.plugin_host.clone()) else {
@@ -1008,6 +1009,7 @@ pub(super) async fn claim_suggestion_link(
                 &item.provider_id,
                 &item.id,
                 &claim_id,
+                via,
                 &|id| rows.iter().any(|i| i.id == id && !i.is_trashed()),
             )
         })?;
@@ -1123,6 +1125,7 @@ pub async fn create_session(
         body,
         None,
         origin,
+        crate::plugin::suggestions::StartedVia::Wizard,
     )
     .await
 }
@@ -1133,6 +1136,7 @@ pub async fn create_session(
 /// `initial_turn` is a structured session's first prompt and its origin, delivered once its
 /// worker runs. `body_prompt_origin` attributes the body's own `initial_prompt` when no
 /// `initial_turn` is given.
+/// `via` is how a suggestion link it claims is recorded.
 pub(crate) async fn create_session_with(
     state: Arc<AppState>,
     local_owner: bool,
@@ -1141,6 +1145,7 @@ pub(crate) async fn create_session_with(
     body: CreateSessionBody,
     initial_turn: Option<(String, crate::daemon::PromptOrigin)>,
     body_prompt_origin: crate::daemon::PromptOrigin,
+    via: crate::plugin::suggestions::StartedVia,
 ) -> axum::response::Response {
     if let Some(key) = body.idempotency_key.as_deref() {
         if key.is_empty() || key.len() > IDEMPOTENCY_KEY_MAX_LEN {
@@ -1907,6 +1912,7 @@ pub(crate) async fn create_session_with(
         &state,
         spec.suggestion.as_ref(),
         spec.session_id.as_deref().unwrap_or_default(),
+        via,
     )
     .await
     {

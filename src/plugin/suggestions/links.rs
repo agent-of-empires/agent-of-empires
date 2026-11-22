@@ -37,6 +37,24 @@ fn is_starting(session_id: &str) -> bool {
         .any(|id| id == session_id)
 }
 
+/// How the Session behind a link was started.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum StartedVia {
+    /// `POST /api/suggestions/start`: the preset's own prompt, agent and project.
+    Start,
+    /// A create carrying a suggestion, from "Start with changes".
+    Wizard,
+}
+
+impl StartedVia {
+    pub(crate) fn as_str(self) -> &'static str {
+        match self {
+            Self::Start => "start",
+            Self::Wizard => "wizard",
+        }
+    }
+}
+
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) enum Claim {
     Won,
@@ -56,13 +74,15 @@ pub(crate) fn claim_link(
     provider_id: &str,
     item_id: &str,
     session_id: &str,
+    via: StartedVia,
     is_live: &dyn Fn(&str) -> bool,
 ) -> rusqlite::Result<Claim> {
     let tx = conn.unchecked_transaction()?;
     let inserted = tx.execute(
-        "INSERT OR IGNORE INTO suggestion_links (profile, provider_id, item_id, holder, pending)
-         VALUES (?1, ?2, ?3, ?4, 1)",
-        params![profile, provider_id, item_id, session_id],
+        "INSERT OR IGNORE INTO suggestion_links
+             (profile, provider_id, item_id, holder, pending, started_via)
+         VALUES (?1, ?2, ?3, ?4, 1, ?5)",
+        params![profile, provider_id, item_id, session_id, via.as_str()],
     )?;
     if inserted == 1 {
         tx.commit()?;
@@ -89,24 +109,42 @@ pub(crate) fn claim_link(
         return Ok(Claim::Session(holder));
     }
     tx.execute(
-        "UPDATE suggestion_links SET holder = ?4, pending = 1
+        "UPDATE suggestion_links SET holder = ?4, pending = 1, started_via = ?5
          WHERE profile = ?1 AND provider_id = ?2 AND item_id = ?3",
-        params![profile, provider_id, item_id, session_id],
+        params![profile, provider_id, item_id, session_id, via.as_str()],
     )?;
     tx.commit()?;
     Ok(Claim::Won)
 }
 
-/// `(provider_id, item_id, session_id)` of every primary link of `profile`. A
-/// claim still provisioning names a Session that is not recorded yet, so a join
-/// to live Sessions drops it.
-pub(crate) fn links(
-    conn: &Connection,
-    profile: &str,
-) -> rusqlite::Result<Vec<(String, String, String)>> {
-    conn.prepare("SELECT provider_id, item_id, holder FROM suggestion_links WHERE profile = ?1")?
-        .query_map([profile], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))?
-        .collect()
+/// A primary link: the item, its Session and how that Session was started.
+pub(crate) struct Link {
+    pub provider_id: String,
+    pub item_id: String,
+    pub session_id: String,
+    pub started_via: StartedVia,
+}
+
+/// Every primary link of `profile`. A claim still provisioning names a Session
+/// that is not recorded yet, so a join to live Sessions drops it.
+pub(crate) fn links(conn: &Connection, profile: &str) -> rusqlite::Result<Vec<Link>> {
+    conn.prepare(
+        "SELECT provider_id, item_id, holder, started_via FROM suggestion_links WHERE profile = ?1",
+    )?
+    .query_map([profile], |row| {
+        let via: String = row.get(3)?;
+        Ok(Link {
+            provider_id: row.get(0)?,
+            item_id: row.get(1)?,
+            session_id: row.get(2)?,
+            started_via: if via == "start" {
+                StartedVia::Start
+            } else {
+                StartedVia::Wizard
+            },
+        })
+    })?
+    .collect()
 }
 
 /// Marks the claim of `session_id` as a created Session.
@@ -151,7 +189,16 @@ mod tests {
         let conn = store();
         let none = |_: &str| false;
         let claim = |session: &str, live: &dyn Fn(&str) -> bool| {
-            claim_link(&conn, "p", "acme.github", "a", session, live).unwrap()
+            claim_link(
+                &conn,
+                "p",
+                "acme.github",
+                "a",
+                session,
+                StartedVia::Start,
+                live,
+            )
+            .unwrap()
         };
         let first = mark_starting("s1");
         assert_eq!(claim("s1", &none), Claim::Won);
@@ -162,11 +209,29 @@ mod tests {
         assert_eq!(claim("s3", &live), Claim::Session("s1".into()));
         // Another item and another profile are independent.
         assert_eq!(
-            claim_link(&conn, "p", "acme.github", "b", "s4", &live).unwrap(),
+            claim_link(
+                &conn,
+                "p",
+                "acme.github",
+                "b",
+                "s4",
+                StartedVia::Start,
+                &live
+            )
+            .unwrap(),
             Claim::Won
         );
         assert_eq!(
-            claim_link(&conn, "q", "acme.github", "a", "s5", &live).unwrap(),
+            claim_link(
+                &conn,
+                "q",
+                "acme.github",
+                "a",
+                "s5",
+                StartedVia::Start,
+                &live
+            )
+            .unwrap(),
             Claim::Won
         );
         // Trash (or deletion) frees it: the holder is no longer live.
@@ -184,7 +249,16 @@ mod tests {
     fn a_claim_stranded_by_a_crash_is_taken_over_and_a_slow_create_is_not() {
         let conn = store();
         let claim = |session: &str| {
-            claim_link(&conn, "p", "acme.github", "a", session, &|_| false).unwrap()
+            claim_link(
+                &conn,
+                "p",
+                "acme.github",
+                "a",
+                session,
+                StartedVia::Start,
+                &|_| false,
+            )
+            .unwrap()
         };
         // A long create is still in flight, however long it has run.
         let slow = mark_starting("slow");
@@ -199,8 +273,18 @@ mod tests {
     fn a_pending_claim_whose_session_was_persisted_is_settled_not_taken_over() {
         let conn = store();
         let live = |id: &str| id == "made";
-        let claim =
-            |session: &str| claim_link(&conn, "p", "acme.github", "a", session, &live).unwrap();
+        let claim = |session: &str| {
+            claim_link(
+                &conn,
+                "p",
+                "acme.github",
+                "a",
+                session,
+                StartedVia::Wizard,
+                &live,
+            )
+            .unwrap()
+        };
         // The create persisted its Session, then the process died (or the settle
         // failed) before the row left pending.
         let starting = mark_starting("made");
@@ -208,13 +292,66 @@ mod tests {
         drop(starting);
         assert_eq!(claim("dup"), Claim::Session("made".into()));
         let rows = links(&conn, "p").unwrap();
-        assert_eq!(
-            rows,
-            vec![("acme.github".into(), "a".into(), "made".into())]
-        );
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].session_id, "made");
+        assert_eq!(rows[0].started_via, StartedVia::Wizard);
         let pending: bool = conn
             .query_row("SELECT pending FROM suggestion_links", [], |r| r.get(0))
             .unwrap();
         assert!(!pending, "recovery settles the row");
+    }
+
+    #[test]
+    fn a_link_remembers_how_it_was_started_and_a_takeover_replaces_it() {
+        let conn = store();
+        let via = || links(&conn, "p").unwrap()[0].started_via;
+        assert_eq!(
+            claim_link(
+                &conn,
+                "p",
+                "acme.github",
+                "a",
+                "s1",
+                StartedVia::Start,
+                &|_| false
+            )
+            .unwrap(),
+            Claim::Won
+        );
+        assert_eq!(via(), StartedVia::Start);
+        // The holder is gone: the next claim takes the row over and its own way.
+        assert_eq!(
+            claim_link(
+                &conn,
+                "p",
+                "acme.github",
+                "a",
+                "s2",
+                StartedVia::Wizard,
+                &|_| false
+            )
+            .unwrap(),
+            Claim::Won
+        );
+        assert_eq!(via(), StartedVia::Wizard);
+    }
+
+    #[test]
+    fn a_link_from_before_started_via_reads_as_a_wizard_start() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(&format!(
+            "CREATE TABLE suggestion_schema (id INTEGER PRIMARY KEY CHECK (id = 1), version INTEGER NOT NULL);
+             INSERT INTO suggestion_schema VALUES (1, {SCHEMA_VERSION});
+             CREATE TABLE suggestion_links (
+                 profile TEXT NOT NULL, provider_id TEXT NOT NULL, item_id TEXT NOT NULL,
+                 holder TEXT NOT NULL, pending INTEGER NOT NULL,
+                 PRIMARY KEY (profile, provider_id, item_id));
+             INSERT INTO suggestion_links VALUES ('p', 'acme.github', 'a', 'old', 0);"
+        ))
+        .unwrap();
+        init(&conn).unwrap();
+        let rows = links(&conn, "p").unwrap();
+        assert_eq!(rows.len(), 1, "the link survives");
+        assert_eq!(rows[0].started_via, StartedVia::Wizard);
     }
 }

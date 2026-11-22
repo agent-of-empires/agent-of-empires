@@ -11439,6 +11439,41 @@ fn linked_body(title: &str, key: Option<&str>) -> serde_json::Value {
     body
 }
 
+/// A link records which path made its Session, so a client can tell a preset
+/// start (safe to redo) from a wizard one (custom choices).
+#[tokio::test]
+#[serial_test::serial]
+async fn a_link_records_whether_start_or_the_wizard_made_it() {
+    use crate::plugin::suggestions::StartedVia;
+    let (_guards, state) = suggestion_state().await;
+    let host = state.plugin_host.clone().unwrap();
+    crate::server::api::suggestions_tests::seed_item_on(&host, "43", None, "43");
+    let (status, body) = post_create(&state, linked_body("wizard", None)).await;
+    assert_eq!(status, axum::http::StatusCode::CREATED, "{body}");
+    let mut start = linked_body("start", None);
+    start["suggestion"]["id"] = "43".into();
+    let response = create::create_session_with(
+        state.clone(),
+        false,
+        "test",
+        false,
+        serde_json::from_value(start).unwrap(),
+        None,
+        StartedVia::Start,
+    )
+    .await;
+    assert_eq!(response.status(), axum::http::StatusCode::CREATED);
+
+    let links = host
+        .with_suggestions_db(crate::plugin::suggestions::links)
+        .unwrap();
+    let instances = state.instances.read().await;
+    let started = crate::plugin::suggestions::started_sessions(&links, instances.iter());
+    let via = |id: &str| started[&("acme.gh".to_string(), id.to_string())]["started_via"].clone();
+    assert_eq!(via("42"), "wizard");
+    assert_eq!(via("43"), "start");
+}
+
 /// Starts racing on one suggestion leave exactly one primary Session.
 #[tokio::test]
 #[serial_test::serial]
@@ -11537,10 +11572,15 @@ async fn a_conflict_names_the_holder_only_where_the_caller_can_see_it() {
             profile: Some("default".into()),
         };
         let refused = || async {
-            let response = create::claim_suggestion_link(&state, Some(&origin), "new")
-                .await
-                .err()
-                .expect("the link is held");
+            let response = create::claim_suggestion_link(
+                &state,
+                Some(&origin),
+                "new",
+                crate::plugin::suggestions::StartedVia::Wizard,
+            )
+            .await
+            .err()
+            .expect("the link is held");
             assert_eq!(response.status(), axum::http::StatusCode::CONFLICT);
             let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
                 .await

@@ -192,6 +192,7 @@ pub(crate) fn init(conn: &Connection) -> rusqlite::Result<()> {
              item_id     TEXT NOT NULL,
              holder      TEXT NOT NULL,
              pending     INTEGER NOT NULL,
+             started_via TEXT NOT NULL DEFAULT 'wizard',
              PRIMARY KEY (profile, provider_id, item_id)
          );
          CREATE TABLE IF NOT EXISTS suggestion_provider_prefs (
@@ -201,7 +202,20 @@ pub(crate) fn init(conn: &Connection) -> rusqlite::Result<()> {
              sort_order  INTEGER NOT NULL DEFAULT 2147483647,
              PRIMARY KEY (profile, provider_id)
          );",
-    )
+    )?;
+    // A link written before `started_via` existed is a wizard start, the safe
+    // reading: a client never discards a Session it cannot tell the origin of.
+    let has_via: i64 = conn.query_row(
+        "SELECT COUNT(*) FROM pragma_table_info('suggestion_links') WHERE name = 'started_via'",
+        [],
+        |r| r.get(0),
+    )?;
+    if has_via == 0 {
+        conn.execute_batch(
+            "ALTER TABLE suggestion_links ADD COLUMN started_via TEXT NOT NULL DEFAULT 'wizard'",
+        )?;
+    }
+    Ok(())
 }
 
 fn db_error(e: rusqlite::Error) -> DispatchError {

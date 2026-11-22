@@ -664,8 +664,16 @@ pub async fn start_suggestion(
         Err(error) => return internal(error),
     };
     let reference = uuid::Uuid::new_v4().to_string();
-    let response =
-        super::sessions::create_session_with(state, false, &reference, false, create, None).await;
+    let response = super::sessions::create_session_with(
+        state,
+        false,
+        &reference,
+        false,
+        create,
+        None,
+        crate::plugin::suggestions::StartedVia::Start,
+    )
+    .await;
     start_outcome(response, profile, path).await
 }
 

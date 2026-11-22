@@ -239,6 +239,7 @@ impl McpServer {
             body,
             initial_turn,
             crate::daemon::PromptOrigin::Mcp,
+            crate::plugin::suggestions::StartedVia::Wizard,
         )
         .await;
         let (session, fresh) = success_body(response).await.map_err(|e| *e)?;
