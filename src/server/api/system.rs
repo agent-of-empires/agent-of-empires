@@ -847,7 +847,12 @@ async fn save_settings_patch(
         match tokio::task::spawn_blocking(move || crate::telemetry::consent::set_consent(enabled))
             .await
         {
-            Ok(Ok(())) => {}
+            Ok(Ok(())) => record_applied(
+                &mut applied,
+                stamp.as_ref(),
+                "",
+                &serde_json::json!({"telemetry": {"enabled": enabled}}),
+            ),
             Ok(Err(e)) => {
                 tracing::warn!(target: "http.api.system", "Telemetry consent update failed: {e}");
                 return api_error(
@@ -4406,7 +4411,7 @@ command = "zzzeta"
         let home = tempfile::TempDir::new().unwrap();
         let _home = crate::session::test_support::isolate_home(home.path());
         let state = crate::server::test_support::build_test_app_state(Vec::new());
-        let save = |tab_seq: &'static str, slice: &'static str| {
+        let save = |tab_seq: &'static str, body: serde_json::Value| {
             let state = state.clone();
             async move {
                 let mut headers = HeaderMap::new();
@@ -4420,7 +4425,7 @@ command = "zzzeta"
                     headers,
                     None,
                     None,
-                    Ok(Json(json!({"systemd": {"slice": slice}}))),
+                    Ok(Json(body)),
                 )
                 .await
                 .into_response()
@@ -4428,14 +4433,21 @@ command = "zzzeta"
             }
         };
 
-        assert_eq!(save("tab1.2", "newer.slice").await, StatusCode::OK);
-        assert_eq!(save("tab1.1", "older.slice").await, StatusCode::CONFLICT);
+        let slice = |slice: &str| json!({"systemd": {"slice": slice}});
+        assert_eq!(save("tab1.2", slice("newer.slice")).await, StatusCode::OK);
+        assert_eq!(
+            save("tab1.1", slice("older.slice")).await,
+            StatusCode::CONFLICT
+        );
         assert_eq!(
             crate::session::Config::load().unwrap().systemd.slice,
             "newer.slice"
         );
         // Another tab has its own sequence, and an unstamped write is never dropped.
-        assert_eq!(save("tab2.1", "other-tab.slice").await, StatusCode::OK);
+        assert_eq!(
+            save("tab2.1", slice("other-tab.slice")).await,
+            StatusCode::OK
+        );
         assert_eq!(
             update_settings(
                 State(state.clone()),
@@ -4453,6 +4465,13 @@ command = "zzzeta"
             .status(),
             StatusCode::OK
         );
+
+        // Consent has its own writer, and still records the stamp it applied.
+        let consent = |enabled: bool| json!({"telemetry": {"enabled": enabled}});
+        assert_eq!(save("tab3.2", consent(true)).await, StatusCode::OK);
+        assert_eq!(save("tab3.1", consent(false)).await, StatusCode::CONFLICT);
+        assert!(crate::session::get_telemetry_settings().enabled);
+        crate::telemetry::consent::set_consent(false).unwrap();
     }
 
     #[tokio::test]

@@ -25,6 +25,17 @@ fn lock() -> MutexGuard<'static, Gate> {
     GATE.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
 }
 
+/// Serializes consent writers from their read of the saved opt-in to their last file
+/// write, so an opt-out never deletes an id a later opt-in installed. Separate from
+/// [`GATE`] so counting never waits on file work.
+static WRITER: Mutex<()> = Mutex::new(());
+
+fn writer() -> MutexGuard<'static, ()> {
+    WRITER
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
 impl Gate {
     fn refresh(&mut self) {
         let id = if super::is_opted_in() {
@@ -47,6 +58,7 @@ impl Gate {
 /// delete is never reused; if that fails, consent stays off. File work runs outside the
 /// gate, so counting never waits on the state lock.
 pub fn set_consent(enabled: bool) -> anyhow::Result<()> {
+    let _writer = writer();
     let saved = crate::session::get_telemetry_settings().enabled;
     if enabled && !saved {
         if super::do_not_track() {
@@ -67,6 +79,7 @@ pub fn set_consent(enabled: bool) -> anyhow::Result<()> {
 
 /// Replaces the install id; counts recorded under the old one are zeroed.
 pub fn reset_install_id() -> anyhow::Result<()> {
+    let _writer = writer();
     super::state::rotate_install_id()?;
     lock().refresh();
     Ok(())
@@ -303,6 +316,36 @@ mod tests {
             "an opt-in over a retained id carried its counts"
         );
 
+        set_consent(false).unwrap();
+    }
+
+    /// Concurrent opt-ins and opt-outs leave the saved opt-in and the id in agreement:
+    /// an opt-out never deletes the id a later opt-in installed.
+    #[test]
+    #[serial_test::serial]
+    fn concurrent_consent_writers_keep_the_opt_in_and_id_in_agreement() {
+        let _env = crate::session::test_support::EnvGuard::unset(&["DO_NOT_TRACK"]);
+        let _app_dir = crate::session::test_support::isolate_app_dir();
+        for _ in 0..20 {
+            let start = Arc::new(std::sync::Barrier::new(4));
+            let writers: Vec<_> = [true, false, true, false]
+                .into_iter()
+                .map(|enabled| {
+                    let start = start.clone();
+                    std::thread::spawn(move || {
+                        start.wait();
+                        set_consent(enabled).unwrap();
+                    })
+                })
+                .collect();
+            for writer in writers {
+                writer.join().unwrap();
+            }
+            assert_eq!(
+                crate::session::get_telemetry_settings().enabled,
+                crate::telemetry::state::install_id().is_some(),
+            );
+        }
         set_consent(false).unwrap();
     }
 
