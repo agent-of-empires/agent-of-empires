@@ -103,7 +103,7 @@ impl Timestamp {
 
     /// Like `from_millis`, but saturates values chrono could represent.
     pub fn from_millis_saturating(ms: i64) -> Option<Self> {
-        const CHRONO_MIN_MS: i64 = -8_334_601_315_200_000;
+        const CHRONO_MIN_MS: i64 = -8_334_601_228_800_000;
         const CHRONO_MAX_MS: i64 = 8_210_266_876_799_999;
         Self::from_millis(ms).or(match ms {
             1..=CHRONO_MAX_MS => Some(Self::MAX),
@@ -473,8 +473,8 @@ mod tests {
             (8_210_266_876_799_999, Some(Timestamp::MAX)),
             (8_210_266_876_800_000, None),
             (i64::MAX, None),
-            (-8_334_601_315_200_000, Some(Timestamp::MIN)),
-            (-8_334_601_315_200_001, None),
+            (-8_334_601_228_800_000, Some(Timestamp::MIN)),
+            (-8_334_601_228_800_001, None),
         ];
         for (ms, expected) in cases {
             assert_eq!(Timestamp::from_millis_saturating(ms), expected, "{ms}");
