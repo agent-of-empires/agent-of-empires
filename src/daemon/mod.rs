@@ -22,6 +22,7 @@ pub(crate) mod transport;
 pub(crate) mod websocket;
 pub use websocket::WsError;
 pub mod live;
+pub mod suggestions;
 mod wire;
 
 use std::fmt;

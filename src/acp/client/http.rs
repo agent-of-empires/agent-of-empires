@@ -26,9 +26,6 @@ const SEND_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(120);
 /// A spawn answers only after sandbox prep, hooks (which have no deadline) and the handshake,
 /// so the client waits like the dashboard Retry and the user aborts with Ctrl-C.
 const SPAWN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(24 * 60 * 60);
-/// `POST /api/suggestions/start` answers after the create, which can take
-/// minutes for a sandbox; `POST /api/sessions` waits as long.
-const START_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30 * 60);
 const PLUGIN_PREVIEW_TIMEOUT: std::time::Duration =
     crate::plugin::EXECUTION_BUDGET.saturating_add(std::time::Duration::from_secs(10 * 60));
 
@@ -519,82 +516,6 @@ impl HttpClient {
         Ok(crate::daemon::decode_json::<PluginCommandsEnvelope>(res)
             .await?
             .commands)
-    }
-
-    /// `GET /api/suggestions`. The raw snapshot (`providers`, `items`); the
-    /// caller decodes only the fields it renders. Global, like `plugin_ui_state`.
-    pub async fn suggestions(&self) -> Result<serde_json::Value, HttpError> {
-        let url = format!("{}/api/suggestions", self.endpoint.base_url);
-        let res = self.execute(self.http.get(&url)).await?;
-        let res = check_global_status(res)?;
-        Ok(crate::daemon::decode_json(res).await?)
-    }
-
-    /// `POST /api/suggestions/refresh`. Asks every provider to discover again;
-    /// the new items arrive in a later [`suggestions`](Self::suggestions) read.
-    pub async fn refresh_suggestions(&self) -> Result<(), HttpError> {
-        let url = format!("{}/api/suggestions/refresh", self.endpoint.base_url);
-        let res = self.execute(self.http.post(&url)).await?;
-        check_global_status(res)?;
-        Ok(())
-    }
-
-    /// `POST /api/suggestions/{dismiss,undismiss}`.
-    pub async fn set_suggestion_dismissed(
-        &self,
-        provider_id: &str,
-        id: &str,
-        dismissed: bool,
-    ) -> Result<(), HttpError> {
-        let verb = if dismissed { "dismiss" } else { "undismiss" };
-        let url = format!("{}/api/suggestions/{verb}", self.endpoint.base_url);
-        let body = serde_json::json!({ "provider_id": provider_id, "id": id });
-        let res = self.execute(self.http.post(&url).json(&body)).await?;
-        check_global_status(res)?;
-        Ok(())
-    }
-
-    /// `POST /api/suggestions/prepare`. The wizard prefill for one item.
-    pub async fn prepare_suggestion(
-        &self,
-        provider_id: &str,
-        id: &str,
-    ) -> Result<serde_json::Value, HttpError> {
-        let url = format!("{}/api/suggestions/prepare", self.endpoint.base_url);
-        let body = serde_json::json!({ "provider_id": provider_id, "id": id });
-        let res = self.execute(self.http.post(&url).json(&body)).await?;
-        if res.status().is_success() {
-            return Ok(crate::daemon::decode_json(res).await?);
-        }
-        // A refusal explains itself (for example an over-long prompt); keep that
-        // text, or the typed code when the body has no message.
-        Err(match status_error(&res, None, false) {
-            HttpError::Server { status, body } => HttpError::Server {
-                status,
-                body: refusal_message(res).await.unwrap_or(body),
-            },
-            other => other,
-        })
-    }
-
-    /// `POST /api/suggestions/start`. The status and JSON body of the answer,
-    /// which carries the typed outcomes (409 and 422) a caller acts on.
-    pub async fn start_suggestion(
-        &self,
-        body: &serde_json::Value,
-    ) -> Result<(u16, serde_json::Value), HttpError> {
-        let url = format!("{}/api/suggestions/start", self.endpoint.base_url);
-        let res = self
-            .execute(self.http.post(&url).json(body).timeout(START_TIMEOUT))
-            .await?;
-        let status = res.status();
-        if status.is_success() || matches!(status.as_u16(), 400 | 409 | 422) {
-            let value = crate::daemon::decode_json::<serde_json::Value>(res)
-                .await
-                .unwrap_or_default();
-            return Ok((status.as_u16(), value));
-        }
-        Err(status_error(&res, None, false))
     }
 
     /// `POST /api/plugins/commands/{fqid}/invoke`. Dispatch an action-less
@@ -1389,17 +1310,6 @@ async fn brief_server_error(error: HttpError, res: reqwest::Response) -> HttpErr
         None => body,
     };
     HttpError::Server { status, body }
-}
-
-/// The `message` of a daemon error body, bounded; `None` when there is none.
-async fn refusal_message(res: reqwest::Response) -> Option<String> {
-    const MAX_BODY_BYTES: usize = 4096;
-    const MAX_MESSAGE_CHARS: usize = 200;
-    crate::daemon::decode_json_bounded::<serde_json::Value>(res, MAX_BODY_BYTES)
-        .await
-        .ok()
-        .and_then(|body| body.get("message")?.as_str().map(str::to_owned))
-        .map(|message| message.chars().take(MAX_MESSAGE_CHARS).collect())
 }
 
 fn check_global_status(res: reqwest::Response) -> Result<reqwest::Response, HttpError> {
@@ -2476,36 +2386,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_suggestion_start_outlives_the_general_http_budget() {
-        use axum::{routing::post, Json, Router};
-
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let address = listener.local_addr().unwrap();
-        // A sandboxed create answers only once its container is up.
-        let app = Router::new().route(
-            "/api/suggestions/start",
-            post(|| async {
-                tokio::time::sleep(Duration::from_millis(400)).await;
-                (
-                    StatusCode::CREATED,
-                    Json(serde_json::json!({ "session_id": "s1", "title": "t" })),
-                )
-            }),
-        );
-        let server = tokio::spawn(async move { axum::serve(listener, app).await });
-        let mut client =
-            HttpClient::new(endpoint(&format!("http://{address}"), Some("token"))).unwrap();
-        client.http = reqwest::Client::builder()
-            .no_proxy()
-            .timeout(Duration::from_millis(200))
-            .build()
-            .unwrap();
-        let started = client.start_suggestion(&serde_json::json!({})).await;
-        server.abort();
-        assert_eq!(started.unwrap().0, 201);
-    }
-
-    #[tokio::test]
     async fn plugin_previews_outlive_an_elapsed_general_http_budget() {
         use axum::{body::Bytes, routing::get, Router};
         use std::sync::Arc;
@@ -3032,93 +2912,5 @@ mod tests {
             body,
             &serde_json::json!({"config_id": "reasoning_effort", "value": "high"})
         );
-    }
-
-    #[tokio::test]
-    async fn a_start_returns_the_typed_outcome_of_a_409_and_posts_the_approval() {
-        use axum::{http::StatusCode as Code, routing::post, Json, Router};
-        let app = Router::new().route(
-            "/api/suggestions/start",
-            post(|Json(body): Json<serde_json::Value>| async move {
-                (
-                    Code::CONFLICT,
-                    Json(serde_json::json!({ "error": "hooks_need_trust", "echo": body })),
-                )
-            }),
-        );
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let base = format!("http://{}", listener.local_addr().unwrap());
-        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
-        let client = HttpClient::new(endpoint(&base, None)).unwrap();
-        let body = serde_json::json!({ "provider_id": "gh", "id": "1", "approve_hooks": true });
-        let (status, answer) = client.start_suggestion(&body).await.unwrap();
-        assert_eq!(status, 409);
-        assert_eq!(answer["error"], "hooks_need_trust");
-        assert_eq!(answer["echo"], body);
-        server.abort();
-    }
-
-    #[tokio::test]
-    async fn a_prepare_refusal_keeps_the_daemons_explanation() {
-        use axum::{http::StatusCode as Code, routing::post, Json, Router};
-        let app = Router::new().route(
-            "/api/suggestions/prepare",
-            post(|| async {
-                (
-                    Code::BAD_REQUEST,
-                    Json(serde_json::json!({
-                        "error": "validation_failed",
-                        "message": "The expanded prompt exceeds 10 bytes"
-                    })),
-                )
-            }),
-        );
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let base = format!("http://{}", listener.local_addr().unwrap());
-        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
-        let client = HttpClient::new(endpoint(&base, None)).unwrap();
-        let error = client.prepare_suggestion("gh", "1").await.unwrap_err();
-        assert!(
-            matches!(&error, HttpError::Server { status, body }
-                if *status == StatusCode::BAD_REQUEST && body == "The expanded prompt exceeds 10 bytes"),
-            "{error:?}"
-        );
-        server.abort();
-    }
-
-    #[tokio::test]
-    async fn a_prepare_refusal_without_a_message_keeps_the_typed_code() {
-        use axum::{http::StatusCode as Code, routing::post, Json, Router};
-        // A typed code with no message keeps the code; plain text leaves it empty.
-        let coded = Router::new().route(
-            "/api/suggestions/prepare",
-            post(|| async {
-                (
-                    Code::INTERNAL_SERVER_ERROR,
-                    [(crate::daemon::ERROR_CODE_HEADER, "start_failed")],
-                    Json(serde_json::json!({ "error": "start_failed" })),
-                )
-            }),
-        );
-        let plain = Router::new().route(
-            "/api/suggestions/prepare",
-            post(|| async { (Code::BAD_GATEWAY, "upstream down") }),
-        );
-        for (app, status, expected) in [
-            (coded, StatusCode::INTERNAL_SERVER_ERROR, "start_failed"),
-            (plain, StatusCode::BAD_GATEWAY, ""),
-        ] {
-            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-            let base = format!("http://{}", listener.local_addr().unwrap());
-            let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
-            let client = HttpClient::new(endpoint(&base, None)).unwrap();
-            let error = client.prepare_suggestion("gh", "1").await.unwrap_err();
-            assert!(
-                matches!(&error, HttpError::Server { status: s, body }
-                    if *s == status && body == expected),
-                "{error:?}"
-            );
-            server.abort();
-        }
     }
 }

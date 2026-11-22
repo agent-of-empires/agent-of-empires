@@ -12,90 +12,18 @@ use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, BorderType, Borders, Clear, Paragraph, Wrap};
 use ratatui::Frame;
-use serde::Deserialize;
+
+#[cfg(test)]
+use crate::daemon::suggestions::{Draft, Prefs, PreparedProject, ResolvedProject};
+use crate::daemon::suggestions::{Item, Prepared, Provider, Snapshot, Started, WirePreset};
 
 #[cfg(not(test))]
-use crate::acp::client::{locate_daemon, HttpClient};
+use crate::acp::client::locate_daemon;
+#[cfg(not(test))]
+use crate::daemon::DaemonClient;
 use crate::tui::session_feed::MutationBlock;
 use crate::tui::styles::Theme;
 use crate::tui::worker::Worker;
-
-#[derive(Debug, Clone, Deserialize)]
-struct Snapshot {
-    /// The profile the daemon publishes suggestions under.
-    #[serde(default)]
-    profile: Option<String>,
-    /// The daemon that served this snapshot; set by the loader, not the wire.
-    #[serde(skip)]
-    daemon: Option<String>,
-    providers: Vec<Provider>,
-    items: Vec<Item>,
-    #[serde(default)]
-    prefs: Prefs,
-}
-
-#[derive(Debug, Clone, Deserialize)]
-#[serde(default)]
-struct Prefs {
-    show_source_ref: bool,
-}
-
-impl Default for Prefs {
-    fn default() -> Self {
-        Self {
-            show_source_ref: true,
-        }
-    }
-}
-
-#[derive(Debug, Clone, Deserialize)]
-struct Provider {
-    id: String,
-    name: String,
-    #[serde(default)]
-    error: Option<String>,
-    #[serde(default = "enabled_by_default")]
-    enabled: bool,
-    /// Unix seconds of the last report.
-    #[serde(default)]
-    updated_at: Option<i64>,
-    #[serde(default)]
-    refreshing: bool,
-    #[serde(default)]
-    sources: Vec<Source>,
-}
-
-/// A source's effective preset, as `GET /api/suggestions` resolves it.
-#[derive(Debug, Clone, Deserialize)]
-struct Source {
-    criterion: String,
-    #[serde(default)]
-    preset: Option<WirePreset>,
-}
-
-#[derive(Debug, Clone, Deserialize)]
-struct WirePreset {
-    #[serde(default)]
-    yolo: bool,
-    /// A template; `None` sends the plugin's own draft prompt.
-    #[serde(default)]
-    prompt: Option<String>,
-}
-
-/// What Start creates an item with, resolved against its Project.
-#[derive(Debug, Clone, Deserialize)]
-struct ItemStart {
-    agent: String,
-    view: String,
-    #[serde(default)]
-    worktree: bool,
-    #[serde(default)]
-    sandbox: bool,
-}
-
-fn enabled_by_default() -> bool {
-    true
-}
 
 impl Item {
     /// `(key, name)` of the full view's group: the repo, named by its last
@@ -108,89 +36,6 @@ impl Item {
             .as_ref()
             .map(|p| (p.path.as_str(), p.name.as_str()))
     }
-}
-
-/// The registered Project an item resolves to.
-#[derive(Debug, Clone, Deserialize)]
-struct ResolvedProject {
-    name: String,
-    path: String,
-}
-
-#[derive(Debug, Clone, Deserialize)]
-struct Item {
-    provider_id: String,
-    id: String,
-    title: String,
-    reason: String,
-    source_url: String,
-    source_ref: String,
-    preview: String,
-    #[serde(default)]
-    project: Option<String>,
-    #[serde(default)]
-    dismissed: bool,
-    draft: Draft,
-    #[serde(default)]
-    started_session: Option<Started>,
-    #[serde(default)]
-    resolved_project: Option<ResolvedProject>,
-    /// The repo the provider links to a Project, as `owner/repo` for GitHub.
-    #[serde(default)]
-    mapping_key: Option<String>,
-    #[serde(default)]
-    criterion: String,
-    #[serde(default)]
-    variables: std::collections::BTreeMap<String, String>,
-    #[serde(default)]
-    start: Option<ItemStart>,
-    /// The source closed or changed; the item cannot start.
-    #[serde(default)]
-    stale: bool,
-}
-
-/// The live Session an item was started as.
-#[derive(Debug, Clone, Deserialize)]
-struct Started {
-    id: String,
-    status: String,
-    #[serde(default)]
-    archived: bool,
-    /// `"start"` for a one-click Start; only those may be trashed and started again.
-    #[serde(default)]
-    started_via: Option<String>,
-}
-
-impl Started {
-    fn one_click(&self) -> bool {
-        self.started_via.as_deref() == Some("start")
-    }
-}
-
-#[derive(Debug, Clone, Deserialize)]
-struct Draft {
-    prompt: String,
-}
-
-#[derive(Debug, Clone, Deserialize)]
-struct PreparedProject {
-    path: String,
-}
-
-#[derive(Debug, Clone, Deserialize)]
-struct Prepared {
-    title: String,
-    initial_prompt: String,
-    tool: String,
-    project: Option<PreparedProject>,
-    #[serde(default)]
-    view: Option<String>,
-    #[serde(default)]
-    worktree: bool,
-    #[serde(default)]
-    sandbox: bool,
-    #[serde(default)]
-    yolo: bool,
 }
 
 /// The kind's preset rows the New Session dialog starts from.
@@ -406,9 +251,8 @@ fn text(e: impl std::fmt::Display) -> String {
 }
 
 #[cfg(not(test))]
-async fn load(client: &HttpClient, daemon: &str) -> Result<Snapshot, String> {
-    let value = client.suggestions().await.map_err(text)?;
-    let mut snapshot: Snapshot = serde_json::from_value(value).map_err(text)?;
+async fn load(client: &DaemonClient, daemon: &str) -> Result<Snapshot, String> {
+    let mut snapshot = client.suggestions().await.map_err(text)?;
     snapshot.daemon = Some(daemon.to_owned());
     Ok(snapshot)
 }
@@ -416,7 +260,7 @@ async fn load(client: &HttpClient, daemon: &str) -> Result<Snapshot, String> {
 /// Refuses a request bound to a daemon or profile other than the one answering.
 #[cfg(not(test))]
 async fn check_bound(
-    client: &HttpClient,
+    client: &DaemonClient,
     daemon: &str,
     origin: Option<&Origin>,
 ) -> Result<(), String> {
@@ -435,7 +279,7 @@ async fn run(req: &Req) -> Res {
         Err(message) => return failed(req, message),
     };
     let daemon = located.base_url.clone();
-    let client = match HttpClient::new(located).map_err(text) {
+    let client = match located.daemon_client().map_err(text) {
         Ok(client) => client,
         Err(message) => return failed(req, message),
     };
@@ -482,14 +326,10 @@ async fn run(req: &Req) -> Res {
         Req::Prepare {
             provider_id, id, ..
         } => Res::Prepared(
-            async {
-                let value = client
-                    .prepare_suggestion(provider_id, id)
-                    .await
-                    .map_err(text)?;
-                serde_json::from_value(value).map_err(text)
-            }
-            .await,
+            client
+                .prepare_suggestion(provider_id, id)
+                .await
+                .map_err(text),
         ),
     }
 }
