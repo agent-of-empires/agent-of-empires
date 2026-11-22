@@ -23,6 +23,8 @@ use crate::plugin::ui_state::UiSnapshot;
 
 /// The daemon revives, waits for readiness and delivers before it answers a terminal send.
 const SEND_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(120);
+/// The daemon prepares the sandbox, runs hooks and handshakes before it answers a spawn.
+const SPAWN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(120);
 const PLUGIN_PREVIEW_TIMEOUT: std::time::Duration =
     crate::plugin::EXECUTION_BUDGET.saturating_add(std::time::Duration::from_secs(10 * 60));
 
@@ -583,16 +585,22 @@ impl HttpClient {
         Ok(())
     }
 
-    /// `POST /api/sessions/{id}/acp/spawn`: start the worker, resuming the stored conversation.
-    pub async fn spawn_acp(&self, session_id: &str) -> Result<(), HttpError> {
+    fn spawn_request(&self, session_id: &str) -> Result<reqwest::RequestBuilder, HttpError> {
         let url = format!(
             "{}/api/sessions/{}/acp/spawn",
             self.endpoint.base_url,
             path_segment(session_id)?
         );
-        let res = self
-            .execute(self.http.post(&url).json(&serde_json::json!({})))
-            .await?;
+        Ok(self
+            .http
+            .post(&url)
+            .json(&serde_json::json!({}))
+            .timeout(SPAWN_TIMEOUT))
+    }
+
+    /// `POST /api/sessions/{id}/acp/spawn`: start the worker, resuming the stored conversation.
+    pub async fn spawn_acp(&self, session_id: &str) -> Result<(), HttpError> {
+        let res = self.execute(self.spawn_request(session_id)?).await?;
         check_status(res, session_id)?;
         Ok(())
     }
@@ -1602,6 +1610,14 @@ mod tests {
         assert_eq!(rx.await.unwrap(), serde_json::json!({}));
         server.abort();
         let _ = server.await;
+    }
+
+    #[test]
+    fn spawn_request_outlasts_the_default_transport_timeout() {
+        let client = HttpClient::new(endpoint("http://127.0.0.1:1", Some("t"))).unwrap();
+        let request = client.spawn_request("abc").unwrap().build().unwrap();
+        // The daemon transport default is 15s.
+        assert!(*request.timeout().unwrap() > Duration::from_secs(15));
     }
 
     #[tokio::test]
