@@ -15,8 +15,9 @@ export function useHistoryWindow(
   activity: ActivityRow[],
   showClearedTurns: boolean,
 ): HistoryWindowState {
-  // Read at open and session switch only, so changing the setting never resizes an open session.
-  const baseWindow = useWebSettings().settings.structuredHistoryWindow;
+  const liveBaseWindow = useWebSettings().settings.structuredHistoryWindow;
+  // Captured at open and session switch only, so changing the setting never resizes an open session.
+  const [baseWindow, setBaseWindow] = useState(liveBaseWindow);
   const [visibleRows, setVisibleRows] = useState(baseWindow);
   const [windowSessionId, setWindowSessionId] = useState(sessionId);
   // null until first populate, so the initial page lands as the default window, not as growth.
@@ -24,7 +25,8 @@ export function useHistoryWindow(
   const [anchorRowId, setAnchorRowId] = useState<string | null>(null);
   if (windowSessionId !== sessionId) {
     setWindowSessionId(sessionId);
-    setVisibleRows(initialHistoryWindow(activity, baseWindow));
+    setBaseWindow(liveBaseWindow);
+    setVisibleRows(initialHistoryWindow(activity, liveBaseWindow));
     setAnchorLen(activity.length > 0 ? activity.length : null);
     setAnchorRowId(null);
   } else if (anchorLen === null) {

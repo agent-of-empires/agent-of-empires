@@ -143,4 +143,14 @@ describe("useHistoryWindow", () => {
     act(() => result.current.web.update({ structuredHistoryWindow: 1000 }));
     expect(result.current.view.windowedActivity).toHaveLength(50);
   });
+
+  it("keeps the window captured at open when the setting changes before history loads", () => {
+    const { result, rerender } = renderHook(
+      ({ a }: { a: ActivityRow[] }) => ({ view: useHistoryWindow("s1", a, false), web: useWebSettings() }),
+      { initialProps: { a: [] as ActivityRow[] } },
+    );
+    act(() => result.current.web.update({ structuredHistoryWindow: 50 }));
+    rerender({ a: transcript(150, 1) });
+    expect(result.current.view.windowedActivity).toHaveLength(DEFAULT_HISTORY_WINDOW);
+  });
 });
