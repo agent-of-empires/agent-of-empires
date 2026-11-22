@@ -227,8 +227,10 @@ impl HomeView {
     pub(super) fn open_suggestions_view(&mut self) {
         let mut view = SuggestionsView::new(&mut self.suggestions_feed);
         view.strict = self.strict_hotkeys;
-        view.pretrusted =
-            crate::session::config::Config::load().is_ok_and(|c| c.session.pre_trust_agent_folders);
+        // The local config stands in until a load reads the daemon's setting.
+        view.pretrusted = self.suggestions_feed.daemon_pre_trust().unwrap_or_else(|| {
+            crate::session::config::Config::load().is_ok_and(|c| c.session.pre_trust_agent_folders)
+        });
         self.suggestions_view = Some(view);
     }
 

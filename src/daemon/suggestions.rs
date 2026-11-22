@@ -24,6 +24,9 @@ pub struct Snapshot {
     /// The daemon that served this snapshot; set by the loader, not the wire.
     #[serde(skip)]
     pub(crate) daemon: Option<String>,
+    /// The daemon's `pre_trust_agent_folders`; set by the loader, not the wire.
+    #[serde(skip)]
+    pub(crate) pre_trust: Option<bool>,
     pub(crate) providers: Vec<Provider>,
     pub(crate) items: Vec<Item>,
     #[serde(default)]
@@ -199,24 +202,38 @@ impl DaemonClient {
         transport::execute(&self.http, self.unix_path.as_deref(), request).await
     }
 
-    /// A non-success answer as an error that keeps the daemon's `message`, or
-    /// its typed code when the body has no message.
+    /// A non-success answer as an error with its typed code and the daemon's
+    /// bounded `message`. A 401 or a finite rejection keeps no body, as in
+    /// [`request_response`](DaemonClient::request_response).
     async fn suggestion_refusal(response: reqwest::Response) -> DaemonClientError {
+        use super::ApiErrorCode;
         let status = response.status();
-        let code = response
-            .headers()
-            .get(super::ERROR_CODE_HEADER)
-            .and_then(|value| value.to_str().ok())
-            .map(str::to_owned);
-        let message = super::decode_json_bounded::<serde_json::Value>(response, MAX_REFUSAL_BYTES)
-            .await
-            .ok()
-            .and_then(|body| body.get("message")?.as_str().map(str::to_owned))
-            .map(|message| message.chars().take(MAX_REFUSAL_CHARS).collect());
+        let code = ApiErrorCode::from_headers(status, response.headers(), false);
+        let finite = status == StatusCode::UNAUTHORIZED
+            || matches!(
+                code,
+                Some(
+                    ApiErrorCode::LifecycleLocked
+                        | ApiErrorCode::TrashIncomplete
+                        | ApiErrorCode::LifecycleSuperseded
+                        | ApiErrorCode::ManagedResumeRefused(_)
+                        | ApiErrorCode::SandboxMigrationDeferred
+                        | ApiErrorCode::SandboxMigrationFailed
+                )
+            );
+        let message = if finite {
+            None
+        } else {
+            super::decode_json_bounded::<serde_json::Value>(response, MAX_REFUSAL_BYTES)
+                .await
+                .ok()
+                .and_then(|body| body.get("message")?.as_str().map(str::to_owned))
+                .map(|message| message.chars().take(MAX_REFUSAL_CHARS).collect())
+        };
         DaemonClientError::Status {
             status,
-            code: None,
-            body: message.or(code).unwrap_or_default(),
+            code,
+            body: message.unwrap_or_default(),
             truncated: false,
         }
     }
@@ -404,21 +421,27 @@ mod tests {
             "/api/suggestions/prepare",
             post(|| async { (Code::BAD_GATEWAY, "upstream down") }),
         );
-        for (app, status, expected) in [
+        for (app, status, code, expected) in [
             (
                 explained,
                 StatusCode::BAD_REQUEST,
+                None,
                 "The expanded prompt exceeds 10 bytes",
             ),
-            (coded, StatusCode::INTERNAL_SERVER_ERROR, "start_failed"),
-            (plain, StatusCode::BAD_GATEWAY, ""),
+            (
+                coded,
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Some(super::super::ApiErrorCode::StartFailed),
+                "",
+            ),
+            (plain, StatusCode::BAD_GATEWAY, None, ""),
         ] {
             let (client, server) = serve(app).await;
             let error = client.prepare_suggestion("gh", "1").await.unwrap_err();
             server.abort();
             assert!(
-                matches!(&error, DaemonClientError::Status { status: s, body, .. }
-                    if *s == status && body == expected),
+                matches!(&error, DaemonClientError::Status { status: s, code: c, body, .. }
+                    if *s == status && *c == code && body == expected),
                 "{error:?}"
             );
         }

@@ -262,6 +262,12 @@ fn text(e: impl std::fmt::Display) -> String {
 async fn load(client: &DaemonClient, daemon: &str) -> Result<Snapshot, String> {
     let mut snapshot = client.suggestions().await.map_err(text)?;
     snapshot.daemon = Some(daemon.to_owned());
+    snapshot.pre_trust = client.settings().await.ok().and_then(|settings| {
+        settings
+            .get("session")?
+            .get("pre_trust_agent_folders")?
+            .as_bool()
+    });
     Ok(snapshot)
 }
 
@@ -750,6 +756,9 @@ impl SuggestionsView {
         let mut changed = false;
         if polled.changed {
             self.sync(store);
+            if let Some(on) = store.daemon_pre_trust() {
+                self.pretrusted = on;
+            }
             changed = true;
         }
         if polled.refreshed {
@@ -1663,6 +1672,11 @@ impl SuggestionsFeed {
         self.submit_start(key, None, origin);
     }
 
+    /// The daemon's `pre_trust_agent_folders` as of the last load, when it answered.
+    pub(super) fn daemon_pre_trust(&self) -> Option<bool> {
+        self.snapshot.as_ref()?.pre_trust
+    }
+
     /// Asks the daemon to turn on pre-trust, bound to the list on screen.
     pub(super) fn turn_on_pre_trust(&mut self) {
         let origin = self.origin();
@@ -1944,6 +1958,7 @@ mod tests {
         let mut store = SuggestionsFeed::with_worker(worker);
         store.snapshot = Some(Snapshot {
             daemon: None,
+            pre_trust: None,
             profile: None,
             providers: vec![Provider {
                 id: "p".into(),
@@ -2044,6 +2059,7 @@ mod tests {
         it.preview = hostile("body");
         let snapshot = Snapshot {
             daemon: None,
+            pre_trust: None,
             profile: None,
             providers: vec![Provider {
                 id: "p".into(),
@@ -2099,6 +2115,7 @@ mod tests {
         assert_eq!(rig.view.selected_key().unwrap().1, "b");
         rig.store.snapshot = Some(Snapshot {
             daemon: None,
+            pre_trust: None,
             profile: None,
             providers: vec![],
             items: vec![
@@ -2327,6 +2344,7 @@ mod tests {
     fn dismissed_snapshot(rig: &mut Rig, dismissed: bool) {
         rig.store.snapshot = Some(Snapshot {
             daemon: None,
+            pre_trust: None,
             profile: None,
             providers: vec![],
             items: vec![item("a", None, dismissed)],
@@ -2381,6 +2399,7 @@ mod tests {
         rig.store.dismissing = vec![key("a"), key("b")];
         let snapshot = |a: bool, b: bool| Snapshot {
             daemon: None,
+            pre_trust: None,
             profile: None,
             providers: vec![],
             items: vec![item("a", None, a), item("b", None, b)],
@@ -3001,6 +3020,7 @@ mod tests {
     fn a_snapshot_of_another_profile_is_not_shown_and_says_so() {
         let published = |profile: &str| Snapshot {
             daemon: None,
+            pre_trust: None,
             profile: Some(profile.into()),
             providers: vec![],
             items: vec![item("a", None, false)],
@@ -3064,6 +3084,7 @@ mod tests {
                 let _ = sink.send("load".to_string());
                 Res::Snapshot(Ok(Snapshot {
                     daemon: Some("http://b".into()),
+                    pre_trust: None,
                     profile: Some("B".into()),
                     providers: Vec::new(),
                     items: vec![item("a", None, false)],
