@@ -101,13 +101,14 @@ impl PendingRequests {
         state.entries.contains_key(id) && send()
     }
 
-    /// Only the plugin that owns the request can answer it.
-    pub fn resolve(&self, plugin_id: &str, reply: WorkerReply) -> bool {
+    /// Only the worker instance the request was queued to can answer it: a superseded worker
+    /// whose stdout is still read must not answer a request registered for its replacement.
+    pub fn resolve(&self, plugin_id: &str, generation: u64, reply: WorkerReply) -> bool {
         let mut state = self.state();
         let entries = &mut state.entries;
         if entries
             .get(&reply.id)
-            .is_none_or(|e| e.plugin_id != plugin_id)
+            .is_none_or(|e| e.plugin_id != plugin_id || e.generation != generation)
         {
             return false;
         }
@@ -190,7 +191,22 @@ mod tests {
     async fn resolve_delivers_to_the_registered_receiver() {
         let pending = PendingRequests::new();
         let (id, rx) = pending.register("acme.a", 1);
-        assert!(pending.resolve("acme.a", reply(&id)));
+        assert!(pending.resolve("acme.a", 1, reply(&id)));
+        assert_eq!(rx.await.unwrap().unwrap(), json!({"ok": true}));
+    }
+
+    /// Request ids are sequential, so a worker could guess the next one: only the instance the
+    /// request was queued to may answer it.
+    #[tokio::test]
+    async fn a_reply_from_another_worker_instance_is_dropped() {
+        let pending = PendingRequests::new();
+        let (id, mut rx) = pending.register("acme.a", 2);
+        assert!(
+            !pending.resolve("acme.a", 1, reply(&id)),
+            "a superseded instance must not answer"
+        );
+        assert!(is_open(&mut rx), "the request is still waiting");
+        assert!(pending.resolve("acme.a", 2, reply(&id)));
         assert_eq!(rx.await.unwrap().unwrap(), json!({"ok": true}));
     }
 
@@ -199,11 +215,11 @@ mod tests {
         let pending = PendingRequests::new();
         let (id, mut rx) = pending.register("acme.a", 1);
         assert!(
-            !pending.resolve("acme.evil", reply(&id)),
+            !pending.resolve("acme.evil", 1, reply(&id)),
             "forged reply must be ignored"
         );
         assert!(is_open(&mut rx), "receiver must still be waiting");
-        assert!(pending.resolve("acme.a", reply(&id)));
+        assert!(pending.resolve("acme.a", 1, reply(&id)));
     }
 
     #[tokio::test]
@@ -216,7 +232,7 @@ mod tests {
         assert!(rx_a.await.is_err(), "sender dropped means worker gone");
         assert!(is_open(&mut rx_a2), "a newer instance is untouched");
         assert!(is_open(&mut rx_b));
-        assert!(pending.resolve("acme.b", reply(&b)));
+        assert!(pending.resolve("acme.b", 1, reply(&b)));
     }
 
     #[tokio::test]
@@ -233,7 +249,7 @@ mod tests {
         pending.reopen("acme.a", 1);
         let (id, mut rx_again) = pending.register("acme.a", 1);
         assert!(is_open(&mut rx_again), "a respawn accepts requests again");
-        assert!(pending.resolve("acme.a", reply(&id)));
+        assert!(pending.resolve("acme.a", 1, reply(&id)));
     }
 
     #[tokio::test]
@@ -265,6 +281,6 @@ mod tests {
         let pending = PendingRequests::new();
         let (id, _rx) = pending.register("acme.a", 1);
         pending.cancel(&id);
-        assert!(!pending.resolve("acme.a", reply(&id)));
+        assert!(!pending.resolve("acme.a", 1, reply(&id)));
     }
 }

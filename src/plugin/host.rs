@@ -1110,7 +1110,10 @@ async fn serve_connection(
             },
         };
         if let Some(reply) = protocol::parse_worker_reply(&line) {
-            if !requests.pending.resolve(&ctx.plugin_id, reply) {
+            if !requests
+                .pending
+                .resolve(&ctx.plugin_id, requests.generation, reply)
+            {
                 tracing::debug!(
                     target: "plugin.host",
                     plugin = %ctx.plugin_id,
