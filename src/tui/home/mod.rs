@@ -320,6 +320,10 @@ pub struct HomeView {
     pub(super) pending_volume_ignores_glob_data: Option<NewSessionData>,
     pub(super) intro_dialog: Option<IntroDialog>,
     pub(super) pending_intro_theme: Option<String>,
+    /// Agent the first-run wizard chose for the first Structured session. No
+    /// terminal tool maps to the bundled agent, so the wizard's choice has to
+    /// reach the session explicitly; the next creation consumes it.
+    pub(super) first_session_agent: Option<String>,
     pub(super) no_agents_dialog: Option<NoAgentsDialog>,
     pub(super) changelog_dialog: Option<ChangelogDialog>,
     pub(super) info_dialog: Option<InfoDialog>,

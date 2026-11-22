@@ -170,6 +170,7 @@ impl HomeView {
             intro_dialog: None,
             pending_intro_theme: None,
             no_agents_dialog: None,
+            first_session_agent: None,
             changelog_dialog: None,
             info_dialog: None,
             pending_indeterminate_resolution: None,

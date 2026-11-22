@@ -39,9 +39,12 @@ pub async fn run(args: SetupArgs) -> Result<()> {
     let detection = Detection::detect_env();
     let app_dir = crate::session::get_app_dir().ok();
 
-    let adapter_missing = app_dir.as_deref().is_some_and(|app_dir| {
-        !crate::acp::adapters::installation_is_current(app_dir, quickstart::BUNDLED_AGENT)
-    });
+    // Readiness, not mere installation: a current package whose Node runtime
+    // cannot run the sources still needs the install offer, and `--install-adapter
+    // --agent aoe-agent` has to reach it.
+    let adapter_missing = app_dir
+        .as_deref()
+        .is_some_and(|app_dir| !quickstart::bundled_ready(Some(app_dir)));
     let install_allowed = args.install_adapter
         || config.acp.allow_agent_install
         || (!args.quick && adapter_missing && prompt_install(quickstart::BUNDLED_AGENT));
@@ -121,6 +124,19 @@ pub async fn run(args: SetupArgs) -> Result<()> {
                 "auto".to_string(),
             ));
         }
+        if let Some(model) = changes.model {
+            config
+                .acp
+                .acp_defaults
+                .entry(quickstart::BUNDLED_AGENT.to_string())
+                .or_default()
+                .model = Some(model.clone());
+            written.push((
+                "acp.acp_defaults.aoe-agent.model",
+                model,
+                "(unset)".to_string(),
+            ));
+        }
     });
     let write_error = match result {
         Ok(()) => None,
@@ -147,7 +163,7 @@ pub async fn run(args: SetupArgs) -> Result<()> {
     if plan.bundled && !adapter_ready {
         println!();
         println!(
-            "The bundled adapter is not installed yet. Install it with:\n  \
+            "The bundled adapter cannot start yet. Install or repair it with:\n  \
              aoe acp doctor --fix --adapter {}",
             quickstart::BUNDLED_AGENT
         );

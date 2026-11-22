@@ -33,6 +33,7 @@ running this.
 | Detect | Reads what `aoe agents` and `aoe acp doctor` already report: which agents resolve on this machine, and whether the bundled adapter is installed. |
 | Default the agent | Writes `acp.default_agent = "aoe-agent"`, the one adapter AoE ships and maintains, while the value is still the built-in `claude-code`. A value you already set is kept, and `--agent` is how you change it. |
 | Default the view | Writes `acp.structured_view = "structured"` while it is still `auto`. `terminal` and `off` are left alone. |
+| Pick the model | With only `OTARI_API_KEY` in the environment, writes `acp.acp_defaults.aoe-agent.model = "openai-compatible:anthropic/claude-fable-5"` while that agent has no model. Without it the adapter's own default is an Anthropic id your Otari key cannot authenticate. A model you set for `aoe-agent` is kept, and a detected `OPENAI_BASE_URL` gateway is left to its own model ids. |
 | Install the adapter | Offers the bundled `aoe-agent` adapter with consent. It installs into the data dir with bundled Node's npm, exactly as `aoe acp doctor --fix --adapter aoe-agent` does. |
 | Otari guidance | With no gateway credential present, prints the account steps below. Setup never blocks on it. |
 
@@ -96,10 +97,14 @@ reach the adapter. The forms, all still supported:
 | anything else | Anthropic, unchanged | the id as given |
 
 An `openai-compatible:` id keeps everything after the prefix as the request's `model`, so
-vendor-namespaced gateway ids need no rewriting. The endpoint comes from `OTARI_BASE_URL`
-when set, which is how a self-hosted gateway works, and otherwise from Otari. The key comes
-from `OTARI_API_KEY`. The endpoint is per adapter, not per session, so it is environment, not
-a setting.
+vendor-namespaced gateway ids need no rewriting. The endpoint and key come from the same
+pair: `OTARI_BASE_URL` and `OTARI_API_KEY` when either is set, else `OPENAI_BASE_URL` with
+`OPENAI_API_KEY` for a gateway you already run, else Otari. Both are per adapter, not per
+session, so they are environment, not settings.
+
+`aoe setup` and the first-run wizard therefore save an Otari model for `aoe-agent` when only
+`OTARI_API_KEY` is present, so the first Structured session reaches Otari without a `--model`
+flag. Any `--model` or picker choice still wins over it.
 
 ## Requirements
 

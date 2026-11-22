@@ -108,6 +108,8 @@ pub struct Plan {
     pub alternatives: Vec<String>,
     /// Explain how to get an Otari key: the bundled agent has no credential.
     pub needs_gateway_key: bool,
+    /// The gateway credential detection found, which decides the model.
+    pub gateway_credential: Option<GatewayCredential>,
     /// Why the bundled agent did not take the default.
     pub fallback: Option<&'static str>,
 }
@@ -153,8 +155,18 @@ pub fn plan(detection: &Detection, config: &AcpConfig, install_allowed: bool) ->
         install,
         alternatives,
         needs_gateway_key: detection.gateway_credential.is_none(),
+        gateway_credential: detection.gateway_credential,
         fallback,
     }
+}
+
+/// The model the bundled agent has to run on here. With only the Otari key the
+/// adapter's own default is an Anthropic id, which needs an Anthropic
+/// credential, so the plan names an Otari model instead. A detected
+/// `OPENAI_BASE_URL` gateway is left alone: its model ids are the user's.
+pub fn gateway_model(plan: &Plan) -> Option<&'static str> {
+    (plan.bundled && plan.gateway_credential == Some(GatewayCredential::Otari))
+        .then_some(OTARI_MODEL_EXAMPLE)
 }
 
 /// The settings a plan has to write, given what the config already says.
@@ -164,11 +176,13 @@ pub struct Changes {
     pub default_agent: Option<String>,
     /// `acp.structured_view`, when it is still `auto`.
     pub structured_view: bool,
+    /// `acp.acp_defaults.<bundled>.model`, while it has no model.
+    pub model: Option<String>,
 }
 
 impl Changes {
     pub fn is_empty(&self) -> bool {
-        self.default_agent.is_none() && !self.structured_view
+        self.default_agent.is_none() && !self.structured_view && self.model.is_none()
     }
 }
 
@@ -179,10 +193,18 @@ impl Changes {
 pub fn changes(config: &AcpConfig, plan: &Plan, explicit: bool) -> Changes {
     let configured = config.default_agent.trim();
     let still_default = configured.is_empty() || configured == DEFAULT_ACP_AGENT;
+    let has_model = config
+        .acp_defaults
+        .get(BUNDLED_AGENT)
+        .and_then(|defaults| defaults.model.as_deref())
+        .is_some_and(|model| !model.trim().is_empty());
     Changes {
         default_agent: ((still_default || explicit) && configured != plan.agent)
             .then(|| plan.agent.clone()),
         structured_view: config.structured_view == StructuredView::Auto,
+        model: (!has_model)
+            .then(|| gateway_model(plan).map(str::to_string))
+            .flatten(),
     }
 }
 
@@ -331,6 +353,42 @@ mod tests {
             changes(&raced, &plan, true).default_agent.as_deref(),
             Some(BUNDLED_AGENT)
         );
+    }
+
+    #[test]
+    fn only_the_otari_credential_supplies_a_model() {
+        let configured = config("", StructuredView::Auto);
+        let otari = plan(&detection(&[], true, true), &configured, false);
+        // Without this the adapter's own default is an Anthropic id, which the
+        // Otari key cannot authenticate.
+        assert_eq!(
+            changes(&configured, &otari, false).model.as_deref(),
+            Some(OTARI_MODEL_EXAMPLE)
+        );
+
+        // A model already set for the bundled agent is kept.
+        let mut pinned = config("", StructuredView::Auto);
+        pinned.acp_defaults.insert(
+            BUNDLED_AGENT.to_string(),
+            crate::session::config::AcpAgentDefaults {
+                model: Some("openai-compatible:moonshotai/kimi-k3.1-pro".to_string()),
+                ..Default::default()
+            },
+        );
+        assert_eq!(changes(&pinned, &otari, false).model, None);
+
+        // A detected OpenAI-compatible gateway has its own model ids.
+        let gateway = Detection {
+            gateway_credential: Some(GatewayCredential::Gateway),
+            bundled_installed: true,
+            ..Detection::default()
+        };
+        let gateway_plan = plan(&gateway, &configured, false);
+        assert_eq!(changes(&configured, &gateway_plan, false).model, None);
+
+        // No credential: the guidance asks for a key instead of pinning a model.
+        let credentialless = plan(&detection(&[], true, false), &configured, true);
+        assert_eq!(changes(&configured, &credentialless, false).model, None);
     }
 
     #[test]

@@ -25,6 +25,10 @@ pub struct IntroOutcome {
     /// `acp.default_agent` picked on the Structured view page; the plan it came
     /// from already folded in detection, so it names an agent that can start.
     pub acp_default_agent: Option<String>,
+    /// `acp.acp_defaults.<bundled>.model` for that choice: with only the Otari
+    /// key the adapter's own default is an Anthropic id it has no credential
+    /// for, so the first Structured session needs this model.
+    pub acp_default_model: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -286,7 +290,20 @@ impl IntroDialog {
             } else {
                 None
             },
+            // Keyed off the chosen row, not the plan: the user can pick the
+            // bundled agent on a machine whose configured default was another.
+            acp_default_model: (self.structured_visited
+                && self.chosen_agent_is_bundled()
+                && self.plan.gateway_credential == Some(quickstart::GatewayCredential::Otari))
+            .then(|| quickstart::OTARI_MODEL_EXAMPLE.to_string()),
         }
+    }
+
+    /// The row under the cursor names the bundled agent.
+    fn chosen_agent_is_bundled(&self) -> bool {
+        self.agent_options
+            .get(self.agent_cursor)
+            .is_some_and(|agent| agent == quickstart::BUNDLED_AGENT)
     }
 
     fn move_agent_cursor(&mut self, delta: isize) {
@@ -1332,6 +1349,43 @@ mod tests {
 
         let _ = dialog.handle_key(key(KeyCode::Enter));
         assert_eq!(dialog.outcome().acp_default_agent.as_deref(), Some("codex"));
+    }
+
+    #[test]
+    fn the_bundled_choice_carries_the_otari_model() {
+        let acp = crate::session::config::AcpConfig::default();
+        let bundled_row = |credential| {
+            park(
+                IntroDialog::with_detection(
+                    "zinc",
+                    &acp,
+                    &quickstart::Detection {
+                        present_agents: vec!["aoe-agent".to_string()],
+                        bundled_installed: true,
+                        gateway_credential: credential,
+                    },
+                ),
+                Page::StructuredDefault,
+            )
+        };
+
+        // The adapter's own default model needs an Anthropic credential the
+        // Otari key cannot supply, so the session is given an Otari model.
+        let mut dialog = bundled_row(Some(quickstart::GatewayCredential::Otari));
+        assert_eq!(dialog.agent_cursor, 0);
+        let _ = dialog.handle_key(key(KeyCode::Enter));
+        assert_eq!(
+            dialog.outcome().acp_default_model.as_deref(),
+            Some(quickstart::OTARI_MODEL_EXAMPLE)
+        );
+
+        // A detected OpenAI-compatible gateway picks its own models.
+        let mut dialog = bundled_row(Some(quickstart::GatewayCredential::Gateway));
+        let _ = dialog.handle_key(key(KeyCode::Enter));
+        assert_eq!(dialog.outcome().acp_default_model, None);
+
+        // Skipping the wizard writes nothing.
+        assert_eq!(fresh().outcome().acp_default_model, None);
     }
 
     fn row_rect() -> Rect {

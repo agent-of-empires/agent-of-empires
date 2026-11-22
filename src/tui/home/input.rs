@@ -56,6 +56,37 @@ pub(super) fn web_plugin_disabled() -> bool {
         .is_some_and(|p| !p.enabled)
 }
 
+impl HomeView {
+    /// Tools the new-session dialog offers. A machine with no terminal agent but
+    /// a runnable bundled adapter gets that adapter, so the first-run wizard's
+    /// choice can create the first Structured session here instead of only in
+    /// the CLI.
+    fn dialog_tools(&self) -> crate::tmux::AvailableTools {
+        if self.available_tools.any_available() {
+            return self.available_tools.clone();
+        }
+        let config = load_config().ok().flatten().unwrap_or_default();
+        let app_dir = crate::session::get_app_dir().ok();
+        if config.acp.structured_view == StructuredView::Off
+            || !crate::acp::quickstart::bundled_ready(app_dir.as_deref())
+        {
+            return self.available_tools.clone();
+        }
+        self.available_tools
+            .with_tool(crate::acp::quickstart::BUNDLED_AGENT)
+    }
+
+    /// Hold the wizard's Structured agent for the session it creates. No
+    /// terminal tool maps to the bundled agent, so without this the first
+    /// session would run whatever agent the default tool resolves to.
+    fn remember_first_session_agent(&mut self, outcome: &IntroOutcome) {
+        self.first_session_agent = outcome
+            .acp_default_agent
+            .clone()
+            .filter(|agent| agent == crate::acp::quickstart::BUNDLED_AGENT);
+    }
+}
+
 /// Persist the first-run intro picks: theme name to `config.theme.name`, attach mode to
 /// `default_attach_mode`, telemetry opt-in to `config.telemetry.enabled`. Failures are
 /// logged and swallowed so a config write hiccup cannot block startup.
@@ -64,6 +95,7 @@ fn apply_intro_outcome(outcome: &IntroOutcome) {
         && outcome.final_attach_mode.is_none()
         && outcome.telemetry_opt_in.is_none()
         && outcome.acp_default_agent.is_none()
+        && outcome.acp_default_model.is_none()
     {
         return;
     }
@@ -76,6 +108,22 @@ fn apply_intro_outcome(outcome: &IntroOutcome) {
             }
             if config.acp.structured_view == StructuredView::Auto {
                 config.acp.structured_view = StructuredView::Structured;
+            }
+        }
+        if let Some(model) = &outcome.acp_default_model {
+            // The model the first Structured session needs to reach the
+            // gateway; a model already set for the bundled agent is kept.
+            let entry = config
+                .acp
+                .acp_defaults
+                .entry(crate::acp::quickstart::BUNDLED_AGENT.to_string())
+                .or_default();
+            if entry
+                .model
+                .as_deref()
+                .is_none_or(|current| current.trim().is_empty())
+            {
+                entry.model = Some(model.clone());
             }
         }
         if let Some(theme) = &outcome.final_theme {
@@ -1709,6 +1757,7 @@ impl HomeView {
                     DialogResult::Submit(outcome) => {
                         self.intro_dialog = None;
                         apply_intro_outcome(&outcome);
+                        self.remember_first_session_agent(&outcome);
                         // No pending_intro_theme: the live preview already applied
                         // the chosen theme, and re-applying would force a
                         // `clear_terminal` close-flash. Same as the keyboard Submit.
@@ -2442,6 +2491,7 @@ impl HomeView {
                 DialogResult::Submit(outcome) => {
                     self.intro_dialog = None;
                     apply_intro_outcome(&outcome);
+                    self.remember_first_session_agent(&outcome);
                     // No SetTheme dispatch: the live preview already applied the theme
                     // on the picker page, and re-dispatching would re-trigger
                     // `set_theme -> needs_redraw`, forcing the close-flash
@@ -3692,7 +3742,7 @@ impl HomeView {
             let profiles =
                 list_profiles_for_display().unwrap_or_else(|_| vec![current_profile.clone()]);
             let mut dialog = NewSessionDialog::new(
-                self.available_tools.clone(),
+                self.dialog_tools(),
                 existing_groups,
                 &current_profile,
                 profiles,
@@ -5816,7 +5866,7 @@ impl HomeView {
         let profiles =
             list_profiles_for_display().unwrap_or_else(|_| vec![current_profile.clone()]);
         self.new_dialog = Some(NewSessionDialog::new(
-            self.available_tools.clone(),
+            self.dialog_tools(),
             existing_groups,
             &current_profile,
             profiles,

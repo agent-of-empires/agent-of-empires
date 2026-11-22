@@ -57,10 +57,51 @@ export function resolveModelRoute(modelId: string): ModelRoute {
   return { provider: "anthropic", modelId };
 }
 
-/** Gateway endpoint: `OTARI_BASE_URL` when set, else Otari's OpenAI-compatible root. */
+/** A gateway endpoint and the key that authenticates it. */
+export type Gateway = {
+  baseUrl: string;
+  apiKey: string | undefined;
+  /** The variable a missing key is reported against. */
+  keyVar: string;
+};
+
+function trimmed(value: string | undefined): string | undefined {
+  return value?.trim() || undefined;
+}
+
+/**
+ * The gateway this host configured, endpoint and key from the same pair: the
+ * `OTARI_*` pair when either is set, else an `OPENAI_BASE_URL` gateway with
+ * `OPENAI_API_KEY`, else Otari with whatever key is present.
+ */
+export function gateway(env: Env = process.env): Gateway {
+  const otariBase = trimmed(env.OTARI_BASE_URL)?.replace(/\/+$/, "");
+  const otariKey = trimmed(env.OTARI_API_KEY);
+  if (otariBase || otariKey) {
+    return {
+      baseUrl: otariBase ?? DEFAULT_GATEWAY_BASE_URL,
+      apiKey: otariKey,
+      keyVar: "OTARI_API_KEY",
+    };
+  }
+  const openaiBase = trimmed(env.OPENAI_BASE_URL)?.replace(/\/+$/, "");
+  if (openaiBase) {
+    return {
+      baseUrl: openaiBase,
+      apiKey: trimmed(env.OPENAI_API_KEY),
+      keyVar: "OPENAI_API_KEY",
+    };
+  }
+  return {
+    baseUrl: DEFAULT_GATEWAY_BASE_URL,
+    apiKey: undefined,
+    keyVar: "OTARI_API_KEY",
+  };
+}
+
+/** Gateway endpoint alone, for messages. */
 export function gatewayBaseUrl(env: Env = process.env): string {
-  const override = env.OTARI_BASE_URL?.trim().replace(/\/+$/, "");
-  return override ? override : DEFAULT_GATEWAY_BASE_URL;
+  return gateway(env).baseUrl;
 }
 
 export function pickModel(modelId: string, env: Env = process.env) {
@@ -73,15 +114,15 @@ export function pickModel(modelId: string, env: Env = process.env) {
     case "google":
       return google(route.modelId);
     case "openai-compatible": {
-      const apiKey = env.OTARI_API_KEY?.trim() || undefined;
+      const { baseUrl, apiKey, keyVar } = gateway(env);
       if (!apiKey) {
         process.stderr.write(
-          `[aoe-agent] OTARI_API_KEY is not set; requests to ${gatewayBaseUrl(env)} will be unauthenticated\n`,
+          `[aoe-agent] ${keyVar} is not set; requests to ${baseUrl} will be unauthenticated\n`,
         );
       }
       return createOpenAICompatible({
         name: "openai-compatible",
-        baseURL: gatewayBaseUrl(env),
+        baseURL: baseUrl,
         apiKey,
       })(route.modelId);
     }

@@ -368,7 +368,13 @@ impl App {
             return false;
         }
         self.startup_dialogs_pending = false;
-        if !self.home.available_tools.any_available() {
+        // The no-agents screen is a dead end for a first run: the wizard can
+        // still deliver the bundled adapter, which needs no terminal agent. Only
+        // fall back to it when the Structured view is off.
+        let structured_off = crate::session::config::Config::load().is_ok_and(|config| {
+            config.acp.structured_view == crate::session::config::StructuredView::Off
+        });
+        if !self.home.available_tools.any_available() && structured_off {
             self.home.show_no_agents();
             return true;
         }
@@ -4087,6 +4093,39 @@ mod tests {
 
     #[tokio::test]
     #[serial_test::serial]
+    async fn startup_declares_no_agents_only_when_structured_view_is_off() {
+        for tools in [&[][..], &["claude"][..]] {
+            let temp = tempfile::tempdir().unwrap();
+            let _guard = crate::session::test_support::isolate_app_dir_at(temp.path());
+            crate::session::get_profile_dir("test").unwrap();
+            crate::session::config::update_config(|config| {
+                config.acp.structured_view = crate::session::config::StructuredView::Off;
+            })
+            .unwrap();
+            let mut app = App::new(
+                "test",
+                AvailableTools::with_tools(&[]),
+                false,
+                false,
+                crate::file_watch::FileWatchService::noop(),
+            )
+            .unwrap();
+            let (tx, rx) = tokio::sync::oneshot::channel();
+            app.available_tools_rx = Some(rx);
+            tx.send(AvailableTools::with_tools(tools)).unwrap();
+            assert!(app.poll_tool_detection());
+            assert_eq!(
+                app.home.no_agents_dialog.is_some(),
+                tools.is_empty(),
+                "{tools:?}"
+            );
+            // The dead-end screen and the wizard never share the first run.
+            assert_eq!(app.home.intro_dialog.is_none(), tools.is_empty());
+        }
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
     async fn startup_waits_for_full_detection_before_declaring_no_agents() {
         for (initial_tools, tools, suppress) in [
             (&[][..], &[][..], false),
@@ -4130,18 +4169,17 @@ mod tests {
                     "the startup warning keeps priority"
                 );
                 app.home.info_dialog = None;
-                assert_eq!(app.poll_tool_detection(), tools.is_empty());
+                assert!(
+                    !app.poll_tool_detection(),
+                    "the Structured view onboards instead of declaring no agents"
+                );
             }
             assert_eq!(app.home.available_tools.available_list().len(), tools.len());
-            assert_eq!(app.home.no_agents_dialog.is_some(), tools.is_empty());
-            assert_eq!(
-                app.home.intro_dialog.is_some(),
-                !tools.is_empty() && !suppress
-            );
-            assert_eq!(
-                Config::load_or_warn().app_state.has_seen_welcome,
-                !tools.is_empty() && !suppress
-            );
+            // With the Structured view offered, no terminal agent is not a dead
+            // end: the wizard reaches the bundled adapter.
+            assert!(app.home.no_agents_dialog.is_none());
+            assert_eq!(app.home.intro_dialog.is_some(), !suppress);
+            assert_eq!(Config::load_or_warn().app_state.has_seen_welcome, !suppress);
             assert!(
                 !app.poll_tool_detection(),
                 "completion is applied only once"
