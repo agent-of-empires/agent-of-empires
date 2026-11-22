@@ -21,6 +21,8 @@ Both surfaces consume the same `aoe serve` daemon over the same HTTP and WebSock
 
 The view opens with the composer ready. The transcript stays scrollable from the composer, a pending authorization opens a focused approval shelf above it, and the status line keeps the worker state and primary controls visible. The active session's agent, directory, and permission mode sit in a compact card in the upper left; user turns use a `›` gutter and agent replies a `•` gutter, so only modal decisions get a full-width border.
 
+The approval shelf shows the request itself above its buttons: the command or path, which the title has to elide to one line, then the other arguments as `key: value` lines. A command that runs over several lines keeps them. The body is capped at five rows, or fewer on a short terminal, and anything dropped is counted in a `+N more` footer, so read the full request in the dashboard when that footer appears. The question popup shows the lead-in and the question's own detail above the options, plus the highlighted answer's description, so a question reads without opening the dashboard.
+
 | Focus       | Key             | Action                                                |
 | ----------- | --------------- | ----------------------------------------------------- |
 | Composer    | `Enter`         | Send, or queue if the session cannot accept it yet |

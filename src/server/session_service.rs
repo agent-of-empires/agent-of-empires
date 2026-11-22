@@ -2009,6 +2009,12 @@ impl SessionService {
                     let _ = reduced.apply_event(seq, event);
                     last_seq = seq;
                 }
+                tracing::debug!(
+                    target: "acp.control_fold",
+                    session = %sid,
+                    last_seq,
+                    "hydrated a cold control fold from the log"
+                );
                 (reduced, last_seq)
             })
         })
@@ -2022,26 +2028,73 @@ impl SessionService {
         })
     }
 
-    /// The sidebar status right after `seq`, rebuilt from the durable log. For
-    /// a frame published while the control cache was cold, so no status rode
-    /// with it; exact for whatever the journal's retention still holds.
+    /// The sidebar status projected at `seq`, for a frame published while the
+    /// control cache was cold or behind, so no status rode with it.
+    ///
+    /// A frame at the fold's last seq answers from the fold. A frame ahead of it
+    /// folds only the events through its seq. A cold session hydrates through
+    /// [`Self::fold_control_state`] first. A frame behind the fold is projected
+    /// at its own seq from the log to preserve transitions such as running to idle.
     pub(crate) async fn sidebar_status_at(
         &self,
         id: &str,
         seq: u64,
     ) -> Option<crate::session::Status> {
         use crate::acp::state::{AcpSessionId, AcpState, AgentName};
+        let fold = self.fold_control_state(id).await;
+        if fold.last_seq == seq {
+            tracing::debug!(
+                target: "acp.sidebar_projection",
+                session = %id,
+                since = seq,
+                seq,
+                folded = 0,
+                "projected sidebar status from the cached fold"
+            );
+            return Some(fold.sidebar_status());
+        }
         let store = Arc::clone(&self.acp_event_store);
         let sid = id.to_string();
+        let since = fold.last_seq;
+        let behind = fold.last_seq > seq;
         tokio::task::spawn_blocking(move || {
-            let mut state =
-                AcpState::new(AcpSessionId(sid.clone()), AgentName(String::new()), None);
-            let mut folded = false;
-            for (at, event) in store.replay_before(&sid, seq.saturating_add(1)) {
-                let _ = state.apply_event(at, event);
-                folded = true;
+            if behind {
+                let mut state =
+                    AcpState::new(AcpSessionId(sid.clone()), AgentName(String::new()), None);
+                let mut folded = 0usize;
+                let mut found_event = false;
+                for (at, event) in store.replay_before(&sid, seq.saturating_add(1)) {
+                    found_event = true;
+                    if state.apply_event(at, event).is_ok() {
+                        folded += 1;
+                    }
+                }
+                tracing::debug!(
+                    target: "acp.sidebar_projection",
+                    session = %sid,
+                    since = 0,
+                    seq,
+                    folded,
+                    "projected sidebar status from the event log"
+                );
+                return found_event.then(|| state.sidebar_status());
             }
-            folded.then(|| state.sidebar_status())
+            let mut state = fold;
+            let mut folded = 0usize;
+            for (at, event) in store.replay_through(&sid, since, seq) {
+                if state.apply_event(at, event).is_ok() {
+                    folded += 1;
+                }
+            }
+            tracing::debug!(
+                target: "acp.sidebar_projection",
+                session = %sid,
+                since,
+                seq,
+                folded,
+                "projected sidebar status from the cached fold"
+            );
+            Some(state.sidebar_status())
         })
         .await
         .ok()
@@ -2674,6 +2727,21 @@ struct CreationEntry {
 #[derive(Debug, thiserror::Error)]
 #[error("Session creation cancelled")]
 pub(crate) struct CreationCancelled;
+
+impl CreationCancelled {
+    /// A create's setup that fails once `cancel` fired reads as cancelled, whatever the setup
+    /// reported: a cancelled shared pull, say, or the create's own cancel ending its wait.
+    pub(crate) fn or_error(
+        cancel: &tokio_util::sync::CancellationToken,
+        error: anyhow::Error,
+    ) -> anyhow::Error {
+        if cancel.is_cancelled() {
+            Self.into()
+        } else {
+            error
+        }
+    }
+}
 
 pub(super) struct CreationGuard {
     service: Arc<SessionService>,
@@ -5824,5 +5892,50 @@ mod tests {
             .await
             .unwrap_or_else(|_| panic!("{case}: the resume reached the container runtime"));
         }
+    }
+
+    #[tokio::test]
+    async fn sidebar_status_at_folds_only_the_tail_and_replays_behind_frames() {
+        use crate::acp::state::test_support::{prompt, stopped};
+        use crate::session::Status;
+
+        let id = "sidebar-tail";
+        let mut inst = Instance::new("sidebar-tail", "/tmp/aoe-sidebar-tail");
+        inst.id = id.to_string();
+        inst.view = crate::session::View::Structured;
+        let state = crate::server::test_support::build_test_app_state(vec![inst]);
+        let at = chrono::Utc::now().timestamp_millis();
+        let store = &state.acp_event_store;
+        let service = &state.session_service;
+        let first = prompt("go");
+        let second = stopped("end_turn");
+        store.record_at(id, 1, &first, at).unwrap();
+        store.record_at(id, 2, &second, at).unwrap();
+
+        let fold = service.fold_control_state(id).await;
+        assert_eq!(fold.last_seq, 2);
+
+        let running = prompt("again");
+        store.record_at(id, 3, &running, at).unwrap();
+        let ahead = service.sidebar_status_at(id, 3).await;
+        assert_eq!(ahead, Some(Status::Running));
+
+        // Advance the live fold beyond seq 3. A late frame at seq 3 still
+        // projects the running transition at that sequence, not the later idle
+        // level held by the fold.
+        let ended = stopped("end_turn");
+        store.record_at(id, 4, &ended, at).unwrap();
+        assert_eq!(
+            state.acp_control_cache.apply_if_cached(id, 3, &running),
+            Some(Status::Running)
+        );
+        assert_eq!(
+            state.acp_control_cache.apply_if_cached(id, 4, &ended),
+            Some(Status::Idle)
+        );
+        let behind = service.sidebar_status_at(id, 3).await;
+        assert_eq!(behind, Some(Status::Running));
+        let folded = service.sidebar_status_at(id, 4).await;
+        assert_eq!(folded, Some(Status::Idle));
     }
 }

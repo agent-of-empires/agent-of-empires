@@ -2,7 +2,8 @@ use super::container_interface::{
     docker_env_args, ContainerConfig, RunFlag, TargetEnvFile, CGROUP_PARENT_LABEL,
 };
 use super::error::{sanitize_stderr, DockerError, Result};
-use super::image_pull::PullFailureReason;
+use super::image_pull::{PullContext, PullFailureReason};
+use super::pull_progress::{LayerUpdate, LineBuffer};
 use std::collections::HashSet;
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
@@ -67,6 +68,9 @@ pub(crate) struct RuntimeBase {
     pub name: &'static str,
     pub daemon_check_args: &'static [&'static str],
     pub pull_prefix: &'static [&'static str],
+    /// Reads a pull's layer lines. `None` until the runtime's non-TTY output is captured, so
+    /// its pulls show a spinner.
+    pub pull_progress: Option<fn(&str) -> Option<LayerUpdate>>,
     pub remove_subcommand: &'static str,
     pub supports_read_only_volumes: bool,
     pub supports_remove_volumes: bool,
@@ -99,6 +103,7 @@ impl RuntimeBase {
         name: "Docker",
         daemon_check_args: &["info"],
         pull_prefix: &["pull"],
+        pull_progress: Some(super::pull_progress::docker_layer),
         remove_subcommand: "rm",
         supports_read_only_volumes: true,
         supports_remove_volumes: true,
@@ -121,6 +126,8 @@ impl RuntimeBase {
         name: "Apple Container",
         daemon_check_args: &["system", "status"],
         pull_prefix: &["image", "pull"],
+        // `auto` already picks plain without a TTY; this keeps it from depending on that.
+        pull_progress: None,
         remove_subcommand: "delete",
         supports_read_only_volumes: false,
         supports_remove_volumes: false,
@@ -141,6 +148,7 @@ impl RuntimeBase {
         name: "Podman",
         daemon_check_args: &["info"],
         pull_prefix: &["pull"],
+        pull_progress: None,
         remove_subcommand: "rm",
         supports_read_only_volumes: true,
         supports_remove_volumes: true,
@@ -305,25 +313,44 @@ impl RuntimeBase {
         self.probe_succeeds(&["image", "inspect", image])
     }
 
-    pub fn pull_until_cancelled(&self, image: &str, cancel: &CancellationToken) -> Result<()> {
-        self.pull_with_timeout(image, cancel, PULL_TIMEOUT)
+    pub(crate) fn pull_until_cancelled(&self, image: &str, pull: &PullContext) -> Result<()> {
+        self.pull_with_timeout(image, pull, PULL_TIMEOUT)
     }
 
-    fn pull_with_timeout(
-        &self,
-        image: &str,
-        cancel: &CancellationToken,
-        timeout: Duration,
-    ) -> Result<()> {
+    fn pull_with_timeout(&self, image: &str, pull: &PullContext, timeout: Duration) -> Result<()> {
+        let cancel = pull.kill;
         let mut cmd = self.command();
         cmd.args(self.pull_prefix);
         cmd.arg(image);
         cmd.stdin(Stdio::null());
         let start = Instant::now();
         tracing::info!(target: "containers.image", runtime = %self.name, %image, "pulling image");
-        let output = match crate::process::run_until_cancelled_process_group(
-            &mut cmd, timeout, cancel,
-        )? {
+        let ran = match self.pull_progress {
+            // A runtime with no parser is not observed, so its output isn't split into lines.
+            None => crate::process::run_until_cancelled_process_group(&mut cmd, timeout, cancel),
+            Some(parse) => {
+                let (mut stdout_lines, mut stderr_lines) =
+                    (LineBuffer::default(), LineBuffer::default());
+                let mut on_output = |stream: crate::process::OutputStream, bytes: &[u8]| {
+                    let lines = match stream {
+                        crate::process::OutputStream::Stdout => &mut stdout_lines,
+                        crate::process::OutputStream::Stderr => &mut stderr_lines,
+                    };
+                    lines.push(bytes, |line| {
+                        if let Some(update) = parse(line) {
+                            pull.report(update);
+                        }
+                    });
+                };
+                crate::process::run_until_cancelled_process_group_observed(
+                    &mut cmd,
+                    timeout,
+                    cancel,
+                    &mut on_output,
+                )
+            }
+        };
+        let output = match ran? {
             Some(output) => output,
             None if cancel.is_cancelled() => {
                 tracing::info!(target: "containers.image", runtime = %self.name, %image, "image pull cancelled");
@@ -1057,6 +1084,68 @@ mod tests {
         ));
     }
 
+    #[cfg(unix)]
+    #[test]
+    #[serial_test::parallel]
+    fn a_running_pull_reports_the_layers_its_runtime_prints() {
+        use super::super::pull_progress::{Progress, PullPhase};
+        use std::io::Write as _;
+        use std::os::unix::fs::PermissionsExt;
+        use std::sync::{Arc, Mutex};
+        const DEADLINE: Duration = Duration::from_secs(10);
+        let _env = crate::session::test_support::EnvGuard::read_lock();
+        let dir = tempfile::tempdir().unwrap();
+        let (binary, gate) = (dir.path().join("docker"), dir.path().join("gate"));
+        nix::unistd::mkfifo(&gate, nix::sys::stat::Mode::S_IRWXU).unwrap();
+        std::fs::write(
+            &binary,
+            format!(
+                "#!/bin/sh\n\
+                 echo '6458fc480f83: Pulling fs layer'\n\
+                 read _ < '{gate}'\n\
+                 echo '6458fc480f83: Pull complete'\n",
+                gate = gate.display(),
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(&binary, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let runtime = RuntimeBase {
+            binary: Box::leak(binary.to_string_lossy().into_owned().into_boxed_str()),
+            ..RuntimeBase::DOCKER
+        };
+        let progress = Arc::new(Mutex::new(Progress::default()));
+        let pulling = {
+            let progress = progress.clone();
+            std::thread::spawn(move || {
+                let pull = PullContext {
+                    kill: &CancellationToken::new(),
+                    progress: &progress,
+                };
+                runtime.pull_with_timeout("img", &pull, DEADLINE)
+            })
+        };
+        let snapshot = || progress.lock().unwrap().snapshot();
+        let deadline = Instant::now() + DEADLINE;
+        while snapshot().layers_known != Some(1) {
+            assert!(
+                Instant::now() < deadline,
+                "the first line never reached the progress"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert_eq!(snapshot().phase, Some(PullPhase::Downloading));
+
+        crate::process::test_support::open_fifo_writer(&gate, deadline)
+            .write_all(b"go\n")
+            .unwrap();
+        pulling.join().unwrap().unwrap();
+        let end = snapshot();
+        assert_eq!(
+            (end.phase, end.layers_done),
+            (Some(PullPhase::Unpacking), Some(1))
+        );
+    }
+
     #[cfg(target_os = "linux")]
     #[test]
     #[serial_test::parallel]
@@ -1081,8 +1170,12 @@ mod tests {
             ..RuntimeBase::DOCKER
         };
 
-        let result =
-            runtime.pull_with_timeout("img", &CancellationToken::new(), Duration::from_secs(1));
+        let progress = std::sync::Mutex::default();
+        let pull = PullContext {
+            kill: &CancellationToken::new(),
+            progress: &progress,
+        };
+        let result = runtime.pull_with_timeout("img", &pull, Duration::from_secs(1));
         assert!(matches!(
             result,
             Err(DockerError::ImagePullFailed {

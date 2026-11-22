@@ -56,6 +56,13 @@ impl ControlStateCache {
             return None;
         }
         if seq != cached.last_seq + 1 || cached.state.apply_event(seq, event.clone()).is_err() {
+            tracing::debug!(
+                target: "acp.control_fold",
+                session = %session_id,
+                expected = cached.last_seq + 1,
+                seq,
+                "dropped a control fold that no longer follows the log"
+            );
             *guard = None;
             return None;
         }
@@ -75,7 +82,13 @@ impl ControlStateCache {
     /// Drop a session's fold.
     pub fn forget(&self, session_id: &str) {
         let mut map = lock(&self.sessions);
-        map.remove(session_id);
+        let had = map.remove(session_id).is_some();
+        tracing::debug!(
+            target: "acp.control_fold",
+            session = %session_id,
+            had,
+            "forgot a session's control fold"
+        );
     }
 
     /// The session's control state, running `hydrate` on a miss.

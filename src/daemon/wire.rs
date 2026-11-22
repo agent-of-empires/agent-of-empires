@@ -1317,7 +1317,7 @@ pub struct SessionResponse {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub workspace_cleanup_on_delete: Option<bool>,
     /// Non-fatal warnings surfaced by a mutation response. On create these are
-    /// worktree-creation warnings (e.g. post-checkout hook failures where the
+    /// worktree-creation warnings (e.g. a stale fetch where the
     /// worktree was still created successfully). On rename these carry the
     /// tmux rekey warning emitted when the title was persisted durably but the
     /// live tmux session could not be renamed afterwards. Both live on the

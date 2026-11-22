@@ -382,6 +382,22 @@ struct PendingCreation {
     receipt: Option<Box<MutationReceipt<crate::daemon::SessionResponse>>>,
 }
 
+/// Whether a snapshot status may accompany a confirmed agent-pane receipt.
+///
+/// Readiness comes from the receipt's identity (generation, profile, tmux
+/// name) and the snapshot's pane observation, so status only has to rule out a
+/// row that is stopped, failed, or mid-teardown. `Unknown` is the live state of
+/// a pane that is alive but whose screen the detector cannot classify (see
+/// `crate::session::instance::pane_status`), which is exactly what an agent
+/// whose status adapter has not reported yet looks like; it is not evidence the
+/// pane is gone.
+fn status_allows_attachment(status: &str) -> bool {
+    matches!(
+        status,
+        "Running" | "Waiting" | "Idle" | "Starting" | "Unknown"
+    )
+}
+
 fn set_grant(grant: &AtomicU64, allowed: bool) {
     // Renamed to try_update in the standard library; the MSRV this builds against
     // does not have it yet. Upstream carries the same allowance.
@@ -1853,15 +1869,13 @@ impl SessionFeed {
                                             && row.agent_pane.state == crate::session::PanePresence::Alive
                                             && receipt.outcome.target.as_ref().is_some_and(|target|
                                                 row.agent_pane.tmux_session.as_deref() == Some(target.tmux_session.as_str()))
-                                            && matches!(row.status.as_str(), "Running" | "Waiting" | "Idle" | "Starting"),
+                                            && status_allows_attachment(row.status.as_str()),
                                         CommandReply::Terminal(receipt) => {
                                             let identity_matches = row.lifecycle_generation
                                                 == receipt.outcome.lifecycle_generation
                                                 && row.profile == receipt.outcome.profile;
-                                            let status_ok = matches!(
-                                                row.status.as_str(),
-                                                "Running" | "Waiting" | "Idle" | "Starting"
-                                            );
+                                            let status_ok =
+                                                status_allows_attachment(row.status.as_str());
                                             let pane_ok = match row.agent_pane.state {
                                                 crate::session::PanePresence::Alive => {
                                                     row.agent_pane.tmux_session.as_deref()
@@ -4502,6 +4516,82 @@ mod tests {
         assert!(feed.drain_command_errors().is_empty());
         assert!(prepared.result.try_recv().unwrap().is_ok());
     }
+
+    /// An agent whose screen the detector cannot classify keeps its pane alive
+    /// and alive-pane identity is what the receipt confirms, so the row must
+    /// attach instead of failing as a stale target. A stopped or failed row is
+    /// still refused.
+    #[test]
+    fn ensure_agent_accepts_an_unclassified_status_only_with_the_same_live_pane() {
+        use crate::session::PanePresence;
+        for (status, pane, tmux_session, generation, attach) in [
+            ("Unknown", PanePresence::Alive, Some("agent-4"), 4, true),
+            ("Idle", PanePresence::Alive, Some("agent-4"), 4, true),
+            ("Stopped", PanePresence::Alive, Some("agent-4"), 4, false),
+            ("Error", PanePresence::Alive, Some("agent-4"), 4, false),
+            ("Deleting", PanePresence::Alive, Some("agent-4"), 4, false),
+            (
+                "Unknown",
+                PanePresence::Alive,
+                Some("another-agent"),
+                4,
+                false,
+            ),
+            ("Unknown", PanePresence::Alive, Some("agent-4"), 5, false),
+            ("Unknown", PanePresence::Dead, Some("agent-4"), 4, false),
+            ("Unknown", PanePresence::Absent, Some("agent-4"), 4, false),
+        ] {
+            let mut row: crate::daemon::SessionResponse =
+                serde_json::from_value(serde_json::json!({
+                    "id": "session",
+                    "profile": "test",
+                    "lifecycle_generation": 4,
+                    "status": status,
+                    "agent_pane": {"state": "alive", "tmux_session": "agent-4"},
+                }))
+                .unwrap();
+            row.agent_pane.state = pane;
+            row.agent_pane.tmux_session = tmux_session.map(str::to_owned);
+            let mut initial = snapshot("test", 1);
+            Arc::make_mut(&mut initial).contents.sessions.push(row);
+            let mut feed =
+                SessionFeed::seeded_for_test(SessionFeedResult::Snapshot(initial.clone()));
+            feed.mark_snapshot_applied(initial.clone());
+            let (commands, mut requests) = tokio::sync::mpsc::channel(COMMAND_CAPACITY);
+            feed.commands = Some(commands);
+            set_grant(&feed.native_grant, true);
+            let mut prepared = feed.ensure_agent("session".into(), None).unwrap();
+            let command = requests.try_recv().unwrap();
+            command
+                .result
+                .send(Ok(CommandReply::Terminal(MutationReceipt {
+                    cursor: RuntimeCursor {
+                        epoch: "test".into(),
+                        revision: 2,
+                    },
+                    outcome: TerminalTarget {
+                        tmux_session: "agent-4".into(),
+                        status: crate::daemon::TerminalTargetStatus::Alive,
+                        lifecycle_generation: 4,
+                        profile: "test".into(),
+                    },
+                })))
+                .unwrap();
+            let mut next = initial;
+            Arc::make_mut(&mut next).cursor.revision = 2;
+            Arc::make_mut(&mut next).contents.sessions[0].lifecycle_generation = generation;
+            feed.publish_for_test(SessionFeedResult::Snapshot(next.clone()));
+            assert!(feed.drain_command_errors().is_empty());
+            feed.mark_snapshot_applied(next);
+            assert!(feed.drain_command_errors().is_empty());
+            assert_eq!(
+                prepared.result.try_recv().unwrap().is_ok(),
+                attach,
+                "{status} {pane:?} {tmux_session:?} generation={generation}"
+            );
+        }
+    }
+
     #[test]
     fn native_preparation_requires_current_permission_and_an_applied_live_target() {
         use crate::session::PanePresence;

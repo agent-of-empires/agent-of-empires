@@ -730,19 +730,27 @@
       "notes": "The real Advanced Session switch defaults off, saves strict plugin staging machine-wide, rejects profile overrides and non-boolean PATCH values, and preserves opt-in across reload and daemon restart. Switching off persists too; TCP saves require schema elevation."
     },
     {
-      "id": "settings.startup-recovery-wake",
-      "kind": "live-playwright",
-      "risk": "high",
-      "specs": ["tests/live/settings-persistence.spec.ts", "tests/live/startup-recovery.spec.ts"],
-      "components": [
-        "web/src/components/SettingsView.tsx",
-        "web/src/components/settings/SchemaSection.tsx",
-        "src/session/config/mod.rs",
-        "src/server/api/sessions/lifecycle.rs",
-        "src/server/startup_recovery.rs"
-      ],
-      "notes": "The real schema switch defaults off, validates boolean PATCH values, persists per profile, and resets to machine inheritance. Missing Idle/Waiting/Running panes still resume; opted-in default/custom text, empty opt-out, profile precedence, failed resume, and unchanged explicit API/CLI restart wake behavior use private fake agents."
+      "id": "settings.mcp-enabled-copy",
+      "kind": "deferred",
+      "issue": "https://github.com/agent-of-empires/agent-of-empires/issues/5769",
+      "risk": "low",
+      "reason": "Copy only: the Let other apps control AoE description and summary say what the MCP tools allow instead of read-only. The switch and its persistence are covered by settings.mcp-server-toggle.",
+      "components": ["web/src/components/settings/SchemaSection.tsx"]
     },
+    {
+    "id": "settings.startup-recovery-wake",
+    "kind": "live-playwright",
+    "risk": "high",
+    "specs": ["tests/live/settings-persistence.spec.ts", "tests/live/startup-recovery.spec.ts"],
+    "components": [
+      "web/src/components/SettingsView.tsx",
+      "web/src/components/settings/SchemaSection.tsx",
+      "src/session/config/mod.rs",
+      "src/server/api/sessions/lifecycle.rs",
+      "src/server/startup_recovery.rs"
+    ],
+    "notes": "The real schema switch defaults off, validates boolean PATCH values, persists per profile, and resets to machine inheritance. Missing Idle/Waiting/Running panes still resume; opted-in default/custom text, empty opt-out, profile precedence, failed resume, and unchanged explicit API/CLI restart wake behavior use private fake agents."
+  },
     {
       "id": "settings.list-field",
       "kind": "mocked-playwright",
@@ -1018,7 +1026,7 @@
         "web/src/components/settings/FormFields.tsx",
         "web/src/components/settings/SchemaSection.tsx"
       ],
-      "notes": "The Updates tab shows the Daemon port (`serve.port`) under a Daemon heading; editing it saves `{ serve: { port } }` through the normal settings path. Global only; a new value applies after a stop and start. The same block renders the Funnel port select (`serve.funnel_port`) from the schema with no web code of its own. Folder-ignore entries (`sandbox.volume_ignores`) are checked client-side from the schema's `volume_ignore_list` rule: an absolute path, a `:` or a `..` segment is rejected inline and not saved, while a relative entry such as node_modules saves as `{ sandbox: { volume_ignores } }`."
+      "notes": "The Updates tab shows the Daemon port (`serve.port`) under a Daemon heading; editing it saves `{ serve: { port } }` through the normal settings path. Global only; a new value applies after a stop and start. The same block renders the Funnel port select (`serve.funnel_port`) from the schema with no web code of its own. Folder-ignore entries (`sandbox.volume_ignores`) are checked client-side from the schema's `volume_ignore_list` rule: an absolute path, a `:` or a `..` segment is rejected inline and not saved, while a relative entry such as node_modules saves as `{ sandbox: { volume_ignores } }`. Port mappings (`sandbox.port_mappings`) reject a port above 65535 on either side inline and keep the draft, while `65535:65535` saves as `{ sandbox: { port_mappings } }`."
     },
     {
       "id": "settings.global-migration-and-persistence",
@@ -1050,6 +1058,18 @@
       "risk": "medium",
       "specs": ["src/components/__tests__/SettingsView.session.test.tsx"],
       "components": ["web/src/components/SettingsView.tsx", "web/src/components/settings/FormFields.tsx"]
+    },
+    {
+      "id": "settings.narrow-breakpoint",
+      "kind": "vitest",
+      "risk": "low",
+      "specs": ["src/components/settings/__tests__/SchemaFieldPatches.test.tsx"],
+      "components": [
+        "web/src/components/settings/SchemaSection.tsx",
+        "web/src/components/settings/FormFields.tsx",
+        "src/session/config/mod.rs"
+      ],
+      "notes": "The breakpoint is a number control in the Terminal UI group with the 0 to 1000 range the TUI accepts, patching { session: { narrow_breakpoint } } sparsely like its neighbours, so a config holding a value below the 50-column floor still saves."
     },
     {
       "id": "settings.advanced-fold-persistence",
@@ -3280,10 +3300,13 @@
         "src/components/settings/__tests__/StructuredViewDisplaySettings.test.tsx",
         "src/components/acp/__tests__/StructuredViewRoot.test.tsx",
         "src/components/acp/Markdown.test.tsx",
+        "src/hooks/__tests__/useHistoryWindow.test.tsx",
         "tests/acp-structured-view.spec.ts"
       ],
       "components": [
         "web/src/components/settings/StructuredViewDisplaySettings.tsx",
+        "web/src/hooks/useHistoryWindow.ts",
+        "web/src/lib/structuredHistoryWindow.ts",
         "web/src/components/settings/FontSizeControl.tsx",
         "web/src/components/TerminalSettings.tsx",
         "web/src/lib/fontSizeRange.ts",
@@ -3363,7 +3386,8 @@
         "web/src/hooks/useConnectionBanner.ts",
         "web/src/hooks/useUpdateBanner.ts",
         "web/src/components/SandboxImageBanner.tsx"
-      ]
+      ],
+      "notes": "#5932: a hung update-status poll is aborted after 15s, the offer stays visible and the next hourly poll runs; pinned in UpdateBanner.test.tsx."
     },
     {
       "id": "connectivity.sandbox-image-banner",
