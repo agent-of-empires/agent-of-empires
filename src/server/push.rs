@@ -76,6 +76,34 @@ fn publish_committed(
     );
 }
 
+/// Re-arms push's error dwell for a row already in Error: a failed Retry's rollback put that
+/// status back before the new worker's own startup error arrived, so the failure is new. Other
+/// consumers skip it ([`StatusChange::rearms_error`]).
+pub fn publish_new_failure(
+    status_tx: &tokio::sync::broadcast::Sender<StatusChange>,
+    inst: &crate::session::Instance,
+) {
+    publish(
+        status_tx,
+        StatusChange {
+            instance_id: inst.id.clone(),
+            instance_title: inst.title.clone(),
+            effective_profile: inst.effective_profile(),
+            old: Status::Error,
+            new: Status::Error,
+            at: Utc::now(),
+            restores_prior: false,
+        },
+    );
+}
+
+impl StatusChange {
+    /// Only [`publish_new_failure`] sends a change that moves nothing; it is for push alone.
+    pub fn rearms_error(&self) -> bool {
+        self.old == self.new
+    }
+}
+
 /// Logs then broadcasts; the log must not depend on a subscriber existing.
 pub fn publish(status_tx: &tokio::sync::broadcast::Sender<StatusChange>, change: StatusChange) {
     tracing::info!(
@@ -684,15 +712,36 @@ fn notification_matches_live_instance(
     )
 }
 
-/// Returns the `(instance_id, title, event)` notifications whose dwell has
-/// elapsed at `now`, and disarms those sessions. A session a foreground window
-/// already shows (`web_watch`) is skipped with its dwell still armed, so it
+/// A notification whose dwell elapsed, with what selecting it consumed.
+struct Due {
+    id: String,
+    title: String,
+    event: NotificationEvent,
+    since: std::time::Instant,
+    last_notified: Option<std::time::Instant>,
+}
+
+/// Puts back what `due` consumed: its dwell and the cooldown it started, as if never selected.
+fn put_back(dwell: &mut HashMap<String, DwellState>, due: Due) {
+    let Some(state) = dwell.get_mut(&due.id) else {
+        return;
+    };
+    state.last_notified = due.last_notified;
+    match due.event {
+        NotificationEvent::Waiting => state.waiting_since = Some(due.since),
+        NotificationEvent::Idle => state.idle_since = Some(due.since),
+        NotificationEvent::Error => state.error_since = Some(due.since),
+    }
+}
+
+/// The notifications whose dwell has elapsed at `now`, with those sessions disarmed. A session
+/// a foreground window already shows (`web_watch`) is skipped with its dwell still armed, so it
 /// fires once no window covers it.
 fn due_events(
     dwell: &mut HashMap<String, DwellState>,
     web_watch: &super::state::WebWatch,
     now: std::time::Instant,
-) -> Vec<(String, String, NotificationEvent)> {
+) -> Vec<Due> {
     let mut to_fire = Vec::new();
     for (id, state) in dwell.iter_mut() {
         if web_watch.covers(id) {
@@ -716,11 +765,16 @@ fn due_events(
             if now.duration_since(since).as_millis() < event.dwell_ms() as u128 {
                 continue;
             }
-            state.last_notified = Some(now);
+            to_fire.push(Due {
+                id: id.clone(),
+                title: state.title.clone(),
+                event,
+                since,
+                last_notified: state.last_notified.replace(now),
+            });
             state.waiting_since = None;
             state.idle_since = None;
             state.error_since = None;
-            to_fire.push((id.clone(), state.title.clone(), event));
             break;
         }
     }
@@ -779,7 +833,8 @@ async fn fire_due_pushes(
     let instances = app_state.instances.read().await.clone();
     let web_config = app_state.web_config.clone();
 
-    for (instance_id, instance_title, event) in to_fire {
+    for due in to_fire {
+        let (instance_id, instance_title, event) = (due.id.clone(), due.title.clone(), due.event);
         // If the instance vanished (externally deleted, tmux killed, storage file
         // hand-edited) between the dwell timer starting and firing, skip rather than
         // sending a notification that deep-links to a 404.
@@ -788,6 +843,11 @@ async fn fire_due_pushes(
             continue;
         };
         if !notification_matches_live_instance(event, instance) {
+            // The row moved on before its change reached this consumer, such as a Retry's
+            // Starting over an Error: the candidate stays pending so that change decides it.
+            if !instance.is_trashed() {
+                put_back(dwell, due);
+            }
             continue;
         }
         if !should_fire(event, &web_config, Some(instance)) {
@@ -1465,6 +1525,25 @@ pub async fn test(
     }))
 }
 
+/// Test-only: how many "errored" pushes `changes` send when the consumer ticks after each one,
+/// every tick past both the dwell and the cooldown.
+#[cfg(test)]
+pub(crate) fn errors_pushed(changes: impl IntoIterator<Item = StatusChange>) -> usize {
+    let watch = super::state::WebWatch::Nothing;
+    let start = std::time::Instant::now();
+    let mut dwell = HashMap::new();
+    let mut pushed = 0;
+    for (tick, change) in (1u32..).zip(changes) {
+        handle_status_change(&mut dwell, change);
+        let now = start + std::time::Duration::from_secs(3600) * tick;
+        pushed += due_events(&mut dwell, &watch, now)
+            .iter()
+            .filter(|due| due.event == NotificationEvent::Error)
+            .count();
+    }
+    pushed
+}
+
 #[cfg(test)]
 mod tests {
     #[test]
@@ -1858,14 +1937,16 @@ mod tests {
         let watch = crate::server::state::WebWatch::Nothing;
         let later = std::time::Instant::now() + std::time::Duration::from_secs(3600);
         // (statuses before the launch, whether the error already notified and its cooldown has
-        // passed, whether the Error is a rollback, notifications due)
+        // passed, whether a tick selected it but the live row was already Starting, whether the
+        // Error is a rollback, notifications due)
         let cases = [
-            (vec![Status::Running, Status::Error], true, true, 0),
-            (vec![Status::Running, Status::Error], false, true, 1),
-            (vec![Status::Stopped], false, true, 1),
-            (vec![Status::Running, Status::Error], true, false, 1),
+            (vec![Status::Running, Status::Error], true, false, true, 0),
+            (vec![Status::Running, Status::Error], false, false, true, 1),
+            (vec![Status::Running, Status::Error], false, true, true, 1),
+            (vec![Status::Stopped], false, false, true, 1),
+            (vec![Status::Running, Status::Error], true, false, false, 1),
         ];
-        for (before, notified, rollback, want) in cases {
+        for (before, notified, skipped, rollback, want) in cases {
             let mut dwell: HashMap<String, DwellState> = HashMap::new();
             for pair in before.windows(2) {
                 handle_status_change(&mut dwell, change(pair[0], pair[1], false));
@@ -1873,6 +1954,11 @@ mod tests {
             if notified {
                 assert_eq!(due_events(&mut dwell, &watch, later).len(), 1, "{before:?}");
                 dwell.get_mut("sess-5671").unwrap().last_notified = None;
+            }
+            if skipped {
+                let due = due_events(&mut dwell, &watch, later);
+                assert_eq!(due.len(), 1, "{before:?}");
+                due.into_iter().for_each(|due| put_back(&mut dwell, due));
             }
             let prior = *before.last().unwrap();
             handle_status_change(&mut dwell, change(prior, Status::Starting, false));
@@ -1884,7 +1970,7 @@ mod tests {
             assert_eq!(
                 due.len(),
                 want,
-                "{before:?} notified={notified} rollback={rollback}"
+                "{before:?} notified={notified} skipped={skipped} rollback={rollback}"
             );
         }
     }
@@ -1903,8 +1989,8 @@ mod tests {
             ("focused".to_string(), waiting("f")),
             ("other".to_string(), waiting("o")),
         ]);
-        let ids = |fired: Vec<(String, String, NotificationEvent)>| {
-            let mut ids: Vec<String> = fired.into_iter().map(|(id, ..)| id).collect();
+        let ids = |fired: Vec<Due>| {
+            let mut ids: Vec<String> = fired.into_iter().map(|due| due.id).collect();
             ids.sort();
             ids
         };

@@ -501,6 +501,16 @@ mod tests {
         assert_eq!(state.instances.read().await[0].group_path, "moved");
     }
 
+    /// A failed Retry leaves only its rolled-back owner, kept for the new worker's startup error.
+    fn rolled_back_only(state: &AppState) -> bool {
+        state
+            .retry_starting
+            .lock()
+            .unwrap()
+            .values()
+            .all(crate::server::acp_events::RetryAttempt::is_rolled_back)
+    }
+
     fn retry_request(
     ) -> Result<Json<worker::SpawnAcpRequest>, axum::extract::rejection::JsonRejection> {
         Ok(Json(worker::SpawnAcpRequest {
@@ -582,10 +592,7 @@ mod tests {
                 "{endpoint}"
             );
             assert_eq!(state.instances.read().await[0].status, Error, "{endpoint}");
-            assert!(
-                state.retry_starting.lock().unwrap().is_empty(),
-                "{endpoint}"
-            );
+            assert!(rolled_back_only(&state), "{endpoint}");
         }
     }
 
@@ -638,7 +645,7 @@ mod tests {
                     state.instances.read().await[0].status,
                     crate::session::Status::Error
                 );
-                assert!(state.retry_starting.lock().unwrap().is_empty());
+                assert!(rolled_back_only(&state));
             } else {
                 assert!(response.status().is_success(), "{}", response.status());
                 assert_ne!(
@@ -702,7 +709,7 @@ mod tests {
         drop(release);
         assert_eq!(restored, (Starting, Error));
         assert_eq!(state.instances.read().await[0].status, Error);
-        assert!(state.retry_starting.lock().unwrap().is_empty());
+        assert!(rolled_back_only(&state));
     }
 
     /// #4116: a peer archive committed while the `before_session` hook runs (after the handler's
