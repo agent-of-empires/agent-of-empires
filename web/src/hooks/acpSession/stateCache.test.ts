@@ -268,10 +268,13 @@ describe("pending queued rows", () => {
     lastSeq: 1,
     queuedPrompts: rows,
   });
-  const pendingIds = (id: string) =>
-    (
-      JSON.parse(localStorage.getItem(PENDING_KEY_PREFIX + id) ?? "null") as { rows: { id: string }[] } | null
-    )?.rows.map((r) => r.id);
+  const pendingKeys = (id: string) =>
+    Object.keys(localStorage)
+      .filter((k) => k.startsWith(`${PENDING_KEY_PREFIX}${id}:`))
+      .map((k) => k.slice(`${PENDING_KEY_PREFIX}${id}:`.length))
+      .sort();
+  const writeRow = (id: string, r: ReturnType<typeof row>) =>
+    localStorage.setItem(`${PENDING_KEY_PREFIX}${id}:${r.id}`, JSON.stringify({ savedAt: T, row: r }));
   const loadedIds = (id: string) => loadPersistedState(id)?.queuedPrompts.map((q) => q.id);
 
   beforeEach(() => {
@@ -283,40 +286,55 @@ describe("pending queued rows", () => {
     vi.useRealTimers();
   });
 
-  it("writes an enqueued row at once, with the throttled transcript write still pending", () => {
+  it("writes an enqueued row at once, and never into the throttled transcript", () => {
     cacheSet("pr-now", withRows(row("a")));
-    expect(pendingIds("pr-now")).toEqual(["a"]);
+    expect(pendingKeys("pr-now")).toEqual(["a"]);
     expect(localStorage.getItem(key("pr-now"))).toBeNull();
+    flushPersist("pr-now");
+    expect(JSON.parse(localStorage.getItem(key("pr-now"))!).state.queuedPrompts).toEqual([]);
   });
 
-  it("keeps the row when a stale snapshot without it flushes later, in either order and on a same-millisecond tie", () => {
-    // Order 1: this tab queues the row; another tab's older snapshot (same ms) lands afterwards.
+  it("loads pending rows with no transcript, as after an eviction", () => {
+    cacheSet("pr-evict", withRows(row("a")));
+    expect(localStorage.getItem(key("pr-evict"))).toBeNull();
+    expect(loadedIds("pr-evict")).toEqual(["a"]);
+    expect(loadPersistedState("pr-none")).toBeUndefined();
+  });
+
+  it("keeps the row when a stale snapshot without it is stored, in either order and on a same-millisecond tie", () => {
     cacheSet("pr-o1", withRows(row("a")));
     flushPersist("pr-o1");
     writeEntry("pr-o1", { ...withRows(), lastSeq: 1 }, T);
     expect(loadedIds("pr-o1")).toEqual(["a"]);
-    // Order 2: the stale snapshot is stored first, then this tab's newer one flushes on the tie.
     writeEntry("pr-o2", { ...withRows(), lastSeq: 1 }, T);
     cacheSet("pr-o2", withRows(row("a")));
     flushPersist("pr-o2");
     expect(loadedIds("pr-o2")).toEqual(["a"]);
   });
 
-  it("drops a confirmed or removed row from storage, keeping rows another tab added", () => {
-    cacheSet("pr-confirm", withRows(row("a")));
-    localStorage.setItem(PENDING_KEY_PREFIX + "pr-confirm", JSON.stringify({ savedAt: T, rows: [row("a"), row("b")] }));
-    cacheSet("pr-confirm", withRows(row("a", { pending: false })));
-    expect(pendingIds("pr-confirm")).toEqual(["b"]);
-    cacheSet("pr-solo", withRows(row("a")));
-    cacheSet("pr-solo", withRows());
-    expect(pendingIds("pr-solo")).toBeUndefined();
+  it("lets removal or confirmation win over a stale transcript that still lists the row", () => {
+    cacheSet("pr-gone", withRows(row("a")));
+    cacheSet("pr-gone", withRows());
+    expect(pendingKeys("pr-gone")).toEqual([]);
+    // A stale snapshot from before the removal is stored afterwards: it must not bring the row back.
+    persistState("pr-gone", withRows(row("a")), T);
+    expect(loadedIds("pr-gone")).toEqual([]);
   });
 
-  it("never stores attachment rows, and clearAcpCache removes the entry", () => {
+  it("does not let concurrent additions replace each other, and removes only the rows this tab removed", () => {
+    cacheSet("pr-tabs", withRows(row("a")));
+    writeRow("pr-tabs", row("b"));
+    cacheSet("pr-tabs", withRows(row("a"), row("c")));
+    expect(pendingKeys("pr-tabs")).toEqual(["a", "b", "c"]);
+    cacheSet("pr-tabs", withRows(row("a", { pending: false }), row("c")));
+    expect(pendingKeys("pr-tabs")).toEqual(["b", "c"]);
+  });
+
+  it("never stores attachment rows, and clearAcpCache removes the entries", () => {
     cacheSet("pr-att", withRows(row("a", { attachments: [{ name: "x" }] }), row("b")));
-    expect(pendingIds("pr-att")).toEqual(["b"]);
+    expect(pendingKeys("pr-att")).toEqual(["b"]);
     clearAcpCache("pr-att");
-    expect(pendingIds("pr-att")).toBeUndefined();
+    expect(pendingKeys("pr-att")).toEqual([]);
   });
 });
 

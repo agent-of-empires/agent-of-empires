@@ -93,30 +93,30 @@ function toPersistedState(state: AcpState): AcpState {
           retriedError: null,
         }
       : state;
-  if (!base.queuedPrompts.some((q) => q.attachments?.length)) return base;
-  return { ...base, queuedPrompts: base.queuedPrompts.filter((q) => !q.attachments?.length) };
+  if (!base.queuedPrompts.some((q) => q.pending || q.attachments?.length)) return base;
+  return { ...base, queuedPrompts: base.queuedPrompts.filter((q) => !q.pending && !q.attachments?.length) };
 }
 
-// Unconfirmed queued prompts are the only retry copy, so they live apart from the throttled transcript
-// entry: written at once, and merged by id so a stale transcript snapshot cannot erase them.
+// An unconfirmed queued prompt is the only retry copy. Each lives in its own entry, written at once and never
+// part of the throttled transcript, so a stale snapshot or a concurrent tab can neither erase nor resurrect it.
 interface PendingEntry {
   savedAt: number;
-  rows: QueuedPrompt[];
+  row: QueuedPrompt;
 }
 
-function pendingKey(sessionId: string): string {
-  return PENDING_KEY_PREFIX + sessionId;
-}
+const pendingPrefix = (sessionId: string) => `${PENDING_KEY_PREFIX}${sessionId}:`;
 
 function readPendingRows(sessionId: string): QueuedPrompt[] {
+  const rows: QueuedPrompt[] = [];
   try {
-    const raw = window.localStorage.getItem(pendingKey(sessionId));
-    const parsed = raw === null ? null : (JSON.parse(raw) as PendingEntry | null);
-    if (!parsed || !Array.isArray(parsed.rows) || Date.now() - parsed.savedAt > STATE_TTL_MS) return [];
-    return parsed.rows;
+    for (const k of keysWithPrefix(pendingPrefix(sessionId))) {
+      const parsed = JSON.parse(window.localStorage.getItem(k) ?? "null") as PendingEntry | null;
+      if (parsed?.row && Date.now() - parsed.savedAt <= STATE_TTL_MS) rows.push(parsed.row);
+    }
   } catch {
-    return [];
+    // Storage unavailable or corrupt.
   }
+  return rows.sort((a, b) => a.queuedAt.localeCompare(b.queuedAt));
 }
 
 // Rows with attachments are never persisted: their bytes would blow the quota.
@@ -134,18 +134,21 @@ function syncPendingRows(sessionId: string, state: AcpState): void {
   const before = lastPendingIds.get(sessionId) ?? new Set<string>();
   if (ids.size === before.size && [...ids].every((id) => before.has(id))) return;
   lastPendingIds.set(sessionId, ids);
-  const kept = readPendingRows(sessionId).filter((q) => ids.has(q.id) || !before.has(q.id));
-  const merged = [...kept.filter((q) => !ids.has(q.id)), ...rows];
   try {
-    if (merged.length === 0) window.localStorage.removeItem(pendingKey(sessionId));
-    else
-      safeSetItem(pendingKey(sessionId), JSON.stringify({ savedAt: Date.now(), rows: merged } satisfies PendingEntry));
+    for (const id of before) if (!ids.has(id)) window.localStorage.removeItem(pendingPrefix(sessionId) + id);
+    for (const row of rows) {
+      if (before.has(row.id)) continue;
+      safeSetItem(
+        pendingPrefix(sessionId) + row.id,
+        JSON.stringify({ savedAt: Date.now(), row } satisfies PendingEntry),
+      );
+    }
   } catch {
     // Storage unavailable.
   }
 }
 
-/** Stored pending rows the state lacks, so a stale snapshot never drops a retry copy. */
+/** The state with its unconfirmed rows taken from their own entries; the stored list never carries pending rows. */
 function withStoredPendingRows(sessionId: string, state: AcpState): AcpState {
   const known = new Set(state.queuedPrompts.map((q) => q.id));
   const missing = readPendingRows(sessionId).filter((q) => !known.has(q.id));
@@ -170,19 +173,24 @@ export function loadPersistedState(sessionId: string): AcpState | undefined {
   if (typeof window === "undefined") return undefined;
   try {
     const parsed = parseEntry(window.localStorage.getItem(storageKey(sessionId)));
-    if (!parsed || typeof parsed.state !== "object" || parsed.state === null) return undefined;
-    const state = parsed.state as Partial<AcpState>;
-    if (
-      Date.now() - parsed.savedAt > STATE_TTL_MS ||
-      typeof state.lastSeq !== "number" ||
-      !Array.isArray(state.activity) ||
-      !Array.isArray(state.queuedPrompts)
-    ) {
-      window.localStorage.removeItem(storageKey(sessionId));
-      return undefined;
+    let base: AcpState | undefined;
+    if (parsed && typeof parsed.state === "object" && parsed.state !== null) {
+      const state = parsed.state as Partial<AcpState>;
+      if (
+        Date.now() - parsed.savedAt > STATE_TTL_MS ||
+        typeof state.lastSeq !== "number" ||
+        !Array.isArray(state.activity) ||
+        !Array.isArray(state.queuedPrompts)
+      ) {
+        window.localStorage.removeItem(storageKey(sessionId));
+      } else {
+        // Merge over defaults so entries from an older bundle gain newly added fields.
+        base = { ...emptyAcpState(), ...(state as AcpState) };
+      }
     }
-    // Merge over defaults so entries from an older bundle gain newly added fields.
-    const loaded = withStoredPendingRows(sessionId, { ...emptyAcpState(), ...(state as AcpState) });
+    // Unconfirmed rows outlive a missing or evicted transcript.
+    const loaded = withStoredPendingRows(sessionId, base ?? emptyAcpState());
+    if (!base && loaded.queuedPrompts.length === 0) return undefined;
     if (!lastPendingIds.has(sessionId)) lastPendingIds.set(sessionId, new Set(pendingRowsOf(loaded).map((q) => q.id)));
     return reopenState(normaliseTurnState(loaded));
   } catch {
@@ -372,6 +380,6 @@ export function clearAcpCache(sessionId?: string): void {
   } else {
     stateCache.delete(sessionId);
     lastPendingIds.delete(sessionId);
-    removePersisted(() => [storageKey(sessionId), pendingKey(sessionId)]);
+    removePersisted(() => [storageKey(sessionId), ...keysWithPrefix(pendingPrefix(sessionId))]);
   }
 }
