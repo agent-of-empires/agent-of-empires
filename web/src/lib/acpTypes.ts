@@ -883,9 +883,9 @@ export interface ActivityRow {
   at: string; // ISO-8601
 }
 
-/** Wire mirror of the Rust `TranscriptRow` (src/acp/transcript.rs). */
 export type PromptOrigin = "dashboard" | "tui" | "cli" | "mcp" | "plugin" | "aoe" | "unknown";
 
+/** Wire mirror of the Rust `TranscriptRow` (src/acp/transcript.rs). */
 export interface TranscriptRow {
   id: string;
   group_id: string;
