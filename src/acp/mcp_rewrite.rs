@@ -523,7 +523,14 @@ pub fn parse_edit(value: Value, serving_plugin: Option<&str>) -> Result<McpEdit,
         || value
             .get("add")
             .and_then(Value::as_array)
-            .is_some_and(|add| add.iter().any(|entry| !entry.is_object()));
+            .is_some_and(|add| {
+                add.iter().any(|entry| {
+                    !entry.is_object()
+                        || entry
+                            .get("serve")
+                            .is_some_and(|serve| !serve.is_null() && !serve.is_object())
+                })
+            });
     if not_objects {
         return Err("response does not match the mcp.rewrite schema (not an object)".into());
     }
@@ -1446,6 +1453,24 @@ mod tests {
         ];
         for (label, v) in cases {
             assert!(parse_edit(v, None).is_err(), "{label} must be rejected");
+        }
+    }
+
+    /// `serve` is a struct too, so `[false]` must not read as `{"prefix": false}`.
+    #[test]
+    fn parse_edit_rejects_a_positional_serve_value() {
+        for serve in [
+            json!([]),
+            json!([false]),
+            json!([true]),
+            json!("x"),
+            json!(1),
+        ] {
+            let edit = json!({"add": [{"name": "x", "serve": serve}]});
+            assert!(
+                parse_edit(edit, Some("acme.a")).is_err(),
+                "{serve} must be rejected"
+            );
         }
     }
 

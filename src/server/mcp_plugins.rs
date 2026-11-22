@@ -1315,6 +1315,13 @@ mod tests {
                 "malformed",
                 Box::new(|| Ok(json!({"tools": "worker-secret", "content": "worker-secret"}))),
             ),
+            // A derived decoder reads a sequence by position.
+            ("empty array", Box::new(|| Ok(json!([])))),
+            ("positional list", Box::new(|| Ok(json!([[]])))),
+            (
+                "positional call",
+                Box::new(|| Ok(json!([[{"type": "text", "text": "worker-secret"}]]))),
+            ),
         ];
         for (label, reply) in cases {
             let reply = Arc::new(reply);

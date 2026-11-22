@@ -53,6 +53,21 @@ pub fn hooks_for<'a>(
     hooks
 }
 
+/// Whether a session of this kind has a plugin that is sent the sandbox layout.
+fn wants_layout<'a>(
+    manifests: impl Iterator<Item = (&'a PluginManifest, &'a str)>,
+    sandboxed: bool,
+) -> bool {
+    let manifests: Vec<_> = manifests.collect();
+    !hooks_for(manifests.iter().copied(), sandboxed).is_empty()
+        || manifests.iter().any(|(m, _)| {
+            m.runtime.is_some()
+                && m.capabilities
+                    .iter()
+                    .any(|c| c.as_str() == MCP_SERVE_CAPABILITY)
+        })
+}
+
 pub async fn run_chain(
     caller: &dyn WorkerCall,
     hooks: &[RewriteHook],
@@ -186,13 +201,12 @@ impl McpRewriter for PluginMcpRewriter {
 
     fn applies(&self, sandboxed: bool) -> bool {
         let registry = crate::plugin::registry();
-        !hooks_for(
+        wants_layout(
             registry
                 .active()
                 .map(|p| (&p.manifest, p.manifest_hash.as_str())),
             sandboxed,
         )
-        .is_empty()
     }
 
     fn served_servers<'a>(
@@ -254,6 +268,29 @@ mod tests {
 
     fn ids(hooks: &[RewriteHook]) -> Vec<&str> {
         hooks.iter().map(|h| h.plugin_id.as_str()).collect()
+    }
+
+    /// The sandbox layout also goes to `mcp.serve` workers, so a serving plugin needs it
+    /// resolved even without a rewrite hook.
+    #[test]
+    fn the_layout_is_wanted_for_a_hook_or_a_serving_plugin() {
+        let serving = PluginManifest::from_toml_str(
+            "id = \"acme.s\"\nname = \"N\"\nversion = \"1.0.0\"\napi_version = 24\ncapabilities = [\"runtime.worker\", \"mcp.serve\"]\n\n[runtime]\nkind = \"command\"\ncommand = [\"bin/w\"]\n",
+        )
+        .unwrap();
+        let hooked = manifest("acme.h", "sandbox", true, true);
+        let plain = manifest("acme.p", "sandbox", false, false);
+        let wanted = |ms: &[&PluginManifest], sandboxed| {
+            wants_layout(ms.iter().map(|m| (*m, "sha256:h")), sandboxed)
+        };
+        assert!(!wanted(&[&plain], true));
+        assert!(!wanted(&[], true));
+        assert!(wanted(&[&plain, &hooked], true));
+        assert!(
+            !wanted(&[&hooked], false),
+            "a sandbox-scoped hook skips plain sessions"
+        );
+        assert!(wanted(&[&plain, &serving], true));
     }
 
     #[test]
