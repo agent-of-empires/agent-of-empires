@@ -5864,11 +5864,13 @@ fn public_create_session_error_forwards_typed_causes_as_fixed_templates() {
             anyhow::Error::new(crate::server::session_spawn::ImageUpdateFailed {
                 image: "ghcr.io/acme/sandbox:1".into(),
                 detail: format!("denied: token {SECRET} at /root/.docker/config.json"),
-                cancelled: false,
+                failure: crate::server::session_spawn::UpdateFailure::Pull(
+                    crate::containers::image_pull::PullFailureReason::Auth,
+                ),
             }),
             (
                 "sandbox_image_update_failed",
-                "Couldn't pull the latest Sandbox image ghcr.io/acme/sandbox:1.".into(),
+                "Couldn't download the sandbox image: the registry needs you to sign in.".into(),
             ),
         ),
         (
@@ -5876,7 +5878,7 @@ fn public_create_session_error_forwards_typed_causes_as_fixed_templates() {
             anyhow::Error::new(crate::server::session_spawn::ImageUpdateFailed {
                 image: "ghcr.io/acme/sandbox:1".into(),
                 detail: String::new(),
-                cancelled: true,
+                failure: crate::server::session_spawn::UpdateFailure::Cancelled,
             }),
             (
                 "sandbox_image_update_failed",
@@ -10573,20 +10575,21 @@ async fn post_create_raw(
 fn only_a_local_owner_sees_why_the_latest_image_pull_failed() {
     let error = anyhow::Error::new(crate::server::session_spawn::ImageUpdateFailed {
         image: "img:1".into(),
-        detail: "manifest unknown".into(),
-        cancelled: false,
+        detail: "dial tcp: lookup ghcr.io: no such host".into(),
+        failure: crate::server::session_spawn::UpdateFailure::Pull(
+            crate::containers::image_pull::PullFailureReason::Network,
+        ),
     });
     let stage = crate::server::create_progress::CreateStage::PullingImage;
     let public = create_failure(&error, stage, "ref").unwrap();
-    assert_eq!(
-        public.message,
-        "Couldn't pull the latest Sandbox image img:1."
-    );
+    // The banner's wording for everyone; the runtime's output only for a local owner.
+    let why = "Couldn't download the sandbox image: no network connection.";
+    assert_eq!(public.message, why);
     for (local_owner, message) in [
-        (false, "Couldn't pull the latest Sandbox image img:1."),
+        (false, why.to_string()),
         (
             true,
-            "Couldn't pull the latest Sandbox image img:1. manifest unknown",
+            format!("{why} dial tcp: lookup ghcr.io: no such host"),
         ),
     ] {
         let shown = with_local_pull_detail(public.clone(), &error, local_owner);
@@ -11147,11 +11150,15 @@ fn the_failure_log_names_a_context_wrapped_cause() {
 #[tokio::test]
 async fn a_create_whose_shared_pull_was_cancelled_is_not_replayed() {
     use crate::containers::error::DockerError;
-    use crate::server::session_spawn::ImageUpdateFailed;
+    use crate::server::session_spawn::{ImageUpdateFailed, UpdateFailure};
     let failed = |cancelled| ImageUpdateFailed {
         image: "img".into(),
         detail: String::new(),
-        cancelled,
+        failure: if cancelled {
+            UpdateFailure::Cancelled
+        } else {
+            UpdateFailure::Pull(crate::containers::image_pull::PullFailureReason::Other)
+        },
     };
     let cases: Vec<(&str, anyhow::Error, bool)> = vec![
         ("latest pull cancelled", failed(true).into(), false),
