@@ -797,6 +797,16 @@ fn group_bounds(groups: &[Option<String>], group: &str) -> Option<(usize, usize)
     Some((start, start + len))
 }
 
+/// Last row of `[start, end)` with text, since an identity can end on the blank
+/// separator that follows it. Anchoring on that blank pushes the identity's own
+/// content off the top when the rows below it fill the pane.
+fn last_content_row(lines: &[Line<'static>], start: usize, end: usize) -> usize {
+    (start..end)
+        .rev()
+        .find(|&row| !line_text(&lines[row]).trim().is_empty())
+        .unwrap_or(end.saturating_sub(1))
+}
+
 /// Row index of the identity the reader anchored on, found by identity rather
 /// than by text, since identical replies either side of the row they were
 /// reading are the same text. `first` hints the fallback search.
@@ -817,7 +827,7 @@ fn anchored_offset(
             .map(|(offset, _)| start + offset)
             .min_by_key(|index| index.abs_diff(expected))
             .unwrap_or(expected)
-            .min(end.saturating_sub(1));
+            .min(last_content_row(lines, start, end));
         return u16::try_from(row).ok();
     }
     // The projection no longer holds that identity (a windowed row, say): fall
@@ -3444,6 +3454,53 @@ mod tests {
             rows_after[after.text_area.y as usize..].to_vec(),
             visible_before,
             "expanding the thought leaves the reader's pane as it was"
+        );
+    }
+
+    /// Collapsing a thought the reader was inside has to keep its preview on
+    /// screen. Its group ends on a blank separator, so anchoring there with
+    /// later replies filling the pane drops the preview above the viewport.
+    #[test]
+    fn collapsing_a_thought_keeps_its_preview_visible() {
+        let thought = |text: &str, id: &str| Event::AgentThoughtChunk {
+            text: text.into(),
+            message_id: Some(id.into()),
+        };
+        let mut state = test_state();
+        let body = (0..10)
+            .map(|line| format!("thought line {line}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let mut events = vec![thought(&body, "t-a")];
+        for index in 0..20 {
+            events.push(Event::AgentMessageChunk {
+                text: format!("reply number {index}"),
+                message_id: Some(format!("m-{index}")),
+            });
+        }
+        state.transcript.server_rows = server_rows(&events);
+        state.show_full_thinking = true;
+
+        let row_at = |state: &StructuredViewState, offset: u16| {
+            state.scroll_offset.set(offset);
+            let geometry = render_geometry(state, 60, 20);
+            let rows = render_rows(state, 60, 20, true);
+            rows[geometry.text_area.y as usize].trim().to_string()
+        };
+        let offset = (1..20u16)
+            .find(|offset| row_at(&state, *offset).starts_with("thought line"))
+            .expect("fixture puts the pane inside the expanded thought");
+        state.scroll_offset.set(offset);
+        state.anchor_scroll_to_top_line();
+
+        state.show_full_thinking = false;
+        let geometry = render_geometry(&state, 60, 20);
+        let rows = render_rows(&state, 60, 20, true);
+        assert!(
+            rows[geometry.text_area.y as usize..]
+                .iter()
+                .any(|row| row.contains("Thinking")),
+            "the collapsed preview stays visible: {rows:?}"
         );
     }
 
