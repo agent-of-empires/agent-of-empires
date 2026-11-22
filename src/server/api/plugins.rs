@@ -557,6 +557,8 @@ pub async fn invoke_plugin_action(
             serde_json::Value::Null => params = json!({ "session_id": sid }),
             _ => {}
         }
+    } else if let serde_json::Value::Object(map) = &mut params {
+        map.remove("session_id");
     }
     tracing::debug!(target: "plugin.host", plugin = %id, method = %body.method, principal = ?principal.as_ref().map(|p| &p.0), "forwarding plugin action");
     if !stamp_origin(&mut params, principal.as_ref().map(|p| &p.0)) {
