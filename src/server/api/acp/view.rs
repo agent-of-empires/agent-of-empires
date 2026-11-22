@@ -4398,7 +4398,7 @@ mod tests {
                 false,
             ),
             ("claude", "claude", None, None, false, true, None, false),
-            // The caller passes a custom tool's `agent_execution_as` identity.
+            // `claude-code` pairs with the claude identity like `claude` does.
             (
                 "claude",
                 "claude-code",
