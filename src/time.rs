@@ -68,8 +68,13 @@ impl Timestamp {
         });
         let dt = match signed {
             Some((year, tail)) => {
-                // 2000 is a leap year, so Feb 29 is checked against `year` below.
+                // 2000 is a leap year, so the day is checked against `year` below.
                 let dt = parse_offset(&format!("2000{tail}"))?;
+                if !(-262_143..=262_142).contains(&year)
+                    || dt.day() > ::time::util::days_in_month(dt.month(), year)
+                {
+                    return Err(ParseError::OutOfRange);
+                }
                 // Clamp chrono values outside our range so stored records still load.
                 if year > 9999 {
                     return Ok(Self::MAX);
@@ -512,7 +517,14 @@ mod tests {
         assert!(Timestamp::parse_rfc3339("2024-01-02T03:04:05").is_err());
         assert!(Timestamp::parse_rfc3339("9999-12-31T23:59:59-01:00").is_err());
         assert!(Timestamp::parse_rfc3339("2024-01-02T03:04:05+000").is_err());
-        for bad in ["-0001-02-29T00:00:00Z", "+", "-x-01-01T00:00:00Z", "+57000"] {
+        for bad in [
+            "-0001-02-29T00:00:00Z",
+            "+57001-02-29T00:00:00Z",
+            "+262143-01-01T00:00:00Z",
+            "+",
+            "-x-01-01T00:00:00Z",
+            "+57000",
+        ] {
             assert!(Timestamp::parse_rfc3339(bad).is_err(), "{bad}");
         }
 
