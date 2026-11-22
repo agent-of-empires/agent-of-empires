@@ -148,7 +148,7 @@ def bench_list(bench, runs):
 
 def bench_stop(bench, runs):
     added = bench.aoe_cmd(
-        "add", str(bench.project), "-t", "sandboxed", "--cmd", AGENT_CMD, "--sandbox", "--launch"
+        "add", str(bench.project), "-t", "sandboxed", "--cmd", AGENT_CMD, "--sandbox"
     )
     bench.sandbox_id = re.search(r"^\s*ID:\s*(\S+)", added.stdout, re.M).group(1)
     samples = []
