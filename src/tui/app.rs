@@ -2599,6 +2599,15 @@ impl App {
                 .as_mut()
                 .expect("checked above");
             let mut failure = None;
+            // A refused send is back in the composer and had its own Enter, so
+            // it becomes the next segment: pasting the one after it onto that
+            // text would submit both as one prompt.
+            if view.last_submit_rejected() {
+                let restored = view.take_restored_prompt();
+                if !restored.is_empty() {
+                    unsent.insert(0, restored);
+                }
+            }
             // Each segment was frozen when its Enter fell, so replaying them in
             // order submits exactly what the user had typed before each Enter.
             while let Some(segment) = unsent.first().cloned() {
@@ -4119,6 +4128,31 @@ mod tests {
                 .as_deref(),
             Some("second"),
             "the later segment waits for the next mount instead of riding along"
+        );
+
+        // Reopening the retained view starts the drain again, where the refused
+        // "first" is back in the composer. It has to go out as its own prompt
+        // rather than take "second" with it.
+        app.open_structured_view(&id).await.unwrap();
+        let view = app
+            .home
+            .structured_preview
+            .as_ref()
+            .expect("the retained view is still on screen");
+        assert_eq!(
+            view.submitted_prompts(),
+            ["first".to_string(), "first".to_string()],
+            "the restored prompt is retried alone, never joined with the next one"
+        );
+        assert_eq!(view.composer_text(), "first");
+        assert_eq!(
+            app.home
+                .pending_paste_for_structured_view
+                .get(&id)
+                .map(PendingStructuredInput::text)
+                .as_deref(),
+            Some("second"),
+            "the later segment still waits on its own"
         );
     }
 

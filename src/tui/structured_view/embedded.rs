@@ -479,6 +479,12 @@ impl EmbeddedView {
         self.state.composer.lines().join("\n")
     }
 
+    /// Take the prompt a refused send restored to the composer, so the replay
+    /// submits it on its own Enter instead of appending the next segment to it.
+    pub(crate) fn take_restored_prompt(&mut self) -> String {
+        self.state.take_composer_text()
+    }
+
     /// The session this view is streaming.
     pub fn session_id(&self) -> &str {
         &self.state.session_id
