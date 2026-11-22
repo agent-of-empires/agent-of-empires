@@ -3933,7 +3933,7 @@ impl HomeView {
         // agent_name or the tool. See #2252.
         let keeps_context = self.get_instance(&id).is_some_and(|inst| {
             let acp_agent = inst.agent_name.as_deref().unwrap_or(&inst.tool);
-            crate::agents::acp_transcript_cli_resumable(&inst.tool, acp_agent)
+            inst.acp_transcript_cli_resumable(acp_agent)
         });
         let (title, body) = if to_structured && keeps_context {
             (

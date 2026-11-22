@@ -192,8 +192,7 @@ pub(super) fn session_response_from_instance_with_plan(
         structured_view_off: false,
         // Same agent resolution as `acp_agent` above; computed once here so
         // the web dashboard and native TUI stop mirroring the gate.
-        keeps_context: crate::agents::acp_transcript_cli_resumable(
-            &inst.tool,
+        keeps_context: inst.acp_transcript_cli_resumable(
             inst.agent_name
                 .as_deref()
                 .filter(|s| !s.is_empty())

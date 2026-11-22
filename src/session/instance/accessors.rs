@@ -221,6 +221,25 @@ impl Instance {
         self.execution_agent().ok()
     }
 
+    /// Whether structured view can carry this terminal transcript to `acp_agent`.
+    /// Resolves config only for a non-claude tool paired with a claude agent.
+    pub(crate) fn acp_transcript_cli_resumable(&self, acp_agent: &str) -> bool {
+        crate::agents::acp_transcript_cli_resumable(
+            &self.execution_identity_name(acp_agent),
+            acp_agent,
+        )
+    }
+
+    /// Name of the native agent this session executes as, so a custom tool with
+    /// `agent_execution_as = "claude"` counts as claude. Falls back to the tool.
+    pub(crate) fn execution_identity_name(&self, acp_agent: &str) -> String {
+        if self.tool == "claude" || !matches!(acp_agent, "claude" | "claude-code") {
+            return self.tool.clone();
+        }
+        self.resolved_agent()
+            .map_or_else(|| self.tool.clone(), |agent| agent.name.to_string())
+    }
+
     pub(crate) fn declared_agent(&self) -> Option<crate::plugin::agent_integration::DeclaredAgent> {
         if crate::agents::get_agent(&self.tool).is_some() {
             return None;
@@ -1051,6 +1070,26 @@ pub(crate) fn resolved_agent_for(
 mod tests {
     use super::*;
     use crate::session::instance::test_helpers::*;
+
+    /// A custom tool resumes a terminal transcript only when it declares it
+    /// executes as claude (#5938).
+    #[test]
+    #[serial_test::serial]
+    fn custom_tool_executing_as_claude_is_transcript_resumable() {
+        let home = tempfile::tempdir().unwrap();
+        let _isolation = crate::session::test_support::isolate_app_dir_at(home.path());
+        const PROFILE: &str = "custom-claude-resumable-test";
+        let mut inst = Instance::new("custom", "/tmp/custom-claude");
+        inst.source_profile = PROFILE.to_string();
+        inst.tool = "corp-claude".to_string();
+        inst.command = "corp-wrapper --serve".to_string();
+        assert!(!inst.acp_transcript_cli_resumable("claude"));
+
+        declare_execution_aliases(PROFILE, &[("corp-claude", "claude")], home.path());
+        assert!(inst.acp_transcript_cli_resumable("claude"));
+        assert!(inst.acp_transcript_cli_resumable("claude-code"));
+        assert!(!inst.acp_transcript_cli_resumable("codex"));
+    }
 
     /// A session stored with the fallback's own command keeps its capture after
     /// an approved declaration takes over the OMP listing.

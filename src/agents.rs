@@ -1597,8 +1597,9 @@ pub fn terminal_tool_for_acp_agent(agent: &str) -> Option<&'static str> {
 }
 
 /// Only claude qualifies: claude-agent-acp's session id is the id `claude --resume` reads.
-pub fn acp_transcript_cli_resumable(tool: &str, acp_agent: &str) -> bool {
-    tool == "claude" && matches!(acp_agent, "claude" | "claude-code")
+/// `execution_agent` is the native identity the session runs as, not its tool name.
+pub fn acp_transcript_cli_resumable(execution_agent: &str, acp_agent: &str) -> bool {
+    execution_agent == "claude" && matches!(acp_agent, "claude" | "claude-code")
 }
 
 fn configured_status_map<'a>(
