@@ -282,8 +282,9 @@ async fn acquire_local_read(
     ))
 }
 
-/// An unreachable update endpoint must not delay a table that is already rendered.
-const UPDATE_NOTICE_BUDGET: std::time::Duration = std::time::Duration::from_millis(300);
+/// Long enough for a healthy update check (about 0.3 to 0.6 s) to finish and refresh
+/// its cache; a hung endpoint costs this instead of the client's 5 s timeouts.
+const UPDATE_NOTICE_BUDGET: std::time::Duration = std::time::Duration::from_secs(2);
 
 async fn bounded_notice(
     budget: std::time::Duration,
