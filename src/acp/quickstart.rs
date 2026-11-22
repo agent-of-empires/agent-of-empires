@@ -418,5 +418,16 @@ mod tests {
         // A blank value is not a credential.
         let blank_env = |name: &str| (name == "OTARI_API_KEY").then(|| "  ".to_string());
         assert_eq!(Detection::detect(None, &blank_env).gateway_credential, None);
+        // An `OTARI_BASE_URL` with no key beside a complete OpenAI pair is that
+        // pair, which is the rule the adapter reads too.
+        let mixed_env = |name: &str| match name {
+            "OTARI_BASE_URL" => Some("https://otari.example/v1".to_string()),
+            "OPENAI_API_KEY" | "OPENAI_BASE_URL" => Some("set".to_string()),
+            _ => None,
+        };
+        assert_eq!(
+            Detection::detect(None, &mixed_env).gateway_credential,
+            Some(GatewayCredential::Gateway)
+        );
     }
 }

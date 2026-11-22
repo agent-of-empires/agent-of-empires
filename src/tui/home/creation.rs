@@ -135,12 +135,13 @@ impl HomeView {
         }
         self.new_dialog = None;
 
-        // The first-run wizard's agent choice only applies to a Structured
-        // session: a Terminal one runs the tool, not an ACP agent.
-        let agent_name = self
-            .first_session_agent
-            .clone()
-            .filter(|_| request.data.structured);
+        // The dialog owns the tool, so the ACP agent is the one it submitted.
+        // The wizard's agent only seeded that dialog's initial default.
+        let agent_name = request
+            .data
+            .structured
+            .then(|| request.data.tool.clone())
+            .filter(|tool| tool == crate::acp::quickstart::BUNDLED_AGENT);
         let mut body = wizard_create_body(
             &request.data,
             request.trust_hooks,

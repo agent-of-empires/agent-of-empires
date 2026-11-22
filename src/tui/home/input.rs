@@ -76,14 +76,23 @@ impl HomeView {
             .with_tool(crate::acp::quickstart::BUNDLED_AGENT)
     }
 
-    /// Hold the wizard's Structured agent for the session it creates. No
-    /// terminal tool maps to the bundled agent, so without this the first
-    /// session would run whatever agent the default tool resolves to.
+    /// Hold the wizard's Structured agent as the new-session dialog's default
+    /// tool. No terminal tool maps to the bundled agent, so without it the first
+    /// session would open on whatever tool the config defaults to.
     fn remember_first_session_agent(&mut self, outcome: &IntroOutcome) {
         self.first_session_agent = outcome
             .acp_default_agent
             .clone()
             .filter(|agent| agent == crate::acp::quickstart::BUNDLED_AGENT);
+    }
+}
+
+/// Open the new-session dialog on the wizard's agent. It is a default, not an
+/// override: the tool the dialog submits is the one the session runs, so a
+/// choice made there wins.
+fn seed_wizard_agent(agent: Option<&str>, dialog: &mut NewSessionDialog) {
+    if let Some(agent) = agent {
+        dialog.set_tool(agent);
     }
 }
 
@@ -3747,6 +3756,7 @@ impl HomeView {
                 &current_profile,
                 profiles,
             );
+            seed_wizard_agent(self.first_session_agent.as_deref(), &mut dialog);
             let has_prefilled_path = prefill_path.is_some();
             if let Some(path) = prefill_path {
                 dialog.set_path(path);
@@ -5865,12 +5875,14 @@ impl HomeView {
         let current_profile = self.config_profile();
         let profiles =
             list_profiles_for_display().unwrap_or_else(|_| vec![current_profile.clone()]);
-        self.new_dialog = Some(NewSessionDialog::new(
+        let mut dialog = NewSessionDialog::new(
             self.dialog_tools(),
             existing_groups,
             &current_profile,
             profiles,
-        ));
+        );
+        seed_wizard_agent(self.first_session_agent.as_deref(), &mut dialog);
+        self.new_dialog = Some(dialog);
     }
 
     /// Open the tips overlay from `crate::tips`, shared by the palette, the `?` screen

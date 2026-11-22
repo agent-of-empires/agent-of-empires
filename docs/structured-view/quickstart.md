@@ -98,8 +98,10 @@ reach the adapter. The forms, all still supported:
 
 An `openai-compatible:` id keeps everything after the prefix as the request's `model`, so
 vendor-namespaced gateway ids need no rewriting. The endpoint and key come from the same
-pair: `OTARI_BASE_URL` and `OTARI_API_KEY` when either is set, else `OPENAI_BASE_URL` with
-`OPENAI_API_KEY` for a gateway you already run, else Otari. Both are per adapter, not per
+pair, chosen by its key: `OTARI_API_KEY` (with `OTARI_BASE_URL` if you set one) else
+`OPENAI_BASE_URL` with `OPENAI_API_KEY` for a gateway you already run, else Otari's root with
+a missing key reported. `aoe setup` detects by that rule too, so a lone `OTARI_BASE_URL`
+beside a complete OpenAI pair leaves the pair in charge. Both are per adapter, not per
 session, so they are environment, not settings.
 
 `aoe setup` and the first-run wizard therefore save an Otari model for `aoe-agent` when only

@@ -101,7 +101,7 @@ pub async fn run(args: SetupArgs) -> Result<()> {
         install_failed = !adapter_ready;
     }
 
-    let mut written: Vec<(&'static str, String, String)> = Vec::new();
+    let mut written: Vec<(&'static str, String, Undo)> = Vec::new();
     let result = crate::session::config::update_config(|config| {
         let changes = quickstart::changes(&config.acp, &plan, args.agent.is_some());
         if let Some(agent) = changes.default_agent {
@@ -114,14 +114,14 @@ pub async fn run(args: SetupArgs) -> Result<()> {
                 previous
             };
             config.acp.default_agent = agent.clone();
-            written.push(("acp.default_agent", agent, previous));
+            written.push(("acp.default_agent", agent, Undo::Value(previous)));
         }
         if changes.structured_view {
             config.acp.structured_view = StructuredView::Structured;
             written.push((
                 "acp.structured_view",
                 "structured".to_string(),
-                "auto".to_string(),
+                Undo::Value("auto".to_string()),
             ));
         }
         if let Some(model) = changes.model {
@@ -131,11 +131,7 @@ pub async fn run(args: SetupArgs) -> Result<()> {
                 .entry(quickstart::BUNDLED_AGENT.to_string())
                 .or_default()
                 .model = Some(model.clone());
-            written.push((
-                "acp.acp_defaults.aoe-agent.model",
-                model,
-                "(unset)".to_string(),
-            ));
+            written.push(("acp.acp_defaults.aoe-agent.model", model, Undo::Remove));
         }
     });
     let write_error = match result {
@@ -155,7 +151,7 @@ pub async fn run(args: SetupArgs) -> Result<()> {
             println!("Configured in {}:", crate::session::config_path_display());
             for (key, value, undo) in &written {
                 println!("  {key} = \"{value}\"");
-                println!("    undo: set {key} = \"{undo}\" in that file");
+                println!("{}", undo_instruction(key, undo));
             }
         }
     }
@@ -267,4 +263,44 @@ fn print_otari_guidance() {
     println!("       export OTARI_API_KEY=\"paste-the-key-here\"");
     println!("  Docs: {OTARI_QUICKSTART_URL}");
     println!("  Support: Mozilla AI Discord {OTARI_SUPPORT_URL}");
+}
+
+/// How a printed undo restores one written key.
+enum Undo {
+    /// Assign the value the key had before.
+    Value(String),
+    /// Remove the key: a placeholder value is itself a value the next setup
+    /// would treat as chosen.
+    Remove,
+}
+
+/// The printed line that undoes one written key.
+fn undo_instruction(key: &str, undo: &Undo) -> String {
+    match undo {
+        Undo::Value(previous) => format!("    undo: set {key} = \"{previous}\" in that file"),
+        // Assigning a placeholder would be a model the next setup treats as
+        // chosen, so the only undo is removing the key.
+        Undo::Remove => format!("    undo: remove {key} from that file"),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A model default's undo has to remove the key: assigning a placeholder
+    /// would leave a model the next setup treats as chosen.
+    #[test]
+    fn the_model_default_undo_removes_the_key() {
+        let line = undo_instruction("acp.acp_defaults.aoe-agent.model", &Undo::Remove);
+        assert_eq!(
+            line,
+            "    undo: remove acp.acp_defaults.aoe-agent.model from that file"
+        );
+        assert!(!line.contains("(unset)"), "{line}");
+        assert_eq!(
+            undo_instruction("acp.structured_view", &Undo::Value("auto".into())),
+            "    undo: set acp.structured_view = \"auto\" in that file"
+        );
+    }
 }

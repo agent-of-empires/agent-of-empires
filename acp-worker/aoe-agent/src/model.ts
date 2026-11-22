@@ -70,14 +70,16 @@ function trimmed(value: string | undefined): string | undefined {
 }
 
 /**
- * The gateway this host configured, endpoint and key from the same pair: the
- * `OTARI_*` pair when either is set, else an `OPENAI_BASE_URL` gateway with
- * `OPENAI_API_KEY`, else Otari with whatever key is present.
+ * The gateway this host configured, endpoint and key from the same pair. A pair
+ * counts only when its key is set, which is the rule `aoe setup` detects by: an
+ * `OTARI_BASE_URL` beside a complete OpenAI pair belongs to the pair, not to
+ * Otari. With no key at all, the Otari endpoint stays whatever `OTARI_BASE_URL`
+ * says and the missing key is reported.
  */
 export function gateway(env: Env = process.env): Gateway {
   const otariBase = trimmed(env.OTARI_BASE_URL)?.replace(/\/+$/, "");
   const otariKey = trimmed(env.OTARI_API_KEY);
-  if (otariBase || otariKey) {
+  if (otariKey) {
     return {
       baseUrl: otariBase ?? DEFAULT_GATEWAY_BASE_URL,
       apiKey: otariKey,
@@ -85,15 +87,16 @@ export function gateway(env: Env = process.env): Gateway {
     };
   }
   const openaiBase = trimmed(env.OPENAI_BASE_URL)?.replace(/\/+$/, "");
-  if (openaiBase) {
+  const openaiKey = trimmed(env.OPENAI_API_KEY);
+  if (openaiBase && openaiKey) {
     return {
       baseUrl: openaiBase,
-      apiKey: trimmed(env.OPENAI_API_KEY),
+      apiKey: openaiKey,
       keyVar: "OPENAI_API_KEY",
     };
   }
   return {
-    baseUrl: DEFAULT_GATEWAY_BASE_URL,
+    baseUrl: otariBase ?? DEFAULT_GATEWAY_BASE_URL,
     apiKey: undefined,
     keyVar: "OTARI_API_KEY",
   };

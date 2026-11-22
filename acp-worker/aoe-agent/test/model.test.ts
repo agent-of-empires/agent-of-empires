@@ -100,6 +100,24 @@ test("the gateway takes its endpoint and key from the same pair", () => {
     apiKey: "k",
     keyVar: "OTARI_API_KEY",
   });
-  // An endpoint with no key is reported against its own variable.
-  assert.equal(gateway({ OPENAI_BASE_URL: "http://gw/v1" }).keyVar, "OPENAI_API_KEY");
+  // A lone `OTARI_BASE_URL` beside a complete OpenAI pair is not the Otari pair:
+  // `aoe setup` detects that OpenAI gateway, so the adapter has to call its
+  // endpoint with its key instead of Otari's URL without one.
+  const mixed = {
+    OTARI_BASE_URL: "http://otari.internal/v1",
+    OPENAI_BASE_URL: "http://gateway.internal:4000/v1",
+    OPENAI_API_KEY: "key",
+  };
+  assert.deepEqual(gateway(mixed), {
+    baseUrl: "http://gateway.internal:4000/v1",
+    apiKey: "key",
+    keyVar: "OPENAI_API_KEY",
+  });
+  // An endpoint with no key is no pair in either place, so the Otari root
+  // answers and the key is reported against Otari.
+  assert.deepEqual(gateway({ OPENAI_BASE_URL: "http://gw/v1" }), {
+    baseUrl: DEFAULT_GATEWAY_BASE_URL,
+    apiKey: undefined,
+    keyVar: "OTARI_API_KEY",
+  });
 });
