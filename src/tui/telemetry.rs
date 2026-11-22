@@ -35,7 +35,7 @@ fn report(path: &'static str, body: serde_json::Value) {
 }
 
 /// Saves an opt-in answer through the Daemon, which also marks the prompt answered. Only
-/// the latest of several quick changes is sent; a failure is left for
+/// the latest of several quick changes is sent; a failure of the latest is left for
 /// [`take_consent_failure`].
 pub(crate) fn set_consent(enabled: bool) {
     let Ok(runtime) = tokio::runtime::Handle::try_current() else {
@@ -50,6 +50,10 @@ pub(crate) fn set_consent(enabled: bool) {
         let body = serde_json::json!({ "enabled": enabled });
         if let Err(error) = post("/api/telemetry/consent", body).await {
             tracing::warn!(target: "telemetry", "telemetry consent not saved: {error}");
+            // A newer change is queued and will report its own outcome.
+            if CONSENT_SEQUENCE.load(Ordering::SeqCst) != sequence {
+                return;
+            }
             *CONSENT_FAILURE
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner()) =

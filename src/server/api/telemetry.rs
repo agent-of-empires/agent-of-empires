@@ -71,7 +71,13 @@ pub async fn set_telemetry_consent(
         Err(rej) => return rej.into_response(),
     };
 
-    if let Err(e) = crate::telemetry::consent::set_consent(req.enabled) {
+    let enabled = req.enabled;
+    let saved =
+        tokio::task::spawn_blocking(move || crate::telemetry::consent::set_consent(enabled))
+            .await
+            .map_err(anyhow::Error::from)
+            .and_then(|result| result);
+    if let Err(e) = saved {
         tracing::error!(target: "http.api.telemetry", "failed to save telemetry consent: {e}");
         return api_error(
             StatusCode::INTERNAL_SERVER_ERROR,
@@ -101,7 +107,11 @@ pub async fn reset_telemetry_id(State(state): State<Arc<AppState>>) -> impl Into
     }
     let status = current_status();
     if status.enabled && !status.do_not_track {
-        if let Err(error) = crate::telemetry::consent::reset_install_id() {
+        let reset = tokio::task::spawn_blocking(crate::telemetry::consent::reset_install_id)
+            .await
+            .map_err(anyhow::Error::from)
+            .and_then(|result| result);
+        if let Err(error) = reset {
             tracing::warn!(target: "http.api.telemetry", "install id reset failed: {error}");
             return api_error(
                 StatusCode::INTERNAL_SERVER_ERROR,

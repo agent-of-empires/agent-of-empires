@@ -842,33 +842,8 @@ async fn save_settings_patch(
         return stale_write_response();
     }
     let write_profile = profile.is_some() && !is_empty_patch(&profile_patch);
-    // Consent goes through its single writer, which rotates the install id on opt-in.
-    if let Some(enabled) = take_telemetry_consent(&mut machine) {
-        match tokio::task::spawn_blocking(move || crate::telemetry::consent::set_consent(enabled))
-            .await
-        {
-            Ok(Ok(())) => record_applied(
-                &mut applied,
-                stamp.as_ref(),
-                "",
-                &serde_json::json!({"telemetry": {"enabled": enabled}}),
-            ),
-            Ok(Err(e)) => {
-                tracing::warn!(target: "http.api.system", "Telemetry consent update failed: {e}");
-                return api_error(
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    "save_failed",
-                    "Failed to save telemetry setting",
-                );
-            }
-            Err(e) => {
-                tracing::error!(target: "http.api.system", "Telemetry consent update panicked: {e}");
-                return internal_error();
-            }
-        }
-    }
-    // The profile override is written first: a machine-wide failure then leaves
-    // the narrower half in place, which is what the partial-save message says.
+    // The profile override is written first: a machine-wide or consent failure
+    // then leaves the narrower half in place, which the partial-save messages say.
     if let Some(name) = profile.clone().filter(|_| write_profile) {
         let patch = profile_patch.clone();
         let label = name.clone();
@@ -884,6 +859,34 @@ async fn save_settings_patch(
             }
             Err(e) => {
                 tracing::error!(target: "http.api.system", "Profile settings update panicked: {e}");
+                return internal_error();
+            }
+        }
+    }
+
+    // Consent goes through its single writer, which rotates the install id on opt-in.
+    if let Some(enabled) = take_telemetry_consent(&mut machine) {
+        match tokio::task::spawn_blocking(move || crate::telemetry::consent::set_consent(enabled))
+            .await
+        {
+            Ok(Ok(())) => record_applied(
+                &mut applied,
+                stamp.as_ref(),
+                "",
+                &serde_json::json!({"telemetry": {"enabled": enabled}}),
+            ),
+            Ok(Err(e)) => {
+                tracing::warn!(target: "http.api.system", "Telemetry consent update failed: {e}");
+                let message = match profile.as_deref().filter(|_| write_profile) {
+                    Some(name) => format!(
+                        "Failed to save telemetry setting. The profile layer of '{name}' was saved."
+                    ),
+                    None => "Failed to save telemetry setting".to_string(),
+                };
+                return api_error(StatusCode::INTERNAL_SERVER_ERROR, "save_failed", message);
+            }
+            Err(e) => {
+                tracing::error!(target: "http.api.system", "Telemetry consent update panicked: {e}");
                 return internal_error();
             }
         }
