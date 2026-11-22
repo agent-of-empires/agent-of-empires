@@ -3929,12 +3929,10 @@ impl HomeView {
         };
         // Claude keeps context on the way back to the terminal (the switch resumes
         // `claude --resume`), so the warning must not threaten data loss for it. Mirrors
-        // the backend gate (agents::acp_transcript_cli_resumable), approximated here by
-        // agent_name or the tool. See #2252.
-        let keeps_context = self.get_instance(&id).is_some_and(|inst| {
-            let acp_agent = inst.agent_name.as_deref().unwrap_or(&inst.tool);
-            inst.acp_transcript_cli_resumable(acp_agent)
-        });
+        // the backend gate (agents::acp_transcript_cli_resumable). See #2252.
+        let keeps_context = self
+            .get_instance(&id)
+            .is_some_and(|inst| inst.acp_transcript_cli_resumable(&inst.effective_acp_agent()));
         let (title, body) = if to_structured && keeps_context {
             (
                 "Switch to structured view",

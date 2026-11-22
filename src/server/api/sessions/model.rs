@@ -192,12 +192,7 @@ pub(super) fn session_response_from_instance_with_plan(
         structured_view_off: false,
         // Same agent resolution as `acp_agent` above; computed once here so
         // the web dashboard and native TUI stop mirroring the gate.
-        keeps_context: inst.acp_transcript_cli_resumable(
-            inst.agent_name
-                .as_deref()
-                .filter(|s| !s.is_empty())
-                .unwrap_or(inst.tool.as_str()),
-        ),
+        keeps_context: inst.acp_transcript_cli_resumable(&inst.effective_acp_agent()),
         claude_fullscreen: inst.tool == "claude" && agent_profile_wire.fullscreen,
         agent_profile: agent_profile_wire,
         // A session converted by `attach_project` (#3103) has a real

@@ -230,6 +230,34 @@ impl Instance {
         )
     }
 
+    /// The ACP agent a structured switch launches. Mirrors `pick_agent_for_tool` minus the
+    /// live registry and default-agent fallback; resolves config only for a custom tool.
+    pub(crate) fn effective_acp_agent(&self) -> String {
+        if let Some(name) = self.agent_name.as_deref().filter(|name| !name.is_empty()) {
+            return name.to_string();
+        }
+        if crate::session::fork::builtin_acp_registry()
+            .get(&self.tool)
+            .is_some()
+        {
+            return self.tool.clone();
+        }
+        let config = crate::session::config::repo_config::resolve_config_with_repo_or_warn(
+            &self.effective_profile(),
+            Path::new(&self.project_path),
+        );
+        if config
+            .session
+            .agent_acp_cmd
+            .get(&self.tool)
+            .is_some_and(|cmd| crate::acp::AgentSpec::from_acp_cmd(&self.tool, cmd).is_ok())
+        {
+            return self.tool.clone();
+        }
+        crate::acp::inherited_acp_base(&self.tool, &config.session.agent_detect_as)
+            .unwrap_or_else(|| self.tool.clone())
+    }
+
     /// Name of the native agent this session executes as, so a custom tool with
     /// `agent_execution_as = "claude"` counts as claude. Falls back to the tool.
     pub(crate) fn execution_identity_name(&self, acp_agent: &str) -> String {
@@ -1089,6 +1117,39 @@ mod tests {
         assert!(inst.acp_transcript_cli_resumable("claude"));
         assert!(inst.acp_transcript_cli_resumable("claude-code"));
         assert!(!inst.acp_transcript_cli_resumable("codex"));
+    }
+
+    /// The switch previews resolve the same ACP target as the daemon launch.
+    #[test]
+    #[serial_test::serial]
+    fn wrapper_inheriting_claude_previews_as_resumable() {
+        let home = tempfile::tempdir().unwrap();
+        let _isolation = crate::session::test_support::isolate_app_dir_at(home.path());
+        const PROFILE: &str = "effective-acp-agent-test";
+        let mut inst = Instance::new("custom", "/tmp/custom-claude");
+        inst.source_profile = PROFILE.to_string();
+        inst.tool = "corp-claude".to_string();
+        inst.command = "corp-wrapper --serve".to_string();
+        declare_execution_aliases(PROFILE, &[("corp-claude", "claude")], home.path());
+        let path =
+            crate::session::config::profile_config::get_profile_config_path(PROFILE).unwrap();
+        let mut config: toml::Table =
+            toml::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        config["session"].as_table_mut().unwrap().insert(
+            "agent_detect_as".into(),
+            toml::Value::Table(toml::Table::from_iter([(
+                "corp-claude".into(),
+                toml::Value::String("claude".into()),
+            )])),
+        );
+        std::fs::write(&path, toml::to_string(&config).unwrap()).unwrap();
+
+        assert_eq!(inst.effective_acp_agent(), "claude");
+        assert!(inst.acp_transcript_cli_resumable(&inst.effective_acp_agent()));
+
+        inst.agent_name = Some("codex".to_string());
+        assert_eq!(inst.effective_acp_agent(), "codex");
+        assert!(!inst.acp_transcript_cli_resumable(&inst.effective_acp_agent()));
     }
 
     /// A session stored with the fallback's own command keeps its capture after
