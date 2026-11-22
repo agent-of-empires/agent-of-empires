@@ -4859,6 +4859,14 @@ fn session_cfg_store_reresolves_only_after_an_input_edit() {
         format!("gitdir: {}/.git/worktrees/w\n", current.display()),
     )
     .unwrap();
+    // Git records the worktree in each admin dir; a link is only real if it does.
+    for repo in ["a", "b"] {
+        std::fs::write(
+            layout.path().join(repo).join(".git/worktrees/w/gitdir"),
+            format!("{}\n", worktree.join(".git").display()),
+        )
+        .unwrap();
+    }
     let worktree = worktree.to_str().unwrap();
     let link = |repo: &str| {
         let _ = std::fs::remove_file(&current);
@@ -6122,11 +6130,13 @@ fn public_create_session_error_forwards_typed_causes_as_fixed_templates() {
             anyhow::Error::new(crate::server::session_spawn::ImageUpdateFailed {
                 image: "ghcr.io/acme/sandbox:1".into(),
                 detail: format!("denied: token {SECRET} at /root/.docker/config.json"),
-                cancelled: false,
+                failure: crate::server::session_spawn::UpdateFailure::Pull(
+                    crate::containers::image_pull::PullFailureReason::Auth,
+                ),
             }),
             (
                 "sandbox_image_update_failed",
-                "Couldn't pull the latest Sandbox image ghcr.io/acme/sandbox:1.".into(),
+                "Couldn't download the sandbox image: the registry needs you to sign in.".into(),
             ),
         ),
         (
@@ -6134,7 +6144,7 @@ fn public_create_session_error_forwards_typed_causes_as_fixed_templates() {
             anyhow::Error::new(crate::server::session_spawn::ImageUpdateFailed {
                 image: "ghcr.io/acme/sandbox:1".into(),
                 detail: String::new(),
-                cancelled: true,
+                failure: crate::server::session_spawn::UpdateFailure::Cancelled,
             }),
             (
                 "sandbox_image_update_failed",
@@ -10831,20 +10841,21 @@ async fn post_create_raw(
 fn only_a_local_owner_sees_why_the_latest_image_pull_failed() {
     let error = anyhow::Error::new(crate::server::session_spawn::ImageUpdateFailed {
         image: "img:1".into(),
-        detail: "manifest unknown".into(),
-        cancelled: false,
+        detail: "dial tcp: lookup ghcr.io: no such host".into(),
+        failure: crate::server::session_spawn::UpdateFailure::Pull(
+            crate::containers::image_pull::PullFailureReason::Network,
+        ),
     });
     let stage = crate::server::create_progress::CreateStage::PullingImage;
     let public = create_failure(&error, stage, "ref").unwrap();
-    assert_eq!(
-        public.message,
-        "Couldn't pull the latest Sandbox image img:1."
-    );
+    // The banner's wording for everyone; the runtime's output only for a local owner.
+    let why = "Couldn't download the sandbox image: no network connection.";
+    assert_eq!(public.message, why);
     for (local_owner, message) in [
-        (false, "Couldn't pull the latest Sandbox image img:1."),
+        (false, why.to_string()),
         (
             true,
-            "Couldn't pull the latest Sandbox image img:1. manifest unknown",
+            format!("{why} dial tcp: lookup ghcr.io: no such host"),
         ),
     ] {
         let shown = with_local_pull_detail(public.clone(), &error, local_owner);
@@ -11014,6 +11025,77 @@ async fn create_rejects_hook_env_without_sandbox() {
     assert_eq!(status, axum::http::StatusCode::BAD_REQUEST, "{body}");
     assert_eq!(body["error"], "validation_failed");
     assert!(state.instances.read().await.is_empty());
+}
+
+#[tokio::test]
+async fn create_rejects_blank_or_oversized_initial_prompt() {
+    let _home = crate::session::test_support::isolate_app_dir();
+    let state = crate::server::test_support::build_test_app_state_impl(
+        Vec::new(),
+        Vec::new(),
+        Vec::new(),
+        None,
+        false,
+        |_| {},
+        |supervisor| supervisor,
+    );
+    let oversized = "x".repeat(crate::session::MAX_INITIAL_PROMPT_BYTES + 1);
+    for prompt in ["  \n", oversized.as_str()] {
+        let (status, body) = post_create(
+            &state,
+            serde_json::json!({
+                "title": "bad-prompt", "path": "", "tool": "claude",
+                "scratch": true, "view": "structured", "initial_prompt": prompt,
+            }),
+        )
+        .await;
+        assert_eq!(status, axum::http::StatusCode::BAD_REQUEST, "{body}");
+        assert_eq!(body["error"], "validation_failed");
+        assert!(state.instances.read().await.is_empty());
+    }
+}
+
+#[tokio::test]
+async fn create_persists_initial_prompt_as_pending_turn() {
+    let _home = crate::session::test_support::isolate_app_dir();
+    let _adapter = crate::session::test_support::stub_claude_adapter_on_agent_path();
+    crate::session::purge_owners::initialize(&crate::session::get_app_dir().unwrap()).unwrap();
+    crate::tmux::tool_retirement::initialize(&crate::session::get_app_dir().unwrap()).unwrap();
+    crate::session::config::update_app_state(|state| {
+        state.has_acknowledged_agent_hooks = true;
+    })
+    .expect("acknowledge the agent hook paths");
+    crate::session::config::update_config(|config| {
+        config.default_profile = "chosen-default".to_string();
+    })
+    .unwrap();
+    crate::session::Storage::new_unwatched("chosen-default").unwrap();
+    let (launcher, _launches) = crate::server::test_support::counting_failing_launcher();
+    let state = crate::server::test_support::build_test_app_state_impl(
+        Vec::new(),
+        Vec::new(),
+        Vec::new(),
+        None,
+        false,
+        |state| {
+            state.profile = std::sync::RwLock::new(crate::session::config::effective_profile(""));
+        },
+        |supervisor| supervisor.with_launcher(launcher),
+    );
+    crate::server::test_support::refresh_canonical_metadata_for_test(&state).await;
+    let (status, body) = post_create(
+        &state,
+        serde_json::json!({
+            "title": "with-prompt", "path": "", "tool": "claude",
+            "scratch": true, "view": "structured", "initial_prompt": "fix the bug",
+        }),
+    )
+    .await;
+    assert_eq!(status, axum::http::StatusCode::CREATED, "{body}");
+    let instances = state.instances.read().await;
+    let turn = instances[0].pending_initial_turn.as_ref().expect("queued");
+    assert_eq!(turn.text, "fix the bug");
+    assert!(!turn.synthesized);
 }
 
 #[tokio::test]
@@ -11405,11 +11487,15 @@ fn the_failure_log_names_a_context_wrapped_cause() {
 #[tokio::test]
 async fn a_create_whose_shared_pull_was_cancelled_is_not_replayed() {
     use crate::containers::error::DockerError;
-    use crate::server::session_spawn::ImageUpdateFailed;
+    use crate::server::session_spawn::{ImageUpdateFailed, UpdateFailure};
     let failed = |cancelled| ImageUpdateFailed {
         image: "img".into(),
         detail: String::new(),
-        cancelled,
+        failure: if cancelled {
+            UpdateFailure::Cancelled
+        } else {
+            UpdateFailure::Pull(crate::containers::image_pull::PullFailureReason::Other)
+        },
     };
     let cases: Vec<(&str, anyhow::Error, bool)> = vec![
         ("latest pull cancelled", failed(true).into(), false),

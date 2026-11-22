@@ -187,6 +187,9 @@ pub struct CreateSessionBody {
     pub command_override: String,
     #[serde(default)]
     pub custom_instruction: Option<String>,
+    /// Typed into the agent as its first turn, only once it is ready.
+    #[serde(default)]
+    pub initial_prompt: Option<String>,
     pub profile: Option<String>,
     /// Structured view requires an ACP-capable agent.
     #[serde(default)]
@@ -1051,6 +1054,13 @@ pub struct SessionResponse {
     /// `last_accessed_at` but leaves `idle_entered_at` alone.
     pub idle_entered_at: Option<String>,
     pub last_error: Option<String>,
+    /// Why the initial prompt was not typed into a terminal session.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub initial_prompt_error: Option<String>,
+    /// Machine-readable `initial_prompt_error` cause when one applies:
+    /// `agent_folder_not_trusted` or `agent_bypass_not_accepted`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub initial_prompt_error_code: Option<String>,
     pub branch: Option<String>,
     pub main_repo_path: Option<String>,
     /// Base branch the worktree was created from when AoE managed the
@@ -1340,7 +1350,7 @@ pub struct SessionResponse {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub workspace_cleanup_on_delete: Option<bool>,
     /// Non-fatal warnings surfaced by a mutation response. On create these are
-    /// worktree-creation warnings (e.g. post-checkout hook failures where the
+    /// worktree-creation warnings (e.g. a stale fetch where the
     /// worktree was still created successfully). On rename these carry the
     /// tmux rekey warning emitted when the title was persisted durably but the
     /// live tmux session could not be renamed afterwards. Both live on the

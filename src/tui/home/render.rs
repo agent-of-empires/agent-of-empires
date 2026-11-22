@@ -1221,8 +1221,8 @@ impl HomeView {
         // `one_pane` already gives the narrow screen to a single pane, so a collapsed
         // sidebar there would only shrink it to a three-column strip plus preview.
         let narrow_layout = self.narrow_layout;
-        let single_pane_narrow = available_width < responsive::STACKED_BREAKPOINT
-            && matches!(narrow_layout, NarrowLayout::OnePane);
+        let narrow = responsive::is_narrow(available_width, self.narrow_breakpoint);
+        let single_pane_narrow = narrow && matches!(narrow_layout, NarrowLayout::OnePane);
         // A collapsed strip leaves enough preview space even on narrow terminals.
         if self.sidebar_collapsed && !single_pane_narrow {
             self.divider_col = None;
@@ -1238,7 +1238,7 @@ impl HomeView {
             let strip_col = self.diagnostics_dock(frame, strip_area, theme);
             self.render_collapsed_strip(frame, strip_col, theme);
             self.render_preview(frame, preview_area, theme);
-        } else if available_width < responsive::STACKED_BREAKPOINT {
+        } else if narrow {
             self.divider_col = None;
             match responsive::narrow_arrangement(
                 narrow_layout,
@@ -3276,7 +3276,7 @@ impl HomeView {
             );
             return;
         }
-        let compact = area.width < responsive::STACKED_BREAKPOINT;
+        let compact = responsive::is_narrow(area.width, self.narrow_breakpoint);
         let (border_color, title_color) = match self.view_mode {
             ViewMode::Structured => (theme.border, theme.title),
             ViewMode::Terminal | ViewMode::Tool(_) => {
