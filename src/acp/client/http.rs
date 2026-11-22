@@ -421,6 +421,7 @@ impl HttpClient {
         session_id: &str,
         text: &str,
         no_revive: bool,
+        origin: crate::daemon::PromptOrigin,
     ) -> Result<PromptDispatchWire, HttpError> {
         let url = format!(
             "{}/api/sessions/{}/acp/prompt",
@@ -434,7 +435,11 @@ impl HttpClient {
             no_revive,
             queued_prompt_id: None,
         };
-        let res = self.execute(self.http.post(&url).json(&body)).await?;
+        let mut request = self.http.post(&url).json(&body);
+        if let Some(origin) = origin.as_header_value() {
+            request = request.header(crate::daemon::PromptOrigin::HEADER, origin);
+        }
+        let res = self.execute(request).await?;
         let res = check_status(res, session_id)?;
         Ok(crate::daemon::decode_json::<PromptDispatchWire>(res).await?)
     }
@@ -2426,6 +2431,40 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn prompt_names_its_client_in_the_origin_header() {
+        use crate::daemon::PromptOrigin;
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let cases = [
+            (PromptOrigin::Tui, Some("tui")),
+            (PromptOrigin::Cli, Some("cli")),
+            (PromptOrigin::Mcp, None),
+        ];
+        for (origin, header) in cases {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let address = listener.local_addr().unwrap();
+            let server = tokio::spawn(async move {
+                let (mut stream, _) = listener.accept().await.unwrap();
+                let mut request = [0; 4096];
+                let n = stream.read(&mut request).await.unwrap();
+                stream
+                    .write_all(b"HTTP/1.1 500 Error\r\nContent-Length: 0\r\n\r\n")
+                    .await
+                    .unwrap();
+                String::from_utf8_lossy(&request[..n]).to_lowercase()
+            });
+            let client =
+                HttpClient::new(endpoint(&format!("http://{address}"), Some("secret"))).unwrap();
+            let _ = client.prompt("session", "hello", false, origin).await;
+            let request = server.await.unwrap();
+            let sent = request
+                .lines()
+                .find_map(|l| l.strip_prefix("x-aoe-prompt-origin: "))
+                .map(str::to_string);
+            assert_eq!(sent.as_deref(), header, "{origin:?}");
+        }
+    }
+
+    #[tokio::test]
     async fn no_revive_refusal_explains_the_conflict_without_reading_its_body() {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -2441,7 +2480,7 @@ mod tests {
             HttpClient::new(endpoint(&format!("http://{address}"), Some("secret"))).unwrap();
         let result = tokio::time::timeout(
             Duration::from_secs(1),
-            client.prompt("session", "hello", true),
+            client.prompt("session", "hello", true, crate::daemon::PromptOrigin::Cli),
         )
         .await;
         server.abort();

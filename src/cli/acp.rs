@@ -1173,7 +1173,7 @@ async fn prompt(session: &str, text: &str) -> Result<()> {
     let endpoint = require_daemon().await?;
     let client = HttpClient::new(endpoint)?;
     client
-        .prompt(session, &body, false)
+        .prompt(session, &body, false, crate::daemon::PromptOrigin::Cli)
         .await
         .map_err(map_http)?;
     println!("prompt accepted ({} bytes)", body.len());
