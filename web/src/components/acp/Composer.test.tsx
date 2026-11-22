@@ -165,7 +165,9 @@ describe("toolbar and send", () => {
     mount({ sessionUsage: { used: 50_000, size: 200_000, cost: null } });
     const slot = screen.getByTestId("plugin-composer-status");
     expect(slot.textContent).toBe("status mine");
-    expect(slot.parentElement).toBe(screen.getByTestId("composer-usage").closest("div"));
+    const trailing = screen.getByTestId("composer-trailing");
+    expect(trailing.contains(slot)).toBe(true);
+    expect(trailing.contains(screen.getByTestId("composer-usage"))).toBe(true);
   });
 
   it("stages pasted image files and leaves text paste alone", async () => {
