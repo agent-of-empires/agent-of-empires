@@ -518,6 +518,7 @@ pub struct PluginActionBody {
 pub async fn invoke_plugin_action(
     State(state): State<std::sync::Arc<AppState>>,
     Path(id): Path<String>,
+    principal: Option<axum::Extension<Principal>>,
     body: Result<Json<PluginActionBody>, axum::extract::rejection::JsonRejection>,
 ) -> Response {
     if state.read_only {
@@ -555,6 +556,13 @@ pub async fn invoke_plugin_action(
             serde_json::Value::Null => params = json!({ "session_id": sid }),
             _ => {}
         }
+    }
+    if !stamp_origin(&mut params, principal.as_ref().map(|p| &p.0)) {
+        return api_error(
+            StatusCode::BAD_REQUEST,
+            "invalid_params",
+            "Plugin action params must be a JSON object",
+        );
     }
     if host.notify_worker(&id, &body.method, params).await {
         (
@@ -677,6 +685,25 @@ fn active_plugin_declares(plugin_id: &str, capability: &str) -> bool {
                 .iter()
                 .any(|cap| cap.as_str() == capability)
         })
+}
+
+/// Sets `params.origin` from the caller's principal, replacing any client value.
+/// `dashboard` is a signed-in browser login; `socket` the daemon's Unix socket;
+/// `token` any other caller. Returns false when `params` cannot carry the field.
+fn stamp_origin(params: &mut serde_json::Value, principal: Option<&Principal>) -> bool {
+    let origin = match principal {
+        Some(Principal::Device) => "dashboard",
+        Some(Principal::LocalPeer { .. }) => "socket",
+        Some(Principal::TokenHolder) | None => "token",
+    };
+    if params.is_null() {
+        *params = json!({});
+    }
+    let Some(map) = params.as_object_mut() else {
+        return false;
+    };
+    map.insert("origin".into(), origin.into());
+    true
 }
 
 fn strip_composer_snapshot_without_capability(plugin_id: &str, params: &mut serde_json::Value) {
@@ -2134,6 +2161,23 @@ while not (p/'finish').exists():
                 "{bad:?} should not resolve"
             );
         }
+    }
+
+    #[test]
+    fn stamp_origin_overwrites_client_value_per_principal() {
+        for (principal, expected) in [
+            (Some(Principal::Device), "dashboard"),
+            (Some(Principal::LocalPeer { uid: 1000 }), "socket"),
+            (Some(Principal::TokenHolder), "token"),
+            (None, "token"),
+        ] {
+            for mut params in [json!({ "origin": "dashboard", "k": 1 }), json!(null)] {
+                assert!(stamp_origin(&mut params, principal.as_ref()));
+                assert_eq!(params["origin"], expected, "{principal:?}");
+            }
+        }
+        let mut params = json!([1]);
+        assert!(!stamp_origin(&mut params, None));
     }
 
     #[tokio::test]
