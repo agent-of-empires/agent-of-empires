@@ -1189,3 +1189,26 @@ fn a_prompt_blocked_on_folder_trust_turns_on_pre_trust_then_tries_again() {
         Some((instance.id.clone(), ("gh".to_string(), "i0".to_string())))
     );
 }
+
+#[test]
+#[serial]
+fn a_prepare_answer_is_applied_when_a_prompt_error_changes_in_the_same_poll() {
+    let (mut env, requests) = expanded_env(2);
+    terminal_view_config();
+    with_authenticated_local_project_registry(&mut env.view, |view| {
+        view.open_suggestions_view();
+        view.handle_key(key(KeyCode::Char('e')), None);
+    });
+    assert_eq!(next_request(&requests), "prepare gh/i0");
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while env.view.new_dialog.is_none() {
+        // A stale entry makes every poll also see a prompt-error change.
+        env.view
+            .suggestions_feed
+            .blocked_prompts
+            .insert("gone".into(), ("blocked".into(), None));
+        env.view.apply_suggestions_results();
+        assert!(Instant::now() < deadline, "the prepare answer was dropped");
+        std::thread::sleep(Duration::from_millis(5));
+    }
+}

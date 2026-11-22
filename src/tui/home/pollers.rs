@@ -93,12 +93,11 @@ impl HomeView {
             }
             review_closed = true;
         }
-        let mut changed = review_closed
-            || blocked_changed
-            || match &mut self.suggestions_view {
-                Some(view) => view.apply(&mut self.suggestions_feed, &mut polled),
-                None => false,
-            };
+        let applied = match &mut self.suggestions_view {
+            Some(view) => view.apply(&mut self.suggestions_feed, &mut polled),
+            None => false,
+        };
+        let mut changed = applied || review_closed || blocked_changed;
         if let Some(start) = self
             .suggestions_view
             .as_mut()
