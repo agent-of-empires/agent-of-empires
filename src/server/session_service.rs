@@ -714,12 +714,12 @@ impl SessionService {
         mut spec: StructuredSessionSpec,
         plugin_id: Option<&str>,
         idempotency_key: Option<&str>,
-        initial_turn: Option<&str>,
+        initial_turn: Option<(&str, crate::daemon::PromptOrigin)>,
     ) -> anyhow::Result<(SpawnOutcome, bool)> {
         // Persisted with the instance in the same Storage::update, so the
         // create and its first turn are accepted atomically; the drain paths
         // deliver it once the worker is live.
-        spec.pending_initial_turn = initial_turn.map(str::to_string);
+        spec.pending_initial_turn = initial_turn.map(|(text, origin)| (text.to_string(), origin));
         let Some(plugin_id) = plugin_id else {
             let outcome = spawn_structured_session(self, spec).await?;
             return Ok((outcome, true));
@@ -3486,7 +3486,9 @@ fn spec_payload_hash(spec: &StructuredSessionSpec) -> String {
     field("profile", &spec.profile);
     field(
         "initial_turn",
-        spec.pending_initial_turn.as_deref().unwrap_or_default(),
+        spec.pending_initial_turn
+            .as_ref()
+            .map_or("", |(text, _)| text.as_str()),
     );
     field(
         "acp_mode_id",
@@ -3716,6 +3718,37 @@ mod tests {
         Ok(())
     }
 
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn create_time_prompt_keeps_the_origin_its_surface_passed() -> anyhow::Result<()> {
+        use crate::daemon::PromptOrigin;
+        let _home = crate::session::test_support::isolate_app_dir();
+        let app = crate::session::get_app_dir()?;
+        crate::session::purge_owners::initialize(&app)?;
+        crate::tmux::tool_retirement::initialize(&app)?;
+        crate::session::config::update_app_state(|state| {
+            state.has_acknowledged_agent_hooks = true;
+        })?;
+        crate::session::config::update_config(|config| config.systemd.enabled = false)?;
+        let _storage = crate::session::Storage::new_unwatched("default")?;
+        let state = crate::server::test_support::build_test_app_state(Vec::new());
+        crate::server::test_support::refresh_canonical_metadata_for_test(&state).await;
+        for (plugin, origin) in [
+            (None, PromptOrigin::Mcp),
+            (Some("cron"), PromptOrigin::Plugin),
+        ] {
+            let mut spec = test_spec();
+            spec.scratch = true;
+            let (outcome, _) = state
+                .session_service
+                .create_structured_session(spec, plugin, None, Some(("go", origin)))
+                .await?;
+            let turn = outcome.instance.pending_initial_turn.expect("pending turn");
+            assert_eq!((turn.text.as_str(), turn.origin), ("go", origin));
+        }
+        Ok(())
+    }
+
     /// Skipping setup skips only on_create: on_launch still runs.
     #[tokio::test]
     #[serial_test::serial]
@@ -3883,7 +3916,10 @@ mod tests {
         );
 
         let mut with_turn = test_spec();
-        with_turn.pending_initial_turn = Some("run the nightly task".to_string());
+        with_turn.pending_initial_turn = Some((
+            "run the nightly task".to_string(),
+            crate::daemon::PromptOrigin::Unknown,
+        ));
         assert_ne!(
             a,
             spec_payload_hash(&with_turn),

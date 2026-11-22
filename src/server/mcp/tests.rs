@@ -1225,10 +1225,9 @@ async fn create_session_stores_a_structured_prompt_and_its_parent() {
         .unwrap();
     assert_eq!(row.parent_session_id.as_deref(), Some("parent"));
     assert_eq!(row.group_path, "team");
-    assert_eq!(
-        row.pending_initial_turn.map(|turn| turn.text).as_deref(),
-        Some("review the diff")
-    );
+    let turn = row.pending_initial_turn.unwrap();
+    assert_eq!(turn.text, "review the diff");
+    assert_eq!(turn.origin, crate::daemon::PromptOrigin::Mcp);
 
     // A caller that names no parent becomes it only where an explicit parent would pass.
     // (caller, extra arguments, parent, group)

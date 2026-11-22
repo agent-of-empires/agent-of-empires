@@ -846,6 +846,7 @@ pub async fn create_session(
     axum::extract::Query(query): axum::extract::Query<CreateSessionQuery>,
     local: Option<axum::Extension<crate::server::principal::Principal>>,
     request_id: Option<axum::Extension<crate::server::router::RequestId>>,
+    headers: axum::http::HeaderMap,
     body: Result<Json<CreateSessionBody>, axum::extract::rejection::JsonRejection>,
 ) -> impl IntoResponse {
     let local_owner = crate::server::principal::authorize(
@@ -862,20 +863,24 @@ pub async fn create_session(
         Err(rej) => return rej.into_response(),
     };
     let wait_ready = query.wait.as_deref() == Some("ready");
-    create_session_with(state, local_owner, &reference, wait_ready, body, None).await
+    let origin = crate::server::api::prompt_origin(&headers);
+    create_session_with(state, local_owner, &reference, wait_ready, body, None, origin).await
 }
 
 /// `POST /api/sessions` once the caller is authorized and the body parsed, for a surface
 /// that builds the body itself. `local_owner` sees hook failure detail, `reference` names
 /// the request in failure logs and responses, `wait_ready` is `?wait=ready`, and
-/// `initial_turn` is a structured session's first prompt, delivered once its worker runs.
+/// `initial_turn` is a structured session's first prompt and its origin, delivered once its
+/// worker runs. `body_prompt_origin` attributes the body's own `initial_prompt` when no
+/// `initial_turn` is given.
 pub(crate) async fn create_session_with(
     state: Arc<AppState>,
     local_owner: bool,
     reference: &str,
     wait_ready: bool,
     body: CreateSessionBody,
-    initial_turn: Option<String>,
+    initial_turn: Option<(String, crate::daemon::PromptOrigin)>,
+    body_prompt_origin: crate::daemon::PromptOrigin,
 ) -> axum::response::Response {
     if let Some(key) = body.idempotency_key.as_deref() {
         if key.is_empty() || key.len() > IDEMPOTENCY_KEY_MAX_LEN {
@@ -1477,7 +1482,10 @@ pub(crate) async fn create_session_with(
         );
     }
 
-    let initial_turn = initial_turn.or(body.initial_prompt.take());
+    let initial_turn = initial_turn.or(body
+        .initial_prompt
+        .take()
+        .map(|text| (text, body_prompt_origin)));
     let profile = body.profile.unwrap_or(default_profile);
     // `body.profile` is the caller's authority when it names one; otherwise
     // the served profile resolved above, which is also what the validation
@@ -1568,7 +1576,14 @@ pub(crate) async fn create_session_with(
                 panic_hook::fire(key.as_deref()).await;
                 task_state
                     .session_service
-                    .create_structured_session(spec, None, None, initial_turn.as_deref())
+                    .create_structured_session(
+                        spec,
+                        None,
+                        None,
+                        initial_turn
+                            .as_ref()
+                            .map(|(text, origin)| (text.as_str(), *origin)),
+                    )
                     .await
             },
             &task_state.create_progress,

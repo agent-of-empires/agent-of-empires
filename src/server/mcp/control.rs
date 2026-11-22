@@ -224,7 +224,10 @@ impl McpServer {
             return Err(tool_error("invalid_request", "The prompt is empty"));
         }
         let body = create_body(&params).map_err(|e| tool_error("invalid_request", e))?;
-        let initial_turn = if structured { prompt.clone() } else { None };
+        let initial_turn = prompt
+            .clone()
+            .filter(|_| structured)
+            .map(|text| (text, crate::daemon::PromptOrigin::Mcp));
         let wait_ready = !structured && prompt.is_some();
         // Names this create in failure logs and responses, as an HTTP request's id does.
         let reference = format!("mcp-{}", uuid::Uuid::new_v4());
@@ -235,6 +238,7 @@ impl McpServer {
             wait_ready,
             body,
             initial_turn,
+            crate::daemon::PromptOrigin::Mcp,
         )
         .await;
         let (session, fresh) = success_body(response).await.map_err(|e| *e)?;

@@ -534,7 +534,10 @@ async fn admit_and_create(
         plugin_create_idempotency: None,
         // Set here (not just inside the service) so the idempotency probe below
         // hashes the same payload the create will.
-        pending_initial_turn: req.initial_turn.as_ref().map(|t| t.text.clone()),
+        pending_initial_turn: req
+            .initial_turn
+            .as_ref()
+            .map(|t| (t.text.clone(), crate::daemon::PromptOrigin::Plugin)),
         parent_session_id: None,
         acp_mode_id: req.mode_id.clone(),
         view: crate::session::View::Structured,
@@ -587,14 +590,17 @@ async fn admit_and_create(
     // cannot overshoot the cap.
     let _reservation = deps.policy.admit_create(plugin_id, active_sessions)?;
 
-    let initial_turn_text = req.initial_turn.as_ref().map(|t| t.text.as_str());
+    let initial_turn = req
+        .initial_turn
+        .as_ref()
+        .map(|t| (t.text.as_str(), crate::daemon::PromptOrigin::Plugin));
     let (outcome, created) = deps
         .session_service
         .create_structured_session(
             spec,
             Some(plugin_id),
             req.idempotency_key.as_deref(),
-            initial_turn_text,
+            initial_turn,
         )
         .await
         .map_err(map_create_error)?;
