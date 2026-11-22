@@ -475,7 +475,8 @@ impl HomeView {
         {
             self.switch_profile(Some(row.profile.clone()))
         } else {
-            self.reload()
+            self.reload();
+            Ok(())
         };
         let failure = match loaded {
             Err(error) => Some(format!(

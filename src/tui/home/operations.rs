@@ -23,18 +23,9 @@ fn group_membership<'a>(
 }
 
 impl HomeView {
-    /// Why this process may not write `projects.json`, or `None` when it may.
-    ///
-    /// The runtime republishes the registry in every snapshot
-    /// (`global_projects`), so once it owns the rows a local write diverges
-    /// from the state it will send back next. No runtime route exists for a
-    /// client-side pin: the daemon's own project mutations map to
-    /// `POST /api/projects` / `PATCH /api/projects/{name}` /
-    /// Project registry has an independent local-write policy; sessions/groups never write locally.
+    /// Why this process may not write `projects.json`, or `None` when it may: only while a
+    /// writable Daemon is attached, since it republishes the registry in every snapshot.
     pub(super) fn project_write_block(&self) -> Option<&'static str> {
-        if !self.project_registry_authoritative {
-            return None;
-        }
         if self.session_feed.cityhall_mode() {
             return Some("The attached runtime serves a City Hall client, whose policy does not allow this process to write the project registry locally");
         }

@@ -337,11 +337,12 @@ pub async fn run(profile: &str, startup_warning: Option<String>) -> Result<()> {
         anyhow::bail!("stdin is not a terminal; aoe requires an interactive TTY");
     }
 
-    if let Err(error) = crate::acp::client::daemon_manager::ensure_native_daemon(profile).await {
-        if !opens_despite_startup_error(&error) {
-            return Err(error.context("aoe needs its Daemon and could not reach one"));
-        }
-    }
+    // A connection that fails after the Daemon is reached is retried, and shown, by the feed.
+    let prepared = match crate::acp::client::daemon_manager::ensure_native_daemon(profile).await {
+        Ok(endpoint) => session_feed::prepare(endpoint, profile).await.ok(),
+        Err(error) if opens_despite_startup_error(&error) => None,
+        Err(error) => return Err(error.context("aoe needs its Daemon and could not reach one")),
+    };
 
     // Mosh mangles mouse-tracking escapes, so capture stays off under it.
     // `App` re-resolves the config so a mid-session toggle still applies.
@@ -351,9 +352,6 @@ pub async fn run(profile: &str, startup_warning: Option<String>) -> Result<()> {
     let startup_session_config = crate::session::resolve_config(profile)
         .map(|c| c.session)
         .unwrap_or_default();
-    crate::session::poller::configure_session_id_poller_max_threads(
-        startup_session_config.session_id_poller_max_threads,
-    );
     let enable_mouse = mouse_capture_requested(&startup_session_config) && !mosh_active;
     let _terminal_guard = TerminalGuard::enter(enable_mouse, mosh_active)?;
 
@@ -393,7 +391,7 @@ pub async fn run(profile: &str, startup_warning: Option<String>) -> Result<()> {
     // Shares the hyperlink map the renderer fills.
     let backend = crate::tui::hyperlink::HyperlinkBackend::new(io::stdout(), app.hyperlink_cells());
     let mut terminal = Terminal::new(backend)?;
-    let result = app.run(&mut terminal).await;
+    let result = app.run(&mut terminal, prepared).await;
 
     crate::session::clear_tui_heartbeat();
 

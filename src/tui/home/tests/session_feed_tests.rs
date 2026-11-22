@@ -2428,9 +2428,7 @@ fn disk_ahead_reload_keeps_complete_model_and_newer_frame_applies_without_waitin
             Ok(())
         })
         .unwrap();
-    env.view
-        .reload_storage_only()
-        .expect("routine disk-ahead reload is recoverable");
+    env.view.reload_storage_only();
     assert_eq!(
         serde_json::to_value(env.view.cloned_instances()).unwrap(),
         before
@@ -2495,7 +2493,7 @@ fn persistent_metadata_lag_latches_across_revisions_without_focus_theft() {
         1,
     );
     seed_profile("test", &[]);
-    env.view.reload_storage_only().unwrap();
+    env.view.reload_storage_only();
     let first = env.view.canonical_metadata_lag.as_mut().unwrap();
     first.first_seen = std::time::Instant::now() - HomeView::CANONICAL_RELOAD_RETRY_INTERVAL;
     let first_seen = first.first_seen;

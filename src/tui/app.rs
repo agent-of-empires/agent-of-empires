@@ -593,8 +593,12 @@ impl App {
         self.needs_redraw = true;
     }
 
-    pub async fn run(&mut self, terminal: &mut Terminal<TuiBackend>) -> Result<()> {
-        self.home.connect_runtime();
+    pub async fn run(
+        &mut self,
+        terminal: &mut Terminal<TuiBackend>,
+        prepared: Option<crate::tui::session_feed::Prepared>,
+    ) -> Result<()> {
+        self.home.connect_runtime_prepared(prepared);
         // Display snapshots are refreshed off the paint thread. Don't warm the
         // cache here: startup must paint before any tmux deadline.
         crate::tmux::spawn_snapshot_poller();
@@ -607,9 +611,6 @@ impl App {
         e2e_render_ack(true)?;
 
         self.spawn_tool_detection(false);
-        tokio::spawn(async {
-            crate::plugin::auto_update::run_if_enabled(&Config::load_or_warn(), None).await;
-        });
 
         // `None` when checks are off, so enabling them later checks immediately.
         let settings = get_update_settings();
@@ -1399,25 +1400,20 @@ impl App {
 
             match refresh_plan.decision {
                 DiskRefreshDecision::FullHeartbeat => {
-                    let reload_result = self.home.reload();
-                    let reload_ok = reload_result.is_ok();
-                    handle_tick_reload_storage(reload_result, &mut self.home.reload_failure_state);
-                    if reload_ok {
-                        let profile = self.home.active_profile.as_deref().unwrap_or("default");
-                        let mouse_capture_allowed = crate::session::resolve_config(profile)
-                            .map(|c| crate::tui::mouse_capture_requested(&c.session))
-                            .unwrap_or(self.mouse_capture_allowed);
-                        if mouse_capture_allowed != self.mouse_capture_allowed {
-                            self.mouse_capture_allowed = mouse_capture_allowed;
-                            self.sync_mouse_capture(terminal)?;
-                        }
+                    self.home.reload();
+                    let profile = self.home.active_profile.as_deref().unwrap_or("default");
+                    let mouse_capture_allowed = crate::session::resolve_config(profile)
+                        .map(|c| crate::tui::mouse_capture_requested(&c.session))
+                        .unwrap_or(self.mouse_capture_allowed);
+                    if mouse_capture_allowed != self.mouse_capture_allowed {
+                        self.mouse_capture_allowed = mouse_capture_allowed;
+                        self.sync_mouse_capture(terminal)?;
                     }
                     last_disk_refresh = std::time::Instant::now();
                     needs_full_refresh = true;
                 }
                 DiskRefreshDecision::StorageOnly => {
-                    let reload_result = self.home.reload_storage_only();
-                    handle_tick_reload_storage(reload_result, &mut self.home.reload_failure_state);
+                    self.home.reload_storage_only();
                     if heartbeat_due {
                         last_disk_refresh = std::time::Instant::now();
                     }
@@ -2057,27 +2053,7 @@ fn plan_disk_refresh(
     }
 }
 
-/// Log and record reload errors; the loop keeps the previous in-memory state.
-fn handle_tick_reload_storage(
-    result: anyhow::Result<()>,
-    state: &mut crate::tui::home::ReloadFailureState,
-) {
-    if let Err(ref e) = result {
-        tracing::warn!(
-            target: "tui.file_watch",
-            error = %e,
-            "tick storage reload failed; preserving in-memory state, will retry on next tick"
-        );
-    }
-    if state.record_storage(&result) {
-        tracing::info!(
-            target: "tui.file_watch",
-            "storage reload recovered"
-        );
-    }
-}
-
-/// Like storage reloads, but also keeps a malformed config from resetting
+/// Log and record config reload errors, keeping a malformed config from resetting
 /// safety settings like `confirm_before_quit` to defaults.
 fn handle_tick_reload_config(
     result: anyhow::Result<()>,
@@ -3167,8 +3143,7 @@ impl App {
         self.needs_redraw = true;
         crate::tmux::refresh_session_cache();
         self.home.apply_session_feed_before_input();
-        let result = self.home.reload();
-        self.home.reload_failure_state.record_storage(&result);
+        self.home.reload();
         self.home.try_present_reload_failure_dialog();
         self.home.clear_unread_on_view(session_id);
         self.home.stamp_last_accessed(session_id);
