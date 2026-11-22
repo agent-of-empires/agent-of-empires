@@ -244,7 +244,7 @@ impl Instance {
         }
         let config = crate::session::config::repo_config::resolve_config_with_repo_or_warn(
             &self.effective_profile(),
-            Path::new(&self.project_path),
+            self.repo_config_path(),
         );
         if config
             .session
