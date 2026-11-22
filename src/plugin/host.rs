@@ -672,7 +672,7 @@ impl PluginHost {
             .collect();
         self.teardown_workers(to_teardown).await;
         for id in uninstalled {
-            self.forget_suggestions(id).await;
+            self.settle_owed_cleanup(&id, true).await;
         }
     }
 
@@ -3348,11 +3348,15 @@ variables = []
         })
         .await;
 
+        // An uninstall while the daemon runs leaves its obligation until the
+        // worker is retired and the clear behind it has succeeded.
+        crate::plugin::install::persist_suggestions_cleanup(plugin_id, true).unwrap();
         update_config(|config| config.plugins.remove(plugin_id)).unwrap();
         std::fs::remove_dir_all(crate::plugin::plugins_dir().unwrap().join(plugin_id)).unwrap();
         host.reconcile(&crate::plugin::reload_registry()).await;
         assert!(host.state.lock().await.running.is_empty());
         assert_eq!(published(), 0);
+        assert!(!crate::plugin::install::suggestions_cleanup_owed(plugin_id));
         host.shutdown().await;
     }
 

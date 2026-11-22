@@ -1958,8 +1958,17 @@ fn is_installed_external(id: &str) -> Result<bool> {
 /// Drop the plugin's directory, config entry and lock entry.
 fn remove_external(id: &str) -> Result<()> {
     // First, so a failed cleanup leaves the plugin installed rather than
-    // removed with live published rows.
-    forget_suggestion_publication(id)?;
+    // removed with live published rows. With a daemon running, its worker can
+    // still publish after this clear, so the marker outlives it and the daemon
+    // clears again behind the retired worker.
+    let cleanup = persist_suggestions_cleanup(id, true)?;
+    let retired = crate::acp::client::discovery::discover_local().is_err();
+    if let Err(error) = run_suggestions_cleanup(id, &cleanup, retired) {
+        if cleanup == Cleanup::Persisted {
+            let _ = std::fs::remove_file(cleanup_marker(id)?);
+        }
+        return Err(error);
+    }
     let dir = super::plugins_dir()?.join(id);
     remove_owned_tree(&dir).with_context(|| format!("removing {}", dir.display()))?;
     update_config(|config| config.plugins.remove(id))?;
@@ -5036,6 +5045,54 @@ mod tests {
         assert!(!Config::load().unwrap().plugins.contains_key("acme.thing"));
     }
 
+    /// With no daemon to retire a worker, an uninstall clears the published
+    /// rows itself and leaves no obligation; one a daemon was to settle is
+    /// still owed to a same-ID reinstall.
+    #[test]
+    #[serial]
+    fn uninstall_clears_published_rows_and_settles_its_obligation() {
+        let _home = isolate_app_dir();
+        let db = crate::session::get_app_dir()
+            .unwrap()
+            .join(super::super::host_api::EVENTS_DB);
+        let host = super::super::host_api::HostApiState::open(&db, "default", 100).unwrap();
+        let published = || -> i64 {
+            host.with_suggestions_db(|conn, _| {
+                conn.query_row("SELECT COUNT(*) FROM suggestion_providers", [], |r| {
+                    r.get(0)
+                })
+                .unwrap()
+            })
+        };
+        host.with_suggestions_db(|conn, _| {
+            conn.execute(
+                "INSERT INTO suggestion_providers (profile, provider_id, updated_at) VALUES ('p', 'acme.thing', 0)",
+                [],
+            )
+            .unwrap();
+        });
+        update_config(|config| {
+            config.plugins.insert(
+                "acme.thing".to_string(),
+                PluginConfig {
+                    source: Some("gh:acme/thing".to_string()),
+                    ..PluginConfig::default()
+                },
+            );
+        })
+        .unwrap();
+        uninstall("acme.thing").unwrap();
+        assert_eq!(published(), 0);
+        assert!(!suggestions_cleanup_owed("acme.thing"));
+
+        // An obligation a running daemon left behind reaches a reinstall.
+        persist_suggestions_cleanup("acme.thing", true).unwrap();
+        assert_eq!(
+            persist_suggestions_cleanup("acme.thing", false).unwrap(),
+            Cleanup::Pending
+        );
+    }
+
     /// A failed cleanup is an error, not a logged warning, and it keeps the
     /// plugin installed.
     #[test]
@@ -5052,6 +5109,10 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         assert!(remove_external("acme.thing").is_err());
         assert!(dir.exists(), "a failed cleanup must not remove the plugin");
+        assert!(
+            !cleanup_marker("acme.thing").unwrap().exists(),
+            "and must not leave an obligation for a plugin that stays"
+        );
     }
 
     #[test]
