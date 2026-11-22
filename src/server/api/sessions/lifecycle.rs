@@ -5101,7 +5101,7 @@ mod durable_stop_tests {
                 if superseded {
                     ""
                 } else {
-                    "inspect --format {{json .Config.Entrypoint}} c1\nstop c1"
+                    "inspect --format {{json .Config.Entrypoint}}|{{json .HostConfig.Init}}|{{json .Config.StopTimeout}} c1\nstop c1"
                 },
                 "superseded={superseded}"
             );

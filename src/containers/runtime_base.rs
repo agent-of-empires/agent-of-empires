@@ -9,15 +9,21 @@ use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 use tokio_util::sync::CancellationToken;
 
-/// Format printing a container's image ENTRYPOINT as JSON.
-pub(crate) const ENTRYPOINT_FORMAT: &str = "{{json .Config.Entrypoint}}";
+/// Format printing the settings that decide what PID 1 does on stop: the
+/// image ENTRYPOINT, `--init` and `--stop-timeout`, as `|`-separated JSON.
+pub(crate) const STOP_SETTINGS_FORMAT: &str =
+    "{{json .Config.Entrypoint}}|{{json .HostConfig.Init}}|{{json .Config.StopTimeout}}";
 
-/// Stop args for a container whose ENTRYPOINT printed as `entrypoint`. With
-/// none, PID 1 is the appended `sleep`, which ignores SIGTERM, so waiting out
-/// the grace only delays SIGKILL. Any other PID 1 keeps the runtime's grace.
-pub(crate) fn stop_args(entrypoint: Option<&str>) -> &'static [&'static str] {
-    match entrypoint {
-        Some("null" | "[]" | "\"\"") => &["stop", "-t", "0"],
+/// Stop args for a container whose settings printed as `settings`. With no
+/// ENTRYPOINT, no init and no explicit timeout, PID 1 is the appended `sleep`,
+/// which ignores SIGTERM, so waiting out the grace only delays SIGKILL. Any
+/// other setup, or an unreadable answer, keeps the runtime's grace.
+pub(crate) fn stop_args(settings: Option<&str>) -> &'static [&'static str] {
+    let mut fields = settings.unwrap_or_default().split('|');
+    match (fields.next(), fields.next(), fields.next(), fields.next()) {
+        (Some("null" | "[]" | "\"\""), Some("null" | "false"), Some("null"), None) => {
+            &["stop", "-t", "0"]
+        }
         _ => &["stop"],
     }
 }
@@ -809,14 +815,14 @@ impl RuntimeBase {
     pub fn stop_container(&self, name: &str) -> Result<()> {
         tracing::info!(target: "containers.runtime", runtime = %self.name, %name, "stopping container");
         let mut inspect = self.command();
-        inspect.args(["inspect", "--format", ENTRYPOINT_FORMAT, name]);
-        let entrypoint = self
+        inspect.args(["inspect", "--format", STOP_SETTINGS_FORMAT, name]);
+        let settings = self
             .probe_output(&mut inspect)
             .ok()
             .filter(|output| output.status.success())
             .map(|output| String::from_utf8_lossy(&output.stdout).trim().to_owned());
         let mut cmd = self.command();
-        cmd.args(stop_args(entrypoint.as_deref())).arg(name);
+        cmd.args(stop_args(settings.as_deref())).arg(name);
         let output = self.probe_output(&mut cmd)?;
 
         if !output.status.success() {
@@ -998,15 +1004,22 @@ mod tests {
     }
 
     #[test]
-    fn stop_skips_the_grace_only_without_an_entrypoint() {
-        for (entrypoint, expected) in [
-            (Some("null"), &["stop", "-t", "0"][..]),
-            (Some("[]"), &["stop", "-t", "0"][..]),
-            (Some("\"\""), &["stop", "-t", "0"][..]),
-            (Some("[\"/entry.sh\"]"), &["stop"][..]),
-            (None, &["stop"][..]),
+    fn stop_skips_the_grace_only_for_a_bare_sleep() {
+        const NOW: &[&str] = &["stop", "-t", "0"];
+        const GRACE: &[&str] = &["stop"];
+        for (settings, expected) in [
+            (Some("null|null|null"), NOW),
+            (Some("[]|false|null"), NOW),
+            (Some("\"\"|null|null"), NOW),
+            (Some("[\"/entry.sh\"]|null|null"), GRACE),
+            (Some("null|true|null"), GRACE),
+            (Some("null|null|30"), GRACE),
+            (Some("null|null|10"), GRACE),
+            (Some("null"), GRACE),
+            (Some(""), GRACE),
+            (None, GRACE),
         ] {
-            assert_eq!(stop_args(entrypoint), expected, "{entrypoint:?}");
+            assert_eq!(stop_args(settings), expected, "{settings:?}");
         }
     }
 

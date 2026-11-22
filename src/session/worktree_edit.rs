@@ -577,7 +577,7 @@ mod tests {
             assert_eq!(
                 log.trim(),
                 if called {
-                    "inspect --format {{json .Config.Entrypoint}} c1\nstop c1"
+                    "inspect --format {{json .Config.Entrypoint}}|{{json .HostConfig.Init}}|{{json .Config.StopTimeout}} c1\nstop c1"
                 } else {
                     ""
                 },
