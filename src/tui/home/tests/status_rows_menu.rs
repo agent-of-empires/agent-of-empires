@@ -2111,3 +2111,51 @@ fn update_bar_live_line_shows_no_dismiss_hint() {
     assert!(out.contains("moving the sandbox store"), "{out}");
     assert!(!out.contains("dismiss"), "{out}");
 }
+
+/// A hidden running pull keeps its progress on the key line: with the shortcut bar shown, in
+/// Live send (beside its exit hint), and with the bar hidden, where the row is kept for it.
+#[test]
+#[serial]
+fn a_hidden_pull_shows_its_progress_on_every_key_line() {
+    use crate::containers::pull_progress::ProgressSnapshot;
+    use crate::tui::styles::load_theme;
+    use ratatui::backend::TestBackend;
+    use ratatui::Terminal;
+
+    let theme = load_theme("empire");
+    // (case, shortcut bar shown, in Live send)
+    for (case, bar, live) in [
+        ("shortcut bar", true, false),
+        ("Live send", true, true),
+        ("bar hidden", false, false),
+    ] {
+        let mut env = create_test_env_empty();
+        env.view.show_shortcut_bar = bar;
+        if live {
+            env.view.enter_live_send_for_test();
+        }
+        env.view.hidden_pull = Some(ProgressSnapshot {
+            layers_done: Some(3),
+            layers_known: Some(7),
+            ..ProgressSnapshot::default()
+        });
+        let mut terminal = Terminal::new(TestBackend::new(100, 30)).unwrap();
+        terminal
+            .draw(|f| {
+                let area = f.area();
+                env.view.render(f, area, &theme, None);
+            })
+            .unwrap();
+        let buf = terminal.backend().buffer();
+        let last = (0..buf.area.width)
+            .map(|x| buf[(x, buf.area.height - 1)].symbol())
+            .collect::<String>();
+        assert!(last.contains("Image 3/7"), "{case}: {last:?}");
+        if live {
+            assert!(
+                last.contains("to exit"),
+                "{case} lost its exit hint: {last:?}"
+            );
+        }
+    }
+}

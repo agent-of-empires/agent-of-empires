@@ -15,8 +15,7 @@ use std::time::Duration;
 use super::home::update_bar::{DrawnBar, UpdateBar};
 use super::home::{bindings, HomeView, TerminalMode};
 use super::image_pull::{
-    self, Applied, CancelKey, ImageOffer, PullAnswer, PullReport, PullRequest, PullSource,
-    PullWatch,
+    self, Applied, ImageOffer, PullAnswer, PullReport, PullRequest, PullSource, PullWatch,
 };
 use super::styles::Theme;
 use crate::containers::image_update::ImageUpdate;
@@ -103,25 +102,23 @@ impl UpdateStatus {
 
 pub type TuiBackend = crate::tui::hyperlink::HyperlinkBackend<std::io::Stdout>;
 
-/// Sends a pull request to the Daemon, or to this process's pull without one. Replaceable so
-/// tests can answer requests themselves.
+/// Sends a pull request to the Daemon. Replaceable so tests can answer requests themselves.
 type PullRunner =
     Box<dyn FnMut(PullRequest, String) -> tokio::sync::oneshot::Receiver<PullAnswer> + Send>;
 
 const CANCEL_PULL_PROMPT: &str =
-    "Press Ctrl+E again to cancel the download. To keep going, press any other key.";
+    "Press y to cancel the download. To keep going, press any other key.";
+
+/// The cancel prompt's confirming key: not Ctrl+E, so holding Ctrl+E can't confirm it.
+const CONFIRM_CANCEL_PULL: KeyCode = KeyCode::Char('y');
 
 fn run_pull_request(
     request: PullRequest,
     image: String,
 ) -> tokio::sync::oneshot::Receiver<PullAnswer> {
-    let runtime = Config::load_or_warn().sandbox.container_runtime;
     let (tx, rx) = tokio::sync::oneshot::channel();
     tokio::spawn(async move {
-        let answer = PullSource::locate()
-            .await
-            .run(runtime, &image, request)
-            .await;
+        let answer = PullSource::locate().await.run(&image, request).await;
         let _ = tx.send(answer);
     });
     rx
@@ -149,12 +146,16 @@ pub struct App {
     /// Snoozed via Ctrl+x until a newer release ships.
     dismissed_update_version: Option<String>,
     image_update: Option<ImageUpdate>,
-    image_update_rx: Option<
-        tokio::sync::oneshot::Receiver<anyhow::Result<crate::containers::image_update::ImageCheck>>,
-    >,
     pull: PullWatch,
     /// The pull request in flight and where its answer arrives.
     pull_rx: Option<(PullRequest, tokio::sync::oneshot::Receiver<PullAnswer>)>,
+    /// The image the watched pull is of, so a changed default can't redirect its requests;
+    /// empty for the Daemon's default.
+    pull_image: String,
+    /// The update the watched pull installs, recorded when it starts.
+    pull_digest: Option<String>,
+    /// A Cancel asked for while the Start is in flight; sent once the Start answers.
+    cancel_after_start: bool,
     /// The update a pull this TUI watched just installed, so a stale offer of it stays away.
     pulled_image_digest: Option<String>,
     pull_runner: PullRunner,
@@ -376,7 +377,9 @@ impl App {
             update_status_rx: None,
             dismissed_update_version,
             image_update: None,
-            image_update_rx: None,
+            pull_image: String::new(),
+            pull_digest: None,
+            cancel_after_start: false,
             pull: PullWatch::default(),
             pull_rx: None,
             pulled_image_digest: None,
@@ -693,11 +696,6 @@ impl App {
             } else {
                 None
             };
-
-        // Only for users who run sandboxed sessions.
-        if settings.update_check_mode.is_enabled() && self.sandbox_in_use() {
-            self.spawn_image_update_check();
-        }
 
         // Exit cleanly when the terminal is force-quit, preventing PTY slot leaks.
         #[cfg(unix)]
@@ -1358,11 +1356,7 @@ impl App {
             }
             needs_full_refresh |= self.poll_tool_detection();
             // Every banner poll must run.
-            if self.poll_update_check()
-                | self.poll_update_status()
-                | self.poll_image_update_check()
-                | self.poll_pull()
-            {
+            if self.poll_update_check() | self.poll_update_status() | self.poll_pull() {
                 self.needs_redraw = true;
                 needs_full_refresh = true;
             }
@@ -1757,13 +1751,6 @@ impl App {
         true
     }
 
-    fn sandbox_in_use(&self) -> bool {
-        if Config::load_or_warn().sandbox.enabled_by_default {
-            return true;
-        }
-        self.home.instances().any(|i| i.is_sandboxed())
-    }
-
     /// Ctrl+X on the update bar: returns whether a line was drawn. It dismisses that line if
     /// it is still current; a live line, or one whose state has since changed, spends the key.
     /// Expired statuses are cleared only by draw: until then they are the line on screen.
@@ -1817,8 +1804,7 @@ impl App {
                 if !self.pull.retries(line) {
                     return false;
                 }
-                let image = Config::load_or_warn().sandbox.default_image;
-                self.start_pull(image);
+                self.start_pull(self.pull_image.clone());
             }
             Some(DrawnBar::ImageUpdate { digest }) => {
                 if let Some(update) = self
@@ -1835,85 +1821,47 @@ impl App {
         true
     }
 
-    fn spawn_image_update_check(&mut self) {
-        if self.image_update_rx.is_some() {
-            return;
-        }
-        let sandbox = Config::load_or_warn().sandbox;
-        let image = sandbox.default_image;
-        let runtime = crate::containers::ContainerRuntime::from(sandbox.container_runtime);
-        let (tx, rx) = tokio::sync::oneshot::channel();
-        self.image_update_rx = Some(rx);
-        tokio::spawn(async move {
-            // With a Daemon, its image-status offers the update instead.
-            if !matches!(PullSource::locate().await, PullSource::Local) {
-                return;
-            }
-            let result = crate::containers::image_update::check_image(runtime, &image).await;
-            let _ = tx.send(result);
-        });
-    }
-
-    fn poll_image_update_check(&mut self) -> bool {
-        let Some(mut rx) = self.image_update_rx.take() else {
-            return false;
-        };
-        match rx.try_recv() {
-            Ok(Ok(crate::containers::image_update::ImageCheck::Available(update))) => {
-                if self.dismissed_image_digest.as_deref() == Some(update.remote_digest.as_str()) {
-                    return false;
-                }
-                self.image_update = Some(update);
-                true
-            }
-            // The TUI banner only offers an update; it has no row for "can't tell".
-            Ok(Ok(_)) => false,
-            Ok(Err(e)) => {
-                tracing::debug!(target: "containers.image_update", error = %e, "image update check failed");
-                false
-            }
-            Err(tokio::sync::oneshot::error::TryRecvError::Empty) => {
-                self.image_update_rx = Some(rx);
-                false
-            }
-            Err(tokio::sync::oneshot::error::TryRecvError::Closed) => false,
-        }
-    }
-
     fn start_pull(&mut self, image: String) {
+        self.pull_image = image.clone();
+        self.pull_digest = self.image_update.as_ref().map(|u| u.remote_digest.clone());
+        self.cancel_after_start = false;
         self.pull.start();
         self.request_pull(PullRequest::Start, image);
     }
 
-    /// A poll waits for the request in flight; a start or cancel replaces it.
+    /// A poll waits for the request in flight, and so does a cancel behind a start, which the
+    /// Daemon may not have registered yet; otherwise a request replaces the one in flight.
     fn request_pull(&mut self, request: PullRequest, image: String) {
-        if request == PullRequest::Poll && self.pull_rx.is_some() {
-            return;
+        match (&self.pull_rx, request) {
+            (Some(_), PullRequest::Poll) => return,
+            (Some((PullRequest::Start, _)), PullRequest::Cancel) => {
+                self.cancel_after_start = true;
+                return;
+            }
+            _ => {}
         }
         self.pull_rx = Some((request, (self.pull_runner)(request, image)));
     }
 
-    /// Reads the pull's state on its interval while this TUI watches one, or while update
-    /// checks are on and a sandbox is in use, as the startup image check runs.
+    /// Reads the Daemon's pull state and offer on an interval, whatever this TUI's update
+    /// checks are: the Daemon's answer decides the offer, and shows a pull started elsewhere.
     fn schedule_pull_poll(&mut self, now: std::time::Instant) {
         if now < self.next_pull_poll {
             return;
         }
         self.next_pull_poll = now + image_pull::poll_interval(self.pull.running());
-        if !self.pull.holds_line()
-            && !(get_update_settings().update_check_mode.is_enabled() && self.sandbox_in_use())
-        {
-            return;
-        }
-        let image = Config::load_or_warn().sandbox.default_image;
-        self.request_pull(PullRequest::Poll, image);
+        self.request_pull(PullRequest::Poll, self.pull_image.clone());
     }
 
     fn poll_pull(&mut self) -> bool {
         let Some((request, mut rx)) = self.pull_rx.take() else {
             return false;
         };
-        let PullAnswer { report, offer } = match rx.try_recv() {
+        let PullAnswer {
+            report,
+            offer,
+            image,
+        } = match rx.try_recv() {
             Ok(answer) => answer,
             Err(tokio::sync::oneshot::error::TryRecvError::Empty) => {
                 self.pull_rx = Some((request, rx));
@@ -1927,15 +1875,46 @@ impl App {
             Applied::Unchanged => false,
             Applied::Changed => true,
             Applied::Updated => {
-                self.pulled_image_digest = self.image_update.take().map(|u| u.remote_digest);
+                let installed = self
+                    .pull_digest
+                    .take()
+                    .or_else(|| self.image_update.as_ref().map(|u| u.remote_digest.clone()));
+                if self.image_update.as_ref().map(|u| &u.remote_digest) == installed.as_ref() {
+                    self.image_update = None;
+                }
+                self.pulled_image_digest = installed;
                 true
             }
             Applied::Unanswered(text) => {
                 self.set_status(text);
                 true
             }
+            Applied::Recheck => {
+                self.next_pull_poll = std::time::Instant::now();
+                false
+            }
         };
-        offer.is_some_and(|offer| self.offer_image_update(offer)) || changed
+        let offered = offer.is_some_and(|offer| self.offer_image_update(offer));
+        if self.pull.running() {
+            // A pull seen running elsewhere installs the update on offer now, and is of the
+            // image this poll reported on.
+            if self.pull_digest.is_none() {
+                self.pull_digest = self.image_update.as_ref().map(|u| u.remote_digest.clone());
+            }
+            if self.pull_image.is_empty() {
+                self.pull_image = image.unwrap_or_default();
+            }
+        } else if !self.pull.holds_line() {
+            self.pull_image.clear();
+            self.pull_digest = None;
+        }
+        if request == PullRequest::Start
+            && std::mem::take(&mut self.cancel_after_start)
+            && self.pull.running()
+        {
+            self.request_pull(PullRequest::Cancel, self.pull_image.clone());
+        }
+        offered || changed
     }
 
     /// A Daemon's offer replaces the update on the bar, so one dismissed or pulled from the web
@@ -1958,22 +1937,13 @@ impl App {
         true
     }
 
-    /// Ctrl+E on a running pull: the first press asks, a second within the prompt's 3 s
-    /// cancels.
+    /// Ctrl+E on a running pull asks; the prompt's confirming key, within 3 s, cancels.
     fn cancel_pull_key(&mut self) {
-        match self.pull.cancel_key(std::time::Instant::now()) {
-            CancelKey::Ignored => {}
-            CancelKey::Confirm => {
-                self.update_status = Some(UpdateStatus::lasting(
-                    CANCEL_PULL_PROMPT.to_string(),
-                    image_pull::CANCEL_CONFIRM_TTL,
-                ));
-            }
-            CancelKey::Cancel => {
-                self.clear_cancel_pull_prompt();
-                let image = Config::load_or_warn().sandbox.default_image;
-                self.request_pull(PullRequest::Cancel, image);
-            }
+        if self.pull.arm_cancel(std::time::Instant::now()) {
+            self.update_status = Some(UpdateStatus::lasting(
+                CANCEL_PULL_PROMPT.to_string(),
+                image_pull::CANCEL_CONFIRM_TTL,
+            ));
         }
     }
 
@@ -2420,6 +2390,15 @@ impl App {
             && self.pull.running();
         if cancels_pull {
             self.cancel_pull_key();
+            return Ok(());
+        }
+        if key.code == CONFIRM_CANCEL_PULL
+            && key.modifiers == KeyModifiers::NONE
+            && !self.home.has_dialog()
+            && self.pull.confirm_cancel(std::time::Instant::now())
+        {
+            self.clear_cancel_pull_prompt();
+            self.request_pull(PullRequest::Cancel, self.pull_image.clone());
             return Ok(());
         }
         self.pull.other_key();
@@ -3720,6 +3699,7 @@ mod tests {
         let answer = |pull, offer| PullAnswer {
             report: PullReport::State(pull),
             offer: Some(offer),
+            image: None,
         };
         let offered =
             |update: &ImageUpdate| answer(PullState::Idle, ImageOffer::Update(update.clone()));
@@ -3826,9 +3806,174 @@ mod tests {
         log
     }
 
-    /// The pull line's keys in both modes: Ctrl+E asks, then cancels; the Update key retries
-    /// a cancelled pull; Done clears on the next key, which still acts; and with a dialog open,
-    /// as while Live send captures keys, Ctrl+E is not the pull's.
+    type SentPulls = std::sync::Arc<
+        std::sync::Mutex<
+            Vec<(
+                PullRequest,
+                String,
+                tokio::sync::oneshot::Sender<PullAnswer>,
+            )>,
+        >,
+    >;
+
+    /// Keeps each pull request, its image and the sender that answers it.
+    fn hold_pull_requests(app: &mut App) -> SentPulls {
+        let log = SentPulls::default();
+        let sent = log.clone();
+        app.pull_runner = Box::new(move |request, image| {
+            let (tx, rx) = tokio::sync::oneshot::channel();
+            sent.lock().unwrap().push((request, image, tx));
+            rx
+        });
+        log
+    }
+
+    fn sent_requests(sent: &SentPulls) -> Vec<(PullRequest, String)> {
+        sent.lock()
+            .unwrap()
+            .iter()
+            .map(|(request, image, _)| (*request, image.clone()))
+            .collect()
+    }
+
+    /// Answers the `index`th request sent, then reads the answer as the event loop does.
+    fn answer_sent(app: &mut App, sent: &SentPulls, index: usize, answer: impl Into<PullAnswer>) {
+        let (request, _, tx) = sent.lock().unwrap().remove(index);
+        let _ = tx.send(answer.into());
+        assert_eq!(app.pull_rx.as_ref().map(|(r, _)| *r), Some(request));
+        app.poll_pull();
+    }
+
+    /// A cancel while the Start is in flight waits for it, then goes out, of the image the pull
+    /// started with although the default has since changed; a Start the Daemon didn't answer
+    /// polls again at once rather than dropping the watch.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn a_cancel_behind_a_start_waits_for_it_and_names_the_watched_image() {
+        let _home = crate::session::test_support::isolate_app_dir();
+        crate::session::get_profile_dir("test").unwrap();
+        const IMAGE: &str = "ghcr.io/example/watched:latest";
+        let (mut app, mut terminal) = key_app();
+        let sent = hold_pull_requests(&mut app);
+        let ctrl_e = bindings::key_event(bindings::ActionId::CancelImagePull, false).unwrap();
+        let confirm = KeyEvent::new(CONFIRM_CANCEL_PULL, KeyModifiers::NONE);
+
+        app.start_pull(IMAGE.into());
+        crate::session::update_config(|c| c.sandbox.default_image = "ghcr.io/example/new".into())
+            .unwrap();
+        app.handle_key(ctrl_e, &mut terminal).await.unwrap();
+        app.handle_key(confirm, &mut terminal).await.unwrap();
+        assert_eq!(
+            sent_requests(&sent),
+            [(PullRequest::Start, IMAGE.into())],
+            "the cancel replaced the Start in flight"
+        );
+        assert!(app.pull.running());
+
+        answer_sent(
+            &mut app,
+            &sent,
+            0,
+            PullReport::State(PullState::Running(Default::default())),
+        );
+        assert_eq!(sent_requests(&sent), [(PullRequest::Cancel, IMAGE.into())]);
+        assert!(
+            app.pull.running(),
+            "the line cleared before the cancel answered"
+        );
+        answer_sent(&mut app, &sent, 0, PullReport::State(PullState::Cancelled));
+        assert_eq!(app.pull.line(), Some(&PullLine::Cancelled));
+        app.schedule_pull_poll(app.next_pull_poll);
+        assert_eq!(
+            sent_requests(&sent),
+            [(PullRequest::Poll, IMAGE.into())],
+            "the outcome's poll, and so its Retry, lost the watched image"
+        );
+
+        sent.lock().unwrap().clear();
+        app.pull_rx = None;
+        app.start_pull(IMAGE.into());
+        app.next_pull_poll = std::time::Instant::now() + std::time::Duration::from_secs(60);
+        answer_sent(&mut app, &sent, 0, PullReport::Unavailable);
+        assert!(app.pull.running(), "an unanswered Start dropped the watch");
+        let now = std::time::Instant::now();
+        assert!(
+            app.next_pull_poll <= now,
+            "an unanswered Start didn't recheck"
+        );
+        app.schedule_pull_poll(now);
+        assert_eq!(sent_requests(&sent), [(PullRequest::Poll, IMAGE.into())]);
+    }
+
+    /// Done takes off the update the pull started for, not whatever the bar offers by then.
+    /// A pull first seen running elsewhere installs the update on offer at that poll.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn done_records_the_update_the_pull_started_for() {
+        let _home = crate::session::test_support::isolate_app_dir();
+        crate::session::get_profile_dir("test").unwrap();
+        let (mut app, _terminal) = key_app();
+        let sent = hold_pull_requests(&mut app);
+        let newer = ImageUpdate {
+            remote_digest: "sha256:def".into(),
+            ..image_update()
+        };
+        let poll = |pull, update: &ImageUpdate| PullAnswer {
+            report: PullReport::State(pull),
+            offer: Some(ImageOffer::Update(update.clone())),
+            image: Some(update.image.clone()),
+        };
+        let running = || PullState::Running(Default::default());
+
+        app.image_update = Some(image_update());
+        app.start_pull(image_update().image);
+        answer_sent(&mut app, &sent, 0, PullReport::State(running()));
+        answer_pull(&mut app, PullRequest::Poll, poll(running(), &newer));
+        assert_eq!(app.image_update, Some(newer.clone()));
+        answer_pull(&mut app, PullRequest::Poll, poll(PullState::Done, &newer));
+        assert_eq!(app.pull.line(), Some(&PullLine::Done));
+        assert_eq!(
+            app.image_update,
+            Some(newer.clone()),
+            "Done took off a newer update"
+        );
+        assert_eq!(app.pulled_image_digest, Some(image_update().remote_digest));
+
+        let (mut app, _terminal) = key_app();
+        answer_pull(
+            &mut app,
+            PullRequest::Poll,
+            poll(running(), &image_update()),
+        );
+        assert!(app.pull.running(), "a pull started elsewhere isn't shown");
+        answer_pull(&mut app, PullRequest::Poll, poll(running(), &newer));
+        answer_pull(&mut app, PullRequest::Poll, poll(PullState::Done, &newer));
+        assert_eq!(app.image_update, Some(newer));
+        assert_eq!(app.pulled_image_digest, Some(image_update().remote_digest));
+    }
+
+    /// The Daemon's state is read with this TUI's update checks off and no sandbox in use: the
+    /// Daemon decides what to offer, and a pull started elsewhere still shows.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn the_pull_poll_runs_whatever_the_update_checks_are() {
+        let _home = crate::session::test_support::isolate_app_dir();
+        crate::session::get_profile_dir("test").unwrap();
+        crate::session::update_config(|c| {
+            c.updates.update_check_mode = crate::session::config::UpdateCheckMode::Off;
+            c.sandbox.enabled_by_default = false;
+        })
+        .unwrap();
+        let (mut app, _terminal) = key_app();
+        let sent = record_pull_requests(&mut app);
+        app.schedule_pull_poll(app.next_pull_poll);
+        assert_eq!(*sent.lock().unwrap(), [PullRequest::Poll]);
+    }
+
+    /// The pull line's keys in both modes: Ctrl+E asks and `y` cancels, so a held Ctrl+E, as
+    /// Repeat events or as repeated presses, never does; the Update key retries a cancelled
+    /// pull; Done clears on the next key, which still acts; and with a dialog open, as while
+    /// Live send captures keys, Ctrl+E is not the pull's.
     #[tokio::test]
     #[serial_test::serial]
     async fn the_pull_line_keys_cancel_retry_and_clear_in_both_modes() {
@@ -3841,6 +3986,7 @@ mod tests {
             let ctrl_e = bindings::key_event(bindings::ActionId::CancelImagePull, strict).unwrap();
             let update = bindings::key_event(bindings::ActionId::Update, strict).unwrap();
             let help = bindings::key_event(bindings::ActionId::Help, strict).unwrap();
+            let confirm = KeyEvent::new(CONFIRM_CANCEL_PULL, KeyModifiers::NONE);
             let prompt = |app: &App| {
                 app.update_status
                     .as_ref()
@@ -3860,12 +4006,23 @@ mod tests {
                 !prompt(&app),
                 "strict={strict}: another key left the prompt"
             );
-            app.handle_key(ctrl_e, &mut terminal).await.unwrap();
-            assert!(
-                sent.lock().unwrap().is_empty(),
-                "strict={strict}: one Ctrl+E cancelled"
+            let held = KeyEvent::new_with_kind(
+                ctrl_e.code,
+                ctrl_e.modifiers,
+                crossterm::event::KeyEventKind::Repeat,
             );
-            app.handle_key(ctrl_e, &mut terminal).await.unwrap();
+            for (how, repeat) in [("Repeat", held), ("Press", ctrl_e)] {
+                app.handle_key(ctrl_e, &mut terminal).await.unwrap();
+                for _ in 0..5 {
+                    app.handle_key(repeat, &mut terminal).await.unwrap();
+                }
+                assert!(
+                    sent.lock().unwrap().is_empty(),
+                    "strict={strict}: a held Ctrl+E ({how}) cancelled"
+                );
+                assert!(prompt(&app), "strict={strict}: {how} ended the prompt");
+            }
+            app.handle_key(confirm, &mut terminal).await.unwrap();
             assert_eq!(
                 *sent.lock().unwrap(),
                 [PullRequest::Cancel],

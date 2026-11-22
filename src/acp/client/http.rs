@@ -502,36 +502,52 @@ impl HttpClient {
 
     /// `GET /api/sandbox/image-status` for the configured image. `fresh` skips the cached
     /// registry check.
-    pub async fn sandbox_image_status(&self, fresh: bool) -> Result<SandboxImageStatus, HttpError> {
+    /// `image` empty: the Daemon's configured default.
+    pub async fn sandbox_image_status(
+        &self,
+        fresh: bool,
+        image: &str,
+    ) -> Result<SandboxImageStatus, HttpError> {
         let url = format!("{}/api/sandbox/image-status", self.endpoint.base_url);
-        let res = self
-            .execute(self.http.get(&url).query(&[("fresh", fresh)]))
-            .await?;
+        let mut request = self.http.get(&url).query(&[("fresh", fresh)]);
+        if !image.is_empty() {
+            request = request.query(&[("image", image)]);
+        }
+        let res = self.execute(request).await?;
         let res = check_global_status(res)?;
         Ok(crate::daemon::decode_json(res).await?)
     }
 
-    /// `POST /api/sandbox/image-pull`: starts the configured image's pull, or joins it.
+    /// `POST /api/sandbox/image-pull`: starts `image`'s pull, or joins it; empty is the
+    /// Daemon's configured default.
     pub async fn sandbox_image_pull(
         &self,
+        image: &str,
     ) -> Result<crate::containers::image_pull::PullState, HttpError> {
-        self.sandbox_pull_request("/api/sandbox/image-pull").await
+        self.sandbox_pull_request("/api/sandbox/image-pull", image)
+            .await
     }
 
-    /// `POST /api/sandbox/image-pull/cancel`: the state the cancelled pull ended in.
+    /// `POST /api/sandbox/image-pull/cancel`: the state `image`'s cancelled pull ended in.
     pub async fn sandbox_image_cancel(
         &self,
+        image: &str,
     ) -> Result<crate::containers::image_pull::PullState, HttpError> {
-        self.sandbox_pull_request("/api/sandbox/image-pull/cancel")
+        self.sandbox_pull_request("/api/sandbox/image-pull/cancel", image)
             .await
     }
 
     async fn sandbox_pull_request(
         &self,
         path: &str,
+        image: &str,
     ) -> Result<crate::containers::image_pull::PullState, HttpError> {
         let url = format!("{}{path}", self.endpoint.base_url);
-        let res = self.execute(self.http.post(&url)).await?;
+        let mut request = self.http.post(&url);
+        if !image.is_empty() {
+            request = request.json(&serde_json::json!({ "image": image }));
+        }
+        let res = self.execute(request).await?;
         let res = check_global_status(res)?;
         Ok(crate::daemon::decode_json::<SandboxPullReply>(res)
             .await?
@@ -2772,14 +2788,15 @@ mod tests {
         );
     }
 
-    /// The three sandbox image calls against the real router. A stand-in flight is the pull,
-    /// so no runtime is run.
+    /// The three sandbox image calls against the real router, naming the watched image after the
+    /// machine default moved on. A stand-in flight is the pull, so no runtime is run.
     #[tokio::test]
     #[serial_test::serial]
     async fn sandbox_image_status_pull_and_cancel_round_trip() {
         use crate::containers::image_pull::{self, PullState};
         use crate::server::test_support;
         const IMAGE: &str = "aoe-test/http-client-pull:latest";
+        const OTHER: &str = "aoe-test/http-client-other:latest";
         let _app = crate::session::test_support::isolate_app_dir();
         crate::session::update_config(|c| {
             c.updates.update_check_mode = crate::session::config::UpdateCheckMode::Off;
@@ -2806,7 +2823,7 @@ mod tests {
 
         let state = test_support::build_test_app_state(Vec::new());
         let (client, server) = serve(state.clone()).await;
-        let status = client.sandbox_image_status(false).await.unwrap();
+        let status = client.sandbox_image_status(false, "").await.unwrap();
         assert_eq!(status.image, IMAGE);
         assert_eq!(status.pull, PullState::Idle);
         assert_eq!(status.pull_blocked, None);
@@ -2835,17 +2852,42 @@ mod tests {
             ))
         });
         assert_eq!(
-            client.sandbox_image_pull().await.unwrap(),
+            client.sandbox_image_pull("").await.unwrap(),
             PullState::Running(Default::default())
         );
+        // The default moves on; a profile still uses the watched image, so it stays configured.
+        crate::session::create_profile("work").unwrap();
+        crate::session::update_profile_config("work", |p| {
+            p.overrides.insert(
+                "sandbox".into(),
+                serde_json::json!({ "default_image": IMAGE }),
+            );
+            Ok(())
+        })
+        .unwrap();
+        crate::session::update_config(|c| c.sandbox.default_image = OTHER.into()).unwrap();
+        assert_eq!(
+            client.sandbox_image_status(false, "").await.unwrap().pull,
+            PullState::Idle,
+            "the default image isn't pulling"
+        );
         assert!(matches!(
-            client.sandbox_image_status(false).await.unwrap().pull,
+            client
+                .sandbox_image_status(false, IMAGE)
+                .await
+                .unwrap()
+                .pull,
             PullState::Running(_)
         ));
         assert_eq!(
-            client.sandbox_image_cancel().await.unwrap(),
+            client.sandbox_image_cancel(IMAGE).await.unwrap(),
             PullState::Cancelled
         );
+        assert!(matches!(
+            client.sandbox_image_pull("aoe-test/not-configured:latest").await,
+            Err(HttpError::Server { status, ref body })
+                if status == reqwest::StatusCode::BAD_REQUEST && body.contains("unknown_image")
+        ));
         assert!(flight
             .wait(&tokio_util::sync::CancellationToken::new())
             .is_err());
@@ -2857,7 +2899,7 @@ mod tests {
         let (client, server) = serve(read_only.clone()).await;
         assert_eq!(
             client
-                .sandbox_image_status(false)
+                .sandbox_image_status(false, "")
                 .await
                 .unwrap()
                 .pull_blocked
@@ -2865,7 +2907,7 @@ mod tests {
             Some("read_only")
         );
         assert!(matches!(
-            client.sandbox_image_pull().await,
+            client.sandbox_image_pull("").await,
             Err(HttpError::ReadOnly)
         ));
         read_only.shutdown.cancel();

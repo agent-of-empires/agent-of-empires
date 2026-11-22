@@ -128,21 +128,20 @@ impl PullLine {
                     label(ActionId::CancelImagePull)
                 );
                 let safe = "Sessions keep running";
-                let forms = match counts(snapshot) {
-                    Some((done, known)) => [
+                let (full, short) = match counts(snapshot) {
+                    Some((done, known)) => (
                         format!(
                             "{head} {} {done} of {known} layers · {safe}{keys}",
                             meter(done, known)
                         ),
-                        format!("{head} {done}/{known}{keys}"),
-                    ],
-                    None => [format!("{head} · {safe}{keys}"), format!("{head}{keys}")],
+                        format!("{head} {done}/{known}"),
+                    ),
+                    None => (format!("{head} · {safe}{keys}"), head),
                 };
-                let [full, short] = forms;
                 if full.width() <= width {
                     full
                 } else {
-                    short
+                    shorten(&short, &keys, width)
                 }
             }
             Self::Done => " ✓ Sandbox image updated. Applies to new Sessions.".to_string(),
@@ -297,6 +296,19 @@ mod tests {
                     80,
                     vec!["Downloading sandbox image… 3/7", hide.as_str(), cancel.as_str()],
                     vec!["▰", "Sessions keep running"],
+                ),
+                // Too narrow for the short form: the heading gives way to an ellipsis, never the keys.
+                (
+                    PullLine::Running(downloading),
+                    50,
+                    vec!["⠹ Download", "…", hide.as_str(), cancel.as_str()],
+                    vec!["3/7"],
+                ),
+                (
+                    PullLine::Running(ProgressSnapshot::default()),
+                    50,
+                    vec!["…", hide.as_str(), cancel.as_str()],
+                    vec!["Sessions keep running"],
                 ),
                 (
                     PullLine::Running(unpacking),

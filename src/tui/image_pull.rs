@@ -1,20 +1,17 @@
-//! Reads, starts and cancels the sandbox image pull for the home screen: through the Daemon when
-//! one is running, else through this process's own pull.
+//! Reads, starts and cancels the sandbox image pull for the home screen, through the Daemon.
 
 use std::time::{Duration, Instant};
 
 use crate::acp::client::http::{SandboxImageAvailability, SandboxImageStatus};
-use crate::acp::client::{DiscoveryError, HttpClient, HttpError, ManagerError};
+use crate::acp::client::{HttpClient, HttpError, ManagerError};
 use crate::containers::image_pull::PullState;
 use crate::containers::image_update::ImageUpdate;
 use crate::containers::pull_progress::ProgressSnapshot;
-use crate::containers::ContainerRuntime;
 use crate::daemon::DaemonEndpoint;
-use crate::session::ContainerRuntimeName;
 use crate::tui::home::update_bar::PullLine;
 
-/// How long a local Cancel waits for the killed pull to end, as the Daemon's Cancel does.
-const CANCEL_BACKSTOP: Duration = Duration::from_secs(5);
+const START_UNANSWERED: &str =
+    "Couldn't start the sandbox image download: the Daemon didn't answer.";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum PullRequest {
@@ -30,6 +27,8 @@ pub(crate) enum PullReport {
     Gated {
         command: String,
     },
+    /// The Daemon no longer has this image configured.
+    UnknownImage,
     /// No answer: the Daemon is unreachable or failed the request.
     Unavailable,
 }
@@ -37,9 +36,9 @@ pub(crate) enum PullReport {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct PullAnswer {
     pub(crate) report: PullReport,
-    /// Only a Daemon's poll says: with a Daemon, its offer replaces this TUI's own registry
-    /// check, so both clients offer the same update.
+    /// Only a poll carries the Daemon's offer, and the image it reported on.
     pub(crate) offer: Option<ImageOffer>,
+    pub(crate) image: Option<String>,
 }
 
 impl From<PullReport> for PullAnswer {
@@ -47,6 +46,7 @@ impl From<PullReport> for PullAnswer {
         Self {
             report,
             offer: None,
+            image: None,
         }
     }
 }
@@ -74,11 +74,9 @@ impl ImageOffer {
     }
 }
 
+/// Without a usable Daemon nothing pulls: the home screen shows the offline gate then.
 pub(crate) enum PullSource {
     Daemon(HttpClient),
-    /// No Daemon is running, so this process owns the pull.
-    Local,
-    /// A Daemon exists but can't be used. Never pull locally then, or two pulls would run.
     Unavailable,
 }
 
@@ -88,43 +86,50 @@ impl PullSource {
     }
 
     fn from_lookup(lookup: Result<DaemonEndpoint, ManagerError>) -> Self {
-        match lookup {
-            Ok(endpoint) => HttpClient::new(endpoint).map_or(Self::Unavailable, Self::Daemon),
-            Err(ManagerError::NoDaemonRunning(DiscoveryError::NoLocalDaemon)) => Self::Local,
-            Err(_) => Self::Unavailable,
-        }
+        lookup
+            .ok()
+            .and_then(|endpoint| HttpClient::new(endpoint).ok())
+            .map_or(Self::Unavailable, Self::Daemon)
     }
 
-    /// `runtime` and `image` name the local pull; the Daemon pulls its own configured image.
-    pub(crate) async fn run(
-        &self,
-        runtime: ContainerRuntimeName,
-        image: &str,
-        request: PullRequest,
-    ) -> PullAnswer {
+    /// `image` is the pull's image; empty means the Daemon's configured default.
+    pub(crate) async fn run(&self, image: &str, request: PullRequest) -> PullAnswer {
         match self {
-            Self::Daemon(client) => daemon(client, request).await,
-            Self::Local => local(runtime, image.to_string(), request).await.into(),
+            Self::Daemon(client) => daemon(client, image, request).await,
             Self::Unavailable => PullReport::Unavailable.into(),
         }
     }
 }
 
-async fn daemon(client: &HttpClient, request: PullRequest) -> PullAnswer {
+async fn daemon(client: &HttpClient, image: &str, request: PullRequest) -> PullAnswer {
     let answer = match request {
         PullRequest::Poll => client
-            .sandbox_image_status(false)
+            .sandbox_image_status(false, image)
             .await
-            .map(|status| (Some(ImageOffer::from_status(&status)), status.pull)),
-        PullRequest::Start => client.sandbox_image_pull().await.map(|pull| (None, pull)),
-        PullRequest::Cancel => client.sandbox_image_cancel().await.map(|pull| (None, pull)),
+            .map(|status| {
+                let offer = ImageOffer::from_status(&status);
+                (Some((offer, status.image)), status.pull)
+            }),
+        PullRequest::Start => client
+            .sandbox_image_pull(image)
+            .await
+            .map(|pull| (None, pull)),
+        PullRequest::Cancel => client
+            .sandbox_image_cancel(image)
+            .await
+            .map(|pull| (None, pull)),
     };
     match answer {
-        Ok((offer, pull)) => PullAnswer {
-            report: PullReport::State(pull),
-            offer,
-        },
-        Err(error) if is_refusal(&error) => match client.sandbox_image_status(false).await {
+        Ok((polled, pull)) => {
+            let (offer, image) = polled.unzip();
+            PullAnswer {
+                report: PullReport::State(pull),
+                offer,
+                image,
+            }
+        }
+        Err(error) if is_unknown_image(&error) => PullReport::UnknownImage.into(),
+        Err(error) if is_refusal(&error) => match client.sandbox_image_status(false, image).await {
             Ok(status) => PullReport::Gated {
                 command: status.pull_command,
             }
@@ -142,27 +147,14 @@ fn is_refusal(error: &HttpError) -> bool {
         || matches!(error, HttpError::Server { status, .. } if *status == reqwest::StatusCode::FORBIDDEN)
 }
 
-async fn local(runtime: ContainerRuntimeName, image: String, request: PullRequest) -> PullReport {
-    tokio::task::spawn_blocking(move || {
-        let runtime = ContainerRuntime::from(runtime);
-        match request {
-            PullRequest::Poll => runtime.pull_state(&image),
-            PullRequest::Start => {
-                // A flight runs only while it has a waiter, so this pull keeps one to its end.
-                let waiter = runtime.join_pull(&image);
-                std::thread::spawn(move || {
-                    let _ = waiter.wait(&tokio_util::sync::CancellationToken::new());
-                });
-                runtime.pull_state(&image)
-            }
-            PullRequest::Cancel => runtime.cancel_pull(&image, CANCEL_BACKSTOP),
-        }
-    })
-    .await
-    .map_or(PullReport::Unavailable, PullReport::State)
+fn is_unknown_image(error: &HttpError) -> bool {
+    matches!(error, HttpError::Server { status, body }
+        if *status == reqwest::StatusCode::BAD_REQUEST
+            && serde_json::from_str::<serde_json::Value>(body)
+                .is_ok_and(|v| v["error"] == "unknown_image"))
 }
 
-/// How long the first Ctrl+E waits for the second.
+/// How long Ctrl+E's prompt waits for its confirming key.
 pub(crate) const CANCEL_CONFIRM_TTL: Duration = Duration::from_secs(3);
 
 /// How often the TUI reads the pull's state: often while it runs, so the meter moves, and
@@ -180,6 +172,10 @@ pub(crate) struct PullWatch {
     /// Ctrl+X on a running pull hides its line until the pull ends.
     hidden: bool,
     watched: bool,
+    /// The Daemon reported this pull running since it was started here.
+    seen_running: bool,
+    /// The Start got no reply, so whether it registered is unknown until a poll says.
+    start_unanswered: bool,
     cancel_armed: Option<Instant>,
 }
 
@@ -192,17 +188,8 @@ pub(crate) enum Applied {
     Updated,
     /// The request got no answer; the text says what didn't happen.
     Unanswered(&'static str),
-}
-
-/// What a Ctrl+E did.
-#[derive(Debug, PartialEq, Eq)]
-pub(crate) enum CancelKey {
-    /// No pull is running.
-    Ignored,
-    /// The first press: ask for a second within [`CANCEL_CONFIRM_TTL`].
-    Confirm,
-    /// The second press in time: cancel.
-    Cancel,
+    /// The Start got no answer, but the Daemon may have registered it: poll now.
+    Recheck,
 }
 
 impl PullWatch {
@@ -235,6 +222,8 @@ impl PullWatch {
     pub(crate) fn start(&mut self) {
         self.set_line(Some(PullLine::Running(ProgressSnapshot::default())));
         self.watched = true;
+        self.seen_running = false;
+        self.start_unanswered = false;
     }
 
     pub(crate) fn apply(&mut self, request: PullRequest, report: PullReport) -> Applied {
@@ -243,15 +232,27 @@ impl PullWatch {
         match report {
             PullReport::State(PullState::Running(snapshot)) => {
                 self.watched = true;
+                self.seen_running = true;
+                self.start_unanswered = false;
                 self.set_line(Some(PullLine::Running(snapshot)));
             }
             PullReport::State(PullState::Idle) => {
                 // A pull this TUI just started may not have registered yet.
                 if self.running() && request != PullRequest::Start {
+                    let unanswered = self.start_unanswered;
                     self.end(None);
+                    if unanswered {
+                        return Applied::Unanswered(START_UNANSWERED);
+                    }
                 }
             }
             PullReport::State(_) if !self.watched => {}
+            // Without a reply to the Start, an outcome is this pull's only once a poll saw it run;
+            // before that it may be an earlier pull's.
+            PullReport::State(_) if self.start_unanswered && !self.seen_running => {
+                self.end(None);
+                return Applied::Unanswered(START_UNANSWERED);
+            }
             PullReport::State(PullState::Done) => {
                 self.end(Some(PullLine::Done));
                 applied = Applied::Updated;
@@ -261,13 +262,20 @@ impl PullWatch {
                 self.end(Some(PullLine::Failed(reason)))
             }
             PullReport::Gated { command } => self.end(Some(PullLine::Gated { command })),
+            PullReport::UnknownImage => {
+                if !self.running() || request == PullRequest::Poll {
+                    return Applied::Unchanged;
+                }
+                self.end(None);
+                return Applied::Unanswered(
+                    "The Daemon no longer has this sandbox image configured, so nothing changed.",
+                );
+            }
             PullReport::Unavailable => match request {
                 PullRequest::Poll => {}
                 PullRequest::Start => {
-                    self.end(None);
-                    return Applied::Unanswered(
-                        "Couldn't start the sandbox image download: the Daemon didn't answer.",
-                    );
+                    self.start_unanswered = true;
+                    return Applied::Recheck;
                 }
                 PullRequest::Cancel => {
                     return Applied::Unanswered(
@@ -302,22 +310,24 @@ impl PullWatch {
             && matches!(drawn, PullLine::Failed(_) | PullLine::Cancelled)
     }
 
-    pub(crate) fn cancel_key(&mut self, now: Instant) -> CancelKey {
+    /// Ctrl+E on a running pull opens the cancel prompt, or restarts its time; it never cancels,
+    /// so a held key's repeats can't confirm. Returns whether a pull is running.
+    pub(crate) fn arm_cancel(&mut self, now: Instant) -> bool {
         if !self.running() {
-            return CancelKey::Ignored;
+            return false;
         }
-        match self.cancel_armed.take() {
-            Some(at) if now.saturating_duration_since(at) <= CANCEL_CONFIRM_TTL => {
-                CancelKey::Cancel
-            }
-            _ => {
-                self.cancel_armed = Some(now);
-                CancelKey::Confirm
-            }
-        }
+        self.cancel_armed = Some(now);
+        true
     }
 
-    /// Any key but Ctrl+E ends a cancel prompt, and a Done line clears so the key acts as
+    /// The prompt's confirming key: whether it cancels now. Ends the prompt either way.
+    pub(crate) fn confirm_cancel(&mut self, now: Instant) -> bool {
+        self.cancel_armed.take().is_some_and(|at| {
+            self.running() && now.saturating_duration_since(at) <= CANCEL_CONFIRM_TTL
+        })
+    }
+
+    /// Any key but Ctrl+E or the confirming key ends a cancel prompt, and a Done line clears so the key acts as
     /// usual. Returns whether the line changed.
     pub(crate) fn other_key(&mut self) -> bool {
         self.cancel_armed = None;
@@ -330,6 +340,8 @@ impl PullWatch {
 
     fn end(&mut self, outcome: Option<PullLine>) {
         self.watched = false;
+        self.seen_running = false;
+        self.start_unanswered = false;
         self.set_line(outcome);
     }
 
@@ -345,7 +357,7 @@ impl PullWatch {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::containers::image_pull::{self, PullKey};
+    use crate::containers::image_pull;
     use crate::server::test_support;
     use std::time::Instant;
 
@@ -467,13 +479,46 @@ mod tests {
                 shown(PullLine::Running(ProgressSnapshot::default())),
                 Applied::Unchanged,
             ),
+            // The Daemon may have registered a Start it didn't answer, so the watch stays.
             (
                 "no answer to a start",
                 true,
                 vec![(Start, PullReport::Unavailable)],
+                shown(PullLine::Running(ProgressSnapshot::default())),
+                Applied::Recheck,
+            ),
+            (
+                "no answer to a start, then it runs and finishes",
+                true,
+                vec![
+                    (Start, PullReport::Unavailable),
+                    (Poll, running(3)),
+                    (Poll, done()),
+                ],
+                shown(PullLine::Done),
+                Applied::Updated,
+            ),
+            (
+                "no answer to a start, and no pull",
+                true,
+                vec![(Start, PullReport::Unavailable), (Poll, idle())],
+                None,
+                Applied::Unanswered(START_UNANSWERED),
+            ),
+            (
+                "no answer to a start, and an earlier pull's outcome",
+                true,
+                vec![(Start, PullReport::Unavailable), (Poll, done())],
+                None,
+                Applied::Unanswered(START_UNANSWERED),
+            ),
+            (
+                "an image no longer configured",
+                true,
+                vec![(Start, PullReport::UnknownImage)],
                 None,
                 Applied::Unanswered(
-                    "Couldn't start the sandbox image download: the Daemon didn't answer.",
+                    "The Daemon no longer has this sandbox image configured, so nothing changed.",
                 ),
             ),
             (
@@ -531,38 +576,70 @@ mod tests {
 
     /// The first Ctrl+E asks; a second within the prompt's window cancels, one after it asks
     /// again, and any other key ends the prompt. Done clears on any key.
+    /// Ctrl+E only opens the prompt, so repeating it never cancels; the confirming key cancels
+    /// within the prompt's time, and any other key ends the prompt.
     #[test]
-    fn ctrl_e_cancels_only_when_pressed_twice_in_time() {
+    fn ctrl_e_asks_and_only_the_confirming_key_cancels() {
         let at = Instant::now();
         let mut watch = PullWatch::default();
-        assert_eq!(
-            watch.cancel_key(at),
-            CancelKey::Ignored,
-            "nothing to cancel"
-        );
+        assert!(!watch.arm_cancel(at), "nothing to cancel");
+        assert!(!watch.confirm_cancel(at), "no prompt to confirm");
         watch.start();
-        for (second, expected) in [
-            (at + CANCEL_CONFIRM_TTL, CancelKey::Cancel),
-            (
-                at + CANCEL_CONFIRM_TTL + Duration::from_millis(1),
-                CancelKey::Confirm,
-            ),
+        for (confirm, expected) in [
+            (at + CANCEL_CONFIRM_TTL, true),
+            (at + CANCEL_CONFIRM_TTL + Duration::from_millis(1), false),
         ] {
-            assert_eq!(watch.cancel_key(at), CancelKey::Confirm);
-            assert_eq!(watch.cancel_key(second), expected, "{:?}", second - at);
-            watch.other_key();
+            for repeat in 0..5 {
+                assert!(watch.arm_cancel(at), "Ctrl+E #{repeat} didn't ask");
+            }
+            assert_eq!(
+                watch.confirm_cancel(confirm),
+                expected,
+                "{:?}",
+                confirm - at
+            );
+            assert!(
+                !watch.confirm_cancel(confirm),
+                "the prompt outlived its answer"
+            );
         }
-        assert_eq!(watch.cancel_key(at), CancelKey::Confirm);
+        watch.arm_cancel(at);
         assert!(!watch.other_key(), "a running pull's line changed on a key");
-        assert_eq!(
-            watch.cancel_key(at),
-            CancelKey::Confirm,
-            "another key left the prompt"
-        );
+        assert!(!watch.confirm_cancel(at), "another key left the prompt");
 
         watch.apply(PullRequest::Poll, PullReport::State(PullState::Done));
         assert!(watch.other_key());
         assert_eq!(watch.line(), None);
+    }
+
+    #[test]
+    fn only_an_unknown_image_refusal_is_one() {
+        let server = |status, body: &str| HttpError::Server {
+            status,
+            body: body.into(),
+        };
+        let bad = reqwest::StatusCode::BAD_REQUEST;
+        for (error, unknown) in [
+            (
+                server(bad, r#"{"error":"unknown_image","message":"x"}"#),
+                true,
+            ),
+            (
+                server(bad, r#"{"error":"invalid_body","message":"x"}"#),
+                false,
+            ),
+            (server(bad, "unknown_image"), false),
+            (
+                server(
+                    reqwest::StatusCode::FORBIDDEN,
+                    r#"{"error":"unknown_image"}"#,
+                ),
+                false,
+            ),
+            (HttpError::Transport, false),
+        ] {
+            assert_eq!(is_unknown_image(&error), unknown, "{error:?}");
+        }
     }
 
     /// A Daemon offers an update only when one is available, a sandbox is in use and nobody
@@ -614,29 +691,9 @@ mod tests {
         }
     }
 
-    fn key() -> PullKey {
-        PullKey {
-            runtime: ContainerRuntime::from(ContainerRuntimeName::default()).display_name(),
-            image: IMAGE.into(),
-        }
-    }
-
-    /// A stand-in pull that runs until cancelled, or ends itself at a deadline so a broken
-    /// cancel fails the test instead of hanging it.
-    fn stand_in() -> image_pull::Waiter {
-        let deadline = Instant::now() + Duration::from_secs(10);
-        image_pull::join_with(key(), move |pull| {
-            while !pull.kill.is_cancelled() && Instant::now() < deadline {
-                std::thread::sleep(Duration::from_millis(5));
-            }
-            Err(crate::containers::error::DockerError::Cancelled(
-                "pull".into(),
-            ))
-        })
-    }
-
     #[test]
-    fn only_a_missing_local_daemon_pulls_locally() {
+    fn only_a_usable_daemon_is_a_source() {
+        use crate::acp::client::DiscoveryError;
         let endpoint = DaemonEndpoint::new(
             "http://127.0.0.1:1".into(),
             None,
@@ -646,13 +703,9 @@ mod tests {
             PullSource::from_lookup(Ok(endpoint)),
             PullSource::Daemon(_)
         ));
-        assert!(matches!(
-            PullSource::from_lookup(Err(ManagerError::NoDaemonRunning(
-                DiscoveryError::NoLocalDaemon
-            ))),
-            PullSource::Local
-        ));
+        // No Daemon pulls nothing here: the home screen is the offline gate then.
         for unusable in [
+            ManagerError::NoDaemonRunning(DiscoveryError::NoLocalDaemon),
             ManagerError::NoDaemonRunning(DiscoveryError::Unreachable),
             ManagerError::NoDaemonRunning(DiscoveryError::LocalPath),
             ManagerError::EnvOverrideUnreachable,
@@ -669,36 +722,7 @@ mod tests {
         }
     }
 
-    #[tokio::test]
-    #[serial_test::serial]
-    async fn a_local_start_keeps_a_waiter_and_cancel_ends_the_pull() {
-        let runtime = ContainerRuntimeName::default();
-        let source = PullSource::Local;
-        assert_eq!(
-            source.run(runtime, IMAGE, PullRequest::Poll).await,
-            PullAnswer::from(PullReport::State(PullState::Idle)),
-            "no offer: without a Daemon, the startup check offers the update"
-        );
-        let flight = stand_in();
-        assert!(matches!(
-            source.run(runtime, IMAGE, PullRequest::Start).await.report,
-            PullReport::State(PullState::Running(_))
-        ));
-        assert_eq!(
-            image_pull::waiters_for_test(&key()),
-            2,
-            "the stand-in and Start's"
-        );
-        assert_eq!(
-            source.run(runtime, IMAGE, PullRequest::Cancel).await.report,
-            PullReport::State(PullState::Cancelled)
-        );
-        assert!(flight
-            .wait(&tokio_util::sync::CancellationToken::new())
-            .is_err());
-    }
-
-    /// A Daemon that won't pull reports the command to run instead, and nothing pulls here.
+    /// A Daemon that won't pull reports the command to run instead.
     #[tokio::test]
     #[serial_test::serial]
     async fn a_refused_daemon_pull_is_gated_and_never_pulls_locally() {
@@ -726,28 +750,22 @@ mod tests {
         });
         let endpoint = DaemonEndpoint::new(base, None, crate::daemon::Source::Env);
         let source = PullSource::Daemon(HttpClient::new(endpoint).unwrap());
-        let runtime = ContainerRuntimeName::default();
 
         assert_eq!(
-            source.run(runtime, IMAGE, PullRequest::Poll).await,
+            source.run(IMAGE, PullRequest::Poll).await,
             PullAnswer {
                 report: PullReport::State(PullState::Idle),
                 offer: Some(ImageOffer::NoUpdate),
+                image: Some(IMAGE.into()),
             },
             "checks are off, so the Daemon offers nothing"
         );
         for request in [PullRequest::Start, PullRequest::Cancel] {
-            let PullReport::Gated { command } = source.run(runtime, IMAGE, request).await.report
-            else {
+            let PullReport::Gated { command } = source.run(IMAGE, request).await.report else {
                 panic!("{request:?} should be gated");
             };
             assert!(command.contains(IMAGE), "{command}");
         }
-        assert_eq!(image_pull::waiters_for_test(&key()), 0);
-        assert_eq!(
-            ContainerRuntime::from(runtime).pull_state(IMAGE),
-            PullState::Idle
-        );
         state.shutdown.cancel();
         server.await.unwrap();
     }

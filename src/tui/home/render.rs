@@ -1179,7 +1179,8 @@ impl HomeView {
         // Keep temporary feedback and the leader menu available with the bar hidden.
         let has_status_bar = self.show_shortcut_bar
             || self.status_flash_text().is_some()
-            || (self.live_send.is_some() && self.live_send_pending_leader);
+            || (self.live_send.is_some() && self.live_send_pending_leader)
+            || self.hidden_pull.is_some();
         let has_update_bar = update_bar.is_some();
         let mut constraints = vec![Constraint::Min(0)];
         if last_prompt.is_some() {
@@ -4305,6 +4306,18 @@ impl HomeView {
         frame.render_widget(Paragraph::new(Line::from(spans)), area);
     }
 
+    /// A hidden running pull's progress, for the end of the key line.
+    fn hidden_pull_badge(&self, theme: &Theme) -> Option<Span<'static>> {
+        let snapshot = self.hidden_pull.as_ref()?;
+        let spinner = spinners::dots()
+            .set_interval(Duration::from_millis(220))
+            .current_frame();
+        Some(Span::styled(
+            super::update_bar::hidden_pull_badge(snapshot, spinner),
+            Style::default().fg(theme.accent).bold(),
+        ))
+    }
+
     fn render_status_bar(&mut self, frame: &mut Frame, area: Rect, theme: &Theme) {
         // The bar is on screen from here, so a queued flash can start counting.
         self.arm_status_flash();
@@ -4349,6 +4362,13 @@ impl HomeView {
             return;
         }
         if !self.show_shortcut_bar && !(self.live_send.is_some() && self.live_send_pending_leader) {
+            // With the bar hidden, the row is kept only for a hidden pull's progress.
+            if let Some(badge) = self.hidden_pull_badge(theme) {
+                frame.render_widget(
+                    Paragraph::new(Line::from(vec![Span::raw(" "), badge])),
+                    area,
+                );
+            }
             return;
         }
         // The leader menu can temporarily restore the hidden shortcut row.
@@ -4486,6 +4506,10 @@ impl HomeView {
                     leader_hint,
                     Style::default().fg(theme.dimmed).italic(),
                 ));
+            }
+            if let Some(badge) = self.hidden_pull_badge(theme) {
+                spans.push(Span::raw("  "));
+                spans.push(badge);
             }
             frame.render_widget(Paragraph::new(Line::from(spans)), area);
             return;
@@ -4776,18 +4800,8 @@ impl HomeView {
             index
         });
 
-        if let Some(snapshot) = &self.hidden_pull {
-            let spinner = spinners::dots()
-                .set_interval(Duration::from_millis(220))
-                .current_frame();
-            groups.push((
-                0,
-                None,
-                vec![Span::styled(
-                    super::update_bar::hidden_pull_badge(snapshot, spinner),
-                    Style::default().fg(theme.accent).bold(),
-                )],
-            ));
+        if let Some(badge) = self.hidden_pull_badge(theme) {
+            groups.push((0, None, vec![badge]));
         }
 
         // Pack shortcuts and optional Tips by priority within the runtime status boundary.
