@@ -158,7 +158,10 @@ export function PluginComposerStatus({ sessionId }: { sessionId: string }) {
   const entries = byOrder(sessionEntries(usePluginUiEntries(), "composer-status", sessionId));
   if (entries.length === 0) return null;
   return (
-    <div className="flex min-w-0 flex-wrap items-center gap-1.5" data-testid="plugin-composer-status">
+    <div
+      className="flex max-h-14 min-w-0 flex-wrap items-center gap-1.5 overflow-y-auto"
+      data-testid="plugin-composer-status"
+    >
       {entries.map((e) => (
         <EntryBadge key={entryKey(e)} entry={e} />
       ))}

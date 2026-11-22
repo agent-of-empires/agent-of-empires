@@ -46,3 +46,46 @@ test("long composer-status stays inside the footer at 360px", async ({ page }) =
   const box = await status.boundingBox();
   expect(box!.x + box!.width).toBeLessThanOrEqual(viewport.width);
 });
+
+test("many composer-status items stay capped and keep Send on screen", async ({ page }) => {
+  await page.setViewportSize({ width: 360, height: 480 });
+  const mock = await mockAcpSession(page, {
+    title: "composer-status-many",
+    initialEvents: [usageUpdated({ used: 120_000, size: 200_000, cost: null })],
+  });
+  await page.route("**/api/plugins/ui-state", (r) =>
+    r.fulfill({
+      json: {
+        entries: [
+          {
+            plugin_id: "acme.kit",
+            slot: "composer-status",
+            id: "status",
+            session_id: mock.sessionId,
+            payload: { items: Array.from({ length: 12 }, (_, i) => ({ text: `status item ${i + 1}` })) },
+          },
+        ],
+        notifications: [],
+      },
+    }),
+  );
+  await openStructuredSession(page, mock);
+  await waitForComposerConnected(page);
+
+  const status = page.getByTestId("plugin-composer-status");
+  await expect(status).toBeVisible();
+  const { height, scrollHeight, clientHeight } = await status.evaluate((el) => ({
+    height: el.getBoundingClientRect().height,
+    scrollHeight: el.scrollHeight,
+    clientHeight: el.clientHeight,
+  }));
+  expect(height).toBeLessThanOrEqual(60);
+  expect(scrollHeight).toBeGreaterThan(clientHeight);
+
+  const viewport = page.viewportSize()!;
+  const footer = await page.getByTestId("composer-footer").boundingBox();
+  expect(footer!.y + footer!.height).toBeLessThanOrEqual(viewport.height);
+  const send = await page.getByRole("button", { name: "Send message" }).boundingBox();
+  expect(send!.x + send!.width).toBeLessThanOrEqual(viewport.width);
+  expect(send!.y + send!.height).toBeLessThanOrEqual(viewport.height);
+});
