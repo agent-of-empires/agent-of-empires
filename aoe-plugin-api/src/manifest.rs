@@ -586,6 +586,8 @@ pub enum UiSlot {
     ComposerAction,
     /// A badge in a session's detail view (per session).
     DetailBadge,
+    /// A read-only status chip beside a session's composer (per session, API v23).
+    ComposerStatus,
     HomePane,
     Notification,
     /// A full dashboard view rendered from a plugin HTML bundle (global, API v16).
@@ -601,6 +603,7 @@ impl UiSlot {
                 | UiSlot::Pane
                 | UiSlot::ComposerAction
                 | UiSlot::DetailBadge
+                | UiSlot::ComposerStatus
         )
     }
 
@@ -616,6 +619,7 @@ impl UiSlot {
             UiSlot::Pane => "pane",
             UiSlot::ComposerAction => "composer-action",
             UiSlot::DetailBadge => "detail-badge",
+            UiSlot::ComposerStatus => "composer-status",
             UiSlot::HomePane => "home-pane",
             UiSlot::Notification => "notification",
             UiSlot::Page => "page",
@@ -1494,6 +1498,12 @@ impl PluginManifest {
             check(
                 self.ui.iter().all(|u| u.slot != UiSlot::ComposerAction),
                 "composer-action UI slots require api_version >= 8".into(),
+            );
+        }
+        if self.api_version < 23 {
+            check(
+                self.ui.iter().all(|u| u.slot != UiSlot::ComposerStatus),
+                "composer-status UI slots require api_version >= 23".into(),
             );
         }
         if self.api_version < 9 {

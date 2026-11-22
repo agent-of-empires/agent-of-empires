@@ -702,6 +702,11 @@ fn invalid_manifests_report_each_problem() {
             "[[ui]]\nslot = \"composer-action\"\nid = \"voice\"\n",
             &["composer-action UI slots require api_version >= 8"],
         ),
+        (
+            22,
+            "[[ui]]\nslot = \"composer-status\"\nid = \"ctx\"\n",
+            &["composer-status UI slots require api_version >= 23"],
+        ),
         (4, "[[screenshots]]\npath = \"a.png\"\nalt = \"a\"\n", &["screenshots require api_version >= 5"]),
         (5, "[[screenshots]]\npath = \"a.png\"\nalt = \"   \"\n", &["alt must not be empty"]),
         (5, &too_many_screenshots, &["at most 8 screenshots"]),
@@ -792,6 +797,7 @@ fn path_icon_and_hash_helpers() {
         ("row-badge", UiSlot::RowBadge),
         ("pane", UiSlot::Pane),
         ("composer-action", UiSlot::ComposerAction),
+        ("composer-status", UiSlot::ComposerStatus),
         ("home-pane", UiSlot::HomePane),
         ("notification", UiSlot::Notification),
     ] {
@@ -900,4 +906,11 @@ fn suggestion_items_reject_host_owned_fields() {
     assert!(item(serde_json::json!({"provider_id":"forged"})).is_err());
     assert!(!item(serde_json::json!({})).unwrap().stale);
     assert!(item(serde_json::json!({"stale":true})).unwrap().stale);
+}
+
+#[test]
+fn composer_status_slot_parses_at_api_23() {
+    let parsed = parse(23, "[[ui]]\nslot = \"composer-status\"\nid = \"ctx\"\n");
+    assert_eq!(parsed.ui[0].slot, UiSlot::ComposerStatus);
+    assert!(parsed.ui[0].slot.is_per_session());
 }
