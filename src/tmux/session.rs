@@ -330,6 +330,39 @@ fn capture_output(success: bool, stdout: &[u8]) -> Option<String> {
     success.then(|| String::from_utf8_lossy(stdout).into_owned())
 }
 
+/// Capture `pane_id` only while it still belongs to `session_name`: one tmux call prints the
+/// pane's owner, then the capture. A moved or renumbered pane id yields `None`.
+fn capture_pane_in_session(
+    pane_id: &str,
+    session_name: &str,
+    lines: usize,
+) -> std::io::Result<Option<String>> {
+    let output = crate::tmux::tmux_command()
+        .args([
+            "display-message",
+            "-p",
+            "-t",
+            pane_id,
+            "#{session_name}",
+            ";",
+            "capture-pane",
+            "-t",
+            pane_id,
+            "-p",
+            "-e",
+            "-S",
+            &format!("-{lines}"),
+        ])
+        .output()?;
+    let Some(text) = capture_output(output.status.success(), &output.stdout) else {
+        return Ok(None);
+    };
+    Ok(text
+        .split_once('\n')
+        .filter(|(owner, _)| *owner == session_name)
+        .map(|(_, screen)| screen.to_owned()))
+}
+
 impl Session {
     pub fn new(id: &str, title: &str) -> Result<Self> {
         Ok(Self {
@@ -861,9 +894,12 @@ impl Session {
     }
 
     /// Capture a pane the caller already resolved, skipping the existence and pane-id probes.
-    /// `None` when `capture-pane` failed, so a stale id never reads as a blank pane.
+    /// `None` when the capture failed or the pane no longer belongs to this session, so a stale
+    /// or moved id never reads as a blank pane.
     pub(crate) fn capture_pane_at(&self, pane_id: &str, lines: usize) -> Option<String> {
-        self.capture_target(pane_id, lines).ok().flatten()
+        capture_pane_in_session(pane_id, &self.name, lines)
+            .ok()
+            .flatten()
     }
 
     /// Wait for any known marker, or for two stable captures when no marker exists.

@@ -1411,6 +1411,19 @@ Esc to cancel \u{b7} Tab to amend \u{b7} ctrl+e to explain\n\
             count > 1,
             "the fallback resolves the pane after the failed id"
         );
+
+        // A live pane moved into another session is not this session's pane.
+        let other = tmux::Session::generate_name("aoe_test_5788_cap", "pane id moved");
+        let _other_guard = spawn_pane(&other, "sleep 300");
+        let moved = tmux::first_pane_id(&other).expect("other pane id");
+        metadata.pane_id = moved.clone();
+        let (out, count) = forks(Some(&metadata), &session);
+        assert!(
+            out.contains("pane-id-marker"),
+            "a pane of another session falls back: {out:?}"
+        );
+        assert!(count > 1, "the foreign pane id is rejected, then resolved");
+        assert!(session.capture_pane_at(&moved, 20).is_none());
     }
 
     /// Pane metadata for a live agent pane: not dead, running the agent itself, so neither the
