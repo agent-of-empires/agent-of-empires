@@ -2,9 +2,10 @@
 // with the card's decisions in the footer. Holds no approval state, so the
 // card stays the single place a decision is submitted.
 
-import { useEffect, useMemo, useRef, useState } from "react";
+import { type RefObject, useEffect, useMemo, useRef, useState } from "react";
 import { TextMessagePartProvider } from "@assistant-ui/react";
 
+import { tabStops, useFocusTrap } from "../../hooks/useFocusTrap";
 import type { ApprovalDecision, ApprovalOption } from "../../lib/acpTypes";
 import { OFFLINE_TITLE } from "../../lib/connectionState";
 import type { FileRef } from "../../lib/fileRef";
@@ -23,60 +24,37 @@ interface Props {
   onClose: () => void;
 }
 
-const FOCUSABLE = 'button:not([disabled]):not([tabindex="-1"])';
+// The root is found through a marker in this instance's own body, so retained plan
+// modals in other sessions never act on each other's dialog.
+const dialogOf = (marker: RefObject<HTMLSpanElement | null>) =>
+  marker.current?.closest<HTMLElement>('[role="dialog"]') ?? null;
 
-// Dialog contains no focus itself, so the plan modal moves focus in, cycles Tab
-// inside the panel, closes on Escape and hands focus back to the opener. The
-// root is found through a marker in this instance's own body, so retained
-// plan modals in other sessions never act on each other's dialog.
+// Dialog contains no focus itself, so the plan modal moves focus in, closes on Escape
+// and, through the trap, cycles Tab inside the panel and hands focus back to the opener.
 function useModalFocus(onClose: () => void) {
   const marker = useRef<HTMLSpanElement>(null);
   const onCloseRef = useRef(onClose);
   useEffect(() => {
     onCloseRef.current = onClose;
   });
+  useFocusTrap(() => dialogOf(marker), { restoreFocus: true });
   useEffect(() => {
-    const opener = document.activeElement as HTMLElement | null;
-    const root = () => marker.current?.closest<HTMLElement>('[role="dialog"]') ?? null;
-    root()?.querySelector<HTMLElement>(FOCUSABLE)?.focus();
+    const root = dialogOf(marker);
+    if (root) tabStops(root)[0]?.focus();
     const onKey = (e: KeyboardEvent) => {
-      // A covered session (inert) or a higher overlay such as the command
-      // palette owns the keyboard. Focus on a non-modal element, like a
-      // terminal behind the plan, does not: the trap pulls it back and
-      // consumes the key so that target never receives it.
-      const el = root();
-      const holder = document.activeElement;
-      if (!el || el.closest("[inert]")) return;
-      const overlay = holder?.closest('[aria-modal="true"]');
+      // A covered session (inert) or a higher overlay such as the command palette owns the key.
+      const el = dialogOf(marker);
+      if (e.key !== "Escape" || !el || el.closest("[inert]")) return;
+      const overlay = document.activeElement?.closest('[aria-modal="true"]');
       if (overlay && overlay !== el) return;
-      if (e.key === "Escape") {
-        e.preventDefault();
-        e.stopPropagation();
-        onCloseRef.current();
-        return;
-      }
-      if (e.key !== "Tab") return;
-      const items = Array.from(el.querySelectorAll<HTMLElement>(FOCUSABLE));
-      const first = items.at(0);
-      const last = items.at(-1);
-      if (!first || !last) return;
-      if (!el.contains(holder) || (e.shiftKey && holder === first)) {
-        e.preventDefault();
-        e.stopPropagation();
-        (e.shiftKey && holder === first ? last : first).focus();
-      } else if (!e.shiftKey && holder === last) {
-        e.preventDefault();
-        e.stopPropagation();
-        first.focus();
-      }
+      e.preventDefault();
+      e.stopPropagation();
+      onCloseRef.current();
     };
     // Capture phase: the palette can unmount on this same Escape before a
     // bubbling listener runs, which would make the plan look like the owner.
     document.addEventListener("keydown", onKey, true);
-    return () => {
-      document.removeEventListener("keydown", onKey, true);
-      opener?.focus();
-    };
+    return () => document.removeEventListener("keydown", onKey, true);
   }, []);
   return marker;
 }

@@ -1406,6 +1406,26 @@
       "components": []
     },
     {
+      "id": "modal.focus-trap",
+      "kind": "vitest",
+      "risk": "medium",
+      "specs": [
+        "src/hooks/__tests__/useFocusTrap.test.tsx",
+        "src/components/acp/__tests__/BackgroundAgentsPanel.test.tsx",
+        "tests/wizard.spec.ts"
+      ],
+      "components": [
+        "web/src/components/AboutModal.tsx",
+        "web/src/components/ContextMenu.tsx",
+        "web/src/components/TerminalComposeSheet.tsx",
+        "web/src/components/acp/BackgroundShells.tsx",
+        "web/src/components/acp/PlanModal.tsx",
+        "web/src/components/acp/SwitchAccountModal.tsx",
+        "web/src/components/session-wizard/SessionWizard.tsx"
+      ],
+      "notes": "Every modal keeps Tab and Shift+Tab inside it through useFocusTrap: Tab wraps at either end, Tab from focus behind the modal enters it, a modal opened inside it keeps the key, and an inert or inactive trap does nothing. PlanModal, the shell dialog and the session wizard return focus to the opener on close."
+    },
+    {
       "id": "wizard",
       "kind": "mocked-playwright",
       "risk": "high",

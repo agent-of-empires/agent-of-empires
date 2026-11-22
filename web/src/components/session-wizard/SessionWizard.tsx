@@ -1,4 +1,4 @@
-import { type RefObject, useCallback, useEffect, useMemo, useReducer, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useReducer, useRef, useState } from "react";
 import { createPortal } from "react-dom";
 import type {
   CreateFailure,
@@ -44,6 +44,7 @@ import {
   retryBody,
   type PendingCreate,
 } from "../../lib/pendingCreates";
+import { useFocusTrap } from "../../hooks/useFocusTrap";
 import { hasFinePointer } from "../../lib/platform";
 import { useServerDown } from "../../lib/connectionState";
 import { ProjectStep } from "./steps/ProjectStep";
@@ -243,62 +244,6 @@ interface Props {
 
 const NO_GROUPS: GroupInfo[] = [];
 
-const FOCUSABLE =
-  'a[href], button:not([disabled]), input:not([disabled]):not([type="hidden"]), select:not([disabled]), textarea:not([disabled]), [tabindex]:not([tabindex="-1"])';
-
-/** The panel's Tab stops in order; a radio group is one stop, its checked radio. */
-function tabStops(panel: HTMLElement): HTMLElement[] {
-  return Array.from(panel.querySelectorAll<HTMLElement>(FOCUSABLE)).filter(
-    (el) =>
-      el.tabIndex >= 0 &&
-      el.getClientRects().length > 0 &&
-      !(el instanceof HTMLInputElement && el.type === "radio" && !el.checked),
-  );
-}
-
-/**
- * Keeps Tab inside the wizard panel and hands focus back to the opener on close. With
- * a fine pointer the fields focus themselves once loaded, so a Tab before that enters
- * at the first stop; a coarse pointer starts on Close, which opens no keyboard. The
- * wizard's own confirm dialogs and higher overlays hold their own focus, so a key
- * whose focus sits in another modal is left alone.
- */
-function useWizardFocusTrap(panelRef: RefObject<HTMLDivElement | null>, closeRef: RefObject<HTMLButtonElement | null>) {
-  const [opener] = useState(() => document.activeElement as HTMLElement | null);
-  useEffect(() => {
-    const panel = panelRef.current;
-    if (!hasFinePointer() && !panel?.contains(document.activeElement)) closeRef.current?.focus();
-    const onKey = (e: KeyboardEvent) => {
-      if (e.key !== "Tab" || !panel) return;
-      const holder = document.activeElement;
-      const overlay = holder?.closest('[aria-modal="true"]');
-      if (overlay && !overlay.contains(panel)) return;
-      const stops = tabStops(panel);
-      const first = stops.at(0);
-      const last = stops.at(-1);
-      if (!first || !last) return;
-      const wrapTo = !panel.contains(holder)
-        ? first
-        : e.shiftKey && holder === first
-          ? last
-          : !e.shiftKey && holder === last
-            ? first
-            : null;
-      if (wrapTo) {
-        e.preventDefault();
-        wrapTo.focus();
-      }
-    };
-    document.addEventListener("keydown", onKey, true);
-    return () => {
-      document.removeEventListener("keydown", onKey, true);
-      // Something that took focus after the wizard (a session view) keeps it.
-      const lost = !document.activeElement || document.activeElement === document.body;
-      if (lost && opener?.isConnected) opener.focus();
-    };
-  }, [panelRef, closeRef, opener]);
-}
-
 export function SessionWizard({
   onClose,
   onCreated,
@@ -337,7 +282,11 @@ export function SessionWizard({
   const viewGroupRef = useRef<HTMLDivElement>(null);
   const panelRef = useRef<HTMLDivElement>(null);
   const closeRef = useRef<HTMLButtonElement>(null);
-  useWizardFocusTrap(panelRef, closeRef);
+  useFocusTrap(() => panelRef.current, { restoreFocus: true });
+  // A fine pointer's fields focus themselves; a coarse one starts on Close, which opens no keyboard.
+  useEffect(() => {
+    if (!hasFinePointer() && !panelRef.current?.contains(document.activeElement)) closeRef.current?.focus();
+  }, []);
   const pullLatestRef = useRef<HTMLDivElement>(null);
   // The failure box grows the footer and shrinks the form above it; keep the pull box it blames in view.
   useEffect(() => {
