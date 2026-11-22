@@ -612,6 +612,7 @@ id = "my_pane"
 | `detail-badge` | per-session | A badge in the session detail view. |
 | `pane` | per-session | A dockable tool-window pane (requires `api_version >= 3`). See [Pane payload](#pane-payload). |
 | `home-pane` | global | A host-wide docked pane on the dashboard overview and the structured-view pane overlay, carrying the same block vocabulary as `pane` but session-less (requires `api_version >= 13`). Several plugins' home panes stack in snapshot order. |
+| `composer-status` | per-session | A read-only badge in the ACP composer footer beside the context hint, web only (requires `api_version >= 23`). |
 | `composer-action` | per-session | A button beside the ACP composer controls (requires `api_version >= 8`). |
 | `page` | global | A full dashboard view rendered from a plugin HTML file (requires `api_version >= 16`). Optional pushed state is opaque to the host. See [Pages](#pages). |
 | `notification` | n/a | A transient notification pushed via `ui.notify`; gated by the `notifications` capability, not a slot declaration. |
@@ -705,9 +706,9 @@ With `api_version >= 20`, `ui.notify` takes an optional `link: { "page", "value"
 
 ### Badge payload
 
-`status-bar`, `header-start`, `row-badge` and `detail-badge` take either one badge, `{ text?, icon?, tone?, href?, tooltip? }` (`status-bar`, `header-start` and `detail-badge` require `text` or `items`), or an `items` list of such badges that replaces the top-level fields. `items: []` clears the badge. Row badges also accept `presentation?` on the badge and its items, as described below.
+`status-bar`, `header-start`, `row-badge`, `detail-badge` and `composer-status` take either one badge, `{ text?, icon?, tone?, href?, tooltip? }` (`status-bar`, `header-start`, `detail-badge` and `composer-status` require `text` or `items`), or an `items` list of such badges that replaces the top-level fields. `items: []` clears the badge. Row badges also accept `presentation?` on the badge and its items, as described below.
 
-`status-bar`, `header-start` and `detail-badge` also take an integer `order`, default 0, lowest first; ties keep plugin id then entry id order. In the terminal UI they render as text and tone in the status line, `header-start` first; icons, tooltips and links are web only.
+`status-bar`, `header-start`, `detail-badge` and `composer-status` also take an integer `order`, default 0, lowest first; ties keep plugin id then entry id order. In the terminal UI they render as text and tone in the status line, `header-start` first; icons, tooltips and links are web only. `composer-status` has no terminal rendering.
 
 `row-badge` items on terminal session rows render items with `text` or `tooltip`, using `tooltip` when `text` is absent. With no `items` list, the top-level `row-badge` uses `tooltip` as a fallback label for missing `text`. `row-column` renders text only; the TUI omits icons and links. The status strip is right-aligned. In the local session list, it appears before the activity age when enabled, and its bounded lane considers one item per plugin before considering a second item from any plugin. Items may be truncated or omitted when space runs out.
 
