@@ -3,11 +3,13 @@
 
 release-plz writes stable notes from `release-plz.toml`'s `[changelog]` section on a
 release PR. A nightly has no release PR, so this script renders the same bullets
-between two revisions. Groups, skipped commit types and the bullet template stay in
-`release-plz.toml`; this reads them rather than keeping a second copy of the rules.
-The in-app "What's New" dialog parses these bullets, so keep the shape intact.
-Author handles are omitted: they would need one GitHub API call per commit, and the
-dialog shows only the PR number.
+between two revisions. Which commits are listed, and in which group, comes from that
+section's `commit_parsers` and `commit_preprocessors`. The bullet and section shape
+below is a copy of its `body` template, since nothing renders that template for a
+nightly: editing the template in `release-plz.toml` means editing `render()` too. The
+in-app "What's New" dialog parses these bullets, so keep the shape intact. Author
+handles are omitted: they would need one GitHub API call per commit, and the dialog
+shows only the PR number.
 
 Usage:
     python3 .github/scripts/nightly-notes.py --base nightly-20261120 --head <sha>

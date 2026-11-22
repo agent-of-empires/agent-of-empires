@@ -117,7 +117,7 @@ jobs:
           {
             echo "Nightly build of \`main\` at ${SHA}."
             echo
-            if [ -s changes.md ]; then
+            if grep -q '[^[:space:]]' changes.md; then
               cat changes.md
             else
               echo "No user-facing changes since ${BASE}."
