@@ -7,13 +7,16 @@
 use std::ffi::OsStr;
 use std::path::Path;
 use std::process::{Command, Output, Stdio};
-use std::sync::Mutex;
+use std::sync::{Mutex, TryLockError};
 use std::time::{Duration, Instant};
 
 /// The user's own system/global `core.sshCommand` and `credential.helper`,
 /// as lowercase `(key, value)` pairs. `None` when git cannot answer within the
-/// deadline (a stalled `include.path`) or fails to spawn.
-fn discover_user_config(envs: &[(&str, &Path)]) -> Option<Vec<(String, String)>> {
+/// deadline (a stalled `include.path`, or the caller's `deadline`) or fails to spawn.
+fn discover_user_config(
+    envs: &[(&str, &Path)],
+    deadline: Option<Instant>,
+) -> Option<Vec<(String, String)>> {
     let mut found = Vec::new();
     for scope in ["--system", "--global"] {
         let mut cmd = Command::new("git");
@@ -27,7 +30,11 @@ fn discover_user_config(envs: &[(&str, &Path)]) -> Option<Vec<(String, String)>>
         ])
         .envs(envs.iter().copied())
         .stdin(Stdio::null());
-        let out = crate::process::run_with_timeout(&mut cmd, Duration::from_secs(2)).ok()??;
+        let mut limit = Duration::from_secs(2);
+        if let Some(deadline) = deadline {
+            limit = limit.min(deadline.checked_duration_since(Instant::now())?);
+        }
+        let out = crate::process::run_with_timeout(&mut cmd, limit).ok()??;
         // 1 is "no match"; anything else is an unreadable config.
         if !matches!(out.status.code(), Some(0 | 1)) {
             return None;
@@ -73,15 +80,30 @@ fn build_hardening_args(user: &[(String, String)]) -> Vec<String> {
 }
 
 /// Cached only after a complete discovery, so a timed-out one is retried.
-fn hardening_args() -> Vec<String> {
-    static CACHE: Mutex<Option<Vec<String>>> = Mutex::new(None);
-    let mut cache = CACHE.lock().unwrap_or_else(|e| e.into_inner());
-    if let Some(args) = cache.as_ref() {
-        return args.clone();
+/// `None` means `deadline` passed while waiting for the cache or discovery.
+fn hardening_args_in(
+    cache: &Mutex<Option<Vec<String>>>,
+    envs: &[(&str, &Path)],
+    deadline: Option<Instant>,
+) -> Option<Vec<String>> {
+    let mut guard = loop {
+        match cache.try_lock() {
+            Ok(guard) => break guard,
+            Err(TryLockError::Poisoned(e)) => break e.into_inner(),
+            Err(TryLockError::WouldBlock) => match deadline {
+                None => break cache.lock().unwrap_or_else(|e| e.into_inner()),
+                Some(d) if Instant::now() >= d => return None,
+                Some(_) => std::thread::sleep(Duration::from_millis(5)),
+            },
+        }
+    };
+    if let Some(args) = guard.as_ref() {
+        return Some(args.clone());
     }
-    match discover_user_config(&[]) {
-        Some(user) => cache.insert(build_hardening_args(&user)).clone(),
-        None => build_hardening_args(&[]),
+    match discover_user_config(envs, deadline) {
+        Some(user) => Some(guard.insert(build_hardening_args(&user)).clone()),
+        None if deadline.is_some_and(|d| Instant::now() >= d) => None,
+        None => Some(build_hardening_args(&[])),
     }
 }
 
@@ -89,13 +111,20 @@ fn hardening_args() -> Vec<String> {
 /// `core.fsmonitor`, repo-local `core.sshCommand` or `credential.helper`, or
 /// `ext::` transport. Hooks are off unless `hooks`; only `worktree add` opts in.
 pub fn hardened_git(hooks: bool) -> Command {
+    hardened_git_within(hooks, None).expect("discovery cannot time out without a deadline")
+}
+
+/// [`hardened_git`] for a caller with a deadline: `None` once `deadline` passes
+/// before the user's git config has been read.
+pub fn hardened_git_within(hooks: bool, deadline: Option<Instant>) -> Option<Command> {
+    static CACHE: Mutex<Option<Vec<String>>> = Mutex::new(None);
     let mut cmd = Command::new("git");
-    cmd.args(hardening_args());
+    cmd.args(hardening_args_in(&CACHE, &[], deadline)?);
     if !hooks {
         cmd.args(["-c", "core.hooksPath=/dev/null"]);
     }
     cmd.env("LC_ALL", "C");
-    cmd
+    Some(cmd)
 }
 
 /// Run `git <args>` in `cwd`, instrumented with target `git.command`.
@@ -248,9 +277,14 @@ where
         timeout_s = timeout.as_secs(),
         "running git with timeout"
     );
-    let mut cmd = hardened_git(false);
-    cmd.args(&argv).current_dir(cwd).stdin(Stdio::null());
-    let result = crate::process::run_with_timeout_process_group(&mut cmd, timeout)?;
+    let result = match hardened_git_within(false, Some(start + timeout)) {
+        Some(mut cmd) => {
+            cmd.args(&argv).current_dir(cwd).stdin(Stdio::null());
+            let remaining = timeout.saturating_sub(start.elapsed());
+            crate::process::run_with_timeout_process_group(&mut cmd, remaining)?
+        }
+        None => None,
+    };
     let dur = start.elapsed().as_millis() as u64;
     match &result {
         Some(output) if output.status.success() => tracing::debug!(
@@ -466,8 +500,10 @@ mod tests {
         let none = Path::new("/dev/null");
 
         let ok = global(&included);
-        let found =
-            discover_user_config(&[("GIT_CONFIG_SYSTEM", none), ("GIT_CONFIG_GLOBAL", &ok)]);
+        let found = discover_user_config(
+            &[("GIT_CONFIG_SYSTEM", none), ("GIT_CONFIG_GLOBAL", &ok)],
+            None,
+        );
         assert_eq!(
             found,
             Some(vec![("core.sshcommand".into(), "my-ssh".into())])
@@ -475,10 +511,46 @@ mod tests {
 
         let stalled = global(&fifo);
         let start = Instant::now();
-        let found =
-            discover_user_config(&[("GIT_CONFIG_SYSTEM", none), ("GIT_CONFIG_GLOBAL", &stalled)]);
+        let found = discover_user_config(
+            &[("GIT_CONFIG_SYSTEM", none), ("GIT_CONFIG_GLOBAL", &stalled)],
+            None,
+        );
         assert_eq!(found, None);
         assert!(start.elapsed() < Duration::from_secs(10));
+    }
+
+    /// The caller's deadline covers discovery and the cache lock wait.
+    #[cfg(unix)]
+    #[test]
+    fn hardening_discovery_honors_the_caller_deadline() {
+        let tmp = tempfile::tempdir().unwrap();
+        let fifo = tmp.path().join("stalled");
+        assert!(Command::new("mkfifo")
+            .arg(&fifo)
+            .status()
+            .unwrap()
+            .success());
+        let global = tmp.path().join("gitconfig");
+        std::fs::write(&global, format!("[include]\n\tpath = {}\n", fifo.display())).unwrap();
+        let none = Path::new("/dev/null");
+        let envs = [("GIT_CONFIG_SYSTEM", none), ("GIT_CONFIG_GLOBAL", &*global)];
+
+        let cache = Mutex::new(None);
+        let start = Instant::now();
+        let args = hardening_args_in(&cache, &envs, Some(start + Duration::from_millis(300)));
+        assert_eq!(args, None);
+        assert!(start.elapsed() < Duration::from_millis(1500));
+        assert!(
+            cache.lock().unwrap().is_none(),
+            "a timeout must not be cached"
+        );
+
+        let held = Mutex::new(None);
+        let _guard = held.lock().unwrap();
+        let start = Instant::now();
+        let args = hardening_args_in(&held, &[], Some(start + Duration::from_millis(100)));
+        assert_eq!(args, None);
+        assert!(start.elapsed() < Duration::from_millis(1500));
     }
 
     #[test]
@@ -487,12 +559,16 @@ mod tests {
         let broken = tmp.path().join("gitconfig");
         std::fs::write(&broken, "[core\n\tsshCommand = my-ssh\n").unwrap();
         let none = Path::new("/dev/null");
-        let found =
-            discover_user_config(&[("GIT_CONFIG_SYSTEM", none), ("GIT_CONFIG_GLOBAL", &broken)]);
+        let found = discover_user_config(
+            &[("GIT_CONFIG_SYSTEM", none), ("GIT_CONFIG_GLOBAL", &broken)],
+            None,
+        );
         assert_eq!(found, None);
         let missing = tmp.path().join("absent");
-        let found =
-            discover_user_config(&[("GIT_CONFIG_SYSTEM", none), ("GIT_CONFIG_GLOBAL", &missing)]);
+        let found = discover_user_config(
+            &[("GIT_CONFIG_SYSTEM", none), ("GIT_CONFIG_GLOBAL", &missing)],
+            None,
+        );
         assert_eq!(found, Some(vec![]));
     }
 
@@ -506,8 +582,10 @@ mod tests {
         )
         .unwrap();
         let none = Path::new("/dev/null");
-        let found =
-            discover_user_config(&[("GIT_CONFIG_SYSTEM", none), ("GIT_CONFIG_GLOBAL", &global)]);
+        let found = discover_user_config(
+            &[("GIT_CONFIG_SYSTEM", none), ("GIT_CONFIG_GLOBAL", &global)],
+            None,
+        );
         assert_eq!(
             found,
             Some(vec![(
