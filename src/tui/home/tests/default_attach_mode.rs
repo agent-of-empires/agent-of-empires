@@ -706,8 +706,11 @@ fn send_message_drains_pending_paste_for_structured_view() {
         "pending_paste must be drained when routing to structured view"
     );
     assert_eq!(
-        env.view.pending_paste_for_structured_view.get(&id),
-        Some(&"cached text".to_string()),
+        env.view
+            .pending_paste_for_structured_view
+            .get(&id)
+            .map(crate::tui::home::PendingStructuredInput::text),
+        Some("cached text".to_string()),
         "drained text must land in pending_paste_for_structured_view, bound to the selected session"
     );
 }
@@ -723,8 +726,11 @@ fn send_message_merges_buffered_paste_for_same_session() {
     env.view.pending_paste = Some("second".to_string());
     env.view.handle_key(key(KeyCode::Char('m')), None);
     assert_eq!(
-        env.view.pending_paste_for_structured_view.get(&id),
-        Some(&"first second".to_string()),
+        env.view
+            .pending_paste_for_structured_view
+            .get(&id)
+            .map(crate::tui::home::PendingStructuredInput::text),
+        Some("first second".to_string()),
         "same-target paste must merge into the buffered text"
     );
 }
@@ -747,13 +753,19 @@ fn send_message_keeps_buffered_paste_per_session() {
     env.view.select_session_by_id(&other);
     env.view.handle_key(key(KeyCode::Char('m')), None);
     assert_eq!(
-        env.view.pending_paste_for_structured_view.get(&other),
-        Some(&"session b draft".to_string()),
+        env.view
+            .pending_paste_for_structured_view
+            .get(&other)
+            .map(crate::tui::home::PendingStructuredInput::text),
+        Some("session b draft".to_string()),
         "the new target owns its own draft"
     );
     assert_eq!(
-        env.view.pending_paste_for_structured_view.get(&id_a),
-        Some(&"session a draft".to_string()),
+        env.view
+            .pending_paste_for_structured_view
+            .get(&id_a)
+            .map(crate::tui::home::PendingStructuredInput::text),
+        Some("session a draft".to_string()),
         "the previous target's unsent draft must survive the switch"
     );
 }

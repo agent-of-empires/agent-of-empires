@@ -13,7 +13,7 @@ use std::process::Stdio;
 use std::time::Duration;
 
 use super::home::update_bar::{DrawnBar, UpdateBar};
-use super::home::{bindings, HomeView, TerminalMode};
+use super::home::{bindings, HomeView, PendingStructuredInput, TerminalMode};
 use super::styles::Theme;
 use crate::containers::image_update::ImageUpdate;
 use crate::session::config::AppStateConfig;
@@ -164,11 +164,6 @@ pub struct App {
     /// The row whose in-flight mount just took the screen for Enter: the run
     /// loop delivers paste buffered for it once the poll returns.
     structured_paste_drain: Option<String>,
-    /// Enter presses made while that row's mount connected, as offsets into the
-    /// draft buffered for it. Each submits the text before it, so what the user
-    /// typed after an Enter stays in the composer instead of riding along.
-    structured_submit_boundaries: Option<(String, Vec<usize>)>,
-    /// Cleared on failure so the user can retry.
     pending_install_version: Option<String>,
     /// The running binary keeps its old version until restart, so this stops
     /// periodic re-checks from re-offering a release we already installed.
@@ -371,7 +366,7 @@ impl App {
             structured_mount_failed: None,
             structured_mount_activate: None,
             structured_paste_drain: None,
-            structured_submit_boundaries: None,
+
             pending_view_switch: None,
             pending_smart_rename: None,
             dashboard_launch: None,
@@ -2535,28 +2530,40 @@ impl App {
                     .pending_paste_for_structured_view
                     .entry(target)
                     .or_default()
-                    .push(c);
+                    .push_str(&c.to_string());
             }
-            // Enter is a submit, not text: record where in the draft it fell so
-            // the replay can submit what preceded it.
+            // Enter is a submit, not text: it freezes what precedes it so no
+            // later key can rewrite a segment already on its way.
             (KeyCode::Enter, KeyModifiers::NONE) => {
-                let at = self
-                    .home
+                self.home
                     .pending_paste_for_structured_view
-                    .get(&target)
-                    .map_or(0, String::len);
-                let (owner, mut boundaries) = self
-                    .structured_submit_boundaries
-                    .take()
-                    .filter(|(owner, _)| *owner == target)
-                    .unwrap_or((target, Vec::new()));
-                boundaries.push(at);
-                self.structured_submit_boundaries = Some((owner, boundaries));
+                    .entry(target)
+                    .or_default()
+                    .submit();
             }
             (KeyCode::Backspace, KeyModifiers::NONE) => {
-                if let Some(buf) = self.home.pending_paste_for_structured_view.get_mut(&target) {
-                    buf.pop();
+                if let Some(pending) = self.home.pending_paste_for_structured_view.get_mut(&target)
+                {
+                    pending.backspace();
                 }
+            }
+            // Esc gives up the hold instead of being swallowed until the
+            // connect settles, and hands the text back where it came from.
+            (KeyCode::Esc, _) => {
+                if let Some((completed, draft)) = self
+                    .home
+                    .pending_paste_for_structured_view
+                    .remove(&target)
+                    .map(|pending| pending.into_parts())
+                {
+                    let mut text = completed.concat();
+                    text.push_str(&draft);
+                    if !text.is_empty() {
+                        self.home.pending_paste = Some(text);
+                    }
+                }
+                self.structured_mount_activate = None;
+                return false;
             }
             _ => {}
         }
@@ -2571,56 +2578,65 @@ impl App {
         }
     }
 
-    /// Consume the requested session's draft only if that session mounted.
+    /// Consume the requested session's pending input only if that session mounted.
     async fn drain_pending_paste_for_structured_view(&mut self, session_id: &str) {
-        let boundaries = match self.structured_submit_boundaries.take() {
-            Some((owner, boundaries)) if owner == session_id => boundaries,
-            // Another row's Enter is not this row's submit.
-            other => {
-                self.structured_submit_boundaries = other;
-                Vec::new()
-            }
-        };
-        let Some(view) = self
-            .home
-            .structured_preview
-            .as_mut()
-            .filter(|view| view.session_id() == session_id)
-        else {
-            return;
-        };
-        let Some(buf) = self
+        let Some(pending) = self
             .home
             .pending_paste_for_structured_view
             .remove(session_id)
         else {
             return;
         };
-        // Replay the edits and submits in the order they were made: each Enter
-        // submits exactly the text before it, and anything typed after the last
-        // one is left in the composer for the user to send.
-        let mut sent = 0;
-        for end in boundaries {
-            let end = end.clamp(sent, buf.len());
-            if end == sent {
-                continue;
-            }
-            view.paste_text_with_file_load(&buf[sent..end]).await;
-            sent = end;
-            if let Err(e) = view
-                .handle_event(Event::Key(KeyEvent::new(
-                    KeyCode::Enter,
-                    KeyModifiers::NONE,
-                )))
-                .await
-            {
-                self.close_embedded_structured();
-                self.update_status = Some(UpdateStatus::transient(format!("structured view: {e}")));
-                return;
-            }
+        if self
+            .home
+            .structured_preview
+            .as_ref()
+            .is_none_or(|view| view.session_id() != session_id)
+        {
+            self.home
+                .pending_paste_for_structured_view
+                .insert(session_id.to_owned(), pending);
+            return;
         }
-        if sent < buf.len() {
-            view.paste_text_with_file_load(&buf[sent..]).await;
+        let (completed, draft) = pending.into_parts();
+        let mut unsent = completed;
+        let failure = {
+            let view = self
+                .home
+                .structured_preview
+                .as_mut()
+                .expect("checked above");
+            let mut failure = None;
+            // Each segment was frozen when its Enter fell, so replaying them in
+            // order submits exactly what the user had typed before each Enter.
+            while let Some(segment) = unsent.first().cloned() {
+                view.paste_text_with_file_load(&segment).await;
+                if let Err(e) = view
+                    .handle_event(Event::Key(KeyEvent::new(
+                        KeyCode::Enter,
+                        KeyModifiers::NONE,
+                    )))
+                    .await
+                {
+                    failure = Some(e);
+                    break;
+                }
+                unsent.remove(0);
+            }
+            if failure.is_none() && !draft.is_empty() {
+                view.paste_text_with_file_load(&draft).await;
+            }
+            failure
+        };
+        if let Some(e) = failure {
+            // Nothing that never reached the composer is dropped: the rest waits
+            // for the next mount of this row.
+            self.home.pending_paste_for_structured_view.insert(
+                session_id.to_owned(),
+                PendingStructuredInput::from_parts(unsent, draft),
+            );
+            self.close_embedded_structured();
+            self.update_status = Some(UpdateStatus::transient(format!("structured view: {e}")));
         }
     }
 
@@ -2732,7 +2748,6 @@ impl App {
             Ok(_) => true,
             Err(e) => {
                 self.structured_mount_activate = None;
-                self.structured_submit_boundaries = None;
                 if wanted {
                     self.structured_mount_failed = Some(target);
                     self.set_status(e);
@@ -2769,7 +2784,6 @@ impl App {
         {
             self.structured_mount = None;
             self.structured_mount_activate = None;
-            self.structured_submit_boundaries = None;
         }
         // A failure is remembered only for the row it belongs to, so the early
         // returns below cannot strand it on a row the user has come back to.
@@ -2827,7 +2841,6 @@ impl App {
             self.clear_preview_mount_pending();
             self.structured_mount = None;
             self.structured_mount_activate = None;
-            self.structured_submit_boundaries = None;
             self.structured_mount_failed = None;
             return self.home.structured_preview.take().is_some();
         }
@@ -3918,9 +3931,10 @@ mod tests {
         let (mut app, _guard, id) = app_on_a_structured_row();
         let (tx, rx) = tokio::sync::oneshot::channel();
         app.structured_mount = Some((id.clone(), rx));
-        app.home
-            .pending_paste_for_structured_view
-            .insert(id.clone(), "typed while connecting".to_owned());
+        app.home.pending_paste_for_structured_view.insert(
+            id.clone(),
+            PendingStructuredInput::from_parts(Vec::new(), "typed while connecting".to_owned()),
+        );
 
         app.open_structured_view(&id).await.unwrap();
         assert_eq!(app.structured_mount_activate.as_deref(), Some(id.as_str()));
@@ -4082,6 +4096,50 @@ mod tests {
         assert_eq!(submitted.first().map(String::as_str), Some("first"));
     }
 
+    /// Backspace after a buffered Enter edits only the draft that has not been
+    /// submitted: the frozen segment keeps its text, so no byte offset can ever
+    /// land inside a multibyte character.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn backspace_after_enter_leaves_the_frozen_segment_alone() {
+        use crate::tui::structured_view::embedded::EmbeddedView;
+        let (mut app, _guard, id) = app_on_a_structured_row();
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        app.structured_mount = Some((id.clone(), rx));
+        app.open_structured_view(&id).await.unwrap();
+
+        let hold = |app: &mut App, code| {
+            app.hold_key_for_pending_structured_view(&KeyEvent::new(code, KeyModifiers::NONE))
+        };
+        // Enter, then Backspace, then a multibyte character: with byte offsets
+        // into one flat string the Backspace shifts the draft under the frozen
+        // boundary and the replay slices inside 界.
+        app.route_pasted_text("éa").await;
+        hold(&mut app, KeyCode::Enter);
+        hold(&mut app, KeyCode::Backspace);
+        app.route_pasted_text("界").await;
+
+        assert!(tx.send(Ok(EmbeddedView::for_test(&id))).is_ok());
+        assert!(app.poll_structured_mount());
+        app.drain_structured_paste().await;
+
+        let view = app
+            .home
+            .structured_preview
+            .as_ref()
+            .expect("the mount Enter asked for is on screen");
+        assert_eq!(
+            view.submitted_prompts(),
+            ["éa".to_string()],
+            "the segment frozen by Enter is submitted whole"
+        );
+        assert!(
+            view.composer_text().ends_with('界'),
+            "the multibyte draft survives, got {:?}",
+            view.composer_text()
+        );
+    }
+
     /// A click can move the selection before the mount is reconciled, so the
     /// next paste must not still be buffered for the row the user left.
     #[tokio::test]
@@ -4138,7 +4196,8 @@ mod tests {
             app.home
                 .pending_paste_for_structured_view
                 .get(&id)
-                .map(String::as_str),
+                .map(PendingStructuredInput::text)
+                .as_deref(),
             Some("pasted while connecting")
         );
 
@@ -5323,12 +5382,14 @@ mod tests {
             crate::file_watch::FileWatchService::noop(),
         )
         .expect("app");
-        app.home
-            .pending_paste_for_structured_view
-            .insert("s-1".into(), "buffered draft".into());
-        app.home
-            .pending_paste_for_structured_view
-            .insert("s-2".into(), "other target".into());
+        app.home.pending_paste_for_structured_view.insert(
+            "s-1".into(),
+            PendingStructuredInput::from_parts(Vec::new(), "buffered draft".into()),
+        );
+        app.home.pending_paste_for_structured_view.insert(
+            "s-2".into(),
+            PendingStructuredInput::from_parts(Vec::new(), "other target".into()),
+        );
         app.home.structured_preview =
             Some(crate::tui::structured_view::embedded::EmbeddedView::for_test("s-1"));
 
@@ -5346,7 +5407,8 @@ mod tests {
             app.home
                 .pending_paste_for_structured_view
                 .get("s-1")
-                .map(String::as_str),
+                .map(PendingStructuredInput::text)
+                .as_deref(),
             Some("buffered draft"),
         );
 
@@ -5359,14 +5421,19 @@ mod tests {
             "buffered draft",
             "the captured buffer must land in the mounted composer"
         );
-        assert_eq!(
-            app.home.pending_paste_for_structured_view.get("s-1"),
-            None,
+        assert!(
+            !app.home
+                .pending_paste_for_structured_view
+                .contains_key("s-1"),
             "a forwarded buffer must be consumed"
         );
         assert_eq!(
-            app.home.pending_paste_for_structured_view.get("s-2"),
-            Some(&"other target".to_string()),
+            app.home
+                .pending_paste_for_structured_view
+                .get("s-2")
+                .map(PendingStructuredInput::text)
+                .as_deref(),
+            Some("other target"),
             "another target's unsent draft must survive the drain"
         );
     }

@@ -230,6 +230,47 @@ pub(super) struct PassiveSynced {
     pub(super) adopted_at: std::time::Instant,
 }
 
+/// Keys typed while a row's mount connects, kept in submit order. Each Enter
+/// freezes the segment before it, so editing can only reach the draft after the
+/// last one.
+#[derive(Default)]
+pub(super) struct PendingStructuredInput {
+    completed: Vec<String>,
+    draft: String,
+}
+
+impl PendingStructuredInput {
+    pub(super) fn push_str(&mut self, text: &str) {
+        self.draft.push_str(text);
+    }
+
+    pub(super) fn backspace(&mut self) {
+        self.draft.pop();
+    }
+
+    /// An empty Enter submits nothing, matching the composer it replays into.
+    pub(super) fn submit(&mut self) {
+        if !self.draft.is_empty() {
+            self.completed.push(std::mem::take(&mut self.draft));
+        }
+    }
+
+    pub(super) fn into_parts(self) -> (Vec<String>, String) {
+        (self.completed, self.draft)
+    }
+
+    pub(super) fn from_parts(completed: Vec<String>, draft: String) -> Self {
+        Self { completed, draft }
+    }
+
+    #[cfg(test)]
+    pub(super) fn text(&self) -> String {
+        let mut text = self.completed.concat();
+        text.push_str(&self.draft);
+        text
+    }
+}
+
 pub(in crate::tui) struct ReadyNativeAttachment {
     pub id: String,
     pub tmux_name: String,
@@ -392,7 +433,8 @@ pub struct HomeView {
     /// Resize only when geometry repeats on two refreshes, so a one-frame toast can't resize the agent twice.
     pub(super) preview_pane_pending: Option<(String, u16, u16)>,
     pub(super) pending_paste: Option<String>,
-    pub(super) pending_paste_for_structured_view: HashMap<String, String>,
+    /// Input for a row whose mount is still connecting, split at each Enter.
+    pub(super) pending_paste_for_structured_view: HashMap<String, PendingStructuredInput>,
     pub(super) pending_attach_after_warning: Option<String>,
     pub(super) pending_stop_session: Option<String>,
     /// Target captured when the auxiliary stop confirmation opens.
