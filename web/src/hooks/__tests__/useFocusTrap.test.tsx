@@ -21,6 +21,8 @@ function Modal({ active = true, restoreFocus = false }: { active?: boolean; rest
         <button>nested</button>
       </div>
       <button>last</button>
+      <input type="radio" name="unpicked" aria-label="unpicked first" />
+      <input type="radio" name="unpicked" aria-label="unpicked second" />
     </div>
   );
 }
@@ -41,13 +43,17 @@ const tab = (shiftKey = false) => !fireEvent.keyDown(document.activeElement ?? d
 describe("useFocusTrap", () => {
   it("wraps at either end and leaves Tab between stops to the browser", () => {
     render(<Page open />);
-    button("last").focus();
+    // A radio group with nothing picked is still one stop, entered at its first radio.
+    const lastStop = screen.getByRole("radio", { name: "unpicked first" });
+    lastStop.focus();
     expect(tab()).toBe(true);
     expect(document.activeElement).toBe(button("first"));
     expect(tab(true)).toBe(true);
-    expect(document.activeElement).toBe(button("last"));
-    screen.getByRole("radio", { name: "checked" }).focus();
-    expect(tab()).toBe(false);
+    expect(document.activeElement).toBe(lastStop);
+    for (const between of [screen.getByRole("radio", { name: "checked" }), button("last")]) {
+      between.focus();
+      expect(tab()).toBe(false);
+    }
   });
 
   it("brings Tab from outside the modal back in", () => {
@@ -57,7 +63,7 @@ describe("useFocusTrap", () => {
     expect(document.activeElement).toBe(button("first"));
     button("outside").focus();
     expect(tab(true)).toBe(true);
-    expect(document.activeElement).toBe(button("last"));
+    expect(document.activeElement).toBe(screen.getByRole("radio", { name: "unpicked first" }));
   });
 
   it("leaves the key to a modal opened inside it, and does nothing while inactive", () => {
@@ -66,7 +72,7 @@ describe("useFocusTrap", () => {
     expect(tab()).toBe(false);
     cleanup();
     render(<Page open active={false} />);
-    button("last").focus();
+    screen.getByRole("radio", { name: "unpicked first" }).focus();
     expect(tab()).toBe(false);
   });
 

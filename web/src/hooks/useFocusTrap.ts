@@ -3,14 +3,23 @@ import { useEffect, useEffectEvent, useState } from "react";
 const FOCUSABLE =
   'a[href], button:not([disabled]), input:not([disabled]):not([type="hidden"]), select:not([disabled]), textarea:not([disabled]), [tabindex]:not([tabindex="-1"])';
 
-/** The Tab stops inside `root` in order; a radio group is one stop, its checked radio. */
+/** A radio group is one stop: its checked radio, or its first one while none is checked. */
+function radioStop(radio: HTMLInputElement, root: HTMLElement): boolean {
+  if (radio.checked || !radio.name) return true;
+  const group = Array.from(root.querySelectorAll<HTMLInputElement>('input[type="radio"]')).filter(
+    (other) => other.name === radio.name,
+  );
+  return group[0] === radio && !group.some((other) => other.checked);
+}
+
+/** The Tab stops inside `root` in order. */
 export function tabStops(root: HTMLElement): HTMLElement[] {
   return Array.from(root.querySelectorAll<HTMLElement>(FOCUSABLE)).filter(
     (el) =>
       el.tabIndex >= 0 &&
       !el.closest("[hidden], [inert]") &&
-      (el.checkVisibility?.() ?? true) &&
-      !(el instanceof HTMLInputElement && el.type === "radio" && !el.checked),
+      (el.checkVisibility?.({ visibilityProperty: true }) ?? true) &&
+      !(el instanceof HTMLInputElement && el.type === "radio" && !radioStop(el, root)),
   );
 }
 

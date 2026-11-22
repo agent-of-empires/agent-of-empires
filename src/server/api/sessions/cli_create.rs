@@ -208,6 +208,11 @@ fn resolve_host_creation(
                 .collect::<Result<_>>()?;
     }
     for path in &mut body.extra_repo_paths {
+        if !std::path::Path::new(path).is_dir() {
+            return Err(
+                crate::session::builder::BuildRefusal::WorkingDirMissing(path.clone()).into(),
+            );
+        }
         *path = std::path::Path::new(path)
             .canonicalize()
             .context("Failed to resolve an additional repository on the Daemon host")?

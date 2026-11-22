@@ -269,7 +269,7 @@ fn daemon_status_message(status: StatusCode, code: Option<ApiErrorCode>, body: &
         Some(ApiErrorCode::StartFailed) => "Session start failed".into(),
         // The body names the path or branch when this client may read it.
         Some(ApiErrorCode::WorkingDirMissing) if body.is_empty() => {
-            "The project path does not exist where the Daemon runs".into()
+            "A project or repository path does not exist where the Daemon runs".into()
         }
         Some(ApiErrorCode::BranchNotFound) if body.is_empty() => {
             "The worktree branch was not found".into()

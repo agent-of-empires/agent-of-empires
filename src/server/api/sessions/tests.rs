@@ -16069,7 +16069,7 @@ async fn missing_path_and_branch_refusals_carry_their_code() {
     support::refresh_canonical_metadata_for_test(&state).await;
     let missing = tempfile::tempdir().unwrap().path().join("missing");
     let response = review_creation_trust(
-        State(state),
+        State(state.clone()),
         Ok(Json(
             serde_json::from_value(serde_json::json!({"path": missing, "profile": "test"}))
                 .unwrap(),
@@ -16080,6 +16080,34 @@ async fn missing_path_and_branch_refusals_carry_their_code() {
         ApiErrorCode::from_headers(response.status(), response.headers(), false)
     };
     assert_eq!(code(&response), Some(ApiErrorCode::WorkingDirMissing));
+
+    // `aoe add . -w ws/one -b --repo <missing>` names the repository it could not find.
+    let (project, _repo) = crate::git::test_support::init_repo();
+    let response = {
+        use axum::response::IntoResponse;
+        create_session(
+            State(state),
+            axum::extract::Query(CreateSessionQuery { wait: None }),
+            None,
+            None,
+            Ok(Json(
+                serde_json::from_value(serde_json::json!({
+                    "path": project.path(), "tool": "", "profile": "test",
+                    "worktree_branch": "ws/one", "create_new_branch": true,
+                    "extra_repo_paths": [missing], "cli": {"no_submodules": true},
+                }))
+                .unwrap(),
+            )),
+        )
+        .await
+        .into_response()
+    };
+    assert_eq!(code(&response), Some(ApiErrorCode::WorkingDirMissing));
+    let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let body = String::from_utf8_lossy(&body);
+    assert!(body.contains(&*missing.to_string_lossy()), "{body}");
 
     for (error, expected) in [
         (

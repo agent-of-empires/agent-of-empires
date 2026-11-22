@@ -958,6 +958,17 @@ pub(crate) async fn create_session_with(
                 "Internal server error",
             );
         }
+        Err(error)
+            if matches!(
+                error.downcast_ref(),
+                Some(crate::session::builder::BuildRefusal::WorkingDirMissing(_))
+            ) =>
+        {
+            return crate::server::api::api_error_with_code_header(
+                crate::daemon::ApiErrorCode::WorkingDirMissing,
+                error.to_string(),
+            );
+        }
         Err(error) => {
             let code = error
                 .downcast_ref::<super::cli_create::CliParentRefused>()
