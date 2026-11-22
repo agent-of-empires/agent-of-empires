@@ -188,9 +188,13 @@ pub fn delete_install_id() -> Result<()> {
     Ok(())
 }
 
-pub fn reset_install_id() -> Result<Option<String>> {
-    delete_install_id()?;
-    try_ensure_install_id()
+/// Replaces any id with a fresh one whatever the saved opt-in, for opt-in and `reset-id`.
+pub fn rotate_install_id() -> Result<String> {
+    update_state_locked(|state| {
+        let id = uuid::Uuid::new_v4().to_string();
+        state.install_id = Some(id.clone());
+        (id, true)
+    })
 }
 
 pub fn record_cli_command(name: &str) {

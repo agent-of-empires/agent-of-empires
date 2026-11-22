@@ -494,7 +494,6 @@ impl HomeView {
             self.pending_creation = Some(pending);
             return None;
         }
-        crate::tui::app::record_session_create();
         self.clear_creation_tracking(&pending.request_key);
         self.rebuild_group_trees();
         self.rebuild_flat_items();

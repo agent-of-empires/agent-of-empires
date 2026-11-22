@@ -1,5 +1,5 @@
-//! Closed registry of accessory-feature use counts, shared by the TUI and the web dashboard.
-//! Counts accumulate in-process and are folded into the next `usage_snapshot`.
+//! Closed registry of accessory-feature use counts. The TUI and the web dashboard report
+//! uses to the Daemon, which folds them into its next `usage_snapshot`.
 
 use std::collections::BTreeMap;
 use std::sync::LazyLock;
@@ -105,11 +105,7 @@ static COUNTS: LazyLock<UsageSeenCounters> = LazyLock::new(|| {
     UsageSeenCounters::with_names(FeatureUse::NAMES.iter().chain(WEB_ONLY).copied())
 });
 
-pub fn record(feature: FeatureUse) {
-    COUNTS.record(feature.as_str());
-}
-
-/// For names arriving from the web dashboard; false when off the registry.
+/// For names a client reports to the Daemon; false when off the registry.
 pub fn record_name(name: &str) -> bool {
     COUNTS.record(name)
 }

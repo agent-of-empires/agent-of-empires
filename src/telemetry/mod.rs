@@ -11,7 +11,6 @@ pub mod plugins;
 pub mod sanitize;
 mod state;
 pub mod usage_signals;
-pub mod window;
 
 use std::collections::BTreeMap;
 use std::time::Duration;
@@ -22,7 +21,6 @@ pub use events::{
 pub use form_factor::WebClientFormFactor;
 pub use state::{
     cli_usage_due, ensure_install_id, install_id, record_cli_command, record_cli_usage_flush,
-    reset_install_id,
 };
 
 use crate::session::Instance;
@@ -78,10 +76,6 @@ fn opted_in_with(config: &crate::session::Config) -> bool {
     config.telemetry.enabled && !do_not_track()
 }
 
-pub fn apply_opt_in_change(enabled: bool) {
-    consent::apply_opt_in_change(enabled);
-}
-
 fn now_rfc3339() -> String {
     chrono::Utc::now().to_rfc3339()
 }
@@ -115,11 +109,12 @@ fn substrate_bucket(inst: &Instance) -> &'static str {
     "local"
 }
 
+/// Reads the id and never creates one: only the Daemon does, on opt-in or for a snapshot.
 pub fn build_process_start(surface: Surface) -> Option<ProcessStart> {
     if !is_opted_in() {
         return None;
     }
-    let install_id = state::ensure_install_id()?;
+    let install_id = state::install_id()?;
     let (update_status, update_releases_behind) =
         crate::update::cached_version_health(env!("CARGO_PKG_VERSION"));
     Some(ProcessStart {
@@ -415,7 +410,7 @@ pub fn build_cli_usage() -> Option<CliUsage> {
     if command_counts.is_empty() {
         return None;
     }
-    let install_id = state::ensure_install_id()?;
+    let install_id = state::install_id()?;
     let window_start = window_start
         .map(|w| w.to_rfc3339())
         .unwrap_or_else(now_rfc3339);

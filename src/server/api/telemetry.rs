@@ -71,9 +71,7 @@ pub async fn set_telemetry_consent(
         Err(rej) => return rej.into_response(),
     };
 
-    if let Err(e) = crate::session::update_config(|config| {
-        config.telemetry.enabled = req.enabled;
-    }) {
+    if let Err(e) = crate::telemetry::consent::set_consent(req.enabled) {
         tracing::error!(target: "http.api.telemetry", "failed to save telemetry consent: {e}");
         return api_error(
             StatusCode::INTERNAL_SERVER_ERROR,
@@ -91,9 +89,6 @@ pub async fn set_telemetry_consent(
             "Failed to save telemetry setting",
         );
     }
-    // Reconcile the install id (no-op under DO_NOT_TRACK). The daemon, not the
-    // browser, owns the id.
-    crate::telemetry::apply_opt_in_change(req.enabled);
     tracing::info!(target: "http.api.telemetry", enabled = req.enabled, "telemetry consent changed");
     (StatusCode::OK, Json(current_mutation())).into_response()
 }
@@ -106,7 +101,7 @@ pub async fn reset_telemetry_id(State(state): State<Arc<AppState>>) -> impl Into
     }
     let status = current_status();
     if status.enabled && !status.do_not_track {
-        if let Err(error) = crate::telemetry::reset_install_id() {
+        if let Err(error) = crate::telemetry::consent::reset_install_id() {
             tracing::warn!(target: "http.api.telemetry", "install id reset failed: {error}");
             return api_error(
                 StatusCode::INTERNAL_SERVER_ERROR,
@@ -120,7 +115,7 @@ pub async fn reset_telemetry_id(State(state): State<Arc<AppState>>) -> impl Into
 
 #[derive(Deserialize)]
 pub struct SeenRequest {
-    /// `"web"` or `"structured_view"`.
+    /// A `USAGE_SIGNALS` name, such as `"tui"` or `"web"`.
     surface: String,
     /// Optional coarse client form-factor (`"desktop"` / `"desktop_pwa"` /
     /// `"mobile"` / `"mobile_pwa"`). Absent on older clients; any value outside

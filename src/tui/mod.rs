@@ -23,6 +23,7 @@ mod session_feed;
 pub mod settings;
 pub(crate) mod structured_view;
 pub(crate) mod styles;
+mod telemetry;
 mod worker;
 
 pub use app::*;
@@ -327,6 +328,11 @@ pub async fn run(profile: &str, startup_warning: Option<String>) -> Result<()> {
     if !io::stdin().is_terminal() {
         anyhow::bail!("stdin is not a terminal; aoe requires an interactive TTY");
     }
+
+    // The TUI is a Daemon client: it starts one, or reaches the running one, before it opens.
+    crate::acp::client::daemon_manager::ensure_native_daemon(profile)
+        .await
+        .map_err(|error| error.context("aoe needs its Daemon and could not reach one"))?;
 
     // Mosh mangles mouse-tracking escapes, so capture stays off under it.
     // `App` re-resolves the config so a mid-session toggle still applies.

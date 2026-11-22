@@ -833,8 +833,18 @@ impl SettingsView {
                 // `aoe serve` PATCH, a second `aoe`, a hand edit) wrote to an
                 // unrelated field while the pane sat open, which is the same
                 // clobber the removed `save_config` caused.
-                let edited = config_to_json(&self.global_config);
+                let mut edited = config_to_json(&self.global_config);
                 let baseline = self.baseline_global.clone();
+                // The Daemon owns consent, so the toggle is sent to it, never written here.
+                let consent = self.global_config.telemetry.enabled;
+                let consent_changed =
+                    edited.pointer("/telemetry/enabled") != baseline.pointer("/telemetry/enabled");
+                if let (Some(slot), Some(saved)) = (
+                    edited.pointer_mut("/telemetry/enabled"),
+                    baseline.pointer("/telemetry/enabled"),
+                ) {
+                    *slot = saved.clone();
+                }
                 let baseline_plugins: std::collections::BTreeMap<
                     String,
                     crate::session::PluginConfig,
@@ -891,6 +901,10 @@ impl SettingsView {
                         state.has_responded_to_telemetry = true;
                     })?;
                 }
+                if consent_changed {
+                    self.global_config.telemetry.enabled = consent;
+                    crate::tui::telemetry::set_consent(consent);
+                }
                 self.resolved_base =
                     merge_configs(self.global_config.clone(), &self.profile_config);
                 // Persist + live-apply the logging filter so a running
@@ -904,10 +918,6 @@ impl SettingsView {
                         &app_dir,
                     );
                 }
-                // Reconcile the on-disk install id with the saved opt-in
-                // state: generate one when enabled, delete it on opt-out.
-                // Idempotent, so running it on every global save is safe.
-                crate::telemetry::apply_opt_in_change(self.global_config.telemetry.enabled);
             }
             SettingsScope::Profile => {
                 // Same changed-leaves write-back as the global scope: a whole-struct

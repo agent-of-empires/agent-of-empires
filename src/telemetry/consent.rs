@@ -1,7 +1,7 @@
-//! Binds every snapshot counter to the consent state it was recorded under: the persisted
-//! opt-in together with the install id, which opting out deletes and opting in or
-//! `reset-id` regenerates. Each record, capture and clear rereads both under one lock, and
-//! a change zeroes every counter before anything is counted or read under the new state.
+//! Binds every snapshot counter to the consent state it was recorded under. The Daemon is
+//! the only writer of consent: [`set_consent`] saves the opt-in and the install id, then
+//! moves the gate. Each move zeroes every counter. Recording touches only memory; captures
+//! and binds reread both files, which also catches a hand edit.
 
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Mutex, MutexGuard};
@@ -13,15 +13,12 @@ struct Gate {
     seen: Option<Option<String>>,
     epoch: u64,
     resets: Vec<Reset>,
-    /// An id an opt-out here failed to delete; never reused by a later opt-in.
-    retained: Option<String>,
 }
 
 static GATE: Mutex<Gate> = Mutex::new(Gate {
     seen: None,
     epoch: 0,
     resets: Vec::new(),
-    retained: None,
 });
 
 fn lock() -> MutexGuard<'static, Gate> {
@@ -45,26 +42,29 @@ impl Gate {
     }
 }
 
-/// Reconciles the install id with a saved opt-in choice under the gate, so no count or
-/// capture interleaves. An id an opt-out failed to delete is regenerated, not reused.
-pub(super) fn apply_opt_in_change(enabled: bool) {
-    let mut gate = lock();
+/// Saves an opt-in answer. An opt-in mints a fresh id before it saves `enabled`, so an id
+/// an earlier opt-out failed to delete is never reused; if minting fails, consent stays
+/// off. File work runs outside the gate, so counting never waits on the state lock.
+pub fn set_consent(enabled: bool) -> anyhow::Result<()> {
+    let saved = crate::session::get_telemetry_settings().enabled;
+    if enabled && !saved && !super::do_not_track() {
+        super::state::rotate_install_id()?;
+    }
+    crate::session::update_config(|config| config.telemetry.enabled = enabled)?;
     if !enabled {
         if let Err(e) = super::state::delete_install_id() {
             tracing::debug!(target: "telemetry", "failed to delete install id on opt-out: {e}");
         }
-        gate.retained = super::install_id();
-    } else if !super::do_not_track() {
-        let retained = gate.retained.take();
-        if retained.is_some() && super::install_id() == retained {
-            if let Err(e) = super::state::reset_install_id() {
-                tracing::debug!(target: "telemetry", "failed to rotate a retained install id: {e}");
-            }
-        } else {
-            let _ = super::state::ensure_install_id();
-        }
     }
-    gate.refresh();
+    lock().refresh();
+    Ok(())
+}
+
+/// Replaces the install id; counts recorded under the old one are zeroed.
+pub fn reset_install_id() -> anyhow::Result<()> {
+    super::state::rotate_install_id()?;
+    lock().refresh();
+    Ok(())
 }
 
 /// Adds counters to zero on every consent change; `reset` returns false once its owner
@@ -76,7 +76,9 @@ pub fn register(reset: impl Fn() -> bool + Send + 'static) {
 /// Runs one counter increment under the current consent state.
 pub fn record<R>(count: impl FnOnce() -> R) -> R {
     let mut gate = lock();
-    gate.refresh();
+    if gate.seen.is_none() {
+        gate.refresh();
+    }
     count()
 }
 
@@ -107,11 +109,13 @@ impl Bound {
         self.epoch == other.epoch
     }
 
-    /// Strips the counts from a snapshot sent under an id other than the one they were
-    /// captured under; the consent change that caused it zeroes them on the next refresh.
-    /// Returns whether the snapshot stays in the captured window.
+    /// Strips the counts from a snapshot unless consent is still the one they were
+    /// captured under and the snapshot carries that id. Returns whether it is.
     pub fn bind(&self, snapshot: &mut super::UsageSnapshot) -> bool {
-        let same = self.install_id.as_deref() == Some(snapshot.install_id.as_str());
+        let mut gate = lock();
+        gate.refresh();
+        let same = gate.epoch == self.epoch
+            && self.install_id.as_deref() == Some(snapshot.install_id.as_str());
         if !same {
             snapshot.clear_deltas();
         }
@@ -133,16 +137,7 @@ mod tests {
     use super::*;
     use std::sync::Arc;
 
-    fn set_opt_in(enabled: bool) {
-        crate::session::update_config(|c| c.telemetry.enabled = enabled).unwrap();
-    }
-
-    fn opt_in(enabled: bool) {
-        set_opt_in(enabled);
-        apply_opt_in_change(enabled);
-    }
-
-    /// A counter zeroed on every consent change, and a reader for it.
+    /// A counter zeroed on every consent change.
     fn gated_counter() -> Arc<AtomicU32> {
         let counter = Arc::new(AtomicU32::new(0));
         let owned = Arc::downgrade(&counter);
@@ -170,7 +165,7 @@ mod tests {
         assert_eq!(off.install_id, None);
         bump(&counter);
 
-        opt_in(true);
+        set_consent(true).unwrap();
         let after_opt_in = 2;
         for _ in 0..after_opt_in {
             bump(&counter);
@@ -184,7 +179,7 @@ mod tests {
         );
 
         bump(&counter);
-        opt_in(false);
+        set_consent(false).unwrap();
         on.clear_reported(|| {
             counter.fetch_sub(reported, Ordering::Relaxed);
         });
@@ -194,7 +189,7 @@ mod tests {
             "opting out zeroes, and the stale clear is skipped"
         );
 
-        opt_in(true);
+        set_consent(true).unwrap();
         let (again, reported) = capture(read);
         assert_eq!(reported, 0, "counts from the opted-out gap never return");
         bump(&counter);
@@ -203,12 +198,11 @@ mod tests {
         });
         assert_eq!(read(), 1, "a clear inside the window keeps later counts");
 
-        opt_in(false);
+        set_consent(false).unwrap();
     }
 
-    /// The persisted opt-in gates counts even when the id outlives an opt-out, as when its
-    /// delete failed: counts made while disabled are dropped on re-enable, the stale id is
-    /// never handed out while disabled, and an opt-in here regenerates it.
+    /// An id an opt-out failed to delete is never handed out while disabled and is
+    /// replaced by the next opt-in, which also discards the counts made in between.
     #[test]
     #[serial_test::serial]
     fn a_retained_id_does_not_carry_counts_or_identity_across_an_opt_out() {
@@ -216,11 +210,11 @@ mod tests {
         let _app_dir = crate::session::test_support::isolate_app_dir();
         let counter = gated_counter();
         let read = || counter.load(Ordering::Relaxed);
-        opt_in(true);
+        set_consent(true).unwrap();
         let id = crate::telemetry::install_id().expect("opted in");
 
-        // Another process saved the opt-out; its delete has not happened or failed.
-        set_opt_in(false);
+        // The opt-out saved, but its delete failed and left the id behind.
+        crate::session::update_config(|c| c.telemetry.enabled = false).unwrap();
         bump(&counter);
         assert_eq!(capture(read).0.install_id, None);
         assert_eq!(
@@ -229,24 +223,53 @@ mod tests {
             "a snapshot never reuses the retained id while disabled"
         );
         bump(&counter);
-        assert_eq!(crate::telemetry::install_id().as_deref(), Some(id.as_str()));
 
-        opt_in(true);
+        set_consent(true).unwrap();
         bump(&counter);
         let (on, reported) = capture(read);
-        assert_eq!(on.install_id.as_deref(), Some(id.as_str()));
+        let rotated = on.install_id.expect("opted in");
+        assert_ne!(rotated, id, "the next opt-in replaces a retained id");
         assert_eq!(
             reported, 1,
             "only the count made after re-enable is captured"
         );
 
-        // This process's own opt-out failed to delete the id.
-        set_opt_in(false);
-        lock().retained = crate::telemetry::install_id();
-        opt_in(true);
-        let rotated = crate::telemetry::install_id().expect("opted in");
-        assert_ne!(rotated, id, "a retained id is regenerated on opt-in");
+        set_consent(false).unwrap();
+    }
 
-        opt_in(false);
+    /// A consent change between capture and send strips the counts, even when the id the
+    /// snapshot carries still matches.
+    #[test]
+    #[serial_test::serial]
+    fn a_bind_after_a_consent_change_strips_the_counts() {
+        let _env = crate::session::test_support::EnvGuard::unset(&["DO_NOT_TRACK"]);
+        let _app_dir = crate::session::test_support::isolate_app_dir();
+        set_consent(true).unwrap();
+        let (bound, ()) = capture(|| ());
+        let mut snapshot = crate::telemetry::build_usage_snapshot(
+            crate::telemetry::Surface::Serve,
+            &[],
+            Default::default(),
+            3,
+            None,
+            None,
+            &Default::default(),
+        )
+        .expect("opted in");
+        assert!(bound.clone().bind(&mut snapshot.clone()));
+
+        // Hand edits off and on again: the retained id matches, the epoch does not.
+        for enabled in [false, true] {
+            crate::session::update_config(|c| c.telemetry.enabled = enabled).unwrap();
+            lock().refresh();
+        }
+        assert_eq!(
+            bound.install_id.as_deref(),
+            Some(snapshot.install_id.as_str())
+        );
+        assert!(!bound.bind(&mut snapshot));
+        assert_eq!(snapshot.session_creates_since_last_snapshot, 0);
+
+        set_consent(false).unwrap();
     }
 }

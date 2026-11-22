@@ -5,6 +5,7 @@ use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicU32, Ordering};
 
 pub const USAGE_SIGNALS: &[&str] = &[
+    "tui",
     "web",
     "structured_view",
     "diff_panel",
@@ -87,7 +88,7 @@ impl UsageSeenCounters {
     }
 }
 
-/// The TUI reports the full zeroed key set so the wire shape matches the daemon's.
+/// The full registry at zero, the shape of a snapshot with nothing seen.
 pub fn zeroed() -> BTreeMap<String, u32> {
     USAGE_SIGNALS
         .iter()

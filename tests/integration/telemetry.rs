@@ -28,8 +28,7 @@ fn isolate() -> crate::common::TestHome {
 /// `isolate` plus an opt-in, which is what most stories start from.
 fn opted_in() -> crate::common::TestHome {
     let home = isolate();
-    update_config(|config| config.telemetry.enabled = true).expect("save config");
-    telemetry::apply_opt_in_change(true);
+    telemetry::consent::set_consent(true).expect("save consent");
     home
 }
 
@@ -142,8 +141,7 @@ fn opt_in_lifecycle_and_do_not_track() {
     )
     .is_none());
 
-    update_config(|config| config.telemetry.enabled = true).expect("save config");
-    telemetry::apply_opt_in_change(true);
+    telemetry::consent::set_consent(true).expect("save consent");
     assert!(telemetry::is_opted_in());
     let id = telemetry::install_id().expect("id generated on opt-in");
     assert!(!id.is_empty());
@@ -152,8 +150,7 @@ fn opt_in_lifecycle_and_do_not_track() {
     assert_eq!(event.event, "process_start");
     assert_eq!(event.install_id, id);
 
-    update_config(|config| config.telemetry.enabled = false).expect("save config");
-    telemetry::apply_opt_in_change(false);
+    telemetry::consent::set_consent(false).expect("save consent");
     assert!(!telemetry::is_opted_in());
     assert_eq!(telemetry::install_id(), None);
     assert!(telemetry::build_process_start(Surface::Tui).is_none());
@@ -162,7 +159,7 @@ fn opt_in_lifecycle_and_do_not_track() {
     unsafe { std::env::set_var("DO_NOT_TRACK", "1") };
     assert!(telemetry::do_not_track());
     assert!(!telemetry::is_opted_in());
-    telemetry::apply_opt_in_change(true);
+    telemetry::consent::set_consent(true).expect("save consent");
     assert_eq!(telemetry::install_id(), None, "suppressed: no id");
     assert!(telemetry::build_process_start(Surface::Cli).is_none());
     unsafe { std::env::remove_var("DO_NOT_TRACK") };
@@ -425,7 +422,9 @@ fn snapshot_carries_feature_uses_and_prefs() {
     use agent_of_empires::telemetry::feature_use::{self, FeatureUse};
     let _tmp = opted_in();
     update_app_state(|state| state.sort_order = Some(SortOrder::Attention)).expect("save");
-    feature_use::record(FeatureUse::from(SortOrder::Attention));
+    assert!(feature_use::record_name(
+        FeatureUse::from(SortOrder::Attention).as_str()
+    ));
     assert!(feature_use::record_name("sort_attention"));
     assert!(!feature_use::record_name("not_a_feature"));
 
@@ -581,8 +580,7 @@ fn cli_usage_records_allowlisted_subcommands_only_when_opted_in() {
     assert!(!telemetry::is_opted_in());
     assert!(telemetry::build_cli_usage().is_none());
 
-    update_config(|config| config.telemetry.enabled = true).expect("save config");
-    telemetry::apply_opt_in_change(true);
+    telemetry::consent::set_consent(true).expect("save consent");
     telemetry::record_cli_command("add");
     telemetry::record_cli_command("session");
     telemetry::record_cli_command("add");

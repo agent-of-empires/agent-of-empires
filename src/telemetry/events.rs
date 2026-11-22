@@ -87,7 +87,7 @@ pub struct UsageSnapshot {
     pub session_sandboxed: u32,
     pub session_yolo: u32,
 
-    /// `aoe serve` reports the window peak; the TUI reports the point-in-time total.
+    /// The window peak, or the point-in-time total when a consent change discarded the window.
     pub peak_concurrent_sessions: u32,
 
     pub session_pinned: u32,

@@ -34,8 +34,8 @@ The CLI asks the Daemon to provision and save the session. A terminal-view sessi
 `Ctrl+b d` detaches back to the TUI. Inside tmux, attaching switches your client to the
 agent's tmux session; `Ctrl+b L` switches back.
 
-`aoe add` starts a local Daemon when needed. Use `--no-autostart` to require one already
-running. With `--daemon-url` or `AOE_DAEMON_URL`, creation runs only on the selected
+`aoe` and `aoe add` start a local Daemon when needed. Use `--no-autostart` to require one
+already running; without one, the TUI refuses to open. With `--daemon-url` or `AOE_DAEMON_URL`, creation runs only on the selected
 Daemon, never locally if that connection fails. Pass an absolute path on that host,
 or `--scratch`; registered `--project` names and agent settings also come from that host.
 `--hook-env KEY` explicitly reads that client variable; no other client environment is sent.
