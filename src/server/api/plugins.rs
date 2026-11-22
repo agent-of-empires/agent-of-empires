@@ -518,6 +518,7 @@ pub struct PluginActionBody {
 pub async fn invoke_plugin_action(
     State(state): State<std::sync::Arc<AppState>>,
     Path(id): Path<String>,
+    // Option: an unstamped request is stamped `token`, the least trusted origin.
     principal: Option<axum::Extension<Principal>>,
     body: Result<Json<PluginActionBody>, axum::extract::rejection::JsonRejection>,
 ) -> Response {
