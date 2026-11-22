@@ -92,36 +92,130 @@ fn render_choice_picker(
     let Some(picker) = &state.choice else {
         return;
     };
-    let (first, lines) = window_rows(
+    // Body width inside the popup: its border and horizontal padding.
+    let body_width = composer_area.width.saturating_sub(4);
+    // Rows the popup can paint above the composer, less its two borders.
+    let budget = (composer_area.y as usize).saturating_sub(2);
+    // The detail block is reserved at its fullest across the open options, so
+    // moving to another option cannot resize the popup and slide the rows out
+    // from under the pointer.
+    let detail_rows = picker
+        .details
+        .iter()
+        .flatten()
+        .map(|detail| detail_row_count(detail, body_width))
+        .max()
+        .unwrap_or(0)
+        .min(CHOICE_DETAIL_MAX_ROWS)
+        .min(budget.saturating_sub(1));
+    // The answers come first: context is what gets dropped on a short terminal,
+    // never the option the user is about to accept.
+    let (first, mut lines) = window_rows(
         composer_area,
-        8,
+        budget.saturating_sub(detail_rows).min(8),
         picker.selected,
         prev_first,
         &picker.options,
         |(_, label)| vec![label.clone()],
     );
     let rows = lines.len();
+    let context_cap = CHOICE_CONTEXT_MAX_ROWS.min(budget.saturating_sub(rows + detail_rows));
+    let context_rows = picker.context.as_deref().map_or(0, |context| {
+        let style = Style::default().fg(theme.hint);
+        let mut wrapped = Vec::new();
+        for text in context.lines() {
+            wrap_line_into(
+                Line::styled(text.to_string(), style),
+                body_width,
+                &mut wrapped,
+            );
+        }
+        cap_rows(&mut wrapped, context_cap, style);
+        let count = wrapped.len() as u16;
+        lines.splice(0..0, wrapped);
+        count
+    });
+    // The highlighted option carries its own detail, so the answer being
+    // considered reads in full without opening the web form.
+    let detail_style = Style::default()
+        .fg(theme.dimmed)
+        .add_modifier(Modifier::ITALIC);
+    let mut detail = Vec::new();
+    if let Some(Some(text)) = picker.details.get(picker.selected) {
+        push_detail_rows(text, body_width, detail_style, &mut detail);
+    }
+    // Capped at the reserved height rather than the constant, so a short
+    // terminal ends on the marker instead of dropping rows silently.
+    cap_rows(&mut detail, detail_rows, detail_style);
+    // Padded to the reserved height so the option rows keep their position.
+    detail.resize(detail_rows, Line::default());
+    lines.extend(detail);
     let drawn = render_popup_above(frame, composer_area, theme, picker.title.clone(), lines);
-    record_picker(state, PickerKind::Choice, drawn, first, rows);
+    record_picker(state, PickerKind::Choice, drawn, first, rows, context_rows);
+}
+
+/// Rows `detail` takes at `width`, counted the way it is painted.
+fn detail_row_count(detail: &str, width: u16) -> usize {
+    let style = Style::default().add_modifier(Modifier::ITALIC);
+    let mut wrapped = Vec::new();
+    push_detail_rows(detail, width, style, &mut wrapped);
+    wrapped.len()
+}
+
+/// Wrap one option's detail into `rows`: the bullet opens the first source line
+/// and later lines align under the text.
+fn push_detail_rows(detail: &str, width: u16, style: Style, rows: &mut Vec<Line<'static>>) {
+    for (index, line) in detail.lines().enumerate() {
+        let prefix = if index == 0 { "· " } else { "  " };
+        wrap_line_into(Line::styled(format!("{prefix}{line}"), style), width, rows);
+    }
+}
+
+/// Context rows a choice picker shows above its options, and detail rows it
+/// shows under them, so a long question never hides the answers themselves.
+const CHOICE_CONTEXT_MAX_ROWS: usize = 4;
+const CHOICE_DETAIL_MAX_ROWS: usize = 3;
+
+/// Cap `rows` at `max`, ending on a marker row when text was dropped so a cut
+/// sentence never reads as the whole of it.
+fn cap_rows(rows: &mut Vec<Line<'static>>, max: usize, style: Style) {
+    if rows.len() <= max {
+        return;
+    }
+    if max == 0 {
+        rows.clear();
+        return;
+    }
+    rows.truncate(max - 1);
+    rows.push(Line::styled("…", style));
 }
 
 /// Store a drawn picker as the frame's click / hover target. `rows` counts the
-/// item rows at the top of the popup body, excluding any trailing note.
+/// item rows, and `top_rows` the context rows painted above them; a trailing
+/// note under the items is in neither.
 fn record_picker(
     state: &StructuredViewState,
     kind: PickerKind,
     drawn: Option<(Rect, Rect)>,
     first: usize,
     rows: usize,
+    top_rows: u16,
 ) {
     let Some((area, inner)) = drawn else {
         return;
     };
-    let height = u16::try_from(rows).unwrap_or(u16::MAX).min(inner.height);
+    let top_rows = top_rows.min(inner.height);
+    let height = u16::try_from(rows)
+        .unwrap_or(u16::MAX)
+        .min(inner.height - top_rows);
     state.mouse_targets.borrow_mut().picker = Some(PickerTarget {
         kind,
         area,
-        rows: Rect { height, ..inner },
+        rows: Rect {
+            y: inner.y + top_rows,
+            height,
+            ..inner
+        },
         first,
     });
 }
@@ -214,7 +308,8 @@ fn render_popup_above(
 /// Pure so the redraw path can stash it on `state.layout` for hit-testing.
 pub(super) fn compute_layout(area: Rect, state: &StructuredViewState) -> ViewLayout {
     let queue_height = queued_strip_height(state);
-    let approval_height = u16::from(!state.transcript.pending_approvals.is_empty()) * 3;
+    // A tall shelf on a short terminal would crowd out the transcript behind it.
+    let approval_height = approval_shelf_height(state, area.width).min(area.height / 2);
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
@@ -234,6 +329,21 @@ pub(super) fn compute_layout(area: Rect, state: &StructuredViewState) -> ViewLay
         composer: chunks[4],
         status: chunks[5],
     }
+}
+
+/// The approval shelf's height: borders, its request detail, and its actions
+/// row, all from the rows the shelf will paint.
+fn approval_shelf_height(state: &StructuredViewState, width: u16) -> u16 {
+    let Some(row) = selected_pending_approval(state) else {
+        return 0;
+    };
+    let body = approval_body_rows(
+        row,
+        state.path_roots.as_ref(),
+        width.saturating_sub(4),
+        APPROVAL_BODY_MAX_ROWS,
+    );
+    2 + body.len() as u16 + 1
 }
 
 /// Plugin pane overlay: right half when wide, full width when narrow.
@@ -404,6 +514,18 @@ fn render_queue(frame: &mut Frame, area: Rect, theme: &Theme, state: &Structured
     frame.render_widget(Paragraph::new(line), area);
 }
 
+/// The approval the shelf is showing: the selected nonce, if it is still
+/// pending. The layout and the render both ask, so the reserved rows and the
+/// painted card always agree.
+fn selected_pending_approval(state: &StructuredViewState) -> Option<&PendingApproval> {
+    let selected = state.selected_approval.as_deref()?;
+    state
+        .transcript
+        .pending_approvals
+        .iter()
+        .find(|pending| pending.nonce == selected)
+}
+
 fn render_approval_shelf(
     frame: &mut Frame,
     area: Rect,
@@ -411,22 +533,14 @@ fn render_approval_shelf(
     state: &StructuredViewState,
     active: bool,
 ) {
-    let Some(selected) = state.selected_approval.as_deref() else {
-        return;
-    };
-    let Some(row) = state
-        .transcript
-        .pending_approvals
-        .iter()
-        .find(|pending| pending.nonce == selected)
-    else {
+    let Some(row) = selected_pending_approval(state) else {
         return;
     };
     let position = state
         .transcript
         .pending_approvals
         .iter()
-        .position(|pending| pending.nonce == selected)
+        .position(|pending| pending.nonce == row.nonce)
         .unwrap_or_default()
         + 1;
     let total = state.transcript.pending_approvals.len();
@@ -452,9 +566,30 @@ fn render_approval_shelf(
         .border_style(Style::default().fg(accent));
     let inner = block.inner(area);
     frame.render_widget(block, area);
+    // The request itself, so the user reads what they are approving rather
+    // than only the tool name: the actions sit on the bottom row.
+    if inner.height > 1 {
+        let body_area = Rect {
+            height: inner.height - 1,
+            ..inner
+        };
+        let body = approval_body_lines(
+            row,
+            state.path_roots.as_ref(),
+            theme,
+            body_area.width,
+            body_area.height as usize,
+        );
+        frame.render_widget(Paragraph::new(body), body_area);
+    }
+    let actions_area = Rect {
+        y: inner.y + inner.height.saturating_sub(1),
+        height: 1.min(inner.height),
+        ..inner
+    };
     let (actions, spans) =
         approval_actions_line(theme, active, row.choice && !row.options.is_empty());
-    frame.render_widget(Paragraph::new(actions), inner);
+    frame.render_widget(Paragraph::new(actions), actions_area);
     // An open choice picker owns the keyboard, so the decision buttons go
     // inert with their keys.
     if state.choice.is_some() {
@@ -466,7 +601,7 @@ fn render_approval_shelf(
         .map(|(offset, width, intent)| {
             let rect = Rect {
                 x: inner.x + offset,
-                y: inner.y,
+                y: actions_area.y,
                 width: width.min(inner.width - offset),
                 height: 1,
             };
@@ -475,6 +610,165 @@ fn render_approval_shelf(
         .collect();
     paint_hovered_button(frame, theme, state, &buttons);
     state.mouse_targets.borrow_mut().buttons = buttons;
+}
+
+/// Request detail rows the shelf shows above its actions. Capped so a modal
+/// prompt leaves the transcript readable behind it.
+const APPROVAL_BODY_MAX_ROWS: usize = 5;
+
+/// How one body row of the shelf reads.
+#[derive(Clone, Copy)]
+enum ApprovalRowKind {
+    /// The command or path the call is about, which leads the body.
+    Primary,
+    /// Any other argument, as `key: value`.
+    Detail,
+    /// The count of rows that did not fit.
+    Hidden,
+}
+
+/// One line of the approval's request payload. `primary` marks the command or
+/// path the call is about, which leads the body.
+fn approval_body_entries(
+    row: &PendingApproval,
+    target: Option<&ToolTarget>,
+) -> Vec<(String, bool)> {
+    let Some(args) = parse_args_object(&row.args) else {
+        let raw = row.args.trim();
+        return if raw.is_empty() {
+            Vec::new()
+        } else {
+            vec![(raw.to_string(), true)]
+        };
+    };
+    // The kind decides which argument leads: a path-based call that also carries a
+    // command string must not promote it over the path the call is about.
+    let keys: Vec<&str> = match target {
+        Some(ToolTarget::Path(_)) => PATH_KEYS.to_vec(),
+        Some(ToolTarget::Command(_)) => CMD_KEYS.to_vec(),
+        None => CMD_KEYS.iter().chain(PATH_KEYS).copied().collect(),
+    };
+    let primary_key = keys
+        .iter()
+        .find(|key| args.get(**key).is_some_and(|value| value.is_string()));
+    let mut entries = Vec::new();
+    if let Some(key) = primary_key {
+        // The title elides this to its first line, so show it whole here.
+        if let Some(value) = args.get(*key).and_then(|value| value.as_str()) {
+            entries.push((value.to_string(), true));
+        }
+    }
+    for (key, value) in &args {
+        if key.starts_with("_aoe_") || Some(key.as_str()) == primary_key.copied() {
+            continue;
+        }
+        let text = match value {
+            serde_json::Value::String(text) => text.clone(),
+            other => other.to_string(),
+        };
+        if !text.trim().is_empty() {
+            entries.push((format!("{key}: {text}"), false));
+        }
+    }
+    entries
+}
+
+/// Render control characters as the control pictures that occupy one cell each,
+/// so a tab or an escape byte is visible instead of vanishing into its neighbors.
+fn visible_controls(text: &str) -> String {
+    text.chars()
+        .map(|c| match c {
+            '\t' => '\u{2409}',
+            // DEL sits past the C0 pictures, whose offset would land on a digit.
+            '\x7f' => '\u{2421}',
+            c if c.is_ascii_control() => char::from_u32(0x2400 + c as u32).unwrap_or('\u{fffd}'),
+            // C1 controls have no control picture; a replacement keeps them from
+            // vanishing out of the command being approved.
+            c if c.is_control() => '\u{fffd}',
+            c => c,
+        })
+        .collect()
+}
+
+/// The request detail, wrapped to `width` and capped at
+/// [`APPROVAL_BODY_MAX_ROWS`], unstyled. The shelf's height and the rows it
+/// paints both come from here, so the reserved space cannot disagree with the
+/// text, which matters when the text is a command the user is approving.
+fn approval_body_rows(
+    row: &PendingApproval,
+    path_roots: Option<&SessionPathRoots>,
+    width: u16,
+    max_rows: usize,
+) -> Vec<(Line<'static>, ApprovalRowKind)> {
+    let mut rows: Vec<(Line<'static>, ApprovalRowKind)> = Vec::new();
+    let args = parse_args_object(&row.args);
+    let target = args.as_ref().and_then(|args| tool_target(&row.kind, args));
+    for (text, primary) in approval_body_entries(row, target.as_ref()) {
+        let is_command = primary && matches!(target, Some(ToolTarget::Command(_)));
+        let text = match (target.as_ref(), primary) {
+            (Some(ToolTarget::Path(_)), true) => {
+                relative_display_path(&text, path_roots).to_string()
+            }
+            _ => text,
+        };
+        let kind = if primary {
+            ApprovalRowKind::Primary
+        } else {
+            ApprovalRowKind::Detail
+        };
+        let mut wrapped = Vec::new();
+        // A command may run over several lines, and wrapping it as one would run
+        // those lines together: the shelf must show what would actually run.
+        for (index, logical) in text.split('\n').enumerate() {
+            let prefix = if is_command && index == 0 { "$ " } else { "" };
+            // Ratatui drops control characters, so a tab would silently join words:
+            // show them instead, wrapped as they will read on screen.
+            wrap_line_into(
+                Line::raw(format!("{prefix}{}", visible_controls(logical))),
+                width,
+                &mut wrapped,
+            );
+        }
+        rows.extend(wrapped.into_iter().map(|line| (line, kind)));
+    }
+    // The shelf's real height wins: a capped body would otherwise be clipped by
+    // the paragraph, hiding rows without saying so.
+    let cap = max_rows.clamp(1, APPROVAL_BODY_MAX_ROWS);
+    if rows.len() > cap {
+        let hidden = rows.len() - (cap - 1);
+        rows.truncate(cap - 1);
+        rows.push((
+            Line::raw(format!("… +{hidden} more")),
+            ApprovalRowKind::Hidden,
+        ));
+    }
+    rows
+}
+
+/// Style the shared body rows for painting.
+fn approval_body_lines(
+    row: &PendingApproval,
+    path_roots: Option<&SessionPathRoots>,
+    theme: &Theme,
+    width: u16,
+    max_rows: usize,
+) -> Vec<Line<'static>> {
+    approval_body_rows(row, path_roots, width, max_rows)
+        .into_iter()
+        .map(|(mut line, kind)| {
+            let style = match kind {
+                ApprovalRowKind::Primary => Style::default().fg(theme.text),
+                ApprovalRowKind::Detail => Style::default().fg(theme.hint),
+                ApprovalRowKind::Hidden => {
+                    Style::default().fg(theme.hint).add_modifier(Modifier::DIM)
+                }
+            };
+            for span in &mut line.spans {
+                span.style = style;
+            }
+            line
+        })
+        .collect()
 }
 
 /// Highlight whichever of this frame's `buttons` the pointer is over.
@@ -596,7 +890,7 @@ fn render_slash_picker(
         " Commands (↑/↓ or Ctrl+n/p · Enter/Tab select · Esc dismiss) ".into(),
         lines,
     );
-    record_picker(state, PickerKind::Slash, drawn, first, rows);
+    record_picker(state, PickerKind::Slash, drawn, first, rows, 0);
 }
 
 /// `@` mention picker, with placeholders while the file index loads or fails.
@@ -650,7 +944,7 @@ fn render_mention_picker(
         " Files (↑/↓ or Ctrl+n/p · Enter/Tab insert · Esc close) ".into(),
         lines,
     );
-    record_picker(state, PickerKind::Mention, drawn, first, rows);
+    record_picker(state, PickerKind::Mention, drawn, first, rows, 0);
 }
 
 /// One separator row above the terminal-native prompt rail.
@@ -2918,6 +3212,340 @@ mod tests {
             24,
         );
         assert!(dump.contains("src/main.rs") && !dump.contains("zzz/other.md"));
+    }
+
+    /// A pending question has to say what it is asking: the option labels alone
+    /// leave the lead-in and the chosen answer's detail unsaid.
+    #[test]
+    fn question_picker_shows_the_question_context_and_highlighted_detail() {
+        use super::super::state::{ChoicePicker, ChoicePurpose};
+
+        let mut state = test_state();
+        state.choice = Some(ChoicePicker {
+            title: " Which store? (Enter=pick · Esc=dismiss) ".into(),
+            context: Some(
+                "Picking the store for the new service; the one we can migrate cheaply".into(),
+            ),
+            options: vec![
+                ("a".into(), "Postgres".into()),
+                ("b".into(), "SQLite".into()),
+            ],
+            details: vec![Some("Managed, boring, already there".into()), None],
+            selected: 0,
+            purpose: ChoicePurpose::Mode,
+        });
+        let dump = render_dump(&state, 80, 24);
+        assert!(dump.contains("Picking the store for"), "{dump}");
+        assert!(
+            dump.contains("Postgres") && dump.contains("SQLite"),
+            "{dump}"
+        );
+        assert!(dump.contains("Managed, boring"), "{dump}");
+
+        // The context rows sit above the items, so clicking the first item row
+        // must still resolve to the first option rather than to the context.
+        let targets = state.mouse_targets.borrow();
+        let picker = targets.picker.expect("choice picker target");
+        let first_row = Rect {
+            y: picker.rows.y,
+            height: 1,
+            ..picker.rows
+        };
+        assert_eq!(
+            super::super::input::picker_row_at(
+                &targets,
+                ratatui::layout::Position::new(first_row.x, first_row.y)
+            ),
+            Some((PickerKind::Choice, 0))
+        );
+    }
+
+    /// The approval shelf has to show the request itself: the tool name and an
+    /// elided target in the title are not enough to decide on a command.
+    #[test]
+    fn approval_shelf_shows_the_request_payload() {
+        let mut state = test_state();
+        state.transcript.pending_approvals = vec![PendingApproval {
+            nonce: "n-1".into(),
+            title: "Bash".into(),
+            kind: "execute".into(),
+            args: r#"{"command":"rm -rf build && make","description":"clean the tree"}"#.into(),
+            destructive: true,
+            options: Vec::new(),
+            choice: false,
+        }];
+        state.selected_approval = Some("n-1".into());
+        state.focus = Focus::Approval;
+        let dump = render_dump(&state, 80, 24);
+        for want in [
+            "$ rm -rf build && make",
+            "description: clean the tree",
+            "destructive",
+            "allow once",
+        ] {
+            assert!(dump.contains(want), "missing {want:?}:\n{dump}");
+        }
+
+        // A payload longer than the shelf keeps the head and counts the rest.
+        state.transcript.pending_approvals[0].args = serde_json::json!({
+            "command": (0..40)
+                .map(|i| format!("step-{i}"))
+                .collect::<Vec<_>>()
+                .join(" && "),
+        })
+        .to_string();
+        let dump = render_dump(&state, 40, 24);
+        assert!(dump.contains("step-0"), "{dump}");
+        assert!(dump.contains(" more"), "the rest is counted: {dump}");
+
+        // A shelf clamped by a short terminal clips the paragraph, so the count
+        // has to come from the height it really has.
+        let dump = render_dump(&state, 40, 12);
+        assert!(
+            dump.contains(" more"),
+            "a clipped body still counts what it dropped: {dump}"
+        );
+    }
+
+    /// A command that runs over several lines is shown as it will run, not run
+    /// together the way a single wrapped line would show it.
+    #[test]
+    fn approval_shelf_keeps_the_lines_of_a_multiline_command() {
+        let mut state = test_state();
+        state.transcript.pending_approvals = vec![PendingApproval {
+            nonce: "n-1".into(),
+            title: "Bash".into(),
+            kind: "execute".into(),
+            args: serde_json::json!({ "command": "echo ok\nrm -rf build" }).to_string(),
+            destructive: false,
+            options: Vec::new(),
+            choice: false,
+        }];
+        state.selected_approval = Some("n-1".into());
+        state.focus = Focus::Approval;
+        let lines = render_rows(&state, 80, 24, true);
+        let dump = lines.join("\n");
+        assert!(
+            lines.iter().any(|line| line.contains("$ echo ok")),
+            "the command's pilot line is missing:\n{dump}"
+        );
+        assert!(
+            lines.iter().any(|line| line.contains("rm -rf build")),
+            "the command's second line is missing:\n{dump}"
+        );
+        assert!(
+            !lines
+                .iter()
+                .any(|line| line.contains("echo ok") && line.contains("rm -rf build")),
+            "the command's lines ran together:\n{dump}"
+        );
+    }
+
+    /// A command's control characters are shown, not dropped: a tab would
+    /// otherwise join the words either side of it, and DEL would reach the
+    /// terminal as a digit-like glyph.
+    #[test]
+    fn approval_shelf_shows_control_characters_in_the_command() {
+        let cases = [
+            ("\t", "echo\u{2409}ok", "the tab is shown as one cell"),
+            ("\u{7f}", "echo\u{2421}ok", "DEL is the delete symbol"),
+            ("\u{9b}", "echo\u{fffd}ok", "a C1 control is replaced"),
+        ];
+        for (byte, expected, why) in cases {
+            let mut state = test_state();
+            state.transcript.pending_approvals = vec![PendingApproval {
+                nonce: "n-1".into(),
+                title: "Bash".into(),
+                kind: "execute".into(),
+                args: serde_json::json!({ "command": format!("echo{byte}ok") }).to_string(),
+                destructive: false,
+                options: Vec::new(),
+                choice: false,
+            }];
+            state.selected_approval = Some("n-1".into());
+            state.focus = Focus::Approval;
+            let lines = render_rows(&state, 80, 24, true);
+            let dump = lines.join("\n");
+            assert!(
+                lines.iter().any(|line| line.contains(expected)),
+                "{why} ({expected:?} missing):\n{dump}"
+            );
+        }
+    }
+
+    /// The kind decides the leading argument: a path-based call that also
+    /// carries a command string must not promote that string over the path.
+    #[test]
+    fn approval_body_entries_lead_with_the_kinds_own_target() {
+        let row = PendingApproval {
+            nonce: "n-1".into(),
+            title: "Edit".into(),
+            kind: "edit".into(),
+            args: serde_json::json!({ "command": "touch /tmp/x", "path": "src/a.rs" }).to_string(),
+            destructive: false,
+            options: Vec::new(),
+            choice: false,
+        };
+        let target = ToolTarget::Path("src/a.rs");
+        let entries = approval_body_entries(&row, Some(&target));
+        assert_eq!(
+            entries
+                .first()
+                .map(|(text, primary)| (text.as_str(), *primary)),
+            Some(("src/a.rs", true)),
+            "the edited path leads: {entries:?}"
+        );
+        assert!(
+            entries
+                .iter()
+                .any(|(text, primary)| !*primary && text.contains("touch /tmp/x")),
+            "the command stays a detail: {entries:?}"
+        );
+    }
+
+    /// A question whose lead-in is longer than the room above the composer must
+    /// still show its answers: they are what the keys act on.
+    #[test]
+    fn question_picker_keeps_its_options_visible_on_a_short_terminal() {
+        use super::super::state::{ChoicePicker, ChoicePurpose};
+        let mut state = test_state();
+        state.choice = Some(ChoicePicker {
+            title: " Which store? ".into(),
+            context: Some(
+                (0..6)
+                    .map(|i| format!("line {i} of the lead-in"))
+                    .collect::<Vec<_>>()
+                    .join("\n"),
+            ),
+            options: vec![
+                ("a".into(), "Postgres".into()),
+                ("b".into(), "SQLite".into()),
+            ],
+            details: vec![Some("Managed, boring, already there".into()), None],
+            selected: 0,
+            purpose: ChoicePurpose::Mode,
+        });
+        let dump = render_dump(&state, 60, 12);
+        assert!(
+            dump.contains("Postgres") && dump.contains("SQLite"),
+            "the answers must stay on screen:\n{dump}"
+        );
+    }
+
+    /// Moving between options must not resize the popup: it is bottom-anchored,
+    /// so a shorter detail would slide the options out from under the pointer.
+    #[test]
+    fn question_picker_option_rows_hold_still_while_the_detail_changes() {
+        use super::super::state::{ChoicePicker, ChoicePurpose};
+        let mut state = test_state();
+        state.choice = Some(ChoicePicker {
+            title: " Which store? ".into(),
+            context: None,
+            options: vec![
+                ("a".into(), "Postgres".into()),
+                ("b".into(), "SQLite".into()),
+            ],
+            details: vec![
+                Some("Managed, boring, already there and worth its own rows".into()),
+                None,
+            ],
+            selected: 0,
+            purpose: ChoicePurpose::Mode,
+        });
+        let _ = render_dump(&state, 80, 24);
+        let with_detail = state.mouse_targets.borrow().picker.expect("picker").rows;
+
+        state.choice.as_mut().unwrap().selected = 1;
+        let _ = render_dump(&state, 80, 24);
+        let without_detail = state.mouse_targets.borrow().picker.expect("picker").rows;
+        assert_eq!(
+            with_detail.y, without_detail.y,
+            "the option rows must keep their place when the detail shrinks"
+        );
+    }
+
+    /// An option detail written over several lines has to read as those lines:
+    /// the popup has no other way to show a break, so losing it runs two
+    /// sentences together.
+    #[test]
+    fn question_picker_keeps_the_lines_of_a_multiline_detail() {
+        use super::super::state::{ChoicePicker, ChoicePurpose};
+        let mut state = test_state();
+        state.choice = Some(ChoicePicker {
+            title: " Which store? ".into(),
+            context: None,
+            options: vec![
+                ("a".into(), "Postgres".into()),
+                ("b".into(), "SQLite".into()),
+            ],
+            details: vec![
+                Some("Use the managed one\nOnly for the new service".into()),
+                None,
+            ],
+            selected: 0,
+            purpose: ChoicePurpose::Mode,
+        });
+        let rows = render_rows(&state, 80, 24, true);
+        let dump = rows.join("\n");
+        assert!(
+            rows.iter().any(|row| row.contains("· Use the managed one")),
+            "the detail's first line is missing:\n{dump}"
+        );
+        assert!(
+            rows.iter()
+                .any(|row| row.contains("Only for the new service")),
+            "the detail's second line is missing:\n{dump}"
+        );
+        assert!(
+            !rows
+                .iter()
+                .any(|row| row.contains("managed one") && row.contains("Only for the new service")),
+            "the detail's lines ran together:\n{dump}"
+        );
+    }
+
+    /// A detail clipped by a short terminal ends on the marker, so a cut
+    /// sentence never reads as the whole of it.
+    #[test]
+    fn question_picker_marks_a_detail_clipped_to_the_reserved_height() {
+        use super::super::state::{ChoicePicker, ChoicePurpose};
+        let tail = "and the tail of this answer must not survive the clip";
+        let mut state = test_state();
+        state.choice = Some(ChoicePicker {
+            title: " Which store? ".into(),
+            context: None,
+            options: vec![
+                ("a".into(), "Postgres".into()),
+                ("b".into(), "SQLite".into()),
+            ],
+            details: vec![
+                Some(format!(
+                    "This answer needs more rows than the popup can spare here, {tail}"
+                )),
+                None,
+            ],
+            selected: 0,
+            purpose: ChoicePurpose::Mode,
+        });
+        let rows = render_rows(&state, 40, 8, true);
+        let dump = rows.join("\n");
+        assert!(
+            rows.iter().any(|row| row.contains("· This answer needs")),
+            "the detail has to start on screen:\n{dump}"
+        );
+        let marker_rows: Vec<&String> = rows
+            .iter()
+            .filter(|row| row.trim_matches(['│', ' ']) == "…")
+            .collect();
+        assert_eq!(
+            marker_rows.len(),
+            1,
+            "a clipped detail must end on a marker row of its own:\n{dump}"
+        );
+        assert!(
+            !dump.contains("must not survive"),
+            "the clip must still drop the tail:\n{dump}"
+        );
     }
 
     /// Two agent messages render as two bubbles; one streamed message

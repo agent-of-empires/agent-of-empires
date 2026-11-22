@@ -114,7 +114,7 @@ pub struct BuildResult {
     /// Workspace worktrees created during build (for cleanup)
     pub created_workspace_worktrees: Vec<CreatedWorktree>,
     /// Non-fatal warnings from worktree/workspace creation. Callers should
-    /// surface these to the user (post-checkout hook failures etc.).
+    /// surface these to the user (stale fetches etc.).
     pub warnings: Vec<String>,
 }
 
@@ -216,8 +216,8 @@ pub struct WorkspaceResult {
     pub workspace_info: WorkspaceInfo,
     pub created_worktrees: Vec<CreatedWorktree>,
     pub workspace_path: PathBuf,
-    /// Non-fatal warnings from worktree creation (e.g. post-checkout hook
-    /// failures where the worktree itself was created successfully).
+    /// Non-fatal warnings from worktree creation (e.g. stale fetches
+    /// where the worktree itself was created successfully).
     pub warnings: Vec<String>,
 }
 

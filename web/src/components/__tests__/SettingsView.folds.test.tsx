@@ -339,6 +339,28 @@ describe("Settings Advanced fold", () => {
     );
   });
 
+  it("rejects a port above 65535 on either side and keeps the draft (#5885)", async () => {
+    const { container } = renderView("sandbox");
+    await screen.findByText("Sandbox enabled by default");
+    expandAdvanced(container);
+
+    for (const bad of ["3000:65536", "65536:3000"]) {
+      addListItem(container, "Port mappings", bad);
+      const list = within(within(container).getByRole("group", { name: "Port mappings" }));
+      expect(list.getByText("Must be port:port, ports up to 65535 (e.g. 3000:3000)")).toBeTruthy();
+      expect((list.getByRole("textbox", { name: "Port mappings" }) as HTMLInputElement).value).toBe(bad);
+    }
+    expect(vi.mocked(api.updateSettings)).not.toHaveBeenCalled();
+
+    addListItem(container, "Port mappings", "65535:65535");
+    await waitFor(() =>
+      expect(vi.mocked(api.updateSettings)).toHaveBeenCalledWith(
+        { sandbox: { port_mappings: ["65535:65535"] } },
+        "main",
+      ),
+    );
+  });
+
   it("renders the systemd tab from the schema and saves its fields", async () => {
     const { container } = renderView("systemd");
     await screen.findByText("Use systemd scopes");

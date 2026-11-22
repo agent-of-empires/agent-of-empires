@@ -53,6 +53,10 @@ pub enum DockerError {
     #[error("Cancelled: {0}")]
     Cancelled(String),
 
+    /// The shared pull this caller was waiting on was cancelled for everyone.
+    #[error("The pull of {0} was cancelled")]
+    PullCancelled(String),
+
     #[error("IO error: {0}")]
     IoError(#[from] std::io::Error),
 }

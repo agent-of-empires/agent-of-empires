@@ -466,6 +466,7 @@ pub(super) const CITYHALL_MUTATION_DENY: &[(&str, &str)] = &[
     // The setup wizard never shows in CityHall mode.
     ("PATCH", "/api/setup"),
     ("POST", "/api/sandbox/image-pull"),
+    ("POST", "/api/sandbox/image-pull/cancel"),
     ("POST", "/api/sandbox/image-dismiss"),
     ("POST", "/api/sessions/creation-trust"),
     ("POST", "/api/sessions/empty-trash"),
