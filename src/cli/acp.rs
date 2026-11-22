@@ -107,7 +107,7 @@ pub enum AcpCommands {
         #[arg(long)]
         follow: bool,
     },
-    /// Restart a wedged worker after its runner and native workers have stopped.
+    /// Restart a worker, or start a stopped one through `aoe serve`.
     Restart {
         /// Session id whose worker to restart.
         session: String,
@@ -1026,7 +1026,11 @@ fn logs(session: Option<String>, follow: bool) -> Result<()> {
 async fn restart(session: &str) -> Result<()> {
     use crate::process::worker_registry;
     let Some(record) = worker_registry::load(session)? else {
-        anyhow::bail!("No agent worker registry entry for session {session}");
+        // A cleanly stopped worker has no registry entry; start it like the dashboard's Retry.
+        let client = HttpClient::new(require_daemon().await?)?;
+        client.spawn_acp(session).await.map_err(map_http)?;
+        println!("Started agent worker for {session}.");
+        return Ok(());
     };
     let native = match record.source_profile.clone() {
         Some(profile) => {
