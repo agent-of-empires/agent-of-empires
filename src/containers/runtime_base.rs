@@ -11,14 +11,14 @@ use tokio_util::sync::CancellationToken;
 
 /// Format printing the settings that decide what PID 1 does on stop: the
 /// image ENTRYPOINT, `--init` and `--stop-timeout`, as `|`-separated JSON.
-pub(crate) const STOP_SETTINGS_FORMAT: &str =
+const STOP_SETTINGS_FORMAT: &str =
     "{{json .Config.Entrypoint}}|{{json .HostConfig.Init}}|{{json .Config.StopTimeout}}";
 
 /// Stop args for a container whose settings printed as `settings`. With no
 /// ENTRYPOINT, no init and no explicit timeout, PID 1 is the appended `sleep`,
 /// which ignores SIGTERM, so waiting out the grace only delays SIGKILL. Any
 /// other setup, or an unreadable answer, keeps the runtime's grace.
-pub(crate) fn stop_args(settings: Option<&str>) -> &'static [&'static str] {
+fn stop_args(settings: Option<&str>) -> &'static [&'static str] {
     let mut fields = settings.unwrap_or_default().split('|');
     match (fields.next(), fields.next(), fields.next(), fields.next()) {
         (Some("null" | "[]" | "\"\""), Some("null" | "false"), Some("null"), None) => {
@@ -26,6 +26,23 @@ pub(crate) fn stop_args(settings: Option<&str>) -> &'static [&'static str] {
         }
         _ => &["stop"],
     }
+}
+
+/// Full `stop` arguments for container `name`. `inspect` runs the given
+/// `inspect` arguments and returns its output, or `None` when it cannot run.
+pub(crate) fn stop_args_for(
+    name: &str,
+    inspect: impl FnOnce(&[String]) -> Option<std::process::Output>,
+) -> Vec<String> {
+    let probe = ["inspect", "--format", STOP_SETTINGS_FORMAT, name].map(str::to_owned);
+    let settings = inspect(&probe)
+        .filter(|output| output.status.success())
+        .map(|output| String::from_utf8_lossy(&output.stdout).trim().to_owned());
+    stop_args(settings.as_deref())
+        .iter()
+        .map(|arg| (*arg).to_owned())
+        .chain([name.to_owned()])
+        .collect()
 }
 
 /// `docker pull` has no timeout of its own; this only fires on a wedged pull.
@@ -814,15 +831,13 @@ impl RuntimeBase {
 
     pub fn stop_container(&self, name: &str) -> Result<()> {
         tracing::info!(target: "containers.runtime", runtime = %self.name, %name, "stopping container");
-        let mut inspect = self.command();
-        inspect.args(["inspect", "--format", STOP_SETTINGS_FORMAT, name]);
-        let settings = self
-            .probe_output(&mut inspect)
-            .ok()
-            .filter(|output| output.status.success())
-            .map(|output| String::from_utf8_lossy(&output.stdout).trim().to_owned());
+        let args = stop_args_for(name, |args| {
+            let mut inspect = self.command();
+            inspect.args(args);
+            self.probe_output(&mut inspect).ok()
+        });
         let mut cmd = self.command();
-        cmd.args(stop_args(settings.as_deref())).arg(name);
+        cmd.args(args);
         let output = self.probe_output(&mut cmd)?;
 
         if !output.status.success() {
