@@ -103,6 +103,8 @@ export function useSandboxImageBanner(): SandboxImageBannerState {
   const createPullSince = useRef<number | null>(null);
   // Each "Update now" or Retry is a new attempt; a reply to an older one changes nothing.
   const attempt = useRef(0);
+  // The image the last Cancel named; its reply and refusal belong to that image until a status names another.
+  const cancelImage = useRef<string | null>(null);
   // The digest the latest status offered, and the one the current attempt pulled, so a finished
   // pull can tell a newer image published since from the one it just pulled.
   const offeredDigest = useRef<string | null>(null);
@@ -145,6 +147,11 @@ export function useSandboxImageBanner(): SandboxImageBannerState {
         answer.pull.state !== "running";
       if (answer) {
         watching = answer.checks_enabled && answer.sandbox_in_use;
+        if (cancelImage.current !== null && cancelImage.current !== answer.image) {
+          cancelImage.current = null;
+          setCancelling(false);
+          setCancelRefused(null);
+        }
         offeredDigest.current = answer.state === "available" ? answer.remote_digest : null;
         setStatus(predatesPull ? { ...answer, pull: { state: "running" } } : answer);
         if (answer.pull.state === "running") {
@@ -254,11 +261,12 @@ export function useSandboxImageBanner(): SandboxImageBannerState {
   // `image` is the one on the banner, so a default changed since can't cancel a different pull.
   const cancel = useCallback((image: string) => {
     const mine = attempt.current;
+    cancelImage.current = image;
     setCancelling(true);
     setCancelRefused(null);
     void cancelSandboxImagePull(image).then((reply) => {
-      // A newer update owns the banner now.
-      if (mine !== attempt.current) return;
+      // A newer update owns the banner now, or it shows another image.
+      if (mine !== attempt.current || cancelImage.current !== image) return;
       setCancelling(false);
       if (!reply.ok) setCancelRefused(reply.message ?? "Couldn't reach the Daemon.");
       if (reply.pull) {

@@ -701,6 +701,40 @@ describe("SandboxImageBanner progress, cancel and hide (#5751)", () => {
     expect(cancelSandboxImagePull).toHaveBeenCalledWith("ghcr.io/example/other:1");
   });
 
+  it("drops a Cancel once the banner shows another image, so its reply and refusal stay off it", async () => {
+    const OTHER = "ghcr.io/example/other:1";
+    const cancelButton = () => screen.getByRole("button", { name: "Cancel" }) as HTMLButtonElement;
+    let answer!: (r: { ok: boolean; pull?: SandboxImagePull; message?: string }) => void;
+    cancelSandboxImagePull.mockReturnValueOnce(new Promise((r) => (answer = r)));
+    await mount(running());
+    fireEvent.click(cancelButton());
+    expect(cancelButton().disabled).toBe(true);
+    // A poll shows another image's pull while this Cancel's reply is still out.
+    fetchSandboxImageStatus.mockResolvedValue({ ...running(), image: OTHER });
+    await pollAfter(2000);
+    expect(cancelButton().disabled, "Cancelling… stayed on the other image").toBe(false);
+    // Hold the poll the reply triggers, so only the reply itself can change what shows.
+    fetchSandboxImageStatus.mockReturnValueOnce(new Promise(() => {}));
+    await act(async () => answer({ ok: true, pull: { state: "cancelled" } }));
+    // A's late reply leaves B running: no outcome, and Cancel still free for B.
+    expect(banner()?.textContent).toBe(DOWNLOADING);
+    expect(screen.queryByText(CANCELLED)).toBeNull();
+    expect(cancelButton().disabled).toBe(false);
+    fetchSandboxImageStatus.mockResolvedValue({ ...running(), image: OTHER });
+    await pollAfter(2000);
+
+    // A refused Cancel's notice goes too once another image is on the banner.
+    cancelSandboxImagePull.mockResolvedValueOnce({ ok: false, message: "cancels are off here" });
+    fireEvent.click(cancelButton());
+    expect(cancelSandboxImagePull).toHaveBeenLastCalledWith(OTHER);
+    await pollAfter(0);
+    expect(banner()?.textContent).toBe(`${DOWNLOADING} Couldn't cancel.`);
+    fetchSandboxImageStatus.mockResolvedValue(running());
+    await pollAfter(2000);
+    expect(banner()?.textContent).toBe(DOWNLOADING);
+    expect(screen.queryByText("cancels are off here")).toBeNull();
+  });
+
   it("frees Cancel when a create's pull supersedes the attempt it was sent for", async () => {
     let answer!: (r: { ok: boolean; pull?: SandboxImagePull }) => void;
     cancelSandboxImagePull.mockReturnValueOnce(new Promise((r) => (answer = r)));
