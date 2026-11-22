@@ -575,7 +575,7 @@ fn collect_tmux_states(instances: &mut [Instance]) -> Vec<TmuxState> {
             } else {
                 Status::Idle
             },
-            pid: live_pane_pid(m),
+            pid: pane_pid_or(Some(m), || crate::process::get_pane_pid(name)),
             activity_epoch: crate::tmux::session_activity(name),
             agent: m.pane_current_command.clone().unwrap_or_default(),
         });
