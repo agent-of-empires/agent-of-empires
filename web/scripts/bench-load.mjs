@@ -161,8 +161,11 @@ try {
       uploadThroughput: (10 * 1024 * 1024) / 8,
     });
     const done = [];
-    const workers = [];
-    page.on("worker", (w) => workers.push(w.url()));
+    const live = new Set();
+    page.on("worker", (w) => {
+      live.add(w);
+      w.on("close", () => live.delete(w));
+    });
     // content-length is the encoded body size; worker requests expose nothing richer.
     ctx.on("response", (res) => done.push([res.url(), Number(res.headers()["content-length"] ?? 0)]));
     const total = (f = () => true) => done.filter(([u]) => f(u)).reduce((n, [, b]) => n + b, 0);
@@ -186,12 +189,15 @@ try {
     await page.getByText("example.ts").first().click();
     await page.waitForFunction(highlighted, null, { timeout: 120000 });
     const elapsed = Date.now() - t0;
-    // The main-thread fallback also highlights; only a started worker and no fallback banner count.
+    // Main-thread fallback also highlights. The pool terminates its workers when it falls back
+    // (including on init timeout), so require a worker still alive and no fallback banner.
     if (
-      !workers.some((u) => /\/assets\/worker-/.test(u)) ||
+      ![...live].some((w) => /\/assets\/worker-/.test(w.url())) ||
       (await page.getByText("Highlighting on the main thread").count())
     ) {
-      throw new Error(`diff was not highlighted by the worker (workers: ${JSON.stringify(workers)})`);
+      throw new Error(
+        `diff was not highlighted by a live worker (live: ${JSON.stringify([...live].map((w) => w.url()))})`,
+      );
     }
     R.timeToHighlight.push(elapsed);
     await page.waitForTimeout(2000);
