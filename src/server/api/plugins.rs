@@ -557,6 +557,7 @@ pub async fn invoke_plugin_action(
             _ => {}
         }
     }
+    tracing::debug!(target: "plugin.host", plugin = %id, method = %body.method, principal = ?principal.as_ref().map(|p| &p.0), "forwarding plugin action");
     if !stamp_origin(&mut params, principal.as_ref().map(|p| &p.0)) {
         return api_error(
             StatusCode::BAD_REQUEST,
