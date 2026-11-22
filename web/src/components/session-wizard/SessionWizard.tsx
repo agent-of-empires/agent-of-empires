@@ -257,15 +257,17 @@ function tabStops(panel: HTMLElement): HTMLElement[] {
 }
 
 /**
- * Keeps Tab inside the wizard panel and hands focus back to the opener on close. The
- * fields focus themselves once loaded, so a Tab before that enters at the first stop.
- * The wizard's own confirm dialogs and higher overlays hold their own focus, so a key
+ * Keeps Tab inside the wizard panel and hands focus back to the opener on close. With
+ * a fine pointer the fields focus themselves once loaded, so a Tab before that enters
+ * at the first stop; a coarse pointer starts on Close, which opens no keyboard. The
+ * wizard's own confirm dialogs and higher overlays hold their own focus, so a key
  * whose focus sits in another modal is left alone.
  */
-function useWizardFocusTrap(panelRef: RefObject<HTMLDivElement | null>) {
+function useWizardFocusTrap(panelRef: RefObject<HTMLDivElement | null>, closeRef: RefObject<HTMLButtonElement | null>) {
   const [opener] = useState(() => document.activeElement as HTMLElement | null);
   useEffect(() => {
     const panel = panelRef.current;
+    if (!hasFinePointer() && !panel?.contains(document.activeElement)) closeRef.current?.focus();
     const onKey = (e: KeyboardEvent) => {
       if (e.key !== "Tab" || !panel) return;
       const holder = document.activeElement;
@@ -294,7 +296,7 @@ function useWizardFocusTrap(panelRef: RefObject<HTMLDivElement | null>) {
       const lost = !document.activeElement || document.activeElement === document.body;
       if (lost && opener?.isConnected) opener.focus();
     };
-  }, [panelRef, opener]);
+  }, [panelRef, closeRef, opener]);
 }
 
 export function SessionWizard({
@@ -334,7 +336,8 @@ export function SessionWizard({
   const [rechecking, setRechecking] = useState(false);
   const viewGroupRef = useRef<HTMLDivElement>(null);
   const panelRef = useRef<HTMLDivElement>(null);
-  useWizardFocusTrap(panelRef);
+  const closeRef = useRef<HTMLButtonElement>(null);
+  useWizardFocusTrap(panelRef, closeRef);
   const pullLatestRef = useRef<HTMLDivElement>(null);
   // The failure box grows the footer and shrinks the form above it; keep the pull box it blames in view.
   useEffect(() => {
@@ -1321,6 +1324,7 @@ export function SessionWizard({
             {creating ? "Creating session" : "New session"}
           </h1>
           <button
+            ref={closeRef}
             onClick={creating ? handleBackground : onClose}
             className="w-8 h-8 flex items-center justify-center text-text-dim hover:text-text-secondary cursor-pointer rounded-md hover:bg-surface-700/50 transition-colors"
             aria-label="Close"

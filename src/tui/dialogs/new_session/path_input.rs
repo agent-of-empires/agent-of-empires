@@ -57,7 +57,7 @@ fn path_completion_base(parent_prefix: &str) -> Option<PathBuf> {
     }
 
     if let Some(stripped) = trimmed.strip_prefix("~/") {
-        return dirs::home_dir().map(|home| home.join(stripped));
+        return dirs::home_dir().map(|home| home.join(stripped.trim_start_matches('/')));
     }
 
     Some(PathBuf::from(trimmed))

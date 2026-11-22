@@ -2271,14 +2271,19 @@ fn workspace_is_unavailable_when_attaching_an_existing_branch() {
 }
 
 /// The daemon rejects `~` as a shell metacharacter, so a home-relative path
-/// must reach it already expanded.
+/// must reach it already expanded, and completion must read the same directory.
 #[test]
 #[serial_test::serial]
-fn tilde_path_is_submitted_expanded() {
+fn tilde_path_completes_and_submits_under_home() {
     let temp_home = tempfile::tempdir().expect("temp home");
     let _home = crate::session::test_support::isolate_home(temp_home.path());
+    std::fs::create_dir_all(temp_home.path().join("code/projects")).unwrap();
     for typed in ["~/code", "~//code", "~///code"] {
         let mut dialog = single_tool_dialog();
+        dialog.focused_field = 0;
+        dialog.path = Input::new(format!("{typed}/pro"));
+        dialog.recompute_path_ghost();
+        assert_eq!(dialog.ghost_text(), Some("jects/"), "{typed}");
         dialog.path = Input::new(typed.to_string());
         assert_eq!(
             submitted(dialog.build_submit_result()).path,

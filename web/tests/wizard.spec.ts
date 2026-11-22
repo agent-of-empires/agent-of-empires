@@ -220,6 +220,14 @@ test.describe("create progress", () => {
 test.describe("mobile", () => {
   test.use({ hasTouch: true, isMobile: true, viewport: { width: 390, height: 844 } });
 
+  test("opening starts focus inside the wizard, on Close, without a field", async ({ page }) => {
+    await mockWizardApis(page);
+    await page.goto("/");
+    await expect(page.getByTestId("sidebar-session-row").first()).toBeVisible();
+    await openWizard(page);
+    await expect(wizard(page).getByRole("button", { name: "Close" })).toBeFocused();
+  });
+
   test("the wizard is a bottom sheet sized to its rows, with Launch right under them", async ({ page }) => {
     await mockWizardApis(page);
     await page.goto("/");
