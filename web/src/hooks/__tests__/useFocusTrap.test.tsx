@@ -76,6 +76,27 @@ describe("useFocusTrap", () => {
     expect(tab()).toBe(false);
   });
 
+  it("leaves focus outside both to the modal opened last", () => {
+    function Confirm() {
+      const ref = useRef<HTMLDivElement>(null);
+      useFocusTrap(() => ref.current);
+      return (
+        <div ref={ref} role="dialog" aria-modal="true">
+          <button>confirm</button>
+        </div>
+      );
+    }
+    render(
+      <>
+        <Page open />
+        <Confirm />
+      </>,
+    );
+    button("outside").focus();
+    expect(tab()).toBe(true);
+    expect(document.activeElement).toBe(button("confirm"));
+  });
+
   it("returns focus to the opener on close only when asked", () => {
     for (const restoreFocus of [true, false]) {
       const { rerender } = render(<Page open={false} />);

@@ -209,9 +209,12 @@ fn resolve_host_creation(
     }
     for path in &mut body.extra_repo_paths {
         if !std::path::Path::new(path).is_dir() {
-            return Err(
-                crate::session::builder::BuildRefusal::WorkingDirMissing(path.clone()).into(),
-            );
+            return Err(anyhow::Error::new(
+                crate::session::builder::BuildRefusal::WorkingDirMissing(path.clone()),
+            )
+            .context(format!(
+                "Repository path does not exist or is not a directory: {path}"
+            )));
         }
         *path = std::path::Path::new(path)
             .canonicalize()

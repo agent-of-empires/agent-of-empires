@@ -30,6 +30,9 @@ function trapTab(e: KeyboardEvent, root: HTMLElement | null) {
   // Another modal holding focus, such as a confirm over this one or the palette, owns the key.
   const overlay = holder?.closest('[aria-modal="true"]');
   if (overlay && overlay !== root && !overlay.contains(root)) return;
+  // Focus outside every modal belongs to the top one, the last opened.
+  const top = Array.from(document.querySelectorAll('[aria-modal="true"]')).at(-1);
+  if (!root.contains(holder) && top && !top.contains(root) && !root.contains(top)) return;
   const stops = tabStops(root);
   const first = stops.at(0);
   const last = stops.at(-1);

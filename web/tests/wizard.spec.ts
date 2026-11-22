@@ -166,6 +166,35 @@ test.describe("modal focus", () => {
     await expect(w).toHaveCount(0);
     await expect(opener).toBeFocused();
   });
+
+  test("Tab stays inside a hooks trust confirm opened over the wizard", async ({ page }) => {
+    let refused = false;
+    await startWizard(page, {
+      onCreate: async (_body, route) => {
+        if (refused) return undefined;
+        refused = true;
+        await route.fulfill({
+          status: 403,
+          json: {
+            error: "hooks_need_trust",
+            message: "trust",
+            on_create: ["make setup"],
+            on_launch: [],
+            on_destroy: [],
+          },
+        });
+        return true;
+      },
+    });
+    await launch(page);
+    await expect(page.getByTestId("hooks-trust-dialog")).toBeVisible();
+    const insideConfirm = () =>
+      page.evaluate(() => !!document.activeElement?.closest('[data-testid="hooks-trust-dialog"]'));
+    for (const key of ["Tab", "Tab", "Tab", "Shift+Tab", "Shift+Tab", "Shift+Tab"]) {
+      await page.keyboard.press(key);
+      expect(await insideConfirm()).toBe(true);
+    }
+  });
 });
 
 test.describe("panels focus their first field", () => {

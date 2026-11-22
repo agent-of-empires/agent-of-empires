@@ -909,7 +909,7 @@ impl HomeView {
     }
 
     /// Restore the selected trashed session, clearing `trashed_at` so it
-    /// returns to its prior bucket. No-op when the selection is not trashed.
+    /// returns to its prior bucket. Flashes a hint when the selection is not trashed.
     /// The session stays stopped (trash killed its panes); the user restarts
     /// it with `e` like any stopped session. See #2489.
     pub(super) fn restore_selected_from_trash(&mut self) {
