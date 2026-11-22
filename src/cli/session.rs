@@ -2799,7 +2799,7 @@ async fn set_session_id(profile: &str, args: SetSessionIdArgs) -> Result<()> {
                 pending.context = context;
                 pending.source_conversation = target.clone();
                 pending.source_acp_session_id = source_acp_session_id;
-                pending.terminal = Some(target);
+                pending.set_terminal(Some(target));
                 pending.launch_started = false;
                 // Retain the original checkpoint solely as the owned dead-pane receipt.
             }

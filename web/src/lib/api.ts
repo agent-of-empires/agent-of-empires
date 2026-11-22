@@ -1655,8 +1655,8 @@ export interface UpdateStatus {
   update_command?: string;
 }
 
-export function fetchUpdateStatus(): Promise<UpdateStatus | null> {
-  return fetchJson<UpdateStatus>("/api/system/update-status");
+export function fetchUpdateStatus(init?: RequestInit): Promise<UpdateStatus | null> {
+  return fetchJson<UpdateStatus>("/api/system/update-status", init);
 }
 
 /** Persist that the update banner was dismissed for `version`, server-side, so

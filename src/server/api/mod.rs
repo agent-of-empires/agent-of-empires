@@ -62,7 +62,9 @@ pub(crate) use sandbox_image::status_generation_for_test as sandbox_image_status
 pub(crate) use sandbox_image::{
     create_pull_refusal, invalidate_status as invalidate_sandbox_image_status,
 };
-pub use sandbox_image::{sandbox_image_dismiss, sandbox_image_pull, sandbox_image_status};
+pub use sandbox_image::{
+    sandbox_image_cancel, sandbox_image_dismiss, sandbox_image_pull, sandbox_image_status,
+};
 pub use sessions::{
     abandon_purge, attach_session_project, cancel_creation, create_session,
     create_session_progress, delete_session, delete_workspace, empty_trash,
@@ -613,7 +615,11 @@ mod tests {
         (
             "sandbox_image.rs",
             include_str!("sandbox_image.rs"),
-            &["sandbox_image_pull", "sandbox_image_dismiss"],
+            &[
+                "sandbox_image_pull",
+                "sandbox_image_cancel",
+                "sandbox_image_dismiss",
+            ],
         ),
         ("setup.rs", include_str!("setup.rs"), &["patch_setup"]),
         (
@@ -1862,6 +1868,7 @@ mod tests {
             (Method::POST, "/api/plugins/missing/update/dismiss"),
             (Method::PATCH, "/api/theme"),
             (Method::POST, "/api/sandbox/image-pull"),
+            (Method::POST, "/api/sandbox/image-pull/cancel"),
             (Method::POST, "/api/sandbox/image-dismiss"),
             (Method::PUT, "/api/sessions/missing/file"),
         ] {

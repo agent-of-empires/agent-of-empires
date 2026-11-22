@@ -55,6 +55,7 @@
                 ./assets
                 ./docker
                 ./tests/fixtures/cli-read
+                ./tests/fixtures/pull-progress
                 ./tests/fixtures/pull-stderr
                 ./web/tests/helpers/fakeAcpAgent.mjs
                 ./LICENSE

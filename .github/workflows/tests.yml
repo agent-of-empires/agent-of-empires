@@ -11,7 +11,9 @@ on:
 # Queue generations have distinct refs; cancel-obsolete-queue-runs handles them.
 concurrency:
   group: tests-${{ github.event_name }}-${{ github.event.pull_request.number || github.ref }}
-  cancel-in-progress: true
+  # A push to main runs to completion so macOS results and kache seeds land;
+  # a newer push waits as the single pending run.
+  cancel-in-progress: ${{ github.event_name != 'push' }}
 
 env:
   CARGO_TERM_COLOR: always
@@ -627,9 +629,6 @@ jobs:
           node-version: '22'
           cache: npm
           cache-dependency-path: web/package-lock.json
-      - name: Install web deps
-        working-directory: web
-        run: npm ci
       - uses: ./.github/actions/rust-toolchain
       - uses: ./.github/actions/kache
         with:

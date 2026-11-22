@@ -141,8 +141,14 @@ pub struct StructuredViewState {
 /// Generic so the mode picker and the elicitation answer flow share routing.
 pub struct ChoicePicker {
     pub title: String,
+    /// Context shown above the options, wrapped: the lead-in and the question's
+    /// own detail, which a one-line title cannot hold.
+    pub context: Option<String>,
     /// `(value, label)` rows; `value` is what gets submitted.
     pub options: Vec<(String, String)>,
+    /// Per-option detail, parallel to `options`: a question option's own
+    /// description, shown for the highlighted row. Empty when they carry none.
+    pub details: Vec<Option<String>>,
     pub selected: usize,
     pub purpose: ChoicePurpose,
 }

@@ -1148,6 +1148,8 @@ fn open_mode_picker(state: &mut StructuredViewState) {
         .collect();
     state.choice = Some(ChoicePicker {
         title: " Mode (Enter=set · Esc=close) ".to_string(),
+        context: None,
+        details: Vec::new(),
         options,
         selected,
         purpose: ChoicePurpose::Mode,
@@ -1177,6 +1179,8 @@ fn open_toggle_picker(state: &mut StructuredViewState) {
     }
     state.choice = Some(ChoicePicker {
         title: " Toggles (Enter=flip · Esc=close) ".to_string(),
+        context: None,
+        details: Vec::new(),
         options,
         selected: 0,
         purpose: ChoicePurpose::Toggle,
@@ -1255,20 +1259,33 @@ fn question_picker(
     remaining: Vec<crate::acp::elicitations::ElicitationQuestion>,
     answers: std::collections::BTreeMap<String, crate::acp::elicitations::AnswerValue>,
 ) -> ChoicePicker {
-    let prompt = question
-        .title
-        .clone()
-        .filter(|t| !t.trim().is_empty())
-        .unwrap_or_else(|| {
-            // Later questions advance with an empty lead-in; never a blank title.
-            if message.trim().is_empty() {
-                "Answer".to_string()
-            } else {
-                message.to_string()
-            }
-        });
+    let titled = question.title.as_deref().filter(|t| !t.trim().is_empty());
+    let prompt = match (titled, message.trim()) {
+        (Some(title), _) => title.to_string(),
+        // Later questions advance with an empty lead-in; never a blank title.
+        (None, "") => "Answer".to_string(),
+        (None, lead_in) => lead_in.to_string(),
+    };
+    // The title holds the question; the lead-in and the question's own detail
+    // are what tell the user how to read the options. Some agents send the lead-in
+    // as the title too, so skip a repeat rather than print it twice.
+    let context: Vec<String> = [
+        titled.map(|_| message.trim()),
+        question.description.as_deref(),
+    ]
+    .into_iter()
+    .flatten()
+    .filter(|text| !text.is_empty() && Some(*text) != titled)
+    .map(str::to_string)
+    .collect();
     ChoicePicker {
         title: format!(" {prompt} (Enter=pick · Esc=dismiss) "),
+        context: (!context.is_empty()).then(|| context.join("\n")),
+        details: question
+            .options
+            .iter()
+            .map(|o| o.description.clone().filter(|d| !d.trim().is_empty()))
+            .collect(),
         options: question
             .options
             .iter()
@@ -1319,6 +1336,8 @@ fn approval_key_outcome(
 fn approval_option_picker(pending: &reducer::PendingApproval) -> ChoicePicker {
     ChoicePicker {
         title: format!(" {} (Enter=pick · Esc=dismiss) ", pending.title),
+        context: None,
+        details: Vec::new(),
         options: pending
             .options
             .iter()
@@ -1558,6 +1577,8 @@ fn open_link_picker(state: &mut StructuredViewState, links: Vec<(String, String)
         .collect();
     state.choice = Some(ChoicePicker {
         title: " Open link (1-9=open · Esc=close) ".to_string(),
+        context: None,
+        details: Vec::new(),
         options,
         selected: 0,
         purpose: ChoicePurpose::OpenLink,
@@ -2824,6 +2845,49 @@ mod tests {
             picker.title.contains("Answer"),
             "blank picker title: {:?}",
             picker.title
+        );
+    }
+
+    /// A titled question keeps the form's lead-in and its own detail as context,
+    /// and each option carries the description the highlighted row shows. An
+    /// agent that repeats the lead-in as the title must not print it twice.
+    #[test]
+    fn question_picker_carries_the_context_and_option_details_once() {
+        let mut q = select_question("question_1", "Which store?", true, &["pg", "sqlite"]);
+        q.description = Some("Both are supported today.".into());
+        q.options[1].description = Some("No server to run.".into());
+        let picker = question_picker(
+            test_nonce(),
+            "Choose where the new service keeps its data.",
+            q,
+            Vec::new(),
+            std::collections::BTreeMap::new(),
+        );
+        let context = picker.context.as_deref().unwrap_or_default();
+        assert!(
+            context.contains("Choose where the new service"),
+            "{context}"
+        );
+        assert!(context.contains("Both are supported today."), "{context}");
+        assert_eq!(
+            picker.details,
+            [None, Some("No server to run.".to_string())],
+            "a detail belongs to its own option"
+        );
+
+        let mut repeated = select_question("question_1", "Which store?", true, &["pg"]);
+        repeated.description = None;
+        let picker = question_picker(
+            test_nonce(),
+            "Which store?",
+            repeated,
+            Vec::new(),
+            std::collections::BTreeMap::new(),
+        );
+        assert_eq!(
+            picker.context, None,
+            "the title already says it: {:?}",
+            picker.context
         );
     }
 

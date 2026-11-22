@@ -8,6 +8,11 @@ impl HomeView {
     /// revive cascade (`ensure_pane_ready` / `prepare_live_send`) is expected
     /// to be a fast no-op.
     ///
+    /// `Unknown` counts: it is what an agent-pane adapter that has not
+    /// classified the screen yet reports, and those panes are exactly the ones
+    /// live send now attaches. Liveness still comes from `exists()`, so a
+    /// stale cache can only cost the toast.
+    ///
     /// The `EnterLiveSend` / `SendMessage` handlers use this to skip the
     /// "Reviving session..." toast frame for warm sessions: the toast claims a
     /// bottom bar row, and for the frame(s) it is on screen the bottom-anchored
@@ -31,6 +36,7 @@ impl HomeView {
             crate::session::Status::Running
                 | crate::session::Status::Waiting
                 | crate::session::Status::Idle
+                | crate::session::Status::Unknown
         ) {
             return false;
         }
