@@ -41,7 +41,15 @@ function listValidator(validation: SettingsValidation): ((value: string) => stri
       return (v) =>
         /^[A-Za-z_][A-Za-z0-9_]*(=.*)?$/.test(v) ? null : "Must be KEY or KEY=VALUE (letters, digits, underscores)";
     case "port_mapping_list":
-      return (v) => (/^\d+:\d+$/.test(v) ? null : "Must be port:port (e.g. 3000:3000)");
+      return (v) =>
+        /^\d+:\d+$/.test(v) && v.split(":").every((p) => Number(p) <= 65535)
+          ? null
+          : "Must be port:port, ports up to 65535 (e.g. 3000:3000)";
+    case "volume_ignore_list":
+      return (v) =>
+        v.trim() === "" || v.startsWith("/") || /[:\\\0]/.test(v) || v.split("/").includes("..")
+          ? "Must be a relative path without ':', '\\', or '..' segments"
+          : null;
     default:
       return undefined;
   }

@@ -1827,11 +1827,11 @@ Start the aoe daemon: REST/WebSocket API, plus the web dashboard in builds that 
 * `--host <HOST>` — Host/IP to bind to (use 0.0.0.0 for LAN/VPN access)
 
   Default value: `127.0.0.1`
-* `--auth <AUTH>` — Authentication mode: `token` (default, random URL token), `passphrase` (no token URL, passphrase login wall only), or `none` (no auth at all, loopback-only unless --behind-proxy). Mutually exclusive with --no-auth (which aliases --auth=none)
+* `--auth <AUTH>` — Authentication mode: `token` (default, random URL token), `passphrase` (no token URL, passphrase login wall only), or `none` (no auth at all, requires --behind-proxy). Mutually exclusive with --no-auth (which aliases --auth=none)
 
   Possible values: `token`, `passphrase`, `none`
 
-* `--no-auth` — Disable authentication (only allowed with localhost binding). Alias for --auth=none
+* `--no-auth` — Disable authentication (requires --behind-proxy). Alias for --auth=none
 * `--behind-proxy` — Mark this server as sitting behind a reverse proxy that terminates TLS upstream. Sets cookies as `; Secure` and trusts the `X-Forwarded-For` header from loopback peers. Does NOT auto-spawn a tunnel (unlike --remote). Required when --auth=passphrase or --auth=none is combined with a non-loopback bind
 * `--dangerously-allow-plaintext-remote` — Accept plain HTTP from non-loopback peers. By default the server answers those with 426 before authentication: bearer tokens and passphrases would cross the network in the clear. A TLS proxy or tunnel in front of a loopback listener (`--behind-proxy`, `--remote`) needs no opt-out. This applies to this bind only, is never inferred from the address, and is logged at every start
 * `--allowed-host <HOST>` — Extra `Host` header value to accept (repeatable). The DNS-rebinding gate trusts loopback, any routable IP-literal `Host` (LAN/tailnet IPs can't be rebound), and a non-wildcard `--host` by default. A browser `Origin` is accepted without `--allowed-origin` only when it is allowlisted or has the exact same authority as `Host`; add a HOSTNAME or mDNS name here when serving behind a reverse proxy, a custom tunnel, or by name when binding `0.0.0.0` (access by IP needs no flag). Auto-injected tunnel hosts (`--remote`) need no flag

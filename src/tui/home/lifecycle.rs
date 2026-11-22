@@ -219,6 +219,7 @@ impl HomeView {
             hover_cell: None,
             status_flash: None,
             live_send_ctrl_c_flash_until: None,
+            update_bar_drawn: false,
             live_takeover: None,
             sidebar_collapsed: user_config
                 .as_ref()

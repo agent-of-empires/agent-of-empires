@@ -262,6 +262,28 @@ pub(crate) enum TerminalHandoffContext {
     Discard,
 }
 
+/// What a handoff does with the conversation it retires.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum TerminalHandoffOutcome {
+    Continue,
+    Fresh,
+}
+
+impl TerminalHandoffOutcome {
+    /// A `Discard` continues only when its target resumes.
+    pub(crate) fn of(
+        context: &TerminalHandoffContext,
+        terminal: Option<&ConversationState>,
+    ) -> Self {
+        match (context, terminal) {
+            (TerminalHandoffContext::Keep { .. }, _) => Self::Continue,
+            (TerminalHandoffContext::Discard, Some(target)) if target.resumes() => Self::Continue,
+            (TerminalHandoffContext::Discard, _) => Self::Fresh,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub(crate) struct TerminalHandoffLaunch {
     pub(crate) generation: u64,
@@ -296,9 +318,14 @@ pub(crate) struct TerminalHandoffIntent {
     pub(crate) runner: crate::session::purge_owners::RunnerCapture,
     pub(crate) unborn_fence: Option<TerminalHandoffUnbornFence>,
     pub(crate) terminal: Option<ConversationState>,
+    pub(crate) outcome: TerminalHandoffOutcome,
     pub(crate) launch_required: bool,
     pub(crate) launch_started: bool,
     pub(crate) launch: Option<TerminalHandoffLaunch>,
+    /// The owed launch was refused for the command's own session selector, so the switch ended
+    /// without a pane. Missing on rows from before the refusal, which never ended this way.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub(crate) selector_ended: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -308,6 +335,12 @@ pub(crate) struct TerminalHandoffKey {
 }
 
 impl TerminalHandoffIntent {
+    /// Replace the launch target; the outcome follows it.
+    pub(crate) fn set_terminal(&mut self, terminal: Option<ConversationState>) {
+        self.outcome = TerminalHandoffOutcome::of(&self.context, terminal.as_ref());
+        self.terminal = terminal;
+    }
+
     pub(crate) fn validate_relationships(&self) -> Result<()> {
         anyhow::ensure!(
             self.target_generation <= self.generation,

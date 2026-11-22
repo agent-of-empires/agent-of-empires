@@ -1473,6 +1473,51 @@ describe("server queue", () => {
   });
 });
 
+describe("retryRejectedPrompt (#5662)", () => {
+  const image = { id: "att-1", kind: "image" as const, mime_type: "image/png", name: "shot.png", size: 3 };
+
+  // Node 22's Response.blob() returns a Node Blob, which jsdom's FileReader rejects.
+  function blobResponse(bytes: Uint8Array): Response {
+    const res = new Response(bytes);
+    res.blob = () => Promise.resolve(new Blob([bytes]));
+    return res;
+  }
+
+  async function rejectedThenRetry(text: string, blob: () => Response) {
+    calls = installAcpFakes(({ url }) => (url.includes("/acp/attachments/") ? blob() : undefined));
+    const { result } = await openSession("s-retry");
+    lastSocket().message({
+      session_id: "s-retry",
+      seq: 5,
+      event: { PromptRejected: { reason: "prompt_failed", text, attachments: [image] } },
+    });
+    await flushAsync();
+    const rejected = result.current.state.rejectedPrompts[0]!;
+    await act(() => result.current.retryRejectedPrompt(rejected));
+    return result;
+  }
+
+  it.each([
+    ["a captioned image", "look at this"],
+    ["an attachment-only prompt", ""],
+  ])("resends %s with its stored attachment", async (_label, text) => {
+    await rejectedThenRetry(text, () => blobResponse(new Uint8Array([112, 110, 103])));
+    expect(calls.some((c) => c.method === "GET" && c.url === "/api/sessions/s-retry/acp/attachments/att-1")).toBe(true);
+    const sent = posts("/acp/prompt");
+    expect(sent).toHaveLength(1);
+    expect(JSON.parse(sent[0]!.body!)).toMatchObject({
+      text,
+      attachments: [{ kind: "image", mime_type: "image/png", name: "shot.png", data: "cG5n" }],
+    });
+  });
+
+  it("does not resend without an attachment it cannot reload", async () => {
+    const result = await rejectedThenRetry("look at this", () => new Response("gone", { status: 404 }));
+    expect(posts("/acp/prompt")).toHaveLength(0);
+    expect(result.current.state.lastError).toMatch(/attachments/);
+  });
+});
+
 describe("resolveApproval outcomes", () => {
   it.each([
     ["a 500", () => new Response("boom", { status: 500 }), /Could not resolve approval \(500\)/],

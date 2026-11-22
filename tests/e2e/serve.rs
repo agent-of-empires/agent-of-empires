@@ -142,8 +142,8 @@ fn wait_for_local_dashboard(h: &TuiTestHarness) -> (u16, String) {
 fn restart_local_from_tui(h: &TuiTestHarness) -> u32 {
     let before = daemon_pid(h).expect("serve.pid missing before restart");
     h.send_keys_unfenced("R");
-    h.wait_for("Press R again to restart.");
-    h.send_keys_unfenced("R");
+    h.wait_for("Press Enter to restart.");
+    h.send_keys_unfenced("Enter");
     wait_until(Duration::from_secs(30), Duration::from_millis(100), || {
         let pid = daemon_pid(h).ok_or("serve.pid missing after restart")?;
         if pid == before {
@@ -2332,7 +2332,16 @@ fn cli_serve_daemon_starts_and_stops_cleanly() {
     let port = pick_free_port();
     let port_s = port.to_string();
 
-    let start = h.run_cli(&["serve", "--daemon", "--port", &port_s, "--no-auth"]);
+    let start = h.run_cli(&[
+        "serve",
+        "--daemon",
+        "--port",
+        &port_s,
+        "--no-auth",
+        "--behind-proxy",
+        "--allowed-host",
+        "127.0.0.1",
+    ]);
     assert!(
         start.status.success(),
         "aoe serve --daemon failed.\nstdout: {}\nstderr: {}",
@@ -2724,14 +2733,32 @@ fn cli_serve_restart_replays_launch_state() {
         .trim()
         .parse()
         .unwrap();
-    let invalid = h.run_cli(&["serve", "--daemon", "--host", "0.0.0.0", "--no-auth"]);
+    let invalid = h.run_cli(&[
+        "serve",
+        "--daemon",
+        "--host",
+        "0.0.0.0",
+        "--no-auth",
+        // Invalid on purpose: --behind-proxy without --allowed-host fails
+        // validate_behind_proxy_allowlist, before the running core is stopped.
+        "--behind-proxy",
+    ]);
     assert!(!invalid.status.success());
     assert!(
         pid_alive(core_pid),
         "invalid exposure stopped the running core"
     );
 
-    let provisional = h.run_cli(&["serve", "--daemon", "--port", &port_s, "--no-auth"]);
+    let provisional = h.run_cli(&[
+        "serve",
+        "--daemon",
+        "--port",
+        &port_s,
+        "--no-auth",
+        "--behind-proxy",
+        "--allowed-host",
+        "127.0.0.1",
+    ]);
     assert!(
         provisional.status.success(),
         "{}",
@@ -2759,7 +2786,16 @@ fn cli_serve_restart_replays_launch_state() {
         .parse()
         .unwrap();
 
-    let start = h.run_cli(&["serve", "--daemon", "--port", &port_s, "--no-auth"]);
+    let start = h.run_cli(&[
+        "serve",
+        "--daemon",
+        "--port",
+        &port_s,
+        "--no-auth",
+        "--behind-proxy",
+        "--allowed-host",
+        "127.0.0.1",
+    ]);
     assert!(
         start.status.success(),
         "initial --daemon failed.\nstdout: {}\nstderr: {}",
@@ -3147,8 +3183,8 @@ fn tui_local_restart_preserves_the_gate_without_the_env_variable() {
     h.wait_for("R: restart");
     std::fs::remove_file(app_dir_in(h.home_path()).join("serve.passphrase")).unwrap();
     h.send_keys_unfenced("R");
-    h.wait_for("Press R again to restart.");
-    h.send_keys_unfenced("R");
+    h.wait_for("Press Enter to restart.");
+    h.send_keys_unfenced("Enter");
     h.wait_for("Dashboard start failed");
     assert_eq!(daemon_pid(&h), Some(successor));
     assert!(
@@ -3227,7 +3263,16 @@ fn cli_serve_daemon_writes_marker_to_debug_log_not_serve_log() {
     let port = pick_free_port();
     let port_s = port.to_string();
 
-    let start = h.run_cli(&["serve", "--daemon", "--port", &port_s, "--no-auth"]);
+    let start = h.run_cli(&[
+        "serve",
+        "--daemon",
+        "--port",
+        &port_s,
+        "--no-auth",
+        "--behind-proxy",
+        "--allowed-host",
+        "127.0.0.1",
+    ]);
     assert!(start.status.success(), "aoe serve --daemon failed");
 
     assert!(
@@ -4103,6 +4148,9 @@ fn cli_serve_daemon_profile_reaches_the_served_layer() {
         "--port",
         &port_s,
         "--no-auth",
+        "--behind-proxy",
+        "--allowed-host",
+        "127.0.0.1",
     ]);
     assert!(
         start.status.success(),
@@ -4323,7 +4371,7 @@ case "$*" in
     fi
     ;;
   "funnel --bg --yes "*)
-    printf '%s\n' '{"Web":{"fixture.tailnet.ts.net:443":{"Handlers":{"/":{"Proxy":"http://127.0.0.1:'"$4"'"}}}},"AllowFunnel":{"fixture.tailnet.ts.net:443":true}}' > "$AOE_TEST_FUNNEL_STATE"
+    printf '%s\n' '{"Web":{"fixture.tailnet.ts.net:443":{"Handlers":{"/":{"Proxy":"http://127.0.0.1:'"$5"'"}}}},"AllowFunnel":{"fixture.tailnet.ts.net:443":true}}' > "$AOE_TEST_FUNNEL_STATE"
     ;;
   "funnel "*off)
     printf '{}\n' > "$AOE_TEST_FUNNEL_STATE"
@@ -4390,8 +4438,8 @@ exit 0
             std::fs::write(&reconnect_flag, "").unwrap();
         }
         h.send_keys_unfenced("G");
-        h.wait_for("Press G again for a new passphrase.");
-        h.send_keys_unfenced("G");
+        h.wait_for("Press Enter for a new passphrase.");
+        h.send_keys_unfenced("Enter");
         if replacement_succeeds {
             let (successor, running) =
                 wait_until(Duration::from_secs(30), Duration::from_millis(50), || {
@@ -4470,7 +4518,7 @@ case "$*" in
     fi
     ;;
   "funnel --bg --yes "*)
-    printf '%s\n' '{"Web":{"fixture.tailnet.ts.net:443":{"Handlers":{"/":{"Proxy":"http://127.0.0.1:'"$4"'"}}}},"AllowFunnel":{"fixture.tailnet.ts.net:443":true}}' > "$AOE_TEST_FUNNEL_STATE"
+    printf '%s\n' '{"Web":{"fixture.tailnet.ts.net:443":{"Handlers":{"/":{"Proxy":"http://127.0.0.1:'"$5"'"}}}},"AllowFunnel":{"fixture.tailnet.ts.net:443":true}}' > "$AOE_TEST_FUNNEL_STATE"
     ;;
   "funnel "*off)
     printf '{}\n' > "$AOE_TEST_FUNNEL_STATE"
@@ -4520,8 +4568,8 @@ exit 0
         fs2::FileExt::try_lock_exclusive(&transaction).map_err(|error| error.to_string())
     });
     h.send_keys_unfenced("R");
-    h.wait_for("Press R again to restart.");
-    h.send_keys_unfenced("R");
+    h.wait_for("Press Enter to restart.");
+    h.send_keys_unfenced("Enter");
     h.wait_for("Elapsed:");
     assert!(!running.exists());
     std::fs::rename(&hidden, &running).unwrap();

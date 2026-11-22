@@ -4,15 +4,40 @@
 use agent_client_protocol::v1::schema::ContentBlock;
 use tokio::sync::oneshot;
 
+use crate::daemon::PromptAttachmentRef;
+
 use super::delete::DeleteSessionOutcome;
 use super::reset::ResetSessionOutcome;
 
+/// A user prompt as `send_prompt` built it (#1000): the blocks the agent
+/// receives, and refs to the stored attachments among them, which a refusal
+/// hands back so Retry resends the same payload.
+#[derive(Debug, Clone, Default)]
+pub(super) struct PromptInput {
+    pub(super) blocks: Vec<ContentBlock>,
+    pub(super) attachments: Vec<PromptAttachmentRef>,
+}
+
+impl PromptInput {
+    /// The text the retry pill shows and resends.
+    pub(super) fn text(&self) -> String {
+        super::steer::first_text_block(&self.blocks)
+    }
+}
+
+#[cfg(test)]
+impl From<Vec<ContentBlock>> for PromptInput {
+    fn from(blocks: Vec<ContentBlock>) -> Self {
+        Self {
+            blocks,
+            attachments: Vec::new(),
+        }
+    }
+}
+
 /// Commands sent from `AcpClient` methods to the background connection task.
 pub(super) enum ClientCmd {
-    /// The fully-built prompt content blocks (text first, then any
-    /// attachments). Built in `send_prompt` so the connection task just
-    /// forwards them to `session/prompt`. See #1000.
-    Prompt(Vec<ContentBlock>),
+    Prompt(PromptInput),
     Cancel,
     /// `session/cancel` for one subagent session. Answers whether it was sent:
     /// false when the child is unknown or did not advertise `cancel`.

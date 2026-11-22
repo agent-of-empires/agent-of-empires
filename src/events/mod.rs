@@ -79,6 +79,35 @@ fn not_like_clauses(prefixes: &[&str]) -> (String, Vec<String>) {
     (fragment, patterns)
 }
 
+fn create_owner_only(path: &Path) -> std::io::Result<()> {
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    match options.open(path) {
+        Ok(_) => Ok(()),
+        // Reopening a database already open in this process would drop its SQLite locks.
+        Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => create_dangling_target(path),
+        Err(err) => Err(err),
+    }
+}
+
+/// `create_new` also reports `AlreadyExists` for a symlink whose target is missing; create that
+/// target owner-only so SQLite does not create it with the default mode.
+fn create_dangling_target(path: &Path) -> std::io::Result<()> {
+    match std::fs::metadata(path) {
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+            let link = std::fs::read_link(path)?;
+            create_owner_only(&path.parent().unwrap_or(Path::new("")).join(link))
+        }
+        Err(err) => Err(err),
+        Ok(_) => Ok(()),
+    }
+}
+
 pub fn open(db_path: &Path, schema: &Schema) -> Result<Connection> {
     if let Some(parent) = db_path.parent() {
         if !parent.exists() {
@@ -86,6 +115,12 @@ pub fn open(db_path: &Path, schema: &Schema) -> Result<Connection> {
                 format!("create parent dir for event log at {}", parent.display())
             })?;
         }
+    }
+    // SQLite gives the -wal and -shm files the main file's mode, so create it owner-only first.
+    // Private memory and temporary databases have no file to create.
+    if !matches!(db_path.to_str(), Some("" | ":memory:")) {
+        create_owner_only(db_path)
+            .with_context(|| format!("create event log at {}", db_path.display()))?;
     }
     let conn = Connection::open(db_path)
         .with_context(|| format!("open event log at {}", db_path.display()))?;
@@ -773,6 +808,39 @@ mod tests {
         ))
         .unwrap();
         conn
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn open_creates_owner_only_db_and_sidecars() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("e.db");
+        let schema = Schema::new("demo").unwrap();
+        let conn = open(&db, &schema).unwrap();
+        insert_event(&conn, &schema, "a", 1, "\"x\"", 1).unwrap();
+        for suffix in ["", "-wal", "-shm"] {
+            let path = dir.path().join(format!("e.db{suffix}"));
+            let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+            assert_eq!(mode, 0o600, "{}", path.display());
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn open_through_a_dangling_symlink_creates_the_target_owner_only() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let link = dir.path().join("e.db");
+        std::os::unix::fs::symlink("history.sqlite", &link).unwrap();
+        let schema = Schema::new("demo").unwrap();
+        let conn = open(&link, &schema).unwrap();
+        insert_event(&conn, &schema, "a", 1, "\"x\"", 1).unwrap();
+        for suffix in ["", "-wal", "-shm"] {
+            let path = dir.path().join(format!("history.sqlite{suffix}"));
+            let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+            assert_eq!(mode, 0o600, "{}", path.display());
+        }
     }
 
     #[test]
