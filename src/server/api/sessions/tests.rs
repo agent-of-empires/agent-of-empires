@@ -5924,7 +5924,7 @@ fn public_create_session_error_forwards_typed_causes_as_fixed_templates() {
             "git: under context",
             anyhow::Error::from(GitError::BranchNotFound("nope".into()))
                 .context("while creating worktree"),
-            ("create_failed", "Branch 'nope' not found".into()),
+            ("branch_not_found", "Branch 'nope' not found".into()),
         ),
         (
             "git: worktree path template",
@@ -16053,5 +16053,50 @@ async fn the_list_projects_each_queues_count_and_what_it_waits_on() {
             "{}",
             row.id
         );
+    }
+}
+
+/// A missing project path and a missing worktree branch carry their code header, so a
+/// client that does not read error bodies can still say what was wrong.
+#[tokio::test]
+#[serial_test::serial]
+async fn missing_path_and_branch_refusals_carry_their_code() {
+    use crate::daemon::ApiErrorCode;
+    use crate::server::test_support as support;
+    let _home = crate::session::test_support::isolate_app_dir();
+    support::seed_instances_on_disk_for_test("test", Vec::new());
+    let state = support::build_test_app_state(Vec::new());
+    support::refresh_canonical_metadata_for_test(&state).await;
+    let missing = tempfile::tempdir().unwrap().path().join("missing");
+    let response = review_creation_trust(
+        State(state),
+        Ok(Json(
+            serde_json::from_value(serde_json::json!({"path": missing, "profile": "test"}))
+                .unwrap(),
+        )),
+    )
+    .await;
+    let code = |response: &axum::response::Response| {
+        ApiErrorCode::from_headers(response.status(), response.headers(), false)
+    };
+    assert_eq!(code(&response), Some(ApiErrorCode::WorkingDirMissing));
+
+    for (error, expected) in [
+        (
+            anyhow::Error::from(crate::git::error::GitError::BranchNotFound("feat/x".into())),
+            ApiErrorCode::BranchNotFound,
+        ),
+        (
+            crate::session::builder::BuildRefusal::WorkingDirMissing("/nope".into()).into(),
+            ApiErrorCode::WorkingDirMissing,
+        ),
+    ] {
+        let failure = create_failure(
+            &error,
+            crate::server::create_progress::CreateStage::Preparing,
+            "ref",
+        )
+        .unwrap();
+        assert_eq!(code(&create_failure_response(failure)), Some(expected));
     }
 }

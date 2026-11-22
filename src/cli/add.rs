@@ -295,7 +295,8 @@ pub async fn run(profile: &str, args: AddArgs) -> Result<()> {
             },
             &epoch,
         )
-        .await?;
+        .await
+        .map_err(|error| with_missing_path(error.into(), &path))?;
     if args.interactive && title.is_none() {
         let titles: Vec<&str> = rows.iter().map(|row| row.title.as_str()).collect();
         let default = if args.generated_name {
@@ -551,11 +552,6 @@ fn host_path(path: Option<&std::path::Path>, local: bool) -> Result<String> {
     } else {
         std::env::current_dir()?.join(path)
     };
-    anyhow::ensure!(
-        path.is_dir(),
-        "Path does not exist or is not a directory: {}",
-        path.display()
-    );
     path.into_os_string()
         .into_string()
         .map_err(|_| anyhow::anyhow!("Project path must be UTF-8"))
@@ -757,14 +753,27 @@ fn with_skip_hint(error: anyhow::Error) -> anyhow::Error {
     }
 }
 
+fn error_code(error: &anyhow::Error) -> Option<crate::daemon::ApiErrorCode> {
+    match error.downcast_ref::<DaemonClientError>() {
+        Some(DaemonClientError::Status { code, .. }) => *code,
+        _ => None,
+    }
+}
+
+/// Names the path the CLI sent, which a refusal without a readable body cannot.
+fn with_missing_path(error: anyhow::Error, path: &str) -> anyhow::Error {
+    match error_code(&error) {
+        Some(crate::daemon::ApiErrorCode::WorkingDirMissing) => {
+            anyhow::anyhow!("Path does not exist where the Daemon runs: {path}")
+        }
+        _ => error,
+    }
+}
+
 /// `-w <branch>` without `-b` checks out an existing branch; name the flag that creates one.
 fn with_create_branch_hint(error: anyhow::Error, existing_branch: Option<&str>) -> anyhow::Error {
-    let Some(branch) = existing_branch else {
-        return error;
-    };
-    let not_found = crate::git::error::GitError::BranchNotFound(branch.to_owned()).to_string();
-    match error.downcast_ref::<DaemonClientError>() {
-        Some(DaemonClientError::Status { body, .. }) if body.starts_with(&not_found) => {
+    match (existing_branch, error_code(&error)) {
+        (Some(branch), Some(crate::daemon::ApiErrorCode::BranchNotFound)) => {
             anyhow::anyhow!("{error:#}\nPass -b to create branch '{branch}'.")
         }
         _ => error,
@@ -781,38 +790,37 @@ fn definitive(error: &DaemonClientError) -> bool {
 mod tests {
     use super::*;
 
+    /// Both hints key off the Daemon's error code, never its message text.
     #[test]
-    fn missing_existing_branch_suggests_create_flag() {
-        let status = |body: &str| {
+    fn typed_refusals_name_the_path_and_the_create_flag() {
+        use crate::daemon::ApiErrorCode;
+        let status = |code: Option<ApiErrorCode>| {
             anyhow::Error::from(DaemonClientError::Status {
                 status: reqwest::StatusCode::BAD_REQUEST,
-                code: None,
-                body: body.to_owned(),
+                code,
+                body: String::new(),
                 truncated: false,
             })
         };
-        let missing = "Branch 'feat/x' not found [stage: preparing]";
-        let hinted = with_create_branch_hint(status(missing), Some("feat/x")).to_string();
+        let missing = with_missing_path(status(Some(ApiErrorCode::WorkingDirMissing)), "/nope");
+        assert!(missing.to_string().ends_with(": /nope"), "{missing}");
+        let hinted =
+            with_create_branch_hint(status(Some(ApiErrorCode::BranchNotFound)), Some("feat/x"));
         assert!(
-            hinted.ends_with("Pass -b to create branch 'feat/x'."),
+            hinted
+                .to_string()
+                .ends_with("Pass -b to create branch 'feat/x'."),
             "{hinted}"
         );
-        for (body, branch) in [(missing, None), ("Branch 'main' not found", Some("feat/x"))] {
-            let error = with_create_branch_hint(status(body), branch).to_string();
+        for (code, branch) in [
+            (Some(ApiErrorCode::BranchNotFound), None),
+            (None, Some("feat/x")),
+        ] {
+            let error = with_create_branch_hint(status(code), branch).to_string();
             assert!(!error.contains("-b"), "{error}");
         }
-    }
-
-    #[test]
-    fn local_host_path_rejects_a_missing_directory() {
-        let dir = tempfile::TempDir::new().unwrap();
-        let missing = dir.path().join("missing");
-        let error = host_path(Some(&missing), true).unwrap_err().to_string();
-        assert!(error.contains(&missing.display().to_string()), "{error}");
-        assert_eq!(
-            host_path(Some(dir.path()), true).unwrap(),
-            dir.path().to_str().unwrap()
-        );
+        let other = with_missing_path(status(None), "/nope").to_string();
+        assert!(!other.contains("/nope"), "{other}");
     }
 
     #[cfg(unix)]

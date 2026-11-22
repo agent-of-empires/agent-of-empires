@@ -598,6 +598,11 @@ hooks, MCP summaries with environment/header names but not their values,
 `hooks_need_trust`, `mcp_need_trust`, and a `fingerprint`. Unknown profiles are
 rejected without creating them; read-only and CityHall modes refuse this route.
 
+A project path that is not a directory on the Daemon host returns `400` with
+`aoe-error-code: working_dir_missing`, from this review and from creation.
+Checking out a worktree branch that exists neither locally nor on a remote fails
+creation with `400` and `aoe-error-code: branch_not_found`.
+
 For an interactive generated worktree title, the review may also receive
 `generated_worktree_branch` and `create_new_branch`. It returns `suggested_title`
 and `worktree_path_id`, computed without provisioning. Pass the accepted title and

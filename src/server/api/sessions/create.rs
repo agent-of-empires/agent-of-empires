@@ -486,7 +486,12 @@ pub async fn review_creation_trust(
             anyhow::ensure!(!profile.is_empty(), "Missing profile");
             let profile = crate::session::resolve_existing_profile(&profile)?;
             let path = std::path::Path::new(&body.path);
-            anyhow::ensure!(body.scratch || path.is_dir(), "Project path does not exist");
+            if !body.scratch && !path.is_dir() {
+                return Err(crate::session::builder::BuildRefusal::WorkingDirMissing(
+                    body.path.clone(),
+                )
+                .into());
+            }
             let base = crate::session::resolve_config(&profile)?.hooks;
             let trust = read_creation_trust(path, body.scratch)?;
             let fingerprint = creation_trust_fingerprint(&base, &trust);
@@ -546,6 +551,15 @@ pub async fn review_creation_trust(
         Ok(Ok(review)) => Json(review).into_response(),
         Ok(Err(error)) => {
             tracing::warn!(target: "http.api.sessions", error = %error, "Creation trust review refused");
+            if matches!(
+                error.downcast_ref(),
+                Some(crate::session::builder::BuildRefusal::WorkingDirMissing(_))
+            ) {
+                return crate::server::api::text_error_with_code_header(
+                    crate::daemon::ApiErrorCode::WorkingDirMissing,
+                    error.to_string(),
+                );
+            }
             (StatusCode::BAD_REQUEST, error.to_string()).into_response()
         }
         Err(error) => {
@@ -1606,12 +1620,14 @@ pub(crate) async fn create_session_with(
     }
 }
 
-fn create_failure_response(
+pub(super) fn create_failure_response(
     failure: crate::server::create_progress::CreateFailure,
 ) -> axum::response::Response {
     let code = [
         crate::daemon::ApiErrorCode::AgentHooksNotApproved,
         crate::daemon::ApiErrorCode::CreateOutcomeUnknown,
+        crate::daemon::ApiErrorCode::WorkingDirMissing,
+        crate::daemon::ApiErrorCode::BranchNotFound,
     ]
     .into_iter()
     .find(|code| failure.code == code.as_str());
@@ -1925,9 +1941,9 @@ pub(super) fn public_create_session_error(e: &anyhow::Error) -> (&'static str, S
     }
     if let Some(git_err) = e.chain().find_map(|c| c.downcast_ref::<GitError>()) {
         match git_err {
+            GitError::BranchNotFound(_) => return ("branch_not_found", git_err.to_string()),
             GitError::WorktreeAlreadyExists(_)
             | GitError::BranchAlreadyCheckedOut(_)
-            | GitError::BranchNotFound(_)
             | GitError::InvalidTemplate(_)
             | GitError::NotAGitRepo => return ("create_failed", git_err.to_string()),
             // Raw command output / libgit2 / IO: not safe to expose.
