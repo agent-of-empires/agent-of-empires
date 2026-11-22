@@ -869,6 +869,12 @@ fn take_rolled_back_retry(retry_starting: &RetryStarting, id: &str, seq: u64) ->
 /// first, so the failure is new: a Stopped row takes the Error its Stopped guard would refuse
 /// (the attempt's own launch, as `Launch` admits), and an Error row re-arms push's error dwell.
 fn report_failure_after_rollback(inst: &mut Instance, status_tx: &broadcast::Sender<StatusChange>) {
+    tracing::info!(
+        target: "acp.retry_starting",
+        session = %inst.id,
+        status = ?inst.status,
+        "Retry's new worker failed to start after its rollback"
+    );
     if inst.status == Status::Error {
         if !inst.is_trashed() {
             crate::server::push::publish_new_failure(status_tx, inst);
@@ -907,6 +913,7 @@ impl RetryStartingGuard {
             .retry_starting
             .lock()
             .unwrap_or_else(|e| e.into_inner());
+        let took_over = inst.status == Status::Starting;
         let prior = match (inst.status, owners.get(id)) {
             (Status::Starting, Some(earlier)) if !earlier.rolled_back => earlier.prior,
             (Status::Starting, _) => return None,
@@ -934,6 +941,15 @@ impl RetryStartingGuard {
                 rolled_back: false,
             },
         );
+        tracing::debug!(
+            target: "acp.retry_starting",
+            session = %id,
+            attempt,
+            watermark,
+            prior = ?prior,
+            took_over,
+            "Retry shows Starting"
+        );
         Some(Self {
             state: state.clone(),
             id: id.to_string(),
@@ -944,6 +960,12 @@ impl RetryStartingGuard {
 
     /// The launch succeeded: the new worker's own frames now move the row.
     pub(crate) fn disarm(mut self) {
+        tracing::debug!(
+            target: "acp.retry_starting",
+            session = %self.id,
+            attempt = self.attempt,
+            "Retry launched; the new worker's frames move the row"
+        );
         self.armed = false;
     }
 }
@@ -990,7 +1012,16 @@ async fn revert_retry_starting(state: &AppState, id: &str, attempt: u64) {
             .find(|i| i.id == id && i.status == Status::Starting),
         prior,
     ) {
-        if let Some(prev) = commit_status_intent(inst, StatusPolicy::Authoritative, prior) {
+        let restored = commit_status_intent(inst, StatusPolicy::Authoritative, prior);
+        tracing::info!(
+            target: "acp.retry_starting",
+            session = %id,
+            attempt,
+            prior = ?prior,
+            restored = restored.is_some(),
+            "Retry launch failed; rolled back its Starting"
+        );
+        if let Some(prev) = restored {
             crate::server::push::publish_retry_rollback(&state.status_tx, inst, prev);
         }
         state.note_row_mutation();
