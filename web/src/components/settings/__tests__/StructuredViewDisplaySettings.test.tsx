@@ -85,4 +85,22 @@ describe("StructuredViewDisplaySettings localStorage contract", () => {
       cleanup();
     }
   });
+
+  it("stores the initial history window clamped, backfilling 150 for old blobs", () => {
+    window.localStorage.setItem(KEY, JSON.stringify({ mobileFontSize: 8 }));
+    const { getByLabelText } = render(<StructuredViewDisplaySettings />);
+    const input = getByLabelText("Initial visible history (rows)") as HTMLInputElement;
+    expect(input.value).toBe("150");
+    for (const [typed, expected] of [
+      ["300", 300],
+      ["5", 50],
+      ["99999", 1000],
+      ["200.4", 200],
+    ] as const) {
+      fireEvent.change(input, { target: { value: typed } });
+      expect(readStored().structuredHistoryWindow, typed).toBe(expected);
+    }
+    window.localStorage.setItem(KEY, JSON.stringify({ structuredHistoryWindow: "junk" }));
+    expect(getWebSettingsSnapshot().structuredHistoryWindow).toBe(150);
+  });
 });
