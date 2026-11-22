@@ -21,7 +21,7 @@ import {
   type Route,
 } from "./__tests__/acpHarness";
 import { useQueuedCounts } from "./useAcpQueueCount";
-import { clearAcpCache, useAcpSession } from "./useAcpSession";
+import { clearAcpCache, confirmedPendingRow, pendingRowIds, useAcpSession } from "./useAcpSession";
 
 vi.mock("../lib/api", async (importActual) => {
   const actual = await importActual<typeof import("../lib/api")>();
@@ -632,6 +632,20 @@ describe("persist flush on cleanup", () => {
     expect(localStorage.getItem(storedKey("sess-a"))).toBeNull();
     rerender({ id: "sess-b" });
     expect(JSON.parse(localStorage.getItem(storedKey("sess-a"))!).state.lastSeq).toBe(7);
+  });
+});
+
+describe("confirmedPendingRow", () => {
+  const queuedAt = "2026-01-01T00:00:00.000Z";
+  const row = (id: string, pending?: boolean) => ({ id, text: id, queuedAt, pending });
+  const withRows = (...rows: ReturnType<typeof row>[]) => ({ ...emptyAcpState(), queuedPrompts: rows });
+
+  it("detects a confirmation by row identity, even when another row is enqueued in the same render", () => {
+    const before = pendingRowIds(withRows(row("a", true)));
+    expect(confirmedPendingRow(before, withRows(row("a", false), row("b", true)))).toBe(true);
+    expect(confirmedPendingRow(before, withRows(row("a", true), row("b", true)))).toBe(false);
+    expect(confirmedPendingRow(before, withRows(row("a", true)))).toBe(false);
+    expect(confirmedPendingRow(before, withRows())).toBe(true);
   });
 });
 

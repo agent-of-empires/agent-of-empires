@@ -136,6 +136,16 @@ const queuePosts = new Map<string, QueuePosts>();
 // The mounted hooks showing each Session; with none, an acknowledgment goes to its stored state.
 const queueAckTargets = new Map<string, Set<Dispatch<Action>>>();
 
+export function pendingRowIds(state: AcpState): ReadonlySet<string> {
+  return new Set(state.queuedPrompts.filter((q) => q.pending).map((q) => q.id));
+}
+
+/** True when a row pending in `before` is confirmed, removed or delivered in `state`. */
+export function confirmedPendingRow(before: ReadonlySet<string>, state: AcpState): boolean {
+  const now = pendingRowIds(state);
+  return [...before].some((id) => !now.has(id));
+}
+
 function acknowledgeQueued(sessionId: string, action: Action): void {
   const targets = queueAckTargets.get(sessionId);
   if (targets?.size) {
@@ -238,14 +248,13 @@ export function useAcpSession(
   const archivedAtRef = useLatestRef(archivedAt);
   const snoozedUntilRef = useLatestRef(snoozedUntil);
   const sessionIdRef = useLatestRef(sessionId);
-  const unconfirmedRef = useRef(0);
+  const unconfirmedRef = useRef<ReadonlySet<string>>(new Set());
   useEffect(() => {
     if (!sessionIdRef.current) return;
     cacheSet(sessionIdRef.current, state);
     // Another window must not read a delivered row as unconfirmed and POST it again, so persist confirmations now.
-    const unconfirmed = state.queuedPrompts.filter((q) => q.pending).length;
-    if (unconfirmed < unconfirmedRef.current) flushPersist(sessionIdRef.current);
-    unconfirmedRef.current = unconfirmed;
+    if (confirmedPendingRow(unconfirmedRef.current, state)) flushPersist(sessionIdRef.current);
+    unconfirmedRef.current = pendingRowIds(state);
   }, [state, sessionIdRef]);
   // Separate from the `[state]` effect: its cleanup runs on every state change and would defeat the throttle.
   useEffect(
