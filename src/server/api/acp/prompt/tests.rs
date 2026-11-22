@@ -1160,6 +1160,84 @@ async fn sending_a_queued_plugin_row_now_keeps_its_stored_sender() {
     assert_eq!(again.status(), StatusCode::CONFLICT);
 }
 
+/// A human-edited plugin row keeps its `Plugin` origin but delivers as a user turn, by
+/// queue drain and by send now alike.
+#[tokio::test]
+async fn an_edited_plugin_row_delivers_as_a_user_turn() {
+    let _app_dir = crate::session::test_support::isolate_app_dir();
+    for send_now in [false, true] {
+        let id = format!("sess-edited-plugin-{send_now}");
+        let state = structured_state(&id, true).await;
+        let _cmds = state
+            .acp_supervisor
+            .test_insert_worker_cmd_recording(&id)
+            .await;
+        let _live = crate::acp::supervisor::test_support::save_agent_record(&id, "claude", true);
+        state
+            .session_service
+            .enqueue_prompt(
+                &id,
+                "q1".into(),
+                "from the plugin".into(),
+                vec![],
+                None,
+                crate::server::session_service::QueueSender {
+                    plugin: Some("cron".into()),
+                    origin: crate::daemon::PromptOrigin::Plugin,
+                },
+            )
+            .await
+            .expect("session exists");
+        state
+            .session_service
+            .edit_queued_prompt(&id, "q1".into(), "reworded".into())
+            .await;
+
+        if send_now {
+            let response = acp_prompt(
+                State(Arc::clone(&state)),
+                Path(id.clone()),
+                axum::http::HeaderMap::new(),
+                send_now_req("reworded", "q1"),
+            )
+            .await
+            .into_response();
+            assert_eq!(response.status(), StatusCode::ACCEPTED);
+        } else {
+            state.session_service.drain_queued_prompts_once(&id).await;
+        }
+
+        let sent: Vec<_> = state
+            .acp_event_store
+            .replay_from(&id, 0)
+            .into_iter()
+            .filter_map(|(_, e)| match e {
+                Event::UserPromptSent {
+                    text,
+                    origin,
+                    origin_plugin,
+                    ..
+                } => Some((text, origin, origin_plugin)),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            sent,
+            [(
+                "reworded".to_string(),
+                crate::daemon::PromptOrigin::Plugin,
+                None
+            )],
+            "send_now={send_now}"
+        );
+        assert!(state
+            .session_service
+            .queued_prompts_snapshot(&id)
+            .await
+            .is_empty());
+    }
+}
+
 /// The recorded origin is the header's client value; a forged, missing or body-supplied one
 /// is `Unknown`. A queued row keeps the origin it was stored with, whatever the send-now
 /// request claims.

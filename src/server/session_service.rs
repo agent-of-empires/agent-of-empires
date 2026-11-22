@@ -2216,6 +2216,10 @@ impl SessionService {
 
     /// Replace a queued prompt's text in place.
     ///
+    /// The row keeps its `origin` (provenance) but loses `origin_plugin`: once a
+    /// human rewrites the text, the plugin no longer authored the message, so it
+    /// delivers as a plain user turn.
+    ///
     /// Enforces the same non-empty invariant `queue_enqueue` does, because the
     /// drain relies on it: a row whose text is blank and which carries no
     /// attachments makes `drain_queued_prompts_once` return without retiring
@@ -2244,6 +2248,7 @@ impl SessionService {
                 }
                 Some(q) => {
                     q.text = text.clone();
+                    q.origin_plugin = None;
                     tracing::debug!(
                         target: "acp.queue",
                         session = %inst.id,
@@ -5007,7 +5012,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn editing_a_queued_prompt_keeps_its_sender() {
+    async fn editing_a_queued_prompt_keeps_its_origin_and_drops_the_plugin_sender() {
         let _app_dir = crate::session::test_support::isolate_app_dir();
         let mut inst = Instance::new("edit-origin", "/tmp/aoe-edit-origin");
         inst.id = "sess-edit-origin".to_string();
@@ -5037,7 +5042,7 @@ mod tests {
         assert!(matches!(outcome, EditQueuedOutcome::Updated));
         let queue = service.queued_prompts_snapshot("sess-edit-origin").await;
         assert_eq!(queue[0].text, "reworded");
-        assert_eq!(queue[0].origin_plugin.as_deref(), Some("cron"));
+        assert_eq!(queue[0].origin_plugin, None);
         assert_eq!(queue[0].origin, crate::daemon::PromptOrigin::Plugin);
     }
 
