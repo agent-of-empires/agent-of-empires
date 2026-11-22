@@ -577,7 +577,7 @@ mod linux {
             let worker = r#"["sleep", "600"]"#;
             crate::plugin::install_test_plugin(
                 "acme.serve",
-                24,
+                26,
                 &["runtime.worker", "mcp.serve"],
                 worker,
             );

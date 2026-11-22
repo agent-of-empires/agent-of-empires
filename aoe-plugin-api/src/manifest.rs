@@ -1671,8 +1671,8 @@ impl PluginManifest {
             .any(|c| c.as_str() == MCP_SERVE_CAPABILITY)
         {
             check(
-                self.api_version >= 24,
-                "the mcp.serve capability requires api_version >= 24".into(),
+                self.api_version >= 26,
+                "the mcp.serve capability requires api_version >= 26".into(),
             );
             check(
                 self.runtime.is_some(),
@@ -1978,17 +1978,17 @@ mod tests {
         };
         rejects(&[
             (
-                "mcp.serve below v24",
-                toml(23, true),
-                "mcp.serve capability requires api_version >= 24",
+                "mcp.serve below v26",
+                toml(25, true),
+                "mcp.serve capability requires api_version >= 26",
             ),
             (
                 "mcp.serve without runtime",
-                toml(24, false),
+                toml(26, false),
                 "mcp.serve capability requires a runtime worker",
             ),
         ]);
-        PluginManifest::from_toml_str(&toml(24, true)).expect("v24 mcp.serve parses");
+        PluginManifest::from_toml_str(&toml(26, true)).expect("v26 mcp.serve parses");
     }
 
     #[test]
