@@ -2323,12 +2323,20 @@ impl HomeView {
                     );
                 }
                 SuggestionsAction::TryAgain(key, session_id) => {
-                    self.start_after_trash = Some((session_id.clone(), key));
-                    self.trash_session_by_id(&session_id);
-                    if let Some(view) = &mut self.suggestions_view {
-                        view.set_notice(
-                            "Moving the blocked Session to Trash, then starting again…",
-                        );
+                    let epoch = self.session_feed.applied_epoch().map(str::to_owned);
+                    let origin = self.suggestions_feed.origin();
+                    if let Some(epoch) = epoch.filter(|_| self.trash_session_by_id(&session_id)) {
+                        self.start_after_trash = Some(super::RetryAfterTrash {
+                            session_id,
+                            key,
+                            epoch,
+                            origin,
+                        });
+                        if let Some(view) = &mut self.suggestions_view {
+                            view.set_notice(
+                                "Moving the blocked Session to Trash, then starting again…",
+                            );
+                        }
                     }
                 }
                 SuggestionsAction::OpenSession(id) => match self.try_open_linked_session(&id) {

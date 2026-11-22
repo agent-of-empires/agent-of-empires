@@ -626,7 +626,7 @@ pub struct HomeView {
     /// Sessions whose undelivered first prompt was already announced.
     pub(super) prompt_failures_announced: std::collections::HashSet<String>,
     /// A suggestion to start again once its blocked Session, by id, is in Trash.
-    pub(super) start_after_trash: Option<(String, (String, String))>,
+    pub(super) start_after_trash: Option<RetryAfterTrash>,
     pub(super) suggestions_feed: super::suggestions::SuggestionsFeed,
 
     /// Non-web links handed to the system opener until their exit status arrives.
@@ -647,4 +647,14 @@ pub struct HomeView {
     pub(super) watcher_config_refresh_count: std::sync::atomic::AtomicU64,
     pub(super) reload_failure_state: ReloadFailureState,
     pub(super) pending_watcher_theme: Option<String>,
+}
+
+/// A one-click start to repeat once the runtime accepts its blocked Session's Trash.
+pub(super) struct RetryAfterTrash {
+    pub(super) session_id: String,
+    pub(super) key: (String, String),
+    /// The runtime the Trash request went to.
+    pub(super) epoch: String,
+    /// The suggestions daemon and profile the retry was asked from.
+    pub(super) origin: Option<crate::tui::suggestions::Origin>,
 }

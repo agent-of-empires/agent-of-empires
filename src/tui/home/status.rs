@@ -380,6 +380,19 @@ impl HomeView {
         }
         for error in &errors {
             if self
+                .start_after_trash
+                .as_ref()
+                .is_some_and(|retry| retry.session_id == error.id)
+            {
+                self.start_after_trash = None;
+                if let Some(view) = &mut self.suggestions_view {
+                    view.set_error(format!(
+                        "Couldn't move the blocked Session to Trash, so nothing started: {}",
+                        error.message
+                    ));
+                }
+            }
+            if self
                 .pending_archive_cursor
                 .as_ref()
                 .is_some_and(|pending| pending.id == error.id)
@@ -1163,10 +1176,12 @@ impl HomeView {
                     if self
                         .start_after_trash
                         .as_ref()
-                        .is_some_and(|(trashed, _)| *trashed == id)
+                        .is_some_and(|retry| retry.session_id == id)
                     {
-                        if let Some((_, key)) = self.start_after_trash.take() {
-                            self.suggestions_feed.start(key);
+                        if let Some(retry) = self.start_after_trash.take() {
+                            if retry.epoch == receipt.cursor.epoch {
+                                self.suggestions_feed.start_from(retry.key, retry.origin);
+                            }
                         }
                     }
                     match receipt.outcome.relocation {

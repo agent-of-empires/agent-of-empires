@@ -56,6 +56,18 @@ impl HomeView {
         self.suggestions_feed
             .tick(self.session_feed.latest_snapshot().is_some());
         let mut polled = self.suggestions_feed.poll();
+        if self
+            .start_after_trash
+            .as_ref()
+            .is_some_and(|retry| self.session_feed.applied_epoch() != Some(retry.epoch.as_str()))
+        {
+            self.start_after_trash = None;
+            if let Some(view) = &mut self.suggestions_view {
+                view.set_notice(
+                    "The runtime changed before the Trash finished, so nothing started.",
+                );
+            }
+        }
         let blocked: std::collections::HashMap<_, _> = self
             .session_feed
             .applied_snapshot()

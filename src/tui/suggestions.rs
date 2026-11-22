@@ -299,7 +299,7 @@ fn start_answer(status: u16, body: &serde_json::Value) -> StartAnswer {
 /// The daemon and profile a list was read from. A mutation is bound to it, so
 /// a replaced daemon or another profile never receives work meant for the list shown.
 #[derive(Debug, Clone, PartialEq, Eq)]
-struct Origin {
+pub(super) struct Origin {
     daemon: Option<String>,
     profile: Option<String>,
 }
@@ -1402,7 +1402,7 @@ impl SuggestionsFeed {
     }
 
     /// Where the list on screen came from; `None` before the first load.
-    fn origin(&self) -> Option<Origin> {
+    pub(super) fn origin(&self) -> Option<Origin> {
         self.snapshot.as_ref().map(|s| Origin {
             daemon: s.daemon.clone(),
             profile: s.profile.clone(),
@@ -1784,8 +1784,14 @@ impl SuggestionsFeed {
 
     /// Starts the item with its preset, behind the request in flight.
     pub(super) fn start(&mut self, key: ItemKey) {
-        self.failed = None;
         let origin = self.origin();
+        self.start_from(key, origin);
+    }
+
+    /// Starts `key` bound to `origin`, which the worker refuses if the daemon
+    /// or profile changed since.
+    pub(super) fn start_from(&mut self, key: ItemKey, origin: Option<Origin>) {
+        self.failed = None;
         self.submit_start(key, None, origin);
     }
 

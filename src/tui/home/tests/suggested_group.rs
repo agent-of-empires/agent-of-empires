@@ -1147,9 +1147,9 @@ fn a_home_row_leads_with_the_title_not_the_source() {
     assert!(!text.contains("GitHub #0"), "{text}");
 }
 
-#[test]
-#[serial]
-fn a_prompt_blocked_on_folder_trust_turns_on_pre_trust_then_tries_again() {
+/// Home with the full view open on a one-click started item whose Session is
+/// blocked on folder trust; the suggestions worker records its requests.
+fn blocked_on_folder_trust() -> (TestEnv, String, mpsc::Receiver<String>) {
     use crate::tui::session_feed::SessionFeedResult;
     let mut env = create_test_env_with_sessions(1);
     let instance = env.view.instances().next().unwrap().clone();
@@ -1165,29 +1165,105 @@ fn a_prompt_blocked_on_folder_trust_turns_on_pre_trust_then_tries_again() {
     let mut snap = snapshot(1, &[]);
     snap["items"][0]["started_session"] =
         serde_json::json!({ "id": instance.id, "status": "Idle", "started_via": "start" });
+    let (sink, requests) = mpsc::channel();
+    env.view.suggestions_feed = SuggestionsFeed::recording_for_test(snap.clone(), sink);
     env.view.suggestions_feed.set_snapshot_for_test(snap);
     env.view.apply_suggestions_results();
     env.view.open_suggestions_view();
+    (env, instance.id, requests)
+}
 
+fn trashed_at(epoch: &str) -> crate::tui::session_feed::SessionCommandOutcome {
+    crate::tui::session_feed::SessionCommandOutcome::Trashed(crate::daemon::MutationReceipt {
+        cursor: crate::daemon::RuntimeCursor {
+            epoch: epoch.into(),
+            revision: 6,
+        },
+        outcome: crate::daemon::TrashOutcome {
+            relocation: crate::daemon::TrashRelocationOutcome::Skipped,
+        },
+    })
+}
+
+/// Publishes the applied rows again at `revision`, confirming receipts up to it.
+fn publish_revision(env: &mut TestEnv, revision: u64) {
+    let mut rows = (*env.view.session_feed.applied_snapshot().unwrap()).clone();
+    rows.cursor.revision = revision;
+    env.view
+        .session_feed
+        .publish_for_test(crate::tui::session_feed::SessionFeedResult::Snapshot(
+            Arc::new(rows),
+        ));
+}
+
+fn apply_feed_until(env: &mut TestEnv, done: impl Fn(&TestEnv) -> bool) {
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while !done(env) {
+        env.view.apply_session_feed();
+        assert!(Instant::now() < deadline, "condition not reached in time");
+        std::thread::sleep(Duration::from_millis(5));
+    }
+}
+
+#[test]
+#[serial]
+fn a_prompt_blocked_on_folder_trust_turns_on_pre_trust_then_tries_again() {
+    let (mut env, id, requests) = blocked_on_folder_trust();
     let text = render_home_to_string(&mut env.view, 120, 40);
     assert!(text.contains("t turn on pre-trust"), "{text}");
-    with_authenticated_local_project_registry(&mut env.view, |view| {
-        view.handle_key(key(KeyCode::Char('t')), None);
-        let text = render_home_to_string(view, 120, 40);
-        assert!(text.contains("Turn on pre-trust"), "{text}");
-        view.handle_key(key(KeyCode::Char('y')), None);
-        assert!(
-            crate::session::config::Config::load()
-                .unwrap()
-                .session
-                .pre_trust_agent_folders
-        );
-        view.handle_key(key(KeyCode::Enter), None);
-    });
-    assert_eq!(
-        env.view.start_after_trash,
-        Some((instance.id.clone(), ("gh".to_string(), "i0".to_string())))
+    let mut commands = env.view.session_feed.request_driver_for_test();
+    env.view.handle_key(key(KeyCode::Char('t')), None);
+    let text = render_home_to_string(&mut env.view, 120, 40);
+    assert!(text.contains("Turn on pre-trust"), "{text}");
+    env.view.handle_key(key(KeyCode::Char('y')), None);
+    assert!(
+        crate::session::config::Config::load()
+            .unwrap()
+            .session
+            .pre_trust_agent_folders
     );
+    env.view.handle_key(key(KeyCode::Enter), None);
+    let (trashed, _) = commands(Ok(trashed_at("test"))).expect("Trash was sent");
+    assert_eq!(trashed, id);
+    publish_revision(&mut env, 6);
+    apply_feed_until(&mut env, |env| env.view.start_after_trash.is_none());
+    // The start may queue behind a reload, which a poll sends on.
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while !requests.try_iter().any(|r| r == "start gh/i0") {
+        env.view.apply_suggestions_results();
+        assert!(Instant::now() < deadline, "the retry never started");
+        std::thread::sleep(Duration::from_millis(5));
+    }
+}
+
+#[test]
+#[serial]
+fn a_failed_try_again_trash_disarms_so_a_later_trash_starts_nothing() {
+    let (mut env, id, requests) = blocked_on_folder_trust();
+    crate::session::config::update_config(|c| c.session.pre_trust_agent_folders = true).unwrap();
+    env.view.open_suggestions_view();
+    let mut commands = env.view.session_feed.request_driver_for_test();
+    env.view.handle_key(key(KeyCode::Enter), None);
+    assert!(commands(Err("refused".into())).is_some(), "Trash was sent");
+    apply_feed_until(&mut env, |env| env.view.start_after_trash.is_none());
+    let shown = env.view.suggestions_view.as_ref().unwrap();
+    assert!(
+        shown
+            .error
+            .as_deref()
+            .is_some_and(|e| e.contains("nothing started")),
+        "{:?}",
+        shown.error
+    );
+
+    env.view.info_dialog = None;
+    assert!(env.view.trash_session_by_id(&id));
+    assert!(commands(Ok(trashed_at("test"))).is_some());
+    publish_revision(&mut env, 6);
+    apply_feed_until(&mut env, |env| env.view.session_feed.can_submit(&id));
+    env.view.apply_suggestions_results();
+    let sent: Vec<String> = requests.try_iter().collect();
+    assert!(sent.iter().all(|r| !r.starts_with("start")), "{sent:?}");
 }
 
 #[test]
